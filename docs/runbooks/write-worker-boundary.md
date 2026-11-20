@@ -31,6 +31,11 @@ Muse retains its existing self-contained filesystem sandbox.
 Read-only AGY retains its existing filesystem boundary and uses
 the same GitHub domain and address refusal rules, without nesting two boundaries.
 
+The launcher links the project virtual environment at the review worktree's `.venv` and removes the
+link during cleanup when it created it. Governed pytest can use `.venv/bin/python` and queue against
+the [host test pool](test-slots.md#sandboxed-reviews). The boundary receipt reports whether the launcher
+bound the pool and gives the pool size or the refusal reason.
+
 Both paths withhold the host's GitHub login and refuse direct GitHub egress. The existing read-only
 `gh` relay admits `pr view`, `pr diff`, `pr checks`, `pr list`, `issue view` and `run view`, each with its
 own listed flags read at that form's arity (a flag that is a boolean in one form and takes a value in another
@@ -123,7 +128,8 @@ One bubblewrap invocation per launch, built in full by the launcher:
   Claude's and Cursor's file tools get the same grants (`--add-dir`): the shared skills and
   `<task>.inputs`.
 - Writable: a private `TMPDIR` (also `LU_SCRATCH_ROOT` and `XDG_RUNTIME_DIR`) and the declared outputs
-  (the final-message file). The worktree and its Git metadata are read-only mounts.
+  (the final-message file). When available, the verified test pool's ticket directories and lock files
+  are mounted writable inside a read-only pool root. The worktree and its Git metadata are read-only mounts.
 - Network: only the CONNECT-only egress proxy of the formal review attempts (`attempt_network`),
   reached through the in-namespace forwarder. Any public host on port 443 except GitHub: its names
   (`github.com`, every name below it, and `ghcr.io`) and every name that resolves into the address
@@ -198,10 +204,6 @@ and worker-authored `pre-push` and `reference-transaction` marker hooks. It veri
 file and SSH-form origins, new and existing branch updates, and that a secret-bearing commit message is refused
 without changing the remote or executing either hook.
 
-The provider keep-list retains `sources_mcp_config` and `_SOURCES_MCP_HOME`, including their AGY and
-OpenCode shapes and the associated projection branches. Only Cursor's projection is reached by native
-read-only dispatches. These retained definitions do not re-enable a write-mode boundary.
-
 ## Sources inside the boundary
 
 Sources goes through the read-only AGY boundary's `SourcesRelay` (read-only tools only). The launcher
@@ -219,10 +221,15 @@ real Codex configuration reaches the run. The checkout's untrusted `.codex/` lay
 Dispatched Codex therefore omits their hooks, agents settings and context-window overrides, as well as
 MCP servers, connectors and loopback Sources URLs. Codex uses its model defaults. `mcp_optional_startup_grace_ms = 0` waits for the optional server to
 finish startup or reach its existing timeout before the first model turn. The default one-second grace
-can omit the still-starting relay's tools from that turn. Sources stays optional if startup fails. The read-only Codex argv enables only Sources readers and passes `--disable apps`. The tools that persist
-fetched entries stay refused by the relay. The receipt's `sources` holds the relay's call counts, or why
-it was unavailable, and `codex_home` the config digest and whether the login was linked. Sources is
-optional: without the relay the server fails to start and the run goes on.
+can omit the still-starting relay's tools from that turn. The read-only Codex argv enables only Sources
+readers and passes `--disable apps`. Cursor reads the relay definition from its task-local, read-only MCP
+file. The relay refuses tools that persist fetched entries.
+
+A Ukrainian review requires a Sources projection and relay before the provider starts.
+`sources_mcp_required` identifies missing setup and `sources_mcp_unavailable` identifies a relay
+startup failure. Other reviews can proceed if the relay is unavailable. The boundary receipt's
+`sources` field holds the relay evidence. Settlement copies a verified completed-call count to
+`sources_mcp_call_count`.
 
 ## Known limits
 
