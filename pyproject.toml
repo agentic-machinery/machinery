@@ -59,7 +59,7 @@ semgrep = ["semgrep==1.183.0"]
 
 [tool.uv]
 # One uv for the lock and every CI job (pins.txt UV_VERSION).
-required-version = "==0.13.1"
+required-version = "==0.13.9"
 # Semgrep 1.183.0 pins vulnerable MCP and OpenTelemetry releases. Scope the
 # patched versions to that wheel and keep the entire scanner hash-locked.
 # The OpenTelemetry SDK, exporter and instrumentations share version pins.
@@ -82,8 +82,31 @@ include-package-data = true
 # Other resource readers use machinery_path.
 include = ["lu_machinery*", "agents_extensions.shared"]
 
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+src = [".", "lu_machinery"]
+exclude = [".venv/", "node_modules/", "starlight/", "lu_machinery/oneoff/"]
+
+[tool.ruff.per-file-target-version]
+# The fingerprint functions must retain the 3.12 ast.dump branch.
+"lu_machinery/ci/subprocess_timeout_guard.py" = "py312"
+"lu_machinery/hygiene/lint_source_db_writable_connects.py" = "py312"
+"lu_machinery/lint/lint_test_waits.py" = "py312"
+# Generator requires all three type arguments on the supported floor.
+"lu_machinery/common/pytest_scratch.py" = "py312"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "SIM", "RUF", "PLC0415"]
+ignore = ["RUF001", "RUF002", "RUF003", "E402", "E501", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+"!lu_machinery/{api,project_api}/**.py" = ["PLC0415"]
+"lu_machinery/api/*.py" = ["B008"]
+"lu_machinery/project_api/*.py" = ["B008"]
+
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true

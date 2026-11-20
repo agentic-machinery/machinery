@@ -668,20 +668,21 @@ class MuseAdapter:
             if not isinstance(response, str) or not response.strip() or input_tokens + output_tokens < 1:
                 raise ValueError("muse_evidence_incomplete")
             task_id, nonce = plan.metadata["task_id"], plan.metadata["run_nonce"]
+            cli_sha256, prompt_sha256 = plan.metadata["cli_sha256"], plan.metadata["prompt_sha256"]
             if (
                 not isinstance(task_id, str) or not 0 < len(task_id) <= 100
                 or not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{16}", nonce) is None
                 or not isinstance(plan.metadata["cli_version"], str)
                 or not 0 < len(plan.metadata["cli_version"]) <= 128
-                or any(re.fullmatch(r"[0-9a-f]{64}", plan.metadata[key]) is None
-                       for key in ("cli_sha256", "prompt_sha256"))
+                or not isinstance(cli_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", cli_sha256) is None
+                or not isinstance(prompt_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", prompt_sha256) is None
             ):
                 raise ValueError("muse_launch_binding_invalid")
             evidence = MuseRunEvidence(
                 task_id=task_id, run_nonce=nonce, provider_session_id=session, provider_run_id=command,
                 requested_selector=plan.metadata["model"], usage_model=counters["model"],
-                cli_version=plan.metadata["cli_version"], cli_sha256=bytes.fromhex(plan.metadata["cli_sha256"]),
-                prompt_sha256=bytes.fromhex(plan.metadata["prompt_sha256"]), declared_mode=mode,
+                cli_version=plan.metadata["cli_version"], cli_sha256=bytes.fromhex(cli_sha256),
+                prompt_sha256=bytes.fromhex(prompt_sha256), declared_mode=mode,
                 declared_profile=_PROFILES[mode], declared_toolset=_TOOLS[mode],
                 input_tokens=input_tokens, output_tokens=output_tokens,
                 cached_tokens=counters["cached_tokens"], reasoning_tokens=counters["reasoning_tokens"],

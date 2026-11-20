@@ -1173,7 +1173,9 @@ class OwnershipLedger:
                             (task_id, json.dumps([self._stored_claim(c) for c in concrete], sort_keys=True),
                              os.getpid(), enqueued_at, now + bound - cycle_waited),
                         )
-                        ticket = int(cursor.lastrowid)
+                        ticket = cursor.lastrowid
+                        if ticket is None:
+                            raise sqlite3.DatabaseError("write waiter insert did not return a ticket")
                         self._record_event(
                             conn, task_id, "requeued" if requeued else "queued",
                             {"task_id": task_id, "conflicts": blockers, "caller": caller,

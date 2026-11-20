@@ -86,20 +86,22 @@ CI_GATE_RUNNER=ubuntu-24.04
 #   (ubuntu-latest pointed to it on 2026-11-05). The versioned label keeps the
 #   image fixed when ubuntu-latest moves.
 CI_GATE_PYTHON=.python-version
-#   Every job runs the uv-managed CPython named in the repository's
-#   .python-version (3.14.8 on 2026-11-17), the build the host's uv installs.
+#   Machinery jobs default to the uv-managed CPython named in the repository's
+#   .python-version (3.14.10 on 2026-11-20).
 #   .github/actions/uv-python checks the interpreter it puts on PATH.
 #   UV_PYTHON_PREFERENCE=only-managed keeps uv off the runner's own Pythons.
-UV_VERSION=0.13.1
-#   https://github.com/astral-sh/uv/releases/tag/0.13.1 (published
-#   2026-10-14), the host's uv. pyproject.toml [tool.uv] required-version pins
-#   the same release, so one uv writes and reads uv.lock. It also matches
-#   the required-version at the product commit in product-consumer.pin.
-UV_LINUX_X86_64_SHA256=eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+UV_VERSION=0.13.9
+#   https://github.com/astral-sh/uv/releases/tag/0.13.9 (published 2026-11-17).
+#   pyproject.toml [tool.uv] required-version pins the same release.
+UV_LINUX_X86_64_SHA256=a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5
 #   uv-x86_64-unknown-linux-gnu.tar.gz of that release; equals its GitHub
 #   release asset digest. ci-gate.yml and tests.yml carry both values.
 #   uv checks every uv.lock wheel against its recorded SHA-256 at sync
 #   (`uv sync --locked` refused an edited hash with "Hash mismatch", 2026-11-17).
+PRODUCT_UV_VERSION=0.13.1
+PRODUCT_UV_LINUX_X86_64_SHA256=eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+#   The installed-wheel job uses these pins only to sync uv.lock at the
+#   product revision in product-consumer.pin, which requires uv 0.13.1.
 ACTIONS_CACHE=55cc8345863c7cc4c66a329aec7e433d2d1c52a9
 #   actions/cache v6.1.0, checked against its upstream tag on 2026-11-08.
 #   Restore/save sub-actions cache checksum-verified release archives only.

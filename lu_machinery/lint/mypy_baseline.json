@@ -305,22 +305,7 @@
     {
       "path": "lu_machinery/agent_runtime/adapters/muse.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"fromhex\" of \"bytes\" has incompatible type \"object\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/agent_runtime/adapters/muse.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"fromhex\" of \"bytes\" has incompatible type \"object\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/agent_runtime/adapters/muse.py",
-      "code": "arg-type",
       "message": "Argument 2 to \"_workspace\" has incompatible type \"Any | None\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/agent_runtime/adapters/muse.py",
-      "code": "call-overload",
-      "message": "No overload variant of \"fullmatch\" matches argument types \"str\", \"object\""
     },
     {
       "path": "lu_machinery/agent_runtime/adapters/muse.py",
@@ -921,11 +906,6 @@
       "path": "lu_machinery/api/delegate_router.py",
       "code": "arg-type",
       "message": "Argument 1 to \"_delegate_task_rows\" has incompatible type \"None | set[Literal['cancelled', 'crashed', 'done', 'dry_run', 'failed', 'needs_finalize', 'no_deliverable', 'rate_limited', 'running', 'spawning', 'timeout']]\"; expected \"None | set[str]\""
-    },
-    {
-      "path": "lu_machinery/api/delegate_router.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
     },
     {
       "path": "lu_machinery/api/delegate_router.py",
@@ -2731,11 +2711,6 @@
       "path": "lu_machinery/ci/flake_ledger.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/ci/junit_results.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"None | str\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
     },
     {
       "path": "lu_machinery/ci/junit_results.py",
@@ -5469,11 +5444,6 @@
     },
     {
       "path": "lu_machinery/guardrails/delegate_ownership.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"None | int\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/guardrails/delegate_ownership.py",
       "code": "return-value",
       "message": "Incompatible return value type (got \"Any | Connection\", expected \"SQLiteConnection\")"
     },
@@ -6768,16 +6738,6 @@
       "message": "Item \"None\" of \"Any | None\" has no attribute \"__iter__\" (not iterable)"
     },
     {
-      "path": "lu_machinery/orchestration/task_family/codex_state.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"None | int\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/task_family/codex_state.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"None | int\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
       "path": "lu_machinery/orchestration/task_family/executor.py",
       "code": "arg-type",
       "message": "Argument 1 to \"get\" of \"dict\" has incompatible type \"tuple[str, Any | None | str]\"; expected \"tuple[str, str]\""
@@ -7910,16 +7870,6 @@
     {
       "path": "lu_machinery/review/reviewer_scheduler.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"None | float\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/review/reviewer_scheduler.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"None | float\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/review/reviewer_scheduler.py",
-      "code": "arg-type",
       "message": "Argument 2 to \"_quota_fresh\" has incompatible type \"object\"; expected \"Mapping[str, object]\""
     },
     {
@@ -8324,16 +8274,6 @@
     },
     {
       "path": "lu_machinery/work/attention.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/work/attention.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
-    },
-    {
-      "path": "lu_machinery/work/attention.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
@@ -8361,11 +8301,6 @@
       "path": "lu_machinery/work/attention.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/work/normalize.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
     },
     {
       "path": "lu_machinery/work/normalize.py",
@@ -8396,11 +8331,6 @@
       "path": "lu_machinery/work/schema/__init__.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"dict[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/work/sources_public.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str\""
     },
     {
       "path": "lu_machinery/work/sources_public.py",

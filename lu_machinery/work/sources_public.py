@@ -160,8 +160,11 @@ def admit_delegate_task_row(
         for entry in row["linked_issues"]:
             if not isinstance(entry, dict):
                 continue
+            raw_issue = entry.get("issue")
+            if raw_issue is None:
+                continue
             try:
-                number = int(entry.get("issue"))
+                number = int(raw_issue)
             except (TypeError, ValueError):
                 continue
             repository = entry.get("repository")

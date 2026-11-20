@@ -224,8 +224,11 @@ def _task_issue_links(task: dict[str, Any]) -> list[tuple[int, str]] | None:
         for entry in raw:
             if not isinstance(entry, dict):
                 continue
+            raw_issue = entry.get("issue")
+            if raw_issue is None:
+                continue
             try:
-                number = int(entry.get("issue"))
+                number = int(raw_issue)
             except (TypeError, ValueError):
                 continue
             repository = entry.get("repository")

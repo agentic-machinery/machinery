@@ -420,8 +420,11 @@ def qualify_merge_advice(
     repository = str(item.get("repository_id") or "")
     if str(github.get("repository") or "") != repository:
         return _unknown("receipt_repository_mismatch")
+    remote_id = item.get("remote_id")
+    if remote_id is None:
+        return _unknown("receipt_pr_mismatch")
     try:
-        pr_number = int(item.get("remote_id"))
+        pr_number = int(remote_id)
     except (TypeError, ValueError):
         return _unknown("receipt_pr_mismatch")
     if pr.get("number") != pr_number:
@@ -508,8 +511,12 @@ def attach_merge_evidence(
         projections = item.setdefault("projections", {})
         verification = projections.setdefault("verification", {})
         repository = str(item.get("repository_id") or "")
+        remote_id = item.get("remote_id")
+        if remote_id is None:
+            verification["merge_evidence"] = _unknown("no_ledger")
+            continue
         try:
-            number = int(item.get("remote_id"))
+            number = int(remote_id)
         except (TypeError, ValueError):
             verification["merge_evidence"] = _unknown("no_ledger")
             continue

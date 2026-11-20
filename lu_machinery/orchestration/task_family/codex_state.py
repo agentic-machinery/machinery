@@ -112,9 +112,7 @@ def _coerce_task_id(raw: Any) -> str:
         raise CodexStateContextError(f"task id must be a UUID: {candidate!r}") from exc
 
 
-def _coerce_timestamp(raw: Any, *, field: str, optional: bool = False) -> int | None:
-    if raw is None and optional:
-        return None
+def _coerce_timestamp(raw: Any, *, field: str) -> int:
     if isinstance(raw, bool):
         raise CodexStateContextError(f"{field} must be an integer timestamp")
     try:
@@ -141,15 +139,16 @@ def _row_to_record(row: sqlite3.Row, *, has_host: bool) -> ThreadRecord:
 
 
 def _row_to_cleanup_record(row: sqlite3.Row) -> CleanupThreadRecord:
+    archived_at = row["archived_at"]
     return CleanupThreadRecord(
         thread_id=_coerce_task_id(row["id"]),
         title=_to_text(row["title"]) or "",
         cwd=_to_text(row["cwd"]) or "",
         rollout_path=_to_text(row["rollout_path"]) or "",
-        created_at=int(_coerce_timestamp(row["created_at"], field="created_at")),
-        updated_at=int(_coerce_timestamp(row["updated_at"], field="updated_at")),
+        created_at=_coerce_timestamp(row["created_at"], field="created_at"),
+        updated_at=_coerce_timestamp(row["updated_at"], field="updated_at"),
         archived=_coerce_bool(row["archived"]),
-        archived_at=_coerce_timestamp(row["archived_at"], field="archived_at", optional=True),
+        archived_at=_coerce_timestamp(archived_at, field="archived_at") if archived_at is not None else None,
     )
 
 
