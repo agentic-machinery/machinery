@@ -36,11 +36,18 @@ Practices used:
 - Triage PRs by leverage: land now; one action from landing; needs a fix round; needs a
   decision.
 - Reversible and in scope: decide now and report; otherwise P6.
+- Review every suggestion, fix, routing change, retro change, and security item from the operator
+  or eggbot for fit, risk, and root-cause value (2026-11-20 operator rule). The council security
+  seat reviews security items. Record a reasoned accept, change, or reject decision. Slot only
+  accepted items into a milestone and implement them.
 - Probe a claimed limit, outage or impossibility before routing around it.
 - Use the [CI recovery recipe](recipes.md#ci-recovery) before the single rerun, which is
   only for an infrastructure failure: a failing test node is fixed or deleted, never rerun.
 - For review scope and repeated findings, apply the canonical
   [review budget](../../review-loop/references/policy.md).
+- If the review budget ends with a blocker, limit work to open findings and allow at most one
+  successor lineage per card. Close the predecessor PR when the successor opens. If the budget
+  runs out again, re-slot or redesign without a third lineage.
 - Apply OO-99 through the binding [native usage pace/reserve rule](../../../rules/model-assignment.md).
   Read each pool's CodexBar pace line, used minus expected. A pool is short only when
   it will not last to reset; reset credits cover a deficit. Use capacity before reset,
