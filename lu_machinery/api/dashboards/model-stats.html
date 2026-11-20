@@ -432,7 +432,7 @@ function percentTicks(sy, left, right) {
     `<line class="grid" x1="${left}" x2="${right}" y1="${sy(share)}" y2="${sy(share)}"/>`
     + `<text x="${left - 6}" y="${sy(share) + 4}" text-anchor="end">${share * 100}%</text>`).join("");
 }
-function scatter(points, id, yLabel, xLabel, connect = false) {
+function scatter(points, id, yLabel, xLabel, connect = false, yMetric = "approval") {
   const W = chartWidth(id), H = 270, left = 43, right = W - 26, top = 29, bottom = H - 43;
   const scale = niceScale(Math.max(...points.map((p) => p.x)), W);
   const sx = (value) => left + value / scale.max * (right - left);
@@ -464,7 +464,7 @@ function scatter(points, id, yLabel, xLabel, connect = false) {
   }).join("");
   const legend = points.map((p) => `<span>${modelKey(p.model, p.low_sample)}</span>`).join("");
   const shared = groups.filter((group) => group.length > 1).map((group) =>
-    `<li>At ${num(group[0].x, 3)} on the horizontal axis and ${num(group[0].y * 100, 1)}% approval, ${group.map((p) => esc(p.model)).join(", ")} share a position.</li>`).join("");
+    `<li>At ${num(group[0].x, 3)} on the horizontal axis and ${num(group[0].y * 100, 1)}% ${esc(yMetric)}, ${group.map((p) => esc(p.model)).join(", ")} share a position.</li>`).join("");
   return svgChart(W, H, `${yLabel} against ${xLabel}`,
     percentTicks(sy, left, right) + verticalTicks(scale, sx, top, bottom) + line + intervals + dots
     + `<text x="${left}" y="14">${yLabel} ↑</text>`
@@ -497,25 +497,37 @@ function pareto(data) {
   if (xWrap) xWrap.hidden = cls !== "all";
   if (cls !== "all") {
     const job = (charts.jobs || []).find((entry) => entry.class === cls);
-    const allTimed = (job?.models || []).filter((m) => {
+    const jobModels = job?.models || [];
+    const hasClassFrontier = jobModels.some((m) => "frontier" in m);
+    const hasHoursExact = jobModels.some((m) => "hours_exact" in m);
+    const allTimed = jobModels.filter((m) => {
       const h = exactHours(m);
       return h !== null && h > 0;
     });
     const shown = allTimed.filter((m) => keepModel(m.model));
-    if (!shown.length) return `<p class="muted">Not enough data in ${esc(cls)}: no model has both timed wall hours and a landed task in this selection.</p>`;
+    if (!shown.length) {
+      return !hasHoursExact && jobModels.length
+        ? `<p class="muted">Not enough data in ${esc(cls)} from this cached snapshot: no model has a non-zero rounded hours-per-merge value (cached snapshots round short durations to 0 and omit unrounded hours).</p>`
+        : `<p class="muted">Not enough data in ${esc(cls)}: no model has both timed wall hours and a landed task in this selection.</p>`;
+    }
     const frontier = shown.filter((m) => m.frontier);
     const frontierNames = frontier.map((m) => esc(m.model)).join(", ");
     const shownHasEligible = shown.some((m) => !m.low_sample);
-    const frontierNote = frontier.length > 1 ? `The dashed line connects the frontier models in ${esc(cls)} (${frontierNames}).`
-      : frontier.length === 1 ? `${frontierNames} alone is on the frontier for ${esc(cls)} among the models shown.`
-        : shownHasEligible ? `None of the models shown is on the window's frontier for ${esc(cls)}.`
-          : `Not enough data for a frontier in ${esc(cls)} (needs at least ${lowBelow()} tasks and a timed merge per model).`;
+    const frontierNote = !hasClassFrontier
+      ? `This cached snapshot does not include precomputed frontier rankings for ${esc(cls)}.`
+      : frontier.length > 1 ? `The dashed line connects the frontier models in ${esc(cls)} (${frontierNames}).`
+        : frontier.length === 1 ? `${frontierNames} alone is on the frontier for ${esc(cls)} among the models shown.`
+          : shownHasEligible ? `None of the models shown is on the window's frontier for ${esc(cls)}.`
+            : `Not enough data for a frontier in ${esc(cls)} (needs at least ${lowBelow()} tasks and a timed merge per model).`;
+    const legacyHoursNote = !hasHoursExact
+      ? " Cached snapshot fallback: hours per merge are rounded to 2 decimals, so models under 0.005 h/merge may be omitted."
+      : "";
     const rows = shown.map((m) => `<tr><td>${modelKey(m.model, m.low_sample)}${m.low_sample ? LOW : ""}</td>`
       + cell(displayHours(m)) + cell(share(m.rate, m.tasks)) + cell(ciText(m.ci))
-      + cell(num(m.tasks)) + cell(num(m.landed)) + `<td>${m.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
+      + cell(num(m.tasks)) + cell(num(m.landed)) + `<td>${!hasClassFrontier ? "unavailable" : m.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
     return scatter(shown.map((m) => ({...m, x: exactHours(m), y: m.rate, ci: m.ci})),
-      "chart", `Landed share (${esc(cls)})`, "Recorded hours per merge →", frontier.length > 1)
-      + `<p class="note">Hollow markers have fewer than ${lowBelow()} tasks in ${esc(cls)}. ${frontierNote} First-round PR approval is not split by write job class because review rows record profile/risk.</p>`
+      "chart", `Landed share (${esc(cls)})`, "Recorded hours per merge →", frontier.length > 1, "landed share")
+      + `<p class="note">Hollow markers have fewer than ${lowBelow()} tasks in ${esc(cls)}. ${frontierNote}${legacyHoursNote} First-round PR approval is not split by write job class because review rows record profile/risk.</p>`
       + values(`Landed share and cost values in ${esc(cls)}`, ["Model", "Hours per merge", "Landed %", "Interval", "Tasks", "Landed", "Ranking"], rows, [0, 6]);
   }
   if (axis === "speed") {
@@ -530,7 +542,7 @@ function pareto(data) {
         low_sample: p.speed_low_sample !== undefined ? p.speed_low_sample : p.low_sample,
         frontier: p.speed_frontier !== undefined ? p.speed_frontier : false,
       }));
-    const allSpeed = rawSpeed.filter((p) => p.median_seconds !== null && p.median_seconds !== undefined && p.median_seconds > 0);
+    const allSpeed = rawSpeed.filter((p) => typeof p.median_seconds === "number" && Number.isFinite(p.median_seconds) && p.median_seconds >= 0);
     const shown = allSpeed.filter((p) => keepModel(p.model));
     if (!shown.length) {
       return legacySpeed
@@ -555,9 +567,9 @@ function pareto(data) {
       : "Includes every write model with timed runs and reviewed PRs, even when hours per merge is unavailable; no composite speed/quality score is computed.";
     const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
       + cell(mins(p.median_seconds)) + cell(num(p.timed_n)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
-      + cell(num(p.prs)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
+      + cell(num(p.prs)) + `<td>${!hasSpeedFrontier ? "unavailable" : p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
     return scatter(shown.map((p) => ({...p, x: p.median_seconds / 60, y: p.approval, ci: p.approval_ci})),
-      "chart", "First-round approval", "Median write minutes →", frontier.length > 1)
+      "chart", "First-round approval", "Median write minutes →", frontier.length > 1, "first-round approval")
       + `<p class="note">${hollowNote} ${frontierNote} ${coverageNote}</p>`
       + values("Approval and speed values by model", ["Model", "Median min", "Timed writes", "Approval", "Interval", "Reviewed PRs", "Ranking"], rows, [0, 6]);
   }
@@ -575,7 +587,7 @@ function pareto(data) {
     + cell(displayHours(p)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
     + cell(num(p.prs)) + cell(num(p.landed)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
   return scatter(shown.map((p) => ({...p, x: exactHours(p) ?? p.hours, y: p.approval, ci: p.approval_ci})),
-    "chart", "First-round approval", "Recorded hours per merge →", frontier.length > 1)
+    "chart", "First-round approval", "Recorded hours per merge →", frontier.length > 1, "first-round approval")
     + `<p class="note">Hollow markers have a low sample. A green ring marks a frontier model, which no eligible model beats on cost and approval together. ${frontierNote}</p>`
     + values("Approval and cost values by model", ["Model", "Hours per merge", "Approval", "Interval", "Reviewed PRs", "Landed", "Ranking"], rows, [0, 6]);
 }
@@ -591,10 +603,11 @@ function jobs(data) {
       landedShare(b) - landedShare(a) || b.tasks - a.tasks || a.model.localeCompare(b.model));
     const models = ranked.filter((m) => keepModel(m.model));
     if (!models.length) continue;
-    const eligible = ranked.filter((m) => m.tasks >= lowBelow() && m.landed > 0);
+    const qualified = ranked.filter((m) => m.tasks >= lowBelow());
+    const eligible = qualified.filter((m) => m.landed > 0);
     const best = eligible[0] || null;
     const winners = best ? eligible.filter((m) => landedShare(m) === landedShare(best)) : [];
-    const runnerUp = best ? eligible.find((m) => landedShare(m) < landedShare(best)) : null;
+    const runnerUp = best ? qualified.find((m) => landedShare(m) < landedShare(best)) : null;
     const maxN = Math.max(...ranked.map((m) => m.tasks), 0);
     const totalLanded = ranked.reduce((sum, m) => sum + (m.landed || 0), 0);
     const hasQualifiedSample = ranked.some((m) => m.tasks >= lowBelow());
@@ -696,15 +709,22 @@ function isoWeekStart(week) {
   const monday = jan4.getTime() - ((jan4.getUTCDay() + 6) % 7) * 86400000;
   return monday + (Number(week.slice(6)) - 1) * WEEK_MS;
 }
-function trends(items, window) {
+function trends(items, window, authors = []) {
   const all = items || [];
   const isApproval = ($("trends-metric")?.value || "landed") === "approval";
   const countKey = isApproval ? "prs" : "tasks";
   const numKey = isApproval ? "first_approved" : "landed";
-  const eligible = weeklyNames(all, countKey).filter(keepModel);
+  const keep = isApproval ? keepAuthor : keepModel;
+  const eligible = weeklyNames(all, countKey).filter(keep);
+  const missingAuthors = isApproval
+    ? (authors || []).filter((a) => keepAuthor(a.model) && a.prs >= lowBelow() && !eligible.includes(a.model))
+    : [];
   const names = eligible.slice(0, 6);
   const shown = all.filter((p) => names.includes(p.model) && (p[countKey] || 0) > 0);
   if (!shown.length) {
+    if (missingAuthors.length) {
+      return `<p class="muted">This cached snapshot omits weekly approval rows for models without ${lowBelow()} write tasks (${missingAuthors.map((a) => esc(a.model)).join(", ")}); see Reviewed PRs for their window totals.</p>`;
+    }
     return `<p class="muted">Not enough data yet for weekly ${isApproval ? "approval" : "landing"} comparisons. A model needs ${lowBelow()} ${isApproval ? "reviewed PRs" : "write tasks"} in the window.</p>`;
   }
   const weeks = [...new Set(shown.map((p) => p.week))].sort();
@@ -742,17 +762,29 @@ function trends(items, window) {
     `<tr><td>${modelKey(p.model, low(p))}</td><td>${esc(p.week)}${partial(p.week) ? " (partial)" : ""}</td>`
     + cell(num(p.landed)) + cell(num(p.tasks)) + cell(p.tasks ? share(p.landed / p.tasks, p.tasks) : "—")
     + cell(num(p.first_approved)) + cell(num(p.prs)) + cell(p.prs ? share(p.first_approved / p.prs, p.prs) : "—") + "</tr>");
+  const legacyNote = missingAuthors.length
+    ? `<p class="note warn">Cached snapshot fallback: weekly approval omits ${num(missingAuthors.length)} qualifying author${missingAuthors.length === 1 ? "" : "s"} without ${lowBelow()} write tasks (${missingAuthors.map((a) => esc(a.model)).join(", ")}); see Reviewed PRs for full totals.</p>`
+    : "";
   return svgChart(W, H, isApproval ? "Weekly first-round PR approval" : "Weekly landed share", percentTicks(sy, left, right) + labels.join("") + series)
     + `<div class="legend">${legend}</div>`
     + '<p class="note">An asterisk means the window covers only part of that week. Hollow points have a low sample, and gaps mean no comparable result.</p>'
+    + legacyNote
     + (eligible.length > names.length ? `<p class="note">${eligible.length - names.length} more eligible models are in the ${isApproval ? "reviewed PRs" : "write"} table.</p>` : "")
     + values("Weekly counts and sample sizes", ["Model", "UTC week", "Landed", "Writes", "Landed %", "1st-round", "PRs", "Approval %"], rows, [0, 1]);
 }
 function neon(data) {
   const block = data.charts?.neon;
   if (!block) return '<p class="muted">Neon is absent from this window.</p>';
+  const neonReview = (data.models || []).find((m) => m.role === "review" && m.model === "gemini-4-neon");
+  const reviewByEffort = new Map((neonReview?.by_effort || []).map((e) => [e.effort, e]));
   const rows = block.arms.map((arm) => {
-    const revTasks = arm.review_tasks !== undefined ? arm.review_tasks : arm.review_results;
+    const revEffort = reviewByEffort.get(arm.effort);
+    const revTasks = arm.review_tasks !== undefined
+      ? arm.review_tasks
+      : (revEffort && revEffort.tasks !== undefined ? revEffort.tasks : null);
+    const revCount = revTasks !== null
+      ? `${num(arm.review_results)} / ${num(revTasks)}`
+      : `${num(arm.review_results)} / unknown`;
     const revTiming = arm.review_timed_n
       ? `${mins(arm.review_median_seconds)} / ${mins(arm.review_p90_seconds)} <span class="muted">(${num(arm.review_timed_n)})</span>${arm.review_timed_n < lowBelow() ? LOW : ""}`
       : "—";
@@ -765,7 +797,7 @@ function neon(data) {
       ? withSample(num(arm.p0_p2_per_review, 2), arm.findings_n) : "—";
     return `<tr><td>${esc(arm.effort)}${arm.low_sample ? LOW : ""}</td>`
       + cell(arm.write_tasks ? `${num(arm.write_landed)} / ${num(arm.write_tasks)}${arm.write_tasks < lowBelow() ? LOW : ""}` : "0")
-      + cell(`${num(arm.review_results)} / ${num(revTasks)}${arm.review_results < lowBelow() ? LOW : ""}`)
+      + cell(`${revCount}${arm.review_results < lowBelow() ? LOW : ""}`)
       + cell(arm.review_results ? `${share(arm.approval, arm.review_results)} <span class="muted">(${ciText(arm.approval_ci)})</span>` : "—")
       + cell(blocking) + cell(p0p2) + cell(revTiming) + cell(writeTiming) + "</tr>";
   });
@@ -791,7 +823,7 @@ function strictness(items) {
     + cell(share(p.approve, p.approve_n)) + cell(ciText(p.approve_ci)) + cell(p.approve_n)
     + cell(num(p.p0_p2, 3)) + cell(p.findings_n) + "</tr>");
   return scatter(shown.map((p) => ({...p, x: p.p0_p2, y: p.approve, ci: p.approve_ci})),
-    "strictness", "Reviewer approval", "P0–P2 findings per review →")
+    "strictness", "Reviewer approval", "P0–P2 findings per review →", false, "reviewer approval")
     + '<p class="note">Hollow markers have low samples. The records count reviewer findings and verdicts. Reviewer accuracy below estimates which blocking findings were real.</p>'
     + values("Approval and findings values by reviewer", ["Reviewer", "Approval", "Interval", "Verdicts", "P0–P2 per review", "Reviews with counts"], rows);
 }
@@ -932,7 +964,7 @@ function renderCoverage(data) {
 }
 function renderCharts() {
   const {data} = current, charts = data.charts || {};
-  for (const [id, markup] of [["chart", pareto(data)], ["trends", trends(charts.trends, data.window)],
+  for (const [id, markup] of [["chart", pareto(data)], ["trends", trends(charts.trends, data.window, data.authors)],
     ["strictness", strictness(charts.reviewers)], ["boxes", boxes(charts.durations)]]) {
     const chart = $(id), expanded = chart.querySelector("details[open]");
     chart.innerHTML = markup;
@@ -1023,12 +1055,19 @@ function render() {
 function formatPace(pace, responseStale = false) {
   if (!pace || typeof pace !== "object") return {text: "—", tone: ""};
   if (responseStale || pace.stale) return {text: "stale", tone: "warn"};
+  const at = typeof pace.runs_out_at === "string" && pace.runs_out_at.length >= 16
+    ? pace.runs_out_at.slice(0, 16).replace("T", " ") : null;
+  if (pace.pace_reason === "ran_out_before_reset") {
+    return {text: at ? `ran out ${at}` : "ran out before reset", tone: "warn"};
+  }
   if (pace.pace_reason === "runs_out_before_reset") {
-    const at = typeof pace.runs_out_at === "string" && pace.runs_out_at.length >= 16
-      ? pace.runs_out_at.slice(0, 16).replace("T", " ") : null;
     return {text: at ? `runs out ${at}` : "runs out before reset", tone: "warn"};
   }
+  if (pace.pace_reason === "weekly_used_up") {
+    return {text: at ? `ran out ${at}` : "weekly used up", tone: "warn"};
+  }
   if (pace.pace_reason === "lasts_to_reset") return {text: "lasts to reset", tone: "good"};
+  if (pace.pace_reason === "on_pace") return {text: "on pace", tone: "good"};
   return {text: "—", tone: ""};
 }
 function routingResponseStale(response, body) {

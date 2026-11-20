@@ -1092,6 +1092,9 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         _record(split_tasks, f"spd-u-{index}", model="gemini-4-hydrogen", research_task_family="code")
     for index in range(10):
         _review(split_tasks, f"spd-r-{index}", "correct", [], pr=600 + index, review_author_model="gemini-4-hydrogen")
+        _record(split_tasks, f"zmed-w-{index}", model="gemini-4-neon",
+                duration_s=0 if index < 6 else 1, research_task_family="code")
+        _review(split_tasks, f"zmed-r-{index}", "correct", [], pr=900 + index, review_author_model="gemini-4-neon")
     rows.backfill(split_tasks, split_root)
     split_landed = (
         {f"hi-{index}" for index in range(9)}
@@ -1123,13 +1126,18 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     opus_trends = [t for t in split_charts["trends"] if t["model"] == "claude-opus-5-5"]
     assert len(opus_trends) == 1 and opus_trends[0]["tasks"] == 10 and opus_trends[0]["prs"] == 3
     assert opus_trends[0]["first_approved"] == 3
-    # Speed/quality keeps gemini-4-hydrogen (20 timed + 2 untimed writes -> no hours_observed, 10 PRs, F5).
+    # Speed/quality keeps gemini-4-hydrogen (20 timed + 2 untimed writes -> no hours_observed, 10 PRs, F5)
+    # and keeps finite zero medians (6x 0s + 4x 1s writes -> median 0.0, 10 PRs, F17).
     assert "gemini-4-hydrogen" not in {p["model"] for p in split_charts["pareto"]}
     split_speed = {p["model"]: p for p in split_charts["speed_quality"]}
     assert split_speed["gemini-4-hydrogen"]["median_seconds"] == 120.0
     assert split_speed["gemini-4-hydrogen"]["timed_n"] == 20
     assert split_speed["gemini-4-hydrogen"]["prs"] == 10
-    assert split_speed["gemini-4-hydrogen"]["frontier"] is True
+    assert split_speed["gemini-4-hydrogen"]["frontier"] is False
+    assert split_speed["gemini-4-neon"]["median_seconds"] == 0.0
+    assert split_speed["gemini-4-neon"]["timed_n"] == 10
+    assert split_speed["gemini-4-neon"]["prs"] == 10
+    assert split_speed["gemini-4-neon"]["frontier"] is True
     # Equal approval counts: the unrounded durations decide, not the one-decimal total or the model name.
     fine = tmp_path / "fine"
     fine_tasks = fine / "tasks"

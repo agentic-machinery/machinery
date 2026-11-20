@@ -1227,7 +1227,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         wall = model.get("wall_seconds") or {}
         median_s = _number(wall.get("median"))
         timed_n = int(wall.get("n") or 0)
-        if trials > 0 and median_s is not None and median_s > 0 and timed_n > 0:
+        if trials > 0 and median_s is not None and median_s >= 0 and timed_n > 0:
             successes = approved[name]
             speed_quality.append({
                 "model": name, "identity": model["identity"],
