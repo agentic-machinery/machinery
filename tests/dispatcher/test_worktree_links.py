@@ -3,23 +3,20 @@
 import errno
 import json
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
+
 import pytest
+
 from lu_machinery.common.repo_root import product_root
-from lu_machinery.dispatcher import agy_sandbox, environment, git
-from lu_machinery.dispatcher import site_deps
+from lu_machinery.dispatcher import agy_sandbox, environment, git, site_deps
 from lu_machinery.dispatcher.types import TaskSpec
 from lu_machinery.orchestration.worktree_artifacts import is_disposable_path
 from lu_machinery.storage.topology import STORE_FILES
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-
-
-
-
 
 LINKS = (*(f"data/{STORE_FILES[store][0]}" for store in ("sources", "vesum")), "node_modules", "site/node_modules")
 SOURCES_LINK = LINKS[0]
@@ -123,7 +120,7 @@ def test_dependency_materialization_publishes_complete_private_tree(layout, monk
 
 @pytest.mark.parametrize("relative", ["node_modules", "site/node_modules"])
 def test_real_npm_ci_cannot_corrupt_primary_install(layout, tmp_path, monkeypatch, relative):
-    """Defect classes: cleaning the primary install and exposing the worker home to npm scripts."""
+    """Catch primary install corruption, worker home exposure and cold npm caches on store misses."""
     primary, worktree = layout
     shim_dirs = {("agent_runtime", "shims"), ("dispatcher", "npm_shims")}
     tool_path = os.pathsep.join(
@@ -163,22 +160,28 @@ def test_real_npm_ci_cannot_corrupt_primary_install(layout, tmp_path, monkeypatc
         package["scripts"] = {"preinstall": (
             "node -e \"const fs = require('node:fs'); fs.mkdirSync('node_modules', {recursive: true}); "
             "fs.writeFileSync('node_modules/install-env.json', JSON.stringify([process.env.HOME, "
-            "process.env.npm_config_userconfig, process.env.npm_config_globalconfig]));\""
+            "process.env.npm_config_userconfig, process.env.npm_config_globalconfig, "
+            "process.env.npm_config_cache, process.env.npm_config_logs_dir]));\""
         )}
         (local.parent / "package.json").write_text(json.dumps(package))
         ambient_home = tmp_path / "ambient-home"
         ambient_home.mkdir()
+        release_cache = tmp_path / "release npm cache"
+        monkeypatch.setenv("NPM_CACHE", str(release_cache))
         monkeypatch.setenv("HOME", str(ambient_home))
         monkeypatch.setenv("NPM_CONFIG_USERCONFIG", str(ambient_home / "user.npmrc"))
         monkeypatch.setenv("npm_config_globalconfig", str(ambient_home / "global.npmrc"))
-        monkeypatch.setenv("npm_config_cache", str(ambient_home / "npm-cache"))
+        monkeypatch.setenv("NPM_CONFIG_CACHE", str(ambient_home / "npm-cache"))
+        monkeypatch.setenv("NPM_CONFIG_LOGS_DIR", str(ambient_home / "logs"))
         monkeypatch.setenv("npm_config_offline", "true")
         installed = site_deps.ensure(primary, worktree)
         assert installed["state"] == "installed"
-        scratch, userconfig, globalconfig = map(Path, json.loads((local / "install-env.json").read_text()))
+        scratch, userconfig, globalconfig, cache, logs = map(Path, json.loads((local / "install-env.json").read_text()))
         assert scratch != ambient_home
         assert userconfig == scratch / ".npmrc"
         assert globalconfig == scratch / "etc/npmrc"
+        assert cache == release_cache
+        assert logs.is_relative_to(scratch)
         assert not scratch.exists()
         assert list(ambient_home.iterdir()) == []
         second = tmp_path / "second"
