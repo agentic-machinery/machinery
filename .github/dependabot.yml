@@ -26,7 +26,7 @@ updates:
     ignore:
       # Auto mode can approve tools without an ACP permission request.
       - dependency-name: "@agentclientprotocol/claude-agent-acp"
-        versions: [">=0.101.0 <=0.106.0"]
+        versions: [">=0.101.0 <=0.109.0"]
       # debug reads the CommonJS .stderr export. The ESM releases put it under .default.
       - dependency-name: "supports-color"
         versions: [">=9.0.0 <=11.0.0"]
