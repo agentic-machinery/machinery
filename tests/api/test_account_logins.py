@@ -691,6 +691,27 @@ def test_routing_status_of_a_pool_running_out_before_reset_is_never_cool(usage_f
     assert bad_delta["pace"].get("lasts_to_reset") is True
     assert subscriptions.pool_status(bad_delta)["pace_reason"] == "lasts_to_reset"
 
+    # Defect class: the cap compared the one-decimal display percent. 98.99 and
+    # 98.95 display as 99.0, so a rejected pace below the cap became cool when
+    # the flag was true and near_cap when it was not. A percent that is at the
+    # cap, including one whose display is also 99.0, keeps the cap verdict.
+    for below_cap in (98.99, 98.95):
+        for lasts in (True, False):
+            row = subscriptions._cache_account(
+                rejected_pool(below_cap, lasts, "60"), _fixture_now(), provider="codex")
+            assert (row["weekly"]["used_pct"], row["weekly"]["used_pct_exact"]) == (99.0, below_cap)
+            assert row["pace"]["reason"] == "not_reported"
+            assert subscriptions.pool_status(row)["status"] == "unknown", (below_cap, lasts)
+    at_cap = subscriptions._cache_account(rejected_pool(99.04, True, "60"), _fixture_now(), provider="codex")
+    assert at_cap["weekly"]["used_pct"] == 99.0
+    assert subscriptions.pool_status(at_cap)["pace_reason"] == "lasts_to_reset"
+    over = subscriptions._cache_account(rejected_pool(99.04, False, "60"), _fixture_now(), provider="codex")
+    assert subscriptions.pool_status(over)["pace_reason"] == "weekly_used_up"
+    on_pace = subscriptions._cache_account(
+        rejected_pool(98.99, False, 98.4, delta=0.5), _fixture_now(), provider="codex")
+    assert (subscriptions.pool_status(on_pace)["status"], subscriptions.pool_status(on_pace)["pace_reason"]) == (
+        "cool", "on_pace")
+
 
 def test_routing_status_of_an_unseen_pool_is_unknown_not_cool(usage_files):
     """Defect class: an account the reader cannot see (Codex b absent from the usage cache, Codex a with no

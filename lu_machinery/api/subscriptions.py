@@ -191,6 +191,9 @@ def _window(label: str | None, used: Any, resets_at: Any, minutes: Any, now: dat
     used_pct = _pct(used)
     if used_pct is None:
         return {**_unknown("no_reading"), "label": label}
+    # The cap compares this percent. used_pct is the one-decimal display, so a
+    # reading that only rounds onto 99 is not at the cap.
+    exact = _number(used)
     reset = _moment(resets_at)
     seconds = None if reset is None else int((reset - now).total_seconds())
     window_minutes = _number(minutes)
@@ -199,6 +202,7 @@ def _window(label: str | None, used: Any, resets_at: Any, minutes: Any, now: dat
         "label": label,
         "window_minutes": int(window_minutes) if window_minutes else None,
         "used_pct": used_pct,
+        "used_pct_exact": exact,
         "left_pct": round(100 - used_pct, 1),
         "resets_at": _iso(reset) if reset else None,
         "resets_in_s": seconds,
@@ -645,7 +649,11 @@ def pool_status(row: Mapping[str, Any]) -> dict[str, Any]:
         return verdict("unknown", reading.get("reason") or "no_reading")
     if weekly.get("status") != "ok":
         return verdict("unknown", weekly.get("reason") or "no_weekly_window")
-    used = _number(weekly.get("used_pct"))
+    # used_pct is rounded for display. The cap uses the percent the window
+    # accepted, and falls back to the display value for a row that has none.
+    used = _number(weekly.get("used_pct_exact"))
+    if used is None or not 0.0 <= used <= 100.0:
+        used = _number(weekly.get("used_pct"))
     if used is None or not 0.0 <= used <= 100.0:
         return verdict("unknown", "unreadable_reading")
     if pace.get("status") == "ok" and not _pace_row_readable(pace):
