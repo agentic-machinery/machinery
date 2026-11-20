@@ -107,9 +107,16 @@ def workspace_write_cli_config(readers: tuple[str, ...], writers: tuple[str, ...
     return json.dumps(config, indent=2) + "\n"
 
 
-def _workspace_config_dir(spec: TaskSpec, env: Mapping[str, str]) -> str:
+def _workspace_config_dir(spec: TaskSpec, env: Mapping[str, str], *, require_server: bool) -> str | None:
     """Create a task-local ``CURSOR_CONFIG_DIR`` carrying ``cli-config.json`` with Sources writer denies."""
-    readers, writers = sources_tool_sets()
+    from lu_machinery.common.repo_root import ProductRootError
+
+    try:
+        readers, writers = sources_tool_sets()
+    except (FileNotFoundError, ProductRootError):
+        if require_server:
+            raise
+        return None
     content = workspace_write_cli_config(readers, writers).encode("utf-8")
     scratch_raw = env.get("LU_TASK_SCRATCH")
     if isinstance(scratch_raw, str) and scratch_raw.strip():
@@ -169,14 +176,16 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     elif spec.mode == "workspace-write":
         if refusal := workspace_sources_refusal(spec, env):
             raise ValueError(refusal)
-        if not has_ambient_sources_config("cursor", worktree=spec.worktree, env=env):
+        ambient = has_ambient_sources_config("cursor", worktree=spec.worktree, env=env)
+        if not ambient:
             _LOG.warning(
                 "cursor_sources_mcp_unavailable: cursor-agent CLI has no per-invocation MCP server flag or env var "
                 "and neither %s/.cursor/mcp.json nor ~/.cursor/mcp.json defines an active %r server",
                 spec.worktree,
                 SOURCES_SERVER,
             )
-        child_env["CURSOR_CONFIG_DIR"] = _workspace_config_dir(spec, env)
+        if (config_dir := _workspace_config_dir(spec, env, require_server=ambient)) is not None:
+            child_env["CURSOR_CONFIG_DIR"] = config_dir
         argv += ["--approve-mcps", "--sandbox", "disabled", "--force"]
     else:
         raise ValueError(f"cursor: unsupported mode {spec.mode!r}")

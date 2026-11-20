@@ -556,7 +556,7 @@ def test_opencode_workspace_sources_config_and_writer_denies(
         keys.index(f"sources_{name}") for name in writers
     )
 
-    # 2. Local stdio Sources server
+    # 2. Local stdio Sources server (including cwd forwarding so Sources never anchors to the untrusted worktree)
     (product / ".mcp.json").write_text(
         json.dumps({
             "mcpServers": {
@@ -564,6 +564,7 @@ def test_opencode_workspace_sources_config_and_writer_denies(
                     "command": "/opt/venv/bin/python",
                     "args": ["-m", "sources.server"],
                     "env": {"SOURCES_MODE": "ro"},
+                    "cwd": "/opt/sources",
                 }
             }
         }),
@@ -575,6 +576,7 @@ def test_opencode_workspace_sources_config_and_writer_denies(
         "type": "local",
         "command": ["/opt/venv/bin/python", "-m", "sources.server"],
         "environment": {"SOURCES_MODE": "ro"},
+        "cwd": "/opt/sources",
         "enabled": True,
     }
 

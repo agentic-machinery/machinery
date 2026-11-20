@@ -90,7 +90,7 @@ def load_product_sources_server(agent: str) -> SourcesServerSpec | None:
         raw = mcp_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(f"{agent}_sources_config_invalid: could not read product .mcp.json: {exc}") from None
     try:
         payload = json_depth.loads(raw, max_depth=_SOURCES_JSON_MAX_DEPTH)
@@ -169,7 +169,7 @@ def _ambient_sources_entry_state(path: Path, *, allow_server_url: bool, allow_sy
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
     try:
         payload = json_depth.loads(raw, max_depth=_SOURCES_JSON_MAX_DEPTH)

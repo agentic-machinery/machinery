@@ -190,13 +190,17 @@ def _toml_inline_table(mapping: Mapping[str, str]) -> str:
     return "{" + ",".join(f"{json.dumps(key)}={json.dumps(value)}" for key, value in mapping.items()) + "}"
 
 
-def _workspace_sources_transport(spec: TaskSpec | None = None) -> list[str]:
+def _workspace_sources_transport(
+    spec: TaskSpec | None = None,
+    child_env: dict[str, str] | None = None,
+) -> list[str]:
     """The Sources transport flags for a workspace-write run, from ``product_root()/.mcp.json``.
 
     Write workers run outside the boundary, so no task-local config.toml defines Sources. Supports
-    both HTTP ``url`` and stdio ``command``/``args``/``env``/``cwd`` entries from the product
-    checkout's ``.mcp.json`` (never the task worktree). Fails closed on malformed entries or when
-    Sources is missing on a Ukrainian-content task; warns when missing on other tasks.
+    both HTTP ``url`` (with headers kept out of argv via ``env_http_headers``) and stdio
+    ``command``/``args``/``env`` (via ``env_vars``)/``cwd`` entries from the product checkout's
+    ``.mcp.json`` (never the task worktree). Fails closed on malformed entries or when Sources is
+    missing on a Ukrainian-content task; warns when missing on other tasks.
     """
     server = load_product_sources_server("codex")
     if server is None:
@@ -214,7 +218,13 @@ def _workspace_sources_transport(spec: TaskSpec | None = None) -> list[str]:
     if server.url is not None:
         flags = ["-c", "mcp_servers.sources.url=" + json.dumps(server.url)]
         if server.headers:
-            flags += ["-c", "mcp_servers.sources.http_headers=" + _toml_inline_table(server.headers)]
+            header_env_map: dict[str, str] = {}
+            for index, (header, value) in enumerate(server.headers.items()):
+                env_name = f"LU_CODEX_SOURCES_HEADER_{index}"
+                header_env_map[header] = env_name
+                if child_env is not None:
+                    child_env[env_name] = value
+            flags += ["-c", "mcp_servers.sources.env_http_headers=" + _toml_inline_table(header_env_map)]
         return flags
     assert server.command is not None
     flags = [
@@ -224,7 +234,9 @@ def _workspace_sources_transport(spec: TaskSpec | None = None) -> list[str]:
         "mcp_servers.sources.args=" + json.dumps(list(server.args)),
     ]
     if server.env:
-        flags += ["-c", "mcp_servers.sources.env=" + _toml_inline_table(server.env)]
+        if child_env is not None:
+            child_env.update(server.env)
+        flags += ["-c", "mcp_servers.sources.env_vars=" + json.dumps(list(server.env))]
     if server.cwd is not None:
         flags += ["-c", "mcp_servers.sources.cwd=" + json.dumps(server.cwd)]
     return flags
@@ -234,6 +246,7 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     from lu_machinery.dispatcher.checks import check_model_admission
 
     check_model_admission(spec.agent, spec.model, spec.mode, spec.options, spec.prompt_file.read_bytes())
+    child_env = env.copy()
     argv = ["codex", "exec", "--json", "-C", str(spec.worktree), "-m", spec.model, "-o", str(spec.final_file)]
     if spec.options.get("output_schema_path") is not None:
         from lu_machinery.dispatcher.output_schema import load
@@ -250,7 +263,7 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     # workspace-write run has no boundary config, so the argv also names the server's transport.
     sources = _sources_read_only_flags(sources_tool_sets()[0])
     if spec.mode == "workspace-write":
-        sources = [*_workspace_sources_transport(spec), *sources]
+        sources = [*_workspace_sources_transport(spec, child_env), *sources]
     argv += ["--disable", "apps", *sources]
     if spec.mode in {"read-only", "workspace-write"}:
         # Read-only reviews use the supervisor's worktree/Git mounts; an inner sandbox cannot
@@ -258,7 +271,7 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
         argv += ["--dangerously-bypass-approvals-and-sandbox"]
     else:
         raise ValueError(f"codex: unsupported mode {spec.mode!r}")
-    return Invocation(argv, spec.prompt_file.read_bytes(), env, spec.final_file)
+    return Invocation(argv, spec.prompt_file.read_bytes(), child_env, spec.final_file)
 
 
 def parse(stdout: str, stderr: str, returncode: int, final_text: str | None) -> ParsedResult:

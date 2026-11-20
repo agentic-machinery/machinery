@@ -259,9 +259,16 @@ def schema_argument(options: dict) -> str | None:
     return argument
 
 
-def _workspace_sources_settings() -> str:
+def _workspace_sources_settings(*, require_server: bool) -> str | None:
     """Session-only ``--settings`` JSON denying persisting Sources MCP tools without touching user settings."""
-    _, writers = sources_tool_sets()
+    from lu_machinery.common.repo_root import ProductRootError
+
+    try:
+        _, writers = sources_tool_sets()
+    except (FileNotFoundError, ProductRootError):
+        if require_server:
+            raise
+        return None
     return json.dumps(
         {"permissions": {"deny": [f"mcp({SOURCES_SERVER}/{name})" for name in writers]}},
         separators=(",", ":"),
@@ -277,13 +284,15 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     if spec.mode == "workspace-write":
         if refusal := workspace_sources_refusal(spec, env):
             raise ValueError(refusal)
-        if not has_ambient_sources_config("agy", worktree=spec.worktree, env=env):
+        ambient = has_ambient_sources_config("agy", worktree=spec.worktree, env=env)
+        if not ambient:
             _LOG.warning(
                 "agy_sources_mcp_unavailable: agy CLI has no per-invocation MCP server flag or env var and "
                 "~/.gemini/config/mcp_config.json defines no active %r server",
                 SOURCES_SERVER,
             )
-        argv += ["--settings", _workspace_sources_settings()]
+        if (settings := _workspace_sources_settings(require_server=ambient)) is not None:
+            argv += ["--settings", settings]
         # AGY runs its commands in its first workspace folder, so the worktree comes before any read root (#423);
         # without it the commands ran in the first read root (the shared skills directory of the code checkout).
         argv += ["--add-dir", str(spec.worktree), "--log-file", str(spec.final_file.with_suffix(".log"))]

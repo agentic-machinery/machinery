@@ -428,6 +428,8 @@ def _workspace_sources_entry(spec: TaskSpec) -> dict[str, object] | None:
     entry = {"type": "local", "command": [server.command, *server.args], "enabled": True}
     if server.env:
         entry["environment"] = dict(server.env)
+    if server.cwd is not None:
+        entry["cwd"] = server.cwd
     return entry
 
 

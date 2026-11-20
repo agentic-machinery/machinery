@@ -513,19 +513,33 @@ def test_codex_workspace_sources_supports_url_and_stdio_and_fails_closed(
     readers, writers = sources_tool_sets()
     base = TaskSpec("codex-ws", "codex", "gpt-6.2-sol", "high", "workspace-write", worktree, prompt, tmp_path / "final")
 
-    # 1. URL entry
+    # 1. URL entry (plus HTTP header passed via env_http_headers, never literal secret in argv)
     (product / ".mcp.json").write_text(
-        json.dumps({"mcpServers": {"sources": {"type": "streamable-http", "url": "http://127.0.0.1:8766/mcp"}}}),
+        json.dumps({
+            "mcpServers": {
+                "sources": {
+                    "type": "streamable-http",
+                    "url": "http://127.0.0.1:8766/mcp",
+                    "headers": {"Authorization": "Bearer fixture-header-token"},
+                }
+            }
+        }),
         encoding="utf-8",
     )
-    argv_url = codex.build(base, {}).argv
+    caller_env: dict[str, str] = {}
+    inv_url = codex.build(base, caller_env)
+    argv_url = inv_url.argv
     assert 'mcp_servers.sources.url="http://127.0.0.1:8766/mcp"' in argv_url
+    assert 'mcp_servers.sources.env_http_headers={"Authorization"="LU_CODEX_SOURCES_HEADER_0"}' in argv_url
+    assert "fixture-header-token" not in " ".join(argv_url)
+    assert inv_url.env["LU_CODEX_SOURCES_HEADER_0"] == "Bearer fixture-header-token"
+    assert caller_env == {}
     enabled = next(arg for arg in argv_url if arg.startswith("mcp_servers.sources.enabled_tools="))
     enabled_tools = json.loads(enabled.removeprefix("mcp_servers.sources.enabled_tools="))
     assert enabled_tools == list(readers)
     assert all(writer not in enabled_tools for writer in writers)
 
-    # 2. Stdio entry (command + args + env + cwd)
+    # 2. Stdio entry (command + args + env via env_vars + cwd; env values stay out of argv)
     (product / ".mcp.json").write_text(
         json.dumps({
             "mcpServers": {
@@ -540,15 +554,18 @@ def test_codex_workspace_sources_supports_url_and_stdio_and_fails_closed(
         }),
         encoding="utf-8",
     )
-    argv_stdio = codex.build(base, {}).argv
+    inv_stdio = codex.build(base, {})
+    argv_stdio = inv_stdio.argv
     assert 'mcp_servers.sources.command="/opt/venv/bin/python"' in argv_stdio
     assert 'mcp_servers.sources.args=["-m", "sources.server", "--read-only"]' in argv_stdio
-    assert 'mcp_servers.sources.env={"SOURCES_DB"="/data/sources.db"}' in argv_stdio
+    assert 'mcp_servers.sources.env_vars=["SOURCES_DB"]' in argv_stdio
+    assert inv_stdio.env["SOURCES_DB"] == "/data/sources.db"
+    assert "/data/sources.db" not in " ".join(argv_stdio)
     assert 'mcp_servers.sources.cwd="/opt/sources"' in argv_stdio
     assert not any(arg.startswith("mcp_servers.sources.url=") for arg in argv_stdio)
     assert "/bin/sh" not in " ".join(argv_stdio)
 
-    # 3. Malformed entries fail closed
+    # 3. Malformed entries (including non-UTF-8 bytes) fail closed with typed error
     for bad in (
         {"mcpServers": {"sources": {"url": "http://127.0.0.1:8766/mcp", "command": "/bin/true"}}},
         {"mcpServers": {"sources": {"command": "/bin/true", "args": "not-a-list"}}},
@@ -559,6 +576,9 @@ def test_codex_workspace_sources_supports_url_and_stdio_and_fails_closed(
         (product / ".mcp.json").write_text(json.dumps(bad), encoding="utf-8")
         with pytest.raises(ValueError, match="codex_sources_config_invalid"):
             codex.build(base, {})
+    (product / ".mcp.json").write_bytes(b"\xff\xfeinvalid-utf8")
+    with pytest.raises(ValueError, match="codex_sources_config_invalid"):
+        codex.build(base, {})
 
     # 4. Missing Sources entry: fail closed for Ukrainian tasks, warn for non-Ukrainian
     (product / ".mcp.json").unlink()
@@ -688,3 +708,12 @@ def test_agy_and_cursor_workspace_sources_fail_closed_for_ukrainian_and_warn_oth
         )
     with pytest.raises(ValueError, match=f"{agent}_sources_mcp_unavailable"):
         provider.build(replace(base, options={"research_task_family": "ukrainian-authoring"}), env)
+
+    # 4. Non-UTF-8 ambient config fails closed for Ukrainian tasks and warns (never raw UnicodeDecodeError) otherwise.
+    cfg_file.write_bytes(b"\xff\xfeinvalid-utf8")
+    with pytest.raises(ValueError, match=f"{agent}_sources_mcp_unavailable"):
+        provider.build(replace(base, options={"research_task_family": "ukrainian-authoring"}), env)
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        provider.build(base, env)
+    assert any(f"{agent}_sources_mcp_unavailable" in record.message for record in caplog.records)
