@@ -62,9 +62,10 @@ def read_only_cli_config(readers: tuple[str, ...], writers: tuple[str, ...]) -> 
     ``--mode ask`` refused every shell call, ``git diff`` and ``sha256sum`` included (2026-11-15 bench). Cursor
     takes per-command rules only from this file and rewrites it at every start, so the write boundary puts a private
     copy at HOME's ``.cursor/cli-config.json``, discarded with the run's scratch. Every shell command
-    runs except the Git and GitHub writes Claude's profile denies; file writes and the Sources tools that persist
-    entries are denied too, and deny wins over allow. ``allowlist`` approval with no ``--force`` refuses any other
-    call that needs approval. Cursor's own sandbox stays off, as Claude's per-shell prefix is stripped: a nested
+    runs except the Git and GitHub writes Claude's profile denies. Native WebFetch can run without prompting.
+    File writes and the Sources tools that persist entries are denied, and deny wins over allow.
+    ``allowlist`` approval with no ``--force`` refuses any other call that needs approval.
+    Cursor's own sandbox stays off, as Claude's per-shell prefix is stripped: a nested
     bubblewrap cannot start, and the read-only whole-process boundary is the launcher's.
     """
     from lu_machinery.dispatcher.providers.claude import _READ_DENIES
@@ -80,7 +81,7 @@ def read_only_cli_config(readers: tuple[str, ...], writers: tuple[str, ...]) -> 
         "autoAcceptWebSearch": True,
         "sandbox": {"mode": "disabled"},
         "permissions": {
-            "allow": ["Shell(*)", "Read(*)", *(f"Mcp({server}:{name})" for name in readers)],
+            "allow": ["Shell(*)", "Read(*)", "WebFetch(*)", *(f"Mcp({server}:{name})" for name in readers)],
             "deny": ["Write(*)", *deny, *(f"Mcp({server}:{name})" for name in writers)],
         },
     }
