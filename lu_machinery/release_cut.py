@@ -32,6 +32,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
@@ -81,6 +82,14 @@ _SITE_PATHS = "import sysconfig; print(sysconfig.get_path('purelib')); print(sys
 
 class CutError(Exception):
     """A refused precondition or a failed step; the message names the cause."""
+
+
+class UvPreflightError(CutError):
+    """A release runner or repository could not satisfy the uv precondition."""
+
+    def __init__(self, side: Literal["machinery", "product", "runner"], message: str) -> None:
+        self.side = side
+        super().__init__(f"uv preflight ({side}): {message}")
 
 
 @dataclass(frozen=True)
@@ -492,6 +501,7 @@ class Cut:
     ci: str = ""
     section: str = ""
     notes: str = ""
+    uv: Path | None = field(default=None, init=False)
     # Fresh clones carry no identity. Commits and the annotated tag pass the registered
     # machinery checkout's user.name and user.email.
     git_identity: tuple[str, ...] = ()
@@ -578,6 +588,45 @@ class Cut:
 
     # Preflight and build
 
+    def check_uv_requirement(self, uv: Path, manifest: str, *, side: Literal["machinery", "product"]) -> None:
+        try:
+            tool = _manifest_table(tomllib.loads(manifest), "tool")
+            required = _manifest_table(tool, "uv").get("required-version")
+        except (CutError, tomllib.TOMLDecodeError) as exc:
+            raise UvPreflightError(side, "could not read [tool.uv] required-version from pyproject.toml") from exc
+        if not isinstance(required, str) or not required.strip():
+            raise UvPreflightError(side, "pyproject.toml must declare a nonempty [tool.uv] required-version")
+
+        # Let uv apply its own version semantics to just this setting. cache dir needs no project or network.
+        with tempfile.TemporaryDirectory(dir=self.work) as scratch:
+            config = Path(scratch) / "uv.toml"
+            config.write_text(f"required-version = {json.dumps(required, ensure_ascii=False)}\n", encoding="utf-8")
+            try:
+                self.run([uv, "--offline", "--config-file", config, "cache", "dir"], env=self.scratch_env(), timeout=30)
+            except (CutError, OSError, subprocess.SubprocessError, UnicodeError) as exc:
+                raise UvPreflightError(
+                    side, f"uv on PATH could not satisfy [tool.uv] required-version {required!r} (see cut.log)",
+                ) from exc
+
+    def prepare_uv(self, machinery_manifest: str) -> None:
+        executable = shutil.which("uv")
+        if executable is None:
+            raise UvPreflightError("runner", "uv is not on PATH")
+        uv = Path(executable).absolute()
+        self.check_uv_requirement(uv, machinery_manifest, side="machinery")
+
+        product = self.work / "product"
+        # --depth needs a URL; a local checkout path becomes file://.
+        local = Path(self.product_remote)
+        remote = local.resolve().as_uri() if local.is_dir() else self.product_remote
+        self.run(["git", "clone", "--quiet", "--depth", "1", "--branch", "main", "--", remote, product], timeout=900)
+        try:
+            manifest = self.git(product, "show", "HEAD:pyproject.toml")
+        except (CutError, OSError, subprocess.SubprocessError, UnicodeError) as exc:
+            raise UvPreflightError("product", "could not read pyproject.toml at product main") from exc
+        self.check_uv_requirement(uv, manifest, side="product")
+        self.uv = uv
+
     def preflight(self) -> tuple[Decision, list[str], str]:
         self.step = "preflight"
         self.committer()  # tag and commits need it; refuse before the clone and the wheel build
@@ -590,9 +639,10 @@ class Cut:
         baseline = self.last_full_release(clone, last_tag)
         self.baseline = baseline.removeprefix("v")
         titles = self.git(clone, "log", "--first-parent", "--format=%s", f"{baseline}..{self.head}").splitlines()
+        manifests = {name: self.git(clone, "show", f"{self.head}:{name}") for name in VERSION_FILES}
         versions: dict[str, str] = {}
-        for name in VERSION_FILES:
-            versions.update(version_of(name, self.git(clone, "show", f"{self.head}:{name}")))
+        for name, manifest in manifests.items():
+            versions.update(version_of(name, manifest))
         tags = self.git(clone, "tag", "--list", "v*").splitlines()
         changelog = self.run(["git", "-C", clone, "show", f"{self.head}:CHANGELOG.md"]).stdout
         runs = self.run(
@@ -612,6 +662,8 @@ class Cut:
         self.version = decision.version
         if decision.action == "cut":
             self.verify_ci_receipt(clone, run_rows)
+        if decision.action == "cut" or (self.dry_run and decision.action == "refuse"):
+            self.prepare_uv(manifests["pyproject.toml"])
         return decision, titles, versions["pyproject.toml"]
 
     def verify_ci_receipt(self, clone: Path, run_rows: Sequence[Mapping[str, object]]) -> None:
@@ -686,7 +738,7 @@ class Cut:
         house.mkdir()
         # Export core and the runtime extras with hashes, as in CI. The
         # consumer lock keeps the bare release pin used by product CI.
-        uv = shutil.which("uv")
+        uv = self.uv or shutil.which("uv")
         if uv is None:
             raise CutError("uv is not on PATH; the release wheelhouse is exported from uv.lock")
         lock = self.work / "runtime-requirements.txt"
@@ -756,7 +808,7 @@ class Cut:
         if not os.path.lexists(lock):
             shutil.copyfile(consumer_lock, product / "requirements-machinery.lock")
             return ("requirements-machinery.lock",)
-        uv = shutil.which("uv")
+        uv = self.uv or shutil.which("uv")
         if uv is None:
             raise CutError("uv is not on PATH; cannot refresh the product's uv.lock")
         manifest = product / "pyproject.toml"
@@ -1193,9 +1245,6 @@ def execute(cut: Cut) -> int:
     consumer_lock = cut.wheelhouse(files, built)
     python = cut.install(consumer_lock, built)
     product = cut.work / "product"
-    # --depth needs a URL; a local checkout path becomes file://.
-    remote = f"file://{Path(cut.product_remote).resolve()}" if Path(cut.product_remote).is_dir() else cut.product_remote
-    cut.run(["git", "clone", "--quiet", "--depth", "1", "--branch", "main", remote, product], timeout=900)
     ci = cut.ci
     pending = "Pre-release: acceptance is running. Adopt only after this release is no longer a pre-release.\n"
     if not cut.dry_run:
