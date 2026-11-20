@@ -43,8 +43,9 @@ The check applies this grammar (the module docstring of
    - `HTML_BLOCK`: any raw HTML block (`<div>`, `<pre>`, `<details>`, a tag alone on a
      line, …).
 2. **Parse** the LF-normalised message with markdown-it-py's CommonMark preset
-   (`markdown-it-py` 4.2.0 and `mdurl` 0.1.2; the wheel hashes are in `uv.lock`,
-   and the install commands below pass them with `--require-hashes`). A **declaration paragraph** is a top-level
+   (`markdown-it-py` 4.2.0 and `mdurl` 0.1.2; the wheel hashes are in `uv.lock`.
+   The install below puts each hash on its requirement line and passes that file
+   to pip with `--require-hashes`. pip accepts `--hash` only in a requirements file). A **declaration paragraph** is a top-level
    paragraph (not inside a list, quote, heading, code block or link reference) whose every
    source line is `Key: value` (`[A-Za-z][A-Za-z0-9-]*`, colon, one space, no leading or
    trailing whitespace). Lines come from the parser's line map over `text.split("\n")`,
@@ -245,11 +246,11 @@ version alone. Those hashes are the `wheels` entries for `markdown-it-py` 4.2.0 
 `mdurl` 0.1.2; replace them when the lock changes:
 
 ```bash
-pip install --no-deps --only-binary=:all: --require-hashes \
-  "markdown-it-py==4.2.0" \
-  --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a \
-  "mdurl==0.1.2" \
-  --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
+cat > attribution-requirements.txt <<'EOF'
+markdown-it-py==4.2.0 --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+mdurl==0.1.2 --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
+EOF
+pip install --no-deps --only-binary=:all: --require-hashes -r attribution-requirements.txt
 ```
 
 The rest of the checker's import closure is the standard library and `scripts/` itself.
