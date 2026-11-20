@@ -573,6 +573,32 @@ def test_republish_withheld_posts_the_sealed_security_reply(monkeypatch, low_rev
 
 
 
+def test_republish_withheld_refuses_malformed_later_trusted_marker(low_review, tmp_path):
+    """A malformed later verdict must prevent republication out of order."""
+    tasks, comments, statuses, _files, _admit = low_review
+    _seal(tasks, comments, statuses, reply="VERDICT: CHANGES_REQUESTED\n", profile="security")
+    recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+    comments.append({**comments[0], "id": 2, "body": f"{sweep.MARKER_PREFIX} malformed -->"})
+
+    with pytest.raises(recorder.RecordError, match="malformed trusted verdict marker"):
+        recorder.republish_withheld("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+    assert len(comments) == 2
+    assert len(statuses) == 1
+
+
+def test_republish_withheld_refuses_comment_without_timestamps(low_review, tmp_path):
+    """Missing creation and update times must not pass as evidence of an unedited comment."""
+    tasks, comments, statuses, _files, _admit = low_review
+    _seal(tasks, comments, statuses, reply="VERDICT: CHANGES_REQUESTED\n", profile="security")
+    recorder.record("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+    del comments[0]["created_at"], comments[0]["updated_at"]
+
+    with pytest.raises(recorder.RecordError, match="malformed trusted verdict comment timestamps"):
+        recorder.republish_withheld("review-one", pr_number=1, task_root=tasks, lock_root=tmp_path / "locks")
+    assert len(comments) == 1
+    assert len(statuses) == 1
+
+
 def setup_record(monkeypatch, tmp_path, **kwargs):
     result = _setup_record(monkeypatch, tmp_path, **kwargs)
     # The fixture owns GitHub reads. The package also reads the PR file list

@@ -2264,8 +2264,10 @@ def _pr_files_and_tier(
     return rows, classify_pr_files(rows)
 
 
-def _trusted_markers(comments: Sequence[Mapping[str, Any]], login: str) -> list[tuple[int, dict[str, Any]]]:
-    """Comment index and parsed marker of each verdict ``login`` posted with a trusted association."""
+def _trusted_markers(
+    comments: Sequence[Mapping[str, Any]], login: str, *, reject_malformed: bool = False,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Read trusted verdict markers. Replay requires every such comment to be readable."""
     markers: list[tuple[int, dict[str, Any]]] = []
     for index, item in enumerate(comments):
         body = item.get("body") if isinstance(item, Mapping) else None
@@ -2274,8 +2276,19 @@ def _trusted_markers(comments: Sequence[Mapping[str, Any]], login: str) -> list[
         if item.get("user", {}).get("login") != login or item.get("author_association") not in TRUSTED_ASSOCIATIONS:
             continue
         marker = parse_marker(body)
-        if marker is not None:
-            markers.append((index, marker))
+        if marker is None:
+            if reject_malformed:
+                raise RecordError("malformed trusted verdict marker")
+            continue
+        if reject_malformed:
+            for field in ("created_at", "updated_at"):
+                try:
+                    timestamp = integration_sweep._timestamp(item.get(field))
+                except OverflowError:
+                    timestamp = None
+                if timestamp is None:
+                    raise RecordError("malformed trusted verdict comment timestamps")
+        markers.append((index, marker))
     return markers
 
 
@@ -3837,7 +3850,7 @@ def republish_withheld(
             comments = adapter.comments(review.repository, pr_number)
         except SweepError as exc:
             raise RecordError(f"comment lookup failed: {exc}") from exc
-        markers = _trusted_markers(comments, login)
+        markers = _trusted_markers(comments, login, reject_malformed=True)
         own_markers = [
             (index, marker) for index, marker in markers if (marker["sha"], marker["task"]) == (review.sha, task_id)
         ]
