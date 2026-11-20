@@ -471,7 +471,7 @@ def _count_by_state(connection: Any, table: str, column: str) -> dict[str, int]:
         rows = connection.execute(
             f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column} ORDER BY {column}"
         ).fetchall()
-    except _DATABASE_ERRORS:
+    except sqlite3.Error:
         return {}
     return {_safe_text(row[0], fallback="unknown"): int(row[1]) for row in rows}
 
