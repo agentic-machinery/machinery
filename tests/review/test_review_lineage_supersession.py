@@ -188,6 +188,16 @@ def test_an_approval_at_the_candidate_head_never_supersedes_to_prove_the_approve
         lineage(opus, orphan, at_candidate, exclude_head=CANDIDATE)
 
 
+@pytest.mark.parametrize("user", [None, "fleet"])
+def test_lineage_refuses_unpublished_verdict_with_malformed_comment_author(user):
+    """Defect class: a malformed author crashes lineage instead of treating the verdict as unpublished."""
+    run, comment = review("sol-r1", APPROVED, "VERDICT: APPROVE", minute=1)
+    comment.update(user=user, author={"login": "fleet"})
+
+    with pytest.raises(LineageRefused, match="review task sol-r1 finished but its verdict is unpublished"):
+        lineage((run, comment))
+
+
 def _edited(pair):
     run, comment = pair
     return run, {**comment, "updated_at": "2026-10-28T23:59:00Z"}

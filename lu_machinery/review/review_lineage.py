@@ -41,6 +41,7 @@ from lu_machinery.orchestration.integration_sweep import (
     REJECTED,
     SHA,
     TRUSTED_ASSOCIATIONS,
+    _author_login,
     lookup_verdict,
     parse_marker,
 )
@@ -258,7 +259,7 @@ def _trusted_markers(
         if MARKER_PREFIX not in body:
             continue
         if (
-            comment.get("user", {}).get("login") != login
+            _author_login(comment, rest_only=True) != login
             or comment.get("author_association") not in TRUSTED_ASSOCIATIONS
         ):
             continue

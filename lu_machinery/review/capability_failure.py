@@ -52,6 +52,7 @@ from typing import Any
 
 from lu_machinery.common import json_depth
 from lu_machinery.opsec.prepublish import check_texts, normalize_repository, publication_boundary, publication_cli
+from lu_machinery.orchestration.integration_sweep import _author_login
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.language_lane import is_ukrainian_review
 from lu_machinery.review.verdict_parser import MISSING_CAPABILITIES_FIELD, REVIEW_CAPABILITIES, recognized_verdicts
@@ -279,7 +280,7 @@ def events(comments: Sequence[Mapping[str, Any]], login: str) -> list[Capability
         if not isinstance(body, str):
             raise CapabilityFailureRefused(PUBLICATION, f"PR comment {index} malformed")
         if (
-            comment.get("user", {}).get("login") != login
+            _author_login(comment, rest_only=True) != login
             or comment.get("author_association") not in recorder.TRUSTED_ASSOCIATIONS
         ):
             continue
@@ -376,7 +377,7 @@ def record_capability_failure(
             if (
                 not isinstance(readback, dict)
                 or readback.get("body") != comment
-                or readback.get("user", {}).get("login") != login
+                or _author_login(readback, rest_only=True) != login
                 or readback.get("author_association") not in recorder.TRUSTED_ASSOCIATIONS
                 or readback.get("created_at") != readback.get("updated_at")
             ):

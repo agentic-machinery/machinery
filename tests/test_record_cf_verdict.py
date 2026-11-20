@@ -809,6 +809,56 @@ def _ledger(tmp_path):
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
+@pytest.mark.parametrize("user", [None, "fleet"])
+def test_review_budget_ignores_malformed_comment_author(user):
+    """Defect class: a malformed REST comment author crashes review budget accounting."""
+    from tests.review.record_support import recorded_verdict
+
+    comment = {**recorded_verdict(SHA, "APPROVED"), "user": user, "author": {"login": "fleet"}}
+
+    assert recorder._trusted_verdict_shas([comment], "fleet") == set()
+
+
+@pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
+@pytest.mark.parametrize("user", [None, "fleet"])
+def test_record_refuses_malformed_readback_author(monkeypatch, tmp_path, user):
+    """Defect class: a malformed verdict readback author crashes before reporting unknown publication state."""
+    tasks, _comments, calls = setup_record(monkeypatch, tmp_path)
+    run_json = recorder._run_json
+
+    def readback_with_malformed_user(request, **kwargs):
+        response = run_json(request, **kwargs)
+        if isinstance(request, recorder.Request) and request.verb == "read-comment":
+            return {**response, "user": user, "author": {"login": "fleet"}}
+        return response
+
+    monkeypatch.setattr(recorder, "_run_json", readback_with_malformed_user)
+
+    with pytest.raises(recorder.RecordError, match="comment readback mismatch; publication state unknown"):
+        recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert calls == {"posts": 1, "statuses": 0}
+
+
+@pytest.mark.usefixtures("configured_roots", "recorder_matcher", "agent_runtime_roots")
+@pytest.mark.parametrize("user", [None, "fleet"])
+def test_record_does_not_reuse_a_verdict_with_malformed_author(monkeypatch, tmp_path, user):
+    """Defect class: an existing same-task marker with a malformed author crashes verdict deduplication."""
+    from lu_machinery.review import capability_failure
+
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+    recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    comments[0].update(user=user, author={"login": "fleet"})
+    # The earlier capability and budget readers have their own regressions.
+    monkeypatch.setattr(capability_failure, "require_unclassified", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(recorder, "budget_admission", lambda **_kwargs: {})
+
+    receipt = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+
+    assert receipt["comment"] == "posted"
+    assert calls == {"posts": 2, "statuses": 2}
+    assert comments[-1]["user"] == {"login": "fleet"}
+
+
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
 @pytest.mark.parametrize("verdict", ["APPROVED", "CHANGES_REQUESTED"])
