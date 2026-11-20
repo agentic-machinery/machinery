@@ -48,6 +48,9 @@ def primary(tmp_path, monkeypatch):
     # empties (/var/tmp): keep that one root visible, every other data root stays emptied.
     monkeypatch.setattr(write_boundary, "_DATA_ROOTS",
                         tuple(root for root in write_boundary._DATA_ROOTS if not tmp_path.resolve().is_relative_to(root)))
+    # Without the /var/tmp tmpfs, bubblewrap needs an existing destination on the inherited read-only filesystem.
+    monkeypatch.setattr(test_slots, "DEFAULT_SCRATCH_ROOT", tmp_path / "slot-mounts")
+    test_slots._default_pool().mkdir(parents=True)
     return repo, worktree, tmp_path / "receipt.json"
 
 
@@ -68,10 +71,18 @@ def test_review_runs_named_pytest_with_a_real_shared_slot_and_task_local_interpr
     monkeypatch.setenv(test_slots.COUNT_ENV, "1")
     monkeypatch.setenv(test_slots.ENABLE_ENV, "on")
     monkeypatch.setenv(test_slots.TASK_ENV, "wb-test")
+    # The nested pytest starts its own session, even when this fixture runs in an outer xdist worker.
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     monkeypatch.setenv("PYTHONPATH", str(Path(write_boundary.__file__).parents[2]))
     with test_slots.acquire(1, kind="pytest", task_id="fixture"):
         inode = (pool / "slot-000.lock").stat()
-    (worktree / "conftest.py").write_text('pytest_plugins = ["lu_machinery.ci.pytest_dispatch_cap"]\n')
+    (worktree / "conftest.py").write_text(f"""
+from pathlib import Path
+from lu_machinery.common import test_slots
+
+test_slots.DEFAULT_SCRATCH_ROOT = Path({str(test_slots.DEFAULT_SCRATCH_ROOT)!r})
+pytest_plugins = ["lu_machinery.ci.pytest_dispatch_cap"]
+""")
     (worktree / "test_slot_probe.py").write_text(f"""
 from lu_machinery.common import test_slots
 
