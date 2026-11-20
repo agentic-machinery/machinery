@@ -599,7 +599,6 @@ _PAGE_SENTENCES = frozenset({
     "count; a blocking reply with no recorded publication (an unpublished run, or one from "
     "before the publication ledger and not imported) is of unknown publication and left out.",
     "No planted-defect result is recorded in the summary rows.",
-    "No Savant model is in the catalog, and no row names one.",
     "This snapshot does not include task ids.",
     "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
     "that pool's net drop once. A cluster shared by more than one model or effort, or one that "
@@ -673,6 +672,8 @@ def test_samples_view_returns_the_reply_text_view_page_omits(tmp_path, monkeypat
     assert page.status_code == samples.status_code == full.status_code == 200
     assert _LEAK not in page.text
     assert "unparsed_samples" not in page.text
+    assert {"gemini-4-neon", "subq-savant-1.4"} <= set(page.json()["idle_catalog_models"])
+    assert "savant" not in page.json()["charts"]["limits"]
     body = samples.json()
     assert body["status"] == "ok" and set(body) == {"schema_version", "status", "age_seconds", "window", "models"}
     found = [model for model in body["models"] if model["model"] == "claude-opus-5-5" and model["role"] == "review"]

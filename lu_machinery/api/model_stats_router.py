@@ -60,6 +60,7 @@ from .model_stats_rows import (
     POOLS,
     UNPARSED_REASONS,
     VERDICTS,
+    current_catalog_model_ids,
     fleet_catalog,
     model_catalog_reading,
     path_digest,
@@ -1464,7 +1465,6 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
                          "count; a blocking reply with no recorded publication (an unpublished run, or one from "
                          "before the publication ledger and not imported) is of unknown publication and left out.",
             "recall": "No planted-defect result is recorded in the summary rows.",
-            "savant": "No Savant model is in the catalog, and no row names one.",
             "links": "This snapshot does not include task ids.",
             "quota": "An allowance reading is the whole pool, not the one model. Overlapping tasks are charged "
                      "that pool's net drop once. A cluster shared by more than one model or effort, or one that "
@@ -1495,6 +1495,7 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
     record_prs = _prs(selected, of_record=True) if record_prs is None else record_prs
     models = _models(fine)
     _stamp_allowance(models, selected)
+    catalog_model_ids = current_catalog_model_ids()
     used = {model for model, *_ in fine}
     return {
         "models": models, "authors": _authors(prs), "author_risks": _author_risks(record_prs, prs),
@@ -1504,8 +1505,7 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
                               "planted_defect_recall": PLANTED_DEFECT_RECALL},
         "review_levels": _review_levels(selected, models, selected if history is None else history),
         "allowance": _allowance_rows(selected), "charts": _charts(models, prs, selected), "records": len(selected),
-        # Every model the catalog still routes (not retired) that ran no task in this window; None without a catalog.
-        "idle_catalog_models": sorted(_routed_models() - used) if model_catalog_reading() is not None else None,
+        "idle_catalog_models": sorted(catalog_model_ids - used) if catalog_model_ids is not None else None,
         # Which evidence landed each landed write task: its X-Agent trailer, its own merged delivery, or both.
         "landed_by": dict(sorted(Counter(
             "both" if row.trailer and row.delivery else "trailer" if row.trailer else "delivery"
@@ -1534,12 +1534,6 @@ def _catalog_models() -> dict[str, Any]:
 @lru_cache(maxsize=1)
 def _known_models() -> frozenset[str]:
     return frozenset({*_catalog_models(), *NATIVE_ALIASES, "unknown"})
-
-
-def _routed_models() -> frozenset[str]:
-    """Every catalog model not retired; none without a catalog."""
-    return frozenset(mid for mid, info in _catalog_models().items()
-                     if isinstance(info, Mapping) and info.get("lifecycle") != "retired")
 
 
 @lru_cache(maxsize=256)

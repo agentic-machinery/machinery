@@ -2170,8 +2170,17 @@ def _weekly(**fields):
             **fields}
 
 
-def test_home_usage_fresh_reading_shows_left_pace_and_reset():
-    row = _home_row(_render_home_usage(_home_subs()), 'Codex a')
+def test_home_usage_fresh_reading_shows_left_pace_and_reset(monkeypatch):
+    from lu_machinery.api import runtime_router
+
+    snapshot = {**_home_subs(), 'catalog_models': ['arbitrary-cache-label']}
+    monkeypatch.setattr(runtime_router.subscriptions, 'subscriptions_snapshot', lambda: snapshot)
+    payload = json.loads(runtime_router.runtime_subscriptions().body)
+    rendered = _render_home_usage(payload)
+    assert {'gemini-4-neon', 'subq-savant-1.4'} <= set(payload['catalog_models'])
+    assert 'arbitrary-cache-label' not in rendered
+    assert all(model in rendered for model in ('gemini-4-neon', 'subq-savant-1.4'))
+    row = _home_row(rendered, 'Codex a')
     assert '70%' in row and '20 pp deficit' in row
     assert 'runs out 2030-01-02 00:00Z (in 12h 0m)' in row
     assert '<strong>in 1d 12h</strong>' in row and '2030-01-03 00:00Z' in row
@@ -2187,6 +2196,7 @@ def test_home_usage_invalid_percentages_are_unknown(invalid):
 
 
 def test_home_usage_missing_stale_and_unavailable_are_explicit():
+    assert 'Catalog unavailable.' in _render_home_usage({**_home_subs(), 'catalog_models': None})
     missing = _home_row(_render_home_usage(_home_subs(
         reading={'status': 'unknown', 'read_at': None, 'age_s': None, 'reason_code': 'no_reading'},
         weekly={'status': 'unknown', 'reason_code': 'no_reading'}, pace={'status': 'unknown', 'reason_code': 'no_reading'})), 'Codex a')
@@ -2216,6 +2226,7 @@ def test_home_usage_unsafe_labels_are_escaped():
                             banked_resets={'status': 'ok', 'count': 1, 'items': [{'count': 1, 'kind': unsafe}]})
     subs = _home_subs({'provider': 'x', 'label': unsafe, 'accounts': [account]})
     subs['sources']['plan_facts'] = {'status': 'unknown', 'reason': unsafe}
+    subs['catalog_models'] = [unsafe]
     budget = {'api_accounts': {'x': {'balance_probe_state': unsafe, 'freshness': unsafe}}}
     rendered = _render_home_usage(subs, budget)
     assert '<img' not in rendered

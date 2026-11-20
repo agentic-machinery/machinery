@@ -179,8 +179,7 @@
     <div id="allowance">Loading…</div></section>
   <section class="wide" id="neon-section"><h2>Neon medium against high</h2>
     <p class="note">Compare Neon medium and high on write landings, reviewer approvals and typical runtime. Use the counts and approval intervals before favoring a setting, and compare approvals only for similar review work.</p>
-    <div id="neon">Loading…</div>
-    <p class="note" id="new-models"></p></section>
+    <div id="neon">Loading…</div></section>
   <section class="wide" id="accuracy-section"><h2>Reviewer accuracy <span class="meta" id="accuracy-meta"></span></h2>
     <p class="note">Each blocking (P0–P1) finding counts as fixed when the author changed its file before the same reviewer approved, and as dismissed when that reviewer approved with the file unchanged. Higher precision means more of a reviewer's blocking findings led to a change; check the settled count and interval before comparing reviewers. Only verdicts the recorder published count: a blocking reply with no recorded publication is of unknown publication and is left out.</p>
     <div id="accuracy">Loading…</div></section>
@@ -347,11 +346,11 @@ function withClasses(models, role, render, width) {
 function keepModel(name) { return !picked() || name === picked(); }
 // An author label can join several models (`a+b`): it matches the picked model when that model is one of them, exactly.
 function keepAuthor(name) { return !picked() || String(name).split("+").includes(picked()); }
-// Every model a filtered table can show, so each one can be picked: task models, authors (each member of a joint
-// author), the matrix's reviewers and the reviewer accuracy rows.
+// Include idle catalog models as well as every model a filtered table can show.
 function pickerModels(data) {
   const members = (name) => String(name).split("+");
   return [...new Set([
+    ...(data.idle_catalog_models || []),
     ...(data.models || []).map((m) => m.model),
     ...[...(data.authors || []), ...(data.author_risks || [])].flatMap((a) => members(a.model)),
     ...(data.first_round_matrix || []).flatMap((c) => [...members(c.author), c.reviewer]),
@@ -1005,10 +1004,10 @@ function render() {
       + `${cell(num(a.pct_points_spent, 1))}${cell(rate(a.pct_points_per_landed))}${cell(a.overlapped_tasks, a.overlapped_tasks ? "warn" : "")}${cell(a.reset_crossed, a.reset_crossed ? "warn" : "")}</tr>`), [0, 1, 2])
     : '<p class="muted">No write task in this window has both readings.</p>';
   $("idle").textContent = data.idle_catalog_models == null
-    ? "Routed catalog models with no task in this window: unknown, because the model catalog could not be read."
+    ? "The model catalog could not be read."
     : data.idle_catalog_models.length
-    ? `Routed catalog models with no task in this window: ${data.idle_catalog_models.join(", ")}.`
-    : "Every routed catalog model ran at least one task in this window.";
+    ? `Catalog models with no task in this window: ${data.idle_catalog_models.join(", ")}.`
+    : "";
   updateTableScroll();
 }
 function formatPace(pace, responseStale = false) {
