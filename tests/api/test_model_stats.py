@@ -956,6 +956,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "kimi-slash": dict(agent="kimi", model="kimi-code/k3-256k", effort=None),
         "kimi-alias": dict(agent="kimi", model="k3-256k", effort=None),
         "glm-alias": dict(agent="glm", model="zai-coding-plan/glm-5.3", effort="high"),
+        "glm-legacy": dict(agent="glm", model="retired_glm", effort="high"),
         "deepseek-prefix": dict(agent="deepseek", model="deepseek-direct/deepseek-v4-flash", effort=None),
         "attested-over-auto": dict(agent="cursor", model="auto", resolved_model="Grok 4.7 256K High",
                                    resolved_model_known=True, effort=None),
@@ -988,6 +989,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "kimi-slash": ("kimi-code/k3-256k", "unset"),
         "kimi-alias": ("kimi-code/k3-256k", "unset"),
         "glm-alias": ("glm-5.3", "high"),
+        "glm-legacy": ("retired_glm", "high"),
         "deepseek-prefix": ("deepseek-v4-flash", "unset"),
         "attested-over-auto": ("grok-4.7", "unset"),
         "attested-fast-over-request": ("unknown", "unset"),
@@ -1212,7 +1214,8 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
             resolved_model="gemini-4-neon", effort=None, duration_s=10000)
     _record(tasks, "grok-review", mode="read-only", agent="cursor", model="grok-4.7-high",
             status="failed")
-    _record(tasks, "landed", delivery_pr="example/repo#9", delivery_merge_sha="3" * 40)
+    # Reviewer-effort costs use the PR's landing even when the writer effort is unknown.
+    _record(tasks, "landed", effort=None, delivery_pr="example/repo#9", delivery_merge_sha="3" * 40)
     rows.backfill(tasks, batch_state)
     # A retained structured result can repair an existing summary even when its task record did not change.
     (tasks / "neon-initial-review.result").write_text(json.dumps({

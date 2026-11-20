@@ -106,7 +106,7 @@ _SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 # The dispatcher's task-id grammar (dispatcher.store.record_path); a legacy record's id is not checked on read.
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _EFFORT_SUFFIX = re.compile(rf"-({VARIANT_SUFFIX.pattern})\Z")
-_RETIRED_SUBSCRIPTION_MODEL = re.compile(r"\b(?:glm|kimi)(?:cc)?(?![a-z])", re.I)
+_RETIRED_SUBSCRIPTION_MODEL = re.compile(r"(?<![a-z0-9])(?:glm|kimi)(?:cc)?(?![a-z])", re.I)
 # Plan-metered pools only; an API-key account label names no allowance and is never stored.
 POOLS = frozenset({*(f"claude:{label}" for label in CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS),
                    "codex:a", "codex:b", "agy_claude", "gemini", "cursor"})

@@ -2199,13 +2199,6 @@ def _aged_routing_budget(
     if not isinstance(payload, dict):
         return payload
     served = {**payload, **(claude_account_routing_fields() if claude_fields is None else claude_fields)}
-    if isinstance(snapshot := payload.get("subscriptions"), dict):
-        served["subscriptions"] = subscriptions.age_snapshot(snapshot, age_s)
-    agents = panel_values.mapping(payload.get("agents"))
-    cursor = panel_values.mapping(agents.get("cursor"))
-    cursor_age = panel_values.number(cursor.get("age_s"))
-    if cursor_age is not None and cursor_age >= 0:
-        served["agents"] = {**agents, "cursor": {**cursor, "age_s": cursor_age + age_s}}
     diagnostics = payload.get("diagnostics")
     threshold = ROUTING_BUDGET_MAX_AGE_S
     reported_age = age_s
@@ -2442,7 +2435,7 @@ _ROUTING_ENUMS = {
 }
 
 
-def _public_routing_budget(raw: object, *, _depth: int = 0) -> dict[str, Any]:
+def _public_routing_budget(raw: object, *, subscription_age_s: float | None = None, _depth: int = 0) -> dict[str, Any]:
     if _depth > 8:
         return {}
     row = panel_values.mapping(raw)
@@ -2465,9 +2458,16 @@ def _public_routing_budget(raw: object, *, _depth: int = 0) -> dict[str, Any]:
                 model for value in values[:64]
                 if (model := panel_values.model(value)) is not None and not retired_subscription_model(model)
             ]
-    if _depth == 0 and "subscriptions" in row:
-        snapshot = row["subscriptions"]
-        out["subscriptions"] = _public_subscriptions(snapshot) if isinstance(snapshot, dict) else None
+    if subscription_age_s is not None:
+        snapshot = row.get("subscriptions")
+        out["subscriptions"] = (
+            _public_subscriptions(subscriptions.age_snapshot(snapshot, subscription_age_s))
+            if isinstance(snapshot, dict) else None
+        )
+        cursor = panel_values.mapping(panel_values.mapping(out.get("agents")).get("cursor"))
+        cursor_age = panel_values.number(cursor.get("age_s"))
+        if cursor_age is not None and cursor_age >= 0:
+            cursor["age_s"] = cursor_age + subscription_age_s
     if "covered_by" in row:
         values = row["covered_by"] if isinstance(row["covered_by"], list) else []
         out["covered_by"] = [value for value in values[:8]
@@ -2504,6 +2504,7 @@ async def routing_budget(
     fresh_codexbar: bool = Query(False),
     transport: Literal["dispatch", "acp"] = Query("dispatch"),
     ctx: MonitorContext = Depends(get_ctx),
+    include_subscriptions: bool = False,
 ):
     """Per-agent soft-cap burn and routing recommendation for dispatch planning.
 
@@ -2511,6 +2512,7 @@ async def routing_budget(
     background refresh and still returns the cached/LKG snapshot. In-process
     callers that need a blocking probe use
     ``compute_routing_budget(fresh_codexbar=True)`` directly.
+    ``?include_subscriptions=true`` adds the aged snapshot used by the Subscriptions page.
     """
     if fresh_codexbar:
         trigger_background_refresh()
@@ -2542,11 +2544,11 @@ async def routing_budget(
         # Stat-only serving withholds changed bindings and schedules their
         # validation in the background. A warm read never waits for it.
         claude_fields = claude_account_routing_fields()
-        payload = _public_routing_budget(_aged_routing_budget(
-            value,
-            state_helpers._ttl_clock() - observed.started_at,
-            claude_fields=claude_fields,
-        ))
+        elapsed_s = state_helpers._ttl_clock() - observed.started_at
+        payload = _public_routing_budget(
+            _aged_routing_budget(value, elapsed_s, claude_fields=claude_fields),
+            subscription_age_s=elapsed_s if include_subscriptions else None,
+        )
         return _routing_budget_response(payload)
     # Nothing stored yet. One deadline bounds the whole cold path, the account
     # read included, so the request timeout's 504 cannot fire. The shared
@@ -2573,11 +2575,11 @@ async def routing_budget(
                 "Cache-Control": "no-store",
             },
         ) from None
-    payload = _public_routing_budget(_aged_routing_budget(
-        value,
-        state_helpers._ttl_clock() - observed.started_at,
-        claude_fields=claude_fields,
-    ))
+    elapsed_s = state_helpers._ttl_clock() - observed.started_at
+    payload = _public_routing_budget(
+        _aged_routing_budget(value, elapsed_s, claude_fields=claude_fields),
+        subscription_age_s=elapsed_s if include_subscriptions else None,
+    )
     return _routing_budget_response(payload)
 
 

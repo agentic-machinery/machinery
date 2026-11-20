@@ -1149,7 +1149,7 @@ def _review_levels(rows: list[_Row], models: list[dict[str, Any]], history: list
     landed: set[_PrKey] = set()
     for row in history:
         head = row.raw.get("pinned_head")
-        if row.effort != UNKNOWN_EFFORT and row.landed and row.delivery:
+        if row.landed and row.delivery:
             landed.add((row.raw["repo"], row.raw["landing"]["pr"]))
         if row.review is not None and (pr := _reviewed_pr(row)) is not None:
             if head:

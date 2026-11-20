@@ -341,7 +341,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "/api/state/routing-budget",
         "exact",
         "http",
-        "Per-agent soft-cap burn, routing recommendation, subscription account snapshots, and Cursor Auto and API windows.",
+        "Per-agent soft-cap burn, routing recommendation, and Cursor Auto and API windows. "
+        "The Subscriptions page requests the per-account snapshot with ?include_subscriptions=true.",
         f"{_rel('config', 'agent_budgets.yaml')}, cost records, delegate in-flight state, process-local CodexBar, and the usage and plan-facts inputs shared with /api/runtime/subscriptions.",
         "15-second routing cache with background refresh of expired snapshots; age, state and the 900-second source bound are exposed in snapshot headers. Subscription usage has its own background scheduler. HTTP ?fresh_codexbar=true starts a refresh and returns cache/LKG without waiting for a probe.",
         ("subscriptions.html", "model-stats.html", "agents"),
@@ -678,7 +679,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "subscriptions.html",
         "/subscriptions",
         "Subscriptions: per-account weekly usage, pace, resets, 5-hour and scoped windows, credits, banked resets, plan renewal or end, sign-in state, Cursor Auto and API windows, and API account balances.",
-        "GET /api/state/routing-budget and /api/runtime/logins.",
+        "GET /api/state/routing-budget?include_subscriptions=true and /api/runtime/logins.",
         "HTTP reads every 30 seconds; stale or unverified readings hide actionable quota, pace, reset and balance figures.",
         ("humans", "operators"),
         "Full detail backing the Overview capacity summary.",

@@ -175,19 +175,21 @@ function apiRows(budget) {
 function cursorUsage(budget) {
   const cursor = budget?.agents?.cursor;
   const freshness = readingState(cursor?.freshness, cursor?.age_s, budget?.diagnostics?.stale_threshold_s);
+  const needsLogin = cursor?.probe_state === "NEED_LOGIN" || cursor?.login_state === "NEED_LOGIN";
   const reason = !budget ? "routing budget did not answer"
-    : cursor?.probe_state === "NEED_LOGIN" ? "sign-in required"
+    : needsLogin ? "sign-in required"
     : cursor?.codexbar?.reason_code === "provider_error" ? "usage probe failed"
     : freshness === "stale" || freshness === "last_good" ? "last reading is stale"
     : "no current usage reading";
-  const cells = ["auto", "api"].map(key => {
+  const rows = [["auto", "Cursor Auto"], ["api", "Cursor API"]].map(([key, label]) => {
     const window = cursor?.provider_windows?.[key];
     const remaining = validPct(window?.remaining_pct) ? window.remaining_pct
       : validPct(window?.used_pct) ? 100 - window.used_pct : null;
-    return freshness === "fresh" && cursor?.probe_state !== "NEED_LOGIN" && remaining !== null
+    const reading = freshness === "fresh" && !needsLogin && remaining !== null
       ? text(`${pct(remaining)} left`) : text(`Unavailable (${reason})`, "muted");
+    return [text(label), reading];
   });
-  return table(["Cursor Auto", "Cursor API"], [cells], true);
+  return table(["Cursor window", "Remaining"], rows, true);
 }
 
 function renderUsage(subs, budget, logins) {
@@ -220,7 +222,7 @@ const PANELS = [
   {
     id: "usage",
     label: "Subscriptions",
-    urls: ["/api/state/routing-budget", "/api/runtime/logins"],
+    urls: ["/api/state/routing-budget?include_subscriptions=true", "/api/runtime/logins"],
     sourceLabels: ["Routing budget", "Sign-in"],
     render: (budget, logins) => renderUsage(budget?.subscriptions, budget, logins),
     onData: (data, latest) => { latest.logins = data[1]; },

@@ -1171,7 +1171,9 @@ def test_compute_routing_budget_includes_api_accounts(monkeypatch, tmp_path):
     ranked_api = [row for row in data["ranked_by_headroom"] if row["type"] == "api"]
     assert len(ranked_api) == 2
     assert ranked_api[0]["remaining_usd"] == 49.0
-    public = state_router._public_routing_budget(state_router._aged_routing_budget(data, 880, claude_fields={}))
+    aged = state_router._aged_routing_budget(data, 880, claude_fields={})
+    assert "subscriptions" not in state_router._public_routing_budget(aged)
+    public = state_router._public_routing_budget(aged, subscription_age_s=880)
     account = public["subscriptions"]["providers"][0]["accounts"][0]
     assert account["account"] == "Codex a"
     assert account["reading"]["status"] == "stale" and account["reading"]["age_s"] == 910
@@ -2235,7 +2237,7 @@ def test_home_usage_missing_stale_and_unavailable_are_explicit():
     assert 'FRESHNESS UNKNOWN, age unknown' in unknown
     budget = {'agents': {'cursor': {'probe_state': 'NEED_PROBE'}}}
     rendered = _render_home_usage(_home_subs(), budget)
-    assert '<th>Cursor Auto</th><th>Cursor API</th>' in rendered
+    assert '<td>Cursor Auto</td>' in rendered and '<td>Cursor API</td>' in rendered
     assert rendered.count('Unavailable (no current usage reading)') == 2
 
     cursor = {
@@ -2244,13 +2246,14 @@ def test_home_usage_missing_stale_and_unavailable_are_explicit():
     }
     budget['agents']['cursor'] = cursor
     rendered = _render_home_usage(_home_subs(), budget)
-    assert '77% left' in rendered and 'data-label="Cursor API">0% left' in rendered
+    assert '77% left' in rendered and '<td>Cursor API</td><td data-label="Remaining">0% left' in rendered
     cursor['provider_windows']['api'] = {'used_pct': -5, 'remaining_pct': True}
     rendered = _render_home_usage(_home_subs(), budget)
     assert '77% left' in rendered and rendered.count('Unavailable (no current usage reading)') == 1
     cursor['age_s'] = 901
     assert _render_home_usage(_home_subs(), budget).count('Unavailable (last reading is stale)') == 2
-    cursor['probe_state'] = 'NEED_LOGIN'
+    cursor['age_s'] = 30
+    cursor['login_state'] = 'NEED_LOGIN'
     assert _render_home_usage(_home_subs(), budget).count('Unavailable (sign-in required)') == 2
 
 
