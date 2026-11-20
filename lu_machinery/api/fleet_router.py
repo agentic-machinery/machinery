@@ -8,36 +8,31 @@ initializes schema, writes a receipt, invokes an agent, or retrieves artifacts.
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import logging
 import math
 import os
 import re
 import sqlite3
-import stat
-import threading
-import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.control_plane import storage
 from lu_machinery.control_plane.health import read_failure_code
-from lu_machinery.fleet_comms import message_plane
+from lu_machinery.fleet_comms import message_plane, migrations
 from lu_machinery.fleet_comms.endpoints import load_endpoint_registry
 from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.fleet_comms.migrations import MIGRATIONS
+from lu_machinery.fleet_comms.opsec_store import COMMS_RESPONSE_SCHEMA_VERSION, store_descriptor
 from lu_machinery.fleet_comms.paths import (
     RETIRED_LOCAL_PLANE_MESSAGE,
     PlaneRootAnchorError,
@@ -51,10 +46,9 @@ from lu_machinery.guardrails.worktree_containment import (
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, is_sqlite_connection, open_readonly
 
 from .monitor_context import MonitorContext, get_ctx, resolve_context
-from .panel_values import snapshot_headers
 from .product_contribution import fleet_batches
 from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
-from .state_helpers import reports_failure, swr_route
+from .state_helpers import swr_route
 
 _DATABASE_ERRORS: tuple[type[Exception], ...] = (sqlite3.Error,)
 try:
@@ -65,11 +59,6 @@ except ModuleNotFoundError as exc:
 else:
     _DATABASE_ERRORS += (PostgresError,)
 _OVERVIEW_ERRORS: tuple[type[Exception], ...] = (*_DATABASE_ERRORS, storage.ControlPlaneError)
-_OVERVIEW_READ_ERRORS: tuple[type[Exception], ...] = (
-    *_OVERVIEW_ERRORS,
-    ValueError,
-    json.JSONDecodeError,
-)
 
 router = APIRouter(tags=["fleet"])
 # Fleet read models served stale-while-revalidate (``state_helpers.swr_route``):
@@ -164,13 +153,13 @@ def _plane_db_path(ctx: MonitorContext | None = None) -> Path:
 
 
 @contextmanager
-def _read_connection_with_authority(
+def _read_connection(
     ctx: MonitorContext | None = None,
     *,
     pg_supported: bool = False,
     plane_root: Path | None = None,
-) -> Iterator[tuple[Any | None, str, storage.Authority]]:
-    """Yield a query-only connection, availability, and resolved authority."""
+) -> Iterator[tuple[Any | None, str]]:
+    """Yield a query-only connection, never creating a database or schema."""
     resolved_ctx = resolve_context(ctx)
     db_path = (
         plane_root / "comms.sqlite3"
@@ -181,10 +170,10 @@ def _read_connection_with_authority(
     if authority is storage.Authority.PG and not pg_supported:
         # Detail routes still use SQLite-shaped SQL. Do not read a stale
         # local file or mistake this component limit for database absence.
-        yield None, "authority_unsupported_component", authority
+        yield None, "authority_unsupported_component"
         return
     if authority is not storage.Authority.PG and not db_path.is_file():
-        yield None, "db_missing", authority
+        yield None, "db_missing"
         return
 
     connection = None
@@ -203,29 +192,13 @@ def _read_connection_with_authority(
     except Exception as exc:
         availability = read_failure_code(exc, authority)
     try:
-        yield connection if availability == "available" else None, availability, authority
+        yield connection if availability == "available" else None, availability
     finally:
         if connection is not None:
             try:
                 connection.close()
             except Exception:
                 logger.warning("Fleet observer read-only connection close failed")
-
-
-@contextmanager
-def _read_connection(
-    ctx: MonitorContext | None = None,
-    *,
-    pg_supported: bool = False,
-    plane_root: Path | None = None,
-) -> Iterator[tuple[Any | None, str]]:
-    """Yield a query-only connection, never creating a database or schema."""
-    with _read_connection_with_authority(
-        ctx,
-        pg_supported=pg_supported,
-        plane_root=plane_root,
-    ) as (connection, availability, _authority):
-        yield connection, availability
 
 
 def _table_exists(connection: Any, table: str) -> bool:
@@ -424,12 +397,11 @@ def _safe_plane_status(
     ctx: MonitorContext | None = None,
     *,
     plane_root: Path | None = None,
-    telemetry_path: Path | None = None,
 ) -> dict[str, Any]:
     """Project the existing plane read model without paths or raw telemetry rows."""
     resolved_ctx = resolve_context(ctx)
     status = (
-        read_plane_status(root=plane_root, telemetry_path=telemetry_path, recent_limit=0)
+        read_plane_status(root=plane_root, recent_limit=0)
         if plane_root is not None
         else read_plane_status(repo_root=resolved_ctx.roots.state_root, recent_limit=0)
     )
@@ -573,6 +545,7 @@ def _authority_health_snapshot(
     *,
     now: datetime | None = None,
     availability: str = "available",
+    raise_on_error: bool = False,
 ) -> dict[str, Any]:
     """Derive current health only from a fixed authority evidence window."""
     window = _authority_health_window(now)
@@ -618,6 +591,8 @@ def _authority_health_snapshot(
             )
     except _DATABASE_ERRORS:
         logger.warning("Fleet observer could not derive authority health")
+        if raise_on_error:
+            raise
         return {**unavailable, "availability": "schema_read_failed"}
     return _authority_health_payload(
         states,
@@ -824,18 +799,11 @@ def fleet_health(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
     }
 
 
-OVERVIEW_CACHE_TTL_S = FACADE_TTL_S
-_OVERVIEW_CACHE_MAX_ENTRIES = 16
-_overview_clock: Callable[[], float] = time.monotonic
-_overview_cache_lock = threading.Lock()
-# Keyed by live routing state (a routing change produces a distinct key):
-# no invalidation, no in-flight join, no waiters.
-_overview_cache: dict[tuple[Any, ...], tuple[float, dict[str, Any]]] = {}
-
-_SQLITE_OVERVIEW_REQUIRED_TABLE_COUNT = 7
+_SQLITE_OVERVIEW_REQUIRED_TABLE_COUNT = 8
 _SQLITE_OVERVIEW_TABLES_SQL = """
 SELECT COUNT(*) FROM sqlite_master
 WHERE type = 'table' AND name IN (
+    'comms_schema_migrations',
     'requests',
     'comms_messages',
     'formal_review_jobs',
@@ -845,8 +813,10 @@ WHERE type = 'table' AND name IN (
     'acp_conversations'
 )
 """
-_SQLITE_OVERVIEW_COUNTS_SQL = """
+_SQLITE_OVERVIEW_SNAPSHOT_SQL = """
 SELECT
+    (SELECT json_group_array(json_array(version, name, checksum))
+     FROM (SELECT version, name, checksum FROM comms_schema_migrations ORDER BY version LIMIT ?)),
     (SELECT json_group_array(json_array(k, c))
      FROM (SELECT state AS k, COUNT(*) AS c FROM requests GROUP BY state ORDER BY state)),
     (SELECT json_group_array(json_array(k, c))
@@ -869,147 +839,6 @@ SELECT
 """
 
 
-@dataclass(frozen=True, slots=True)
-class _OverviewRoutingSnapshot:
-    plane_root: Path
-    authority: storage.Authority
-    telemetry_path: Path
-    db_identity: tuple[int, int] | None
-    expected_mode: str | None
-    mode_spec: tuple[Any, ...]
-    key: tuple[Any, ...]
-    cacheable: bool
-
-
-def _file_stat_key(path: Path) -> tuple[int, int, int, int, int] | None:
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-
-
-def _sqlite_db_identity(db_path: Path) -> tuple[int, int] | None:
-    try:
-        st = db_path.stat()
-    except OSError:
-        return None
-    if not stat.S_ISREG(st.st_mode):
-        return None
-    return (st.st_dev, st.st_ino)
-
-
-def _overview_mode_spec() -> tuple[tuple[Any, ...], str | None]:
-    env = os.environ.get(message_plane.ENV_MODE)
-    if env is not None and env.strip():
-        value = env.strip().lower()
-        if value in {"0", "false", "off", "disabled"}:
-            return ("env", "off"), "off"
-        if value in {"dual-write", "dualwrite"}:
-            return ("env", "dual_write"), "dual_write"
-        return ("env", value), value
-    cfg_path = machinery_path("config/fleet_communications.yaml")
-    return ("config", str(cfg_path), _file_stat_key(cfg_path)), None
-
-
-def _capture_overview_routing(ctx: MonitorContext) -> _OverviewRoutingSnapshot:
-    plane_root = _plane_root(ctx)
-    authority = storage.resolve_authority(storage.StoreId.FLEET_COMMS)
-    telemetry_path = message_plane.default_parity_telemetry_path(plane_root)
-    telemetry_stat = _file_stat_key(telemetry_path)
-    mode_spec, expected_mode = _overview_mode_spec()
-    allow_shadow = os.environ.get("FLEET_COMMS_ALLOW_LOCAL_SHADOW", "").strip() == "1"
-    db_identity = (
-        None
-        if authority is storage.Authority.PG
-        else _sqlite_db_identity(plane_root / "comms.sqlite3")
-    )
-    # PostgreSQL status/count readers resolve DSN from live environment without
-    # a caller-supplied connection target, so PG reads skip cache publication.
-    cacheable = authority is not storage.Authority.PG and db_identity is not None
-    key = (
-        repr(ctx.roots),
-        str(plane_root),
-        authority.value,
-        db_identity,
-        mode_spec,
-        str(telemetry_path),
-        telemetry_stat,
-        allow_shadow,
-    )
-    return _OverviewRoutingSnapshot(
-        plane_root=plane_root,
-        authority=authority,
-        telemetry_path=telemetry_path,
-        db_identity=db_identity,
-        expected_mode=expected_mode,
-        mode_spec=mode_spec,
-        key=key,
-        cacheable=cacheable,
-    )
-
-
-def _current_plane_mode() -> str:
-    try:
-        return str(message_plane.resolve_plane_mode())
-    except ValueError:
-        return "invalid"
-
-
-def _overview_is_storable(result: dict[str, Any]) -> bool:
-    if reports_failure(result):
-        return False
-    if result.get("availability") not in {"available", "empty"}:
-        return False
-    health = result.get("health")
-    if not isinstance(health, dict):
-        return False
-    if health.get("mode") == "invalid":
-        return False
-    store = health.get("store")
-    if not isinstance(store, dict) or store.get("reachable") is not True:
-        return False
-    schema = health.get("schema")
-    return isinstance(schema, dict) and not schema.get("db_error")
-
-
-def _overview_cache_get(key: tuple[Any, ...]) -> tuple[dict[str, Any], float] | None:
-    with _overview_cache_lock:
-        entry = _overview_cache.get(key)
-        if entry is None:
-            return None
-        started, stored_payload = entry
-        if (_overview_clock() - started) >= OVERVIEW_CACHE_TTL_S:
-            return None
-    # Deep-copy outside the mutex; stored_payload is immutable after insertion.
-    payload = copy.deepcopy(stored_payload)
-    age = _overview_clock() - started
-    if age >= OVERVIEW_CACHE_TTL_S:
-        return None
-    return payload, max(0.0, age)
-
-
-def _overview_cache_put(key: tuple[Any, ...], started: float, payload: dict[str, Any]) -> bool:
-    if (_overview_clock() - started) >= OVERVIEW_CACHE_TTL_S:
-        return False
-    cloned = copy.deepcopy(payload)
-    with _overview_cache_lock:
-        now = _overview_clock()
-        if (now - started) >= OVERVIEW_CACHE_TTL_S:
-            return False
-        expired = [k for k, (ts, _) in _overview_cache.items() if (now - ts) >= OVERVIEW_CACHE_TTL_S]
-        for k in expired:
-            _overview_cache.pop(k, None)
-        existing = _overview_cache.get(key)
-        if existing is not None and started < existing[0]:
-            return True
-        if key not in _overview_cache and len(_overview_cache) >= _OVERVIEW_CACHE_MAX_ENTRIES:
-            oldest = min(_overview_cache, key=lambda item: _overview_cache[item][0])
-            _overview_cache.pop(oldest, None)
-        _overview_cache[key] = (started, cloned)
-    return True
-
-
 def _decode_json_counts(raw: Any) -> dict[str, int]:
     if not isinstance(raw, str) or not raw:
         return {}
@@ -1022,6 +851,37 @@ def _decode_json_counts(raw: Any) -> dict[str, int]:
             raise ValueError("overview count entry is not a key/count pair")
         counts[_safe_text(pair[0], fallback="unknown")] = int(pair[1])
     return counts
+
+
+def _decode_json_migrations(raw: Any) -> list[list[Any]]:
+    if not isinstance(raw, str) or not raw:
+        return []
+    entries = json_depth.loads(raw, max_depth=8)
+    if not isinstance(entries, list):
+        raise ValueError("overview migration payload is not a JSON list")
+    for entry in entries:
+        if not isinstance(entry, list) or len(entry) != 3:
+            raise ValueError("overview migration entry is not a version/name/checksum triple")
+    return entries
+
+
+def _empty_overview_result(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "read_only": True,
+        "authority": status["authority"],
+        "cutover": status["cutover"],
+        "health": status,
+        "counts": {
+            "requests": {"total": 0, "by_state": {}},
+            "legacy_requests": {"total": 0, "by_state": {}},
+            "messages": {"total": 0, "by_kind": {}},
+            "reviews": {"total": 0, "by_state": {}},
+            "dead_letters": {"total": 0},
+            "acp_conversations": {"total": 0},
+            "authority_jobs": {"total": 0, "by_state": {}},
+        },
+        "availability": "db_missing",
+    }
 
 
 def _assign_overview_counts(
@@ -1057,144 +917,190 @@ def _assign_overview_counts(
     counts["dead_letters"]["total"] = dead_letters_total
     counts["acp_conversations"]["total"] = acp_conversations_total
     result["counts"] = counts
-    result["availability"] = "available" if any(
-        section["total"] for section in counts.values()
-    ) else "empty"
+    if authority_health is not None and authority_health.get("availability") != "available":
+        result["availability"] = str(authority_health["availability"])
+    else:
+        result["availability"] = "available" if any(
+            section["total"] for section in counts.values()
+        ) else "empty"
     result["authority_health"] = authority_health
     return result
 
 
-def _populate_fleet_overview_sqlite(
-    connection: Any,
-    result: dict[str, Any],
-    status: dict[str, Any],
-) -> bool:
-    """Fast single-row SQLite collector avoiding per-row GIL handoffs."""
-    table_count_row = connection.execute(_SQLITE_OVERVIEW_TABLES_SQL).fetchone()
-    if table_count_row is None or int(table_count_row[0]) != _SQLITE_OVERVIEW_REQUIRED_TABLE_COUNT:
-        return False
+def _sqlite_overview_snapshot(plane_root: Path) -> dict[str, Any] | None:
+    """Single-open, single-row SQLite overview avoiding per-row GIL handoffs."""
+    if read_plane_status is not message_plane.read_plane_status:
+        return None
+    authority = storage.resolve_authority(storage.StoreId.FLEET_COMMS)
+    if authority is storage.Authority.PG:
+        return None
+    try:
+        storage.assert_component_supported(storage.StoreId.FLEET_COMMS, "plane_status")
+    except storage.ControlPlaneError:
+        return None
+    db_path = plane_root / "comms.sqlite3"
+    if not db_path.is_file():
+        return None
+
+    known = {migration.version: migration for migration in migrations.MIGRATIONS}
+    version = max(known, default=0)
     window = _authority_health_window()
-    row = connection.execute(
-        _SQLITE_OVERVIEW_COUNTS_SQL,
-        (window["since"], window["until"], window["since"]),
-    ).fetchone()
-    if row is None:
-        return False
-    legacy_request_states = _decode_json_counts(row[0])
-    if status["mode"] == "authority":
-        request_states = _decode_json_counts(row[1])
+
+    connection = None
+    close_failed = False
+    try:
+        connection = open_readonly(db_path, timeout=0.25)
+        table_count_row = connection.execute(_SQLITE_OVERVIEW_TABLES_SQL).fetchone()
+        if (
+            table_count_row is None
+            or int(table_count_row[0]) != _SQLITE_OVERVIEW_REQUIRED_TABLE_COUNT
+        ):
+            return None
+        row = connection.execute(
+            _SQLITE_OVERVIEW_SNAPSHOT_SQL,
+            (len(known) + 1, window["since"], window["until"], window["since"]),
+        ).fetchone()
+        if row is None:
+            return None
+    except (sqlite3.Error, OSError, RuntimeError):
+        return None
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                close_failed = True
+                logger.warning("Fleet observer read-only connection close failed")
+    if close_failed:
+        return None
+
+    try:
+        migration_entries = _decode_json_migrations(row[0])
+        legacy_request_states = _decode_json_counts(row[1])
+        authority_request_states = _decode_json_counts(row[2])
+        message_kinds = _decode_json_counts(row[3])
+        review_states = _decode_json_counts(row[4])
+        authority_job_states = _decode_json_counts(row[5])
+        authority_dead_letters_total = int(row[6] or 0)
+        legacy_dead_letters_total = int(row[7] or 0)
+        acp_conversations_total = int(row[8] or 0)
+        authority_window_states = _decode_json_counts(row[9])
+        authority_overdue = int(row[10] or 0)
+        authority_window_dead_letters = int(row[11] or 0)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+    applied_version: int | None = None
+    applied_name: str | None = None
+    db_error: str | None = None
+    try:
+        applied = {
+            int(entry[0]): (str(entry[1]), str(entry[2])) for entry in migration_entries
+        }
+        migrations._validate_applied_migrations(applied, known)
+        if set(applied) != set(known) or len(migration_entries) != len(known):
+            db_error = "schema_incompatible"
+        else:
+            applied_version = version
+            applied_name = known[version].name if known else None
+    except (migrations.CommsMigrationError, ValueError, TypeError):
+        db_error = "schema_incompatible"
+
+    try:
+        raw_mode: str = message_plane.resolve_plane_mode()
+    except ValueError:
+        logger.warning("invalid FLEET_COMMS_MESSAGE_PLANE value; reporting mode=invalid")
+        raw_mode = "invalid"
+
+    mode = _safe_text(raw_mode, fallback="invalid")
+    authority_active = mode == "authority"
+    store = {
+        **store_descriptor(
+            kind="comms-plane",
+            reachable=True,
+            schema_versions={"known": version, "applied": applied_version},
+        ),
+        "authority": authority.value,
+    }
+    telemetry = message_plane._summarize_parity_telemetry(
+        message_plane.default_parity_telemetry_path(plane_root),
+        limit=0,
+    )
+    status: dict[str, Any] = {
+        "mode": mode,
+        "enabled": raw_mode not in {"off", "invalid"},
+        "read_only": True,
+        "response_schema_version": COMMS_RESPONSE_SCHEMA_VERSION,
+        "store": store,
+        "authority": (
+            "fleet_comms_authoritative" if authority_active else "file_handoffs_authoritative"
+        ),
+        "cutover": "authority_active" if authority_active else "pre_flip_operator_gated",
+        "schema": {
+            "known_version": version,
+            "applied_version": applied_version,
+            "applied_name": applied_name,
+            "db_exists": True,
+            "authority": authority.value,
+            "db_error": db_error,
+            "store": store,
+        },
+        "parity_telemetry": {
+            "store": telemetry.get("store"),
+            "exists": bool(telemetry.get("exists")),
+            "event_count": int(telemetry.get("event_count") or 0),
+            "parity_ok_count": int(telemetry.get("parity_ok_count") or 0),
+            "parity_fail_count": int(telemetry.get("parity_fail_count") or 0),
+        },
+    }
+
+    if authority_active:
+        request_states = authority_request_states
         request_source = "authority_jobs"
-        dead_letters_total = int(row[5] or 0)
+        dead_letters_total = authority_dead_letters_total
         authority_health: dict[str, Any] | None = _authority_health_payload(
-            _decode_json_counts(row[8]),
-            overdue=int(row[9] or 0),
-            dead_letters=int(row[10] or 0),
+            authority_window_states,
+            overdue=authority_overdue,
+            dead_letters=authority_window_dead_letters,
             window=window,
         )
     else:
         request_states = legacy_request_states
         request_source = "legacy_requests"
-        dead_letters_total = int(row[6] or 0)
+        dead_letters_total = legacy_dead_letters_total
         authority_health = None
-    _assign_overview_counts(
-        result,
+
+    return _assign_overview_counts(
+        _empty_overview_result(status),
         request_states=request_states,
         request_source=request_source,
         legacy_request_states=legacy_request_states,
-        message_kinds=_decode_json_counts(row[2]),
-        review_states=_decode_json_counts(row[3]),
-        authority_job_states=_decode_json_counts(row[4]),
+        message_kinds=message_kinds,
+        review_states=review_states,
+        authority_job_states=authority_job_states,
         dead_letters_total=dead_letters_total,
-        acp_conversations_total=int(row[7] or 0),
+        acp_conversations_total=acp_conversations_total,
         authority_health=authority_health,
     )
-    return True
 
 
 @router.get("/overview")
-def fleet_overview(
-    response: Response,
-    ctx: MonitorContext = Depends(get_ctx),
-) -> dict[str, Any]:
+def fleet_overview(ctx: MonitorContext = Depends(get_ctx)) -> dict[str, Any]:
     """Compact durable-plane counts for the consolidated fleet dashboard."""
     resolved_ctx = resolve_context(ctx)
-    snapshot = _capture_overview_routing(resolved_ctx)
-    if snapshot.cacheable:
-        cached = _overview_cache_get(snapshot.key)
-        if cached is not None:
-            payload, age = cached
-            response.headers.update(snapshot_headers(age, OVERVIEW_CACHE_TTL_S))
-            return payload
+    plane_root = _plane_root(resolved_ctx)
+    snapshot = _sqlite_overview_snapshot(plane_root)
+    if snapshot is not None:
+        return snapshot
 
-    started = _overview_clock()
-    status = _safe_plane_status(
-        resolved_ctx,
-        plane_root=snapshot.plane_root,
-        telemetry_path=snapshot.telemetry_path,
-    )
-    result: dict[str, Any] = {
-        "read_only": True,
-        "authority": status["authority"],
-        "cutover": status["cutover"],
-        "health": status,
-        "counts": {
-            "requests": {"total": 0, "by_state": {}},
-            "legacy_requests": {"total": 0, "by_state": {}},
-            "messages": {"total": 0, "by_kind": {}},
-            "reviews": {"total": 0, "by_state": {}},
-            "dead_letters": {"total": 0},
-            "acp_conversations": {"total": 0},
-            "authority_jobs": {"total": 0, "by_state": {}},
-        },
-        "availability": "db_missing",
-    }
-    conn_authority: storage.Authority | None = None
-    complete = False
-    db_identity_opened: tuple[int, int] | None = None
+    status = _safe_plane_status(resolved_ctx, plane_root=plane_root)
+    result = _empty_overview_result(status)
     try:
-        result, conn_authority, complete, db_identity_opened = _populate_fleet_overview(
-            result,
-            status,
-            resolved_ctx,
-            plane_root=snapshot.plane_root,
-        )
-    except _OVERVIEW_READ_ERRORS:
+        return _populate_fleet_overview(result, status, resolved_ctx, plane_root=plane_root)
+    except _OVERVIEW_ERRORS:
         # Never expose a driver exception or leave partial counts looking complete.
         result["availability"] = "schema_read_failed"
-
-    storable = complete and _overview_is_storable(result)
-    stored = False
-    if snapshot.cacheable and storable and conn_authority is snapshot.authority:
-        status_authority = status.get("schema", {}).get("authority")
-        expected_mode = (
-            snapshot.expected_mode
-            if snapshot.expected_mode is not None
-            else _current_plane_mode()
-        )
-        if (
-            status_authority == snapshot.authority.value
-            and status.get("mode") == expected_mode
-            and db_identity_opened == snapshot.db_identity
-        ):
-            try:
-                post_snapshot = _capture_overview_routing(resolved_ctx)
-            except (PlaneRootAnchorError, storage.ControlPlaneError):
-                post_snapshot = None
-            if (
-                post_snapshot is not None
-                and post_snapshot.cacheable
-                and post_snapshot.key == snapshot.key
-            ):
-                stored = _overview_cache_put(snapshot.key, started, result)
-
-    age = max(0.0, _overview_clock() - started)
-    unavailable = (
-        not storable
-        if snapshot.authority is storage.Authority.PG
-        else not stored
-    )
-    response.headers.update(snapshot_headers(age, OVERVIEW_CACHE_TTL_S, unavailable=unavailable))
-    return result
+        return result
 
 
 def _populate_fleet_overview(
@@ -1203,27 +1109,15 @@ def _populate_fleet_overview(
     ctx: MonitorContext,
     *,
     plane_root: Path | None = None,
-) -> tuple[dict[str, Any], storage.Authority, bool, tuple[int, int] | None]:
-    with _read_connection_with_authority(
+) -> dict[str, Any]:
+    with _read_connection(
         ctx,
         pg_supported=True,
         plane_root=plane_root,
-    ) as (connection, availability, authority):
+    ) as (connection, availability):
         if connection is None:
             result["availability"] = availability
-            return result, authority, False, None
-        db_identity_opened = (
-            _sqlite_db_identity(plane_root / "comms.sqlite3")
-            if plane_root is not None and authority is not storage.Authority.PG
-            else None
-        )
-        if is_sqlite_connection(connection) and _populate_fleet_overview_sqlite(connection, result, status):
-            return result, authority, True, db_identity_opened
-        complete = (
-            not is_sqlite_connection(connection)
-            and _table_exists(connection, "requests")
-            and _table_exists(connection, "comms_messages")
-        )
+            return result
         legacy_request_states = _count_by_state(
             connection, "requests", "state", raise_on_error=True
         )
@@ -1251,7 +1145,7 @@ def _populate_fleet_overview(
             if _table_exists(connection, "acp_conversations")
             else 0
         )
-        _assign_overview_counts(
+        return _assign_overview_counts(
             result,
             request_states=request_states,
             request_source=request_source,
@@ -1268,12 +1162,11 @@ def _populate_fleet_overview(
             dead_letters_total=dead_letters_total,
             acp_conversations_total=acp_conversations_total,
             authority_health=(
-                _authority_health_snapshot(connection)
+                _authority_health_snapshot(connection, raise_on_error=True)
                 if status["mode"] == "authority"
                 else None
             ),
         )
-    return result, authority, complete, db_identity_opened
 
 
 def _registered_endpoints(connection: SQLiteConnection | None) -> dict[str, dict[str, Any]]:
