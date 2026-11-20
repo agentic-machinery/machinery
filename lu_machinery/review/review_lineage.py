@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -191,6 +193,32 @@ def review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dict
         raise LineageRefused(f"task ledger unavailable: {exc}") from None
 
 
+def _denied(path: Path, exc: PermissionError) -> str:
+    """Why a denied record refuses, and what lets the scan read it again.
+
+    Its repository and role are inside it, so it may be a review run of this PR and is never skipped.
+    The dispatcher writes every record owner-readable (``dispatcher.store``, mode 0600). The mode is
+    read after the denial, as the read followed it (through a link), so it can have changed since.
+    """
+    try:
+        status = path.stat()
+    except OSError:
+        cause = "its mode is unknown"
+    else:
+        mode, user = stat.S_IMODE(status.st_mode), os.geteuid()
+        if user not in (0, status.st_uid):
+            cause = f"it belongs to uid {status.st_uid}, not this process"
+        elif user and not mode & stat.S_IRUSR:
+            cause = f"mode {mode:03o}: another process removed the owner's read permission"
+        else:
+            cause = (f"mode now {mode:03o} permits this read: a sandbox or security module denied it, "
+                     "or its mode changed after it")
+    # A file name is anyone's text: it never starts a line of its own in the refusal.
+    name = path.name if path.name.isprintable() else ascii(path.name)
+    return (f"task record {name} unreadable: {exc.strerror or exc} ({cause}); its repository and role are "
+            "inside it, so the lineage cannot rule it out as a review run of this PR until it can be read")
+
+
 def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dict[str, Any]]]:
     paths = [*sorted((task_root / ARCHIVE_DIR_NAME).glob("*.json")), *sorted(task_root.glob("*.json"))]
     records = []
@@ -207,6 +235,8 @@ def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dic
                 ) from None
             _LOG.warning("NON_RECORD_FILE: %s copies task record %s", path, exc.record["task_id"])
             continue
+        except PermissionError as exc:
+            raise LineageRefused(_denied(path, exc)) from None
         except (OSError, ValueError) as exc:
             raise LineageRefused(f"task record {path.name} unreadable: {exc}") from None
         if not isinstance(record, dict):
