@@ -7480,67 +7480,7 @@
     {
       "path": "lu_machinery/review/record_cf_verdict.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[None | str]\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[None | str]\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[None | str]\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[None | str]\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str] | None\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str] | None\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str] | None\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str] | None\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str] | None\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str]\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str]\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str]\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Iterable[str]\""
     },
     {
       "path": "lu_machinery/review/record_cf_verdict.py",
@@ -7555,41 +7495,6 @@
     {
       "path": "lu_machinery/review/record_cf_verdict.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Literal['unknown'] | None | int\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Literal['unknown'] | None | int\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"Literal['unknown'] | None | int\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | int\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | int\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | int\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | int\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | int\""
     },
     {
@@ -7600,67 +7505,7 @@
     {
       "path": "lu_machinery/review/record_cf_verdict.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"None | str\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"bool\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"str\""
-    },
-    {
-      "path": "lu_machinery/review/record_cf_verdict.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"build_comment\" has incompatible type \"**dict[str, None | int | str | tuple[None | str, ...]]\"; expected \"str\""
     },
     {
       "path": "lu_machinery/review/record_cf_verdict.py",
