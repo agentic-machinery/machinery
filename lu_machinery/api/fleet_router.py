@@ -815,7 +815,14 @@ WHERE type = 'table' AND name IN (
 """
 _SQLITE_OVERVIEW_SNAPSHOT_SQL = """
 SELECT
-    (SELECT json_group_array(json_array(version, name, checksum))
+    (SELECT CASE
+        WHEN MAX(
+            typeof(version) <> 'integer'
+            OR typeof(name) <> 'text'
+            OR typeof(checksum) <> 'text'
+        ) THEN NULL
+        ELSE json_group_array(json_array(version, name, checksum))
+     END
      FROM (SELECT version, name, checksum FROM comms_schema_migrations ORDER BY version LIMIT ?)),
     (SELECT json_group_array(json_array(k, c))
      FROM (SELECT state AS k, COUNT(*) AS c FROM requests GROUP BY state ORDER BY state)),
@@ -853,16 +860,25 @@ def _decode_json_counts(raw: Any) -> dict[str, int]:
     return counts
 
 
-def _decode_json_migrations(raw: Any) -> list[list[Any]]:
+def _decode_json_migrations(raw: Any) -> list[tuple[int, str, str]]:
     if not isinstance(raw, str) or not raw:
-        return []
+        raise ValueError("overview migration payload is missing")
     entries = json_depth.loads(raw, max_depth=8)
     if not isinstance(entries, list):
         raise ValueError("overview migration payload is not a JSON list")
+    decoded: list[tuple[int, str, str]] = []
     for entry in entries:
         if not isinstance(entry, list) or len(entry) != 3:
             raise ValueError("overview migration entry is not a version/name/checksum triple")
-    return entries
+        entry_version, entry_name, entry_checksum = entry
+        if (
+            type(entry_version) is not int
+            or not isinstance(entry_name, str)
+            or not isinstance(entry_checksum, str)
+        ):
+            raise ValueError("overview migration entry has non-canonical types")
+        decoded.append((entry_version, entry_name, entry_checksum))
+    return decoded
 
 
 def _empty_overview_result(status: dict[str, Any]) -> dict[str, Any]:
@@ -974,6 +990,8 @@ def _sqlite_overview_snapshot(plane_root: Path) -> dict[str, Any] | None:
     if close_failed:
         return None
 
+    if row[0] is None:
+        return None
     try:
         migration_entries = _decode_json_migrations(row[0])
         legacy_request_states = _decode_json_counts(row[1])
@@ -987,7 +1005,7 @@ def _sqlite_overview_snapshot(plane_root: Path) -> dict[str, Any] | None:
         authority_window_states = _decode_json_counts(row[9])
         authority_overdue = int(row[10] or 0)
         authority_window_dead_letters = int(row[11] or 0)
-    except (ValueError, TypeError, json.JSONDecodeError):
+    except (ValueError, TypeError, OverflowError, json.JSONDecodeError):
         return None
 
     applied_version: int | None = None
@@ -995,7 +1013,8 @@ def _sqlite_overview_snapshot(plane_root: Path) -> dict[str, Any] | None:
     db_error: str | None = None
     try:
         applied = {
-            int(entry[0]): (str(entry[1]), str(entry[2])) for entry in migration_entries
+            int(entry_version): (str(entry_name), str(entry_checksum))
+            for entry_version, entry_name, entry_checksum in migration_entries
         }
         migrations._validate_applied_migrations(applied, known)
         if set(applied) != set(known) or len(migration_entries) != len(known):
@@ -1003,7 +1022,7 @@ def _sqlite_overview_snapshot(plane_root: Path) -> dict[str, Any] | None:
         else:
             applied_version = version
             applied_name = known[version].name if known else None
-    except (migrations.CommsMigrationError, ValueError, TypeError):
+    except (migrations.CommsMigrationError, ValueError, TypeError, OverflowError):
         db_error = "schema_incompatible"
 
     try:

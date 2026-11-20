@@ -91,3 +91,70 @@ def test_health_names_both_ledgers_when_authority_window_is_empty(
     assert runtime["ledger"] == "runtime_delegate_usage"
     assert runtime["availability"] == "available"
     assert runtime["records_in_window"] == 2
+
+
+def test_overview_non_integer_migration_versions_fall_back_to_diagnostic_reader(
+    client: TestClient, fleet_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Non-integer SQLite migration versions must fall back instead of rounding or raising OverflowError."""
+    monkeypatch.delenv("LEARN_UKRAINIAN_CP_AUTHORITY", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_CP_FLEET_COMMS_AUTHORITY", raising=False)
+    db_path = fleet_root / "comms.sqlite3"
+    connection = sqlite3.connect(db_path)
+    try:
+        original_rows = connection.execute(
+            "SELECT version, name, checksum, applied_at FROM comms_schema_migrations ORDER BY version"
+        ).fetchall()
+        connection.execute("DROP TABLE comms_schema_migrations")
+        connection.execute(
+            """CREATE TABLE comms_schema_migrations (
+                version,
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )"""
+        )
+        connection.commit()
+
+        cases: list[tuple[object, str | None]] = [
+            (0.9999999999999999, "schema_incompatible"),
+            (1.0, None),
+            (float("inf"), "sqlite_probe_failed"),
+            (float("-inf"), "sqlite_probe_failed"),
+            (None, "schema_incompatible"),
+            ("1", None),
+            (b"1", None),
+        ]
+        for malformed_version, expected_db_error in cases:
+            connection.execute("DELETE FROM comms_schema_migrations")
+            modified = [
+                (malformed_version, original_rows[0][1], original_rows[0][2], original_rows[0][3]),
+                *original_rows[1:],
+            ]
+            connection.executemany(
+                "INSERT INTO comms_schema_migrations VALUES (?, ?, ?, ?)",
+                modified,
+            )
+            connection.commit()
+
+            assert fleet_router._sqlite_overview_snapshot(fleet_root) is None
+            response = client.get("/api/fleet/overview")
+            assert response.status_code == 200
+            schema = response.json()["health"]["schema"]
+            expected = fleet_router.read_plane_status(root=fleet_root, recent_limit=0)["schema"]
+            assert schema["db_error"] == expected_db_error == expected.get("db_error")
+            assert schema["applied_version"] == expected["applied_version"]
+
+        connection.execute("DELETE FROM comms_schema_migrations")
+        connection.executemany(
+            "INSERT INTO comms_schema_migrations VALUES (?, ?, ?, ?)",
+            original_rows,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert fleet_router._sqlite_overview_snapshot(fleet_root) is not None
+    restored = client.get("/api/fleet/overview")
+    assert restored.status_code == 200
+    assert restored.json()["health"]["schema"]["db_error"] is None
