@@ -98,10 +98,6 @@ UV_LINUX_X86_64_SHA256=a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39
 #   release asset digest. ci-gate.yml and tests.yml carry both values.
 #   uv checks every uv.lock wheel against its recorded SHA-256 at sync
 #   (`uv sync --locked` refused an edited hash with "Hash mismatch", 2026-11-17).
-PRODUCT_UV_VERSION=0.13.1
-PRODUCT_UV_LINUX_X86_64_SHA256=eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
-#   The installed-wheel job uses these pins only to sync uv.lock at the
-#   product revision in product-consumer.pin, which requires uv 0.13.1.
 ACTIONS_CACHE=55cc8345863c7cc4c66a329aec7e433d2d1c52a9
 #   actions/cache v6.1.0, checked against its upstream tag on 2026-11-08.
 #   Restore/save sub-actions cache checksum-verified release archives only.

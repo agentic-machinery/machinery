@@ -271,9 +271,13 @@ order:
      breaks it fails before merge. The `Installed wheel` job of CI Gate runs
      `release_cut consumer-collection` with the wheel built from the tested
      head, against the product commit in `.github/workflows/product-consumer.pin`.
-     The job runs `uv sync --locked` from that commit's `uv.lock` with the
-     product CI exclusions. It skips `torch`, `torchvision`, `open-clip-torch`,
-     `stanza`, and `lu-machinery`. `LEARN_UKRAINIAN_PYTHON` names the candidate
+     Using the job's single checksum-verified `UV_VERSION`, it installs the
+     product pin's `.python-version` CPython via `uv python install --no-bin`
+     and runs `uv sync --locked` from that commit's `uv.lock` with the
+     product CI exclusions (skipping `torch`, `torchvision`, `open-clip-torch`,
+     `stanza`, and `lu-machinery`), then builds v4 runtime assets and creates
+     the candidate wheel venv on that product Python so the overlay matches the
+     release cut's ABI and runtime. `LEARN_UKRAINIAN_PYTHON` names the candidate
      interpreter. The job then runs the pin's key consumer tests and reports
      the pin and the wheel's SHA-256. The pin never follows product `main`.
      Bump it in its own PR to a product commit whose CI Gate passed, and update
