@@ -334,10 +334,9 @@ sums both over the reviewers it shows, in the selected window.
 
 `batch_state/model-stats/publications.jsonl` (schema `review-publication.v1`) holds one line per verdict the
 recorder published: task id, repository, PR, head, verdict and GitHub's comment time. Its one writer is
-`lu_machinery/review/record_cf_verdict.py`, under the rows lock. Both of its paths read a posted comment the way
-the verdict reader (`integration_sweep.lookup_verdict`) does (`publication_of`): a `CHANGES_REQUESTED` whose open
-findings are all P3, and that no repair receipt holds back, is an approval; a voided chunk, a second review and a
-marker of a model that cannot supply a review of record store nothing. `record` stores the line after it posts
+`lu_machinery/review/record_cf_verdict.py`, under the rows lock. Both of its paths use `publication_of` to read
+the published marker's verdict, including legacy markers recorded as `APPROVED`. A voided chunk, a second review,
+or a marker from a model ineligible to supply a review of record stores nothing. `record` stores the line after it posts
 the verdict or finds it already posted, and reports `publication_marker`: `stored`, `not stored: <reason>`, or
 `failed: <reason>; store it with: ... import-publications --repository <owner/name> --pr <N>`. A failure never
 undoes the publication, and that one-PR import works even after the PR has moved on or closed.

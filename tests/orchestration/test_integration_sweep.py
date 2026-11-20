@@ -226,7 +226,7 @@ def test_readiness_report_does_not_hold_a_security_pr_for_carbon(monkeypatch, re
 @pytest.mark.parametrize("repository", ["learn-ukrainian/machinery", "learn-ukrainian/learn-ukrainian.github.io"])
 @pytest.mark.parametrize("tokened", [True, False])
 def test_carbon_rejection_blocks_even_with_p3_only_findings(repository, tokened):
-    """Defect class: Carbon REQUEST_CHANGES is downgraded to approval by the P3 residual rule."""
+    """A historical Carbon rejection still blocks, including when the reply lists only P3 findings."""
     import json
 
     reply = json.dumps({
@@ -241,7 +241,6 @@ def test_carbon_rejection_blocks_even_with_p3_only_findings(repository, tokened)
     })
     rejection = record(task="review-carbon", model=CARBON, family="google", verdict="CHANGES_REQUESTED",
                        reply=reply, second=tokened)
-    assert sweep.recorded_p3_residuals(rejection["body"]) == ("F1",)
     assert sweep.lookup_verdict(
         [record(task="review-sol"), rejection], SHA, "fleet", second_review=True, repository=repository,
     ).state == "CHANGES_REQUESTED"

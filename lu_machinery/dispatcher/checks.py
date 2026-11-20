@@ -420,7 +420,9 @@ def check_review_family(author_model: str | None, reviewer_model: str, *, review
         raise ValueError("review independence requires two known, different model families")
 
 
-def check_branch_author_families(args, repo: Path, repository: dict, head_sha: str, reviewer_model: str) -> None:
+def check_branch_author_families(
+    args, repo: Path, repository: dict, head_sha: str, reviewer_model: str, low_tier: bool = False,
+) -> None:
     """Keep a branch review outside every author family committed on the branch (FR-23, C-2902).
 
     Families are derived from the branch itself, read with the facts the
@@ -434,6 +436,7 @@ def check_branch_author_families(args, repo: Path, repository: dict, head_sha: s
     that family. A red-team review differs only in its seat rule, which the
     recorder applies: it may share an author family.
     """
+    from lu_machinery.review.app_bot_authorship import VERIFIED_APP_BOT
     from lu_machinery.review.record_cf_verdict import (
         RecordError,
         admitted_unknown_history,
@@ -442,6 +445,8 @@ def check_branch_author_families(args, repo: Path, repository: dict, head_sha: s
         refuse_excluded_only_range,
         require_resolved_branch_authors,
     )
+    from lu_machinery.review.reviewer_resolver import review_task_id_comparison_keys
+    from lu_machinery.review.security_paths import is_security_sensitive_change
 
     red_team = (args.review_mode or "").strip().casefold() == "red_team"
     try:
@@ -462,6 +467,30 @@ def check_branch_author_families(args, repo: Path, repository: dict, head_sha: s
         raise ValueError(f"review independence: branch author families unavailable ({exc})") from None
     if not facts.existing_families:
         raise ValueError("review independence: the reviewed range has no attributed author commits")
+    reviewer = _model_families().get(reviewer_model)
+    protected = is_security_sensitive_change(facts.changed_paths)
+    if low_tier:
+        if protected:
+            raise ValueError("review admission: Low tier conflicts with security-sensitive changes")
+        if any(c.family and c.source != VERIFIED_APP_BOT and not (c.task_id or c.record_task_id) for c in facts.commits):
+            raise ValueError("AUTHOR_IDENTITY_UNRESOLVED: Low-tier review needs attributed author task identities")
+        reviewer_ids = review_task_id_comparison_keys(args.task_id or "", agent=args.agent)
+        if any(reviewer_ids & review_task_id_comparison_keys(task) for task in facts.author_task_ids):
+            raise ValueError("SELF_REVIEW_DETECTED: reviewer task equals a branch author task")
+    if (args.branch or args.pr) and not args.trial_role and (protected or low_tier):
+        from lu_machinery.dispatcher.cli import ALIASES
+        from lu_machinery.review.record_cf_verdict import _require_qualified_reviewer
+
+        if not reviewer:
+            raise ValueError("review admission: reviewer family is unknown")
+        task = {**vars(args), "agent": ALIASES.get(args.agent, args.agent), "review_risk": args.risk}
+        mode = "red_team" if red_team else "cross_family"
+        try:
+            _require_qualified_reviewer(
+                facts, task=task, model=reviewer_model, family=reviewer, review_mode=mode, low_tier=low_tier,
+            )
+        except RecordError as exc:
+            raise ValueError(f"review admission: {exc}") from None
     if red_team:
         if load_model_catalog()["models"].get(canonical_model_id(reviewer_model), {}).get("red_team_only"):
             from lu_machinery.fleet import claude_account_lane, credit_lane
@@ -470,7 +499,7 @@ def check_branch_author_families(args, repo: Path, repository: dict, head_sha: s
                 require_no_outside_rejection,
                 require_no_outside_review_in_flight,
             )
-            from lu_machinery.review.reviewer_resolver import resolve_reviewer, review_task_id_comparison_keys
+            from lu_machinery.review.reviewer_resolver import resolve_reviewer
 
             reviewer_ids = review_task_id_comparison_keys(args.task_id or "", agent=args.agent)
             if any(reviewer_ids & review_task_id_comparison_keys(task) for task in facts.author_task_ids):
@@ -492,15 +521,14 @@ def check_branch_author_families(args, repo: Path, repository: dict, head_sha: s
             except RecordError as exc:
                 raise ValueError(str(exc)) from None
         return
-    reviewer = _model_families().get(reviewer_model)
+    if low_tier:
+        return
     scope = facts
     if facts.mixed_family and args.review_profile in {"code", "infra"}:
         try:
             scope = facts.reviewer_scope(reviewer)
         except RecordError as exc:
             raise ValueError(f"review independence: {exc}") from None
-        from lu_machinery.review.reviewer_resolver import review_task_id_comparison_keys
-
         reviewer_ids = review_task_id_comparison_keys(args.task_id or "", agent=args.agent)
         if any(reviewer_ids & review_task_id_comparison_keys(task) for task in scope.author_task_ids):
             raise ValueError("SELF_REVIEW_DETECTED: reviewer task equals a branch author task")

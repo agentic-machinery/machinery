@@ -376,13 +376,17 @@ Operationalizes the Claude seat selection within the 2-Tier Formal Review Routin
   * **Claude seat**: `claude-sonnet-5-5` (preserves frontier window; fast & efficient). For the `code` and `infra` review profiles, security-sensitive changed paths automatically raise effective review risk to `critical`, even when the author requests low, medium or high. The shared `lu_machinery/review/security_paths.py` classifier includes both rename names and deletions; owned paths can only add coverage. Resolve the target first. The resolver and every code/infra review-typed dispatch collect target changed paths before admission and require the catalog `critical_review` role, preserve cross-family and subject-seat exclusions, and refuse with a reason when no qualified reviewer is available (#9125). Catalog weaknesses remain descriptive.
   * **Codex seat**: `gpt-6.2-sol` @ `high` (standard review)
   * **Gemini seat:** `gemini-4-neon-high` through native AGY. The resolver admits low-, medium- and high-risk code review (high after the OpenAI and Anthropic seats, GEMINI-TIERS-1119). Ukrainian review requires the Sources MCP and VESUM.
-Every `code` or `infra` review-typed dispatch, including `ask-* --review`, resolves its target before admission:
-branch/PR reviews collect literal changes from the base-branch merge-base to the pinned head;
-attempts require the record's `target.changed_paths`. An unresolved target refuses with
-`REVIEW_TARGET_UNRESOLVED`. Ukrainian-content review attempts use `--review-profile ukrainian`;
-they do not collect paths or require a target for this floor. Owned directories
-add security coverage with or without a trailing slash, and leading `./` is normalized.
-Code-profile `closeout_cli resolve-reviewer` requires a resolved target or an owned path.
+
+Formal review dispatches with `--branch` or `--pr` collect the target's literal changed paths before admission.
+`--pr` binds the review to the open PR's published head. Any supplied branch or commit must match that head.
+For a security-sensitive diff, admission uses the verdict recorder's reviewer qualification in both formal
+review modes, regardless of the `--review-profile` label. The diff requires a `critical_review` seat, and a
+`ukrainian` profile is refused with `protected scope needs a code-profile review` for an otherwise eligible seat.
+Code and infra review attempts require the record's `target.changed_paths` and refuse an unresolved target.
+Ukrainian-content review attempts without a branch or PR use `--review-profile ukrainian` and have no target
+requirement for this floor. Owned directories add security coverage with or without a trailing slash, and leading
+`./` is normalized. The `closeout_cli resolve-reviewer` command requires a resolved target or an owned path for
+code and infra profiles, regardless of case.
 
 * **Complex tasks, deep reviews, and Anthropic advisory consultations**:
   * **Execution**: `claude-opus-5-5` for architecture, hard coding, and deep code review.

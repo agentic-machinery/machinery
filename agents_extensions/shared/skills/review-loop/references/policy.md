@@ -44,9 +44,9 @@ policy calls learner content, is never Trivial.
 
 **Low is one quick red-team pass.** The reviewer tries to break the change and reports only
 break-it findings, each a P0-P2 reproducible failure (command, input, wrong output), never style
-or "consider". A recorded APPROVE, or a reply with no break-it finding (recorded as an approval),
-lets the PR land. A break-it finding is fixed, and the same reviewer confirms the fix in one delta round; that is the whole Low
-budget.
+or "consider". If the reviewer finds no break-it failure, the reviewer gives APPROVE. Landing
+requires a recorded APPROVE and the other merge gates. The author fixes a break-it finding,
+and the same reviewer confirms the fix in one delta round. That is the whole Low budget.
 
 The reviewer's risk is the `--risk` passed to the resolver: `high` or `critical` for a High-tier
 change. At `critical` the resolver seats only Opus or Sol; at `high` it seats Sol, then Opus,
@@ -74,8 +74,10 @@ At most 3 charged rounds; Low uses at most 2 (the red-team pass and one fix conf
 Trivial none. A round is charged when a review is dispatched at a new head, whether
 or not its verdict is recorded. The clean base merge, the repair round and the capability
 failure under [Recording the verdict](#recording-the-verdict) do not count against the 3.
-Round 1 is the full review; rounds 2-3 review only the diff since the last reviewed head. After
-round 3 the author steps back and reshapes or closes the PR; no grants.
+Round 1 is the full review. Rounds 2-3 review only the diff since the last reviewed head.
+If the budget ends with a P0-P2 blocker, stop and send the findings ledger to `claude-cto`
+for a decision on narrower scope. Continuing requires explicit authorization from `claude-cto`
+and a fresh branch and PR that carry the ledger forward.
 
 ## 5. Recovery over gates
 
@@ -106,7 +108,12 @@ The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in 
   in `lu_machinery/config/review_budget_policy.yaml`.
 - **Findings** use the `code-review-findings.v1` object. Each keeps a stable id (`F1`, `F2`, …)
   across rounds; the PR body ledger lists id, New or Pre-existing, blocking or not, and state.
-  P0-P2 are blocking defects; a reply whose open findings are all P3 is recorded as an approval.
+  P0-P2 are blocking defects. The recorder preserves the reviewer's verdict.
+- **Carried findings.** If the only open findings are P3 and every acceptance criterion is met,
+  the reviewer gives APPROVE and lists each carried finding in the reply. The explicit APPROVE
+  confirms the carry. The author sends each finding to `claude-cto` for filing as its own
+  `known-issue` issue under rules core P4 and links the issues in the PR ledger before landing.
+  The release notes list the known issues fixed by the release and those still open.
 - **A recorded rejection** (`CHANGES_REQUESTED` or `BLOCKED`) is cleared only by an APPROVE at
   a new head.
 - **Pending CI is not a verdict.** Review runs in parallel with PR CI. A `BLOCKED` reply with no
