@@ -5,16 +5,29 @@
 set -euo pipefail
 
 readonly image="${LINUX_FS_PARITY_IMAGE:-python:3.12-bookworm}"
-readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
 source "$script_dir/../lib/project_interpreter.sh"
 repo_root="$(project_product_root_resolve)" || exit 1
 readonly repo_root
+
+pins="$PROJECT_CODE_ROOT/.github/workflows/pins.txt"
+case "$PROJECT_CODE_ROOT" in
+  */lib/python*/site-packages|*/lib64/python*/site-packages)
+    pins="${PROJECT_CODE_ROOT%/*/*/*}/share/lu-machinery/ci/pins.txt"
+    ;;
+esac
+if [[ ! -f "$pins" || ! -r "$pins" ]]; then
+  echo "linux_fs_parity: cannot read machinery pins at $pins" >&2
+  exit 1
+fi
 
 # The container has no uv. It installs the pins.txt uv release, checks that
 # archive, and exports pytest from the mounted uv.lock. The prune list only
 # keeps the probe small: a core package that is not listed is still installed,
 # and only with lock hashes.
-docker run --rm --init \
+# Stream machinery's pins through stdin before running any product tests.
+docker run --rm --init --interactive \
   --mount "type=bind,src=${repo_root},dst=/workspace,readonly" \
   --workdir /workspace \
   --env PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -27,11 +40,14 @@ docker run --rm --init \
       echo "linux_fs_parity: the uv pin is linux x86_64 only (got $(uname -m))" >&2
       exit 1
     fi
-    pins=".github/workflows/pins.txt"
-    mapfile -t uv_versions < <(sed -n "s/^UV_VERSION=//p" "$pins")
-    mapfile -t uv_shas < <(sed -n "s/^UV_LINUX_X86_64_SHA256=//p" "$pins")
+    if IFS= read -r -d '' pins; then
+      echo "linux_fs_parity: machinery pins must be a text file" >&2
+      exit 1
+    fi
+    mapfile -t uv_versions < <(sed -n "s/^UV_VERSION=//p" <<< "$pins")
+    mapfile -t uv_shas < <(sed -n "s/^UV_LINUX_X86_64_SHA256=//p" <<< "$pins")
     if [ "${#uv_versions[@]}" -ne 1 ] || [ "${#uv_shas[@]}" -ne 1 ]; then
-      echo "linux_fs_parity: ${pins} must contain one UV_VERSION and one UV_LINUX_X86_64_SHA256" >&2
+      echo "linux_fs_parity: machinery pins must contain one UV_VERSION and one UV_LINUX_X86_64_SHA256" >&2
       exit 1
     fi
     uv_version="${uv_versions[0]}"
@@ -91,4 +107,4 @@ PY
       tests/test_deploy_script_idempotency.py::test_agent_manifest_rejects_symlinked_intermediate_component \
       tests/test_deploy_script_idempotency.py::test_agent_manifest_unlinks_symlink_leaf_without_following_target
 INNER
-)"
+)" < "$pins"
