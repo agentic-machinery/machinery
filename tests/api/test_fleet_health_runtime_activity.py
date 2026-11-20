@@ -97,8 +97,9 @@ def test_overview_non_integer_migration_versions_fall_back_to_diagnostic_reader(
     client: TestClient, fleet_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Non-integer SQLite migration versions must fall back instead of rounding or raising OverflowError."""
+    monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "sqlite")
     monkeypatch.delenv("LEARN_UKRAINIAN_CP_AUTHORITY", raising=False)
-    monkeypatch.delenv("LEARN_UKRAINIAN_CP_FLEET_COMMS_AUTHORITY", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_CP_PG_DSN", raising=False)
     db_path = fleet_root / "comms.sqlite3"
     connection = sqlite3.connect(db_path)
     try:

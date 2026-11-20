@@ -464,13 +464,7 @@ BOARD_PR_LIST_TTL_S = 30.0
 
 
 
-def _count_by_state(
-    connection: Any,
-    table: str,
-    column: str,
-    *,
-    raise_on_error: bool = False,
-) -> dict[str, int]:
+def _count_by_state(connection: Any, table: str, column: str) -> dict[str, int]:
     if not _table_exists(connection, table):
         return {}
     try:
@@ -478,8 +472,6 @@ def _count_by_state(
             f"SELECT {column}, COUNT(*) FROM {table} GROUP BY {column} ORDER BY {column}"
         ).fetchall()
     except _DATABASE_ERRORS:
-        if raise_on_error:
-            raise
         return {}
     return {_safe_text(row[0], fallback="unknown"): int(row[1]) for row in rows}
 
@@ -545,7 +537,6 @@ def _authority_health_snapshot(
     *,
     now: datetime | None = None,
     availability: str = "available",
-    raise_on_error: bool = False,
 ) -> dict[str, Any]:
     """Derive current health only from a fixed authority evidence window."""
     window = _authority_health_window(now)
@@ -591,8 +582,6 @@ def _authority_health_snapshot(
             )
     except _DATABASE_ERRORS:
         logger.warning("Fleet observer could not derive authority health")
-        if raise_on_error:
-            raise
         return {**unavailable, "availability": "schema_read_failed"}
     return _authority_health_payload(
         states,
@@ -824,20 +813,38 @@ SELECT
         ELSE json_group_array(json_array(version, name, checksum))
      END
      FROM (SELECT version, name, checksum FROM comms_schema_migrations ORDER BY version LIMIT ?)),
-    (SELECT json_group_array(json_array(k, c))
+    (SELECT CASE
+        WHEN MAX(typeof(k) NOT IN ('text', 'null')) THEN NULL
+        ELSE json_group_array(json_array(k, c))
+     END
      FROM (SELECT state AS k, COUNT(*) AS c FROM requests GROUP BY state ORDER BY state)),
-    (SELECT json_group_array(json_array(k, c))
+    (SELECT CASE
+        WHEN MAX(typeof(k) NOT IN ('text', 'null')) THEN NULL
+        ELSE json_group_array(json_array(k, c))
+     END
      FROM (SELECT state AS k, COUNT(*) AS c FROM authority_jobs WHERE job_kind = 'request' GROUP BY state ORDER BY state)),
-    (SELECT json_group_array(json_array(k, c))
+    (SELECT CASE
+        WHEN MAX(typeof(k) NOT IN ('text', 'null')) THEN NULL
+        ELSE json_group_array(json_array(k, c))
+     END
      FROM (SELECT kind AS k, COUNT(*) AS c FROM comms_messages GROUP BY kind ORDER BY kind)),
-    (SELECT json_group_array(json_array(k, c))
+    (SELECT CASE
+        WHEN MAX(typeof(k) NOT IN ('text', 'null')) THEN NULL
+        ELSE json_group_array(json_array(k, c))
+     END
      FROM (SELECT state AS k, COUNT(*) AS c FROM formal_review_jobs GROUP BY state ORDER BY state)),
-    (SELECT json_group_array(json_array(k, c))
+    (SELECT CASE
+        WHEN MAX(typeof(k) NOT IN ('text', 'null')) THEN NULL
+        ELSE json_group_array(json_array(k, c))
+     END
      FROM (SELECT state AS k, COUNT(*) AS c FROM authority_jobs GROUP BY state ORDER BY state)),
     (SELECT COUNT(*) FROM authority_dead_letters),
     (SELECT COUNT(*) FROM dead_letters),
     (SELECT COUNT(*) FROM acp_conversations),
-    (SELECT json_group_array(json_array(k, c))
+    (SELECT CASE
+        WHEN MAX(typeof(k) NOT IN ('text', 'null')) THEN NULL
+        ELSE json_group_array(json_array(k, c))
+     END
      FROM (SELECT state AS k, COUNT(*) AS c FROM authority_jobs WHERE updated_at >= ? GROUP BY state ORDER BY state)),
     (SELECT COUNT(*) FROM authority_jobs
      WHERE state IN ('queued', 'running') AND deadline_at IS NOT NULL AND deadline_at < ?),
@@ -848,7 +855,7 @@ SELECT
 
 def _decode_json_counts(raw: Any) -> dict[str, int]:
     if not isinstance(raw, str) or not raw:
-        return {}
+        raise ValueError("overview count payload is missing")
     pairs = json_depth.loads(raw, max_depth=8)
     if not isinstance(pairs, list):
         raise ValueError("overview count payload is not a JSON list")
@@ -856,7 +863,10 @@ def _decode_json_counts(raw: Any) -> dict[str, int]:
     for pair in pairs:
         if not isinstance(pair, list) or len(pair) != 2:
             raise ValueError("overview count entry is not a key/count pair")
-        counts[_safe_text(pair[0], fallback="unknown")] = int(pair[1])
+        key, count = pair
+        if (key is not None and not isinstance(key, str)) or type(count) is not int:
+            raise ValueError("overview count entry has non-canonical types")
+        counts[_safe_text(key, fallback="unknown")] = count
     return counts
 
 
@@ -933,12 +943,9 @@ def _assign_overview_counts(
     counts["dead_letters"]["total"] = dead_letters_total
     counts["acp_conversations"]["total"] = acp_conversations_total
     result["counts"] = counts
-    if authority_health is not None and authority_health.get("availability") != "available":
-        result["availability"] = str(authority_health["availability"])
-    else:
-        result["availability"] = "available" if any(
-            section["total"] for section in counts.values()
-        ) else "empty"
+    result["availability"] = "available" if any(
+        section["total"] for section in counts.values()
+    ) else "empty"
     result["authority_health"] = authority_health
     return result
 
@@ -990,7 +997,7 @@ def _sqlite_overview_snapshot(plane_root: Path) -> dict[str, Any] | None:
     if close_failed:
         return None
 
-    if row[0] is None:
+    if any(row[idx] is None for idx in (0, 1, 2, 3, 4, 5, 9)):
         return None
     try:
         migration_entries = _decode_json_migrations(row[0])
@@ -1137,9 +1144,7 @@ def _populate_fleet_overview(
         if connection is None:
             result["availability"] = availability
             return result
-        legacy_request_states = _count_by_state(
-            connection, "requests", "state", raise_on_error=True
-        )
+        legacy_request_states = _count_by_state(connection, "requests", "state")
         if status["mode"] == "authority":
             request_states = _count_by_state_where(
                 connection,
@@ -1169,19 +1174,13 @@ def _populate_fleet_overview(
             request_states=request_states,
             request_source=request_source,
             legacy_request_states=legacy_request_states,
-            message_kinds=_count_by_state(
-                connection, "comms_messages", "kind", raise_on_error=True
-            ),
-            review_states=_count_by_state(
-                connection, "formal_review_jobs", "state", raise_on_error=True
-            ),
-            authority_job_states=_count_by_state(
-                connection, "authority_jobs", "state", raise_on_error=True
-            ),
+            message_kinds=_count_by_state(connection, "comms_messages", "kind"),
+            review_states=_count_by_state(connection, "formal_review_jobs", "state"),
+            authority_job_states=_count_by_state(connection, "authority_jobs", "state"),
             dead_letters_total=dead_letters_total,
             acp_conversations_total=acp_conversations_total,
             authority_health=(
-                _authority_health_snapshot(connection, raise_on_error=True)
+                _authority_health_snapshot(connection)
                 if status["mode"] == "authority"
                 else None
             ),
