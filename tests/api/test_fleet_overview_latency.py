@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import subprocess
 import threading
@@ -410,6 +411,106 @@ def test_overview_swr_fresh_stale_and_dormant_headers_and_refresh(
         drifted = client.get("/api/fleet/overview")
         assert drifted.status_code == 503
         assert drifted.json()["detail"] == "fleet overview routing changed during read"
+
+
+def test_overview_routing_drift_fails_every_waiter_and_a_late_final_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class: a routing change fails every request still in that read, including one that joined the refresh."""
+    plane_root = tmp_path / "plane"
+    _seed_plane_db(plane_root)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane_root))
+    monkeypatch.setenv("FLEET_COMMS_MESSAGE_PLANE", "authority")
+    clock = [1000.0]
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: clock[0])
+
+    both_waiting = threading.Event()
+    entered = 0
+    entered_lock = threading.Lock()
+    real_refresh = state_helpers.cache_get_or_refresh
+    real_collect = fleet_router._collect_fleet_overview
+
+    def _count_refresh(*args: Any, **kwargs: Any) -> Any:
+        nonlocal entered
+        with entered_lock:
+            entered += 1
+            if entered >= 2:
+                both_waiting.set()
+        return real_refresh(*args, **kwargs)
+
+    def _drift_once_both_wait(
+        ctx: MonitorContext,
+        *,
+        expected_routing: fleet_router._OverviewRouting | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        assert both_waiting.wait(timeout=5)
+        os.environ["FLEET_COMMS_MESSAGE_PLANE"] = "shadow"
+        try:
+            return real_collect(ctx, expected_routing=expected_routing)
+        finally:
+            os.environ["FLEET_COMMS_MESSAGE_PLANE"] = "authority"
+
+    app, _ctx = _make_app(tmp_path)
+    results: list[Any] = []
+
+    def _get() -> None:
+        with TestClient(app) as client:
+            results.append(client.get("/api/fleet/overview"))
+
+    with TestClient(app) as client:
+        warm = client.get("/api/fleet/overview")
+        assert warm.status_code == 200
+        clock[0] += fleet_router.FACADE_TTL_S + state_helpers.DEMAND_WINDOW_S + 10.0
+        monkeypatch.setattr(state_helpers, "cache_get_or_refresh", _count_refresh)
+        monkeypatch.setattr(fleet_router, "_collect_fleet_overview", _drift_once_both_wait)
+        entered = 0
+        both_waiting.clear()
+        first = threading.Thread(target=_get)
+        second = threading.Thread(target=_get)
+        first.start()
+        second.start()
+        first.join(timeout=8)
+        second.join(timeout=8)
+    assert len(results) == 2
+    assert all(item.status_code == 503 for item in results)
+    assert all(
+        item.json()["detail"] == "fleet overview routing changed during read" for item in results
+    )
+
+    # A collector that reports drift only after the route has started final validation still fails closed.
+    monkeypatch.setattr(fleet_router, "_collect_fleet_overview", real_collect)
+    monkeypatch.setattr(state_helpers, "cache_get_or_refresh", real_refresh)
+    monkeypatch.setattr(fleet_router, "OVERVIEW_COLD_DEADLINE_S", 0.25)
+    state_helpers.cache_invalidate()
+    final_started = threading.Event()
+    drift_noted = threading.Event()
+    real_final = fleet_router._overview_final_routing_ok
+
+    def _hold_collect(
+        ctx: MonitorContext,
+        *,
+        expected_routing: fleet_router._OverviewRouting | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        assert final_started.wait(timeout=5)
+        os.environ["FLEET_COMMS_MESSAGE_PLANE"] = "shadow"
+        try:
+            return real_collect(ctx, expected_routing=expected_routing)
+        finally:
+            os.environ["FLEET_COMMS_MESSAGE_PLANE"] = "authority"
+            drift_noted.set()
+
+    def _slow_final(ctx: MonitorContext, expected: fleet_router._OverviewRouting) -> bool:
+        final_started.set()
+        assert drift_noted.wait(timeout=5)
+        return real_final(ctx, expected)
+
+    monkeypatch.setattr(fleet_router, "_collect_fleet_overview", _hold_collect)
+    monkeypatch.setattr(fleet_router, "_overview_final_routing_ok", _slow_final)
+    with TestClient(app) as client:
+        late = client.get("/api/fleet/overview")
+    assert late.status_code == 503
+    assert late.json()["detail"] == "fleet overview routing changed during read"
 
 
 def test_overview_missing_required_table_is_not_cached_and_recovers_immediately(

@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterator
@@ -971,6 +972,21 @@ def _overview_routing_matches(ctx: MonitorContext, expected: _OverviewRouting) -
     return _capture_overview_routing(current_root) == expected
 
 
+_overview_drift_counts: dict[str, int] = {}
+_overview_drift_lock = threading.Lock()
+
+
+def _overview_drift_count(key: str) -> int:
+    with _overview_drift_lock:
+        return _overview_drift_counts.get(key, 0)
+
+
+def _note_overview_drift(key: str) -> None:
+    """Record one observed routing change for every request waiting on this cache key."""
+    with _overview_drift_lock:
+        _overview_drift_counts[key] = _overview_drift_counts.get(key, 0) + 1
+
+
 def _overview_final_routing_ok(ctx: MonitorContext, expected: _OverviewRouting) -> bool:
     """Re-read the root after the blocking mode capture. False when either moved."""
     try:
@@ -1109,7 +1125,7 @@ async def fleet_overview(
     routing: _OverviewRouting | None = None
     key: str | None = None
     final_validation_timed_out = False
-    routing_drifted = [False]
+    drift_seen_at = 0
     try:
         plane_root = await _await_within_deadline(
             lambda: asyncio.to_thread(_resolve_overview_plane_root, resolved_ctx),
@@ -1135,14 +1151,15 @@ async def fleet_overview(
                     resolved_ctx, expected_routing=captured_routing
                 )
             except fleet_paths.PlaneRootAnchorError as exc:
-                routing_drifted[0] = True
+                _note_overview_drift(key)
                 raise _OverviewRoutingChangedError(
                     "plane root invalidated during overview read"
                 ) from exc
             except _OverviewRoutingChangedError:
-                routing_drifted[0] = True
+                _note_overview_drift(key)
                 raise
 
+        drift_seen_at = _overview_drift_count(key)
         collect = cache_read_swr(
             key,
             FACADE_TTL_S,
@@ -1150,7 +1167,7 @@ async def fleet_overview(
             storable=_overview_is_storable,
         )
         (payload, _complete), age, stored = await asyncio.wait_for(collect, timeout=collect_timeout)
-        if routing_drifted[0]:
+        if _overview_drift_count(key) != drift_seen_at:
             raise _OverviewRoutingChangedError("routing changed during overview read")
         try:
             routing_ok = await _await_within_deadline(
@@ -1170,7 +1187,7 @@ async def fleet_overview(
             detail="fleet overview routing changed during read",
         ) from exc
     except TimeoutError:
-        if routing_drifted[0]:
+        if key is not None and _overview_drift_count(key) != drift_seen_at:
             raise HTTPException(
                 status_code=503,
                 detail="fleet overview routing changed during read",
@@ -1193,7 +1210,9 @@ async def fleet_overview(
                 status_code=503,
                 detail="fleet overview target validation timed out",
             ) from None
-        if not routing_ok:
+        if not routing_ok or (
+            key is not None and _overview_drift_count(key) != drift_seen_at
+        ):
             raise HTTPException(
                 status_code=503,
                 detail="fleet overview routing changed during read",
@@ -1214,6 +1233,11 @@ async def fleet_overview(
         )
         return _overview_deadline_payload(routing)
 
+    if key is not None and _overview_drift_count(key) != drift_seen_at:
+        raise HTTPException(
+            status_code=503,
+            detail="fleet overview routing changed during read",
+        )
     response.headers.update(snapshot_headers(age, FACADE_TTL_S, unavailable=not stored))
     return payload
 
