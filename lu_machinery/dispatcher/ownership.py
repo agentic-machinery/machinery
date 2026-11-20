@@ -71,14 +71,14 @@ def outside_owned(paths: Iterable[str], owned: Sequence[str]) -> list[str]:
 
 
 def delivered_paths(run: Callable[..., str], head_sha: str, base_sha: str, start_sha: str, *,
-                    commits_expected: bool = False) -> list[str]:
+                    commits_expected: bool = False, other_bases: Sequence[str] = ()) -> list[str]:
     """Every path the task's own commits touch, as settlement reads them.
 
-    The range excludes everything reachable from the task's start or any of the delivery's
-    merge bases with the base branch. Remerge diffs isolate edits made during a merge from clean
-    upstream changes. Older Git and octopus merges cannot prove the absence of resolution edits.
+    The range excludes the task's start and the merge bases with trusted upstream and checked
+    commits. Git treats multiple bases as the parents of a hypothetical merge. Remerge diffs
+    isolate resolution edits. Older Git and octopus merges cannot prove those edits absent.
     """
-    merge_bases = run("merge-base", "--all", head_sha, base_sha).splitlines()
+    merge_bases = run("merge-base", "--all", head_sha, base_sha, *other_bases).splitlines()
     revision_range = (head_sha, "--not", *merge_bases, start_sha)
     if commits_expected and not run("rev-list", "--max-count=1", *revision_range):
         raise ValueError("empty ownership range with recorded commits ahead")

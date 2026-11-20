@@ -96,7 +96,7 @@ class VerificationFetchError(subprocess.CalledProcessError):
 
 
 def _ownership_fetch(run, record: dict, *args: str, phase: str) -> None:
-    """Retry HTTP 503 once and retain the classified failure."""
+    """Retain classified failures and give recoverable transport errors one retry."""
     for attempt in (1, 2):
         try:
             run("fetch", "--no-tags", "--no-write-fetch-head", "--filter=blob:none", *args,
@@ -108,7 +108,8 @@ def _ownership_fetch(run, record: dict, *args: str, phase: str) -> None:
                 "reason": (exc.reason if isinstance(exc, VerificationFetchError) else
                            "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "unclassified transport error"),
                 "returncode": getattr(exc, "returncode", None)})
-            if attempt == 2 or not isinstance(exc, VerificationFetchError) or exc.reason != "HTTP 503":
+            if attempt == 2 or (isinstance(exc, VerificationFetchError) and
+                                exc.reason in {"remote ref missing", "remote object missing"}):
                 raise
 
 
@@ -1200,6 +1201,29 @@ def _fetch_merged_parent(run: Callable[..., str], merge: str, record: dict) -> s
     return run("rev-parse", "--verify", merge + "^1")
 
 
+def _supplemental_paths(record: dict, snapshot: str, start: str, branches: tuple[str, ...],
+                        covered_commits: set[str]) -> list[str]:
+    """Paths from an independently published snapshot beyond trusted or already verified history."""
+    from lu_machinery.dispatcher import ownership
+
+    refs = tuple(f"refs/heads/{branch}" for branch in dict.fromkeys(branches))
+    with _private_remote_git(record["task_id"], record["worktree_remote_url"]) as (run, _):
+        advertised = {ref: sha for sha, ref in
+                      (line.split() for line in run("ls-remote", "--heads", "--", "origin", *refs).splitlines())}
+        upstream = [advertised[ref] for ref in refs if ref in advertised]
+        if not upstream:
+            raise ValueError("no canonical upstream tip for supplemental ownership")
+        base, *other_bases = dict.fromkeys((*upstream, *sorted(covered_commits)))
+        objects = tuple(dict.fromkeys((snapshot, start, base, *other_bases)))
+        if any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) for sha in objects):
+            raise ValueError("supplemental ownership requires full object names")
+        _ownership_fetch(run, record, "--", "origin", *objects, phase="supplemental-history")
+        if run("rev-parse", "--is-shallow-repository") != "false":
+            raise ValueError("supplemental ownership requires complete history")
+        # A reset onto upstream has no additional paths. The merged history was already checked.
+        return ownership.delivered_paths(run, snapshot, base, start, other_bases=other_bases)
+
+
 def merged_delivery(record: dict) -> dict | None:
     """The merged pull request that carries this task's delivery, or None when none is proven.
 
@@ -1229,6 +1253,7 @@ def merged_delivery(record: dict) -> dict | None:
         accepted_default = None
         deliveries = []
         paths: set[str] = set()
+        covered_commits: set[str] = set()
         primary = None
         strong_delivery = False
         snapshot = record.get("head_sha")
@@ -1288,6 +1313,7 @@ def merged_delivery(record: dict) -> dict | None:
                 snapshot_covered = (snapshot_covered or exact_snapshot or snapshot == merge_sha or
                                     snapshot in run("rev-list", pr_head, "--not", parent, start).splitlines())
             paths.update(history)
+            covered_commits.update((pr_head, merge_sha))
             delivery = dict(repo=repo, number=number, merged_at=pr["mergedAt"], merge_sha=merge_sha)
             deliveries.append(delivery)
             strong_delivery = strong_delivery or strong
@@ -1304,10 +1330,8 @@ def merged_delivery(record: dict) -> dict | None:
                 if not (merged or tip == snapshot):
                     return None  # merged splits cannot conceal further unpublished work
                 if record.get("owned_paths"):
-                    with ownership_git(record) as run:
-                        base_sha = run("rev-parse", "--verify", "refs/heads/base^{commit}")
-                        paths.update(ownership.delivered_paths(
-                            run, snapshot, base_sha, start, commits_expected=(record.get("commits_ahead") or 0) > 0))
+                    default = accepted_default or _remote_default_branch(record)
+                    paths.update(_supplemental_paths(record, snapshot, start, (base, default), covered_commits))
             record.pop("merged_delivery_lookup", None)
             return {**(primary or deliveries[0]), "pull_requests": deliveries, "paths": sorted(paths - {""})}
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:
