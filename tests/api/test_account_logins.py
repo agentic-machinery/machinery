@@ -632,6 +632,65 @@ def test_routing_status_of_a_pool_running_out_before_reset_is_never_cool(usage_f
     assert subscriptions.pool_status(
         subscriptions._cache_account(supplied, _fixture_now(), provider="codex"))["pace_reason"] == "too_early_in_window"
 
+    # Defect class: an omitted or null expected percentage is filled from the
+    # whole-second display timestamp. A weekly reset at 10:19:12.500, read at
+    # 12:00:00, is just under one percent elapsed. The display timestamp makes
+    # that 1.0, so a deficit of 8 with eta 7200 is hot. Epoch seconds and epoch
+    # milliseconds truncate the same way. The display timestamp stays whole seconds.
+    def fractional_pool(resets_at, *, expected_key: bool):
+        pace_row = {"deltaPercent": 8, "willLastToReset": False, "etaSeconds": 7200}
+        if expected_key:
+            pace_row["expectedUsedPercent"] = None
+        return {
+            "read_at": "2030-01-01T12:00:00Z",
+            "usage": {"usage": {"secondary": {"windowMinutes": 10080, "usedPercent": 9.0, "resetsAt": resets_at}},
+                      "pace": {"secondary": pace_row}},
+        }
+
+    epoch_seconds = 1894097952.5
+    for resets_at in ("2030-01-08T10:19:12.500Z", "2030-01-08T11:19:12.500+01:00",
+                      epoch_seconds, epoch_seconds * 1000, int(epoch_seconds * 1000)):
+        for keep_null in (False, True):
+            row = subscriptions._cache_account(
+                fractional_pool(resets_at, expected_key=keep_null), _fixture_now(), provider="codex")
+            assert row["reading"]["reason"] != "unreadable_reading"
+            assert row["weekly"]["resets_at"] == "2030-01-08T10:19:12Z"
+            assert (subscriptions.pool_status(row)["status"], subscriptions.pool_status(row)["pace_reason"]) == (
+                "cool", "too_early_in_window"), (resets_at, keep_null)
+
+    # Defect class: a supplied non-percentage drops an explicit lasts-to-reset
+    # flag, so a pool at the cap that will last becomes near_cap. Below the cap
+    # the same rejection stays unknown. A rejected pace whose flag is not true
+    # stays near_cap at the cap.
+    def rejected_pool(used: float, lasts, expected, *, delta=8):
+        return {
+            "read_at": "2030-01-01T12:00:00Z",
+            "usage": {"usage": {"secondary": {"windowMinutes": 10080, "usedPercent": used,
+                                              "resetsAt": "2030-01-05T00:00:00Z"}},
+                      "pace": {"secondary": {"deltaPercent": delta, "expectedUsedPercent": expected,
+                                             "willLastToReset": lasts, "etaSeconds": 7200}}},
+        }
+
+    for bad_expected in (False, True, "60", [], {}, 150, -1, float("nan"), float("inf"), 10**400):
+        lasting = subscriptions._cache_account(rejected_pool(99.0, True, bad_expected), _fixture_now(), provider="codex")
+        assert lasting["pace"]["reason"] == "not_reported"
+        assert lasting["pace"].get("lasts_to_reset") is True
+        assert (subscriptions.pool_status(lasting)["status"], subscriptions.pool_status(lasting)["pace_reason"]) == (
+            "cool", "lasts_to_reset"), bad_expected
+        below = subscriptions._cache_account(rejected_pool(60.0, True, bad_expected), _fixture_now(), provider="codex")
+        assert below["pace"].get("lasts_to_reset") is True
+        assert subscriptions.pool_status(below)["status"] == "unknown", bad_expected
+        capped = subscriptions._cache_account(rejected_pool(99.0, False, bad_expected), _fixture_now(), provider="codex")
+        assert "lasts_to_reset" not in capped["pace"]
+        assert subscriptions.pool_status(capped)["pace_reason"] == "weekly_used_up", bad_expected
+    not_a_flag = subscriptions._cache_account(rejected_pool(99.0, 1, False), _fixture_now(), provider="codex")
+    assert "lasts_to_reset" not in not_a_flag["pace"]
+    assert subscriptions.pool_status(not_a_flag)["pace_reason"] == "weekly_used_up"
+    bad_delta = subscriptions._cache_account(
+        rejected_pool(99.0, True, 40, delta=False), _fixture_now(), provider="codex")
+    assert bad_delta["pace"].get("lasts_to_reset") is True
+    assert subscriptions.pool_status(bad_delta)["pace_reason"] == "lasts_to_reset"
+
 
 def test_routing_status_of_an_unseen_pool_is_unknown_not_cool(usage_files):
     """Defect class: an account the reader cannot see (Codex b absent from the usage cache, Codex a with no

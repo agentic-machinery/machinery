@@ -209,19 +209,23 @@ def _window(label: str | None, used: Any, resets_at: Any, minutes: Any, now: dat
 
 def _pace(delta: float | None, expected: float | None, lasts: Any, runs_out: datetime | None,
           summary: Any, now: datetime, *, source: str = "provider") -> dict[str, Any]:
+    def with_lasts(reason: str) -> dict[str, Any]:
+        # An explicit lasts flag stays on a pace that is not a verdict. The cap
+        # check then leaves a pool that will last cool; below the cap it stays unknown.
+        row = _unknown(reason)
+        if lasts is True:
+            row["lasts_to_reset"] = True
+        return row
+
     if isinstance(delta, bool) or not isinstance(delta, (int, float)) or not -100 <= delta <= 100:
-        return _unknown("not_reported")
+        return with_lasts("not_reported")
     raw_expected = _number(expected)
     if expected is not None and (raw_expected is None or not 0 <= raw_expected <= 100):
-        return _unknown("not_reported")
+        return with_lasts("not_reported")
     if raw_expected is not None and not pace_is_visible({"expected_pct": raw_expected}):
         # The visibility floor sees the provider's percentage. Rounding it onto
-        # the floor would publish an early window as a pace verdict. A positive
-        # lasts flag stays, so a cap reading that lasts is not near_cap.
-        hidden = _unknown("too_early_in_window")
-        if lasts is True:
-            hidden["lasts_to_reset"] = True
-        return hidden
+        # the floor would publish an early window as a pace verdict.
+        return with_lasts("too_early_in_window")
     # ``state`` keeps the unrounded delta's side of the band. Headroom is rounded for display.
     state = "on_pace" if abs(delta) <= ON_PACE_BAND_PCT else "deficit" if delta > 0 else "reserve"
     lasts_to_reset = lasts if isinstance(lasts, bool) else None
@@ -362,24 +366,23 @@ def _cache_usage(entry: Mapping[str, Any], read_at: datetime, now: datetime, *, 
 
     pace = _dict(report.get("pace")).get(weekly_key) if weekly_key else None
     if isinstance(pace, dict):
-        # An omitted expected percentage is the elapsed fraction of the weekly reset
-        # the window reader already accepted. A supplied value that is not a
-        # percentage is unknown; it is not replaced by that fraction.
+        # An omitted expected percentage is the elapsed fraction of the reset
+        # instant the window reader already accepted, fractional seconds kept.
+        # The display timestamp drops them. The raw cache value is not forwarded:
+        # that path throws and blanks the account. A supplied value is passed
+        # through, so a non-percentage stays unknown instead of being filled.
         if "expectedUsedPercent" not in pace or pace.get("expectedUsedPercent") is None:
+            raw_reset = windows[weekly_key].get("resetsAt") if isinstance(weekly_key, str) else None
+            accepted = _moment(raw_reset)
             expected = pace_expected_pct(
-                {"resets_at": result["weekly"].get("resets_at"),
+                {"resets_at": None if accepted is None else accepted.isoformat(),
                  "window_minutes": result["weekly"].get("window_minutes")},
                 now=read_at)
-            rejected = False
         else:
-            expected = _number(pace.get("expectedUsedPercent"))
-            rejected = expected is None or not 0 <= expected <= 100
-        if rejected:
-            result["pace"] = _unknown("not_reported")
-        else:
-            runs_out = _after(read_at, _number(pace.get("etaSeconds")))
-            result["pace"] = _pace(_number(pace.get("deltaPercent")), expected,
-                                   pace.get("willLastToReset"), runs_out, pace.get("summary"), now)
+            expected = pace.get("expectedUsedPercent")
+        runs_out = _after(read_at, _number(pace.get("etaSeconds")))
+        result["pace"] = _pace(_number(pace.get("deltaPercent")), expected,
+                               pace.get("willLastToReset"), runs_out, pace.get("summary"), now)
     else:  # CodexBar gives no pace for this window (AGY): the same algorithm, computed here
         result["pace"] = _computed_pace(result["weekly"], read_at, now)
 
@@ -653,6 +656,10 @@ def pool_status(row: Mapping[str, Any]) -> dict[str, Any]:
     if pace.get("status") != "ok":
         if pace.get("reason") == "too_early_in_window":
             return verdict("cool", "too_early_in_window")
+        # The cap check above already skipped a pool whose explicit flag says it
+        # lasts. That pool stays cool. Below the cap a rejected pace stays unknown.
+        if used >= _EXHAUSTED_USED_PCT and pace.get("lasts_to_reset") is True:
+            return verdict("cool", "lasts_to_reset")
         return verdict("unknown", pace.get("reason") or "no_pace")
     if pace.get("lasts_to_reset") is True:
         return verdict("cool", "lasts_to_reset")
