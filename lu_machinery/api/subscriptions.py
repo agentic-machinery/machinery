@@ -55,10 +55,12 @@ from lu_machinery.common import json_depth
 
 from . import account_logins
 from .subscription_usage import (
+    ON_PACE_BAND_PCT,
     PROVIDER_ERROR,
     compute_usage_pace,
     format_usage_pace_summary,
     get_provider_usage_data,
+    pace_is_deficit,
     pace_is_visible,
 )
 
@@ -67,7 +69,6 @@ CACHE_ENV = "LU_USAGE_CACHE_FILE"
 _CACHE_MAX_BYTES = 1 << 20
 _WEEKLY_MINUTES = 10080
 _SESSION_MINUTES = 300
-_ON_PACE_BAND_PCT = 2.0  # CodexBar's "On pace" band
 _MAX_LIST = 10
 _MAX_COUNT = 999
 _MAX_ETA_S = 400 * 86400  # beyond any monthly or weekly window
@@ -207,17 +208,20 @@ def _window(label: str | None, used: Any, resets_at: Any, minutes: Any, now: dat
 
 def _pace(delta: float | None, expected: float | None, lasts: Any, runs_out: datetime | None,
           summary: Any, now: datetime, *, source: str = "provider") -> dict[str, Any]:
-    if delta is None or not -100 <= delta <= 100:
+    if isinstance(delta, bool) or not isinstance(delta, (int, float)) or not -100 <= delta <= 100:
         return _unknown("not_reported")
-    expected = _pct(expected)
-    state = "on_pace" if abs(delta) <= _ON_PACE_BAND_PCT else "deficit" if delta > 0 else "reserve"
+    raw_expected = _number(expected)
+    if raw_expected is None or not 0 <= raw_expected <= 100:
+        raw_expected = None
+    # ``state`` keeps the unrounded delta's side of the band. Headroom is rounded for display.
+    state = "on_pace" if abs(delta) <= ON_PACE_BAND_PCT else "deficit" if delta > 0 else "reserve"
     lasts_to_reset = lasts if isinstance(lasts, bool) else None
     return {
         "status": "ok",
         "state": state,
         # Positive: percentage points in reserve; negative: in deficit.
         "headroom_pct": round(-delta, 1),
-        "expected_used_pct": None if expected is None else round(expected, 1),
+        "expected_used_pct": None if raw_expected is None else round(raw_expected, 1),
         "lasts_to_reset": lasts_to_reset,
         "runs_out_at": _iso(runs_out) if runs_out and lasts_to_reset is False else None,
         "runs_out_in_s": int((runs_out - now).total_seconds()) if runs_out and lasts_to_reset is False else None,
@@ -541,7 +545,8 @@ POOL_IDS = {
 }
 POOL_STATUSES = ("cool", "hot", "near_cap", "unknown")
 POOL_PACE_REASONS = frozenset({
-    "lasts_to_reset", "too_early_in_window", "runs_out_before_reset", "ran_out_before_reset", "weekly_used_up",
+    "lasts_to_reset", "on_pace", "too_early_in_window", "runs_out_before_reset", "ran_out_before_reset",
+    "weekly_used_up",
     "no_reading", "read_time_in_future", NO_MONITOR_READING, PROVIDER_ERROR, "unreadable_reading",
     "usage_cache_missing", "usage_cache_not_configured", "usage_cache_unreadable", "usage_cache_invalid",
     "no_weekly_window", "not_reported", "no_pace", "last_to_reset_unknown", "no_account_row",
@@ -549,13 +554,42 @@ POOL_PACE_REASONS = frozenset({
 _EXHAUSTED_USED_PCT = 99.0  # the routing near-cap line (``credit_lane.SUBSCRIPTION_NEAR_CAP_USED_PCT``)
 
 
+def _routing_deficit(pace: Mapping[str, Any]) -> bool | None:
+    """The routing pace verdict for a page pace row: :func:`pace_is_deficit`, not a second band.
+
+    ``state`` was classified from the unrounded delta, so a value whose displayed headroom
+    rounds onto the band boundary stays on the side ``state`` already chose.
+    """
+    lasts = pace.get("lasts_to_reset")
+    state = pace.get("state")
+    if state == "on_pace":
+        delta: float | None = 0.0
+    elif state == "deficit":
+        delta = ON_PACE_BAND_PCT + 0.1
+    elif state == "reserve":
+        delta = -(ON_PACE_BAND_PCT + 0.1)
+    else:
+        headroom = pace.get("headroom_pct")
+        delta = None if isinstance(headroom, bool) or not isinstance(headroom, (int, float)) else -float(headroom)
+    expected = pace.get("expected_used_pct")
+    return pace_is_deficit({
+        "expected_pct": expected,
+        "delta_pct": delta,
+        "will_last_to_reset": lasts if isinstance(lasts, bool) else None,
+    })
+
+
 def pool_status(row: Mapping[str, Any]) -> dict[str, Any]:
     """One account row's pace verdict, from the same pace the page shows.
 
-    ``hot``: the pace runs out before the weekly reset. ``near_cap``: the weekly
-    window is used up, or the projected run-out has passed. ``cool``: the pace
-    lasts to the reset, or the window is too young for a pace (CodexBar shows
-    none yet). ``unknown``: no reading, no weekly window, or no pace verdict;
+    ``hot`` only when :func:`pace_is_deficit` says the pace is outside the
+    on-pace band and empties before reset, and that run-out is still ahead.
+    A cumulative rate that merely misses the reset stays ``cool`` while the
+    reading is on pace. ``near_cap``: the weekly window is at the cap and the
+    pace does not say the remainder lasts, or a confirmed deficit has already
+    run out. A cap reading that lasts to reset is not ``near_cap``. ``cool``:
+    the pace lasts, the reading is on pace, or the window is too young for a
+    pace. ``unknown``: no reading, no weekly window, or no pace verdict;
     never ``cool``. A stale reading keeps its verdict and says so.
     """
     reading, weekly, pace = row.get("reading") or {}, row.get("weekly") or {}, row.get("pace") or {}
@@ -571,7 +605,12 @@ def pool_status(row: Mapping[str, Any]) -> dict[str, Any]:
         return verdict("unknown", reading.get("reason") or "no_reading")
     if weekly.get("status") != "ok":
         return verdict("unknown", weekly.get("reason") or "no_weekly_window")
-    if weekly["used_pct"] >= _EXHAUSTED_USED_PCT:
+    used = weekly.get("used_pct")
+    # Missing pace is not evidence the remainder lasts, so the cap stays near_cap.
+    if (
+        isinstance(used, (int, float)) and not isinstance(used, bool) and used >= _EXHAUSTED_USED_PCT
+        and pace.get("lasts_to_reset") is not True
+    ):
         return verdict("near_cap", "weekly_used_up")
     if pace.get("status") != "ok":
         if pace.get("reason") == "too_early_in_window":
@@ -580,10 +619,14 @@ def pool_status(row: Mapping[str, Any]) -> dict[str, Any]:
     if pace.get("lasts_to_reset") is True:
         return verdict("cool", "lasts_to_reset")
     if pace.get("lasts_to_reset") is False:
-        seconds = pace.get("runs_out_in_s")
-        if isinstance(seconds, int) and seconds <= 0:
-            return verdict("near_cap", "ran_out_before_reset")
-        return verdict("hot", "runs_out_before_reset")
+        deficit = _routing_deficit(pace)
+        if deficit is True:
+            seconds = pace.get("runs_out_in_s")
+            if isinstance(seconds, int) and not isinstance(seconds, bool) and seconds <= 0:
+                return verdict("near_cap", "ran_out_before_reset")
+            return verdict("hot", "runs_out_before_reset")
+        if deficit is False:
+            return verdict("cool", "on_pace")
     return verdict("unknown", "last_to_reset_unknown")
 
 
@@ -600,10 +643,11 @@ class PoolPaceCollector:
     """Prometheus collector: each pool's :func:`pool_status`, read from the snapshot at scrape time.
 
     ``monitor_subscription_pool_status{pool,status}`` is 1 for the pool's current status and 0 for the
-    others, so an alert matches ``status=~"hot|near_cap"`` (runs out before its reset) or
-    ``status="unknown"`` (not visible). ``monitor_subscription_pool_runs_out_seconds{pool}`` is the time
-    to the projected run-out, for pools that run out before their reset. A reader failure reports every
-    pool ``unknown``; the series never disappear.
+    others, so an alert matches ``status=~"hot|near_cap"`` (a pace deficit empties the pool before
+    reset, or the pool is at the cap and will not last) or ``status="unknown"`` (not visible).
+    ``monitor_subscription_pool_runs_out_seconds{pool}`` is the time to the projected run-out, for
+    pools that run out before their reset. A reader failure reports every pool ``unknown``; the
+    series never disappear.
     """
 
     def __init__(self, snapshot: Callable[[], Mapping[str, Any]] | None = None) -> None:
@@ -618,8 +662,9 @@ class PoolPaceCollector:
         except Exception:
             pools = pool_statuses({})
         status = GaugeMetricFamily("monitor_subscription_pool_status",
-                                   "1 for the subscription pool's pace status (cool, hot = runs out before reset, "
-                                   "near_cap = used up, unknown = not visible), 0 for the others.",
+                                   "1 for the subscription pool's pace status (cool, hot = pace deficit empties "
+                                   "before reset, near_cap = at the cap or already out and will not last, "
+                                   "unknown = not visible), 0 for the others.",
                                    labels=("pool", "status"))
         runs_out = GaugeMetricFamily("monitor_subscription_pool_runs_out_seconds",
                                      "Seconds to the projected run-out of a pool that runs out before its reset.",

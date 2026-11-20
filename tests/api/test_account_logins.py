@@ -511,6 +511,34 @@ def test_routing_status_of_a_pool_running_out_before_reset_is_never_cool(usage_f
     assert collected[("codex:b", "hot")] == 1.0 and collected[("codex:b", "cool")] == 0.0
     assert collected[("claude:b", "hot")] == 1.0
 
+    # Defect class: an on-pace reading is hot because the cumulative rate misses reset, and a cap
+    # reading is near_cap even when the remainder lasts. Fixed rows, not the cache clock.
+    def reading(used: float, delta: float, expected: float, lasts: bool, *, seconds: int | bool | None = 3600):
+        state = "on_pace" if abs(delta) <= 2 else "deficit" if delta > 0 else "reserve"
+        return {
+            "reading": {"status": "fresh"},
+            "weekly": {"status": "ok", "used_pct": used, "resets_at": "2030-01-08T00:00:00Z"},
+            "pace": {
+                "status": "ok", "state": state, "headroom_pct": round(-delta, 1),
+                "expected_used_pct": round(expected, 1), "lasts_to_reset": lasts,
+                "runs_out_in_s": seconds, "runs_out_at": "2030-01-02T00:00:00Z",
+            },
+        }
+
+    on_pace = subscriptions.pool_status(reading(15.5, 1.2, 14.3, False))
+    assert (on_pace["status"], on_pace["pace_reason"]) == ("cool", "on_pace")
+    hot = subscriptions.pool_status(reading(68.0, 8.0, 60.0, False, seconds=7200))
+    assert (hot["status"], hot["pace_reason"], hot["runs_out_in_s"]) == ("hot", "runs_out_before_reset", 7200)
+    lasts = subscriptions.pool_status(reading(99.0, -0.5, 99.5, True))
+    assert (lasts["status"], lasts["pace_reason"]) == ("cool", "lasts_to_reset")
+    # The same edges the verdict uses: the cap that will not last, a deficit already out, the band
+    # boundary, and a boolean duration that is not a number of seconds.
+    assert subscriptions.pool_status(reading(99.0, 8.0, 91.0, False))["status"] == "near_cap"
+    assert subscriptions.pool_status(reading(80.0, 8.0, 72.0, False, seconds=0))["pace_reason"] == "ran_out_before_reset"
+    assert subscriptions.pool_status(reading(42.0, 2.0, 40.0, False))["status"] == "cool"
+    assert subscriptions.pool_status(reading(42.0, 2.01, 39.99, False))["status"] == "hot"
+    assert subscriptions.pool_status(reading(40.0, 8.0, 32.0, False, seconds=False))["status"] == "hot"
+
 
 def test_routing_status_of_an_unseen_pool_is_unknown_not_cool(usage_files):
     """Defect class: an account the reader cannot see (Codex b absent from the usage cache, Codex a with no
