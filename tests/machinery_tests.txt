@@ -631,11 +631,13 @@ tests/dispatcher/test_core_admission.py
 tests/dispatcher/test_dispatch_card_gate.py
 tests/dispatcher/test_core_branch_start.py
 tests/dispatcher/test_core_delivery.py
+tests/dispatcher/test_core_delivery_heads.py
 tests/dispatcher/test_core_delivery_scope.py
 tests/dispatcher/test_core_ownership_walk.py
 tests/dispatcher/test_core_provider_results.py
 tests/dispatcher/test_core_review_gate_supervision.py
 tests/dispatcher/test_core_scope_verification.py
+tests/dispatcher/test_core_worktree_entry.py
 tests/dispatcher/test_drive_epic_review_docs.py
 tests/dispatcher/test_environment.py
 tests/dispatcher/test_installed_dispatch_linked_worktree.py
@@ -645,6 +647,7 @@ tests/dispatcher/test_providers_b.py
 tests/dispatcher/test_providers_c.py
 tests/dispatcher/test_retention_inventory.py
 tests/dispatcher/test_review_metadata.py
+tests/dispatcher/test_review_attempt.py
 tests/dispatcher/test_review_tools.py
 tests/review/test_review_verdict_parser.py
 tests/review/test_routing_amendment_11327.py
