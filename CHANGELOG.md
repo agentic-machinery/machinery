@@ -9,6 +9,53 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.45"></a>
+## [0.1.45] - 2026-11-20
+
+### Added
+
+- Restore read-only Sources MCP parity for write workers ([#986](https://github.com/learn-ukrainian/machinery/pull/986))
+- Per-class frontier, compact best-pick matrix, quota pace and responsive layout ([#995](https://github.com/learn-ukrainian/machinery/pull/995))
+- Show catalog models and SubQ balance availability ([#1024](https://github.com/learn-ukrainian/machinery/pull/1024))
+- Add planning for issues and capacity ([#1026](https://github.com/learn-ukrainian/machinery/pull/1026))
+
+### Changed
+
+- Run machinery on Python 3.14.10 ([#973](https://github.com/learn-ukrainian/machinery/pull/973))
+- Tighten ci-gate.yml to workflow-level permissions: {} ([#989](https://github.com/learn-ukrainian/machinery/pull/989))
+- Call the consumer-lock checker directly ([#996](https://github.com/learn-ukrainian/machinery/pull/996))
+- Add grouped Dependabot config with 7-day cooldown ([#1000](https://github.com/learn-ukrainian/machinery/pull/1000))
+- Update Codex ACP, the SDK, and ACPX ([#1009](https://github.com/learn-ukrainian/machinery/pull/1009))
+- Describe current reviewer execution ([#1011](https://github.com/learn-ukrainian/machinery/pull/1011))
+- Describe read-only OpenCode tools ([#1016](https://github.com/learn-ukrainian/machinery/pull/1016))
+- Defer Claude ACP updates that fail musl sealing ([#1015](https://github.com/learn-ukrainian/machinery/pull/1015))
+- Keep fleet overview under 1s without cache invalidation ([#1014](https://github.com/learn-ukrainian/machinery/pull/1014))
+- Update supports-color, fix Node sealing, and shorten cooldowns ([#1018](https://github.com/learn-ukrainian/machinery/pull/1018))
+- Bump the npm group with 2 updates ([#1020](https://github.com/learn-ukrainian/machinery/pull/1020))
+
+### Fixed
+
+- Refuse malformed withheld-verdict evidence ([#975](https://github.com/learn-ukrainian/machinery/pull/975))
+- Handle malformed GitHub comment authors ([#983](https://github.com/learn-ukrainian/machinery/pull/983))
+- Hash-pin the four unpinned install sites ([#979](https://github.com/learn-ukrainian/machinery/pull/979))
+- Cool dependency updates and isolate package tools ([#984](https://github.com/learn-ukrainian/machinery/pull/984))
+- Update uv pin to 0.13.9 in stack_pins.yaml ([#990](https://github.com/learn-ukrainian/machinery/pull/990))
+- Tolerate malformed REST comment authors ([#993](https://github.com/learn-ukrainian/machinery/pull/993))
+- Restore governed tests and Sources evidence for read-only reviews ([#997](https://github.com/learn-ukrainian/machinery/pull/997))
+- Check both uv requirements before building ([#1002](https://github.com/learn-ukrainian/machinery/pull/1002))
+- Exclude verification probes from review lineage ([#999](https://github.com/learn-ukrainian/machinery/pull/999))
+- Reuse npm cache on site dependency store misses ([#1007](https://github.com/learn-ukrainian/machinery/pull/1007))
+- Use machinery pins in the Linux parity probe ([#1004](https://github.com/learn-ukrainian/machinery/pull/1004))
+- Enable shell and Sources in read-only OpenCode ([#1008](https://github.com/learn-ukrainian/machinery/pull/1008))
+- Check the selected Codex account for credits ([#1013](https://github.com/learn-ukrainian/machinery/pull/1013))
+- Document Cursor headless web access and write interpreter ([#1022](https://github.com/learn-ukrainian/machinery/pull/1022))
+- Claude ACP 0.109.0 with no write or exec tools in any mode (supersedes #1019) ([#1023](https://github.com/learn-ukrainian/machinery/pull/1023))
+- Report subscription readings and model effort ([#1025](https://github.com/learn-ukrainian/machinery/pull/1025))
+
+### Removed
+
+- Remove second uv pin by updating product-consumer.pin ([#982](https://github.com/learn-ukrainian/machinery/pull/982))
+
 <a id="v0.1.44"></a>
 ## [0.1.44] - 2026-11-20
 
@@ -1105,7 +1152,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.44...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.45...HEAD
+[0.1.45]: https://github.com/learn-ukrainian/machinery/compare/v0.1.44...v0.1.45
 [0.1.44]: https://github.com/learn-ukrainian/machinery/compare/v0.1.43...v0.1.44
 [0.1.43]: https://github.com/learn-ukrainian/machinery/compare/v0.1.42...v0.1.43
 [0.1.42]: https://github.com/learn-ukrainian/machinery/compare/v0.1.41...v0.1.42
