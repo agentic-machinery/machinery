@@ -337,6 +337,7 @@ pytestmark = pytest.mark.usefixtures("configured_roots")
     ("claude", "claude-opus-5-5", ("--pr", "42"), None),
     ("claude", "claude-opus-5-5", ("--pr", "43"), "--branch does not match the PR head branch"),
     ("claude", "claude-opus-5-5", ("--pr", "42", "--pinned-head", "b" * 40), "checkout does not match the PR head SHA"),
+    ("claude", "claude-opus-5-5", ("--pr", "42", "--cwd", "/unused"), "--pr cannot borrow an existing worktree"),
     ("agy", "gemini-4-neon-high", ("--pr", "44"), None),
     ("codex", CURRENT_SOL, ("--pr", "44", "--review-author-model", CURRENT_SOL), None),
 ])
@@ -384,7 +385,7 @@ def test_mislabelled_review_dispatch_cannot_avoid_the_critical_floor(dispatch, m
         headRefName="other/branch" if number == 43 else "review/target", headRefOid=head,
     ))
     monkeypatch.setattr(cf.GitHubAdapter, "pr_file_rows", lambda *_a: [{"filename": path, "status": "added"}])
-    branch = () if flags == ("--pr", "42") else ("--branch", "review/target")
+    branch = () if flags == ("--pr", "42") or "--cwd" in flags else ("--branch", "review/target")
     review = ("--mode", "read-only", "--risk", "low", *branch, *flags)
     if refusal is None:
         record = dispatch(*review, agent=agent, model=model)

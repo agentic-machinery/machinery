@@ -522,14 +522,16 @@ def _dispatch(args) -> int:
         from lu_machinery.review.record_cf_verdict import GitHubAdapter, RecordError, _pr, _pr_files_and_tier
 
         with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+            if args.cwd:
+                raise ValueError("review admission: --pr cannot borrow an existing worktree (--cwd)")
             try:
                 review_pr = _pr(info["github"], args.branch or "", args.pr)
             except RecordError as exc:
                 raise ValueError(f"review admission: {exc}") from None
-            pr_branch = review_pr.get("headRefName")
-            if not isinstance(pr_branch, str):
+            raw_pr_branch = review_pr.get("headRefName")
+            if not isinstance(raw_pr_branch, str):
                 raise ValueError("review admission: PR head branch is unavailable")
-            pr_branch = validate_plain_branch_name(pr_branch, repo_root=repo)
+            pr_branch = validate_plain_branch_name(raw_pr_branch, repo_root=repo)
             if args.branch is not None and args.branch != pr_branch:
                 raise ValueError("review admission: --branch does not match the PR head branch")
             args.branch = pr_branch
@@ -557,7 +559,7 @@ def _dispatch(args) -> int:
         # rev-parse a local refs/heads/<branch> that may be absent or stale (#12468).
         start, publish_remote = git.publish_start(repo, info, args.branch, task_id)
         exact = True
-    elif args.mode == "read-only" and args.branch and not args.pinned_head and not args.cwd:
+    elif args.mode == "read-only" and args.branch and not args.cwd and (review_pr is not None or not args.pinned_head):
         # A branch-pinned review runs at the branch's remote head, never at a possibly
         # stale local refs/heads/<branch> that worktree_plan would resolve (#12441).
         start = git.review_branch_start(repo, info, args.branch, task_id, base=args.base)
@@ -569,6 +571,8 @@ def _dispatch(args) -> int:
     )
     if args.pinned_head and not re.fullmatch(r"[0-9a-fA-F]{40}", args.pinned_head):
         raise ValueError("pinned head must be a full commit SHA")
+    if review_pr is not None and args.pinned_head:
+        args.pinned_head = args.pinned_head.lower()
     prompt_path = _PromptPath(path.with_suffix(".prompt"))
     prompt_path.content = prompt
     options = {key: str(value) for key, value in vars(args).items()
@@ -630,17 +634,17 @@ def _dispatch(args) -> int:
         review_contract = review_attempt.admit(args, prompt, binding, repo, sha) if binding and not args.dry_run else None
         low_tier = False
         if review_pr is not None:
-            if review_pr.get("headRefOid") != sha:
+            if review_pr.get("headRefOid") != sha or (args.pinned_head and args.pinned_head != sha):
                 raise ValueError("review admission: checkout does not match the PR head SHA")
             if args.review_mode != "red_team" and not args.trial_role and not is_ukrainian_review(vars(args)):
                 _, tier = _pr_files_and_tier(GitHubAdapter(repo), info["github"], args.pr)
                 low_tier = tier == "low"
                 if low_tier:
                     try:
-                        current_pr = _pr(info["github"], args.branch, args.pr)
+                        current_pr = _pr(info["github"], pr_branch, args.pr)
                     except RecordError as exc:
                         raise ValueError(f"review admission: {exc}") from None
-                    if (current_pr.get("headRefOid"), current_pr.get("headRefName")) != (sha, args.branch):
+                    if (current_pr.get("headRefOid"), current_pr.get("headRefName")) != (sha, pr_branch):
                         raise ValueError("review admission: PR head changed while resolving the review tier")
         if args.review_mode == "red_team":
             checks.check_review_family(args.review_author_model, args.model, review_mode=args.review_mode)
