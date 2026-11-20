@@ -314,8 +314,9 @@ def test_snapshot_and_removal_reads_reveal_at_least_what_main_did(tmp_path, monk
         (work / name).parent.mkdir(exist_ok=True)
         (work / name).write_text(f"left over {name!r}\n")
     if case.startswith("attributes-file"):
-        os.utime(work / "delivered.txt")  # new timestamps, same bytes: status re-reads it through the attributes
-        assert _git(work, "status", "--porcelain") == ""
+        # Make status re-read through the attributes without caching that result in the index.
+        os.utime(work / "delivered.txt", (1_000_000_001, 1_000_000_001))
+        assert _git(work, "--no-optional-locks", "status", "--porcelain") == ""
     elif case == "global-conversion":
         (tmp_path / "global-attributes").write_text("delivered.txt text\n")
         global_config.write_text(f"[core]\n\tattributesFile = {tmp_path / 'global-attributes'}\n")
