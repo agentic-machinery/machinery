@@ -508,7 +508,7 @@ function pareto(data) {
     if (!shown.length) {
       return !hasHoursExact && jobModels.length
         ? `<p class="muted">Not enough data in ${esc(cls)}: no model in the current selection has a positive rounded hours-per-merge value in this cached snapshot (cached snapshots round short durations to 0 and omit unrounded hours).</p>`
-        : `<p class="muted">Not enough data in ${esc(cls)}: no model in the current selection has both timed wall hours and a landed task.</p>`;
+        : `<p class="muted">Not enough data in ${esc(cls)}: no model in the current selection has positive recorded hours per merge.</p>`;
     }
     const frontier = shown.filter((m) => m.frontier);
     const frontierNames = frontier.map((m) => esc(m.model)).join(", ");
@@ -575,7 +575,7 @@ function pareto(data) {
   }
   const points = charts.pareto || [];
   const shown = points.filter((p) => keepModel(p.model));
-  if (!shown.length) return '<p class="muted">No model in the current selection has both timed wall hours and a reviewed PR in this window.</p>';
+  if (!shown.length) return '<p class="muted">No model in the current selection has usable recorded hours per merge and a reviewed PR in this window.</p>';
   const frontier = shown.filter((p) => p.frontier);
   const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
   const shownHasEligible = shown.some((p) => !p.low_sample);
