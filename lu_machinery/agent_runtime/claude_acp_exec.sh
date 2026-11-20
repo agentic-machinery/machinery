@@ -50,4 +50,14 @@ for arg in "$@"; do
         *) set -- "$@" "$arg" ;;
     esac
 done
-exec "$host" --disallowedTools Monitor,ScheduleWakeup,CronCreate,Workflow --permission-mode=default "$@"
+# The ACP seat only reads, so no tool that writes files, runs commands or acts
+# outside the ask exists in it, whatever mode Claude Code ends up in (an adapter
+# can still switch a running session to Accept edits). Deny rules hold in every
+# mode. Kept: Read, Glob, Grep, WebFetch, WebSearch (read only; Claude Code adds
+# Glob, Grep and WebFetch once Bash is denied), ToolSearch (finds the sealed
+# review MCP tool), ListAgents and ReportFindings; the cron tools are off
+# through CLAUDE_CODE_DISABLE_CRON. MultiEdit, Agent and PowerShell are listed
+# for Claude Code builds that ship them.
+exec "$host" --disallowedTools Monitor,ScheduleWakeup,CronCreate,Workflow \
+    --disallowedTools Bash,PowerShell,Edit,MultiEdit,Write,NotebookEdit,Task,Agent,Skill,EnterWorktree,ExitWorktree,DesignSync,RemoteTrigger,SendMessage,PushNotification,TaskStop \
+    --permission-mode=default "$@"

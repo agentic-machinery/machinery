@@ -422,9 +422,6 @@ def _ok_stream(session_id: str = _SESSION_ID) -> str:
     events = [
         {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}},
         {"jsonrpc": "2.0", "id": 1, "result": {"sessionId": session_id}},
-        # The seat's ACPX sets Manual; the agent confirms it before the prompt.
-        {"jsonrpc": "2.0", "id": 5, "method": "session/set_config_option", "params": {"configId": "mode", "value": "default"}},
-        {"jsonrpc": "2.0", "id": 5, "result": {"configOptions": [{"id": "mode", "currentValue": "default"}]}},
         {"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {}},
         {
             "jsonrpc": "2.0",
@@ -658,6 +655,9 @@ def test_launcher_execs_the_pinned_binary_with_merged_denies_and_a_clean_env(tmp
     assert record["argv"][1:] == [
         "--disallowedTools",
         "Monitor,ScheduleWakeup,CronCreate,Workflow",
+        # No tool that writes files or runs commands, in any mode.
+        "--disallowedTools",
+        "Bash,PowerShell,Edit,MultiEdit,Write,NotebookEdit,Task,Agent,Skill,EnterWorktree,ExitWorktree,DesignSync,RemoteTrigger,SendMessage,PushNotification,TaskStop",
         "--permission-mode=default",
         *(arg for arg in _SDK_ARGS if arg != "--permission-mode=auto"),
     ]
