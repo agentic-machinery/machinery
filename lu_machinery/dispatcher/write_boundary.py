@@ -1333,7 +1333,11 @@ class _Broker:
 
     def _fleet_publish(self, payload: dict) -> dict:
         if self.final_delivery is None:
-            raise _BrokerRefusal("this launch has no final Fleet delivery target")
+            # Say why (#551): a top-level dispatcher that passed no --initiator gets no reply here.
+            raise _BrokerRefusal("this launch has no final Fleet delivery target: " + (
+                "its task record names no parent task and no valid dispatch --initiator (a seat such as "
+                "claude-cto, not this task)"
+                if self.boundary.args.task_artifacts else "it was not launched with task artifacts"))
         if self.final_publish_attempted:
             raise _BrokerRefusal("the final Fleet publication has already been attempted")
         if set(payload) != {"channel", "body", "sender", "recipient"}:
