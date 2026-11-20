@@ -9,7 +9,7 @@ import os
 import re
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -44,7 +44,7 @@ _SCOPE_ITEM = re.compile(r"^(?:(?:[-*+]|\d+[.)])\s+)?(?:\[[ xX]\]\s+)?(?:Paths:[
 _SCOPE_SEPARATOR = re.compile(r"\s*(?:[,;]\s*(?:and\s+)?|\s+and\s+)\s*")
 _SOURCE_LINE = re.compile(r":[1-9][0-9]*(?:-[1-9][0-9]*)?$")
 _PATH = re.compile(r"(?:\./)?[\w.@+-][\w.@+*/?\[\]-]*")
-_ROOT_FILE = re.compile(r"[\w.-]+\.[A-Za-z][A-Za-z0-9_-]*")
+_FILE_SUFFIX = re.compile(r"\.[A-Za-z][A-Za-z0-9_-]*$")
 _SCORECARD_POOLS = {"claude-a": "claude:a", "claude-b": "claude:b", "codex": "codex:a", "grok": "grok"}
 _ALLOWANCE_POOLS = {"grok": "cursor", "agy:gemini": "gemini", "agy:claude_gpt": "agy_claude"}
 _METRICS = frozenset(f"lu_cto_pool_{field}" for field in (
@@ -226,7 +226,7 @@ def collect_issues() -> IssueSnapshot | None:
     )
 
 
-def _scope(body: str) -> list[PathClaim]:
+def _scope(body: str, repositories: Collection[str]) -> list[PathClaim]:
     """Read explicit path lists. A prose or unreadable item makes the scope unknown."""
     section = _SCOPE.search(body)
     if section is None:
@@ -241,8 +241,14 @@ def _scope(body: str) -> list[PathClaim]:
                 if len(item) > 2 * len(wrapper) and item.startswith(wrapper) and item.endswith(wrapper):
                     item = item[len(wrapper):-len(wrapper)]
             token = _SOURCE_LINE.sub("", item)
-            if (token.startswith("-") or token.endswith(".") or not _PATH.fullmatch(token)
-                    or ("/" not in token and not _ROOT_FILE.fullmatch(token))):
+            if token.startswith("-") or token.endswith(".") or not _PATH.fullmatch(token):
+                return []
+            root, separator, _ = token.partition("/")
+            if not token.startswith("./") and (
+                token.lower().removesuffix("/**").removesuffix("/") in repositories
+                or (separator and "." in root.lstrip("."))
+                or (not token.endswith(("/", "/**")) and not _FILE_SUFFIX.search(token))
+            ):
                 return []
             claims = expand_claim(token)
             if any(claim.kind == ClaimKind.UNKNOWN for claim in claims):
@@ -298,6 +304,7 @@ def project_issues(
 
     blocked, ready, ready_now = [], [], []
     states: Counter[str] = Counter()
+    repositories = frozenset(snap.aliases.values())
     for ref, issue in sorted(snap.issues.items()):
         if deps := snap.dependencies.get(ref):
             if ref[0] in snap.public:
@@ -307,7 +314,7 @@ def project_issues(
             states["blocked"] += 1
         elif ref not in snap.unresolved:
             states["ready"] += 1
-            scope = _scope(issue.body)
+            scope = _scope(issue.body, repositories)
             live = workers.get(ref[0], []) if workers is not None and not stale else None
             if not scope:
                 path_status = "scope_unknown"

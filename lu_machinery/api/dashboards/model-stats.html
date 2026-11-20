@@ -1125,7 +1125,7 @@ function renderPlanning(data) {
   if (issues.workers === "unknown") notes.push("Worker paths are unavailable. Ready-now results are withheld.");
   if (issues.workers === "partial") notes.push("Some worker paths are unknown. Affected ready-now results are withheld.");
   if (coverage.path_conflicts) notes.push(`${num(coverage.path_conflicts)} ready cards overlap a live worker.`);
-  if (coverage.scope_unknown) notes.push(`${num(coverage.scope_unknown)} ready cards have no comparable scope paths.`);
+  if (coverage.scope_unknown) notes.push(`${num(coverage.scope_unknown)} ready cards have no comparable scope paths. Use explicit file paths or end directory paths with a slash.`);
   $("planning-coverage").textContent = notes.join(" ");
   const fill = (id, columns, rows, empty, textColumns) => {
     $(id).innerHTML = rows.length ? table(columns, rows, textColumns) : `<p class="muted">${esc(empty)}</p>`;

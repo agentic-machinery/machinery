@@ -495,7 +495,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "Meter reads refresh every 30 seconds. Unmeasured forecasts are unknown.",
         ("model-stats.html", "operators"),
         "Private issue identities, issue text and worker paths stay internal. Private blockers have anonymous ranks. "
-        "Ready-now requires an explicit comparable path list in the card's scope.",
+        "Ready-now requires an explicit path list in the card's scope. Files may use an extension and directories "
+        "may use a trailing slash. The ./ prefix explicitly marks a repository-relative path.",
         "medium if incomplete inputs are mistaken for complete planning data",
         "keep as a read-only planning view",
         response_schema_version="model-planning.v1",

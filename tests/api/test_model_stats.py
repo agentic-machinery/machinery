@@ -79,7 +79,7 @@ def _record(tasks: Path, task_id: str, **fields) -> dict:
 
 def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, monkeypatch):
     """Diamond dependencies count once, and a ready issue cannot overlap a live grant."""
-    product, machinery, private = "sample/product", "sample/machinery", "sample/private"
+    product, machinery, private = "sample/product", "sample/machinery", "sample/private.dev"
     repos = {slug: FleetRepo(slug, slug, slug.rsplit("/", 1)[1], role) for slug, role in (
         (product, "public-product"), (machinery, "public-machinery"), (private, "private-infra"))}
     title = "Product: remove the classified in-tree machinery copy"
@@ -89,6 +89,7 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
         return {"number": value, "title": name, "state": "OPEN",
                 "body": f"## In scope\n{scope}\n\n## Dependencies\n{deps}\n"}
 
+    ambiguous_scopes = ["N/A", "CI/CD", machinery, private, "github.com/docs/readme.md"]
     inventories = {
         product: [issue(13032, title, "None", "src/shared.py")],
         machinery: [
@@ -104,6 +105,8 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
             issue(589, "Unresolved cycle partner", "#588"),
             issue(590, "Blocked by a private issue", f"{private}#999"),
             issue(591, "Ready card with partial scope", "None", "- src/elsewhere.py\n- Its callers and tests"),
+            *(issue(number, "Ready card with a slash in prose", "None", scope)
+              for number, scope in enumerate(ambiguous_scopes, start=592)),
         ],
         private: [issue(999, "Private work", product_ref)],
     }
@@ -143,16 +146,17 @@ def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, 
         response = client.get("/api/fleet/model-stats/planning")
         assert response.status_code == 200
         result = response.json()["issues"]
-        assert result["coverage"]["open_issues"] == 14
+        assert result["coverage"]["open_issues"] == 19
         assert result["coverage"]["dependency_unknown"] == 1
         assert result["blockers"][0] == {"ref": product_ref, "direct": 3, "total": 6}
         assert {"ref": None, "direct": 1, "total": 1} in result["blockers"]
         assert result["blocked"][0] == {"ref": f"{machinery}#503", "blocked_by": [product_ref], "private_blockers": 0}
         assert result["ready_now"] == [{"ref": f"{machinery}#585"}, {"ref": product_ref}]
         assert result["coverage"]["path_conflicts"] == 1
-        assert result["coverage"]["scope_unknown"] == 2
+        assert result["coverage"]["scope_unknown"] == 7
         assert {"ref": f"{machinery}#584", "path_status": "path_conflicts"} in result["ready"]
-        assert {"ref": f"{machinery}#591", "path_status": "scope_unknown"} in result["ready"]
+        for issue_number in range(591, 597):
+            assert {"ref": f"{machinery}#{issue_number}", "path_status": "scope_unknown"} in result["ready"]
         assert private not in response.text
         assert "src/owned" not in response.text
 
