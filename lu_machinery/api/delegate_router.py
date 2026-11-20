@@ -11,7 +11,7 @@ import re
 import sqlite3
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -23,13 +23,14 @@ from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fiel
 from lu_machinery.agent_runtime.codex_accounts import CODEX_ACCOUNT_ALIASES, CODEX_ACCOUNT_LABELS, DEFAULT_CODEX_ACCOUNT
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record
+from lu_machinery.dispatcher.ownership import effective_scope
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME as TASK_ARCHIVE_DIR_NAME
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 from lu_machinery.work.sources_public import public_repository_id
 
-from . import panel_values
+from . import config, panel_values
 from .lane_health import sanitize_error_excerpt
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .monitor_context import production_context as production_context  # re-export: test monkeypatches
@@ -106,8 +107,6 @@ def _tasks_dir(ctx: MonitorContext | None = None) -> Path:
     # historically read BATCH_STATE_DIR / "tasks". Keep that cheap fallback
     # so they do not construct a production MonitorContext (and its git
     # session-streams probe) just to resolve a directory.
-    from lu_machinery.api import config  # noqa: PLC0415, I001  # lazy-ok: cheap BATCH_STATE_DIR fallback without production_context
-
     return Path(config.BATCH_STATE_DIR) / "tasks"
 
 
@@ -631,6 +630,7 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     """Read hot records without waiting for the history scan or writing its cache."""
     tasks_dir = _tasks_dir(ctx)
     rows = []
+    claims: list[tuple[str | None, list[str]]] = []
     for path in iter_task_records(tasks_dir, include_archive=False):
         try:
             file_stat = path.stat()
@@ -645,18 +645,29 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
                     alive = _pid_alive(pid)
                     if not alive:
                         continue
+                task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
             else:
-                task = _read_task_state(str(path), tasks_dir=tasks_dir)
+                task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
                 if task is None or str(task.get("status") or "") not in ACTIVE_TASK_STATUSES:
                     continue
                 status, alive = _derived_task_status(task)
                 if status not in ACTIVE_TASK_STATUSES:
                     continue
                 summary = _task_summary(path, task)
-        except (OSError, ValueError):
+        except OSError:
+            claims.append((None, []))
+            continue
+        except ValueError:
             continue
         rows.append(_task_summary_row(summary, status, alive, file_stat.st_mtime))
-    return {"total": len(rows), "tasks": _sort_public_task_rows(rows)}
+        if task is None or task.get("mode") != "read-only":
+            paths = []
+            if task and isinstance(task.get("owned_paths"), list):
+                with suppress(TypeError, ValueError):
+                    paths = effective_scope(task)
+            claims.append((_authoritative_task_repository(task) if task else None, paths))
+    # The HTTP /active projection omits these internal claims, including grants.
+    return {"total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims}
 
 
 def _delegate_task_rows_locked(

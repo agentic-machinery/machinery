@@ -55,6 +55,7 @@ from lu_machinery.review.model_catalog import (
     VALID_RISKS,
 )
 
+from . import planning
 from .model_stats_rows import (
     NATIVE_ALIASES,
     POOLS,
@@ -92,7 +93,7 @@ PAGE_DROP = frozenset({
     "by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed",
     "unparsed_samples", "unparsed_sample_efforts"})
 # Snapshot sides the route never spreads into a response. ``sample_windows`` is served only by ``view=samples``.
-_UNSERVED = frozenset({"windows", "page_windows", "sample_windows", "metrics"})
+_UNSERVED = frozenset({"windows", "page_windows", "sample_windows", "metrics", "worker_allowance"})
 STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed", NEVER_STARTED)
 START_REFUSAL_CODES = frozenset(StartRefusal)
 UNPARSED_REASON_KEYS = (*UNPARSED_REASONS, "not_done", "unknown")
@@ -1125,6 +1126,23 @@ def _allowance_rows(rows: list[_Row]) -> list[dict[str, Any]]:
     return table
 
 
+def _worker_allowance(rows: list[_Row]) -> dict[str, dict[str, float | int]]:
+    """Pool drop per worker-hour across readable write clusters in the planning window."""
+    points: defaultdict[str, float] = defaultdict(float)
+    hours: defaultdict[str, float] = defaultdict(float)
+    tasks: Counter[str] = Counter()
+    for cluster in _clusters(rows):
+        if cluster.points is None or any(
+            row.started is None or row.duration is None or row.duration <= 0 for row in cluster.rows
+        ):
+            continue
+        points[cluster.pool] += cluster.points
+        hours[cluster.pool] += sum(row.duration or 0 for row in cluster.rows) / 3600
+        tasks[cluster.pool] += len(cluster.rows)
+    return {pool: {"points_per_hour": points[pool] / total, "tasks": tasks[pool]}
+            for pool, total in hours.items()}
+
+
 _PrKey = tuple[str, int]
 
 
@@ -1746,6 +1764,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "sample_windows": sample_windows,
         "weeks": _weeks(weeks),
         "metrics": {"windows": metric_windows, "weeks": _weeks(bounded_weeks)},
+        "worker_allowance": _worker_allowance([row for row in rows if row.moment >= until - timedelta(days=7)]),
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict(),
                      "publications": dict(sorted(publication_counts.items())),
                      # Blocked-to-approved head pairs whose changed files were read from a local checkout.
@@ -1878,6 +1897,14 @@ async def model_stats(
         body["coverage"] = {**coverage, "landing": _page_landing(coverage["landing"])}
     payload = {**body, **snapshot[window_key][window], "status": "ok", "age_seconds": round(age, 1)}
     return JSONResponse(payload, headers=headers)
+
+
+@router.get("/planning")
+def model_planning(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
+    """Planning data is independent of the selected model-statistics window."""
+    snapshot = cached_snapshot(ctx)
+    rates = snapshot[0].get("worker_allowance", {}) if snapshot and snapshot[1] <= FRESHNESS_BOUND_SECONDS else {}
+    return JSONResponse(planning.payload(ctx, rates), headers={"Cache-Control": "no-store"})
 
 
 # Grafana's contract (docs/runbooks/model-stats.md): names and label sets change only with that runbook.
