@@ -1559,13 +1559,11 @@ def _end_lingering(child: subprocess.Popen, spec: TaskSpec) -> None:
 
 
 def _verdict_failure(record: dict, text: str | None) -> str | None:
-    """Why a successful review must fail its requested verdict gate (``--require-review-verdict``), or None."""
-    if record.get("schema_version") != 2 or record.get("require_review_verdict") is not True:
-        return None
+    """Check a Ukrainian verdict or diagnose an unstructured code-review reply."""
     try:
         from lu_machinery.review.verdict_parser import recognized_verdicts
 
-        verdicts = set(recognized_verdicts(text))
+        verdicts = set(recognized_verdicts(text or ""))
     except Exception:
         return "review_gate_error"
     if not verdicts:
@@ -1603,30 +1601,19 @@ def _correction_stdin(prior: str) -> bytes:
     ).encode()
 
 
-def _format_correction(record: dict, schema: dict | None, text: str | None, launches: int) -> tuple[bytes, dict] | None:
-    """A second launch when a code review cannot bind a schema and the reply cannot be a receipt.
+def _format_correction(record: dict, text: str | None, launches: int) -> tuple[bytes, dict] | None:
+    """A second launch after the receipt gate refuses a schemaless code review.
 
     Schema-capable providers fail closed on their own schema check. An ambiguous
     reply is not rewritten into one verdict. One launch is the limit.
     """
-    if schema is not None or launches >= 1 or record.get("require_review_verdict") is not True:
+    if launches >= 1 or record.get("require_review_verdict") is not True:
         return None
     if not text or not text.strip():
         return None
-    from lu_machinery.review.review_contract import (
-        ContractError,
-        canonical_receipt_payload,
-        decision_lock,
-        schema_path,
-    )
+    from lu_machinery.review.review_contract import decision_lock, schema_path
 
     if schema_path(profile=record.get("review_profile"), task=record) is None:
-        return None
-    try:
-        canonical_receipt_payload(text)
-    except ContractError:
-        pass
-    else:
         return None
     lock = decision_lock(text)
     # A correction is accepted only when this reply already states one decision.
@@ -1636,7 +1623,7 @@ def _format_correction(record: dict, schema: dict | None, text: str | None, laun
     return _correction_stdin(text), lock
 
 
-def _receipt_failure(record: dict, text: str | None) -> str | None:
+def _receipt_failure(record: dict, text: str | None, *, lock: dict | None = None) -> str | None:
     """A code review settles only when the reply is a canonical receipt.
 
     A verdict line alone is not a receipt. Ukrainian reviews do not use this
@@ -1644,27 +1631,25 @@ def _receipt_failure(record: dict, text: str | None) -> str | None:
     """
     if record.get("schema_version") != 2 or record.get("require_review_verdict") is not True:
         return None
-    from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload, schema_path
-
-    if schema_path(profile=record.get("review_profile"), task=record) is None:
-        return None
-    try:
-        canonical_receipt_payload(text or "")
-    except ContractError:
-        return _verdict_failure(record, text) or "review_gate_error"
-    return None
-
-
-def _corrected_reply_refusal(lock: dict, text: str | None) -> str | None:
-    """Refuse a correction that is still not a receipt, or that changes the locked decision."""
-    from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload, same_decision
+    from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload, same_decision, schema_path
 
     try:
+        if schema_path(profile=record.get("review_profile"), task=record) is None:
+            return _verdict_failure(record, text)
         payload = canonical_receipt_payload(text or "")
-    except ContractError:
-        return _verdict_failure({"schema_version": 2, "require_review_verdict": True}, text) or "review_gate_error"
-    if not same_decision(lock, payload):
-        return "review_ambiguous_verdict"
+        if lock is not None and not same_decision(lock, payload):
+            return "review_ambiguous_verdict"
+    except ContractError as exc:
+        # A present but invalid findings object is a contract failure. The
+        # Markdown scanner is only needed to diagnose replies without one.
+        if str(exc).startswith((
+            "empty_review_input", "non_json_or_chatter:", "legacy_FINDING_text_removed:",
+            "review_envelope_invalid_headers", "review_envelope_duplicate_",
+        )):
+            return _verdict_failure(record, text) or "review_gate_error"
+        return "review_gate_error"
+    except Exception:
+        return "review_gate_error"
     return None
 
 
@@ -1864,7 +1849,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 # place in the task's private stdout log.
                 with stdout_path.open("w", encoding="utf-8") as trace:
                     trace.writelines(json.dumps(call, ensure_ascii=False) + "\n" for call in outcome.trace)
-            if status == "done" and (refusal := _verdict_failure(record, text)):
+            if status == "done" and (refusal := _receipt_failure(record, text)):
                 status, error = "failed", refusal
             return
         schema = None
@@ -2046,8 +2031,10 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 continuations += 1
                 continue
             text = parsed.text
-            if parsed.error is None and (
-                correction := _format_correction(record, schema, text, correction_launches)
+            receipt_checked = parsed.error is None and schema is None
+            review_refusal = _receipt_failure(record, text, lock=locked) if receipt_checked else None
+            if review_refusal and (
+                correction := _format_correction(record, text, correction_launches)
             ):
                 pending_correction, locked = correction
                 correction_launches += 1
@@ -2101,16 +2088,14 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             from lu_machinery.dispatcher.providers.agy import AgyParsedResult
 
             if isinstance(parsed, AgyParsedResult) and parsed.terminal_warning:
-                from lu_machinery.agent_runtime.adapters._output_schema import json_value
-                from lu_machinery.review.review_contract import ContractError, validate_reviewer_payload
+                from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload
 
                 try:
-                    payload = json_value(text)
-                    if isinstance(payload, dict):
-                        validate_reviewer_payload(payload)
-                        transport_warning = parsed.terminal_warning
-                except (ContractError, RecursionError):
+                    canonical_receipt_payload(text)
+                except (ContractError, ValueError, RecursionError):
                     pass
+                else:
+                    transport_warning = parsed.terminal_warning
         status = "done" if exit_code == 0 and (not parsed.error or transport_warning) and text and text.strip() else "failed"
         if exit_code < 0:
             status = "crashed"
@@ -2164,12 +2149,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 if (attested := executor_failure(spec, stdout)) is not None:
                     record.update(_stream_attestation(MODEL_USAGE_SOURCE, attested[0]))
                     refusal = attested[1]
-            if not refusal and locked is not None:
-                refusal = _corrected_reply_refusal(locked, text)
             if not refusal:
-                refusal = _receipt_failure(record, text)
-            if not refusal:
-                refusal = _verdict_failure(record, text)
+                refusal = review_refusal if receipt_checked else _receipt_failure(record, text, lock=locked)
             if refusal:
                 if record["provider_terminal_failure"]:
                     record["provider_failure_rescue_refusal"] = refusal

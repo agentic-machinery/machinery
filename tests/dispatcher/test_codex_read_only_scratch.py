@@ -582,7 +582,7 @@ def test_verdict_gate_accepts_ukrainian_item_judgments_block(tmp_path):
         '"finding": "", "sources": "VESUM", "quote": "слово"}]}\n'
         "```\n"
     )
-    assert worker._verdict_failure(_item_review_record(tmp_path), reply) is None
+    assert worker._receipt_failure(_item_review_record(tmp_path), reply) is None
 
 
 @pytest.mark.usefixtures('configured_roots')
@@ -590,7 +590,7 @@ def test_verdict_gate_accepts_ukrainian_item_judgments_block(tmp_path):
 def test_verdict_gate_refuses_ukrainian_reply_without_block_or_verdict(tmp_path):
     """Defect class (#12417): a Ukrainian reply with neither a valid block nor a verdict passes the gate."""
     reply = "```ukrainian-item-judgments\n{not valid json\n```\n"
-    assert worker._verdict_failure(_item_review_record(tmp_path), reply) == "review_missing_verdict_line"
+    assert worker._receipt_failure(_item_review_record(tmp_path), reply) == "review_missing_verdict_line"
 
 
 @pytest.mark.usefixtures('configured_roots')
@@ -603,7 +603,7 @@ def test_verdict_gate_code_review_without_verdict_still_fails(tmp_path):
         '"finding": "", "sources": "VESUM", "quote": "слово"}]}\n'
         "```\n"
     )
-    assert worker._verdict_failure(_item_review_record(tmp_path, "code"), reply) == "review_missing_verdict_line"
+    assert worker._receipt_failure(_item_review_record(tmp_path, "code"), reply) == "review_missing_verdict_line"
 
 
 @pytest.mark.usefixtures('configured_roots')
@@ -636,7 +636,7 @@ def test_agy_structured_terminal_not_response(case):
         assert parsed.error is None
         assert json.loads(parsed.text) == payload
         assert recognized_verdicts(parsed.text) == ["APPROVE"]
-        assert worker._verdict_failure({"schema_version": 2, "require_review_verdict": True}, parsed.text) is None
+        assert worker._receipt_failure({"schema_version": 2, "require_review_verdict": True}, parsed.text) is None
     else:
         assert parsed.error is not None
 

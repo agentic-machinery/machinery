@@ -1,6 +1,7 @@
 """Incomplete review replies cannot authorize a merge (#12254)."""
 
 import pytest
+from lu_machinery.dispatcher.worker import _format_correction
 from lu_machinery.review.record_cf_verdict import RecordError, normalize_verdict
 
 
@@ -16,6 +17,8 @@ def test_truncated_findings_block_beside_approve_is_inconclusive():
     )
     with pytest.raises(RecordError, match=r"inconclusive.*findings"):
         normalize_verdict(reply)
+    review = {"schema_version": 2, "require_review_verdict": True, "review_profile": "code"}
+    assert _format_correction(review, reply, 0) is None
 
 
 def test_reply_stating_incomplete_review_is_inconclusive():

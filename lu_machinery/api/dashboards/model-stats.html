@@ -160,7 +160,7 @@
     <p class="note">These counts group dispatches refused before execution by cause and role. Fewer refusals generally mean fewer dispatches lost before work starts.</p>
     <div id="never-started">Loading…</div></section>
   <section><h2>Reviews <span class="meta" id="reviews-meta"></span></h2>
-    <p class="note">The count above includes settled reviews for this selection, and fewer unreadable or unfinished results are better. Compare approval and findings with the sample size and type of review in mind.</p>
+    <p class="note">The count above includes settled reviews and other read-only tasks. Evidence absent counts tasks with neither review metadata nor a readable verdict. Look for fewer unreadable or unfinished results. Compare approval and findings with the sample size and type of review in mind.</p>
     <div id="review">Loading…</div>
     <div id="unparsed-samples"></div></section>
   <section><h2>Compare reviewer levels</h2>
@@ -258,10 +258,15 @@ function samplesOf(model) {
 }
 function reviewRow(r, kind) {
   const v = r.verdicts, u = r.unparsed_reasons || {}, samples = kind ? {} : samplesOf(r.model);
-  const notDone = pct(r.not_done) + (u.not_done ? ` <span class="muted">(${num(u.not_done)})</span>` : "");
+  const unfinished = r.tasks - r.status.done;
+  const notDone = pct(r.not_done) + (unfinished ? ` <span class="muted">(${num(unfinished)})</span>` : "");
   const totalUnparsed = num(v.unparsed) + (u.unknown ? ` <span class="muted" title="legacy rows without a recorded reason">(+${num(u.unknown)} legacy)</span>` : "");
+  const absent = Object.entries(r.review_evidence_absent || {});
+  const absentTotal = absent.reduce((total, [, count]) => total + count, 0);
+  const absentReasons = absent.map(([reason, count]) => `${reason.replaceAll("_", " ")} ${num(count)}`).join(", ");
   return `<tr class="${kind || ""}"><td>${rowName(r, kind)}</td>${cell(nOf({n: r.tasks, low_sample: r.low_sample}))}${cell(notDone)}`
     + `${cell(`${v.correct} / ${v.incorrect} / ${v.uncertain}`)}${cell(totalUnparsed, v.unparsed ? "warn" : "")}`
+    + reasonCell(absentTotal, absentReasons || null)
     + `${reasonCell(u.missing_result)}${reasonCell(u.too_big)}`
     + `${reasonCell(u.bad_format, samples.bad_format)}${reasonCell(u.bad_fields, samples.bad_fields)}`
     + `${cell(withSample(pct(r.approve_rate), r.approve_rate.n))}`
@@ -739,8 +744,8 @@ function render() {
   $("reviews-meta").textContent = `${label}; n = ${total(reviews)} tasks`;
   $("never-started").innerHTML = neverStarted(data.models);
   $("review").innerHTML = table(["Model / effort", "Tasks", "Not done", "Approve / changes / block", "Unreadable",
-    "Missing result", "Too big", "Bad format", "Bad fields",
-    "Approve %", "Blocking per review", "P0–P2 per review", "Median min", "p90 min"], withClasses(data.models, "review", reviewRow, 14));
+    "Evidence absent", "Missing result", "Too big", "Bad format", "Bad fields",
+    "Approve %", "Blocking per review", "P0–P2 per review", "Median min", "p90 min"], withClasses(data.models, "review", reviewRow, 15));
   $("unparsed-samples").innerHTML = unparsedSamples(reviews);
   const after = (a, key) => a.after_blocked_first_round.blocked ? pct(a.after_blocked_first_round[key]) : "—";
   const authors = (data.authors || []).filter((a) => keepAuthor(a.model));
