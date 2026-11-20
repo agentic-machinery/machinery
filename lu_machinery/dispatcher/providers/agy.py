@@ -1,19 +1,27 @@
 """AGY headless user-event envelope and terminal result extraction."""
 
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.dispatcher import agy_sandbox
-from lu_machinery.dispatcher.providers import read_only_refusal
+from lu_machinery.dispatcher.providers import (
+    has_ambient_sources_config,
+    read_only_refusal,
+    workspace_sources_refusal,
+)
 from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER, one_model
 from lu_machinery.dispatcher.providers.stream_json import model_observer as _observe
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, StartRefusal, TaskSpec
 from lu_machinery.dispatcher.watchdog import deadlines
+
+_LOG = logging.getLogger(__name__)
 
 MODEL_SOURCE = "agy-stream-json"
 
@@ -251,6 +259,15 @@ def schema_argument(options: dict) -> str | None:
     return argument
 
 
+def _workspace_sources_settings() -> str:
+    """Session-only ``--settings`` JSON denying persisting Sources MCP tools without touching user settings."""
+    _, writers = sources_tool_sets()
+    return json.dumps(
+        {"permissions": {"deny": [f"mcp({SOURCES_SERVER}/{name})" for name in writers]}},
+        separators=(",", ":"),
+    )
+
+
 def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     argv = ["agy", "--mode", "auto", "--input-format", "stream-json", "--output-format", "stream-json"]
     argv += ["--model", transport_model(spec.model)]
@@ -258,6 +275,15 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     if (argument := schema_argument(spec.options)) is not None:
         argv += ["--json-schema", argument]
     if spec.mode == "workspace-write":
+        if refusal := workspace_sources_refusal(spec, env):
+            raise ValueError(refusal)
+        if not has_ambient_sources_config("agy", worktree=spec.worktree, env=env):
+            _LOG.warning(
+                "agy_sources_mcp_unavailable: agy CLI has no per-invocation MCP server flag or env var and "
+                "~/.gemini/config/mcp_config.json defines no active %r server",
+                SOURCES_SERVER,
+            )
+        argv += ["--settings", _workspace_sources_settings()]
         # AGY runs its commands in its first workspace folder, so the worktree comes before any read root (#423);
         # without it the commands ran in the first read root (the shared skills directory of the code checkout).
         argv += ["--add-dir", str(spec.worktree), "--log-file", str(spec.final_file.with_suffix(".log"))]

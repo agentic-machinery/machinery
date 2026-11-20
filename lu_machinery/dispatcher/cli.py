@@ -625,6 +625,8 @@ def _dispatch(args) -> int:
     with admission.record_refusal(args, agent, StartRefusal.BOUNDARY):
         if args.mode == "read-only" and (refusal := providers.read_only_refusal(agent, child_env(spec))):
             raise ValueError(refusal)
+        if args.mode == "workspace-write" and (refusal := providers.workspace_sources_refusal(spec, child_env(spec))):
+            raise ValueError(refusal)
         if (args.mode == "read-only" and not binding and agent not in {"agy", "muse"}
                 and (refusal := agy_sandbox.native_unavailable())):
             raise ValueError(f"read_only_unenforceable: {refusal}")

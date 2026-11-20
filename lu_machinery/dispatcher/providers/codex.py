@@ -4,6 +4,7 @@ import copy
 import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -16,9 +17,12 @@ from lu_machinery.agent_runtime.attempt_safe_read import safe_read_attempt_file
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
+from lu_machinery.dispatcher.providers import is_ukrainian_content_task, load_product_sources_server
 from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from lu_machinery.review.product_hooks import attempt_hooks
+
+_LOG = logging.getLogger(__name__)
 
 
 @functools.cache
@@ -182,19 +186,48 @@ def _strict_schema_path(spec: TaskSpec, document: dict) -> str:
     return str(path)
 
 
-def _workspace_sources_transport() -> list[str]:
-    """The Sources URL a workspace-write run names, or nothing when the product declares no server.
+def _toml_inline_table(mapping: Mapping[str, str]) -> str:
+    return "{" + ",".join(f"{json.dumps(key)}={json.dumps(value)}" for key, value in mapping.items()) + "}"
 
-    Write workers run outside the boundary, so no task-local config.toml defines Sources.
-    The URL is the product checkout entry the Claude provider passes for the same mode.
+
+def _workspace_sources_transport(spec: TaskSpec | None = None) -> list[str]:
+    """The Sources transport flags for a workspace-write run, from ``product_root()/.mcp.json``.
+
+    Write workers run outside the boundary, so no task-local config.toml defines Sources. Supports
+    both HTTP ``url`` and stdio ``command``/``args``/``env``/``cwd`` entries from the product
+    checkout's ``.mcp.json`` (never the task worktree). Fails closed on malformed entries or when
+    Sources is missing on a Ukrainian-content task; warns when missing on other tasks.
     """
-    from lu_machinery.dispatcher.providers.claude import _sources_mcp_config
-
-    server = json_depth.loads(_sources_mcp_config("workspace-write"), max_depth=512)["mcpServers"].get(SOURCES_SERVER)
-    url = server.get("url") if isinstance(server, dict) else None
-    if not isinstance(url, str) or not url.strip():
+    server = load_product_sources_server("codex")
+    if server is None:
+        if spec is not None and is_ukrainian_content_task(spec.options):
+            raise ValueError(
+                f"codex_sources_mcp_unavailable: product .mcp.json declares no active {SOURCES_SERVER!r} "
+                "MCP server for this Ukrainian-content write task"
+            )
+        _LOG.warning(
+            "codex_sources_mcp_unavailable: product .mcp.json declares no active %r MCP server; "
+            "continuing without dispatcher-configured Sources transport",
+            SOURCES_SERVER,
+        )
         return []
-    return ["-c", "mcp_servers.sources.url=" + json.dumps(url)]
+    if server.url is not None:
+        flags = ["-c", "mcp_servers.sources.url=" + json.dumps(server.url)]
+        if server.headers:
+            flags += ["-c", "mcp_servers.sources.http_headers=" + _toml_inline_table(server.headers)]
+        return flags
+    assert server.command is not None
+    flags = [
+        "-c",
+        "mcp_servers.sources.command=" + json.dumps(server.command),
+        "-c",
+        "mcp_servers.sources.args=" + json.dumps(list(server.args)),
+    ]
+    if server.env:
+        flags += ["-c", "mcp_servers.sources.env=" + _toml_inline_table(server.env)]
+    if server.cwd is not None:
+        flags += ["-c", "mcp_servers.sources.cwd=" + json.dumps(server.cwd)]
+    return flags
 
 
 def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
@@ -217,7 +250,7 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     # workspace-write run has no boundary config, so the argv also names the server's transport.
     sources = _sources_read_only_flags(sources_tool_sets()[0])
     if spec.mode == "workspace-write":
-        sources = [*_workspace_sources_transport(), *sources]
+        sources = [*_workspace_sources_transport(spec), *sources]
     argv += ["--disable", "apps", *sources]
     if spec.mode in {"read-only", "workspace-write"}:
         # Read-only reviews use the supervisor's worktree/Git mounts; an inner sandbox cannot

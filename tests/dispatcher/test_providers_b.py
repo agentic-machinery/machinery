@@ -356,8 +356,16 @@ def test_cli_prompt_or_mode_regression(tmp_path, monkeypatch, provider, mode, ef
                      else ["--approve-mcps", "--sandbox", "disabled", "--force"])
     else:
         expected += ["--dangerously-skip-permissions"]
-        expected += ["--print-timeout", "7260s", "--add-dir", str(worktree),
-                     "--log-file", str(final.with_suffix(".log"))]
+        expected += ["--print-timeout", "7260s"]
+        if mode == "workspace-write":
+            expected += [
+                "--settings",
+                json.dumps(
+                    {"permissions": {"deny": [f"mcp(sources/{name})" for name in sources_tool_sets()[1]]}},
+                    separators=(",", ":"),
+                ),
+            ]
+        expected += ["--add-dir", str(worktree), "--log-file", str(final.with_suffix(".log"))]
     proc = subprocess.run(
         invocation.argv, input=invocation.stdin, env=invocation.env, cwd=worktree, capture_output=True, timeout=10
     )
