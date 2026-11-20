@@ -595,6 +595,43 @@ def test_routing_status_of_a_pool_running_out_before_reset_is_never_cool(usage_f
     absent_pace["pace"] = {"status": "unknown", "reason": "not_reported"}
     assert subscriptions.pool_status(absent_pace)["pace_reason"] == "weekly_used_up"
 
+    # A supplied expected percentage that is not a percentage stays unknown. Only a
+    # missing one is filled from the reset, and that fill uses the reset the window
+    # reader already accepted. A cap that says it lasts stays cool when the pace is early.
+    supplied = cache["pools"]["Codex b"]
+    supplied["usage"]["pace"]["secondary"].update(deltaPercent=10.0, willLastToReset=False, etaSeconds=7200)
+    supplied["usage"]["usage"]["secondary"]["usedPercent"] = 60.0
+    supplied["usage"]["usage"]["secondary"]["resetsAt"] = "2030-01-05T00:00:00Z"
+    for bad_expected in (False, "60", [], {}, 150, -1, float("nan"), float("inf")):
+        supplied["usage"]["pace"]["secondary"]["expectedUsedPercent"] = bad_expected
+        row = subscriptions._cache_account(supplied, _fixture_now(), provider="codex")
+        assert row["pace"]["reason"] == "not_reported"
+        assert subscriptions.pool_status(row)["status"] == "unknown"
+    supplied["usage"]["pace"]["secondary"]["expectedUsedPercent"] = None
+    filled = subscriptions._cache_account(supplied, _fixture_now(), provider="codex")
+    assert subscriptions.pool_status(filled)["status"] == "hot"
+    supplied["usage"]["pace"]["secondary"]["expectedUsedPercent"] = 0.96
+    supplied["usage"]["pace"]["secondary"]["willLastToReset"] = True
+    supplied["usage"]["usage"]["secondary"]["usedPercent"] = 99.0
+    lasting = subscriptions.pool_status(subscriptions._cache_account(supplied, _fixture_now(), provider="codex"))
+    assert lasting["status"] == "cool" and lasting["pace_reason"] != "weekly_used_up"
+    supplied["usage"]["pace"]["secondary"]["willLastToReset"] = False
+    assert subscriptions.pool_status(
+        subscriptions._cache_account(supplied, _fixture_now(), provider="codex"))["pace_reason"] == "weekly_used_up"
+    del supplied["usage"]["pace"]["secondary"]["expectedUsedPercent"]
+    supplied["usage"]["usage"]["secondary"]["resetsAt"] = "0001-01-01T00:00:00+01:00"
+    unreadable_reset = subscriptions._cache_account(supplied, _fixture_now(), provider="codex")
+    assert unreadable_reset["reading"]["reason"] != "unreadable_reading"
+    assert subscriptions.pool_status(unreadable_reset)["pace_reason"] == "weekly_used_up"
+    supplied["usage"]["usage"]["secondary"]["resetsAt"] = 10**400
+    huge_reset = subscriptions._cache_account(supplied, _fixture_now(), provider="codex")
+    assert huge_reset["reading"]["reason"] != "unreadable_reading"
+    assert subscriptions.pool_status(huge_reset)["pace_reason"] == "weekly_used_up"
+    supplied["usage"]["usage"]["secondary"].update(usedPercent=1.0, resetsAt="2030-01-08T11:30:00Z")
+    supplied["usage"]["pace"]["secondary"]["deltaPercent"] = 0.48
+    assert subscriptions.pool_status(
+        subscriptions._cache_account(supplied, _fixture_now(), provider="codex"))["pace_reason"] == "too_early_in_window"
+
 
 def test_routing_status_of_an_unseen_pool_is_unknown_not_cool(usage_files):
     """Defect class: an account the reader cannot see (Codex b absent from the usage cache, Codex a with no

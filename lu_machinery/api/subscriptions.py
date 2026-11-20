@@ -60,6 +60,7 @@ from .subscription_usage import (
     compute_usage_pace,
     format_usage_pace_summary,
     get_provider_usage_data,
+    pace_expected_pct,
     pace_is_deficit,
     pace_is_visible,
 )
@@ -211,12 +212,16 @@ def _pace(delta: float | None, expected: float | None, lasts: Any, runs_out: dat
     if isinstance(delta, bool) or not isinstance(delta, (int, float)) or not -100 <= delta <= 100:
         return _unknown("not_reported")
     raw_expected = _number(expected)
-    if raw_expected is None or not 0 <= raw_expected <= 100:
-        raw_expected = None
-    elif not pace_is_visible({"expected_pct": raw_expected}):
+    if expected is not None and (raw_expected is None or not 0 <= raw_expected <= 100):
+        return _unknown("not_reported")
+    if raw_expected is not None and not pace_is_visible({"expected_pct": raw_expected}):
         # The visibility floor sees the provider's percentage. Rounding it onto
-        # the floor would publish an early window as a pace verdict.
-        return _unknown("too_early_in_window")
+        # the floor would publish an early window as a pace verdict. A positive
+        # lasts flag stays, so a cap reading that lasts is not near_cap.
+        hidden = _unknown("too_early_in_window")
+        if lasts is True:
+            hidden["lasts_to_reset"] = True
+        return hidden
     # ``state`` keeps the unrounded delta's side of the band. Headroom is rounded for display.
     state = "on_pace" if abs(delta) <= ON_PACE_BAND_PCT else "deficit" if delta > 0 else "reserve"
     lasts_to_reset = lasts if isinstance(lasts, bool) else None
@@ -357,21 +362,24 @@ def _cache_usage(entry: Mapping[str, Any], read_at: datetime, now: datetime, *, 
 
     pace = _dict(report.get("pace")).get(weekly_key) if weekly_key else None
     if isinstance(pace, dict):
-        # A provider pace that omits the expected percentage still has one: the same
-        # elapsed fraction ``compute_usage_pace`` uses, so the visibility floor and
-        # ``pace_is_deficit`` see it. Rounding happens only after that.
-        expected = _number(pace.get("expectedUsedPercent"))
-        if expected is None and weekly_key is not None:
-            raw_window = windows[weekly_key]
-            minutes = _number(raw_window.get("windowMinutes"))
-            computed = compute_usage_pace(
-                _number(raw_window.get("usedPercent")) or 0.0, raw_window.get("resetsAt"),
-                window_minutes=None if minutes is None else int(minutes), now=read_at)
-            if isinstance(computed, dict):
-                expected = _number(computed.get("expected_pct"))
-        runs_out = _after(read_at, _number(pace.get("etaSeconds")))
-        result["pace"] = _pace(_number(pace.get("deltaPercent")), expected,
-                               pace.get("willLastToReset"), runs_out, pace.get("summary"), now)
+        # An omitted expected percentage is the elapsed fraction of the weekly reset
+        # the window reader already accepted. A supplied value that is not a
+        # percentage is unknown; it is not replaced by that fraction.
+        if "expectedUsedPercent" not in pace or pace.get("expectedUsedPercent") is None:
+            expected = pace_expected_pct(
+                {"resets_at": result["weekly"].get("resets_at"),
+                 "window_minutes": result["weekly"].get("window_minutes")},
+                now=read_at)
+            rejected = False
+        else:
+            expected = _number(pace.get("expectedUsedPercent"))
+            rejected = expected is None or not 0 <= expected <= 100
+        if rejected:
+            result["pace"] = _unknown("not_reported")
+        else:
+            runs_out = _after(read_at, _number(pace.get("etaSeconds")))
+            result["pace"] = _pace(_number(pace.get("deltaPercent")), expected,
+                                   pace.get("willLastToReset"), runs_out, pace.get("summary"), now)
     else:  # CodexBar gives no pace for this window (AGY): the same algorithm, computed here
         result["pace"] = _computed_pace(result["weekly"], read_at, now)
 
@@ -634,8 +642,8 @@ def pool_status(row: Mapping[str, Any]) -> dict[str, Any]:
         return verdict("unknown", reading.get("reason") or "no_reading")
     if weekly.get("status") != "ok":
         return verdict("unknown", weekly.get("reason") or "no_weekly_window")
-    used = weekly.get("used_pct")
-    if not _percent_in_range(used):
+    used = _number(weekly.get("used_pct"))
+    if used is None or not 0.0 <= used <= 100.0:
         return verdict("unknown", "unreadable_reading")
     if pace.get("status") == "ok" and not _pace_row_readable(pace):
         return verdict("unknown", "unreadable_reading")
