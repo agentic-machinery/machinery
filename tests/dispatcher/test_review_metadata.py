@@ -269,7 +269,12 @@ def test_reviewer_excludes_every_branch_author_family(dispatch, monkeypatch, tmp
     assert refusal in capsys.readouterr().err
     # A reviewer from a third family (Google; Grok is retired, GROK-CANCEL-1110) is outside every author family.
     outside = ("agy", "gemini-4-neon-high")
-    if trailers and refusal.startswith("["):
+    if refusal == "['anthropic', 'openai']":
+        # A mixed-family head needs the Anthropic/OpenAI pair whatever the profile label: the recorder's rule binds
+        # at dispatch, so a Google seat is refused before a round is spent (#58).
+        dispatch(*review, agent=outside[0], model=outside[1], expected=2, refusal="review_setup_refusal")
+        assert "mixed-family review requires an Anthropic or OpenAI seat" in capsys.readouterr().err
+    elif trailers and refusal.startswith("["):
         if "--dry-run" in flags:
             assert cli.main(["dispatch", "--agent", outside[0], "--model", outside[1],
                              "--prompt", "Review this change", *review]) == 0
@@ -321,6 +326,49 @@ def test_fourth_default_tier_review_dispatch_is_refused_without_any_recorded_ver
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
+
+
+@pytest.mark.parametrize("agent,model,profile,refusal", [
+    ("claude", "claude-sonnet-5-5", ("--review-profile", "ukrainian"), "Ukrainian review needs a Gemini or Sol seat"),
+    ("agy", "gemini-4-neon-high", ("--review-profile", " Ukrainian "), "protected scope needs a code-profile review"),
+    ("claude", "claude-sonnet-5-5", ("--review-profile", "Code"), "Sonnet is excluded from security review"),
+    ("claude", "claude-sonnet-5-5", (), "Sonnet is excluded from security review"),
+    ("claude", "claude-opus-5-5", ("--review-profile", "code"), None),
+])
+def test_mislabelled_review_dispatch_cannot_avoid_the_critical_floor(dispatch, monkeypatch, tmp_path, capsys,
+                                                                  agent, model, profile, refusal):
+    """Defect class: mislabelled review dispatch avoids the critical floor (#58)."""
+    repo, origin = tmp_path / "repo", tmp_path / "origin.git"
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@example.invalid")
+
+    def run(*args):
+        command = ["git", "-C", str(repo), *args]
+        return subprocess.run(command, check=True, capture_output=True, text=True, env=env, timeout=30).stdout.strip()
+
+    repo.mkdir()
+    run("init", "-q", "--initial-branch=main")
+    run("commit", "-q", "--allow-empty", "-m", "base")
+    run("clone", "-q", "--bare", str(repo), str(origin))
+    run("remote", "add", "origin", str(origin))
+    secure = repo / "lu_machinery" / "dispatcher" / "example.py"
+    secure.parent.mkdir(parents=True)
+    secure.write_text("VALUE = 1\n")
+    run("add", "lu_machinery/dispatcher/example.py")
+    run("commit", "-q", "-m", f"work\n\nX-Agent: codex/{CURRENT_SOL}")
+    head = run("rev-parse", "HEAD")
+    monkeypatch.setattr(git, "resolve_repo", lambda _: (repo, dict(key="public", github="example/public")))
+    monkeypatch.setattr(git, "review_branch_start", lambda *a, **k: head)
+    monkeypatch.setattr(git, "worktree_plan", lambda *a, **k: (tmp_path, "claude/branch", head))
+    monkeypatch.setattr(checks, "check_branch_author_families", BRANCH_AUTHOR_FAMILIES)
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    review = ("--mode", "read-only", "--branch", "review/target", "--risk", "low", *profile)
+    if refusal is None:
+        assert dispatch(*review, agent=agent, model=model)["model"] == model
+    else:
+        dispatch(*review, agent=agent, model=model, expected=2, refusal="review_setup_refusal")
+        assert refusal in capsys.readouterr().err
 
 
 def test_mixed_family_head_refuses_neon(dispatch, monkeypatch, tmp_path, capsys):

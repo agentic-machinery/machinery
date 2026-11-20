@@ -509,6 +509,18 @@ def check_branch_author_families(args, repo: Path, repository: dict, head_sha: s
             f"review independence: reviewer family {reviewer or 'unknown'} is not outside the branch's author "
             f"families {sorted(facts.excluded_families)}; choose a reviewer from another family"
         )
+    # Whatever its profile label, a review of a branch or PR is qualified by the verdict recorder's own rule on
+    # these facts before a round is spent: the critical floor and the Ukrainian seat rules bind here (#58). A
+    # trial never supplies review of record.
+    if (args.branch or args.pr) and not args.trial_role:
+        from lu_machinery.dispatcher.cli import ALIASES
+        from lu_machinery.review.record_cf_verdict import _require_qualified_reviewer
+
+        task = {**vars(args), "agent": ALIASES.get(args.agent, args.agent), "review_risk": args.risk}
+        try:
+            _require_qualified_reviewer(facts, task=task, model=reviewer_model, family=reviewer)
+        except RecordError as exc:
+            raise ValueError(f"review admission: {exc}") from None
 
 
 # ``#N`` or ``owner/repo#N``: the card flag, an override, and the only dependency entry the gate reads.
