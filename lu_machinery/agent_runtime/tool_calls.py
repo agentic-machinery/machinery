@@ -325,6 +325,13 @@ def _coerce_arguments(value: Any) -> dict[str, Any]:
 
 
 def _tool_output(payload: Mapping[str, Any]) -> Any:
+    # A Codex ``mcp_tool_call`` item keeps a failed call's tool-error text in
+    # ``result`` (status ``failed``, no ``isError``), and a started item has no
+    # result yet. Only a completed, error-free item carries tool output.
+    if _payload_type(payload) == "mcp_tool_call" and (
+        payload.get("status") != "completed" or payload.get("error") is not None
+    ):
+        return None
     for key in ("output", "result", "content", "observation"):
         if key in payload:
             return _coerce_tool_output(payload.get(key))

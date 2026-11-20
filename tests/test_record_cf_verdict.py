@@ -2281,8 +2281,12 @@ def test_unbound_ukrainian_source_claims_refused_before_publication(
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
-def test_codex_server_tool_sources_call_supports_unbound_claims(monkeypatch, tmp_path):
-    """Defect: a Codex mcp_tool_call names its call only by server and tool, so its Sources output went uncaptured."""
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_codex_server_tool_sources_call_supports_unbound_claims(monkeypatch, tmp_path, status):
+    """Defect: a Codex mcp_tool_call names its call only by server and tool, so its Sources output went uncaptured.
+
+    A failed call keeps its tool-error text in ``result``; that text must never support a claim.
+    """
     from lu_machinery.review.review_contract import build_item_packet
     from lu_machinery.review.review_contract import render_item_packet
     from tests.helpers.codex_exec_stream import completed_stream, item_started, mcp_call
@@ -2297,16 +2301,24 @@ def test_codex_server_tool_sources_call_supports_unbound_claims(monkeypatch, tmp
         "items": [{"id": "item-a", "verdict": "APPROVE", "finding": claim, "sources": "none"}],
     }) + "\n```\n"
     # The event pair `codex exec --json` writes for one MCP call, as in a real Ukrainian-profile review trace.
+    # Codex marks a tool-reported error `failed` but keeps its text in `result`, with `error` null.
     arguments = {"query": "suffix"}
+    finished = mcp_call("sources", "search_style_guide", arguments, text=claim, item_id="item_7")
+    finished["item"]["status"] = status
     log = tasks / "logs" / "review-one.stdout.log"
     log.parent.mkdir(exist_ok=True)
     log.write_text(completed_stream(
         item_started("item_7", "mcp_tool_call", server="sources", tool="search_style_guide", arguments=arguments,
                      result=None, error=None, status="in_progress"),
-        mcp_call("sources", "search_style_guide", arguments, text=claim, item_id="item_7"),
+        finished,
     ))
     write_task(tasks, reply=reply, review_profile="ukrainian", sources_mcp_call_count=1,
                prompt_file=str(prompt), prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest())
+    if status == "failed":
+        with pytest.raises(recorder.RecordError, match="UKRAINIAN_CLAIMS_UNSUPPORTED"):
+            recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+        assert comments == [] and calls == {"posts": 0, "statuses": 0}
+        return
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert result["verdict"] == "APPROVED"
     assert len(comments) == 1 and calls == {"posts": 1, "statuses": 1}
