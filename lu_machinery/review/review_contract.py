@@ -433,10 +433,12 @@ def decision_lock(raw: str) -> dict[str, Any]:
     only when exactly one findings object is readable, even if it does not
     yet validate.
     """
-    from lu_machinery.review.verdict_parser import recognized_verdicts
+    from lu_machinery.review.verdict_parser import declares_incomplete_review, recognized_verdicts
 
     try:
         objects = _json_objects(_outside_blockquotes(raw))
+        incomplete = declares_incomplete_review(raw)
+        verdicts = list(dict.fromkeys(recognized_verdicts(raw)))
     except (ValueError, RecursionError):
         return {"ambiguous": True, "verdicts": [], "payload": None}
     candidates: list[dict[str, Any]] = []
@@ -448,9 +450,8 @@ def decision_lock(raw: str) -> dict[str, Any]:
         if key not in seen:
             seen.add(key)
             candidates.append(payload)
-    verdicts = list(dict.fromkeys(recognized_verdicts(raw)))
     return {
-        "ambiguous": len(candidates) > 1 or len(verdicts) > 1,
+        "ambiguous": incomplete or len(candidates) > 1 or len(verdicts) > 1,
         "verdicts": verdicts,
         "payload": candidates[0] if len(candidates) == 1 else None,
     }
