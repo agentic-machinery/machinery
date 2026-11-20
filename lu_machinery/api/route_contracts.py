@@ -484,6 +484,22 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         response_schema_version="model-stats.v2",
     ),
     RouteContract(
+        "/api/fleet/model-stats/planning",
+        "exact",
+        "http",
+        "Open-issue blocker ranking, ready cards with non-overlapping write paths, and pool allowance at next reset.",
+        "Registered GitHub issue inventories and dependency states, the internal active delegate snapshot, "
+        "the existing Prometheus pool series and cached subscription meters, and settled task allowance readings.",
+        "Issue snapshots refresh on demand every 300 seconds and are stale after 420 seconds. "
+        "The live-worker snapshot must be at most 10 seconds old to show ready-now entries. "
+        "Meter reads refresh every 30 seconds. Unmeasured forecasts are unknown.",
+        ("model-stats.html", "operators"),
+        "Private issue identities, issue text and worker paths stay internal. Private issues count toward the graph.",
+        "medium if incomplete inputs are mistaken for complete planning data",
+        "keep as a read-only planning view",
+        response_schema_version="model-planning.v1",
+    ),
+    RouteContract(
         "/api/git/pull-requests",
         "exact",
         "http",
@@ -725,7 +741,8 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Model value, waste and speed: best-value frontier, per-class job ranking, status mix, weekly trends, "
         "reviewer strictness, wall-time distributions, pool allowance, observed wall hours per landed task "
         "(wall_hours_observed), and write/review/author tables labelled with window and sample size.",
-        "GET /api/fleet/model-stats?window=24h|7d|30d|90d|all&view=page and GET /api/state/routing-budget.",
+        "GET /api/fleet/model-stats?window=24h|7d|30d|90d|all&view=page, GET /api/state/routing-budget, "
+        "and GET /api/fleet/model-stats/planning.",
         "HTTP read on load and on window change; the model-stats snapshot is at most 420 seconds old and its age is "
         "shown.",
         ("humans", "operators"),

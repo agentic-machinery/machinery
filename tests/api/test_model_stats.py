@@ -16,6 +16,7 @@ import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -24,10 +25,14 @@ from prometheus_client import CollectorRegistry, generate_latest
 from lu_machinery.agent_runtime import model_pause
 from lu_machinery.api import model_stats_router as stats
 from lu_machinery.api import model_stats_rows as rows
-from lu_machinery.api.monitor_context import get_ctx
-from lu_machinery.api.state_helpers import cache_invalidate
+from lu_machinery.api import planning
+from lu_machinery.api.delegate_router import active_snapshot
+from lu_machinery.api.monitor_context import fixture_context, get_ctx
+from lu_machinery.api.state_helpers import cache_get_or_compute, cache_invalidate, ctx_scoped_ttl_key
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import store, worker
+from lu_machinery.github_rest_cache import RestPage, RestResult
+from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 NOW = datetime(2026, 11, 15, 12, tzinfo=UTC)
 SINCE = NOW - timedelta(days=7)
@@ -70,6 +75,157 @@ def _record(tasks: Path, task_id: str, **fields) -> dict:
               "finished_at": (NOW - timedelta(hours=1)).isoformat(), **fields}
     (tasks / f"{task_id}.json").write_text(json.dumps(record))
     return record
+
+
+def test_planning_ranks_product_blocker_and_withholds_colliding_cards(tmp_path, monkeypatch):
+    """Diamond dependencies count once, and a ready issue cannot overlap a live grant."""
+    product, machinery, private = "sample/product", "sample/machinery", "sample/private"
+    repos = {slug: FleetRepo(slug, slug, slug.rsplit("/", 1)[1], role) for slug, role in (
+        (product, "public-product"), (machinery, "public-machinery"), (private, "private-infra"))}
+    title = "Product: remove the classified in-tree machinery copy"
+    product_ref = f"{product}#13032"
+
+    def issue(value, name, deps, scope="src/later.py"):
+        return {"number": value, "title": name, "state": "OPEN",
+                "body": f"## In scope\n{scope}\n\n## Dependencies\n{deps}\n"}
+
+    inventories = {
+        product: [issue(13032, title, "None", "src/shared.py")],
+        machinery: [
+            issue(503, "Redirect runtime callers", title),
+            issue(505, "Remove duplicate API", product_ref),
+            issue(519, "Remove mirrored readers", "#503; #505"),
+            issue(525, "Run issue checks", "#519"),
+            issue(584, "Ready card with collision", "#581", "`src/owned/worker.py`"),
+            issue(585, "Ready card on a sibling prefix", "#581", "src/owned-extra/file.py"),
+            issue(586, "Unknown dependency", "#404", "docs/guide.md"),
+            issue(587, "Scope is in prose", "None", "Refine the reader"),
+            issue(588, "Unresolved cycle", "#589"),
+            issue(589, "Unresolved cycle partner", "#588"),
+        ],
+        private: [issue(999, "Private work", product_ref)],
+    }
+    monkeypatch.setattr(planning, "load_fleet_repos", lambda: repos)
+    monkeypatch.setattr(planning.github, "list_open_issues",
+                        lambda repo, **_: RestPage(inventories[repo], truncated=False))
+    monkeypatch.setattr(planning.github, "issue_states", lambda repo, numbers, **_: {
+        issue: "closed" for issue in numbers if (repo, issue) in {(machinery, 581), (product, 13032)}})
+
+    def search(endpoint, **_):
+        terms = parse_qs(urlsplit(endpoint).query)["q"][0]
+        candidates = [{"title": title, "repository_url": f"https://api.github.com/repos/{product}", "number": 13032}
+                      ] if title in terms else []
+        return RestResult(200, {"items": candidates, "total_count": len(candidates), "incomplete_results": False},
+                          None, None, False)
+
+    monkeypatch.setattr(planning.github, "shared_cache", lambda: SimpleNamespace(get_json=search))
+    context = fixture_context(tmp_path)
+    tasks = context.roots.batch_state_dir / "tasks"
+    tasks.mkdir(parents=True)
+    _record(tasks, "live-writer", status="spawning", repository=machinery,
+            owned_paths=["src/shared.py"], run_nonce="run",
+            owned_path_grants=[{"grant_id": "grant", "task_id": "live-writer", "run_nonce": "run",
+                                "owned_paths": ["src/owned"]}])
+    _record(tasks, "observer", status="spawning", mode="read-only", owned_paths=["src/owned-extra"])
+    active_snapshot(context).refresh()
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _: None)
+    app = FastAPI()
+    app.state.ctx = context
+    app.include_router(stats.router, prefix="/api/fleet/model-stats")
+
+    key = ctx_scoped_ttl_key(context, "planning", "issues", context.roots)
+    cache_get_or_compute(key, 300, planning.collect_issues)
+    meter_key = ctx_scoped_ttl_key(context, "planning", "meters", context.roots)
+    cache_get_or_compute(meter_key, 30, lambda: planning.MeterSnapshot({}, {}, {}))
+    with TestClient(app) as client:
+        response = client.get("/api/fleet/model-stats/planning")
+        assert response.status_code == 200
+        result = response.json()["issues"]
+        assert result["coverage"]["open_issues"] == 12
+        assert result["coverage"]["dependency_unknown"] == 1
+        assert result["blockers"][0] == {"ref": product_ref, "direct": 3, "total": 5}
+        assert result["blocked"][0] == {"ref": f"{machinery}#503", "blocked_by": [product_ref], "private_blockers": 0}
+        assert result["ready_now"] == [{"ref": f"{machinery}#585"}, {"ref": product_ref}]
+        assert result["coverage"]["path_conflicts"] == 1
+        assert result["coverage"]["scope_unknown"] == 1
+        assert private not in response.text
+        assert "src/owned" not in response.text
+
+        inventories[product] = []
+        cache_invalidate(key)
+        cache_get_or_compute(key, 300, planning.collect_issues)
+        closed = client.get("/api/fleet/model-stats/planning").json()["issues"]
+        assert all(row["ref"] != product_ref for row in closed["blockers"])
+        assert {"ref": f"{machinery}#503"} in closed["ready_now"]
+        assert {"ref": f"{machinery}#505"} in closed["ready_now"]
+
+
+def test_planning_forecast_matches_two_meter_readings(tmp_path, monkeypatch):
+    """Recent burn comes from two observations of one reset window, independent of the reported average."""
+    now = datetime.now(UTC)
+    earlier = now - timedelta(hours=2, minutes=10)
+    reset = now + timedelta(hours=25)
+
+    def series(name, value, *, previous=False, pool=None):
+        metric = {"__name__": name}
+        if previous:
+            metric["planning_sample"] = "previous"
+        if pool is not None:
+            metric["pool"] = pool
+        return {"metric": metric, "value": [now.timestamp(), str(value)]}
+
+    samples = []
+    for previous, when, remaining in ((False, now, 20), (True, earlier, 21)):
+        samples.extend([
+            series("lu_cto_source_ok", 1, previous=previous),
+            series("node_textfile_mtime_seconds", when.timestamp(), previous=previous),
+            series("lu_cto_pool_left_percent", remaining, previous=previous, pool="claude-a"),
+            series("lu_cto_pool_reset_days", round((reset - when).total_seconds() / 86400, 1),
+                   previous=previous, pool="claude-a"),
+        ])
+    samples.extend([
+        series("lu_cto_pool_burn_percent_per_hour", 0.9, pool="claude-a"),
+        series("lu_cto_pool_sustainable_percent_per_hour", 0.8, pool="claude-a"),
+    ])
+    monkeypatch.setattr(planning, "_prometheus", lambda: samples)
+    monkeypatch.setattr(planning.subscriptions, "subscriptions_snapshot", lambda **_: {"providers": [{
+        "accounts": [{"account": "Claude a", "reading": {"status": "fresh"},
+                      "weekly": {"status": "ok", "used_pct_exact": 80, "resets_at": reset.isoformat()}},
+                     {"account": "Codex b", "reading": {"status": "fresh"},
+                      "weekly": {"status": "ok", "used_pct_exact": 40, "resets_at": reset.isoformat()}}],
+    }]})
+    rates = {"claude:a": {"points_per_hour": 0.2, "tasks": 12}}
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _: ({"worker_allowance": rates}, 0.0))
+    context = fixture_context(tmp_path)
+    for name, value in (("issues", None), ("meters", planning.collect_meters())):
+        key = ctx_scoped_ttl_key(context, "planning", name, context.roots)
+        cache_get_or_compute(key, 300, lambda value=value: value)
+    app = FastAPI()
+    app.state.ctx = context
+    app.include_router(stats.router, prefix="/api/fleet/model-stats")
+    with TestClient(app) as client:
+        data = client.get("/api/fleet/model-stats/planning").json()
+    pools = {row["pool"]: row for row in data["capacity"]}
+    assert set(pools) == {"claude:a", "claude:b", "codex:a", "codex:b", "agy:gemini", "agy:claude_gpt", "grok"}
+    claude = pools["claude:a"]
+    # 20 points left, 1 point used in 130 minutes, and 25 hours to reset.
+    assert abs(claude["unused_pct"] - 8.46) < 0.1
+    assert claude["burn_pct_per_hour"] == 0.462
+    assert claude["reported_burn_pct_per_hour"] == 0.9
+    assert claude["workers_needed"] == 2
+    assert claude["worker_samples"] == 12
+    assert pools["codex:b"]["remaining_pct"] == 60
+    assert pools["codex:b"]["unused_pct"] is None
+
+    meter_key = ctx_scoped_ttl_key(context, "planning", "meters", context.roots)
+    for row in samples:
+        if row["metric"] == {"__name__": "lu_cto_pool_left_percent", "planning_sample": "previous", "pool": "claude-a"}:
+            row["value"][1] = "19"  # The remaining allowance rose between samples.
+    cache_invalidate(meter_key)
+    cache_get_or_compute(meter_key, 30, planning.collect_meters)
+    with TestClient(app) as client:
+        data = client.get("/api/fleet/model-stats/planning").json()
+    assert next(row for row in data["capacity"] if row["pool"] == "claude:a")["unused_pct"] is None
 
 
 def _review(tasks: Path, task_id: str, correctness: str, priorities: list[str], **fields) -> None:
