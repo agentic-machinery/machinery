@@ -535,17 +535,21 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
     author, reviewer, risk = "author.example.invalid", "reviewer.example.invalid", "risk.example.invalid"
     repo = "repository.example.invalid"
     for i in range(10):
-        _record(tasks, f"w{i}", resolved_model=model, resolved_model_known=True, effort=effort,
+        _record(tasks, f"w{i}", resolved_model=model, resolved_model_known=True, effort="medium",
                 research_task_family=task_class, duration_s=3600)
-    _record(tasks, "w10", model="second-worker.example.invalid", effort="second-effort.example.invalid",
+    _record(tasks, "w10", model="second-worker.example.invalid", effort=effort,
             research_task_family="second-class.example.invalid", duration_s=3600)
     for i in range(10):
         _record(tasks, f"known{i}", research_task_family="bounded", duration_s=3600)
     _record(tasks, "cursor-auto", agent="cursor", model="auto")
     _record(tasks, "agy-unreported", agent="agy", resolved_model="unrecognized", resolved_model_known=True)
     _review(tasks, "r1-review", "correct", [], pr=1, repo=repo, review_author_model=author,
-            resolved_model=reviewer, effort=effort, review_risk=risk)
+            resolved_model=reviewer, effort="medium", review_risk=risk)
     _review(tasks, "r2-review", "incorrect", [], pr=2, repo="public", review_author_model="gpt-6.1-sol")
+    _review(tasks, "unknown-effort-review", "incorrect", [], pr=3, repo="public", review_author_model="gpt-6.1-sol",
+            effort=None, pinned_head="1" * 40, started_at=_at(4))
+    _review(tasks, "later-known-review", "correct", [], pr=3, repo="public", review_author_model="gpt-6.1-sol",
+            pinned_head="2" * 40, started_at=_at(3))
     rows.backfill(tasks, batch_state)
     landing = stats.Landing(task_ids={"w0", "w10", "known0"})
     landing.by_repository.update({"public": 1, repo: 2, "second-repository.example.invalid": 3})
@@ -561,23 +565,31 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
         page = client.get("/api/fleet/model-stats?view=page")
 
     assert full.status_code == page.status_code == 200
-    assert all(label in full.text for label in (model, effort, task_class, author, reviewer, risk, repo))
+    assert all(label in full.text for label in (model, task_class, author, reviewer, risk, repo))
+    assert effort not in full.text
     assert ".example.invalid" not in page.text
     payload = page.json()
-    assert _row(payload, "other", "write")["tasks"] == 11
-    assert [(e["effort"], e["tasks"]) for e in _row(payload, "other", "write")["by_effort"]] == [("other", 11)]
+    other = _row(payload, "other", "write")
+    assert (other["tasks"], other["landed"], other["wall_seconds"]["total_seconds"]) == (10, 1, 36000)
+    assert [(e["effort"], e["tasks"], e["landed"]) for e in other["by_effort"]] == [
+        ("medium", 10, 1), ("unknown", 1, 1),
+    ]
     assert _row(payload, "gpt-6.1-sol", "write")["tasks"] == 10
     assert _row(payload, "auto", "write")["identity"] == "harness_choice"
     assert _row(payload, "unrecognized", "write")["identity"] == "unreported"
     assert [(a["model"], a["prs"]) for a in payload["authors"]] == [("gpt-6.1-sol", 1), ("other", 1)]
+    opus = _row(payload, "claude-opus-5-5", "review")
+    assert (opus["tasks"], opus["approve_rate"]["n"]) == (2, 2)
+    assert [(e["effort"], e["tasks"]) for e in opus["by_effort"]] == [("high", 2), ("unknown", 1)]
     assert {(c["author"], c["reviewer"], c["class"]) for c in payload["first_round_matrix"]} == {
         ("other", "other", "all"), ("other", "other", "other"),
         ("gpt-6.1-sol", "claude-opus-5-5", "all"), ("gpt-6.1-sol", "claude-opus-5-5", "code/medium"),
     }
     assert [(r["model"], [level["effort"] for level in r["levels"]])
-            for r in payload["review_levels"] if r["model"] == "other"] == [("other", ["other"])]
-    assert [(job["class"], job["tasks"], job["models"][0]["model"]) for job in payload["charts"]["jobs"]] == [
-        ("other", 11, "other"), ("bounded", 10, "gpt-6.1-sol"),
+            for r in payload["review_levels"] if r["model"] == "other"] == [("other", ["medium"])]
+    assert [(job["class"], job["tasks"], job["models"][0]["model"], job["models"][0]["efforts"])
+            for job in payload["charts"]["jobs"]] == [
+        ("bounded", 10, "gpt-6.1-sol", ["high"]), ("other", 10, "other", ["medium"]),
     ]
     assert payload["coverage"]["landing"]["trailer_task_ids_by_repository"] == {"other": 5, "public": 1}
     # A joint author keeps its join on the page, each member bounded like a model label.
@@ -643,7 +655,7 @@ def _serve(snapshot: dict, tmp_path: Path, monkeypatch) -> TestClient:
 def _page_label_ok(text: str, labels: set[str], models: set[str]) -> bool:
     if text in labels or text in models or text in _PAGE_SENTENCES:
         return True
-    if stats.VARIANT_SUFFIX.fullmatch(text):
+    if rows.VARIANT_SUFFIX.fullmatch(text):
         return True
     if "+" in text:
         return all(part in models for part in text.split("+"))
@@ -678,7 +690,7 @@ def test_samples_view_returns_the_reply_text_view_page_omits(tmp_path, monkeypat
     assert body["status"] == "ok" and set(body) == {"schema_version", "status", "age_seconds", "window", "models"}
     found = [model for model in body["models"] if model["model"] == "claude-opus-5-5" and model["role"] == "review"]
     assert found == [{"model": "claude-opus-5-5", "role": "review",
-                      "unparsed_samples": {"bad_format": _LEAK}}]
+                      "unparsed_samples": {"bad_format": _LEAK}, "unparsed_sample_efforts": {"bad_format": "high"}}]
     assert _LEAK in full.text
     review = _row(page.json(), "claude-opus-5-5", "review")
     assert review["unparsed_reasons"]["bad_format"] == 1
@@ -697,7 +709,7 @@ def test_page_view_string_leaves_stay_closed_for_every_window(tmp_path, monkeypa
     models = set(stats._known_models()) | set(stats._NOT_CONCRETE) | {stats.OTHER}
     labels = {
         *stats.WINDOWS, stats.SCHEMA_VERSION, "ok", *stats.STATUSES, "other", *rows.VERDICTS,
-        *stats.UNPARSED_REASON_KEYS, *stats._PAGE_CLASSES, stats.ALL_CLASSES, *stats._KNOWN_EFFORTS,
+        *stats.UNPARSED_REASON_KEYS, *stats._PAGE_CLASSES, stats.ALL_CLASSES, rows.UNKNOWN_EFFORT,
         stats.ALL_EFFORTS, *rows.POOLS, *stats.FINDING_OUTCOMES, *stats.AFTER_BLOCK, *stats._RISK_ORDER,
         *stats.VALID_RISKS, "unknown", *stats.START_REFUSAL_CODES, *{value for value in stats._NOT_CONCRETE.values()},
         "catalog", "joint", "not_in_catalog", "write", "review", *repo_keys, "read", "unavailable",
@@ -920,7 +932,7 @@ def test_missing_meter_reading_records_unknown_never_zero(tmp_path, monkeypatch)
         "value": None, "n": 2, "low_sample": True}
 
 
-def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
+def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, monkeypatch):
     """Defect class: effort or model version collapsed into a family, a default or another class's figures."""
     batch_state, tasks = _state(tmp_path)
     cases = {
@@ -943,6 +955,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
                          resolved_model_known=True, effort=None),
         "kimi-slash": dict(agent="kimi", model="kimi-code/k3-256k", effort=None),
         "kimi-alias": dict(agent="kimi", model="k3-256k", effort=None),
+        "glm-alias": dict(agent="glm", model="zai-coding-plan/glm-5.3", effort="high"),
         "deepseek-prefix": dict(agent="deepseek", model="deepseek-direct/deepseek-v4-flash", effort=None),
         "attested-over-auto": dict(agent="cursor", model="auto", resolved_model="Grok 4.7 256K High",
                                    resolved_model_known=True, effort=None),
@@ -974,23 +987,36 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         "composer": ("composer-2.5", "unset"),
         "kimi-slash": ("kimi-code/k3-256k", "unset"),
         "kimi-alias": ("kimi-code/k3-256k", "unset"),
+        "glm-alias": ("glm-5.3", "high"),
         "deepseek-prefix": ("deepseek-v4-flash", "unset"),
         "attested-over-auto": ("grok-4.7", "unset"),
         "attested-fast-over-request": ("unknown", "unset"),
         "attested-kimi-over-request": ("kimi-code/k3-256k", "unset"),
     }
     flash = _row(window, "gemini-3.8-flash-high", "write")
-    assert flash["effort"] == "all" and [(e["effort"], e["tasks"]) for e in flash["by_effort"]] == [
-        ("medium", 1), ("unset", 1)]
-    assert {(r["model"], e["effort"]) for r in window["models"] for e in r["by_effort"]} == set(stored.values())
+    assert (flash["effort"], flash["efforts"], flash["tasks"]) == ("all", ["medium"], 1)
+    assert [(e["effort"], e["tasks"]) for e in flash["by_effort"]] == [("medium", 1), ("unknown", 1)]
+    assert {(r["model"], e["effort"]) for r in window["models"] for e in r["by_effort"]} == {
+        ("grok-4.7", "high"), ("grok-4.7", "unknown"), ("gemini-3.8-flash-high", "medium"),
+        ("gemini-3.8-flash-high", "unknown"), ("opus", "unknown"), ("claude-opus-5-5", "xhigh"),
+        ("opus", "high"), ("claude-opus-5-5", "unknown"), ("claude-opus-5-6", "high"),
+        ("gpt-6.1-sol", "unknown"), ("unknown", "unknown"), ("composer-2.5", "unknown"),
+        ("deepseek-v4-flash", "unknown"),
+    }
     sol = _row(window, "gpt-6.1-sol", "write")
-    assert [(e["effort"], [c["class"] for c in e["by_class"]]) for e in sol["by_effort"]] == [("request-0", ["docs"])]
+    assert sol["tasks"] == 0
+    assert [(e["effort"], [c["class"] for c in e["by_class"]]) for e in sol["by_effort"]] == [("unknown", ["docs"])]
     # /metrics keeps finite label sets: values outside the catalog's known set export as "other".
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    with _serve(snapshot, tmp_path, monkeypatch) as client:
+        for view in ("full", "page", "samples"):
+            response = client.get(f"/api/fleet/model-stats?window=all&view={view}")
+            assert response.status_code == 200
+            assert not re.search(r"\b(?:glm|kimi)", response.text, re.I), view
     assert "24h" in snapshot["windows"] and "24h" not in snapshot["metrics"]["windows"]
     metrics = snapshot["metrics"]["windows"]["all"]
     exported = {(r["model"], e["effort"]) for r in metrics["models"] for e in r["by_effort"]}
-    assert ("gpt-6.1-sol", "other") in exported and ("other", "high") in exported
+    assert ("gpt-6.1-sol", "unknown") in exported and ("other", "high") in exported
     assert not {"request-0", "claude-opus-5-6"} & {value for pair in exported for value in pair}
     page = stats.page_window(snapshot["windows"]["all"])
     dropped = ("by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed",
@@ -1182,6 +1208,8 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     _record(tasks, "neon-later-review", mode="read-only", agent="agy", model="gemini-4-neon-high",
             options={"pinned_head": "2" * 40}, duration_s=180)
     (tasks / "neon-later-review.result").write_text("VERDICT: APPROVE\nSCORE: 9/10\n\nReviewed the complete diff.")
+    _review(tasks, "neon-unknown-review", "correct", [], agent="agy", model="gemini-4-neon",
+            resolved_model="gemini-4-neon", effort=None, duration_s=10000)
     _record(tasks, "grok-review", mode="read-only", agent="cursor", model="grok-4.7-high",
             status="failed")
     _record(tasks, "landed", delivery_pr="example/repo#9", delivery_merge_sha="3" * 40)
@@ -1240,6 +1268,8 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     assert author["after_blocked_first_round"]["blocked"] == 0
     neon_chart = window["charts"]["neon"]
     assert neon_chart["enough"] is False
+    unknown_arm = neon_chart["unknown_effort"]
+    assert (unknown_arm["effort"], unknown_arm["review_tasks"], unknown_arm["review_results"]) == ("unknown", 1, 1)
     arms = {arm["effort"]: arm for arm in neon_chart["arms"]}
     assert {effort: arm["review_results"] for effort, arm in arms.items()} == {"medium": 1, "high": 1}
     assert (arms["medium"]["review_tasks"], arms["medium"]["blocking_per_review"], arms["medium"]["p0_p2_per_review"],
@@ -1558,7 +1588,8 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     assert snapshot["coverage"]["finding_heads"] == {"pairs": 2, "read": 1}
     assert snapshot["coverage"]["publications"] == {"lines": 22, "tasks": 22}
     opus = {
-        "model": "claude-opus-5-5", "identity": "catalog", "blocking_reviews": 8, "reviews_unknown_publication": 4,
+        "model": "claude-opus-5-5", "identity": "catalog", "efforts": ["high"],
+        "blocking_reviews": 8, "reviews_unknown_publication": 4,
         "reviews_without_paths": 0, "blocking_findings": 8, "fixed": 2, "dismissed": 1, "open": 4, "unknown": 1,
         # PRs 1, 4 and 12 were approved later by Opus at another head; PR 4's blocked head could not be read.
         "reviews_approved_later": 3, "reviews_approved_later_read": 2,

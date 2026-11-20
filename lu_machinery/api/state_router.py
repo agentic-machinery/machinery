@@ -55,11 +55,12 @@ from .codexbar_usage import (
     trigger_background_refresh,
 )
 from .lane_health import LaneHealthScan, scan_lane_health
+from .model_stats_rows import retired_subscription_model
 from .monitor_context import MonitorContext, get_ctx
 from .project_state_store import REPORT_TTL_SECONDS, get_freshest_lane_usage
 from .resilience import request_timeout_s
 from .rules_router import rules_hash
-from .runtime_router import summarize_runtime_usage
+from .runtime_router import _public_subscriptions, summarize_runtime_usage
 from .session_router import session_hash
 from .state_helpers import (
     cache_get_or_compute,
@@ -755,7 +756,8 @@ def _pool_pace(current_time: datetime) -> dict[str, Any]:
     except Exception as exc:  # the page reader must never break routing
         logging.getLogger("state_router").warning("pool pace unreadable: %s", type(exc).__name__)
         return {"source": "unreadable", "pools": subscriptions.pool_statuses({})}
-    return {"source": snapshot["sources"]["usage_cache"]["status"], "pools": subscriptions.pool_statuses(snapshot)}
+    return {"source": snapshot["sources"]["usage_cache"]["status"], "pools": subscriptions.pool_statuses(snapshot),
+            "subscriptions": snapshot}
 
 
 def _apply_pool_pace(records: Mapping[str, Any], pool_pace: Mapping[str, Any], warnings: list[str]) -> None:
@@ -1004,6 +1006,7 @@ def _compute_dispatch_routing_budget(
     curriculum_root: Path | None = None,
     batch_state_dir: Path | None = None,
     task_generation: list[str] | None = None,
+    include_subscriptions: bool = False,
 ) -> dict[str, Any]:
     current_time = (now or datetime.now(UTC)).astimezone(UTC)
     today = current_time.date()
@@ -1792,6 +1795,7 @@ def _compute_dispatch_routing_budget(
         "agents": agents,
         "codex_accounts": codex_accounts,
         "reset_reserve": reset_reserve,
+        **({"subscriptions": pool_pace.get("subscriptions")} if include_subscriptions else {}),
         "api_accounts": api_accounts,
         "in_flight": in_flight_by_agent,
         "recommendation": rec,
@@ -2062,6 +2066,7 @@ def compute_routing_budget(
     curriculum_root: Path | None = None,
     batch_state_dir: Path | None = None,
     task_generation: list[str] | None = None,
+    include_subscriptions: bool = False,
 ) -> dict[str, Any]:
     """Budget recommendations for native dispatch or ordinary ACP asks.
 
@@ -2070,6 +2075,7 @@ def compute_routing_budget(
     or unknown routes even when every participant is unavailable.
     When supplied, ``task_generation`` receives the observed in-flight scan's
     generation so HTTP caches can validate the counts without changing the payload.
+    The HTTP caller also retains the subscription snapshot for public projection.
     """
     if transport not in {"dispatch", "acp"}:
         raise ValueError("transport must be dispatch or acp")
@@ -2083,6 +2089,7 @@ def compute_routing_budget(
         curriculum_root=curriculum_root,
         batch_state_dir=batch_state_dir,
         task_generation=task_generation,
+        include_subscriptions=include_subscriptions,
     )
     budget["transport"] = transport
     # Per-account view (#10630): additive. ``agents.claude`` stays the
@@ -2192,6 +2199,13 @@ def _aged_routing_budget(
     if not isinstance(payload, dict):
         return payload
     served = {**payload, **(claude_account_routing_fields() if claude_fields is None else claude_fields)}
+    if isinstance(snapshot := payload.get("subscriptions"), dict):
+        served["subscriptions"] = subscriptions.age_snapshot(snapshot, age_s)
+    agents = panel_values.mapping(payload.get("agents"))
+    cursor = panel_values.mapping(agents.get("cursor"))
+    cursor_age = panel_values.number(cursor.get("age_s"))
+    if cursor_age is not None and cursor_age >= 0:
+        served["agents"] = {**agents, "cursor": {**cursor, "age_s": cursor_age + age_s}}
     diagnostics = payload.get("diagnostics")
     threshold = ROUTING_BUDGET_MAX_AGE_S
     reported_age = age_s
@@ -2339,6 +2353,7 @@ def _routing_budget_compute(
             curriculum_root=ctx.roots.curriculum_root,
             batch_state_dir=ctx.roots.batch_state_dir,
             task_generation=generation,
+            include_subscriptions=True,
         )
         observed = _RoutingBudgetGeneration(generation[0] if generation else None, directory_token, started_at)
         if (
@@ -2446,7 +2461,13 @@ def _public_routing_budget(raw: object, *, _depth: int = 0) -> dict[str, Any]:
     for key in ("allowed_models", "models_rate_limited", "credit_models"):
         if key in row:
             values = row[key] if isinstance(row[key], list) else []
-            out[key] = None if row[key] is None else [model for value in values[:64] if (model := panel_values.model(value)) is not None]
+            out[key] = None if row[key] is None else [
+                model for value in values[:64]
+                if (model := panel_values.model(value)) is not None and not retired_subscription_model(model)
+            ]
+    if _depth == 0 and "subscriptions" in row:
+        snapshot = row["subscriptions"]
+        out["subscriptions"] = _public_subscriptions(snapshot) if isinstance(snapshot, dict) else None
     if "covered_by" in row:
         values = row["covered_by"] if isinstance(row["covered_by"], list) else []
         out["covered_by"] = [value for value in values[:8]

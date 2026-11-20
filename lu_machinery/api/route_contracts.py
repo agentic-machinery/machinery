@@ -319,8 +319,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "Every subscription account's weekly usage, pace (headroom or deficit, run-out time), 5-hour and scoped windows, credits, banked resets and plan renewal or end, one row per account grouped by provider. Also lists non-retired catalog model IDs.",
         "The Monitor's validated per-account Claude snapshots, the host usage cache (Codex, AGY, Grok+Cursor), the operator's plan-facts file and the fleet model catalog.",
         "Generated per request from those caches and files only, never a provider call; each account carries its read time and is stale after 15 minutes; missing usage is typed unknown and an unreadable catalog is null.",
-        ("index.html", "subscriptions.html", "agents", "operators"),
-        "Complements /api/state/routing-budget, which decides routing; this route reports plan state for people and planners. The console command python -m lu_machinery.api.subscriptions prints the underlying usage snapshot.",
+        ("index.html", "agents", "operators"),
+        "The routing-budget route shares this subscription projection for the Subscriptions page. The console command python -m lu_machinery.api.subscriptions prints the underlying usage snapshot.",
         "medium if a stale or unknown reading is read as current headroom",
         "keep as the subscriptions view",
     ),
@@ -341,8 +341,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "/api/state/routing-budget",
         "exact",
         "http",
-        "Per-agent soft-cap burn and routing recommendation.",
-        f"{_rel('config', 'agent_budgets.yaml')}, cost records, delegate in-flight state, and the process-local CodexBar snapshot.",
+        "Per-agent soft-cap burn, routing recommendation, subscription account snapshots, and Cursor Auto and API windows.",
+        f"{_rel('config', 'agent_budgets.yaml')}, cost records, delegate in-flight state, process-local CodexBar, and the usage and plan-facts inputs shared with /api/runtime/subscriptions.",
         "15-second routing cache with background refresh of expired snapshots; age, state and the 900-second source bound are exposed in snapshot headers. Subscription usage has its own background scheduler. HTTP ?fresh_codexbar=true starts a refresh and returns cache/LKG without waiting for a probe.",
         ("subscriptions.html", "model-stats.html", "agents"),
         "Overlaps runtime usage and cost summaries but adds routing recommendation.",
@@ -467,7 +467,8 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "review class, what followed a blocked first round, routed catalog models idle in the window, cluster-grouped "
         "weekly allowance spent per landed task and ISO-week counts, each with its sample size (#581). /metrics exports "
         "selected gauges from the same cached snapshot for 7d, 30d, 90d, all and ISO weeks (omitting 24h, observed "
-        "wall hours and chart series).",
+        "wall hours and chart series). Comparisons list the observed effort levels. The unknown effort group is "
+        "reported separately and excluded from model totals.",
         "The durable model-stats summary rows under batch_state/model-stats/, written at settlement and "
         "backfilled from hot and archived task records, plus whole-line X-Agent trailers on each registered "
         "repository's local origin/main (never fetched) and the merged delivery each task recorded.",
@@ -676,8 +677,8 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
     PageContract(
         "subscriptions.html",
         "/subscriptions",
-        "Subscriptions: per-account weekly usage, pace, resets, 5-hour and scoped windows, credits, banked resets, plan renewal/end, sign-in state, and API account balances.",
-        "GET /api/runtime/subscriptions, /api/state/routing-budget and /api/runtime/logins.",
+        "Subscriptions: per-account weekly usage, pace, resets, 5-hour and scoped windows, credits, banked resets, plan renewal or end, sign-in state, Cursor Auto and API windows, and API account balances.",
+        "GET /api/state/routing-budget and /api/runtime/logins.",
         "HTTP reads every 30 seconds; stale or unverified readings hide actionable quota, pace, reset and balance figures.",
         ("humans", "operators"),
         "Full detail backing the Overview capacity summary.",

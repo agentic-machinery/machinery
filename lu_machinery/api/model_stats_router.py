@@ -12,7 +12,8 @@ window of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on
 ``/metrics`` keeps the four longer windows, so a 24-hour series does not add a label value. ``view=page`` serves
 the same figures without the per-class tree and without reply text. ``view=samples`` serves that reply text
 alone, and the page asks for it on its own. Every figure
-splits by the concrete model id and the effective effort (``unset`` when none was recorded); a bare Claude alias
+splits by the concrete model id and the effective effort. Unknown effort is shown separately from model totals.
+A bare Claude alias
 (``opus``) counts as the catalog model it ran only where the rows make that unambiguous. Definitions follow the
 CTO's 2026-11-15 reference scripts: a task is a review when its mode is ``read-only`` or its id names a review,
 otherwise a write. Reviewer totals include structured results from every lane. Author figures use reviews of
@@ -52,14 +53,15 @@ from lu_machinery.review.model_catalog import (
     MECHANICAL_FAMILIES,
     VALID_REVIEW_PROFILES,
     VALID_RISKS,
-    VARIANT_SUFFIX,
 )
 
 from .model_stats_rows import (
     NATIVE_ALIASES,
     POOLS,
+    UNKNOWN_EFFORT,
     UNPARSED_REASONS,
     VERDICTS,
+    comparison_effort,
     current_catalog_model_ids,
     fleet_catalog,
     model_catalog_reading,
@@ -68,6 +70,7 @@ from .model_stats_rows import (
     read_rows,
     refresh_readings,
     repository_keys,
+    retired_subscription_model,
     timestamp,
     variant_effort,
 )
@@ -87,7 +90,7 @@ WINDOWS: dict[str, int | None] = {"24h": 1, "7d": 7, "30d": 30, "90d": 90, "all"
 METRIC_WINDOWS = ("7d", "30d", "90d", "all")
 PAGE_DROP = frozenset({
     "by_class", "tokens", "fresh_input_tokens_per_landed", "output_tokens_per_landed",
-    "unparsed_samples"})
+    "unparsed_samples", "unparsed_sample_efforts"})
 # Snapshot sides the route never spreads into a response. ``sample_windows`` is served only by ``view=samples``.
 _UNSERVED = frozenset({"windows", "page_windows", "sample_windows", "metrics"})
 STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed", NEVER_STARTED)
@@ -447,7 +450,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
         counts = cast(dict[str, Any], raw.get("tokens")) if isinstance(raw.get("tokens"), Mapping) else {}
         yield _Row(
             task_id=raw["task_id"], model=resolve(str(raw.get("model") or "unknown"), moment),
-            effort=str(raw.get("effort") or "unset"),
+            effort=comparison_effort(raw.get("effort")),
             role=role, task_class=str(raw.get("class") or "unclassified"),
             status=row_status, moment=moment, started=timestamp(raw.get("started_at")),
             duration=None if row_status == NEVER_STARTED else _number(raw.get("duration_s")),
@@ -466,6 +469,7 @@ def _rows(raw_rows: Iterable[Mapping[str, Any]], landing: Landing,
 class _Group:
     def __init__(self) -> None:
         self.status: Counter[str] = Counter()
+        self.efforts: set[str] = set()
         self.durations: list[float] = []
         self.tokens = [0, 0, 0]
         self.landed = 0
@@ -473,7 +477,7 @@ class _Group:
         self.never_started_reasons: Counter[str] = Counter()
         self.unparsed_reasons: Counter[str] = Counter()
         self.review_evidence_absent: Counter[str] = Counter()
-        self.unparsed_samples: dict[str, tuple[tuple[datetime, str], str]] = {}
+        self.unparsed_samples: dict[str, tuple[tuple[datetime, str], str, str]] = {}
         self.priorities: Counter[str] = Counter()
         self.findings_n = 0
         self.allowance: Counter[str] = Counter()
@@ -481,6 +485,7 @@ class _Group:
 
     def add(self, row: _Row) -> None:
         self.status[row.status] += 1
+        self.efforts.add(row.effort)
         if row.status == NEVER_STARTED:
             reason = row.raw.get("never_started_reason")
             code = reason if isinstance(reason, str) and reason in START_REFUSAL_CODES else "unknown"
@@ -505,7 +510,7 @@ class _Group:
                         order = _review_order(row)
                         prev = self.unparsed_samples.get(key_reason)
                         if prev is None or order < prev[0]:
-                            self.unparsed_samples[key_reason] = (order, sample)
+                            self.unparsed_samples[key_reason] = (order, sample, row.effort)
         if row.role == "write" and row.allowance is not None:
             if row.allowance[1] < 0:  # the weekly window reset between the readings
                 self.allowance["reset_crossed"] += 1
@@ -517,6 +522,7 @@ class _Group:
     def merge(self, other: _Group) -> _Group:
         """Add another group's tasks: one pass over the rows, then cheap merges, builds every coarser group."""
         self.status.update(other.status)
+        self.efforts.update(other.efforts)
         self.durations.extend(other.durations)
         self.tokens = [a + b for a, b in zip(self.tokens, other.tokens, strict=True)]
         self.landed += other.landed
@@ -585,6 +591,8 @@ class _Group:
                     name: self.unparsed_samples[name][1]
                     for name in UNPARSED_REASONS if name in self.unparsed_samples
                 }
+                out["unparsed_sample_efforts"] = {name: self.unparsed_samples[name][2]
+                                                  for name in out["unparsed_samples"]}
         return out
 
 
@@ -604,31 +612,34 @@ def _fine(rows: Iterable[_Row]) -> _Fine:
 
 
 def _bounded(fine: _Fine) -> _Fine:
-    """The same groups under /metrics labels: a model or effort outside the catalog's known values is ``other``."""
+    """The same groups under /metrics labels: a model outside the catalog's known values is ``other``."""
     bounded: _Fine = defaultdict(_Group)
     for (model, role, effort, task_class), group in fine.items():
-        bounded[(metric_model(model), role, metric_effort(effort), task_class)].merge(group)
+        bounded[(metric_model(model), role, effort, task_class)].merge(group)
     return bounded
 
 
 def _models(fine: _Fine, *, include_samples: bool = True) -> list[dict[str, Any]]:
-    """Per (model, role): the totals over every effort and their class split, then per effort with its own classes."""
+    """Model and class totals use known effort. The per-effort rows also include unknown effort."""
     totals: dict[tuple[str, str], _Group] = defaultdict(_Group)
     classes: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
     efforts: dict[tuple[str, str], dict[str, _Group]] = defaultdict(lambda: defaultdict(_Group))
     effort_classes: dict[tuple[str, str, str], dict[str, _Group]] = defaultdict(dict)
     for (model, role, effort, task_class), group in fine.items():
         key = (model, role)
-        totals[key].merge(group)
-        classes[key][task_class].merge(group)
+        total = totals[key]
+        if effort != UNKNOWN_EFFORT:
+            total.merge(group)
+            classes[key][task_class].merge(group)
         efforts[key][effort].merge(group)
         effort_classes[(*key, effort)][task_class] = group
 
     def by_class(groups: Mapping[str, _Group], role: str) -> list[dict[str, Any]]:
-        return [{"class": name, **group.to_dict(role)} for name, group in _ordered(groups)]
+        return [{"class": name, "efforts": sorted(group.efforts), **group.to_dict(role)}
+                for name, group in _ordered(groups)]
 
     return [
-        {"model": model, "identity": identity(model), "role": role, "effort": ALL_EFFORTS,
+        {"model": model, "identity": identity(model), "role": role, "effort": ALL_EFFORTS, "efforts": sorted(group.efforts),
          **group.to_dict(role, include_samples=include_samples),
          "by_effort": [{"effort": effort, **cls.to_dict(role),
                         "by_class": by_class(effort_classes[(model, role, effort)], role)}
@@ -640,14 +651,18 @@ def _models(fine: _Fine, *, include_samples: bool = True) -> list[dict[str, Any]
 
 # A published verdict as the parsed verdict it stands for.
 _OF_RECORD = {"APPROVED": "correct", "CHANGES_REQUESTED": "incorrect", "BLOCKED": "uncertain"}
-_Review = tuple[datetime, str, str, Counter[str] | None, str, str, datetime]
+_Review = tuple[datetime, str, str, Counter[str] | None, str, str, datetime, str]
 
 
-def _outcome(by_head: Mapping[str, list[_Review]]) -> dict[str, Any]:
+def _outcome(by_head: Mapping[str, list[_Review]]) -> dict[str, Any] | None:
     """A PR's outcome over its rounds (the distinct heads, ordered by their first review's start)."""
     heads = sorted((sorted(reviews, key=lambda r: r[:2]) for reviews in by_head.values()),
                    key=lambda reviews: reviews[0][:2])
-    _, _, verdict, _, reviewer, review_class, first_moment = heads[0][0]
+    _, _, verdict, _, reviewer, review_class, first_moment, first_effort = heads[0][0]
+    efforts = {r[7] for head in heads for r in head}
+    # Dropping individual rounds would change the first round or turn an approval into a block.
+    if UNKNOWN_EFFORT in efforts or any(retired_subscription_model(r[4]) for head in heads for r in head):
+        return None
     after_block = None
     if verdict != "correct":
         after_block = ("approved_on_same_head" if any(r[2] == "correct" for r in heads[0][1:])
@@ -656,6 +671,7 @@ def _outcome(by_head: Mapping[str, list[_Review]]) -> dict[str, Any]:
     return {
         "rounds": len(heads), "first": verdict,
         "reviewer": reviewer, "class": review_class, "week": week_of(first_moment), "first_at": first_moment,
+        "effort": first_effort, "review_efforts": sorted(efforts),
         "after_block": after_block,
         "approved": any(r[2] == "correct" for h in heads for r in h),
         # Findings of each round: the head's first review.
@@ -693,9 +709,11 @@ def _prs(rows: Iterable[_Row], *, of_record: bool = False) -> list[dict[str, Any
         entry = prs[key]
         entry["authors"].add(author)
         entry["heads"][row.raw.get("pinned_head") or row.task_id].append(
-            (row.started or never, row.task_id, verdict, row.review[1], row.model, row.task_class, row.moment))
-    return [{"author": "+".join(sorted(entry["authors"])), "key": key, **_outcome(entry["heads"])}
-            for key, entry in prs.items()]
+            (row.started or never, row.task_id, verdict, row.review[1], row.model, row.task_class, row.moment, row.effort))
+    return [{"author": "+".join(sorted(entry["authors"])), "key": key, **outcome}
+            for key, entry in prs.items()
+            if not any(retired_subscription_model(author) for author in entry["authors"])
+            and (outcome := _outcome(entry["heads"])) is not None]
 
 
 AFTER_BLOCK = ("approved_on_new_head", "approved_on_same_head", "not_approved")
@@ -704,8 +722,11 @@ AFTER_BLOCK = ("approved_on_new_head", "approved_on_same_head", "not_approved")
 def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str) -> list[dict[str, Any]]:
     """Author-side review outcomes per author model (a PR with two author models is grouped under ``a+b``)."""
     by_author: dict[str, Counter[str]] = defaultdict(Counter)
+    efforts: dict[str, set[str]] = defaultdict(set)
     for pr in prs:
-        counts = by_author[name(pr["author"])]
+        author = name(pr["author"])
+        counts = by_author[author]
+        efforts[author].update(pr["review_efforts"])
         counts["prs"] += 1
         counts["rounds"] += pr["rounds"]
         counts["approved"] += pr["approved"]
@@ -718,7 +739,8 @@ def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str)
             counts["blocked"] += 1
             counts[pr["after_block"]] += 1
     return [
-        {"model": author, "identity": identity(author), "prs": c["prs"], "low_sample": c["prs"] < LOW_SAMPLE,
+        {"model": author, "identity": identity(author), "review_efforts": sorted(efforts[author]),
+         "prs": c["prs"], "low_sample": c["prs"] < LOW_SAMPLE,
          "rounds_per_pr": _rate(c["rounds"], c["prs"], 2),
          "approved_eventually": _rate(c["approved"], c["prs"]),
          "first_round_approved": _rate(c["first_round_approved"], c["prs"]),
@@ -735,12 +757,16 @@ def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str)
 def _matrix(prs: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """First-round approval per (author, first reviewer, review class), and per pair over every class (``all``)."""
     cells: dict[tuple[str, str, str], list[int]] = defaultdict(lambda: [0, 0])
+    efforts: dict[tuple[str, str, str], set[str]] = defaultdict(set)
     for pr in prs:
         for review_class in (ALL_CLASSES, pr["class"]):
-            cell = cells[(pr["author"], pr["reviewer"], review_class)]
+            key = (pr["author"], pr["reviewer"], review_class)
+            cell = cells[key]
+            efforts[key].add(pr["effort"])
             cell[0] += pr["first"] == "correct"
             cell[1] += 1
     return [{"author": author, "reviewer": reviewer, "class": review_class, "approved": approved,
+             "review_efforts": sorted(efforts[(author, reviewer, review_class)]),
              "first_round_approved": _rate(approved, n)}
             for (author, reviewer, review_class), (approved, n) in sorted(cells.items())]
 
@@ -815,14 +841,21 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     """
     rows = list(rows)
     counts: dict[str, Counter[str]] = defaultdict(Counter)
+    efforts: dict[str, set[str]] = defaultdict(set)
     for row in rows:
         # A formal review names its author's model; one dispatched by branch alone has no PR until a publication
         # supplies it, so the author model, not the PR, decides.
-        if (row.published is None and row.review_author is not None and row.review is not None
+        if (row.effort != UNKNOWN_EFFORT and row.published is None and row.review_author is not None and row.review is not None
                 and row.review[0] == "incorrect"):
-            counts[name(row.model)]["unknown_publication"] += 1
+            model = name(row.model)
+            counts[model]["unknown_publication"] += 1
+            efforts[model].add(row.effort)
     for row, later, paths, count in _blocking_reviews(rows):
-        tally = counts[name(row.model)]
+        if row.effort == UNKNOWN_EFFORT:
+            continue
+        model = name(row.model)
+        tally = counts[model]
+        efforts[model].add(row.effort)
         tally["reviews"] += 1
         if paths is None:
             tally["unknown"] += count or 0
@@ -847,7 +880,8 @@ def _finding_outcomes(rows: Iterable[_Row], touched: Mapping[_HeadPair, frozense
     for model, tally in sorted(counts.items(), key=lambda item: (-item[1]["reviews"], item[0])):
         decided = tally["fixed"] + tally["dismissed"]
         out.append({
-            "model": model, "identity": identity(model), "blocking_reviews": tally["reviews"],
+            "model": model, "identity": identity(model), "efforts": sorted(efforts[model]),
+            "blocking_reviews": tally["reviews"],
             "reviews_unknown_publication": tally["unknown_publication"],
             "reviews_without_paths": tally["reviews_without_paths"],
             "reviews_approved_later": tally["reviews_approved_later"],
@@ -876,9 +910,12 @@ def _author_risks(record_prs: Iterable[Mapping[str, Any]], prs: Iterable[Mapping
     record_prs = list(record_prs)
     recorded = {pr["key"] for pr in record_prs}
     cells: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
+    efforts: dict[tuple[str, str], set[str]] = defaultdict(set)
     without_record: Counter[str] = Counter(name(pr["author"]) for pr in prs if pr["key"] not in recorded)
     for pr in record_prs:
-        cell = cells[name(pr["author"])][_risk(pr["class"])]
+        author, risk = name(pr["author"]), _risk(pr["class"])
+        cell = cells[author][risk]
+        efforts[(author, risk)].update(pr["review_efforts"])
         cell["prs"] += 1
         cell["first_round_approved"] += pr["first"] == "correct"
         if pr["findings_known"]:
@@ -894,6 +931,7 @@ def _author_risks(record_prs: Iterable[Mapping[str, Any]], prs: Iterable[Mapping
 
     return [{"model": author, "identity": identity(author), "prs_without_review_of_record": without_record[author],
              "by_risk": [{"risk": risk, "prs": c["prs"], "low_sample": c["prs"] < LOW_SAMPLE,
+                          "review_efforts": sorted(efforts[(author, risk)]),
                           "first_round_approved": _rate(c["first_round_approved"], c["prs"]),
                           "blocking_per_pr": _rate(c["blocking"], c["findings_known"], 2),
                           "p0_p2_per_pr": _rate(c["p0_p2"], c["findings_known"], 2)}
@@ -1032,8 +1070,7 @@ def _selected(rows: list[_Row], predicate: Callable[[_Row], bool]) -> tuple[set[
 
 
 def _stamp_allowance(models: list[dict[str, Any]], rows: list[_Row], *,
-                     model_of: Callable[[str], str] = lambda model: model,
-                     effort_of: Callable[[str], str] = lambda effort: effort) -> None:
+                     model_of: Callable[[str], str] = lambda model: model) -> None:
     """Replace the summed per-task allowance with one net drop per overlapping cluster."""
     clusters = _clusters(rows)
 
@@ -1041,7 +1078,7 @@ def _stamp_allowance(models: list[dict[str, Any]], rows: list[_Row], *,
         def predicate(row: _Row) -> bool:
             if model_of(row.model) != name:
                 return False
-            if effort_name is not None and effort_of(row.effort) != effort_name:
+            if (row.effort == UNKNOWN_EFFORT if effort_name is None else row.effort != effort_name):
                 return False
             return class_name is None or row.task_class == class_name
         return _selected(rows, predicate)
@@ -1112,7 +1149,7 @@ def _review_levels(rows: list[_Row], models: list[dict[str, Any]], history: list
     landed: set[_PrKey] = set()
     for row in history:
         head = row.raw.get("pinned_head")
-        if row.landed and row.delivery:
+        if row.effort != UNKNOWN_EFFORT and row.landed and row.delivery:
             landed.add((row.raw["repo"], row.raw["landing"]["pr"]))
         if row.review is not None and (pr := _reviewed_pr(row)) is not None:
             if head:
@@ -1202,14 +1239,16 @@ def _observed_hours(model: Mapping[str, Any]) -> float | None:
 
 def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[_Row]) -> dict[str, Any]:
     """The page's chart series. Counts only: no task id, prompt, path or account."""
-    writes = [model for model in models if model["role"] == "write"]
-    reviews = [model for model in models if model["role"] == "review"]
+    writes = [model for model in models if model["role"] == "write" and model["tasks"]]
+    reviews = [model for model in models if model["role"] == "review" and model["tasks"]]
     by_name = {model["model"]: model for model in writes}
     approved: Counter[str] = Counter()
     reviewed: Counter[str] = Counter()
+    review_efforts: dict[str, set[str]] = defaultdict(set)
     for pr in prs:
         approved[pr["author"]] += pr["first"] == "correct"
         reviewed[pr["author"]] += 1
+        review_efforts[pr["author"]].add(pr["effort"])
 
     # total_seconds on the model is rounded to one decimal. Ranking and frontier checks use unrounded durations.
     raw_seconds: dict[str, float] = defaultdict(float)
@@ -1228,10 +1267,11 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         wall = model.get("wall_seconds") or {}
         median_s = _number(wall.get("median"))
         timed_n = int(wall.get("n") or 0)
+        effort_labels = {"efforts": model.get("efforts", []), "review_efforts": sorted(review_efforts[name])}
         if trials > 0 and median_s is not None and median_s >= 0 and timed_n > 0:
             successes = approved[name]
             speed_quality.append({
-                "model": name, "identity": model["identity"],
+                "model": name, "identity": model["identity"], **effort_labels,
                 "approval_raw": successes / trials,
                 "approval": round(successes / trials, 3), "approval_n": trials,
                 "approval_ci": _wilson(successes, trials),
@@ -1246,7 +1286,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         recorded = total / 3600
         per_landed = recorded / model["landed"]
         pareto.append({
-            "model": name, "identity": model["identity"], "approval_raw": successes / trials,
+            "model": name, "identity": model["identity"], **effort_labels, "approval_raw": successes / trials,
             "approval": round(successes / trials, 3), "approval_n": trials, "approvals": successes,
             "approval_ci": _wilson(successes, trials), "hours_raw": per_landed,
             "hours_exact": per_landed,
@@ -1279,6 +1319,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         best = max(eligible, key=lambda point: (
             point["approvals"] / point["recorded_hours"], point["approval_raw"], point["model"]))
         recommendation = {"model": best["model"], "approval": best["approval"], "approval_n": best["approval_n"],
+                          "efforts": best["efforts"], "review_efforts": best["review_efforts"],
                           "approvals": best["approvals"], "approval_ci": best["approval_ci"],
                           "hours": best["hours"], "recorded_hours": round(best["recorded_hours"], 4),
                           "landed": best["landed"], "score": round(best["approvals"] / best["recorded_hours"], 3),
@@ -1294,6 +1335,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         if model["tasks"] < LOW_SAMPLE or rate["value"] is None or rate["value"] >= 0.15:
             continue
         waste.append({"model": model["model"], "tasks": model["tasks"], "landed": model["landed"],
+                      "efforts": model.get("efforts", []),
                       "rate": rate["value"], "ci": _wilson(model["landed"], model["tasks"]),
                       "low_sample": False})
     waste.sort(key=lambda item: (-item["tasks"], item["model"]))
@@ -1317,6 +1359,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
                 hours = None
             class_models[cls_name].append({
                 "model": model_name, "tasks": tasks_n, "landed": landed_n,
+                "efforts": task_class.get("efforts", []),
                 "rate": task_class["landed_rate"]["value"],
                 "_rate_raw": landed_n / tasks_n if tasks_n else 0.0,
                 "ci": _wilson(landed_n, tasks_n),
@@ -1347,25 +1390,34 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
 
     failures = []
     for model in sorted(writes, key=lambda item: (-item["tasks"], item["model"]))[:8]:
-        failures.append({"model": model["model"], "tasks": model["tasks"], "status": model["status"]})
+        failures.append({"model": model["model"], "efforts": model.get("efforts", []),
+                         "tasks": model["tasks"], "status": model["status"]})
 
     week_write: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    week_write_efforts: dict[tuple[str, str], set[str]] = defaultdict(set)
     busy_writes = {model["model"] for model in writes if model["tasks"] >= LOW_SAMPLE}
     busy_prs = {author for author, count in reviewed.items() if count >= LOW_SAMPLE}
     busy = busy_writes | busy_prs
     for row in rows:
         if row.role == "write" and row.model in busy:
-            slot = week_write[(week_of(row.moment), row.model)]
+            key = (week_of(row.moment), row.model)
+            slot = week_write[key]
             slot[0] += 1
             slot[1] += row.landed
+            week_write_efforts[key].add(row.effort)
     week_review: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    week_review_efforts: dict[tuple[str, str], set[str]] = defaultdict(set)
     for pr in prs:
         if pr["author"] in busy:
-            slot = week_review[(pr["week"], pr["author"])]
+            key = (pr["week"], pr["author"])
+            slot = week_review[key]
             slot[0] += 1
             slot[1] += pr["first"] == "correct"
+            week_review_efforts[key].add(pr["effort"])
     weeks = sorted(set(week_write) | set(week_review))
     trends = [{"week": week, "model": model, "tasks": week_write[(week, model)][0],
+               "efforts": sorted(week_write_efforts[(week, model)]),
+               "review_efforts": sorted(week_review_efforts[(week, model)]),
                "landed": week_write[(week, model)][1], "prs": week_review[(week, model)][0],
                "first_approved": week_review[(week, model)][1]}
               for week, model in weeks if week_write[(week, model)][0] or week_review[(week, model)][0]]
@@ -1376,12 +1428,13 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         findings = model["p0_p2_per_review"]
         reviewers.append({
             "model": model["model"], "identity": model["identity"], "approve": rate["value"], "approve_n": rate["n"],
+            "efforts": model["efforts"],
             "approve_ci": _wilson(model["verdicts"]["correct"], rate["n"]),
             "p0_p2": findings["value"], "findings_n": model["findings_n"], "tasks": model["tasks"],
             "low_sample": rate["n"] < LOW_SAMPLE or model["findings_n"] < LOW_SAMPLE,
         })
 
-    durations = [{"model": model["model"], "n": model["wall_seconds"]["n"],
+    durations = [{"model": model["model"], "n": model["wall_seconds"]["n"], "efforts": model.get("efforts", []),
                   "p25": model["wall_seconds"]["p25"], "median": model["wall_seconds"]["median"],
                   "p75": model["wall_seconds"]["p75"], "p90": model["wall_seconds"]["p90"],
                   "tasks": model.get("tasks", 0), "landed": model.get("landed", 0),
@@ -1391,8 +1444,8 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
                  for model in writes if model["wall_seconds"]["n"]]
 
     def _arm(name: str, effort: str) -> dict[str, Any]:
-        write = next((model for model in writes if model["model"] == name), None)
-        review = next((model for model in reviews if model["model"] == name), None)
+        write = next((model for model in models if model["model"] == name and model["role"] == "write"), None)
+        review = next((model for model in models if model["model"] == name and model["role"] == "review"), None)
         write_effort = next((item for item in (write or {}).get("by_effort", []) if item["effort"] == effort), None)
         review_effort = next((item for item in (review or {}).get("by_effort", []) if item["effort"] == effort), None)
         approval = (review_effort or {}).get("approve_rate") or {"value": None, "n": 0}
@@ -1422,6 +1475,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         }
 
     neon_arms = [_arm("gemini-4-neon", effort) for effort in ("medium", "high")]
+    neon_unknown = _arm("gemini-4-neon", UNKNOWN_EFFORT)
     hydrogen = by_name.get("gemini-4-hydrogen")
     ukrainian = []
     for model in (*writes, *reviews):
@@ -1430,6 +1484,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
                 continue
             ukrainian.append({
                 "model": model["model"], "role": model["role"], "class": task_class["class"],
+                "efforts": task_class["efforts"],
                 "tasks": task_class["tasks"],
                 "landed": task_class.get("landed"),
                 "rate": (task_class.get("landed_rate") or {}).get("value"),
@@ -1449,6 +1504,7 @@ def _charts(models: list[dict[str, Any]], prs: list[dict[str, Any]], rows: list[
         "reviewers": reviewers,
         "durations": durations,
         "neon": {"model": "gemini-4-neon", "arms": neon_arms,
+                 "unknown_effort": neon_unknown if neon_unknown["write_tasks"] or neon_unknown["review_tasks"] else None,
                  "enough": all(arm["review_results"] >= LOW_SAMPLE for arm in neon_arms)
                  or all(arm["write_tasks"] >= LOW_SAMPLE for arm in neon_arms)},
         "hydrogen": None if hydrogen is None else {
@@ -1497,6 +1553,7 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
     _stamp_allowance(models, selected)
     catalog_model_ids = current_catalog_model_ids(model_catalog_reading())
     used = {model for model, *_ in fine}
+    known = [row for row in selected if row.effort != UNKNOWN_EFFORT]
     return {
         "models": models, "authors": _authors(prs), "author_risks": _author_risks(record_prs, prs),
         "first_round_matrix": _matrix(prs),
@@ -1504,7 +1561,7 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
                                                             touched or {}, reviewer_name),
                               "planted_defect_recall": PLANTED_DEFECT_RECALL},
         "review_levels": _review_levels(selected, models, selected if history is None else history),
-        "allowance": _allowance_rows(selected), "charts": _charts(models, prs, selected), "records": len(selected),
+        "allowance": _allowance_rows(selected), "charts": _charts(models, prs, known), "records": len(selected),
         "idle_catalog_models": sorted(catalog_model_ids - used) if catalog_model_ids is not None else None,
         # Which evidence landed each landed write task: its X-Agent trailer, its own merged delivery, or both.
         "landed_by": dict(sorted(Counter(
@@ -1515,7 +1572,6 @@ def summarize(rows: Iterable[_Row], fine: _Fine | None = None,
 
 OTHER = "other"
 ALL_CLASSES = "all"
-_KNOWN_EFFORTS = frozenset({"unset", "not-exposed", "unknown"})
 _PAGE_CLASSES = frozenset({
     *TASK_FAMILIES, *MECHANICAL_FAMILIES, *UKRAINIAN_TASK_FAMILIES,
     "code", "infra", "docs", "difficulty-gate", "bounded", "bounded_implementation",
@@ -1567,11 +1623,6 @@ def metric_model(model: str) -> str:
     except Exception:  # no catalog: no value is known
         return OTHER
     return model if model in known else OTHER
-
-
-def metric_effort(effort: str) -> str:
-    """A catalog effort word, ``unset`` or a legacy telemetry value as itself; anything else is ``other``."""
-    return effort if effort in _KNOWN_EFFORTS or VARIANT_SUFFIX.fullmatch(effort) else OTHER
 
 
 def _page_model(model: str) -> str:
@@ -1644,11 +1695,14 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         landing = scan_landing(primary_root, first)
     rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows), publications, keys)
             if row.moment < until]
+    all_prs, all_record_prs = _prs(rows), _prs(rows, of_record=True)
+    rows = [replace(row, author=None, review_author=None)
+            if row.review_author and retired_subscription_model(row.review_author) else row
+            for row in rows if not retired_subscription_model(row.model)]
     pairs = head_pairs(rows)
     touched = scan_touched(primary_root, pairs, catalog)
-    all_prs, all_record_prs = _prs(rows), _prs(rows, of_record=True)
     # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
-    page_rows = [replace(row, model=_page_model(row.model), effort=metric_effort(row.effort),
+    page_rows = [replace(row, model=_page_model(row.model),
                          task_class=_page_class(row.task_class)) for row in rows]
     windows, metric_windows, page_windows, sample_windows = {}, {}, {}, {}
     for name, days in WINDOWS.items():
@@ -1672,16 +1726,16 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
                                  touched=touched, accuracy_rows=selected, reviewer_name=_page_model)
         sample_windows[name] = {"window": window, "models": _sample_models(page_summary["models"])}
         page_windows[name] = {"window": window, **page_window(page_summary)}
-        # /metrics labels come from a finite set: a model or effort outside the catalog's known values is "other".
+        # /metrics labels come from a finite set: a model outside the catalog's known values is "other".
         # 24h stays off this label set.
         if name in METRIC_WINDOWS:
             metric_models = _models(_bounded(fine), include_samples=False)
-            _stamp_allowance(metric_models, selected, model_of=metric_model, effort_of=metric_effort)
+            _stamp_allowance(metric_models, selected, model_of=metric_model)
             metric_windows[name] = {"models": metric_models, "authors": _authors(prs, metric_model)}
     weeks = _week_groups(rows)
     bounded_weeks: _Weeks = defaultdict(_Group)
     for (week, model, effort, role), group in weeks.items():
-        bounded_weeks[(week, metric_model(model), metric_effort(effort), role)].merge(group)
+        bounded_weeks[(week, metric_model(model), effort, role)].merge(group)
     return {
         "schema_version": SCHEMA_VERSION,
         "observed_at": datetime.now(UTC).isoformat(),
@@ -1751,7 +1805,8 @@ def _sample_models(models: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     for model in models:
         samples = model.get("unparsed_samples")
         if samples:
-            found.append({"model": model["model"], "role": model["role"], "unparsed_samples": samples})
+            found.append({"model": model["model"], "role": model["role"], "unparsed_samples": samples,
+                          "unparsed_sample_efforts": model["unparsed_sample_efforts"]})
     return found
 
 

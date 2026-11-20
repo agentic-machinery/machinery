@@ -49,14 +49,14 @@ const {
 function resetText(window) {
   if (!window || window.status !== "ok") return null;
   if (!toDate(window.resets_at)) return "reset not reported";
-  if (window.reset_passed) return `${utc(window.resets_at)} (passed; awaiting a new reading)`;
+  if (window.reset_passed || toDate(window.resets_at) <= Date.now()) return `${utc(window.resets_at)} (passed; awaiting a new reading)`;
   return `${utc(window.resets_at)} (${relative(window.resets_at)})`;
 }
 
 function weeklyResetCell(window) {
   if (!window || window.status !== "ok") return text("unknown", "muted");
   if (!toDate(window.resets_at)) return text("not reported", "muted");
-  if (window.reset_passed) return text(`passed; awaiting a new reading (${utc(window.resets_at)})`, "warn");
+  if (window.reset_passed || toDate(window.resets_at) <= Date.now()) return text(`passed; awaiting a new reading (${utc(window.resets_at)})`, "warn");
   return td(`<strong>${escapeHtml(relative(window.resets_at))}</strong> <br><span class="muted">${escapeHtml(utc(window.resets_at))}</span>`);
 }
 
@@ -172,7 +172,28 @@ function apiRows(budget) {
   });
 }
 
+function cursorUsage(budget) {
+  const cursor = budget?.agents?.cursor;
+  const freshness = readingState(cursor?.freshness, cursor?.age_s, budget?.diagnostics?.stale_threshold_s);
+  const reason = !budget ? "routing budget did not answer"
+    : cursor?.probe_state === "NEED_LOGIN" ? "sign-in required"
+    : cursor?.codexbar?.reason_code === "provider_error" ? "usage probe failed"
+    : freshness === "stale" || freshness === "last_good" ? "last reading is stale"
+    : "no current usage reading";
+  const cells = ["auto", "api"].map(key => {
+    const window = cursor?.provider_windows?.[key];
+    const remaining = validPct(window?.remaining_pct) ? window.remaining_pct
+      : validPct(window?.used_pct) ? 100 - window.used_pct : null;
+    return freshness === "fresh" && cursor?.probe_state !== "NEED_LOGIN" && remaining !== null
+      ? text(`${pct(remaining)} left`) : text(`Unavailable (${reason})`, "muted");
+  });
+  return table(["Cursor Auto", "Cursor API"], [cells], true);
+}
+
 function renderUsage(subs, budget, logins) {
+  const api = budget ? table(["API account", "Balance / spend", "Reading", ""], apiRows(budget), true)
+    : unknown("API account balances: the routing budget did not answer");
+  if (!subs) return unknown("subscription account snapshot unavailable") + cursorUsage(budget) + api;
   const {groups, hidden} = subscriptionRows(subs, logins);
   const facts = subs.sources?.plan_facts;
   const notes = [];
@@ -187,13 +208,11 @@ function renderUsage(subs, budget, logins) {
     + "The Codex API credits belong to Codex a and renew with its monthly turnover.");
   notes.push("Sign-in is read for Claude a, Claude b, Codex a and Codex b only. Any other account has no side-effect-free sign-in reader.");
   const head = `<thead><tr>${SUBSCRIPTION_HEADERS.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>`;
-  const api = budget ? table(["API account", "Balance / spend", "Reading", ""], apiRows(budget), true)
-    : unknown("API account balances: the routing budget did not answer");
   const subsTable = groups ? `<table class="subs">${head}<tbody>${groups}</tbody></table>`
     : '<p class="muted">None.</p>';
   const models = subs.catalog_models;
   const catalog = Array.isArray(models) ? escapeHtml(models.join(", ") || "No current models.") : "Catalog unavailable.";
-  return subsTable + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("") + api
+  return subsTable + cursorUsage(budget) + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("") + api
     + `<p class="muted"><strong>Current catalog models.</strong> ${catalog}</p>`;
 }
 
@@ -201,18 +220,18 @@ const PANELS = [
   {
     id: "usage",
     label: "Subscriptions",
-    urls: ["/api/runtime/subscriptions", "/api/state/routing-budget", "/api/runtime/logins"],
-    sourceLabels: ["Usage", "API balances", "Sign-in"],
-    render: renderUsage,
-    onData: (data, latest) => { latest.logins = data[2]; },
+    urls: ["/api/state/routing-budget", "/api/runtime/logins"],
+    sourceLabels: ["Routing budget", "Sign-in"],
+    render: (budget, logins) => renderUsage(budget?.subscriptions, budget, logins),
+    onData: (data, latest) => { latest.logins = data[1]; },
     onError: latest => { latest.logins = null; },
-    retry: (subs, budget, logins) => !budget || !logins || logins.state === "pending",
+    retry: (budget, logins) => !budget.subscriptions || !logins || logins.state === "pending",
   },
 ];
 
 const runner = createPanelRunner({
   panels: PANELS,
-  renderChips: latest => subscriptionChips(latest.usage, latest.logins, "#subs").join(""),
+  renderChips: latest => subscriptionChips(latest.usage?.subscriptions, latest.logins, "#subs").join(""),
 });
 runner.start();
 </script>

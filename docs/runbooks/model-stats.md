@@ -4,9 +4,9 @@
 concrete model id, effective effort, role and task class, how much work a model does, how much it wastes and how
 slow it is (#581). `view=full` (default) includes per-class breakdowns (`by_class`), token counts and token rates,
 ISO-week buckets (`weeks`) and the reply samples below. `view=page` (the figures `/model-stats` reads) omits those
-fields, including every `unparsed_samples` leaf, and keeps model and effort totals plus `charts` series. Its string
+fields, including the reply text and sample effort, and keeps model and effort totals plus `charts` series. Its string
 values are closed-vocabulary labels, timestamps or ISO weeks, and the fixed sentences in `window.cohort`,
-`charts.recommendation` and `charts.limits`. `view=samples` returns only the reply samples for that window.
+`charts.recommendation` and `charts.limits`. `view=samples` returns the reply samples and their recorded effort.
 `/model-stats` fetches it on its own and leaves the failing-reply section empty when that fetch is refused
 or when the samples window name or `until` does not match the page snapshot.
 The page groups model, author, reviewer, effort and class labels before calculating
@@ -109,23 +109,23 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   observed), `harness_choice` (Cursor `auto`), `unreported` (`unknown`, `unrecognized`: the harness reported no
   model), `joint` (a PR reviewed for two author models) or `not_in_catalog` (any other spelling). The page lists
   catalog models first and groups the rest under "Not a concrete model id". The full view retains the recorded
-  model labels.
+  model labels. GLM and Kimi runs stay in the history store. The API and dashboard omit those retired models.
 - **Idle catalog models**: `idle_catalog_models` lists every catalog model the catalog still routes (lifecycle
   not `retired`) that ran no task in the window, so a routed model never silently drops off the page. It is
   `null` when the model catalog cannot be read, and the page then says the list is unknown.
-- **Effort**: the effort the task recorded; else the effort suffix of a requested variant id (`grok-4.7-high` is
-  `high`, `gemini-3.8-flash-medium` is `medium`); else `unset`. A catalog id that merely ends in an effort word
-  (`gemini-3.8-flash-high`) is `unset` without a recorded effort. Legacy values such as `not-exposed` stay as
-  recorded. Each model row shows its totals (`effort` `all`) and the same figures per effort; under `view=full`,
-  each effort and the totals split again by task class (`by_class`), so `code` at `high` and `code` at `low` compare
-  directly.
+- **Effort** comes from the observed runtime variant, the matching requested variant, or the recorded effort
+  field. A catalog ID ending in an effort word carries no implied effort. Missing values and legacy markers such
+  as `unset` and `not-exposed` appear as `unknown` in the API and dashboard.
+  Model totals (`effort: all`) and comparisons count known effort only and report the levels they include.
+  The `by_effort` entries include the separate unknown group. In `view=full`, each group splits by task class
+  in `by_class`.
 - **Role**: a task is a review when its mode is `read-only` or its id contains `review`; otherwise a write.
 - **Class**: a write's `research_task_family` (else `unclassified`); a review's `review_profile/review_risk`.
 - **Never started** records a dispatch refusal before the provider model ran. The task retains its dispatcher
   terminal status and carries `never_started_reason`. Model stats projects `status.never_started` and reports
   `never_started_reasons` by model, effort, role and class. The dashboard lists counts by cause for the selected
-  window and model. These rows have zero tokens, count toward total and not-done attempts and contribute no
-  review verdict, unparsed reply, allowance spend or runtime measurement. A sandbox launcher can have a
+  window and model. A refusal with known effort counts toward the total and not-done attempts. These rows
+  have zero tokens and contribute no review verdict, unparsed reply, allowance spend or runtime measurement. A sandbox launcher can have a
   process group while the provider it guards has yet to start.
   Admission refusals without an attributed worktree have their own record ID. The requested task ID remains
   available for a later invocation. If preparation leaves a worktree, its original task record retains custody.
@@ -177,8 +177,9 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   reviews of record count, read from the PR's whole history so a window that starts mid-PR never takes a later
   round for the first; an unparsed reply is no round. Rounds are the distinct pinned heads those reviews judged,
   ordered by the start of each head's first review; the first round is the earliest review of the earliest head.
-  "Approved eventually" means any parsed review approved. They split by author model only: a review records its author's model but not the author's
-  effort. A PR reviewed for more than one author model is grouped under the joined ids (`a+b`), which `/metrics`
+  "Approved eventually" means any parsed review approved. The author rows report the effort of the reviewers.
+  The PR cohort requires known effort on every counted review so the first round and eventual outcome retain their meaning.
+  A PR reviewed for more than one author model is grouped under the joined ids (`a+b`), which `/metrics`
   exports as `other`. The page keeps the join with each member bounded like a model label (`gpt-6.1-sol+other`),
   and its model picker selects a joint author's PRs by any of its members.
 - **After a blocked first round** (`after_blocked_first_round`, per author): of the PRs whose first round did not
@@ -254,11 +255,11 @@ when the snapshot is older than 300 seconds. Label values come from finite sets:
 `all`; `week` is an ISO week (`2026-W46`) since the first row; `model` is a catalog model id, a bare native alias
 (`opus`, `sonnet`, `haiku`, `fable`) whose version could not be determined, or `unknown`, and any other spelling
 is `other`; `effort` is a catalog effort word
-(`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `thinking`, `thinking-<level>`), `unset`, `not-exposed`,
-`unknown` or `all` (every effort of that model), and any other value is `other`; `role` is `write`, `review` or
+(`low`, `medium`, `high`, `xhigh`, `max`, `minimal`, `thinking`, `thinking-<level>`), `unknown` or `all`
+(the total for known effort); `role` is `write`, `review` or
 `author`; `status` is a terminal status other than `done` (`no_deliverable`, `failed`, `timeout`, `rate_limited`,
 `cancelled`, `crashed`, `never_started`, `other`). The collector calculates each `other` bucket from its grouped inputs. Exact
-values stay in the rows and `view=full`. No task ids, paths or accounts.
+model labels stay in the rows and `view=full`. No task ids, paths or accounts.
 
 | Metric | Labels | Meaning |
 | --- | --- | --- |
