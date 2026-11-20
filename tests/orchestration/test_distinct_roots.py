@@ -49,6 +49,37 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def git_commands_name_their_repository(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the repository-selection names ``configured_primary_root`` and ``git init`` read.
+
+    ``GIT_OBJECT_DIRECTORY`` changes which directory counts as a Git object store.
+    ``GIT_DIR`` makes ``git init`` record ``core.worktree`` in another repository. The one case
+    that means to use an external object directory passes that name in its own environment.
+    """
+    from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS
+
+    for name in (
+        *GIT_REDIRECT_ENV_KEYS,
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    # Home and system Git config are also inputs. Point both at an empty file so a
+    # caller's core.worktree cannot select a repository after the names above are gone.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in list(os.environ):
+        if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            monkeypatch.delenv(name, raising=False)
+
+
 def _subprocess_env(**configured: str) -> dict[str, str]:
     env = {
         key: value
@@ -465,7 +496,10 @@ def test_an_empty_git_directory_is_never_the_configured_primary(clean_env, monke
         with pytest.raises(rr.MachineryConfigError, match="not a real Git directory"):
             resolve()
     real = tmp_path / "real"
-    subprocess.run(["git", "init", "-q", str(real)], check=True, capture_output=True, timeout=30)
+    real.mkdir()
+    # Each repository is named explicitly, so no inherited setting can make Git initialize another.
+    subprocess.run(["git", f"--git-dir={real / '.git'}", f"--work-tree={real}", "init", "-q"],
+                   check=True, capture_output=True, timeout=30)
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(real))
     assert rr.configured_primary_root() == real
     assert rr.state_root() == real
@@ -475,8 +509,9 @@ def test_an_empty_git_directory_is_never_the_configured_primary(clean_env, monke
     odb = tmp_path / "odb"
     odb.mkdir()
     external = tmp_path / "external"
-    subprocess.run(["git", "init", "-q", str(external)], check=True, capture_output=True, timeout=30,
-                   env={**os.environ, "GIT_OBJECT_DIRECTORY": str(odb)})
+    external.mkdir()
+    subprocess.run(["git", f"--git-dir={external / '.git'}", f"--work-tree={external}", "init", "-q"],
+                   check=True, capture_output=True, timeout=30, env={**os.environ, "GIT_OBJECT_DIRECTORY": str(odb)})
     assert not (external / ".git" / "objects").exists()
     configured = {rr.PRIMARY_ROOT_ENV: str(external), "GIT_OBJECT_DIRECTORY": str(odb)}
     assert rr.configured_primary_root(configured) == external
@@ -495,6 +530,28 @@ def test_unset_configuration_reexecs_with_this_interpreter(clean_env, monkeypatc
     runtime_primary, tree = _linked_worktree(tmp_path)
     call = _reexec(monkeypatch, tree)
     assert call == [sys.executable, sys.executable, "-I", str(runtime_primary / "lu_machinery/dispatch.py"), "list"]
+
+
+@pytest.mark.parametrize("metadata", [b"gitdir: /nonexistent/metadata\n", b"gitdir: \xff\n", b"gitdir: /a\0b\n"])
+def test_linked_worktree_entry_refuses_an_unresolvable_primary(
+    clean_env, monkeypatch, tmp_path: Path, capsys, metadata: bytes
+) -> None:
+    """A linked worktree whose Git metadata names no primary refuses instead of running its own dispatcher.
+
+    Restored from learn-ukrainian ``tests/dispatcher/test_core_worktree_entry.py`` at 5aba2adb (machinery #904).
+    Defect class: an unresolvable, undecodable or NUL-bearing gitdir lets a stale worktree supervise tasks (FR-43).
+    """
+    _, tree = _linked_worktree(tmp_path)
+    (tree / ".git").write_bytes(metadata)
+    calls: list[tuple] = []
+    monkeypatch.setattr(dispatcher_primary, "in_tree_source", lambda: True)
+    monkeypatch.setattr(dispatcher_primary, "machinery_path", lambda relative: tree / "lu_machinery" / relative)
+    monkeypatch.setattr(dispatcher_primary.os, "execv", lambda *args: calls.append(args))
+    with pytest.raises(SystemExit) as refused:
+        dispatcher_primary.exec_primary(["list"])
+    assert refused.value.code == 2
+    assert "cannot resolve the primary checkout of linked worktree" in capsys.readouterr().err
+    assert calls == []
 
 
 def test_unset_configuration_keeps_todays_systemd_exec_start() -> None:

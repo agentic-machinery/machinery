@@ -35,6 +35,36 @@ CURRENT_SOL = current_sol()
 TASK_ID = "review-demo-r1"
 
 
+@pytest.fixture(autouse=True)
+def git_commands_name_their_repository(monkeypatch):
+    """Drop the repository-selection names Git reads before ``configured_roots`` builds its primary.
+
+    That fixture runs ``git init`` in a temporary directory. A caller's ``GIT_DIR`` would record
+    ``core.worktree`` in another repository. The schema cases mock the dispatcher Git boundary.
+    """
+    from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS
+
+    for name in (
+        *GIT_REDIRECT_ENV_KEYS,
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    # Home and system Git config are also inputs. Point both at an empty file so a
+    # caller's core.worktree cannot select a repository after the names above are gone.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in list(os.environ):
+        if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def worktree(tmp_path, monkeypatch):
     monkeypatch.setenv("LU_RUNTIME_TMP_BASE_ROOT", str(tmp_path / "runtime"))
@@ -195,6 +225,129 @@ def test_schema_loss_record_and_real_codex_argv(dispatch, absolute, agent):
 
 
 @pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("output_schema_hooks")
+def test_explicit_external_absolute_schema_allowed(dispatch):
+    """An absolute schema outside the checkout is bound as given, and the task stays read-only.
+
+    Restored from learn-ukrainian ``tests/dispatcher/test_output_schema.py`` at 5aba2adb (machinery #904).
+    The product asserted Codex's own ``sandbox_mode="read-only"``; read-only Codex now runs inside the
+    supervisor's write boundary instead (machinery #472, #629), so the mode is read from the spec.
+    Defect class: an explicit external schema is refused, rebound to another path, or turns the task writable.
+    """
+    path = dispatch.schema.parent.parent / "external.json"
+    path.write_text('{}')
+    spec, record = dispatch.invoke(path)
+    assert record["output_schema_path"] == str(path)
+    assert record["output_schema_sha256"] == store.digest(b"{}")
+    assert (spec.mode, record["mode"]) == ("read-only", "read-only")
+    argv = codex.build(spec, {}).argv
+    assert argv[argv.index("--output-schema") + 1] == str(path)
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("output_schema_hooks")
+def test_claude_review_binds_findings_schema(dispatch):
+    """Case 4: a native Claude code review must bind the findings schema.
+
+    A VERDICT-only reply still cannot become a receipt. Restored from learn-ukrainian
+    ``tests/dispatcher/test_output_schema.py`` at 5aba2adb (machinery #904); the product's own
+    Codex schema validator (``scripts.audit.post_build_review``) stays with the product.
+    Defect class: a Claude or Codex code review launches without the findings schema, binds the
+    meta-schema Claude refuses, or settles a reply whose structured output is missing.
+    """
+    from lu_machinery.dispatcher.providers import claude
+    from lu_machinery.review.review_contract import ContractError, canonical_receipt_payload
+
+    spec, record = dispatch.invoke(path=None, agent="claude", review=True, task_id="claude-schema")
+    assert record["require_review_verdict"] is True
+    assert record["output_schema_path"].endswith("/schemas/code-review-findings.v1.schema.json")
+    argv = claude.build(spec, {}).argv
+    schema = json.loads(argv[argv.index("--json-schema") + 1])
+    canonical = json.loads(Path(record["output_schema_path"]).read_text(encoding="utf-8"))
+    assert "$schema" in canonical and "$schema" not in schema  # Claude Code refuses the meta-schema reference
+    assert schema == {key: value for key, value in canonical.items() if key != "$schema"}
+    assert schema["properties"]["schema_version"]["const"] == "code-review-findings.v1"
+    assert schema["required"] == ["schema_version", "overall", "findings"]
+    with pytest.raises(ContractError, match="review_envelope_requires_one_json_block"):
+        canonical_receipt_payload("VERDICT: APPROVE\nSCORE: 9/10 No defects.\nNo findings.\n")
+    receipt = {
+        "schema_version": "code-review-findings.v1",
+        "overall": {"correctness": "correct", "explanation": "No defects.", "confidence": 0.9},
+        "findings": [],
+    }
+    bound = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "", "structured_output": receipt,
+    })
+    parsed = claude.parse(bound, "", 0, None, output_schema=schema)
+    assert parsed.error is None
+    assert json.loads(parsed.text) == receipt
+    preamble = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "VERDICT: APPROVE", "structured_output": receipt,
+    })
+    parsed = claude.parse(preamble, "", 0, None, output_schema=schema)
+    assert json.loads(parsed.text) == receipt
+    missing = claude.parse(
+        json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "VERDICT: APPROVE"}),
+        "", 0, None, output_schema=schema,
+    )
+    assert missing.error == "claude: missing structured output"
+    failed = claude.parse(bound, "", 1, None, output_schema=schema)
+    assert failed.error == "claude: exited with status 1"
+    codex_spec, codex_record = dispatch.invoke(path=None, agent="sol", review=True, task_id="codex-schema")
+    assert codex_record["output_schema_path"].endswith("/schemas/code-review-findings.v1.schema.json")
+    codex_argv = codex.build(codex_spec, {}).argv
+    assert codex_argv.count("--output-schema") == 1
+    bound_path = Path(codex_argv[codex_argv.index("--output-schema") + 1])
+    assert bound_path.parent.name == ".codex-schemas"
+    assert bound_path.parent.parent == codex_spec.final_file.parent
+    assert codex_spec.options.get("provider_output_schema_sha256") is not None
+    bound = json.loads(bound_path.read_text())
+    assert "if" not in bound and "oneOf" not in json.dumps(bound) and "not" not in bound
+    assert "missing_capabilities" not in bound.get("properties", {})
+    assert bound["properties"]["schema_version"]["type"] == "string"
+    receipt_schema = json.loads(Path(codex_record["output_schema_path"]).read_text())
+    assert "if" in receipt_schema
+    refused = {**receipt, "missing_capabilities": ["shell"]}
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import ValidationError
+
+    with pytest.raises(ValidationError, match="missing_capabilities"):
+        Draft202012Validator(receipt_schema).validate(refused)
+    Draft202012Validator(receipt_schema).validate(receipt)
+    failed_codex = codex.parse("", "HTTP 400 schema.if is not permitted when strict is true", 1, None)
+    assert failed_codex.error == (
+        "codex: exited with status 1: HTTP 400 schema.if is not permitted when strict is true"
+    )
+
+    dry_spec = TaskSpec(
+        "codex-dry-schema", "sol", CURRENT_SOL, None, "read-only",
+        codex_spec.worktree, codex_spec.prompt_file, codex_spec.final_file,
+        options={**codex_spec.options, "dry_run": "True"},
+    )
+    dry_argv = codex.build(dry_spec, {}).argv
+    dry_path = Path(dry_argv[dry_argv.index("--output-schema") + 1])
+    assert not dry_path.exists()
+
+    name_map_schema = {
+        "type": "object",
+        "properties": {
+            "const": {"type": "string"},
+            "if": {"type": "integer"},
+            "not": {"type": "boolean"},
+        },
+        "required": ["const", "if", "not"],
+    }
+    projected = codex.openai_strict_schema(name_map_schema)
+    assert "const" in projected["properties"]
+    assert "if" in projected["properties"]
+    assert "not" in projected["properties"]
+    assert projected["properties"]["const"]["type"] == "string"
+    assert codex._needs_openai_strict(name_map_schema) is False
+
+
+@pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("agent", ["cursor", "muse", "opencode"])
 @pytest.mark.usefixtures("output_schema_hooks")
 def test_unsupported_schema_refused_before_launch(dispatch, capsys, agent):
@@ -284,12 +437,12 @@ def test_invalid_schema_result_cannot_settle_done(dispatch, monkeypatch, output,
 def test_codex_stderr_excerpt_redacts_secret_and_home_path():
     secret = "key_" + "aB09" * 16
     home_path = "/home/fixture/.codex/config.toml"
-    failed = codex.parse("", f"open {home_path} failed\nwith {secret}  rejected", 1, None)
+    failed = codex.parse("", f"open {home_path} failed with {secret}  rejected", 1, None)
     assert failed.error is not None
     assert secret not in failed.error
     assert home_path not in failed.error
     assert "/home/" not in failed.error
-    assert failed.error.startswith("codex: exited with status 1: ")
+    assert failed.error == "codex: exited with status 1: open <path> failed with [REDACTED_SECRET] rejected"
     assert len(failed.error) <= len("codex: exited with status 1: ") + 500
 
 
@@ -311,12 +464,47 @@ def test_control_format_characters_removed_from_stderr_excerpt(character, placem
     if placement == "trailing" and character in {"\t", "\r", "\n", "\r\n", "\x85"}:
         expected = "codex: exited with status 1: notice [REDACTED_SECRET]"
     else:
-        expected = "codex: exited with status 1: [stderr excerpt withheld: control or format characters]"
+        expected = "codex: exited with status 1: [stderr excerpt withheld: control or format characters] [stderr_cause=unknown]"
     assert parsed.error == expected
     assert character not in parsed.error
     assert secret[:8] not in parsed.error
     assert secret[8:] not in parsed.error
     assert secret[4:12] not in parsed.error
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.parametrize(("diagnostic", "cause"), [
+    ("You've hit your usage limit", "rate_limit"),
+    ("rate limit exceeded", "rate_limit"),
+    ("unexpected status 429", "rate_limit"),
+    ("Not logged in", "auth"),
+    ("Authentication failed", "auth"),
+    ("unexpected status 401", "auth"),
+    ("Temporary failure in name resolution", "network"),
+    ("Failed to resolve host", "network"),
+    ("Connection refused", "network"),
+    ("Permission denied", "permission"),
+    ("\x1b[31mPermission denied\x1b[0m", "permission"),
+    ("\x9b31mPermission denied\x9b0m", "permission"),
+    ("Operation not permitted", "permission"),
+    ("Sandbox refused", "permission"),
+    ("process killed by signal", "process_terminated"),
+    ("signal: 9 (SIGKILL)", "process_terminated"),
+    ("signal: 15 (SIGTERM)", "process_terminated"),
+    ("an unrecognized diagnostic", "unknown"),
+    ("Permission denied\nAuthentication failed", "unknown"),
+    ("unexpected status 4290", "unknown"),
+])
+def test_codex_withheld_stderr_records_only_a_fixed_cause(diagnostic, cause):
+    """Withheld stderr must retain a cause without copying raw diagnostic text."""
+    raw = f"{diagnostic}\nsource /home/fixture/config.toml TOKEN: private fixture value"
+    parsed = codex.parse("", raw, 1, None)
+    assert parsed.error == (
+        "codex: exited with status 1: [stderr excerpt withheld: control or format characters] "
+        f"[stderr_cause={cause}]"
+    )
+    assert not parsed.rate_limited
 
 
 @pytest.mark.usefixtures('configured_roots')
@@ -429,7 +617,7 @@ def test_verdict_gate_accepts_ukrainian_item_judgments_block(tmp_path):
         '"finding": "", "sources": "VESUM", "quote": "слово"}]}\n'
         "```\n"
     )
-    assert worker._verdict_failure(_item_review_record(tmp_path), reply) is None
+    assert worker._receipt_failure(_item_review_record(tmp_path), reply) is None
 
 
 @pytest.mark.usefixtures('configured_roots')
@@ -437,7 +625,7 @@ def test_verdict_gate_accepts_ukrainian_item_judgments_block(tmp_path):
 def test_verdict_gate_refuses_ukrainian_reply_without_block_or_verdict(tmp_path):
     """Defect class (#12417): a Ukrainian reply with neither a valid block nor a verdict passes the gate."""
     reply = "```ukrainian-item-judgments\n{not valid json\n```\n"
-    assert worker._verdict_failure(_item_review_record(tmp_path), reply) == "review_missing_verdict_line"
+    assert worker._receipt_failure(_item_review_record(tmp_path), reply) == "review_missing_verdict_line"
 
 
 @pytest.mark.usefixtures('configured_roots')
@@ -450,7 +638,7 @@ def test_verdict_gate_code_review_without_verdict_still_fails(tmp_path):
         '"finding": "", "sources": "VESUM", "quote": "слово"}]}\n'
         "```\n"
     )
-    assert worker._verdict_failure(_item_review_record(tmp_path, "code"), reply) == "review_missing_verdict_line"
+    assert worker._receipt_failure(_item_review_record(tmp_path, "code"), reply) == "review_missing_verdict_line"
 
 
 @pytest.mark.usefixtures('configured_roots')
@@ -483,7 +671,7 @@ def test_agy_structured_terminal_not_response(case):
         assert parsed.error is None
         assert json.loads(parsed.text) == payload
         assert recognized_verdicts(parsed.text) == ["APPROVE"]
-        assert worker._verdict_failure({"schema_version": 2, "require_review_verdict": True}, parsed.text) is None
+        assert worker._receipt_failure({"schema_version": 2, "require_review_verdict": True}, parsed.text) is None
     else:
         assert parsed.error is not None
 

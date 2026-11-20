@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestones — Machinery</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/machinery.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+<header>
+  <div class="header-top">
+    <div class="title">
+      <h1>Milestones and progress</h1>
+      <p class="purpose">Open milestones and issue progress across fleet repositories.</p>
+    </div>
+    <div class="header-utils">
+      <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
+      <button type="button" class="theme-toggle" id="theme-toggle">Theme: Auto</button>
+      <div class="refresh">
+        <span class="muted" id="last-refresh">Loading…</span>
+        <button type="button" class="retry" id="refresh-retry" hidden aria-label="Retry refresh">Retry</button>
+      </div>
+    </div>
+  </div>
+  <div class="header-nav">
+    <nav class="pages" id="machinery-nav" aria-label="Machinery pages"></nav>
+    <div class="chips" id="chips"></div>
+  </div>
+</header>
+<main id="main" tabindex="-1">
+  <section class="wide" id="milestones">
+    <h2>Milestones and progress <span class="age" id="milestones-age">Loading…</span></h2>
+    <p id="milestones-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="milestones-content">Loading…</div>
+  </section>
+</main>
+<script src="/machinery.js"></script>
+<script>
+"use strict";
+const {escapeHtml, safeHttpUrl, createPanelRunner} = Machinery;
+
+function renderMilestones(data) {
+  if (data.status === "pending") return '<p class="muted">Loading milestones from GitHub…</p>';
+  const repos = Array.isArray(data.repositories) ? data.repositories : [];
+  const age = value => Number.isFinite(value) ? `${Math.ceil(value)}s` : "unknown";
+  const expanded = new Set([...document.querySelectorAll("#milestones details[open]")].map(item => item.dataset.milestone));
+  const out = [`<p class="${data.stale ? "warn" : "muted"}">${data.stale ? "Stale. " : ""}${escapeHtml(data.freshness || "")} Private repositories show counts only.</p>`];
+  for (const repo of repos) {
+    out.push(`<h3>${escapeHtml(repo.repository)} · data age ${age(repo.age_seconds)}${repo.stale ? " · STALE" : ""}</h3>`);
+    if (repo.status !== "ok") out.push(`<p class="warn">${escapeHtml(repo.reason || "Milestone data unknown")}</p>`);
+    const milestones = Array.isArray(repo.milestones) ? repo.milestones : [];
+    if (!milestones.length && repo.status === "ok") out.push('<p class="muted">No open milestones.</p>');
+    for (const [index, item] of milestones.entries()) {
+      const name = repo.private ? "Private milestone" : escapeHtml(item.title);
+      const percent = Number.isFinite(item.percent_complete) ? `${item.percent_complete}%` : "unknown";
+      const counts = `${item.open_issues ?? "?"} open · ${item.closed_issues ?? "?"} closed · ${percent} complete`;
+      const key = `${repo.repository}:${item.number ?? index}`;
+      out.push(`<details data-milestone="${escapeHtml(key)}"${expanded.has(key) ? " open" : ""}><summary>${name} · ${escapeHtml(counts)}</summary>`);
+      if (Number.isFinite(item.percent_complete)) out.push(`<progress max="100" value="${item.percent_complete}" aria-label="${name} completion">${percent}</progress>`);
+      if (!repo.private) {
+        out.push(`<p>${escapeHtml(item.description_first_line || "")}</p><p class="muted">Due ${escapeHtml(item.due_on ? item.due_on.slice(0, 10) : "not set")}</p>`);
+        const issues = Array.isArray(item.issues) ? item.issues : [];
+        if (item.issues_status !== "ok") out.push('<p class="warn">Open issue list is incomplete or unavailable.</p>');
+        else if (!issues.length) out.push('<p class="muted">No open issues.</p>');
+        if (issues.length) out.push('<table><thead><tr><th scope="col">Issue</th><th scope="col">Labels</th></tr></thead><tbody>');
+        for (const issue of issues) {
+          const safe = safeHttpUrl(issue.url);
+          const link = safe
+            ? `<a href="${escapeHtml(safe)}">#${escapeHtml(issue.number)} ${escapeHtml(issue.title)}</a>`
+            : `#${escapeHtml(issue.number)} ${escapeHtml(issue.title)}`;
+          const labels = (Array.isArray(issue.labels) ? issue.labels : []).map(escapeHtml).join(", ");
+          out.push(`<tr><td>${link}</td><td>${labels}</td></tr>`);
+        }
+        if (issues.length) out.push('</tbody></table>');
+      }
+      out.push('</details>');
+    }
+  }
+  if (!repos.length) out.push('<p class="warn">Fleet milestone data is unavailable.</p>');
+  return out.join("");
+}
+
+const PANELS = [
+  {id: "milestones", label: "Milestones", urls: ["/api/milestones"], render: renderMilestones, retry: data => data.status === "pending"},
+];
+
+const runner = createPanelRunner({panels: PANELS});
+runner.start();
+</script>
+</body>
+</html>

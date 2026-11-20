@@ -10,6 +10,7 @@ exit alert. Each docstring names the defect class it can fail for.
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 from lu_machinery.common.repo_root import machinery_path
@@ -32,7 +33,6 @@ CONFLICTING_STREAM = [
 ] + [{"type": "negative_constraint", "body": f"Another lane negative constraint {index}."} for index in range(1, 3)]
 
 NEXT_THREE = "\n".join(f"{index}. anchor-check next item {index}" for index in range(1, 4))
-HANDS_TWO = "\n".join(f"- anchor-check hands-off rule {index}" for index in range(1, 3))
 SENDER = "codex-atlas"
 LANE = "codex-atlas"  # The tmux session the atlas Codex lane runs in.
 EPIC = "atlas"
@@ -45,28 +45,37 @@ LAUNCHER_EXIT_RC1 = (
 )
 
 
-def handoff_text(*, next_heading: bool = True, hands_off_heading: bool = True) -> str:
-    parts = ["# Handoff\n"]
-    if next_heading:
-        parts.append(f"## Next drive order\n{NEXT_THREE}\n")
-    if hands_off_heading:
-        parts.append(f"## Hands-off\n{HANDS_TWO}\n")
-    return "\n".join(parts)
+def handoff_note(*, next_actions: bool = True, working_set: bool = True) -> dict[str, object]:
+    return {
+        "id": "C-4170",
+        "kind": "handoff_note",
+        "lane": EPIC,
+        "owner": SENDER,
+        "status": "open",
+        "created_utc": "2026-11-02 20:23:39+00:00",
+        "statement": NEXT_THREE if next_actions else "No next actions.",
+        "done_when": "The successor verifies the exact lineage." if working_set else "",
+    }
 
 
-def lane_repo(tmp_path: Path, text: str | None) -> Path:
+def lane_repo(tmp_path: Path, note: dict[str, object] | None) -> Path:
     repo = tmp_path / "repo"
     epic = repo / ".claude" / "atlas-epic"
     epic.mkdir(parents=True, exist_ok=True)
-    if text is not None:
-        (epic / "CODEX-DRIVER-HANDOFF.md").write_text(text, encoding="utf-8")
+    (tmp_path / "driver-state-fixture.json").write_text(json.dumps(note), encoding="utf-8")
     return repo
 
 
 @pytest.fixture(autouse=True)
-def _no_host_driver_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the guard's anchor check off a host's driver-state database (#12567)."""
+def _fixture_driver_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supply only the test's lane handoff note."""
     monkeypatch.setenv(handoff_select.DRIVER_STATE_CLI_ENV, "")
+
+    def read(lane: str) -> dict[str, object] | None:
+        fixture = tmp_path / "driver-state-fixture.json"
+        return json.loads(fixture.read_text(encoding="utf-8")) if lane == EPIC and fixture.is_file() else None
+
+    monkeypatch.setattr(handoff_select, "_read_newest_handoff_note", read)
 
 
 @pytest.fixture
@@ -120,7 +129,7 @@ def exit_typed(h: Harness) -> bool:
 # ---- behaviour 1: the check before the exit command -------------------------------
 def test_valid_handoff_still_exits(tmp_path: Path, launcher_stream: None) -> None:
     """Defect class: the guard blocks a lane whose handoff the launcher accepts."""
-    lane_repo(tmp_path, handoff_text())
+    lane_repo(tmp_path, handoff_note())
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
     h.tick(LANE)
@@ -131,18 +140,14 @@ def test_valid_handoff_still_exits(tmp_path: Path, launcher_stream: None) -> Non
 def test_db_handoff_note_lets_a_lane_with_stale_markdown_exit(
     tmp_path: Path, launcher_stream: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#12567: the guard reads the lane's newest DB handoff_note first, as the launcher's mint does."""
-    lane_repo(tmp_path, handoff_text(next_heading=False, hands_off_heading=False))
-    note = {
-        "id": "C-4170", "kind": "handoff_note", "lane": "atlas", "owner": SENDER, "status": "open",
-        "created_utc": "2026-11-02 20:23:39+00:00", "source_ref": "message_0123456789abcdef",
-        "statement": "1. Render then check first.\n2. Settle the held review.\n3. Dispatch the next worker.\n",
-        "done_when": "The successor verifies the exact lineage.",
-    }
+    """#12567: the guard reads the lane's newest active DB handoff_note, as the launcher's mint does."""
+    repo = lane_repo(tmp_path, handoff_note())
+    (repo / ".claude/atlas-epic/CODEX-DRIVER-HANDOFF.md").write_text("# Stale handoff", encoding="utf-8")
     reads: list[str] = []
-    monkeypatch.setattr(handoff_select, "_driver_state_cli", lambda: "lu-driver-state")
-    monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", lambda lane: reads.append(lane) or note)
+    monkeypatch.setattr(handoff_select, "_read_newest_handoff_note", lambda lane: reads.append(lane) or handoff_note())
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
+    lane = next(lane for lane in h.guard.registry.lanes if lane.session == LANE)
+    assert "record a DB handoff_note for lane atlas" in h.guard._prompt(lane, "fixture rotation", 1)
     enter_handoff(h)
     h.tick(LANE)
     assert h.fake.typed(LANE) == ["/quit"]
@@ -151,30 +156,29 @@ def test_db_handoff_note_lets_a_lane_with_stale_markdown_exit(
 
 
 @pytest.mark.parametrize(
-    ("next_heading", "hands_off_heading", "anchors", "missing_name"),
+    ("next_actions", "working_set", "anchors"),
     [
-        (False, True, 7, "Next"),
-        (True, False, 8, "Hands-off"),
-        (False, False, 5, "Next and Hands-off"),
+        (False, True, 7),
+        (True, False, 9),
+        (False, False, 6),
     ],
 )
 def test_short_handoff_is_sent_back_instead_of_exiting(
     tmp_path: Path,
     launcher_stream: None,
-    next_heading: bool,
-    hands_off_heading: bool,
+    next_actions: bool,
+    working_set: bool,
     anchors: int,
-    missing_name: str,
 ) -> None:
     """Defect class: lane exits with a handoff the launcher will refuse (anchors short)."""
-    lane_repo(tmp_path, handoff_text(next_heading=next_heading, hands_off_heading=hands_off_heading))
+    lane_repo(tmp_path, handoff_note(next_actions=next_actions, working_set=working_set))
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
     h.tick(LANE)
     assert not exit_typed(h)
     assert anchor_sendbacks(h), h.fake.typed(LANE)
     assert f"{anchors}/{handoff_select.N_ANCHORS}" in anchor_sendbacks(h)[0]
-    assert missing_name in anchor_sendbacks(h)[0]
+    assert "Add numbered next actions and working-set details to the lane's DB note" in anchor_sendbacks(h)[0]
     assert h.state[LANE]["done_seen"] is False
     assert h.state[LANE]["anchor_sendbacks"] == 1
     assert len(alerts(h)) == 1 and f"{anchors}" in alerts(h)[0]
@@ -182,7 +186,7 @@ def test_short_handoff_is_sent_back_instead_of_exiting(
 
 def test_the_same_failure_alerts_once_across_ticks(tmp_path: Path, launcher_stream: None) -> None:
     """Defect class: an alert storm from re-checking the same shortfall every tick."""
-    lane_repo(tmp_path, handoff_text(next_heading=False))
+    lane_repo(tmp_path, handoff_note(next_actions=False))
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
     h.tick(LANE)
@@ -196,7 +200,7 @@ def test_the_same_failure_alerts_once_across_ticks(tmp_path: Path, launcher_stre
 
 def test_sendbacks_are_bounded_then_the_lane_is_left_running(tmp_path: Path, launcher_stream: None) -> None:
     """Defect class: unbounded send-backs, or a forced kill after a hopeless handoff."""
-    lane_repo(tmp_path, handoff_text(next_heading=False))
+    lane_repo(tmp_path, handoff_note(next_actions=False))
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
     for _ in range(cg.ANCHOR_MAX_SENDBACKS + 2):
@@ -211,19 +215,19 @@ def test_sendbacks_are_bounded_then_the_lane_is_left_running(tmp_path: Path, lau
     assert sum("would give" in body for body in alerts(h)) == 1
 
 
-def test_handoff_file_missing_fails_open_with_one_alert(tmp_path: Path, launcher_stream: None) -> None:
-    """Defect class: a missing handoff file wedges the lane instead of failing open."""
+def test_handoff_note_missing_fails_open_with_one_alert(tmp_path: Path, launcher_stream: None) -> None:
+    """Defect class: a missing DB handoff note wedges the lane instead of failing open."""
     lane_repo(tmp_path, None)
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
     h.tick(LANE)
     assert exit_typed(h)
-    assert len(alerts(h)) == 1 and "no handoff file" in alerts(h)[0]
+    assert len(alerts(h)) == 1 and "no readable DB handoff note" in alerts(h)[0]
 
 
 def test_helper_error_fails_open_and_alerts_once(tmp_path: Path, launcher_stream: None, monkeypatch) -> None:
     """Defect class: a bug in the new check wedges a lane that would otherwise rotate."""
-    lane_repo(tmp_path, handoff_text())
+    lane_repo(tmp_path, handoff_note())
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
 
     def boom(**_kwargs):
@@ -241,7 +245,7 @@ def test_helper_error_fails_open_and_alerts_once(tmp_path: Path, launcher_stream
 
 def test_human_controlled_lane_is_untouched_by_the_anchor_check(tmp_path: Path, launcher_stream: None) -> None:
     """Defect class: the guard types an anchor send-back into a human-controlled lane."""
-    lane_repo(tmp_path, handoff_text(next_heading=False))
+    lane_repo(tmp_path, handoff_note(next_actions=False))
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
     h.advance(5)
@@ -253,7 +257,7 @@ def test_human_controlled_lane_is_untouched_by_the_anchor_check(tmp_path: Path, 
 
 # ---- behaviour 2: post-relaunch launcher exit ------------------------------------
 def relaunched(tmp_path: Path, launcher_stream: None) -> Harness:
-    lane_repo(tmp_path, handoff_text())
+    lane_repo(tmp_path, handoff_note())
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
     h.pane(LANE).agent = None
@@ -324,32 +328,30 @@ def test_nonzero_launcher_exit_is_not_relaunched_in_a_loop(tmp_path: Path, launc
 # ---- behaviour 1 + AC-02: the guard and the launcher cannot drift ------------------
 FIXTURES = {
     "valid": (True, True),
-    "next-missing": (False, True),
-    "hands-off-missing": (True, False),
+    "next-actions-missing": (False, True),
+    "working-set-missing": (True, False),
     "both-missing": (False, False),
 }
 
 
 def launcher_selection(repo: Path):
-    """Exactly what ``codex_lane mint`` selects: the Codex candidates + stream."""
+    """Exactly the note and stream selection that ``codex_lane mint`` uses."""
     return handoff_select.select_anchor_handoff(
         repo=repo,
         epic="atlas",
         stream_id="lane-test",
         stream_entries=list(STREAM),
-        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas"),
     )
 
 
 @pytest.mark.parametrize("case", sorted(FIXTURES))
 def test_shared_verdict_agrees_with_the_launcher_selector(tmp_path: Path, launcher_stream: None, case: str) -> None:
     """Defect class: the guard's check drifts from the launcher's ``select_handoff``."""
-    next_heading, hands_off_heading = FIXTURES[case]
-    repo = lane_repo(tmp_path, handoff_text(next_heading=next_heading, hands_off_heading=hands_off_heading))
+    next_actions, working_set = FIXTURES[case]
+    repo = lane_repo(tmp_path, handoff_note(next_actions=next_actions, working_set=working_set))
     verdict = handoff_select.check_handoff_anchors(
         repo=repo,
         epic="atlas",
-        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas"),
         stream_id="lane-test",
         stream_entries=STREAM,
     )
@@ -368,8 +370,8 @@ def test_shared_verdict_agrees_with_the_launcher_selector(tmp_path: Path, launch
 @pytest.mark.parametrize("case", sorted(FIXTURES))
 def test_guard_exit_decision_follows_the_launcher_selector(tmp_path: Path, launcher_stream: None, case: str) -> None:
     """Defect class: the guard exits where the launcher would refuse the handoff."""
-    next_heading, hands_off_heading = FIXTURES[case]
-    repo = lane_repo(tmp_path, handoff_text(next_heading=next_heading, hands_off_heading=hands_off_heading))
+    next_actions, working_set = FIXTURES[case]
+    repo = lane_repo(tmp_path, handoff_note(next_actions=next_actions, working_set=working_set))
     launcher_ok = bool(launcher_selection(repo).reason)
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     enter_handoff(h)
@@ -383,7 +385,6 @@ def test_absent_handoff_is_reported_as_no_handoff_for_the_fail_open_path(tmp_pat
     verdict = handoff_select.check_handoff_anchors(
         repo=repo,
         epic="atlas",
-        candidates=handoff_select.load_codex_mint_candidates(repo, "atlas"),
         stream_id="lane-test",
         stream_entries=STREAM,
     )
@@ -411,7 +412,7 @@ def test_ambient_session_stream_from_another_lane_cannot_exit_a_short_handoff(
     not. The guard must judge the real stream: matching ``select_handoff`` on
     that stream, it sends the lane back instead of typing ``/quit``.
     """
-    repo = lane_repo(tmp_path, handoff_text(next_heading=False))
+    repo = lane_repo(tmp_path, handoff_note(next_actions=False))
     ambient = shell_stream("open-model-data")
     assert ambient != shell_stream(EPIC)
     monkeypatch.setenv("SESSION_STREAM_ID", ambient)
@@ -427,7 +428,6 @@ def test_ambient_session_stream_from_another_lane_cannot_exit_a_short_handoff(
             epic=EPIC,
             stream_id=lane_stream,
             stream_entries=entries(lane_stream),
-            candidates=handoff_select.load_codex_mint_candidates(repo, EPIC),
         ).reason
     )
     assert not launcher_ok
@@ -577,10 +577,10 @@ def launcher_exit_in_two_relaunches(h: Harness) -> None:
 
 # cause -> (handoff text, two-occurrence scenario, alerts each occurrence sends)
 REPEATED = {
-    "shortfall": (handoff_text(next_heading=False), shortfall_in_two_phases, 1),
+    "shortfall": (handoff_note(next_actions=False), shortfall_in_two_phases, 1),
     "fail-open": (None, fail_open_in_two_phases, 1),
-    "blocked": (handoff_text(next_heading=False), blocked_in_two_phases, 2),
-    "launcher-exit": (handoff_text(), launcher_exit_in_two_relaunches, 1),
+    "blocked": (handoff_note(next_actions=False), blocked_in_two_phases, 2),
+    "launcher-exit": (handoff_note(), launcher_exit_in_two_relaunches, 1),
 }
 
 
@@ -595,8 +595,8 @@ def test_the_same_failure_in_a_later_phase_or_relaunch_is_delivered_again(
     lane's failure once and never again, so a lane whose launcher keeps exiting or
     whose handoff stays short sits dead unobserved.
     """
-    text, scenario, per_occurrence = REPEATED[cause]
-    lane_repo(tmp_path, text)
+    note, scenario, per_occurrence = REPEATED[cause]
+    lane_repo(tmp_path, note)
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
     plane = delivered_alerts(h)
     scenario(h)
@@ -610,7 +610,7 @@ def test_fail_open_alert_truncates_a_long_helper_error(
     tmp_path: Path, launcher_stream: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Defect class: an unbounded exception message bloats the CTO alert body."""
-    lane_repo(tmp_path, handoff_text())
+    lane_repo(tmp_path, handoff_note())
     h = Harness(tmp_path, **{LANE: codex_pane(40)})
 
     def boom(**_kwargs):

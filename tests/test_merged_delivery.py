@@ -307,9 +307,9 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
     elif case in {"outside", "rename-outside", "history-outside"}:
         assert (record["status"], record["error"]) == ("no_deliverable", "outside_owned_paths: outside.md")
     else:
-        reason = "remote delivery tip does not match snapshot" if replacement else "git fetch failed"
+        reason = "work_not_pushed_or_unknown" if tree == "clean" else "worktree_dirty_or_unknown"
         expected = (("failed", "provider failed") if provider_status == "failed" else
-                    ("no_deliverable", f"owned_paths_verification_failed: {reason}"))
+                    ("no_deliverable", reason))
         assert (record["status"], record["error"]) == expected
         assert "delivery_pr" not in record
         if tree == "clean":
@@ -326,7 +326,9 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
     the pull request into the default branch and both refs were then deleted. Lookup stayed
     ``no_match`` because the base names differed, and the rescue walk fetched the deleted
     base ref. The default branch also moved on its own, so a depth-limited fetch of the
-    squash commit left its parent as a shallow boundary and ``merge-base`` failed. The shape
+    squash commit left its parent as a shallow boundary and ``merge-base`` failed. The task
+    resets onto a later main commit after the squash, so the recorded ahead count includes
+    upstream history. The shape
     is the cto-9069-handoffreq2-opus and cto-9069-packet5-opus records: commits ahead, a
     clean tree, ``push_state`` unpushed, ``remote_branch_missing``.
     """
@@ -366,11 +368,18 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
     _git(work, "merge", "--squash", branch)
     _git(work, "commit", "-m", "deliver (#1250)")
     merge = _git(work, "rev-parse", "HEAD")
+    (work / "main.md").write_text("advanced after squash\n")
+    _git(work, "add", "main.md")
+    _git(work, "commit", "-m", "main moved after delivery")
     _git(work, "push", "origin", "main", f":{parent}", f":{branch}")
     _git(work, "switch", branch)
+    _git(work, "reset", "--hard", "main")
+    snapshot = _git(work, "rev-parse", "HEAD")
+    commits_ahead = int(_git(work, "rev-list", "--count", f"{start}..HEAD"))
     _git(work, "remote", "set-url", "origin", "https://github.com/org/repo.git")
     assert not _git(remote, "for-each-ref", f"refs/heads/{parent}", f"refs/heads/{branch}")
-    assert _git(remote, "rev-parse", "refs/heads/main") == merge
+    assert _git(remote, "rev-parse", "refs/heads/main") == snapshot
+    assert snapshot != merge and commits_ahead > 1
 
     @contextmanager
     def private_remote(task_id, url):
@@ -408,7 +417,7 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
         "worktree_remote_url": "https://github.com/org/repo.git",
         "worktree_base_ref": f"origin/{parent}", "worktree_branch": branch, "publish_branch": None,
         "started_at": "2026-11-16T07:55:45+00:00", "worktree_base_sha": start, "worktree_start_sha": start,
-        "worktree_path": str(work), "head_sha": head, "remote_head_sha": None, "commits_ahead": 1,
+        "worktree_path": str(work), "head_sha": snapshot, "remote_head_sha": None, "commits_ahead": commits_ahead,
         "push_state": "unpushed", "push_state_reason": "remote_branch_missing",
         "worktree_dirty_on_exit": False, "worktree_untracked_only_on_exit": False,
     }

@@ -188,14 +188,13 @@ case "$prompt" in
 
 
 def test_review_gate_exception_cannot_leave_supervisor_running(sandbox):
-    """Defect class: scanner exceptions lose terminal failure or expose exception contents."""
+    """Defect class: receipt parser exceptions lose terminal failure or expose exception contents."""
     review = sandbox.repo / "lu_machinery/review"
     review.mkdir(exist_ok=True)
     (review / "__init__.py").touch()
-    # Dispatch admission reads branch authorship through the recorder, which imports the rest of the parser.
-    parser = review / "verdict_parser.py"
+    parser = review / "review_contract.py"
     parser.write_text(
-        parser.read_text() + "\n\ndef recognized_verdicts(text):\n    raise RuntimeError('sensitive scanner diagnostic')\n"
+        parser.read_text() + "\n\ndef canonical_receipt_payload(text):\n    raise RuntimeError('sensitive parser diagnostic')\n"
     )
     receipt = (
         '{"schema_version":"code-review-findings.v1","overall":{"correctness":"correct",'

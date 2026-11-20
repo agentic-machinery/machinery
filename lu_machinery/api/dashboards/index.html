@@ -3,544 +3,59 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Machinery</title>
+<title>Machinery — Overview</title>
 <link rel="icon" href="data:,">
-<style>
-  :root { color-scheme: light dark; --fg: #1d1f23; --muted: #646a73; --bg: #f4f5f7; --card: #fff; --line: #e3e4e8;
-          --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --link: #0969da; }
-  @media (prefers-color-scheme: dark) {
-    :root { --fg: #e6e7ea; --muted: #9aa0aa; --bg: #15171a; --card: #1d2024; --line: #30343a;
-            --ok: #3fb950; --warn: #d29922; --bad: #f85149; --link: #58a6ff; }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
-  header { position: sticky; top: 0; z-index: 2; background: var(--card); border-bottom: 1px solid var(--line);
-           padding: 10px 20px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
-  header h1 { margin: 0; font-size: 18px; }
-  .title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 10px; min-width: 0; flex: 1 1 16rem; max-width: 100%; }
-  .purpose { margin: 0; flex: 1 1 16rem; min-width: 0; font-size: 13px; color: var(--muted); }
-  nav.sites { display: flex; gap: 12px; font-size: 13px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 1px 10px; font-size: 13px; color: inherit; text-decoration: none; }
-  .chip b { font-variant-numeric: tabular-nums; }
-  .chip.bad { border-color: var(--bad); color: var(--bad); }
-  .chip.warn { border-color: var(--warn); color: var(--warn); }
-  .refresh { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; max-width: 100%; }
-  #last-refresh { font-size: inherit; }
-  button.retry { font: inherit; font-size: 13px; color: var(--fg); background: var(--card); border: 1px solid var(--line);
-                 border-radius: 6px; padding: 2px 10px; cursor: pointer; }
-  .skip { position: absolute; left: 8px; top: 8px; transform: translateY(-150%); z-index: 3; background: var(--card);
-          color: var(--fg); padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; }
-  .skip:focus { transform: none; }
-  .visually-hidden { position: absolute; left: 0; top: 0; width: 1px; height: 1px; padding: 0; margin: -1px;
-                     overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
-  main { display: grid; gap: 14px; padding: 14px 20px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 560px), 1fr)); }
-  section { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; overflow-x: auto; min-width: 0; }
-  section.wide { grid-column: 1 / -1; }
-  h2 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
-  h2 .age { font-weight: normal; font-size: 12px; color: var(--muted); }
-  h2 .age.bad { color: var(--bad); }
-  h2 .age.warn { color: var(--warn); }
-  h3 { margin: 10px 0 4px; font-size: 13px; color: var(--muted); font-weight: 600; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { font-size: 12px; color: var(--muted); font-weight: 600; white-space: nowrap; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  p { margin: 6px 0; }
-  details { margin: 8px 0; } summary { cursor: pointer; }
-  .muted { color: var(--muted); }
-  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); font-weight: 600; }
-  .error { color: var(--bad); }
-  .bar { display: inline-block; width: 64px; height: 8px; background: var(--line); border-radius: 4px; vertical-align: middle; margin-right: 6px; }
-  .bar > span { display: block; height: 100%; border-radius: 4px; }
-  a { color: var(--link); }
-  table.subs { border-collapse: separate; border-spacing: 0; }
-  table.subs td { min-width: 4.5em; }
-  table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
-  @media (max-width: 640px) {
-    header { padding: 8px 10px; } main { padding: 10px; gap: 10px; } section { padding: 8px 10px; }
-    .refresh { margin-left: 0; }
-    /* One line per row; each table scrolls sideways inside its card instead of the page growing tall. */
-    th, td { white-space: nowrap; }
-    td br { display: none; }
-    /* The subscriptions table stacks instead: every account is a card, so no column sits off-screen. */
-    #subs table, #subs tbody, #subs tr, #subs td, #subs th { display: block; white-space: normal; }
-    #subs thead { display: none; }
-    #subs tr { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; padding: 4px 8px; }
-    #subs tr.group { border: 0; padding: 0; margin: 10px 0 4px; }
-    #subs th[colspan] { border: 0; padding: 0; }
-    #subs td { display: flex; gap: 8px; padding: 2px 0; border: 0; min-width: 0; overflow-wrap: anywhere; }
-    #subs td::before { content: attr(data-label); flex: 0 0 7.5em; color: var(--muted); font-size: 12px; }
-    #subs td:first-child { font-weight: 600; }
-    #subs td:first-child::before { display: none; }
-  }
-</style>
+<link rel="stylesheet" href="/machinery.css">
 </head>
 <body>
 <a class="skip" href="#main">Skip to main content</a>
 <header>
-  <div class="title">
-    <h1>Machinery</h1>
-    <span class="muted" id="machinery-version" data-version="__MACHINERY_VERSION__"></span>
-    <p class="purpose">Which subscription is near its limit, when it resets, and whether anything is signed out.</p>
+  <div class="header-top">
+    <div class="title">
+      <h1>Machinery</h1>
+      <span class="muted" id="machinery-version" data-version="__MACHINERY_VERSION__"></span>
+      <p class="purpose">What needs attention now: firing alerts, subscription capacity, and merge queue status.</p>
+    </div>
+    <div class="header-utils">
+      <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
+      <button type="button" class="theme-toggle" id="theme-toggle">Theme: Auto</button>
+      <div class="refresh">
+        <span class="muted" id="last-refresh">Loading…</span>
+        <button type="button" class="retry" id="refresh-retry" hidden aria-label="Retry refresh">Retry</button>
+      </div>
+    </div>
   </div>
-  <nav class="sites" aria-label="Sites"><a href="/model-stats">Model value</a><a href="/">Learn Ukrainian</a><a href="http://localhost:8768/">KubeDojo</a></nav>
-  <div class="chips" id="chips"></div>
-  <div class="refresh">
-    <span class="muted" id="last-refresh">Loading…</span>
-    <button type="button" class="retry" id="refresh-retry" hidden onclick="refreshAll()" aria-label="Retry refresh">Retry</button>
+  <div class="header-nav">
+    <nav class="pages" id="machinery-nav" aria-label="Machinery pages"></nav>
+    <div class="chips" id="chips"></div>
   </div>
 </header>
 <main id="main" tabindex="-1">
-  <section class="wide" id="subs"><h2>Subscriptions: usage, pace, resets and sign-in <span class="age" id="usage-age">Loading…</span></h2><p id="usage-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><div id="usage-content">Loading…</div></section>
-  <section class="wide" id="fleet"><h2>Agent fleet <span class="age" id="workers-age">Loading…</span></h2>
-    <p id="workers-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
-    <div id="workers-content">Loading…</div>
-    <h3>Recently finished <span class="age muted" id="recent-age">Loading…</span></h3>
-    <p id="recent-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
-    <div id="recent-content">Loading…</div></section>
-  <section class="wide" id="milestones"><h2>Milestones and progress <span class="age" id="milestones-age">Loading…</span></h2><p id="milestones-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><div id="milestones-content">Loading…</div></section>
-  <section id="prs"><h2>Pull requests and merge queue <span class="age" id="prs-age">Loading…</span></h2><p id="prs-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><div id="prs-content">Loading…</div></section>
-  <section id="alerts"><h2>Alerts firing <span class="age" id="alerts-age">Loading…</span></h2><p id="alerts-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><div id="alerts-content">Loading…</div></section>
-  <section id="comms"><h2>Fleet Comms <span class="age" id="comms-age">Loading…</span></h2><p id="comms-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p><div id="comms-content">Loading…</div></section>
+  <section class="wide" id="alerts">
+    <h2>Alerts firing <span class="age" id="alerts-age">Loading…</span></h2>
+    <p id="alerts-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="alerts-content">Loading…</div>
+  </section>
+  <section id="capacity">
+    <h2>Capacity summary <span class="age" id="usage-age">Loading…</span> <a class="more" href="/subscriptions">Full subscriptions →</a></h2>
+    <p id="usage-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="usage-content">Loading…</div>
+  </section>
+  <section id="queue">
+    <h2>Merge queue status <span class="age" id="prs-age">Loading…</span> <a class="more" href="/pull-requests">All pull requests →</a></h2>
+    <p id="prs-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="prs-content">Loading…</div>
+  </section>
 </main>
+<script src="/machinery.js"></script>
 <script>
 "use strict";
-const API_TIMEOUT_MS = 8000;
-const REFRESH_MS = 30000;
-const ACTIVE = new Set(["spawning", "running", "settling", "needs_finalize"]);
-
-function escapeHtml(value) {
-  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;").replaceAll("'", "&#39;");
-}
-
-async function fetchJson(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, {signal: controller.signal, headers: {Accept: "application/json"}});
-    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-    let data;
-    try { data = JSON.parse(await response.text()); } catch { throw new Error(`${url}: Invalid JSON`); }
-    if (data === null || typeof data !== "object" || Array.isArray(data)) throw new Error(`${url}: Invalid JSON shape`);
-    const rawAge = response.headers.get("X-Snapshot-Age-S");
-    const age = rawAge === null ? null : Number(rawAge);
-    const rawBound = response.headers.get("X-Snapshot-Stale-After-S");
-    const bound = rawBound === null ? null : Number(rawBound);
-    const state = response.headers.get("X-Snapshot-State");
-    return {data, age: age !== null && Number.isFinite(age) && age >= 0 ? age : null,
-      bound: bound !== null && Number.isFinite(bound) && bound > 0 ? bound : null,
-      state, snapshot: true, receivedAt: Date.now(), url};
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function toDate(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const moment = typeof value === "number" ? new Date(value < 1e11 ? value * 1000 : value) : new Date(value);
-  return Number.isNaN(moment.getTime()) ? null : moment;
-}
-
-function utc(value) {
-  const moment = toDate(value);
-  return moment ? moment.toISOString().slice(0, 16).replace("T", " ") + "Z" : "—";
-}
-
-function span(seconds) {
-  if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return "—";
-  const s = Math.abs(Math.round(seconds));
-  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
-  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : m ? `${m}m` : `${s}s`;
-}
-
-function relative(value) {
-  const moment = toDate(value);
-  if (!moment) return "";
-  const seconds = (moment.getTime() - Date.now()) / 1000;
-  return seconds >= 0 ? `in ${span(seconds)}` : `${span(seconds)} ago`;
-}
-
-function validPct(value) {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100;
-}
-
-function pct(value) {
-  return validPct(value) ? `${Math.round(value)}%` : "—";
-}
-
-function bar(left) {
-  if (!validPct(left)) return "";
-  const color = left < 15 ? "var(--bad)" : left < 35 ? "var(--warn)" : "var(--ok)";
-  return `<span class="bar"><span style="width:${left}%;background:${color}"></span></span>`;
-}
-
-// A cell carries its column name, so a stacked (card) layout can show it beside the value.
-// The first cell is the card's own heading, so it keeps no label.
-const labelled = (cells, headers) => cells.map((cell, index) => index && headers[index]
-  ? cell.replace(/^<td/, `<td data-label="${escapeHtml(headers[index])}"`) : cell).join("");
-
-function table(headers, rows, stacked = false) {
-  if (!rows.length) return '<p class="muted">None.</p>';
-  return `<table><thead><tr>${headers.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead><tbody>`
-    + rows.map(cells => `<tr>${stacked ? labelled(cells, headers) : cells.join("")}</tr>`).join("") + "</tbody></table>";
-}
-
-const td = (html, cls = "") => `<td${cls ? ` class="${cls}"` : ""}>${html}</td>`;
-const text = (value, cls = "") => td(value === null || value === undefined || value === "" ? "—" : escapeHtml(value), cls);
-const unknown = reason => `<p class="muted">Unknown: ${escapeHtml(String(reason || "no reason given").replaceAll("_", " "))}.</p>`;
-
-// A "fresh" flag is believed only with a numeric age inside the threshold;
-// an older reading is stale whatever the flag says.
-function readingState(freshness, ageS, thresholdS) {
-  const aged = typeof ageS === "number" && Number.isFinite(ageS) && ageS >= 0;
-  const limit = typeof thresholdS === "number" && thresholdS > 0 ? thresholdS : 900;
-  if (freshness === "stale_last_good") return "last_good";
-  if (freshness === "stale" || ((freshness === "fresh") && aged && ageS > limit)) return "stale";
-  if (freshness === "fresh") return aged ? "fresh" : "unknown";
-  return freshness ? String(freshness) : "missing";
-}
-
-function freshnessCell(state, ageS) {
-  const age = typeof ageS === "number" && Number.isFinite(ageS) ? `${span(ageS)} old` : "age unknown";
-  if (state === "fresh") return text(`fresh, ${age}`, "ok");
-  if (state === "last_good") return text(`Last good reading, ${age}`, "warn");
-  if (state === "stale") return text(`STALE, ${age}`, "bad");
-  if (state === "unknown") return text(`FRESHNESS UNKNOWN, ${age}`, "bad");
-  return text(state === "missing" ? "NO READING" : state.toUpperCase(), "bad");
-}
-
-function pp(value) {
-  return typeof value === "number" && Number.isFinite(value) ? `${Math.round(Math.abs(value))} pp` : null;
-}
-
-function windowLeft(window) {
-  if (!window || window.status === "none") return text("none", "muted");
-  if (window.status !== "ok" || !validPct(window.left_pct)) return text("unknown", "muted");
-  return td(`${bar(window.left_pct)}${escapeHtml(pct(window.left_pct))}`, "num");
-}
-
-function resetText(window) {
-  if (!window || window.status !== "ok") return null;
-  if (!toDate(window.resets_at)) return "reset not reported";
-  if (window.reset_passed) return `${utc(window.resets_at)} (passed; awaiting a new reading)`;
-  return `${utc(window.resets_at)} (${relative(window.resets_at)})`;
-}
-
-function weeklyResetCell(window) {
-  if (!window || window.status !== "ok") return text("unknown", "muted");
-  if (!toDate(window.resets_at)) return text("not reported", "muted");
-  if (window.reset_passed) return text(`passed; awaiting a new reading (${utc(window.resets_at)})`, "warn");
-  return td(`<strong>${escapeHtml(relative(window.resets_at))}</strong> <br><span class="muted">${escapeHtml(utc(window.resets_at))}</span>`);
-}
-
-function paceCell(pace) {
-  if (!pace || pace.status !== "ok") return text("unknown", "muted");
-  const head = pace.state === "on_pace" ? "on pace"
-    : pace.state === "reserve" ? `${pp(pace.headroom_pct)} headroom` : `${pp(pace.headroom_pct)} deficit`;
-  const tail = pace.lasts_to_reset === true ? "lasts to reset"
-    : pace.lasts_to_reset === false ? (!toDate(pace.runs_out_at) ? "runs out before reset"
-      : toDate(pace.runs_out_at).getTime() <= Date.now() ? `ran out ${utc(pace.runs_out_at)} (${relative(pace.runs_out_at)})`
-      : `runs out ${utc(pace.runs_out_at)} (${relative(pace.runs_out_at)})`)
-    : "last-to-reset unknown";
-  // The routing status reads the same verdict: running out before the reset is bad at any headroom.
-  return text(`${head} · ${tail}`, pace.lasts_to_reset === false ? "bad" : pace.state === "deficit" ? "warn" : "ok");
-}
-
-function sessionCell(window) {
-  if (!window || window.status === "none") return text("none", "muted");
-  if (window.status !== "ok" && window.reason_code === "not_reported") return text("not reported", "muted");
-  if (window.status !== "ok" || !validPct(window.left_pct)) return text("unknown", "muted");
-  return text(`${pct(window.left_pct)} left · ${resetText(window)}`);
-}
-
-function extraCell(row) {
-  if (!row.reading?.read_at) return text("unknown", "muted");
-  const windows = (Array.isArray(row.extra_windows) ? row.extra_windows : []).map(window =>
-    `${window.label || "window"} ${window.status === "ok" && validPct(window.left_pct) ? `${pct(window.left_pct)} left` : "unknown"}`);
-  const breakdown = (Array.isArray(row.breakdown) ? row.breakdown : []).map(item => `${item.label} ${item.value}`);
-  return text([...windows, ...breakdown].join("; ") || "none", windows.length || breakdown.length ? "" : "muted");
-}
-
-function creditsCell(credits) {
-  if (credits?.status === "ok" && typeof credits.balance === "number") {
-    const balance = credits.balance.toLocaleString("en-US", {maximumFractionDigits: 1});
-    return text(credits.renews_on ? `${balance} (renew ${credits.renews_on} with the plan)` : balance);
-  }
-  return credits?.status === "none" ? text("none", "muted") : text("unknown", "muted");
-}
-
-function planCell(plan) {
-  const name = "plan";
-  if (!plan || plan.status !== "ok") return text(`${name} · renewal unknown`, "muted");
-  if (plan.cancelled) {
-    return text(`${name} · ${plan.ends_on ? `${plan.ended ? "ENDED" : "cancelled, ends"} ${plan.ends_on} (${plan.days_to_end} d)`
-      : "cancelled, end date not configured"}`, "warn");
-  }
-  if (!plan.next_renewal_on) return text(`${name} · renewal not configured`, "muted");
-  return text(`${name} · renews ${plan.next_renewal_on} (in ${plan.days_to_renewal} d)`, plan.days_to_renewal <= 3 ? "warn" : "muted");
-}
-
-function bankedCell(banked) {
-  if (!banked || banked.status !== "ok" || typeof banked.count !== "number") return text("not reported", "muted");
-  const items = (Array.isArray(banked.items) ? banked.items : []).filter(item => !item.expired)
-    .map(item => `${item.count}× ${item.kind || "reset"}${item.expires_on ? `, expires ${String(item.expires_on).slice(0, 10)}` : ""}`);
-  return text(`${banked.count}${items.length ? ` (${items.join("; ")})` : ""}`, banked.count ? "ok" : "");
-}
-
-function readingCell(reading, staleAfter) {
-  const state = readingState(reading?.status, reading?.age_s, staleAfter);
-  if (state === "missing" || state === "unknown" && !reading?.read_at) {
-    return text(`NO READING${reading?.reason_code ? ` (${String(reading.reason_code).replaceAll("_", " ")})` : ""}`, "bad");
-  }
-  return freshnessCell(state, reading?.age_s);
-}
-
-// Sign-in state joins the subscriptions row by account label ("Claude a").
-function signInCell(account, logins) {
-  if (!logins) return text("unknown", "muted");
-  if (logins.state === "pending") return text("checking…", "muted");
-  const row = (Array.isArray(logins.accounts) ? logins.accounts : []).find(item => item.account === account);
-  if (!row) return text("no sign-in reader", "muted");
-  if (row.logged_in === false) return text("SIGNED OUT", "bad");
-  if (row.logged_in !== true) return text(`UNKNOWN${row.reason_code ? ` (${String(row.reason_code).replaceAll("_", " ")})` : ""}`, "bad");
-  const expires = toDate(row.expires_at);
-  if (!expires) return text("signed in", "ok");
-  const daysLeft = (expires.getTime() - Date.now()) / 86400000;
-  return text(`signed in · ends ${relative(row.expires_at)}`, daysLeft < 3 ? "bad" : daysLeft < 7 ? "warn" : "ok");
-}
-
-const SUBSCRIPTION_HEADERS = ["Account", "Weekly resets", "Weekly left", "Pace", "5-hour", "Other windows",
-  "Credits", "Banked resets", "Plan · renews or ends", "Sign-in", "Reading"];
-
-function liveAccounts(subs) {
-  return (Array.isArray(subs?.providers) ? subs.providers : [])
-    .flatMap(provider => Array.isArray(provider.accounts) ? provider.accounts : []).filter(row => !row.plan?.ended);
-}
-
-function subscriptionRows(subs, logins) {
-  const staleAfter = subs.stale_after_s;
-  const hidden = [];
-  const groups = (Array.isArray(subs.providers) ? subs.providers : []).map(provider => {
-    const accounts = (Array.isArray(provider.accounts) ? provider.accounts : []).filter(row => {
-      if (row.plan?.ended) { hidden.push(`${row.account} (ended ${row.plan.ends_on})`); return false; }
-      return true;
-    });
-    if (!accounts.length) return "";
-    return `<tr class="group"><th colspan="${SUBSCRIPTION_HEADERS.length}">${escapeHtml(provider.label || provider.provider)}</th></tr>`
-      + accounts.map(row => {
-        const usage = readingState(row.reading?.status, row.reading?.age_s, staleAfter) === "fresh" ? row : {};
-        const weekly = usage.weekly || {};
-        return `<tr>${labelled([
-          text(row.account),
-          weeklyResetCell(weekly),
-          windowLeft(weekly),
-          paceCell(usage.pace),
-          sessionCell(usage.session),
-          extraCell(usage),
-          creditsCell(usage.credits),
-          bankedCell(row.banked_resets?.source === "provider" ? usage.banked_resets : row.banked_resets),
-          planCell(row.plan),
-          signInCell(row.account, logins),
-          readingCell(row.reading, staleAfter),
-        ], SUBSCRIPTION_HEADERS)}</tr>`;
-      }).join("");
-  }).join("");
-  return {groups, hidden};
-}
-
-const PROBE_REASONS = {
-  ok: null, fresh: null, NEED_KEY: "needs an API key", NEED_PROBE: "not probed yet",
-  unknown: "probe result unknown", unavailable: "probe unavailable",
-  unsupported: "balance probe is not supported", error: "probe failed", stale: "probe is stale",
-};
-
-function probeReason(state) {
-  if (!state) return null;
-  if (Object.hasOwn(PROBE_REASONS, state)) return PROBE_REASONS[state];
-  return String(state).replaceAll("_", " ").toLowerCase();
-}
-
-function apiRows(budget) {
-  const accounts = budget.api_accounts || {};
-  return Object.entries(accounts).map(([name, row]) => {
-    const state = readingState(row.freshness, row.age_s, budget.diagnostics?.stale_threshold_s);
-    const balance = typeof row.total_balance === "number" ? `${row.total_balance.toFixed(2)} ${row.currency || ""}`.trim() + " balance"
-      : typeof row.limit_remaining_usd === "number" ? `$${row.limit_remaining_usd.toFixed(2)} left` : null;
-    const spent = typeof row.usage_weekly_usd === "number" ? `$${row.usage_weekly_usd.toFixed(2)} this week` : null;
-    const figures = [balance, spent].filter(Boolean);
-    const probe = probeReason(row.balance_probe_state);
-    let values = "unknown";
-    let valueClass = "muted";
-    if (state === "fresh") {
-      values = [...figures, probe].filter(Boolean).join("; ") || null;
-      valueClass = "";
-    } else if (state === "last_good") {
-      const marked = figures.length ? `${figures.join("; ")} (last good)` : null;
-      values = [marked, probe].filter(Boolean).join("; ") || "unknown";
-      valueClass = "warn";
-    }
-    return [text(name), text(values, valueClass),
-            freshnessCell(state, row.age_s),
-            text(row.health?.healthy === false ? "unhealthy" : null, "bad")];
-  });
-}
-
-function renderUsage(subs, budget, logins) {
-  const {groups, hidden} = subscriptionRows(subs, logins);
-  const facts = subs.sources?.plan_facts;
-  const notes = [];
-  if (facts?.reason_code) {
-    notes.push(`Plan facts: ${facts.reason_code === "not_configured" ? "not configured" : facts.reason_code}; renewal, plan and banked resets show unknown.`);
-  }
-  const cache = subs.sources?.usage_cache;
-  if (cache && cache.status !== "ok") notes.push(`Usage cache: ${cache.status}.`);
-  if (hidden.length) notes.push(`Hidden, subscription ended: ${hidden.join(", ")}.`);
-  if (logins === null || logins === undefined) notes.push("Sign-in state unknown: the sign-in reader did not answer.");
-  notes.push("Headroom and deficit are percentage points against an even pace to the weekly reset. Neon draws on the AGY pools. "
-    + "The Codex API credits belong to Codex a and renew with its monthly turnover.");
-  notes.push("Sign-in is read for Claude a, Claude b, Codex a and Codex b only. Any other account has no side-effect-free sign-in reader.");
-  const head = `<thead><tr>${SUBSCRIPTION_HEADERS.map(h => `<th>${escapeHtml(h)}</th>`).join("")}</tr></thead>`;
-  const api = budget ? table(["API account", "Balance / spend", "Reading", ""], apiRows(budget), true)
-    : unknown("API account balances: the routing budget did not answer");
-  const subsTable = groups ? `<table class="subs">${head}<tbody>${groups}</tbody></table>`
-    : '<p class="muted">None.</p>';
-  return subsTable + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("") + api;
-}
-
-// ---- Agent fleet ----
-
-// The newest data of each panel, for the summary chips and the fleet PR column.
-const latest = {};
-
-// Account labels are shown only from this allow-list; any other recorded value is "other".
-const CLAUDE_ACCOUNTS = {a: "Claude a", b: "Claude b"};
-const CODEX_ACCOUNTS = {sub: "Codex a", "b-sub": "Codex b", api: "Codex API", "b-api": "Codex b API"};
-
-function account(task) {
-  if (task.claude_account) return Object.hasOwn(CLAUDE_ACCOUNTS, task.claude_account) ? CLAUDE_ACCOUNTS[task.claude_account] : "Claude, other account";
-  if (task.codex_account) return Object.hasOwn(CODEX_ACCOUNTS, task.codex_account) ? CODEX_ACCOUNTS[task.codex_account] : "Codex, other account";
-  return task.agent === "agy" ? "AGY" : null;
-}
-
-function modelOf(task) {
-  return task.observed_model || task.model || null;
-}
-
-// Validated task references join public PRs to task rows without exposing branch prose.
-function prIndex(prs) {
-  const index = [];
-  for (const repo of Array.isArray(prs?.repositories) ? prs.repositories : []) {
-    for (const pr of Array.isArray(repo.pull_requests) ? repo.pull_requests : []) {
-      if (pr.task_reference) index.push({repo: repo.name, ...pr});
-    }
-  }
-  return index;
-}
-
-function prLink(repo, pr) {
-  const label = `${repo}#${pr.number}`;
-  return pr.url ? `<a href="${escapeHtml(pr.url)}">${escapeHtml(label)}</a>` : escapeHtml(label);
-}
-
-function ciLabel(state) {
-  if (state === "success") return ["CI green", "ok"];
-  if (state === "failure" || state === "error") return ["CI red", "bad"];
-  if (state === "pending" || state === "expected") return ["CI running", "warn"];
-  return ["no CI yet", "muted"];
-}
-
-// The server gives tasks and matching public PR branches the same validated identifier.
-function ownPr(task, index) {
-  const id = String(task.task_id || "");
-  return id ? index.find(pr => pr.task_reference === id) || null : null;
-}
-
-function taskPrCell(task, index) {
-  let open = ownPr(task, index);
-  // A recorded delivery PR is authoritative; a different open PR never replaces it.
-  if (open && task.delivery_pr && task.delivery_pr !== `#${open.number}`) open = null;
-  if (open) {
-    const [label, cls] = ciLabel(open.ci);
-    return td(`${prLink(open.repo, open)} <span class="${cls}">${escapeHtml(label)}</span>`
-      + (open.queue ? ` <span class="ok">queued ${escapeHtml(open.queue.position ?? "")}</span>` : ""));
-  }
-  return text(task.delivery_pr || null, task.delivery_pr ? "" : "muted");
-}
-
-function doing(task) {
-  const review = /-review-(\d+)-r(\d+)$/.exec(task.task_id || "");
-  const role = review ? `reviewing PR ${review[1]}, round ${review[2]}` : task.research_role || task.status;
-  const progress = typeof task.commits_ahead === "number" ? `${task.commits_ahead} commits ahead` : null;
-  const touched = task.updated_at ? `record updated ${relative(task.updated_at)}` : null;
-  return [role, progress, task.push_state && task.push_state !== "unknown" ? task.push_state : null, touched]
-    .filter(Boolean).join(" · ");
-}
-
-function renderWorkers(active, prs = latest.prs) {
-  const tasks = Array.isArray(active.tasks) ? active.tasks : [];
-  const index = prIndex(prs);
-  return table(["Task", "Model", "Account", "Running", "Doing", "PR"], tasks.map(task => [
-    text(task.task_id),
-    text(modelOf(task) || task.agent),
-    text(account(task)),
-    text(span(task.age_s), task.age_s > 3 * 3600 ? "num bad" : task.age_s > 2 * 3600 ? "num warn" : "num"),
-    text(doing(task)),
-    taskPrCell(task, index),
-  ]));
-}
-
-const OUTCOME_CLASS = {done: "ok", failed: "bad", crashed: "bad", timeout: "bad", no_deliverable: "warn",
-  cancelled: "muted", rate_limited: "warn"};
-
-function renderRecent(list) {
-  const tasks = (Array.isArray(list.tasks) ? list.tasks : []).filter(task => !ACTIVE.has(task.status));
-  const attention = list.needs_attention || {};
-  const pending = Array.isArray(attention.tasks) ? attention.tasks : [];
-  // The settlement command removes empty records; these remaining records need a keep/close decision.
-  const attentionHtml = attention.total ? `<details><summary class="warn">${escapeHtml(attention.total)} unfinished task records need a keep/close decision. Showing up to ${pending.length}.</summary>`
-    + table(["Task", "Model", "State"], pending.map(task => [text(task.task_id),
-      text(modelOf(task) || task.agent), text(task.status, "bad")])) + "</details>" : "";
-  return table(["Task", "Model", "Outcome", "Finished", "Took", "PR"], tasks.map(task => [
-    text(task.task_id),
-    text(modelOf(task) || task.agent),
-    text(task.status, OUTCOME_CLASS[task.status] || "bad"),
-    text(task.finished_at ? relative(task.finished_at) : null, "num"),
-    text(span(task.duration_s), "num"),
-    text(task.delivery_pr || null, task.delivery_pr ? "" : "muted"),
-  ])) + attentionHtml;
-}
-
-// ---- Pull requests ----
-
-function reviewLabel(state) {
-  if (state === "success") return ["approved", "ok"];
-  if (state === "failure" || state === "error") return ["changes / refused", "bad"];
-  if (state === "pending") return ["pending", "warn"];
-  return ["none", "muted"];
-}
-
-function renderPrs(prs) {
-  if (prs.status !== "ok") return unknown(prs.reason);
-  return (Array.isArray(prs.repositories) ? prs.repositories : []).map(repo => {
-    const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
-    if (repo.status !== "ok") return title + unknown(repo.reason);
-    const rows = (Array.isArray(repo.pull_requests) ? repo.pull_requests : []).map(pr => {
-      const [ci, ciClass] = ciLabel(pr.ci);
-      const [review, reviewClass] = reviewLabel(pr.review);
-      const name = text(pr.draft ? "draft" : "ready for review");
-      return [td(pr.url ? `<a href="${escapeHtml(pr.url)}">#${escapeHtml(pr.number)}</a>` : `#${escapeHtml(pr.number)}`),
-        name, text(ci, ciClass), text(review, reviewClass),
-        pr.queue ? text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}`, "ok")
-          : text(null, "muted"),
-        text(pr.created_at ? span((Date.now() - toDate(pr.created_at)) / 1000) : null, "num")];
-    });
-    return title + table(["PR", "State", "CI", "Review", "Queue", "Age"], rows);
-  }).join("");
-}
-
-// ---- Alerts ----
+const {
+  escapeHtml, toDate, ageSpan, table, td, text, unknown, chip,
+  readingState, windowLeft, paceCell, readingCell, signInCell,
+  liveAccounts, summarizeSubscriptions, subscriptionChips,
+  ciLabel, reviewLabel, prLink, repoCoverageIncomplete, repoOpenCount, prChips, prSnapshotState, createPanelRunner,
+} = Machinery;
 
 function alertIdentity(alert) {
   const skip = new Set(["alertname", "severity", "starts_at"]);
@@ -579,7 +94,7 @@ function renderAlerts(alerts) {
   const rows = [...groups.values()].map(group => [
     text(alertTitle(group)),
     text(group.severity, group.severity === "critical" ? "bad" : group.severity === "warning" ? "warn" : ""),
-    text(group.oldest ? span((Date.now() - toDate(group.oldest)) / 1000) : null, "num"),
+    text(ageSpan(group.oldest), "num"),
     text(group.count, "num"),
   ]);
   const beat = alerts.heartbeat ? '<p class="ok">Alertmanager heartbeat present.</p>'
@@ -587,394 +102,205 @@ function renderAlerts(alerts) {
   return (rows.length ? table(["Alert", "Severity", "Since", "Count"], rows) : '<p class="ok">Nothing firing.</p>') + beat;
 }
 
-// ---- Fleet Comms ----
-
-function renderComms(metrics) {
-  if (metrics.db_error || metrics.db_missing) return unknown("Fleet Comms is unavailable");
-  const deliveries = metrics.deliveries || {}, jobs = metrics.jobs || {};
-  const reachable = metrics.store?.reachable;
-  const windows = metrics.failure_windows || {}, lifetime = metrics.failure_lifetime || {};
-  const rows = [
-    [text("Store"), text(reachable ? `${metrics.source || "plane"} reachable` : "UNREACHABLE", reachable ? "ok" : "bad"), text(""), text(""), text("")],
-    [text("Deliveries queued"), text(deliveries.queued, "num"), text(""), text(""), text("")],
-    [text("Jobs queued"), text(jobs.queued, "num"), text(""), text(""), text("")],
-  ];
-  for (const [key, label] of [["dead_letters", "Dead letters"], ["failed_deliveries", "Deliveries failed"], ["failed_jobs", "Jobs failed"]]) {
-    const day = windows["24h"]?.[key], week = windows["7d"]?.[key];
-    rows.push([text(label), text(""), text(day?.total ?? "?", day?.total ? "num warn" : "num"), text(week?.total ?? "?", week?.total ? "num warn" : "num"), text(lifetime[key] ?? "?", "num")]);
-    const recipients = new Set([...Object.keys(day?.by_recipient || {}), ...Object.keys(week?.by_recipient || {})]);
-    for (const recipient of [...recipients].sort()) rows.push([text(`  ${recipient}`), text(""), text(day?.by_recipient?.[recipient] ?? 0, "num"), text(week?.by_recipient?.[recipient] ?? 0, "num"), text("")]);
-  }
-  return table(["Measure", "Current", "24 h", "7 d", "Lifetime"], rows);
+function signInNeedsAttention(account, logins) {
+  if (!logins || logins.state === "pending") return false;
+  const row = (Array.isArray(logins.accounts) ? logins.accounts : []).find(item => item.account === account);
+  if (!row) return false;
+  if (row.logged_in !== true) return true;
+  const expires = toDate(row.expires_at);
+  return Boolean(expires && (expires.getTime() - Date.now()) / 86400000 < 7);
 }
 
-// ---- Summary chips ----
+function renderCapacitySummary(subs, logins) {
+  const summary = summarizeSubscriptions(subs, logins);
+  const staleAfter = subs.stale_after_s;
+  const accounts = liveAccounts(subs);
+  const stats = [
+    `<span><b>${summary.total}</b> active accounts</span>`,
+    `<span class="${summary.runsOut ? "bad" : "ok"}"><b>${summary.runsOut}</b> run out before reset</span>`,
+    summary.deficitCount ? `<span class="warn"><b>${summary.deficitCount}</b> in deficit</span>` : "",
+    summary.unknownCount ? `<span class="warn"><b>${summary.unknownCount}</b> unknown / stale</span>` : "",
+    summary.signedOut ? `<span class="bad"><b>${summary.signedOut}</b> signed out</span>` : "",
+  ].filter(Boolean);
+  const attentionRows = [];
+  for (const row of accounts) {
+    const state = readingState(row.reading?.status, row.reading?.age_s, staleAfter);
+    const fresh = state === "fresh";
+    const usage = fresh ? row : {};
+    const pace = usage.pace;
+    const paceRisk = !fresh || !pace || pace.status !== "ok" || pace.lasts_to_reset !== true || pace.state === "deficit";
+    if (!paceRisk && !signInNeedsAttention(row.account, logins)) continue;
+    attentionRows.push([
+      text(row.account),
+      windowLeft(usage.weekly || {}),
+      paceCell(pace),
+      signInCell(row.account, logins),
+      readingCell(row.reading, staleAfter),
+    ]);
+  }
+  const notes = [];
+  if (logins === null || logins === undefined) notes.push("Sign-in state unknown: the sign-in reader did not answer.");
+  else if (logins.state === "pending") notes.push("Sign-in state is refreshing…");
+  const allClear = summary.total > 0 && attentionRows.length === 0
+    && summary.unknownCount === 0 && summary.runsOut === 0
+    && summary.deficitCount === 0 && summary.signedOut === 0;
+  const body = attentionRows.length
+    ? table(["Account", "Weekly left", "Pace", "Sign-in", "Reading"], attentionRows)
+    : allClear
+      ? `<p class="ok">All ${summary.total} active subscriptions are on pace with fresh readings.</p>`
+      : summary.total
+        ? '<p class="warn">Subscription attention status is incomplete; open Full subscriptions for details.</p>'
+        : '<p class="muted">No active subscriptions reported.</p>';
+  return `<div class="summary-stats">${stats.join("")}</div>`
+    + body + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("");
+}
 
-function chip(href, count, label, cls = "") {
-  return `<a class="chip${cls ? ` ${cls}` : ""}" href="${href}"><b>${escapeHtml(count)}</b> ${escapeHtml(label)}</a>`;
+function renderQueueSummary(prs, prState = null) {
+  if (prs.status !== "ok") return unknown(prs.reason);
+  const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
+  const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
+  const unavailable = prState === "unavailable" || allUnknown;
+  const ageUnknown = !unavailable && prState === "unknown";
+  const unbounded = !unavailable && prState === "unbounded";
+  const expired = !unavailable && !ageUnknown && !unbounded && (prState === "expired" || prState === true);
+  let totalOpen = 0, totalRed = 0, unknownRepos = 0, truncatedRepos = 0;
+  const queuedRows = [];
+  const repoRows = [];
+  for (const repo of repos) {
+    if (unavailable || repo.status !== "ok") {
+      if (repo.status !== "ok") unknownRepos += 1;
+      const reason = repo.status !== "ok"
+        ? (repo.reason ? String(repo.reason).replaceAll("_", " ") : "unknown")
+        : "snapshot unavailable";
+      repoRows.push([text(repo.name), text("?"), text("?"), text("?"), text(reason, "warn")]);
+      continue;
+    }
+    const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
+    const truncated = repoCoverageIncomplete(repo);
+    if (truncated) truncatedRepos += 1;
+    const open = typeof repo.open_total === "number" && Number.isFinite(repo.open_total) && repo.open_total >= 0 ? repo.open_total : null;
+    const queued = list.filter(pr => pr.queue);
+    const red = list.filter(pr => pr.ci === "failure" || pr.ci === "error").length;
+    totalOpen += repoOpenCount(repo);
+    totalRed += red;
+    repoRows.push([
+      text(repo.name),
+      text(open ?? "?", open === null ? "num warn" : "num"),
+      text(truncated ? `${queued.length} observed` : queued.length, truncated ? "num warn" : queued.length ? "num ok" : "num"),
+      text(truncated ? `${red} observed` : red, red ? "num bad" : truncated ? "num warn" : "num"),
+      truncated
+        ? text(open !== null ? `showing ${list.length} of ${open}` : "open total unknown", "warn")
+        : text("ok", "ok"),
+    ]);
+    for (const pr of queued) {
+      const [ci, ciClass] = ciLabel(pr.ci);
+      const [review, reviewClass] = reviewLabel(pr.review);
+      queuedRows.push([
+        td(prLink(repo.name, pr)),
+        text(ci, ciClass),
+        text(review, reviewClass),
+        text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}${expired ? " (cached)" : ""}`, expired ? "warn" : "ok"),
+        text(ageSpan(pr.created_at), "num"),
+      ]);
+    }
+  }
+  const incomplete = repos.length === 0 || unknownRepos > 0 || truncatedRepos > 0;
+  const expiredNote = expired
+    ? '<p class="warn">PR snapshot is expired; counts and queue positions below are cached observations.</p>'
+    : ageUnknown
+      ? '<p class="warn">Snapshot age unknown. Counts and queue positions below are not confirmed as current.</p>'
+      : unbounded
+        ? '<p class="warn">Freshness unknown. The snapshot age is known, and the freshness bound is not, so counts and queue positions are not confirmed as current.</p>'
+        : "";
+  const stats = unavailable
+    ? [
+        "<span><b>?</b> open PRs</span>",
+        '<span class="warn"><b>?</b> queued</span>',
+        unknownRepos ? `<span class="warn"><b>${unknownRepos}</b> repo unknown</span>` : "",
+      ].filter(Boolean)
+    : [
+        `<span><b>${totalOpen}</b> ${expired ? "open PRs (cached)" : unknownRepos || truncatedRepos ? "open PRs observed" : "open PRs"}</span>`,
+        `<span class="${expired ? "warn" : queuedRows.length ? "ok" : incomplete ? "warn" : "muted"}"><b>${queuedRows.length}</b> ${expired ? "queued (cached)" : incomplete ? "queued observed" : "queued"}</span>`,
+        totalRed ? `<span class="bad"><b>${totalRed}</b> ${expired ? "CI red (cached)" : incomplete ? "CI red observed" : "CI red"}</span>` : "",
+        unknownRepos ? `<span class="warn"><b>${unknownRepos}</b> repo unknown</span>` : "",
+        truncatedRepos ? `<span class="warn"><b>${truncatedRepos}</b> repo truncated</span>` : "",
+      ].filter(Boolean);
+  const queueQualifier = expired
+    ? (incomplete ? " (cached — snapshot expired, coverage incomplete)" : " (cached — snapshot expired)")
+    : ageUnknown
+      ? " (age unknown)"
+      : unbounded
+        ? " (freshness unknown)"
+        : (incomplete ? " (observed — coverage incomplete)" : "");
+  const queueBlock = queuedRows.length
+    ? `<h3>In merge queue${queueQualifier}</h3>` + table(["PR", "CI", "Review", "Queue", "Age"], queuedRows)
+    : !repos.length
+      ? '<p class="warn">No repositories reported; merge queue status is unknown.</p>'
+      : unavailable
+        ? '<p class="warn">All repositories are unavailable; merge queue status is unknown.</p>'
+        : expired
+          ? '<p class="warn">PR snapshot is expired (cached); current merge queue status is unknown.</p>'
+          : ageUnknown
+            ? '<p class="warn">Snapshot age unknown; current merge queue status is not confirmed.</p>'
+            : unbounded
+              ? '<p class="warn">Freshness unknown; current merge queue status is not confirmed.</p>'
+              : incomplete
+              ? '<p class="warn">Merge queue coverage is incomplete: no queued PRs in the returned rows, but missing or truncated repository lists may hide queued PRs.</p>'
+              : '<p class="muted">No PRs currently in the merge queue.</p>';
+  return expiredNote
+    + `<div class="summary-stats">${stats.join("")}</div>`
+    + queueBlock
+    + "<h3>By repository</h3>"
+    + table(["Repository", "Open", "Queued", "CI red", "Status"], repoRows);
 }
 
 function renderChips(latest) {
   const out = [];
-  if (latest.workers) out.push(chip("#fleet", (latest.workers.tasks || []).length, "live workers"));
-  if (latest.usage) {
-    const accounts = liveAccounts(latest.usage);
-    let runsOut = 0, unknownCount = 0;
-    for (const row of accounts) {
-      const state = readingState(row.reading?.status, row.reading?.age_s, latest.usage.stale_after_s);
-      const pace = row.pace;
-      const answered = state === "fresh" && pace && pace.status === "ok" && typeof pace.lasts_to_reset === "boolean";
-      if (!answered) { unknownCount += 1; continue; }
-      if (pace.lasts_to_reset === false) runsOut += 1;
-    }
-    const noun = runsOut === 1 ? "account runs out before reset" : "accounts run out before reset";
-    out.push(chip("#subs", runsOut, noun + (unknownCount ? `, ${unknownCount} unknown` : ""),
-      runsOut ? "bad" : unknownCount ? "warn" : ""));
-    const out_ = (latest.logins?.accounts || []).filter(row => row.logged_in === false).length;
-    if (out_) out.push(chip("#subs", out_, "signed out", "bad"));
-  }
-  if (latest.prs?.status === "ok") {
-    const repos = latest.prs.repositories || [];
-    const open = repos.reduce((sum, repo) => sum + (typeof repo.open_total === "number" ? repo.open_total : 0), 0);
-    const queued = repos.reduce((sum, repo) => sum + (repo.pull_requests || []).filter(pr => pr.queue).length, 0);
-    const partial = repos.some(repo => repo.status !== "ok");
-    out.push(chip("#prs", open, `open PRs · ${queued} queued${partial ? " (a repository is unknown)" : ""}`, partial ? "warn" : ""));
-  } else if (latest.prs) out.push(chip("#prs", "?", "PRs unknown", "warn"));
   if (latest.alerts?.status === "ok") {
     const firing = (latest.alerts.alerts || []).length;
     const critical = (latest.alerts.alerts || []).some(alert => alert.severity === "critical");
     out.push(chip("#alerts", firing, "alerts firing", critical ? "bad" : firing ? "warn" : ""));
   } else if (latest.alerts) out.push(chip("#alerts", "?", "alerts unknown", "bad"));
-  if (latest.comms) out.push(chip("#comms", latest.comms.failure_windows?.["24h"]?.dead_letters?.total ?? "?", "dead letters / 24 h", latest.comms.failure_windows?.["24h"]?.dead_letters?.total ? "warn" : ""));
+  out.push(...subscriptionChips(latest.usage, latest.logins, "/subscriptions"));
+  out.push(...prChips(latest.prs, "/pull-requests", latest.prsStatus));
   return out.join("");
 }
 
-function renderMilestones(data) {
-  if (data.status === "pending") return '<p class="muted">Loading milestones from GitHub…</p>';
-  const repos = Array.isArray(data.repositories) ? data.repositories : [];
-  const age = value => Number.isFinite(value) ? `${Math.ceil(value)}s` : "unknown";
-  const expanded = new Set([...document.querySelectorAll("#milestones details[open]")].map(item => item.dataset.milestone));
-  const out = [`<p class="${data.stale ? "warn" : "muted"}">${data.stale ? "Stale. " : ""}GitHub data age ${age(data.age_seconds)}. ${escapeHtml(data.freshness)} Private repositories show counts only.</p>`];
-  for (const repo of repos) {
-    out.push(`<h3>${escapeHtml(repo.repository)} · data age ${age(repo.age_seconds)}${repo.stale ? " · STALE" : ""}</h3>`);
-    if (repo.status !== "ok") out.push(`<p class="warn">${escapeHtml(repo.reason || "Milestone data unknown")}</p>`);
-    const milestones = Array.isArray(repo.milestones) ? repo.milestones : [];
-    if (!milestones.length && repo.status === "ok") out.push('<p class="muted">No open milestones.</p>');
-    for (const [index, item] of milestones.entries()) {
-      const name = repo.private ? "Private milestone" : escapeHtml(item.title);
-      const percent = Number.isFinite(item.percent_complete) ? `${item.percent_complete}%` : "unknown";
-      const counts = `${item.open_issues ?? "?"} open · ${item.closed_issues ?? "?"} closed · ${percent} complete`;
-      const key = `${repo.repository}:${item.number ?? index}`;
-      out.push(`<details data-milestone="${escapeHtml(key)}"${expanded.has(key) ? " open" : ""}><summary>${name} · ${escapeHtml(counts)}</summary>`);
-      if (Number.isFinite(item.percent_complete)) out.push(`<progress max="100" value="${item.percent_complete}" aria-label="${name} completion">${percent}</progress>`);
-      if (!repo.private) {
-        out.push(`<p>${escapeHtml(item.description_first_line || "")}</p><p class="muted">Due ${escapeHtml(item.due_on ? item.due_on.slice(0, 10) : "not set")}</p>`);
-        if (item.issues_status !== "ok") out.push('<p class="warn">Open issue list is incomplete or unavailable.</p>');
-        else if (!item.issues.length) out.push('<p class="muted">No open issues.</p>');
-        if (item.issues.length) out.push('<table><thead><tr><th scope="col">Issue</th><th scope="col">Labels</th></tr></thead><tbody>');
-        for (const issue of item.issues) {
-          out.push(`<tr><td><a href="${escapeHtml(issue.url)}">#${issue.number} ${escapeHtml(issue.title)}</a></td><td>${issue.labels.map(escapeHtml).join(", ")}</td></tr>`);
-        }
-        if (item.issues.length) out.push('</tbody></table>');
-      }
-      out.push('</details>');
-    }
-  }
-  if (!repos.length) out.push('<p class="warn">Fleet milestone data is unavailable.</p>');
-  return out.join("");
-}
-
-// ---- Panels ----
-
-const OPTIONAL = new Set(["/api/git/pull-requests", "/api/state/routing-budget", "/api/runtime/logins"]);
 const PANELS = [
-  {id: "milestones", label: "Milestones", urls: ["/api/milestones"], render: renderMilestones, retry: data => data.status === "pending"},
-  {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers},
-  {id: "recent", label: "Recently finished", urls: ["/api/delegate/recent"], render: renderRecent},
-  {id: "usage", label: "Subscriptions", urls: ["/api/runtime/subscriptions", "/api/state/routing-budget", "/api/runtime/logins"], render: renderUsage,
-   retry: (subs, budget, logins) => !budget || !logins || logins.state === "pending"},
-  {id: "prs", label: "Pull requests", urls: ["/api/git/pull-requests"], render: renderPrs},
   {id: "alerts", label: "Alerts", urls: ["/api/ops/v1/alerts"], render: renderAlerts},
-  {id: "comms", label: "Fleet Comms", urls: ["/api/comms/v1/metrics"], render: renderComms},
+  {
+    id: "usage",
+    label: "Capacity summary",
+    urls: ["/api/runtime/subscriptions", "/api/runtime/logins"],
+    sourceLabels: ["Usage", "Sign-in"],
+    render: renderCapacitySummary,
+    onData: (data, latest) => { latest.logins = data[1]; },
+    onError: latest => { latest.logins = null; },
+    retry: (subs, logins) => !logins || logins.state === "pending",
+  },
+  {
+    id: "prs",
+    label: "Merge queue",
+    urls: ["/api/git/pull-requests"],
+    withReadings: true,
+    render: (prs, readings, now) => renderQueueSummary(prs, prSnapshotState(readings?.[0], now).status),
+    onData: (_data, latest, readings, now) => { latest.prsStatus = prSnapshotState(readings?.[0], now).status; },
+    onError: latest => { latest.prsStatus = null; },
+    onTick: (panel, latest, updateChips, now) => {
+      if (!panel.ok) return;
+      const reading = panel.readings?.[0];
+      const next = prSnapshotState(reading, now);
+      if (next.status === latest.prsStatus) return;
+      latest.prsStatus = next.status;
+      const box = document.getElementById("prs-content");
+      if (box && reading && reading.data) box.innerHTML = renderQueueSummary(reading.data, next.status);
+      updateChips();
+    },
+  },
 ];
-const inFlight = new Set();
 
-// A secondary source that fails, or is slower than OPTIONAL_WAIT_MS, leaves its part unknown
-// until the next refresh; only the first source decides the panel.
-const OPTIONAL_WAIT_MS = 1500;
-const RETRY_LIMIT = 10;
-function readSource(url, index) {
-  if (index === 0 || !OPTIONAL.has(url)) return fetchJson(url);
-  const missing = {data: null, age: null, snapshot: false};
-  return Promise.race([fetchJson(url).catch(() => missing),
-    new Promise(resolve => setTimeout(() => resolve(missing), OPTIONAL_WAIT_MS))]);
-}
-
-function clockUtc(moment = Date.now()) {
-  return new Date(moment).toISOString().slice(11, 19) + " UTC";
-}
-
-// ---- Freshness: one reading of "how old, and is it stale" per source ----
-//
-// The panel heading and the rows below it both come from the payload fields the API returns.
-// The X-Snapshot-* headers are only the fallback for a payload that carries no age of its own
-// (a gateway or cache between the page and the API can strip or rewrite headers, never the body).
-
-const finiteAge = value => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
-
-// Rows of one source -> {age, flag}: the oldest reading, and the worst state any row shows,
-// by the same readingState() the rows use.
-function rowsFreshness(rows, bound) {
-  const ages = rows.map(row => finiteAge(row.age)).filter(age => age !== null);
-  // A row with no usable reading (missing, unknown) is not fresh, so it cannot leave the heading fresh.
-  const flag = rows.some(row => row.state !== "fresh" && row.state !== "last_good") ? "stale"
-    : rows.some(row => row.state === "last_good") ? "last_good" : ages.length ? "fresh" : null;
-  return {age: ages.length ? Math.max(...ages) : null, bound, flag};
-}
-
-// Where each panel source keeps its own age. Returns null when the payload has none.
-function payloadFreshness(url, data, receivedAt) {
-  const own = payloadAge(url, data, receivedAt);
-  // A timestamp of the attempt does not make a failed collection usable: availability is the payload's own status.
-  const status = typeof data.status === "string" ? data.status : typeof data.state === "string" ? data.state : null;
-  // "pending" is a body with no observation yet, so it is unavailable too; "partial" is populated but degraded.
-  // A partial list in which no repository answered is a total outage, not partial data.
-  const repos = Array.isArray(data.repositories) ? data.repositories : [];
-  // Usable data is a repository that answered, or one that still carries milestones (a page limit, a later failure).
-  const usable = repo => repo.status === "ok" || (Array.isArray(repo.milestones) && repo.milestones.length > 0);
-  const nobody = status === "partial" && repos.length > 0 && !repos.some(usable);
-  const failed = status !== null && status !== "ok" && status !== "partial";
-  return own && {...own, unavailable: failed || nobody, partial: status === "partial"};
-}
-
-function payloadAge(url, data, receivedAt) {
-  const since = value => {
-    const moment = toDate(value);
-    return moment ? Math.max(0, (receivedAt - moment.getTime()) / 1000) : null;
-  };
-  if (url === "/api/milestones") {
-    return {age: finiteAge(data.age_seconds), bound: null, flag: typeof data.stale === "boolean" ? (data.stale ? "stale" : "fresh") : null};
-  }
-  if (url === "/api/runtime/subscriptions") {
-    const bound = finiteAge(data.stale_after_s) || null;
-    return rowsFreshness(liveAccounts(data).map(row => ({age: row.reading?.age_s,
-      state: readingState(row.reading?.status, row.reading?.age_s, bound ?? undefined)})), bound);
-  }
-  if (url === "/api/state/routing-budget") {
-    const bound = finiteAge(data.diagnostics?.stale_threshold_s) || null;
-    const rows = Object.values(data.api_accounts || {}).map(row => ({age: row.age_s,
-      state: readingState(row.freshness, row.age_s, bound ?? undefined)}));
-    // The age is the rows' own, as the rows show it; the snapshot's age and stale flag only add a stale verdict
-    // (an old snapshot is stale however its account rows read) and stand in for the age when no row has one.
-    const base = rowsFreshness(rows, bound), snapshotAge = finiteAge(data.diagnostics?.data_age_s);
-    const stale = data.diagnostics?.stale;
-    return {age: base.age ?? snapshotAge, bound, flag: stale === true ? "stale" : base.flag ?? (stale === false ? "fresh" : null)};
-  }
-  if (url === "/api/runtime/logins") return {age: since(data.read_at), bound: null, flag: null};
-  if (url === "/api/git/pull-requests") {
-    // A repository that did not answer leaves the list partial, which the server also reports as stale.
-    const partial = (Array.isArray(data.repositories) ? data.repositories : []).some(repo => repo.status !== "ok");
-    return {age: since(data.observed_at), bound: null, flag: partial ? "stale" : null};
-  }
-  if (url === "/api/ops/v1/alerts") return {age: since(data.observed_at), bound: finiteAge(data.stale_after_s) || null, flag: null};
-  return null;
-}
-
-// The reading's freshness: its own payload first, then the snapshot headers, never a mix of both ages.
-function freshnessOf(reading) {
-  if (!reading || !reading.data) return {age: null, bound: null, flag: null, unavailable: true};
-  const own = payloadFreshness(reading.url, reading.data, reading.receivedAt ?? Date.now());
-  const headerBound = Number.isFinite(reading.bound) && reading.bound > 0 ? reading.bound : null;
-  // The payload's own verdict (age, stale or failed) outranks the headers, even with no age to show.
-  // The payload's bound is its own, null included: a header bound (which a gateway can rewrite) never loosens it.
-  if (own && (own.age !== null || own.flag !== null || own.unavailable)) return own;
-  const flag = reading.state === "stale" ? "stale" : null;
-  return {age: reading.age ?? null, bound: headerBound, flag, unavailable: reading.state === "unavailable"};
-}
-
-// fresh | stale | last_good | unknown | unavailable; `elapsed` is the time since the reading was received.
-function freshnessState(fresh, elapsed = 0) {
-  if (fresh.unavailable) return "unavailable";
-  if (fresh.flag === "stale") return "stale";
-  const age = fresh.age === null ? null : fresh.age + elapsed;
-  if (age !== null && fresh.bound !== null && age > fresh.bound) return "stale";
-  if (fresh.flag === "last_good") return "last_good";
-  if (fresh.partial) return "partial";
-  if (age === null) return fresh.unavailable ? "unavailable" : "unknown";
-  return fresh.flag === "fresh" || fresh.bound !== null ? "fresh" : "unknown";
-}
-
-const FRESHNESS_LABELS = {fresh: "fresh", stale: "STALE", last_good: "last good reading", partial: "partial data", unknown: "freshness unknown", unavailable: "unavailable"};
-
-function headingAge(readings, badOnFailure, attemptedAt = null) {
-  const sources = Array.isArray(readings) ? readings : [];
-  const moment = sources[0]?.receivedAt ?? attemptedAt;
-  const label = sources.length ? "Fetched" : "Last attempt";
-  const fetched = moment ? `${label} at ${clockUtc(moment)}` : `${label} time unknown`;
-  if (!sources.length) return {text: `${fetched} · unavailable · source age unknown`, bad: Boolean(badOnFailure)};
-  let bad = false, caution = false;
-  const labels = sources.map((reading, index) => {
-    const fresh = freshnessOf(reading);
-    const elapsed = reading?.receivedAt ? Math.max(0, Date.now() - reading.receivedAt) / 1000 : 0;
-    const state = freshnessState(fresh, elapsed);
-    bad ||= state === "stale" || state === "unavailable";
-    caution ||= state === "last_good" || state === "unknown" || state === "partial";
-    const prefix = sources.length > 1 ? `${["Usage", "API balances", "Sign-in"][index] || "Source"}: ` : "";
-    // The age shown is the reading's own, as the rows show it; a stall since the fetch is named separately.
-    const overdue = state === "stale" && freshnessState(fresh) !== "stale" ? " · refresh overdue" : "";
-    return `${prefix}${FRESHNESS_LABELS[state]} · source age ${fresh.age === null ? "unknown" : `${Math.ceil(fresh.age)}s`}`
-      + ` · bound ${fresh.bound === null ? "unknown" : `${fresh.bound}s`}${overdue}`;
-  });
-  return {text: `${fetched} · ${labels.join("; ")}`, bad, caution};
-}
-
-function updatePanelAge(panel) {
-  const age = document.getElementById(`${panel.id}-age`);
-  const line = headingAge(panel.readings, panel.ok === false && !panel.refusal, panel.attemptedAt);
-  age.textContent = line.text;
-  age.className = line.bad ? "age bad" : line.caution ? "age warn" : "age";
-}
-
-// Announce only when the status changes, so a healthy 30 s refresh stays quiet.
-function announce(panel, state) {
-  if (panel.state === state) return;
-  panel.state = state;
-  const region = document.getElementById(`${panel.id}-status`);
-  if (!region) return;
-  const name = panel.label || panel.id;
-  region.textContent = state === "loading" ? `Loading ${name}.`
-    : state === "ready" ? `${name} loaded.`
-    : state === "unavailable" ? `${name} isn't available in this view.`
-    : `${name} couldn't load.`;
-}
-
-function isRefusal(error) {
-  const message = String(error && error.message ? error.message : error);
-  const status = /HTTP (\d{3})/.exec(message);
-  return Boolean(status) && (status[1] === "401" || status[1] === "403");
-}
-
-function failureSentence(error) {
-  const message = String(error && error.message ? error.message : error);
-  const status = /HTTP (\d{3})/.exec(message);
-  if (status) {
-    const code = Number(status[1]);
-    if (code === 401 || code === 403) return "This panel couldn't load: the source refused the request.";
-    if (code === 404) return "This panel couldn't load: the source was not found.";
-    if (code >= 500) return "This panel couldn't load: the source failed.";
-    return "This panel couldn't load: the source rejected the request.";
-  }
-  if (/abort|timeout|timed out/i.test(message)) return "This panel couldn't load: the source did not answer in time.";
-  if (/JSON/i.test(message)) return "This panel couldn't load: the source returned data this page could not read.";
-  return "This panel couldn't load.";
-}
-
-function panelError(panel, error) {
-  const name = escapeHtml(panel.label || panel.id);
-  const detail = escapeHtml(error && error.message ? error.message : error);
-  return `<p class="error">${failureSentence(error)}</p>`
-    + `<p><button type="button" class="retry" onclick="retryPanel('${panel.id}')" aria-label="Retry ${name}">Retry</button></p>`
-    + `<details><summary>Technical detail</summary><p class="muted">${detail}</p></details>`;
-}
-
-function panelUnavailable() {
-  return '<p class="muted">This panel isn\'t available in this view.</p>';
-}
-
-function showRefresh() {
-  const status = document.getElementById("last-refresh");
-  const retry = document.getElementById("refresh-retry");
-  if (!status) return;
-  const realFailure = PANELS.some(panel => panel.ok === false && panel.refusal !== true);
-  const anyLoaded = PANELS.some(panel => panel.ok === true);
-  if (!realFailure) {
-    status.textContent = anyLoaded ? `Updated ${clockUtc()} · every 30 s` : `Nothing is available in this view, ${clockUtc()}`;
-    if (retry) retry.hidden = true;
-    return;
-  }
-  status.textContent = `Couldn't refresh, last attempt ${clockUtc()}`;
-  if (retry) retry.hidden = false;
-}
-
-async function loadPanel(panel) {
-  if (inFlight.has(panel.id)) return;
-  inFlight.add(panel.id);
-  panel.attemptedAt = Date.now();
-  const content = document.getElementById(`${panel.id}-content`);
-  const age = document.getElementById(`${panel.id}-age`);
-  if (!age.textContent) age.textContent = "Loading…";
-  if (panel.state !== "ready") announce(panel, "loading");
-  try {
-    const readings = await Promise.all(panel.urls.map(readSource));
-    const data = readings.map(reading => reading.data);
-    content.innerHTML = panel.render(...data);
-    latest[panel.id] = data[0];
-    if (panel.id === "usage") latest.logins = data[2];
-    // The PR column of the fleet table joins the PR reading whenever either arrives.
-    if (panel.id === "prs" && latest.workers) document.getElementById("workers-content").innerHTML = renderWorkers(latest.workers);
-    const ageLine = headingAge(readings, false, panel.attemptedAt);
-    panel.readings = readings;
-    age.textContent = ageLine.text;
-    age.className = ageLine.bad ? "age bad" : ageLine.caution ? "age warn" : "age";
-    panel.ok = true;
-    panel.refusal = false;
-    announce(panel, "ready");
-    // A pending or missing secondary source is read again shortly, at most RETRY_LIMIT times in a row.
-    if (panel.retry && panel.retry(...data)) {
-      panel.retries = (panel.retries || 0) + 1;
-      if (panel.retries <= RETRY_LIMIT) setTimeout(() => loadPanel(panel), 3000);
-    } else {
-      panel.retries = 0;
-    }
-  } catch (error) {
-    const refused = isRefusal(error);
-    content.innerHTML = refused ? panelUnavailable() : panelError(panel, error);
-    const ageLine = headingAge(null, !refused, panel.attemptedAt);
-    panel.readings = null;
-    age.textContent = ageLine.text;
-    age.className = ageLine.bad ? "age bad" : "age";
-    latest[panel.id] = null;
-    panel.ok = false;
-    panel.refusal = refused;
-    announce(panel, refused ? "unavailable" : "error");
-  } finally {
-    inFlight.delete(panel.id);
-  }
-}
-
-async function retryPanel(id) {
-  const panel = PANELS.find(item => item.id === id);
-  if (!panel) return;
-  await loadPanel(panel);
-  document.getElementById("chips").innerHTML = renderChips(latest);
-  showRefresh();
-}
-
-// The installed lu-machinery release, linked to its section of the changelog.
-const CHANGELOG_URL = "https://github.com/learn-ukrainian/machinery/blob/main/CHANGELOG.md";
-function renderVersion(version) {
-  if (typeof version !== "string" || !/^\d+(\.\d+)*[0-9A-Za-z.+!-]*$/.test(version)) return "lu-machinery version unknown";
-  return `<a href="${CHANGELOG_URL}#v${encodeURIComponent(version)}" title="What changed in this release">lu-machinery ${escapeHtml(version)}</a>`;
-}
-
-// The server writes the installed release into data-version when it serves this page, so the header
-// needs no request (the UI gateway does not admit /api/health). An unfilled or empty value reads as unknown.
-function loadVersion() {
-  const header = document.getElementById("machinery-version");
-  header.innerHTML = renderVersion(header.dataset?.version);
-}
-
-async function refreshAll() {
-  loadVersion();
-  await Promise.all(PANELS.map(loadPanel));
-  document.getElementById("chips").innerHTML = renderChips(latest);
-  showRefresh();
-}
-
-refreshAll();
-setInterval(refreshAll, REFRESH_MS);
-// This clock advances even if a refresh stalls or the network disappears. It makes no requests.
-setInterval(() => PANELS.filter(panel => panel.ok !== undefined).forEach(updatePanelAge), 1000);
+const runner = createPanelRunner({panels: PANELS, renderChips});
+runner.start();
 </script>
 </body>
 </html>

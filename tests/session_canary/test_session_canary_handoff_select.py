@@ -21,10 +21,7 @@ _STREAM = [
     {"type": "negative_constraint", "body": "Never merge without an independent cross-family review."},
 ]
 
-_LANES = (
-    (codex_lane, "CODEX-DRIVER-HANDOFF.md"),
-    (gemini_lane, "GEMINI-DRIVER-HANDOFF.md"),
-)
+_FILE_PREFERENCES = ("CODEX-DRIVER-HANDOFF.md", "GEMINI-DRIVER-HANDOFF.md")
 
 
 @pytest.fixture(autouse=True)
@@ -126,9 +123,9 @@ def _answers(tmp_path: Path) -> str:
     return " ".join(fact["a"] for fact in facts)
 
 
-@pytest.mark.parametrize(("lane", "own_name"), _LANES)
+@pytest.mark.parametrize("own_name", _FILE_PREFERENCES)
 def test_stale_interim_loses_to_fresh_claude_when_own_file_is_absent(
-    tmp_path: Path, lane, own_name: str | None
+    tmp_path: Path, own_name: str
 ) -> None:
     epic = _epic(tmp_path)
     _write(epic / "INTERIM-DRIVER-HANDOFF.md", "stale interim\n", mtime=1_000)
@@ -138,38 +135,37 @@ def test_stale_interim_loses_to_fresh_claude_when_own_file_is_absent(
         "archived\n",
         mtime=9_000,
     )
-    names = _existing(lane._handoff_candidates(tmp_path, "atlas"))
+    names = _existing(recall_core._handoff_candidates(tmp_path, "atlas", preferred=[own_name]))
     assert names[0] == "CLAUDE-DRIVER-HANDOFF.md"
     assert "INTERIM-DRIVER-HANDOFF.md" in names
     assert all("superseded" not in name for name in names)
-    if own_name is not None:
-        assert own_name not in names
+    assert own_name not in names
 
 
-@pytest.mark.parametrize(("lane", "own_name"), [row for row in _LANES if row[1]])
-def test_own_lane_handoff_wins_when_fresh(tmp_path: Path, lane, own_name: str) -> None:
+@pytest.mark.parametrize("own_name", _FILE_PREFERENCES)
+def test_own_lane_handoff_wins_when_fresh(tmp_path: Path, own_name: str) -> None:
     epic = _epic(tmp_path)
     _write(epic / "INTERIM-DRIVER-HANDOFF.md", "interim\n", mtime=1_000)
     _write(epic / "CLAUDE-DRIVER-HANDOFF.md", "claude\n", mtime=3_000)
     _write(epic / own_name, "own\n", mtime=5_000)
-    assert _existing(lane._handoff_candidates(tmp_path, "atlas"))[0] == own_name
+    assert _existing(recall_core._handoff_candidates(tmp_path, "atlas", preferred=[own_name]))[0] == own_name
 
 
-@pytest.mark.parametrize(("lane", "own_name"), [row for row in _LANES if row[1]])
-def test_stale_own_lane_loses_to_a_fresher_claude_handoff(tmp_path: Path, lane, own_name: str) -> None:
+@pytest.mark.parametrize("own_name", _FILE_PREFERENCES)
+def test_stale_own_lane_loses_to_a_fresher_claude_handoff(tmp_path: Path, own_name: str) -> None:
     epic = _epic(tmp_path)
     _write(epic / own_name, "## Session 2026-09-18\n\nown\n", mtime=9_000_000_000)
     _write(epic / "CLAUDE-DRIVER-HANDOFF.md", "## Session 2026-09-23\n\nclaude\n", mtime=50)
-    assert _existing(lane._handoff_candidates(tmp_path, "atlas"))[0] == "CLAUDE-DRIVER-HANDOFF.md"
+    assert _existing(recall_core._handoff_candidates(tmp_path, "atlas", preferred=[own_name]))[0] == "CLAUDE-DRIVER-HANDOFF.md"
 
 
-@pytest.mark.parametrize(("lane", "own_name"), [row for row in _LANES if row[1]])
-def test_same_day_own_lane_handoff_wins_the_tie(tmp_path: Path, lane, own_name: str) -> None:
+@pytest.mark.parametrize("own_name", _FILE_PREFERENCES)
+def test_same_day_own_lane_handoff_wins_the_tie(tmp_path: Path, own_name: str) -> None:
     epic = _epic(tmp_path)
     _write(epic / own_name, "## Session 2026-09-23\n\nown\n", mtime=50)
     if own_name != "CLAUDE-DRIVER-HANDOFF.md":
         _write(epic / "CLAUDE-DRIVER-HANDOFF.md", "## Session 2026-09-23\n\nclaude\n", mtime=9_000_000_000)
-    assert _existing(lane._handoff_candidates(tmp_path, "atlas"))[0] == own_name
+    assert _existing(recall_core._handoff_candidates(tmp_path, "atlas", preferred=[own_name]))[0] == own_name
 
 
 def test_touched_undated_interim_loses_to_dated_claude(tmp_path: Path) -> None:
@@ -232,7 +228,7 @@ def test_shortfall_falls_through_to_the_next_candidate(
     _write(epic / "CODEX-DRIVER-HANDOFF.md", "# Codex\n\nNo next or hands-off sections.\n", mtime=8_000)
     _write(epic / "CLAUDE-DRIVER-HANDOFF.md", _full("claude-sentinel"), mtime=1_000)
 
-    assert _mint(codex_lane, tmp_path) == 0
+    assert _mint(recall_core, tmp_path) == 0
     assert "claude-sentinel" in _answers(tmp_path)
     meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
     assert meta["handoff"].endswith("CLAUDE-DRIVER-HANDOFF.md")
@@ -272,7 +268,7 @@ def test_explicit_shortfall_falls_through_before_failing(
         (gemini_lane, "GEMINI-COLD-START.md"),
     ],
 )
-def test_cold_start_board_uses_the_recorded_mint_file(tmp_path: Path, lane, board_name: str) -> None:
+def test_cold_start_board_uses_the_db_note_even_with_a_recorded_file(tmp_path: Path, lane, board_name: str) -> None:
     epic = _epic(tmp_path)
     canary = epic / "canary"
     canary.mkdir()
@@ -297,7 +293,10 @@ def test_cold_start_board_uses_the_recorded_mint_file(tmp_path: Path, lane, boar
     assert lane.main(["--repo", str(tmp_path), "bootstrap", "--epic", "atlas"]) == 0
 
     board = (epic / board_name).read_text(encoding="utf-8")
-    assert f"**Canary recall input:** `{recorded}`" in board
+    assert "lu-driver-state render --lane atlas" in board
+    assert "lu-driver-state show <its ID>" in board
+    assert recorded not in board
+    assert own not in board
 
 
 def test_explicit_superseded_path_is_not_minted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -313,37 +312,13 @@ def test_explicit_superseded_path_is_not_minted(tmp_path: Path, monkeypatch: pyt
     assert "superseded-sentinel" not in answers
 
 
-def test_gemini_board_and_mint_both_fall_through_a_short_own_handoff(
+def test_gemini_uses_the_db_note_for_recall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Board before mint must name the same file mint records (#8588 finding 5)."""
-    _patch_mint(monkeypatch)
-    epic = _epic(tmp_path)
-    _write(
-        epic / "GEMINI-DRIVER-HANDOFF.md",
-        "# Gemini\n\n## Session 2026-09-23\n\nNo next or hands-off sections.\n",
-        mtime=9_000,
-    )
-    _write(
-        epic / "CLAUDE-DRIVER-HANDOFF.md",
-        _full("claude-sentinel", session="2026-09-23"),
-        mtime=1_000,
-    )
-
-    assert (
-        gemini_lane.main(["--repo", str(tmp_path), "bootstrap", "--epic", "atlas", "--stream", "lane-test"])
-        == 0
-    )
-    board = (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Canary recall input:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in board
-
-    assert _mint(gemini_lane, tmp_path) == 0
-    meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
-    assert meta["handoff"].endswith("CLAUDE-DRIVER-HANDOFF.md")
-    assert "claude-sentinel" in _answers(tmp_path)
+    _assert_db_note_mint(gemini_lane, tmp_path, monkeypatch)
 
 
-def test_score_and_board_fail_closed_when_the_recorded_handoff_is_removed(
+def test_file_based_score_and_hydrate_fail_when_the_recorded_handoff_is_removed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """After mint, consumers use only the recorded file — never re-rank (#8588 finding 6)."""
@@ -357,7 +332,7 @@ def test_score_and_board_fail_closed_when_the_recorded_handoff_is_removed(
         mtime=1_000,
     )
 
-    assert gemini_lane.main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
+    assert _core_main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
     canary = epic / "canary"
     meta = json.loads((canary / "mint_meta.json").read_text(encoding="utf-8"))
     assert meta["handoff"].endswith("GEMINI-DRIVER-HANDOFF.md")
@@ -367,24 +342,7 @@ def test_score_and_board_fail_closed_when_the_recorded_handoff_is_removed(
     gemini.unlink()
 
     with pytest.raises(handoff_select.RecordedHandoffMissingError, match=re.escape("GEMINI-DRIVER-HANDOFF.md")):
-        gemini_lane.main(["--repo", str(tmp_path), "bootstrap", "--epic", "atlas", "--stream", "lane-test"])
-
-    answers = tmp_path / "answers.json"
-    answers.write_text(json.dumps({fact["id"]: fact["a"] for fact in facts}), encoding="utf-8")
-    with pytest.raises(handoff_select.RecordedHandoffMissingError, match=re.escape("GEMINI-DRIVER-HANDOFF.md")):
-        gemini_lane.main(
-            [
-                "--repo",
-                str(tmp_path),
-                "score",
-                "--epic",
-                "atlas",
-                "--stream",
-                "lane-test",
-                "--answers",
-                str(answers),
-            ]
-        )
+        _score(tmp_path, canary, facts)
     with pytest.raises(handoff_select.RecordedHandoffMissingError, match=re.escape("GEMINI-DRIVER-HANDOFF.md")):
         recall_core.emit_hydrate_capsule(
             repo=tmp_path,
@@ -437,35 +395,24 @@ def _score(tmp_path: Path, epic_canary: Path, facts: list[dict[str, str]]) -> in
     )
 
 
-def test_stream_alone_board_and_mint_both_report_no_handoff(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_gemini_refuses_mint_without_a_db_note_even_with_enough_stream_anchors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Stream supplies the anchors and no handoff file exists (#8588 finding 1)."""
     _patch_stream(monkeypatch, _stream_alone())
-    _epic(tmp_path)
+    _write(_epic(tmp_path) / "GEMINI-DRIVER-HANDOFF.md", _full("legacy-sentinel"), mtime=9_000)
 
-    assert (
-        gemini_lane.main(["--repo", str(tmp_path), "bootstrap", "--epic", "atlas", "--stream", "lane-test"])
-        == 0
-    )
-    board = (tmp_path / ".claude" / "atlas-epic" / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Canary recall input:** `(no handoff)`" in board
-    assert "GEMINI-DRIVER-HANDOFF.md" not in board
-
-    assert _mint(gemini_lane, tmp_path) == 0
-    meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
-    assert meta["handoff"] is None
-    assert meta["handoff_sha256"] is None
-    assert meta["n_anchors"] >= 10
+    assert _mint(gemini_lane, tmp_path) == 1
+    assert "no readable active DB handoff note for lane atlas" in capsys.readouterr().err
+    assert not (tmp_path / "canary" / "probe.json").exists()
 
 
 def test_recorded_no_handoff_stays_when_a_file_appears_later(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A minted null is binding for score, board, and diary (#8588 finding 2)."""
+    """A minted null is binding for file-based score, hydrate and diary (#8588 finding 2)."""
     _patch_stream(monkeypatch, _stream_alone())
     epic = _epic(tmp_path)
-    assert gemini_lane.main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
+    assert _core_main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
     canary = epic / "canary"
     meta = json.loads((canary / "mint_meta.json").read_text(encoding="utf-8"))
     assert meta["handoff"] is None
@@ -475,14 +422,6 @@ def test_recorded_no_handoff_stays_when_a_file_appears_later(
     late = epic / "GEMINI-DRIVER-HANDOFF.md"
     _write(late, _full("late-sentinel", session="2026-09-23"), mtime=9_000)
     before = late.read_text(encoding="utf-8")
-
-    assert (
-        gemini_lane.main(["--repo", str(tmp_path), "bootstrap", "--epic", "atlas", "--stream", "lane-test"])
-        == 0
-    )
-    board = (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Canary recall input:** `(no handoff)`" in board
-    assert "GEMINI-DRIVER-HANDOFF.md" not in board
 
     assert diary.resolve_handoff_path(tmp_path, "atlas", out_dir=canary) is handoff_select.NO_HANDOFF
     assert recall_core._bound_handoff_path(tmp_path, "atlas", out_dir=canary) is handoff_select.NO_HANDOFF
@@ -510,7 +449,7 @@ def test_unreadable_recorded_handoff_is_not_swallowed_by_score(
     epic = _epic(tmp_path)
     gemini = epic / "GEMINI-DRIVER-HANDOFF.md"
     _write(gemini, _full("gemini-sentinel", session="2026-09-23"), mtime=9_000)
-    assert gemini_lane.main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
+    assert _core_main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
     canary = epic / "canary"
     facts = json.loads((canary / "facts.json").read_text(encoding="utf-8"))
 
@@ -575,18 +514,10 @@ def test_living_edit_after_mint_is_a_notice_not_a_failure(
     epic = _epic(tmp_path)
     gemini = epic / "GEMINI-DRIVER-HANDOFF.md"
     _write(gemini, _full("gemini-sentinel", session="2026-09-23"), mtime=9_000)
-    assert gemini_lane.main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
+    assert _core_main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
     canary = epic / "canary"
     facts = json.loads((canary / "facts.json").read_text(encoding="utf-8"))
     gemini.write_text(gemini.read_text(encoding="utf-8") + "\nextra line after mint\n", encoding="utf-8")
-
-    assert (
-        gemini_lane.main(["--repo", str(tmp_path), "bootstrap", "--epic", "atlas", "--stream", "lane-test"])
-        == 0
-    )
-    board = (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Canary recall input:** `.claude/atlas-epic/GEMINI-DRIVER-HANDOFF.md`" in board
-    assert diary.resolve_handoff_path(tmp_path, "atlas", out_dir=canary) == gemini
 
     assert _score(tmp_path, canary, facts) == 0
     verdict = json.loads((canary / "last_verdict.json").read_text(encoding="utf-8"))
@@ -594,10 +525,10 @@ def test_living_edit_after_mint_is_a_notice_not_a_failure(
     assert verdict["verdict"] == "PASS"
 
 
-def test_absent_mint_meta_keeps_cold_start_selection(
+def test_absent_mint_meta_keeps_file_based_diary_selection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No mint record still selects: the board by anchors, the diary by freshness."""
+    """When no mint record exists, the file-based diary still selects by freshness."""
     _patch_mint(monkeypatch)
     epic = _epic(tmp_path)
     _write(
@@ -611,13 +542,6 @@ def test_absent_mint_meta_keeps_cold_start_selection(
         mtime=1_000,
     )
     assert handoff_select.recorded_mint_handoff(tmp_path, "atlas") is None
-
-    assert (
-        gemini_lane.main(["--repo", str(tmp_path), "bootstrap", "--epic", "atlas", "--stream", "lane-test"])
-        == 0
-    )
-    board = (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
-    assert "**Canary recall input:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in board
 
     resolved = diary.resolve_handoff_path(tmp_path, "atlas")
     ranked = handoff_select.lane_handoff_candidates(
@@ -637,7 +561,7 @@ def test_explicit_handoff_after_mint_does_not_rewrite_the_record(
     epic = _epic(tmp_path)
     recorded = epic / "GEMINI-DRIVER-HANDOFF.md"
     _write(recorded, _full("gemini-sentinel", session="2026-09-23"), mtime=9_000)
-    assert gemini_lane.main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
+    assert _core_main(["--repo", str(tmp_path), "mint", "--epic", "atlas", "--stream", "lane-test"]) == 0
     canary = epic / "canary"
     before = json.loads((canary / "mint_meta.json").read_text(encoding="utf-8"))
     facts = json.loads((canary / "facts.json").read_text(encoding="utf-8"))
@@ -675,96 +599,24 @@ def test_explicit_handoff_after_mint_does_not_rewrite_the_record(
     assert diary.resolve_handoff_path(tmp_path, "atlas", out_dir=canary) == recorded
 
 
-def test_board_and_mint_share_a_custom_stream_limit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_db_note_mint_applies_the_custom_stream_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The same --stream-limit selects the same handoff on the preview board and at mint."""
-    entries = [
-        {"type": "binding_order", "body": f"Binding order {i} forbids shortcuts in this lane."}
-        for i in range(1, 5)
-    ] + [
-        {"type": "negative_constraint", "body": "Never commit directly to main from a driver."},
-        {"type": "negative_constraint", "body": "Never merge without an independent cross-family review."},
-        {"type": "next_action", "body": "Stream next action one for this lane."},
-        {"type": "next_action", "body": "Stream next action two for this lane."},
-    ]
-
-    def _load(_stream_id: str, *, limit: int = 40) -> list[dict[str, str]]:
-        return [dict(item) for item in entries[: int(limit)]]
-
-    monkeypatch.setattr(handoff_select, "load_stream_entries", _load)
-
-    def _freeze(command, **_kwargs):
-        return subprocess.CompletedProcess(command, 0, stdout="minted\n", stderr="")
-
-    monkeypatch.setattr(recall_core.subprocess, "run", _freeze)
-    epic = _epic(tmp_path)
-    _write(
-        epic / "GEMINI-DRIVER-HANDOFF.md",
-        "# Gemini\n\n## Session 2026-09-23\n\nNo next or hands-off sections.\n",
-        mtime=9_000,
+    _patch_mint(monkeypatch)
+    monkeypatch.setattr(
+        handoff_select, "load_stream_entries", lambda _stream, *, limit: _stream_alone()[:limit]
     )
-    _write(
-        epic / "CLAUDE-DRIVER-HANDOFF.md",
-        _full("claude-sentinel", session="2026-09-18"),
-        mtime=1_000,
-    )
+    _lane_note(monkeypatch, _note("C-4170", "2026-11-02 20:23:39+00:00"))
+    _write(_epic(tmp_path) / "GEMINI-DRIVER-HANDOFF.md", _full("legacy-sentinel"), mtime=9_000)
 
-    def board(limit: int) -> str:
-        assert (
-            gemini_lane.main(
-                [
-                    "--repo",
-                    str(tmp_path),
-                    "bootstrap",
-                    "--epic",
-                    "atlas",
-                    "--stream",
-                    "lane-test",
-                    "--stream-limit",
-                    str(limit),
-                ]
-            )
-            == 0
-        )
-        return (epic / "GEMINI-COLD-START.md").read_text(encoding="utf-8")
+    assert _mint(gemini_lane, tmp_path, ["--stream-limit", "3"]) == 0
+    meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
+    assert meta["stream_limit"] == 3
+    assert meta["handoff_source"] == "lu-driver-state show C-4170"
 
-    wide = board(8)
-    assert "**Handoff binding:** preview" in wide
-    assert "**Canary recall input:** `.claude/atlas-epic/GEMINI-DRIVER-HANDOFF.md`" in wide
-    narrow = board(4)
-    assert "**Handoff binding:** preview" in narrow
-    assert "**Canary recall input:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in narrow
+    assert _mint(gemini_lane, tmp_path, ["--stream-limit", "2"]) == 1
+    assert "could only derive 9/10 durable anchors" in capsys.readouterr().err
 
-    assert (
-        gemini_lane.main(
-            [
-                "--repo",
-                str(tmp_path),
-                "mint",
-                "--epic",
-                "atlas",
-                "--stream",
-                "lane-test",
-                "--stream-limit",
-                "4",
-            ]
-        )
-        == 0
-    )
-    meta = json.loads((epic / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
-    assert meta["handoff"].endswith("CLAUDE-DRIVER-HANDOFF.md")
-    assert meta["stream_limit"] == 4
-    assert meta["candidates"][0].endswith("GEMINI-DRIVER-HANDOFF.md")
-    assert any(name.endswith("CLAUDE-DRIVER-HANDOFF.md") for name in meta["candidates"])
-
-    stuck = board(8)
-    assert "**Handoff binding:** recorded path" in stuck
-    assert "**Canary recall input:** `.claude/atlas-epic/CLAUDE-DRIVER-HANDOFF.md`" in stuck
-    assert "preview (not minted)" not in stuck
-
-
-# --- Codex canary reads the newest driver-state handoff_note first (#12567) ---
 
 _NOTE_STATEMENT = (
     "FINAL FULL-CONTENT DB HANDOFF for the atlas lane.\n\n"
@@ -799,9 +651,6 @@ _SHORT_STREAM = [
     {"type": "negative_constraint", "body": "Never merge without an independent cross-family review."},
 ]
 
-_EMPTY_SECTIONS = "# Interim handoff\n\n## Next drive order\n\n## Hands-off\n"
-
-
 def _fake_driver_state_cli(tmp_path: Path, payload: object, *, exit_code: int = 0) -> tuple[Path, Path]:
     argv_file = tmp_path / "cli-argv.json"
     script = tmp_path / "bin" / "lu-driver-state"
@@ -824,7 +673,7 @@ def test_fetch_newest_handoff_note_reads_one_lane(tmp_path: Path, monkeypatch: p
         _note("C-0001", "2026-11-01 10:00:00+00:00"),
         _note("C-0003", "2026-11-03 10:00:00+00:00", status="dropped"),
         _note("C-0006", "2026-11-06 10:00:00+00:00", status="done"),
-        _note("C-0004", "2026-11-04 10:00:00+00:00", owner="claude-atlas"),
+        _note("C-0004", "2026-11-04 10:00:00+00:00", owner="claude-atlas", status="paused"),
         _note("C-0005", "2026-11-05 10:00:00+00:00", lane="infra"),
         _note("C-0002", "2026-11-02 20:23:39.965370+00:00"),
     ]
@@ -840,7 +689,7 @@ def test_fetch_newest_handoff_note_reads_one_lane(tmp_path: Path, monkeypatch: p
 
 
 @pytest.mark.parametrize(("payload", "exit_code"), [([], 0), ("not a list", 0), ([_note("C-1", "2026-11-02")], 2)])
-def test_fetch_newest_handoff_note_falls_back_on_absent_or_failed_reads(
+def test_fetch_newest_handoff_note_reports_absent_or_failed_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: object, exit_code: int
 ) -> None:
     script, _ = _fake_driver_state_cli(tmp_path, payload, exit_code=exit_code)
@@ -848,69 +697,71 @@ def test_fetch_newest_handoff_note_falls_back_on_absent_or_failed_reads(
     assert handoff_select.fetch_newest_handoff_note("atlas") is None
 
 
-def _lane_note(monkeypatch: pytest.MonkeyPatch, note: dict[str, object] | None) -> list[str]:
-    """Launcher environment plus a database that returns ``note``; records each read."""
-    reads: list[str] = []
-    monkeypatch.setenv("SESSION_HANDOFF_AGENT", "codex-atlas")
-    monkeypatch.setenv("SESSION_EPIC", "atlas")
+def _lane_note(monkeypatch: pytest.MonkeyPatch, note: dict[str, object] | None) -> list[tuple[str, ...]]:
+    """A driver-state CLI fixture with distinct list and show responses."""
+    calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(handoff_select, "_driver_state_cli", lambda: "lu-driver-state")
 
-    def fetch(lane: str) -> dict[str, object] | None:
-        reads.append(lane)
+    def read(_cli: str, *args: str) -> object:
+        calls.append(args)
+        if args[0] == "list":
+            return [dict(note, statement="List statement must not be scored.")] if note is not None else []
         return note
 
-    monkeypatch.setattr(handoff_select, "fetch_newest_handoff_note", fetch)
-    return reads
+    monkeypatch.setattr(handoff_select, "_read_driver_state", read)
+    return calls
 
 
-def test_codex_mint_derives_anchors_from_the_newest_db_handoff_note(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _assert_db_note_mint(lane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_mint(monkeypatch)
     monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM))
     epic = _epic(tmp_path)
-    _write(epic / "INTERIM-DRIVER-HANDOFF.md", _EMPTY_SECTIONS, mtime=9_000)
-    reads = _lane_note(monkeypatch, _note("C-4170", "2026-11-02 20:23:39+00:00"))
+    _write(epic / "INTERIM-DRIVER-HANDOFF.md", _full("legacy-sentinel"), mtime=9_000)
+    calls = _lane_note(monkeypatch, _note("C-4170", "2026-11-02 20:23:39+00:00"))
 
-    assert _mint(codex_lane, tmp_path) == 0
+    assert _mint(lane, tmp_path) == 0
 
-    assert reads == ["atlas"]
+    assert calls == [
+        ("list", "--lane", "atlas", "--kind", "handoff_note", "--json"),
+        ("show", "--", "C-4170"),
+    ]
     meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
-    assert meta["handoff"] == ".claude/atlas-epic/canary/driver-state-handoff-note.md"
+    assert meta["handoff"] is None
+    assert meta["handoff_source"] == "lu-driver-state show C-4170"
     assert meta["n_anchors"] == 10
     answers = _answers(tmp_path)
     assert "C-4170" in answers
     assert "Render then check the newest handoff_note" in answers
     assert "older next action" not in answers
-    snapshot = (epic / "canary" / "driver-state-handoff-note.md").read_text(encoding="utf-8")
-    assert "lu-driver-state show C-4170" in snapshot
+    assert "legacy-sentinel" not in answers
+    assert not (epic / "canary").exists()
 
 
-def test_codex_mint_without_a_db_note_keeps_the_markdown_shortfall(
+def test_codex_mint_derives_anchors_from_the_newest_db_handoff_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _assert_db_note_mint(codex_lane, tmp_path, monkeypatch)
+
+
+def test_codex_mint_refuses_missing_note_even_when_markdown_has_enough_anchors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _patch_mint(monkeypatch)
-    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM))
-    _write(_epic(tmp_path) / "INTERIM-DRIVER-HANDOFF.md", _EMPTY_SECTIONS, mtime=9_000)
+    _write(_epic(tmp_path) / "INTERIM-DRIVER-HANDOFF.md", _full("legacy-sentinel"), mtime=9_000)
     _lane_note(monkeypatch, None)
 
     assert _mint(codex_lane, tmp_path) == 1
-    assert "could only derive 7/10 durable anchors" in capsys.readouterr().err
+    assert "no readable active DB handoff note for lane atlas" in capsys.readouterr().err
 
 
-def test_codex_mint_falls_back_to_markdown_when_the_db_note_is_short(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_codex_mint_refuses_a_short_db_note_even_when_markdown_has_enough_anchors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _patch_mint(monkeypatch)
-    # Identity plus three stream entries: the full markdown reaches 10, the
-    # note without next actions reaches 7.
     monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: list(_SHORT_STREAM[:3]))
-    epic = _epic(tmp_path)
-    _write(epic / "INTERIM-DRIVER-HANDOFF.md", _full("interim-sentinel", session="2026-11-01"), mtime=9_000)
+    _write(_epic(tmp_path) / "INTERIM-DRIVER-HANDOFF.md", _full("legacy-sentinel"), mtime=9_000)
     _lane_note(monkeypatch, _note("C-4170", "2026-11-02 20:23:39+00:00", statement="No numbered list."))
 
-    assert _mint(codex_lane, tmp_path) == 0
-
-    meta = json.loads((tmp_path / "canary" / "mint_meta.json").read_text(encoding="utf-8"))
-    assert meta["handoff"] == ".claude/atlas-epic/INTERIM-DRIVER-HANDOFF.md"
-    assert "interim-sentinel" in _answers(tmp_path)
+    assert _mint(codex_lane, tmp_path) == 1
+    assert "could only derive 7/10 durable anchors" in capsys.readouterr().err
+    assert not (tmp_path / "canary" / "probe.json").exists()

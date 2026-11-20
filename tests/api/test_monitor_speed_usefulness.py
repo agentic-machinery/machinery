@@ -20,9 +20,17 @@ def _node(script: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-def _script(page: str, start: str, end: str) -> str:
+def _machinery_js_prelude() -> str:
+    js_path = machinery_path("api/dashboards/machinery.js")
+    return f"const Machinery = require({json.dumps(str(js_path))});\nglobalThis.Machinery = Machinery;\n"
+
+
+def _page_script(page: str, *, until: str = "\nrunner.start();") -> str:
     html = (machinery_path("api/dashboards") / page).read_text()
-    return html[html.index(start) : html.index(end, html.index(start))]
+    marker = '<script src="/machinery.js"></script>'
+    after = html.split(marker, 1)[1]
+    inline = after.split("<script>", 1)[1].split("</script>", 1)[0]
+    return inline.split(until, 1)[0]
 
 
 @pytest.mark.parametrize("source_status", ["ok", "degraded", "unavailable"])
@@ -85,37 +93,32 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 
 def test_home_panels_paint_independently_and_a_failed_panel_clears_old_data():
-    code = _script("index.html", "const inFlight = new Set();", "\nasync function refreshAll")
     _node(
         _DOM
+        + _machinery_js_prelude()
         + r"""
 const calls = [];
-const REFRESH_MS = 30000;
-const latest = {};
-const OPTIONAL = new Set();
 let loginPolls = 0;
 const setTimeout = (fn, ms) => {if (ms === 3000) loginPolls++;};
+globalThis.setTimeout = setTimeout;
 let resolveSlow;
 const slow = new Promise(resolve => {resolveSlow = resolve;});
-const fetchJson = async url => {
+const fakeFetch = async url => {
   calls.push(url);
   if (url === '/slow') return slow;
   if (url === '/broken') throw new Error('/broken: HTTP 503');
   if (url === '/login') return {data: {state: 'pending'}, age: null, snapshot: false};
   return {data: {tasks: []}, age: 900, bound: 150, snapshot: true};
 };
-const escapeHtml = value => String(value);
 const PANELS = [
   {id: 'fast', urls: ['/fast'], render: data => `fast ${data.tasks.length}`},
   {id: 'broken', urls: ['/broken'], render: () => 'never'},
   {id: 'slow', urls: ['/slow'], render: data => `slow ${data.marker}`},
   {id: 'logins', urls: ['/login'], render: data => data.state, retry: data => data.state === 'pending'},
 ];
-"""
-        + code
-        + r"""
+const runner = Machinery.createPanelRunner({panels: PANELS, optionalUrls: new Set(), fetchJson: fakeFetch});
 (async () => {
-  const first = Promise.all(PANELS.map(loadPanel));
+  const first = Promise.all(PANELS.map(runner.loadPanel));
   await tick();
   assert.equal(document.getElementById('fast-content').innerHTML, 'fast 0');
   assert.match(document.getElementById('fast-age').textContent, /^Fetched at \d{2}:\d{2}:\d{2} UTC · STALE · source age 900s · bound 150s$/);
@@ -127,7 +130,7 @@ const PANELS = [
   assert.doesNotMatch(broken.split('<details>')[0], /\/broken/);
   assert.doesNotMatch(broken, /old data/);
   assert.equal(document.getElementById('slow-content').innerHTML, 'old data');
-  await loadPanel(PANELS[2]);
+  await runner.loadPanel(PANELS[2]);
   assert.equal(calls.filter(url => url === '/slow').length, 1, 'overlap must not duplicate requests');
   resolveSlow({data: {marker: 'new'}, age: null, snapshot: false});
   await first;
@@ -135,9 +138,8 @@ const PANELS = [
 })().catch(e => {console.error(e); process.exitCode = 1;});
 """
     )
-    page = machinery_path("api/dashboards/index.html").read_text()
-    script = page.split("<script>", 1)[1].split("\nrefreshAll();", 1)[0]
-    _node(_DOM + script + r"""
+    fleet_script = _page_script("fleet.html", until="\nconst PANELS = [")
+    _node(_DOM + _machinery_js_prelude() + fleet_script + r"""
 const recent = renderRecent({tasks: [{task_id: 'finished', status: 'done'}],
   needs_attention: {total: 1530, tasks: [{task_id: 'unfinished', status: 'needs_finalize'},
     {task_id: 'crashed', status: 'zombie'}]}});
@@ -152,8 +154,18 @@ assert.doesNotMatch(renderWorkers({tasks: []}), /unfinished|zombie/);
 
 def test_home_hides_stale_subscription_quota_and_api_balances():
     """Stale or unverified readings must not render actionable quota, pace, reset or balance numbers."""
-    code = _script("index.html", "function escapeHtml", "// ---- Panels ----")
-    _node(_DOM + code + r"""
+    subs_script = _page_script("subscriptions.html", until="\nconst PANELS = [")
+    overview_script = _page_script("index.html", until="\nconst PANELS = [")
+    _node(
+        _DOM
+        + _machinery_js_prelude()
+        + "(() => {\n"
+        + subs_script
+        + "\nglobalThis.subscriptionRows = subscriptionRows; globalThis.renderUsage = renderUsage; globalThis.apiRows = apiRows;\n})();\n"
+        + "(() => {\n"
+        + overview_script
+        + "\nglobalThis.renderAlerts = renderAlerts; globalThis.renderChips = renderChips;\n})();\n"
+        + r"""
 const row = {account: 'Fixture', reading: {status: 'fresh', age_s: 60, read_at: '2026-11-12T00:00:00Z'},
   weekly: {status: 'ok', left_pct: 70, resets_at: '2099-01-02T03:04:00Z'},
   pace: {status: 'ok', state: 'reserve', headroom_pct: 18, lasts_to_reset: true},
@@ -227,8 +239,8 @@ assert.equal(countOf(rowFor('ApprovedNotLanded30m')), '<td class="num">2</td>');
 
 def test_home_comms_collection_errors_are_unavailable_even_when_store_exists():
     """A collector failure must not appear as successful plane access just because the database exists."""
-    code = _script("index.html", "function escapeHtml", "// ---- Summary chips ----")
-    _node(_DOM + code + r"""
+    fleet_script = _page_script("fleet.html", until="\nconst PANELS = [")
+    _node(_DOM + _machinery_js_prelude() + fleet_script + r"""
 const metrics = {source: 'authority', store: {reachable: true}, deliveries: {queued: 99}};
 assert.match(renderComms(metrics), /authority reachable/);
 for (const failure of [{db_error: 'DatabaseError'}, {db_missing: true}]) {
@@ -241,37 +253,29 @@ for (const failure of [{db_error: 'DatabaseError'}, {db_missing: true}]) {
 
 @pytest.mark.parametrize("body", ["not-json", "null", "[]"])
 def test_home_invalid_json_is_an_error(body):
-    code = _script("index.html", "async function fetchJson", "\nfunction toDate")
     _node(
         _DOM
-        + "const API_TIMEOUT_MS = 1000;\nconst fetch = async () => ({ok: true, text: async () => "
+        + "globalThis.fetch = async () => ({ok: true, text: async () => "
         + json.dumps(body)
         + "});\n"
-        + code
+        + _machinery_js_prelude()
         + r"""
-assert.rejects(fetchJson('/fixture'), /Invalid/).catch(e => {console.error(e); process.exitCode = 1;});
+assert.rejects(Machinery.fetchJson('/fixture'), /Invalid/).catch(e => {console.error(e); process.exitCode = 1;});
 """
     )
 
 
 def test_failing_panel_shows_a_calm_sentence_retry_and_hidden_detail():
     """Defect class: a failed panel shows a raw API path, omits Retry, or leaves its age blank."""
-    code = _script("index.html", "const inFlight = new Set();", "\nasync function refreshAll")
     _node(
         _DOM
+        + _machinery_js_prelude()
         + r"""
-const REFRESH_MS = 30000;
-const latest = {};
-const OPTIONAL = new Set();
-const setTimeout = () => {};
-const fetchJson = async url => { throw new Error(`${url}: HTTP 503`); };
-const escapeHtml = value => String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+const fakeFetch = async url => { throw new Error(`${url}: HTTP 503`); };
 const PANELS = [{id: 'usage', label: 'Subscriptions', urls: ['/api/runtime/subscriptions'], render: () => 'never'}];
-"""
-        + code
-        + r"""
+const runner = Machinery.createPanelRunner({panels: PANELS, optionalUrls: new Set(), fetchJson: fakeFetch});
 (async () => {
-  await loadPanel(PANELS[0]);
+  await runner.loadPanel(PANELS[0]);
   const html = document.getElementById('usage-content').innerHTML;
   const visible = html.split('<details>')[0];
   assert.match(visible, /This panel couldn't load: the source failed\./);
@@ -298,15 +302,15 @@ def test_refresh_header_names_a_failure_and_claims_updated_only_after_success():
     assert served.status_code == 200
     assert f'id="machinery-version" data-version="{version}"' in served.text
     assert "__MACHINERY_VERSION__" not in served.text
-    page = machinery_path("api/dashboards/index.html").read_text()
-    script = page.split("<script>", 1)[1].split("\nrefreshAll();", 1)[0]
+    script = _page_script("index.html")
     _node(
         _DOM
         + f"const HEALTH = {json.dumps(health.text)};\nconst VERSION = {json.dumps(version)};\n"
         + r"""
+globalThis.document = document;
 document.getElementById('machinery-version').dataset = {version: VERSION};
 const realSetTimeout = setTimeout;
-setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
+globalThis.setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
 let failSubscriptions = true;
 globalThis.fetch = async (url) => {
   const refused = failSubscriptions && String(url).includes('/api/runtime/subscriptions');
@@ -315,10 +319,11 @@ globalThis.fetch = async (url) => {
   return {ok: !refused, status: refused ? 503 : 200, text: async () => body, headers: {get: name => ({'X-Snapshot-Age-S': '2', 'X-Snapshot-Stale-After-S': '60', 'X-Snapshot-State': 'fresh'}[name] ?? null)}};
 };
 """
+        + _machinery_js_prelude()
         + script
         + r"""
 (async () => {
-  await refreshAll();
+  await runner.refreshAll();
   assert.equal(document.getElementById('machinery-version').innerHTML,
     `<a href="https://github.com/learn-ukrainian/machinery/blob/main/CHANGELOG.md#v${VERSION}" title="What changed in this release">lu-machinery ${VERSION}</a>`);
   const status = document.getElementById('last-refresh');
@@ -327,9 +332,9 @@ globalThis.fetch = async (url) => {
   assert.equal(retry.hidden, false);
   assert.doesNotMatch(status.textContent, /Updated/);
   assert.match(document.getElementById('usage-content').innerHTML, /couldn't load/i);
-  assert.doesNotMatch(document.getElementById('workers-content').innerHTML, /couldn't load/i);
+  assert.doesNotMatch(document.getElementById('alerts-content').innerHTML, /couldn't load/i);
   failSubscriptions = false;
-  await refreshAll();
+  await runner.refreshAll();
   assert.match(status.textContent, /^Updated \d{2}:\d{2}:\d{2} UTC \u00b7 every 30 s$/);
   assert.equal(retry.hidden, true);
   assert.doesNotMatch(status.textContent, /Couldn't refresh/);
@@ -341,13 +346,22 @@ globalThis.fetch = async (url) => {
 
 def test_home_announces_panel_status_and_has_skip_purpose_and_sites_label():
     """Defect class: a panel status change is silent, or the skip link, sites label, or purpose line is missing."""
-    page = machinery_path("api/dashboards/index.html").read_text()
-    assert 'class="skip" href="#main"' in page
-    assert '<main id="main" tabindex="-1">' in page
-    assert 'aria-label="Sites"' in page
-    assert page.count('aria-live="polite"') == 7
-    assert "Which subscription is near its limit, when it resets, and whether anything is signed out." in page
-    script = page.split("<script>", 1)[1].split("\nrefreshAll();", 1)[0]
+    dashboards = machinery_path("api/dashboards")
+    for name in ("index.html", "subscriptions.html", "fleet.html", "pull-requests.html", "milestones.html", "model-stats.html"):
+        page = (dashboards / name).read_text()
+        assert 'class="skip" href="#main"' in page, name
+        assert '<main id="main" tabindex="-1">' in page, name
+        assert 'aria-label="Sites"' in page, name
+    assert (dashboards / "index.html").read_text().count('aria-live="polite"') == 3
+    subs_page = (dashboards / "subscriptions.html").read_text()
+    assert subs_page.count('aria-live="polite"') == 1
+    assert "Which subscription is near its limit, when it resets, and whether anything is signed out." in subs_page
+    assert (dashboards / "fleet.html").read_text().count('aria-live="polite"') == 3
+    assert (dashboards / "pull-requests.html").read_text().count('aria-live="polite"') == 1
+    assert (dashboards / "milestones.html").read_text().count('aria-live="polite"') == 1
+
+    subs_script = _page_script("subscriptions.html")
+    fleet_script = _page_script("fleet.html")
     _node(
         r"""
 const assert = require('node:assert/strict');
@@ -365,24 +379,30 @@ const document = {querySelectorAll() { return []; }, getElementById(id) {
   }
   return elements.get(id);
 }};
+globalThis.document = document;
 const realSetTimeout = setTimeout;
-setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
+globalThis.setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
 let failSubscriptions = true;
 globalThis.fetch = async (url) => {
   const refused = failSubscriptions && String(url).includes('/api/runtime/subscriptions');
   return {ok: !refused, status: refused ? 403 : 200, text: async () => '{}', headers: {get: name => ({'X-Snapshot-Age-S': '2', 'X-Snapshot-Stale-After-S': '60', 'X-Snapshot-State': 'fresh'}[name] ?? null)}};
 };
 """
-        + script
+        + _machinery_js_prelude()
+        + "const subsRunner = (() => {\n" + subs_script + "\nreturn runner;\n})();\n"
+        + "const fleetRunner = (() => {\n" + fleet_script + "\nreturn runner;\n})();\n"
         + r"""
 (async () => {
-  await refreshAll();
+  await subsRunner.refreshAll();
+  await fleetRunner.refreshAll();
   assert.ok(announced.indexOf('Loading Subscriptions.') < announced.indexOf("Subscriptions isn't available in this view."));
   assert.equal(announced.filter(item => item === 'Agent fleet loaded.').length, 1);
   failSubscriptions = false;
-  await refreshAll();
+  await subsRunner.refreshAll();
+  await fleetRunner.refreshAll();
   assert.equal(announced.filter(item => item === 'Subscriptions loaded.').length, 1);
-  await refreshAll();
+  await subsRunner.refreshAll();
+  await fleetRunner.refreshAll();
   assert.equal(announced.filter(item => item === 'Subscriptions loaded.').length, 1);
   assert.equal(announced.filter(item => item === 'Agent fleet loaded.').length, 1);
 })().catch(error => {console.error(error); process.exitCode = 1;});
@@ -392,13 +412,14 @@ globalThis.fetch = async (url) => {
 
 def test_refused_panels_stay_unavailable_and_do_not_fail_refresh():
     """Defect class: a panel refused in this view turns the page into Couldn't refresh, or shows Retry and a red age."""
-    page = machinery_path("api/dashboards/index.html").read_text()
-    script = page.split("<script>", 1)[1].split("\nrefreshAll();", 1)[0]
+    overview_script = _page_script("index.html")
+    fleet_script = _page_script("fleet.html")
     _node(
         _DOM
         + r"""
+globalThis.document = document;
 const realSetTimeout = setTimeout;
-setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
+globalThis.setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
 const REFUSED = ['/api/delegate/active', '/api/delegate/recent', '/api/git/pull-requests'];
 globalThis.fetch = async (url) => {
   const refused = REFUSED.some(item => String(url).includes(item));
@@ -407,11 +428,17 @@ globalThis.fetch = async (url) => {
     dead_letters: 0, store: {reachable: true}, repositories: []})};
 };
 """
-        + script
+        + _machinery_js_prelude()
+        + "const overviewRunner = (() => {\n" + overview_script + "\nreturn runner;\n})();\n"
+        + "const fleetRunner = (() => {\n" + fleet_script + "\nreturn runner;\n})();\n"
         + r"""
 (async () => {
-  await refreshAll();
+  await overviewRunner.refreshAll();
   const status = document.getElementById('last-refresh');
+  assert.match(status.textContent, /^Updated \d{2}:\d{2}:\d{2} UTC \u00b7 every 30 s$/);
+  assert.equal(document.getElementById('refresh-retry').hidden, true);
+  assert.doesNotMatch(status.textContent, /Couldn't refresh/);
+  await fleetRunner.refreshAll();
   assert.match(status.textContent, /^Updated \d{2}:\d{2}:\d{2} UTC \u00b7 every 30 s$/);
   assert.equal(document.getElementById('refresh-retry').hidden, true);
   assert.doesNotMatch(status.textContent, /Couldn't refresh/);
@@ -432,10 +459,11 @@ globalThis.fetch = async (url) => {
 
 def test_at_risk_chip_counts_fresh_run_outs_and_names_unknowns():
     """Defect class: one account with no reading replaces the run-out count with a question mark."""
-    code = _script("index.html", "function escapeHtml", "// ---- Panels ----")
+    overview_script = _page_script("index.html", until="\nconst PANELS = [")
     _node(
         _DOM
-        + code
+        + _machinery_js_prelude()
+        + overview_script
         + r"""
 const fresh = {reading: {status: 'fresh', age_s: 30, read_at: '2026-11-13T00:00:00Z'},
   pace: {status: 'ok', lasts_to_reset: false}};
@@ -459,67 +487,90 @@ assert.doesNotMatch(clear, /unknown|chip bad|chip warn/);
     )
 
 
-def test_home_freshness_is_read_from_the_payload_so_heading_and_rows_agree():
-    """Defect class: a heading judged from transport headers (stripped or rewritten in transit) says fresh or unavailable while the payload and its rows say stale or populated."""
-    code = _script("index.html", "function escapeHtml", "function updatePanelAge")
-    _node(_DOM + code + r"""
+def test_panel_age_is_the_snapshot_header_plus_elapsed():
+    """Defect class: client-side age from observed_at, or Number('') becoming 0, disagrees with the server snapshot age."""
+    subs_script = _page_script("subscriptions.html", until="\nconst PANELS = [")
+    _node(_DOM + _machinery_js_prelude() + subs_script + r"""
+const {headingAge, panelAgeSeconds} = Machinery;
 const now = Date.now();
-const line = (...readings) => headingAge(readings.map(reading => ({receivedAt: now, snapshot: true, ...reading})), false);
-// The body says stale at 817 s while rewritten headers claim a young, fresh reading: the body wins.
-const milestones = {url: '/api/milestones', age: 40, bound: 420, state: 'fresh', data: {status: 'ok', age_seconds: 817, stale: true}};
-assert.match(line(milestones).text, /· STALE · source age 817s · bound unknown$/);
-assert.equal(line(milestones).bad, true);
-// With every header stripped, the same body still judges itself.
-assert.match(line({url: '/api/milestones', data: {status: 'ok', age_seconds: 12, stale: false}}).text, /· fresh · source age 12s · bound unknown$/);
-// Subscriptions: the heading and each row come from the same reading, with no header at all.
-const claudeRow = age => ({account: 'Claude a', reading: {status: 'fresh', age_s: age, read_at: '2030-01-01T00:00:00Z'}, plan: {status: 'ok'}});
-for (const [age, heading, row] of [[51, /fresh · source age 51s · bound 900s/, /fresh, 51s old/], [1800, /STALE · source age 1800s · bound 900s/, /STALE, 30m old/]]) {
-  const subs = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(age)]}]};
-  assert.match(line({url: '/api/runtime/subscriptions', data: subs}).text, heading);
-  assert.match(subscriptionRows(subs, null).groups, row);
+const skewed = new Date(now + 120000).toISOString();
+const line = (...readings) => headingAge(readings.map(reading => ({receivedAt: now, snapshot: true, ...reading})), false, null, undefined, now);
+// A present header wins over a body age and a future observed_at.
+assert.match(line({url: '/api/milestones', age: 40, bound: 420, state: 'fresh',
+  data: {status: 'ok', age_seconds: 817, stale: true, observed_at: skewed}}).text, /· fresh · source age 40s · bound 420s$/);
+assert.equal(panelAgeSeconds({ageHeader: '200', receivedAt: now - 11000, data: {observed_at: skewed}}, now), 211);
+assert.equal(panelAgeSeconds({ageHeader: '30', receivedAt: now + 5000}, now), 30);
+assert.equal(panelAgeSeconds({ageHeader: '30', receivedAt: now}, Number.NaN), null);
+// Missing, empty, whitespace, and non-decimal headers are unknown, never 0.
+for (const raw of [undefined, null, '', ' ', '\t', 'unknown', '-1', '1e2', '0x10', '+5']) {
+  const reading = {ageHeader: raw, boundHeader: '210', state: 'fresh', receivedAt: now,
+    data: {status: 'ok', observed_at: skewed, age_seconds: 12, stale: true}};
+  assert.equal(panelAgeSeconds(reading, now), null, JSON.stringify(raw));
+  assert.match(line(reading).text, /source age unknown/);
+  assert.doesNotMatch(line(reading).text, /source age 0s/);
 }
-// A source whose payload has no age falls back to its headers; with neither it is unjudged, never "unavailable".
-assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: 27, bound: 60, state: 'fresh'}).text, /· fresh · source age 27s · bound 60s$/);
-assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: null, bound: null, state: null}).text, /· freshness unknown · source age unknown · bound unknown$/);
+// A real zero stays fresh under a positive bound. Age past the bound is stale.
+assert.match(line({ageHeader: '0', boundHeader: '60', state: 'fresh', receivedAt: now, data: {status: 'ok'}}).text,
+  /· fresh · source age 0s · bound 60s$/);
+assert.match(line({ageHeader: '0.000', boundHeader: '60.000', state: 'fresh', receivedAt: now, data: {status: 'ok'}}).text,
+  /· fresh · source age 0s · bound 60s$/);
+assert.match(line({age: 240, bound: 210, state: 'fresh', receivedAt: now, data: {status: 'ok', observed_at: skewed}}).text,
+  /· STALE · source age 240s · bound 210s$/);
+assert.equal(line({age: 240, bound: 210, state: 'fresh', receivedAt: now, data: {status: 'ok'}}).bad, true);
+// Server state stale (partial coverage) keeps the heading stale at the header age, without observed_at.
+assert.match(line({age: 30, bound: 210, state: 'stale', receivedAt: now, url: '/api/git/pull-requests',
+  data: {status: 'ok', observed_at: skewed, repositories: [{status: 'ok'}, {status: 'unknown'}]}}).text,
+  /· STALE · source age 30s · bound 210s$/);
+assert.match(line({ageHeader: '30', boundHeader: ' 210 ', state: ' STALE ', receivedAt: now, url: '/api/git/pull-requests?limit=1',
+  data: {status: 'ok', observed_at: skewed, repositories: [{status: 'ok'}]}}).text,
+  /· STALE · source age 30s · bound 210s$/);
+assert.match(line({ageHeader: '5', boundHeader: '210', state: ' Unavailable ', receivedAt: now, url: '/api/git/pull-requests',
+  data: {status: 'ok', repositories: [{status: 'ok'}]}}).text, /· unavailable · source age 5s/);
+// No header at all is unknown, including when the body carries its own age.
+assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: null, bound: null, state: null}).text,
+  /· freshness unknown · source age unknown · bound unknown$/);
+assert.match(line({url: '/api/milestones', data: {status: 'ok', age_seconds: 12, stale: false, observed_at: skewed}}).text,
+  /· freshness unknown · source age unknown/);
 assert.match(line({data: null, age: null, snapshot: false}).text, /· unavailable · source age unknown/);
-// A failed collection stamped with the attempt time stays unavailable; its age does not make it healthy.
 assert.match(line({url: '/api/ops/v1/alerts', age: 0, bound: 60, state: 'unavailable',
-  data: {status: 'unknown', reason_code: 'alertmanager_unreachable', observed_at: new Date(now).toISOString(), stale_after_s: 60}}).text, /· unavailable · source age 0s/);
-// One account with no reading keeps the aggregate from reading fresh, as its row says NO READING.
+  data: {status: 'unknown', observed_at: skewed, stale_after_s: 60}}).text, /· unavailable · source age 0s/);
+assert.match(line({url: '/api/delegate/active', data: {tasks: []}, age: 27, bound: 60, state: 'fresh'}).text,
+  /· fresh · source age 27s · bound 60s$/);
+// Account rows still show the server's age_s. That number is not the panel age.
+const claudeRow = age => ({account: 'Claude a', reading: {status: 'fresh', age_s: age, read_at: '2030-01-01T00:00:00Z'}, plan: {status: 'ok'}});
+const subs = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(51)]}]};
+assert.match(line({url: '/api/runtime/subscriptions', data: subs}).text, /source age unknown/);
+assert.match(subscriptionRows(subs, null).groups, /fresh, 51s old/);
+assert.match(subscriptionRows({stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(1800)]}]}, null).groups, /STALE, 30m old/);
 const partial = {stale_after_s: 900, providers: [{provider: 'claude', accounts: [claudeRow(51),
   {account: 'Claude b', reading: {status: 'unknown', age_s: null, reason_code: 'provider_error'}, plan: {status: 'ok'}}]}]};
-assert.match(line({url: '/api/runtime/subscriptions', data: partial}).text, /· STALE · source age 51s · bound 900s$/);
 assert.match(subscriptionRows(partial, null).groups, /NO READING/);
-// Other failed or degraded payloads keep their own verdict over a young header, even with no age to show.
-const young = {age: 5, bound: 900, state: 'fresh'};
-assert.match(line({...young, url: '/api/runtime/logins', data: {state: 'unknown', read_at: new Date(now).toISOString()}}).text, /· unavailable ·/);
-assert.match(line({...young, url: '/api/git/pull-requests', data: {status: 'ok', observed_at: new Date(now).toISOString(),
-  repositories: [{status: 'ok'}, {status: 'unknown'}]}}).text, /· STALE ·/);
-assert.match(line({...young, url: '/api/milestones', data: {status: 'ok', age_seconds: null, stale: true}}).text, /· STALE ·/);
-assert.match(line({...young, url: '/api/milestones', data: {status: 'unknown', repositories: [], age_seconds: 0, stale: false}}).text, /· unavailable ·/);
-// Populated but degraded data reads partial, and a body with no observation yet reads unavailable, whatever the header says.
-assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
-  repositories: [{status: 'ok'}, {status: 'unknown', reason: 'github_unavailable'}]}}).text, /· partial data · source age 5s · bound unknown$/);
-assert.match(line({...young, url: '/api/milestones', data: {status: 'pending', repositories: []}}).text, /· unavailable ·/);
-assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 0, stale: false,
-  repositories: [{status: 'unknown'}, {status: 'unknown'}]}}).text, /· unavailable ·/);
-assert.match(line({...young, url: '/api/runtime/logins', data: {state: 'pending', accounts: []}}).text, /· unavailable ·/);
-// Populated partial data is not unavailable, and a rewritten header bound never loosens a payload that owns its age.
-assert.match(line({...young, url: '/api/milestones', data: {status: 'partial', age_seconds: 5, stale: false,
-  repositories: [{status: 'partial', milestones: [{number: 1}]}, {status: 'unknown', milestones: []}]}}).text, /· partial data ·/);
-const oldLogins = {url: '/api/runtime/logins', age: 1200, bound: 9999, state: 'stale',
-  data: {state: 'ok', read_at: new Date(now - 1200000).toISOString()}};
-assert.match(line(oldLogins).text, /· freshness unknown · source age 1200s · bound unknown$/);
-assert.doesNotMatch(line({...oldLogins, url: '/api/git/pull-requests', data: {status: 'ok', repositories: [],
-  observed_at: new Date(now - 1200000).toISOString()}}).text, /· fresh ·/);
-// An old routing-budget snapshot is stale though its account rows read fresh (the age shown is the rows' own); unavailable rows are not fresh.
-const budget = (diagnostics, accounts) => ({url: '/api/state/routing-budget', ...young, data: {diagnostics, api_accounts: accounts}});
-assert.match(line(budget({data_age_s: 1200, stale: true, stale_threshold_s: 900}, {x: {freshness: 'fresh', age_s: 12}})).text, /· STALE · source age 12s · bound 900s$/);
-assert.match(line(budget({data_age_s: 5, stale: false, stale_threshold_s: 900}, {x: {freshness: 'unavailable', age_s: null}})).text, /· STALE ·/);
-// Alerts carry their own bound in the body.
-const observed = new Date(now - 5000).toISOString();
-assert.match(line({url: '/api/ops/v1/alerts', data: {status: 'ok', observed_at: observed, stale_after_s: 60}}).text, /· fresh · source age 5s · bound 60s$/);
+// Without a monotonic stamp, elapsed still never shrinks: a rollback cannot make an expired snapshot fresh.
+const wall = {ageHeader: '0', boundHeader: '10', state: 'fresh', receivedAt: now, data: {status: 'ok'}};
+assert.equal(panelAgeSeconds(wall, now + 11000), 11);
+assert.equal(panelAgeSeconds(wall, now - 20000), 11);
+const clock = performance.now;
+performance.now = undefined;
+assert.equal(Machinery.snapshotClockStamp(), null);
+performance.now = clock;
+// A wall-clock jump does not change an age stamped with the monotonic clock, and a backward step does not shrink it.
+const realPerf = performance.now.bind(performance);
+let mono = realPerf();
+performance.now = () => mono;
+try {
+  const stamped = {ageHeader: '200', boundHeader: '210', state: 'fresh', receivedAt: now, receivedMono: mono, data: {status: 'ok'}};
+  assert.equal(panelAgeSeconds(stamped, now + 60000), 200);
+  mono += 11000;
+  assert.equal(panelAgeSeconds(stamped, now), 211);
+  mono -= 20000;
+  assert.equal(panelAgeSeconds(stamped, now - 60000), 211);
+  assert.equal(panelAgeSeconds({ageHeader: '0', receivedAt: Number.NaN, data: {status: 'ok'}}, now), null);
+  assert.equal(panelAgeSeconds({ageHeader: '0', receivedAt: now, receivedMono: Number.NaN, data: {status: 'ok'}}, now), null);
+} finally {
+  performance.now = realPerf;
+}
 """)
+
 
 
 def _swr_app(monkeypatch, tmp_path, handler_factory, *, ttl: float = 10.0, vary: tuple[str, ...] = ()):

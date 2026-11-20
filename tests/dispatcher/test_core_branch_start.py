@@ -78,7 +78,8 @@ def test_merged_pr_outside_owned_paths_is_still_refused(merged_delivery_world):
     """Control: a merged PR is no licence to change paths outside the task's ownership."""
     world = merged_delivery_world
     world.accept(79)
-    world.prs[79], world.files[79] = MERGED, ["docs/owned.md", "scripts/elsewhere.py"]
+    world.prs[79] = {**MERGED, "headRefOid": world.record["head_sha"]}
+    world.files[79] = ["docs/owned.md", "scripts/elsewhere.py"]
     worker._enforce_delivery(world.record)
     assert (world.record["status"], world.record["error"]) == (
         "no_deliverable", "outside_owned_paths: scripts/elsewhere.py")
@@ -102,7 +103,7 @@ def test_unpushed_change_without_a_provable_merged_delivery_is_still_refused(mer
     world.accept(80)
     world.prs[80], world.files[80] = dict(MERGED), ["docs/owned.md"]
     world.record["commits_ahead"] = 1
-    expected = "owned_paths_verification_failed: git fetch failed"
+    expected = "work_not_pushed_or_unknown"
     if fault == "open-pr":
         world.prs[80]["state"] = "OPEN"
     elif fault == "merged-before-start":
@@ -142,7 +143,8 @@ def test_additional_task_prs_recover_split_branch_delivery(
         {"number": 79, "isCrossRepository": False, "headRefName": f"claude/merge-probe{separator}alerts",
          "headRefOid": "e" * 40},
     ]
-    world.prs = {78: dict(MERGED), 79: {**MERGED, "headRefOid": "e" * 40}}
+    world.prs = {78: dict(MERGED), 79: {**MERGED, "headRefOid": "e" * 40,
+                                     "mergeCommit": {"oid": world.record["head_sha"]}}}
     world.files = {78: ["docs/owned.md"], 79: ["docs/second.md"]}
     world.record["owned_paths"].append("docs/second.md")
     world.search_listed = []
@@ -194,6 +196,8 @@ def test_split_delivery_checks_every_owned_path(merged_delivery_world, monkeypat
     ]
     world.prs = {78: dict(MERGED), 79: dict(MERGED)}
     world.files = {78: ["docs/owned.md"], 79: ["outside.txt"]}
+    if fault in {"outside-path", "reverted-outside-path"}:
+        world.prs[79]["headRefOid"] = world.record["head_sha"]
     if fault == "reverted-outside-path":
         world.files[79] = ["docs/owned.md"]
         monkeypatch.setattr(worker.ownership, "delivered_paths", lambda *_args, **_kwargs: ["outside.txt"])
@@ -248,7 +252,8 @@ def test_split_delivery_preserves_provider_failure_evidence(merged_delivery_worl
     world.record.update(status="failed", error="provider exited unsuccessfully", provider_terminal_failure=True,
                         commits_ahead=2, returncode=17)
     world.listed = [{"number": 78, "isCrossRepository": False, "headRefName": "claude/merge-probe-layout"}]
-    world.prs[78], world.files[78] = {**MERGED, "state": "MERGED" if merged else "OPEN"}, ["docs/owned.md"]
+    world.prs[78] = {**MERGED, "state": "MERGED" if merged else "OPEN", "headRefOid": world.record["head_sha"]}
+    world.files[78] = ["docs/owned.md"]
     worker._enforce_delivery(world.record)
     assert world.record["status"] == ("done" if merged else "failed")
     assert world.record["provider_terminal_error"] == "provider exited unsuccessfully"

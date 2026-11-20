@@ -1,8 +1,7 @@
-"""Rank driver handoffs by one freshness date, then an own-lane tiebreak.
+"""Select recall anchors from driver-state notes or historical handoffs.
 
-Mint used to walk a fixed name list and keep the first file that existed.
-A stale ``INTERIM-DRIVER-HANDOFF.md`` therefore beat a newer
-``CLAUDE-DRIVER-HANDOFF.md``. Selection is now:
+Codex and Gemini use the newest active DB note for the lane. For file-based
+callers, selection is:
 
 1. An explicit ``--handoff`` path, when the caller supplies one. That path
    applies to the invocation only. Nothing writes it into ``mint_meta.json``.
@@ -23,8 +22,7 @@ A stale ``INTERIM-DRIVER-HANDOFF.md`` therefore beat a newer
    any mint.
 3. Otherwise :func:`select_handoff`. Ranking and selection share one read per
    candidate. Mint builds facts and the 10-anchor minimum from that same
-   text. A board drawn before mint is a preview of those inputs, including
-   ``--stream-limit``. After mint the board reads the recorded inputs.
+   text.
 
 Freshness is a single calendar date per file, never a mix of a session
 timestamp and an mtime:
@@ -80,19 +78,14 @@ _SESSION_HEADING_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 # Prefix used to rank candidates and to count the 10-anchor minimum.
-# Hydrate, score, diary, and the board read the whole file past this prefix.
+# Historical hydration, scoring and diary readers consume the whole file.
 # A tail beyond the cap cannot change which path is selected.
 SELECTION_TEXT_LIMIT = 120_000
 # Historical name. Selection slices to :data:`SELECTION_TEXT_LIMIT`; consumers
 # of a recorded path read the full file.
 HANDOFF_TEXT_LIMIT = SELECTION_TEXT_LIMIT
 NO_HANDOFF_LABEL = "(no handoff)"
-REMINT_RULE = "Material edits after mint → re-mint to refresh facts."
-STREAM_LIMIT_HELP = (
-    "Max stream entries ranked into the anchor set. "
-    "Board-before-mint and mint must pass the same value; after mint the board "
-    "reads the recorded inputs. " + REMINT_RULE
-)
+STREAM_LIMIT_HELP = "Maximum stream entries considered for recall anchors. Default: %(default)s."
 
 
 def is_superseded_name(name: str) -> bool:
@@ -278,37 +271,14 @@ def load_and_rank_candidates(
     return [LoadedCandidate(path=path, text=texts.get(path)) for path in ranked]
 
 
-def load_codex_candidates(repo: Path, epic: str) -> list[LoadedCandidate]:
-    """Shared Codex ranking for the canary and the bounded PostCompact hook.
-
-    Keep selection independent of lane CLI and hydration runtime imports so
-    unrelated startup work cannot consume the hook's selection deadline.
-    """
-    return load_and_rank_candidates(
-        repo,
-        epic,
-        (
-            "CODEX-DRIVER-HANDOFF.md",
-            "INTERIM-DRIVER-HANDOFF.md",
-            "CLAUDE-DRIVER-HANDOFF.md",
-            "GEMINI-DRIVER-HANDOFF.md",
-        ),
-        preferred=("CODEX-DRIVER-HANDOFF.md",),
-    )
-
-
 # A lane's handoff content lives in the driver-state database as one
-# full-content ``handoff_note`` (the lane's DB note). It is the only handoff
-# content authority on cold start, compaction and replacement (#511); markdown
-# handoffs are canary inputs only. The fence matches ``lu-driver-state render``
-# and the driver keeper: the exact lane, notes that are not done or dropped,
+# full-content ``handoff_note``. The fence matches ``lu-driver-state render``
+# and the driver keeper: the exact lane, active notes,
 # newest first. The owner is not part of the fence, so a lane's successor on
 # another harness reads the same note.
 DRIVER_STATE_CLI_ENV = "LU_DRIVER_STATE_CLI"
 DRIVER_STATE_CLI_DEFAULT = "lu-driver-state"
 DRIVER_STATE_TIMEOUT_SECONDS = 60
-DRIVER_STATE_SNAPSHOT_NAME = "driver-state-handoff-note.md"
-_TERMINAL_NOTE_STATUSES = frozenset({"done", "dropped"})
 _NUMBERED_ITEM_RE = re.compile(r"^\s*\d+[.)]\s+(.+?)\s*$")
 
 
@@ -328,48 +298,52 @@ def _note_created(note: Mapping[str, object]) -> datetime | None:
         return None
     try:
         created = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-    except ValueError:
+        return created.astimezone(UTC) if created.tzinfo else created.replace(tzinfo=UTC)
+    except (ValueError, OverflowError):
         return None
-    return created if created.tzinfo else created.replace(tzinfo=UTC)
 
 
-def fetch_newest_handoff_note(lane: str) -> dict[str, object] | None:
-    """The lane's DB note: its newest ``handoff_note`` that is not done or dropped, or None.
-
-    Reads through the ``lu-driver-state`` CLI (override or disable with
-    ``LU_DRIVER_STATE_CLI``; an empty value disables the lookup). Any failure
-    returns None with a warning; callers decide whether that blocks.
-    """
-    cli = _driver_state_cli()
-    if not cli:
-        return None
-    command = [cli, "list", "--lane", lane, "--kind", "handoff_note", "--json"]
+def _read_driver_state(cli: str, *args: str) -> object:
+    command = [cli, *args]
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, timeout=DRIVER_STATE_TIMEOUT_SECONDS, check=False
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         _warn(f"driver-state handoff_note unavailable ({type(exc).__name__})")
         return None
     if result.returncode != 0:
         _warn(f"driver-state handoff_note unavailable (exit {result.returncode})")
         return None
     try:
-        items = json_depth.loads(result.stdout, max_depth=512)
-    except json.JSONDecodeError:
-        _warn("driver-state handoff_note output is not JSON")
+        return json_depth.loads(result.stdout, max_depth=512)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        _warn(f"cannot parse driver-state handoff_note output ({type(exc).__name__})")
         return None
-    notes = [
-        item
-        for item in (items if isinstance(items, list) else [])
-        if isinstance(item, dict)
+
+
+def _active_lane_note(item: dict[str, object], lane: str) -> bool:
+    return (
+        item.get("lane") == lane
         and item.get("kind") == "handoff_note"
-        and item.get("lane") == lane
-        and item.get("status") not in _TERMINAL_NOTE_STATUSES
+        and isinstance(status := item.get("status"), str)
+        and status not in ("done", "dropped")
         and isinstance(item.get("id"), str)
-        and isinstance(item.get("statement"), str)
+        and isinstance(statement := item.get("statement"), str)
+        and bool(statement.strip())
         and _note_created(item) is not None
-    ]
+    )
+
+
+def fetch_newest_handoff_note(lane: str) -> dict[str, object] | None:
+    """The lane's newest active note, as listed by `lu-driver-state`."""
+    cli = _driver_state_cli()
+    if not cli:
+        return None
+    items = _read_driver_state(cli, "list", "--lane", lane, "--kind", "handoff_note", "--json")
+    if not isinstance(items, list):
+        return None
+    notes = [item for item in items if isinstance(item, dict) and _active_lane_note(item, lane)]
     if not notes:
         return None
     return max(notes, key=lambda item: (_note_created(item), str(item["id"])))
@@ -395,17 +369,15 @@ def render_handoff_note(note: Mapping[str, object], *, lane: str) -> str:
     created = _note_created(note)
     if created is None:
         raise ValueError(f"handoff_note {note_id} has no valid created_utc")
-    created_utc = created.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    created_utc = created.strftime("%Y-%m-%dT%H:%M:%SZ")
     statement = str(note.get("statement") or "")
     owner = note.get("owner")
     lines = [
         f"# Driver-state handoff_note {note_id}",
         "",
-        f"> Snapshot written by the Codex lane canary from the driver-state database "
-        f"(lane `{lane}`, owner `{owner}`). The database note is the authority; "
-        f"full content: `lu-driver-state show {note_id}`.",
+        f"> Lane `{lane}`, owner `{owner}`. Full content from `lu-driver-state show {note_id}`.",
         "",
-        f"## Session {created.astimezone(UTC).date().isoformat()} — handoff_note {note_id}",
+        f"## Session {created.date().isoformat()} — handoff_note {note_id}",
         "",
         "## Next actions",
         *(f"- {item}" for item in _next_actions(statement)),
@@ -420,41 +392,17 @@ def render_handoff_note(note: Mapping[str, object], *, lane: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def load_driver_state_candidate(repo: Path, epic: str) -> LoadedCandidate | None:
-    """The lane's DB note as a mint candidate, or None.
-
-    The driver-state lane is the launcher's epic. The rendered snapshot is
-    written under the epic's canary directory so mint, score and hydrate read
-    the same recorded file.
-    """
-    if _driver_state_cli() is None:
+def _read_newest_handoff_note(lane: str) -> dict[str, object] | None:
+    """Read the full note selected by the lane fence, including its current status."""
+    listed = fetch_newest_handoff_note(lane)
+    cli = _driver_state_cli()
+    if listed is None or cli is None:
         return None
-    note = fetch_newest_handoff_note(epic)
-    if note is None:
-        return None
-    text = render_handoff_note(note, lane=epic)
-    path = repo / ".claude" / f"{epic}-epic" / "canary" / DRIVER_STATE_SNAPSHOT_NAME
-    try:
-        if read_candidate_text(path) != text:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_name(f".{path.name}.tmp")
-            temporary.write_text(text, encoding="utf-8")
-            temporary.replace(path)
-    except OSError as exc:
-        _warn(f"cannot write the driver-state handoff snapshot ({exc}); using markdown handoffs")
-        return None
-    return LoadedCandidate(path=path, text=text)
-
-
-def load_codex_mint_candidates(repo: Path, epic: str) -> list[LoadedCandidate]:
-    """What the Codex launcher mints from: the lane's DB note, then markdown.
-
-    Selection takes the first candidate that yields the full anchor set, so the
-    markdown handoffs are used only when the database note is absent or short.
-    """
-    markdown = load_codex_candidates(repo, epic)
-    note = load_driver_state_candidate(repo, epic)
-    return [note, *markdown] if note is not None else markdown
+    note_id = str(listed["id"])
+    note = _read_driver_state(cli, "show", "--", note_id)
+    if isinstance(note, dict) and note.get("id") == note_id and _active_lane_note(note, lane):
+        return note
+    return None
 
 
 def lane_handoff_candidates(
@@ -530,14 +478,11 @@ def handoff_changed_since_mint(recorded_sha: object, current_text: str) -> bool:
 
 @dataclass(frozen=True)
 class HandoffSelection:
-    """One immutable pass over the candidate files.
+    """The facts source selected for one mint.
 
-    ``path`` is None when the stream alone supplied the anchors (``reason``
-    is ``(no handoff)``) or when every candidate fell short (``reason`` is
-    empty). ``text`` is the selection prefix that was measured — downstream
-    fact building uses it and does not read the file again. ``sha256`` is an
-    informational digest of the full file text from that same read, or None
-    when no file was selected.
+    ``path`` is present only for a selected file. ``text`` is the measured
+    prefix and ``sha256`` describes the full source text from the same read.
+    On success, ``reason`` names the source. It is empty on a shortfall.
     """
 
     path: Path | None
@@ -715,45 +660,6 @@ def display_repo_path(repo: Path, path: Path) -> str:
         return str(path)
 
 
-def handoff_binding_line(*, preview: bool) -> str:
-    """Board line: a pre-mint preview, or the path mint already recorded."""
-    if preview:
-        return (
-            "**Handoff binding:** preview (not minted). "
-            "Mint with the same --stream-limit to record this path. " + REMINT_RULE
-        )
-    return "**Handoff binding:** recorded path. " + REMINT_RULE
-
-
-def board_handoff_view(
-    repo: Path,
-    epic: str,
-    select: Callable[[], HandoffSelection],
-    *,
-    out_dir: Path | None = None,
-) -> tuple[str, bool]:
-    """``(label, preview)`` for a cold-start board.
-
-    ``select`` runs only when mint has not already recorded a selection, and
-    it must be the same :func:`select_handoff` mint runs, including the same
-    ``--stream-limit``. That result is a preview. A recorded null is
-    ``(no handoff)`` and does not select again. A recorded path is consumed
-    with :func:`read_consumed_handoff`; missing or unreadable bytes raise
-    :class:`RecordedHandoffMissingError`. Preview is false once mint has
-    recorded a selection.
-    """
-    recorded = recorded_mint_handoff(repo, epic, out_dir)
-    if isinstance(recorded, NoHandoff):
-        return NO_HANDOFF_LABEL, False
-    if isinstance(recorded, Path):
-        read_consumed_handoff(recorded, meta_path=_mint_meta_path(repo, epic, out_dir))
-        return display_repo_path(repo, recorded), False
-    chosen = select()
-    if chosen.path is None:
-        return NO_HANDOFF_LABEL, True
-    return display_repo_path(repo, chosen.path), True
-
-
 def ordered_mint_handoffs(candidates: Sequence[Path], explicit: Path | None) -> list[Path]:
     """``--handoff`` first, then the ranked candidates. Superseded paths drop out."""
     ordered: list[Path] = []
@@ -928,7 +834,7 @@ def format_anchor_shortfall(attempts: list[tuple[str, int, int, int]]) -> str:
     return (
         f"error: could only derive {best}/{N_ANCHORS} durable anchors; "
         f"tried {tried}; "
-        "dual-write handoff next/hands-off sections, then re-mint only within thread-rollover; "
+        "add durable handoff or stream anchors before re-minting; "
         "the launcher owns the stream lease; agents never open, claim, renew, release, or recover it"
     )
 
@@ -941,9 +847,8 @@ class HandoffAnchorCheck:
     reach :data:`N_ANCHORS`. ``next_count`` and ``hands_off_count`` are the
     section counts of the best attempt (the selected file when ``ok``).
     ``shortfall`` is the launcher's own message when ``ok`` is false, else empty.
-    ``no_handoff`` is true when no candidate file existed at all, so the caller
-    can fail open instead of demanding a rewrite. The check writes no file,
-    opens no network connection, and touches no lease.
+    ``no_handoff`` is true when no readable DB note existed, so the guard can
+    retain its fail-open disposition. The check writes no file and touches no lease.
     """
 
     ok: bool
@@ -960,24 +865,15 @@ def check_handoff_anchors(
     *,
     repo: Path,
     epic: str,
-    candidates: Sequence[LoadedCandidate | Path],
     stream_id: str = "",
     stream_entries: Sequence[dict[str, str]] = (),
 ) -> HandoffAnchorCheck:
-    """Run the launcher's selector over ``candidates`` without writing anything.
-
-    This calls :func:`select_anchor_handoff`, which counts sections through
-    :func:`handoff_section_counts` exactly as mint does, on the text the
-    launcher already ranked. Callers pass the candidates the launcher resolves
-    (``load_codex_candidates`` for the Codex lane) and the stream
-    entries the launcher loads; the helper itself reads nothing.
-    """
+    """Run the launcher's DB note selector without writing files or touching the lease."""
     selection = select_anchor_handoff(
         repo=repo,
         epic=epic,
         stream_id=stream_id,
         stream_entries=list(stream_entries),
-        candidates=candidates,
     )
     attempts = list(selection.attempts)
     if selection.reason and selection.anchor_count >= N_ANCHORS:
@@ -1042,12 +938,12 @@ def build_facts(
     # 1) Session identity (always; never reserved against)
     add(
         "lane-stream",
-        "What session stream id is this Grok lane driving?",
+        "What session stream id is this lane driving?",
         stream_id,
     )
     add(
         "lane-epic",
-        "What epic slug is this Grok lane bound to?",
+        "What epic slug is this lane bound to?",
         epic,
     )
 
@@ -1081,7 +977,7 @@ def build_facts(
     for i, bullet in enumerate(next_bullets[:3], start=1):
         if not add(
             f"next-handoff-{i}",
-            f"According to the dual-write handoff ({handoff_rel}), what is next-item #{i}?",
+            f"According to the handoff ({handoff_rel}), what is next-item #{i}?",
             bullet,
             reserve=workset_reserve,
         ):
@@ -1091,7 +987,7 @@ def build_facts(
     for i, bullet in enumerate(working_set[:2], start=1):
         add(
             f"workset-{i}",
-            f"According to the dual-write handoff, what is active working-set fact #{i}?",
+            f"According to the handoff, what is active working-set fact #{i}?",
             bullet,
             reserve=0,
         )
@@ -1103,7 +999,7 @@ def build_facts(
     for i, bullet in enumerate(hands_off[:2], start=1):
         if not add(
             f"handsoff-{i}",
-            f"According to the dual-write handoff, what is hands-off rule #{i}?",
+            f"According to the handoff, what is hands-off rule #{i}?",
             bullet,
             reserve=0,
         ):
@@ -1156,17 +1052,10 @@ def select_anchor_handoff(
     epic: str,
     stream_id: str,
     stream_entries: list[dict[str, str]],
-    candidates: Sequence[LoadedCandidate | Path],
+    candidates: Sequence[LoadedCandidate | Path] | None = None,
     explicit: Path | None = None,
 ) -> HandoffSelection:
-    """Anchor-yield selection mint and every pre-mint board share.
-
-    Ranking already read each :class:`LoadedCandidate`. Fact
-    counts are measured from that text's selection prefix, and mint builds
-    facts from the same string. ``reason`` is the selected file's
-    repo-relative label, ``(no handoff)`` when the stream alone suffices, or
-    empty when every candidate fell short.
-    """
+    """Measure facts from the DB note, or from a file-based caller's candidates."""
 
     def measure(text: str, rel: str) -> tuple[int, int, int]:
         next_n, hands_n = handoff_section_counts(text)
@@ -1179,6 +1068,24 @@ def select_anchor_handoff(
             raise_on_shortfall=False,
         )
         return len(built), next_n, hands_n
+
+    if candidates is None:
+        note = _read_newest_handoff_note(epic)
+        if note is None:
+            return HandoffSelection(None, "", None, 0, "", ((NO_HANDOFF_LABEL, 0, 0, 0),))
+
+        full_text = render_handoff_note(note, lane=epic)
+        text = full_text[:SELECTION_TEXT_LIMIT]
+        source = f"lu-driver-state show {note['id']}"
+        anchors, next_n, hands_n = measure(text, source)
+        return HandoffSelection(
+            path=None,
+            text=text,
+            sha256=text_sha256(full_text),
+            anchor_count=anchors,
+            reason=source if anchors >= N_ANCHORS else "",
+            attempts=((source, anchors, next_n, hands_n),),
+        )
 
     return select_handoff(
         repo=repo,

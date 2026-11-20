@@ -913,7 +913,7 @@ def test_abandoned_preserved_refs_settle_without_changing_refs(tasks_dir, repo):
     assert newer.is_dir()
 
 
-def test_open_pr_or_existing_worktree_keeps_abandoned_records_reported(tasks_dir, repo, tmp_path):
+def test_open_pr_or_existing_worktree_keeps_abandoned_records_reported(tasks_dir, repo, tmp_path, monkeypatch):
     """Defect class: abandoned-ref closure terminalizes an open PR, an existing directory, or a young record."""
     head = _git(repo, "rev-parse", "HEAD")
     tree = tmp_path / "interrupted-tree"
@@ -949,6 +949,155 @@ def test_open_pr_or_existing_worktree_keeps_abandoned_records_reported(tasks_dir
     assert raced["actions"] == {"report": 2, "skipped": 2}
     assert _snapshot(tasks_dir) == before
     assert all(json.loads(path.read_text())["status"] == "needs_finalize" for path in (raced_open, raced_tree))
+
+    # A repo-relative worktree_path is the checkout of the record's repository, never the caller's cwd.
+    rel_tasks = tmp_path / "rel-tasks"
+    rel_tasks.mkdir()
+    decoy = tmp_path / "caller-cwd"
+    decoy.mkdir()
+    live_rel, gone_rel = Path("dispatch-live"), Path("dispatch-gone")
+    (repo / live_rel).mkdir()
+    (decoy / gone_rel).mkdir()
+    (decoy / live_rel).mkdir()
+    monkeypatch.chdir(decoy)
+    fetch = str_mod.fleet_fetch_target(SLUG)
+    unanchored = "owner/unanchored"
+    monkeypatch.setattr(
+        str_mod, "fleet_fetch_target", lambda slug, _fetch=fetch: _fetch if slug in {SLUG, unanchored} else None
+    )
+    monkeypatch.setattr(str_mod, "_repository_checkout", lambda slug: repo if slug == SLUG else None)
+    live = _record(rel_tasks, "rel-live", worktree_path=live_rel.as_posix(), commits_ahead=0, worktree_dirty_on_exit=False)
+    gone = _record(rel_tasks, "rel-gone", worktree_path=gone_rel.as_posix(), commits_ahead=0, worktree_dirty_on_exit=False)
+    unknown = _record(
+        rel_tasks, "rel-unknown", repository=unanchored, worktree_path=gone_rel.as_posix(),
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+    anchored = str_mod.settle_stale(
+        rel_tasks, repo_checkouts={SLUG: repo, unanchored: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True,
+    )
+    rel_rows = _by_file(anchored)
+    assert rel_rows["rel-live.json"]["evidence"]["worktree_path"] == str(repo / live_rel)
+    assert rel_rows["rel-live.json"]["evidence"]["worktree_exists"] is True
+    assert rel_rows["rel-live.json"]["class"] == "D"
+    assert json.loads(live.read_text())["status"] == "needs_finalize"
+    assert rel_rows["rel-gone.json"]["evidence"]["worktree_path"] == str(repo / gone_rel)
+    assert rel_rows["rel-gone.json"]["outcome"] == "no_deliverable"
+    assert json.loads(gone.read_text())["status"] == "no_deliverable"
+    assert (decoy / gone_rel).is_dir()
+    assert rel_rows["rel-unknown.json"]["skip_reason"] == "worktree path state unknown"
+    assert rel_rows["rel-unknown.json"]["evidence"]["worktree_path"] == gone_rel.as_posix()
+    assert json.loads(unknown.read_text())["status"] == "needs_finalize"
+
+    # A missing checkout reports the path, and a checkout retargeted under the lock is not the path that was classified.
+    nocheck_tasks = tmp_path / "nocheck-tasks"
+    nocheck_tasks.mkdir()
+    (decoy / "lost").mkdir()
+    missing = _record(
+        nocheck_tasks, "rel-nocheck", repository="owner/no-checkout", worktree_path="lost",
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+    missing_report = str_mod.settle_stale(
+        nocheck_tasks, repo_checkouts={SLUG: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True,
+    )
+    missing_row = _by_file(missing_report)["rel-nocheck.json"]
+    assert missing_row["skip_reason"] == "worktree path state unknown"
+    assert missing_row["evidence"]["worktree_path"] == "lost"
+    assert json.loads(missing.read_text())["status"] == "needs_finalize"
+    assert (decoy / "lost").is_dir()
+
+    moved_tasks = tmp_path / "moved-tasks"
+    moved_tasks.mkdir()
+    repo_b = tmp_path / "repo-b"
+    (repo_b / gone_rel).mkdir(parents=True)
+    holder = {"checkout": repo}
+    monkeypatch.setattr(
+        str_mod, "_repository_checkout", lambda slug, _holder=holder: _holder["checkout"] if slug == SLUG else None
+    )
+    shifted = _record(
+        moved_tasks, "rel-shifted", worktree_path=gone_rel.as_posix(),
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+
+    def retarget(_candidates, _holder=holder, _repo_b=repo_b) -> None:
+        _holder["checkout"] = _repo_b
+
+    shifted_report = str_mod.settle_stale(
+        moved_tasks, repo_checkouts={SLUG: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True, before_apply=retarget,
+    )
+    shifted_row = _by_file(shifted_report)["rel-shifted.json"]
+    assert shifted_row["action"] == "skipped"
+    assert shifted_row["skip_reason"] == "worktree path reappeared since classification"
+    assert json.loads(shifted.read_text())["status"] == "needs_finalize"
+    assert (repo_b / gone_rel).is_dir()
+
+    # The existence check uses the same anchored string as the lock comparison.
+    # A later checkout answer must not make an absent path authorize the write.
+    split_tasks = tmp_path / "split-tasks"
+    split_tasks.mkdir()
+    repo_empty, repo_live, repo_other = (tmp_path / name for name in ("repo-empty", "repo-live", "repo-other"))
+    repo_empty.mkdir()
+    (repo_live / gone_rel).mkdir(parents=True)
+    repo_other.mkdir()
+    phase = {"apply": False, "n": 0}
+
+    def split_checkout(slug, _phase=phase):
+        if slug != SLUG:
+            return None
+        if not _phase["apply"]:
+            return repo_empty
+        _phase["n"] += 1
+        return repo_live if _phase["n"] <= 2 else repo_other
+
+    monkeypatch.setattr(str_mod, "_repository_checkout", split_checkout)
+    split = _record(
+        split_tasks, "rel-split", worktree_path=gone_rel.as_posix(),
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+
+    def arm(_candidates, _phase=phase) -> None:
+        _phase["apply"] = True
+
+    split_report = str_mod.settle_stale(
+        split_tasks, repo_checkouts={SLUG: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True, before_apply=arm,
+    )
+    split_row = _by_file(split_report)["rel-split.json"]
+    assert split_row["action"] == "skipped"
+    assert split_row["skip_reason"] == "worktree path reappeared since classification"
+    assert json.loads(split.read_text())["status"] == "needs_finalize"
+    assert (repo_live / gone_rel).is_dir()
+
+    lost_tasks = tmp_path / "lost-tasks"
+    lost_tasks.mkdir()
+    repo_gone = tmp_path / "repo-gone"
+    repo_gone.mkdir()
+    lost_holder = {"checkout": repo_gone}
+
+    def lost_checkout(slug, _holder=lost_holder):
+        if slug != SLUG:
+            return None
+        return _holder["checkout"]
+
+    monkeypatch.setattr(str_mod, "_repository_checkout", lost_checkout)
+    lost = _record(
+        lost_tasks, "rel-lost", worktree_path=gone_rel.as_posix(),
+        commits_ahead=0, worktree_dirty_on_exit=False,
+    )
+
+    def drop(_candidates, _holder=lost_holder) -> None:
+        _holder["checkout"] = None
+
+    lost_report = str_mod.settle_stale(
+        lost_tasks, repo_checkouts={SLUG: repo}, pager=FakePager([]), open_pager=FakePager([]),
+        now=NOW, apply=True, before_apply=drop,
+    )
+    lost_row = _by_file(lost_report)["rel-lost.json"]
+    assert lost_row["action"] == "skipped"
+    assert lost_row["skip_reason"] == "worktree path state unknown"
+    assert json.loads(lost.read_text())["status"] == "needs_finalize"
 
 
 # ---------------------------------------------------------------------------
@@ -1155,15 +1304,35 @@ def test_archive_selects_only_old_terminal_records_without_a_live_worktree(tasks
     _terminal(tasks_dir, "old-queued", status="queued")
     _terminal(tasks_dir, "old-with-worktree", worktree_path=str(linked))
     _terminal(tasks_dir, "old-read-only", status="failed", cwd=str(primary))
+    # A list or dict status is unhashable. Membership in the released-status set
+    # used to abort the whole batch; the record is reported and the rest still move.
+    for name, status in (("old-list-status", ["done"]), ("old-dict-status", {"value": "done"}), ("old-number-status", 1)):
+        path = _terminal(tasks_dir, name)
+        body = json.loads(path.read_text())
+        body["status"] = status
+        path.write_text(json.dumps(body))
 
     report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)
 
-    assert sorted(row["file"] for row in report["records"]) == ["old-done.json", "old-read-only.json"]
+    rows = {row["file"]: row for row in report["records"]}
+    assert rows["old-done.json"]["action"] == "archived"
+    assert rows["old-read-only.json"]["action"] == "archived"
+    assert (tasks_dir / "archive" / "old-done.json").is_file()
+    assert (tasks_dir / "archive" / "old-read-only.json").is_file()
+    for name in ("old-list-status.json", "old-dict-status.json"):
+        assert rows[name]["action"] == "skipped"
+        assert rows[name]["skip_reason"] == "malformed status"
+        assert (tasks_dir / name).is_file()
+    assert "old-number-status.json" not in rows
+    assert (tasks_dir / "old-number-status.json").is_file()
     assert report["kept_hot"] == {"worktree path still exists": 1}
     assert report["younger_left_alone"] == 1
     hot = sorted(path.name for path in tasks_dir.glob("*.json"))
     assert hot == [
+        "old-dict-status.json",
+        "old-list-status.json",
         "old-needs-finalize.json",
+        "old-number-status.json",
         "old-queued.json",
         "old-running.json",
         "old-with-worktree.json",
@@ -1211,6 +1380,132 @@ def test_cli_defaults_to_dry_run_json(tasks_dir, capsys):
     assert str_mod.main(["archive", "--tasks-dir", str(tasks_dir / "missing")]) == str_mod.EXIT_USAGE
 
 
+def test_archive_anchors_repo_relative_paths_while_another_task_holds_its_live_claim(tasks_dir, tmp_path, monkeypatch):
+    """Defect class: a legacy repo-relative ``worktree_path`` read relative to the caller's cwd.
+
+    Its lock refused it as not absolute ("worktree lock unavailable"), so archive
+    skipped every such record while live tasks ran, and its keep-hot check looked
+    in the wrong directory. A relative path belongs to the checkout of the fleet
+    repository its record names, from any cwd, with another task's claim held. A
+    path whose repository has no usable checkout, or whose state cannot be read,
+    keeps the record hot rather than counting as gone.
+    """
+    public, sibling_slug, looped_slug = (
+        "learn-ukrainian/learn-ukrainian.github.io",
+        "learn-ukrainian/machinery",
+        "learn-ukrainian/ukrainian-llm-eval",
+    )
+    fleet = tmp_path / "fleet"
+    primary, sibling = fleet / "learn-ukrainian", fleet / "machinery"
+    first, second = fleet / "first-checkout", fleet / "second-checkout"
+    for checkout in (primary, first, second):
+        (checkout / ".git").mkdir(parents=True)
+    sibling.symlink_to(first, target_is_directory=True)
+    (fleet / "ukrainian-llm-eval").symlink_to(fleet / "ukrainian-llm-eval")  # a sibling that cannot resolve
+    monkeypatch.setattr(str_mod, "state_root", lambda: primary)
+    codex = Path(".worktrees") / "dispatch" / "codex"
+    live = primary / codex / "live"
+    live.mkdir(parents=True)
+    (primary / codex / "kept").mkdir()
+    (primary / "alias").symlink_to("missing/../.worktrees", target_is_directory=True)
+    (primary / "valid-alias").symlink_to(".worktrees", target_is_directory=True)
+    for checkout in (first, second):
+        (checkout / codex / "sibling-kept").mkdir(parents=True)
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    (tmp_path / "dangling").symlink_to(tmp_path / "no-target")
+    _terminal(tasks_dir, "live-task", status="running", age_days=0, repository=public, worktree_path=str(live))
+    old = {"status": "failed", "repository": public}
+    _terminal(tasks_dir, "old-gone", **old, worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-kept", **old, worktree_path=str(codex / "kept"))
+    _terminal(tasks_dir, "old-canonical-kept", **old, worktree_path=str(codex / "missing" / ".." / "kept"))
+    alias_path = "alias/dispatch/codex/kept"
+    _terminal(tasks_dir, "old-alias-kept", **old, worktree_path=alias_path)
+    _terminal(tasks_dir, "old-alias-acp", **old, acp_runtime_paths=[alias_path])
+    _terminal(tasks_dir, "old-dangling-slash", **old, worktree_path=f"{tmp_path / 'dangling'}/")
+    _terminal(tasks_dir, "old-sibling-kept", status="failed", repository=sibling_slug,
+              worktree_path=str(codex / "sibling-kept"))
+    _terminal(tasks_dir, "old-retargeted", status="failed", repository=sibling_slug,
+              worktree_path=str(codex / "retargeted"))
+    _terminal(tasks_dir, "old-unattributed", status="failed", repository="owner/elsewhere",
+              worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-looped-sibling", status="failed", repository=looped_slug,
+              worktree_path=str(codex / "gone"))
+    _terminal(tasks_dir, "old-loop", **old, worktree_path=str(tmp_path / "loop" / "gone"))
+    _terminal(tasks_dir, "old-acp-nul", **old, worktree_path=str(codex / "gone"),
+              acp_runtime_paths=[str(tmp_path / "acp\x00gone")])
+    _terminal(tasks_dir, "old-acp-junk", **old, worktree_path=str(codex / "gone"),
+              acp_runtime_paths=[42, " ", "", None, "valid-alias/missing/child"])
+    blocked = primary / "blocked"
+    blocked.mkdir(mode=0o000)
+    _terminal(tasks_dir, "old-blocked-cwd", **old, cwd="blocked/child")
+    # The caller's cwd holds the gone path and the junk names and lacks the kept one: none may decide.
+    elsewhere = tmp_path / "elsewhere"
+    for name in (codex / "gone", Path("42"), Path(" ")):
+        (elsewhere / name).mkdir(parents=True)
+    monkeypatch.chdir(elsewhere)
+    held, release = threading.Event(), threading.Event()
+
+    def live_worker() -> None:
+        with (
+            str_mod.worktree_lock(str(live), timeout_s=1),
+            str_mod.worktree_lock(str(second / codex / "retargeted"), timeout_s=1),
+        ):
+            held.set()
+            release.wait(10)
+
+    def retarget_sibling(path: Path) -> None:
+        if path.name == "old-retargeted.json":
+            replacement = sibling.with_suffix(".new")
+            replacement.symlink_to(second, target_is_directory=True)
+            replacement.replace(sibling)
+
+    thread = threading.Thread(target=live_worker)
+    thread.start()
+    try:
+        assert held.wait(5)
+        report = str_mod.archive_terminal(
+            tasks_dir, now=NOW, apply=True, lock_timeout_s=0.1, before_move=retarget_sibling,
+        )
+        live_still_held = worktree_claims.existing_worktree_lock_refusal(
+            live, lock_dir=worktree_claims.repository_lock_dir(primary)
+        )
+    finally:
+        release.set()
+        thread.join()
+        blocked.chmod(0o700)
+
+    assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
+        "old-gone.json": ("archived", None),
+        "old-acp-junk.json": ("archived", None),
+        "old-retargeted.json": ("skipped", "worktree lock target changed since selection"),
+    }
+    assert report["kept_hot"] == {
+        "worktree path still exists": 3,
+        "worktree path state unknown": 6,
+        "ACP runtime path state unknown": 2,
+    }
+    assert live_still_held == worktree_claims.LOCK_BUSY
+    assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
+        "live-task.json",
+        "old-acp-nul.json",
+        "old-alias-acp.json",
+        "old-alias-kept.json",
+        "old-blocked-cwd.json",
+        "old-canonical-kept.json",
+        "old-dangling-slash.json",
+        "old-kept.json",
+        "old-loop.json",
+        "old-looped-sibling.json",
+        "old-retargeted.json",
+        "old-sibling-kept.json",
+        "old-unattributed.json",
+    ]
+    assert (tasks_dir / "archive" / "old-gone.json").is_file()
+    # Without a configured primary, a library dry run reads every relative path as unattributed.
+    monkeypatch.setattr(str_mod, "state_root", lambda: (_ for _ in ()).throw(str_mod.MachineryConfigError("unset")))
+    assert str_mod.archive_terminal(tasks_dir, now=NOW)["selected"] == 0
+
+
 @pytest.mark.parametrize("names_checkout", [True, False])
 def test_archive_skips_a_record_whose_lock_is_held(tasks_dir, tmp_path, names_checkout):
     """Archive takes the canonical task lock: the checkout's, else the record file's own."""
@@ -1238,12 +1533,22 @@ def test_archive_skips_a_record_whose_lock_is_held(tasks_dir, tmp_path, names_ch
     assert record_path.is_file()
 
 
-def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
+def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path, monkeypatch):
     reattached = tmp_path / "reattached-wt"
     _terminal(tasks_dir, "revived")
     _terminal(tasks_dir, "touched")
     _terminal(tasks_dir, "reattached", worktree_path=str(reattached))
+    _terminal(tasks_dir, "replaced", worktree_path=str(tmp_path / "old-worktree"))
     _terminal(tasks_dir, "untouched")
+    _terminal(tasks_dir, "listed")
+    _terminal(tasks_dir, "listed-moved")
+    anchors = {
+        "lost-before-lock": iter((tmp_path, None)),
+        "lost-under-lock": iter((tmp_path, tmp_path, tmp_path, None)),
+    }
+    for slug in anchors:
+        _terminal(tasks_dir, slug, repository=slug, worktree_path="~nonexistent archive user/missing")
+    monkeypatch.setattr(str_mod, "_repository_checkout", lambda slug: next(anchors[slug], None))
 
     def live_writer(path: Path) -> None:
         stat = path.stat()
@@ -1255,20 +1560,41 @@ def test_archive_rechecks_the_record_under_its_lock(tasks_dir, tmp_path):
             os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
         elif path.name == "reattached.json":
             reattached.mkdir()
+        elif path.name == "replaced.json":
+            replacement = path.with_suffix(".pending")
+            record = json.loads(path.read_text())
+            record["worktree_path"] = str(tmp_path / "replacement-worktree")
+            replacement.write_text(json.dumps(record))
+            os.utime(replacement, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            replacement.replace(path)
+        elif path.name == "listed.json":
+            path.write_text(json.dumps({**json.loads(path.read_text()), "status": ["done"]}))
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        elif path.name == "listed-moved.json":
+            path.write_text(json.dumps({**json.loads(path.read_text()), "status": {"value": "done"}}))
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
 
     report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=live_writer)
 
     rows = {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]}
     assert rows == {
+        "lost-before-lock.json": ("skipped", worktree_claims.LOCK_UNAVAILABLE),
+        "lost-under-lock.json": ("skipped", worktree_claims.LOCK_UNAVAILABLE),
         "revived.json": ("skipped", "record no longer terminal"),
         "touched.json": ("skipped", "record changed since selection"),
         "reattached.json": ("skipped", "worktree path still exists"),
+        "replaced.json": ("skipped", "worktree lock target changed since selection"),
+        "listed.json": ("skipped", "malformed status"),
+        "listed-moved.json": ("skipped", "malformed status"),
         "untouched.json": ("archived", None),
     }
-    assert sorted(path.name for path in tasks_dir.glob("*.json")) == ["reattached.json", "revived.json", "touched.json"]
+    assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
+        "listed-moved.json", "listed.json", "lost-before-lock.json", "lost-under-lock.json",
+        "reattached.json", "replaced.json", "revived.json", "touched.json",
+    ]
 
 
-def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path):
+def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path, monkeypatch):
     half_removed = tmp_path / "half-removed"  # a checkout directory without its .git file
     half_removed.mkdir()
     acp_runtime = tmp_path / "acp-runtime"
@@ -1282,13 +1608,48 @@ def test_archive_keeps_records_that_still_own_a_path(tasks_dir, tmp_path):
         acp_runtime_paths=[str(tmp_path / "acp-gone"), str(acp_runtime)],
     )
     _terminal(tasks_dir, "acp-gone", acp_runtime_paths=[str(tmp_path / "acp-gone")])
+    # An alias can start pointing at a live directory after ENOENT from the leaf probe.
+    alias = tmp_path / "alias"
+    live_runtime = tmp_path / "real" / "runtime"
+    live_runtime.mkdir(parents=True)
+    aliased_runtime = alias / live_runtime.name
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    alias.symlink_to(empty, target_is_directory=True)
+    _terminal(tasks_dir, "acp-retargeted", acp_runtime_paths=[str(aliased_runtime)])
+    original_lstat = Path.lstat
+    armed = False
 
-    report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True)
+    def retarget_on_missing(path: Path) -> os.stat_result:
+        nonlocal armed
+        try:
+            return original_lstat(path)
+        except FileNotFoundError:
+            if armed and path == aliased_runtime:
+                armed = False
+                replacement = alias.with_suffix(".new")
+                replacement.symlink_to(live_runtime.parent, target_is_directory=True)
+                replacement.replace(alias)
+            raise
 
-    assert [row["file"] for row in report["records"]] == ["acp-gone.json"]
+    def arm_retarget(path: Path) -> None:
+        nonlocal armed
+        if path.name == "acp-retargeted.json":
+            armed = True
+
+    monkeypatch.setattr(Path, "lstat", retarget_on_missing)
+
+    report = str_mod.archive_terminal(tasks_dir, now=NOW, apply=True, before_move=arm_retarget)
+
+    assert {row["file"]: (row["action"], row.get("skip_reason")) for row in report["records"]} == {
+        "acp-gone.json": ("archived", None),
+        "acp-retargeted.json": ("skipped", "ACP runtime path state unknown"),
+    }
+    assert aliased_runtime.is_dir()
     assert report["kept_hot"] == {"worktree path still exists": 2, "ACP runtime path still exists": 1}
     assert sorted(path.name for path in tasks_dir.glob("*.json")) == [
         "acp-owner.json",
+        "acp-retargeted.json",
         "cwd-owner.json",
         "half-removed.json",
     ]

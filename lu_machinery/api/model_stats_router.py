@@ -471,6 +471,7 @@ class _Group:
         self.verdicts: Counter[str] = Counter()
         self.never_started_reasons: Counter[str] = Counter()
         self.unparsed_reasons: Counter[str] = Counter()
+        self.review_evidence_absent: Counter[str] = Counter()
         self.unparsed_samples: dict[str, tuple[tuple[datetime, str], str]] = {}
         self.priorities: Counter[str] = Counter()
         self.findings_n = 0
@@ -489,18 +490,21 @@ class _Group:
         self.landed += row.landed
         if row.review is not None:
             verdict, priorities, reason, sample = row.review
-            self.verdicts[verdict] += 1
-            if verdict != "unparsed" and priorities is not None:
-                self.priorities.update(priorities)
-                self.findings_n += 1
-            elif verdict == "unparsed":
-                key_reason = reason if reason in UNPARSED_REASON_KEYS else "unknown"
-                self.unparsed_reasons[key_reason] += 1
-                if sample is not None and key_reason in UNPARSED_REASONS:
-                    order = _review_order(row)
-                    prev = self.unparsed_samples.get(key_reason)
-                    if prev is None or order < prev[0]:
-                        self.unparsed_samples[key_reason] = (order, sample)
+            key_reason = reason if reason is not None and reason in UNPARSED_REASON_KEYS else "unknown"
+            if row.raw.get("review_evidence_absent") is True:
+                self.review_evidence_absent[key_reason] += 1
+            else:
+                self.verdicts[verdict] += 1
+                if verdict != "unparsed" and priorities is not None:
+                    self.priorities.update(priorities)
+                    self.findings_n += 1
+                elif verdict == "unparsed":
+                    self.unparsed_reasons[key_reason] += 1
+                    if sample is not None and key_reason in UNPARSED_REASONS:
+                        order = _review_order(row)
+                        prev = self.unparsed_samples.get(key_reason)
+                        if prev is None or order < prev[0]:
+                            self.unparsed_samples[key_reason] = (order, sample)
         if row.role == "write" and row.allowance is not None:
             if row.allowance[1] < 0:  # the weekly window reset between the readings
                 self.allowance["reset_crossed"] += 1
@@ -518,6 +522,7 @@ class _Group:
         self.verdicts.update(other.verdicts)
         self.never_started_reasons.update(other.never_started_reasons)
         self.unparsed_reasons.update(other.unparsed_reasons)
+        self.review_evidence_absent.update(other.review_evidence_absent)
         for reason, item in other.unparsed_samples.items():
             prev = self.unparsed_samples.get(reason)
             if prev is None or item[0] < prev[0]:
@@ -567,6 +572,7 @@ class _Group:
             out.update(
                 verdicts={name: self.verdicts[name] for name in VERDICTS},
                 unparsed_reasons={name: self.unparsed_reasons[name] for name in UNPARSED_REASON_KEYS},
+                review_evidence_absent=dict(sorted(self.review_evidence_absent.items())),
                 findings=sum(self.priorities.values()) if self.findings_n else None,
                 findings_n=self.findings_n,
                 approve_rate=_rate(self.verdicts["correct"], parsed),

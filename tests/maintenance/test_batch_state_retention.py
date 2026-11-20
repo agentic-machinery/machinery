@@ -66,10 +66,72 @@ def test_retention_contends_on_the_shared_worktree_lock(tmp_path: Path, record: 
                 pytest.fail("retention acquired a lock held by another record writer")
 
 
-def test_retention_record_age_and_primary_checkout_fallback(tmp_path: Path) -> None:
+def test_retention_record_age_and_primary_checkout_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / ".git").mkdir()
     path = tmp_path / "task.json"
     assert retention._record_lock_target({"cwd": str(tmp_path)}, path) == str(path)
+    checkout = tmp_path / "fleet-checkout"
+    relative = Path(".worktrees") / "dispatch" / "kept"
+    (checkout / relative).mkdir(parents=True)
+    decoy = tmp_path / "caller-cwd"
+    (decoy / relative).mkdir(parents=True)
+    monkeypatch.chdir(decoy)
+    monkeypatch.setattr(
+        stale_task_records, "_repository_checkout", lambda slug: checkout if slug == "owner/repo" else None
+    )
+    anchored = {"repository": "owner/repo", "worktree_path": relative.as_posix()}
+    assert retention._record_lock_target(anchored, path) == str(checkout / relative)
+    with pytest.raises(retention.WorktreeLockError):
+        retention._record_lock_target({"repository": "owner/missing", "worktree_path": relative.as_posix()}, path)
+    root = _batch(tmp_path)
+    tasks = root / "tasks"
+    _write_record(
+        tasks, "rel-unknown", status="done", age_days=10, repository="owner/missing", worktree_path=relative.as_posix()
+    )
+    snapshot = _write_full_sidecars(tasks, "rel-unknown", entries=1)
+    _write_record(tasks, "listed", status="done", age_days=10)
+    listed = tasks / "listed.json"
+    listed.write_text(json.dumps({**json.loads(listed.read_text()), "status": ["done"]}), encoding="utf-8")
+    _write_full_sidecars(tasks, "listed", entries=1)
+    _write_record(
+        tasks, "nul-path", status="done", age_days=10, repository="owner/repo",
+        worktree_path=relative.as_posix() + "\0",
+    )
+    nul_snapshot = _write_full_sidecars(tasks, "nul-path", entries=1)
+    digests = {"n": 0}
+    original_digest = retention._digest_bytes
+
+    def _counting_digest(*args, **kwargs):
+        digests["n"] += 1
+        return original_digest(*args, **kwargs)
+
+    monkeypatch.setattr(retention, "_digest_bytes", _counting_digest)
+    unknown_report = plan_retention(root, min_age_days=0, apply=True, now=NOW)
+    by_task = {row["task_id"]: row for row in unknown_report["selected"]}
+    assert set(by_task) == {"rel-unknown", "nul-path"}
+    assert by_task["rel-unknown"]["skip_reason"] == "worktree path state unknown"
+    assert by_task["nul-path"]["skip_reason"] == "worktree path state unknown"
+    assert by_task["rel-unknown"]["reclaimable_bytes"] == 0
+    assert digests["n"] == 0
+    assert _names(snapshot) == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
+    assert _names(nul_snapshot) == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
+    assert _names(tasks / "listed.snapshots") == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
+    _write_record(
+        tasks, "rel-race", status="done", age_days=10, repository="owner/repo", worktree_path=relative.as_posix()
+    )
+    race_snapshot = _write_full_sidecars(tasks, "rel-race", entries=1)
+
+    def lose_checkout() -> None:
+        record_path = tasks / "rel-race.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["repository"] = "owner/missing"
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    race_report = plan_retention(root, min_age_days=0, apply=True, now=NOW, on_before_lock=lose_checkout)
+    race_rows = {row["task_id"]: row for row in race_report["selected"]}
+    assert race_rows["rel-race"]["action"] == "skipped"
+    assert race_rows["rel-race"]["skip_reason"] == "worktree path state unknown"
+    assert _names(race_snapshot) == {"read_only_checkout_pre.json", "read_only_checkout_post.json"}
     mtime = int((NOW - timedelta(days=3)).timestamp() * 1e9)
     for finished in (None, "bad", " "):
         assert retention._record_age_days({"finished_at": finished}, mtime, NOW) == 3
@@ -417,11 +479,11 @@ def test_archive_between_digest_and_record_does_not_recreate_the_hot_record(
     snapshot = _write_full_sidecars(tasks, "moving", entries=2)
     record_path = tasks / "moving.json"
 
+    # Relax retention's checkout lock to force the interleaving. Archive
+    # still acquires and verifies the actual lock before moving the record.
+    monkeypatch.setattr(retention, "worktree_lock", lambda *_args, **_kwargs: contextlib.nullcontext())
+
     def _archive_midway() -> None:
-        # The sweep already holds the checkout lock. Archive takes that same
-        # lock; this call drops it so the move lands between the digest write
-        # and the record write, which is the interleaving under test.
-        monkeypatch.setattr(stale_task_records, "worktree_lock", lambda *_args, **_kwargs: contextlib.nullcontext())
         stale_task_records.archive_terminal(tasks, min_age_days=0, apply=True, now=NOW)
 
     report = plan_retention(root, min_age_days=0, apply=True, now=NOW, on_after_digest=_archive_midway)

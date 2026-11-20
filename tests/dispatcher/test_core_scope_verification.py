@@ -6,6 +6,7 @@ import json
 import subprocess
 from contextlib import suppress
 from pathlib import Path
+from unittest.mock import Mock
 import pytest
 from lu_machinery.dispatcher import git, worker
 from tests.dispatcher.conftest import run_git as run_git
@@ -68,11 +69,79 @@ def test_fetch_failure_does_not_falsely_reject_published_owned_delivery(
         assert (record["status"], record["error"]) == (
             ("no_deliverable", "outside_owned_paths: delivered.txt") if scope == "outside" else ("done", None))
         assert len(attempts) >= 2
-    failures = record["owned_paths_fetch_failures"]
-    assert failures[0]["reason"] == ("remote ref missing" if fault.startswith("deleted-") else "HTTP 503")
+    failures = record.get("owned_paths_fetch_failures", [])
+    if fault.startswith("deleted-"):
+        assert failures == []
+        assert len(attempts) == 2
+        assert all(f"+{record['head_sha']}:refs/heads/delivery" in argv for argv in attempts)
+    else:
+        assert failures[0]["reason"] == "HTTP 503"
     assert "secret" not in json.dumps(record) and "transport-location" not in json.dumps(failures)
     if scope == "granted" and fault != "persistent":
         assert record["owned_path_grants_used"] == [{"path": "delivered.txt", "grant_id": "approved"}]
+
+
+@pytest.mark.parametrize("remote_state", ["missing", "different"])
+def test_unpublished_snapshot_skips_live_ownership_fetch(sandbox, delivery_settle, monkeypatch, remote_state):
+    """A missing or stale task ref is an unpublished delivery unless merged proof exists."""
+    _, settle = delivery_settle
+    record = settle("pushed")
+    ref = record["remote_ref"]
+    if remote_state == "missing":
+        run_git(sandbox.remote, "update-ref", "-d", ref)
+    else:
+        run_git(sandbox.remote, "update-ref", ref, record["worktree_base_sha"])
+    record.update(git.snapshot_delivery(worker._spec(record, {}), record))
+    assert (record["push_state"], record["remote_ref"]) == ("unpushed", None)
+
+    live_walk = Mock(side_effect=AssertionError("unpublished head cannot use the live ownership walk"))
+    merged_lookup = Mock(return_value=None)
+    monkeypatch.setattr(git, "ownership_git", live_walk)
+    monkeypatch.setattr(git, "merged_delivery", merged_lookup)
+    worker._enforce_delivery(record)
+    live_walk.assert_not_called()
+    merged_lookup.assert_called_once_with(record)
+    assert (record["status"], record["error"]) == ("no_deliverable", "work_not_pushed_or_unknown")
+
+
+@pytest.mark.parametrize("dirty", [False, True], ids=["clean", "untracked-only"])
+@pytest.mark.parametrize("fault", ["transport", "outside"])
+def test_matching_branch_requires_ownership_even_for_merge_rescue(
+        delivery_settle, monkeypatch, dirty, fault):
+    """Untracked scratch does not waive a missing ownership proof or a known scope violation."""
+    _, settle = delivery_settle
+    record = settle("pushed")
+    if dirty:
+        (Path(record["worktree_path"]) / "scratch.txt").write_text("untracked\n")
+        record.update(git.snapshot_delivery(worker._spec(record, {}), record))
+    assert record["remote_ref"] is not None
+    assert record["remote_head_sha"] == record["head_sha"]
+    assert record["worktree_untracked_only_on_exit"] is dirty
+
+    merged_lookup = Mock(return_value=None)
+    monkeypatch.setattr(git, "merged_delivery", merged_lookup)
+    if fault == "outside":
+        record["owned_paths"] = ["other.txt"]
+    else:
+        real_run = git._verification_git
+
+        def rejected_fetch(path, command, *args, **kwargs):
+            if command == "fetch":
+                raise git.VerificationFetchError(128, "fatal: git upload-pack: not our ref")
+            return real_run(path, command, *args, **kwargs)
+
+        monkeypatch.setattr(git, "_verification_git", rejected_fetch)
+
+    worker._enforce_delivery(record)
+    assert record["status"] == "no_deliverable"
+    if fault == "outside":
+        assert record["error"] == "outside_owned_paths: delivered.txt"
+        merged_lookup.assert_not_called()
+    else:
+        assert record["error"] == "owned_paths_verification_failed: git fetch failed (exit 128; remote object missing)"
+        assert record["owned_paths_fetch_failures"] == [
+            {"phase": "initial", "attempt": 1, "reason": "remote object missing", "returncode": 128}]
+        merged_lookup.assert_called_once_with(record)
 
 
 @pytest.mark.parametrize("status", ["done", "failed", "cancelled", "timeout", "crashed"])
@@ -384,7 +453,7 @@ class TestMergedPRRecoveryUsesGrant:
         world.record["owned_path_grants"] = [dict(task_id="merge-probe", run_nonce="nonce",
                                                       grant_id="grant", owned_paths=["extra.txt"])]
         world.accept(77)
-        world.prs[77], world.files[77] = MERGED, ["extra.txt"]
+        world.prs[77], world.files[77] = {**MERGED, "headRefOid": world.record["head_sha"]}, ["extra.txt"]
         worker._enforce_delivery(world.record)
         assert (world.record["status"], world.record["error"]) == ("done", None)
         assert world.record["owned_path_grants_used"] == [{"path": "extra.txt", "grant_id": "grant"}]

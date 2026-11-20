@@ -42,6 +42,7 @@ from lu_machinery.review.target_resolution import ReviewTarget
 
 # Deepest JSON this module reads (json_depth): reviewer replies.
 _JSON_MAX_DEPTH = 512
+_JSON_PROPERTY_START = re.compile(r'[ \t\r\n]*"')
 
 SCHEMA_VERSION = "code-review-findings.v1"
 RECEIPT_SCHEMA_VERSION = "code-review-receipt.v1"
@@ -197,27 +198,31 @@ def parse_reviewer_json(raw: str) -> dict[str, Any]:
 
     A reply that is nothing but one closed ``json`` (or untagged) code fence is bare JSON.
     """
-    text = raw.strip()
+    from lu_machinery.review.verdict_parser import load_findings_json
+
+    text = raw.strip(" \t\r\n")
     if not text:
         raise ContractError("empty_review_input", exit_code=EXIT_INCOMPLETE)
-    text = _whole_reply_fence(text)
     if text.startswith("VERDICT:"):
         try:
-            return _parse_review_loop_envelope(text)
+            return _parse_review_loop_envelope(raw)
         except (ValueError, RecursionError) as exc:
             raise ContractError(f"review_envelope_unreadable:{type(exc).__name__}") from exc
+    text = _whole_reply_fence(raw)
     if _looks_like_legacy_text(text) and not text.lstrip().startswith("{"):
         raise ContractError(
             f"legacy_FINDING_text_removed: use schema_version {SCHEMA_VERSION!r} JSON (see docs/review-protocol.md)",
             exit_code=EXIT_INVALID,
         )
     try:
-        payload = json_depth.loads(text, max_depth=_JSON_MAX_DEPTH)
+        payload = load_findings_json(text)
     except json.JSONDecodeError as exc:
         raise ContractError(
             f"non_json_or_chatter:{exc.msg}",
             exit_code=EXIT_INVALID,
         ) from exc
+    except (ValueError, RecursionError) as exc:
+        raise ContractError("review_json_unreadable") from exc
     if not isinstance(payload, dict):
         raise ContractError("review_root_must_be_object", exit_code=EXIT_INVALID)
     return payload
@@ -225,7 +230,7 @@ def parse_reviewer_json(raw: str) -> dict[str, Any]:
 
 def _whole_reply_fence(text: str) -> str:
     """The content of a reply that is exactly one closed top-level json fence, else ``text``."""
-    if not text.startswith(("```", "~~~")):
+    if not text.lstrip(" \t\r\n").startswith(("```", "~~~")):
         return text
     from markdown_it import MarkdownIt
 
@@ -236,32 +241,38 @@ def _whole_reply_fence(text: str) -> str:
     if len(tokens) != 1 or tokens[0].type != "fence":
         return text
     block = tokens[0]
+    if block.map is None:
+        return text
+    start, end = block.map
     if (
         block.info.strip() not in {"", "json"}
-        or block.map != [0, len(lines)]
-        or len(lines) < 2
-        or not _closes_code_fence(lines[-1], block.markup)
+        or end - start < 2
+        or not _closes_code_fence(lines[end - 1], block.markup)
+        or any(line.strip(" \t") for line in (*lines[:start], *lines[end:]))
     ):
         return text
-    content = "\n".join(lines[1:-1]).strip()
+    content = "\n".join(lines[start + 1:end - 1]).strip(" \t\r\n")
     return content if content.startswith("{") else text
 
 
 def _parse_review_loop_envelope(text: str) -> dict[str, Any]:
     from markdown_it import MarkdownIt
 
-    from lu_machinery.fleet_comms.review_publication import ReviewPublicationError
+    from lu_machinery.fleet_comms.review_publication import ReviewPublicationError, resolve_verdict_and_evidence
     from lu_machinery.review.verdict_parser import (
         _REVIEW_SCORE_LABEL_RE,
         _REVIEW_VERDICT_LINE_RE,
         _closes_code_fence,
         _commonmark_lines,
         _without_code_fences,
-        checked_findings_payload,
+        load_findings_json,
     )
 
     lines = _commonmark_lines(text)
-    verdict = re.fullmatch(r"VERDICT: (APPROVE|REQUEST_CHANGES|BLOCKED)(?:[ \t]+[^\r\n]+)?", lines[0])
+    start = next(i for i, line in enumerate(lines) if line.strip(" \t"))
+    lines = lines[start:]
+    text = "\n".join(lines)
+    verdict = re.fullmatch(r" {0,3}VERDICT: (APPROVE|REQUEST_CHANGES|BLOCKED)(?:[ \t]+[^\r\n]+)?", lines[0])
     score = re.fullmatch(r"[ \t]*SCORE: (?:[1-9]|10)/10(?:[ \t]+[^\r\n]+|[.,;:!?)](?:[ \t]+[^\r\n]+)?)?", lines[1]) if len(lines) > 1 else None
     if verdict is None or score is None:
         raise ContractError("review_envelope_invalid_headers")
@@ -283,7 +294,7 @@ def _parse_review_loop_envelope(text: str) -> dict[str, Any]:
     ):
         raise ContractError("review_envelope_invalid_json_fence")
     try:
-        payload = json_depth.loads(block.content, max_depth=_JSON_MAX_DEPTH)
+        payload = load_findings_json(block.content)
     except json.JSONDecodeError as exc:
         raise ContractError(f"review_envelope_invalid_json:{exc.msg}") from exc
     if not isinstance(payload, dict):
@@ -295,7 +306,7 @@ def _parse_review_loop_envelope(text: str) -> dict[str, Any]:
         raise ContractError("review_envelope_verdict_mismatch")
     canonical = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED", "BLOCKED": "BLOCKED"}[stated]
     try:
-        derived, _ = checked_findings_payload(payload, stated=canonical)
+        derived, _ = resolve_verdict_and_evidence(payload, stated=canonical)
     except ReviewPublicationError as exc:
         raise ContractError(f"review_envelope_invalid_verdict:{exc}") from exc
     if derived != canonical:
@@ -319,17 +330,26 @@ def canonical_receipt_payload(raw: str) -> dict[str, Any]:
     ``confidence`` or ``verbatim``, still fail here. This does not accept a
     reply the recorder or ``verify_review`` would refuse.
     """
-    text = raw.strip()
-    payload = parse_reviewer_json(text)
-    if not text.startswith("VERDICT:"):
+    from lu_machinery.review.verdict_parser import declares_incomplete_review
+
+    text = raw.strip(" \t\r\n")
+    payload = parse_reviewer_json(raw)
+    envelope = text.startswith("VERDICT:")
+    if not envelope:
         validate_reviewer_payload(payload)
+        if _effective_verdict(payload) is None:
+            raise ContractError("review_invalid_verdict")
+    if declares_incomplete_review(text if envelope else "", findings_payloads=(payload,)):
+        raise ContractError("review_declares_incomplete", exit_code=EXIT_INCOMPLETE)
     return payload
 
 
 def _json_objects(text: str) -> list[dict[str, Any]]:
     """JSON objects in ``text``, including one that follows commentary."""
+    from lu_machinery.review.verdict_parser import _not_json_constant, _unique_object
+
     found: list[dict[str, Any]] = []
-    decoder = json.JSONDecoder()
+    decoder = json.JSONDecoder(object_pairs_hook=_unique_object, parse_constant=_not_json_constant)
     index = 0
     while True:
         start = text.find("{", index)
@@ -337,7 +357,11 @@ def _json_objects(text: str) -> list[dict[str, Any]]:
             return found
         try:
             payload, end = json_depth.raw_decode(text, start, max_depth=_JSON_MAX_DEPTH, decoder=decoder)
-        except (json.JSONDecodeError, RecursionError):
+        except json.JSONDecodeError:
+            # A broken object can contain the decision or explain why it was
+            # incomplete. Its nested objects cannot attest what it said.
+            if _JSON_PROPERTY_START.match(text, start + 1):
+                raise
             index = start + 1
             continue
         if isinstance(payload, dict):
@@ -415,26 +439,35 @@ def decision_lock(raw: str) -> dict[str, Any]:
     only when exactly one findings object is readable, even if it does not
     yet validate.
     """
-    from lu_machinery.review.verdict_parser import recognized_verdicts
+    from lu_machinery.review.verdict_parser import (
+        MISSING_CAPABILITIES_FIELD,
+        declares_incomplete_review,
+        recognized_verdicts,
+    )
 
     try:
-        visible = _outside_blockquotes(raw)
-    except ValueError:
+        objects = _json_objects(_outside_blockquotes(raw))
+        incomplete = (
+            declares_incomplete_review("", findings_payloads=objects)
+            or declares_incomplete_review(raw)
+            or any(MISSING_CAPABILITIES_FIELD in payload for payload in objects)
+        )
+        verdicts = list(dict.fromkeys(recognized_verdicts(raw)))
+    except (ValueError, RecursionError):
         return {"ambiguous": True, "verdicts": [], "payload": None}
-    objects: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for payload in _json_objects(visible):
+    for payload in objects:
         if not _findings_candidate(payload):
             continue
         key = json.dumps(payload, sort_keys=True, default=str)
         if key not in seen:
             seen.add(key)
-            objects.append(payload)
-    verdicts = list(dict.fromkeys(recognized_verdicts(raw)))
+            candidates.append(payload)
     return {
-        "ambiguous": len(objects) > 1 or len(verdicts) > 1,
+        "ambiguous": incomplete or len(candidates) > 1 or len(verdicts) > 1,
         "verdicts": verdicts,
-        "payload": objects[0] if len(objects) == 1 else None,
+        "payload": candidates[0] if len(candidates) == 1 else None,
     }
 
 

@@ -115,7 +115,7 @@ def test_never_started_refusals_survive_backfill_and_keep_failed_review_counts_s
                       "usage": {"input_tokens": 7, "cached_input_tokens": 0}},
     }
     for task_id, fields in cases.items():
-        record = _record(tasks, task_id, **{"mode": "read-only", "status": "failed", **fields})
+        record = _record(tasks, task_id, **{"mode": "read-only", "review_profile": "code", "status": "failed", **fields})
         path = tasks / f"{task_id}.json"
         old_row = rows.summary_row(path, record, path.stat().st_mtime_ns)
         assert old_row is not None
@@ -223,7 +223,7 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     # Conflicting unstamped result_file declaration must never attach another task's sidecar.
     (u_tasks / "other-secret.result").write_text("OTHER-TASK-REPLY-NEVER-SHOWN", encoding="utf-8")
     _record(u_tasks, "u-conflict-sidecar-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            started_at=_at(5.05), result_file=str(u_tasks / "other-secret.result"))
+            review_profile="code", started_at=_at(5.05), result_file=str(u_tasks / "other-secret.result"))
     # Later bad_format reply sits on a different effort and risk class: must not leak via by_effort or by_class.
     _record(u_tasks, "u-fmt-later-review", mode="read-only", agent="claude", model="claude-opus-5-5",
             effort="medium", review_profile="infra", review_risk="high", started_at=_at(2))
@@ -234,12 +234,12 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
         "first\n\t\x1b[31m\u202e<script>" + "B" * 240 + "TAIL-BEYOND-200", encoding="utf-8",
     )
     _record(u_tasks, "u-fields-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            started_at=_at(3))
+            review_branch="pinned-recon", started_at=_at(3))
     (u_tasks / "u-fields-review.result").write_text(
         '{"overall": {"correctness": "maybe"}, "findings": []}', encoding="utf-8",
     )
     _record(u_tasks, "u-envelope-fields-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            started_at=_at(2.5))
+            review_profile="code", started_at=_at(2.5))
     (u_tasks / "u-envelope-fields-review.result").write_text(
         'VERDICT: APPROVE\nSCORE: 9/10\n\n```json\n{"schema_version": "code-review-findings.v1", "overall": {}}\n```',
         encoding="utf-8",
@@ -257,6 +257,7 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     (u_tasks / "archive" / "u-stamped-review.20261115T050000Z.archived.json").write_text(json.dumps({
         "schema_version": 2, "task_id": "u-stamped-review", "agent": "claude", "model": "claude-opus-5-5",
         "effort": "high", "mode": "read-only", "status": "done", "started_at": _at(4.5), "finished_at": _at(1),
+        "review_profile": "code",
         "result_file": str(u_tasks / "u-stamped-review.result"),
         "result_sha256": hashlib.sha256(stamped_bytes).hexdigest(),
     }), encoding="utf-8")
@@ -265,7 +266,7 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     # Seed a legacy pre-change unparsed row without unparsed_reason; reader marks it unknown, backfill upgrades it.
     legacy_path = u_tasks / "u-legacy-review.json"
     legacy_rec = _record(u_tasks, "u-legacy-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-                         started_at=_at(1.5), duration_s=100)
+                         review_profile="code", started_at=_at(1.5), duration_s=100)
     (u_tasks / "u-legacy-review.result").write_text("legacy prose reply", encoding="utf-8")
     legacy_row = rows.summary_row(legacy_path, legacy_rec, os.stat(legacy_path).st_mtime_ns)
     assert legacy_row is not None
@@ -291,9 +292,10 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
 
     u_window = _window(u_state, stats.Landing())
     u_review = _row(u_window, "claude-opus-5-5", "review")
-    assert u_review["verdicts"]["unparsed"] == 8
+    assert u_review["tasks"] == 8 and u_review["verdicts"]["unparsed"] == 6
+    assert u_review["review_evidence_absent"] == {"bad_fields": 1, "not_done": 1}
     assert u_review["unparsed_reasons"] == {
-        "missing_result": 1, "too_big": 0, "bad_format": 4, "bad_fields": 2, "not_done": 1, "unknown": 0,
+        "missing_result": 1, "too_big": 0, "bad_format": 4, "bad_fields": 1, "not_done": 0, "unknown": 0,
     }
     assert set(u_review["unparsed_samples"]) == {"bad_format", "bad_fields"}
     # Samples are emitted only at model total, never on by_effort or by_class subgroups.
@@ -306,10 +308,11 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     fmt_stored = stored_u["u-fmt-first-review"]["review"]["unparsed_sample"]
     assert fmt_stored.startswith(r"first\n\t\x1b[31m\u202e<script>B")
     assert "TAIL-BEYOND-200" not in fmt_stored and len(fmt_stored) <= rows.MAX_SAMPLE_CHARS
-    assert u_review["unparsed_samples"]["bad_fields"] == '{"overall": {"correctness": "maybe"}, "findings": []}'
+    assert u_review["unparsed_samples"]["bad_fields"].startswith(r"VERDICT: APPROVE\nSCORE: 9/10")
     page = stats.page_window(u_window)
     page_u = _row(page, "claude-opus-5-5", "review")
     assert page_u["unparsed_reasons"] == u_review["unparsed_reasons"]
+    assert page_u["review_evidence_absent"] == u_review["review_evidence_absent"]
     assert "unparsed_samples" not in page_u
     assert "stamped archive reply" not in json.dumps(page)
     assert all("unparsed_samples" not in e for e in page_u["by_effort"])
@@ -463,27 +466,27 @@ def test_route_rows_and_metrics_carry_no_prompt_body_path_or_account(tmp_path, m
     result.write_text(json.dumps(payload))
     # Private-repo, invalid-repo, unknown-data-class, and OPSEC-bearing replies suppress the sample (F1).
     _record(tasks, "unparsed-private-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            repo="infra-private", started_at=_at(5))
+            review_profile="code", repo="infra-private", started_at=_at(5))
     (tasks / "unparsed-private-review.result").write_text("PRIVATE-BRIEF-x5 quoted line", encoding="utf-8")
     _record(tasks, "unparsed-invalid-repo-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            repo="/srv/private/repo", started_at=_at(4.5))
+            review_profile="code", repo="/srv/private/repo", started_at=_at(4.5))
     (tasks / "unparsed-invalid-repo-review.result").write_text("INVALID-REPO-x6 quoted line", encoding="utf-8")
     _record(tasks, "unparsed-bad-class-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            repo="public", data_class="public-unadmitted", started_at=_at(4))
+            review_profile="code", repo="public", data_class="public-unadmitted", started_at=_at(4))
     (tasks / "unparsed-bad-class-review.result").write_text("UNKNOWN-CLASS-x7 quoted line", encoding="utf-8")
     _record(tasks, "unparsed-opsec-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            repo="public", started_at=_at(3))
+            review_profile="code", repo="public", started_at=_at(3))
     (tasks / "unparsed-opsec-review.result").write_text(
         "failed for acct-identity@example.invalid in /home/leaky/worktree", encoding="utf-8",
     )
     # An identity that starts before the 200-character cut and ends after it withholds the whole sample.
     _record(tasks, "unparsed-straddle-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            repo="public", started_at=_at(2.5))
+            review_profile="code", repo="public", started_at=_at(2.5))
     (tasks / "unparsed-straddle-review.result").write_text(
         "STRADDLE-x8 " + "s" * 178 + " acct-identity@example.invalid", encoding="utf-8",
     )
     _record(tasks, "unparsed-public-review", mode="read-only", agent="claude", model="claude-opus-5-5",
-            repo="public", data_class="public-code", started_at=_at(2))
+            review_profile="code", repo="public", data_class="public-code", started_at=_at(2))
     (tasks / "unparsed-public-review.result").write_text(
         "UNPARSED-PREFIX-x4 " + "z" * 220 + "AFTER-200-DIFF-TEXT-x9", encoding="utf-8",
     )
@@ -1056,7 +1059,8 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     _record(tasks, "neon-rate-limited-review", mode="read-only", agent="agy", model="gemini-4-neon-medium",
             options={"pinned_head": "1" * 40}, status="rate_limited", started_at=_at(4), duration_s=60)
     _record(tasks, "neon-later-review", mode="read-only", agent="agy", model="gemini-4-neon-high",
-            options={"pinned_head": "2" * 40}, duration_s=180, verdict="APPROVED")
+            options={"pinned_head": "2" * 40}, duration_s=180)
+    (tasks / "neon-later-review.result").write_text("VERDICT: APPROVE\nSCORE: 9/10\n\nReviewed the complete diff.")
     _record(tasks, "grok-review", mode="read-only", agent="cursor", model="grok-4.7-high",
             status="failed")
     _record(tasks, "landed", delivery_pr="example/repo#9", delivery_merge_sha="3" * 40)
@@ -1090,9 +1094,11 @@ def test_supplemental_reviews_enter_reviewer_figures_without_changing_author_out
     assert review["approve_rate"] == {"value": 1.0, "n": 1, "low_sample": True}
     assert review["blocking_per_review"]["value"] == 0.0
     grok = _row(window, "grok-4.7", "review")
-    assert grok["verdicts"]["unparsed"] == 1
+    assert grok["status"]["failed"] == grok["tasks"] == 1
+    assert grok["verdicts"]["unparsed"] == 0
+    assert grok["review_evidence_absent"] == {"not_done": 1}
     assert grok["unparsed_reasons"] == {
-        "missing_result": 0, "too_big": 0, "bad_format": 0, "bad_fields": 0, "not_done": 1, "unknown": 0,
+        "missing_result": 0, "too_big": 0, "bad_format": 0, "bad_fields": 0, "not_done": 0, "unknown": 0,
     }
     assert grok["unparsed_samples"] == {}
     neon = _row(window, "gemini-4-neon", "review")

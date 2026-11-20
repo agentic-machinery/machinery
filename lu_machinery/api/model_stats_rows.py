@@ -45,6 +45,7 @@ from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCO
 from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
+from lu_machinery.dispatcher.admission import review_typed
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
 from lu_machinery.fleet_comms.review_publication import (
     BLOCKING_PRIORITIES,
@@ -56,7 +57,11 @@ from lu_machinery.orchestration.fleet_repos import FleetRepo, clear_repository_c
 from lu_machinery.orchestration.task_record_store import iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
-from lu_machinery.review.verdict_parser import checked_findings_payload
+from lu_machinery.review.verdict_parser import (
+    checked_findings_payload,
+    declares_incomplete_review,
+    unsupported_verdict_tokens,
+)
 from lu_machinery.secret_redactor import redact_text
 
 # Deepest JSON this module reads (json_depth): its own model-stats rows.
@@ -489,7 +494,8 @@ def _result(path: Path, record: Mapping[str, Any]) -> dict[str, Any]:
         return _unparsed("too_big")
     if expected is not None and hashlib.sha256(raw).hexdigest() != expected:
         return _unparsed("missing_result")
-    return review_summary(raw, allow_sample=_record_allows_sample(record))
+    return review_summary(raw, allow_sample=_record_allows_sample(record),
+                          allow_markdown=record.get("require_review_verdict") is not True)
 
 
 def _recorded_review(verdict: object) -> dict[str, Any] | None:
@@ -505,7 +511,7 @@ def path_digest(path: str) -> str:
     return hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:16]
 
 
-def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
+def review_summary(raw: bytes, *, allow_sample: bool = False, allow_markdown: bool = False) -> dict[str, Any]:
     """Read structured review output through the review contract, retaining only counts, verdict, or parse cause.
 
     A ``code-review-findings.v1`` reply also keeps the path digest of each blocking (P0-P1) finding's location, so
@@ -521,11 +527,28 @@ def review_summary(raw: bytes, *, allow_sample: bool = False) -> dict[str, Any]:
     try:
         payload = parse_reviewer_json(text)
     except ContractError as exc:
+        if allow_markdown and str(exc).startswith((
+            "non_json_or_chatter:", "review_envelope_invalid_headers", "review_envelope_requires_one_json_block",
+            "review_envelope_invalid_json_fence",
+        )):
+            # The existing recorder checks visibility and refuses conflicting
+            # tokens or malformed findings blocks in historical text replies.
+            from lu_machinery.review import record_cf_verdict  # noqa: PLC0415  The recorder also loads these rows.
+
+            try:
+                if not unsupported_verdict_tokens(text):
+                    recorded_verdict = record_cf_verdict.normalize_verdict(text)
+                    return {"verdict": _RECORDED_VERDICTS[recorded_verdict], "priorities": None}
+            except (record_cf_verdict.RecordError, ValueError, RecursionError):
+                pass
         reason = "bad_fields" if str(exc).startswith(_FIELD_CONTRACT_ERRORS) else "bad_format"
         return fail(reason)
     except (ValueError, RecursionError, TypeError):
         return fail("bad_format")
     try:
+        envelope = text.lstrip(" \t\r\n").startswith("VERDICT:")
+        if declares_incomplete_review(text if envelope else "", findings_payloads=(payload,)):
+            return fail("bad_fields")
         if payload.get("schema_version") == SCHEMA_VERSION:
             decision, evidence = checked_findings_payload(payload)
             counts = Counter(finding.priority for finding in evidence.findings)
@@ -619,6 +642,19 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     repo = "public" if raw_repo is None else label(raw_repo, "unknown")
     raw_class = record.get("data_class") if record.get("data_class") is not None else options.get("data_class")
     fresh, cached, output = tokens(record.get("usage"))
+    review = None
+    evidence_absent = False
+    if role == "review" and not refusal:
+        expected = review_typed(dict(record)) or pr is not None or (
+            options.get("review_profile") in ("code", "infra", "ukrainian")
+            or record.get("research_role") in ("review", "reviewer")
+        )
+        # Untyped failures can still have a readable review reply. It establishes
+        # what the task did, while its terminal status still decides success.
+        reading = _review(path, record) if status == "done" or not expected else None
+        evidence_absent = not expected and (reading is None or reading["verdict"] == "unparsed")
+        if status == "done":
+            review = reading
     return {
         "schema": ROW_SCHEMA,
         "task_id": task_id,
@@ -634,7 +670,8 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "duration_s": _number(record.get("duration_s")),
         "tokens": {"fresh_input": fresh, "cached_input": cached, "output": output},
         "allowance": None if refusal else _allowance(record),
-        "review": _review(path, record) if role == "review" and status == "done" else None,
+        "review": review,
+        **({"review_evidence_absent": True} if evidence_absent else {}),
         "repo": repo,
         "data_class": None if raw_class is None else label(raw_class),
         "pr": int(pr) if isinstance(pr, int | str) and not isinstance(pr, bool) and str(pr).isdigit() else None,
@@ -974,6 +1011,9 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
                   and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
         _review_ok(review, role=row.get("role"), status=row.get("status"), repo=row.get("repo"),
                    data_class=row.get("data_class")),
+        _optional(row.get("review_evidence_absent"), lambda flag: flag is True and row.get("role") == "review"
+                  and row.get("status") != NEVER_STARTED and (review is None or (
+                      isinstance(review, dict) and review.get("verdict") == "unparsed"))),
         _optional(row.get("pr"), _count_value),
         _optional(row.get("pinned_head"), _sha),
         _optional(landing, lambda d: isinstance(d, dict) and d.keys() == {"pr", "merge_sha"}
@@ -1044,8 +1084,8 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
     source = candidate["source_mtime_ns"]
     if not isinstance(stored, int) or stored < source:
         return True
-    return stored == source and any(present.get(key) != candidate[key] for key in (
-        "review", "effort", "pinned_head", "never_started_reason",
+    return stored == source and any(present.get(key) != candidate.get(key) for key in (
+        "review", "effort", "pinned_head", "never_started_reason", "review_evidence_absent",
     ))
 
 

@@ -15,6 +15,7 @@ from lu_machinery.common.repo_root import machinery_path
 import pytest
 from lu_machinery.ops import context_guard as cg
 from lu_machinery.ops.driver_lanes import EXIT_MARKER, PANE_SCRIPT, START_MARKER, load_registry
+from lu_machinery.session_canary import handoff_select
 
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.ops._fake_tmux import BOOT, FakePane, FakeTmux
@@ -430,7 +431,11 @@ def test_lane_in_handoff_is_listed_for_keepalive_suppression(tmp_path: Path) -> 
     assert json.loads(result.stdout) == ["devops-muse"]
 
 
-def test_codex_quit_is_retried_when_the_first_is_swallowed(tmp_path: Path) -> None:
+def test_codex_quit_is_retried_when_the_first_is_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(handoff_select.DRIVER_STATE_CLI_ENV, "")
+    monkeypatch.setattr(handoff_select, "load_stream_entries", lambda *_args, **_kwargs: [])
     h = Harness(tmp_path, **{"codex-atlas": codex_pane(40)})
     h.tick("codex-atlas")
     h.posted["codex-atlas"] = cg.iso(h.moment)
