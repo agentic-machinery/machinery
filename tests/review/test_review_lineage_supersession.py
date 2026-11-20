@@ -16,6 +16,7 @@ from lu_machinery.review.review_lineage import (
     superseded_runs,
 )
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 CURRENT_SOL = current_sol()
 
@@ -111,6 +112,7 @@ def test_lineage_keeps_the_reply_when_a_listed_review_moves_to_archive(tmp_path,
     assert [(entry.task_id, entry.reply) for entry in runs] == [("review", "VERDICT: APPROVE")]
 
 
+@pytest.mark.usefixtures("configured_roots")
 def test_verification_probe_does_not_block_the_post_approval_repair_round(tmp_path, monkeypatch, capsys):
     """Defect class: a PR-linked verification probe enters lineage and blocks a repair round (#994)."""
     from lu_machinery.review import repair_round
