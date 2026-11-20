@@ -1187,6 +1187,8 @@ class _Boundary:
     gh: _GhBroker | None = None
 
     def __init__(self, args: argparse.Namespace, receipt: dict):
+        if not _TASK_ID.fullmatch(args.task_id):
+            raise Refused("the task id is unsafe as a task-store name")
         self.args, self.receipt = args, receipt
         self.worktree = Path(args.worktree).resolve(strict=True)
         self.base = Path(args.scratch)
@@ -1324,6 +1326,8 @@ class _Boundary:
         _write_private(boundary / "group", f"review:x:{gid}:\n".encode(), 0o444)
 
         reads, hidden = full_review_reads(self.worktree)
+        shared, tasks = runtime_context.read_roots()
+        own = runtime_context.task_reads(self.args.task_id)
         corpus = (repository / "data").resolve()
         reads = [path for path in reads if path != corpus]
         databases = []
@@ -1346,6 +1350,9 @@ class _Boundary:
         if tracked is None:
             raise Refused("the worktree has no tracked regular file to probe")
         probes = self._probes(tracked, git_dir, overlays, databases, repository, tmp / f"canary-{nonce}", nonce)
+        probes += [{"op": "stat", "path": str(path), "expect": "OK"} for path in own]
+        probes.append({"op": "stat", "path": str(tasks / f"{self.args.task_id}.json"), "expect": "ENOENT"})
+        probes.append({"op": "create", "path": str(tasks / f"canary-{nonce}"), "expect": "EROFS"})
         for slot, target in databases:
             store = "sources" if slot.name == "sources.db" else "vesum"
             probes.append({"op": "store_read", "path": str(self.worktree), "store": store,
@@ -1384,7 +1391,7 @@ class _Boundary:
         sandbox = prepare_host_sandbox(
             engine="agy", snapshot_root=self.worktree, write_root=runtime, reject_root=repository,
             runtime_reads=[*runtime_files(agy), *_venv_reads(), *reads, *(target for _, target in databases), *sidecars,
-                           *runtime_context.read_roots(), boundary],
+                           shared, boundary],
             network_allowed=False,
         )
         self.receipt["bwrap"] = str(sandbox.binary)
@@ -1400,6 +1407,11 @@ class _Boundary:
                  *forwarder, str(agy), *command[1:]]
         argv = wrap_argv_with_sandbox(inner, sandbox)
         masks = [argument for path in hidden for argument in ("--tmpfs", str(path), "--remount-ro", str(path))]
+        # Match the other read-only dispatchers: mask the store and restore only this task's inputs and context.
+        masks += ["--tmpfs", str(tasks)]
+        for path in own:
+            masks += ["--ro-bind", str(path), str(path)]
+        masks += ["--remount-ro", str(tasks)]
         masks += [argument for copy, source in overlays for argument in ("--ro-bind", str(copy), str(source))]
         for link, target in databases:
             primary = repository / link.relative_to(self.worktree)
@@ -1424,7 +1436,7 @@ class _Boundary:
         env = {
             "HOME": str(home), "TMPDIR": str(tmp), "PATH": f"{boundary / 'bin'}:/usr/bin:/bin:{agy.parent}",
             "LANG": os.environ.get("LANG", "C.UTF-8"), "USER": "review", "LOGNAME": "review", "SHELL": "/bin/bash",
-            "LU_TASKS_DIR": str(runtime_context.read_roots()[1]),
+            "LU_TASKS_DIR": str(tasks),
             # The project's scratch root (scripts.common.scratch) defaults to a host path that is
             # read-only here; tests and probes run by a review write their scratch under TMPDIR.
             "LU_SCRATCH_ROOT": str(tmp),
