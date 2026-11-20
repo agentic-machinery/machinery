@@ -596,6 +596,8 @@ _SDK_ARGS = [
     "--verbose",
     "--input-format",
     "stream-json",
+    # claude-agent-acp 0.101.0+ asks for Auto when settings name no defaultMode.
+    "--permission-mode=auto",
     "--disallowedTools",
     "AskUserQuestion",
 ]
@@ -649,10 +651,12 @@ def test_launcher_execs_the_pinned_binary_with_merged_denies_and_a_clean_env(tmp
     proc, dump = _run_launcher(tmp_path, host=str(fake), identity=acpx_module._claude_code_launch_identity(fake.stat()))
     assert proc.returncode == 0, proc.stderr
     record = json.loads(dump.read_text(encoding="utf-8"))
+    # The SDK's mode is replaced: Claude Code always starts in Manual.
     assert record["argv"][1:] == [
         "--disallowedTools",
         "Monitor,ScheduleWakeup,CronCreate,Workflow",
-        *_SDK_ARGS,
+        "--permission-mode=default",
+        *(arg for arg in _SDK_ARGS if arg != "--permission-mode=auto"),
     ]
     assert "LU_CLAUDE_ACP_HOST" not in record["env"]
     assert "LU_CLAUDE_ACP_HOST_IDENTITY" not in record["env"]

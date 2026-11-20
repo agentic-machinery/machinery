@@ -310,6 +310,7 @@ def test_acp_claude_launcher_reaches_the_child_with_every_control(
     assert child["argv"] == [
         "--disallowedTools",
         ",".join(HEADLESS_BACKGROUND_TOOL_DENIES),
+        "--permission-mode=default",
         *_SDK_CHILD_ARGS,
     ]
     assert child["env"][SWITCH] == "1"

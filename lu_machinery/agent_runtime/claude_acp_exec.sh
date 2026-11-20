@@ -32,4 +32,21 @@ case $identity in *:*:*:*:*) ;; *) echo "claude_acp_exec: pinned Claude Code ide
 stat=/usr/bin/gnustat
 [ -x "$stat" ] || stat=/usr/bin/stat
 [ "$("$stat" -c %d:%i:%s:%.9Y:%.9Z -- "$host" 2>/dev/null)" = "$identity" ] || { echo "claude_acp_exec: pinned Claude Code changed since its version probe, or this host lacks GNU stat" >&2; exit 126; }
-exec "$host" --disallowedTools Monitor,ScheduleWakeup,CronCreate,Workflow "$@"
+# Claude Code starts in Manual whatever mode the adapter asks for: since
+# claude-agent-acp 0.101.0 its default is Auto, which approves tools without an
+# ACP permission request. The SDK sends --permission-mode=<mode> as one argument
+# (option values that start with "-" are joined the same way), so that form is
+# replaced. The two-argument form, which the SDK never sends, is refused, as is
+# --dangerously-skip-permissions, which would override the mode.
+for arg do
+    shift
+    case $arg in
+        --permission-mode=*) ;;
+        --permission-mode | --dangerously-skip-permissions | --dangerously-skip-permissions=*)
+            echo "claude_acp_exec: refusing the SDK argument ${arg%%=*}" >&2
+            exit 126
+            ;;
+        *) set -- "$@" "$arg" ;;
+    esac
+done
+exec "$host" --disallowedTools Monitor,ScheduleWakeup,CronCreate,Workflow --permission-mode=default "$@"
