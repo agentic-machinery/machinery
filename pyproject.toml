@@ -60,7 +60,7 @@ semgrep = ["semgrep==1.183.0"]
 [tool.uv]
 # One uv for the lock and every CI job (pins.txt UV_VERSION).
 required-version = "==0.13.9"
-exclude-newer = "7 days"
+exclude-newer = "3 days"
 exclude-newer-package = { lu-machinery = false }
 # Semgrep 1.183.0 pins vulnerable MCP and OpenTelemetry releases. Scope the
 # patched versions to that wheel and keep the entire scanner hash-locked.

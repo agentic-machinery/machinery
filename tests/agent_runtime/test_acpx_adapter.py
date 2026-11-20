@@ -854,7 +854,8 @@ def test_release_prefix_admission_rejects_untrusted_node_dependency(tmp_path, mo
         # CTO's two additional cases pin both positive and negated npm constraints.
         monkeypatch.setattr(platform, "system", lambda: "Linux")
         monkeypatch.setattr(platform, "machine", lambda: "x86_64")
-        shutil.copytree(package, optional)
+        if not defect.startswith("omitted"):
+            shutil.copytree(package, optional)
         lock["packages"]["node_modules/optional-platform"] = {
             **lock["packages"]["node_modules/acpx"], "optional": True,
             "os": ["!linux"] if defect.startswith("omitted") else ["linux"], "cpu": ["x64"],
@@ -932,12 +933,62 @@ def test_release_prefix_admission_rejects_untrusted_node_dependency(tmp_path, mo
             assert acpx_module._resolve_acpx_binary(adapter_label="test") == str(binary)
             return
     else:
-        shutil.rmtree(optional)
         if defect == "omitted-inapplicable-optional":
-            assert acpx_module._resolve_acpx_binary(adapter_label="test") == str(binary)
             return
+        shutil.rmtree(optional)
     with pytest.raises(AcpxShadowRefusalError, match="without an applicable provider|reviewed peer exemption" if "peer" in defect else None):
         acpx_module._resolve_acpx_binary(adapter_label="test")
+
+
+@pytest.mark.parametrize("cpu", ["x64", "arm64"])
+@pytest.mark.parametrize("libc", ["glibc", "musl"])
+def test_node_seal_requires_the_package_matching_the_selected_node(tmp_path, monkeypatch, cpu, libc):
+    """The wrong libc package cannot substitute for the required Linux package."""
+    import base64
+    import hashlib
+    import platform
+    import shutil
+    import tarfile
+
+    prefix = tmp_path / "release"
+    package = prefix / "node_modules" / f"native-{cpu}-{libc}"
+    package.mkdir(parents=True)
+    manifest = package / "package.json"
+    manifest.write_text('{"version":"1.0.0"}')
+    archive = tmp_path / "native.tgz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(manifest, arcname="package/package.json")
+    digest = hashlib.sha512(archive.read_bytes()).digest()
+    archives = prefix / "archives"
+    archives.mkdir()
+    archive.rename(archives / (digest.hex() + ".tgz"))
+    other_libc = "musl" if libc == "glibc" else "glibc"
+    packages = {
+        f"node_modules/native-{cpu}-{family}": {
+            "version": "1.0.0", "optional": True, "os": ["linux"], "cpu": [cpu], "libc": [family],
+            "integrity": "sha512-" + base64.b64encode(digest).decode(),
+        }
+        for family in (libc, other_libc)
+    }
+    (prefix / "package.json").write_text('{"dependencies":{}}')
+    (prefix / "package-lock.json").write_text(json.dumps({"packages": packages}))
+    (prefix / ".nvmrc").write_text("22\n")
+    node = tmp_path / "node with spaces"
+    node.write_text(f'#!/bin/sh\n[ "$1" = "--eval" ] && printf "%s" {libc}\n')
+    node.chmod(0o700)
+    monkeypatch.setattr(acpx_module, "_NODE_PREFIX", prefix)
+    monkeypatch.setattr(acpx_module, "_NODE_CONTRACT", prefix)
+    monkeypatch.setattr(acpx_module, "_resolve_host_node_binary", lambda *, adapter_label: node)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "machine", lambda: {"x64": "x86_64", "arm64": "aarch64"}[cpu])
+    monkeypatch.setattr(platform, "libc_ver", lambda: (other_libc, ""))
+    assert acpx_module.validate_node_dependencies() == prefix
+
+    wrong_package = package.with_name(f"native-{cpu}-{other_libc}")
+    shutil.copytree(package, wrong_package)
+    with pytest.raises(AcpxShadowRefusalError, match="does not match the runtime platform") as exc:
+        acpx_module.validate_node_dependencies()
+    assert exc.value.failure_code == "acp_adapter_incompatible"
 
 
 # ---------------------------------------------------------------------------
@@ -1948,7 +1999,10 @@ def test_builtin_discussion_seats_are_fixed_active_only_and_confined(
         )
 
     assert adapter.name == f"acpx-{participant}-shadow"
-    assert plan.cmd[-4:] == [acpx_agent, "exec", "-f", "-"]
+    exec_argv = [acpx_agent, "exec", "-f", "-"]
+    if participant == "claude":
+        exec_argv.extend(["--config-option", "mode=default"])
+    assert plan.cmd[-len(exec_argv) :] == exec_argv
     _assert_acpx_env_overrides(
         plan.env_overrides,
         expected=({} if auth_env is None else {auth_env: "1"}),
@@ -2896,6 +2950,40 @@ def _launch_env(host: Path, **extra: str) -> dict[str, str]:
         acpx_module.CLAUDE_ACP_HOST_IDENTITY_ENV: acpx_module._claude_code_launch_identity(host.stat()),
         **extra,
     }
+
+
+def test_claude_acp_selects_manual_mode_before_prompt_and_at_child_start(tmp_path, monkeypatch, leased_copies):
+    require_launcher = acpx_module._require_claude_acp_launcher
+    _stub_binary(monkeypatch, tmp_path)
+    monkeypatch.setattr(acpx_module, "_require_claude_acp_launcher", require_launcher)
+    monkeypatch.setenv(acpx_module.TRANSPORT_ENV, "active")
+    adapter = AcpxClaudeShadowAdapter()
+    with acpx_module.active_discussion_scope():
+        plan = adapter.build_invocation(
+            prompt="ping",
+            mode="read-only",
+            cwd=tmp_path,
+            model=None,
+            task_id="claude-mode-test",
+            session_id=None,
+            tool_config={
+                "acpx_discussion": True, "target_agent": "claude", "correlation_id": "corr", "idempotency_key": "idem",
+            },
+        )
+    assert plan.cmd[plan.cmd.index("exec") + 1 :] == ["-f", "-", "--config-option", "mode=default"]
+
+    launcher = Path(plan.env_overrides[acpx_module.CLAUDE_CODE_EXECUTABLE_ENV])
+    host = _fake_host(tmp_path / "native-host", 'printf "%s\\n" "$@"\n')
+    result = subprocess.run(
+        [str(launcher), "--permission-mode=auto", "--model", "name with spaces"],
+        env=_launch_env(host), capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        "--permission-mode=default", "--disallowedTools", "Monitor,ScheduleWakeup,CronCreate,Workflow",
+        "--model", "name with spaces",
+    ]
+    adapter.cleanup_invocation(plan)
 
 
 def _process_gone(pid: int) -> bool:

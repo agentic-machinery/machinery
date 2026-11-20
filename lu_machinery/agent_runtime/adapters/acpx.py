@@ -1123,14 +1123,47 @@ def _node_target_allows(constraints: Any, target: str) -> bool:
     return not positives or target in positives
 
 
-def _node_package_applies(package: Mapping[str, Any], host_os: str, host_cpu: str) -> bool:
+def _node_runtime_libc() -> str:
+    """Read the libc loaded by the selected Node, independent of Python's libc."""
+    node = _resolve_host_node_binary(adapter_label="Node dependency admission")
+    # Read the same report fields npm-install-checks uses when ldd is unavailable.
+    # ldd can describe the host or shell rather than this Node executable.
+    script = r"""
+        process.report.excludeEnv = true;
+        process.report.excludeNetwork = true;
+        const { header, sharedObjects } = process.report.getReport();
+        if (header.glibcVersionRuntime) {
+            process.stdout.write("glibc");
+        } else if (sharedObjects.some(path => /(?:^|\/)(?:ld-musl-|libc\.musl-)[^/]+\.so\.1$/.test(path))) {
+            process.stdout.write("musl");
+        }
+    """
+    try:
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            [str(node), "--eval", script],
+            capture_output=True,
+            timeout=5,
+            check=False,
+            env=_acp_probe_env(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AcpxShadowRefusalError(
+            "Could not probe the selected Node runtime's libc", failure_code="acp_adapter_incompatible",
+        ) from exc
+    if result.returncode == 0 and result.stdout in {b"glibc", b"musl"}:
+        return result.stdout.decode("ascii")
+    raise AcpxShadowRefusalError("Unknown Node runtime libc", failure_code="acp_adapter_incompatible")
+
+
+def _node_package_applies(
+    package: Mapping[str, Any], host_os: str, host_cpu: str, host_libc: str | None,
+) -> bool:
     if not _node_target_allows(package.get("os"), host_os) or not _node_target_allows(package.get("cpu"), host_cpu):
         return False
     if package.get("libc") is not None:
-        libc = {"glibc": "glibc", "musl": "musl"}.get(platform.libc_ver()[0].lower())
-        if libc is None:
-            raise AcpxShadowRefusalError("Unknown Node dependency host libc", failure_code="acp_adapter_incompatible")
-        return _node_target_allows(package["libc"], libc)
+        if host_libc is None:
+            raise AcpxShadowRefusalError("Unknown Node runtime libc", failure_code="acp_adapter_incompatible")
+        return _node_target_allows(package["libc"], host_libc)
     return True
 
 
@@ -1168,7 +1201,9 @@ def _node_lookup_locations(importer: str, name: str) -> Iterator[str]:
         yield "/".join([*parts[:end], "node_modules", name])
 
 
-def _check_node_peer_providers(prefix: Path, packages: Mapping[str, Any], host_os: str, host_cpu: str) -> None:
+def _check_node_peer_providers(
+    prefix: Path, packages: Mapping[str, Any], host_os: str, host_cpu: str, host_libc: str | None,
+) -> None:
     """Every peer a present package declares must resolve inside the prefix.
 
     A peer absent from the prefix makes Node continue into ancestor and global
@@ -1199,7 +1234,7 @@ def _check_node_peer_providers(prefix: Path, packages: Mapping[str, Any], host_o
                 declared.update(names)
         for name in sorted(declared):
             provider = next((path for path in _node_lookup_locations(location, name) if path in packages), None)
-            if provider is not None and _node_package_applies(packages[provider], host_os, host_cpu):
+            if provider is not None and _node_package_applies(packages[provider], host_os, host_cpu, host_libc):
                 continue
             if provider is None and (location, name) in _NODE_PEER_EXEMPTIONS:
                 continue
@@ -1212,8 +1247,9 @@ def _check_node_peer_providers(prefix: Path, packages: Mapping[str, Any], host_o
 def validate_node_dependencies() -> Path:
     """Verify all installed package bytes against retained, lock-authenticated tarballs.
 
-    This does no network or subprocess work. Extra files, symlinks in packages,
-    foreign owners and group/other writable files are refused before CLI probes.
+    Only the host Node binary can run here, to report its libc. Extra files,
+    symlinks in packages, foreign owners and writable files are refused before
+    any installed dependency can run.
     """
     try:
         prefix = node_prefix()
@@ -1222,15 +1258,24 @@ def validate_node_dependencies() -> Path:
         _check_node_artifact(modules, directory=True)
         _check_node_artifact(prefix / "archives", directory=True)
         lock = json_depth.loads((prefix / "package-lock.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)
+        packages = lock["packages"]
         direct = json_depth.loads((prefix / "package.json").read_bytes(), max_depth=_JSON_MAX_DEPTH)["dependencies"]
         host_os, host_cpu = _node_host_target()
+        host_libc = None
+        if host_os == "linux" and any(package.get("libc") is not None for package in packages.values()):
+            host_libc = _node_runtime_libc()
         expected: set[Path] = set()
-        for location, package in lock["packages"].items():
+        for location, package in packages.items():
             if not location:
                 continue
             root = prefix / location
-            if not root.exists() and package.get("optional") and not _node_package_applies(package, host_os, host_cpu):
-                continue
+            if not _node_package_applies(package, host_os, host_cpu, host_libc):
+                if package.get("optional") and not root.exists():
+                    continue
+                raise AcpxShadowRefusalError(
+                    f"Node dependency {location} does not match the runtime platform",
+                    failure_code="acp_adapter_incompatible",
+                )
             _check_node_artifact(root, directory=True)
             digest = base64.b64decode(package["integrity"].removeprefix("sha512-"), validate=True).hex()
             archive_path = prefix / "archives" / (digest + ".tgz")
@@ -1248,7 +1293,7 @@ def validate_node_dependencies() -> Path:
         for name, required in direct.items():
             if json_depth.loads((modules / name / "package.json").read_bytes(), max_depth=_JSON_MAX_DEPTH).get("version") != required:
                 raise AcpxShadowRefusalError(f"Incompatible Node dependency: {name}")
-        _check_node_peer_providers(prefix, lock["packages"], host_os, host_cpu)
+        _check_node_peer_providers(prefix, packages, host_os, host_cpu, host_libc)
         for path in modules.rglob("*"):
             if path.is_symlink():
                 # npm creates only executable shims. Their targets must be verified files.
@@ -4010,6 +4055,7 @@ class AcpxClaudeShadowAdapter(_AcpxDiscussionAdapter):
             raise
         return replace(
             plan,
+            cmd=[*plan.cmd, "--config-option", "mode=default"],
             env_overrides={
                 **plan.env_overrides,
                 # One-shot exec ends with the turn: no background work or advisor (#9690, #10083).

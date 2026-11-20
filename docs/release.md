@@ -111,29 +111,31 @@ environment. The opt-in permission test gets MCP from the `test`
 dependency group. The release build tools use hash-pinned installs. The
 product consumer check uses the job's checksum-verified `UV_VERSION`.
 
-uv gives third-party distributions a seven-day cooldown. For an urgent CVE
+uv gives third-party distributions a three-day cooldown. For an urgent CVE
 fix inside that window, add a dated entry for the affected package to
 `[tool.uv].exclude-newer-package`. Choose a UTC cutoff just after the upload
 of the last distribution needed for the fix. Record the CVE and removal date
 in a comment, and regenerate the lock with `uv lock --upgrade-package NAME`.
 Remove the entry and regenerate the lock once the last required distribution
-is seven days old. The first-party `lu-machinery = false` entry lets the
+is three days old. The first-party `lu-machinery = false` entry lets the
 release cut adopt a newly published machinery wheel in the product.
 See [uv's package cutoff settings](https://docs.astral.sh/uv/reference/settings/#exclude-newer-package).
 
-`.github/dependabot.yml` applies the same seven-day cooldown (`cooldown.default-days: 7`)
-to scheduled weekly grouped updates for `npm` and `github-actions` (`uv` is left out until
-`dependabot-core` bundles `uv >= 0.13.9`), and ignores the actions pinned in
-`.github/workflows/pins.txt` so coupled workflow pins always move together. No dependency PR
-auto-merges. For an urgent CVE fix that cannot wait for the cooldown or that affects a
-`pins.txt`-coupled tool or action, open a manual PR updating the affected manifest and
-lockfile, and land it through the usual exact-head review and green `CI Gate`:
+`.github/dependabot.yml` schedules weekly grouped updates for npm and GitHub Actions.
+Dependabot's default three-day cooldown applies to version updates. Security updates
+are eligible immediately. The config leaves out uv until Dependabot bundles uv 0.13.9
+or newer. Update actions coupled to `.github/workflows/pins.txt` together with their pin
+records. Adopt the latest eligible releases and fix compatibility in machinery.
+Lockfiles record the exact resolved versions. Every dependency PR requires exact-head
+review and a green `CI Gate`.
 
-- Inside the seven-day `uv` cooldown window, add the dated `[tool.uv].exclude-newer-package`
+Open a manual PR for an urgent uv fix inside the cooldown or for a coordinated pin update.
+
+- Inside the three-day uv cooldown window, add the dated `[tool.uv].exclude-newer-package`
   override above.
 - For a `pins.txt`-coupled tool or action, bump `.github/workflows/pins.txt` and its matching
   workflow, gate, and baseline pins together.
-- When a `pins.txt`-coupled `uv` tool needs an urgent fix inside the seven-day window, apply
+- When a `pins.txt`-coupled uv tool needs an urgent fix inside the three-day window, apply
   both the dated `[tool.uv].exclude-newer-package` override and the coordinated pin bump.
 
 The release wheelhouse includes core and the `api`, `postgres`, and
@@ -425,9 +427,10 @@ Its version must match the wheel, and the full lock digest distinguishes
 dependency sets. Sealing retains integrity-addressed archives from npm's
 cache. Runtime admission verifies the copied contract, package versions,
 archive integrity, installed bytes, executable targets, owners and writable
-modes before any provider is spawned. Every applicable optional package is
-required: only lock OS/CPU/libc constraints excluding this host permit an
-optional package to be absent. Unknown host targets refuse admission.
+modes before any provider is spawned. The seal requires every applicable
+optional package and rejects packages for another platform. On Linux, it
+reads libc from the selected Node executable's diagnostic report. Unknown
+platform targets refuse admission.
 Every peer a present package declares, including names listed only under
 `peerDependenciesMeta`, must resolve from that package's own location to
 the nearest lock entry, and that entry must apply to the host. Otherwise
