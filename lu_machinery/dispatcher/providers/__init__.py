@@ -85,7 +85,8 @@ def load_product_sources_server(agent: str) -> SourcesServerSpec | None:
     Returns ``None`` when the product declares no active ``sources`` entry, and raises a typed
     ``ValueError`` (``<agent>_sources_config_invalid``) on malformed declarations.
     """
-    mcp_path = product_root() / ".mcp.json"
+    root = product_root()
+    mcp_path = root / ".mcp.json"
     try:
         raw = mcp_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -154,7 +155,8 @@ def load_product_sources_server(agent: str) -> SourcesServerSpec | None:
     if raw_cwd is not None:
         if not isinstance(raw_cwd, str) or not raw_cwd.strip() or _has_control_chars(raw_cwd):
             raise ValueError(f"{agent}_sources_config_invalid: sources cwd must be a non-empty string")
-        cwd = raw_cwd
+        # Anchor relative cwd to trusted product_root() so CLIs never resolve it against the untrusted worktree.
+        cwd = raw_cwd if Path(raw_cwd).is_absolute() else os.path.abspath(os.path.join(str(root), raw_cwd))
     return SourcesServerSpec(command=raw_command, args=args, env=env_map, cwd=cwd)
 
 

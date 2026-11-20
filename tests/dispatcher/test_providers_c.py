@@ -530,16 +530,16 @@ def test_codex_workspace_sources_supports_url_and_stdio_and_fails_closed(
     inv_url = codex.build(base, caller_env)
     argv_url = inv_url.argv
     assert 'mcp_servers.sources.url="http://127.0.0.1:8766/mcp"' in argv_url
-    assert 'mcp_servers.sources.env_http_headers={"Authorization"="LU_CODEX_SOURCES_HEADER_0"}' in argv_url
+    assert 'mcp_servers.sources.env_http_headers={"Authorization"="LU_CODEX_SOURCES_HEADER_TOKEN_0"}' in argv_url
     assert "fixture-header-token" not in " ".join(argv_url)
-    assert inv_url.env["LU_CODEX_SOURCES_HEADER_0"] == "Bearer fixture-header-token"
+    assert inv_url.env["LU_CODEX_SOURCES_HEADER_TOKEN_0"] == "Bearer fixture-header-token"
     assert caller_env == {}
     enabled = next(arg for arg in argv_url if arg.startswith("mcp_servers.sources.enabled_tools="))
     enabled_tools = json.loads(enabled.removeprefix("mcp_servers.sources.enabled_tools="))
     assert enabled_tools == list(readers)
     assert all(writer not in enabled_tools for writer in writers)
 
-    # 2. Stdio entry (command + args + env via env_vars + cwd; env values stay out of argv)
+    # 2. Stdio entry: env stays MCP-scoped (never overrides scrubbed Codex agent env); relative cwd anchors to product
     (product / ".mcp.json").write_text(
         json.dumps({
             "mcpServers": {
@@ -547,21 +547,35 @@ def test_codex_workspace_sources_supports_url_and_stdio_and_fails_closed(
                     "type": "stdio",
                     "command": "/opt/venv/bin/python",
                     "args": ["-m", "sources.server", "--read-only"],
-                    "env": {"SOURCES_DB": "/data/sources.db"},
-                    "cwd": "/opt/sources",
+                    "env": {
+                        "SOURCES_DB": "/data/sources.db",
+                        "PATH": "/opt/venv/bin",
+                        "CODEX_HOME": "/srv/other-codex",
+                        "PYTHONPATH": "/opt/sources",
+                        "LEARN_UKRAINIAN_DISPATCH_TASK_ID": "spoofed",
+                    },
+                    "cwd": "sources-subdir",
                 }
             }
         }),
         encoding="utf-8",
     )
-    inv_stdio = codex.build(base, {})
+    scrubbed_env = {
+        "PATH": "/usr/local/bin:/usr/bin",
+        "CODEX_HOME": "/srv/caller-codex",
+        "PYTHONPATH": "/srv/caller-py",
+        "LEARN_UKRAINIAN_DISPATCH_TASK_ID": "codex-ws",
+    }
+    inv_stdio = codex.build(base, scrubbed_env)
     argv_stdio = inv_stdio.argv
     assert 'mcp_servers.sources.command="/opt/venv/bin/python"' in argv_stdio
     assert 'mcp_servers.sources.args=["-m", "sources.server", "--read-only"]' in argv_stdio
-    assert 'mcp_servers.sources.env_vars=["SOURCES_DB"]' in argv_stdio
-    assert inv_stdio.env["SOURCES_DB"] == "/data/sources.db"
-    assert "/data/sources.db" not in " ".join(argv_stdio)
-    assert 'mcp_servers.sources.cwd="/opt/sources"' in argv_stdio
+    env_flag = next(arg for arg in argv_stdio if arg.startswith("mcp_servers.sources.env="))
+    assert '"SOURCES_DB"="/data/sources.db"' in env_flag
+    assert not any(arg.startswith("mcp_servers.sources.env_vars=") for arg in argv_stdio)
+    assert inv_stdio.env == scrubbed_env
+    assert "SOURCES_DB" not in inv_stdio.env
+    assert f'mcp_servers.sources.cwd="{product / "sources-subdir"}"' in argv_stdio
     assert not any(arg.startswith("mcp_servers.sources.url=") for arg in argv_stdio)
     assert "/bin/sh" not in " ".join(argv_stdio)
 

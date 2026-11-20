@@ -556,7 +556,7 @@ def test_opencode_workspace_sources_config_and_writer_denies(
         keys.index(f"sources_{name}") for name in writers
     )
 
-    # 2. Local stdio Sources server (including cwd forwarding so Sources never anchors to the untrusted worktree)
+    # 2. Local stdio Sources server (absolute and relative cwd anchor outside the untrusted worktree)
     (product / ".mcp.json").write_text(
         json.dumps({
             "mcpServers": {
@@ -579,6 +579,20 @@ def test_opencode_workspace_sources_config_and_writer_denies(
         "cwd": "/opt/sources",
         "enabled": True,
     }
+    (product / ".mcp.json").write_text(
+        json.dumps({
+            "mcpServers": {
+                "sources": {
+                    "command": "/opt/venv/bin/python",
+                    "args": ["-m", "sources.server"],
+                    "cwd": "sources-subdir",
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    inv_rel = opencode.build(write_spec, {})
+    assert json.loads(inv_rel.env["OPENCODE_CONFIG_CONTENT"])["mcp"]["sources"]["cwd"] == str(product / "sources-subdir")
 
     # 3. Malformed product .mcp.json fails closed
     (product / ".mcp.json").write_text(json.dumps({"mcpServers": {"sources": {"command": 42}}}), encoding="utf-8")

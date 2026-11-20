@@ -198,9 +198,10 @@ def _workspace_sources_transport(
 
     Write workers run outside the boundary, so no task-local config.toml defines Sources. Supports
     both HTTP ``url`` (with headers kept out of argv via ``env_http_headers``) and stdio
-    ``command``/``args``/``env`` (via ``env_vars``)/``cwd`` entries from the product checkout's
-    ``.mcp.json`` (never the task worktree). Fails closed on malformed entries or when Sources is
-    missing on a Ukrainian-content task; warns when missing on other tasks.
+    ``command``/``args``/``env`` (scoped to the MCP child via ``mcp_servers.sources.env`` so it
+    never alters the scrubbed Codex agent process environment)/``cwd`` entries from the product
+    checkout's ``.mcp.json`` (never the task worktree). Fails closed on malformed entries or when
+    Sources is missing on a Ukrainian-content task; warns when missing on other tasks.
     """
     server = load_product_sources_server("codex")
     if server is None:
@@ -220,7 +221,7 @@ def _workspace_sources_transport(
         if server.headers:
             header_env_map: dict[str, str] = {}
             for index, (header, value) in enumerate(server.headers.items()):
-                env_name = f"LU_CODEX_SOURCES_HEADER_{index}"
+                env_name = f"LU_CODEX_SOURCES_HEADER_TOKEN_{index}"
                 header_env_map[header] = env_name
                 if child_env is not None:
                     child_env[env_name] = value
@@ -234,9 +235,7 @@ def _workspace_sources_transport(
         "mcp_servers.sources.args=" + json.dumps(list(server.args)),
     ]
     if server.env:
-        if child_env is not None:
-            child_env.update(server.env)
-        flags += ["-c", "mcp_servers.sources.env_vars=" + json.dumps(list(server.env))]
+        flags += ["-c", "mcp_servers.sources.env=" + _toml_inline_table(server.env)]
     if server.cwd is not None:
         flags += ["-c", "mcp_servers.sources.cwd=" + json.dumps(server.cwd)]
     return flags
