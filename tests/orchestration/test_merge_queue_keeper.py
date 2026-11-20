@@ -13,7 +13,6 @@ from lu_machinery.orchestration import integration_sweep as sweep
 from lu_machinery.orchestration import merge_queue_keeper as keeper
 from lu_machinery.orchestration.integration_sweep import Verdict
 from lu_machinery.review.record_cf_verdict import build_comment
-
 from tests.helpers.product_tree import configured_roots as configured_roots
 
 HEAD_A = "a" * 40
@@ -260,6 +259,19 @@ def test_queued_without_cf_at_head_is_revoked(tmp_path: Path) -> None:
     assert "drops" not in state
     assert f"42:{HEAD_A}" not in state.get("pending_comments", {})
     assert f"42:{HEAD_A}" not in state.get("squash_revoked", {})
+
+
+def test_revocation_comment_ignores_scalar_user(tmp_path: Path) -> None:
+    """A matching marker with a scalar user cannot suppress a revocation notice."""
+    fake = FakeGitHub(pr(isInMergeQueue=True))
+    marker = f"<!-- mq-keeper head={HEAD_A} reason=needs-CF -->"
+    fake.comments_rows = [{"body": marker, "user": "driver"}]
+
+    _, failed = keeper.run(fake, tmp_path / "state.json", apply=True)
+
+    assert not failed
+    assert mutations(fake) == ["dequeue", "comment"]
+    assert _keeper_comment(fake).endswith(marker)
 
 
 def test_queued_cf_only_at_old_head_is_revoked(tmp_path: Path) -> None:

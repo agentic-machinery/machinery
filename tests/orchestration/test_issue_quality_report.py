@@ -10,9 +10,10 @@ from unittest.mock import Mock
 
 import pytest
 
+from lu_machinery.ci import comment_issue_task_quality as issue_comments
 from lu_machinery.orchestration import issue_quality_report as report
-from lu_machinery.orchestration.fleet_repos import FleetRepo
 from lu_machinery.orchestration import issue_stream_audit as audit
+from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 COMPLETE = """
 ## User-visible outcome
@@ -92,6 +93,23 @@ PRIVATE = FleetRepo("infra-private", "unit/private", "private", "private-infra")
 
 def summarize(issues, count, membership=None, codes=(), repo=PUBLIC):
     return report.summarize_repository(repo, issues, count, membership, list(codes), REGISTRY)
+
+
+def test_advisory_comment_reconciliation_ignores_null_user() -> None:
+    """A deleted account with the advisory marker cannot own the bot comment."""
+    marker = issue_comments.MARKER
+    comments = [
+        {"id": 1, "user": None, "body": marker},
+        {"id": 2, "user": {"login": issue_comments.BOT_LOGIN}, "body": marker},
+    ]
+    api = Mock()
+
+    issue_comments.reconcile_comments({"body": ""}, comments, api, "/issues/42")
+
+    api.assert_called_once()
+    method, path, payload = api.call_args.args
+    assert (method, path) == ("PATCH", "/issues/comments/2")
+    assert payload["body"].startswith(marker + "\n")
 
 
 def test_listing_500_of_612_is_incomplete_independently_of_audit():

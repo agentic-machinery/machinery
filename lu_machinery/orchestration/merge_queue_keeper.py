@@ -36,6 +36,7 @@ from lu_machinery.orchestration.integration_sweep import (
     NEEDS_COVERAGE,
     NEEDS_SEAT,
     Verdict,
+    _author_login,
     changes_learner_content,
     classify_pr,
     lookup_verdict,
@@ -712,7 +713,7 @@ def _comment_once(
 ) -> None:
     """Post a hold reason or prior removal diagnosis once; ``detail`` is already display-safe."""
     marker = MARKER.format(head=marker_value(head), reason=marker_value(reason))
-    if any(marker in str(row.get("body", "")) and (row.get("user") or {}).get("login") == login for row in comments):
+    if any(marker in str(row.get("body", "")) and _author_login(row, rest_only=True) == login for row in comments):
         return
     shown = display_text(reason, DISPLAY_REASON_LIMIT)
     message = "was previously removed from the queue" if reason == "queue-drop" else f"was not queued because {shown}"

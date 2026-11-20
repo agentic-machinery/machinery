@@ -25,6 +25,7 @@ from lu_machinery.ci.check_issue_task_quality import (
 )
 from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubClient, GitHubRateLimited
+from lu_machinery.orchestration.integration_sweep import _author_login
 
 MARKER = "<!-- issue-task-quality:v1 -->"
 BOT_LOGIN = "github-actions[bot]"
@@ -65,7 +66,7 @@ def reconcile_comments(issue: dict[str, Any], comments: list[dict[str, Any]], ap
     matching = [
         comment
         for comment in comments
-        if comment.get("user", {}).get("login") == BOT_LOGIN and (comment.get("body") or "").startswith(MARKER)
+        if _author_login(comment, rest_only=True) == BOT_LOGIN and (comment.get("body") or "").startswith(MARKER)
     ]
     if matching:
         keep = matching[0]
