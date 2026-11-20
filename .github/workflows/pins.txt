@@ -114,10 +114,9 @@ RUFF_VERSION=0.15.21
 #   0.17.x is a separate change: on 2026-11-05, 0.17.3 reported 7 findings
 #   under the same settings on the machinery paths that 0.15.21 passes.
 #   uv.lock (lint group) holds its wheel hashes.
-MYPY_VERSION=2.1.0
-#   https://pypi.org/project/mypy/2.1.0/ (wheel uploaded 2026-05-11). The source
-#   repository's requirements-lock.txt version, which recorded the
-#   lu_machinery/lint/mypy_baseline.json census. Checked 2026-11-08.
+MYPY_VERSION=2.4.0
+#   https://pypi.org/project/mypy/2.4.0/ (wheel uploaded 2026-10-01).
+#   This version matches the lu_machinery/lint/mypy_baseline.json census.
 #   uv.lock (typecheck group) holds its wheel hashes. The mypy job installs
 #   it with the core and runtime extras from the same lock
 #   (`uv sync --locked --no-install-project --all-extras --no-extra test --group typecheck`). The closure

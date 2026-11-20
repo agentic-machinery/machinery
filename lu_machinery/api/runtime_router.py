@@ -389,14 +389,15 @@ def list_runtime_agents(ctx: MonitorContext, unreadable: dict[str, int] | None =
         for _, obj in inspect.getmembers(module, inspect.isclass):
             if obj.__module__ != module.__name__:
                 continue
-            if not all(hasattr(obj, attr) for attr in ("name", "default_model", "supported_modes")):
+            if not hasattr(obj, "name") or not all(hasattr(obj, attr) for attr in ("default_model", "supported_modes")):
                 continue
-            if not callable(getattr(obj, "build_invocation", None)):
+            build_invocation = getattr(obj, "build_invocation", None)
+            if not callable(build_invocation):
                 continue
             if not callable(getattr(obj, "parse_response", None)):
                 continue
             try:
-                source = inspect.getsource(obj.build_invocation)
+                source = inspect.getsource(build_invocation)
             except (OSError, TypeError):
                 source = ""
             if 'shutil.which("claude")' in source:

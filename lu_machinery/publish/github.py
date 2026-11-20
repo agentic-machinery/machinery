@@ -2288,7 +2288,7 @@ def publish(
             # Refuse a blocked supplied subject or body before any GitHub read. With an
             # override set, the one combined scan below decides, so the override is
             # offered once for the whole publish.
-            supplied = [key for key in ("subject", "body") if key in fields]
+            supplied: list[str] = [key for key in ("subject", "body") if key in fields]
             if supplied and not environment.get(gate.OVERRIDE, "").strip():
                 try:
                     gate.check_texts(
