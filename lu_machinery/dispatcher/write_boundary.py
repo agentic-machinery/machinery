@@ -1572,16 +1572,16 @@ class _Boundary:
             outputs.append(Path(os.path.realpath(path)))
         final_delivery = None
         if self.args.task_artifacts:
-            from lu_machinery.dispatcher import store
+            from lu_machinery.dispatcher import store as task_store
 
             task_id = self.args.task_id
-            record = store.read(task_id, missing_ok=True) or {}
+            record = task_store.read(task_id, missing_ok=True) or {}
             nonce = record.get("run_nonce")
             if (record.get("task_id") != task_id or record.get("mode") != "read-only"
                     or record.get("status") not in ("spawning", "running")
                     or not isinstance(nonce, str) or not _REQUEST_ID.fullmatch(nonce)):
                 raise Refused("task artifacts require this read-only run's active task record")
-            record_path = store.record_path(task_id)
+            record_path = task_store.record_path(task_id)
             artifacts = record_path.parent.resolve(strict=True) / record_path.with_suffix(".artifacts").name
             if any(_overlaps(artifacts, protected) for protected in (common, self.worktree, _fleet_plane())):
                 raise Refused("task artifacts overlap Git metadata, the worktree or the Fleet store")
