@@ -66,6 +66,11 @@ except ModuleNotFoundError as exc:
 else:
     _DATABASE_ERRORS += (PostgresError,)
 _OVERVIEW_ERRORS: tuple[type[Exception], ...] = (*_DATABASE_ERRORS, storage.ControlPlaneError)
+_OVERVIEW_READ_ERRORS: tuple[type[Exception], ...] = (
+    *_OVERVIEW_ERRORS,
+    ValueError,
+    json.JSONDecodeError,
+)
 
 router = APIRouter(tags=["fleet"])
 # Fleet read models served stale-while-revalidate (``state_helpers.swr_route``):
@@ -1134,7 +1139,7 @@ def fleet_overview(
             plane_root=plane_root,
             expected_pg_dsn=expected_pg_dsn,
         )
-    except (*_OVERVIEW_ERRORS, ValueError, json.JSONDecodeError):
+    except _OVERVIEW_READ_ERRORS:
         # Never expose a driver exception or leave partial counts looking complete.
         result["availability"] = "schema_read_failed"
 
