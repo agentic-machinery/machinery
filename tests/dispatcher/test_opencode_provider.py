@@ -132,6 +132,7 @@ def test_opencode_read_only_sources_uses_the_boundary_relay(
     invocation = opencode.build(spec, {})
     config = json.loads(invocation.env.get("OPENCODE_CONFIG_CONTENT", "{}"))
     assert invocation.env["OPENCODE_DISABLE_PROJECT_CONFIG"] == invocation.env["OPENCODE_PURE"] == "1"
+    assert invocation.env["npm_config_offline"] == "true"
     assert config.get("mcp", {}).get("sources") == {
         "type": "local", "command": write_boundary.sources_command(), "enabled": True,
     }

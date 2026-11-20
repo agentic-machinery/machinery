@@ -448,7 +448,8 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
         permission = {"bash": "allow", "webfetch": "allow", "edit": "deny", "task": "deny",
                       **_sources_permission(readers, writers)}
         # Checkout config could replace the relay or override tool permissions at agent level.
-        child_env.update(OPENCODE_DISABLE_PROJECT_CONFIG="1", OPENCODE_PURE="1")
+        # Keep OpenCode's background plugin dependency setup offline to leave proxy capacity for webfetch.
+        child_env.update(OPENCODE_DISABLE_PROJECT_CONFIG="1", OPENCODE_PURE="1", npm_config_offline="true")
         config["share"] = "disabled"
     else:
         raise ValueError(f"opencode: unsupported mode {spec.mode!r}")
