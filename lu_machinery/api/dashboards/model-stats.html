@@ -23,8 +23,19 @@
   }
   select { max-width: 100%; font: inherit; font-size: 13px; color: var(--fg); background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
   .filters { margin-left: auto; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; font-size: 13px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; margin: 4px 0 8px; font-size: 13px; }
   main { grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 1024px) {
+    main { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    section.wide { grid-column: 1 / -1; }
+  }
   section { overflow-x: visible; }
+  @media (min-width: 641px) {
+    section[id] { scroll-margin-top: var(--sticky-offset, 96px); }
+  }
+  @media (max-width: 640px) {
+    header { position: static; }
+  }
   @media (max-width: 599px) {
     header, main { padding-inline: 12px; }
     section { padding-inline: 10px; }
@@ -56,8 +67,11 @@
   .coverage { display: flex; flex-wrap: wrap; gap: 4px 20px; margin: 8px 0 0; }
   .coverage div { display: flex; gap: 4px; }
   .coverage dd { margin: 0; font-weight: 600; }
-  .alerts { display: flex; flex-wrap: wrap; gap: 8px; }
+  .alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
   .alert { border: 1px solid var(--bad); color: var(--bad); border-radius: 6px; padding: 4px 8px; font-size: 13px; }
+  .alert.quota { border-color: var(--warn); color: var(--warn); text-decoration: none; }
+  .alert.quota.bad { border-color: var(--bad); color: var(--bad); font-weight: 500; }
+  .jump-links { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0 0; font-size: 13px; }
   details { margin-block: 8px; }
   details summary { cursor: pointer; color: var(--link); font-size: 13px; }
   svg.chart { display: block; max-width: 100%; }
@@ -73,7 +87,7 @@
   .status-fill { background: var(--status-color); }
   .status-fill[data-status="timeout"] { background-image: repeating-linear-gradient(45deg, transparent 0 3px, var(--card) 3px 5px); }
   .status-fill[data-status="crashed"] { background-image: repeating-linear-gradient(90deg, transparent 0 3px, var(--card) 3px 5px); }
-  .duration-row { display: flex; justify-content: space-between; gap: 4px; max-width: 100%; }
+  .duration-row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; max-width: 100%; }
   .duration-row b { overflow-wrap: anywhere; }
   .duration-row .low { margin-left: 0; }
   td.sample { white-space: normal; word-break: break-word; max-width: 48rem; font: 12px/1.35 ui-monospace, monospace; }
@@ -104,76 +118,104 @@
   </div>
 </header>
 <main id="main" tabindex="-1">
-  <section aria-label="Window summary">
+  <section class="wide" aria-label="Window summary">
     <p class="note" id="age">Loading…</p>
     <div id="coverage"></div>
     <div class="banner" id="recommend">Loading…</div>
     <p class="note" id="waste-note" hidden>Delivery alerts show models that landed under 15% of at least 10 write tasks. Use the interval and job class to judge how much weight to give the alert.</p>
     <div class="alerts" id="waste"></div>
+    <p class="note" id="quota-alerts-note" hidden>Live quota pressure alerts come directly from fresh routing-budget readings (hot, near cap, or projected to run out before reset).</p>
+    <div class="alerts" id="quota-alerts"></div>
+    <nav class="jump-links" aria-label="Jump to section">
+      <a href="#jobs">Best picks</a>
+      <a href="#frontier-section">Value frontier</a>
+      <a href="#trends-section">Week by week</a>
+      <a href="#neon-section">Neon effort</a>
+      <a href="#accuracy-section">Reviewer accuracy</a>
+      <a href="#pools-section">Pool pace</a>
+      <span class="muted">· Related live pages:</span>
+      <a href="/fleet">Dispatches</a>
+      <a href="/pull-requests">Pull requests</a>
+      <a href="/subscriptions">Subscriptions</a>
+    </nav>
     <details><summary>Terms used on this page</summary>
       <p class="note">Landed means merged to main. Landed share divides those merges by all write tasks, including failed attempts. Low sample means fewer than 10 observations in the relevant denominator.</p>
       <p class="note">An interval is the 95% Wilson interval for a share. Wide intervals signal uncertainty, and overlapping intervals alone cannot settle a comparison.</p>
       <p class="note">A first-round approval means the first reviewer approved the PR. P0–P2 are findings from the highest priority through P2. A dash means the records lack a value for that metric.</p>
+      <p class="note">Per-task and per-PR links are omitted because the page feed carries no task ids or private repository identifiers.</p>
     </details></section>
-  <section><h2>Value frontier <span class="meta" id="chart-meta"></span></h2>
-    <p class="note">Each marker compares first-round approval with recorded hours per landed task. Look toward the upper left for higher approval at lower cost, and use the vertical intervals to judge uncertainty.</p>
-    <div id="chart">Loading…</div></section>
-  <section id="jobs"><h2>Best model per job <span class="meta" id="jobs-meta"></span></h2>
+  <section class="wide" id="jobs"><h2>Best model per job <span class="meta" id="jobs-meta"></span></h2>
     <p class="note">Compare landed share within each job class and check the interval and hours per merge. A star marks the highest positive share among models with at least 10 tasks in that class, including ties.</p>
     <div id="jobs-body">Loading…</div></section>
+  <section id="frontier-section"><h2>Value frontier <span class="meta" id="chart-meta"></span></h2>
+    <p class="note">Each marker compares first-round approval with recorded hours per landed task (or landed share when filtered to one job class). Look toward the upper left for higher approval or landed share at lower cost or time, and use the vertical intervals to judge uncertainty.</p>
+    <div class="controls">
+      <label>Job class <select id="pareto-class"><option value="all">All classes (PR approval)</option></select></label>
+      <label id="pareto-x-wrap">Horizontal axis <select id="pareto-x">
+        <option value="hours">Hours per merge (cost)</option>
+        <option value="speed">Median write min (speed)</option>
+      </select></label>
+    </div>
+    <div id="chart">Loading…</div></section>
+  <section id="trends-section"><h2>Week by week</h2>
+    <p class="note">Higher points mean a larger share of that UTC week's write tasks landed (or reviewed PRs approved first round), among the busiest models with at least 10 tasks in the window. Use full weeks with enough tasks to compare changes over time.</p>
+    <div class="controls">
+      <label>Metric <select id="trends-metric">
+        <option value="landed">Landed share (writes)</option>
+        <option value="approval">First-round approval (PRs)</option>
+      </select></label>
+    </div>
+    <div id="trends">Loading…</div></section>
   <section><h2>Where the work went</h2>
     <p class="note">Bar length shows how many write tasks settled for each model, and the segments show how they ended. A larger Done share means fewer runs ended in other states, and Write tasks shows the share that merged.</p>
     <div id="failures">Loading…</div></section>
-  <section><h2>Week by week</h2>
-    <p class="note">Higher points mean a larger share of that UTC week's write tasks landed, among the busiest models with at least 10 tasks in the window. Use full weeks with enough tasks to compare changes over time.</p>
-    <div id="trends">Loading…</div></section>
-  <section><h2>Neon medium against high</h2>
-    <p class="note">Compare Neon medium and high on write landings, reviewer approvals and typical runtime. Use the counts and approval intervals before favoring a setting, and compare approvals only for similar review work.</p>
-    <div id="neon">Loading…</div>
-    <p class="note" id="new-models"></p></section>
-  <section><h2>Reviewer strictness <span class="meta" id="review-meta"></span></h2>
-    <p class="note">Higher points approve more often, and points farther right report more P0–P2 findings per review with a findings count. Compare similar assignments and read the intervals before calling a reviewer strict or lenient.</p>
-    <div id="strictness">Loading…</div></section>
-  <section><h2>Reviewer accuracy <span class="meta" id="accuracy-meta"></span></h2>
-    <p class="note">Each blocking (P0–P1) finding counts as fixed when the author changed its file before the same reviewer approved, and as dismissed when that reviewer approved with the file unchanged. Higher precision means more of a reviewer's blocking findings led to a change; check the settled count and interval before comparing reviewers. Only verdicts the recorder published count: a blocking reply with no recorded publication is of unknown publication and is left out.</p>
-    <div id="accuracy">Loading…</div></section>
   <section><h2>Time to finish</h2>
     <p class="note">The box spans the middle half of timed writes, the line inside marks the median, and the whisker ends at the time that 90% finished within. Shorter times are better for comparable work that lands.</p>
     <div id="boxes">Loading…</div></section>
-  <section><h2>Ukrainian tasks</h2>
-    <p class="note">These Ukrainian task classes report merged writes and how often reviewers approved. Prefer a higher landed share on comparable writes with enough tasks, and use review approval to understand reviewer behavior.</p>
-    <div id="ukrainian">Loading…</div></section>
-  <section><h2>Pool allowance</h2>
-    <p class="note">The live meter shows remaining allowance and reset time. Cool means more headroom, while hot and near cap flag pressure on the pool.</p>
+  <section><h2>Reviewer strictness <span class="meta" id="review-meta"></span></h2>
+    <p class="note">Higher points approve more often, and points farther right report more P0–P2 findings per review with a findings count. Compare similar assignments and read the intervals before calling a reviewer strict or lenient.</p>
+    <div id="strictness">Loading…</div></section>
+  <section id="pools-section"><h2>Pool allowance</h2>
+    <p class="note">The live meter shows remaining allowance and reset time, plus pace to reset. Cool means more headroom, while hot and near cap flag pressure on the pool. <a href="/subscriptions">Full per-account pacing on Subscriptions</a>.</p>
     <div id="pools">Loading…</div>
     <h3>Allowance spent</h3>
     <p class="note">These tasks had pool readings, and resets or overlaps can leave their usage unknown. Lower points per landed task are better for comparable work.</p>
     <div id="allowance">Loading…</div></section>
-  <section><h2>Author or reviewer? <span class="meta" id="matrix-meta"></span></h2>
-    <p class="note">Each cell shows the share of an author's PRs that the named reviewer approved first time. Read down one reviewer column in a single class for higher first-round approval, and check the count before comparing.</p>
-    <label>Review class <select id="matrix-class"><option value="all">all classes</option></select></label>
-    <div id="matrix">Loading…</div></section>
-  <section><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
-    <p class="note">The count above includes settled writes for this selection. Compare models or effort levels on higher landed share, fewer failed runs and fewer hours per merge for similar work.</p>
-    <div id="write">Loading…</div></section>
-  <section><h2>Never started</h2>
-    <p class="note">These counts group dispatches refused before execution by cause and role. Fewer refusals generally mean fewer dispatches lost before work starts.</p>
-    <div id="never-started">Loading…</div></section>
-  <section><h2>Reviews <span class="meta" id="reviews-meta"></span></h2>
-    <p class="note">The count above includes settled reviews and other read-only tasks. Evidence absent counts tasks with neither review metadata nor a readable verdict. Look for fewer unreadable or unfinished results. Compare approval and findings with the sample size and type of review in mind.</p>
-    <div id="review">Loading…</div>
-    <div id="unparsed-samples"></div></section>
-  <section><h2>Compare reviewer levels</h2>
+  <section class="wide" id="neon-section"><h2>Neon medium against high</h2>
+    <p class="note">Compare Neon medium and high on write landings, reviewer approvals and typical runtime. Use the counts and approval intervals before favoring a setting, and compare approvals only for similar review work.</p>
+    <div id="neon">Loading…</div>
+    <p class="note" id="new-models"></p></section>
+  <section class="wide" id="accuracy-section"><h2>Reviewer accuracy <span class="meta" id="accuracy-meta"></span></h2>
+    <p class="note">Each blocking (P0–P1) finding counts as fixed when the author changed its file before the same reviewer approved, and as dismissed when that reviewer approved with the file unchanged. Higher precision means more of a reviewer's blocking findings led to a change; check the settled count and interval before comparing reviewers. Only verdicts the recorder published count: a blocking reply with no recorded publication is of unknown publication and is left out.</p>
+    <div id="accuracy">Loading…</div></section>
+  <section class="wide"><h2>Compare reviewer levels</h2>
     <p class="note">Compare recorded reviewer effort levels by readable results, first-round approval, runtime and usage linked to landings. Look for more readable results and lower time or allowance cost on similar work with enough observations.</p>
     <label>Reviewer model <select id="level-model"></select></label>
     <div id="levels">Loading…</div></section>
-  <section><h2>Reviewed PRs <span class="meta" id="author-meta"></span></h2>
+  <section><h2>Ukrainian tasks</h2>
+    <p class="note">These Ukrainian task classes report merged writes and how often reviewers approved. Prefer a higher landed share on comparable writes with enough tasks, and use review approval to understand reviewer behavior.</p>
+    <div id="ukrainian">Loading…</div></section>
+  <section><h2>Never started</h2>
+    <p class="note">These counts group dispatches refused before execution by cause and role. Fewer refusals generally mean fewer dispatches lost before work starts.</p>
+    <div id="never-started">Loading…</div></section>
+  <section class="wide"><h2>Author or reviewer? <span class="meta" id="matrix-meta"></span></h2>
+    <p class="note">Each cell shows the share of an author's PRs that the named reviewer approved first time. Read down one reviewer column in a single class for higher first-round approval, and check the count before comparing.</p>
+    <label>Review class <select id="matrix-class"><option value="all">all classes</option></select></label>
+    <div id="matrix">Loading…</div></section>
+  <section class="wide"><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
+    <p class="note">The count above includes settled writes for this selection. Compare models or effort levels on higher landed share, fewer failed runs and fewer hours per merge for similar work.</p>
+    <div id="write">Loading…</div></section>
+  <section class="wide"><h2>Reviews <span class="meta" id="reviews-meta"></span></h2>
+    <p class="note">The count above includes settled reviews and other read-only tasks. Evidence absent counts tasks with neither review metadata nor a readable verdict. Look for fewer unreadable or unfinished results. Compare approval and findings with the sample size and type of review in mind.</p>
+    <div id="review">Loading…</div>
+    <div id="unparsed-samples"></div></section>
+  <section class="wide"><h2>Reviewed PRs <span class="meta" id="author-meta"></span></h2>
     <p class="note">The count above covers reviewed PRs for the shown authors, and higher first-round approval and fewer rounds are better for similar PRs. After a blocked first round, the percentages show approval on a new head, approval on the same head, or no approval in the window.</p>
     <div id="author">Loading…</div></section>
-  <section><h2>Authors by risk tier <span class="meta" id="risk-meta"></span></h2>
+  <section class="wide"><h2>Authors by risk tier <span class="meta" id="risk-meta"></span></h2>
     <p class="note">Author figures from published reviews only, split by the risk tier of each PR's first published review. Compare authors within one tier, where the work is alike; higher first-round approval and fewer findings per PR are better.</p>
     <div id="risk">Loading…</div></section>
-  <section><details><summary>What the records can tell you</summary><div id="limits" class="note"></div></details>
+  <section class="wide"><details><summary>What the records can tell you</summary><div id="limits" class="note"></div></details>
     <p class="note" id="idle"></p></section>
 </main>
 <script src="/machinery.js"></script>
@@ -338,21 +380,31 @@ function wasteList(items) {
 const PALETTE_SIZE = 8;
 const SERIES_DASHES = ["", "8 4", "3 3", "9 3 2 3", "2 4", "6 3 2 3", "10 5", "4 2"];
 let modelSeries = new Map();
-function weeklyNames(points) {
+function weeklyNames(points, key = "tasks") {
   const totals = new Map();
-  for (const point of points) totals.set(point.model, (totals.get(point.model) || 0) + point.tasks);
+  for (const point of points) totals.set(point.model, (totals.get(point.model) || 0) + (point[key] || 0));
   return [...totals].filter(([, count]) => count >= lowBelow())
     .sort(([a, an], [b, bn]) => bn - an || a.localeCompare(b)).map(([name]) => name);
 }
-function setModelSeries(data) {
-  const names = [...new Set(data.models.map((r) => r.model))].sort();
-  modelSeries = new Map([...new Set([...weeklyNames(data.charts?.trends || []).slice(0, 6), ...names])]
-    .map((name, index) => [name, index]));
+function ciOverlap(a, b) {
+  return Array.isArray(a) && Array.isArray(b) && a.length === 2 && b.length === 2 && a[0] <= b[1] && b[0] <= a[1];
 }
-function seriesColor(name) { return `var(--series-${modelSeries.get(name) % PALETTE_SIZE})`; }
+function setModelSeries(data) {
+  const names = [...new Set([
+    ...data.models.map((r) => r.model),
+    ...(data.authors || []).map((a) => a.model),
+  ])].sort();
+  const trendsList = data.charts?.trends || [];
+  modelSeries = new Map([...new Set([
+    ...weeklyNames(trendsList, "tasks").slice(0, 6),
+    ...weeklyNames(trendsList, "prs").slice(0, 6),
+    ...names,
+  ])].map((name, index) => [name, index]));
+}
+function seriesColor(name) { return `var(--series-${(modelSeries.get(name) || 0) % PALETTE_SIZE})`; }
 function marker(name, x, y, hollow = false) {
   const color = seriesColor(name), fill = hollow ? "var(--card)" : color;
-  const shape = Math.floor(modelSeries.get(name) / PALETTE_SIZE) % 4;
+  const shape = Math.floor((modelSeries.get(name) || 0) / PALETTE_SIZE) % 4;
   const attrs = `stroke="${color}" fill="${fill}" stroke-width="2"`;
   if (shape === 1) return `<rect x="${x - 4}" y="${y - 4}" width="8" height="8" ${attrs}/>`;
   if (shape === 2) return `<path d="M ${x} ${y - 5} l 5 9 h -10 Z" ${attrs}/>`;
@@ -365,7 +417,7 @@ function modelKey(name, hollow) {
 function svgChart(width, height, label, body) {
   return `<svg class="chart" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="${label}">${body}</svg>`;
 }
-function chartWidth(id) { return Math.min(1000, $(id).clientWidth); }
+function chartWidth(id) { return Math.max(260, Math.min(1000, $(id).clientWidth || 320)); }
 function niceScale(maximum, width) {
   const ideal = (maximum || 1) / (width < 400 ? 4 : 6);
   const exponent = Math.floor(Math.log10(ideal)), base = 10 ** exponent;
@@ -424,41 +476,187 @@ function scatter(points, id, yLabel, xLabel, connect = false) {
     + `<div class="legend">${legend}</div>`
     + (shared ? `<p class="note">A plus marks models at the same position.</p><ul class="note">${shared}</ul>` : "");
 }
-function pareto(points) {
-  const shown = (points || []).filter((p) => keepModel(p.model));
+function paretoClasses(data) {
+  const select = $("pareto-class"), chosen = select.value;
+  const jobsList = data.charts?.jobs || [];
+  select.innerHTML = '<option value="all">All classes (PR approval)</option>'
+    + jobsList.map((job) => `<option value="${esc(job.class)}">${esc(job.class)} (${num(job.tasks)} tasks)</option>`).join("");
+  select.value = jobsList.some((job) => job.class === chosen) ? chosen : "all";
+}
+function exactHours(item) {
+  const value = item.hours_exact !== undefined && item.hours_exact !== null ? item.hours_exact : item.hours;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+function displayHours(item) {
+  const exact = exactHours(item);
+  if (exact === null) return "—";
+  if (exact > 0 && exact < 0.005) return "&lt;0.01";
+  return num(item.hours !== undefined && item.hours !== null ? item.hours : exact, 2);
+}
+function pareto(data) {
+  const charts = data.charts || {};
+  const cls = $("pareto-class")?.value || "all";
+  const axis = $("pareto-x")?.value || "hours";
+  const xWrap = $("pareto-x-wrap");
+  if (xWrap) xWrap.hidden = cls !== "all";
+  if (cls !== "all") {
+    const job = (charts.jobs || []).find((entry) => entry.class === cls);
+    const allTimed = (job?.models || []).filter((m) => {
+      const h = exactHours(m);
+      return h !== null && h > 0;
+    });
+    const shown = allTimed.filter((m) => keepModel(m.model));
+    if (!shown.length) return `<p class="muted">Not enough data in ${esc(cls)}: no model has both timed wall hours and a landed task in this selection.</p>`;
+    const frontier = shown.filter((m) => m.frontier);
+    const frontierNames = frontier.map((m) => esc(m.model)).join(", ");
+    const shownHasEligible = shown.some((m) => !m.low_sample);
+    const frontierNote = frontier.length > 1 ? `The dashed line connects the frontier models in ${esc(cls)} (${frontierNames}).`
+      : frontier.length === 1 ? `${frontierNames} alone is on the frontier for ${esc(cls)} among the models shown.`
+        : shownHasEligible ? `None of the models shown is on the window's frontier for ${esc(cls)}.`
+          : `Not enough data for a frontier in ${esc(cls)} (needs at least ${lowBelow()} tasks and a timed merge per model).`;
+    const rows = shown.map((m) => `<tr><td>${modelKey(m.model, m.low_sample)}${m.low_sample ? LOW : ""}</td>`
+      + cell(displayHours(m)) + cell(share(m.rate, m.tasks)) + cell(ciText(m.ci))
+      + cell(num(m.tasks)) + cell(num(m.landed)) + `<td>${m.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
+    return scatter(shown.map((m) => ({...m, x: exactHours(m), y: m.rate, ci: m.ci})),
+      "chart", `Landed share (${esc(cls)})`, "Recorded hours per merge →", frontier.length > 1)
+      + `<p class="note">Hollow markers have fewer than ${lowBelow()} tasks in ${esc(cls)}. ${frontierNote} First-round PR approval is not split by write job class because review rows record profile/risk.</p>`
+      + values(`Landed share and cost values in ${esc(cls)}`, ["Model", "Hours per merge", "Landed %", "Interval", "Tasks", "Landed", "Ranking"], rows, [0, 6]);
+  }
+  if (axis === "speed") {
+    const rawSpeed = Array.isArray(charts.speed_quality)
+      ? charts.speed_quality
+      : (charts.pareto || []).map((p) => ({
+        ...p,
+        low_sample: p.speed_low_sample !== undefined ? p.speed_low_sample : p.low_sample,
+        frontier: p.speed_frontier !== undefined ? p.speed_frontier : false,
+      }));
+    const allSpeed = rawSpeed.filter((p) => p.median_seconds !== null && p.median_seconds !== undefined && p.median_seconds > 0);
+    const shown = allSpeed.filter((p) => keepModel(p.model));
+    if (!shown.length) return '<p class="muted">No model has both timed write durations and a reviewed PR in this window.</p>';
+    const frontier = shown.filter((p) => p.frontier);
+    const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
+    const shownHasEligible = shown.some((p) => !p.low_sample);
+    const frontierNote = frontier.length > 1 ? `The dashed line connects the speed/approval frontier models (${frontierNames}).`
+      : frontier.length === 1 ? `${frontierNames} alone is on the speed/approval frontier among the models shown.`
+        : shownHasEligible ? "None of the models shown is on the window's speed/approval frontier."
+          : `Not enough data for a speed/approval frontier (needs at least ${lowBelow()} timed writes and ${lowBelow()} reviewed PRs per model).`;
+    const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
+      + cell(mins(p.median_seconds)) + cell(num(p.timed_n)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
+      + cell(num(p.prs)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
+    return scatter(shown.map((p) => ({...p, x: p.median_seconds / 60, y: p.approval, ci: p.approval_ci})),
+      "chart", "First-round approval", "Median write minutes →", frontier.length > 1)
+      + `<p class="note">Hollow markers have fewer than ${lowBelow()} timed writes or reviewed PRs. ${frontierNote} Includes every write model with timed runs and reviewed PRs, even when hours per merge is unavailable; no composite speed/quality score is computed.</p>`
+      + values("Approval and speed values by model", ["Model", "Median min", "Timed writes", "Approval", "Interval", "Reviewed PRs", "Ranking"], rows, [0, 6]);
+  }
+  const points = charts.pareto || [];
+  const shown = points.filter((p) => keepModel(p.model));
   if (!shown.length) return '<p class="muted">No model has both timed wall hours and a reviewed PR in this window.</p>';
   const frontier = shown.filter((p) => p.frontier);
   const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
+  const shownHasEligible = shown.some((p) => !p.low_sample);
   const frontierNote = frontier.length > 1 ? `The dashed line connects the frontier models (${frontierNames}).`
     : frontier.length === 1 ? `${frontierNames} alone is on the window's frontier among the models shown.`
-      : "None of the models shown is on the window's frontier.";
+      : shownHasEligible ? "None of the models shown is on the window's frontier."
+        : `Not enough data for a frontier in this window (needs at least ${lowBelow()} landed tasks and ${lowBelow()} reviewed PRs per model).`;
   const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
-    + cell(num(p.hours, 2)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
+    + cell(displayHours(p)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
     + cell(num(p.prs)) + cell(num(p.landed)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
-  return scatter(shown.map((p) => ({...p, x: p.hours, y: p.approval, ci: p.approval_ci})),
+  return scatter(shown.map((p) => ({...p, x: exactHours(p) ?? p.hours, y: p.approval, ci: p.approval_ci})),
     "chart", "First-round approval", "Recorded hours per merge →", frontier.length > 1)
     + `<p class="note">Hollow markers have a low sample. A green ring marks a frontier model, which no eligible model beats on cost and approval together. ${frontierNote}</p>`
     + values("Approval and cost values by model", ["Model", "Hours per merge", "Approval", "Interval", "Reviewed PRs", "Landed", "Ranking"], rows, [0, 6]);
 }
 function jobs(data) {
   const charts = data.charts || {};
-  const rows = (charts.jobs || []).flatMap((job) => {
+  const filter = picked();
+  const matrixRows = [];
+  const detailRows = [];
+  let detailCount = 0;
+  for (const job of charts.jobs || []) {
     const landedShare = (model) => model.landed / model.tasks;
     const ranked = [...job.models].sort((a, b) =>
       landedShare(b) - landedShare(a) || b.tasks - a.tasks || a.model.localeCompare(b.model));
     const models = ranked.filter((m) => keepModel(m.model));
-    if (!models.length) return [];
-    const best = ranked.find((m) => m.tasks >= lowBelow() && m.landed > 0);
-    return [`<tr class="group"><th colspan="6">${esc(job.class)}</th></tr>`, ...models.map((m) => {
+    if (!models.length) continue;
+    const eligible = ranked.filter((m) => m.tasks >= lowBelow() && m.landed > 0);
+    const best = eligible[0] || null;
+    const winners = best ? eligible.filter((m) => landedShare(m) === landedShare(best)) : [];
+    const runnerUp = best ? eligible.find((m) => landedShare(m) < landedShare(best)) : null;
+    const maxN = Math.max(...ranked.map((m) => m.tasks), 0);
+    const totalLanded = ranked.reduce((sum, m) => sum + (m.landed || 0), 0);
+    const hasQualifiedSample = ranked.some((m) => m.tasks >= lowBelow());
+    if (!filter) {
+      if (!best) {
+        const reason = totalLanded === 0
+          ? `<span class="warn">No landed tasks</span> <span class="muted">(0 of ${num(job.tasks)})</span>`
+          : hasQualifiedSample
+            ? `<span class="warn">No eligible pick</span> <span class="muted">(${num(totalLanded)} landed only in n &lt; ${lowBelow()})</span>`
+            : `<span class="warn">Not enough data</span> <span class="muted">(max n = ${num(maxN)}, needs ${lowBelow()})</span>`;
+        matrixRows.push(`<tr><td><b>${esc(job.class)}</b></td>${cell(num(job.tasks))}`
+          + `<td>${reason}</td>`
+          + `${cell("—")}${cell("—")}<td>—</td></tr>`);
+      } else {
+        const pickNames = winners.length === 1
+          ? `<b>${esc(best.model)}</b> <strong class="good">★ Best</strong>`
+          : winners.map((w) => `<div><b>${esc(w.model)}</b> <strong class="good">★ Best</strong></div>`).join("");
+        const pickShare = winners.length === 1
+          ? `${num(best.rate * 100)}% <span class="muted">(${num(best.landed)}/${num(best.tasks)}, ${ciText(best.ci)})</span>`
+          : winners.map((w) => `<div>${esc(w.model)}: ${num(w.rate * 100)}% <span class="muted">(${num(w.landed)}/${num(w.tasks)}, ${ciText(w.ci)})</span></div>`).join("");
+        const pickHours = winners.length === 1
+          ? displayHours(best)
+          : winners.map((w) => `<div>${esc(w.model)}: ${displayHours(w)}</div>`).join("");
+        const overlapping = runnerUp ? winners.filter((w) => ciOverlap(w.ci, runnerUp.ci)) : [];
+        let overlap = "";
+        if (overlapping.length) {
+          overlap = winners.length === 1
+            ? ' <span class="low">CI overlaps</span>'
+            : overlapping.length === winners.length
+              ? ' <span class="low">CI overlaps all tied picks</span>'
+              : ` <span class="low">CI overlaps ${overlapping.map((w) => esc(w.model)).join(", ")}</span>`;
+        }
+        const runnerText = runnerUp
+          ? `${esc(runnerUp.model)} · ${num(runnerUp.rate * 100)}% <span class="muted">(${num(runnerUp.landed)}/${num(runnerUp.tasks)}, ${ciText(runnerUp.ci)})</span>${overlap}`
+          : '<span class="muted">None with n ≥ ' + lowBelow() + "</span>";
+        matrixRows.push(`<tr class="best"><td><b>${esc(job.class)}</b></td>${cell(num(job.tasks))}`
+          + `<td>${pickNames}</td>`
+          + `${cell(pickShare, "good")}${cell(pickHours)}<td>${runnerText}</td></tr>`);
+      }
+    } else {
+      const m = models[0];
       const winner = best && m.tasks >= lowBelow() && landedShare(m) === landedShare(best);
-      return `<tr class="${winner ? "best" : ""}"><td>${esc(m.model)}${winner ? ' <strong class="good">★ Best</strong>' : ""}</td>`
+      const classBest = best
+        ? winners.map((w) => {
+          const hrs = displayHours(w);
+          return `${esc(w.model)} (${num(w.rate * 100)}%, ${num(w.landed)}/${num(w.tasks)}, ${ciText(w.ci)}${hrs !== "—" ? `, ${hrs} h/merge` : ""})`;
+        }).join("; ")
+        : totalLanded === 0
+          ? '<span class="warn">No landed tasks</span>'
+          : hasQualifiedSample
+            ? `<span class="warn">No eligible pick</span> <span class="muted">(landings only in n &lt; ${lowBelow()})</span>`
+            : '<span class="warn">Not enough data</span>';
+      matrixRows.push(`<tr class="${winner ? "best" : ""}"><td><b>${esc(job.class)}</b></td>`
+        + `<td>${esc(m.model)}${winner ? ' <strong class="good">★ Best</strong>' : ""}</td>`
+        + `${cell(nOf({n: m.tasks, low_sample: m.low_sample}))}`
+        + `${cell(`${share(m.rate, m.tasks)} <span class="muted">(${ciText(m.ci)})</span>`, winner ? "good" : "")}`
+        + `${cell(displayHours(m))}<td>${classBest}</td></tr>`);
+    }
+    detailRows.push(`<tr class="group"><th colspan="6">${esc(job.class)} (${num(job.tasks)} tasks)</th></tr>`);
+    for (const m of models) {
+      const winner = best && m.tasks >= lowBelow() && landedShare(m) === landedShare(best);
+      detailCount += 1;
+      detailRows.push(`<tr class="${winner ? "best" : ""}"><td>${esc(m.model)}${winner ? ' <strong class="good">★ Best</strong>' : ""}</td>`
         + cell(nOf({n: m.tasks, low_sample: m.low_sample})) + cell(m.landed) + cell(share(m.rate, m.tasks), winner ? "good" : "")
-        + cell(ciText(m.ci)) + cell(num(m.hours, 2)) + "</tr>";
-    })];
-  });
+        + cell(ciText(m.ci)) + cell(displayHours(m)) + "</tr>");
+    }
+  }
   $("jobs-meta").textContent = `${charts.jobs_low_n || 0} classes across all models are below the ${lowBelow()}-task cutoff`;
-  return rows.length ? table(["Model", "Tasks", "Landed", "Landed %", "Interval", "Hours per merge"], rows)
-    : '<p class="muted">Not enough data yet for a job class in this selection.</p>';
+  if (!matrixRows.length) return '<p class="muted">Not enough data yet for a job class in this selection.</p>';
+  const summaryTable = !filter
+    ? table(["Job class", "Tasks", "Best eligible pick", "Landed % (95% CI)", "Hours / merge", "Runner-up"], matrixRows, [0, 2, 5])
+    : table(["Job class", "Model", "Tasks", "Landed % (95% CI)", "Hours / merge", "Window best"], matrixRows, [0, 1, 5]);
+  return summaryTable
+    + values(`All models by job class (${num(detailCount)} rows)`,
+      ["Model", "Tasks", "Landed", "Landed %", "Interval", "Hours per merge"], detailRows);
 }
 function statusColor(key) { return `--status-color:var(${STATUS[key][1]})`; }
 function failures(items) {
@@ -487,10 +685,15 @@ function isoWeekStart(week) {
 }
 function trends(items, window) {
   const all = items || [];
-  const eligible = weeklyNames(all).filter(keepModel);
+  const isApproval = ($("trends-metric")?.value || "landed") === "approval";
+  const countKey = isApproval ? "prs" : "tasks";
+  const numKey = isApproval ? "first_approved" : "landed";
+  const eligible = weeklyNames(all, countKey).filter(keepModel);
   const names = eligible.slice(0, 6);
-  const shown = all.filter((p) => names.includes(p.model) && p.tasks > 0);
-  if (!shown.length) return `<p class="muted">Not enough data yet for weekly comparisons. A model needs ${lowBelow()} write tasks in the window.</p>`;
+  const shown = all.filter((p) => names.includes(p.model) && (p[countKey] || 0) > 0);
+  if (!shown.length) {
+    return `<p class="muted">Not enough data yet for weekly ${isApproval ? "approval" : "landing"} comparisons. A model needs ${lowBelow()} ${isApproval ? "reviewed PRs" : "write tasks"} in the window.</p>`;
+  }
   const weeks = [...new Set(shown.map((p) => p.week))].sort();
   const times = new Map(weeks.map((week) => [week, isoWeekStart(week)]));
   const since = Date.parse(window.since), until = Date.parse(window.until);
@@ -499,8 +702,8 @@ function trends(items, window) {
   const W = chartWidth("trends"), H = 235, left = 43, right = W - 26, top = 15, bottom = H - 31;
   const sx = (time) => left + (last === first ? 0.5 : (time - first) / (last - first)) * (right - left);
   const sy = (value) => bottom - value * (bottom - top);
-  const low = (p) => p.tasks < lowBelow();
-  const px = (p) => sx(times.get(p.week)), py = (p) => sy(p.landed / p.tasks);
+  const low = (p) => (p[countKey] || 0) < lowBelow();
+  const px = (p) => sx(times.get(p.week)), py = (p) => sy(p[numKey] / p[countKey]);
   const labels = [];
   let previousX = -Infinity;
   for (const week of weeks) {
@@ -524,27 +727,49 @@ function trends(items, window) {
     + `${marker(name, 12, 7)}</svg>${esc(name)}</span>`).join("");
   const rows = shown.sort((a, b) => b.week.localeCompare(a.week) || a.model.localeCompare(b.model)).map((p) =>
     `<tr><td>${modelKey(p.model, low(p))}</td><td>${esc(p.week)}${partial(p.week) ? " (partial)" : ""}</td>`
-    + cell(num(p.landed)) + cell(num(p.tasks)) + cell(share(p.landed / p.tasks, p.tasks)) + "</tr>");
-  return svgChart(W, H, "Weekly landed share", percentTicks(sy, left, right) + labels.join("") + series)
+    + cell(num(p.landed)) + cell(num(p.tasks)) + cell(p.tasks ? share(p.landed / p.tasks, p.tasks) : "—")
+    + cell(num(p.first_approved)) + cell(num(p.prs)) + cell(p.prs ? share(p.first_approved / p.prs, p.prs) : "—") + "</tr>");
+  return svgChart(W, H, isApproval ? "Weekly first-round PR approval" : "Weekly landed share", percentTicks(sy, left, right) + labels.join("") + series)
     + `<div class="legend">${legend}</div>`
     + '<p class="note">An asterisk means the window covers only part of that week. Hollow points have a low sample, and gaps mean no comparable result.</p>'
-    + (eligible.length > names.length ? `<p class="note">${eligible.length - names.length} more eligible models are in the write table.</p>` : "")
-    + values("Landed counts and sample sizes by week", ["Model", "UTC week", "Landed", "Tasks", "Landed %"], rows, [0, 1]);
+    + (eligible.length > names.length ? `<p class="note">${eligible.length - names.length} more eligible models are in the ${isApproval ? "reviewed PRs" : "write"} table.</p>` : "")
+    + values("Weekly counts and sample sizes", ["Model", "UTC week", "Landed", "Writes", "Landed %", "1st-round", "PRs", "Approval %"], rows, [0, 1]);
 }
 function neon(data) {
   const block = data.charts?.neon;
   if (!block) return '<p class="muted">Neon is absent from this window.</p>';
-  const rows = block.arms.map((arm) => `<tr><td>${esc(arm.effort)}${arm.low_sample ? LOW : ""}</td>`
-    + cell(nOf({n: arm.write_tasks, low_sample: arm.write_tasks < lowBelow()})) + cell(arm.write_landed, arm.write_landed ? "good" : "")
-    + cell(nOf({n: arm.review_results, low_sample: arm.review_results < lowBelow()}))
-    + cell(share(arm.approval, arm.review_results)) + cell(ciText(arm.approval_ci)) + cell(mins(arm.median_seconds)) + "</tr>");
+  const rows = block.arms.map((arm) => {
+    const revTasks = arm.review_tasks !== undefined ? arm.review_tasks : arm.review_results;
+    const revTiming = arm.review_timed_n
+      ? `${mins(arm.review_median_seconds)} / ${mins(arm.review_p90_seconds)} <span class="muted">(${num(arm.review_timed_n)})</span>${arm.review_timed_n < lowBelow() ? LOW : ""}`
+      : "—";
+    const writeTiming = arm.write_timed_n
+      ? `${mins(arm.write_median_seconds)} <span class="muted">(${num(arm.write_timed_n)})</span>${arm.write_timed_n < lowBelow() ? LOW : ""}`
+      : "—";
+    const blocking = arm.blocking_per_review !== null && arm.blocking_per_review !== undefined
+      ? withSample(num(arm.blocking_per_review, 2), arm.findings_n) : "—";
+    const p0p2 = arm.p0_p2_per_review !== null && arm.p0_p2_per_review !== undefined
+      ? withSample(num(arm.p0_p2_per_review, 2), arm.findings_n) : "—";
+    return `<tr><td>${esc(arm.effort)}${arm.low_sample ? LOW : ""}</td>`
+      + cell(arm.write_tasks ? `${num(arm.write_landed)} / ${num(arm.write_tasks)}${arm.write_tasks < lowBelow() ? LOW : ""}` : "0")
+      + cell(`${num(arm.review_results)} / ${num(revTasks)}${arm.review_results < lowBelow() ? LOW : ""}`)
+      + cell(arm.review_results ? `${share(arm.approval, arm.review_results)} <span class="muted">(${ciText(arm.approval_ci)})</span>` : "—")
+      + cell(blocking) + cell(p0p2) + cell(revTiming) + cell(writeTiming) + "</tr>";
+  });
+  const [medium, high] = block.arms;
+  let overlapNote = "";
+  if (medium && high && medium.review_results >= lowBelow() && high.review_results >= lowBelow()
+      && medium.approval_ci && high.approval_ci) {
+    overlapNote = ciOverlap(medium.approval_ci, high.approval_ci)
+      ? " Their 95% approval intervals overlap." : " Their 95% approval intervals do not overlap.";
+  }
   const sample = block.enough
-    ? "Compare each measure only when both levels have enough observations for that measure."
+    ? `Compare each measure only when both levels have enough observations for that measure.${overlapNote}`
     : `Both levels need ${lowBelow()} review results or ${lowBelow()} write tasks of the same kind for a comparison.`;
   const hydrogen = data.charts.hydrogen;
   const context = hydrogen ? `<p class="note">For context, Hydrogen landed ${num(hydrogen.landed)} of ${num(hydrogen.tasks)} write tasks in this window. Tasks by effort ${hydrogen.efforts.map((e) => `${esc(e.effort)} ${num(e.tasks)}`).join(", ")}.${hydrogen.tasks < lowBelow() ? LOW : ""}</p>` : "";
   return `<p class="note${block.enough ? "" : " warn"}">${sample}</p>`
-    + table(["Effort", "Writes", "Landed", "Review results", "Approval", "Interval", "Median min"], rows) + context;
+    + table(["Effort", "Writes (landed/total)", "Reviews (parsed/total)", "Approval (95% CI)", "Blocking / rev", "P0–P2 / rev", "Review med / p90 min", "Write med min"], rows) + context;
 }
 function strictness(items) {
   const shown = (items || []).filter((p) => p.approve !== null && p.p0_p2 !== null && keepModel(p.model));
@@ -606,18 +831,23 @@ function boxes(items) {
     const bar = scale.ticks.map((tick) => `<line class="grid" x1="${sx(tick)}" x2="${sx(tick)}" y1="0" y2="20"/>`).join("")
       + `<line x1="${p75}" x2="${p90}" y1="10" y2="10" stroke="${color}" stroke-width="2"/>`
       + `<line x1="${p90}" x2="${p90}" y1="7" y2="13" stroke="${color}" stroke-width="2"/>` + box;
+    const landedNote = item.tasks
+      ? ` · ${share(item.landed_rate, item.tasks)} landed (${num(item.tasks)})`
+      : "";
     return `<div class="duration-row" style="width:${W}px"><b>${esc(item.model)}</b>`
-      + `<span>${mins(item.median)} min median ${item.low_sample ? LOW : ""}</span></div>`
+      + `<span>${mins(item.median)} min median${landedNote}${item.low_sample ? LOW : ""}</span></div>`
       + `<svg class="chart" width="${W}" height="20" viewBox="0 0 ${W} 20" aria-hidden="true">${bar}</svg>`;
   }).join("");
   const axis = svgChart(W, 43, "Write task duration in minutes", verticalTicks(scale, sx, 0, 5)
     + `<text x="${(left + right) / 2}" y="37" text-anchor="middle">Minutes →</text>`);
   const rows = shown.map((item) => `<tr><td>${esc(item.model)}</td>${cell(nOf(item))}`
-    + [item.p25, item.median, item.p75, item.p90].map((v) => cell(mins(v))).join("") + "</tr>");
+    + [item.p25, item.median, item.p75, item.p90].map((v) => cell(mins(v))).join("")
+    + cell(item.tasks ? share(item.landed_rate, item.tasks) : "—")
+    + cell(item.tasks ? num(item.tasks) : "—") + "</tr>");
   return bars + axis
     + '<p class="note">A circle marks a box too narrow to see at this scale. Low-sample rows appear in grey.</p>'
     + (timed.length > shown.length ? '<p class="note">Shows the 12 busiest timed models, ordered by median. See Write tasks for the rest.</p>' : "")
-    + values("Duration values by model", ["Model", "Timed tasks", "25th percentile (min)", "Median (min)", "75th percentile (min)", "90th percentile (min)"], rows);
+    + values("Duration and delivery values by model", ["Model", "Timed tasks", "25th percentile (min)", "Median (min)", "75th percentile (min)", "90th percentile (min)", "Landed %", "Writes"], rows);
 }
 function ukrainian(items) {
   const shown = (items || []).filter((item) => keepModel(item.model));
@@ -689,7 +919,7 @@ function renderCoverage(data) {
 }
 function renderCharts() {
   const {data} = current, charts = data.charts || {};
-  for (const [id, markup] of [["chart", pareto(charts.pareto)], ["trends", trends(charts.trends, data.window)],
+  for (const [id, markup] of [["chart", pareto(data)], ["trends", trends(charts.trends, data.window)],
     ["strictness", strictness(charts.reviewers)], ["boxes", boxes(charts.durations)]]) {
     const chart = $(id), expanded = chart.querySelector("details[open]");
     chart.innerHTML = markup;
@@ -753,7 +983,8 @@ function render() {
   $("author").innerHTML = table(["Author model", "PRs", "Rounds / PR", "Approved eventually", "Approved first round",
     "Blocked first round", "New head", "Same head", "No approval", "Blocking / PR", "P0–P2 / PR"],
     grouped(authors, (a) => [`<tr><td>${named(a)}</td>${cell(nOf({n: a.prs, low_sample: a.low_sample}))}${cell(rate(a.rounds_per_pr))}`
-      + `${cell(pct(a.approved_eventually))}${cell(pct(a.first_round_approved), a.first_round_approved.value > 0 ? "good" : "")}${cell(a.after_blocked_first_round.blocked)}`
+      + `${cell(pct(a.approved_eventually))}${cell(pct(a.first_round_approved), a.first_round_approved.value > 0 ? "good" : "")}`
+      + `${cell(nOf({n: a.after_blocked_first_round.blocked, low_sample: a.after_blocked_first_round.blocked > 0 && a.after_blocked_first_round.blocked < lowBelow()}))}`
       + `${cell(after(a, "approved_on_new_head"))}${cell(after(a, "approved_on_same_head"))}${cell(after(a, "not_approved"))}`
       + `${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`], 11));
   const authorRisks = (data.author_risks || []).filter((a) => keepAuthor(a.model));
@@ -763,10 +994,11 @@ function render() {
   $("accuracy-meta").textContent = label;
   $("accuracy").innerHTML = accuracy(data);
   const allowance = (data.allowance || []).filter((a) => keepModel(a.model));
-  $("allowance").innerHTML = allowance.length ? table(["Pool", "Model", "Effort", "Tasks with readings", "Landed",
-    "Points spent", "Points per landed", "Overlapping tasks", "Reset crossed"], allowance.map((a) =>
-    `<tr><td>${esc(a.pool)}</td><td>${esc(a.model)}</td><td>${esc(a.effort)}</td>${cell(nOf({n: a.tasks, low_sample: a.tasks < lowBelow()}))}${cell(a.landed)}`
-    + `${cell(num(a.pct_points_spent, 1))}${cell(rate(a.pct_points_per_landed))}${cell(a.overlapped_tasks, a.overlapped_tasks ? "warn" : "")}${cell(a.reset_crossed, a.reset_crossed ? "warn" : "")}</tr>`), [0, 1, 2])
+  $("allowance").innerHTML = allowance.length ? values(`Allowance spent by pool and model (${num(allowance.length)} rows)`,
+    ["Pool", "Model", "Effort", "Tasks with readings", "Landed",
+      "Points spent", "Points per landed", "Overlapping tasks", "Reset crossed"], allowance.map((a) =>
+      `<tr><td>${esc(a.pool)}</td><td>${esc(a.model)}</td><td>${esc(a.effort)}</td>${cell(nOf({n: a.tasks, low_sample: a.tasks < lowBelow()}))}${cell(a.landed)}`
+      + `${cell(num(a.pct_points_spent, 1))}${cell(rate(a.pct_points_per_landed))}${cell(a.overlapped_tasks, a.overlapped_tasks ? "warn" : "")}${cell(a.reset_crossed, a.reset_crossed ? "warn" : "")}</tr>`), [0, 1, 2])
     : '<p class="muted">No write task in this window has both readings.</p>';
   $("idle").textContent = data.idle_catalog_models == null
     ? "Routed catalog models with no task in this window: unknown, because the model catalog could not be read."
@@ -775,28 +1007,84 @@ function render() {
     : "Every routed catalog model ran at least one task in this window.";
   updateTableScroll();
 }
-async function loadPools(allowance) {
+function formatPace(pace, responseStale = false) {
+  if (!pace || typeof pace !== "object") return {text: "—", tone: ""};
+  if (responseStale || pace.stale) return {text: "stale", tone: "warn"};
+  if (pace.pace_reason === "runs_out_before_reset") {
+    const at = typeof pace.runs_out_at === "string" && pace.runs_out_at.length >= 16
+      ? pace.runs_out_at.slice(0, 16).replace("T", " ") : null;
+    return {text: at ? `runs out ${at}` : "runs out before reset", tone: "warn"};
+  }
+  if (pace.pace_reason === "lasts_to_reset") return {text: "lasts to reset", tone: "good"};
+  return {text: "—", tone: ""};
+}
+function routingResponseStale(response, body) {
+  const diag = body && typeof body.diagnostics === "object" && body.diagnostics ? body.diagnostics : {};
+  if (diag.stale === true) return true;
+  if (typeof diag.data_age_s === "number" && typeof diag.stale_threshold_s === "number"
+      && diag.data_age_s > diag.stale_threshold_s) return true;
+  const ageHeader = response.headers.get("X-Snapshot-Age-S");
+  const boundHeader = response.headers.get("X-Snapshot-Stale-After-S");
+  const age = ageHeader !== null && ageHeader !== "" ? Number(ageHeader) : null;
+  const bound = boundHeader !== null && boundHeader !== "" ? Number(boundHeader) : null;
+  return age !== null && bound !== null && Number.isFinite(age) && Number.isFinite(bound) && age > bound;
+}
+async function loadPools(allowance, generation) {
   const node = $("pools");
+  const alertNode = $("quota-alerts");
+  const alertNote = $("quota-alerts-note");
   try {
     const response = await fetch("/api/state/routing-budget", {cache: "no-store"});
     const body = await response.json();
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (generation !== loadGeneration) return;
+    const responseStale = routingResponseStale(response, body);
     const landed = new Map();
     for (const row of allowance || []) landed.set(row.pool, (landed.get(row.pool) || 0) + (row.landed || 0));
     const agents = body.agents || {};
+    const quotaAlerts = [];
     const rows = Object.entries(agents).map(([name, info]) => {
       if (!info || typeof info !== "object") return "";
       const remaining = typeof info.remaining_pct === "number" ? info.remaining_pct : null;
       const resets = typeof info.resets_at === "string" ? info.resets_at : (info.pool_pace && info.pool_pace.resets_at) || null;
       const status = typeof info.status === "string" ? info.status : "unknown";
-      const tone = status === "cool" ? "good" : ["hot", "near_cap"].includes(status) ? "warn" : "";
-      return `<tr><td>${esc(name)}</td>${cell(remaining === null ? "—" : `${num(remaining, 1)}%`)}<td>${esc(resets ? String(resets).slice(0, 16).replace("T", " ") : "—")}</td>`
-        + `<td class="${tone}">${esc(status.replaceAll("_", " "))}</td>${cell(landed.get(name) || 0)}</tr>`;
+      const freshness = typeof info.freshness === "string" ? info.freshness : "unknown";
+      const laneFresh = !responseStale && freshness === "fresh" && !info.stale;
+      const paceObj = info.pool_pace && typeof info.pool_pace === "object" ? info.pool_pace : null;
+      const paceFresh = !responseStale && Boolean(paceObj) && paceObj.stale !== true;
+      const stalePacePromoted = Boolean(
+        paceObj && paceObj.stale === true && ["hot", "near_cap"].includes(paceObj.status) && paceObj.status === status,
+      );
+      const statusFresh = laneFresh && !stalePacePromoted;
+      const pace = formatPace(paceObj, responseStale);
+      const tone = statusFresh && status === "cool" ? "good" : statusFresh && ["hot", "near_cap"].includes(status) ? "warn" : "";
+      const statusPressure = statusFresh && (status === "near_cap" || status === "hot");
+      const pacePressure = paceFresh && paceObj.pace_reason === "runs_out_before_reset";
+      if (statusPressure || pacePressure) {
+        const parts = [];
+        if (statusPressure) parts.push(status.replaceAll("_", " "));
+        if (laneFresh && remaining !== null) parts.push(`${num(remaining, 1)}% left`);
+        if (pacePressure) parts.push(pace.text);
+        const severe = statusFresh && status === "near_cap";
+        quotaAlerts.push(`<a class="alert quota${severe ? " bad" : ""}" href="#pools-section">${esc(name)}: ${esc(parts.join(" · "))}</a>`);
+      }
+      const remCell = remaining === null ? '<span class="muted">unknown</span>' : `${num(remaining, 1)}%`;
+      const staleTag = responseStale ? "stale" : stalePacePromoted ? "stale pace" : !laneFresh ? freshness : null;
+      const statusText = `${esc(status.replaceAll("_", " "))}${staleTag ? ` <span class="low">${esc(staleTag)}</span>` : ""}`;
+      return `<tr><td>${esc(name)}</td>${cell(remCell)}<td class="${pace.tone}">${esc(pace.text)}</td>`
+        + `<td>${esc(resets ? String(resets).slice(0, 16).replace("T", " ") : "—")}</td>`
+        + `<td class="${tone}">${statusText}</td>${cell(landed.get(name) || 0)}</tr>`;
     }).filter(Boolean);
-    node.innerHTML = rows.length ? table(["Pool", "Remaining", "Resets (UTC)", "Status", "Landed tasks with a reading"], rows, [0, 2, 3])
+    alertNode.innerHTML = quotaAlerts.join("");
+    alertNote.hidden = !quotaAlerts.length;
+    const staleNote = responseStale ? '<p class="note warn">Quota snapshot is past its freshness bound; live quota alerts are suppressed.</p>' : "";
+    node.innerHTML = rows.length ? staleNote + table(["Pool", "Remaining", "Pace", "Resets (UTC)", "Status", "Landed tasks with a reading"], rows, [0, 2, 3, 4])
       + '<p class="note">The landed count is for this window and uses the exact pool name recorded for each task. A task reading can use a different name from the live meter.</p>'
       : '<p class="muted">The quota snapshot named no pool.</p>';
   } catch (err) {
+    if (generation !== loadGeneration) return;
+    alertNode.innerHTML = "";
+    alertNote.hidden = true;
     node.innerHTML = `<p class="muted">Quota snapshot unavailable (${esc(err.message)}).</p>`;
   }
   updateTableScroll();
@@ -874,6 +1162,7 @@ async function load() {
   if (names.includes(previous)) select.value = previous;
   current = {data, label, samples: new Map()};
   setModelSeries(data);
+  paretoClasses(data);
   matrixClasses(data);
   const levelModel = $("level-model"), previousModel = levelModel.value;
   levelModel.innerHTML = (data.review_levels || []).filter((entry) => keepModel(entry.model))
@@ -881,7 +1170,7 @@ async function load() {
   if ([...levelModel.options].some((option) => option.value === previousModel)) levelModel.value = previousModel;
   render();
   renderLevels();
-  loadPools(data.allowance);
+  loadPools(data.allowance, generation);
   const samples = await samplesPromise;
   if (generation !== loadGeneration || current === null) return;
   const pageWindow = sampleStamp(data.window);
@@ -893,9 +1182,25 @@ async function load() {
 }
 $("window").addEventListener("change", load);
 $("model").addEventListener("change", () => { render(); renderLevels(); });
+$("pareto-class").addEventListener("change", () => { if (current) { renderCharts(); updateTableScroll(); } });
+$("pareto-x").addEventListener("change", () => { if (current) { renderCharts(); updateTableScroll(); } });
+$("trends-metric").addEventListener("change", () => { if (current) { renderCharts(); updateTableScroll(); } });
 $("matrix-class").addEventListener("change", render);
 $("level-model").addEventListener("change", renderLevels);
+function updateStickyOffset() {
+  const header = document.querySelector("header");
+  if (!header) return;
+  const sticky = getComputedStyle(header).position === "sticky";
+  const offset = sticky ? Math.ceil(header.getBoundingClientRect().height) + 12 : 0;
+  document.documentElement.style.setProperty("--sticky-offset", `${offset}px`);
+}
+updateStickyOffset();
+if (typeof ResizeObserver !== "undefined") {
+  const header = document.querySelector("header");
+  if (header) new ResizeObserver(updateStickyOffset).observe(header);
+}
 window.addEventListener("resize", () => {
+  updateStickyOffset();
   if (current) renderCharts();
   updateTableScroll();
 });
