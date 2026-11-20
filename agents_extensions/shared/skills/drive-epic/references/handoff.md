@@ -87,8 +87,9 @@ are in scope; two residuals remain visible:
   paragraph name the authority drain in their own change. The existing core inbox
   block and its legacy counts stay exactly as they are.
 - Behavior 9's executing-review-at-first-push half. Owner: harness lane. Reopen
-  when the review-route policy names it. The existing launcher/hook test step and
-  execution-dependent review route remain binding.
+  when the review-route policy names it. Keep the launcher/hook test step and
+  use the [review brief's route table](../../review-loop/references/brief.md#commands-a-read-only-reviewer-can-run)
+  when choosing reviewer probes.
 
 ## Fleet-comms state — dual-aware, cutover is closed
 

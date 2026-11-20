@@ -93,6 +93,8 @@ The `/machinery` page links the installed version to
   Retain the release's npm cache and provisioned Node prefix alongside its
   wheelhouse, with the same current/previous-release retention policy. The
   prefix includes lock-verified package archives for offline integrity checks.
+- The wheel installs `.github/workflows/pins.txt` at `share/lu-machinery/ci/pins.txt`
+  under its environment.
 
 ## Dependency lock
 

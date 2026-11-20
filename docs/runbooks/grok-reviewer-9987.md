@@ -1,14 +1,14 @@
 # Native Grok reviewer permission incompatibility (#9987)
 
-The reviewer retains `auto` plus unconditional `Bash`, `Write` and `Edit`
-denies. It never enables `--always-approve` and exposes only `read_file`,
-`list_dir` and `grep` through `--tools`; no shell tool is exposed. The hook is
-a second layer for tracked-file reads only. The model is told to report any
-execution evidence it could not obtain; execution-dependent reviews go to
-Opus or Sol. No sandbox is used. Native Bash denial also blocks the literal
-commands retained by the guard for compatibility probes. The round-a stop
-diagnostics and `permission_cancelled` classification remain intact. The accountable driver,
-`claude-infra`, owns the unresolved review-completion outcome and escalation.
+This runbook records the historical native `grok` CLI permission probe.
+Current formal Grok reviews run through Cursor, which allows shell commands
+inside the read-only dispatch boundary. See the [current review routing](grok-formal-cf-isolation.md).
+
+The retained native profile used `auto` with unconditional `Bash`, `Write`,
+and `Edit` denies. It exposed `read_file`, `list_dir`, and `grep` through
+`--tools`. The hook separately restricted reads to tracked files. Without an OS
+sandbox, the native Bash deny also blocked the literal commands retained by the
+guard for compatibility probes.
 
 ## Reproduce without a paid model
 
@@ -97,9 +97,5 @@ code; the retained native Bash deny protects shell execution independently.
 Native read permissions do not
 replicate the guard's tracked-path containment if hooks fail.
 
-Residual owner: `claude-infra`, for routing documentation and review-completion
-follow-up. Grok reviewers remain read-only with no shell; execution-dependent
-reviews use Opus or Sol. The historical matrix does not certify live-model
-held-out review, independent approval, CI, merge or deployment. This final
-round checks only the four ordered text, tool-exposure and refusal-output fixes;
-other findings remain residuals on #9987.
+The historical matrix covers native CLI permissions. Review-completion and live
+tool evidence for current dispatch routes are tracked in machinery issue #24.

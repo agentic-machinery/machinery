@@ -26,8 +26,8 @@ of exactly the offending merge, with no other edits. Normal CI and the merge
 queue remain required. Exceptions follow the same policy and retain all gates.
 
 Label a source-only review static and state its unverified execution behavior.
-Keep the execution-dependent review route in [model-deltas](model-deltas.md);
-do not request an executing review solely because a path is integration code.
+Choose probes based on the change. See the [review brief's route table](../../review-loop/references/brief.md#commands-a-read-only-reviewer-can-run)
+for the commands each route can run.
 Never record an APPROVE over a pipeline `CHANGES_REQUESTED`; reconcile the finding
 through the author and obtain fresh exact-head review after any content change.
 
