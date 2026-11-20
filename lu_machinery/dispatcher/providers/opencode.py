@@ -22,28 +22,6 @@ from lu_machinery.orchestration import dispatch_isolation
 
 _LOG = logging.getLogger(__name__)
 
-# OpenCode allows edits and every shell command by default and has no OS sandbox, so read-only
-# carries its own permission rules (https://opencode.ai/docs/permissions/): ``edit`` covers the
-# edit, write and patch tools, and for bash the last matching pattern wins. Only read-only git
-# forms run; a redirect, or an option that writes a file or starts an external diff program, stays
-# denied (a redirect is not a separate command, so ``git log *`` alone would admit ``> file``). OpenCode
-# merges ``OPENCODE_PERMISSION`` over the loaded config's ``permission``.
-_READ_ONLY_PERMISSION = json.dumps(
-    {
-        "edit": "deny",
-        "task": "deny",
-        "bash": {
-            "*": "deny",
-            **{f"git {verb}{rest}": "allow" for verb in ("diff", "log", "show", "status") for rest in ("", " *")},
-            "* --output*": "deny",
-            "* --ext-diff*": "deny",
-            "*>*": "deny",
-        },
-    },
-    separators=(",", ":"),
-)
-
-
 # The endpoint is chosen explicitly with ``--provider`` and recorded on the task record; nothing
 # switches it. Both run V4.1 Flash only (core P2). The OpenRouter route is pinned to the V4.1 Flash
 # line and to the US provider allow-list in model-assignment.md, with no provider fallback.
@@ -433,15 +411,14 @@ def _workspace_sources_entry(spec: TaskSpec) -> dict[str, object] | None:
     return entry
 
 
-def _workspace_sources_permission() -> str:
-    """OpenCode ``OPENCODE_PERMISSION`` allowing only Sources readers and denying writers (findLast wins)."""
-    readers, writers = sources_tool_sets()
+def _sources_permission(readers: tuple[str, ...], writers: tuple[str, ...]) -> dict[str, str]:
+    """Allow only Sources readers. OpenCode uses the last matching rule."""
     permission: dict[str, str] = {f"{SOURCES_SERVER}_*": "deny"}
     for name in readers:
         permission[f"{SOURCES_SERVER}_{name}"] = "allow"
     for name in writers:
         permission[f"{SOURCES_SERVER}_{name}"] = "deny"
-    return json.dumps(permission, separators=(",", ":"))
+    return permission
 
 
 def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
@@ -450,26 +427,37 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
         return _savant_build(spec, env)
     argv = ["opencode", "run", "--model", MODELS[selected], "--format", "json", "--variant", "high"]
     child_env = env.copy()
+    config = json_depth.loads(_OPENROUTER_CONFIG, max_depth=512) if selected == "openrouter" else {}
+    assert isinstance(config, dict)
     if spec.mode == "workspace-write":
         argv.append("--auto")
         sources_entry = _workspace_sources_entry(spec)
-        child_env["OPENCODE_PERMISSION"] = _workspace_sources_permission()
-        if selected == "openrouter":
-            config = json_depth.loads(_OPENROUTER_CONFIG, max_depth=512)
-            assert isinstance(config, dict)
-            if sources_entry is not None:
-                config["mcp"] = {SOURCES_SERVER: sources_entry}
-            child_env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
-        elif sources_entry is not None:
-            child_env["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-                {"mcp": {SOURCES_SERVER: sources_entry}}, separators=(",", ":")
-            )
+        permission = _sources_permission(*sources_tool_sets())
     elif spec.mode == "read-only":
-        if selected == "openrouter":
-            child_env["OPENCODE_CONFIG_CONTENT"] = _OPENROUTER_CONFIG
-        child_env["OPENCODE_PERMISSION"] = _READ_ONLY_PERMISSION
+        from lu_machinery.dispatcher.write_boundary import sources_command
+
+        try:
+            readers, writers = sources_tool_sets()
+        except Exception as exc:
+            if is_ukrainian_content_task(spec.options):
+                raise ValueError("sources_mcp_unavailable: could not load the read-only Sources tools") from exc
+            _LOG.warning("sources_mcp_unavailable: could not load the read-only Sources tools")
+            readers, writers = (), ()
+        sources_entry = {"type": "local", "command": sources_command(), "enabled": bool(readers)}
+        # The OS boundary contains shell commands. ``edit`` covers edit, write and patch.
+        permission = {"bash": "allow", "webfetch": "allow", "edit": "deny", "task": "deny",
+                      **_sources_permission(readers, writers)}
+        # Checkout config could replace the relay or override tool permissions at agent level.
+        # Keep OpenCode's background plugin dependency setup offline to leave proxy capacity for webfetch.
+        child_env.update(OPENCODE_DISABLE_PROJECT_CONFIG="1", OPENCODE_PURE="1", npm_config_offline="true")
+        config["share"] = "disabled"
     else:
         raise ValueError(f"opencode: unsupported mode {spec.mode!r}")
+    if sources_entry is not None:
+        config["mcp"] = {SOURCES_SERVER: sources_entry}
+    if config:
+        child_env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
+    child_env["OPENCODE_PERMISSION"] = json.dumps(permission, separators=(",", ":"))
     argv += ["--", spec.prompt_file.read_text(encoding="utf-8")]
     return Invocation(argv, None, child_env, None)
 

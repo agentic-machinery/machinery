@@ -11,7 +11,9 @@ from unittest.mock import Mock
 
 import pytest
 
-from lu_machinery.api import model_stats_rows, subscription_usage as usage
+from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
+from lu_machinery.api import model_stats_rows
+from lu_machinery.api import subscription_usage as usage
 from lu_machinery.dispatcher import checks, cli, git, runtime_context, store, worker, write_boundary
 from lu_machinery.dispatcher.providers import opencode
 from lu_machinery.dispatcher.types import TaskSpec
@@ -106,8 +108,52 @@ def test_default_build_stays_direct_api(spec, funded, dispatch):
     for provider in (None, "deepseek"):
         invocation = opencode.build(replace(spec, provider=provider), {})
         assert invocation.argv[invocation.argv.index("--model") + 1] == "deepseek/deepseek-flash"
-        assert "OPENCODE_CONFIG_CONTENT" not in invocation.env
+        assert "provider" not in json.loads(invocation.env.get("OPENCODE_CONFIG_CONTENT", "{}"))
     assert dispatch()["provider"] == "deepseek"
+
+
+@pytest.mark.parametrize("provider", ["deepseek", "openrouter"])
+@pytest.mark.parametrize("tool", ["bash", "webfetch"])
+def test_opencode_read_only_allows_shell_and_webfetch(spec, provider, tool):
+    """Defect class (#24 AC-02 and AC-02c): OpenCode blocks tools that the boundary can contain."""
+    invocation = opencode.build(replace(spec, provider=provider), {})
+    permissions = json.loads(invocation.env["OPENCODE_PERMISSION"])
+    assert permissions.get(tool) == "allow"
+    assert permissions["edit"] == permissions["task"] == "deny"
+    assert "--auto" not in invocation.argv
+
+
+@pytest.mark.parametrize("provider", ["deepseek", "openrouter"])
+def test_opencode_read_only_sources_uses_the_boundary_relay(
+    spec, tmp_path, configured_roots, monkeypatch, provider,  # noqa: F811
+):
+    """Defect class (#24 AC-02b): the read-only run gets no Sources projection or reader permissions."""
+    spec = replace(spec, provider=provider, options={"research_task_family": "ukrainian-review"})
+    invocation = opencode.build(spec, {})
+    config = json.loads(invocation.env.get("OPENCODE_CONFIG_CONTENT", "{}"))
+    assert invocation.env["OPENCODE_DISABLE_PROJECT_CONFIG"] == invocation.env["OPENCODE_PURE"] == "1"
+    assert invocation.env["npm_config_offline"] == "true"
+    assert config.get("mcp", {}).get("sources") == {
+        "type": "local", "command": write_boundary.sources_command(), "enabled": True,
+    }
+    permissions = json.loads(invocation.env["OPENCODE_PERMISSION"])
+    readers, writers = sources_tool_sets()
+    assert permissions["sources_*"] == "deny"
+    assert all(permissions[f"sources_{name}"] == "allow" for name in readers)
+    assert all(permissions[f"sources_{name}"] == "deny" for name in writers)
+    assert list(permissions).index("sources_*") < list(permissions).index("sources_verify_word")
+
+    monkeypatch.setattr(write_boundary.shutil, "which", lambda *args, **kwargs: "/usr/bin/true")
+    launcher = write_boundary.launcher(spec, invocation, tmp_path / "task.json")
+    assert launcher[launcher.index("--sources-mcp") + 1] == "opencode"
+
+
+@pytest.mark.parametrize("options", [{"research_task_family": "ukrainian-review"}, {"research_track": "l2-uk"}])
+def test_opencode_read_only_ukrainian_refuses_without_sources(spec, tmp_path, monkeypatch, options):
+    """Defect class (#24 AC-02b): a Ukrainian-content read-only task starts without a Sources tools partition."""
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path))
+    with pytest.raises(ValueError, match=r"^sources_mcp_unavailable:"):
+        opencode.build(replace(spec, options=options), {})
 
 
 @pytest.mark.parametrize("selected", ["deepseek", "openrouter"])
@@ -381,6 +427,7 @@ def test_savant_launch_builds_the_snapshot_and_ceiling_only_for_public_classes(t
     assert "--upload-ceiling" in private and "--snapshot-bytes" not in private and "--read-path" not in private
     # No Savant run gets a GitHub relay (C4: GitHub access refused even to the process) or a Sources relay (#898).
     assert all(flag in argv for flag in ("--no-github-relays", "--no-sources-relay") for argv in (public, private))
+    assert all("--sources-mcp" not in argv for argv in (public, private))
     # A malformed record's paths are refused, never read as the whole tree.
     with pytest.raises(ValueError, match="savant_read_path_refused"):
         opencode.savant_read_paths({"read_paths": "{}"})
@@ -516,7 +563,7 @@ def test_opencode_workspace_sources_config_and_writer_denies(
     """Defect class (#24 gap 3): OpenCode write workers get no Sources MCP config or writer-tool denies."""
     import shutil
 
-    from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH, sources_tool_sets
+    from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH
 
     product = tmp_path / "product"
     server_dst = product / SERVER_RELATIVE_PATH
@@ -613,11 +660,3 @@ def test_opencode_workspace_sources_config_and_writer_denies(
         assert "OPENCODE_CONFIG_CONTENT" not in inv_missing.env
     else:
         assert "mcp" not in json.loads(inv_missing.env["OPENCODE_CONFIG_CONTENT"])
-
-    # 5. Read-only mode stays untouched (PR 2 owns read-only OpenCode)
-    ro_inv = opencode.build(replace(spec, provider=selected, worktree=worktree), {})
-    assert json.loads(ro_inv.env["OPENCODE_PERMISSION"])["edit"] == "deny"
-    if selected == "deepseek":
-        assert "OPENCODE_CONFIG_CONTENT" not in ro_inv.env
-    else:
-        assert "mcp" not in json.loads(ro_inv.env["OPENCODE_CONFIG_CONTENT"])

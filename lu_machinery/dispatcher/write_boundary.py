@@ -47,6 +47,7 @@ from lu_machinery.common.repo_root import (
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.dispatcher import agy_sandbox
 from lu_machinery.dispatcher.agy_sandbox import REFUSED, Refused, _now, _remove, _write_private, _write_receipt
+from lu_machinery.dispatcher.providers import is_ukrainian_content_task
 from lu_machinery.review.language_lane import is_ukrainian_review
 
 _PACKAGE = Path(__file__).absolute().parents[1].name
@@ -154,7 +155,7 @@ _CODEX_HOME = "codex-home"
 # and Codex reads it from its task-local CODEX_HOME.
 _SOURCES_MCP = "sources-mcp.json"
 _CURSOR_MCP_HOME = ".cursor/mcp.json"
-_SOURCES_MCP_ROUTES = ("claude", "codex", "cursor")
+_SOURCES_MCP_ROUTES = ("claude", "codex", "cursor", "opencode")
 # A public Savant run's tools read only this read-only snapshot of the published start commit (designated
 # approval, Savant tool conditions C1-C4): regular files, none of whose path components names Git metadata, an
 # environment file, a key or credential store, or an instruction or config file OpenCode loads by itself.
@@ -357,7 +358,7 @@ def launcher(spec, invocation, task_file: Path, draft_fd: int | None = None) -> 
         home = Path(invocation.env.get("HOME") or Path.home())
         argv += ["--codex-auth", str(Path(invocation.env.get("CODEX_HOME") or home / ".codex") / "auth.json")]
     savant = spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER
-    if spec.mode == "read-only" and spec.agent in _SOURCES_MCP_ROUTES:
+    if spec.mode == "read-only" and not savant and spec.agent in _SOURCES_MCP_ROUTES:
         argv += ["--sources-mcp", spec.agent]
     if spec.options.get("pr"):
         # The task record's PR, frozen here: a private repository's github-read is that PR and its checks (#565).
@@ -1577,7 +1578,8 @@ class _Boundary:
             from lu_machinery.dispatcher import store as task_store
 
             record = task_store.read(self.args.task_id, missing_ok=True) or {}
-        sources_required = is_ukrainian_review(record)
+        opencode = self.args.sources_mcp == "opencode"
+        sources_required = is_ukrainian_content_task(record) if opencode else is_ukrainian_review(record)
         if sources_required and (self.args.sources_mcp is None or self.args.no_sources_relay
                                  or (self.args.sources_mcp == "codex" and self.args.codex_auth is None)):
             raise Refused("sources_mcp_required: Ukrainian review needs a Sources MCP projection and relay")
@@ -1667,6 +1669,8 @@ class _Boundary:
         nonce = uuid.uuid4().hex
         probes = self._probes(repository, common, sockets, outputs, tmp, nonce, snapshot_only)
         probes += self._view_probes(home, data, masks, restores, private, credentials, own, nonce)
+        if opencode:
+            probes.extend({"op": "write_open", "path": str(path), "expect_any": ["EROFS"]} for path in credentials)
         for path in projected_reads:
             probes.append({"op": "create", "path": str(path / f".write-boundary-canary-{nonce}"), "expect_any": ["EROFS"]})
         if not snapshot_only:
@@ -1708,7 +1712,8 @@ class _Boundary:
             argv += ["--ro-bind", str(self.worktree), str(self.worktree),
                      "--ro-bind", str(dot_git), str(dot_git)]
         for path in credentials:
-            argv += ["--bind", str(path), str(path)]
+            # DeepSeek and OpenRouter use static keys. Shell access needs no writable shared login.
+            argv += ["--ro-bind" if opencode else "--bind", str(path), str(path)]
         for path in outputs:
             argv += ["--bind", str(path), str(path)]
         argv += ["--bind", str(tmp), str(tmp), "--ro-bind", str(boundary), str(boundary)]
