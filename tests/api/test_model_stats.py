@@ -1003,8 +1003,8 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert "output_tokens_per_landed" not in html and "p0_p2 || 0" not in html
     assert all(token in html for token in ("pareto-class", "pareto-x", "trends-metric",
                                            "Not enough data", "pool_pace", "/subscriptions",
-                                           "Cached snapshot fallback:"))
-    assert "quota-alerts" not in html
+                                           "landed_ci"))
+    assert "quota-alerts" not in html and "Cached snapshot fallback:" not in html
     # Ten short tasks must stay eligible, and the score is approvals over recorded hours.
     rank_root = tmp_path / "value"
     rank_tasks = rank_root / "tasks"

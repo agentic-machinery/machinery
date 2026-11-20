@@ -480,7 +480,7 @@ function paretoClasses(data) {
   select.value = jobsList.some((job) => job.class === chosen) ? chosen : "all";
 }
 function exactHours(item) {
-  const value = item.hours_exact !== undefined && item.hours_exact !== null ? item.hours_exact : item.hours;
+  const value = item.hours_exact;
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 function displayHours(item) {
@@ -498,84 +498,54 @@ function pareto(data) {
   if (cls !== "all") {
     const job = (charts.jobs || []).find((entry) => entry.class === cls);
     const jobModels = job?.models || [];
-    const hasClassFrontier = jobModels.some((m) => "frontier" in m);
-    const hasHoursExact = jobModels.some((m) => "hours_exact" in m);
     const allTimed = jobModels.filter((m) => {
       const h = exactHours(m);
       return h !== null && h > 0;
     });
     const shown = allTimed.filter((m) => keepModel(m.model));
     if (!shown.length) {
-      return !hasHoursExact && jobModels.length
-        ? `<p class="muted">Not enough data in ${esc(cls)}: no model in the current selection has a positive rounded hours-per-merge value in this cached snapshot (cached snapshots round short durations to 0 and omit unrounded hours).</p>`
-        : `<p class="muted">Not enough data in ${esc(cls)}: no model in the current selection has positive recorded hours per merge.</p>`;
+      return `<p class="muted">Not enough data in ${esc(cls)}: no model in the current selection has positive recorded hours per merge.</p>`;
     }
     const frontier = shown.filter((m) => m.frontier);
     const frontierNames = frontier.map((m) => esc(m.model)).join(", ");
     const shownHasEligible = shown.some((m) => !m.low_sample);
-    const frontierNote = !hasClassFrontier
-      ? `This cached snapshot does not include precomputed frontier rankings for ${esc(cls)}.`
-      : frontier.length > 1 ? `The dashed line connects the frontier models in ${esc(cls)} (${frontierNames}).`
-        : frontier.length === 1 ? `${frontierNames} alone is on the frontier for ${esc(cls)} among the models shown.`
-          : shownHasEligible ? `None of the models shown is on the window's frontier for ${esc(cls)}.`
-            : `Not enough data for a frontier in ${esc(cls)} (needs at least ${lowBelow()} tasks and a timed merge per model).`;
-    const legacyHoursNote = !hasHoursExact
-      ? " Cached snapshot fallback: hours per merge are rounded to 2 decimals, so models under 0.005 h/merge may be omitted."
-      : "";
+    const frontierNote = frontier.length > 1 ? `The dashed line connects the frontier models in ${esc(cls)} (${frontierNames}).`
+      : frontier.length === 1 ? `${frontierNames} alone is on the frontier for ${esc(cls)} among the models shown.`
+        : shownHasEligible ? `None of the models shown is on the window's frontier for ${esc(cls)}.`
+          : `Not enough data for a frontier in ${esc(cls)} (needs at least ${lowBelow()} tasks and a timed merge per model).`;
     const rows = shown.map((m) => `<tr><td>${modelKey(m.model, m.low_sample)}${m.low_sample ? LOW : ""}</td>`
       + cell(displayHours(m)) + cell(share(m.rate, m.tasks)) + cell(ciText(m.ci))
-      + cell(num(m.tasks)) + cell(num(m.landed)) + `<td>${!hasClassFrontier ? "unavailable" : m.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
+      + cell(num(m.tasks)) + cell(num(m.landed)) + `<td>${m.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
     return scatter(shown.map((m) => ({...m, x: exactHours(m), y: m.rate, ci: m.ci})),
       "chart", `Landed share (${esc(cls)})`, "Recorded hours per merge →", frontier.length > 1, "landed share")
-      + `<p class="note">Hollow markers have fewer than ${lowBelow()} tasks in ${esc(cls)}. ${frontierNote}${legacyHoursNote} First-round PR approval is not split by write job class because review rows record profile/risk.</p>`
+      + `<p class="note">Hollow markers have fewer than ${lowBelow()} tasks in ${esc(cls)}. ${frontierNote} First-round PR approval is not split by write job class because review rows record profile/risk.</p>`
       + values(`Landed share and cost values in ${esc(cls)}`, ["Model", "Hours per merge", "Landed %", "Interval", "Tasks", "Landed", "Ranking"], rows, [0, 6]);
   }
   if (axis === "speed") {
-    const legacySpeed = !Array.isArray(charts.speed_quality);
-    const legacyPareto = charts.pareto || [];
-    const hasSpeedLowSample = !legacySpeed || legacyPareto.some((p) => p.speed_low_sample !== undefined);
-    const hasSpeedFrontier = !legacySpeed || legacyPareto.some((p) => p.speed_frontier !== undefined);
-    const rawSpeed = !legacySpeed
-      ? charts.speed_quality
-      : legacyPareto.map((p) => ({
-        ...p,
-        low_sample: p.speed_low_sample !== undefined ? p.speed_low_sample : p.low_sample,
-        frontier: p.speed_frontier !== undefined ? p.speed_frontier : false,
-      }));
+    const rawSpeed = Array.isArray(charts.speed_quality) ? charts.speed_quality : [];
     const allSpeed = rawSpeed.filter((p) => typeof p.median_seconds === "number" && Number.isFinite(p.median_seconds) && p.median_seconds >= 0);
     const shown = allSpeed.filter((p) => keepModel(p.model));
     if (!shown.length) {
-      return legacySpeed
-        ? '<p class="muted">No model in the current selection has both timed write durations and a reviewed PR in this cached snapshot\'s cost chart (models without hours per merge may be omitted).</p>'
-        : '<p class="muted">No model in the current selection has both timed write durations and a reviewed PR in this window.</p>';
+      return '<p class="muted">Not enough data: no model in the current selection has both timed write durations and a reviewed PR in this window.</p>';
     }
     const frontier = shown.filter((p) => p.frontier);
     const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
     const shownHasEligible = shown.some((p) => !p.low_sample);
-    const scopeLabel = legacySpeed ? "cost-chart speed/approval frontier" : "speed/approval frontier";
-    const frontierNote = !hasSpeedFrontier
-      ? "This cached snapshot does not include a precomputed speed/approval frontier."
-      : frontier.length > 1 ? `The dashed line connects the ${scopeLabel} models (${frontierNames}).`
-        : frontier.length === 1 ? `${frontierNames} alone is on the ${scopeLabel} among the models shown.`
-          : shownHasEligible ? `None of the models shown is on the window's ${scopeLabel}.`
-            : `Not enough data for a ${scopeLabel} (needs at least ${lowBelow()} timed writes and ${lowBelow()} reviewed PRs per model).`;
-    const hollowNote = hasSpeedLowSample
-      ? `Hollow markers have fewer than ${lowBelow()} timed writes or reviewed PRs.`
-      : "Hollow markers have a low sample.";
-    const coverageNote = legacySpeed
-      ? "Cached snapshot fallback: limited to models in the cost chart, so this frontier may omit models without landings or usable hours per merge; no composite speed/quality score is computed."
-      : "Includes every write model with timed runs and reviewed PRs, even when hours per merge is unavailable; no composite speed/quality score is computed.";
+    const frontierNote = frontier.length > 1 ? `The dashed line connects the speed/approval frontier models (${frontierNames}).`
+      : frontier.length === 1 ? `${frontierNames} alone is on the speed/approval frontier among the models shown.`
+        : shownHasEligible ? "None of the models shown is on the window's speed/approval frontier."
+          : `Not enough data for a speed/approval frontier (needs at least ${lowBelow()} timed writes and ${lowBelow()} reviewed PRs per model).`;
     const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
       + cell(mins(p.median_seconds)) + cell(num(p.timed_n)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
-      + cell(num(p.prs)) + `<td>${!hasSpeedFrontier ? "unavailable" : p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
+      + cell(num(p.prs)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
     return scatter(shown.map((p) => ({...p, x: p.median_seconds / 60, y: p.approval, ci: p.approval_ci})),
       "chart", "First-round approval", "Median write minutes →", frontier.length > 1, "first-round approval")
-      + `<p class="note">${hollowNote} ${frontierNote} ${coverageNote}</p>`
+      + `<p class="note">Hollow markers have fewer than ${lowBelow()} timed writes or reviewed PRs. ${frontierNote} Includes every write model with timed runs and reviewed PRs, even when hours per merge is unavailable; no composite speed/quality score is computed.</p>`
       + values("Approval and speed values by model", ["Model", "Median min", "Timed writes", "Approval", "Interval", "Reviewed PRs", "Ranking"], rows, [0, 6]);
   }
   const points = charts.pareto || [];
-  const shown = points.filter((p) => keepModel(p.model));
-  if (!shown.length) return '<p class="muted">No model in the current selection has usable recorded hours per merge and a reviewed PR in this window.</p>';
+  const shown = points.filter((p) => exactHours(p) !== null && keepModel(p.model));
+  if (!shown.length) return '<p class="muted">Not enough data: no model in the current selection has usable recorded hours per merge and a reviewed PR in this window.</p>';
   const frontier = shown.filter((p) => p.frontier);
   const frontierNames = frontier.map((p) => esc(p.model)).join(", ");
   const shownHasEligible = shown.some((p) => !p.low_sample);
@@ -586,7 +556,7 @@ function pareto(data) {
   const rows = shown.map((p) => `<tr><td>${modelKey(p.model, p.low_sample)}${p.low_sample ? LOW : ""}</td>`
     + cell(displayHours(p)) + cell(share(p.approval, p.prs)) + cell(ciText(p.approval_ci))
     + cell(num(p.prs)) + cell(num(p.landed)) + `<td>${p.frontier ? '<strong class="good">Frontier</strong>' : "—"}</td></tr>`);
-  return scatter(shown.map((p) => ({...p, x: exactHours(p) ?? p.hours, y: p.approval, ci: p.approval_ci})),
+  return scatter(shown.map((p) => ({...p, x: exactHours(p), y: p.approval, ci: p.approval_ci})),
     "chart", "First-round approval", "Recorded hours per merge →", frontier.length > 1, "first-round approval")
     + `<p class="note">Hollow markers have a low sample. A green ring marks a frontier model, which no eligible model beats on cost and approval together. ${frontierNote}</p>`
     + values("Approval and cost values by model", ["Model", "Hours per merge", "Approval", "Interval", "Reviewed PRs", "Landed", "Ranking"], rows, [0, 6]);
@@ -709,22 +679,16 @@ function isoWeekStart(week) {
   const monday = jan4.getTime() - ((jan4.getUTCDay() + 6) % 7) * 86400000;
   return monday + (Number(week.slice(6)) - 1) * WEEK_MS;
 }
-function trends(items, window, authors = []) {
+function trends(items, window) {
   const all = items || [];
   const isApproval = ($("trends-metric")?.value || "landed") === "approval";
   const countKey = isApproval ? "prs" : "tasks";
   const numKey = isApproval ? "first_approved" : "landed";
   const keep = isApproval ? keepAuthor : keepModel;
   const eligible = weeklyNames(all, countKey).filter(keep);
-  const missingAuthors = isApproval
-    ? (authors || []).filter((a) => keepAuthor(a.model) && a.prs >= lowBelow() && !eligible.includes(a.model))
-    : [];
   const names = eligible.slice(0, 6);
   const shown = all.filter((p) => names.includes(p.model) && (p[countKey] || 0) > 0);
   if (!shown.length) {
-    if (missingAuthors.length) {
-      return `<p class="muted">This cached snapshot omits weekly approval rows for models without ${lowBelow()} write tasks (${missingAuthors.map((a) => esc(a.model)).join(", ")}); see Reviewed PRs for their window totals.</p>`;
-    }
     return `<p class="muted">Not enough data yet for weekly ${isApproval ? "approval" : "landing"} comparisons. A model needs ${lowBelow()} ${isApproval ? "reviewed PRs" : "write tasks"} in the window.</p>`;
   }
   const weeks = [...new Set(shown.map((p) => p.week))].sort();
@@ -760,31 +724,24 @@ function trends(items, window, authors = []) {
     + `${marker(name, 12, 7)}</svg>${esc(name)}</span>`).join("");
   const rows = shown.sort((a, b) => b.week.localeCompare(a.week) || a.model.localeCompare(b.model)).map((p) =>
     `<tr><td>${modelKey(p.model, low(p))}</td><td>${esc(p.week)}${partial(p.week) ? " (partial)" : ""}</td>`
-    + cell(num(p.landed)) + cell(num(p.tasks)) + cell(p.tasks ? share(p.landed / p.tasks, p.tasks) : "—")
-    + cell(num(p.first_approved)) + cell(num(p.prs)) + cell(p.prs ? share(p.first_approved / p.prs, p.prs) : "—") + "</tr>");
-  const legacyNote = missingAuthors.length
-    ? `<p class="note warn">Cached snapshot fallback: weekly approval omits ${num(missingAuthors.length)} qualifying author${missingAuthors.length === 1 ? "" : "s"} without ${lowBelow()} write tasks (${missingAuthors.map((a) => esc(a.model)).join(", ")}); see Reviewed PRs for full totals.</p>`
-    : "";
+    + cell(num(p.landed)) + cell(num(p.tasks))
+    + cell(p.tasks ? `${num(p.landed / p.tasks * 100)}% <span class="muted">(n=${num(p.tasks)})</span>${p.tasks < lowBelow() ? LOW : ""}` : "—")
+    + cell(num(p.first_approved)) + cell(num(p.prs))
+    + cell(p.prs ? `${num(p.first_approved / p.prs * 100)}% <span class="muted">(n=${num(p.prs)})</span>${p.prs < lowBelow() ? LOW : ""}` : "—") + "</tr>");
   return svgChart(W, H, isApproval ? "Weekly first-round PR approval" : "Weekly landed share", percentTicks(sy, left, right) + labels.join("") + series)
     + `<div class="legend">${legend}</div>`
     + '<p class="note">An asterisk means the window covers only part of that week. Hollow points have a low sample, and gaps mean no comparable result.</p>'
-    + legacyNote
     + (eligible.length > names.length ? `<p class="note">${eligible.length - names.length} more eligible models are in the ${isApproval ? "reviewed PRs" : "write"} table.</p>` : "")
     + values("Weekly counts and sample sizes", ["Model", "UTC week", "Landed", "Writes", "Landed %", "1st-round", "PRs", "Approval %"], rows, [0, 1]);
 }
 function neon(data) {
   const block = data.charts?.neon;
-  if (!block) return '<p class="muted">Neon is absent from this window.</p>';
-  const neonReview = (data.models || []).find((m) => m.role === "review" && m.model === "gemini-4-neon");
-  const reviewByEffort = new Map((neonReview?.by_effort || []).map((e) => [e.effort, e]));
+  if (!block || !Array.isArray(block.arms) || !block.arms.length) return '<p class="muted">Neon is absent from this window.</p>';
+  if (block.arms.some((arm) => typeof arm.review_tasks !== "number")) {
+    return '<p class="muted">Not enough data yet for Neon effort comparison.</p>';
+  }
   const rows = block.arms.map((arm) => {
-    const revEffort = reviewByEffort.get(arm.effort);
-    const revTasks = arm.review_tasks !== undefined
-      ? arm.review_tasks
-      : (revEffort && revEffort.tasks !== undefined ? revEffort.tasks : null);
-    const revCount = revTasks !== null
-      ? `${num(arm.review_results)} / ${num(revTasks)}`
-      : `${num(arm.review_results)} / unknown`;
+    const revCount = `${num(arm.review_results)} / ${num(arm.review_tasks)}`;
     const revTiming = arm.review_timed_n
       ? `${mins(arm.review_median_seconds)} / ${mins(arm.review_p90_seconds)} <span class="muted">(${num(arm.review_timed_n)})</span>${arm.review_timed_n < lowBelow() ? LOW : ""}`
       : "—";
@@ -876,8 +833,9 @@ function boxes(items) {
     const bar = scale.ticks.map((tick) => `<line class="grid" x1="${sx(tick)}" x2="${sx(tick)}" y1="0" y2="20"/>`).join("")
       + `<line x1="${p75}" x2="${p90}" y1="10" y2="10" stroke="${color}" stroke-width="2"/>`
       + `<line x1="${p90}" x2="${p90}" y1="7" y2="13" stroke="${color}" stroke-width="2"/>` + box;
+    const landedCi = item.landed_ci ? `, ${ciText(item.landed_ci)}` : "";
     const landedNote = item.tasks
-      ? ` · ${share(item.landed_rate, item.tasks)} landed (${num(item.tasks)})`
+      ? ` · ${share(item.landed_rate, item.tasks)} landed (${num(item.tasks)}${landedCi})`
       : "";
     return `<div class="duration-row" style="width:${W}px"><b>${esc(item.model)}</b>`
       + `<span>${mins(item.median)} min median${landedNote}${item.low_sample ? LOW : ""}</span></div>`
@@ -888,11 +846,12 @@ function boxes(items) {
   const rows = shown.map((item) => `<tr><td>${esc(item.model)}</td>${cell(nOf(item))}`
     + [item.p25, item.median, item.p75, item.p90].map((v) => cell(mins(v))).join("")
     + cell(item.tasks ? share(item.landed_rate, item.tasks) : "—")
+    + cell(item.tasks && item.landed_ci ? ciText(item.landed_ci) : "—")
     + cell(item.tasks ? num(item.tasks) : "—") + "</tr>");
   return bars + axis
     + '<p class="note">A circle marks a box too narrow to see at this scale. Low-sample rows appear in grey.</p>'
     + (timed.length > shown.length ? '<p class="note">Shows the 12 busiest timed models, ordered by median. See Write tasks for the rest.</p>' : "")
-    + values("Duration and delivery values by model", ["Model", "Timed tasks", "25th percentile (min)", "Median (min)", "75th percentile (min)", "90th percentile (min)", "Landed %", "Writes"], rows);
+    + values("Duration and delivery values by model", ["Model", "Timed tasks", "25th percentile (min)", "Median (min)", "75th percentile (min)", "90th percentile (min)", "Landed %", "Interval", "Writes"], rows);
 }
 function ukrainian(items) {
   const shown = (items || []).filter((item) => keepModel(item.model));
@@ -964,7 +923,7 @@ function renderCoverage(data) {
 }
 function renderCharts() {
   const {data} = current, charts = data.charts || {};
-  for (const [id, markup] of [["chart", pareto(data)], ["trends", trends(charts.trends, data.window, data.authors)],
+  for (const [id, markup] of [["chart", pareto(data)], ["trends", trends(charts.trends, data.window)],
     ["strictness", strictness(charts.reviewers)], ["boxes", boxes(charts.durations)]]) {
     const chart = $(id), expanded = chart.querySelector("details[open]");
     chart.innerHTML = markup;
