@@ -1039,22 +1039,26 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert recommendation["model"] == "gpt-6.2-sol"
     assert recommendation["approvals"] == 10
     pareto_by_model = {p["model"]: p for p in charts["pareto"]}
-    assert pareto_by_model["gpt-6.2-sol"]["median_seconds"] == 3.0
-    assert pareto_by_model["gpt-6.2-sol"]["timed_n"] == 15
-    assert pareto_by_model["gpt-6.2-sol"]["speed_low_sample"] is False
-    assert pareto_by_model["gpt-6.2-sol"]["speed_frontier"] is True
-    assert pareto_by_model["gpt-6.1-sol"]["median_seconds"] == 3600.0
-    assert pareto_by_model["gpt-6.1-sol"]["timed_n"] == 10
-    assert pareto_by_model["gpt-6.1-sol"]["speed_low_sample"] is False
-    assert pareto_by_model["gpt-6.1-sol"]["speed_frontier"] is False
+    assert pareto_by_model["gpt-6.2-sol"]["hours_exact"] > 0
+    speed_by_model = {p["model"]: p for p in charts["speed_quality"]}
+    assert speed_by_model["gpt-6.2-sol"]["median_seconds"] == 3.0
+    assert speed_by_model["gpt-6.2-sol"]["timed_n"] == 15
+    assert speed_by_model["gpt-6.2-sol"]["low_sample"] is False
+    assert speed_by_model["gpt-6.2-sol"]["frontier"] is True
+    assert speed_by_model["gpt-6.1-sol"]["median_seconds"] == 3600.0
+    assert speed_by_model["gpt-6.1-sol"]["timed_n"] == 10
+    assert speed_by_model["gpt-6.1-sol"]["low_sample"] is False
+    assert speed_by_model["gpt-6.1-sol"]["frontier"] is False
     durations_by_model = {d["model"]: d for d in charts["durations"]}
     assert (durations_by_model["claude-sonnet-5-5"]["tasks"], durations_by_model["claude-sonnet-5-5"]["landed"],
             durations_by_model["claude-sonnet-5-5"]["landed_rate"],
             durations_by_model["claude-sonnet-5-5"]["landed_ci"]) == (10, 8, 0.8, stats._wilson(8, 10))
     jobs_by_class = {j["class"]: {m["model"]: m for m in j["models"]} for j in charts["jobs"]}
-    # In code: gpt-6.2-sol is 100% @ 3s (frontier); gpt-6.1-sol is 100% @ 3600s (dominated by gpt-6.2-sol);
-    # claude-sonnet-5-5 is 80% @ 750s (dominated by gpt-6.2-sol's 100% @ 3s); claude-opus-5-5 is 70% @ 10286s
+    # In code: gpt-6.2-sol is 100% @ 3s (hours=0.0, hours_exact>0, frontier=True); gpt-6.1-sol is 100% @ 3600s
+    # (dominated by gpt-6.2-sol); claude-sonnet-5-5 is 80% @ 750s (dominated); claude-opus-5-5 is 70% @ 10286s
     # (dominated); grok-4.7 is 100% @ 1s but n=4 (low_sample, never frontier).
+    assert jobs_by_class["code"]["gpt-6.2-sol"]["hours"] == 0.0
+    assert jobs_by_class["code"]["gpt-6.2-sol"]["hours_exact"] > 0
     assert jobs_by_class["code"]["gpt-6.2-sol"]["frontier"] is True
     assert jobs_by_class["code"]["gpt-6.1-sol"]["frontier"] is False
     assert jobs_by_class["code"]["claude-sonnet-5-5"]["frontier"] is False
@@ -1062,7 +1066,9 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
     assert jobs_by_class["code"]["grok-4.7"]["frontier"] is False
     # In docs: 10 total tasks, max n=5 per model, so no model reaches the frontier.
     assert all(m["frontier"] is False for m in jobs_by_class["docs"].values())
-    # Two eligible non-dominated models in one class: higher-rate slower vs lower-rate faster both sit on the frontier.
+    # Two eligible non-dominated models in one class, plus: (1) unrounded sub-0.1s duration tie-breaking (F2),
+    # (2) PR-only author admitted to weekly approval trends without write tasks (F4), and (3) speed_quality point
+    # retained when wall_hours_observed is unavailable (>1% untimed writes, F5).
     split_root = tmp_path / "split_frontier"
     split_tasks = split_root / "tasks"
     split_tasks.mkdir(parents=True)
@@ -1070,18 +1076,45 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path):
         _record(split_tasks, f"hi-{index}", model="claude-opus-5-5", duration_s=3600, research_task_family="infra")
         _record(split_tasks, f"fast-{index}", model="grok-4.7", duration_s=600, research_task_family="infra")
         _record(split_tasks, f"dom-{index}", model="gpt-6.1-sol", duration_s=7200, research_task_family="infra")
+        _record(split_tasks, f"tie-a-{index}", model="gpt-6.2-sol", duration_s=1.001, research_task_family="docs")
+        _record(split_tasks, f"tie-b-{index}", model="claude-sonnet-5-5", duration_s=1.002, research_task_family="docs")
+        _review(split_tasks, f"pr-only-{index}", "correct", [], pr=500 + index, review_author_model="claude-haiku-5-5")
+    for index in range(20):
+        _record(split_tasks, f"spd-t-{index}", model="gemini-4-hydrogen", duration_s=120, research_task_family="code")
+    for index in range(2):
+        _record(split_tasks, f"spd-u-{index}", model="gemini-4-hydrogen", research_task_family="code")
+    for index in range(10):
+        _review(split_tasks, f"spd-r-{index}", "correct", [], pr=600 + index, review_author_model="gemini-4-hydrogen")
     rows.backfill(split_tasks, split_root)
     split_landed = (
         {f"hi-{index}" for index in range(9)}
         | {f"fast-{index}" for index in range(7)}
         | {f"dom-{index}" for index in range(6)}
+        | {f"tie-a-{index}" for index in range(10)}
+        | {f"tie-b-{index}" for index in range(10)}
+        | {f"spd-t-{index}" for index in range(10)}
     )
-    split_jobs = {j["class"]: {m["model"]: m for m in j["models"]}
-                  for j in stats.collect(split_root, tmp_path, NOW,
-                                         landing=stats.Landing(task_ids=split_landed))["windows"]["7d"]["charts"]["jobs"]}
+    split_charts = stats.collect(split_root, tmp_path, NOW,
+                                 landing=stats.Landing(task_ids=split_landed))["windows"]["7d"]["charts"]
+    split_jobs = {j["class"]: {m["model"]: m for m in j["models"]} for j in split_charts["jobs"]}
     assert split_jobs["infra"]["claude-opus-5-5"]["frontier"] is True
     assert split_jobs["infra"]["grok-4.7"]["frontier"] is True
     assert split_jobs["infra"]["gpt-6.1-sol"]["frontier"] is False
+    # Unrounded durations: 10.01s vs 10.02s both round to 10.0s, but only the faster model sits on the docs frontier.
+    assert split_jobs["docs"]["gpt-6.2-sol"]["frontier"] is True
+    assert split_jobs["docs"]["claude-sonnet-5-5"]["frontier"] is False
+    assert split_jobs["docs"]["gpt-6.2-sol"]["hours_exact"] < split_jobs["docs"]["claude-sonnet-5-5"]["hours_exact"]
+    # Weekly approval trends admit a PR-only author with 10 reviewed PRs and 0 write tasks (F4).
+    haiku_trends = [t for t in split_charts["trends"] if t["model"] == "claude-haiku-5-5"]
+    assert len(haiku_trends) == 1 and haiku_trends[0]["prs"] == 10 and haiku_trends[0]["first_approved"] == 10
+    assert haiku_trends[0]["tasks"] == 0
+    # Speed/quality keeps gemini-4-hydrogen (20 timed + 2 untimed writes -> no hours_observed, 10 PRs, F5).
+    assert "gemini-4-hydrogen" not in {p["model"] for p in split_charts["pareto"]}
+    split_speed = {p["model"]: p for p in split_charts["speed_quality"]}
+    assert split_speed["gemini-4-hydrogen"]["median_seconds"] == 120.0
+    assert split_speed["gemini-4-hydrogen"]["timed_n"] == 20
+    assert split_speed["gemini-4-hydrogen"]["prs"] == 10
+    assert split_speed["gemini-4-hydrogen"]["frontier"] is True
     # Equal approval counts: the unrounded durations decide, not the one-decimal total or the model name.
     fine = tmp_path / "fine"
     fine_tasks = fine / "tasks"
