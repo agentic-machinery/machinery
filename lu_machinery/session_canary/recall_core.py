@@ -1,19 +1,19 @@
 """Lane-neutral recall canary core: mint, questions, score and hydrate.
 
 Auto-compact compresses working context; disk state survives. Mint freezes ten
-durable anchors from the lane's handoff candidates and stream tail, and score
+durable anchors from the lane's handoff and stream tail, and score
 measures recall later, so a session ends on measured rot rather than on a
 compact count. The Codex, Gemini and Muse lane CLIs (``codex_lane``,
-``gemini_lane``, ``muse_lane``) supply their candidate handoffs and call this
-core; it has no CLI of its own. The Grok lane CLI that used to live here was
+``gemini_lane``, ``muse_lane``) call this core. Codex and Gemini use driver-state
+notes and shared hydration, while Muse uses file-based handoffs. The Grok CLI was
 retired in #512: no launcher starts a Grok driver.
 
 - Score with ``context_canary``: ``--pass-ratio`` default 0.8 (8/10).
 - FAIL-HANDOFF (rc 2): write STATE AT HANDBACK and exit; the launcher closes
   its fenced lease. Lanes never claim, renew, release or recover leases.
 - ``score`` hydrates on PASS unless ``--no-hydrate``.
-- Mint binds its handoff path (or none) in ``mint_meta.json``; score and
-  hydrate read the bound path. ``handoff_sha256`` is informational.
+- Mint records its handoff source in ``mint_meta.json``. File-based score and
+  hydrate read the recorded path. ``handoff_sha256`` is informational.
 
 Artifacts live under ``.claude/<epic>-epic/canary/``: ``probe.json``,
 ``questions.json``, ``answers.json``, ``log.csv``, ``last_verdict.json``.
@@ -22,11 +22,11 @@ Artifacts live under ``.claude/<epic>-epic/canary/``: ``probe.json``,
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
 import sys
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -88,7 +88,7 @@ def _canary_dir(repo: Path, epic: str) -> Path:
 
 
 def _load_ranked(repo: Path, epic: str, preferred: list[str] | None = None) -> list[handoff_select.LoadedCandidate]:
-    """One read per candidate, ranked. Mint and the pre-mint board share this."""
+    """Rank file-based candidates after one read each."""
     own = [name for name in preferred or () if name]
     return handoff_select.load_and_rank_candidates(
         repo,
@@ -174,32 +174,14 @@ def _resolve_handoff_override(repo: Path, raw: str | None) -> Path | None:
     return path
 
 
-def select_board_handoff(
-    repo: Path,
-    epic: str,
-    stream_id: str,
-    candidates: Sequence[handoff_select.LoadedCandidate | Path],
-    *,
-    stream_limit: int = 40,
-) -> handoff_select.HandoffSelection:
-    """Board-time pick. Same selector, candidates, and stream limit mint uses."""
-    stream_entries = handoff_select.load_stream_entries(stream_id, limit=int(stream_limit))
-    return handoff_select.select_anchor_handoff(
-        repo=repo,
-        epic=epic,
-        stream_id=stream_id,
-        stream_entries=stream_entries,
-        candidates=candidates,
-    )
-
-
 def cmd_mint(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     epic = args.epic.strip().lower()
     stream_id = _stream_id(args)
 
-    explicit = _resolve_handoff_override(repo, getattr(args, "handoff", None))
-    loaded = _load_ranked(repo, epic, preferred=getattr(args, "preferred", None))
+    db_handoff = getattr(args, "db_handoff", False)
+    explicit = None if db_handoff else _resolve_handoff_override(repo, getattr(args, "handoff", None))
+    loaded = None if db_handoff else _load_ranked(repo, epic, preferred=getattr(args, "preferred", None))
     stream_limit = int(args.stream_limit)
     stream_entries = handoff_select.load_stream_entries(stream_id, limit=stream_limit)
     selected = handoff_select.select_anchor_handoff(
@@ -211,6 +193,9 @@ def cmd_mint(args: argparse.Namespace) -> int:
         explicit=explicit,
     )
     if not selected.reason or selected.anchor_count < handoff_select.N_ANCHORS:
+        if db_handoff and selected.attempts[0][0] == handoff_select.NO_HANDOFF_LABEL:
+            print(f"error: no readable active DB handoff note for lane {epic}", file=sys.stderr)
+            return 1
         print(handoff_select.format_anchor_shortfall(list(selected.attempts)), file=sys.stderr)
         return 1
     # Fact building uses the text the selector already validated. A later
@@ -265,13 +250,17 @@ def cmd_mint(args: argparse.Namespace) -> int:
         "handoff": None if selected.path is None else handoff_rel,
         "handoff_sha256": selected.sha256,
         "stream_limit": stream_limit,
-        "candidates": [handoff_select.display_repo_path(repo, item.path) for item in loaded if item.text is not None],
+        "candidates": [
+            handoff_select.display_repo_path(repo, item.path) for item in loaded or () if item.text is not None
+        ],
         "n_anchors": len(facts),
         "pass_ratio_default": DEFAULT_PASS_RATIO,
         "policy": "operational-8/10-legacy-facts-from-stream+handoff",
         "probe": str(probe_path.relative_to(repo)) if probe_path.is_relative_to(repo) else str(probe_path),
         "ids": [f["id"] for f in facts],
     }
+    if db_handoff:
+        meta["handoff_source"] = selected.reason
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     # Always refresh questions view (no answers)
@@ -304,6 +293,16 @@ def cmd_questions(args: argparse.Namespace) -> int:
         print(f"{i:2d}. [{aid}] {q}")
     print(f"wrote {out}")
     return 0
+
+
+def _score_stream_id(args: argparse.Namespace, out_dir: Path, epic: str) -> str:
+    stream_id = getattr(args, "stream", None)
+    if not stream_id:
+        with contextlib.suppress(json.JSONDecodeError, OSError):
+            meta = json_depth.loads((out_dir / "mint_meta.json").read_text(encoding="utf-8"), max_depth=512)
+            if isinstance(meta, dict):
+                stream_id = meta.get("stream_id")
+    return handoff_select.resolve_stream_id(epic, stream_id)
 
 
 def cmd_score(args: argparse.Namespace) -> int:
@@ -357,6 +356,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         if line.startswith("SCORE "):
             score_line = line
     verdict = "PASS" if returncode == 0 else "FAIL-HANDOFF"
+    db_handoff = getattr(args, "db_handoff", False)
     payload = {
         "scored_at": _utc_now(),
         "epic": epic,
@@ -369,7 +369,8 @@ def cmd_score(args: argparse.Namespace) -> int:
         "handoff_changed_since_mint": False,
         "policy": "operational-end-on-fail-handoff-not-on-compact-count",
         "action_if_fail": [
-            "Append STATE AT HANDBACK to dual-write handoff",
+            "Read the lane's DB handoff note for the next session"
+            if db_handoff else "Append STATE AT HANDBACK to dual-write handoff",
             "Use /quit; launcher owns fenced lease close",
             "Do NOT keep driving after FAIL-HANDOFF",
             "Never claim, renew, release, or recover the stream lease; successor uses the launcher",
@@ -381,6 +382,23 @@ def cmd_score(args: argparse.Namespace) -> int:
     # Diary dual-write: always stamp canary line; on FAIL write STATE AT HANDBACK template.
     try:
         from lu_machinery.session_canary import diary as diary_mod
+
+        canary_line = diary_mod.format_canary_score_line(
+            verdict=verdict,
+            score_line=score_line,
+            context_tokens=int(args.context_tokens),
+            pass_ratio=pass_ratio,
+        )
+        if db_handoff:
+            failed = verdict == "FAIL-HANDOFF"
+            label = "STATE AT HANDBACK (canary FAIL-HANDOFF)" if failed else "Canary PASS"
+            operation = "handback" if failed else "canary-pass"
+            diary_mod.try_stream_state_note(
+                _score_stream_id(args, out_dir, epic),
+                f"{label}: {canary_line}",
+                idempotency_key=f"{operation}-{_utc_now()}",
+            )
+            return returncode
 
         preferred = getattr(args, "preferred", None)
         explicit_raw = getattr(args, "handoff", None)
@@ -405,21 +423,7 @@ def cmd_score(args: argparse.Namespace) -> int:
             verdict_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             if changed:
                 print("notice: handoff_changed_since_mint: true — material edits after mint → re-mint to refresh facts")
-        canary_line = diary_mod.format_canary_score_line(
-            verdict=verdict,
-            score_line=score_line,
-            context_tokens=int(args.context_tokens),
-            pass_ratio=pass_ratio,
-        )
-        stream_id = None
-        meta_path = out_dir / "mint_meta.json"
-        if meta_path.is_file():
-            import contextlib
-
-            with contextlib.suppress(json.JSONDecodeError, OSError):
-                stream_id = json_depth.loads(meta_path.read_text(encoding="utf-8"), max_depth=512).get("stream_id") or stream_id
-
-        stream_id = handoff_select.resolve_stream_id(epic, getattr(args, "stream", None) or stream_id)
+        stream_id = _score_stream_id(args, out_dir, epic)
 
         if verdict == "FAIL-HANDOFF":
             next_drive = _split_csv_lines(getattr(args, "next_drive", "") or "")
@@ -506,7 +510,7 @@ def cmd_score(args: argparse.Namespace) -> int:
     except handoff_select.RecordedHandoffMissingError:
         raise
     except Exception as exc:  # fail-open: never block score exit codes
-        print(f"warning: diary dual-write skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
+        print(f"warning: canary handback update skipped ({type(exc).__name__}: {exc})", file=sys.stderr)
 
     return 0 if returncode == 0 else (2 if returncode == 2 else returncode)
 
