@@ -384,7 +384,7 @@ const realSetTimeout = setTimeout;
 globalThis.setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
 let failSubscriptions = true;
 globalThis.fetch = async (url) => {
-  const refused = failSubscriptions && String(url).includes('/api/runtime/subscriptions');
+  const refused = failSubscriptions && String(url) === '/api/state/routing-budget?include_subscriptions=true';
   return {ok: !refused, status: refused ? 403 : 200, text: async () => '{}', headers: {get: name => ({'X-Snapshot-Age-S': '2', 'X-Snapshot-Stale-After-S': '60', 'X-Snapshot-State': 'fresh'}[name] ?? null)}};
 };
 """
