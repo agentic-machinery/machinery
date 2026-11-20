@@ -10,6 +10,12 @@ and the merge queue. The shell-command write guard stays as an accident tripwire
 
 The operating-system boundary below now contains read-only review dispatches only.
 
+For a workspace-write task, put the absolute project interpreter path in the brief. The dispatcher
+exports the configured path as `LEARN_UKRAINIAN_PYTHON` to the provider. Run tests from the worktree
+with that interpreter, for example `"$LEARN_UKRAINIAN_PYTHON" -m pytest -q <test-file>`.
+Write worktrees leave `.venv` unlinked because a worktree-local install could modify the shared
+project environment.
+
 ## Routes
 
 `worker.supervise` launches every write route (`claude`, `codex`, `cursor`, `agy` and `opencode`,
@@ -19,6 +25,10 @@ the product checkout's `.mcp.json`; the other providers use their own configurat
 read-only routes run through `lu_machinery/dispatcher/write_boundary.py`; for them there is no
 unsandboxed fallback: a host without bubblewrap, a setup error or a failed canary refuses the run with
 exit 125 and the typed error `write_boundary_refused: <reason>`.
+
+The dispatcher supplies no Sources MCP server to Cursor workspace-write workers. Without an active
+Sources server in Cursor's existing configuration, those workers have no Sources MCP. The dispatcher
+refuses Ukrainian-content write tasks in that case with `cursor_sources_mcp_unavailable`.
 
 ## Read-only review dispatches
 
@@ -31,6 +41,7 @@ provider's selected credential.
 Muse retains its existing self-contained filesystem sandbox.
 Read-only AGY retains its existing filesystem boundary and uses
 the same GitHub domain and address refusal rules, without nesting two boundaries.
+An [upstream Cursor defect](https://forum.cursor.com/t/cli-allowlist-cannot-auto-approve-deletetoolcall-or-webfetch-skipapproval-stays-false-print-mode-user-rejected/172763/7) blocks headless WebFetch. Cursor reviews and workers use auto-accepted web search to satisfy #24 AC-02c. The read-only profile retains `WebFetch(*)` so it takes effect when Cursor ships the fix.
 
 The launcher links the project virtual environment at the review worktree's `.venv` and removes the
 link during cleanup when it created it. Governed pytest can use `.venv/bin/python` and queue against
