@@ -172,15 +172,16 @@ SCHEMAS = {
         {"repo": "endpoint", "number": "number", "destination": "alias", "receipt_dir": "path", "dry_run": "bool"},
     ),
 }
-# Workflows this publisher may start. workflow_dispatch input names, required
-# flags, booleans and choice options are read from each workflow file. There
-# is no second copy of that schema. A string input is admitted only when its
+# Workflows this publisher may start. Product workflow_dispatch input names,
+# required flags, booleans and choice options are read from each workflow file.
+# There is no second copy of that schema. A string input is admitted only when its
 # name is a PATTERNS key (coverage-ref's sha). Any other declared input makes
 # that workflow refuse every dispatch.
 WORKFLOWS = frozenset({
     "ci.yml",
     "deploy-pages.yml",
     "pytest-slow-nightly.yml",
+    "security.yml",
     "stale-branch-cleanup.yml",
     "coverage-ref.yml",
 })
@@ -286,19 +287,20 @@ _WORKFLOW_YAML_LOADER = _workflow_yaml_loader()
 
 
 def _workflow_input_schema(workflow: str, *, product_root: Path | None = None) -> dict[str, tuple[object, bool]] | None:
-    """Input schema for an allowlisted workflow, read from its file.
+    """Input schema for an allowlisted workflow.
 
-    The file is a product-repository workflow, read under ``product_root`` (an
-    absolute path; default: the checkout ``scripts.common.repo_root.product_root``
-    selects, C-4746), never from the machinery package. None, also when no product
-    checkout can be selected, refuses every dispatch of that workflow, including
-    an empty input object. A workflow with no declared inputs returns an empty
-    schema.
+    Product workflows are read under ``product_root`` (an absolute path;
+    default: the configured product checkout). An unavailable schema returns
+    None and refuses every dispatch, including with an empty input object.
+    A workflow that takes no inputs returns an empty schema.
     """
     if workflow not in WORKFLOWS or "/" in workflow or workflow.startswith("."):
         return None
     if product_root is not None and not (isinstance(product_root, Path) and product_root.is_absolute()):
         return None
+    if workflow == "security.yml":
+        # Fleet caller workflows live in the destination repositories and take no manual inputs.
+        return {}
     from lu_machinery.common.repo_root import ProductRootError
     from lu_machinery.common.repo_root import product_root as resolve_product_root
 

@@ -1,4 +1,4 @@
-"""Keep slow-nightly dispatch exact and reject unregistered publication inputs."""
+"""Keep slow-nightly and security dispatch exact and reject unregistered inputs."""
 
 import json
 import subprocess
@@ -35,57 +35,61 @@ def dispatch_calls(tmp_path, synthetic_opsec, monkeypatch):
     return calls, sender
 
 
-def test_missing_registration_or_wrong_dispatch_request(dispatch_calls):
+@pytest.mark.parametrize("workflow", ["pytest-slow-nightly.yml", "security.yml"])
+def test_missing_registration_or_wrong_dispatch_request(dispatch_calls, workflow):
     """An omitted workflow or a rewritten destination/ref breaks canonical dispatch."""
     calls, sender = dispatch_calls
     assert pub.main([
         "workflow-run", "--repo", "unit/public",
-        "--workflow", "pytest-slow-nightly.yml", "--ref", "reviewed/slow-nightly",
+        "--workflow", workflow, "--ref", "reviewed/workflow",
     ], runner=sender) == 0
     assert calls == [
         [
-            "gh", "workflow", "run", "pytest-slow-nightly.yml",
-            "--repo", "unit/public", "--ref=reviewed/slow-nightly",
+            "gh", "workflow", "run", workflow,
+            "--repo", "unit/public", "--ref=reviewed/workflow",
         ],
     ]
 
 
-def test_unknown_workflow_cannot_reach_dispatch(dispatch_calls, capsys):
+@pytest.mark.parametrize("workflow", ["pytest-slow-nightly.yaml", "security.yaml"])
+def test_unknown_workflow_cannot_reach_dispatch(dispatch_calls, capsys, workflow):
     """A near-match filename must not bypass the exact workflow allowlist."""
     calls, sender = dispatch_calls
     with pytest.raises(SystemExit) as error:
         pub.main([
             "workflow-run", "--repo", "unit/public",
-            "--workflow", "pytest-slow-nightly.yaml", "--ref", "main",
+            "--workflow", workflow, "--ref", "main",
         ], runner=sender)
     assert error.value.code == 2
     assert capsys.readouterr().err == "OPSEC: invalid publisher arguments; use --help.\n"
     assert calls == []
 
 
-def test_unexpected_inputs_and_fields_cannot_reach_dispatch(dispatch_calls, capsys):
+@pytest.mark.parametrize("workflow", ["pytest-slow-nightly.yml", "security.yml"])
+def test_unexpected_inputs_and_fields_cannot_reach_dispatch(dispatch_calls, capsys, workflow):
     """No-input workflow registration must not admit extra inputs or raw fields."""
     calls, sender = dispatch_calls
     assert pub.main([
         "workflow-run", "--repo", "unit/public",
-        "--workflow", "pytest-slow-nightly.yml", "--ref", "main",
+        "--workflow", workflow, "--ref", "main",
         "--inputs", '{"force": true}',
     ], runner=sender) == 2
     assert capsys.readouterr().err == "OPSEC: invalid publisher field inputs.\n"
     with pytest.raises(gate.PublishBlocked, match=r"^OPSEC: unknown publisher field\.$"):
         pub.publish(
-            "workflow-run", repo="unit/public", workflow="pytest-slow-nightly.yml",
+            "workflow-run", repo="unit/public", workflow=workflow,
             ref="main", raw_field="force=true", runner=sender,
         )
     assert calls == []
 
 
-def test_invalid_ref_cannot_reach_dispatch(dispatch_calls, capsys):
+@pytest.mark.parametrize("workflow", ["pytest-slow-nightly.yml", "security.yml"])
+def test_invalid_ref_cannot_reach_dispatch(dispatch_calls, capsys, workflow):
     """A ref containing a newline must fail existing ref validation before transport."""
     calls, sender = dispatch_calls
     assert pub.main([
         "workflow-run", "--repo", "unit/public",
-        "--workflow", "pytest-slow-nightly.yml", "--ref", "main\nother",
+        "--workflow", workflow, "--ref", "main\nother",
     ], runner=sender) == 2
     assert capsys.readouterr().err == "OPSEC: invalid publisher field ref.\n"
     assert calls == []
