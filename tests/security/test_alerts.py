@@ -23,6 +23,7 @@ from lu_machinery.security.alerts import (
     METRIC_OPEN_ALERTS,
     METRIC_SOURCE_OK,
     build_fix_brief,
+    read_fleet_security,
     scan_fleet_alerts,
     write_prometheus_textfile,
 )
@@ -486,6 +487,53 @@ def _repo_row(slug: str, *, default: bool = False) -> dict[str, Any]:
     return {"github": slug, "local_name": name, "role": "public-app", "default": default}
 
 
+@pytest.mark.parametrize("scalar", ["!!bool maybe", "!!timestamp never", "!!int ''"])
+def test_workflow_loader_exceptions_make_evidence_unreadable(scalar: str) -> None:
+    repo = FleetRepo(key="fixture", github="org/fixture", local_name="fixture", role="public-app", default=True)
+
+    def respond(endpoint: str) -> Result:
+        if endpoint.split("?", 1)[0] == "repos/org/fixture/contents/.github/workflows/security.yml":
+            return Result(status=200, value=_workflow_file(f"name: {scalar}\n"))
+        response = _clean_fleet(endpoint, repo.github)
+        assert response is not None, endpoint
+        return response
+
+    evidence = read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0)
+    assert evidence["state"] == "inaccessible_evidence"
+    assert evidence["reason"] == "workflow_file_unreadable"
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        pytest.param({"message": "actionlint [syntax] at file.yml:²:1"}, id="non-decimal-digit"),
+        pytest.param({"message": "actionlint [syntax] at file.yml:٣:1"}, id="non-ascii-decimal"),
+        pytest.param({"message": "actionlint [syntax] at file.yml:3:٢"}, id="actionlint-column"),
+        pytest.param({"message": "ShellCheck SC2086 (warning) at run.sh:3:bad"}, id="shellcheck-column"),
+        pytest.param({"message": "Trivy licence GPL-2.0 (restricted/HIGH) libc"}, id="licence-separator"),
+        pytest.param({"message": "Trivy image licence GPL-2.0 (restricted/HIGH) libc"}, id="image-licence-separator"),
+        pytest.param({"message": "actionlint [syntax] at file.yml:3:1\x1b[31m"}, id="unrecognized-with-finding"),
+        pytest.param({"message": "actionlint [syntax] at file.yml:3:1", "annotation_level": None}, id="null-level"),
+        pytest.param({"message": "actionlint [syntax] at file.yml:3:1", "annotation_level": {}}, id="object-level"),
+    ],
+)
+def test_malformed_annotations_do_not_leave_a_partial_finding_list(row: dict[str, Any]) -> None:
+    repo = FleetRepo(key="fixture", github="org/fixture", local_name="fixture", role="public-app", default=True)
+
+    def respond(endpoint: str) -> Result:
+        if endpoint.split("?", 1)[0] == "repos/org/fixture/check-runs/9/annotations":
+            valid = {"message": "actionlint [syntax] at valid.yml:3:1", "annotation_level": "failure"}
+            return Result(status=200, value=[valid, row])
+        response = _clean_fleet(endpoint, repo.github)
+        assert response is not None, endpoint
+        return response
+
+    evidence = read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0)
+    assert evidence["state"] == "inaccessible_evidence"
+    assert evidence["reason"] == "annotations_unreadable"
+    assert evidence["findings"] == []
+
+
 def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     """Defect class: missing enrollment, inaccessible evidence and zero findings reported as the same state."""
     registry = _write_registry(
@@ -510,7 +558,6 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
                 "ghcr.io/org/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             )
         },
-        {"message": "actionlint [syntax] at .github/workflows/ci.yml:3:1\x1b[31m"},
         {"message": "actionlint [syntax] at .github/workflows/nightly tasks.yml:3:1"},
         {"message": "zizmor unpinned-uses severity=high confidence=high at ?"},
         {"annotation_level": "warning", "message": "1 trivy-fs licence disposition(s) matched no finding"},
@@ -619,7 +666,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         if path == "repos/org/dirty/check-runs/9/annotations":
             return Result(status=200, value=[])
         if path == "repos/org/broken/check-runs/11/annotations":
-            return Result(status=200, value=[{"message": "trivy fs target 'Dockerfile' is missing; failing closed"}])
+            return Result(status=200, value=[])
         if path == "repos/org/noisy/check-runs/12/annotations":
             return Result(status=200, value=[{"message": "scanner finished"}])
         if path == "repos/org/foreign/check-runs/13/annotations":
@@ -653,7 +700,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     assert hidden["reason"] == "github_http_404"
     assert hidden["state"] != missing["state"]
     assert report["repositories"]["broken"]["fleet_security"]["reason"] == "run_not_success"
-    assert report["repositories"]["noisy"]["fleet_security"]["reason"] == "unrecognized_annotations"
+    assert report["repositories"]["noisy"]["fleet_security"]["reason"] == "annotations_unreadable"
     assert report["repositories"]["foreign"]["fleet_security"]["reason"] == "github_invalid_next_link"
     assert not any("evil/other" in call for call in client.calls)
     findings = report["repositories"]["dirty"]["fleet_security"]["findings"]

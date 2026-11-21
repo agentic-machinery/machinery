@@ -599,12 +599,12 @@ def _split_licence_target(body: str) -> tuple[str, bool]:
     """
     package, separator, target = body.partition(" in ")
     if not separator or not package or not target:
-        return body, False
+        raise _UnreadableAnnotation
     return target, " in " not in target
 
 
 def _line_number(raw: str) -> int:
-    if not raw.isdigit() or len(raw) > 9:
+    if not raw.isascii() or not raw.isdecimal() or len(raw) > 9:
         raise _UnreadableAnnotation
     number = int(raw)
     if number < 1:
@@ -646,6 +646,7 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
     text = message.strip()
     matched = re.fullmatch(r"actionlint \[([^\]]+)\] at (.+):([^:\s]+):([^:\s]+)", text)
     if matched:
+        _line_number(matched.group(4))
         return _finding(
             scanner="actionlint",
             rule=matched.group(1),
@@ -657,6 +658,7 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
         )
     matched = re.fullmatch(r"ShellCheck (SC\S+) \(([^)]+)\) at (.+):([^:\s]+):([^:\s]+)", text)
     if matched:
+        _line_number(matched.group(5))
         return _finding(
             scanner="shellcheck",
             rule=matched.group(1),
@@ -871,7 +873,7 @@ def _pins_in_workflow(
     """Read job-level ``uses`` values. A line inside a script is not a caller."""
     try:
         document = yaml.safe_load(text)
-    except (yaml.YAMLError, ValueError):
+    except Exception:
         return [], [], "workflow_file_unreadable"
     if document is None:
         return [], [], None
@@ -1033,7 +1035,6 @@ def _read_caller_evidence(
         return None, [], "github_invalid_payload"
     record = {**record, "gate_conclusion": gate_conclusion}
     findings: list[dict[str, Any]] = []
-    unparsed = 0
     for job in jobs:
         job_name = job.get("name")
         if not isinstance(job_name, str) or not any(_is_fleet_job(job_name, expected) for expected in _FLEET_JOB_NAMES):
@@ -1063,26 +1064,24 @@ def _read_caller_evidence(
             for row in rows:
                 if not isinstance(row, Mapping):
                     return None, [], "github_invalid_payload"
-                level = row.get("annotation_level")
-                if level is not None and not isinstance(level, str):
+                level = row.get("annotation_level", "")
+                if not isinstance(level, str):
                     return None, [], "annotations_unreadable"
                 if level in {"warning", "notice"}:
                     continue
                 try:
                     parsed = _parse_oss_finding(row.get("message"))
                 except _UnreadableAnnotation:
-                    return None, [], "annotations_unreadable"
+                    parsed = None
                 if parsed is None:
-                    unparsed += 1
-                    continue
+                    return record, [], "annotations_unreadable"
                 findings.append(parsed)
                 if len(findings) > _MAX_OSS_FINDINGS:
                     return None, [], "pagination_limit"
     if findings:
         return record, findings, None
-    if gate_conclusion != "success" or unparsed:
-        reason = "run_not_success" if gate_conclusion != "success" else "unrecognized_annotations"
-        return record, [], reason
+    if gate_conclusion != "success":
+        return record, [], "run_not_success"
     return record, [], None
 
 
