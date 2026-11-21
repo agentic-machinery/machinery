@@ -58,7 +58,10 @@ MERGE_QUEUE_INT_BOUNDS = {
     "min_entries_to_merge_wait_minutes": (0, 360),
 }
 SCHEMAS = {
-    "issue-create": ({"title", "body"}, {**COMMON, **TEXT, "labels": "texts", "milestone": "text", "parent": "number"}),
+    "issue-create": (
+        {"title", "body"},
+        {**COMMON, **TEXT, "labels": "texts", "milestone": "text", "parent": "number", "epic": "bool"},
+    ),
     "issue-edit": ({"number"}, {**COMMON, **EDIT, "number": "number", "remove_milestone": "bool"}),
     "issue-comment": ({"number", "body"}, {**COMMON, "number": "number", "body": "text", "body_file": "file"}),
     "issue-comment-json": ({"number", "body"}, {**COMMON, "number": "number", "body": "text", "body_file": "file"}),
@@ -2414,7 +2417,20 @@ def publish(
                     "REPO_REFUSED: issue-create only targets a repository registered in "
                     f"{_FLEET_REPOS}; nothing was created."
                 )
-            if policy == "stream":
+            if fields.get("epic"):
+                if not cto_safe_mode.is_cto_caller(os.environ):
+                    raise gate.PublishBlocked("EPIC_REFUSED: --epic requires the CTO seat; nothing was created.")
+                if policy != "stream" or not dest.startswith("github.com/") or "parent" in fields:
+                    raise gate.PublishBlocked(
+                        "EPIC_REFUSED: use --epic without --parent in the stream registry repository on github.com; "
+                        "nothing was created."
+                    )
+                if not re.fullmatch(r"\[EPIC\]\[[a-z0-9]+(?:-[a-z0-9]+)*\] \S[^\r\n]*", fields["title"]):
+                    raise gate.PublishBlocked(
+                        "EPIC_REFUSED: --epic requires a title in the form '[EPIC][stream-key] Title'; "
+                        "nothing was created."
+                    )
+            elif policy == "stream":
                 if "parent" not in fields:
                     raise gate.PublishBlocked(
                         "PARENT_REQUIRED: issue-create requires parent, the number of a registered open stream epic; "
@@ -2840,6 +2856,22 @@ def main(argv=None, *, runner=None):
     verbs = parser.add_subparsers(dest="verb", required=True)
     for verb, (_, schema) in SCHEMAS.items():
         sub = verbs.add_parser(verb, help=f"Publish {verb} with scanned fields", allow_abbrev=False)
+        if verb == "issue-create":
+            sub.description = (
+                "Create an issue in a registered repository.\n"
+                "Use --parent for ordinary issues in the stream registry repository. "
+                "Use --epic to create an approved stream root."
+            )
+            sub.formatter_class = argparse.RawDescriptionHelpFormatter
+            sub.epilog = (
+                "Example for the CTO seat:\n"
+                f"  .venv/bin/python -m {_PUBLISHER} issue-create --epic --repo unit/public "
+                "--title '[EPIC][my-stream] Coordination' --body-file epic.md\n"
+                "Outputs: the issue URL. Add the new root to the stream registry with the same delivery.\n"
+                "Exit codes: 0 success; 1 GitHub failure; 2 invalid input, publishing refusal or transport error.\n"
+                "If LINK_FAILED appears, the ordinary issue already exists and needs a parent link.\n"
+                "Related: workflow.md, Work intake."
+            )
         if verb == "code-scanning-dismiss":
             sub.description = (
                 "Dismiss one reviewed code-scanning alert from an interactive seat.\n"
@@ -3030,6 +3062,13 @@ def main(argv=None, *, runner=None):
             )
         for key, kind in schema.items():
             kwargs = {"default": argparse.SUPPRESS, "help": f"{key.replace('_', ' ')} ({kind}); omitted by default"}
+            if verb == "issue-create" and key == "parent":
+                kwargs["help"] = "Open registered epic number, such as 123. Required for ordinary issues in the registry repository."
+            if verb == "issue-create" and key == "epic":
+                kwargs["help"] = (
+                    "CTO seat only. Create a root in the stream registry repository, with no --parent "
+                    "and a title like '[EPIC][my-stream] Coordination'. Default off."
+                )
             if verb == "issue-transfer":
                 kwargs["help"] = {
                     "repo": "Required source: registry alias (e.g. public) or owner/name; no GH_REPO or origin default",
@@ -3174,7 +3213,12 @@ def main(argv=None, *, runner=None):
     )
     args = vars(parser.parse_args(argv))
     verb = args.pop("verb")
-    if verb == "issue-create" and "parent" not in args and _cli_keeps_stream_parent_refusal(args.get("repo")):
+    if (
+        verb == "issue-create"
+        and "parent" not in args
+        and not args.get("epic")
+        and _cli_keeps_stream_parent_refusal(args.get("repo"))
+    ):
         print(
             "issue-create requires --parent <stream epic issue number>; the new issue is linked to it. "
             "Nothing was created.",
