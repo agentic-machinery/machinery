@@ -349,6 +349,12 @@ def test_secret_dump_shapes_blocked(monkeypatch, capsys, cmd):
         "cat <<EOF\ncat .env\nEOF",
         "cat <<-EOF\n\tcat .env\n\tEOF",
         "cat <<'EOF'\nprintenv\nEOF",
+        # Bodies pair with their own operator, not a shared delimiter (C-6334 r2).
+        "printf '%s' \"$(cat <<'E'\nINNER\nE\n)\" <<E\n$GH_TOKEN\nE",
+        "cat <<'A-B' <<LU_HEREDOC_412d42\nok\nA-B\n$GH_TOKEN\nLU_HEREDOC_412d42",
+        # Continuations inside an operator or an unquoted body's expansion (C-6334 r2).
+        "cat <\\\n<'EOF'\ncat .env\nEOF",
+        "cat <<EOF\n$\\\n(cat .env)\nEOF",
     ],
 )
 def test_issue_8896_secret_bypasses_block(monkeypatch, capsys, command):
@@ -599,9 +605,10 @@ def test_issue_9115_malformed_secret_hook_input_blocks(monkeypatch, payload):
 )
 def test_issue_9088_standard_heredoc_delimiters(opener, closer, quoted):
     assert [(d.closer, d.strip_tabs, d.quoted) for d in parse_heredocs(f"cat {opener}\nx\n{closer}")] == [("EOF", opener == "<<-EOF", quoted)]
-    view_opener = ("<<-" if opener.startswith("<<-") else "<<") + ("'EOF'" if quoted else "EOF")
+    # The view names each operator by its document (LU_HEREDOC_<n>, reading order).
+    view_opener = ("<<-" if opener.startswith("<<-") else "<<") + ("'LU_HEREDOC_0'" if quoted else "LU_HEREDOC_0")
     assert heredoc_view(f"cat {opener}\ncat .env\n{closer}\necho $GH_TOKEN") == (
-        f"cat {view_opener}\n( cat .env )\nEOF\necho $GH_TOKEN"
+        f"cat {view_opener}\n( cat .env )\nLU_HEREDOC_0\necho $GH_TOKEN"
     )
 
 
@@ -759,6 +766,8 @@ def test_issue_8896_review_round_two_ordinary_allow(monkeypatch, command):
         'cat <<"EO\\"F"\nit\'s fine\nEO"F',
         "git commit -F - <<E\\OF\nit's fine\nEOF",
         "x=$(cat <<'END'DATA\nit's fine\nENDDATA\n)",
+        # An escape Bash cannot encode is text, never a crash (C-6334 r2).
+        "cat <<'EOF'\n$'\\U00110000'\nEOF",
     ],
 )
 def test_issue_8896_ordinary_commands_allow(monkeypatch, command):

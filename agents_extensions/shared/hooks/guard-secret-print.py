@@ -95,7 +95,6 @@ try:
         split_operator_run,
         split_quote_preserving,
         static_word,
-        view_closer,
     )
 except Exception as exc:
     print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
@@ -1265,7 +1264,8 @@ def _heredoc_inputs(command: str) -> dict[str, list[tuple[str, bool]]]:
     """Here-document bodies from the shared plan, by closer, for their consumer statement."""
     documents: dict[str, list[tuple[str, bool]]] = {}
     for document in parse_heredocs(command):
-        documents.setdefault(view_closer(document.closer), []).append(("\n".join(document.lines), document.quoted))
+        # The view names each operator by its document, so pairing is by identity.
+        documents.setdefault(document.name, []).append(("\n".join(document.lines), document.quoted))
     return documents
 
 

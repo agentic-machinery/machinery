@@ -2673,6 +2673,9 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
             0,
         ),
         ("function cat { bash; }\ncat <<'EOF'\ngh pr merge 5\nEOF", ["CI Gate"], 2),
+        # Prose that mentions gh and a merge is not a merge invocation (C-6334 r2).
+        ("cat <<'DOC'\nWe use gh for listing. The phrase pr merge is documented.\nDOC", ["CI Gate"], 0),
+        ("cat <<'EOF'\n$'\\U00110000'\ngh pr view 5\nEOF", ["CI Gate"], 0),
     ],
 )
 def test_interpreter_heredoc_merge_bypass_refused(monkeypatch, command, failures, expected):

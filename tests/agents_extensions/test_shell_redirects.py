@@ -139,6 +139,8 @@ def test_undecidable_detector_fails_closed(command):
         "echo ${#arr[@]}",
         "cat <<'EOF'\ncase x in x) ${x:-(}\nEOF\ngit switch -c fixture",
         'echo "two\nlines"',
+        # A newline inside a substitution does not read the outer body (C-6334 r2).
+        "printf %s <<EOF \"$(printf '\\n'\n)\"\nmarker\nEOF",
     ],
 )
 def test_whole_command_detector_controls(command):

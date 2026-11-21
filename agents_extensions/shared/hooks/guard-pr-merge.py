@@ -235,8 +235,14 @@ def _join_line_continuations(text: str) -> str:
 
 
 # A merge a here-document body names, in any program's spelling: its words
-# (quotes removed) hold `gh ... pr merge` or the publisher's `pr-merge`.
-_BODY_MERGE = re.compile(r"(?:^|[\s\[,])gh[\s\],](?:.*[\s\[,])?pr[\s\],]+merge(?:[\s\],]|$)|lu_machinery\.publish[\s\],]+pr-merge\b")
+# (quotes removed) hold `gh`, then only options and their values, then
+# `pr merge`, or the publisher's `pr-merge`. Prose that only mentions merging
+# ("we use gh ... the phrase pr merge") is not an invocation.
+_SEP = r"[\s\[\],]+"
+_BODY_MERGE = re.compile(
+    rf"(?:^|[\s\[,])gh(?:{_SEP}-[^\s\[\],]*(?:{_SEP}[^\s\[\],-][^\s\[\],]*)?)*{_SEP}pr{_SEP}merge(?:[\s\],]|$)"
+    r"|lu_machinery\.publish[\s\],]+pr-merge\b"
+)
 
 
 def _body_names_merge(command: str) -> bool:

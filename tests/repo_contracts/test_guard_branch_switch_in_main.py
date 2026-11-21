@@ -619,7 +619,8 @@ def test_attached_dash_heredoc_closes_and_body_words_stay_visible():
     cmd = "cat <<-EOF\n\tgit branch -D fake\n\tEOF\ngit branch -D main"
     assert _dangerous(cmd) is not None  # the trailing real one
     assert [d.closer for d in parse_heredocs(cmd)] == ["EOF"]
-    assert _dangerous("cat <<-EOF\n\tgit branch -D fake\n\tEOF") is not None
+    assert _dangerous("cat <<-EOF\n\tgit branch -D fake\n\tEOF") is None  # not a protected branch
+    assert _dangerous("cat <<-EOF\n\tgit branch -D main\n\tEOF") is not None
 
 
 # --- #4899: target-repo-aware protected-root matching ----------------------

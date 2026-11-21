@@ -369,6 +369,30 @@ class HereDocument(NamedTuple):
     quoted: bool  # a quoted delimiter: the body is literal
     strip_tabs: bool  # `<<-`
     lines: tuple[str, ...]  # physical body lines, leading tabs removed for `<<-`
+    name: str  # the delimiter heredoc_view writes: unique per document, in reading order
+
+
+class _Names:
+    """Unique view names for one parse: `LU_HEREDOC_<n>` in reading order."""
+
+    def __init__(self, start: int) -> None:
+        self.next = start
+        self.assigned: set[str] = set()
+
+    def assign(self, closer: str) -> str:
+        if re.fullmatch(r"LU_HEREDOC_[0-9]+", closer) and closer not in self.assigned:
+            name = closer  # a name an earlier parse wrote: reading the view again keeps it
+        else:
+            name = f"LU_HEREDOC_{self.next}"
+            self.next += 1
+        self.assigned.add(name)
+        return name
+
+
+def _code_point(digits: str, escape: str) -> str:
+    value = int(digits, 16)
+    # Bash prints an escape it cannot encode as written; never raise on one.
+    return chr(value) if value <= 0x10FFFF and not 0xD800 <= value <= 0xDFFF else escape
 
 
 def _ansi_c(text: str) -> str:
@@ -377,7 +401,7 @@ def _ansi_c(text: str) -> str:
     def decode(match: re.Match[str]) -> str:
         escape = match.group(1)
         if escape[0] in "xuU":
-            return chr(int(escape[1:], 16)) if len(escape) > 1 else escape
+            return _code_point(escape[1:], "\\" + escape) if len(escape) > 1 else escape
         if escape[0] in "01234567":
             return chr(int(escape, 8) & 0xFF)
         return {"n": "\n", "t": "\t", "r": "\r", "e": "\x1b", "E": "\x1b", "a": "\a", "b": "\b"}.get(escape, escape)
@@ -385,10 +409,25 @@ def _ansi_c(text: str) -> str:
     return re.sub(r"\\(x[0-9A-Fa-f]{0,2}|u[0-9A-Fa-f]{0,4}|U[0-9A-Fa-f]{0,8}|[0-7]{1,3}|.)", decode, text, flags=re.S)
 
 
+def _join_continuations(text: str) -> str:
+    """Remove backslash-newline pairs in one linear pass; an escaped backslash stays."""
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] == "\\" and index + 1 < len(text):
+            if text[index + 1] != "\n":
+                out.append(text[index : index + 2])
+            index += 2
+            continue
+        out.append(text[index])
+        index += 1
+    return "".join(out)
+
+
 def _body_words(text: str) -> list[str]:
     """A body as plain words, one entry per command a shell could start."""
     # A reading shell joins continuations, quoted delimiter or not.
-    text = re.sub(r"(?<!\\)((?:\\\\)*)\\\n", r"\1", text)
+    text = _join_continuations(text)
     text = re.sub(r"\$'((?:[^'\\]|\\.)*)'?", lambda match: _ansi_c(match.group(1)), text, flags=re.S)
     # A `(` right after a word character never starts a command in Bash
     # (`name()` opens a function definition), so call syntax in code or prose
@@ -420,6 +459,31 @@ def _tail(out: list[str], size: int = 64) -> str:
     return "".join(reversed(parts))[-size:]
 
 
+def _ahead(text: str, index: int, size: int = 5) -> str:
+    """The next `size` characters Bash reads in command context: continuations removed."""
+    out: list[str] = []
+    while index < len(text) and len(out) < size:
+        if text.startswith("\\\n", index):
+            index += 2
+            continue
+        out.append(text[index])
+        index += 1
+    return "".join(out)
+
+
+def _skip(text: str, index: int, count: int) -> int:
+    """The offset after `count` characters read as _ahead reads them."""
+    while count and index < len(text):
+        if text.startswith("\\\n", index):
+            index += 2
+            continue
+        index += 1
+        count -= 1
+    while text.startswith("\\\n", index):
+        index += 2
+    return index
+
+
 def document_words(document: HereDocument) -> list[str]:
     """A body as plain words, one entry per command (see the plan above).
 
@@ -439,8 +503,10 @@ def _backtick_body(command: str, index: int) -> tuple[str, int]:
     return re.sub(r"\\([\\`$])", r"\1", command[index + 1 : end]), end + 1
 
 
-def _body_expansions(text: str, documents: list[HereDocument], depth: int) -> list[str]:
+def _body_expansions(text: str, documents: list[HereDocument], depth: int, names: _Names) -> list[str]:
     """The expansions the outer shell performs on an unquoted body, as shell text."""
+    # Bash joins an unquoted body's continuations before it expands the body.
+    text = _join_continuations(text)
     found: list[str] = []
     index = 0
     while index < len(text):
@@ -449,7 +515,7 @@ def _body_expansions(text: str, documents: list[HereDocument], depth: int) -> li
             continue
         if text[index] == "`":
             body, index = _backtick_body(text, index)
-            inner, view, _ = _parse(body, depth=depth + 1)
+            inner, view, _ = _parse(body, depth=depth + 1, names=names)
             documents.extend(inner)
             found.append("$(" + view + ")")
             continue
@@ -458,7 +524,7 @@ def _body_expansions(text: str, documents: list[HereDocument], depth: int) -> li
             index += 1
             continue
         context = "cmd" if opening == "$(" else "((" if opening == "$((" else opening
-        inner, view, index = _parse(text, index + len(opening), [context], depth + 1)
+        inner, view, index = _parse(text, index + len(opening), [context], depth + 1, names)
         documents.extend(inner)
         found.append(opening + view)
     return found
@@ -467,35 +533,62 @@ def _body_expansions(text: str, documents: list[HereDocument], depth: int) -> li
 def heredoc_view(command: str) -> str:
     """The command as every guard reads it: continuations joined, bodies shown as above.
 
-    The `<<` operators and closer lines stay (closers as view_closer writes
-    them), so a reader can still pair a body with its command, and parsing the
-    view again yields the same plan.
+    Each operator and closer line stays, with the document's unique `name` as
+    its delimiter, so a reader pairs a body with its own operator. Parsing the
+    view again reads the same documents, by the same names, in the same order.
     """
-    if "<<" not in command:
+    if not _may_have_heredoc(command):
         return collapse_line_continuations(command)
-    return _parse(command)[1]
+    return _checked_parse(command)[1]
 
 
 def parse_heredocs(command: str) -> tuple[HereDocument, ...]:
     """Every here-document in `command`, in the order Bash reads them."""
-    if "<<" not in command:
+    if not _may_have_heredoc(command):
         return ()
-    return _parse(command)[0]
+    return _checked_parse(command)[0]
+
+
+def _may_have_heredoc(command: str) -> bool:
+    """Whether a `<<` can occur once continuations are joined (`<\\` newline `<` is one)."""
+    return "<<" in command or "<<" in command.replace("\\\n", "")
+
+
+def _checked_parse(command: str) -> tuple[tuple[HereDocument, ...], str, int]:
+    if "\x01" in command:
+        # The parser marks operator slots with \x01 while it reads bodies.
+        raise ShellPreprocessLimit("control character in a command with a here-document")
+    # A name the parser wrote keeps it when the view is read again; fresh
+    # numbers start above every LU_HEREDOC_<n> already in the text.
+    used = [int(number) for number in re.findall(r"LU_HEREDOC_([0-9]+)", command)]
+    names = _Names(max(used) + 1 if used else 0)
+    try:
+        return _parse(command, names=names)
+    except (ValueError, RecursionError, IndexError) as exc:
+        # Fail closed with a type: an unexpected reader error is a refusal.
+        raise ShellPreprocessLimit(f"here-document could not be read safely ({type(exc).__name__})") from exc
 
 
 def _parse(
-    command: str, index: int = 0, inside: list[str] | None = None, depth: int = 0
+    command: str,
+    index: int = 0,
+    inside: list[str] | None = None,
+    depth: int = 0,
+    names: _Names | None = None,
 ) -> tuple[tuple[HereDocument, ...], str, int]:
     """Parse from `index`, at the top level or inside one expansion context.
 
     Return the documents, the view, and the offset where the expansion closed
-    (the end of `command` at the top level).
+    (the end of `command` at the top level). Pending bodies and the owning
+    command belong to their own `$(...)` frame, as in Bash.
     """
     if depth > _MAX_NESTING:
         raise ShellPreprocessLimit("shell nesting too deep to read safely")
+    names = _Names(0) if names is None else names
     out: list[str] = []
     documents: list[HereDocument] = []
     pending: list[tuple[int, int, str, str, bool, bool]] = []
+    frames: list[tuple[list[tuple[int, int, str, str, bool, bool]], int]] = []
     # Contexts: "cmd" (top level or `$(`), quotes, "${", "((" and "$[".
     stack: list[str] = ["cmd", *(inside or [])]
     base = len(stack) - 1
@@ -509,10 +602,15 @@ def _parse(
         parens.pop()
         return len(stack) <= base
 
+    def finish() -> tuple[tuple[HereDocument, ...], str, int]:
+        if pending or frames:
+            raise ShellPreprocessLimit("here-document body does not close")
+        return tuple(documents), "".join(out), index
+
     while index < length:
         char = command[index]
         context = stack[-1]
-        if stack.count("cmd") > _MAX_NESTING:
+        if len(frames) > _MAX_NESTING:
             raise ShellPreprocessLimit("shell nesting too deep to read safely")
         if context in {"'", "$'"}:
             if context == "$'" and char == "\\" and index + 1 < length:
@@ -522,7 +620,7 @@ def _parse(
             out.append(char)
             index += 1
             if char == "'" and close():
-                return tuple(documents), "".join(out), index
+                return finish()
             continue
         if char == "\\":
             if command.startswith("\\\n", index):
@@ -540,7 +638,7 @@ def _parse(
                 stack.append('"')
                 parens.append(0)
             elif close():
-                return tuple(documents), "".join(out), index
+                return finish()
             continue
         if char == "'" and context != '"':
             stack.append("$'" if out and out[-1] == "$" else "'")
@@ -551,13 +649,14 @@ def _parse(
             continue
         if char == "`":
             body, index = _backtick_body(command, index)
-            inner, view, _ = _parse(body, depth=depth + 1)
+            inner, view, _ = _parse(body, depth=depth + 1, names=names)
             documents.extend(inner)
             out.append("$(" + view + ")")
             word_start = False
             continue
-        opening = next((op for op in _EXPANSIONS if command.startswith(op, index)), "")
-        if not opening and context == "cmd" and word_start and command.startswith("((", index):
+        look = _ahead(command, index)
+        opening = next((op for op in _EXPANSIONS if look.startswith(op)), "")
+        if not opening and context == "cmd" and word_start and look.startswith("(("):
             opening = "(("
         if not opening and context == "cmd" and char == "[" and _SUBSCRIPTED.search(_tail(out)):
             opening = "["  # an array subscript (`x[1 << 2]=1`) is arithmetic: its `<<` is a shift
@@ -566,10 +665,12 @@ def _parse(
                 "cmd" if opening == "$(" else "((" if opening == "$((" else "$[" if opening == "[" else opening
             )
             parens.append(0)
+            index = _skip(command, index, len(opening))
             if opening == "$(":
-                owner = index + 2
+                frames.append((pending, owner))
+                pending = []
+                owner = index
             out.append(opening)
-            index += len(opening)
             word_start = True
             continue
         if context in _CLOSERS:
@@ -578,12 +679,12 @@ def _parse(
                 parens[-1] += 1
             elif context != "${" and char == ")" and parens[-1]:
                 parens[-1] -= 1
-            elif command.startswith(closing, index) and not parens[-1]:
+            elif look.startswith(closing) and not parens[-1]:
                 out.append(closing)
-                index += len(closing)
+                index = _skip(command, index, len(closing))
                 word_start = False
                 if close():
-                    return tuple(documents), "".join(out), index
+                    return finish()
                 continue
             elif char == ")" and context == "((":
                 raise ShellPreprocessLimit("arithmetic context cannot be read safely")
@@ -604,7 +705,7 @@ def _parse(
             out.append(command[index:end])
             index = end
             continue
-        if len(stack) > 1 and word_start and re.match(r"case[ \t\n]", command[index : index + 5]):
+        if len(stack) > 1 and word_start and re.match(r"case[ \t\n]", look):
             raise ShellPreprocessLimit("case command inside a substitution cannot be read safely")
         if char == "(":
             parens[-1] += 1
@@ -612,18 +713,22 @@ def _parse(
             if parens[-1]:
                 parens[-1] -= 1
             elif len(stack) > 1:
+                if pending:
+                    raise ShellPreprocessLimit("here-document in a substitution does not close before it")
                 out.append(char)
                 index += 1
                 word_start = False
+                if frames:
+                    pending, owner = frames.pop()
                 if close():
-                    return tuple(documents), "".join(out), index
+                    return finish()
                 continue
-        if command.startswith("<<<", index):
+        if look.startswith("<<<"):
             out.append("<<<")
-            index += 3
+            index = _skip(command, index, 3)
             word_start = True
             continue
-        if command.startswith("<<", index):
+        if look.startswith("<<"):
             index = _read_operator(command, index, out, pending, owner)
             word_start = True
             continue
@@ -631,7 +736,7 @@ def _parse(
             out.append(char)
             index += 1
             if pending:
-                index = _read_bodies(command, index, out, pending, documents, depth)
+                index = _read_bodies(command, index, out, pending, documents, depth, names)
             word_start = True
             owner = index
             continue
@@ -640,55 +745,50 @@ def _parse(
         out.append(char)
         index += 1
         word_start = char in " \t;&|()<>"
-    if pending:
-        raise ShellPreprocessLimit("here-document body does not close")
     if len(stack) > 1:
         raise ShellPreprocessLimit("quote or substitution left open in a command with a here-document")
-    return tuple(documents), "".join(out), index
+    return finish()
 
 
 def _read_operator(
     command: str, index: int, out: list[str], pending: list[tuple[int, int, str, str, bool, bool]], owner: int
 ) -> int:
-    """Read one `<<` or `<<-` operator and its delimiter word; return the next offset."""
+    """Read one `<<` or `<<-` operator and its delimiter word; return the next offset.
+
+    Continuations inside the operator, before the word and within it are joined, as Bash joins them.
+    """
     operator = index
     descriptor = re.search(r"(?:^|(?<=[ \t\n;&|()<>]))(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})\Z", _tail(out))
-    index += 2
-    strip_tabs = command.startswith("-", index)
-    index += strip_tabs
-    while index < len(command) and command[index] in " \t":
-        index += 1
-    start = index
+    index = _skip(command, index, 2)
+    strip_tabs = _ahead(command, index, 1) == "-"
+    if strip_tabs:
+        index = _skip(command, index, 1)
+    while index < len(command) and (command[index] in " \t" or command.startswith("\\\n", index)):
+        index += 2 if command[index] == "\\" else 1
+    word: list[str] = []
     quote = ""
     while index < len(command):
         char = command[index]
         if char == "\\" and quote != "'":
+            if command.startswith("\\\n", index):
+                index += 2  # Bash joins a continuation inside the word
+                continue
+            word.append(command[index : index + 2])
             index += 2
             continue
         if char in "\"'" and (not quote or quote == char):
             quote = "" if quote else char
         elif not quote and char in _DELIMITER_END:
             break
+        word.append(char)
         index += 1
-    word = command[start:index]
-    closer = heredoc_closer(word) if "\r" not in word and "\n" not in word else None
+    text = "".join(word)
+    closer = heredoc_closer(text) if "\r" not in text and "\n" not in text else None
     if closer is None:
         raise ShellPreprocessLimit("here-document delimiter cannot be read safely")
     pending.append((operator, owner, descriptor.group() if descriptor else "", closer[0], closer[1], strip_tabs))
-    name = view_closer(closer[0])
-    out.append(("<<-" if strip_tabs else "<<") + (f"'{name}'" if closer[1] else name))
+    out.append(("<<-" if strip_tabs else "<<") + "\x01" + str(len(pending) - 1) + "\x01")
     return index
-
-
-def view_closer(closer: str) -> str:
-    """The closer heredoc_view writes for `closer`: itself when it is a plain word.
-
-    Any other closer (`EO"F`, `END-DATA`) becomes an identifier that encodes it,
-    so the view's closer line opens no quote and parses to the same plan.
-    """
-    if re.fullmatch(r"[A-Za-z0-9_]+", closer):
-        return closer
-    return "LU_HEREDOC_" + closer.encode("utf-8").hex()
 
 
 def _read_bodies(
@@ -698,36 +798,46 @@ def _read_bodies(
     pending: list[tuple[int, int, str, str, bool, bool]],
     documents: list[HereDocument],
     depth: int,
+    names: _Names,
 ) -> int:
     """Read the pending bodies that start at `index`; return the offset after them."""
-    for operator, owner, descriptor, closer, quoted, strip_tabs in pending:
+    for slot, (operator, owner, descriptor, closer, quoted, strip_tabs) in enumerate(pending):
         lines: list[str] = []
         while True:
             if index > len(command) or (index == len(command) and command.endswith("\n")):
                 raise ShellPreprocessLimit("here-document body does not close")
             end = command.find("\n", index)
             end = len(command) if end < 0 else end
-            line = command[index:end]
-            logical = line
+            physical = [command[index:end]]
+            logical = [physical[0]]
             # An unquoted body joins continuations before Bash compares the closer.
-            while not quoted and (len(logical) - len(logical.rstrip("\\"))) % 2 and end < len(command):
+            while not quoted and (len(logical[-1]) - len(logical[-1].rstrip("\\"))) % 2 and end < len(command):
                 following = command.find("\n", end + 1)
                 following = len(command) if following < 0 else following
-                logical = logical[:-1] + command[end + 1 : following]
-                line = line + "\n" + command[end + 1 : following]
+                logical[-1] = logical[-1][:-1]
+                logical.append(command[end + 1 : following])
+                physical.append(command[end + 1 : following])
                 end = following
             index = end + 1
-            if (logical.lstrip("\t") if strip_tabs else logical) == closer:
+            candidate = "".join(logical)
+            if (candidate.lstrip("\t") if strip_tabs else candidate) == closer:
                 break
-            lines.extend(part.lstrip("\t") if strip_tabs else part for part in line.split("\n"))
-        documents.append(HereDocument(operator, owner, descriptor, closer, quoted, strip_tabs, tuple(lines)))
+            lines.extend(part.lstrip("\t") if strip_tabs else part for part in physical)
+        name = names.assign(closer)
+        documents.append(HereDocument(operator, owner, descriptor, closer, quoted, strip_tabs, tuple(lines), name))
+        marker = "\x01" + str(slot) + "\x01"
+        # The operator was written with a slot marker; give it the document's name.
+        for position in range(len(out) - 1, -1, -1):
+            if marker in out[position]:
+                out[position] = out[position].replace(marker, f"'{name}'" if quoted else name, 1)
+                break
         text = "\n".join(lines)
         words = _body_words(text)
         if words:
             out.append("( " + " ; ".join(words) + " )\n")
         if not quoted:
-            out.extend(expansion + "\n" for expansion in _body_expansions(text, documents, depth))
-        out.append(view_closer(closer) + ("\n" if index <= len(command) else ""))
+            out.extend(expansion + "\n" for expansion in _body_expansions(text, documents, depth, names))
+        out.append(name + ("\n" if index <= len(command) else ""))
     pending.clear()
     return min(index, len(command))
 
