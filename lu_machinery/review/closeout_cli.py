@@ -29,7 +29,10 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
+from lu_machinery.common.repo_root import MachineryConfigError
+from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.fleet import claude_account_lane, credit_lane
+from lu_machinery.identity import UNKNOWN_AUTHOR_FAMILY, resolve_author_family
 from lu_machinery.review.evidence import compute_target_input_fingerprint
 from lu_machinery.review.findings import FindingEvent, FindingsLedger, FindingsLedgerError
 from lu_machinery.review.model_catalog import VALID_REVIEW_PROFILES, VALID_RISKS
@@ -512,12 +515,13 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
                     if args.review_mode == "red_team"
                     else ()
                 )
+                task_root = (Path(args.task_root) if args.task_root else tasks_dir()).absolute()
                 facts = collect_branch_review_facts(
                     repository=args.repository or _checkout_repository(repo_root),
                     repo_root=repo_root,
                     base_tip_sha=base_sha,
                     head_sha=head_sha,
-                    task_root=Path(args.task_root) if args.task_root else _checkout_task_root(repo_root),
+                    task_root=task_root,
                     owned_paths=tuple(args.owned_path or []),
                     subject_seats=tuple(args.subject_seat or []),
                     subject_families=tuple(args.subject_family or []),
@@ -525,10 +529,28 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
                     unknown_history=history,
                 )
                 refuse_excluded_only_range(facts, repo_root=repo_root, exclude_sha=exclude)
-            except (BranchFactsError, CloseoutStateError) as exc:
+            except (BranchFactsError, CloseoutStateError, MachineryConfigError) as exc:
                 failed: dict[str, Any] = {
                     "selected": None,
                     "fail_closed_reason": f"branch review facts unavailable: {exc}",
+                }
+                state["resolved_reviewer"] = failed
+                _save_state(args.state_file, state)
+                print(json.dumps(failed, indent=2))
+                return 1
+            unknown_authors = list(facts.unresolved_authors)
+            if resolve_author_family(args.author_model, args.author_family) == UNKNOWN_AUTHOR_FAMILY:
+                unknown_authors.append(f"--author-model {args.author_model!r}")
+            if unknown_authors:
+                failed = {
+                    "selected": None,
+                    "quorum": [],
+                    "reason_code": "AUTHOR_UNRESOLVED",
+                    "fail_closed_reason": (
+                        f"No resolvable author family for {', '.join(unknown_authors)} "
+                        f"(task root: {str(task_root)!r})."
+                    ),
+                    "branch_facts": facts.receipt(),
                 }
                 state["resolved_reviewer"] = failed
                 _save_state(args.state_file, state)
@@ -1762,7 +1784,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "Resolve the target first in the same state file, or supply --owned-path. "
             "For a committed target (commit, branch, pr), every author named by the "
             "target's X-Agent trailers and task records contributes to independence checks; "
-            "--author-model adds to them. Anthropic/OpenAI branches return two quorum seats, "
+            "--author-model adds to them. Unresolved authorship returns AUTHOR_UNRESOLVED. "
+            "Anthropic/OpenAI branches return two quorum seats, "
             "each scoped to the other family's commits with the whole diff as context. "
             "Both must approve the same exact head. Single-family routing is unchanged. "
             "Use it after the author model is known. Pass --subject-seat, "
@@ -1910,7 +1933,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Dispatch task-record directory (hot and archive/) that X-Agent task trailers resolve "
-            "against. Default: batch_state/tasks of the target's primary checkout. Example: batch_state/tasks"
+            "against. Default: the dispatcher's configured task store (LU_TASKS_DIR, otherwise "
+            "batch_state/tasks under the configured primary state root). Example: batch_state/tasks"
         ),
     )
     p_reviewer.add_argument(

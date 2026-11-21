@@ -907,6 +907,80 @@ def test_resolve_reviewer_fails_closed_on_an_unattributed_commit(tmp_path, monke
     assert "missing explicit X-Agent" in payload["fail_closed_reason"]
 
 
+def test_resolve_reviewer_refuses_a_branch_with_an_unknown_author_family(tmp_path, monkeypatch):
+    """A known coauthor must not let a reviewer be selected for a commit with missing provenance."""
+    from tests.agent_runtime.test_authoring_review_feasibility import OPUS, REPOSITORY, mini_repo
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    known = repo.commit(OPUS, message="known author")
+    unknown = repo.commit("codex/missing-author-task", message="unknown author")
+    tasks = tmp_path / "empty tasks"
+    tasks.mkdir()
+    state = tmp_path / "state.json"
+    target = _run_cli(
+        state,
+        "target",
+        "--mode",
+        "branch",
+        "--branch",
+        "feature",
+        "--base",
+        "origin/main",
+        "--repo-root",
+        str(repo.root),
+    )
+    assert target.returncode == 0, target.stderr
+
+    args = (
+        "--author-model",
+        OPUS.split("/", 1)[1],
+        "--repository",
+        REPOSITORY,
+        "--task-root",
+        str(tasks),
+        "--risk",
+        "high",
+    )
+    for mode in ("cross_family", "red_team"):
+        result = _run_cli(state, "resolve-reviewer", *args, "--review-mode", mode)
+        assert result.returncode == 1, result.stdout
+        receipt = json.loads(result.stdout)
+        assert receipt["selected"] is None
+        assert receipt["quorum"] == []
+        assert receipt["reason_code"] == "AUTHOR_UNRESOLVED"
+        assert receipt["branch_facts"]["author_families"] == ["anthropic", "unknown"]
+        assert unknown in receipt["fail_closed_reason"]
+        assert known not in receipt["fail_closed_reason"]
+        assert str(tasks) in receipt["fail_closed_reason"]
+        assert json.loads(state.read_text(encoding="utf-8"))["resolved_reviewer"] == receipt
+
+
+def test_resolve_reviewer_uses_the_configured_store_for_known_authors(tmp_path, monkeypatch):
+    """Using the reviewed checkout as the task store loses known author provenance in another repo."""
+    from tests.agent_runtime.test_authoring_review_feasibility import OPUS, REPOSITORY, mini_repo, task_record
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    agent, model = OPUS.split("/", 1)
+    tasks = tmp_path / "dispatch" / "tasks"
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    task_record(tasks, "known-author-task", archived=True, agent=agent, model=model)
+    head = repo.commit(f"{agent}/known-author-task", message="known author")
+    state = tmp_path / "state.json"
+    target = _run_cli(state, "target", "--mode", "commit", "--commit", head, "--repo-root", str(repo.root))
+    assert target.returncode == 0, target.stderr
+
+    args = ("resolve-reviewer", "--author-model", model, "--repository", REPOSITORY, "--risk", "high")
+    explicit = _run_cli(state, *args, "--task-root", str(tasks))
+    assert explicit.returncode == 0, explicit.stdout
+    expected = json.loads(explicit.stdout)
+    assert expected["branch_facts"]["author_families"] == ["anthropic"]
+    assert expected["selected"]["concrete_model"] == CURRENT_SOL
+
+    configured = _run_cli(state, *args)
+    assert configured.returncode == 0, configured.stdout
+    assert json.loads(configured.stdout) == expected
+
+
 def _point_origin_head(repo) -> None:
     repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
 
