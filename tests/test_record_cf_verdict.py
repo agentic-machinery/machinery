@@ -2347,8 +2347,9 @@ def test_unbound_ukrainian_source_claims_refused_before_publication(
     "grok_messages_is_error", "grok_stream_completed", "grok_stream_failed", "grok_stream_in_progress",
     "cursor_tool_result_is_error",
     "gemini_success", "gemini_error", "gemini_cancelled",
-    "agy_done", "agy_done_with_error", "agy_mcp_is_error_text",
-    "codex_rollout_ok", "codex_rollout_ok_is_error", "codex_rollout_err", "codex_rollout_err_then_output",
+    "agy_done", "agy_done_with_error", "agy_mcp_is_error_text", "agy_output_too_deep", "agy_output_long_number",
+    "codex_rollout_ok", "codex_rollout_structured_ok", "codex_rollout_deep_arguments_ok",
+    "codex_rollout_ok_is_error", "codex_rollout_err", "codex_rollout_err_then_output",
 ])
 def test_only_completed_sources_calls_support_unbound_claims(monkeypatch, tmp_path, shape):
     """Defect: a failed or incomplete Sources call's error text supported a claim (C-6314).
@@ -2356,7 +2357,9 @@ def test_only_completed_sources_calls_support_unbound_claims(monkeypatch, tmp_pa
     Each provider keeps a failed call's error text where a successful call keeps its output: Codex
     ``status``/``error``, Claude and Grok ``is_error``, MCP ``isError``, ACP and Gemini ``status``, AGY
     ``error`` on a DONE step, a Codex rollout ``Err``. One row per provider shape; ``*_ok``,
-    ``*_completed``, ``*_success`` and ``agy_done`` rows prove the completed call still supports it.
+    ``*_completed``, ``*_success`` and ``agy_done`` rows prove the completed call still supports it, with
+    its structured content and with arguments too deep to decode. MCP JSON text too deep or with too long a
+    number to decode might be an error result, so it is not captured, and it never aborts the recorder.
     """
     from lu_machinery.review.review_contract import build_item_packet
     from lu_machinery.review.review_contract import render_item_packet
@@ -2397,10 +2400,10 @@ def test_only_completed_sources_calls_support_unbound_claims(monkeypatch, tmp_pa
             "tool_info": {"name": "call_mcp_tool", "parameters": {
                 "ServerName": "sources", "ToolName": "search_style_guide", "Arguments": arguments}, **info}}}]
 
-    def rollout(*results):
+    def rollout(*results, raw_arguments=json.dumps(arguments)):
         call = {"type": "response_item", "payload": {
             "type": "function_call", "name": "search_style_guide", "namespace": "mcp__sources",
-            "arguments": json.dumps(arguments), "call_id": "call_9"}}
+            "arguments": raw_arguments, "call_id": "call_9"}}
         return [call, *({"type": "event_msg", "payload": {
             "type": "mcp_tool_call_end", "call_id": "call_9",
             "invocation": {"server": "sources", "tool": "search_style_guide", "arguments": arguments},
@@ -2438,7 +2441,15 @@ def test_only_completed_sources_calls_support_unbound_claims(monkeypatch, tmp_pa
             "agy_done": lambda: agy(output=claim),
             "agy_done_with_error": lambda: agy(output=claim, error={"message": "tool failed"}),
             "agy_mcp_is_error_text": lambda: agy(output=json.dumps({"content": text, "isError": True})),
+            "agy_output_too_deep": lambda: agy(output=json.dumps({"content": text, "isError": True})[:-1]
+                                               + ', "x": ' + "[" * 513 + "]" * 513 + "}"),
+            "agy_output_long_number": lambda: agy(output=json.dumps({"content": text, "isError": True})[:-1]
+                                                  + ', "x": 1' + "0" * 5000 + "}"),
             "codex_rollout_ok": lambda: rollout({"Ok": {"content": text, "isError": False}}),
+            "codex_rollout_structured_ok": lambda: rollout(
+                {"Ok": {"content": [], "structuredContent": {"entry": claim}, "isError": False}}),
+            "codex_rollout_deep_arguments_ok": lambda: rollout(
+                {"Ok": {"content": text, "isError": False}}, raw_arguments="[" * 513 + "]" * 513),
             "codex_rollout_ok_is_error": lambda: rollout({"Ok": {"content": text, "isError": True}}),
             "codex_rollout_err": lambda: rollout({"Err": claim}),
             "codex_rollout_err_then_output": lambda: rollout({"Err": "tool failed"}, "err: " + claim),

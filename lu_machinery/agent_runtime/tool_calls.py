@@ -326,7 +326,7 @@ def _coerce_arguments(value: Any) -> dict[str, Any]:
     if isinstance(value, str) and value.strip():
         try:
             parsed = json_depth.loads(value, max_depth=512)
-        except json.JSONDecodeError:
+        except _DECODE_LIMIT_ERRORS:
             return {"_raw": summarize_tool_output(value)}
         if isinstance(parsed, Mapping):
             sanitized = _sanitize_argument_value(parsed)
@@ -360,8 +360,16 @@ def tool_call_failed(payload: Mapping[str, Any]) -> bool:
 
 
 def tool_output_failed(value: Any) -> bool:
-    """Whether a tool output, decoded when it is JSON text, is an MCP error result."""
-    value = _coerce_tool_output(value)
+    """Whether a tool output, decoded when it is JSON text, is an MCP error result.
+
+    JSON text too deep or with too long a number to decode might be one, so it
+    counts as failed.
+    """
+    if isinstance(value, str):
+        try:
+            value = _parse_codex_output_envelope(value)
+        except _DECODE_LIMIT_ERRORS:
+            return True
     return isinstance(value, Mapping) and bool(value.get("isError"))
 
 
@@ -371,31 +379,44 @@ def _tool_output(payload: Mapping[str, Any]) -> tuple[bool, Any]:
         return True, None
     if _payload_type(payload) == "mcp_tool_call_end":
         # A Codex rollout wraps the MCP result as ``{"Ok": <CallToolResult>}``
-        # or ``{"Err": <message>}``; anything but ``Ok`` is no tool output.
+        # or ``{"Err": <message>}``; anything but ``Ok`` is no tool output. The
+        # ``Ok`` envelope stays whole, so its structured content stays beside its text.
         result = payload.get("result")
-        if not (isinstance(result, Mapping) and set(result) == {"Ok"}):
+        if not (isinstance(result, Mapping) and set(result) == {"Ok"}) or tool_output_failed(result["Ok"]):
             return True, None
-        output = _coerce_tool_output(result["Ok"])
-    else:
-        output = next(
-            (_coerce_tool_output(payload.get(key)) for key in ("output", "result", "content", "observation")
-             if key in payload),
-            None,
-        )
+        return False, result
+    output = next(
+        (_coerce_tool_output(payload.get(key)) for key in ("output", "result", "content", "observation")
+         if key in payload),
+        None,
+    )
     if tool_output_failed(output):
         return True, None
     return False, output
 
 
+# What ``json_depth.loads`` raises past its depth limit (RecursionError) and on an
+# integer longer than the interpreter's digit limit (ValueError); JSONDecodeError
+# is a ValueError too.
+_DECODE_LIMIT_ERRORS = (RecursionError, ValueError)
+
+
 def _coerce_tool_output(value: Any) -> Any:
     if not isinstance(value, str):
         return value
-    parsed = _parse_codex_output_envelope(value)
+    try:
+        parsed = _parse_codex_output_envelope(value)
+    except _DECODE_LIMIT_ERRORS:
+        # Text the decoder cannot read stays text, never a crash of the trace parse.
+        return value
     return parsed if parsed is not None else value
 
 
 def _parse_codex_output_envelope(value: str) -> Any | None:
-    """Decode Codex CLI ``function_call_output`` wrappers when possible."""
+    """Decode Codex CLI ``function_call_output`` wrappers when possible.
+
+    Text that is not JSON gives None; text past a decoder limit raises.
+    """
     candidates = [value.strip()]
     marker = "\nOutput:\n"
     if marker in value:
