@@ -25,6 +25,64 @@ from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()
 
+
+@pytest.mark.usefixtures("configured_roots", "agent_runtime_roots")
+@pytest.mark.parametrize("rule", [
+    "item-quote", "evidence-quote", "evidence-receipt", "unknown-source", "source-excerpt",
+    "finding-source", "bookkeeping", "unknown-coverage",
+])
+def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule):
+    """Defect class: reviewer instructions and recorder acceptance drift apart."""
+    from lu_machinery.review.review_contract import build_item_packet, judge_item_reply, validate_ukrainian_reply_claims
+
+    reference = (Path(__file__).resolve().parents[1] / "agents_extensions/shared/skills/review-loop/references/ukrainian.md").read_text()
+    phrases = {
+        "item-quote": "row-level `quote` and `quotes` fields quote the frozen item",
+        "evidence-quote": "`quote` inside an item `evidence` entry quotes captured Sources output",
+        "evidence-receipt": "Every item `evidence` entry must have a receipt id and a non-empty `quote`",
+        "unknown-source": "Source-claim checks also apply to UNKNOWN rows in an APPROVED mixed reply",
+        "source-excerpt": "each excerpt must be literal captured Sources output",
+        "finding-source": "`finding` clause naming a source term",
+        "bookkeeping": "coverage set in the reply void the chunk",
+        "unknown-coverage": "coverage equals the denominator",
+    }
+    assert phrases[rule] in reference
+    packet = build_item_packet([{"id": "a", "text": "learner text"}, {"id": "b", "text": "other text"}])
+    rows = [
+        {"id": "a", "verdict": "APPROVE", "finding": "none", "sources": "none"},
+        {"id": "b", "verdict": "UNKNOWN", "finding": "none", "sources": "none"},
+    ]
+    payload = {"schema": "ukrainian-item-judgments.v1", "items": rows}
+    event = {"receipt_id": "r1", "tool": "verify_word", "arguments": {}, "result": "captured output"}
+    if rule == "item-quote":
+        rows[0]["quote"] = "not in item"
+    elif rule == "evidence-quote":
+        rows[0]["evidence"] = {"receipt": "r1", "quote": "captured output"}
+    elif rule == "evidence-receipt":
+        rows[0]["evidence"] = {"receipt": "r1"}
+    elif rule == "unknown-source":
+        rows[1]["sources"] = "uncaptured output"
+    elif rule == "source-excerpt":
+        rows[0]["sources"] = "uncaptured output"
+    elif rule == "finding-source":
+        rows[0]["finding"] = "VESUM says this"
+    elif rule == "bookkeeping":
+        payload["coverage"] = ["a"]
+    reply = "VERDICT: APPROVE\n```ukrainian-item-judgments\n" + json.dumps(payload) + "\n```\n"
+    sanitized, claims = validate_ukrainian_reply_claims(reply, tool_events=[event])
+    if rule in {"evidence-receipt", "unknown-source", "source-excerpt", "finding-source"}:
+        assert claims.claims_unsupported == 1
+    else:
+        assert claims.claims_unsupported == 0
+        chunk = judge_item_reply(packet, sanitized, stated="APPROVED", ukrainian=True, source_claims_validated=True)
+        if rule == "item-quote":
+            assert chunk.void == "quote-mismatch" and chunk.coverage == ()
+        elif rule == "bookkeeping":
+            assert chunk.void == "reviewer-bookkeeping" and chunk.coverage == ()
+        else:
+            assert chunk.void is None and chunk.coverage == ("a",)
+
+
 def test_historical_admission_read_survives_a_listed_record_moving(tmp_path, monkeypatch):
     """Defect class: archiving a listed record refuses the recorder's historical scan."""
     hot = tmp_path / "retired.json"
