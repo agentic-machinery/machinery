@@ -180,6 +180,25 @@ def test_missing_endpoint_access_refused_before_spawn(funded, dispatch, capsys, 
     assert "stub-" not in err
 
 
+@pytest.mark.parametrize(("provider", "effort", "allowed"), [
+    ("deepseek", "medium", "low, high, max"),
+    ("openrouter", "low", "high"),
+])
+def test_endpoint_refuses_unsupported_effort_before_worktree(funded, dispatch, capsys, provider, effort, allowed):
+    """Defect class: dispatch creates a worktree for a route that cannot honor the requested effort."""
+    dispatch("--provider", provider, "--effort", effort, expected=2, refusal="route_eligibility")
+    assert (
+        f"opencode_effort_refused: {provider} does not offer effort {effort!r}; allowed: {allowed}"
+        in capsys.readouterr().err.splitlines()[0]
+    )
+
+
+@pytest.mark.parametrize(("provider", "effort"), [("deepseek", "max"), ("openrouter", "high")])
+def test_endpoint_admits_supported_effort_unchanged(funded, dispatch, provider, effort):
+    record = dispatch("--provider", provider, "--effort", effort)
+    assert (record["provider"], record["effort"]) == (provider, effort)
+
+
 @pytest.mark.parametrize("selected", ["deepseek", "openrouter"])
 @pytest.mark.parametrize("balance", [0.99, None])
 def test_below_floor_refused_before_spawn(funded, dispatch, capsys, selected, balance):

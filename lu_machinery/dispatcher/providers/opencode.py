@@ -96,6 +96,19 @@ def endpoint(provider: str | None) -> str:
     return selected
 
 
+def _deepseek_variant(selected: str, effort: str | None) -> str:
+    # Direct variants come from OpenCode's deepseek-flash model metadata. Only the pinned
+    # OpenRouter variant carries the provider allow-list when OpenCode applies variant options.
+    allowed_variants = ("low", "high", "max") if selected == "deepseek" else (_OPENROUTER_VARIANT,)
+    default_variant = "high" if selected == "deepseek" else _OPENROUTER_VARIANT
+    variant = default_variant if effort is None else effort
+    if variant not in allowed_variants:
+        raise OpenCodeEffortRefused(
+            f"opencode_effort_refused: {selected} does not offer effort {variant!r}; allowed: {', '.join(allowed_variants)}"
+        )
+    return variant
+
+
 def savant_token_cap(raw: str | None) -> int:
     if raw is None:
         return _SAVANT_DEFAULT_MAX_TOKENS
@@ -342,12 +355,14 @@ def endpoint_refusal(
     provider: str | None,
     env: dict[str, str] | None = None,
     *,
+    effort: str | None = None,
     worktree: Path | None = None,
     repo: Path | None = None,
     sha: str | None = None,
 ) -> str | None:
     """The typed refusal for the selected endpoint before spawn, or None when it may run.
 
+    An unsupported DeepSeek variant is refused before probing the endpoint.
     An endpoint with no configured access, an unreadable balance or a balance below its
     ``dispatch_floor_usd`` is refused; the other endpoint is never tried instead. The OpenRouter
     endpoint is also refused when the checkout carries OpenCode config or the resolved config
@@ -362,6 +377,11 @@ def endpoint_refusal(
         except ValueError as exc:
             return str(exc)
         return None
+    try:
+        _deepseek_variant(selected, effort)
+    except OpenCodeEffortRefused as exc:
+        return str(exc)
+
     import yaml
 
     from lu_machinery.api import subscription_usage as usage
@@ -431,15 +451,7 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     selected = endpoint(spec.provider)
     if selected == SAVANT_PROVIDER:
         return _savant_build(spec, env)
-    # Direct variants come from OpenCode's deepseek-flash model metadata. Only the pinned
-    # OpenRouter variant carries the provider allow-list when OpenCode applies variant options.
-    allowed_variants = ("low", "high", "max") if selected == "deepseek" else (_OPENROUTER_VARIANT,)
-    default_variant = "high" if selected == "deepseek" else _OPENROUTER_VARIANT
-    variant = default_variant if spec.effort is None else spec.effort
-    if variant not in allowed_variants:
-        raise OpenCodeEffortRefused(
-            f"opencode_effort_refused: {selected} does not offer effort {variant!r}; allowed: {', '.join(allowed_variants)}"
-        )
+    variant = _deepseek_variant(selected, spec.effort)
     argv = ["opencode", "run", "--model", MODELS[selected], "--format", "json", "--variant", variant]
     child_env = env.copy()
     config = json_depth.loads(_OPENROUTER_CONFIG, max_depth=512) if selected == "openrouter" else {}

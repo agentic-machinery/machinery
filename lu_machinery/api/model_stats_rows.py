@@ -305,7 +305,8 @@ def variant_effort(raw: object) -> str | None:
 
 
 # Harnesses that pass an explicit effort flag separately from the model selector.
-# OpenCode passes reasoningEffort only on the SubQ Savant endpoint (DeepSeek hardcodes --variant high).
+# For OpenCode, Model Stats uses the requested flag effort only for a matching SubQ Savant attestation.
+# DeepSeek routes pass the requested effort via --variant, or use the endpoint default when omitted.
 _EFFORT_FLAG_AGENTS = frozenset({"claude", "codex", "muse"})
 
 
