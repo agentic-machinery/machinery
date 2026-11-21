@@ -538,9 +538,7 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
                 _save_state(args.state_file, state)
                 print(json.dumps(failed, indent=2))
                 return 1
-            unknown_authors = [
-                commit.sha or "(unknown commit)" for commit in facts.commits if commit.family == UNKNOWN_AUTHOR_FAMILY
-            ]
+            unknown_authors = list(facts.unresolved_authors)
             if resolve_author_family(args.author_model, args.author_family) == UNKNOWN_AUTHOR_FAMILY:
                 unknown_authors.append(f"--author-model {args.author_model!r}")
             if unknown_authors:
@@ -1786,7 +1784,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Resolve the target first in the same state file, or supply --owned-path. "
             "For a committed target (commit, branch, pr), every author named by the "
             "target's X-Agent trailers and task records contributes to independence checks; "
-            "--author-model adds to them. An unknown author family returns AUTHOR_UNRESOLVED. "
+            "--author-model adds to them. Unresolved authorship returns AUTHOR_UNRESOLVED. "
             "Anthropic/OpenAI branches return two quorum seats, "
             "each scoped to the other family's commits with the whole diff as context. "
             "Both must approve the same exact head. Single-family routing is unchanged. "

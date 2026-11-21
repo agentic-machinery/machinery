@@ -931,9 +931,7 @@ def test_resolve_reviewer_refuses_a_branch_with_an_unknown_author_family(tmp_pat
     )
     assert target.returncode == 0, target.stderr
 
-    result = _run_cli(
-        state,
-        "resolve-reviewer",
+    args = (
         "--author-model",
         OPUS.split("/", 1)[1],
         "--repository",
@@ -943,16 +941,18 @@ def test_resolve_reviewer_refuses_a_branch_with_an_unknown_author_family(tmp_pat
         "--risk",
         "high",
     )
-    assert result.returncode == 1, result.stdout
-    receipt = json.loads(result.stdout)
-    assert receipt["selected"] is None
-    assert receipt["quorum"] == []
-    assert receipt["reason_code"] == "AUTHOR_UNRESOLVED"
-    assert receipt["branch_facts"]["author_families"] == ["anthropic", "unknown"]
-    assert unknown in receipt["fail_closed_reason"]
-    assert known not in receipt["fail_closed_reason"]
-    assert str(tasks) in receipt["fail_closed_reason"]
-    assert json.loads(state.read_text(encoding="utf-8"))["resolved_reviewer"] == receipt
+    for mode in ("cross_family", "red_team"):
+        result = _run_cli(state, "resolve-reviewer", *args, "--review-mode", mode)
+        assert result.returncode == 1, result.stdout
+        receipt = json.loads(result.stdout)
+        assert receipt["selected"] is None
+        assert receipt["quorum"] == []
+        assert receipt["reason_code"] == "AUTHOR_UNRESOLVED"
+        assert receipt["branch_facts"]["author_families"] == ["anthropic", "unknown"]
+        assert unknown in receipt["fail_closed_reason"]
+        assert known not in receipt["fail_closed_reason"]
+        assert str(tasks) in receipt["fail_closed_reason"]
+        assert json.loads(state.read_text(encoding="utf-8"))["resolved_reviewer"] == receipt
 
 
 def test_resolve_reviewer_uses_the_configured_store_for_known_authors(tmp_path, monkeypatch):
