@@ -43,7 +43,7 @@ that shows it is operator-only.
 ## Council: optional independent panel
 
 **When to use it.** Every PR above the Trivial tier gets normal review: the reviewer or reviewers of record that the
-applicable tier and the branch's author families require (the resolver decides), run through
+applicable tier and the branch's author families require (the resolver for code and infra, the Ukrainian profile's Seats for Ukrainian content), run through
 `review-loop`, (the review policy's Low-tier exception and the Ukrainian
 profile's Sources-backed seats stand). Add a council only for:
 

@@ -12,8 +12,8 @@ linguistic and content review route only to the sanctioned language lanes), folk
 the fallback table; never block on one lane.
 
 Every agent that commits to a branch adds its model family to the branch's author families, and
-the resolver with `check_branch_author_families` (`lu_machinery/dispatcher/checks.py`) decides which
-reviewers stay eligible on a mixed branch; never pick one yourself. The Ukrainian review profile
+`check_branch_author_families` (`lu_machinery/dispatcher/checks.py`) and the resolver decide which
+reviewers stay eligible for code and infra on a mixed branch; never pick one yourself. The Ukrainian review profile
 (`agents_extensions/shared/skills/review-loop/references/ukrainian.md`) seats only Gemini and Sol,
 so a takeover successor or helper on a Ukrainian content branch stays with the family already
 authoring it, or the branch restarts from main with one author family.
