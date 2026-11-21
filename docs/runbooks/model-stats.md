@@ -114,12 +114,14 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   not `retired`) that ran no task in the window, so a routed model never silently drops off the page. It is
   `null` when the model catalog cannot be read, and the page then says the list is unknown.
 - **Effort** comes from the observed runtime variant, the matching requested variant, or the recorded effort
-  field. When `resolved_model_known` is true, an unmapped or `unrecognized` runtime attestation never inherits a
-  requested variant or effort field, a bare or different attested model never inherits a requested variant
-  selector (except a mapped Cursor display name carrying that variant word, such as `Grok 4.7 256K High` for
-  `grok-4.7-high`), and selector-only harnesses (`agy`, `cursor`) never fall back to a request `effort` field
-  when their runtime attestation carries no variant. A catalog ID ending in an effort word carries no implied effort. Missing values and legacy
-  markers such as `unset` and `not-exposed` appear as `unknown` in the API and dashboard.
+  field. When `resolved_model_known` is true and the runtime attestation carries no variant, an unmapped or
+  `unrecognized` attestation never inherits a requested effort, a suffixed request selector applies only when
+  a mapped Cursor display name attests that variant word (such as `Grok 4.7 256K High` for `grok-4.7-high`),
+  and the recorded request `effort` field applies only for harnesses that pass a separate effort flag
+  (`claude`, `codex`, `muse`, or `opencode` on `subq`) whose attested model matches the requested model (or
+  the current catalog target of a native Claude alias). A catalog ID ending in an effort word carries no
+  implied effort. Missing values and legacy markers such as `unset` and `not-exposed` appear as `unknown` in
+  the API and dashboard.
   Model totals (`effort: all`) and comparisons count known effort only and report the levels they include.
   The `by_effort` entries include the separate unknown group. In `view=full`, each group splits by task class
   in `by_class`.

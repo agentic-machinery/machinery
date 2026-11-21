@@ -768,7 +768,7 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
     author, reviewer, risk = "author.example.invalid", "reviewer.example.invalid", "risk.example.invalid"
     repo = "repository.example.invalid"
     for i in range(10):
-        _record(tasks, f"w{i}", resolved_model=model, resolved_model_known=True, effort="medium",
+        _record(tasks, f"w{i}", model=model, resolved_model=model, resolved_model_known=True, effort="medium",
                 research_task_family=task_class, duration_s=3600)
     _record(tasks, "w10", model="second-worker.example.invalid", effort=effort,
             research_task_family="second-class.example.invalid", duration_s=3600)
@@ -777,7 +777,7 @@ def test_page_buckets_unknown_labels_before_grouping(tmp_path, monkeypatch):
     _record(tasks, "cursor-auto", agent="cursor", model="auto")
     _record(tasks, "agy-unreported", agent="agy", resolved_model="unrecognized", resolved_model_known=True)
     _review(tasks, "r1-review", "correct", [], pr=1, repo=repo, review_author_model=author,
-            resolved_model=reviewer, effort="medium", review_risk=risk)
+            model=reviewer, resolved_model=reviewer, effort="medium", review_risk=risk)
     _review(tasks, "r2-review", "incorrect", [], pr=2, repo="public", review_author_model="gpt-6.1-sol")
     _review(tasks, "unknown-effort-review", "incorrect", [], pr=3, repo="public", review_author_model="gpt-6.1-sol",
             effort=None, pinned_head="1" * 40, started_at=_at(4))
@@ -1218,6 +1218,23 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "attested-cursor-auto-with-effort": dict(agent="cursor", model="auto",
                                                  resolved_model="Composer 2.5",
                                                  resolved_model_known=True, effort="high"),
+        "attested-missing-agent-with-effort": dict(agent=None, model="gemini-4-neon",
+                                                   resolved_model="gemini-4-hydrogen",
+                                                   resolved_model_known=True, effort="high"),
+        "attested-malformed-agent-options-effort": dict(agent=123, model="gemini-4-neon",
+                                                        resolved_model="gemini-4-hydrogen",
+                                                        resolved_model_known=True, effort=None,
+                                                        options={"effort": "high"}),
+        "attested-claude-mismatched-executor": dict(agent="claude", model="sonnet",
+                                                    resolved_model="claude-sonnet-4-6",
+                                                    resolved_model_known=True, effort="high"),
+        "attested-runtime-variant-missing-agent": dict(agent=None, model="gemini-4-hydrogen",
+                                                       resolved_model="gemini-4-neon-medium",
+                                                       resolved_model_known=True, effort="high"),
+        "attested-opencode-deepseek-with-effort": dict(agent="opencode", provider="openrouter",
+                                                       model="deepseek-v4.1-flash",
+                                                       resolved_model="deepseek-v4.1-flash",
+                                                       resolved_model_known=True, effort="medium"),
         "attested-cursor-high-with-suffixed-request": dict(agent="cursor", model="grok-4.7-high",
                                                            resolved_model="Grok 4.7 256K High",
                                                            resolved_model_known=True, effort=None),
@@ -1258,6 +1275,11 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "attested-agy-alias-other-model": ("gemini-4-hydrogen", "unset"),
         "attested-agy-alias-bare-options-effort": ("gemini-4-neon", "unset"),
         "attested-cursor-auto-with-effort": ("composer-2.5", "unset"),
+        "attested-missing-agent-with-effort": ("gemini-4-hydrogen", "unset"),
+        "attested-malformed-agent-options-effort": ("gemini-4-hydrogen", "unset"),
+        "attested-claude-mismatched-executor": ("claude-sonnet-4.6-thinking", "unset"),
+        "attested-runtime-variant-missing-agent": ("gemini-4-neon", "medium"),
+        "attested-opencode-deepseek-with-effort": ("deepseek-v4.1-flash", "unset"),
         "attested-cursor-high-with-suffixed-request": ("grok-4.7", "high"),
         "attested-kimi-over-request": ("kimi-code/k3-256k", "unset"),
     }
@@ -1269,11 +1291,15 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         ("gemini-3.8-flash-high", "unknown"), ("opus", "unknown"), ("claude-opus-5-5", "xhigh"),
         ("opus", "high"), ("claude-opus-5-5", "unknown"), ("claude-opus-5-6", "high"),
         ("gpt-6.1-sol", "unknown"), ("unknown", "unknown"), ("unrecognized", "unknown"),
-        ("gemini-4-hydrogen", "unknown"), ("gemini-4-neon", "unknown"),
-        ("composer-2.5", "unknown"), ("deepseek-v4-flash", "unknown"),
+        ("gemini-4-hydrogen", "unknown"), ("gemini-4-neon", "medium"), ("gemini-4-neon", "unknown"),
+        ("claude-sonnet-4.6-thinking", "unknown"), ("composer-2.5", "unknown"),
+        ("deepseek-v4-flash", "unknown"), ("deepseek-v4.1-flash", "unknown"),
     }
-    for model_name in ("unrecognized", "gemini-4-hydrogen", "gemini-4-neon", "composer-2.5"):
+    for model_name in ("unrecognized", "gemini-4-hydrogen", "claude-sonnet-4.6-thinking",
+                       "composer-2.5", "deepseek-v4.1-flash"):
         assert _row(window, model_name, "write")["tasks"] == 0
+    neon = _row(window, "gemini-4-neon", "write")
+    assert (neon["tasks"], neon["efforts"]) == (1, ["medium"])
     sol = _row(window, "gpt-6.1-sol", "write")
     assert sol["tasks"] == 0
     assert [(e["effort"], [c["class"] for c in e["by_class"]]) for e in sol["by_effort"]] == [("unknown", ["docs"])]
@@ -1560,7 +1586,7 @@ def test_first_round_matrix_splits_author_from_reviewer_and_class(tmp_path):
     """Defect class: one first-round figure per author that mixes author, reviewer and risk; the first round taken
     in row order instead of by start; or a blocked PR's later outcome misread (new head, same head, none)."""
     batch_state, tasks = _state(tmp_path)
-    sol, grok, sonnet = "gpt-6.1-sol", "grok-4.7", {"resolved_model": "claude-sonnet-5-5"}
+    sol, grok, sonnet = "gpt-6.1-sol", "grok-4.7", {"model": "claude-sonnet-5-5", "resolved_model": "claude-sonnet-5-5"}
     critical = {"review_profile": "infra", "review_risk": "critical"}
     heads = {name: name[-1] * 40 for name in ("h1", "h2", "h3", "h4", "h5", "h6")}
     # PR 1: Sol, blocked by Opus, then a new head approved.
@@ -1783,7 +1809,7 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
 
     monkeypatch.setattr(stats, "resolve_fleet_repo", resolve)
     batch_state, tasks = _state(tmp_path)
-    sonnet = {"resolved_model": "claude-sonnet-5-5"}
+    sonnet = {"model": "claude-sonnet-5-5", "resolved_model": "claude-sonnet-5-5"}
     sol = {"agent": "codex", "model": "gpt-6.1-sol", "resolved_model": "gpt-6.1-sol"}
     blocked, approved = {"started_at": _at(7), "finished_at": _at(6)}, {"started_at": _at(5), "finished_at": _at(4)}
     # PR 1: two blocking findings; the next head changed a.py only, then Opus approved: 1 fixed, 1 dismissed.
@@ -1811,9 +1837,9 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     _findings_review(tasks, "p6b-review", "correct", [], pr=6, pinned_head=h2, started_at=_at(5), finished_at=_at(3))
     # PR 7: two uncatalogued reviewers the page groups as "other": one's approval never settles the other's finding.
     _findings_review(tasks, "p7a-review", "incorrect", [("P1", "src/a.py")], pr=7, pinned_head=h1, **blocked,
-                     resolved_model="pilot-model-a")
+                     model="pilot-model-a", resolved_model="pilot-model-a")
     _findings_review(tasks, "p7b-review", "correct", [], pr=7, pinned_head=h2, **approved,
-                     resolved_model="pilot-model-b")
+                     model="pilot-model-b", resolved_model="pilot-model-b")
     # PR 8: a blocking review with only a P2 finding has no P0-P1 finding to settle and needs no head pair.
     _findings_review(tasks, "p8a-review", "incorrect", [("P2", "src/c.py")], pr=8, pinned_head=h2, **blocked)
     _findings_review(tasks, "p8b-review", "correct", [], pr=8, pinned_head=h1, **approved)

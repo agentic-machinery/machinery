@@ -304,12 +304,62 @@ def variant_effort(raw: object) -> str | None:
     return None
 
 
-# Providers that encode effort only in the model selector and never pass a separate --effort flag.
-_SELECTOR_ONLY_AGENTS = frozenset({"agy", "gemini", "cursor"})
+# Harnesses that pass an explicit effort flag separately from the model selector.
+# OpenCode passes reasoningEffort only on the SubQ Savant endpoint (DeepSeek hardcodes --variant high).
+_EFFORT_FLAG_AGENTS = frozenset({"claude", "codex", "muse"})
+
+
+def _newest_claude_id(family: str) -> str | None:
+    """The concrete model a native Claude alias names in the current catalog reading."""
+    catalog = model_catalog_reading()
+    models = catalog.get("models") if isinstance(catalog, Mapping) else None
+    if not isinstance(models, Mapping):
+        return None
+    prefix = f"claude-{family}-"
+
+    def version(mid: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in mid[len(prefix):].split("-") if part.isdigit())
+
+    ids = [
+        mid
+        for mid, info in models.items()
+        if isinstance(mid, str)
+        and mid.startswith(prefix)
+        and isinstance(info, Mapping)
+        and info.get("family") == "anthropic"
+    ]
+    return max(ids, key=version) if ids else None
+
+
+def _uses_effort_flag(record: Mapping[str, Any]) -> bool:
+    raw_agent = record.get("agent")
+    if not isinstance(raw_agent, str):
+        return False
+    agent = raw_agent.strip().lower()
+    if agent in _EFFORT_FLAG_AGENTS:
+        return True
+    if agent == "opencode":
+        provider = record.get("provider") if record.get("provider") is not None else _options(record).get("provider")
+        return isinstance(provider, str) and provider.strip().lower() == "subq"
+    return False
+
+
+def _observed_matches_request(record: Mapping[str, Any], observed_id: str, requested_id: str) -> bool:
+    if requested_id == "unknown":
+        return False
+    if observed_id == requested_id:
+        return True
+    raw_agent = record.get("agent")
+    if isinstance(raw_agent, str) and raw_agent.strip().lower() == "claude":
+        alias = requested_id.casefold()
+        if alias in NATIVE_ALIASES:
+            target = _newest_claude_id(alias)
+            return target is not None and observed_id == target
+    return False
 
 
 def effective_effort(record: Mapping[str, Any]) -> str:
-    """Use the runtime selector when observed, then the requested selector or recorded effort."""
+    """Use the runtime selector when observed, then a matching selector or verified flag effort."""
     observed_known = record.get("resolved_model_known") is True
     observed = _spelling(record.get("resolved_model")) if observed_known else ""
     requested = record.get("model")
@@ -319,17 +369,19 @@ def effective_effort(record: Mapping[str, Any]) -> str:
         observed_id = model_id(observed)
         if observed_id.casefold() in {"unknown", "unrecognized"}:
             return UNSET
+        requested_id = model_id(requested)
         req_level = variant_effort(requested)
         if req_level is not None:
             # A mapped Cursor display name (such as "Grok 4.7 256K High") carries the variant as a
             # trailing space-separated word rather than a hyphen suffix; any other bare attestation
             # or a different attested model never inherits the requested selector's effort.
-            if (canonical_cursor_model(observed) != observed and observed_id == model_id(requested)
+            if (canonical_cursor_model(observed) != observed and observed_id == requested_id
                     and re.search(rf"[ \t]{re.escape(req_level)}\Z", observed, re.ASCII | re.IGNORECASE)):
                 return req_level
             return UNSET
-        agent = str(record.get("agent") or "").strip().lower()
-        if agent in _SELECTOR_ONLY_AGENTS:
+        # Require positive evidence before inheriting a request effort flag on an attested run:
+        # the harness must pass a separate effort flag and the attested model must match the request.
+        if not (_uses_effort_flag(record) and _observed_matches_request(record, observed_id, requested_id)):
             return UNSET
     elif level := variant_effort(requested):
         return level
