@@ -590,6 +590,20 @@ class _UnreadableAnnotation(Exception):
     """An annotation looked like a finding but its location could not be read."""
 
 
+# Failure annotations that are not findings: the runner's line for a failed step, the gate's
+# line for a scanner job that failed, and the TruffleHog count header. They are skipped only
+# because a failed scanner job must still yield at least one finding (_read_caller_evidence).
+_CONTEXT_ANNOTATION_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Process completed with exit code [0-9]{1,3}\."),
+    re.compile(r"Job [A-Za-z0-9_-]+ finished with result failure, expected success"),
+    re.compile(r"TruffleHog reported [0-9]+ finding\(s\)\. Secret values are redacted from this log\."),
+)
+
+
+def _is_context_annotation(message: Any) -> bool:
+    return isinstance(message, str) and any(pattern.fullmatch(message) for pattern in _CONTEXT_ANNOTATION_RES)
+
+
 def _split_licence_target(body: str) -> tuple[str, bool]:
     """Return the target and whether it is unambiguous.
 
@@ -603,13 +617,16 @@ def _split_licence_target(body: str) -> tuple[str, bool]:
     return target, " in " not in target
 
 
-def _line_number(raw: str) -> int:
+def _line_number(raw: str) -> int | None:
+    """Return a 1-based line, or None for ``0``.
+
+    The workflow writes ``0`` when the scanner gave no line (``int_or_zero``),
+    so ``0`` is a finding without a line, not an unreadable one.
+    """
     if not raw.isascii() or not raw.isdecimal() or len(raw) > 9:
         raise _UnreadableAnnotation
     number = int(raw)
-    if number < 1:
-        raise _UnreadableAnnotation
-    return number
+    return number if number >= 1 else None
 
 
 def _finding(
@@ -1057,6 +1074,7 @@ def _read_caller_evidence(
         )
         if annotation_error:
             return None, [], annotation_error
+        job_findings = 0
         for annotation_page in annotation_pages:
             rows = annotation_page.value
             if not isinstance(rows, list):
@@ -1067,7 +1085,7 @@ def _read_caller_evidence(
                 level = row.get("annotation_level", "")
                 if not isinstance(level, str):
                     return None, [], "annotations_unreadable"
-                if level in {"warning", "notice"}:
+                if level in {"warning", "notice"} or _is_context_annotation(row.get("message")):
                     continue
                 try:
                     parsed = _parse_oss_finding(row.get("message"))
@@ -1076,8 +1094,17 @@ def _read_caller_evidence(
                 if parsed is None:
                     return record, [], "annotations_unreadable"
                 findings.append(parsed)
+                job_findings += 1
                 if len(findings) > _MAX_OSS_FINDINGS:
                     return None, [], "pagination_limit"
+        # A scanner that failed without a finding line failed for another reason. Its evidence is
+        # missing, so another job's findings must not read as the complete list.
+        if (
+            not _is_fleet_job(job_name, _FLEET_GATE_JOB)
+            and job.get("conclusion") != "success"
+            and job_findings == 0
+        ):
+            return record, [], "scanner_failed_without_findings"
     if findings:
         return record, findings, None
     if gate_conclusion != "success":

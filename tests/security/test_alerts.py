@@ -515,6 +515,8 @@ def test_workflow_loader_exceptions_make_evidence_unreadable(scalar: str) -> Non
         pytest.param({"message": "actionlint [syntax] at file.yml:3:1\x1b[31m"}, id="unrecognized-with-finding"),
         pytest.param({"message": "actionlint [syntax] at file.yml:3:1", "annotation_level": None}, id="null-level"),
         pytest.param({"message": "actionlint [syntax] at file.yml:3:1", "annotation_level": {}}, id="object-level"),
+        pytest.param({"message": "Job zizmor finished with result cancelled, expected success"}, id="gate-cancelled"),
+        pytest.param({"message": "Process completed with exit code 1"}, id="runner-line-variant"),
     ],
 )
 def test_malformed_annotations_do_not_leave_a_partial_finding_list(row: dict[str, Any]) -> None:
@@ -547,8 +549,11 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
             "broken": _repo_row("org/broken"),
             "noisy": _repo_row("org/noisy"),
             "foreign": _repo_row("org/foreign"),
+            "partial": _repo_row("org/partial"),
         },
     )
+    # GitHub adds this failure annotation to every failed step (observed on real fleet-security jobs).
+    runner_line = {"annotation_level": "failure", "path": ".github", "message": "Process completed with exit code 1."}
     dirty_annotations = [
         {"message": "ShellCheck SC2086 (warning) at scripts/run.sh:10:1"},
         {"message": "ShellCheck SC2000 (error) at ../secrets.sh:1:1"},
@@ -560,7 +565,10 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         },
         {"message": "actionlint [syntax] at .github/workflows/nightly tasks.yml:3:1"},
         {"message": "zizmor unpinned-uses severity=high confidence=high at ?"},
+        {"message": "Trivy IaC DS026 (LOW) at Dockerfile:0"},
+        {"message": "TruffleHog reported 1 finding(s). Secret values are redacted from this log."},
         {"annotation_level": "warning", "message": "1 trivy-fs licence disposition(s) matched no finding"},
+        runner_line,
     ]
     unpinned_text = (
         "name: security\n"
@@ -611,6 +619,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
             "repos/org/broken",
             "repos/org/noisy",
             "repos/org/foreign",
+            "repos/org/partial",
         }:
             return Result(status=200, value={"default_branch": "main"})
         if path == "repos/org/missing/contents/.github/workflows":
@@ -644,6 +653,23 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
                     _job("org/dirty", 9, "fleet-security / Fleet security gate", "failure", 9),
                 ],
             )
+        if path == "repos/org/partial/actions/runs/5/jobs":
+            return _jobs(
+                "org/partial",
+                conclusion="failure",
+                total=3,
+                jobs=[
+                    _job("org/partial", 16, "fleet-security / ShellCheck", "failure", 16),
+                    _job("org/partial", 17, "fleet-security / Trivy dependencies and licences", "failure", 17),
+                    _job("org/partial", 18, "fleet-security / Fleet security gate", "failure", 18),
+                ],
+            )
+        if path == "repos/org/partial/check-runs/16/annotations":
+            return Result(status=200, value=[{"message": "ShellCheck SC2086 (warning) at scripts/run.sh:10:1"}, runner_line])
+        if path == "repos/org/partial/check-runs/17/annotations":
+            return Result(status=200, value=[{**runner_line, "message": "Process completed with exit code 22."}])
+        if path == "repos/org/partial/check-runs/18/annotations":
+            return Result(status=200, value=[])
         if path == "repos/org/broken/actions/runs/5/jobs":
             return _jobs("org/broken", conclusion="failure", total=1, jobs=[_job("org/broken", 9, "Fleet security gate", "failure", 11)])
         if path == "repos/org/noisy/actions/runs/5/jobs":
@@ -664,9 +690,10 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         if path == "repos/org/dirty/check-runs/8/annotations":
             return Result(status=200, value=dirty_annotations)
         if path == "repos/org/dirty/check-runs/9/annotations":
-            return Result(status=200, value=[])
+            gate_line = {"annotation_level": "failure", "message": "Job shellcheck finished with result failure, expected success"}
+            return Result(status=200, value=[gate_line, runner_line])
         if path == "repos/org/broken/check-runs/11/annotations":
-            return Result(status=200, value=[])
+            return Result(status=200, value=[runner_line])
         if path == "repos/org/noisy/check-runs/12/annotations":
             return Result(status=200, value=[{"message": "scanner finished"}])
         if path == "repos/org/foreign/check-runs/13/annotations":
@@ -685,6 +712,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         "broken": "inaccessible_evidence",
         "noisy": "inaccessible_evidence",
         "foreign": "inaccessible_evidence",
+        "partial": "inaccessible_evidence",
     }
     assert report["source_ok"] is True
     missing = report["repositories"]["missing"]["fleet_security"]
@@ -702,9 +730,18 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     assert report["repositories"]["broken"]["fleet_security"]["reason"] == "run_not_success"
     assert report["repositories"]["noisy"]["fleet_security"]["reason"] == "annotations_unreadable"
     assert report["repositories"]["foreign"]["fleet_security"]["reason"] == "github_invalid_next_link"
+    assert report["repositories"]["partial"]["fleet_security"]["reason"] == "scanner_failed_without_findings"
+    assert report["repositories"]["partial"]["fleet_security"]["findings"] == []
     assert not any("evil/other" in call for call in client.calls)
     findings = report["repositories"]["dirty"]["fleet_security"]["findings"]
-    assert [item["rule"] for item in findings] == ["SC2086", "SC2000", "CVE-2024-0001", "syntax", "unpinned-uses"]
+    assert [item["rule"] for item in findings] == [
+        "SC2086",
+        "SC2000",
+        "CVE-2024-0001",
+        "syntax",
+        "unpinned-uses",
+        "DS026",
+    ]
     assert findings[0]["path"] == "scripts/run.sh"
     assert findings[0]["severity"] == "medium"
     assert findings[1]["path"] is None
@@ -712,6 +749,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     assert findings[2]["scanner"] == "trivy-image"
     assert findings[3]["path"] == ".github/workflows/nightly tasks.yml"
     assert findings[4]["path"] is None
+    assert (findings[5]["path"], findings[5]["line"], findings[5]["location"]) == ("Dockerfile", None, "Dockerfile")
 
     prom = tmp_path / "states.prom"
     write_prometheus_textfile(prom, report)
