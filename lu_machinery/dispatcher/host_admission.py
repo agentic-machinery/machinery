@@ -83,7 +83,7 @@ def _meter_budget(spec):
 
     try:
         return meter, read_budget()
-    except (OSError, ValueError, http.client.HTTPException):
+    except (OSError, ValueError, RecursionError, http.client.HTTPException):
         return meter, None
 
 

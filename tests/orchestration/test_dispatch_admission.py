@@ -11,9 +11,12 @@ import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from lu_machinery.common import json_depth
+from lu_machinery.dispatcher import host_admission, pool_selector
 from lu_machinery.orchestration import dispatch_admission as adm
 from lu_machinery.orchestration import worktree_prep
 from tests.helpers.product_tree import configured_roots as configured_roots
@@ -108,7 +111,7 @@ def test_meter_cadence_measures_from_the_last_launch_even_if_it_finished(tmp_pat
     assert admitted.admitted
 
 
-def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, probe):
+def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, probe, monkeypatch):
     """Defect class: throttled or depleted meters admit writes, or unknown pace raises the ceiling."""
     tasks = tmp_path / "tasks"
     now = datetime.now(UTC)
@@ -148,6 +151,18 @@ def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, pro
                               meter=f"claude:{account}", now=now)
         assert result.meter is not None and result.meter.defer == expected
         assert result.admitted == (expected is None)
+
+    def overdeep_budget():
+        return json_depth.loads("[" * 600 + "]" * 600, max_depth=512)
+
+    monkeypatch.setattr(pool_selector, "read_budget", overdeep_budget)
+    monkeypatch.setattr(host_admission, "tasks_dir", lambda: tmp_path / "overdeep-tasks")
+    monkeypatch.setattr(adm, "load_thresholds", lambda: limits)
+    spec = SimpleNamespace(mode="workspace-write", agent="codex", model="gpt-6.2-sol",
+                           claude_account=None, codex_account="b-sub")
+    result = host_admission.check(spec.mode, dry_run=True, disk_guard=False, spec=spec)
+    assert result.admitted
+    assert "meter codex:b: live write workers 0/8 (fixed cap)" in result.summary()
 
 
 def test_grok_and_cursor_share_one_meter(tmp_path, probe):
