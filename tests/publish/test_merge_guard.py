@@ -70,8 +70,29 @@ def test_unestablished_check_state_is_refused(stdout):
         merge_with_checks(stdout)
 
 
-def test_explicit_empty_json_check_list_is_allowed():
-    assert merge_with_checks("[]") == "a" * 40
+@pytest.mark.parametrize("returncode,stdout,rollup", [
+    (0, "[]", None),
+    # gh's real answer for a head with no checks: exit 1, no output ("no checks reported").
+    (1, "", []),
+    (0, json.dumps([{"name": "Component shadow (advisory)", "bucket": "pass", "workflow": "CI"}]), [
+        {"__typename": "CheckRun", "name": "Component shadow (advisory)", "workflowName": "CI",
+         "status": "COMPLETED", "conclusion": "SUCCESS"},
+    ]),
+])
+def test_head_without_a_blocking_check_is_refused(returncode, stdout, rollup):
+    """Defect class: a head whose CI never ran (zero checks, or advisory checks only) passed as all-green."""
+    def runner(args, **kwargs):
+        if args[2] == "checks":
+            return subprocess.CompletedProcess(args, returncode, stdout, "no checks reported" if returncode else "")
+        meta = {"number": 1, "isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": "a" * 40}
+        if "headRefOid,statusCheckRollup" in args:
+            assert rollup is not None, "an empty complete check list needs no rollup read"
+            meta = {"headRefOid": "a" * 40, "statusCheckRollup": rollup}
+        return subprocess.CompletedProcess(args, 0, json.dumps(meta), "")
+
+    with pytest.raises(PublishBlocked) as refused:
+        ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
+    assert str(refused.value) == "OPSEC: merge refused: NO_CHECKS: the head has no blocking check."
 
 
 @pytest.mark.parametrize("returncode", [2, 3])
@@ -219,9 +240,12 @@ OLD_CLIENT = (
 )
 
 
-@pytest.mark.parametrize("rollup,ready", [(None, False), ({}, False), ("", False), (False, False), (0, False),
-                                          ([], True)])
-def test_publisher_old_client_rollup_must_be_a_list(rollup, ready):
+@pytest.mark.parametrize("rollup,refusal", [
+    (None, "cannot establish check state"), ({}, "cannot establish check state"),
+    ("", "cannot establish check state"), (False, "cannot establish check state"),
+    (0, "cannot establish check state"), ([], "NO_CHECKS"),
+])
+def test_publisher_old_client_rollup_must_be_a_list(rollup, refusal):
     def runner(args, **kwargs):
         if args[2] == "checks":
             return subprocess.CompletedProcess(args, 1, "", OLD_CLIENT)
@@ -229,11 +253,8 @@ def test_publisher_old_client_rollup_must_be_a_list(rollup, ready):
             return subprocess.CompletedProcess(args, 0, json.dumps({"headRefOid": HEAD, "statusCheckRollup": rollup}), "")
         return subprocess.CompletedProcess(args, 0, json.dumps({"number": 1, "isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": HEAD}), "")
 
-    if ready:
-        assert ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}) == HEAD
-    else:
-        with pytest.raises(PublishBlocked, match="cannot establish check state"):
-            ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
+    with pytest.raises(PublishBlocked, match=refusal):
+        ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
 
 
 @pytest.mark.parametrize("app", [{"id": 15368, "slug": "github-actions"}, None, {"id": "2626939", "slug": "entire"}])

@@ -480,3 +480,18 @@ def test_trivial_head_is_ready_without_verdict(tmp_path: Path) -> None:
     lines, failed = keeper.run(fake, tmp_path / "unknown.json", apply=True)
     assert "#42 revoked: CF-unknown" in "\n".join(lines)
     assert "dequeue" in mutations(fake)
+
+
+def test_keeper_enqueue_pins_the_queue_landing_kind(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Defect class: a keeper enqueue on a base whose merge queue was turned off becomes a direct squash merge."""
+    sent: list[Any] = []
+
+    def request_run(request: Any, **kwargs: Any) -> Any:
+        sent.append(request)
+        return keeper.subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(keeper, "request_run", request_run)
+    keeper.GitHub(tmp_path, "unit/public").enqueue(42, HEAD_A)
+    assert [(request.verb, request.fields) for request in sent] == [
+        ("pr-merge", {"repo": "unit/public", "number": 42, "match_head": HEAD_A, "expect_queue": "true"}),
+    ]

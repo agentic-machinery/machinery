@@ -76,9 +76,12 @@ class Transport:
             assert "isInMergeQueue" not in argv[argv.index("--json") + 1].split(",")
             data = {"number": 42, "isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": self.head,
                     "headRefName": "codex/fixture", "state": "OPEN", "isCrossRepository": False,
-                    "baseRefName": "main"}
+                    "baseRefName": "main", "statusCheckRollup": [{
+                        "__typename": "CheckRun", "name": "CI Gate", "workflowName": "CI",
+                        "status": "COMPLETED", "conclusion": "SUCCESS",
+                    }]}
         elif argv[1:3] == ["pr", "checks"]:
-            data = []
+            data = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}]
         elif argv[1:5] == ["api", "--method", "POST", "graphql"]:
             payload = json.loads(Path(argv[6]).read_text())
             query = payload["query"]

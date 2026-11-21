@@ -35,11 +35,12 @@ def enqueue_transport(writes, *, state="CLEAN", draft=False, priority=False, hea
             "labels": [{"name": "merge-priority"}] if priority else [], **after,
             "isMergeQueueEnabled": queue, "viewerMergeHeadlineText": subject,
             "viewerMergeBodyText": body,
+            "statusCheckRollup": [{"__typename": "CheckRun", "name": "CI Gate", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}],
         }
         if args[:3] == ["gh", "pr", "view"]:
             value = pull
         elif args[:3] == ["gh", "pr", "checks"]:
-            value = []
+            value = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}]
         elif args[:5] == ["gh", "api", "--method", "POST", "graphql"]:
             payload = json.loads(Path(args[args.index("--input") + 1]).read_text())
             if payload["query"].startswith("mutation"):
