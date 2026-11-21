@@ -77,10 +77,12 @@ from __future__ import annotations
 
 import ast
 import codecs
+import io
 import os
 import re
 import shlex
 import sys
+import tokenize
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -540,7 +542,10 @@ def _restore_parameters(token: str, parameters: dict[str, str]) -> str:
 
 
 def _strip_quotes(token: str) -> str:
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+    if len(token) >= 2 and token[0] == token[-1] == "'":
+        # A lexer single-quoted token holds '\'' only where _protect_parameters folded it.
+        return token[1:-1].replace("'\\''", "'")
+    if len(token) >= 2 and token[0] == token[-1] == '"':
         return token[1:-1]
     return token
 
@@ -1176,18 +1181,6 @@ _PROGRAM_STRINGS = re.compile(
     r"(?P<quote>\"\"\"|'''|\"|'|`)(?P<value>.*?)(?P=quote)",
     re.DOTALL,
 )
-# Python comments and string literals, read left to right as Python's tokenizer reads
-# them: a comment hides its quotes, and an escaped delimiter does not end its literal.
-# Possessive runs never backtrack, and an unterminated literal still consumes the rest
-# of its line (or of the program, for triple quotes) without a value, so the scan is linear.
-_PYTHON_LITERALS = re.compile(
-    r"#[^\n]*"
-    r"|(?i:(?<!\w)(?:rb|br|rf|fr|f|r|u|b))?(?:"
-    r"(?P<long>\"\"\"|''')(?P<long_value>(?:\\[\s\S]|(?!(?P=long))[^\\])*+)(?:(?P<long_end>(?P=long))|\Z)"
-    r"|(?P<short>[\"'])(?P<short_value>(?:\\[\s\S]|(?!(?P=short))[^\\\n])*+)(?:(?P<short_end>(?P=short))|$)"
-    r")",
-    re.MULTILINE,
-)
 _ENV_IDENTIFIERS = re.compile(
     "(?:"
     + "|".join(spelling for _, _, kind, spelling in ENVIRONMENT_API_INVENTORY if kind == "identifier")
@@ -1357,11 +1350,14 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     reads = re.compile(r"\b(?:open|read_text|read_bytes)\s*\(")
     if dumped_files and _is_python_command(cmd) and reads.search(program):
         paths = re.findall(r"[\"']([^\"']+)[\"']", program)
-        # Main could not read a word holding a '\'' apostrophe at all. Read the literals
-        # of such a word that itself reads a file as Python does, so an apostrophe inside
-        # "it's" cannot shift the pairs above past the dumped path.
-        for arg in args:
-            if "'\\''" in _protect_parameters(arg)[1].values():
+        # Main could not read a command holding a '\'' apostrophe at all. Read the literals
+        # of its arguments that read a file as Python does, so an apostrophe inside "it's"
+        # cannot shift the pairs above past the dumped path.
+        # Each argument is also read on its own, so a quote or `#` in one (`-X 'it'\''s'`)
+        # cannot swallow another.
+        if any("'\\''" in _protect_parameters(arg)[1].values() for arg in args):
+            paths += _python_literal_values(program)
+            for arg in args:
                 source = "".join(shlex.split(arg, posix=True))
                 if reads.search(source):
                     paths += _python_literal_values(source)
@@ -1370,24 +1366,41 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     return None
 
 
-def _python_literal_values(source: str) -> list[str]:
-    """Return the exact values of the complete constant string literals in Python source."""
+def _python_literal_values(source: str, depth: int = 0) -> list[str]:
+    """Return the constant string values Python's tokenizer reads in source, up to any unreadable part.
+
+    Comments, escapes, raw and bytes prefixes and quotes nested in f-string fields
+    are read exactly as Python reads them. A formatted string with fields has no
+    static value; the literals inside its fields still count. A string holding
+    braces is also read as source, since an older tokenizer returns an f-string or
+    t-string whole.
+    """
     values: list[str] = []
-    for match in _PYTHON_LITERALS.finditer(source):
-        if match["long_end"] is None and match["short_end"] is None:
-            continue  # a comment, or an unterminated literal
-        literal = match[0]
-        prefix = literal[: len(literal) - len(literal.lstrip("rRbBuUfF"))]
-        if "f" in prefix.lower():
-            body = match["long_value"] if match["long_end"] is not None else match["short_value"]
-            if "{" in body or "}" in body:
-                continue  # a formatted value is not known statically
-            literal = prefix.replace("f", "").replace("F", "") + literal[len(prefix) :]
-        try:
-            value = ast.literal_eval(literal)
-        except (SyntaxError, ValueError):
-            continue
-        values.append(value.decode("utf-8", "surrogateescape") if isinstance(value, bytes) else value)
+    formatted: list[list[str] | None] = []  # per open f-/t-string: its static parts, or None once it has a field
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            kind = tokenize.tok_name[token.type]
+            if token.type == tokenize.STRING:
+                try:
+                    value = ast.literal_eval(token.string)
+                except (SyntaxError, ValueError):
+                    continue
+                value = value.decode("utf-8", "surrogateescape") if isinstance(value, bytes) else value
+                values.append(value)
+                if "{" in value and depth < 4:
+                    values += _python_literal_values(value.replace("{", "\n").replace("}", "\n"), depth + 1)
+            elif kind.endswith("STRING_START"):
+                formatted.append([])
+            elif kind.endswith("STRING_MIDDLE") and formatted and formatted[-1] is not None:
+                formatted[-1].append(token.string)
+            elif token.type == tokenize.OP and token.string == "{" and formatted:
+                formatted[-1] = None
+            elif kind.endswith("STRING_END") and formatted:
+                parts = formatted.pop()
+                if parts is not None:
+                    values.append("".join(parts))
+    except (tokenize.TokenError, SyntaxError, ValueError):
+        pass
     return values
 
 
@@ -1430,7 +1443,9 @@ def _heredoc_reason(
     cmd, args, _ = found
     for index, token in enumerate(args[:-1]):
         if token == "<<<":
-            inputs = [(body, True) for body in _script_words(args, index + 1)]
+            # Read the operand alone as well: glued to later words it can hide its script (`bash <<< '...' -s`).
+            bodies = _script_words(args, index + 1) + _script_words(args[index + 1 : index + 2], 0)
+            inputs = [(body, True) for body in dict.fromkeys(bodies)]
         elif token in {"<<", "<<-"}:
             pending = documents.get(_strip_quotes(args[index + 1]), [])
             inputs = [pending.pop(0)] if pending else []
