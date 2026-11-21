@@ -702,12 +702,6 @@ def _dispatch(args) -> int:
             headroom.check_runtime(agent, args.model, codex_account=args.codex_account)
         except headroom.RateLimitedError as exc:
             raise host_admission.Refused(str(exc), 3) from None
-    # A review round is spent at dispatch, so the budget is checked here and not only when a verdict is recorded.
-    if args.mode == "read-only" and (args.pr or args.branch) and not args.advisory_role and (
-        admission.review_typed(vars(args)) or args.risk or args.review_mode
-    ):
-        with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
-            checks.check_review_budget(args, info, sha)
     # A new tree inherits the repository's origin. Refuse known trust failures before creating
     # a hold, directory or branch; new_record still verifies the actual worktree after creation.
     if args.mode == "workspace-write" and args.owned_path:
@@ -718,6 +712,13 @@ def _dispatch(args) -> int:
         if not trusted_origin:
             raise ValueError("write task with owned paths refused: origin must match the registered canonical repository URL")
     with contextlib.ExitStack() as stack:
+        if args.mode == "read-only" and (args.pr or args.branch) and not args.advisory_role and (
+            admission.review_typed(vars(args)) or args.risk or args.review_mode
+        ):
+            # Keep the budget read and worker.start's attempt publication together across concurrent reviews.
+            with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
+                stack.enter_context(git.worktree_lock(repo))
+                checks.check_review_budget(args, info, sha)
         with admission.record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
             hold = stack.enter_context(host_admission.reserve(
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,

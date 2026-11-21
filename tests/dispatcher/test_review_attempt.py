@@ -118,6 +118,7 @@ def test_bound_attempt_cannot_spend_an_exhausted_branch_pr_budget(attempt, tmp_p
     monkeypatch.setattr(recorder, "_open_pr_number", lambda *_: None)
     budget = Mock(wraps=checks.check_review_budget)
     monkeypatch.setattr(checks, "check_review_budget", budget)
+    (tmp_path / ".git").mkdir()
     monkeypatch.setattr(git, "resolve_repo", lambda *_: (tmp_path, dict(key="public", github="example/public")))
     monkeypatch.setattr(git, "review_branch_start", lambda *a, **k: "a" * 40)
     monkeypatch.setattr(git, "worktree_plan", lambda *a, **k: (tmp_path / "checkout", "codex/review", "a" * 40))
