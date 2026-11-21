@@ -124,13 +124,13 @@ from lu_machinery.review.review_contract import (
 )
 from lu_machinery.review.reviewer_resolver import (
     FORMAL_CURSOR_REVIEW_MODELS,
-    MIXED_REVIEW_FAMILIES,
     REVIEW_CANDIDATES,
     UNKNOWN_AUTHOR_FAMILY,
     UNRESOLVED_AUTHOR_FAMILIES,
     ResolverInputs,
     ReviewerResolution,
     evaluate_candidate,
+    is_mixed_family_set,
     mixed_family_review,
     mixed_family_scope,
     normalize_review_task_id,
@@ -918,7 +918,7 @@ class BranchReviewFacts:
 
     @property
     def mixed_family(self) -> bool:
-        return self.excluded_families - {VERIFIED_APP_BOT} == MIXED_REVIEW_FAMILIES
+        return is_mixed_family_set(self.excluded_families)
 
     @property
     def unresolved_authors(self) -> tuple[str, ...]:
@@ -1828,17 +1828,19 @@ def build_comment(
     pair_field = pair_lines = ""
     if scope_commits is not None:
         scope = tuple(sorted(set(scope_commits)))
+        pair_families = attested_author_families([{"author_models": authors}])
         if (
-            family not in MIXED_REVIEW_FAMILIES
+            not is_mixed_family_set(pair_families) or family not in pair_families
             or not scope or any(not SHA.fullmatch(commit) for commit in scope)
             or review_mode != "cross_family" or ukrainian or tokens is not None
-            or attested_author_families([{"author_models": authors}]) != MIXED_REVIEW_FAMILIES
         ):
             raise RecordError("invalid mixed-family review scope")
         scope_token = ",".join(scope)
-        other = next(iter(MIXED_REVIEW_FAMILIES - {family}))
-        pair_field = f" review_pair=anthropic_openai scope_commits={scope_token}"
-        pair_lines = f"Review pair: anthropic_openai\nScope author family: {other}\nScope commits: {scope_token}\n"
+        # The token names the pair's sorted author families, so an Anthropic/OpenAI pair keeps its old wire value.
+        pair_token = "_".join(sorted(pair_families))
+        other = ",".join(sorted(pair_families - {family}))
+        pair_field = f" review_pair={pair_token} scope_commits={scope_token}"
+        pair_lines = f"Review pair: {pair_token}\nScope author family: {other}\nScope commits: {scope_token}\n"
     second_field = second_line = ""
     if second_review:
         if scope_commits is not None or review_mode != "cross_family" or ukrainian or tokens is not None:
@@ -3556,7 +3558,7 @@ def record(
             )
             state = "success" if current.state == "APPROVED" else "failure" if current.state in REJECTED else "pending"
             if current.state == NEEDS_SEAT and mixed_pair:
-                pending_reason = "; awaiting Anthropic/OpenAI review pair"
+                pending_reason = "; awaiting mixed-family review pair"
             elif current.state == NEEDS_SEAT:
                 profiled = [
                     marker
@@ -3863,9 +3865,14 @@ def republish_withheld(
     )
     reply = repository_relative_reply(reply, task=task, primary_root=review_root)
 
-    def rendered(second: bool, verdict: str) -> tuple[str, list[str]]:
-        """Known forms of this recorded comment, and the full form to publish."""
-        mixed_pair = review_mode == "cross_family" and not review.ukrainian and not second and facts.mixed_family
+    def rendered(second: bool, verdict: str, scoped: bool) -> tuple[str, list[str]]:
+        """Known forms of this recorded comment, and the full form to publish.
+
+        ``scoped`` is the recorded marker's own form: a Low-tier record is unscoped even on a pair branch.
+        """
+        mixed_pair = (
+            scoped and review_mode == "cross_family" and not review.ukrainian and not second and facts.mixed_family
+        )
         scope = facts.reviewer_scope(review.family) if mixed_pair else facts
         chunk = _item_chunk(
             task, reply, review.verdict, source_claims_validated=review.ukrainian and review.verdict == "APPROVED",
@@ -3934,7 +3941,7 @@ def republish_withheld(
             not second and not reviews_of_record(review.model)
         ):
             raise RecordError("a recorded verdict of this task does not match its record and sealed reply")
-        withheld, full_forms = rendered(second, verdict)
+        withheld, full_forms = rendered(second, verdict, scoped=bool(marker.get("review_pair")))
         if any(item["body"] != withheld and item["body"] not in full_forms for item in own):
             raise RecordError("a recorded verdict of this task does not match its record and sealed reply")
         comment = full_forms[0]
