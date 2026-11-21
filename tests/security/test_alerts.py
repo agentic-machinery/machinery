@@ -61,8 +61,22 @@ def _enrolled_workflow(pin: str = _PIN) -> str:
         "on: [push]\n"
         "jobs:\n"
         "  fleet-security:\n"
-        f"    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{pin}\n"
+        f'    "uses": learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{pin}\n'
     )
+
+
+def _completed_run(slug: str, *, path: str = ".github/workflows/security.yml") -> dict[str, Any]:
+    return {
+        "id": 5,
+        "path": path,
+        "head_branch": "main",
+        "head_sha": _HEAD,
+        "status": "completed",
+        "conclusion": "success",
+        "event": "push",
+        "head_repository": {"full_name": slug},
+        "html_url": f"https://github.com/{slug}/actions/runs/5",
+    }
 
 
 def _clean_fleet(endpoint: str, slug: str) -> Result | None:
@@ -84,17 +98,9 @@ def _clean_fleet(endpoint: str, slug: str) -> Result | None:
             status=200,
             value={
                 "total_count": 1,
-                "workflow_runs": [
-                    {
-                        "id": 5,
-                        "path": ".github/workflows/security.yml",
-                        "head_branch": "main",
-                        "head_sha": _HEAD,
-                        "status": "completed",
-                        "conclusion": "success",
-                        "html_url": f"https://github.com/{slug}/actions/runs/5",
-                    }
-                ],
+                    "workflow_runs": [
+                        _completed_run(slug, path=".github/workflows/security.yml@main")
+                    ],
             },
         )
     if path == f"repos/{slug}/actions/runs/5/jobs":
@@ -284,7 +290,9 @@ def test_scan_opt_out_repo_skipped(tmp_path: Path) -> None:
             raise AssertionError("opted-out repository must not be queried")
         if "secret-scanning/alerts" in endpoint:
             assert "hide_secret=true" in endpoint
-        if "org/brand-new-project/code-scanning/alerts" in endpoint:
+        if endpoint.split("?", 1)[0] == "repos/org/brand-new-project":
+            return Result(status=200, value={"id": 987654, "default_branch": "main"})
+        if "org/brand-new-project/code-scanning/alerts" in endpoint and "page=2" not in endpoint:
             return Result(
                 status=200,
                 headers={"link": '<https://api.github.com/repositories/987654/code-scanning/alerts?state=open&per_page=100&page=2>; rel="next"'},
@@ -307,6 +315,29 @@ def test_scan_opt_out_repo_skipped(tmp_path: Path) -> None:
     assert report["repositories"]["brand-new-project"]["tools"]["code_scanning"]["total"] == 2
     assert report["repositories"]["brand-new-project"]["tools"]["code_scanning"]["by_severity"]["critical"] == 1
     assert report["repositories"]["brand-new-project"]["tools"]["code_scanning"]["by_severity"]["high"] == 1
+
+    def respond_foreign_id(endpoint: str) -> Result:
+        if endpoint.split("?", 1)[0] == "repos/org/brand-new-project":
+            return Result(status=200, value={"id": 1, "default_branch": "main"})
+        if "org/brand-new-project/code-scanning/alerts" in endpoint and "page=2" not in endpoint:
+            return Result(
+                status=200,
+                headers={
+                    "link": '<https://api.github.com/repositories/987654/code-scanning/alerts?page=2>; rel="next"'
+                },
+                value=[{"number": 1, "rule": {"id": "py/test", "security_severity_level": "high"}}],
+            )
+        if "repositories/987654" in endpoint:
+            raise AssertionError(endpoint)
+        return Result(status=200, value=[])
+
+    foreign_id = scan_fleet_alerts(
+        registry_path=registry,
+        client=_FakeGitHubClient(respond_foreign_id),
+        clock=lambda: 1700000000.0,
+    )
+    assert foreign_id["repositories"]["brand-new-project"]["tools"]["code_scanning"]["status"] == "error"
+    assert foreign_id["repositories"]["brand-new-project"]["tools"]["code_scanning"]["error"] == "github_invalid_next_link"
 
     prom_path = tmp_path / "optout.prom"
     write_prometheus_textfile(prom_path, report)
@@ -476,18 +507,31 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         {
             "message": (
                 "Trivy image vuln CVE-2024-0001 (HIGH) pkg 1.0 (fixed: 2.0) in "
-                "image|alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "ghcr.io/org/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             )
         },
         {"message": "actionlint [syntax] at .github/workflows/ci.yml:3:1\x1b[31m"},
+        {"message": "actionlint [syntax] at .github/workflows/nightly tasks.yml:3:1"},
+        {"message": "zizmor unpinned-uses severity=high confidence=high at ?"},
+        {"annotation_level": "warning", "message": "1 trivy-fs licence disposition(s) matched no finding"},
     ]
     unpinned_text = (
+        "name: security\n"
+        "on: [push]\n"
         "jobs:\n"
-        "  a:\n"
+        "  branch:\n"
         "    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@main\n"
+        "  short:\n"
         '    uses: "learn-ukrainian/machinery/.github/workflows/fleet-security.yml@abc1234"\n'
+        "  upper:\n"
         "    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@"
         "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n"
+        "  script:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: |\n"
+        "          echo uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@"
+        f"{_PIN}\n"
     )
 
     def _jobs(slug: str, *, conclusion: str, total: int, jobs: list[dict[str, Any]], link: str | None = None) -> Result:
@@ -539,20 +583,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
             slug = path.split("/")[1] + "/" + path.split("/")[2]
             return Result(
                 status=200,
-                value={
-                    "total_count": 1,
-                    "workflow_runs": [
-                        {
-                            "id": 5,
-                            "path": ".github/workflows/security.yml",
-                            "head_branch": "main",
-                            "head_sha": _HEAD,
-                            "status": "completed",
-                            "conclusion": "success",
-                            "html_url": f"https://github.com/{slug}/actions/runs/5",
-                        }
-                    ],
-                },
+                value={"total_count": 1, "workflow_runs": [_completed_run(slug)]},
             )
         if path == "repos/org/clean/actions/runs/5/jobs":
             return _jobs("org/clean", conclusion="success", total=1, jobs=[_job("org/clean", 9, "fleet-security / Fleet security gate", "success", 9)])
@@ -579,7 +610,10 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
                 link="https://api.github.com/repos/evil/other/actions/runs/5/jobs?page=2",
             )
         if path == "repos/org/clean/check-runs/9/annotations":
-            return Result(status=200, value=[])
+            return Result(
+                status=200,
+                value=[{"annotation_level": "warning", "message": "1 trivy-fs licence disposition(s) matched no finding"}],
+            )
         if path == "repos/org/dirty/check-runs/8/annotations":
             return Result(status=200, value=dirty_annotations)
         if path == "repos/org/dirty/check-runs/9/annotations":
@@ -623,12 +657,14 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     assert report["repositories"]["foreign"]["fleet_security"]["reason"] == "github_invalid_next_link"
     assert not any("evil/other" in call for call in client.calls)
     findings = report["repositories"]["dirty"]["fleet_security"]["findings"]
-    assert [item["rule"] for item in findings] == ["SC2086", "SC2000", "CVE-2024-0001"]
+    assert [item["rule"] for item in findings] == ["SC2086", "SC2000", "CVE-2024-0001", "syntax", "unpinned-uses"]
     assert findings[0]["path"] == "scripts/run.sh"
     assert findings[0]["severity"] == "medium"
     assert findings[1]["path"] is None
     assert findings[2]["path"] is None
     assert findings[2]["scanner"] == "trivy-image"
+    assert findings[3]["path"] == ".github/workflows/nightly tasks.yml"
+    assert findings[4]["path"] is None
 
     prom = tmp_path / "states.prom"
     write_prometheus_textfile(prom, report)
@@ -666,6 +702,8 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     assert "--owned-path scripts/run.sh" in dirty_brief.dispatch_command
     assert "../secrets.sh" not in dirty_brief.dispatch_command
     assert "image|" not in dirty_brief.dispatch_command
+    assert "ghcr.io" not in dirty_brief.dispatch_command
+    assert "--owned-path ?" not in dirty_brief.dispatch_command
     assert "\x1b" not in dirty_brief.brief_markdown
     hidden_brief = build_fix_brief(
         "hidden",
@@ -689,6 +727,73 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     )
     assert "State: `missing_enrollment`." in missing_brief.brief_markdown
     assert "zero_findings" not in missing_brief.brief_markdown
+
+    def _limit_scan(files: list[dict[str, Any]], texts: dict[str, str]) -> dict[str, Any]:
+        slot = tmp_path / f"limit-{len(list(tmp_path.iterdir()))}"
+        slot.mkdir()
+        limit_registry = _write_registry(slot, {"limited": _repo_row("org/limited", default=True)})
+
+        def respond_limit(endpoint: str) -> Result:
+            if "/alerts" in endpoint:
+                return Result(status=200, value=[])
+            limit_path = endpoint.split("?", 1)[0]
+            if limit_path == "repos/org/limited":
+                return Result(status=200, value={"id": 111, "default_branch": "main"})
+            if limit_path == "repos/org/limited/contents/.github/workflows":
+                return Result(status=200, value=files)
+            filename = limit_path.rsplit("/", 1)[-1]
+            if filename in texts:
+                return Result(status=200, value=_workflow_file(texts[filename]))
+            raise AssertionError(endpoint)
+
+        return scan_fleet_alerts(
+            registry_path=limit_registry,
+            client=_FakeGitHubClient(respond_limit),
+            clock=lambda: 1700000000.0,
+        )
+
+    malformed = _limit_scan(
+        [{"name": None, "path": ".github/workflows/security.yml", "type": "file"}],
+        {},
+    )
+    assert malformed["repositories"]["limited"]["fleet_security"]["state"] == "inaccessible_evidence"
+    assert malformed["repositories"]["limited"]["fleet_security"]["reason"] == "github_invalid_payload"
+
+    previous_files = alerts_module._MAX_WORKFLOW_FILES
+    previous_bytes = alerts_module._MAX_WORKFLOW_BYTES
+    alerts_module._MAX_WORKFLOW_FILES = 1
+    alerts_module._MAX_WORKFLOW_BYTES = 80
+    try:
+        counted = _limit_scan(
+            [
+                {"name": "README.md", "path": ".github/workflows/README.md", "type": "file"},
+                {"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"},
+                {"name": "extra.yml", "path": ".github/workflows/extra.yml", "type": "file"},
+            ],
+            {},
+        )
+        assert counted["repositories"]["limited"]["fleet_security"]["reason"] == "pagination_limit"
+        named = _limit_scan(
+            [
+                {"name": "README.md", "path": ".github/workflows/README.md", "type": "file"},
+                {"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"},
+            ],
+            {"security.yml": "name: security\non: [push]\njobs: {}\n"},
+        )
+        assert named["repositories"]["limited"]["fleet_security"]["state"] == "missing_enrollment"
+        alerts_module._MAX_WORKFLOW_FILES = 2
+        wide = "name: security\n" + ("# " + ("x" * 40) + "\n")
+        oversized = _limit_scan(
+            [
+                {"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"},
+                {"name": "extra.yml", "path": ".github/workflows/extra.yml", "type": "file"},
+            ],
+            {"security.yml": wide, "extra.yml": wide},
+        )
+        assert oversized["repositories"]["limited"]["fleet_security"]["reason"] == "pagination_limit"
+    finally:
+        alerts_module._MAX_WORKFLOW_FILES = previous_files
+        alerts_module._MAX_WORKFLOW_BYTES = previous_bytes
 
 
 def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path) -> None:
@@ -718,9 +823,9 @@ def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path) -> None:
     assert added["repositories"]["fixture-added-repo"]["fleet_security"]["state"] == "missing_enrollment"
 
     catalog = load_fleet_repos()
-    assert len(catalog) == 8
-    assert {repo.key for repo in catalog.values() if repo.security_alerts} == set(catalog)
-    private = [repo for repo in catalog.values() if repo.role.startswith("private")]
+    watched = {key: repo for key, repo in catalog.items() if repo.security_alerts}
+    assert watched
+    private = [repo for repo in watched.values() if repo.role.startswith("private")]
     assert private
 
     def _catalog_client(*, authorize_private: bool) -> _FakeGitHubClient:
@@ -741,14 +846,14 @@ def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path) -> None:
 
     blocked = _catalog_client(authorize_private=False)
     blocked_report = scan_fleet_alerts(repos=catalog, client=blocked, clock=lambda: 1700000000.0)
-    assert set(blocked_report["repositories"]) == set(catalog)
+    assert set(blocked_report["repositories"]) == set(watched)
     for repo in private:
         entry = blocked_report["repositories"][repo.key]["fleet_security"]
         assert entry["state"] == "inaccessible_evidence"
         assert entry["reason"] == "github_http_404"
         assert any(call.split("?", 1)[0] == f"repos/{repo.github}" for call in blocked.calls)
         assert not any(f"repos/{repo.github}/contents/" in call for call in blocked.calls)
-    readable = next(repo for repo in catalog.values() if not repo.role.startswith("private"))
+    readable = next(repo for repo in watched.values() if not repo.role.startswith("private"))
     assert blocked_report["repositories"][readable.key]["fleet_security"]["state"] == "missing_enrollment"
 
     allowed = _catalog_client(authorize_private=True)

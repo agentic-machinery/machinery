@@ -88,8 +88,8 @@ Enrolled means a workflow file on the default branch calls `learn-ukrainian/mach
 | --- | --- |
 | `missing_enrollment` | The repository was readable and no workflow on the default branch calls the reusable workflow at a full SHA. An absent `.github/workflows` directory is this state. |
 | `inaccessible_evidence` | The repository, a listed workflow file, or the CI evidence could not be read, or the Fleet security gate did not succeed with a readable annotation list. A 404 on the repository itself is this state, including a private repository the token cannot see. |
-| `zero_findings` | A full-SHA caller exists, the latest completed default-branch run has exactly one Fleet security gate, that gate succeeded, and its fleet-security jobs produced no OSS finding annotations. |
-| `findings` | Those jobs produced redacted finding annotations (ShellCheck, actionlint, zizmor, TruffleHog, Trivy). `brief` adds a fix table and any safe repo-relative path to the dispatch command. It still does not dispatch. |
+| `zero_findings` | A full-SHA caller exists, the latest completed run on the default branch belongs to that repository (`push`, `schedule`, or `workflow_dispatch`), it has exactly one Fleet security gate, that gate succeeded, and its fleet-security jobs produced no OSS finding annotations. Warning and notice annotations are not findings. |
+| `findings` | Those jobs produced redacted finding annotations (ShellCheck, actionlint, zizmor, TruffleHog, Trivy). `brief` adds a fix table and any safe repo-relative path to the dispatch command. Image targets and a missing-file marker are shown and are not owned paths. It still does not dispatch. |
 
 `brief` keeps the existing code-scanning, Dependabot, and secret-scanning sections and adds a Fleet Security section that names the state above.
 
