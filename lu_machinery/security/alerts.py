@@ -1126,9 +1126,9 @@ def _build_prometheus_registry(scan_result: Mapping[str, Any]) -> CollectorRegis
                 for item in fleet["findings"]:
                     if not isinstance(item, Mapping):
                         continue
-                    scanner = item.get("scanner")
-                    severity = item.get("severity")
-                    if scanner not in {
+                    scanner_name = item.get("scanner")
+                    finding_severity = item.get("severity")
+                    if not isinstance(scanner_name, str) or scanner_name not in {
                         "actionlint",
                         "shellcheck",
                         "zizmor",
@@ -1138,11 +1138,13 @@ def _build_prometheus_registry(scan_result: Mapping[str, Any]) -> CollectorRegis
                         "trivy-image",
                     }:
                         continue
-                    if severity not in SEVERITIES:
+                    if not isinstance(finding_severity, str) or finding_severity not in SEVERITIES:
                         continue
-                    counts[(scanner, severity)] = counts.get((scanner, severity), 0) + 1
-                for (scanner, severity), count in sorted(counts.items()):
-                    fleet_findings_gauge.labels(repo=repo_key, scanner=scanner, severity=severity).set(count)
+                    counts[(scanner_name, finding_severity)] = counts.get((scanner_name, finding_severity), 0) + 1
+                for (scanner_name, finding_severity), count in sorted(counts.items()):
+                    fleet_findings_gauge.labels(
+                        repo=repo_key, scanner=scanner_name, severity=finding_severity
+                    ).set(count)
     return registry
 
 
