@@ -30,15 +30,15 @@ CURRENT_SOL = current_sol()
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir", "acp_runs_in_product")
 
 ASK_SEATS = (
-    ("ask-claude", "_handle_ask_claude", "claude"),
-    ("ask-codex", "_handle_ask_codex", "codex"),
-    ("ask-agy", "_handle_ask_agy", "agy"),
-    ("ask-grok", "_handle_ask_grok_build", "grok"),
-    ("ask-glm", "_handle_ask_glm", "glm"),
-    ("ask-gemma", "_handle_ask_gemma", "gemma"),
-    ("ask-cursor", "_handle_ask_cursor", "cursor"),
-    ("ask-deepseek", "_handle_ask_deepseek", "deepseek"),
-    ("ask-pool", "_handle_ask_pool", "pool"),
+    ("ask-claude", "high"),
+    ("ask-codex", None),
+    ("ask-agy", "high"),
+    ("ask-grok", "high"),
+    ("ask-glm", "high"),
+    ("ask-gemma", None),
+    ("ask-cursor", None),
+    ("ask-deepseek", "high"),
+    ("ask-pool", None),
 )
 
 RETIRED_ASK_SEATS = (
@@ -51,41 +51,86 @@ REFUSED_ASK_SEATS = (
 )
 
 
-@pytest.mark.parametrize(("command", "handler_name", "target"), ASK_SEATS)
-def test_effort_and_to_model_reach_every_enabled_acp_route(
-    command: str, handler_name: str, target: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("command", "pin"), ASK_SEATS)
+def test_acp_ask_checks_effort_before_enqueue_and_preserves_accepted_pins(
+    command: str, pin: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Every enabled compatibility parser forwards controls to the ACP shim."""
-    captured: dict[str, object] = {}
+    from lu_machinery.agent_runtime.runner import InterAgentTransportError
+    from lu_machinery.fleet_comms.authority import AuthorityService
 
-    def fake_compat(*args, **kwargs):
-        captured["args"] = args
-        captured.update(kwargs)
-        return SimpleNamespace(ok=True)
+    target = command.removeprefix("ask-")
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet-comms"))
+    stdin = Mock(return_value="question")
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(read=stdin))
+    forward = Mock(return_value=None)
+    monkeypatch.setattr("lu_machinery.ai_agent_bridge._job_host_forward.maybe_forward_compat_ask", forward)
+    probe = Mock(return_value=None)
+    monkeypatch.setattr("lu_machinery.agent_runtime.adapters.acpx.probe_participant_reachability", probe)
 
-    monkeypatch.setattr(_acp_compat, "run_compat_ask", fake_compat)
-    args = _cli._build_parser().parse_args(
-        [
-            command,
-            "question",
-            "--task-id",
-            "contract-seat",
-            "--from",
-            "claude",
-            "--to-model",
-            "requested-model",
-            "--effort",
-            "xhigh",
-        ]
+    @contextmanager
+    def execution_cwd(*args, **kwargs):
+        yield tmp_path
+
+    monkeypatch.setattr("lu_machinery.ai_agent_bridge._acp_execution.acp_execution_cwd", execution_cwd)
+    invoke = Mock(
+        return_value=SimpleNamespace(
+            ok=True,
+            agent=target,
+            model="fixture-model",
+            effort=pin,
+            response="answer",
+            transport_outcome="ok",
+            returncode=0,
+        )
     )
+    monkeypatch.setattr("lu_machinery.agent_runtime.runner.invoke_inter_agent", invoke)
 
-    getattr(_cli, handler_name)(args)
+    argv = ["ab", command, "-", "--task-id", "contract-seat", "--from", "claude", "--to-model", "requested-model"]
+    unsupported = "registered effort pin 'high'" if pin else "supported effort values: default (omit --effort)"
+    for effort in ("low", "medium", "high", "xhigh", "max"):
+        if effort != pin:
+            monkeypatch.setattr(sys, "argv", [*argv, "--effort", effort])
+            with pytest.raises(SystemExit) as refusal:
+                _cli.main()
+            assert isinstance(refusal.value.__cause__, InterAgentTransportError)
+            assert unsupported in str(refusal.value)
+            assert str(refusal.value).count("\n") == 0
 
-    forwarded = tuple(captured.get("args", ())) + tuple(captured.values())
-    assert captured["args"][0] == target
-    assert "requested-model" in forwarded
-    assert captured["effort"] == "xhigh"
-    assert _acp_compat.ask_hard_timeout(target) == 86400
+    with AuthorityService() as service:
+        assert service.store.connection.execute("SELECT COUNT(*) FROM authority_jobs").fetchone()[0] == 0
+    assert (stdin.call_count, forward.call_count, probe.call_count, invoke.call_count) == (0, 0, 0, 0)
+    assert capsys.readouterr() == ("", "")
+
+    accepted = [None, pin] if pin else [None]
+    for effort in accepted:
+        options = ["--effort", effort] if effort else []
+        monkeypatch.setattr(sys, "argv", [*argv, *options])
+        _cli.main()
+        assert invoke.call_args.args[:2] == (target, "question")
+        assert invoke.call_args.kwargs["model"] == "requested-model"
+        assert invoke.call_args.kwargs["effort"] == effort
+        assert invoke.call_args.kwargs["hard_timeout"] == 86400
+        assert capsys.readouterr().out == "answer\n"
+    assert invoke.call_count == len(accepted)
+
+    with AuthorityService() as service:
+        rows = service.store.connection.execute("SELECT job_id, state FROM authority_jobs").fetchall()
+        assert len(rows) == len(accepted)
+        receipts = [json.loads(service.read_job_result(row["job_id"])) for row in rows]
+    assert all(row["state"] == "complete" for row in rows)
+    assert {receipt["effort_requested"] for receipt in receipts} == set(accepted)
+    for receipt in receipts:
+        assert (receipt["model_requested"], receipt["from_model"], receipt["effort_applied"], receipt["harness"]) == (
+            "requested-model", "fixture-model", pin, "acp"
+        )
+
+    monkeypatch.setattr(sys, "argv", ["ab", command, "--help"])
+    with pytest.raises(SystemExit) as help_exit:
+        _cli.main()
+    assert help_exit.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    expected_help = "Ordinary ACP asks accept only high (the default)." if pin else "Omit --effort for ordinary ACP asks."
+    assert expected_help in help_text
 
 
 def test_terminal_failure_replays_without_invoking_provider_again(
@@ -517,12 +562,13 @@ def test_review_intent_never_reaches_the_toolless_acp_shim(
     monkeypatch.setattr(_dispatch_wrappers, "run_ask_review_dispatch", fake_dispatch)
 
     args = _cli._build_parser().parse_args(
-        [command, "question", "--task-id", "review-intent", "--from", "kimi", *extra_argv]
+        [command, "question", "--task-id", "review-intent", "--from", "kimi", "--effort", "xhigh", *extra_argv]
     )
 
     getattr(_cli, handler_name)(args)
 
     assert captured["agent"] == command.removeprefix("ask-")
+    assert captured["effort"] == "xhigh"
 
 
 def _capture_review_dispatch_argv(

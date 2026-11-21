@@ -13,10 +13,12 @@ from typing import NoReturn
 
 from lu_machinery.agent_identity import get_valid_agents, resolve_recipient_alias
 from lu_machinery.agent_runtime import usage as runtime_usage
+from lu_machinery.agent_runtime.adapters.acpx import ACPX_PARTICIPANT_EFFORTS
 from lu_machinery.agent_runtime.attribution import resolve_invocation_attribution
 from lu_machinery.agent_runtime.errors import AgentTimeoutError, RateLimitedError
 from lu_machinery.agent_runtime.retired_seat_admission import KimiAdmissionRefused
-from lu_machinery.agent_runtime.runner import InterAgentTransportError
+from lu_machinery.agent_runtime.runner import InterAgentTransportError, validate_inter_agent_effort
+from lu_machinery.agent_runtime.target_admission import COMPAT_TARGETS
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, product_root, state_root
 
@@ -444,7 +446,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ask_claude_parser.add_argument("--from-model", dest="from_model", help="Exact sender model ID")
     ask_claude_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_claude_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
 
     # ask-codex
     ask_codex_parser = subparsers.add_parser(
@@ -462,7 +463,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ask_codex_parser.add_argument("--from-model", dest="from_model", help="Exact sender model ID")
     ask_codex_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_codex_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_codex_parser.add_argument(
         "--no-timeout", dest="no_timeout", action="store_true", help="Run sync without timeout"
     )
@@ -564,7 +564,6 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="to_model",
         help="Target Agy model ID (default: the agy seat's live ACP registry pin)",
     )
-    ask_agy_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_agy_parser.add_argument(
         "--stdout-only",
         dest="stdout_only",
@@ -602,7 +601,6 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_opencode_parser.add_argument("--from", dest="from_llm", help="Sender agent family")
     ask_opencode_parser.add_argument("--from-model", dest="from_model", help="Exact sender model")
     ask_opencode_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_opencode_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_opencode_parser.add_argument("--no-timeout", dest="no_timeout", action="store_true")
 
     # ask-deepseek (first-party DeepSeek v4 Flash via the opencode ACP seat; ⚠️ China-hosted, LOCAL-ONLY)
@@ -617,7 +615,6 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_deepseek_parser.add_argument("--from", dest="from_llm", help="Sender agent family")
     ask_deepseek_parser.add_argument("--from-model", dest="from_model", help="Exact sender model")
     ask_deepseek_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_deepseek_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_deepseek_parser.add_argument("--no-timeout", dest="no_timeout", action="store_true")
 
     # ask-pool (poolside.ai laguna-s-2.1 — cross-family CODE + web-verify specialist)
@@ -641,7 +638,6 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_pool_parser.add_argument("--from", dest="from_llm", help="Sender agent family")
     ask_pool_parser.add_argument("--from-model", dest="from_model", help="Exact sender model")
     ask_pool_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_pool_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_pool_parser.add_argument("--no-timeout", dest="no_timeout", action="store_true")
 
     # ask-glm (Zhipu glm-5.3 — cross-family CODE + review; ⚠️ China-hosted, LOCAL-ONLY)
@@ -661,7 +657,6 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_glm_parser.add_argument("--from", dest="from_llm", help="Sender agent family")
     ask_glm_parser.add_argument("--from-model", dest="from_model", help="Exact sender model")
     ask_glm_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_glm_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_glm_parser.add_argument("--no-timeout", dest="no_timeout", action="store_true")
 
     # ask-gemma (Google Gemma 4 31B-it — cheap Google-family lane; ⚠️ not a sole seminar writer / factual reviewer)
@@ -681,7 +676,6 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_gemma_parser.add_argument("--from", dest="from_llm", help="Sender agent family")
     ask_gemma_parser.add_argument("--from-model", dest="from_model", help="Exact sender model")
     ask_gemma_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_gemma_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_gemma_parser.add_argument("--no-timeout", dest="no_timeout", action="store_true")
 
     # ask-cursor
@@ -700,7 +694,6 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_cursor_parser.add_argument("--from", dest="from_llm", help="Sender agent family")
     ask_cursor_parser.add_argument("--from-model", dest="from_model", help="Exact sender model")
     ask_cursor_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_cursor_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_cursor_parser.add_argument("--no-timeout", dest="no_timeout", action="store_true")
 
     # ask-grok (canonical native seat) + ask-grok-build (permanent alias)
@@ -726,7 +719,6 @@ def _build_parser() -> argparse.ArgumentParser:
     ask_grok_build_parser.add_argument("--from", dest="from_llm", help="Sender agent family")
     ask_grok_build_parser.add_argument("--from-model", dest="from_model", help="Exact sender model")
     ask_grok_build_parser.add_argument("--to-model", dest="to_model", help="Target model ID")
-    ask_grok_build_parser.add_argument("--effort", choices=EFFORT_CHOICES, help="Requested reasoning effort")
     ask_grok_build_parser.add_argument("--no-timeout", dest="no_timeout", action="store_true")
 
 
@@ -753,12 +745,28 @@ def _build_parser() -> argparse.ArgumentParser:
         ask_cursor_parser,
         ask_grok_build_parser,
     ):
+        command = ask_parser.prog.split()[-1]
+        if ask_parser is not ask_gemini_parser:
+            participant = COMPAT_TARGETS.get(command.removeprefix("ask-"))
+            if participant is None:
+                effort_help = "No ACP route is registered for this command."
+            elif pin := ACPX_PARTICIPANT_EFFORTS.get(participant):
+                effort_help = (
+                    f"Ordinary ACP asks accept only {pin} (the default). "
+                    "Native reviews use the selected model's supported efforts."
+                )
+            else:
+                effort_help = (
+                    "Omit --effort for ordinary ACP asks. "
+                    "Native reviews use the selected model's supported efforts."
+                )
+            ask_parser.add_argument("--effort", choices=EFFORT_CHOICES, help=effort_help)
         ask_parser.description = (
             "Send an ordinary ask through ACP; use review intent for toolful code review.\n"
             "Provider delays are allowed: no inactivity deadline, only a 24-hour hang guard."
         )
         ask_parser.epilog = (
-            f"Example: {BRIDGE_ENTRY} {ask_parser.prog.split()[-1]} 'question' --task-id advice --from codex\n"
+            f"Example: {BRIDGE_ENTRY} {command} 'question' --task-id advice --from codex\n"
             "Outputs: answer on stdout; durable transcript path on stderr and in the job receipt.\n"
             "Exit codes: 0 successful reply; non-zero refusal, provider failure or hang guard.\n"
             "Related: dispatch for implementation and toolful reviews."
@@ -1233,13 +1241,24 @@ def _handle_acp_compat(args, target: str) -> None:
     if getattr(args, "background", False):
         raise SystemExit("legacy ask --background is retired; enqueue through fleet-comms")
     model = getattr(args, "to_model", None) or getattr(args, "model", None)
+    effort = getattr(args, "effort", None)
+    pr_number = getattr(args, "pr", None)
+    branch = getattr(args, "branch", None)
+    review = (
+        bool(getattr(args, "review", False))
+        or str(getattr(args, "type", "") or "").strip().casefold() == "review"
+        or pr_number is not None
+        or branch is not None
+    )
     # Seat admission first: a refused seat (every Kimi seat) stops before stdin,
     # PR-head resolution, telemetry, or any dispatch.
     from ._acp_compat import require_compat_target
 
     try:
-        require_compat_target(target, model=model)
-    except ValueError as exc:
+        participant = require_compat_target(target, model=model)
+        if effort is not None and not review:
+            validate_inter_agent_effort(participant, effort)
+    except (ValueError, InterAgentTransportError) as exc:
         raise SystemExit(str(exc)) from exc
     data = Path(args.data).read_text(encoding="utf-8") if getattr(args, "data", None) else None
     try:
@@ -1250,14 +1269,9 @@ def _handle_acp_compat(args, target: str) -> None:
     task_id = getattr(args, "task_id", None)
     if not task_id:
         raise SystemExit(f"ask-{target} requires --task-id")
-    # Review intent comes from either spelling: the explicit --review flag or
-    # the --type review drivers actually pass (#6805).
-    review = bool(getattr(args, "review", False)) or str(getattr(args, "type", "") or "").strip().casefold() == "review"
-    pr_number = getattr(args, "pr", None)
-    branch = getattr(args, "branch", None)
     repo = getattr(args, "repo", None)
     if repo is not None:
-        if not (review or pr_number is not None or branch is not None):
+        if not review:
             raise SystemExit("--repo requires review intent (--review, --type review, --pr or --branch)")
         from lu_machinery.orchestration.fleet_repos import FleetRepoError, canonical_repo_key, default_repo_key
         from lu_machinery.review.target_resolution import TargetResolutionError, resolve_review_repository
@@ -1293,7 +1307,6 @@ def _handle_acp_compat(args, target: str) -> None:
         else:
             target_desc = f"remote branch origin/{branch}"
         content = _review_target_content(target_desc, content, sha=resolved_head_sha)
-        review = True
 
     subject_seats = getattr(args, "subject_seat", None)
     subject_families = getattr(args, "subject_family", None)
@@ -1336,7 +1349,7 @@ def _handle_acp_compat(args, target: str) -> None:
             data=data,
             task_id=task_id,
             model=model,
-            effort=getattr(args, "effort", None),
+            effort=effort,
             output_path=getattr(args, "output_path", None),
             stdout_only=bool(getattr(args, "stdout_only", False)),
             # None resolves the seat's per-seat timeout profile default;
@@ -1365,7 +1378,7 @@ def _handle_acp_compat(args, target: str) -> None:
             task_id=task_id,
             source=_resolve_from_llm(args),
             model=model,
-            effort=getattr(args, "effort", None),
+            effort=effort,
             data=data,
             # Review intent already returned above via headless dispatch; this
             # ACP call is reached only for ordinary (non-review) asks.
