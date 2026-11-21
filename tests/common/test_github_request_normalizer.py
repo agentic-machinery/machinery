@@ -1716,3 +1716,129 @@ def test_real_gh_paginated_run_without_include_observes_no_headers(tmp_path):
         assert gh.run(LANDING_ARGV, client=client, runner=subprocess.run, capture_output=True).returncode == 0
     finally:
         server.close()
+
+
+_VALID_GQL_DATA = {"viewer": {"login": "octocat"}}
+
+
+@pytest.mark.parametrize(
+    ("raw_body", "expected_reason"),
+    [
+        # Wrong-typed or falsey-but-present errors members (paired with valid data).
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": []}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": None}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": False}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": ""}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": 0}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": {}}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": "err"}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": 1}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": True}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": ["err"]}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": [None]}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": [{"message": "ok"}, "bad"]}).encode(), "invalid_errors"),
+        # Populated GraphQL errors lists.
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": [{"message": "boom"}]}).encode(), "graphql_errors"),
+        (json.dumps({"data": None, "errors": [{"message": "boom"}]}).encode(), "graphql_errors"),
+        # Missing or non-object data members.
+        (json.dumps({}).encode(), "invalid_data"),
+        (json.dumps({"extensions": {}}).encode(), "invalid_data"),
+        (json.dumps({"data": None}).encode(), "invalid_data"),
+        (json.dumps({"data": []}).encode(), "invalid_data"),
+        (json.dumps({"data": ""}).encode(), "invalid_data"),
+        (json.dumps({"data": False}).encode(), "invalid_data"),
+        (json.dumps({"data": 0}).encode(), "invalid_data"),
+        (json.dumps({"data": "ok"}).encode(), "invalid_data"),
+        # Non-object extensions members.
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": None}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": []}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": False}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": True}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": ""}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": "bad"}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": 0}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": 1}).encode(), "invalid_extensions"),
+        # Non-object top-level documents and unknown top-level members.
+        (json.dumps([]).encode(), "invalid_envelope"),
+        (json.dumps(None).encode(), "invalid_envelope"),
+        (json.dumps(True).encode(), "invalid_envelope"),
+        (json.dumps(1).encode(), "invalid_envelope"),
+        (json.dumps(json.dumps({"data": _VALID_GQL_DATA})).encode(), "invalid_envelope"),
+        (json.dumps({"data": _VALID_GQL_DATA, "unexpected": True}).encode(), "invalid_envelope"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": {}, "extra": 1}).encode(), "invalid_envelope"),
+        # Strict JSON decode failures on HTTP 200 GraphQL responses.
+        (b"", "invalid_json"),
+        (b"not json", "invalid_json"),
+        (b"\xff", "invalid_json"),
+        (b'\xef\xbb\xbf{"data":{"viewer":{"login":"octocat"}}}', "invalid_json"),
+        (b'{"data":{"viewer":{"login":"octocat"}},"data":{}}', "invalid_json"),
+        (b'{"data":{"viewer":{"login":"octocat"}},"extensions":[],"extensions":{}}', "invalid_json"),
+        (b'{"data":{"viewer":{"login":"octocat"}},"extensions":{"cost":NaN}}', "invalid_json"),
+        (b'{"data":{"viewer":{"login":"octocat"}},"extensions":{"cost":Infinity}}', "invalid_json"),
+        (b'{"data":' + b"[" * 513 + b"]" * 513 + b"}", "invalid_json"),
+    ],
+)
+def test_graphql_envelope_rejects_malformed_member_classes_and_never_caches(context, raw_body, expected_reason):
+    """Defect class: lenient GraphQL response classification accepts falsey/wrong-typed errors, non-object data/extensions, unknown keys, or non-strict JSON as success."""
+    context.wire.reply = lambda: gh.Response(200, {}, raw_body)
+
+    direct = context.client.request("POST", "graphql", payload={"query": R})
+    assert direct.error == "github_graphql_error"
+    assert direct.reason == expected_reason
+
+    raw_res = context.client.request("POST", "graphql", payload={"query": R}, raw_response=True)
+    assert raw_res.error == "github_graphql_error"
+    assert raw_res.reason == expected_reason
+
+    cli = gh.run(["gh", "api", "graphql", "-f", "query=" + R], client=context.client, capture_output=True)
+    assert cli.returncode == 1
+    detail = json.loads(cli.stdout)
+    assert detail["error"] == "github_graphql_error"
+    assert detail["reason"] == expected_reason
+
+    # Malformed GraphQL replies are never cached: a subsequent valid envelope succeeds.
+    context.wire.reply = lambda: gh.Response(200, {}, json.dumps({"data": _VALID_GQL_DATA}).encode())
+    recovered = context.client.request("POST", "graphql", payload={"query": R})
+    assert recovered.error is None and recovered.value == {"data": _VALID_GQL_DATA}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": _VALID_GQL_DATA},
+        {"data": _VALID_GQL_DATA, "extensions": {"warnings": []}},
+    ],
+)
+def test_graphql_envelope_accepts_valid_envelopes_and_preserves_rate_limits_and_http_errors(context, payload):
+    """Defect class: strict GraphQL envelope checks break valid envelopes, GraphQL rate-limit classification, or non-2xx HTTP error classification."""
+    raw_valid = json.dumps(payload).encode()
+    context.wire.reply = lambda: gh.Response(200, {}, raw_valid)
+    ok = context.client.request("POST", "graphql", payload={"query": R})
+    assert ok.error is None and ok.value == payload
+    ok_raw = context.client.request("POST", "graphql", payload={"query": R}, raw_response=True)
+    assert ok_raw.error is None and ok_raw.value == raw_valid
+
+    # GraphQL rate-limit responses keep typed pool_exhausted classification unchanged.
+    for rl_body in (
+        {"errors": [{"type": "RATE_LIMIT", "message": "API rate limit exceeded"}]},
+        {"data": None, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]},
+    ):
+        fresh_client = gh.GitHubClient(
+            cache_dir=context.tmp / f"rl-{len(rl_body)}",
+            transport=lambda *a, b=rl_body: gh.Response(200, {}, json.dumps(b).encode()),
+            clock=lambda: context.now,
+            env={"GH_TOKEN": TOKEN},
+        )
+        limited = fresh_client.request("POST", "graphql", payload={"query": R})
+        assert (limited.error, limited.reason, limited.status) == ("github_rate_limited", "pool_exhausted", 429)
+
+    # Non-2xx HTTP errors without GraphQL errors stay github_http_error; 400 with errors stays github_graphql_error.
+    for status, body, expected_error, expected_reason in (
+        (401, b'{"message":"Bad credentials"}', "github_http_error", None),
+        (502, b"<html>502 Bad Gateway</html>", "github_http_error", None),
+        (400, b'{"errors":[{"message":"syntax error"}]}', "github_graphql_error", "graphql_errors"),
+        (400, b'{"errors":[]}', "github_graphql_error", "invalid_errors"),
+    ):
+        context.wire.reply = lambda s=status, b=body: gh.Response(s, {}, b)
+        res = context.client.request("POST", "graphql", payload={"query": R})
+        assert (res.status, res.error, res.reason) == (status, expected_error, expected_reason)

@@ -986,7 +986,77 @@ def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reo
     assert answer.returncode == 75
     assert json.loads(answer.stdout)["error"] == "github_rate_limited"
     assert http_state["gql_calls"] == 1 and http_writes == []
+
+    # AC-02: _dismiss_get decodes REST JSON strictly on both real GitHubClient (runner=None) and injected runner:
+    # duplicate keys, NaN/Infinity, UTF-8 BOM, invalid UTF-8, top-level JSON strings, and bad paginated pages refuse with zero writes.
+    http_state.update(gql_calls=0, phase=None, override=None)
+    valid_alert_json = json.dumps(documents["code-scanning/alerts/1"])
+    bad_rest_bodies = [
+        b'{"number":1,"state":"closed","state":"open","rule":{"id":"py/test"},"tool":{"name":"CodeQL"}}',
+        b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":NaN}',
+        b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":Infinity}',
+        b"\xef\xbb\xbf" + valid_alert_json.encode("utf-8"),
+        b"\xff",
+        json.dumps(valid_alert_json).encode("utf-8"),
+        b"not json",
+    ]
+    for bad_rest in bad_rest_bodies:
+        def rest_override_transport(method, endpoint, headers, body, timeout, bad_rest=bad_rest):
+            if method == "GET" and endpoint == "repos/unit/public/code-scanning/alerts/1":
+                return github_client.Response(200, {}, bad_rest)
+            return http_transport(method, endpoint, headers, body, timeout)
+
+        class BadRestHttpClient(real_client_cls):
+            def __init__(self, **kwargs):
+                kwargs["cache_dir"] = tmp_path / "gh-cache-rest"
+                kwargs["transport"] = rest_override_transport
+                super().__init__(**kwargs)
+
+        monkeypatch.setattr(github_client, "GitHubClient", BadRestHttpClient)
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=None)
+        assert http_writes == []
+
+    # Post-PATCH readback via _dismiss_get also decodes strictly (duplicate key -> exit 3 UNKNOWN, never exit 0).
+    def bad_readback_transport(method, endpoint, headers, body, timeout):
+        if method == "GET" and endpoint == "repos/unit/public/code-scanning/alerts/1" and http_writes:
+            return github_client.Response(
+                200,
+                {},
+                b'{"number":1,"state":"open","state":"dismissed","dismissed_reason":"false positive","dismissed_comment":"' + comment.encode("utf-8") + b'"}',
+            )
+        return http_transport(method, endpoint, headers, body, timeout)
+
+    class BadReadbackHttpClient(real_client_cls):
+        def __init__(self, **kwargs):
+            kwargs["cache_dir"] = tmp_path / "gh-cache-readback"
+            kwargs["transport"] = bad_readback_transport
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(github_client, "GitHubClient", BadReadbackHttpClient)
+    readback_answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=None, capture_output=True, text=True,
+    )
+    assert readback_answer.returncode == 3 and len(http_writes) == 1
+    http_writes.clear()
     monkeypatch.setattr(github_client, "GitHubClient", real_client_cls)
+
+    for bad_rest_text in (
+        '{"number":1,"state":"closed","state":"open","rule":{"id":"py/test"},"tool":{"name":"CodeQL"}}',
+        '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":NaN}',
+        '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":-Infinity}',
+        "\ufeff" + valid_alert_json,
+        json.dumps(valid_alert_json),
+    ):
+        def bad_rest_runner(argv, bad_rest_text=bad_rest_text, **kwargs):
+            if argv[argv.index("--method") + 1] == "GET" and argv[argv.index("--method") + 2] == "repos/unit/public/code-scanning/alerts/1":
+                return subprocess.CompletedProcess(argv, 0, bad_rest_text, "")
+            return sender(argv, **kwargs)
+
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=bad_rest_runner)
+        assert writes == []
 
     # Zero-page paginated REST response ([]) must also fail closed.
     documents["pulls/2/files?per_page=100"] = []
@@ -1184,3 +1254,149 @@ def test_rate_limited_delete_exits_75_without_another_delete(delete_transport, v
     assert answer.returncode == 75
     assert json.loads(answer.stdout)["error"] == "github_rate_limited"
     assert len(deletes) == len(before) + 1
+
+
+def _malformed_envelopes_for(valid_data: dict) -> list[tuple[str, str]]:
+    """Every wrong-typed, falsey-error, unknown-member, and non-strict JSON envelope class paired with valid data."""
+    valid_json = json.dumps(valid_data)
+    return [
+        ("errors-empty-list", json.dumps({"data": valid_data, "errors": []})),
+        ("errors-null", json.dumps({"data": valid_data, "errors": None})),
+        ("errors-false", json.dumps({"data": valid_data, "errors": False})),
+        ("errors-empty-str", json.dumps({"data": valid_data, "errors": ""})),
+        ("errors-zero", json.dumps({"data": valid_data, "errors": 0})),
+        ("errors-dict", json.dumps({"data": valid_data, "errors": {}})),
+        ("errors-str", json.dumps({"data": valid_data, "errors": "err"})),
+        ("errors-non-dict-entry", json.dumps({"data": valid_data, "errors": [1]})),
+        ("errors-populated", json.dumps({"data": valid_data, "errors": [{"message": "boom"}]})),
+        ("data-missing", json.dumps({})),
+        ("data-missing-with-extensions", json.dumps({"extensions": {}})),
+        ("data-null", json.dumps({"data": None})),
+        ("data-list", json.dumps({"data": []})),
+        ("data-false", json.dumps({"data": False})),
+        ("data-str", json.dumps({"data": "ok"})),
+        ("extensions-null", json.dumps({"data": valid_data, "extensions": None})),
+        ("extensions-list", json.dumps({"data": valid_data, "extensions": []})),
+        ("extensions-false", json.dumps({"data": valid_data, "extensions": False})),
+        ("extensions-true", json.dumps({"data": valid_data, "extensions": True})),
+        ("extensions-str", json.dumps({"data": valid_data, "extensions": "bad"})),
+        ("extensions-int", json.dumps({"data": valid_data, "extensions": 1})),
+        ("unknown-top-level-key", json.dumps({"data": valid_data, "unexpected": True})),
+        ("top-level-list", json.dumps([])),
+        ("top-level-json-string", json.dumps(json.dumps({"data": valid_data}))),
+        ("duplicate-key", '{"data":' + valid_json + ',"extensions":[],"extensions":{}}'),
+        ("nan-constant", '{"data":' + valid_json + ',"extensions":{"cost":NaN}}'),
+        ("infinity-constant", '{"data":' + valid_json + ',"extensions":{"cost":Infinity}}'),
+        ("utf8-bom", '\ufeff{"data":' + valid_json + "}"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [name for name, _ in _malformed_envelopes_for({})],
+)
+def test_publish_graphql_callers_refuse_malformed_envelopes_with_zero_writes(monkeypatch, tmp_path, synthetic_opsec, case_id):
+    """Defect class: _confirm_enqueued, _transfer_label_connection, and read('issue-count') accept falsey/wrong-typed errors, non-object data/extensions, unknown keys, or non-strict JSON."""
+    monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
+    head = "a" * 40
+
+    # 1. _confirm_enqueued refuses with ENQUEUE_UNVERIFIED and sends zero writes (no --disable-auto).
+    confirm_valid_data = {"repository": {"pullRequest": {"headRefOid": head, "isInMergeQueue": True, "autoMergeRequest": {"enabledAt": "2026-11-21T00:00:00Z"}}}}
+    confirm_payload = dict(_malformed_envelopes_for(confirm_valid_data))[case_id]
+    writes = []
+
+    def confirm_read(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, confirm_payload, "")
+
+    def confirm_write(argv, **kwargs):
+        writes.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    with pytest.raises(gate.PublishBlocked, match="ENQUEUE_UNVERIFIED"):
+        pub._confirm_enqueued("unit/public", 1, head, "github.com/unit/public", tmp_path, (confirm_read, confirm_write), tmp_path, {})
+    assert writes == []
+
+    # 2. _transfer_label_connection refuses with ValueError (and issue-transfer refuses with zero mutations).
+    transfer_valid_data = {
+        "repository": {
+            "id": "R_1",
+            "nameWithOwner": "unit/public",
+            "visibility": "PUBLIC",
+            "viewerPermission": "ADMIN",
+            "isArchived": False,
+            "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        }
+    }
+    transfer_payload = dict(_malformed_envelopes_for(transfer_valid_data))[case_id]
+
+    def transfer_read(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, transfer_payload, "")
+
+    with pytest.raises(ValueError):
+        pub._transfer_label_connection(
+            pub.TRANSFER_REPOSITORY_QUERY,
+            {"owner": "unit", "name": "public"},
+            lambda repo: ({"id": repo["id"]}, repo["labels"]),
+            transfer_read,
+            tmp_path,
+            {},
+            tmp_path,
+        )
+
+    # 3. read("issue-count") refuses with OPSEC: malformed issue count response.
+    count_valid_data = {"repository": {"issues": {"totalCount": 7}}}
+    count_payload = dict(_malformed_envelopes_for(count_valid_data))[case_id]
+    with pytest.raises(gate.PublishBlocked, match="malformed issue count response"):
+        pub.read(
+            "issue-count",
+            repo="unit/public",
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, count_payload, ""),
+            cwd=tmp_path,
+            env={},
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_publish_graphql_callers_accept_valid_extensions_object(monkeypatch, tmp_path, synthetic_opsec):
+    """Defect class: strict GraphQL envelope check rejects spec-compliant object-valued extensions."""
+    monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
+    head = "a" * 40
+    ext = {"cost": 1}
+
+    confirm_ok = json.dumps({
+        "data": {"repository": {"pullRequest": {"headRefOid": head, "isInMergeQueue": True, "autoMergeRequest": None}}},
+        "extensions": ext,
+    })
+    pub._confirm_enqueued(
+        "unit/public", 1, head, "github.com/unit/public", tmp_path,
+        (lambda argv, **kw: subprocess.CompletedProcess(argv, 0, confirm_ok, ""), lambda *a, **kw: pytest.fail("no write")),
+        tmp_path, {},
+    )
+
+    transfer_ok = json.dumps({
+        "data": {
+            "repository": {
+                "id": "R_1",
+                "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "bug"}]},
+            }
+        },
+        "extensions": ext,
+    })
+    identity, labels = pub._transfer_label_connection(
+        pub.TRANSFER_REPOSITORY_QUERY,
+        {"owner": "unit", "name": "public"},
+        lambda repo: ({"id": repo["id"]}, repo["labels"]),
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, transfer_ok, ""),
+        tmp_path, {}, tmp_path,
+    )
+    assert identity == {"id": "R_1"} and labels == ["bug"]
+
+    count_ok = json.dumps({"data": {"repository": {"issues": {"totalCount": 42}}}, "extensions": ext})
+    result = pub.read(
+        "issue-count",
+        repo="unit/public",
+        runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, count_ok, ""),
+        cwd=tmp_path, env={}, capture_output=True, text=True,
+    )
+    assert result.returncode == 0 and json.loads(result.stdout)["data"]["repository"]["issues"]["totalCount"] == 42

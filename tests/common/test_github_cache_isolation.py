@@ -228,7 +228,7 @@ def test_healthy_observation_replaces_a_poisoned_reset(tmp_path, resource, metho
                 "X-RateLimit-Reset": str(healthy),
                 "X-RateLimit-Resource": resource,
             },
-            b'{"ok":true}',
+            b'{"data":{"ok":true}}' if resource == "graphql" else b'{"ok":true}',
         )
 
     store = gh.GitHubClient(
@@ -427,13 +427,13 @@ def test_post_response_pruning_commits_before_connection_close(tmp_path, monkeyp
         cache_dir=tmp_path,
         env={},
         clock=lambda: 1000,
-        cache_max_bytes=6,
-        transport=lambda *_args: gh.Response(200, {}, b'{"x":1}'),
+        cache_max_bytes=10,
+        transport=lambda *_args: gh.Response(200, {}, b'{"data":{}}'),
     )
     # GraphQL is not core usage-counted: no later counting transaction can
     # accidentally commit or prune the response and hide the missing commit.
     result = store.request("POST", "graphql", payload={"query": "query { viewer { login } }"})
-    assert result.value == {"x": 1} and result.error is None
+    assert result.value == {"data": {}} and result.error is None
     assert transactions and not any(transactions)
     with sqlite3.connect(tmp_path / "cache.sqlite3") as db:
         assert db.execute("SELECT count(*) FROM cache").fetchone() == (0,)
