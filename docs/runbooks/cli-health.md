@@ -68,7 +68,9 @@ Suggested PromQL alert expressions (configured in `infra-private`):
 - **No credential leakage**: sign-in probes use each CLI's own status command or
   a documented status file and extract only an allowlisted boolean or bounded
   state. Tokens, emails, account IDs, raw command output, and file contents are
-  never emitted to JSON, metrics, or logs.
+  never emitted to JSON, metrics, or logs. `--json-out` is written atomically
+  with mode `0600`; `--prom-out` (non-secret metrics only) is staged at `0600`
+  and finalized at `0644` so a separate collector service user can scrape it.
 - **Fail closed**: a failing or missing version command sets `check_ok=0` and
   `behind="unknown"` (omitted in Prometheus) rather than reporting `behind=0`.
   Non-HTTPS URLs, path-bearing executables, symlinks on status files or output

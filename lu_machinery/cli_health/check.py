@@ -592,6 +592,7 @@ def _fetch_http_bytes(
             return None
         with opener(request, timeout=remaining) as response:
             sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+            read_chunk = getattr(response, "read1", response.read)
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -600,7 +601,7 @@ def _fetch_http_bytes(
                     with contextlib.suppress(OSError):
                         sock.settimeout(remaining)
                 to_read = min(_HTTP_CHUNK_BYTES, _MAX_HTTP_BYTES + 1 - len(body))
-                chunk = response.read(to_read)
+                chunk = read_chunk(to_read)
                 if not isinstance(chunk, bytes):
                     return None
                 if not chunk:
@@ -984,10 +985,16 @@ def render_prometheus(report: Mapping[str, Any], *, now_timestamp: float | None 
 
 
 def write_atomic_text(destination: Path, text: str, *, mode: int = 0o600) -> None:
-    """Atomically write ``text`` to ``destination``, refusing symlinks, non-regular files, or extra hard links."""
+    """Atomically write ``text`` to ``destination``, refusing symlinks, non-regular files, or extra hard links.
+
+    Temporary files are always created owner-only (``0o600``) with ``O_EXCL | O_NOFOLLOW``,
+    then set to ``mode & 0o644`` via ``fchmod`` only after the full payload is written.
+    """
     raw_dest = os.fspath(destination)
     if not raw_dest or any(ch in raw_dest for ch in ("\x00", "\r", "\n")):
         raise CliHealthConfigError("output destination path is invalid")
+    if isinstance(mode, bool) or not isinstance(mode, int) or mode < 0 or mode & ~0o644:
+        raise CliHealthConfigError("output mode must stay within 0o644")
     try:
         info = destination.lstat()
     except FileNotFoundError:
@@ -999,14 +1006,15 @@ def write_atomic_text(destination: Path, text: str, *, mode: int = 0o600) -> Non
     parent = destination.parent
     parent.mkdir(parents=True, exist_ok=True)
     temp_path = parent / f".{destination.name}.{secrets.token_hex(12)}.tmp"
-    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temp_path, flags, 0o600)
     try:
         with os.fdopen(fd, "wb") as stream:
             fd = -1
             stream.write(text.encode("utf-8"))
             stream.flush()
+            os.fchmod(stream.fileno(), mode & 0o644)
             os.fsync(stream.fileno())
-            os.fchmod(stream.fileno(), mode & 0o600)
         os.replace(temp_path, destination)
     except OSError:
         temp_path.unlink(missing_ok=True)
@@ -1110,9 +1118,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         report = check_all(specs, timeout=timeout)
         json_text = json.dumps(report, indent=2) + "\n"
         if args.json_out is not None:
-            write_atomic_text(args.json_out, json_text)
+            write_atomic_text(args.json_out, json_text, mode=0o600)
         if args.prom_out is not None:
-            write_atomic_text(args.prom_out, render_prometheus(report))
+            write_atomic_text(args.prom_out, render_prometheus(report), mode=0o644)
     except CliHealthConfigError as exc:
         print(f"cli_health failed: {exc}", file=sys.stderr, flush=True)
         return 1
