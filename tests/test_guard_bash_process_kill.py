@@ -128,6 +128,8 @@ F10_ANSI_C = [
         ("echo a' 'b ; pkill -f worker ; echo 'c'", True),
         ("echo a' 'b ; pgrep -f worker | xargs kill ; echo 'c'", True),
         ("echo it's", True),
+        ("'pk'\"ill\" -f worker", True),
+        ("p'kill' -f worker", True),
         ("pgrep -f worker", False),
         ("pgrep --full worker | sort", False),
         ("pgrep -f worker | xargs echo kill", False),

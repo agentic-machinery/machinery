@@ -329,6 +329,7 @@ def test_secret_dump_shapes_blocked(monkeypatch, capsys, cmd):
         # A quote opening inside a word must not flip quote parity (C-6323).
         "echo a' 'b ; cat .env ; echo 'c'",
         'echo a" "b ; cat .env ; echo "c"',
+        "e'cho' $GH_TOKEN",
     ],
 )
 def test_issue_8896_secret_bypasses_block(monkeypatch, capsys, command):
@@ -559,6 +560,7 @@ def test_issue_9115_backtick_depth_limit_blocks_secret_hook(monkeypatch):
         # Unterminated quoting cannot be read whole (C-6323).
         """{"tool_input":{"command":"echo it's"}}""",
         r"""{"tool_input":{"command":"echo 'won'\\''t"}}""",
+        r"""{"tool_input":{"command":"echo $'it\\'"}}""",
     ],
 )
 def test_issue_9115_malformed_secret_hook_input_blocks(monkeypatch, payload):
