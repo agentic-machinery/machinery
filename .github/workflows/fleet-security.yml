@@ -111,7 +111,13 @@ on:
       trivy-fs-targets:
         description: >-
           Newline-separated repo-relative file or directory targets for trivy fs.
-          Required when run-trivy-fs is true.
+          Required when run-trivy-fs is true unless pip lock files are supplied.
+        type: string
+        default: ''
+      trivy-fs-pip-lock-files:
+        description: >-
+          Optional newline-separated repo-relative pip lock files with exact version
+          pins. Each regular file is scanned as a pip requirements file.
         type: string
         default: ''
       trivy-scanners:
@@ -1530,6 +1536,7 @@ jobs:
         env:
           TRIVY_BIN: ${{ runner.temp }}/trivy/trivy
           INPUT_TARGETS: ${{ inputs.trivy-fs-targets }}
+          INPUT_PIP_LOCK_FILES: ${{ inputs.trivy-fs-pip-lock-files }}
           INPUT_SCANNERS: ${{ inputs.trivy-scanners }}
           INPUT_SEVERITY: ${{ inputs.trivy-severity }}
           INPUT_IGNORE_UNFIXED: ${{ inputs.trivy-ignore-unfixed }}
@@ -1591,7 +1598,7 @@ jobs:
                   return root
               if not value or value.startswith(("/", "-")) or "\0" in value:
                   return None
-              if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value):
+              if any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp") for c in value):
                   return None
               parts = value.split("/")
               if any(part in ("", ".", "..") for part in parts):
@@ -1656,7 +1663,23 @@ jobs:
           else:
               ignorefile_arg = ""
 
+          pip_lock_files = {}
+          lock_lines = os.environ.get("INPUT_PIP_LOCK_FILES", "").replace("\r\n", "\n").split("\n")
+          for line_number, lock_file in enumerate(lock_lines, start=1):
+              if not lock_file:
+                  continue
+              try:
+                  resolved = valid_rel(lock_file)
+                  regular = resolved is not None and resolved.is_file()
+              except OSError:
+                  regular = False
+              if not regular:
+                  print(f"::error::trivy-fs-pip-lock-files line {line_number} must name a repo-relative regular file without symlinks; failing closed")
+                  emit({"tool": "trivy-fs", "version": version, "status": "invalid_target", "targets": []}, 1)
+              pip_lock_files[lock_file] = None
+
           targets = [line.strip() for line in os.environ.get("INPUT_TARGETS", "").splitlines() if line.strip()]
+          targets = [target for target in targets if target not in pip_lock_files] + list(pip_lock_files)
           if not targets:
               print("::error::trivy-fs-targets is empty while run-trivy-fs is true; failing closed")
               emit({"tool": "trivy-fs", "version": version, "status": "missing_target", "targets": []}, 1)
@@ -1689,13 +1712,14 @@ jobs:
           checks_downloaded = False
 
           for idx, raw_target in enumerate(targets):
+              pip_lock = raw_target in pip_lock_files
               resolved = valid_rel(raw_target)
               if resolved is None:
                   print(f"::error::Invalid trivy-fs target path '{raw_target}'; failing closed")
                   target_receipts.append({"target": raw_target, "status": "invalid_target"})
                   failed = True
                   continue
-              if not resolved.exists() or resolved.is_symlink():
+              if not resolved.exists() or resolved.is_symlink() or (pip_lock and not resolved.is_file()):
                   print(f"::error::trivy-fs target '{raw_target}' is missing; failing closed")
                   target_receipts.append({"target": raw_target, "status": "missing_target"})
                   failed = True
@@ -1727,6 +1751,9 @@ jobs:
                   cmd.append("--ignore-unfixed")
               if ignored_licenses:
                   cmd.extend(["--ignored-licenses", ignored_licenses])
+              if pip_lock:
+                  # Trivy walks only the validated file, so the pattern cannot select a sibling.
+                  cmd.extend(["--file-patterns", "pip:.*"])
               cmd.append(raw_target)
 
               with open(err_log, "wb") as err_fh:
@@ -1772,7 +1799,8 @@ jobs:
                   if not isinstance(res, dict):
                       continue
                   r_target = clean_log(res.get("Target", raw_target))
-                  pkgs += len(res.get("Packages") or [])
+                  if not pip_lock or res.get("Type") == "pip":
+                      pkgs += len(res.get("Packages") or [])
                   if res.get("Class") == "config":
                       configs_seen += 1
                   for v in res.get("Vulnerabilities") or []:
@@ -1807,10 +1835,10 @@ jobs:
 
               blocking_findings = vulns + lics - len(accepted_licenses) + misconfigs
               t_status = "finding" if blocking_findings else "clean"
-              if "vuln" in scanners and pkgs == 0:
+              if (pip_lock or "vuln" in scanners) and pkgs == 0:
                   print(f"::error::trivy fs inventoried zero packages for '{clean_log(raw_target)}'; failing closed")
                   t_status = "missing_target"
-              elif "misconfig" in scanners and "vuln" not in scanners and configs_seen == 0:
+              elif not pip_lock and "misconfig" in scanners and "vuln" not in scanners and configs_seen == 0:
                   print(f"::error::trivy fs detected zero config files for '{clean_log(raw_target)}'; failing closed")
                   t_status = "missing_target"
               elif scanners == ["license"] and not results:
