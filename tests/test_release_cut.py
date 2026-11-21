@@ -233,15 +233,7 @@ def test_notes_are_generated_from_every_merged_title_except_the_bump():
     )
 
 
-@pytest.fixture
-def machinery_checkout(monkeypatch, tmp_path):
-    checkout = tmp_path / "machinery"
-    _init_repo(checkout)
-    monkeypatch.setattr(git_module, "resolve_repo", lambda name=None: (checkout, {}))
-    return checkout
-
-
-def test_missing_x_agent_is_refused(capsys, machinery_checkout):
+def test_missing_x_agent_is_refused(capsys):
     """Defect class: a release command with no X-Agent value writes a commit review cannot attribute."""
     for command in ("cut", "post-release"):
         with pytest.raises(SystemExit) as caught:
@@ -256,7 +248,7 @@ def test_missing_x_agent_is_refused(capsys, machinery_checkout):
 
 
 @pytest.mark.usefixtures("unconfigured_primary")
-def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, capsys, machinery_checkout):
+def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, capsys):
     """Defect class: syntactically valid release trailers leave the PR author unresolved."""
     monkeypatch.delenv("LU_TASKS_DIR", raising=False)
     monkeypatch.delenv("LU_PRODUCT_ROOT", raising=False)
@@ -272,8 +264,8 @@ def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, capsys, mach
 
 
 @pytest.mark.usefixtures("unconfigured_primary")
-def test_resolvable_x_agent_reaches_release_runner(monkeypatch, machinery_checkout):
-    """Defect class: parse-time attribution rejects an explicit model without a primary checkout."""
+def test_resolvable_x_agent_reaches_release_runner(monkeypatch):
+    """Defect class: parse-time attribution rejects an explicit model without a checkout."""
     monkeypatch.delenv("LU_TASKS_DIR", raising=False)
     monkeypatch.delenv("LU_PRODUCT_ROOT", raising=False)
     parsed = []
@@ -282,7 +274,7 @@ def test_resolvable_x_agent_reaches_release_runner(monkeypatch, machinery_checko
         parsed.append((args.command, args.x_agent))
         return 0
 
-    monkeypatch.setattr(release_cut, "_run", run)
+    monkeypatch.setattr(release_cut, "_locked_run", run)
     for command in ("cut", "post-release"):
         assert main([command, "--x-agent", "claude/claude-opus-5-5"]) == 0
     assert parsed == [("cut", "claude/claude-opus-5-5"), ("post-release", "claude/claude-opus-5-5")]

@@ -1307,11 +1307,7 @@ def execute(cut: Cut) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    arguments = sys.argv[1:] if argv is None else argv
-    if not arguments or arguments[0] not in {"cut", "post-release"}:
-        return _main(argv)
-
+def _locked_run(args: argparse.Namespace) -> int:
     from lu_machinery.dispatcher.git import resolve_repo
 
     try:
@@ -1331,10 +1327,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         except OSError as exc:
             print(f"release cut refused: cannot acquire {lock_path}: {exc}", file=sys.stderr)
             return 1
-        return _main(argv)
+        return _run(args)
 
 
-def _main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m lu_machinery.release_cut",
         description=__doc__.splitlines()[0] + "\nRun on the host with gh and push credentials, outside a worker.",
@@ -1383,7 +1379,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "consumer-collection":
             return _consumer_collection(args)
-        return _run(args)
+        return _locked_run(args)
     finally:
         os.umask(previous_umask)
 
