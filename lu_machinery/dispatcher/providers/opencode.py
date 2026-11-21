@@ -52,6 +52,7 @@ SAVANT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
 SAVANT_UPLOAD_MAX_BYTES = 16 * 1024 * 1024
 OPENROUTER_PROVIDERS = ("fireworks/us", "baseten/us", "inference-net/us")
 _OPENROUTER_MODEL_ID = MODELS["openrouter"].removeprefix("openrouter/")
+_OPENROUTER_VARIANT = "high"
 _ROUTING = {"only": list(OPENROUTER_PROVIDERS), "allow_fallbacks": False, "data_collection": "deny"}
 # OpenCode deep-merges this over the operator's and the checkout's config, and the merge keeps
 # inherited keys (https://opencode.ai/docs/config/). So it pins what decides each call: only the
@@ -62,7 +63,8 @@ _ROUTING = {"only": list(OPENROUTER_PROVIDERS), "allow_fallbacks": False, "data_
 _OPENROUTER_PROVIDER = {
     "whitelist": [_OPENROUTER_MODEL_ID],
     "models": {_OPENROUTER_MODEL_ID: {
-        "id": _OPENROUTER_MODEL_ID, "options": {"provider": _ROUTING}, "variants": {"high": {"provider": _ROUTING}},
+        "id": _OPENROUTER_MODEL_ID, "options": {"provider": _ROUTING},
+        "variants": {_OPENROUTER_VARIANT: {"provider": _ROUTING}},
     }},
 }
 _PINNED_AGENTS = ("build", "title", "summary", "compaction")
@@ -80,6 +82,10 @@ _PROJECT_CONFIG = ("opencode.json", "opencode.jsonc", ".opencode")
 _BUDGETS = Path(__file__).resolve().parents[2] / "config" / "agent_budgets.yaml"
 _PROBE_TIMEOUT_S = 10.0
 _CONFIG_TIMEOUT_S = 60.0
+
+
+class OpenCodeEffortRefused(ValueError):
+    """The selected route cannot honor an explicit effort."""
 
 
 def endpoint(provider: str | None) -> str:
@@ -425,7 +431,16 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     selected = endpoint(spec.provider)
     if selected == SAVANT_PROVIDER:
         return _savant_build(spec, env)
-    argv = ["opencode", "run", "--model", MODELS[selected], "--format", "json", "--variant", "high"]
+    # Direct variants come from OpenCode's deepseek-flash model metadata. Only the pinned
+    # OpenRouter variant carries the provider allow-list when OpenCode applies variant options.
+    allowed_variants = ("low", "high", "max") if selected == "deepseek" else (_OPENROUTER_VARIANT,)
+    default_variant = "high" if selected == "deepseek" else _OPENROUTER_VARIANT
+    variant = default_variant if spec.effort is None else spec.effort
+    if variant not in allowed_variants:
+        raise OpenCodeEffortRefused(
+            f"opencode_effort_refused: {selected} does not offer effort {variant!r}; allowed: {', '.join(allowed_variants)}"
+        )
+    argv = ["opencode", "run", "--model", MODELS[selected], "--format", "json", "--variant", variant]
     child_env = env.copy()
     config = json_depth.loads(_OPENROUTER_CONFIG, max_depth=512) if selected == "openrouter" else {}
     assert isinstance(config, dict)
