@@ -37,7 +37,9 @@ class Wire:
 
     def __init__(self, reply=None, native=None):
         self.sent = []
-        self._reply = reply or (lambda method, endpoint, body: gh.Response(200, {}, b"{}"))
+        self._reply = reply or (
+            lambda method, endpoint, body: gh.Response(200, {}, b'{"data":{}}' if endpoint == "graphql" else b"{}")
+        )
         self._native = native or (lambda argv: subprocess.CompletedProcess(argv, 0, b"[]", b""))
 
     def transport(self, method, endpoint, headers, body, timeout):
@@ -229,7 +231,9 @@ def test_refusal_precedence(tmp_path):
 
 def _limited_reply(status, headers, body=b'{"message":"You have exceeded a secondary rate limit."}'):
     replies = [gh.Response(status, headers, body)]
-    return lambda method, endpoint, body: replies.pop(0) if replies else gh.Response(200, {}, b"{}")
+    return lambda method, endpoint, body: (
+        replies.pop(0) if replies else gh.Response(200, {}, b'{"data":{}}' if endpoint == "graphql" else b"{}")
+    )
 
 
 def test_native_rate_limit_stderr_never_blocks_landing(tmp_path):

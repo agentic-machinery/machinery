@@ -11,12 +11,14 @@ binary through a local recording proxy when it is present.
 
 from __future__ import annotations
 
+import contextlib
 import email.utils
 import hashlib
 import http.server
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import threading
 import time
@@ -1716,3 +1718,313 @@ def test_real_gh_paginated_run_without_include_observes_no_headers(tmp_path):
         assert gh.run(LANDING_ARGV, client=client, runner=subprocess.run, capture_output=True).returncode == 0
     finally:
         server.close()
+
+
+_VALID_GQL_DATA = {"viewer": {"login": "octocat"}}
+
+
+@pytest.mark.parametrize(
+    ("raw_body", "expected_reason"),
+    [
+        # Wrong-typed or falsey-but-present errors members (paired with valid data).
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": []}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": None}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": False}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": ""}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": 0}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": {}}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": "err"}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": 1}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": True}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": ["err"]}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": [None]}).encode(), "invalid_errors"),
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": [{"message": "ok"}, "bad"]}).encode(), "invalid_errors"),
+        # Populated GraphQL errors lists (including unhashable/non-string type fields, F1).
+        (json.dumps({"data": _VALID_GQL_DATA, "errors": [{"message": "boom"}]}).encode(), "graphql_errors"),
+        (json.dumps({"data": None, "errors": [{"message": "boom"}]}).encode(), "graphql_errors"),
+        (json.dumps({"errors": [{"type": []}]}).encode(), "graphql_errors"),
+        (json.dumps({"errors": [{"type": {}}]}).encode(), "graphql_errors"),
+        # Malformed envelopes carrying rate-limit markers must not bypass validation or poison budgets (F1).
+        (json.dumps({"errors": [1, {"type": "RATE_LIMITED"}]}).encode(), "invalid_errors"),
+        (json.dumps({"errors": [{"type": "RATE_LIMITED"}], "unexpected": True}).encode(), "invalid_envelope"),
+        (json.dumps({"errors": [{"type": "RATE_LIMITED"}], "extensions": []}).encode(), "invalid_extensions"),
+        (json.dumps({"errors": [{"type": "RATE_LIMITED"}], "data": []}).encode(), "invalid_data"),
+        # Missing or non-object data members.
+        (json.dumps({}).encode(), "invalid_data"),
+        (json.dumps({"extensions": {}}).encode(), "invalid_data"),
+        (json.dumps({"data": None}).encode(), "invalid_data"),
+        (json.dumps({"data": []}).encode(), "invalid_data"),
+        (json.dumps({"data": ""}).encode(), "invalid_data"),
+        (json.dumps({"data": False}).encode(), "invalid_data"),
+        (json.dumps({"data": 0}).encode(), "invalid_data"),
+        (json.dumps({"data": "ok"}).encode(), "invalid_data"),
+        # Non-object extensions members.
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": None}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": []}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": False}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": True}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": ""}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": "bad"}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": 0}).encode(), "invalid_extensions"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": 1}).encode(), "invalid_extensions"),
+        # Non-object top-level documents and unknown top-level members.
+        (json.dumps([]).encode(), "invalid_envelope"),
+        (json.dumps(None).encode(), "invalid_envelope"),
+        (json.dumps(True).encode(), "invalid_envelope"),
+        (json.dumps(1).encode(), "invalid_envelope"),
+        (json.dumps(json.dumps({"data": _VALID_GQL_DATA})).encode(), "invalid_envelope"),
+        (json.dumps({"data": _VALID_GQL_DATA, "unexpected": True}).encode(), "invalid_envelope"),
+        (json.dumps({"data": _VALID_GQL_DATA, "extensions": {}, "extra": 1}).encode(), "invalid_envelope"),
+        # Strict JSON decode failures on HTTP 200 GraphQL responses.
+        (b"", "invalid_json"),
+        (b"not json", "invalid_json"),
+        (b"\xff", "invalid_json"),
+        (b'\xef\xbb\xbf{"data":{"viewer":{"login":"octocat"}}}', "invalid_json"),
+        (b'{"data":{"viewer":{"login":"octocat"}},"data":{}}', "invalid_json"),
+        (b'{"data":{"viewer":{"login":"octocat"}},"extensions":[],"extensions":{}}', "invalid_json"),
+        (b'{"data":{"viewer":{"login":"octocat"}},"extensions":{"cost":NaN}}', "invalid_json"),
+        (b'{"data":{"viewer":{"login":"octocat"}},"extensions":{"cost":Infinity}}', "invalid_json"),
+        (b'{"data":{"measurement":1e999}}', "invalid_json"),
+        (b'{"data":{"measurement":-1e999}}', "invalid_json"),
+        (b'{"data":' + b"[" * 513 + b"]" * 513 + b"}", "invalid_json"),
+    ],
+)
+def test_graphql_envelope_rejects_malformed_member_classes_and_never_caches(context, raw_body, expected_reason):
+    """Defect class: lenient GraphQL response classification accepts falsey/wrong-typed errors, non-object data/extensions, unknown keys, or non-strict JSON as success."""
+    context.wire.reply = lambda: gh.Response(200, {}, raw_body)
+
+    direct = context.client.request("POST", "graphql", payload={"query": R})
+    assert direct.error == "github_graphql_error"
+    assert direct.reason == expected_reason
+
+    raw_res = context.client.request("POST", "graphql", payload={"query": R}, raw_response=True)
+    assert raw_res.error == "github_graphql_error"
+    assert raw_res.reason == expected_reason
+
+    cli = gh.run(["gh", "api", "graphql", "-f", "query=" + R], client=context.client, capture_output=True)
+    assert cli.returncode == 1
+    detail = json.loads(cli.stdout)
+    assert detail["error"] == "github_graphql_error"
+    assert detail["reason"] == expected_reason
+
+    # Malformed GraphQL replies are never cached: a subsequent valid envelope succeeds.
+    context.wire.reply = lambda: gh.Response(200, {}, json.dumps({"data": _VALID_GQL_DATA}).encode())
+    recovered = context.client.request("POST", "graphql", payload={"query": R})
+    assert recovered.error is None and recovered.value == {"data": _VALID_GQL_DATA}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"data": _VALID_GQL_DATA},
+        {"data": _VALID_GQL_DATA, "extensions": {"warnings": []}},
+    ],
+)
+def test_graphql_envelope_accepts_valid_envelopes_and_preserves_rate_limits_and_http_errors(context, payload):
+    """Defect class: strict GraphQL envelope checks break valid envelopes, GraphQL rate-limit classification, or non-2xx HTTP error classification."""
+    raw_valid = json.dumps(payload).encode()
+    context.wire.reply = lambda: gh.Response(200, {}, raw_valid)
+    ok = context.client.request("POST", "graphql", payload={"query": R})
+    assert ok.error is None and ok.value == payload
+    ok_raw = context.client.request("POST", "graphql", payload={"query": R}, raw_response=True)
+    assert ok_raw.error is None and ok_raw.value == raw_valid
+
+    # GraphQL rate-limit responses keep typed pool_exhausted classification unchanged.
+    for rl_body in (
+        {"errors": [{"type": "RATE_LIMIT", "message": "API rate limit exceeded"}]},
+        {"data": None, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]},
+    ):
+        fresh_client = gh.GitHubClient(
+            cache_dir=context.tmp / f"rl-{len(rl_body)}",
+            transport=lambda *a, b=rl_body: gh.Response(200, {}, json.dumps(b).encode()),
+            clock=lambda: context.now,
+            env={"GH_TOKEN": TOKEN},
+        )
+        limited = fresh_client.request("POST", "graphql", payload={"query": R})
+        assert (limited.error, limited.reason, limited.status) == ("github_rate_limited", "pool_exhausted", 429)
+
+    # Non-2xx classification follows the single GraphQL classification table across media types and failure classes (F3).
+    over_depth_errors = b'{"errors":' + b"[" * 513 + b"]" * 513 + b"}"
+    over_depth_array = b"[" * 513 + b"]" * 513
+    gql_ct = {"Content-Type": "application/graphql-response+json; charset=utf-8"}
+    json_ct = {"Content-Type": "application/json; charset=utf-8"}
+    html_ct = {"Content-Type": "text/html; charset=utf-8"}
+    for status, resp_headers, body, expected_error, expected_reason in (
+        # Ordinary HTTP errors (REST-style message JSON without GraphQL media type, plain HTML/text, empty body).
+        (401, {}, b'{"message":"Bad credentials"}', "github_http_error", None),
+        (401, json_ct, b'{"message":"Bad credentials"}', "github_http_error", None),
+        (502, {}, b"<html>502 Bad Gateway</html>", "github_http_error", None),
+        (502, html_ct, b"<html>502 Bad Gateway</html>", "github_http_error", None),
+        (502, {}, b"", "github_http_error", None),
+        # Valid GraphQL error envelope on non-2xx.
+        (400, {}, b'{"errors":[{"message":"syntax error"}]}', "github_graphql_error", "graphql_errors"),
+        (400, gql_ct, b'{"errors":[{"message":"syntax error"}]}', "github_graphql_error", "graphql_errors"),
+        (400, {}, b'{"errors":[{"type":[]}]}', "github_graphql_error", "graphql_errors"),
+        # Undecodable bodies on non-2xx: over-depth, invalid UTF-8, BOM, dup keys, non-finite floats, truncated JSON, JSON media-type text.
+        (400, {}, over_depth_errors, "github_graphql_error", "invalid_json"),
+        (400, gql_ct, over_depth_errors, "github_graphql_error", "invalid_json"),
+        (500, {}, over_depth_array, "github_graphql_error", "invalid_json"),
+        (400, {}, b"\xff", "github_graphql_error", "invalid_json"),
+        (400, gql_ct, b'{"errors":[{"message":"boom \xff"}]}', "github_graphql_error", "invalid_json"),
+        (400, html_ct, b"\xff", "github_graphql_error", "invalid_json"),
+        (400, {}, b'\xef\xbb\xbf{"errors":[{"message":"boom"}]}', "github_graphql_error", "invalid_json"),
+        (400, {}, b'{"errors":[{"message":"boom"}],"extensions":{"cost":1e999}}', "github_graphql_error", "invalid_json"),
+        (500, {}, b'{"errors":[{"message":"boom"}],"extensions":{"cost":NaN}}', "github_graphql_error", "invalid_json"),
+        (400, {}, b'{"errors":[{"message":"a"}],"errors":[]}', "github_graphql_error", "invalid_json"),
+        (400, {}, b'{"errors":[', "github_graphql_error", "invalid_json"),
+        (400, gql_ct, b"", "github_graphql_error", "invalid_json"),
+        (502, gql_ct, b"<html>502 Bad Gateway</html>", "github_graphql_error", "invalid_json"),
+        (500, json_ct, b"not json", "github_graphql_error", "invalid_json"),
+        # Non-object JSON, wrong-typed/unknown members, and non-2xx success-only envelopes.
+        (400, {}, b"[]", "github_graphql_error", "invalid_envelope"),
+        (400, {}, b'"oops"', "github_graphql_error", "invalid_envelope"),
+        (500, {}, b"null", "github_graphql_error", "invalid_envelope"),
+        (400, gql_ct, b'{"message":"Bad request"}', "github_graphql_error", "invalid_envelope"),
+        (400, {}, b'{"errors":[]}', "github_graphql_error", "invalid_errors"),
+        (400, {}, b'{"data":[]}', "github_graphql_error", "invalid_data"),
+        (400, {}, b'{"extensions":[]}', "github_graphql_error", "invalid_extensions"),
+        (400, {}, b"{}", "github_graphql_error", "invalid_data"),
+        (400, {}, b'{"data":{}}', "github_graphql_error", "invalid_envelope"),
+    ):
+        context.wire.reply = lambda s=status, h=resp_headers, b=body: gh.Response(s, h, b)
+        res = context.client.request("POST", "graphql", payload={"query": R})
+        assert (res.status, res.error, res.reason) == (status, expected_error, expected_reason)
+
+    # F1 (403 body-only rate-limit holds): never set a synthetic hold from undecodable, non-object,
+    # wrong-typed, unknown-key, non-2xx data-only, or raw non-JSON GraphQL 403 bodies across normal DB,
+    # SQLite transient-lock fallback, SQLite disk-error fallback, and native framed gh api --include.
+    over_depth_rl = b'{"errors":[{"message":"You have exceeded a secondary rate limit."}],"nested":' + b"[" * 513 + b"]" * 513 + b"}"
+    f1_rejected_403_cases = (
+        ("unknown-key", {}, b'{"errors":[{"message":"API rate limit exceeded"}],"unexpected":true}', "github_graphql_error", "invalid_envelope"),
+        ("bad-errors", {}, b'{"errors":[1,{"message":"API rate limit exceeded"}]}', "github_graphql_error", "invalid_errors"),
+        ("bad-ext", {}, b'{"errors":[{"message":"API rate limit exceeded"}],"extensions":[]}', "github_graphql_error", "invalid_extensions"),
+        ("bad-data", {}, b'{"errors":[{"message":"API rate limit exceeded"}],"data":[]}', "github_graphql_error", "invalid_data"),
+        ("float-overflow", {}, b'{"errors":[{"message":"API rate limit exceeded"}],"extensions":{"cost":1e999}}', "github_graphql_error", "invalid_json"),
+        ("over-depth", {}, over_depth_rl, "github_graphql_error", "invalid_json"),
+        ("over-depth-ct", gql_ct, over_depth_rl, "github_graphql_error", "invalid_json"),
+        ("invalid-utf8", {}, b'{"errors":[{"message":"API rate limit exceeded \xff"}]}', "github_graphql_error", "invalid_json"),
+        ("utf8-bom", {}, b'\xef\xbb\xbf{"errors":[{"message":"API rate limit exceeded"}]}', "github_graphql_error", "invalid_json"),
+        ("non-object-str", {}, b'"You have exceeded a secondary rate limit."', "github_graphql_error", "invalid_envelope"),
+        ("non-object-list", {}, b'["API rate limit exceeded"]', "github_graphql_error", "invalid_envelope"),
+        ("wrong-typed-data", {}, b'{"data":"API rate limit exceeded"}', "github_graphql_error", "invalid_data"),
+        ("wrong-typed-ext", {}, b'{"extensions":"API rate limit exceeded"}', "github_graphql_error", "invalid_extensions"),
+        ("data-only-403", {}, b'{"data":{"msg":"API rate limit exceeded"}}', "github_graphql_error", "invalid_envelope"),
+        ("gql-ct-message", gql_ct, b'{"message":"You have exceeded a secondary rate limit."}', "github_graphql_error", "invalid_envelope"),
+        ("raw-html", {}, b"<html>API rate limit exceeded</html>", "github_http_error", None),
+    )
+    for case_name, resp_headers, malformed_403, expected_error, expected_reason in f1_rejected_403_cases:
+        probe_client = gh.GitHubClient(
+            cache_dir=context.tmp / f"f1-403-{case_name}",
+            transport=lambda *a, h=resp_headers, b=malformed_403: gh.Response(403, h, b),
+            clock=lambda: context.now,
+            env={"GH_TOKEN": TOKEN},
+        )
+        res_403 = probe_client.request("POST", "graphql", payload={"query": R})
+        assert (res_403.status, res_403.error, res_403.reason) == (403, expected_error, expected_reason)
+        with probe_client._db() as db:
+            assert db.execute("SELECT resource FROM budget WHERE scope=?", (probe_client.scope,)).fetchall() == []
+
+    # SQLite transient-lock (visible()) and disk-error fallbacks must preserve the same refusal (never exit 75 / secondary_hold).
+    for fallback_name, db_exc in (
+        ("busy-lock", sqlite3.OperationalError("database is locked")),
+        ("disk-error", OSError("disk full")),
+    ):
+        for sample_name, sample_body, sample_reason in (
+            ("over-depth", over_depth_rl, "invalid_json"),
+            ("invalid-utf8", b'{"errors":[{"message":"rate limit \xff"}]}', "invalid_json"),
+            ("non-object", b'"You have exceeded a secondary rate limit."', "invalid_envelope"),
+            ("wrong-typed", b'{"errors":[],"data":"rate limit"}', "invalid_data"),
+        ):
+            fb_client = gh.GitHubClient(
+                cache_dir=context.tmp / f"f1-fb-{fallback_name}-{sample_name}",
+                transport=lambda *a, b=sample_body: gh.Response(403, {}, b),
+                clock=lambda: context.now,
+                env={"GH_TOKEN": TOKEN},
+            )
+            real_db = fb_client._db
+            db_calls = [0]
+
+            def failing_db(_real=real_db, _exc=db_exc, _calls=db_calls):
+                _calls[0] += 1
+                if _calls[0] == 1:
+                    return _real()
+
+                @contextlib.contextmanager
+                def _boom():
+                    raise _exc
+                    yield  # pragma: no cover
+
+                return _boom()
+
+            fb_client._db = failing_db
+            fb_res = fb_client.request("POST", "graphql", payload={"query": R})
+            assert (fb_res.status, fb_res.error, fb_res.reason) == (403, "github_graphql_error", sample_reason)
+
+    # Native framed `gh api --include graphql` 403 with over-depth rate-limit body also sets no hold.
+    native_frame = b"HTTP/2.0 403 Forbidden\r\nContent-Type: application/graphql-response+json\r\n\r\n" + over_depth_rl
+    native_client = gh.GitHubClient(
+        cache_dir=context.tmp / "f1-native-403",
+        runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 1, native_frame, b"gh: HTTP 403"),
+        clock=lambda: context.now,
+        env={"GH_TOKEN": TOKEN},
+    )
+    native_res = gh.run(["gh", "api", "--include", "graphql", "-f", "query=" + R], client=native_client, capture_output=True)
+    assert native_res.returncode == 1
+    with native_client._db() as db:
+        assert db.execute("SELECT resource FROM budget WHERE scope=?", (native_client.scope,)).fetchall() == []
+
+    # Valid 403 GraphQL error body, valid 403 GitHub HTTP message JSON, header-based limits, 429, and REST 403 still hold.
+    for idx, (endpoint, status, resp_headers, body, expected_reason) in enumerate((
+        ("graphql", 403, {}, b'{"errors":[{"message":"You have exceeded a secondary rate limit."}]}', "secondary_hold"),
+        ("graphql", 403, {}, b'{"message":"You have exceeded a secondary rate limit."}', "secondary_hold"),
+        ("graphql", 403, {"retry-after": "120"}, b'{"errors":[]}', "retry_after"),
+        ("graphql", 403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(OPEN)}, over_depth_rl, "pool_exhausted"),
+        ("graphql", 429, {}, over_depth_rl, "secondary_hold"),
+        ("repos/o/r/issues", 403, {}, b"<html>API rate limit exceeded</html>", "secondary_hold"),
+    )):
+        hold_client = gh.GitHubClient(
+            cache_dir=context.tmp / f"f1-hold-{idx}",
+            transport=lambda *a, s=status, h=resp_headers, b=body: gh.Response(s, h, b),
+            clock=lambda: context.now,
+            env={"GH_TOKEN": TOKEN},
+        )
+        req_kwargs = {"payload": {"query": R}} if endpoint == "graphql" else {}
+        method = "POST" if endpoint == "graphql" else "GET"
+        held = hold_client.request(method, endpoint, **req_kwargs)
+        assert (held.error, held.reason) == ("github_rate_limited", expected_reason)
+
+    # F2: legacy cached malformed GraphQL entries (every strict-decode / envelope failure class) are never returned on 304 or allow_stale=True.
+    legacy_payload = {"query": R}
+    legacy_raw = gh._payload_bytes(legacy_payload)
+    legacy_key = hashlib.sha256(
+        ("POST\0graphql\0" + json.dumps({}, sort_keys=True) + "json").encode() + (legacy_raw or b"")
+    ).hexdigest()
+    for cache_case, legacy_body in (
+        ("empty-errors", json.dumps({"data": _VALID_GQL_DATA, "errors": []}).encode()),
+        ("over-depth", b'{"data":' + b"[" * 513 + b"]" * 513 + b"}"),
+        ("invalid-utf8", b'{"data":{"x":"\xff"}}'),
+        ("non-object", b"[]"),
+        ("wrong-typed-ext", json.dumps({"data": _VALID_GQL_DATA, "extensions": []}).encode()),
+        ("float-overflow", b'{"data":{"cost":1e999}}'),
+    ):
+        legacy_cache_dir = context.tmp / f"legacy-gql-cache-{cache_case}"
+        replies = [gh.Response(304, {"etag": '"v2"'}, b"")]
+        legacy_client = gh.GitHubClient(
+            cache_dir=legacy_cache_dir,
+            transport=lambda *a, r=replies: r.pop(0),
+            clock=lambda: context.now,
+            env={"GH_TOKEN": TOKEN},
+            allow_stale=True,
+        )
+        with legacy_client._db() as db:
+            gh._store_cache(db, legacy_client.scope, legacy_key, legacy_body, {"etag": '"v1"'}, context.now - 10)
+        # 304 on a legacy malformed GraphQL entry must miss, not return 304 success or refresh its timestamp.
+        not_modified = legacy_client.request("POST", "graphql", payload=legacy_payload)
+        assert (not_modified.status, not_modified.error) == (304, "github_cache_miss")
+        with legacy_client._db() as db:
+            row = db.execute("SELECT at FROM cache WHERE scope=? AND key=?", (legacy_client.scope, legacy_key)).fetchone()
+            assert row == (context.now - 10,)
+            gh._store_budget(db, legacy_client.scope, "graphql", 0, OPEN)
+        # allow_stale=True under a rate limit must refuse rather than serve the legacy malformed entry.
+        stale_refused = legacy_client.request("POST", "graphql", payload=legacy_payload, allow_stale=True)
+        assert (stale_refused.error, stale_refused.stale, stale_refused.reason) == ("github_rate_limited", False, "pool_exhausted")
