@@ -867,6 +867,9 @@ def _collect_orient_section(
             state.errors[key] = (error, stamp)
         if background:
             state.pending.discard(key)
+        elif state.fresh_threads.get(key) is threading.current_thread():
+            # A later fresh request must start a new scan once this one publishes.
+            state.fresh_threads.pop(key)
 
 
 def _schedule_detached_orient_refresh(
