@@ -11,12 +11,9 @@ Owner order, 2026-11-21: release when a change is ready, not on a schedule.
    the previous release's post-release PR has merged too, and the newest
    `CI Gate` push run on `main`'s HEAD has passed. These are the conditions
    of the cut's preflight.
-2. There is no release schedule and no fixed window. No 06:00 or 18:00 UTC
-   safety-net run is part of the procedure.
+2. There is no release schedule and no fixed window.
 3. `claude-cto` runs every cut, so cuts never overlap. Workers and drivers
    report a merged change to `claude-cto` instead of running the cut.
-   No scheduled run may start a cut; before it cuts, `claude-cto` confirms
-   that no scheduled cut is enabled or active and that none is already running.
 4. The urgent-hotfix rule stays: an urgent fix is released at once. Other
    fixes are no longer held for a later window; they are released when ready
    too.
