@@ -1,0 +1,44 @@
+name: Security
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
+  schedule:
+    - cron: "43 21 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  fleet-security:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/fleet-security.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+    with:
+      run-actionlint: true
+      run-shellcheck: true
+      shellcheck-paths: |
+        .github
+        .githooks|error
+        lu_machinery|error
+        packaging|error
+        agents_extensions|error
+      shellcheck-severity: style
+      run-zizmor: true
+      zizmor-paths: |
+        .github/workflows
+        .github/actions
+      run-secret-scan: true
+      require-trufflehog-ignore: true
+      secret-scan-required-extensions: .py
+      run-trivy-fs: true
+      trivy-fs-targets: |
+        package-lock.json
+        uv.lock
+      trivy-scanners: vuln,license
+      trivy-severity: HIGH,CRITICAL
+      trivy-include-dev-deps: true
