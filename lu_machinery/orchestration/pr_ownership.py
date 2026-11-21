@@ -1197,9 +1197,16 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
         }
 
     for attempt_key in attempts:
-        if isinstance(attempt_key, str) and ":" in attempt_key:
-            continue
-        label = attempt_key if isinstance(attempt_key, str) and attempt_key else "?"
+        # A key with no PR name (missing, or ":" with nothing before it) cannot name a row of its own.
+        if not isinstance(attempt_key, str) or not attempt_key:
+            label = "?"
+        elif ":" not in attempt_key:
+            label = attempt_key
+        else:
+            name = attempt_key.rpartition(":")[0]
+            if name:
+                continue
+            label = "?"
         if label in recorded or label in unknown:
             continue
         episode_row = episodes.get(label)

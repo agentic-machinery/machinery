@@ -345,11 +345,13 @@ def test_ownerless_open_pr_past_grace_records_a_decision_owner(tmp_path):
         "reminders": 0, "branch": "codex/x", "reason": "r", "last_task": "old",
     }
     both["heal_attempts"][KEY] = {"result": "pending", "postcondition": "unknown"}
+    both["heal_attempts"][f":{HEAD}"] = {"result": "pending", "postcondition": "unknown"}
     both_view = own.custody_view(both)
     assert both_view["waiting_for_grace"] == [] and both_view["recorded_custody"] == []
-    assert both_view["unknown_evidence"] == [{
-        "pr": KEY, "why": "heal attempt key is unreadable", "alerted": False,
-    }]
+    assert both_view["unknown_evidence"] == [
+        {"pr": "?", "why": "heal attempt key is unreadable", "alerted": False},
+        {"pr": KEY, "why": "heal attempt key is unreadable", "alerted": False},
+    ]
     bad_clock = own._empty()
     bad_clock["last_tick"] = {"at": at(5).isoformat(), "ok": True}
     bad_clock["episodes"][KEY] = {"since": "not-a-time", "alerted_at": at(5).isoformat()}
