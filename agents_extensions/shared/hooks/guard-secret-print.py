@@ -71,7 +71,8 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 # scripts fed to a shell on stdin and abbreviated long options are not
 # modeled. Only the launchers in _WRAPPER_OPTIONS plus `env` and `xargs` are
 # resolved; others such as setsid, doas or find -exec are not.
-# Quote-spliced command words (`'k'ill`) are a shared tokenizer limit.
+# Literal command words are read after quote removal (`'pk'"ill"`); a command
+# word that may expand (`$p`ill, globs, braces, tildes) is not resolved.
 
 from __future__ import annotations
 
@@ -525,6 +526,21 @@ def _strip_quotes(token: str) -> str:
     return token
 
 
+def _command_word(token: str) -> str:
+    """The name Bash looks up for a literal command word, after quote removal.
+
+    A word that may expand (`$`, backticks, globs, braces, tildes) keeps the
+    outer-quote strip, as before.
+    """
+    if re.search(r"[$`*?\[\]{}~]", token):
+        return _strip_quotes(token)
+    try:
+        words = shlex.split(token, posix=True)
+    except ValueError:
+        return _strip_quotes(token)
+    return words[0] if len(words) == 1 else _strip_quotes(token)
+
+
 # ANSI-C escapes that unicode_escape decodes as Bash does: named controls, quotes,
 # and two-digit hex or octal for a nonzero ASCII byte. Bash truncates at NUL, wraps
 # octal past \377, emits raw bytes past \x7f and reads \e, \c, \u and \? differently.
@@ -565,15 +581,16 @@ def _decode_ansi_c_quotes(command: str) -> str:
                     break
                 else:
                     end += 1
-            if end < len(command):
-                body = command[i + 2 : end]
-                if not _ansi_c_modelled(body):
-                    raise ValueError("ANSI-C escape whose Bash meaning is not modelled")
-                value = codecs.decode(body, "unicode_escape")
-                quoted = shlex.quote(value)
-                out.append(quoted if quoted.startswith("'") else "'" + quoted + "'")
-                i = end + 1
-                continue
+            if end >= len(command):
+                raise ValueError("unterminated ANSI-C quote")
+            body = command[i + 2 : end]
+            if not _ansi_c_modelled(body):
+                raise ValueError("ANSI-C escape whose Bash meaning is not modelled")
+            value = codecs.decode(body, "unicode_escape")
+            quoted = shlex.quote(value)
+            out.append(quoted if quoted.startswith("'") else "'" + quoted + "'")
+            i = end + 1
+            continue
         if char in {"'", '"'}:
             quote = "" if quote == char else quote if quote else char
         out.append(char)
@@ -785,7 +802,7 @@ def _command_at(seg: list[str]) -> tuple[str, list[str], int] | None:
             redirects.extend(seg[i : i + skip])
             i += skip
             continue
-        wrapper = _strip_quotes(seg[i]).rsplit("/", 1)[-1]
+        wrapper = _command_word(seg[i]).rsplit("/", 1)[-1]
         if wrapper in _WRAPPER_OPTIONS:
             i = _after_wrapper_options(seg, i + 1, wrapper, redirects)
             if i < 0:
@@ -829,7 +846,7 @@ def _command_at(seg: list[str]) -> tuple[str, list[str], int] | None:
     if i >= len(seg):
         return None
 
-    cmd = _strip_quotes(seg[i]).rsplit("/", 1)[-1]
+    cmd = _command_word(seg[i]).rsplit("/", 1)[-1]
     return cmd, redirects + seg[i + 1 :], i
 
 
