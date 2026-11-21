@@ -193,7 +193,7 @@ try:
 except ImportError:
     # An installed release older than this hook lacks the helper: read every
     # body as before, which can only refuse more.
-    def drop_literal_cat_bodies(command: str) -> str:
+    def drop_literal_cat_bodies(command: str, directories: object = ()) -> str:
         return command
 try:
     from agents_extensions.shared.hooks.tool_names import is_shell_tool
@@ -3650,7 +3650,13 @@ def _main(payload: dict | None) -> int:
             return _block_uncertain("malformed_hook_command")
         # A body that Bash certainly hands to `cat` is data (C-6323); its
         # opener, with the write target, stays.
-        command = drop_literal_cat_bodies(raw_command)
+        directories = (
+            *(tool_input.get(key) for key in ("cwd", "workdir", "working_directory")),
+            payload.get("cwd"),
+            payload.get("working_directory"),
+            os.getcwd(),
+        )
+        command = drop_literal_cat_bodies(raw_command, directories)
         # #10633: refuse ANSI-C quoting before any parse or early return.
         if _has_ansi_c_quoting(command):
             return _block_ansi_c_quoting()

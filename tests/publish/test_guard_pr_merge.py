@@ -2724,6 +2724,11 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
         ("A=/tmp/a; sh -s <<EOF\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         ("A=/tmp/a; python3 - <<'EOF'\nimport os; os.system('gh pr merge 5')\nEOF", ["CI Gate"], 2),
         ("A=/tmp/a; cat <<'EOF' | bash\ngh pr merge 5\nEOF", ["CI Gate"], 2),
+        # Merge words only in a dropped body still keep main's checks on the rest:
+        # an unreadable later line refuses, a literal one is allowed.
+        ("A=/tmp/a; cat > \"$A/n.md\" <<'EOF'\nrun gh pr merge 5 manually\nEOF\necho \"$(printf marker)\"", ["CI Gate"], 2),
+        ("A=/tmp/a; cat > \"$A/n.md\" <<'EOF'\nrun gh pr merge 5 manually\nEOF\necho 'a\nb'", ["CI Gate"], 2),
+        ("A=/tmp/a; cat > \"$A/n.md\" <<'EOF'\nrun `gh pr merge 5` manually\nEOF\necho done", ["CI Gate"], 0),
         # A closer with a trailing blank is not a closer, even at the end of the text.
         ("A=/tmp/a; cat > \"$A/b.md\" <<'EOF'\nLand with `gh pr merge 5` now.\nEOF ", ["CI Gate"], 2),
     ],

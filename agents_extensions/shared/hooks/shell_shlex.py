@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 _HEREDOC_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _MAX_BACKTICK_DEPTH = 16
@@ -694,6 +694,35 @@ def _device_path(word: str) -> bool:
     return any(part in ("dev", "proc") for part in word.replace("'", "").replace('"', "").split("/"))
 
 
+def _directories_after(directories: list[str] | None, item: list[tuple[str, str]]) -> list[str] | None:
+    """The directories `cat` may start in after one setup item; None when unknown.
+
+    A `cd` adds its absolute static operand and keeps the earlier directories,
+    because the `cd` may fail and a `;` or a new line still runs `cat`. Any
+    other operand (`$NAME`, `~`, `-`, or a relative path that `CDPATH` may
+    resolve) makes the directory unknown.
+    """
+    if directories is None or item[0][1] != "cd":
+        return directories
+    operand = item[1][1].replace("'", "").replace('"', "")
+    return [*directories, operand] if operand.startswith("/") and "$" not in operand else None
+
+
+def _live_target(word: str, directories: list[str] | None) -> bool:
+    """Whether a `cat` target's static spelling may name a stream, not a file.
+
+    A target spelled with `$NAME` or `~` is the script-file residual (owner
+    claude-cto): its value is not known here. A relative target is checked in
+    every directory `cat` may start in, and refused when none is known.
+    """
+    path = word.replace("'", "").replace('"', "")
+    if _device_path(path):
+        return True
+    if "$" in path or path.startswith(("~", "/")):
+        return False
+    return directories is None or any(_device_path(f"{directory}/{path}") for directory in directories)
+
+
 def _setup_item(item: list[tuple[str, str]]) -> bool:
     """`cd WORD`, `mkdir [-p] WORD...` or `NAME=WORD` with a short name."""
     if not item or any(kind != "word" for kind, _ in item):
@@ -707,7 +736,7 @@ def _setup_item(item: list[tuple[str, str]]) -> bool:
     return len(words) == 1 and end is not None and end <= _SETUP_NAME_MAX and words[0][end : end + 1] == "="
 
 
-def _cat_document(item: list[tuple[str, str]]) -> tuple[str, str] | None:
+def _cat_document(item: list[tuple[str, str]], directories: list[str] | None) -> tuple[str, str] | None:
     """(operator, delimiter) of `cat [>|>> WORD] <<'ID'`, in any order, else None."""
     if item[:1] != [("word", "cat")]:
         return None
@@ -715,12 +744,12 @@ def _cat_document(item: list[tuple[str, str]]) -> tuple[str, str] | None:
     outputs = [token for token in item[1:] if token[0] in (">", ">>")]
     if len(documents) != 1 or len(outputs) > 1 or len(documents) + len(outputs) != len(item) - 1:
         return None
-    if outputs and _device_path(outputs[0][1]):
+    if outputs and _live_target(outputs[0][1], directories):
         return None
     return documents[0]
 
 
-def drop_literal_cat_bodies(command: str) -> str:
+def drop_literal_cat_bodies(command: str, directories: Iterable[object] = ()) -> str:
     """Drop the bodies Bash certainly hands, unread, to a top-level `cat` (C-6323).
 
     Only the leading lines of ``command`` are read, and only while each one is
@@ -738,10 +767,18 @@ def drop_literal_cat_bodies(command: str) -> str:
     unquoted or unclosed delimiter, carriage return or any other command before
     the body. A later command that runs the written file is not followed, the
     same limit as a file written by `printf` or an earlier command.
+
+    ``directories`` are the directories the command may start in (the hook
+    payload's and the hook's own working directories). A `cd` operand or
+    `cat` target that may name a stream rather than a file (a `dev` or `proc`
+    path component, also reached through these directories or a `cd`) keeps
+    the command as it was.
     """
     if "<<" not in command or "\r" in command or "\0" in command:
         return command
     lines = command.split("\n")
+    starts = [directory for directory in directories if isinstance(directory, str) and directory.startswith("/")]
+    current: list[str] | None = starts or None
     kept: list[str] = []
     index = 0
     dropped = False
@@ -749,11 +786,15 @@ def drop_literal_cat_bodies(command: str) -> str:
         items = _line_items(lines[index])
         if items is None or not all(_setup_item(item) for item in items[:-1]):
             break
-        if not items[-1] or _setup_item(items[-1]):
+        setup = items if not items[-1] or _setup_item(items[-1]) else items[:-1]
+        for item in setup:
+            if item:
+                current = _directories_after(current, item)
+        if setup is items:
             kept.append(lines[index])
             index += 1
             continue
-        document = _cat_document(items[-1])
+        document = _cat_document(items[-1], current)
         if document is None:
             break
         operator, closer = document

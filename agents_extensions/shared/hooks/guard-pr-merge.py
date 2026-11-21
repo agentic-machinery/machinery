@@ -134,7 +134,7 @@ try:
 except ImportError:
     # An installed release older than this hook lacks the helper: read every
     # body as before, which can only refuse more.
-    def drop_literal_cat_bodies(command: str) -> str:
+    def drop_literal_cat_bodies(command: str, directories: object = ()) -> str:
         return command
 try:
     from lu_machinery.common import json_depth as json_depth
@@ -930,19 +930,24 @@ def _literal_reads_only(command: str) -> bool:
     return found_read
 
 
-def _may_merge(command: str, depth: int = 0) -> bool:
+def _may_merge(command: str, depth: int = 0, *, candidate: bool | None = None) -> bool:
     """Recognize merge operations before applying cwd or readiness refusals.
 
     Redirect uncertainty cannot invent a merge during this pass. Shell and eval
     payloads are command text; ordinary arguments, JSON fields and searches are data.
     The judging pass retains its fail-closed policy for a recognized operation.
+    ``candidate`` overrides the merge-word probe of ``command`` for the
+    uncertainty checks: main() passes True, because the text it read had merge
+    words even where the only ones were in a dropped `cat` body (C-6323).
     """
+    if candidate is None:
+        candidate = _merge_candidate(command)
     # Keep both representations: preprocessing may expose split syntax or
     # remove quote-bearing data, and may rewrite Bash-only syntax itself.
     # Quoted here-doc bodies are data in both: a brief that mentions a merge in
     # Markdown backticks is not shell syntax.
     literal_view = _without_quoted_heredoc_data(command)
-    if _merge_candidate(command) and (
+    if candidate and (
         _unmodeled_quoting(literal_view)
         or _unmodeled_quoting(preprocess_shell_command(literal_view))
     ):
@@ -954,7 +959,7 @@ def _may_merge(command: str, depth: int = 0) -> bool:
     # cannot tokenize, Bash may still be inside that line's quote, so no later
     # line is read as Bash reads it: refuse rather than call it data. Count raw
     # lines: preprocessing can drop the later lines as heredoc data.
-    if _merge_candidate(command) and ("unreadable", []) in events and len(command.splitlines()) > 1:
+    if candidate and ("unreadable", []) in events and len(command.splitlines()) > 1:
         raise _SplitQuoting("quoting spans lines")
     for kind, argv in events:
         if kind != "segment":
@@ -1762,9 +1767,19 @@ def main() -> int:
         return 2
     # A body that Bash certainly hands to `cat` is data (C-6323); every other
     # body stays in the text the checks below read. The helper reads the raw
-    # text, before _command's strip, so trimming cannot complete a closer.
-    command = drop_literal_cat_bodies((payload.get("tool_input") or {}).get("command") or "").strip()
-    if not _merge_candidate(command):
+    # text, before _command's strip, so trimming cannot complete a closer. The
+    # merge-word gate still reads the raw text: words in a dropped body keep
+    # the uncertainty checks on the rest of the command, as on main.
+    tool_input = payload.get("tool_input") or {}
+    raw = tool_input.get("command") or ""
+    directories = (
+        *(tool_input.get(key) for key in ("cwd", "workdir", "working_directory")),
+        payload.get("cwd"),
+        payload.get("working_directory"),
+        os.getcwd(),
+    )
+    command = drop_literal_cat_bodies(raw, directories).strip()
+    if not _merge_candidate(raw):
         return 0
     # Each segment arrives carrying the cwd it runs in, so a PR number is judged in the
     # repo the MERGE runs in, not the session's repo — `cd private-repo && gh pr merge 203`
@@ -1773,7 +1788,7 @@ def main() -> int:
     # to its own shell level is _judged_segments' job: it is the only reader that knows
     # where a subshell or `bash -c` payload begins and ends.
     try:
-        if not _may_merge(command):
+        if not _may_merge(command, candidate=True):
             return 0
         if refusal := cto_safe_mode.refusal("pr-merge", os.environ):
             sys.stderr.write(f"{refusal}\n")

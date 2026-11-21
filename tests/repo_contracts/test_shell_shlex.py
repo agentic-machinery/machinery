@@ -103,9 +103,7 @@ _MERGE = "gh pr merge 5 --admin"
 _PROSE = "Use `gh pr merge` after review; $(gh pr merge 5) ${X} $'\\x41'."
 
 
-@pytest.mark.parametrize(
-    "command,expected",
-    [
+_CAT_FORM_ROWS = [
         # The certain form: setup items, then a top-level `cat` with a quoted delimiter.
         (f"cat > /tmp/b.md <<'EOF'\n{_PROSE}\nEOF", "cat > /tmp/b.md <<'EOF'\nEOF"),
         (
@@ -163,13 +161,34 @@ _PROSE = "Use `gh pr merge` after review; $(gh pr merge 5) ${X} $'\\x41'."
         (f"\"cat\" <<'EOF'\n{_MERGE}\nEOF", None),
         (f"bash <<'EOF'\n{_MERGE}\nEOF", None),
         (f"python3 - <<'EOF'\nimport os; os.system('{_MERGE}')\nEOF", None),
-    ],
+]
+# Rows whose answer depends on the directories the command may start in.
+_START = ("/tmp/work",)
+_DIRECTORY_ROWS = [
+    (f"cat > fd/3 <<'EOF'\n{_MERGE}\nEOF", ("/dev",), None),
+    (f"cat > fd/1 <<'EOF'\n{_MERGE}\nEOF", ("/tmp", "/proc/self"), None),
+    (f"cd /nonexistent; cat > fd/3 <<'EOF'\n{_MERGE}\nEOF", ("/dev",), None),
+    (f"cat > n.md <<'EOF'\n{_MERGE}\nEOF", (), None),
+    (f"cat > n.md <<'EOF'\n{_MERGE}\nEOF", ("relative/dir",), None),
+    (f"cd x && cat > n.md <<'EOF'\n{_MERGE}\nEOF", _START, None),
+    (f"cd ~ && cat > n.md <<'EOF'\n{_MERGE}\nEOF", _START, None),
+    (f"cd \"$W\" && cat > n.md <<'EOF'\n{_MERGE}\nEOF", _START, None),
+    (f"cd /tmp && cat > n.md <<'EOF'\n{_MERGE}\nEOF", ("/home/x",), "cd /tmp && cat > n.md <<'EOF'\nEOF"),
+    (f"cat > \"$A/n.md\" <<'EOF'\n{_MERGE}\nEOF", (), "cat > \"$A/n.md\" <<'EOF'\nEOF"),
+]
+
+
+@pytest.mark.parametrize(
+    "command,directories,expected",
+    [(command, _START, expected) for command, expected in _CAT_FORM_ROWS] + _DIRECTORY_ROWS,
 )
-def test_c6323_body_dropped_only_in_the_certain_cat_form(command: str, expected: str | None):
+def test_c6323_body_dropped_only_in_the_certain_cat_form(
+    command: str, directories: tuple[str, ...], expected: str | None
+):
     """Defect class: a here-document body dropped outside the certain form (C-6323).
 
     Only a quoted-delimiter body read by a top-level `cat` after setup items is
     data; any other shape stays as the guards read it before, so no command
     Bash could run from the text is hidden.
     """
-    assert drop_literal_cat_bodies(command) == (command if expected is None else expected)
+    assert drop_literal_cat_bodies(command, directories) == (command if expected is None else expected)
