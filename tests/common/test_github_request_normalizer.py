@@ -1841,17 +1841,55 @@ def test_graphql_envelope_accepts_valid_envelopes_and_preserves_rate_limits_and_
         limited = fresh_client.request("POST", "graphql", payload={"query": R})
         assert (limited.error, limited.reason, limited.status) == ("github_rate_limited", "pool_exhausted", 429)
 
-    # Non-2xx HTTP errors without GraphQL errors stay github_http_error; 400 with errors stays github_graphql_error.
+    # Non-2xx HTTP errors without GraphQL errors stay github_http_error; non-2xx with GraphQL errors stays github_graphql_error
+    # (including malformed strict-JSON GraphQL error bodies, F3).
     for status, body, expected_error, expected_reason in (
         (401, b'{"message":"Bad credentials"}', "github_http_error", None),
         (502, b"<html>502 Bad Gateway</html>", "github_http_error", None),
         (400, b'{"errors":[{"message":"syntax error"}]}', "github_graphql_error", "graphql_errors"),
         (400, b'{"errors":[]}', "github_graphql_error", "invalid_errors"),
         (400, b'{"errors":[{"type":[]}]}', "github_graphql_error", "graphql_errors"),
+        (400, b'{"errors":[{"message":"boom"}],"extensions":{"cost":1e999}}', "github_graphql_error", "invalid_json"),
+        (500, b'{"errors":[{"message":"boom"}],"extensions":{"cost":NaN}}', "github_graphql_error", "invalid_json"),
+        (400, b'{"errors":[{"message":"a"}],"errors":[]}', "github_graphql_error", "invalid_json"),
     ):
         context.wire.reply = lambda s=status, b=body: gh.Response(s, {}, b)
         res = context.client.request("POST", "graphql", payload={"query": R})
         assert (res.status, res.error, res.reason) == (status, expected_error, expected_reason)
+
+    # F1 (403 body-text heuristic): a malformed GraphQL error envelope on 403 without rate-limit headers
+    # must return github_graphql_error and record no synthetic hold, while valid 403 bodies and header/429 limits still hold.
+    for malformed_403, expected_reason in (
+        (b'{"errors":[{"message":"API rate limit exceeded"}],"unexpected":true}', "invalid_envelope"),
+        (b'{"errors":[1,{"message":"API rate limit exceeded"}]}', "invalid_errors"),
+        (b'{"errors":[{"message":"API rate limit exceeded"}],"extensions":[]}', "invalid_extensions"),
+        (b'{"errors":[{"message":"API rate limit exceeded"}],"data":[]}', "invalid_data"),
+        (b'{"errors":[{"message":"API rate limit exceeded"}],"extensions":{"cost":1e999}}', "invalid_json"),
+    ):
+        probe_client = gh.GitHubClient(
+            cache_dir=context.tmp / f"f1-403-{expected_reason}",
+            transport=lambda *a, b=malformed_403: gh.Response(403, {}, b),
+            clock=lambda: context.now,
+            env={"GH_TOKEN": TOKEN},
+        )
+        res_403 = probe_client.request("POST", "graphql", payload={"query": R})
+        assert (res_403.status, res_403.error, res_403.reason) == (403, "github_graphql_error", expected_reason)
+        with probe_client._db() as db:
+            assert db.execute("SELECT resource FROM budget WHERE scope=?", (probe_client.scope,)).fetchall() == []
+    # Valid 403 GraphQL error body and Retry-After header still produce rate-limit holds.
+    for status, headers, body, expected_reason in (
+        (403, {}, b'{"errors":[{"message":"You have exceeded a secondary rate limit."}]}', "secondary_hold"),
+        (403, {"retry-after": "120"}, b'{"errors":[]}', "retry_after"),
+        (429, {}, b'{"errors":[]}', "secondary_hold"),
+    ):
+        hold_client = gh.GitHubClient(
+            cache_dir=context.tmp / f"f1-hold-{status}-{len(headers)}",
+            transport=lambda *a, s=status, h=headers, b=body: gh.Response(s, h, b),
+            clock=lambda: context.now,
+            env={"GH_TOKEN": TOKEN},
+        )
+        held = hold_client.request("POST", "graphql", payload={"query": R})
+        assert (held.error, held.reason) == ("github_rate_limited", expected_reason)
 
     # F2: legacy cached malformed GraphQL entries are never returned on 304 or allow_stale=True fallback.
     legacy_cache_dir = context.tmp / "legacy-gql-cache"

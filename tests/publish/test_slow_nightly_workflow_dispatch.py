@@ -1419,12 +1419,14 @@ def test_publish_graphql_callers_accept_valid_extensions_object(monkeypatch, tmp
             super().__init__(**kwargs)
 
     monkeypatch.setattr(github_client, "GitHubClient", IssueCountHttpClient)
-    for bad_body in (
-        b'{"data":{"repository":{"issues":{"totalCount":7}}},"errors":[]}',
-        b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":[]}',
-        b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":{"cost":1e999}}',
+    for status_code, bad_body in (
+        (200, b'{"data":{"repository":{"issues":{"totalCount":7}}},"errors":[]}'),
+        (200, b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":[]}'),
+        (200, b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":{"cost":1e999}}'),
+        (400, b'{"errors":[{"message":"boom"}],"extensions":{"cost":1e999}}'),
+        (500, b'{"errors":[{"message":"boom"}],"errors":[]}'),
     ):
-        http_reply["response"] = github_client.Response(200, {}, bad_body)
+        http_reply["response"] = github_client.Response(status_code, {}, bad_body)
         for check_flag in (False, True):
             with pytest.raises(gate.PublishBlocked, match="malformed issue count response"):
                 pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=check_flag)

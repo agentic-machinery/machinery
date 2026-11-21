@@ -1613,6 +1613,18 @@ class GitHubClient:
             reset_at=budget[1] if budget else None,
             now=now,
         )
+        # A 403 body-text heuristic must not turn a malformed GraphQL error envelope into a
+        # synthetic hold; status 429, rate-limit headers, valid GraphQL errors, and REST bodies stay intact.
+        if (
+            graphql
+            and limit is not None
+            and response.status == 403
+            and h.get("x-ratelimit-remaining") != "0"
+            and "retry-after" not in h
+            and result.error == "github_graphql_error"
+            and result.reason != "graphql_errors"
+        ):
+            limit = None
         if cacheable and method == "GET" and response.status == 200 and not response.body:
             # Keep a missing JSON document distinct from a valid JSON null.
             result.value = response.body
@@ -4241,6 +4253,15 @@ def _response_result(response, headers, *, graphql, raw_response, reset_at, now)
                     fallback = json_depth.loads(response.body, max_depth=_JSON_MAX_DEPTH)
                 except (ValueError, RecursionError):
                     fallback = response.body
+                if isinstance(fallback, dict) and "errors" in fallback:
+                    return Result(
+                        response.body,
+                        status=response.status,
+                        error="github_graphql_error",
+                        headers=headers,
+                        reason="invalid_json",
+                        empty_body=False,
+                    )
                 return Result(
                     fallback, status=response.status, error="github_http_error", reset_at=reset_at, headers=headers
                 )
