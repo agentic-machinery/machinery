@@ -110,13 +110,16 @@ Every item must hold on the **current** head. A moved head voids the verdict and
 3. Same-head PR CI Gate green, which includes the affected tests and Frontend, not the full suite.
    It may have finished before or after the review round, but it is green on the live head;
    pending, red or cancelled is not green. Later CI evidence that materially undermines the
-   recorded verdict needs reviewer disposition before enqueue. PR CI never replaces the
-   merge-group CI Gate on the real queue candidate (`workflow.md` § Merge policy).
+   recorded verdict needs reviewer disposition before landing. Where the base branch has a merge
+   queue, PR CI never replaces the merge-group CI Gate on the real queue candidate (`workflow.md`
+   § Merge policy); where it has none, the same-head PR checks are the last CI gate and every one must be green.
 4. Follow-ups sent to the CTO through Fleet Comms, or recorded on the parent issue when they
    share its outcome. A non-blocking follow-up never holds the merge.
 5. The PR is open, not a draft, mergeable and not BEHIND or DIRTY against its base.
 
-`full-send` enqueues after the gate. `full-stop` reports READY_TO_MERGE at the gate; the future
+After the gate, `full-send` lands through `pr-merge`, which enqueues in a merge-queue repository
+and merges directly where the base branch has none (read `isMergeQueueEnabled` first, `full-send` step 8).
+`full-stop` reports READY_TO_MERGE at the gate; in a merge-queue repository the future
 merge-group CI is not yet proven at that point.
 
 ## Terminal states

@@ -85,7 +85,7 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    Push the branch and open a non-draft PR so CI runs on the exact head. PR CI runs
    Frontend and the affected tests (changed tests, tests that import or read changed files,
    the guards and the repository invariants); the full pytest suite runs only in merge-group,
-   nightly and manual runs, so a failure in the merge group can still eject the PR. An open PR is not approval.
+   nightly and manual runs, so in a merge-queue repository a failure in the merge group can still eject the PR. An open PR is not approval.
 
    ```bash
    "$PY" -m lu_machinery.publish pr-create --title "$TITLE" --body-file "$BODY" \
@@ -124,20 +124,31 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    `headRefOid` must equal the head of the recorded APPROVE and of the green PR CI Gate; a
    pending, red or cancelled gate is not green. If CI evidence that arrived after the verdict
    materially undermines it (for example a failure in code the review relied on), get the
-   reviewer's disposition before enqueue, through a round `budget-check` admits; a fix that
+   reviewer's disposition before landing (step 8), through a round `budget-check` admits; a fix that
    moves the head returns to step 4.
    Send follow-ups to the CTO through Fleet Comms
    (`"$PY" -I -m lu_machinery.fleet_comms channel publish … --recipient claude-cto`; the CTO's one durable recipient, never a `claude-cto-<id>` name).
-8. **Drain the inbox, then enqueue** at the approved head. The merge-queue keeper may already
-   have queued it: check `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --json` first.
+8. **Drain the inbox, then land** at the approved head. Read which landing applies from
+   `data.repository.pullRequest.isMergeQueueEnabled` (`$BASE` is the PR's `baseRefName`; `pr-merge`
+   re-reads the flag itself and acts on its own reading):
 
    ```bash
-   "$PY" -m lu_machinery.publish pr-merge --number "$PR" --match-head "$HEAD_SHA"
+   "$PY" -m lu_machinery.publish read queue-status --repo "$REPO" --number "$PR" --branch "$BASE"
+   "$PY" -m lu_machinery.publish pr-merge --repo "$REPO" --number "$PR" --match-head "$HEAD_SHA"
    ```
 
-   Never `--auto`, `--delete-branch` or `--admin`. Queued is not merged. A PR the CTO
-   labelled `merge-priority` after its exact-head approval enqueues at the front of the
-   queue on its own (`workflow.md` § Merge policy, priority line); never apply that label yourself.
+   - `true` (merge queue): `pr-merge` enqueues. The merge-queue keeper may already have queued
+     it: check `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --json` first. Landing also
+     needs a green merge-group CI Gate on the real candidate. Queued is not merged. A PR the CTO
+     labelled `merge-priority` after its exact-head approval enqueues at the front of the queue
+     on its own (`workflow.md` § Merge policy, priority line); never apply that label yourself.
+   - `false` (no merge queue): `pr-merge` squash-merges the PR directly, pinned to the approved
+     head. The step 7 gate (exact-head APPROVE; every check on that head green, none pending,
+     failing or cancelled) is the whole landing gate; no merge-group run exists to wait for, so
+     its absence is no reason to stop.
+   - Any other reading (a failed read, a missing or non-boolean field): stop; never guess.
+
+   Never `--auto`, `--delete-branch` or `--admin`.
 9. **Confirm `MERGED`** and the merge SHA: `gh pr view "$PR" --json state,mergeCommit`. If the
    queue ejects the PR, follow the kick recipe in [pr-watch](references/pr-watch.md). If
    waiting in the queue is the only step left and the integration owner has accepted queue
@@ -196,7 +207,7 @@ first review of record, at most **one per PR lineage**.
 
 ## Run the change
 
-Before the commit, and again before enqueue, run `verify_run` for every area the diff touches. The map from area to command is `agents_extensions/shared/skills/verify/SKILL.md`. A non-zero exit blocks that commit or that enqueue. The JSON on stdout is the receipt; do not commit it. Skip the command only when the diff touches none of those areas.
+Before the commit, and again before landing (step 8), run `verify_run` for every area the diff touches. The map from area to command is `agents_extensions/shared/skills/verify/SKILL.md`. A non-zero exit blocks that commit or that landing. The JSON on stdout is the receipt; do not commit it. Skip the command only when the diff touches none of those areas.
 
 ## Stop and escalate
 
