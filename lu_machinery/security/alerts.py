@@ -789,8 +789,19 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
     return None
 
 
-def _is_fleet_job(name: str, job_name: str) -> bool:
-    return name == job_name or name.endswith(f" / {job_name}")
+def _fleet_job_caller(name: str) -> tuple[str, str] | None:
+    """Return ``(caller, job)`` for a fleet-security job name, or None for any other job.
+
+    GitHub names a reusable workflow's job ``<caller> / <job>``, so one run that calls
+    fleet-security twice holds two sets of jobs. A bare job name has the caller ``""``.
+    """
+    for job_name in _FLEET_JOB_NAMES:
+        if name == job_name:
+            return "", job_name
+        suffix = f" / {job_name}"
+        if name.endswith(suffix):
+            return name[: -len(suffix)], job_name
+    return None
 
 
 def _decode_workflow(document: Mapping[str, Any]) -> tuple[str | None, str | None]:
@@ -1046,92 +1057,108 @@ def _read_caller_evidence(
         if type(job_id) is not int or job_id in seen_job_ids:
             return None, [], "github_invalid_payload"
         seen_job_ids.add(job_id)
-    gates = [job for job in jobs if isinstance(job.get("name"), str) and _is_fleet_job(job["name"], _FLEET_GATE_JOB)]
-    if len(gates) != 1:
-        return record, [], "no_fleet_security_jobs"
-    gate_conclusion = gates[0].get("conclusion")
-    if not isinstance(gate_conclusion, str):
-        return None, [], "github_invalid_payload"
-    record = {**record, "gate_conclusion": gate_conclusion}
-    # A cancelled, timed-out or skipped gate never checked the scanner jobs.
-    if gate_conclusion not in {"success", "failure"}:
-        return record, [], "run_not_success"
-    findings: list[dict[str, Any]] = []
-    failed_scanners = 0
-    gate_failure_lines = 0
+    # A workflow file that calls fleet-security more than once runs one set of fleet jobs per
+    # caller job. Each set is checked as its own run: one gate, its own scanner jobs, its own
+    # failure lines. Every set must pass, so one unreadable set refuses the whole repository.
+    groups: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
     for job in jobs:
         job_name = job.get("name")
-        if not isinstance(job_name, str) or not any(_is_fleet_job(job_name, expected) for expected in _FLEET_JOB_NAMES):
-            continue
-        is_gate = _is_fleet_job(job_name, _FLEET_GATE_JOB)
-        conclusion = job.get("conclusion")
-        if not is_gate:
-            # A skipped scanner did not run. The gate's result lines say whether that skip was expected.
-            if conclusion == "skipped":
-                continue
-            # A cancelled, timed-out or unfinished scanner may have stopped part-way through its targets.
-            if conclusion not in {"success", "failure"}:
-                return record, [], "scanner_incomplete"
-            if conclusion == "failure":
-                failed_scanners += 1
-        annotations_endpoint = _annotation_endpoint(owner, name, job.get("check_run_url"))
-        if annotations_endpoint is None:
-            return None, [], "annotations_unreadable"
-        expected_annotations = annotations_endpoint.split("?", 1)[0]
-        annotation_pages, annotation_error = _collect_pages(
-            client,
-            annotations_endpoint,
-            timeout=timeout,
-            owner=owner,
-            name=name,
-            expected_path=expected_annotations,
-            required_repo_id=required_repo_id,
-        )
-        if annotation_error:
-            return None, [], annotation_error
-        job_findings = 0
-        for annotation_page in annotation_pages:
-            rows = annotation_page.value
-            if not isinstance(rows, list):
-                return None, [], "github_invalid_payload"
-            for row in rows:
-                if not isinstance(row, Mapping):
-                    return None, [], "github_invalid_payload"
-                level = row.get("annotation_level", "")
-                if not isinstance(level, str):
-                    return None, [], "annotations_unreadable"
-                if level in {"warning", "notice"}:
-                    continue
-                if _is_context_annotation(row.get("message")):
-                    if is_gate and _GATE_FAILURE_LINE_RE.fullmatch(row["message"]):
-                        gate_failure_lines += 1
-                    continue
-                try:
-                    parsed = _parse_oss_finding(row.get("message"))
-                except _UnreadableAnnotation:
-                    parsed = None
-                if parsed is None:
-                    return record, [], "annotations_unreadable"
-                findings.append(parsed)
-                job_findings += 1
-                if len(findings) > _MAX_OSS_FINDINGS:
-                    return None, [], "pagination_limit"
-        # A scanner that failed without a finding line failed for another reason. Its evidence is
-        # missing, so another job's findings must not read as the complete list.
-        if not is_gate and conclusion == "failure" and job_findings == 0:
-            return record, [], "scanner_failed_without_findings"
-        # Every fleet scanner exits non-zero on a finding, so a successful job with one is inconsistent.
-        if not is_gate and conclusion == "success" and job_findings:
-            return record, [], "scanner_conclusion_mismatch"
-    if findings:
-        # The gate must have run its check and named each failed scanner, which also confirms
-        # that every skipped scanner was expected to skip.
-        if gate_conclusion != "failure" or gate_failure_lines != failed_scanners:
-            return record, [], "run_not_success"
-        return record, findings, None
-    if gate_conclusion != "success":
+        matched = _fleet_job_caller(job_name) if isinstance(job_name, str) else None
+        if matched is not None:
+            groups.setdefault(matched[0], []).append((matched[1], job))
+    gate_conclusions: dict[str, str] = {}
+    for caller_name, group in groups.items():
+        gates = [job for job_name, job in group if job_name == _FLEET_GATE_JOB]
+        if len(gates) != 1:
+            return record, [], "no_fleet_security_jobs"
+        conclusion = gates[0].get("conclusion")
+        if not isinstance(conclusion, str):
+            return None, [], "github_invalid_payload"
+        gate_conclusions[caller_name] = conclusion
+    if not gate_conclusions:
+        return record, [], "no_fleet_security_jobs"
+    # The run's gate result is success only when every caller's gate succeeded.
+    run_gate = next((value for value in gate_conclusions.values() if value != "success"), "success")
+    record = {**record, "gate_conclusion": run_gate}
+    # A cancelled, timed-out or skipped gate never checked the scanner jobs.
+    if any(value not in {"success", "failure"} for value in gate_conclusions.values()):
         return record, [], "run_not_success"
-    return record, [], None
+    findings: list[dict[str, Any]] = []
+    for caller_name, group in groups.items():
+        gate_conclusion = gate_conclusions[caller_name]
+        caller_findings: list[dict[str, Any]] = []
+        failed_scanners = 0
+        gate_failure_lines = 0
+        for job_name, job in group:
+            is_gate = job_name == _FLEET_GATE_JOB
+            conclusion = job.get("conclusion")
+            if not is_gate:
+                # A skipped scanner did not run. The gate's result lines say whether that skip was expected.
+                if conclusion == "skipped":
+                    continue
+                # A cancelled, timed-out or unfinished scanner may have stopped part-way through its targets.
+                if conclusion not in {"success", "failure"}:
+                    return record, [], "scanner_incomplete"
+                if conclusion == "failure":
+                    failed_scanners += 1
+            annotations_endpoint = _annotation_endpoint(owner, name, job.get("check_run_url"))
+            if annotations_endpoint is None:
+                return None, [], "annotations_unreadable"
+            expected_annotations = annotations_endpoint.split("?", 1)[0]
+            annotation_pages, annotation_error = _collect_pages(
+                client,
+                annotations_endpoint,
+                timeout=timeout,
+                owner=owner,
+                name=name,
+                expected_path=expected_annotations,
+                required_repo_id=required_repo_id,
+            )
+            if annotation_error:
+                return None, [], annotation_error
+            job_findings = 0
+            for annotation_page in annotation_pages:
+                rows = annotation_page.value
+                if not isinstance(rows, list):
+                    return None, [], "github_invalid_payload"
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        return None, [], "github_invalid_payload"
+                    level = row.get("annotation_level", "")
+                    if not isinstance(level, str):
+                        return None, [], "annotations_unreadable"
+                    if level in {"warning", "notice"}:
+                        continue
+                    if _is_context_annotation(row.get("message")):
+                        if is_gate and _GATE_FAILURE_LINE_RE.fullmatch(row["message"]):
+                            gate_failure_lines += 1
+                        continue
+                    try:
+                        parsed = _parse_oss_finding(row.get("message"))
+                    except _UnreadableAnnotation:
+                        parsed = None
+                    if parsed is None:
+                        return record, [], "annotations_unreadable"
+                    caller_findings.append({**parsed, "caller": _sanitize_text(caller_name) or None})
+                    job_findings += 1
+                    if len(findings) + len(caller_findings) > _MAX_OSS_FINDINGS:
+                        return None, [], "pagination_limit"
+            # A scanner that failed without a finding line failed for another reason. Its evidence is
+            # missing, so another job's findings must not read as the complete list.
+            if not is_gate and conclusion == "failure" and job_findings == 0:
+                return record, [], "scanner_failed_without_findings"
+            # Every fleet scanner exits non-zero on a finding, so a successful job with one is inconsistent.
+            if not is_gate and conclusion == "success" and job_findings:
+                return record, [], "scanner_conclusion_mismatch"
+        if caller_findings:
+            # The gate must have run its check and named each failed scanner, which also confirms
+            # that every skipped scanner was expected to skip.
+            if gate_conclusion != "failure" or gate_failure_lines != failed_scanners:
+                return record, [], "run_not_success"
+        elif gate_conclusion != "success":
+            return record, [], "run_not_success"
+        findings.extend(caller_findings)
+    return record, findings, None
 
 
 def read_fleet_security(client: Any, repo: FleetRepo, *, timeout: float) -> dict[str, Any]:
@@ -1583,8 +1610,8 @@ def _render_fleet_section(fleet: Mapping[str, Any]) -> list[str]:
         lines.extend(
             [
                 "",
-                "| Scanner | Rule | Severity | Location | Message |",
-                "| --- | --- | --- | --- | --- |",
+                "| Caller | Scanner | Rule | Severity | Location | Message |",
+                "| --- | --- | --- | --- | --- | --- |",
             ]
         )
         if isinstance(finding_rows, list):
@@ -1592,7 +1619,8 @@ def _render_fleet_section(fleet: Mapping[str, Any]) -> list[str]:
                 if not isinstance(item, Mapping):
                     continue
                 lines.append(
-                    f"| `{_sanitize_md_cell(item.get('scanner'))}` | `{_sanitize_md_cell(item.get('rule'))}` | "
+                    f"| `{_sanitize_md_cell(item.get('caller')) or '-'}` | "
+                    f"`{_sanitize_md_cell(item.get('scanner'))}` | `{_sanitize_md_cell(item.get('rule'))}` | "
                     f"`{_sanitize_md_cell(item.get('severity'))}` | `{_sanitize_md_cell(item.get('location'))}` | "
                     f"{_sanitize_md_cell(item.get('message'))} |"
                 )
