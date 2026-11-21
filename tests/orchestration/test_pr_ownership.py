@@ -233,6 +233,46 @@ def test_ownerless_open_pr_past_grace_records_a_decision_owner(tmp_path):
     handoff = state["handoffs"][KEY]
     assert own.decision_custody(handoff)
     assert handoff["decision_owner"] == own.CTO_INBOX and handoff["head"] == HEAD
+    assert set(handoff) <= own._OWNERSHIP_FIELDS and handoff["custody"] == []
+    view = own.custody_view(state)
+    assert view["evidence"] == "known" and "why" not in view
+    assert view["recorded_custody"] == [{
+        "pr": KEY, "decision_owner": own.CTO_INBOX, "head": HEAD, "by": "keeper",
+    }]
+    assert view["waiting_for_grace"] == [] and view["unknown_evidence"] == []
+    dirty = {**state, "handoffs": {KEY: {**handoff, "merge": True}}}
+    assert own.custody_view(dirty)["recorded_custody"] == []
+    assert own.custody_view(dirty)["unknown_evidence"][0]["why"] == "handoff has fields outside ownership"
+    refused = own._empty()
+    refused["last_tick"] = {"at": at(15).isoformat(), "ok": True}
+    refused["episodes"][KEY] = {
+        "since": at(0).isoformat(), "alerted_at": at(15).isoformat(), "notified_at": at(15).isoformat(),
+        "reminders": 0, "branch": "codex/x", "reason": "r", "last_task": "old",
+    }
+    refused["heal_attempts"][f"{KEY}:{HEAD}"] = {"result": "refused", "postcondition": "false"}
+    assert own.custody_view(refused)["alert_outstanding"] == [{
+        "pr": KEY, "since": at(0).isoformat(), "keeper": "refused",
+    }]
+    refused["heal_attempts"][f"{KEY}:{HEAD}"] = {"result": "pending", "postcondition": "unknown"}
+    unverified = own.custody_view(refused)
+    assert unverified["unknown_evidence"][0]["why"] == "keeper attempt unverified"
+    assert unverified["recorded_custody"] == [] and unverified["waiting_for_grace"] == []
+    # A failed observation does not hide a decision owner, and does not leave an alert looking current.
+    stale = own._empty()
+    stale["last_tick"] = {"at": at(20).isoformat(), "ok": False, "error": "RuntimeError"}
+    stale["handoffs"][KEY] = dict(handoff)
+    stale["heal_attempts"][f"{KEY}:{HEAD}"] = {"result": "recorded", "postcondition": "true"}
+    stale["episodes"][own.pr_key(REPO, 43)] = {
+        "since": at(0).isoformat(), "alerted_at": at(15).isoformat(), "notified_at": at(15).isoformat(),
+        "reminders": 0, "branch": "codex/y", "reason": "r", "last_task": "old",
+    }
+    stale_view = own.custody_view(stale)
+    assert stale_view["evidence"] == "unknown" and stale_view["why"] == "RuntimeError"
+    assert stale_view["recorded_custody"] == [{
+        "pr": KEY, "decision_owner": own.CTO_INBOX, "head": HEAD, "by": "keeper",
+    }]
+    assert stale_view["alert_outstanding"] == [] and stale_view["waiting_for_grace"] == []
+    assert stale_view["unknown_evidence"] == [{"pr": other, "why": "last keeper tick is not evidence", "alerted": True}]
     attempt = state["heal_attempts"][f"{KEY}:{HEAD}"]
     assert attempt["result"] == "recorded" and attempt["postcondition"] == "true"
     assert KEY not in state["episodes"] and other not in state["handoffs"]
@@ -255,6 +295,11 @@ def test_ownerless_open_pr_past_grace_records_a_decision_owner(tmp_path):
         now=at(15), path=queued, observe=lambda handoffs: ({KEY}, {KEY: blind}), service_factory=down,
     )
     assert failed and own.load(queued)["outbox"] and own.load(queued)["heal_attempts"] == {}
+    held = own.custody_view(own.load(queued))
+    assert held["evidence"] == "known" and held["recorded_custody"] == [] and held["waiting_for_grace"] == []
+    assert held["alert_outstanding"] == [{
+        "pr": KEY, "since": at(0).isoformat(), "keeper": "not_recorded",
+    }]
     lines, failed = own.keeper_tick(
         now=at(20), path=queued, observe=lambda handoffs: ({KEY}, {KEY: evidenced}), service_factory=fleet(tmp_path),
     )
@@ -294,6 +339,9 @@ def test_unreadable_source_is_unknown_and_never_counts_toward_grace(tmp_path):
     good = dict(path=path, service_factory=fleet(tmp_path))
     ownerless_now = lambda h: ({KEY}, {KEY: ownerless()})  # noqa: E731
     own.keeper_tick(now=at(0), observe=ownerless_now, **good)
+    waiting = own.custody_view(own.load(path))
+    assert waiting["evidence"] == "known"
+    assert [row["pr"] for row in waiting["waiting_for_grace"]] == [KEY]
 
     def broken(handoffs):
         raise RuntimeError("gh down")
@@ -302,6 +350,9 @@ def test_unreadable_source_is_unknown_and_never_counts_toward_grace(tmp_path):
     assert failed and "UNKNOWN" in lines[0]
     state = own.load(path)
     assert state["episodes"] == {} and state["last_tick"]["ok"] is False
+    unknown = own.custody_view(state)
+    assert unknown["evidence"] == "unknown" and unknown["why"] == "RuntimeError"
+    assert unknown["waiting_for_grace"] == [] and unknown["recorded_custody"] == []
     # The clock restarts once the source is readable again: no alert at minute 60.
     own.keeper_tick(now=at(60), observe=ownerless_now, **good)
     assert own.keeper_tick(now=at(70), observe=ownerless_now, **good)[0][0].endswith("undelivered=0")
@@ -495,11 +546,60 @@ def world(tmp_path, monkeypatch):
 
 
 def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
+    from lu_machinery.dispatcher import store
+
     monkeypatch.delenv(own.TASK_ENV, raising=False)
+    assert own.main(["status"]) == 0
+    empty = json.loads(capsys.readouterr().out)
+    assert empty["custody"]["evidence"] == "unknown"
+    assert empty["custody"]["why"] == "no successful keeper tick"
+    assert empty["custody"]["waiting_for_grace"] == []
+    assert empty["custody"]["recorded_custody"] == []
+    # A mixed call names both forms and writes nothing.
+    assert own.main([
+        "accept", "--pr", "42", "--repo", REPO, "--custody", "--from", "waiter",
+        "--reason", "worker crashed after approval", "--decision-owner", "claude-cto",
+    ]) == 1
+    mixed = json.loads(capsys.readouterr().out)
+    assert mixed["accepted"] is False
+    assert mixed["usage"] == [own.QUEUE_CUSTODY_USAGE, own.RECORDED_CUSTODY_USAGE]
+    monkeypatch.setenv(own.TASK_ENV, "integration")
+    assert own.main([
+        "accept", "--pr", "42", "--repo", REPO, "--custody", "--decision-owner", "claude-cto",
+    ]) == 1
+    assert json.loads(capsys.readouterr().out)["usage"] == [own.QUEUE_CUSTODY_USAGE, own.RECORDED_CUSTODY_USAGE]
+    monkeypatch.delenv(own.TASK_ENV, raising=False)
+    assert own.main(["accept", "--pr", "42", "--repo", REPO, "--release", "--reason", "no"]) == 1
+    assert json.loads(capsys.readouterr().out)["usage"] == [own.RELEASE_CUSTODY_USAGE]
+    assert own.main(["accept", "--pr", "42", "--repo", REPO, "--reason", "held"]) == 1
+    assert json.loads(capsys.readouterr().out)["usage"] == [own.RECORDED_CUSTODY_USAGE]
+    assert not world.exists()
+    monkeypatch.setattr(store, "list_tasks", lambda *a, **k: [task("old", status="timeout")])
+    assert own.main([
+        "accept", "--pr", "42", "--repo", REPO,
+        "--reason", "worker crashed after approval", "--decision-owner", "claude-cto",
+    ]) == 0
+    recorded = own.load(world)["handoffs"][KEY]
+    assert own.decision_custody(recorded)
+    assert set(recorded) <= own._OWNERSHIP_FIELDS and recorded["custody"] == []
+    capsys.readouterr()
+    assert own.main(["status"]) == 0
+    seated = json.loads(capsys.readouterr().out)["custody"]
+    assert seated["recorded_custody"] == [{
+        "pr": KEY, "decision_owner": "claude-cto", "head": HEAD, "by": "coordinator",
+    }]
+    assert seated["waiting_for_grace"] == [] and seated["evidence"] == "unknown"
+    assert own.main(["accept", "--pr", "42", "--repo", REPO, "--release"]) == 0
+    assert own.load(world)["handoffs"] == {}
+    monkeypatch.setattr(store, "list_tasks", lambda *a, **k: [task("waiter"), task("integration", "claude/queue")])
+    capsys.readouterr()
     assert own.main(["accept", "--pr", "42", "--repo", REPO]) == 2
     monkeypatch.setenv(own.TASK_ENV, "integration")
     assert own.main(["accept", "--pr", "42", "--repo", REPO, "--custody", "--from", "waiter"]) == 0
     assert json.loads(capsys.readouterr().out.splitlines()[-1])["accepted"] is True
+    queued = own.load(world)["handoffs"][KEY]
+    assert set(queued) <= own._OWNERSHIP_FIELDS and "decision_owner" not in queued
+    assert queued["custody"] == list(own.CUSTODY_COVERS)
     assert own.accepted_handoffs(world) == {(REPO.casefold(), 42): "integration"}
     monkeypatch.setattr(own, "_queued_at", lambda repo, n, head, base: head == HEAD)
     monkeypatch.setenv(own.TASK_ENV, "waiter")
@@ -520,16 +620,28 @@ def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
                 own.main([verb, "--pr", "42", "--repo", spelled])
             assert "owner/name" in capsys.readouterr().err
     assert own.main(["status"]) == 0
+    final = json.loads(capsys.readouterr().out)["custody"]
+    assert final["evidence"] == "known" and final["recorded_custody"] == []
+    assert final["waiting_for_grace"] == [] and final["unknown_evidence"] == []
 
 
 def test_documented_module_invocation_shows_help():
     import subprocess
     import sys
 
+    root = Path(__file__).resolve().parents[2]
     proc = subprocess.run([sys.executable, "-m", "lu_machinery.orchestration.pr_ownership", "--help"],
-                          capture_output=True, text=True, timeout=60, check=False,
-                          cwd=Path(__file__).resolve().parents[2])
+                          capture_output=True, text=True, timeout=60, check=False, cwd=root)
     assert proc.returncode == 0 and "Exit codes:" in proc.stdout
+    assert own.QUEUE_CUSTODY_USAGE in proc.stdout and own.RECORDED_CUSTODY_USAGE in proc.stdout
+    accept_help = subprocess.run(
+        [sys.executable, "-m", "lu_machinery.orchestration.pr_ownership", "accept", "--help"],
+        capture_output=True, text=True, timeout=60, check=False, cwd=root,
+    )
+    assert accept_help.returncode == 0
+    assert own.QUEUE_CUSTODY_USAGE in accept_help.stdout
+    assert own.RECORDED_CUSTODY_USAGE in accept_help.stdout
+    assert "never a merge gate" in accept_help.stdout
 
 
 # --- round-1 review regressions -----------------------------------------------------
