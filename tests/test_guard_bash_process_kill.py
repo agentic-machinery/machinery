@@ -124,6 +124,10 @@ F10_ANSI_C = [
         ("sudo 2>/dev/null -n pkill -f worker", True),
         ("env -u 2>/dev/null X pkill -f worker", True),
         ("pgrep -f worker | xargs sh -c 'echo x; kill $1' _", True),
+        # A quote opening inside a word must not hide the kill (C-6323).
+        ("echo a' 'b ; pkill -f worker ; echo 'c'", True),
+        ("echo a' 'b ; pgrep -f worker | xargs kill ; echo 'c'", True),
+        ("echo it's", True),
         ("pgrep -f worker", False),
         ("pgrep --full worker | sort", False),
         ("pgrep -f worker | xargs echo kill", False),
@@ -150,6 +154,7 @@ F10_ANSI_C = [
         ("bash --norc --noprofile -c 'echo ok'", False),
         ('bash -c "echo $X" _ y', False),
         (r"printf $'ok\t\x41\101\n'", False),
+        (r"echo 'stop it'\''s ; pkill -f worker'", False),
     ]
     + [(command, True) for command in F7_SHELL_OPTIONS + F10_ANSI_C]
     + [(kill + "; " + DEEP, True) for kill in F7_KILLS]

@@ -326,6 +326,9 @@ def test_secret_dump_shapes_blocked(monkeypatch, capsys, cmd):
         'export X=$GH_TOKEN; printf %s "$X"',
         'export X=$GH_TOKEN; Y=$X; printf %s "$Y"',
         'export X=$GH_TOKEN; echo $(printf %s "$X")',
+        # A quote opening inside a word must not flip quote parity (C-6323).
+        "echo a' 'b ; cat .env ; echo 'c'",
+        'echo a" "b ; cat .env ; echo "c"',
     ],
 )
 def test_issue_8896_secret_bypasses_block(monkeypatch, capsys, command):
@@ -547,7 +550,17 @@ def test_issue_9115_backtick_depth_limit_blocks_secret_hook(monkeypatch):
     assert _run(monkeypatch, "echo " + body) == 2
 
 
-@pytest.mark.parametrize("payload", ["not-json", "null", '{"tool_input":{"command":[]}}'])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        "null",
+        '{"tool_input":{"command":[]}}',
+        # Unterminated quoting cannot be read whole (C-6323).
+        """{"tool_input":{"command":"echo it's"}}""",
+        r"""{"tool_input":{"command":"echo 'won'\\''t"}}""",
+    ],
+)
 def test_issue_9115_malformed_secret_hook_input_blocks(monkeypatch, payload):
     monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
     assert guard.main() == 2
@@ -708,6 +721,15 @@ def test_issue_8896_review_round_two_ordinary_allow(monkeypatch, command):
         'X=$GH_TOKEN echo ok; printf %s "$X"',
         'export X=$GH_TOKEN; X=plain; printf %s "$X"',
         'export X=$GH_TOKEN; unset X; printf %s "$X"',
+        # Quoted apostrophes keep a non-secret argument one word (C-6323).
+        r".venv/bin/python -m scripts.publish code-scanning-dismiss --alert 12 --reason 'won'\''t fix'"
+        r" --comment 'Test-only fixture; the scanner'\''s rule matches tests/fixtures/dev.env by name'",
+        r".venv/bin/python -m scripts.publish issue-close --number 5"
+        r" --comment 'The bot'\''s probe no longer reads ops/.env and the gateway'\''s route is gone.'",
+        r".venv/bin/python -m scripts.publish issue-close --number 5"
+        r" --comment $'The bot\'s probe no longer reads ops/.env any more'",
+        r"echo 'a'\'' ; cat .env ; echo '\''b'",
+        r"echo a\ b\;cat .env",
     ],
 )
 def test_issue_8896_ordinary_commands_allow(monkeypatch, command):

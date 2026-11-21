@@ -1552,6 +1552,42 @@
     },
     {
       "guard": "secret_print",
+      "command_index": 41,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 177,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 191,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 252,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 253,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 254,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
       "command_index": 255,
       "before": true,
       "after": false
@@ -1561,6 +1597,66 @@
       "command_index": 256,
       "before": true,
       "after": false
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 277,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 281,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 283,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 315,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 322,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 331,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 367,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 370,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 371,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 404,
+      "before": false,
+      "after": true
     },
     {
       "guard": "secret_print",
@@ -1624,9 +1720,21 @@
     },
     {
       "guard": "secret_print",
+      "command_index": 1371,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
       "command_index": 1451,
       "before": false,
       "after": true
+    },
+    {
+      "guard": "secret_print",
+      "command_index": 1468,
+      "before": true,
+      "after": false
     }
   ]
 }

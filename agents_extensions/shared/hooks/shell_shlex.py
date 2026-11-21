@@ -1,14 +1,14 @@
 """Quote-preserving Bash word splitting for shared hook guards.
 
-Non-POSIX shlex preserves surrounding quotes, which these guards need, but
-mistakes an escaped double quote for the end of a quoted word. Hide only that
-quote while shlex splits, then restore the original spelling in each token.
+The guards need each word's original spelling, quotes included. Non-POSIX
+shlex keeps that spelling but honours a quote only at the start of a token, so
+a quote opening inside a word (`it'\\''s`, `a' 'b`) flipped quote parity.
+split_quote_preserving tracks Bash quoting itself instead.
 """
 
 from __future__ import annotations
 
 import re
-import shlex
 from collections.abc import Callable
 
 _HEREDOC_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -571,33 +571,45 @@ def strip_skippable_heredoc_bodies(
 
 
 def split_quote_preserving(command: str, *, punctuation_chars: str | bool, whitespace: str) -> list[str]:
-    marker_code = 0xE000
-    while chr(marker_code) in command:
-        marker_code += 1
-        if marker_code > 0xF8FF:
-            raise ValueError("no unused quote marker")
-    marker = chr(marker_code)
+    """Split `command` into Bash words and operator runs, keeping each spelling.
 
-    protected: list[str] = []
-    quote = ""
+    Quotes and backslashes are tracked the way Bash reads them: a quote opens
+    wherever it stands in a word, a backslash outside single quotes takes the
+    next character, and only unquoted blanks and operator characters split.
+    A word that starts with a quote ends at its closing quote, so adjacent
+    quote fragments (`'pk'"ill"`) stay separate tokens for the callers that
+    rejoin them. Operator characters are grouped into runs (`);`) as shlex
+    does. An unterminated quote raises ValueError, like shlex.
+    """
+    punctuation = "();<>|&" if punctuation_chars is True else punctuation_chars or ""
+    tokens: list[str] = []
     index = 0
     while index < len(command):
         char = command[index]
-        if char == "\\" and quote == '"' and index + 1 < len(command):
-            following = command[index + 1]
-            if following in {'"', "\\", "$", "`"}:
-                protected.append(marker if following == '"' else command[index : index + 2])
-                index += 2
-                continue
-        if char == "'" and quote != '"':
-            quote = "" if quote else "'"
-        elif char == '"' and quote != "'":
-            quote = "" if quote else '"'
-        protected.append(char)
-        index += 1
-
-    lexer = shlex.shlex("".join(protected), posix=False, punctuation_chars=punctuation_chars)
-    lexer.whitespace_split = True
-    lexer.whitespace = whitespace
-    lexer.commenters = ""
-    return [token.replace(marker, '\\"') for token in lexer]
+        if char in whitespace:
+            index += 1
+            continue
+        start = index
+        if char in punctuation:
+            while index < len(command) and command[index] in punctuation:
+                index += 1
+            tokens.append(command[start:index])
+            continue
+        fragment = char in "'\""
+        while index < len(command):
+            char = command[index]
+            if char in "'\"":
+                close = index + 1
+                while close < len(command) and command[close] != char:
+                    close += 2 if char == '"' and command[close] == "\\" else 1
+                if close >= len(command):
+                    raise ValueError("No closing quotation")
+                index = close + 1
+                if fragment:
+                    break
+            elif char in whitespace or char in punctuation:
+                break
+            else:
+                index += 2 if char == "\\" else 1
+        tokens.append(command[start : min(index, len(command))])
+    return tokens
