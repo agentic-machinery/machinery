@@ -8,12 +8,7 @@ import subprocess
 from collections.abc import Callable
 from urllib.parse import parse_qs, quote
 
-from lu_machinery.ci.advisory_checks import (
-    external_advisory_check,
-    is_advisory,
-    is_external_advisory_run,
-    load_advisory_checks,
-)
+from lu_machinery.ci.advisory_checks import external_advisory_check, is_external_advisory_run
 from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.github_check_rollup import (
@@ -238,18 +233,15 @@ def _judge_status_rollup_rows(
 ) -> tuple[list[str], list[str], int] | None:
     """``(failing, pending, judged)``: ``judged`` counts the checks proven blocking, whatever their result.
 
-    Advisory checks, proven external advisory runs and unexpanded matrix parents are
-    not judged, so a head carrying only those has ``judged == 0``. A judged row named
-    like an advisory job (its workflow identity missing or another workflow's) still
-    blocks on failure but proves no blocking check. With the advisory policy unavailable
-    (no product checkout, or an unreadable ci.yml) every row is blocking, as the loader states.
+    Proven external advisory runs and unexpanded matrix parents are not judged, so a
+    head carrying only those has ``judged == 0``. Every other row is blocking, including
+    a ``continue-on-error`` job's (C-6339).
     """
     # Only a list is a check collection; null, {}, "" or false establish nothing.
     if not isinstance(rows, list):
         return None
     if not rows:
         return [], [], 0
-    policy = load_advisory_checks()
     named = []
     for row in rows:
         if not isinstance(row, dict):
@@ -260,10 +252,7 @@ def _judge_status_rollup_rows(
             return None
         # Cancelled runs can retain an unexpanded matrix parent. It is not an
         # executed job and cannot be superseded by the differently named shards.
-        # The old-client statusCheckRollup fallback calls the identity workflowName.
-        if "${{" not in name and not exempt and not is_advisory(
-            name, workflow=row.get("workflowName") or row.get("workflow"), policy=policy
-        ):
+        if "${{" not in name and not exempt:
             named.append(row)
     latest = _latest_rollup_rows(named)
     if latest is None:
@@ -280,7 +269,7 @@ def _judge_status_rollup_rows(
             failing.append(name)
         elif result == "PENDING":
             pending.append(name)
-    return failing, pending, sum(1 for row in latest if _rollup_name(row) not in policy.names)
+    return failing, pending, len(latest)
 
 
 def bound_rollup_states(
@@ -312,13 +301,11 @@ def bound_rollup_judgment(
     advisory = prove_external_advisory(repo, head, names, get_json)
     if advisory is None:
         return None
-    # gh's rollup omits workflow/app identity. Both supersession and a single
-    # advisory candidate need check runs joined to exact-head Actions runs.
-    policy = load_advisory_checks()
+    # gh's rollup omits workflow/app identity. Supersession of a duplicate
+    # name needs check runs joined to exact-head Actions runs.
     if isinstance(rows, list) and any(
-        isinstance(row, dict) and row.get("name") and not row.get("workflowName")
-        and (_duplicate_check_names(rows) or row["name"] in policy.names) for row in rows
-    ):
+        isinstance(row, dict) and row.get("name") and not row.get("workflowName") for row in rows
+    ) and _duplicate_check_names(rows):
         page = _read_all_pages(get_json, f"repos/{repo}/commits/{head}/check-runs?filter=all&per_page=100", "check_runs")
         if page is None:
             return None
@@ -375,18 +362,15 @@ def external_check_states(rows, parse, bound_states):
 
 
 def parse_checks(rows):
-    """Parse gh check buckets with the hook's advisory and unknown-state policy."""
+    """Parse gh check buckets with the hook's unknown-state policy; every named check blocks."""
     if not isinstance(rows, list):
         return None
-    policy = load_advisory_checks()
     failing, pending = [], []
     for row in rows:
         if not isinstance(row, dict):
             return None
         name = str(row.get("name") or "")
-        if "${{" in name or is_advisory(
-            name, workflow=row.get("workflow"), policy=policy
-        ):
+        if "${{" in name:
             continue
         bucket = str(row.get("bucket") or row.get("state") or "").lower()
         if bucket in _FAIL_BUCKETS:
@@ -574,7 +558,7 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
         failing, pending, judged = states
         reason = readiness_reason(meta, (failing, pending))
         if not reason and not judged:
-            # Nothing ran (or only advisory checks ran) on this head: no CI result exists to land on.
+            # Nothing ran (or only proven external advisory checks ran) on this head: no CI result to land on.
             reason = NO_CHECKS
         if match_head is not None and meta["headRefOid"].lower() != match_head.lower():
             reason = "reviewed head changed"

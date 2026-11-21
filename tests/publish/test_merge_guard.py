@@ -8,24 +8,6 @@ from lu_machinery.opsec.prepublish import PublishBlocked
 from lu_machinery.publish.merge_guard import ensure_merge_ready
 
 
-
-
-
-
-@pytest.fixture(autouse=True)
-def _advisory_fixture_workflow(monkeypatch):
-    """The real ci.yml has no advisory job; cover the rule with a fixture workflow."""
-    from lu_machinery.ci import advisory_checks
-
-    load = advisory_checks.load_advisory_checks
-    fixture = Path(__file__).resolve().parents[2] / "tests/fixtures/ci_advisory_workflow.yml"
-    from lu_machinery.publish import merge_guard
-    def reader(path=None):
-        return load(path or fixture)
-    monkeypatch.setattr(advisory_checks, "load_advisory_checks", reader)
-    monkeypatch.setattr(merge_guard, "load_advisory_checks", reader)
-
-
 def merge_with_checks(stdout, returncode=0):
     def runner(args, **kwargs):
         if args[1] == "api":
@@ -70,8 +52,6 @@ def test_unestablished_check_state_is_refused(stdout):
         merge_with_checks(stdout)
 
 
-_ADVISORY_ROW = {"__typename": "CheckRun", "name": "Component shadow (advisory)", "status": "COMPLETED",
-                 "conclusion": "SUCCESS"}
 _NO_CHECKS = "OPSEC: merge refused: NO_CHECKS: the head has no blocking check."
 
 
@@ -79,14 +59,9 @@ _NO_CHECKS = "OPSEC: merge refused: NO_CHECKS: the head has no blocking check."
     (0, "[]", None),
     # gh's real answer for a head with no checks: exit 1, no output ("no checks reported").
     (1, "", []),
-    (0, json.dumps([{"name": "Component shadow (advisory)", "bucket": "pass", "workflow": "CI"}]),
-     [{**_ADVISORY_ROW, "workflowName": "CI"}]),
-    # An advisory job name from another workflow still blocks on failure, but proves no blocking check.
-    (0, json.dumps([{"name": "Component shadow (advisory)", "bucket": "pass"}]),
-     [{**_ADVISORY_ROW, "workflowName": "Nightly"}]),
 ])
 def test_head_without_a_blocking_check_is_refused(returncode, stdout, rollup):
-    """Defect class: a head whose CI never ran (zero checks, or advisory checks only) passed as all-green."""
+    """Defect class: a head whose CI never ran (zero checks) passed as all-green."""
     def runner(args, **kwargs):
         if args[2] == "checks":
             return subprocess.CompletedProcess(args, returncode, stdout, "no checks reported" if returncode else "")
@@ -118,18 +93,17 @@ def test_empty_json_check_list_with_exit_code_1_is_refused():
         merge_with_checks("[]", returncode=1)
 
 
-def test_failing_advisory_check_with_exit_code_1_allows_merge():
-    checks = [
-        {"name": "CI Gate", "bucket": "pass"},
-        {"name": "Component shadow (advisory)", "bucket": "fail", "workflow": "CI"},
-    ]
-    assert merge_with_checks(json.dumps(checks), returncode=1) == "a" * 40
-
-
 @pytest.mark.parametrize("identity", [
-    {}, {"workflow": None}, {"workflow": ""}, {"workflow": "Nightly"}, {"workflowName": "CI"},
+    {"workflow": "CI"}, {}, {"workflow": None}, {"workflow": ""}, {"workflow": "Nightly"}, {"workflowName": "CI"},
 ])
-def test_failing_advisory_name_without_ci_workflow_blocks_merge(identity):
+def test_failing_continue_on_error_job_blocks_merge(monkeypatch, tmp_path, identity):
+    """Defect class: ci.yml's continue-on-error flag exempts a failing job's check from the merge guard (C-6339)."""
+    from lu_machinery.ci import advisory_checks
+
+    workflow = tmp_path / ".github/workflows/ci.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_bytes((Path(__file__).resolve().parents[2] / "tests/fixtures/ci_advisory_workflow.yml").read_bytes())
+    monkeypatch.setattr(advisory_checks, "product_root", lambda *_args, **_kwargs: tmp_path)
     checks = [
         {"name": "CI Gate", "bucket": "pass"},
         {"name": "Component shadow (advisory)", "bucket": "fail", **identity},
@@ -139,7 +113,6 @@ def test_failing_advisory_name_without_ci_workflow_blocks_merge(identity):
 
 
 # --- OO-48 external advisory provenance (#11184) ------------------------------------------
-# The publisher/hook parity matrix lives in tests/test_advisory_checks.py.
 
 HEAD = "a" * 40
 ENTIRE_ROWS = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": "Entire Gates", "bucket": "pending"}]
