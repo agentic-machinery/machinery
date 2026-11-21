@@ -9,6 +9,36 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.47"></a>
+## [0.1.47] - 2026-11-21
+
+### Added
+
+- Registry-driven alert scan and routed fix brief (#1077) ([#1082](https://github.com/learn-ukrainian/machinery/pull/1082))
+- Add fleet agent CLI version and sign-in health check ([#1079](https://github.com/learn-ukrainian/machinery/pull/1079))
+
+### Changed
+
+- Cover Ukrainian source claim recorder gates ([#1059](https://github.com/learn-ukrainian/machinery/pull/1059))
+- Record capped work and carry blockers to successors ([#1084](https://github.com/learn-ukrainian/machinery/pull/1084))
+
+### Fixed
+
+- Refuse zero-check heads, pin the keeper landing kind (#1049) ([#1051](https://github.com/learn-ukrainian/machinery/pull/1051))
+- Pin head and queue in closeout enqueue; hook refuses zero-check merges (#1057) ([#1058](https://github.com/learn-ukrainian/machinery/pull/1058))
+- Prevent attested effort leaks and skip unknown-effort head pairs ([#1061](https://github.com/learn-ukrainian/machinery/pull/1061))
+- Honor supported dispatch effort ([#1064](https://github.com/learn-ukrainian/machinery/pull/1064))
+- Every PR check blocks; drop ci.yml advisory exemption (#1054) ([#1067](https://github.com/learn-ukrainian/machinery/pull/1067))
+- Lift wcmatch past GHSA-53pm-wgxf-c6qf and triage CodeQL #42 ([#1068](https://github.com/learn-ukrainian/machinery/pull/1068))
+- Use the supervisor settlement closeout receipt ([#1085](https://github.com/learn-ukrainian/machinery/pull/1085))
+- Admit external recipient jean ([#1090](https://github.com/learn-ukrainian/machinery/pull/1090))
+- Recover one round after an attested provider failure ([#1088](https://github.com/learn-ukrainian/machinery/pull/1088))
+- Name both custody forms and show keeper disposition ([#1089](https://github.com/learn-ukrainian/machinery/pull/1089))
+- Refuse unsupported ACP ask effort before enqueue ([#1091](https://github.com/learn-ukrainian/machinery/pull/1091))
+- Specify both Ukrainian reply forms ([#1092](https://github.com/learn-ukrainian/machinery/pull/1092))
+- Surface Codex policy refusals ([#1095](https://github.com/learn-ukrainian/machinery/pull/1095))
+- Count review usage only for typed or evidenced reviews ([#1094](https://github.com/learn-ukrainian/machinery/pull/1094))
+
 <a id="v0.1.46"></a>
 ## [0.1.46] - 2026-11-21
 
@@ -1180,7 +1210,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.46...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.47...HEAD
+[0.1.47]: https://github.com/learn-ukrainian/machinery/compare/v0.1.46...v0.1.47
 [0.1.46]: https://github.com/learn-ukrainian/machinery/compare/v0.1.45...v0.1.46
 [0.1.45]: https://github.com/learn-ukrainian/machinery/compare/v0.1.44...v0.1.45
 [0.1.44]: https://github.com/learn-ukrainian/machinery/compare/v0.1.43...v0.1.44
