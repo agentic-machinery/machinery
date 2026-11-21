@@ -7,13 +7,18 @@ Owner order, 2026-11-21: release when a change is ready, not on a schedule.
 ## Decision
 
 1. A machinery release is cut as soon as a ready change is on a green `main`.
-   Ready means a change has merged (a post-release PR alone does not count)
-   and the newest `CI Gate` push run on `main`'s HEAD has passed.
-2. The 06:00 and 18:00 UTC timer stays as a safety net. It skips when nothing
-   new has merged since the last full release.
-3. The urgent-hotfix rule stays: an urgent fix is released at once. Other fixes
-   are no longer held for a later window; they are released when ready too.
-4. The rules stay: never rebuild or replace a published version, and never
+   Ready means a change has merged (a post-release PR alone does not count),
+   the previous release's post-release PR has merged too, and the newest
+   `CI Gate` push run on `main`'s HEAD has passed. These are the conditions
+   of the cut's preflight.
+2. There is no release schedule and no fixed window. No 06:00 or 18:00 UTC
+   safety-net run is part of the procedure.
+3. `claude-cto` runs every cut, so cuts never overlap. Workers and drivers
+   report a merged change to `claude-cto` instead of running the cut.
+4. The urgent-hotfix rule stays: an urgent fix is released at once. Other
+   fixes are no longer held for a later window; they are released when ready
+   too.
+5. The rules stay: never rebuild or replace a published version, and never
    move a tag.
 
 ## What it replaces
@@ -30,8 +35,13 @@ A fixed window made a finished change wait for hours with no gain. The cut
 already checks everything that matters, and it skips when nothing changed, so
 cutting earlier costs nothing extra.
 
+## Residual
+
+The release tool has no lock of its own. One runner is what keeps two cuts
+from overlapping. A lock inside the tool is a separate follow-up owned by
+`claude-cto`.
+
 ## Scope
 
-`docs/release.md` carries the runbook. The release tool, the host timer and
-host units are not changed by this record; the host side is handled
-separately by `claude-cto`.
+`docs/release.md` carries the runbook. The release tool is not changed by
+this record.

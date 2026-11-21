@@ -12,18 +12,21 @@ RELEASE-8H-CANARY-AT-CUT-1115. See
 [the decision record](decisions/2026-11-21-release-when-ready.md).
 
 A machinery release is cut as soon as a ready change is on a green `main`.
-Nobody waits for a window. A change is ready when it has merged (a
-post-release PR alone does not count) and the newest `CI Gate` push run on
-`main`'s HEAD has passed. The release is one command (Cut a release) that an
-agent or a host timer runs. It tags `main`'s HEAD; there is no release PR.
-`main` already carries the next version, because each release ends by
-opening the post-release PR that records its changelog and moves the version
-files on.
+There is no schedule and nobody waits for a window. A change is ready when it
+has merged (a post-release PR alone does not count), the previous release's
+post-release PR has also merged (so `main` carries the next version), and the
+newest `CI Gate` push run on `main`'s HEAD has passed. These are the
+conditions the cut's preflight checks (see Cut a release); a cut that starts
+earlier is refused.
 
-The timer at 06:00 and 18:00 UTC stays as a safety net, not as the schedule.
-It runs the same command and catches a change that nobody cut right away. It
-skips (exit 0, `unchanged`) when nothing but the post-release PR has merged
-since the last full release, so it does nothing on a quiet day.
+`claude-cto` runs every cut, on the host, as one command (Cut a release). A
+worker or driver does not run it: when its change has merged, it tells
+`claude-cto` in its report. One runner means two cuts never overlap. The cut
+tags `main`'s HEAD; there is no release PR. `main` already carries the next
+version, because each release ends by opening the post-release PR that
+records its changelog and moves the version files on. The command skips
+(exit 0, `unchanged`) when nothing but the post-release PR has merged since
+the last full release.
 
 An urgent bug gets a hotfix release the same way: the same command, as soon
 as the fix is on a green `main`. Any other bug is fixed in a follow-up PR,
