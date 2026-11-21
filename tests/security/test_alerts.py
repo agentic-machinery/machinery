@@ -1,8 +1,9 @@
-"""Tests for lu_machinery.security.alerts (issue #1077)."""
+"""Tests for lu_machinery.security.alerts (issues #1077 and #1081)."""
 
 from __future__ import annotations
 
 import ast
+import base64
 from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
@@ -14,14 +15,20 @@ import yaml
 from lu_machinery.common.github_client import Result
 from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
 from lu_machinery.review.model_catalog import CATALOG_PATH
+from lu_machinery.security import alerts as alerts_module
 from lu_machinery.security.alerts import (
     METRIC_FEATURE_ENABLED,
+    METRIC_FLEET_SECURITY_FINDINGS,
+    METRIC_FLEET_SECURITY_STATE,
     METRIC_OPEN_ALERTS,
     METRIC_SOURCE_OK,
     build_fix_brief,
     scan_fleet_alerts,
     write_prometheus_textfile,
 )
+
+_PIN = "0123456789abcdef0123456789abcdef01234567"
+_HEAD = "a" * 40
 
 
 class _FakeGitHubClient:
@@ -35,6 +42,88 @@ class _FakeGitHubClient:
         assert method == "GET"
         self.calls.append(endpoint)
         return self._handler(endpoint)
+
+
+def _workflow_file(text: str) -> dict[str, Any]:
+    raw = text.encode()
+    return {
+        "type": "file",
+        "encoding": "base64",
+        "size": len(raw),
+        "content": base64.b64encode(raw).decode("ascii"),
+        "path": ".github/workflows/security.yml",
+    }
+
+
+def _enrolled_workflow(pin: str = _PIN) -> str:
+    return (
+        "name: security\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  fleet-security:\n"
+        f"    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{pin}\n"
+    )
+
+
+def _clean_fleet(endpoint: str, slug: str) -> Result | None:
+    """Answer the enrollment reads with a successful gate and no findings."""
+    if "/alerts" in endpoint:
+        return None
+    path = endpoint.split("?", 1)[0]
+    if path == f"repos/{slug}":
+        return Result(status=200, value={"default_branch": "main"})
+    if path == f"repos/{slug}/contents/.github/workflows":
+        return Result(
+            status=200,
+            value=[{"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"}],
+        )
+    if path == f"repos/{slug}/contents/.github/workflows/security.yml":
+        return Result(status=200, value=_workflow_file(_enrolled_workflow()))
+    if path == f"repos/{slug}/actions/workflows/security.yml/runs":
+        return Result(
+            status=200,
+            value={
+                "total_count": 1,
+                "workflow_runs": [
+                    {
+                        "id": 5,
+                        "path": ".github/workflows/security.yml",
+                        "head_branch": "main",
+                        "head_sha": _HEAD,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "html_url": f"https://github.com/{slug}/actions/runs/5",
+                    }
+                ],
+            },
+        )
+    if path == f"repos/{slug}/actions/runs/5/jobs":
+        return Result(
+            status=200,
+            value={
+                "total_count": 1,
+                "jobs": [
+                    {
+                        "id": 9,
+                        "name": "fleet-security / Fleet security gate",
+                        "conclusion": "success",
+                        "check_run_url": f"https://api.github.com/repos/{slug}/check-runs/9",
+                    }
+                ],
+            },
+        )
+    if path == f"repos/{slug}/check-runs/9/annotations":
+        return Result(status=200, value=[])
+    return None
+
+
+def _series(prom: str, metric: str, labels: dict[str, str], value: str) -> bool:
+    for line in prom.splitlines():
+        if not line.startswith(f"{metric}{{"):
+            continue
+        if all(f'{key}="{label}"' in line for key, label in labels.items()) and line.rsplit(" ", 1)[-1] == value:
+            return True
+    return False
 
 
 def _write_registry(tmp_path: Path, repos: dict[str, dict[str, Any]]) -> Path:
@@ -125,6 +214,9 @@ def test_scan_feature_disabled_is_not_zero(tmp_path: Path) -> None:
     )
 
     def respond(endpoint: str) -> Result:
+        served = _clean_fleet(endpoint, "org/disabled-repo")
+        if served is not None:
+            return served
         if "code-scanning/alerts" in endpoint:
             return Result(
                 status=403,
@@ -265,6 +357,9 @@ def test_brief_routes_through_catalog() -> None:
     }
 
     def respond(endpoint: str) -> Result:
+        served = _clean_fleet(endpoint, "example-org/example-app")
+        if served is not None:
+            return served
         if "code-scanning/alerts" in endpoint:
             return Result(
                 status=200,
@@ -353,3 +448,311 @@ def test_brief_routes_through_catalog() -> None:
         for model_id in forbidden_models:
             assert model_id not in source, f"model literal {model_id!r} found in {py_file.name}"
             assert all(model_id not in lit for lit in literals)
+
+
+def _repo_row(slug: str, *, default: bool = False) -> dict[str, Any]:
+    name = slug.split("/", 1)[1]
+    return {"github": slug, "local_name": name, "role": "public-app", "default": default}
+
+
+def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
+    """Defect class: missing enrollment, inaccessible evidence and zero findings reported as the same state."""
+    registry = _write_registry(
+        tmp_path,
+        {
+            "missing": _repo_row("org/missing", default=True),
+            "unpinned": _repo_row("org/unpinned"),
+            "hidden": _repo_row("org/hidden"),
+            "clean": _repo_row("org/clean"),
+            "dirty": _repo_row("org/dirty"),
+            "broken": _repo_row("org/broken"),
+            "noisy": _repo_row("org/noisy"),
+            "foreign": _repo_row("org/foreign"),
+        },
+    )
+    dirty_annotations = [
+        {"message": "ShellCheck SC2086 (warning) at scripts/run.sh:10:1"},
+        {"message": "ShellCheck SC2000 (error) at ../secrets.sh:1:1"},
+        {
+            "message": (
+                "Trivy image vuln CVE-2024-0001 (HIGH) pkg 1.0 (fixed: 2.0) in "
+                "image|alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            )
+        },
+        {"message": "actionlint [syntax] at .github/workflows/ci.yml:3:1\x1b[31m"},
+    ]
+    unpinned_text = (
+        "jobs:\n"
+        "  a:\n"
+        "    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@main\n"
+        '    uses: "learn-ukrainian/machinery/.github/workflows/fleet-security.yml@abc1234"\n'
+        "    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@"
+        "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n"
+    )
+
+    def _jobs(slug: str, *, conclusion: str, total: int, jobs: list[dict[str, Any]], link: str | None = None) -> Result:
+        headers = {"link": f"<{link}>; rel=\"next\""} if link else {}
+        return Result(status=200, headers=headers, value={"total_count": total, "jobs": jobs})
+
+    def _job(slug: str, job_id: int, name: str, conclusion: str, check_id: int) -> dict[str, Any]:
+        return {
+            "id": job_id,
+            "name": name,
+            "conclusion": conclusion,
+            "check_run_url": f"https://api.github.com/repos/{slug}/check-runs/{check_id}",
+        }
+
+    def respond(endpoint: str) -> Result:
+        if "evil/other" in endpoint:
+            raise AssertionError(endpoint)
+        if "/alerts" in endpoint:
+            if "secret-scanning" in endpoint:
+                assert "hide_secret=true" in endpoint
+            return Result(status=200, value=[])
+        path = endpoint.split("?", 1)[0]
+        if path == "repos/org/hidden":
+            return Result(status=404, error="github_http_error", value={"message": "Not Found"})
+        if path in {
+            "repos/org/missing",
+            "repos/org/unpinned",
+            "repos/org/clean",
+            "repos/org/dirty",
+            "repos/org/broken",
+            "repos/org/noisy",
+            "repos/org/foreign",
+        }:
+            return Result(status=200, value={"default_branch": "main"})
+        if path == "repos/org/missing/contents/.github/workflows":
+            return Result(status=404, error="github_http_error", value={"message": "Not Found"})
+        if path.endswith("/contents/.github/workflows"):
+            return Result(
+                status=200,
+                value=[
+                    {"name": "README.md", "path": f"{path.removeprefix('repos/').split('/', 2)[-1]}/README.md", "type": "file"},
+                    {"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"},
+                ],
+            )
+        if path.endswith("/contents/.github/workflows/security.yml"):
+            text = unpinned_text if "org/unpinned/" in path else _enrolled_workflow()
+            return Result(status=200, value=_workflow_file(text))
+        if path.endswith("/actions/workflows/security.yml/runs"):
+            slug = path.split("/")[1] + "/" + path.split("/")[2]
+            return Result(
+                status=200,
+                value={
+                    "total_count": 1,
+                    "workflow_runs": [
+                        {
+                            "id": 5,
+                            "path": ".github/workflows/security.yml",
+                            "head_branch": "main",
+                            "head_sha": _HEAD,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "html_url": f"https://github.com/{slug}/actions/runs/5",
+                        }
+                    ],
+                },
+            )
+        if path == "repos/org/clean/actions/runs/5/jobs":
+            return _jobs("org/clean", conclusion="success", total=1, jobs=[_job("org/clean", 9, "fleet-security / Fleet security gate", "success", 9)])
+        if path == "repos/org/dirty/actions/runs/5/jobs":
+            return _jobs(
+                "org/dirty",
+                conclusion="failure",
+                total=2,
+                jobs=[
+                    _job("org/dirty", 8, "fleet-security / ShellCheck", "failure", 8),
+                    _job("org/dirty", 9, "fleet-security / Fleet security gate", "failure", 9),
+                ],
+            )
+        if path == "repos/org/broken/actions/runs/5/jobs":
+            return _jobs("org/broken", conclusion="failure", total=1, jobs=[_job("org/broken", 9, "Fleet security gate", "failure", 11)])
+        if path == "repos/org/noisy/actions/runs/5/jobs":
+            return _jobs("org/noisy", conclusion="success", total=1, jobs=[_job("org/noisy", 9, "Fleet security gate", "success", 12)])
+        if path == "repos/org/foreign/actions/runs/5/jobs":
+            return _jobs(
+                "org/foreign",
+                conclusion="success",
+                total=2,
+                jobs=[_job("org/foreign", 9, "Fleet security gate", "success", 13)],
+                link="https://api.github.com/repos/evil/other/actions/runs/5/jobs?page=2",
+            )
+        if path == "repos/org/clean/check-runs/9/annotations":
+            return Result(status=200, value=[])
+        if path == "repos/org/dirty/check-runs/8/annotations":
+            return Result(status=200, value=dirty_annotations)
+        if path == "repos/org/dirty/check-runs/9/annotations":
+            return Result(status=200, value=[])
+        if path == "repos/org/broken/check-runs/11/annotations":
+            return Result(status=200, value=[{"message": "trivy fs target 'Dockerfile' is missing; failing closed"}])
+        if path == "repos/org/noisy/check-runs/12/annotations":
+            return Result(status=200, value=[{"message": "scanner finished"}])
+        if path == "repos/org/foreign/check-runs/13/annotations":
+            return Result(status=200, value=[])
+        raise AssertionError(endpoint)
+
+    client = _FakeGitHubClient(respond)
+    report = scan_fleet_alerts(registry_path=registry, client=client, clock=lambda: 1700000000.0)
+    states = {key: report["repositories"][key]["fleet_security"]["state"] for key in report["repositories"]}
+    assert states == {
+        "missing": "missing_enrollment",
+        "unpinned": "missing_enrollment",
+        "hidden": "inaccessible_evidence",
+        "clean": "zero_findings",
+        "dirty": "findings",
+        "broken": "inaccessible_evidence",
+        "noisy": "inaccessible_evidence",
+        "foreign": "inaccessible_evidence",
+    }
+    assert report["source_ok"] is True
+    missing = report["repositories"]["missing"]["fleet_security"]
+    assert missing["reason"] is None
+    assert missing["findings"] == []
+    unpinned = report["repositories"]["unpinned"]["fleet_security"]
+    assert unpinned["callers"] == []
+    assert {"path": ".github/workflows/security.yml", "ref": "main"} in unpinned["rejected_pins"]
+    assert {"path": ".github/workflows/security.yml", "ref": "abc1234"} in unpinned["rejected_pins"]
+    assert not any("/actions/workflows/" in call and "org/unpinned/" in call for call in client.calls)
+    assert not any("org/hidden/contents/" in call for call in client.calls)
+    hidden = report["repositories"]["hidden"]["fleet_security"]
+    assert hidden["reason"] == "github_http_404"
+    assert hidden["state"] != missing["state"]
+    assert report["repositories"]["broken"]["fleet_security"]["reason"] == "run_not_success"
+    assert report["repositories"]["noisy"]["fleet_security"]["reason"] == "unrecognized_annotations"
+    assert report["repositories"]["foreign"]["fleet_security"]["reason"] == "github_invalid_next_link"
+    assert not any("evil/other" in call for call in client.calls)
+    findings = report["repositories"]["dirty"]["fleet_security"]["findings"]
+    assert [item["rule"] for item in findings] == ["SC2086", "SC2000", "CVE-2024-0001"]
+    assert findings[0]["path"] == "scripts/run.sh"
+    assert findings[0]["severity"] == "medium"
+    assert findings[1]["path"] is None
+    assert findings[2]["path"] is None
+    assert findings[2]["scanner"] == "trivy-image"
+
+    prom = tmp_path / "states.prom"
+    write_prometheus_textfile(prom, report)
+    text = prom.read_text(encoding="utf-8")
+    assert _series(text, METRIC_FLEET_SECURITY_STATE, {"repo": "missing", "state": "missing_enrollment"}, "1.0")
+    assert _series(text, METRIC_FLEET_SECURITY_STATE, {"repo": "hidden", "state": "inaccessible_evidence"}, "1.0")
+    assert _series(text, METRIC_FLEET_SECURITY_STATE, {"repo": "clean", "state": "zero_findings"}, "1.0")
+    assert _series(text, METRIC_FLEET_SECURITY_STATE, {"repo": "dirty", "state": "findings"}, "1.0")
+    assert not _series(text, METRIC_FLEET_SECURITY_STATE, {"repo": "missing", "state": "zero_findings"}, "1.0")
+    assert not _series(text, METRIC_FLEET_SECURITY_STATE, {"repo": "hidden", "state": "missing_enrollment"}, "1.0")
+    assert not any(
+        line.startswith(f"{METRIC_FLEET_SECURITY_FINDINGS}{{") and 'repo="clean"' in line for line in text.splitlines()
+    )
+    assert _series(text, METRIC_FLEET_SECURITY_FINDINGS, {"repo": "dirty", "scanner": "shellcheck", "severity": "medium"}, "1.0")
+    assert _series(text, METRIC_FLEET_SECURITY_FINDINGS, {"repo": "dirty", "scanner": "trivy-image", "severity": "high"}, "1.0")
+
+    catalog = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
+    repos = {
+        key: FleetRepo(key=key, github=f"org/{key}", local_name=key, role="public-app", default=key == "missing")
+        for key in ("missing", "hidden", "dirty")
+    }
+    dirty_brief = build_fix_brief(
+        "dirty",
+        repos=repos,
+        client=client,
+        catalog=catalog,
+        task_id="sec-dirty",
+        prompt_file="brief.md",
+        clock=lambda: 1700000000.0,
+    )
+    assert "State: `findings`." in dirty_brief.brief_markdown
+    assert "SC2086" in dirty_brief.brief_markdown
+    assert "scripts/run.sh:10" in dirty_brief.brief_markdown
+    assert "code-scanning-dismiss" in dirty_brief.brief_markdown
+    assert "--owned-path scripts/run.sh" in dirty_brief.dispatch_command
+    assert "../secrets.sh" not in dirty_brief.dispatch_command
+    assert "image|" not in dirty_brief.dispatch_command
+    assert "\x1b" not in dirty_brief.brief_markdown
+    hidden_brief = build_fix_brief(
+        "hidden",
+        repos=repos,
+        client=client,
+        catalog=catalog,
+        task_id="sec-hidden",
+        prompt_file="brief.md",
+        clock=lambda: 1700000000.0,
+    )
+    assert "State: `inaccessible_evidence`." in hidden_brief.brief_markdown
+    assert "zero_findings" not in hidden_brief.brief_markdown
+    missing_brief = build_fix_brief(
+        "missing",
+        repos=repos,
+        client=client,
+        catalog=catalog,
+        task_id="sec-missing",
+        prompt_file="brief.md",
+        clock=lambda: 1700000000.0,
+    )
+    assert "State: `missing_enrollment`." in missing_brief.brief_markdown
+    assert "zero_findings" not in missing_brief.brief_markdown
+
+
+def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path) -> None:
+    """Defect class: a registry row is scanned only after a code change, and an unreadable private row looks unenrolled."""
+    source = Path(alerts_module.__file__).read_text(encoding="utf-8")
+    assert "fixture-added-repo" not in source
+    registry = _write_registry(
+        tmp_path,
+        {
+            "primary": _repo_row("org/primary", default=True),
+            "fixture-added-repo": _repo_row("org/fixture-added-repo"),
+        },
+    )
+
+    def respond_fixture(endpoint: str) -> Result:
+        if "/alerts" in endpoint:
+            return Result(status=200, value=[])
+        path = endpoint.split("?", 1)[0]
+        if path in {"repos/org/primary", "repos/org/fixture-added-repo"}:
+            return Result(status=200, value={"default_branch": "main"})
+        if path.endswith("/contents/.github/workflows"):
+            return Result(status=404, error="github_http_error", value={"message": "Not Found"})
+        raise AssertionError(endpoint)
+
+    added = scan_fleet_alerts(registry_path=registry, client=_FakeGitHubClient(respond_fixture), clock=lambda: 1700000000.0)
+    assert set(added["repositories"]) == {"primary", "fixture-added-repo"}
+    assert added["repositories"]["fixture-added-repo"]["fleet_security"]["state"] == "missing_enrollment"
+
+    catalog = load_fleet_repos()
+    assert len(catalog) == 8
+    assert {repo.key for repo in catalog.values() if repo.security_alerts} == set(catalog)
+    private = [repo for repo in catalog.values() if repo.role.startswith("private")]
+    assert private
+
+    def _catalog_client(*, authorize_private: bool) -> _FakeGitHubClient:
+        def respond(endpoint: str) -> Result:
+            if "/alerts" in endpoint:
+                return Result(status=200, value=[])
+            path = endpoint.split("?", 1)[0]
+            for repo in catalog.values():
+                if path == f"repos/{repo.github}":
+                    if repo.role.startswith("private") and not authorize_private:
+                        return Result(status=404, error="github_http_error", value={"message": "Not Found"})
+                    return Result(status=200, value={"default_branch": "main"})
+                if path == f"repos/{repo.github}/contents/.github/workflows":
+                    return Result(status=404, error="github_http_error", value={"message": "Not Found"})
+            raise AssertionError(endpoint)
+
+        return _FakeGitHubClient(respond)
+
+    blocked = _catalog_client(authorize_private=False)
+    blocked_report = scan_fleet_alerts(repos=catalog, client=blocked, clock=lambda: 1700000000.0)
+    assert set(blocked_report["repositories"]) == set(catalog)
+    for repo in private:
+        entry = blocked_report["repositories"][repo.key]["fleet_security"]
+        assert entry["state"] == "inaccessible_evidence"
+        assert entry["reason"] == "github_http_404"
+        assert any(call.split("?", 1)[0] == f"repos/{repo.github}" for call in blocked.calls)
+        assert not any(f"repos/{repo.github}/contents/" in call for call in blocked.calls)
+    readable = next(repo for repo in catalog.values() if not repo.role.startswith("private"))
+    assert blocked_report["repositories"][readable.key]["fleet_security"]["state"] == "missing_enrollment"
+
+    allowed = _catalog_client(authorize_private=True)
+    allowed_report = scan_fleet_alerts(repos=catalog, client=allowed, clock=lambda: 1700000000.0)
+    for repo in private:
+        assert allowed_report["repositories"][repo.key]["fleet_security"]["state"] == "missing_enrollment"
+        assert any(f"repos/{repo.github}/contents/.github/workflows" in call for call in allowed.calls)
