@@ -4,9 +4,13 @@ import hashlib
 import ipaddress
 import json
 import os
+import shlex
 import subprocess
 import sys
 import threading
+import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -443,6 +447,31 @@ def test_no_github_write_authority_is_reachable_inside_any_route(primary, monkey
         assert ("cursor_permissions" in result) == (mode == "read-only")
     else:
         assert "sources_mcp" not in result
+
+
+@pytest.mark.parametrize("planted", [True, False], ids=["policy-rollout", "plain-exit"])
+def test_codex_policy_refusal_survives_the_boundary_scratch(primary, planted):
+    """Defect class: a read-only Codex run's typed policy refusal is lost with the boundary's scratch, so the
+    supervisor can only report a plain exit and the driver re-dispatches to the refused route (#1083)."""
+    home = Path(write_boundary.os.environ["HOME"])
+    auth = home / ".codex/auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    millis = time.time_ns() // 1_000_000
+    thread = uuid.UUID(int=(millis << 80) | (7 << 76) | (0b10 << 62) | 1)  # UUIDv7 (RFC 9562 §5.7)
+    events = [{"type": "session_meta", "payload": {"id": str(thread)}},
+              {"type": "event_msg", "payload": {"type": "task_started", "turn_id": "turn-1"}},
+              {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1", "error": {
+                  "message": "provider text marker-1083", "codex_error_info": "cyber_policy"}}}]
+    day = datetime.fromtimestamp(millis / 1000, UTC)
+    rollout = f'"$CODEX_HOME/sessions/{day:%Y/%m/%d}/rollout-{day:%Y-%m-%dT%H-%M-%S}-{thread}.jsonl"'
+    body = "".join(json.dumps(event) + "\n" for event in events)
+    plant = f'mkdir -p "$(dirname {rollout})" && printf %s {shlex.quote(body)} > {rollout} && ' if planted else ""
+    code, receipt = _run(primary, plant + "exit 1", "--credential", str(auth), "--codex-auth", str(auth))
+    assert code == 1 and receipt["status"] == "ran", receipt
+    assert receipt.get("codex_policy") == ({"thread_id": str(thread), "code": "cyber_policy"} if planted else None)
+    assert "marker-1083" not in json.dumps(receipt)  # the code only, never the provider's text
+    assert not write_boundary.scratch("wb-test").exists()
 
 
 class _Launch:

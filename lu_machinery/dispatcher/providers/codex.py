@@ -1,5 +1,6 @@
 """Codex exec flags and JSONL output, extracted from the existing adapter."""
 
+import contextlib
 import copy
 import functools
 import hashlib
@@ -278,34 +279,111 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     return Invocation(argv, spec.prompt_file.read_bytes(), child_env, spec.final_file)
 
 
-def terminal_rollout_policy_code(stdout: str, codex_home: Path) -> str | None:
-    """Read the typed policy refusal for the one fresh turn bound to this exec stream."""
+def _fresh_failed_thread(stdout: str) -> UUID | None:
+    """The one fresh thread of this exec stream when its one turn failed, else None."""
     stream = parse_exec_stream(stdout)
     outcome = codex_outcome(stream, resumed_session_id=None)
     if outcome.state != "failed" or outcome.thread_id is None or stream.turns_started != 1:
         return None
     thread = UUID(outcome.thread_id)
+    return thread if thread.version == 7 else None
+
+
+def terminal_rollout_policy_code(stdout: str, codex_home: Path) -> str | None:
+    """Read the typed policy refusal for the one fresh turn bound to this exec stream."""
+    thread = _fresh_failed_thread(stdout)
+    return None if thread is None else _thread_policy_code(codex_home, thread)
+
+
+def task_home_policy(codex_home: Path) -> dict[str, str] | None:
+    """The typed policy refusal of the only rollout in a task-local CODEX_HOME, with its thread.
+
+    The read-only boundary's launcher calls this once its sandbox has stopped and before it removes the home.
+    No stdout binds the thread there, so the supervisor binds it later (``recorded_policy_code``).
+    """
+    try:
+        # Two are already too many: a run that planted more files gets no recorded code.
+        rollouts = _rollout_files(codex_home, (), 3, ".jsonl", 2)
+        if len(rollouts) != 1:
+            return None
+        thread = UUID(rollouts[0][-1].removesuffix(".jsonl")[-36:])
+    except (OSError, ValueError):
+        return None
     if thread.version != 7:
         return None
+    code = _thread_policy_code(codex_home, thread)
+    return None if code is None else {"thread_id": str(thread), "code": code}
 
+
+def recorded_policy_code(stdout: str, recorded: object) -> str | None:
+    """The boundary-recorded policy refusal when it names this exec stream's one fresh failed thread."""
+    thread = _fresh_failed_thread(stdout)
+    if thread is None or not isinstance(recorded, dict) or set(recorded) != {"thread_id", "code"}:
+        return None
+    code = recorded["code"]
+    if recorded["thread_id"] != str(thread) or not isinstance(code, str) or code not in _POLICY_REFUSALS:
+        return None
+    return code
+
+
+def _thread_policy_code(codex_home: Path, thread: UUID) -> str | None:
     # Codex names the rollout by local creation date and the fresh thread ID.
     # The high 48 bits of UUIDv7 give UTC milliseconds (RFC 9562 §5.7).
     try:
         created = datetime.fromtimestamp((thread.int >> 80) / 1000, UTC).date()
-        rollout = None
+        rollouts: list[tuple[str, ...]] = []
         for day_offset in (-1, 0, 1):
             day = created + timedelta(days=day_offset)
-            directory = codex_home / "sessions" / f"{day:%Y/%m/%d}"
-            for candidate in directory.glob(f"rollout-*-{thread}.jsonl"):
-                if rollout is not None:
-                    return None
-                rollout = candidate
-        if rollout is None:
+            with contextlib.suppress(FileNotFoundError):
+                rollouts += _rollout_files(codex_home, (f"{day:%Y}", f"{day:%m}", f"{day:%d}"), 0,
+                                           f"-{thread}.jsonl", 2)
+        if len(rollouts) != 1:
             return None
-        body = safe_read_attempt_file(rollout, trusted_root=codex_home)
+        body = safe_read_attempt_file(codex_home.joinpath(*rollouts[0]), trusted_root=codex_home)
         return _rollout_policy_code(body, str(thread))
     except (AttemptReadError, OSError, OverflowError, ValueError, RecursionError):
         return None
+
+
+_DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _rollout_files(codex_home: Path, parts: tuple[str, ...], levels: int, suffix: str, limit: int) -> list[tuple[str, ...]]:
+    """Up to ``limit`` paths, relative to ``codex_home``, of regular ``rollout-*<suffix>`` files exactly ``levels``
+    real directories below ``sessions/<parts>``.
+
+    A sandboxed run can write its own home, so every directory is opened without following a link, as the safe
+    reader opens its components: a planted link is never walked, and the walk costs only what the run created.
+    """
+    found: list[tuple[str, ...]] = []
+
+    def walk(fd: int, prefix: tuple[str, ...], depth: int) -> None:
+        with os.scandir(fd) as scan:
+            names = [entry.name for entry in scan
+                     if (entry.is_dir(follow_symlinks=False) if depth else entry.is_file(follow_symlinks=False))]
+        for name in names:
+            if len(found) >= limit:
+                return
+            if not depth:
+                if name.startswith("rollout-") and name.endswith(suffix):
+                    found.append((*prefix, name))
+                continue
+            child = os.open(name, _DIRECTORY, dir_fd=fd)
+            try:
+                walk(child, (*prefix, name), depth - 1)
+            finally:
+                os.close(child)
+
+    fd = os.open(codex_home, _DIRECTORY)
+    try:
+        for part in ("sessions", *parts):
+            child = os.open(part, _DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        walk(fd, ("sessions", *parts), levels)
+    finally:
+        os.close(fd)
+    return found
 
 
 def _rollout_policy_code(body: bytes, thread_id: str) -> str | None:

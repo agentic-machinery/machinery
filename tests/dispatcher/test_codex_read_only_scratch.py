@@ -432,6 +432,50 @@ def test_invalid_schema_result_cannot_settle_done(dispatch, monkeypatch, output,
         assert "structured_output_invalid" in settled["error"]
 
 
+_THREAD = "01a1ffab-2851-7251-9966-9ba9d341eb62"  # UUIDv7, as codex-cli 0.171.0 prints it
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(("recorded", "error"), [
+    ({"thread_id": _THREAD, "code": "cyber_policy"}, "codex: provider_policy_refusal (cyber_policy)"),
+    ({"thread_id": "01a1ffab-2851-7251-9966-9ba9d341eb63", "code": "cyber_policy"}, "codex: exited with status 1"),
+    ({"thread_id": _THREAD, "code": "provider text"}, "codex: exited with status 1"),
+    (None, "codex: exited with status 1"),
+], ids=["bound", "other-thread", "unknown-code", "plain-exit"])
+@pytest.mark.usefixtures("output_schema_hooks")
+def test_read_only_codex_policy_refusal_is_the_recorded_terminal_cause(dispatch, monkeypatch, capsys, recorded, error):
+    """Defect class: a read-only Codex run's typed policy refusal is lost with the boundary's scratch and reported
+    as a plain exit, so the driver re-dispatches to the refused route (#1083). Only the boundary's code for this
+    stream's own thread names the cause; an ordinary exit keeps its classification."""
+    spec, _record = dispatch.invoke(path=None)
+    path = store.record_path(spec.task_id)
+    (path.parent / "logs").mkdir()
+    provider = providers.load(spec.agent)
+    invocation = provider.build(spec, {})
+    monkeypatch.setattr(provider, "build", lambda *a: invocation)
+    monkeypatch.setattr(worker.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(worker.signal, "pthread_sigmask", lambda *a: None)
+    monkeypatch.setattr(git, "snapshot_delivery", lambda *a: {})
+    monkeypatch.setattr(worker, "_reap_settled", lambda *a, **k: None)
+    stream = [{"type": "thread.started", "thread_id": _THREAD}, {"type": "turn.started"},
+              {"type": "turn.failed", "error": {"message": "provider text"}}]
+
+    def popen(*a, **kw):
+        kw["stdout"].write("".join(json.dumps(event) + "\n" for event in stream).encode())
+        return SimpleNamespace(pid=None, returncode=1, wait=lambda *a, **kw: 1)
+
+    summary = {"status": "test-double", "mode": "read-only", "codex_policy": recorded}
+    monkeypatch.setattr(worker.write_boundary, "launcher", lambda _spec, invocation, _task: list(invocation.argv))
+    monkeypatch.setattr(worker.write_boundary, "verify", lambda _task, _id, mode="read-only": (summary, None))
+    monkeypatch.setattr(worker.subprocess, "Popen", popen)
+    worker.supervise(path, spec.options, 10)
+    settled = json.loads(path.read_text())
+    assert (settled["status"], settled["error"], settled["provider_terminal_error"]) == ("failed", error, error)
+    capsys.readouterr()
+    assert cli.main(["status", spec.task_id]) == 0
+    assert json.loads(capsys.readouterr().out)["error"] == error
+
+
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.usefixtures("output_schema_hooks")
 def test_codex_stderr_excerpt_redacts_secret_and_home_path():
