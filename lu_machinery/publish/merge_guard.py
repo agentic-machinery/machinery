@@ -235,11 +235,14 @@ def _parse_status_rollup_rows(
 
 def _judge_status_rollup_rows(
     rows: object, *, advisory: frozenset[str] = frozenset()
-) -> tuple[list[str], list[str], int] | None:
-    """``(failing, pending, judged)``: ``judged`` counts the blocking checks judged, whatever their result.
+) -> tuple[list[str], list[str], int | None] | None:
+    """``(failing, pending, judged)``: ``judged`` counts the checks proven blocking, whatever their result.
 
     Advisory checks, proven external advisory runs and unexpanded matrix parents are
-    not judged, so a head carrying only those has ``judged == 0``.
+    not judged, so a head carrying only those has ``judged == 0``. A judged row named
+    like an advisory job (its workflow identity missing or another workflow's) still
+    blocks on failure but proves no blocking check. ``judged`` is None when judged rows
+    exist but the advisory policy is unavailable, so no row's classification is known.
     """
     # Only a list is a check collection; null, {}, "" or false establish nothing.
     if not isinstance(rows, list):
@@ -277,7 +280,9 @@ def _judge_status_rollup_rows(
             failing.append(name)
         elif result == "PENDING":
             pending.append(name)
-    return failing, pending, len(latest)
+    if policy.reason is not None and latest:
+        return failing, pending, None
+    return failing, pending, sum(1 for row in latest if _rollup_name(row) not in policy.names)
 
 
 def bound_rollup_states(
@@ -290,7 +295,7 @@ def bound_rollup_states(
 
 def bound_rollup_judgment(
     bound: object, head: object, repo: object, get_json: Callable[[str], object]
-) -> tuple[list[str], list[str], int] | None:
+) -> tuple[list[str], list[str], int | None] | None:
     """Judge a ``headRefOid,statusCheckRollup`` read whose own head is the judged ``head``.
 
     The rollup and its head arrive in one response, so the judged rows, the App
@@ -566,7 +571,9 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
             )
         failing, pending, judged = states
         reason = readiness_reason(meta, (failing, pending))
-        if not reason and not judged:
+        if not reason and judged is None:
+            reason = "cannot establish check state (advisory policy unavailable; no check is provably blocking)"
+        elif not reason and not judged:
             # Nothing ran (or only advisory checks ran) on this head: no CI result exists to land on.
             reason = "NO_CHECKS: the head has no blocking check"
         if match_head is not None and meta["headRefOid"].lower() != match_head.lower():

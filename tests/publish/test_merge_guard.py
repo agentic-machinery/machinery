@@ -70,17 +70,34 @@ def test_unestablished_check_state_is_refused(stdout):
         merge_with_checks(stdout)
 
 
-@pytest.mark.parametrize("returncode,stdout,rollup", [
-    (0, "[]", None),
+_ADVISORY_ROW = {"__typename": "CheckRun", "name": "Component shadow (advisory)", "status": "COMPLETED",
+                 "conclusion": "SUCCESS"}
+_NO_CHECKS = "OPSEC: merge refused: NO_CHECKS: the head has no blocking check."
+
+
+@pytest.mark.parametrize("returncode,stdout,rollup,policy_readable,refusal", [
+    (0, "[]", None, True, _NO_CHECKS),
     # gh's real answer for a head with no checks: exit 1, no output ("no checks reported").
-    (1, "", []),
-    (0, json.dumps([{"name": "Component shadow (advisory)", "bucket": "pass", "workflow": "CI"}]), [
-        {"__typename": "CheckRun", "name": "Component shadow (advisory)", "workflowName": "CI",
-         "status": "COMPLETED", "conclusion": "SUCCESS"},
-    ]),
+    (1, "", [], True, _NO_CHECKS),
+    (0, json.dumps([{"name": "Component shadow (advisory)", "bucket": "pass", "workflow": "CI"}]),
+     [{**_ADVISORY_ROW, "workflowName": "CI"}], True, _NO_CHECKS),
+    # Without the advisory policy no row is provably blocking, so the advisory-only head cannot pass.
+    (0, json.dumps([{"name": "Component shadow (advisory)", "bucket": "pass", "workflow": "CI"}]),
+     [{**_ADVISORY_ROW, "workflowName": "CI"}], False,
+     "OPSEC: merge refused: cannot establish check state (advisory policy unavailable; no check is provably blocking)."),
+    # An advisory job name from another workflow still blocks on failure, but proves no blocking check.
+    (0, json.dumps([{"name": "Component shadow (advisory)", "bucket": "pass"}]),
+     [{**_ADVISORY_ROW, "workflowName": "Nightly"}], True, _NO_CHECKS),
 ])
-def test_head_without_a_blocking_check_is_refused(returncode, stdout, rollup):
+def test_head_without_a_blocking_check_is_refused(returncode, stdout, rollup, policy_readable, refusal, monkeypatch, tmp_path):
     """Defect class: a head whose CI never ran (zero checks, or advisory checks only) passed as all-green."""
+    if not policy_readable:
+        from lu_machinery.ci import advisory_checks
+        from lu_machinery.publish import merge_guard
+
+        load = advisory_checks.load_advisory_checks
+        monkeypatch.setattr(merge_guard, "load_advisory_checks", lambda path=None: load(tmp_path / "missing-ci.yml"))
+
     def runner(args, **kwargs):
         if args[2] == "checks":
             return subprocess.CompletedProcess(args, returncode, stdout, "no checks reported" if returncode else "")
@@ -92,7 +109,7 @@ def test_head_without_a_blocking_check_is_refused(returncode, stdout, rollup):
 
     with pytest.raises(PublishBlocked) as refused:
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
-    assert str(refused.value) == "OPSEC: merge refused: NO_CHECKS: the head has no blocking check."
+    assert str(refused.value) == refusal
 
 
 @pytest.mark.parametrize("returncode", [2, 3])
