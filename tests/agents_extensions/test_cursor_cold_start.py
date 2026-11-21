@@ -51,7 +51,7 @@ def test_cursor_cold_start_fetches_api_rules(monkeypatch: pytest.MonkeyPatch, ca
                 }
             )
         if url.endswith("/api/orient"):
-            return _FakeResp({"git": {"branch": "main", "head": "deadbeef00"}})
+            return _FakeResp({"git": None, "delegate": None, "health": None, "governance": None})
         raise AssertionError(url)
 
     monkeypatch.setattr(cursor_cold_start.urllib.request, "urlopen", fake_urlopen)
@@ -61,3 +61,7 @@ def test_cursor_cold_start_fetches_api_rules(monkeypatch: pytest.MonkeyPatch, ca
     assert "fetched /api/rules" in out
     assert "rules skipped" not in out
     assert "# contract" not in out
+    assert "(ahead unknown)" in out
+    assert "**delegate:** active count unknown" in out
+    assert "**health:** UNKNOWN" in out
+    assert "**governance:** unknown" in out

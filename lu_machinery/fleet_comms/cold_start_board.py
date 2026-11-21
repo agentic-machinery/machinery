@@ -280,25 +280,20 @@ def _summarize_orient_payload(payload: Any) -> dict[str, Any]:
     summaries (number/title/state); everything else is dropped here so the
     probe stays small regardless of the raw orient payload size (#8737).
     """
-    raw_issues: list[Any] = []
-    generated_at: Any = None
-    if isinstance(payload, dict):
-        generated_at = payload.get("generated_at")
-        candidate = payload.get("issues")
-        if isinstance(candidate, list):
-            raw_issues = candidate
-    issues: list[dict[str, Any]] = []
-    for issue in raw_issues[:5]:
-        if isinstance(issue, dict):
-            issues.append(
-                {
-                    "number": issue.get("number"),
-                    "title": str(issue.get("title", ""))[:80],
-                    "state": issue.get("state"),
-                }
-            )
+    data = payload if isinstance(payload, dict) else {}
+    candidate = data.get("issues")
+    issues = None
+    if isinstance(candidate, list):
+        issues = [
+            {
+                "number": issue.get("number"),
+                "title": str(issue.get("title", ""))[:80],
+                "state": issue.get("state"),
+            }
+            for issue in candidate[:5] if isinstance(issue, dict)
+        ]
     return {
-        "generated_at": generated_at,
+        "generated_at": data.get("generated_at"),
         "issues": issues,
     }
 
@@ -338,7 +333,7 @@ def _probe_orient_lean(
 
 def _probe_issues_streams_membership(orient_result: ProbeResult) -> dict[str, Any]:
     """Reuse the already-projected orient issue list (single projection)."""
-    issues: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] | None = None
     if orient_result.status == "ok" and isinstance(orient_result.data, dict):
         orient_data = orient_result.data.get("orient") or {}
         candidate = orient_data.get("issues")
@@ -347,7 +342,7 @@ def _probe_issues_streams_membership(orient_result: ProbeResult) -> dict[str, An
 
     return {
         "top_issues": issues,
-        "issue_count": len(issues),
+        "issue_count": len(issues) if issues is not None else None,
     }
 
 

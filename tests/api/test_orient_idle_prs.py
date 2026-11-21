@@ -221,7 +221,7 @@ def test_timeout_refresh_degrades_to_absent_cache():
     assert state_helpers.cache_get(api_main.IDLE_PR_CACHE_KEY, ttl=api_main.ORIENT_SECTION_TTLS["idle_prs"]) is None
     assert api_main._idle_pr_last_error.get("") == "gh_timeout"
 
-    result, meta = api_main._cached_idle_pr_section(timed_out, {"idle_prs": []})
+    result, meta = api_main._cached_idle_pr_section(timed_out)
 
-    assert result == {"idle_prs": []}
+    assert result is None
     assert meta["error"] == "gh_timeout"
