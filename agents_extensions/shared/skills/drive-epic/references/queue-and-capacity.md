@@ -48,7 +48,7 @@ count; `residual > 0` needs a next dispatch in the same session.
 ## §2b. Eggbot QA seat
 
 UI QA, design review, UX review and retests are tasked through the CTO's bot-gateway role, not
-through `dispatch.py`; ask the CTO over Fleet Comms. Eggbot is not a review of record and never
+through the dispatcher; ask the CTO over Fleet Comms. Eggbot is not a review of record and never
 merges; same-family Grok must not review an eggbot-authored PR. Contract:
 `docs/runbooks/grok-bot-qa-observer.md`.
 

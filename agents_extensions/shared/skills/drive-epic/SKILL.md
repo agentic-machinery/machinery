@@ -29,7 +29,8 @@ A dispatch, a branch, an open PR, green CI or "Next:" is **not** done. Deliver e
 the delivery skills: `full-send` (to MERGED and closeout, run by the briefed worker or by you),
 `full-stop` (ready-to-merge), `review-loop` (rounds and budget), entered through `takeover` or
 `modernize` for inherited or old work. A worker starts follow-ups only within its brief's cap.
-You land a PR yourself only when no brief owns it; never ask the operator to merge.
+You land a PR yourself only when no brief owns it, and only with a recorded exact-head APPROVE
+and a green same-head CI Gate (`workflow.md` § Merge policy); never ask the operator to merge.
 
 At each turn end and at session end:
 
@@ -64,12 +65,14 @@ needs evidence, dropped needs an operator reference): [handoff](references/hando
 
 1. **§0 Orient.** Cold-start board, lean orient, Work API projection, the stream's `next` list and
    `plane-status`; read your lane with `lu-driver-state render --lane <lane>` and
-   `lu-driver-state check --lane <lane>`. The launcher holds your lease; never claim it:
-   [orient](references/orient.md).
+   `lu-driver-state check --lane <lane>` (a launcher-provisioned wrapper, not part of the
+   release). The launcher holds your lease; never claim it: [orient](references/orient.md).
 2. **§0a Inbox drain.** A CTO demand (an URGENT order or blocker-report request) outranks all
    lane work. Answer within its deadline (default 10 minutes), one blocker line per named
-   deliverable ([lane-report](references/lane-report.md)); fix what you can, name the owner of
-   the rest; report again on every change.
+   deliverable ([lane-report](references/lane-report.md)). Then work the named deliverables and
+   their blockers first, until they land or the CTO releases them: fix any blocker you can, name
+   the owner of any you cannot, and let other ready work fill only the worker slots the demanded
+   deliverables cannot use. Report again on every change.
 3. **§0c / §0d Epic-specific rules.** Hramatka (#4542) and the core fresh build (#7994) add
    binding rules: [epic-specific](references/epic-specific.md).
 4. **§1 Topology and metrics.** Query `fleet_comms metrics`, `backlog`, `dead-letters`; never hold
@@ -85,9 +88,10 @@ needs evidence, dropped needs an operator reference): [handoff](references/hando
 7. **§4a Inbox drain** immediately before dispatch.
 8. **§4 Dispatch** only with a green task card and preflight, explicit model, research metadata
    and `--owned-path`.
-9. **§5 Settle.** Arm `dispatch.py wait <task-id>` (or Monitor) in the dispatch turn; state a
-   worker's status only after `dispatch.py status <task-id>` this turn and record its task ID, full
-   nonce, status and head in its tracker item.
+9. **§5 Settle.** Arm `.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>`
+   (or Monitor) in the dispatch turn; state a worker's status only after
+   `.venv/bin/python -m lu_machinery.dispatch status <task-id>` this turn, and record its task ID,
+   full nonce, status and head in its tracker item.
 10. **§5a Inbox drain** after settle.
 11. **§6 Review, §7 landing, §7a closeout, §7-rollout** run through the delivery skills above;
     the mechanics a driver still needs (the review launch recipe, red CI and queue kicks, the
@@ -103,17 +107,17 @@ to the CTO hourly, and every 30 minutes while an operator-priority outcome is op
 
 ## Escalate — do NOT decide these solo
 
-Ask Opus 5.5 / Sol 6.2 for review, critique and design input. Route these to the operator or to
-designated approval (rules core P6) and never resolve them from the loop:
+Ask Opus 5.5 / Sol 6.2 for review, critique and design input. Never resolve these from the loop;
+rules core P6 sets who decides each:
 
-1. Any architecture, layout or process change.
+1. Any architecture, layout or process change (designated approval, or the operator).
 2. A contested review verdict (author and reviewer disagree, or two reviewers split).
 3. A fragile fix: root-cause it, then escalate the design if the right layer is unclear.
 4. A high-risk route that would trip `risk_quality_floor` in `model_catalog.yaml`.
 5. A repo-wide safety interruption of another lane (generated artifacts, linter or Python-version
    bumps, cross-track architecture conflict).
-6. A production, Pages or public cutover without a present-tense operator GO; HA, new-server or
-   fenced cutovers; host access and security configuration (§7-rollout).
+6. **Operator only:** a production, Pages or public cutover (needs a present-tense GO), HA or a
+   new server, host access and security configuration, accounts and credentials (§7-rollout).
 
 Apply the risk floor to yourself too. Passing gates is necessary, not sufficient: verify the real
 artifact renders or runs before "ready".

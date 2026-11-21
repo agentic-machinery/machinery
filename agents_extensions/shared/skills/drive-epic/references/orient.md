@@ -7,7 +7,9 @@ stated once in the core `SKILL.md` loop.
 
 Read the pinned provider facts in `.claude/<lane>-epic/DRIVER-STATE.md`, then run
 `lu-driver-state render --lane <lane>` for open work and `lu-driver-state check --lane <lane>`
-(your assigned lane key). Treat `UNOWNED`, `STALE` and `OVERDUE` findings as a worklist. Read the
+(your assigned lane key). `lu-driver-state` is a wrapper the launcher environment puts on `PATH`,
+not a command of the installed release; if `command -v lu-driver-state` is empty, report the
+missing tool to the CTO and do not hand-edit tracker state. Treat `UNOWNED`, `STALE` and `OVERDUE` findings as a worklist. Read the
 program and plan first (the `operator_order` item and its child `goal` items; `lu-driver-state
 show <id>` gives full history), then standing orders, the latest `handoff_note`, in-flight work,
 blockers, decisions and next actions. The database is the lane's handoff; the markdown file is
@@ -35,8 +37,8 @@ never open or resume it. Session health by seat: **gemini** has a canary lane
 
 ## §0b. Fleet Comms inbox count — cold start
 
-The prompt hook `check-agent-inbox.sh` reports queued deliveries, and this body-free count is the
-one-shot equivalent:
+The prompt hook `check-agent-inbox.sh` (`agents_extensions/shared/hooks/`) reports queued
+deliveries, and this body-free count is the one-shot equivalent:
 
 ```bash
 .venv/bin/python -I -m lu_machinery.fleet_comms deliveries pending --recipient "$SESSION_HANDOFF_AGENT"

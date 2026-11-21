@@ -18,8 +18,8 @@ with synchronous dispatch and wait; its legacy `--background` flag is rejected. 
 lines excluding tests is a review-size signal, not a finding
 ([workflow.md § Merge policy](../../../rules/workflow.md#merge-policy--ready-prs-must-not-sit-4703-landing-order-7450)).
 
-Resolve the reviewer with `closeout_cli resolve-reviewer` (exact `--author-model`,
-`--review-profile`, `--risk`; step 2 of `review-loop`) and pass the same profile to the dispatch.
+Resolve the reviewer with `.venv/bin/python -m lu_machinery.review.closeout_cli --state-file <file>
+resolve-reviewer` (exact `--author-model`, `--review-profile`, `--risk`; step 2 of `review-loop`) and pass the same profile to the dispatch.
 `requires_silence_timeout` is boolean: when true, pass `--silence-timeout <seconds>` explicitly
 (default 3600) and confirm `silence_timeout` in the task record. Dispatch v2 resolves the locally
 available branch or the explicit `--pinned-head` SHA and does not fetch or freeze the remote
@@ -70,7 +70,7 @@ The outer subprocess timeout instead reports `dispatch.py wait timed out at proc
 while the original review may still be live. Either signal requires the same lookup and
 original-task wait recovery below; neither is a terminal task-record `timeout`.
 Ask itself does not expose the dispatch nonce (or rc 124 for client expiry). Set `REVIEW_TASK` to the original ask's task ID
-and `PRIMARY_REPO`/`PY` as above; query the live task record via `dispatch.py status`:
+and `PRIMARY_REPO`/`PY` as above; query the live task record via `.venv/bin/python -m lu_machinery.dispatch status`:
 
 ```bash
 set -euo pipefail
@@ -134,7 +134,7 @@ read-only dispatch (#8703; [accepted wording](../../review-loop/references/brief
    [`review-loop`'s Reply format](../../review-loop/references/brief.md#reply-format),
    included verbatim in the brief. That section alone defines the literal reply lines and
    how a structured findings request refers to the canonical schema.
-8. **Reliability checklist** — the `brief_section` that `closeout_cli checklist` prints for
+8. **Reliability checklist** — the `brief_section` that `lu_machinery.review.closeout_cli checklist` prints for
    this round's exact head, verbatim: the checklist items the diff triggers, the owner of
    every area it touches, and the rule that judge inputs are read from the merge-base
    ([`review-loop` brief](../../review-loop/references/brief.md#judge-inputs-come-from-the-merge-base)).
@@ -164,7 +164,8 @@ ids for suite results. Add no test and repeat no run.
 ## §7. Landing
 
 The gates are `workflow.md` § Merge policy; the delivery steps are `full-send` and `full-stop`,
-and the briefed worker enqueues its own PR. You land only a PR no brief owns, and flag another
+and the briefed worker enqueues its own PR once the exact-head APPROVE is recorded and the same-head CI
+Gate is green. You land only a PR no brief owns, and flag another
 lane's PR with `needs=merge` instead of merging it. Run the core inbox drain immediately before an
 enqueue and reconcile its messages with the approved head.
 
@@ -199,8 +200,8 @@ Epic drivers are not standing release owners. Gate rollout by charter:
 | **Local or service proof** after a change (restart Monitor API, smoke `/api/…`, UI check) | **Yes**, part of verifying the artifact |
 | **Routine host maintenance** (pull merged `main`; restart an updated or broken service after checking no active dispatch depends on it; install or enable a reviewed repo systemd user unit or timer; clean agent-generated caches, logs and worktrees; install OS packages a reviewed repo change needs), including sudo where the host needs it | **Yes**: do it, then report. Never ask the operator |
 | **Production, Pages or public cutover** | **Only on a present-tense operator GO**; listing it in the epic is scope, not a green light |
-| **HA, Patroni, new server or fenced cutover** | **Escalate**: operator or advisor GO; drive the checklist, never solo mutate |
-| **Host access and security configuration** (sshd, sudoers, user accounts, SSH keys and other credentials, firewall changes that could cut off operator access) | **Escalate**: operator-only (lock-out risk) |
+| **HA or a new server** (Patroni, new VPS, fenced cutover) | **Operator only**: needs the operator's present-tense GO; drive the checklist, never solo mutate |
+| **Host access and security configuration** (sshd, sudoers, user accounts, SSH keys and other credentials, firewall changes that could cut off operator access) | **Operator only** (lock-out risk) |
 
 Missing local proof on a user-visible API or UI change is incomplete closeout. Issue or PR wording
 never authorizes a cutover.
@@ -216,8 +217,9 @@ residual blocks closeout, and nothing is forced. You remove a retained worktree 
 content is published (checklist in [SKILL.md](../SKILL.md#delivery-and-done)). Stream leases are
 launcher-owned: never open, resume, claim, renew, release or replace one.
 
-**After a suspected secret leak:** run `scripts/audit/secret_scan_local.py tree` and `history`
-(offline); triage only through its `show-keys` and `count` subcommands (never `jq`, `cat` or
+**After a suspected secret leak:** from the product checkout, run
+`.venv/bin/python scripts/audit/secret_scan_local.py --repo <checkout> tree` and `history`
+(offline; the script is absent from this repository); triage only through its `show-keys` and `count` subcommands (never `jq`, `cat` or
 `grep` over the report); tell the operator privately that a report needs inspection and where it
 is on the host, with counts only; delete the report directory when triage ends; never rotate,
 revoke or rewrite history yourself. Runbook: `docs/runbooks/secret-scanning.md`.

@@ -12,7 +12,7 @@ linguistic and content review route only to the sanctioned language lanes), folk
 the fallback table; never block on one lane.
 
 Every agent that commits to a branch adds its model family to the branch's author families, and
-the reviewer must be outside all of them (`check_branch_author_families` in
+above the review policy's Low tier the reviewer must be outside all of them (`check_branch_author_families` in
 `lu_machinery/dispatcher/checks.py`). The Ukrainian review profile
 (`agents_extensions/shared/skills/review-loop/references/ukrainian.md`) seats only Gemini and Sol,
 so a takeover successor or helper on a Ukrainian content branch stays with the family already
@@ -52,11 +52,10 @@ Before **every** implement `dispatch`:
    evidence).
 2. **No card, no dispatch.** Do not launch the worker and write the card later; dispatch v2 does
    not run the retired DoR preflight, so the driver checks the card before launch.
-3. Default eligible code worker, advisory path, Luna and Flash envelopes, Cursor and Gemini
-   overflow: `fleet-driver-routing.md` §2 and `model-assignment.md`. `dispatch.py` refuses a
-   Luna dispatch, and a Flash one not classified Ukrainian authoring or review, without an
-   advisory envelope bound through `--advisory-task`. Do not spend an advisory seat on lockfile,
-   pointer or smoke jobs.
+3. Default eligible code worker, advisory path, Luna and Flash admission (including the bounded
+   read-only and bounded-implementation exceptions and the advisory envelope bound through
+   `--advisory-task`), and Cursor and Gemini overflow: rules core P2, `fleet-driver-routing.md`
+   §2 and `model-assignment.md`. Do not spend an advisory seat on lockfile, pointer or smoke jobs.
 4. After three or more implement dispatches this session, use at least two agents and two tiers,
    or write `NOTE: fleet_breadth` with tool-backed blockers.
 5. Before handoff, run and attach:
@@ -72,7 +71,7 @@ Fixation on one seat while free lanes sit idle is a utilization failure (§2c).
 Freeze the exact prompt before presenting or routing it. Record its SHA-256, the user-visible
 outcome, the real-world or source denominator, non-goals, role map, independent held-out
 evaluation, stop and residual policy, and the completion vocabulary. A non-goal that shrinks the
-actual mission needs operator or advisor approval. Discovery, seeds, prototypes, schemas,
+actual mission needs designated approval or the operator (rules core P6). Discovery, seeds, prototypes, schemas,
 transport checks and self-authored canaries prove research or engine readiness, never product
 completion. On handback, name the verified user-visible outcome, denominator, held-out proof and
 residual gap. For normative language evidence, establish the source's pedagogical or evidential
@@ -134,15 +133,17 @@ Python and config overlays, and tracked dirt is `dirty_tree`.
 The brief's test step names only the existing test files that cover the changed files (including
 tests of code that imports a changed shared helper), and adds no test file or case without the
 CTO's approval. Never collect the whole `tests/` tree or use `-n auto` or `-n` above 2; run those
-tests in the foreground. The full suite runs in the PR's CI and again in the merge queue; that is
-the proof. Use `.venv/bin/python -m lu_machinery.publish workflow-run --workflow ci.yml --ref <branch>`
+tests in the foreground. PR CI runs the affected tests and the merge-group CI Gate runs the full
+suite on the real candidate (rules core r2-root); those runs are the proof, so trigger no extra
+full runs. Use `.venv/bin/python -m lu_machinery.publish workflow-run --workflow ci.yml --ref <branch>`
 only when the brief explicitly asks for it.
 
 ## §5. Settle loop (never poll by hand)
 
 Timers, keeper nudges and reminders are wakeups, not stop conditions: continue authorized work
 until its terminal goal, a real blocker, an explicit operator pause or the seat's handoff signal.
-A dispatch returning is not a settle. Arm `dispatch.py wait <task-id>` in the same turn (or watch
+A dispatch returning is not a settle. Arm
+`.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>` in the same turn (or watch
 the task's `batch_state/tasks/<id>.json` `status` with the Monitor tool); ending a turn with a
 live worker and no wait is a driver defect. When it returns, read the result and act. The wait
 is a §2c fill window, not an idle period.

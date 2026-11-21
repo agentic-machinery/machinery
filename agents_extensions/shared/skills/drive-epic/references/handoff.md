@@ -15,7 +15,8 @@ is the lane's handoff.
 Use `lu-driver-state add --lane <lane>` for every new order, commitment, goal, in-flight task,
 blocker, decision and next action, with the matching kind, an owner and a done condition. Record
 goals under their program's `operator_order` with `--parent <id>`. Every `inflight` item carries
-the task ID and the FULL run nonce (`dispatch.py wait --run-nonce` compares it exactly).
+the task ID and the FULL run nonce (`lu_machinery.dispatch wait --run-nonce` compares it
+exactly).
 
 Update items with `link` (references), `note` (progress) and `evidence` (proof). Never delete an
 item or replace unfinished items with a session summary. Use
@@ -65,7 +66,8 @@ copies such as `.claude/skills/` are overwritten on the next deploy.
 
 Fleet Comms is the durable authority for messages and jobs (plane mode `authority`; query the live
 mode at orient); legacy broker and channel stores are read-only inputs. Live-driver diagnostics:
-`session_streams handoff-status`. A live driver never runs `handoff-claim`: the launcher already
+`.venv/bin/python -m lu_machinery.session_streams handoff-status --stream <stream-id>`
+(for example `epic:4542`). A live driver never runs `handoff-claim`: the launcher already
 claimed the lease, and remote recovery uses Monitor TTL/CAS or an attributed operator release,
 never local PID observations or `--local`. Never flip the plane, enable retention apply or invent
 a competing comms design from this skill; those stay the infra lane's gated actions.

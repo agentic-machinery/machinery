@@ -78,7 +78,7 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   not called complete. A member from the author's model family stays on the panel (operator order
   2026-11-16): it reviews and scores like any member, while the exact-head review of record
   follows the applicable tier and designated approval stays outside the author's family.
-- **Read-only** comes from the harness (`dispatch.py --mode read-only`), not from prompt wording.
+- **Read-only** comes from the harness (`lu_machinery.dispatch dispatch --mode read-only`), not from prompt wording.
 - **Freeze before dispatch:** the question, context, roles and stop condition. Panel rounds
   count against the same `review-loop` budget as any review
   ([policy](../../review-loop/references/policy.md)); never "until all members are satisfied".
