@@ -1113,7 +1113,7 @@ def _meter_observation(meter: str, budget: Mapping[str, Any]) -> tuple[Mapping[s
     agents = _mapping(budget.get("agents"))
     if meter.startswith("claude:"):
         row = _mapping(_mapping(budget.get("claude_accounts")).get(meter))
-        record = {
+        record: Mapping[str, Any] = {
             "remaining_pct": _left_percent(_mapping(row.get("weekly"))),
             "freshness": "fresh" if row.get("status") == "ok" and row.get("stale") is False else "unavailable",
             "stale": row.get("stale") is True or row.get("status") == "stale",
