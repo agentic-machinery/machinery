@@ -53,6 +53,26 @@ def _contract(pattern: str, match: str) -> RouteContract:
     )
 
 
+def test_timed_out_get_that_recovers_passes_with_both_timings(monkeypatch) -> None:
+    """A transient timeout must not fail a route that answers on the next GET."""
+    attempts = iter([(None, b"", 1.001, "timed out"), (200, b"", 0.125, "")])
+    monkeypatch.setattr(verify_run, "_exchange", lambda *args, **kwargs: next(attempts))
+    result = verify_run.check_get("http://127.0.0.1:8765", "/route", budget=1.0)
+    assert result["ok"] is True
+    assert result["status"] == 200
+    assert result["attempt_elapsed_s"] == [1.001, 0.125]
+
+
+def test_get_that_times_out_twice_still_fails(monkeypatch) -> None:
+    """A persistently slow route must fail even after the retry."""
+    attempts = iter([(None, b"", 1.001, "timed out"), (None, b"", 1.002, "timed out")])
+    monkeypatch.setattr(verify_run, "_exchange", lambda *args, **kwargs: next(attempts))
+    result = verify_run.check_get("http://127.0.0.1:8765", "/route", budget=1.0)
+    assert result["ok"] is False
+    assert result["detail"] == "timed out"
+    assert result["attempt_elapsed_s"] == [1.001, 1.002]
+
+
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/broken":
