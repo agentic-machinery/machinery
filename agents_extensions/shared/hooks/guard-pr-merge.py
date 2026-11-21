@@ -1159,7 +1159,9 @@ def _merge_args(seg: list[str]) -> list[str] | None:
         j = 0
         while j < len(rest):
             key, sep, value = rest[j].partition("=")
-            if key not in {"--number", "--repo", "--subject", "--body", "--body-file", "--match-head"}:
+            if key not in {
+                "--number", "--repo", "--subject", "--body", "--body-file", "--match-head", "--expect-queue",
+            }:
                 return [_UNREADABLE_MARKER]
             if not sep:
                 j += 1
@@ -1168,6 +1170,8 @@ def _merge_args(seg: list[str]) -> list[str] | None:
                 value = rest[j]
             if key == "--number":
                 args.append(value)
+            elif key == "--expect-queue":
+                pass  # The publisher's own landing-kind pin; gh has no such flag and it selects no PR.
             else:
                 args.append(("--match-head-commit" if key == "--match-head" else key) + "=" + value)
             j += 1

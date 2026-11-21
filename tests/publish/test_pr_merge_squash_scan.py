@@ -131,6 +131,28 @@ def test_moved_head_refuses_enqueue(queue_publisher, capsys):
     assert writes == []
 
 
+def test_queue_turned_on_after_a_no_queue_gate_check_refuses_the_enqueue(queue_publisher, capsys):
+    """Mode-mismatch class: a caller that checked the no-queue gate never enqueues."""
+    writes = []
+    assert publisher.main(
+        ["pr-merge", "--repo", "unit/public", "--number", "1", "--match-head", HEAD, "--expect-queue", "false"],
+        runner=enqueue_transport(writes, queue=True),
+    ) == 2
+    assert "QUEUE_MODE_CHANGED" in capsys.readouterr().err
+    assert writes == []
+
+
+def test_queue_turned_off_after_a_queue_gate_check_refuses_the_direct_merge(queue_publisher, capsys):
+    """Mode-mismatch class: a caller that checked the merge-queue gate never squash-merges directly."""
+    writes = []
+    assert publisher.main(
+        ["pr-merge", "--repo", "unit/public", "--number", "1", "--match-head", HEAD, "--expect-queue", "true"],
+        runner=enqueue_transport(writes, queue=False),
+    ) == 2
+    assert "QUEUE_MODE_CHANGED" in capsys.readouterr().err
+    assert writes == []
+
+
 def test_already_queued_head_does_not_enqueue_twice(queue_publisher):
     writes = []
     assert publisher.main(
