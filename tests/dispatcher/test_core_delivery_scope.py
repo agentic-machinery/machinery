@@ -3,16 +3,13 @@
 import json
 from pathlib import Path
 from unittest.mock import Mock
+
 import pytest
-from lu_machinery.dispatcher import git, worker
+
+from lu_machinery.dispatcher import cli, git, worker
 from lu_machinery.dispatcher.types import TaskSpec
-from tests.dispatcher.conftest import run_git
-from tests.dispatcher.conftest import MERGED
+from tests.dispatcher.conftest import MERGED, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-
-
-
-
 
 
 @pytest.mark.parametrize(
@@ -193,7 +190,7 @@ def test_scope_checks_each_own_commit(sandbox, delivery_settle, history, monkeyp
     ],
 )
 def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
-    merged_delivery_world, monkeypatch, tmp_path, repo_key, mode, pr_state, closeout_code,
+    merged_delivery_world, monkeypatch, tmp_path, capsys, repo_key, mode, pr_state, closeout_code,
 ):
     """Defect classes: omitted, misrouted, premature, hidden-failure and duplicate settlement closeout.
 
@@ -204,7 +201,18 @@ def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
     root = tmp_path / repo_key
     root.mkdir()
     record = world.record
-    record.update(repo=repo_key, mode=mode, commits_ahead=1, worktree_remote_url=f"https://github.com/{slug}.git")
+    nonce = "f" * 30
+    record.update(repo=repo_key, mode=mode, commits_ahead=1, worktree_remote_url=f"https://github.com/{slug}.git",
+                  schema_version=2, run_nonce=nonce)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path))
+    task_path = tmp_path / "merge-probe.json"
+
+    def wait_result(expected_exit):
+        task_path.write_text(json.dumps(record))
+        assert cli.main(["wait", "merge-probe", "--run-nonce", nonce]) == expected_exit
+        return json.loads(capsys.readouterr().out)
+
+    has_merge = mode == "workspace-write" and pr_state == "MERGED"
     world.listed = [{"number": 78, "isCrossRepository": False, "headRefName": record["worktree_branch"]}]
     world.prs[78] = {**MERGED, "state": pr_state, "headRefOid": record["head_sha"]}
     world.files[78] = ["docs/owned.md"]
@@ -236,19 +244,32 @@ def test_settlement_closes_only_merged_delivery_after_worktree_disposition(
     assert "closeout" not in record
     assert (record["status"], record["error"]) == ("done", None)
     runner.assert_not_called()
+    waited = wait_result(0)
+    assert "closeout" not in waited
+    if has_merge:
+        assert waited["delivery_merge_sha"] == "c" * 40
+        assert waited["worktree_disposition"] == "retained"
+        assert waited["closeout_missing_reason"] == "provider_processes_alive"
+    else:
+        assert "delivery_merge_sha" not in waited
+        assert "closeout_missing_reason" not in waited
     events.clear()
     disposition = "removed"
     worker._reap_settled(record)
-    if mode == "read-only" or pr_state != "MERGED":
+    waited = wait_result(closeout_code)
+    assert waited["worktree_disposition"] == "removed"
+    assert "closeout_missing_reason" not in waited
+    if not has_merge:
         assert events == ["removed"]
-        assert "closeout" not in record
+        assert "closeout" not in waited
         runner.assert_not_called()
     else:
         assert events == ["removed", "closeout"]
         runner.assert_called_once_with(request)
-        assert record["closeout"] == {"pr": 78, "returncode": closeout_code, "stdout": "closeout receipt", "stderr": ""}
-    assert record["status"] == ("failed" if closeout_code else "done")
-    assert record["error"] == ("closeout_failed: PR 78 exit 1" if closeout_code else None)
+        assert waited["delivery_merge_sha"] == "c" * 40
+        assert waited["closeout"] == {"pr": 78, "returncode": closeout_code, "stdout": "closeout receipt", "stderr": ""}
+    assert waited["status"] == ("failed" if closeout_code else "done")
+    assert waited["error"] == ("closeout_failed: PR 78 exit 1" if closeout_code else None)
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

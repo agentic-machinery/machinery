@@ -163,27 +163,38 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    waiting in the queue is the only step left and the integration owner has accepted queue
    custody, `pr_ownership queue-exit` may release you. Then report `QUEUED_UNDER_CUSTODY`, and
    the custodian does steps 9 to 11 ([pr-watch](references/pr-watch.md#queue-custody)).
-10. **Close out.** After every other worker and reviewer process on the PR's worktrees has
-    exited:
+10. **Close out.** A dispatched worker that confirms `MERGED` reports the verified merge
+    SHA, checks that `git status --porcelain` is empty, and ends its run. The supervisor
+    removes the worktree at settlement and runs `merge_closeout`. The driver reads the
+    terminal result from `dispatch wait <task-id> --run-nonce <nonce>` and requires the expected
+    `delivery_merge_sha`, `worktree_disposition: removed`, and a
+    residue-free `closeout` receipt with `returncode: 0`. If the result lists multiple
+    `closeouts`, check them all. That receipt completes cleanup.
+
+    For a missing receipt, read `closeout_missing_reason`, `worktree_disposition_reason`
+    or `merged_delivery_lookup`. For a failed receipt, read its `reason`, `stdout`
+    and `stderr`. Record the evidence and owner and resolve the failure safely. Recover
+    retained or errored worktrees through `workflow.md` § Post-merge cleanup, after
+    confirming publication and process exit. Never force removal.
+
+    Use the manual recipe if no dispatcher will settle the merged PR. This includes a PR
+    that merges after its delivering task settled, as can happen after a queue custody
+    handoff, a full-stop handoff, or a timeout without a successor settling the merge.
+    If a delivering task was involved, confirm it settled before the merge and has no
+    closeout receipt for it.
+    Wait for all worker and reviewer processes on the PR's worktrees to exit, then run from
+    outside those worktrees:
 
     ```bash
     "$PY" -m lu_machinery.orchestration.merge_closeout "$PR" --repo <owner/name> --repo-root <checkout> --apply
     ```
 
-    `merge_closeout` proves no worktree still holds the PR and that its branches are gone; it
-    removes no worktree. Exit 0 with a residue-free receipt is required, with one expected
-    interim case: a worker runs this from its own worktree, which is still in use, so the
-    receipt reports that worktree and its local branch as the only residual and the tool exits
-    1. The worker reports that receipt, disposes of the linked issues (step 11), and only then
-    ends its run. When its task settles, the dispatcher removes both and records
-    `worktree_disposition` in the task record. The driver reads that
-    disposition: once it is `removed`, the driver re-runs the command above from outside the
-    tree, and its exit 0 receipt is the verified final closeout; a `retained` or `error`
-    worktree is removed only after confirming its content is published (`workflow.md` §
-    Post-merge cleanup). Any other residual or non-zero exit means not done: record the
-    evidence and owner and resolve it safely, never with `--force`.
-11. **Dispose of the linked issues.** A worker does this before it ends its run. Close each named issue as completed with evidence on the
-    merged SHA, or comment what remains, its owner and what it waits on (rules core P4).
+    Require exit 0 and a residue-free receipt. `merge_closeout` checks worktree and branch
+    residue and removes no worktree.
+11. **Dispose of the linked issues.** The worker reports the evidence it has on the merged
+    SHA before it exits. The driver or custodian closes each named issue as completed once
+    it has the step-10 receipt and the remaining acceptance evidence. If evidence is
+    missing, record the remaining work, owner and dependency (rules core P4).
 
 ## Optional DeepSeek author pre-check (DS-PRECHECK-1101)
 
