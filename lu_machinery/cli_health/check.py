@@ -63,25 +63,37 @@ _CLI_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _NPM_PACKAGE_RE = re.compile(r"^(?:@[a-z0-9._-]+/)?[a-z0-9._-]+$")
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+_SECRET_ENV_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH", "COOKIE", "PRIVATE")
 _VERSION_TOKEN_RE = re.compile(r"^v?([0-9]+(?:\.[0-9]+){1,3})(?:-([A-Za-z0-9][A-Za-z0-9._-]{0,31}))?$")
 _IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
 _CREDENTIAL_COUNT_RE = re.compile(r"(?<!\d)(\d+)\s+credentials?\b", re.IGNORECASE)
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_HTTP_CHUNK_BYTES = 16 * 1024
 
-# Only non-secret environment variables needed for CLI lookup and CLI-managed state paths.
-_SAFE_CHILD_ENV_KEYS = (
+# Minimal non-secret base environment variables needed for CLI lookup, XDG/keyring/CA/proxy support.
+# Per-CLI config-dir variables come from config `env_passthrough` rather than code constants.
+_BASE_SAFE_ENV_KEYS = (
     "PATH",
     "HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_STATE_HOME",
     "XDG_CACHE_HOME",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
     "LANG",
     "LC_ALL",
     "TMPDIR",
-    "AGY_APP_DATA_DIR",
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
 )
 
 SignedInValue = Literal[0, 1, "unknown"]
@@ -94,8 +106,9 @@ class CliHealthConfigError(ValueError):
 
 @dataclass(frozen=True)
 class LatestSource:
-    kind: Literal["npm", "github", "url_regex", "command", "none"]
+    kind: Literal["npm", "github", "url_json", "url_regex", "command", "none"]
     target: str = ""
+    field: str = "version"
     argv: tuple[str, ...] = ()
     pattern: str | None = None
 
@@ -120,6 +133,7 @@ class CliSpec:
     version_argv: tuple[str, ...]
     latest: LatestSource
     auth: AuthSource
+    env_passthrough: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -224,6 +238,12 @@ def _parse_latest(raw: object, cli: str) -> LatestSource:
         if not isinstance(repo, str) or not _GITHUB_REPO_RE.fullmatch(repo):
             raise CliHealthConfigError(f"cli {cli!r} has an invalid github repo slug")
         return LatestSource(kind="github", target=repo)
+    if kind == "url_json":
+        url = _validate_https_url(raw.get("url"), label=f"cli {cli!r} latest.url")
+        field = raw.get("field", "version")
+        if not isinstance(field, str) or not _FIELD_NAME_RE.fullmatch(field):
+            raise CliHealthConfigError(f"cli {cli!r} latest.field must be a valid key name")
+        return LatestSource(kind="url_json", target=url, field=field)
     if kind == "url_regex":
         url = _validate_https_url(raw.get("url"), label=f"cli {cli!r} latest.url")
         pattern = _validate_regex(raw.get("pattern"), label=f"cli {cli!r} latest.pattern")
@@ -303,6 +323,21 @@ def _parse_auth(raw: object, cli: str) -> AuthSource:
     raise CliHealthConfigError(f"cli {cli!r} has unsupported auth.kind")
 
 
+def _validate_env_passthrough(raw: object, *, cli: str) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise CliHealthConfigError(f"cli {cli!r} env_passthrough must be a list of variable names")
+    names: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not _ENV_VAR_NAME_RE.fullmatch(item):
+            raise CliHealthConfigError(f"cli {cli!r} env_passthrough contains an invalid variable name")
+        if any(token in item for token in _SECRET_ENV_SUBSTRINGS):
+            raise CliHealthConfigError(f"cli {cli!r} env_passthrough refuses credential-shaped variable {item!r}")
+        names.append(item)
+    return tuple(dict.fromkeys(names))
+
+
 def _parse_cli_entry(entry: Mapping[str, Any], *, fallback_name: str | None = None) -> CliSpec:
     raw_name = entry.get("cli", fallback_name)
     if not isinstance(raw_name, str) or not _CLI_NAME_RE.fullmatch(raw_name.strip()):
@@ -311,7 +346,8 @@ def _parse_cli_entry(entry: Mapping[str, Any], *, fallback_name: str | None = No
     version_argv = _validate_argv(entry.get("version_argv"), label=f"cli {cli!r} version_argv")
     latest = _parse_latest(entry.get("latest"), cli)
     auth = _parse_auth(entry.get("auth"), cli)
-    return CliSpec(cli=cli, version_argv=version_argv, latest=latest, auth=auth)
+    env_passthrough = _validate_env_passthrough(entry.get("env_passthrough"), cli=cli)
+    return CliSpec(cli=cli, version_argv=version_argv, latest=latest, auth=auth, env_passthrough=env_passthrough)
 
 
 def default_config_path() -> Path:
@@ -421,8 +457,13 @@ def _parse_version_key(version: str) -> tuple[tuple[int, ...], str | None] | Non
     return tuple(int(part) for part in base.split(".")), suffix
 
 
-def compare_behind(installed: str, latest: str) -> BehindValue:
-    """Return ``1`` if installed < latest, ``0`` if current/newer, ``unknown`` if incomparable."""
+def compare_behind(installed: str, latest: str, *, allow_newer_installed: bool = True) -> BehindValue:
+    """Return ``1`` if installed < latest, ``0`` if current/newer, ``unknown`` if incomparable.
+
+    When ``allow_newer_installed`` is ``False`` (used for ``command``-kind latest
+    sources), an installed version strictly newer than the reported latest fails
+    closed as ``unknown`` so a lagging local source is never treated as current.
+    """
     inst = _parse_version_key(installed)
     lat = _parse_version_key(latest)
     if inst is None or lat is None:
@@ -437,20 +478,25 @@ def compare_behind(installed: str, latest: str) -> BehindValue:
     if padded_inst < padded_lat:
         return 1
     if padded_inst > padded_lat:
-        return 0
+        return 0 if allow_newer_installed else "unknown"
     if inst_suffix == lat_suffix:
         return 0
     if inst_suffix is not None and lat_suffix is None:
         return 1
     if inst_suffix is None and lat_suffix is not None:
-        return 0
+        return 0 if allow_newer_installed else "unknown"
     # Same numeric base (e.g. same-day cursor-agent build) with a different release hash.
     return 1
 
 
-def _sanitized_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
+def _sanitized_child_env(
+    env: Mapping[str, str] | None,
+    *,
+    extra_keys: Sequence[str] = (),
+) -> dict[str, str]:
     source = os.environ if env is None else env
-    clean = {key: source[key] for key in _SAFE_CHILD_ENV_KEYS if source.get(key)}
+    allowed = (*_BASE_SAFE_ENV_KEYS, *extra_keys)
+    clean = {key: source[key] for key in allowed if source.get(key)}
     clean["NO_COLOR"] = "1"
     return clean
 
@@ -459,11 +505,12 @@ def _run_bounded_command(
     argv: tuple[str, ...],
     *,
     env: Mapping[str, str] | None,
+    extra_env_keys: Sequence[str] = (),
     timeout: float,
     combine_stderr: bool,
 ) -> tuple[_CommandOutput | None, str]:
     """Run one validated bare command with bounded output, timeout, and process-group cleanup."""
-    child_env = _sanitized_child_env(env)
+    child_env = _sanitized_child_env(env, extra_keys=extra_env_keys)
     resolved = shutil.which(argv[0], path=child_env.get("PATH", ""))
     if resolved is None:
         return None, "not_found"
@@ -537,14 +584,33 @@ def _fetch_http_bytes(
     opener: Callable[..., Any],
 ) -> bytes | None:
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT, "Accept": accept})
+    deadline = time.monotonic() + timeout
+    body = bytearray()
     try:
-        with opener(request, timeout=timeout) as response:
-            raw = response.read(_MAX_HTTP_BYTES + 1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        with opener(request, timeout=remaining) as response:
+            sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                if sock is not None and hasattr(sock, "settimeout"):
+                    with contextlib.suppress(OSError):
+                        sock.settimeout(remaining)
+                to_read = min(_HTTP_CHUNK_BYTES, _MAX_HTTP_BYTES + 1 - len(body))
+                chunk = response.read(to_read)
+                if not isinstance(chunk, bytes):
+                    return None
+                if not chunk:
+                    break
+                body.extend(chunk)
+                if len(body) > _MAX_HTTP_BYTES or time.monotonic() > deadline:
+                    return None
     except Exception:
         return None
-    if not isinstance(raw, bytes) or len(raw) > _MAX_HTTP_BYTES:
-        return None
-    return raw
+    return bytes(body)
 
 
 def _probe_installed(
@@ -553,7 +619,13 @@ def _probe_installed(
     env: Mapping[str, str] | None,
     timeout: float,
 ) -> tuple[str, str]:
-    result, reason = _run_bounded_command(spec.version_argv, env=env, timeout=timeout, combine_stderr=True)
+    result, reason = _run_bounded_command(
+        spec.version_argv,
+        env=env,
+        extra_env_keys=spec.env_passthrough,
+        timeout=timeout,
+        combine_stderr=True,
+    )
     if result is None:
         return ("absent" if reason == "not_found" else "unknown"), reason
     if result.returncode != 0:
@@ -575,7 +647,13 @@ def _probe_latest(
     if src.kind == "none":
         return "unknown", "no_upstream"
     if src.kind == "command":
-        result, reason = _run_bounded_command(src.argv, env=env, timeout=timeout, combine_stderr=False)
+        result, reason = _run_bounded_command(
+            src.argv,
+            env=env,
+            extra_env_keys=spec.env_passthrough,
+            timeout=timeout,
+            combine_stderr=False,
+        )
         if result is None:
             return "unknown", reason
         if result.returncode != 0:
@@ -619,6 +697,23 @@ def _probe_latest(
         if not isinstance(tag, str):
             return "unknown", "parse_failed"
         version = _normalize_version(tag)
+        return (version, "ok") if version != "unknown" else ("unknown", "parse_failed")
+    if src.kind == "url_json":
+        raw = _fetch_http_bytes(
+            src.target,
+            accept="application/json",
+            timeout=timeout,
+            opener=opener,
+        )
+        if raw is None:
+            return "unknown", "lookup_failed"
+        try:
+            payload = json_depth.loads(raw.decode("utf-8"), max_depth=64)
+        except (UnicodeDecodeError, ValueError):
+            return "unknown", "parse_failed"
+        if not isinstance(payload, dict) or not isinstance(payload.get(src.field), str):
+            return "unknown", "parse_failed"
+        version = _normalize_version(payload[src.field])
         return (version, "ok") if version != "unknown" else ("unknown", "parse_failed")
     if src.kind == "url_regex":
         raw = _fetch_http_bytes(
@@ -713,7 +808,13 @@ def _probe_auth(
         return _probe_status_file(auth, env=env)
     if auth.kind == "command":
         combine_stderr = auth.parser != "json_bool"
-        result, reason = _run_bounded_command(auth.argv, env=env, timeout=timeout, combine_stderr=combine_stderr)
+        result, reason = _run_bounded_command(
+            auth.argv,
+            env=env,
+            extra_env_keys=spec.env_passthrough,
+            timeout=timeout,
+            combine_stderr=combine_stderr,
+        )
         if result is None:
             return "unknown", reason
         if auth.parser == "json_bool":
@@ -774,7 +875,9 @@ def check_cli(
     installed, version_reason = _probe_installed(spec, env=env, timeout=bounded_timeout)
     latest, latest_reason = _probe_latest(spec, env=env, timeout=bounded_timeout, opener=opener)
     signed_in, auth_reason = _probe_auth(spec, env=env, timeout=bounded_timeout)
-    behind = compare_behind(installed, latest)
+    behind = compare_behind(installed, latest, allow_newer_installed=spec.latest.kind != "command")
+    if behind == "unknown" and version_reason == "ok" and latest_reason == "ok":
+        latest_reason = "stale_source"
     auth_ok = spec.auth.kind == "none" or signed_in in (0, 1)
     check_ok: Literal[0, 1] = 1 if (behind in (0, 1) and auth_ok) else 0
     _logger.debug(
@@ -880,7 +983,7 @@ def render_prometheus(report: Mapping[str, Any], *, now_timestamp: float | None 
     return generate_latest(registry).decode("utf-8")
 
 
-def write_atomic_text(destination: Path, text: str, *, mode: int = 0o644) -> None:
+def write_atomic_text(destination: Path, text: str, *, mode: int = 0o600) -> None:
     """Atomically write ``text`` to ``destination``, refusing symlinks, non-regular files, or extra hard links."""
     raw_dest = os.fspath(destination)
     if not raw_dest or any(ch in raw_dest for ch in ("\x00", "\r", "\n")):
@@ -896,14 +999,14 @@ def write_atomic_text(destination: Path, text: str, *, mode: int = 0o644) -> Non
     parent = destination.parent
     parent.mkdir(parents=True, exist_ok=True)
     temp_path = parent / f".{destination.name}.{secrets.token_hex(12)}.tmp"
-    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as stream:
             fd = -1
             stream.write(text.encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
-            os.fchmod(stream.fileno(), mode)
+            os.fchmod(stream.fileno(), mode & 0o600)
         os.replace(temp_path, destination)
     except OSError:
         temp_path.unlink(missing_ok=True)
@@ -925,7 +1028,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  .venv/bin/python -m lu_machinery.cli_health check\n"
             "  .venv/bin/python -m lu_machinery.cli_health check "
-            "--prom-out /var/lib/node_exporter/textfile_collector/lu_cli_health.prom --quiet\n"
+            "--prom-out <textfile-dir>/lu_cli_health.prom --quiet\n"
             "  .venv/bin/python -m lu_machinery.cli_health check --cli cursor-agent --cli claude\n"
             "\n"
             "Outputs:\n"

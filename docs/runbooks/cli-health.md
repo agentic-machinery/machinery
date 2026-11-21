@@ -3,8 +3,8 @@
 `lu_machinery.cli_health` reports, for every configured fleet agent CLI, the
 installed version, the latest released version, whether it is behind, and
 whether it is signed in. It emits JSON on stdout (and optionally `--json-out`)
-and a Prometheus textfile (`--prom-out`) for `node_exporter`'s textfile
-collector so monitoring can alert before a stale or logged-out CLI breaks a
+and a Prometheus textfile (`--prom-out`) for a Prometheus textfile collector
+so monitoring can alert before a stale or logged-out CLI breaks a
 dispatched worker (machinery #1078).
 
 ## Command
@@ -18,7 +18,7 @@ Write a Prometheus textfile atomically (for a host timer wired in
 
 ```bash
 .venv/bin/python -m lu_machinery.cli_health check \
-  --prom-out /var/lib/node_exporter/textfile_collector/lu_cli_health.prom \
+  --prom-out <textfile-dir>/lu_cli_health.prom \
   --quiet
 ```
 
@@ -38,7 +38,7 @@ Current fleet CLIs and their interfaces:
 
 | CLI | Installed version | Latest release source | Sign-in status interface |
 | --- | --- | --- | --- |
-| `agy` | `agy --version` | `agy changelog` | `agy models` |
+| `agy` | `agy --version` | Antigravity CLI release manifest (`url_json`) | `agy models` |
 | `claude` | `claude --version` | npm `@anthropic-ai/claude-code` | `claude auth status --json` |
 | `codex` | `codex --version` | npm `@openai/codex` | `codex login status` |
 | `codexbar` | `codexbar --version` | GitHub `steipete/CodexBar` | none (`unknown`) |

@@ -12,6 +12,7 @@ pins:
     cli_health:
       cli: claude
       version_argv: ["claude", "--version"]
+      env_passthrough: ["CLAUDE_CONFIG_DIR"]
       latest:
         kind: npm
         package: "@anthropic-ai/claude-code"
@@ -30,6 +31,7 @@ pins:
     cli_health:
       cli: codex
       version_argv: ["codex", "--version"]
+      env_passthrough: ["CODEX_HOME"]
       latest:
         kind: npm
         package: "@openai/codex"
@@ -101,9 +103,11 @@ pins:
     cli_health:
       cli: agy
       version_argv: ["agy", "--version"]
+      env_passthrough: ["AGY_APP_DATA_DIR"]
       latest:
-        kind: command
-        argv: ["agy", "changelog"]
+        kind: url_json
+        url: "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json"
+        field: version
       auth:
         kind: command
         argv: ["agy", "models"]
