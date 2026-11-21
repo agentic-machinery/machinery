@@ -20,7 +20,11 @@ typed publisher (`docs/dev/agent-public-text.md`), which scans every field befor
 3. **Proof**, one line: the check or reproduction that shows it works, with the run id.
 4. The public-safe subset of the hand-off record ([delivery](delivery.md#hand-off-record)):
    acceptance ids and their proof, catalog risk and the rounds used of the review budget, and
-   the finding ledger.
+   the finding ledger. For a replacement, name each superseded PR and its predecessor head
+   from the hand-off. For a capped PR, use the full head SHA in the cap disposition.
+   List every inherited blocker by source PR and finding ID. Give its owner and disposition,
+   including the evidence for a claimed fix or inapplicability, or the public work item where
+   it remains open. Distinguish predecessor rounds and findings from the replacement's own.
 5. A size justification when the PR is above the size signal (`workflow.md` § Merge
    policy).
 6. `Refs #N` or `Fixes #N` for the issue. `Fixes` closes the whole issue, so use it only when

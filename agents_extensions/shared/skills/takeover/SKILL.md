@@ -58,10 +58,15 @@ PY="$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/.venv/
    it. Otherwise open a replacement branch that imports the original commits unchanged
    (`git cherry-pick` keeps their authors) and adds your fixes as separate commits. Do not
    overwrite unrelated work. The finding ledger and review budget carry over either way.
-   A takeover or any worker pushing to an existing PR branch is dispatched with `--branch <PR head branch>`.
+   A worker pushing to an existing PR branch is dispatched with `--branch <PR head branch>`.
+   If the predecessor capped, follow the recorded
+   [CTO disposition](../review-loop/references/policy.md#4-convergence) on a fresh branch.
+   Import only changes within the authorized scope and keep the original authorship. Check
+   each predecessor's unresolved blockers against the disposition. Carry each one with its
+   source PR and finding ID, even when its resolution belongs to other named work.
    When the issue already has a task-lifecycle ledger from another identity (`init` refuses it
-   and `init --reuse` refuses the identity), bind your own identity with the same arguments as
-   `init`; never move or edit a ledger by hand:
+   and `init --reuse` refuses the identity), bind your own identity for a same-PR successor
+   with the same arguments as `init`. Never move or edit a ledger by hand:
 
    ```bash
    "$PY" -m lu_machinery.orchestration.task_closeout bind-successor --identity-file identity.json \

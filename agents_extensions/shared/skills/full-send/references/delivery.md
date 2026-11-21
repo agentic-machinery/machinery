@@ -38,6 +38,7 @@ handoff:
   worktree: "<dispatch worktree>"
   scope:
     outcome: "<user-visible outcome>"
+    open_prs: [] # List open PRs for the same issue (empty after checking for them).
     owned_paths: ["<path>"]
     non_goals: ["<non-goal>"]
     denominator: "<what counts as all of it>"
@@ -52,6 +53,7 @@ handoff:
     profile: code|infra
     rounds_used: {full: 0, delta: 0}
     ledger: []
+    cap_disposition: "<CTO decision reference, if replacing a capped PR>"
   landing_state: {hold: false, queued: false, auto_merge: false}
 ```
 
@@ -78,14 +80,20 @@ or CI gate. Reuse then requires the corrected policy. See the
 for typed refusals, replay and retained-history checks.
 
 **Public-safe subset.** Only these fields go into the PR body: target, acceptance ids and their
-proof, catalog risk and the rounds used of the review budget, the finding ledger (including any optional DeepSeek
-pre-check dispositions), and credit. Everything else, such as worktree paths, host details and
-private task metadata, stays in the task result (rules core P8).
+proof, catalog risk and rounds used, the finding ledger (including any optional DeepSeek
+pre-check dispositions), public predecessor PRs and heads, and credit. Worktree paths, host
+details and private task metadata stay in the task result (rules core P8).
 
 The ledger and budget follow the work: a replacement PR, a new reviewer, a new session or an
 accepted successor (`pr_ownership accept`) carries them forward, along with the head's CI rerun
 allowance (infrastructure failures only, never a failing test node). A handoff never resets a
 budget.
+
+For a replacement after the cap, the decision reference points to the existing parent record.
+Carry every unresolved blocker in `review.ledger`, identified by its source PR and finding ID,
+with its owner and disposition. Keep findings assigned elsewhere open in the parent record.
+The new reviewer verifies the disposition of the inherited blockers against the replacement
+scope before approval. Record review and CI evidence for the replacement's own head.
 
 ## Proof
 
@@ -105,8 +113,9 @@ Every item must hold on the **current** head. A moved head voids the verdict and
 
 1. Proof covers every change in the diff.
 2. A recorded exact-head APPROVE from the reviewer of record (`review-loop`), with no open
-   blocker in the ledger. The optional DeepSeek pre-check (DS-PRECHECK-1101) is never a review of
-   record and never satisfies or waives this gate.
+   blocker applicable to that head. Blockers assigned to other work under a cap disposition
+   stay open in the parent record. The optional DeepSeek pre-check (DS-PRECHECK-1101) is never a
+   review of record and never satisfies or waives this gate.
 3. Same-head PR CI green, the same with or without a merge queue: no blocking check on the live
    head pending, red or cancelled, including the PR `CI Gate` (affected tests and Frontend, not
    the full suite) where the repository runs one. It may have finished before or after the

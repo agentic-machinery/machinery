@@ -76,9 +76,19 @@ Trivial none. A round is charged when a review is dispatched at a new head, whet
 or not its verdict is recorded. The clean base merge, the repair round and the capability
 failure under [Recording the verdict](#recording-the-verdict) do not count against the 3.
 Round 1 is the full review. Rounds 2-3 review only the diff since the last reviewed head.
-If the budget ends with a P0-P2 blocker, stop and send the findings ledger to `claude-cto`
-for a decision on narrower scope. Continuing requires explicit authorization from `claude-cto`
-and a fresh branch and PR that carry the ledger forward.
+When the cap prevents the next required round, stop and send the findings ledger and exact PR
+head to `claude-cto`. The CTO records one current disposition per work item on its parent
+issue or ordered brief. Record the capped PR and full head SHA, rounds used, every unresolved
+P0-P2 finding with its owner, and the smallest viable continuation. If none is authorized,
+record what the work is waiting for or why it ends. Update that record if a later continuation
+also caps. Keep the earlier decisions and ledgers linked.
+
+Continuing requires explicit CTO authorization, a fresh branch and a replacement PR. The
+replacement brief carries the ledger, rounds used and cap decision forward. Place any blocker
+outside the continuation on named work with an owner and keep it open in the parent record.
+A replacement PR or narrower scope alone grants no additional rounds. The reviewer checks any
+claimed fix or inapplicability on the replacement's exact head, which also needs its own CI
+under the [delivery gate](../../full-send/references/delivery.md#the-gate).
 
 ## 5. Recovery over gates
 

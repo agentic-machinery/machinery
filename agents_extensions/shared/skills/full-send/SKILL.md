@@ -56,8 +56,10 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 1. **Take the hand-off record** from the entry skill or brief
    ([delivery](references/delivery.md#hand-off-record)). Fill a missing field from the task
    record, issue or PR, or send the work back to the entry stage. Never guess. A successor to
-   an existing PR first accepts it with `pr_ownership accept`; a refusal means another task may
-   still own it, so stop ([pr-watch](references/pr-watch.md#owner-changes)).
+   an existing PR that will push to the same branch first accepts it with `pr_ownership accept`.
+   A refusal means another task may still own it, so stop ([pr-watch](references/pr-watch.md#owner-changes)).
+   For a replacement after the cap, read the CTO's recorded disposition and reconcile the inherited
+   findings before opening the replacement. Include their disposition and evidence in round 1.
 2. **Make the smallest change that achieves the outcome**, in a dispatch worktree on a branch,
    never on `main`. Implementation and fixes go to the authoring lane: a worker makes them
    itself, a driver dispatches them (rules core P1). Fix the case that happened, not every case
@@ -218,8 +220,14 @@ Before the commit, and again before landing (step 8), run `verify_run` for every
 
 ## Stop and escalate
 
+When `budget-check` refuses the next required round at the cap, write the hand-off with the
+refusal, capped PR and full head SHA, rounds used, and every unresolved blocker. Propose the
+smallest continuation and name an owner for each blocker. Send the hand-off to the CTO and
+wait for the recorded [cap disposition](../review-loop/references/policy.md#4-convergence)
+using the exchange below. A replacement needs a new authorized brief.
+
 Stop, and report `BLOCKED <reason>`, when: the proof cannot be obtained; the recorder's
-`budget-check` refuses the next review round, or a dispute is unresolved after two replies
+`budget-check` refuses the next review round for another reason, or a dispute is unresolved after two replies
 (`review-loop`; a base merge, a CI fix or a conflict resolution after approval is not a stop
 while `budget-check` admits it); a breaker trips; ownership
 or stream membership is lost; the change's own checks fail a second time, or CI fails for an
