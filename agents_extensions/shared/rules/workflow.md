@@ -209,9 +209,10 @@ with `review-loop` for review rounds and the budget.
 3. Only then enqueue: a recorded exact-head APPROVE and a green PR CI Gate, both bound to the
    current PR head. Never arm auto-merge ahead of either gate —
 early-armed auto-merge is how #7447–#7449 landed with empty reviews, and a moved head
-voids both approval and CI; re-establish both on the new head. Automated merge pipelines cannot replace review gates; enqueue
-with the task-prescribed interpreter and `-m lu_machinery.publish pr-merge --number <N>` after both gates (never `--auto` as a
-substitute for review). Do **not** pass `--delete-branch` while this repo uses a
+voids both approval and CI; re-establish both on the new head. Automated merge pipelines cannot replace review gates; land
+with the task-prescribed interpreter and `-m lu_machinery.publish pr-merge --number <N> --match-head <approved head>
+--expect-queue <true|false>` after both gates, passing the `isMergeQueueEnabled` reading the gate was checked for
+(`full-send` steps 7 and 8; never `--auto` as a substitute for review). Do **not** pass `--delete-branch` while this repo uses a
 merge queue (head deletion mid-queue can close without landing); delete the remote branch
 only after `MERGED`. Dispatched agents still do NOT self-enable auto-merge or apply merge-automation labels.
 `--auto` never bypasses blocking checks (#M-0.5 semantics unchanged).

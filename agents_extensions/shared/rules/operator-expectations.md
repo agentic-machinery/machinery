@@ -35,7 +35,8 @@ are the tie-breakers.
    direct commits to main. **Merge duty:** nobody arms auto-merge. The worker that
    receives a brief runs its chain to the end (rules core P1): once required CI and independent
    exact-head review at the review-policy tier both pass, it enqueues via
-   `.venv/bin/python -m lu_machinery.publish pr-merge --number <N>`, unless its brief says
+   `.venv/bin/python -m lu_machinery.publish pr-merge --number <N> --match-head <approved head> --expect-queue <reading>`
+   (`full-send` step 8), unless its brief says
    `full-stop`. The accountable orchestrator lands what no brief owns and ensures every
    approved PR lands in `main`. Never leave an approved, green PR unmerged.
    **Landing and cleanup:** follow `workflow.md` § Merge policy and its
