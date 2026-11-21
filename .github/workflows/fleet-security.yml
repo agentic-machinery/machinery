@@ -304,6 +304,7 @@ jobs:
 
           directory = Path(os.environ["RUNNER_TEMP"]) / "fleet-scanner-policy"
           git_env = {"PATH": os.environ["PATH"], "HOME": str(directory), "GIT_CONFIG_NOSYSTEM": "1"}
+          regular_modes = (b"100644", b"100755")
 
           selected = set(defaults)
           if explicit:
@@ -319,7 +320,7 @@ jobs:
 
           def policy_entries(revision: str) -> dict[str, tuple[bytes, bytes]]:
               entries = {}
-              for row in git("ls-tree", "-rz", "--full-tree", revision).split(b"\0"):
+              for row in git("ls-tree", "-rtz", "--full-tree", revision).split(b"\0"):
                   if not row:
                       continue
                   metadata, raw_path = row.split(b"\t", 1)
@@ -345,6 +346,9 @@ jobs:
               with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
                   out.write(f"receipt={encoded}\n")
 
+              if any(path in candidate and candidate[path][0] not in regular_modes for path in changed):
+                  sys.exit("::error::Candidate scanner policy additions and edits must be regular Git files")
+
               value = ""
               if shellcheck:
                   materialize = trusted
@@ -365,11 +369,13 @@ jobs:
                       value = str(empty_config)
 
               for path, (mode, oid) in materialize.items():
-                  if mode not in (b"100644", b"100755"):
+                  if mode not in regular_modes:
                       sys.exit("::error::Trusted scanner policy must be a regular Git file")
                   destination = directory / path
                   destination.parent.mkdir(parents=True, exist_ok=True)
                   destination.write_bytes(git("cat-file", "blob", oid.decode("ascii")))
+          except FileExistsError:
+              sys.exit("::error::Scanner policy directory already exists in RUNNER_TEMP")
           except (OSError, subprocess.SubprocessError):
               sys.exit("::error::Could not read scanner policy from the trusted event base")
 
@@ -2563,6 +2569,7 @@ jobs:
           /usr/bin/python3 -I -B - <<'PY'
           import json
           import os
+          import re
           import sys
 
           try:
@@ -2591,6 +2598,10 @@ jobs:
               failed = True
 
           protected_event = os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "merge_group")
+          base = os.environ.get("POLICY_BASE_SHA", "")
+          if protected_event and re.fullmatch(r"[0-9a-f]{40}", base) is None:
+              print("::error::Missing or invalid event base SHA for scanner policy")
+              failed = True
           jobs_summary = {}
           for name, on in toggles.items():
               entry = needs.get(name)
@@ -2615,7 +2626,7 @@ jobs:
                   policy = job_summary.get("scanner-policy")
                   if (
                       not isinstance(policy, dict)
-                      or policy.get("base_sha") != os.environ["POLICY_BASE_SHA"]
+                      or policy.get("base_sha") != base
                       or not isinstance(policy.get("changed"), list)
                   ):
                       print(f"::error::Job {name} has no receipt for the trusted scanner policy base; failing closed")

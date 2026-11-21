@@ -30,14 +30,14 @@ Every caller receives the exact same scanner binaries, GitHub Action SHAs and ru
 
 ## Select a runner
 
-The workflow uses `ubuntu-24.04` by default. Set `runs-on` to a JSON string or list of labels to use another Linux x64 runner. For a runner label stored as a repository variable, pass it through `toJSON`.
+The workflow uses `ubuntu-24.04` by default. Set `runs-on` to a JSON string or list of labels to use another Linux x64 runner. This example uses a repository variable for one label and defaults to `ubuntu-24.04` when the variable is unset.
 
 ```yaml
 with:
-  runs-on: ${{ toJSON(vars.SECURITY_RUNNER) }}
+  runs-on: ${{ toJSON(vars.SECURITY_RUNNER || 'ubuntu-24.04') }}
 ```
 
-The runner needs Git, Bash, curl, tar, Python 3.10 or later at `/usr/bin/python3`, jq, and sha256sum. The workflow downloads and verifies its scanner binaries. On a runner without Docker, leave `run-trivy-image` disabled. Use self-hosted runners with private repositories. [GitHub runner guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
+Use a Linux x64 runner with glibc, Bash, curl, jq, and standard GNU utilities, including coreutils, gzip, sed, and tar. Make Git available in `/usr/bin` or `/bin` and Python 3.10 or later at `/usr/bin/python3`. The workflow downloads and verifies its scanner binaries. On a runner without Docker, leave `run-trivy-image` disabled. Use self-hosted runners with private repositories. [GitHub runner guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
 
 ## Security and private-repository guarantees
 
@@ -102,7 +102,7 @@ The target receipt lists each accepted finding's tuple in `accepted_license_find
 
 On `pull_request` and `merge_group`, scanner config and ignore files come from the event's base commit. This covers Actionlint and Zizmor config files, ShellCheck configuration in the source directory hierarchy, and the Trivy and TruffleHog ignore files. Explicit repo-relative config and ignore paths also resolve at the base commit.
 
-Each enabled scanner job records the base commit in `scanner-policy.base_sha` and lists changed policy paths in `scanner-policy.changed`. If the candidate adds a policy file, the scan reports the addition and scans without that file's settings. If the candidate edits or removes an existing policy file, the scan uses the base version. Other events use the checked-out policy.
+Each enabled scanner job records the base commit in `scanner-policy.base_sha` and lists changed policy paths in `scanner-policy.changed`. If the candidate adds a policy file, the scan reports the addition and scans without that file's settings. If the candidate edits or removes an existing policy file, the scan uses the base version. A candidate policy addition or edit that is a symlink or another nonregular Git entry fails the job. Other events use the checked-out policy.
 
 ## Output receipt (`fleet-security-receipt.v1`)
 
