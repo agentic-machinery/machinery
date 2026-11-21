@@ -12,14 +12,7 @@ import shlex
 import sys
 from collections.abc import Callable
 
-from agents_extensions.shared.hooks.shell_shlex import (
-    ShellPreprocessLimit,
-    collapse_line_continuations,
-    heredoc_bodies_are_data,
-    heredoc_closer,
-    heredoc_readers_are_data,
-    preprocess_shell_command,
-)
+from agents_extensions.shared.hooks.shell_shlex import preprocess_shell_command
 
 # Do not write bytecode beside deployed hooks.
 sys.dont_write_bytecode = True
@@ -275,203 +268,10 @@ def unmodeled_shell_offset(line: str) -> int | None:
     return word_start if finish_word() or quote or contexts else None
 
 
-def preprocess_branch_command(command: str) -> str:
-    """Expose executable heredoc expansions without lexing their data as shell.
-
-    This is opt-in for the branch detector: the merge guards retain their
-    established preprocessing. Each substitution has its own quote state and
-    pending heredocs. Consume bodies at the introducing command's newline,
-    before reading any quotes, comments or parentheses from the next line.
-    """
-    if "<<" not in command:
-        return preprocess_shell_command(command)
-    # This reader drops every body it consumes, so a body the shared contract
-    # keeps visible (a shell or unknown reader) refuses here instead.
-    if not heredoc_bodies_are_data(collapse_line_continuations(command)):
-        raise ShellPreprocessLimit("here-document body may be read as a script")
-
-    def scan(index: int, closer: str = "", *, data: bool = False, depth: int = 0) -> tuple[str, int]:
-        if depth >= 16:
-            raise ShellPreprocessLimit("nested heredoc scan depth exceeded")
-        out: list[str] = []
-        quote = ""
-        word_start = True
-        pending: list[tuple[str, bool, bool]] = []
-        operators: list[int] = []
-        line_start = index
-        while index < len(command):
-            ch = command[index]
-            if ch == "\\" and quote != "'":
-                # In heredoc data only backslash, $, backtick and newline
-                # are escapable. Other backslashes leave expansions active.
-                following = command[index + 1 : index + 2]
-                size = 2 if not data or following in {"\\", "$", "`", "\n"} else 1
-                out.append(command[index : index + size])
-                index += size
-                word_start = False
-                continue
-            if closer and not quote and command.startswith(closer, index):
-                if pending:
-                    raise ShellPreprocessLimit("heredoc closed before its body")
-                return "".join(out), index + len(closer)
-            if quote != "'":
-                opening = next((op for op in ("$((", "$(", "${", "$[", "`") if command.startswith(op, index)), "")
-                if not data and not quote and not opening:
-                    opening = next((op for op in ("<(", ">(", "((", "(") if command.startswith(op, index)), "")
-                    # Match shared preprocessing's arithmetic array context;
-                    # its << is a shift, never a heredoc introducer (#9102).
-                    if not opening and ch == "[" and re.search(r"[A-Za-z_][A-Za-z0-9_]*$", command[:index]):
-                        opening = "["
-                if opening:
-                    close = (
-                        "))"
-                        if opening in {"$((", "(("}
-                        else "}"
-                        if opening == "${"
-                        else "]"
-                        if opening in {"$[", "["}
-                        else "`"
-                        if opening == "`"
-                        else ")"
-                    )
-                    # Arithmetic/parameter punctuation is argument data, but
-                    # nested substitutions there still have shell syntax.
-                    opaque = opening in {"$((", "((", "${", "$[", "["}
-                    body, index = scan(index + len(opening), close, data=opaque, depth=depth + 1)
-                    # Expose executable substitutions to the line scope
-                    # reader just as shared preprocessing exposes backticks.
-                    boundary = '"' if quote == '"' and opening in {"$(", "`"} else ""
-                    out.append(boundary + opening + body + close + boundary)
-                    word_start = False
-                    continue
-            if data:
-                # Preserve parameter/arithmetic text for the existing tripwire;
-                # ordinary heredoc text is handled separately below.
-                if ch in "\"'" and (not quote or quote == ch):
-                    quote = "" if quote else ch
-                out.append(ch)
-                index += 1
-                continue
-            if quote:
-                out.append(ch)
-                if ch == quote:
-                    quote = ""
-            elif ch in "\"'":
-                quote = ch
-                out.append(ch)
-            elif ch == "#" and word_start:
-                end = command.find("\n", index)
-                index = len(command) if end < 0 else end
-                continue
-            elif command.startswith("<<<", index):
-                out.append("<<<")
-                index += 3
-                word_start = True
-                continue
-            elif command.startswith("<<", index):
-                operators.append(index - line_start)
-                index += 2
-                strip_tabs = command.startswith("-", index)
-                index += int(strip_tabs)
-                while command[index : index + 1] in {" ", "\t"}:
-                    index += 1
-                start = index
-                delimiter_quote = ""
-                while index < len(command):
-                    char = command[index]
-                    if char == "\\" and delimiter_quote != "'":
-                        if index + 1 >= len(command):
-                            raise ShellPreprocessLimit("unterminated heredoc delimiter")
-                        index += 2
-                        continue
-                    if char in "\"'" and (not delimiter_quote or delimiter_quote == char):
-                        delimiter_quote = "" if delimiter_quote else char
-                    elif not delimiter_quote and char in " \t\r\n;|&()<>":
-                        break
-                    index += 1
-                # The shared contract's rule 1 reads the word; CR belongs to
-                # Bash's word, so a delimiter followed by one stays ambiguous.
-                delimiter = heredoc_closer(command[start:index])
-                if command[index : index + 1] == "\r" or delimiter is None:
-                    raise ShellPreprocessLimit("ambiguous heredoc delimiter")
-                name, quoted = delimiter
-                pending.append((name, strip_tabs, quoted))
-                # Avoid a second heredoc pass in shared preprocessing.
-                out.append("</dev/null")
-                word_start = True
-                continue
-            elif ch == "\n" and pending:
-                # Inside a substitution the pre-check above cannot see the
-                # readers, so apply contract rule 2 to this line here.
-                if closer and not all(heredoc_readers_are_data(command[line_start:index], operators)):
-                    raise ShellPreprocessLimit("here-document body may be read as a script")
-                index += 1
-                expansions: list[str] = []
-                for delimiter, strip_tabs, quoted in pending:
-                    body_start = index
-                    while index < len(command):
-                        end = command.find("\n", index)
-                        end = len(command) if end < 0 else end
-                        candidate = command[index:end]
-                        if (candidate.lstrip("\t") if strip_tabs else candidate) == delimiter:
-                            if not quoted:
-                                expansions.extend(body_expansions(command[body_start:index], depth + 1))
-                            index = end + (end < len(command))
-                            break
-                        index = end + (end < len(command))
-                    else:
-                        raise ShellPreprocessLimit("unterminated heredoc body")
-                pending.clear()
-                operators.clear()
-                line_start = index
-                # The introducing newline ends a statement even inside a
-                # substitution. Keep its boundary after the removed bodies
-                # and their executable expansions; otherwise a later command
-                # becomes an argument of the heredoc reader. A semicolon keeps
-                # the nested scope together for the downstream line reader.
-                out.append((" " if closer else "\n") + " ".join(expansions) + (" ; " if closer else "\n"))
-                word_start = True
-                continue
-            else:
-                out.append(ch)
-            word_start = not quote and ch in " \t\n;&|()<>"
-            index += 1
-        if closer or pending:
-            raise ShellPreprocessLimit("unterminated shell or heredoc context")
-        return "".join(out), index
-
-    def body_expansions(body: str, depth: int) -> list[str]:
-        # Heredoc text has no shell quote/comment rules. Reuse the scanner on
-        # just the expansions; an apostrophe outside one cannot quote it away.
-        nonlocal command
-        original = command
-        command = body
-        found: list[str] = []
-        index = 0
-        try:
-            while index < len(body):
-                if body[index] == "\\" and body[index + 1 : index + 2] in {"\\", "$", "`", "\n"}:
-                    index += 2
-                    continue
-                opening = next((op for op in ("$((", "$(", "${", "`") if body.startswith(op, index)), "")
-                if opening:
-                    close = "))" if opening == "$((" else "}" if opening == "${" else "`" if opening == "`" else ")"
-                    text, index = scan(index + len(opening), close, data=opening in {"$((", "${"}, depth=depth)
-                    found.append(opening + text + close)
-                else:
-                    index += 1
-        finally:
-            command = original
-        return found
-
-    visible, _ = scan(0)
-    return preprocess_shell_command(visible)
-
-
 def command_repository_unknown(command: str) -> bool:
     """Refuse the entire command on unmodeled syntax or undecidable heredocs."""
     try:
-        return unmodeled_shell_offset(preprocess_branch_command(command)) is not None
+        return unmodeled_shell_offset(preprocess_shell_command(command)) is not None
     except Exception:
         return True
 
@@ -484,10 +284,9 @@ def unknown_repository_segments(command: str) -> list[list[str]]:
     cannot end a substitution. These lexical contexts never establish a repo.
     Only the branch guard uses this conservative whole-command path.
     """
-    try:
-        command = preprocess_branch_command(command)
-    except ShellPreprocessLimit:
-        command = preprocess_shell_command(command)
+    # The shared view shows here-document bodies as plain words; a command it
+    # cannot read raises ShellPreprocessLimit to the guard, which refuses.
+    command = preprocess_shell_command(command)
     # Preserve the established per-line visibility on malformed quotes and
     # ambiguous heredocs as well. Both readers only collect operations here;
     # neither reader's scope events can establish or restore repository trust.

@@ -90,15 +90,12 @@ try:
         ShellPreprocessLimit,
         heredoc_closer,
         normalize_io_descriptors,
+        parse_heredocs,
         preprocess_shell_command,
-        skippable_heredoc_delimiters,
         split_operator_run,
         split_quote_preserving,
         static_word,
-        strip_skippable_heredoc_bodies,
-    )
-    from agents_extensions.shared.hooks.shell_shlex import (
-        _quote_after as shell_quote_after,
+        view_closer,
     )
 except Exception as exc:
     print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
@@ -285,89 +282,6 @@ def _command(payload: dict) -> str:
     return (payload.get("tool_input") or {}).get("command") or ""
 
 
-def _strip_shell_comments(command: str) -> str:
-    """Remove Bash comments at word boundaries, retaining each newline.
-
-    Keep hashes inside words, quotes, command substitutions, and backticks for
-    the existing tokenizer. Heredoc bodies are removed before this is called
-    on the complete command.
-    """
-    out: list[str] = []
-    quote = ""
-    in_backticks = False
-    substitution_depth = 0
-    substitution_outer_quote = ""
-    word_start = True
-    i = 0
-    while i < len(command):
-        char = command[i]
-        if char == "\\" and quote != "'" and i + 1 < len(command):
-            out.append(command[i : i + 2])
-            if command[i + 1] != "\n":
-                word_start = False
-            i += 2
-            continue
-        if char == "'" and quote != '"' and not in_backticks:
-            quote = "" if quote == "'" else "'"
-            word_start = False
-        elif char == '"' and quote != "'" and not in_backticks:
-            quote = "" if quote == '"' else '"'
-            word_start = False
-        elif char == "`" and quote != "'":
-            in_backticks = not in_backticks
-            word_start = False
-        elif quote != "'" and not in_backticks and command.startswith("$(", i):
-            if not substitution_depth:
-                substitution_outer_quote = quote
-                quote = ""
-            substitution_depth += 1
-            out.append("$(")
-            word_start = False
-            i += 2
-            continue
-        elif substitution_depth and not quote and not in_backticks and char == "(":
-            substitution_depth += 1
-        elif substitution_depth and not quote and not in_backticks and char == ")":
-            substitution_depth -= 1
-            if not substitution_depth:
-                quote = substitution_outer_quote
-        elif not quote and not in_backticks and not substitution_depth:
-            if char == "#" and word_start:
-                end = command.find("\n", i)
-                if end < 0:
-                    break
-                i = end
-                continue
-            # Bash blanks are ASCII; keep # after redirects as a filename for the guard.
-            word_start = char in " \t\n;&|()"
-        out.append(char)
-        i += 1
-    return "".join(out)
-
-
-def _collapse_shell_line_continuations(command: str) -> str:
-    """Remove Bash's escaped newlines before splitting command statements."""
-    out: list[str] = []
-    single = False
-    double = False
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if char == "\\" and not single and index + 1 < len(command):
-            following = command[index + 1]
-            if following != "\n":
-                out.extend((char, following))
-            index += 2
-            continue
-        if char == "'" and not double:
-            single = not single
-        elif char == '"' and not single:
-            double = not double
-        out.append(char)
-        index += 1
-    return "".join(out)
-
-
 def _separate_program_flag_quotes(command: str, *, keep_plain: bool = False) -> str:
     """Give shlex's non-POSIX lexer a word boundary before attached scripts.
 
@@ -538,7 +452,7 @@ def _literal_word(token: str) -> str:
 
 
 def _document_key(token: str) -> str:
-    """The here-document closer a delimiter word names (shared contract rule 1)."""
+    """The here-document closer a delimiter word names, as heredoc_view writes it."""
     closer = heredoc_closer(token)
     return closer[0] if closer is not None else _strip_quotes(token)
 
@@ -621,22 +535,6 @@ def _is_single_quoted(token: str) -> bool:
 
 def _is_assignment(token: str) -> bool:
     return bool(_ASSIGNMENT_RE.match(_strip_quotes(token)))
-
-
-def _heredoc_delimiters(line: str) -> list[tuple[str, bool, bool]] | None:
-    """Keep only the shared parser's unambiguous here-doc delimiters."""
-    return skippable_heredoc_delimiters(line)
-
-
-def _strip_heredoc_bodies(command: str) -> str:
-    return strip_skippable_heredoc_bodies(
-        command, opener_transform=_strip_shell_comments, body_substitutions=_substitution_fragments
-    )
-
-
-def _substitution_fragments(line: str) -> list[str]:
-    """Keep only executable substitutions from an unquoted heredoc line."""
-    return [line[start:end] for start, end, _ in _substitution_spans(line, heredoc=True)]
 
 
 def _is_command_brace(token: str, segment: list[str]) -> bool:
@@ -1162,7 +1060,7 @@ def _env_dump_reason(
         found = _command_at(segment)
         target = _stdout_target(found[1]) if found else None
         if target is not None:
-            target = _normalized_path(target)
+            target = _normalized_path(_literal_word(target))
         # Process substitutions are output consumers, not capture filenames.
         sinks = [substitutions[arg][1] for arg in segment if arg in substitutions and substitutions[arg][0] == ">("]
         if sinks:
@@ -1364,27 +1262,10 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
 
 
 def _heredoc_inputs(command: str) -> dict[str, list[tuple[str, bool]]]:
-    """Retain closed script inputs for inspection at their consumer statement."""
+    """Here-document bodies from the shared plan, by closer, for their consumer statement."""
     documents: dict[str, list[tuple[str, bool]]] = {}
-    lines = _collapse_shell_line_continuations(command).split("\n")
-    index = 0
-    quote = ""
-    while index < len(lines):
-        opener = _strip_shell_comments(lines[index])
-        index += 1
-        pending = skippable_heredoc_delimiters(opener, initial_quote=quote)
-        quote = shell_quote_after(opener, quote)
-        if not pending:
-            continue
-        for delimiter, strip_tabs, quoted in pending:
-            start = index
-            while index < len(lines) and (lines[index].lstrip("\t") if strip_tabs else lines[index]) != delimiter:
-                index += 1
-            if index == len(lines):
-                break
-            body = "\n".join(line.lstrip("\t") if strip_tabs else line for line in lines[start:index])
-            index += 1
-            documents.setdefault(delimiter, []).append((body, quoted))
+    for document in parse_heredocs(command):
+        documents.setdefault(view_closer(document.closer), []).append(("\n".join(document.lines), document.quoted))
     return documents
 
 
@@ -1621,7 +1502,7 @@ def _danger_reason(
     for i, segment in enumerate(pipeline):
         for token in segment:
             for marker, (_, body) in substitutions.items():
-                if marker in token and (nested is None or nested.new(body)):
+                if marker in token and (nested is None or nested.new(body, copied, named, dumped_files)):
                     reason = _scan_command(body, set(copied), dict(named), depth=depth + 1, dumped_files=dumped_files)
                     if reason:
                         return reason
@@ -1651,7 +1532,8 @@ def _danger_reason(
 
 
 def _normalized_path(path: str) -> str:
-    clean = os.path.normpath(_literal_word(path))
+    """Normalize a literal path: quote removal belongs to the caller, once (`".e'n'v"` stays)."""
+    clean = os.path.normpath(path)
     if clean.startswith("//"):
         clean = clean[1:]
     return clean
@@ -2031,7 +1913,7 @@ def _scan_command(
     start = (set(copied), dict(named), set(dumped_files))
     # Nested scripts the first pass read are not read again: each nesting
     # level would otherwise double the work.
-    scanned: set[str] = set()
+    scanned: set[tuple[object, ...]] = set()
     for shell_words in (False, True):
         if shell_words:
             copied, named = set(start[0]), dict(start[1])
@@ -2056,16 +1938,21 @@ def _scan_command(
 
 
 class _Nested:
-    """Nested scripts read by the first pass; the second pass skips them."""
+    """Nested scripts the first pass read, keyed by script and scan state.
 
-    def __init__(self, scanned: set[str], *, skip: bool) -> None:
+    The second pass skips only a script it would read with the same state:
+    the secret copies, names and dumped files a nested scan depends on.
+    """
+
+    def __init__(self, scanned: set[tuple[object, ...]], *, skip: bool) -> None:
         self.scanned = scanned
         self.skip = skip
 
-    def new(self, script: str) -> bool:
+    def new(self, script: str, copied: set[str], named: dict[str, str], dumped_files: set[str]) -> bool:
+        key = (script, frozenset(copied), frozenset(named.items()), frozenset(dumped_files))
         if self.skip:
-            return script not in self.scanned
-        self.scanned.add(script)
+            return key not in self.scanned
+        self.scanned.add(key)
         return True
 
 
@@ -2099,13 +1986,13 @@ def _scan_pipelines(
                 if any(_substitution_bodies(arg) for arg in args) and _eval_secret_source(args, copied, named):
                     return "dynamic eval can reach a known secret source"
                 script = " ".join(_strip_quotes(arg) for arg in args)
-                if nested.new(script):
+                if nested.new(script, copied, named, dumped_files):
                     reason = _scan_command(script, set(copied), dict(named), depth=depth + 1, dumped_files=dumped_files)
                     if reason:
                         return reason
             elif cmd in {"bash", "sh", "dash", "zsh", "ksh"}:
                 for script in _shell_script(args):
-                    if not nested.new(script):
+                    if not nested.new(script, copied, named, dumped_files):
                         continue
                     reason = _scan_command(script, set(copied), dict(named), depth=depth + 1, dumped_files=dumped_files)
                     if reason:

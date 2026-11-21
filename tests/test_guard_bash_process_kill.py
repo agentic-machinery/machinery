@@ -148,8 +148,9 @@ F10_ANSI_C = [
         ('echo "pkill -f worker; pgrep -f worker | xargs kill"', False),
         ("printf '%s\\n' 'kill $(pgrep -f worker)'", False),
         ('git commit -m "refuse pkill -f and pgrep --full | kill"', False),
-        ("cat <<'EOF'\npkill -f worker\nkill $(pgrep -f worker)\nEOF", False),
-        ("cat <<EOF\npkill -f worker\nEOF", False),
+        # No reader name proves a body is data (C-6334): `cat` may be a function.
+        ("cat <<'EOF'\npkill -f worker\nkill $(pgrep -f worker)\nEOF", True),
+        ("cat <<EOF\npkill -f worker\nEOF", True),
         ("bash -e -c 'echo ok'", False),
         ('bash ./run.sh "$@"', False),
         ("bash -o pipefail -O extglob -c 'echo ok'", False),

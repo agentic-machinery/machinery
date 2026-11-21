@@ -6,7 +6,6 @@ import pytest
 
 from agents_extensions.shared.hooks.shell_redirects import (
     command_repository_unknown,
-    preprocess_branch_command,
     scope_events,
     unmodeled_shell_offset,
 )
@@ -209,7 +208,10 @@ def test_original_argv_order_survives_whole_command_refusal():
 def test_nested_quoted_heredocs_are_inert(opener, wrapper):
     body = f"cat {opener}\ncase study: don't lex ${{y:-(z)}} `case` (text)\nEOF\n"
     command = "git switch -c fixture && " + wrapper.format(body=body)
-    assert not command_repository_unknown(command)
+    # Inside backticks the body's own backtick ends the substitution, so Bash
+    # ends the here-document at the end of the backtick text and runs `(text)`
+    # and `EOF` as commands: the reader refuses that shape.
+    assert command_repository_unknown(command) is wrapper.startswith("echo `")
 
 
 @pytest.mark.parametrize(
@@ -250,8 +252,7 @@ def test_nested_heredoc_tabs_and_multiple_bodies():
 def test_nested_heredoc_preserves_statement_boundary(opener, tail):
     closer = "\tEOF" if opener.startswith("<<-") else "EOF"
     command = f'echo "$(cat {opener}\nfirst\n{closer}\n{tail}\n)"'
-    visible = preprocess_branch_command(command)
-    assert "cat </dev/null  ; " in visible
+    visible = preprocess_shell_command(command)
     kwargs = dict(mark_redirect_unreadable=True, unreadable_marker="?", unparsed=["?"], may_match=lambda _: False)
     segments = [argv for kind, argv in scope_events(visible, **kwargs) if kind == "segment"]
     assert (["git", "switch", "-c", "fixture"] in segments) == bool(tail)
@@ -266,12 +267,12 @@ def test_nested_heredoc_depth_limit_is_fail_closed():
 
 def test_branch_preprocessing_does_not_consume_array_arithmetic_as_a_heredoc():
     command = "x[1 << EOF ]=1\ngit checkout -b fixture\nEOF"
-    assert "git checkout -b fixture" in preprocess_branch_command(command)
+    assert "git checkout -b fixture" in preprocess_shell_command(command)
 
 
 @pytest.mark.parametrize("opener", ["<<EOF\r", r"<<E$'O'F"])
 def test_branch_preprocessing_preserves_conservative_exotic_delimiter_refusal(opener):
     command = f"cat {opener}\ngit checkout -b fixture\nEOF"
-    with pytest.raises(ShellPreprocessLimit, match="ambiguous heredoc delimiter"):
-        preprocess_branch_command(command)
+    with pytest.raises(ShellPreprocessLimit, match="here-document delimiter cannot be read safely"):
+        preprocess_shell_command(command)
     assert command_repository_unknown(command)

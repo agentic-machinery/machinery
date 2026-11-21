@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, parse_heredocs
 from lu_machinery.common.repo_root import machinery_path
 from tests.helpers.restore_import_state import restore_import_state
 
@@ -183,8 +184,9 @@ def test_issue_9102_executable_payload_stays_visible(repos, shape):
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
-def test_issue_9102_real_let_heredoc_body_is_inert():
-    assert _dangerous("let x=1<<EOF\ngit checkout -b feature\nEOF") is None
+def test_issue_9102_real_let_heredoc_body_words_stay_visible():
+    # The `<<` of `let x=1<<EOF` is a here-document; its body words stay visible.
+    assert _dangerous("let x=1<<EOF\ngit checkout -b feature\nEOF") is not None
 
 
 @pytest.mark.parametrize(
@@ -219,7 +221,7 @@ def test_issue_9115_backtick_depth_limit_blocks_branch_hook(repos, monkeypatch):
 
 
 def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
-    assert guard._heredoc_delimiters(r'echo "a \" b" <<EOF') == [("EOF", False)]
+    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(r'echo "a \" b" <<EOF' "\nx\nEOF")] == [("EOF", False)]
 
 
 @pytest.mark.parametrize(
@@ -232,8 +234,8 @@ def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
     ],
 )
 def test_issue_9088_standard_heredoc_delimiters(opener, closer):
-    assert guard._heredoc_delimiters(f"cat {opener}") == [("EOF", opener == "<<-EOF")]
-    assert _dangerous(f"cat {opener}\ngit checkout -b feature\n{closer}") is None
+    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(f"cat {opener}\nx\n{closer}")] == [("EOF", opener == "<<-EOF")]
+    assert _dangerous(f"cat {opener}\ngit checkout -b feature\n{closer}") is not None
     assert _dangerous(f"cat {opener}\nnote\n{closer}\ngit checkout -b feature") is not None
 
 
@@ -249,14 +251,15 @@ def test_issue_9088_standard_heredoc_delimiters(opener, closer):
 )
 def test_issue_9088_here_strings_keep_branch_switch_visible(repos, first):
     command = f"{first}\ngit checkout -b feature\nEOF"
-    assert guard._heredoc_delimiters(first) == []
+    assert parse_heredocs(first) == ()
     assert _dangerous(command) is not None
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
 def test_issue_9088_crlf_closer_keeps_branch_switch_visible(repos):
     command = "cat <<EOF\r\nEOF\r\ngit checkout -b feature\nEOF"
-    assert _dangerous(command) is not None
+    with pytest.raises(ShellPreprocessLimit):
+        _dangerous(command)
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
@@ -283,14 +286,17 @@ def test_issue_9088_reviewer_heredoc_bypass_blocks(repos, monkeypatch):
 )
 def test_issue_9088_exotic_heredoc_keeps_branch_switch_visible(repos, opener, closer):
     command = f"cat {opener}\ngit checkout -b x\n{closer}"
-    assert guard._heredoc_delimiters(f"cat {opener}") is None
-    assert _dangerous(command) is not None
+    with pytest.raises(ShellPreprocessLimit):
+        parse_heredocs(f"cat {opener}\nx\n{closer}")
+    with pytest.raises(ShellPreprocessLimit):
+        _dangerous(command)
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
 def test_issue_9088_exotic_body_cannot_skip_later_safe_opener(repos):
     command = "cat <<$'EOF'\ncat <<SAFE\ngit checkout -b x\nSAFE\nEOF"
-    assert _dangerous(command) is not None
+    with pytest.raises(ShellPreprocessLimit):
+        _dangerous(command)
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
@@ -600,16 +606,20 @@ def test_wrapper_options_do_not_hide_branch_verb(cmd):
 def test_unclosed_heredoc_does_not_hide_trailing_danger():
     # A never-closing marker must NOT drop the real command after it (#4877
     # fail-open): the buffered lines were not a real heredoc body.
-    assert _dangerous("cat <<'NOEND'\nbody > fake\ngit branch -D main") is not None
+    command = "cat <<'NOEND'\nbody > fake\ngit branch -D main"
+    with pytest.raises(ShellPreprocessLimit):
+        _dangerous(command)
+    assert guard._command_danger_reason(command) is not None
 
 
-def test_attached_dash_heredoc_closes_and_body_dropped():
-    # `<<-EOF` with a tab-indented closer is a REAL heredoc: body dropped
-    # (no false positive on body content), trailing command still scanned.
+def test_attached_dash_heredoc_closes_and_body_words_stay_visible():
+    # `<<-EOF` with a tab-indented closer is a REAL heredoc: it closes, the
+    # trailing command is still scanned, and no reader name proves its body is
+    # data (C-6334), so the body's words stay visible too.
     cmd = "cat <<-EOF\n\tgit branch -D fake\n\tEOF\ngit branch -D main"
     assert _dangerous(cmd) is not None  # the trailing real one
-    # body-only (properly closed) must not trip:
-    assert _dangerous("cat <<-EOF\n\tgit branch -D fake\n\tEOF") is None
+    assert [d.closer for d in parse_heredocs(cmd)] == ["EOF"]
+    assert _dangerous("cat <<-EOF\n\tgit branch -D fake\n\tEOF") is not None
 
 
 # --- #4899: target-repo-aware protected-root matching ----------------------

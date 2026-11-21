@@ -1,15 +1,17 @@
-"""Quote-preserving Bash word splitting for shared hook guards.
+"""Shared Bash reading for hook guards: words, comments and here-documents.
 
 The guards need each word's original spelling, quotes included. Non-POSIX
 shlex keeps that spelling but honours a quote only at the start of a token, so
 a quote opening inside a word (`it'\\''s`, `a' 'b`) flipped quote parity.
-split_quote_preserving tracks Bash quoting itself instead.
+split_quote_preserving tracks Bash quoting itself instead. parse_heredocs is
+the one here-document parser; see the plan comment above it.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from typing import NamedTuple
 
 _MAX_BACKTICK_DEPTH = 16
 _SHELL_OPERATORS = (
@@ -294,275 +296,440 @@ def _expose_backtick_bodies(command: str, *, depth: int = 0) -> str:
     return "".join(out)
 
 
-def _body_substitutions(body: str) -> list[str] | None:
-    """Expose complete substitutions, including ones spanning body lines.
-
-    A substitution we cannot close leaves the entire body visible to guards.
-    """
-    found: list[str] = []
-    i = 0
-    while i < len(body):
-        if body[i] == "\\":
-            i += 2
-            continue
-        if body.startswith("$((", i):
-            i += 3
-            continue
-        if body.startswith("$(", i):
-            start = i
-            depth = 1
-            quote = ""
-            backticks = False
-            comment = False
-            word_start = True
-            i += 2
-            while i < len(body) and depth:
-                char = body[i]
-                if comment:
-                    if char == "\n":
-                        comment = False
-                        word_start = True
-                    i += 1
-                    continue
-                if char == "\\" and quote != "'":
-                    i += 2
-                    word_start = False
-                    continue
-                if char == "'" and quote != '"' and not backticks:
-                    quote = "" if quote == "'" else "'"
-                    word_start = False
-                elif char == '"' and quote != "'" and not backticks:
-                    quote = "" if quote == '"' else '"'
-                    word_start = False
-                elif char == "`" and quote != "'":
-                    backticks = not backticks
-                    word_start = False
-                elif not quote and not backticks:
-                    if char == "#" and word_start:
-                        comment = True
-                    elif char == "(":
-                        depth += 1
-                    elif char == ")":
-                        depth -= 1
-                    word_start = char in " \t\n;&|()"
-                i += 1
-            if depth:
-                return None
-            found.append(body[start:i])
-            continue
-        if body[i] == "`":
-            start = i + 1
-            i += 1
-            while i < len(body) and body[i] != "`":
-                i += 2 if body[i] == "\\" else 1
-            if i >= len(body):
-                return None
-            found.append("$(" + body[start:i] + ")")
-            i += 1
-            continue
-        i += 1
-    return found
-
-
 def preprocess_shell_command(command: str) -> str:
     """Prepare executable text for every guard in one conservative order.
 
-    Comments are removed from opener lines before recognizing here-docs, but
-    body lines are preserved until substitutions are extracted. A hash at the
-    start of a body line is data, and its substitution can still execute.
+    The here-document parser below joins line continuations in parser
+    context and shows each body as plain words; then comments are removed
+    and backticks are exposed as `$(...)`.
     """
-    collapsed = collapse_line_continuations(command)
-    visible = strip_skippable_heredoc_bodies(
-        collapsed, opener_transform=strip_shell_comments, body_substitutions=_body_substitutions
-    )
-    return _expose_backtick_bodies(strip_shell_comments(visible))
+    return _expose_backtick_bodies(strip_shell_comments(heredoc_view(command)))
 
 
-def skippable_heredoc_delimiters(line: str, *, initial_quote: str = "") -> list[tuple[str, bool, bool]] | None:
-    """Find only here-doc words whose literal closer is unambiguous (contract rule 1).
+# Here-document plan: one parser for every guard.
+#
+# parse_heredocs reads a command the way Bash finds here-documents. It tracks
+# quotes ('...', "...", $'...', $"..."), backslashes, comments, `$(...)`,
+# backticks, `${...}` and arithmetic, so a `<<` is an operator only in command
+# context. Each body starts after the first newline Bash reads as a token once
+# its operator is seen (a newline inside quotes does not count), and ends at
+# the line equal to the closer. A quoted delimiter keeps physical lines; an
+# unquoted one joins backslash-newline continuations before comparing, as
+# Bash does. Line continuations in command text are joined in the same pass.
+#
+# A body is never read as shell words: an apostrophe in prose is data. No
+# body is dropped either, whatever reads it, because no reader name proves
+# what will consume it (a function, alias or PATH entry can stand behind any
+# name). heredoc_view shows every body to the guards in two parts:
+#
+# - its words (_body_words), in one subshell line `( ... ; ... )`. Quotes,
+#   backslashes, comments, redirects and expansion punctuation are removed;
+#   `;`, `&`, `|`, `)`, backticks and a `(` that does not follow a word
+#   character start a new command, and a reserved word leading a command is
+#   dropped. So any command a shell could
+#   run from the body starts a command, no body opens syntax, and a `cd` in it
+#   cannot move a guard's idea of the working directory;
+# - for an unquoted delimiter, the expansions the outer shell performs on the
+#   body (`$(...)`, backticks, `${...}`, `$((...))`), as real shell text, each
+#   on its own line: they run whatever reads the body.
+#
+# Anything the parser cannot resolve refuses with ShellPreprocessLimit: a
+# delimiter that may expand or is empty, a body or expansion that never
+# closes, a `case` inside a substitution (its patterns end in `)`), an
+# unbalanced arithmetic context, nesting deeper than _MAX_NESTING, or a quote
+# or substitution still open at the end of a command that has a
+# here-document.
 
-    Return (closer, strip_tabs, quoted), or None for any ambiguous opener.
-    Callers then keep every remaining line visible to their command scanner.
+_MAX_NESTING = 16
+_DELIMITER_END = frozenset(" \t\n;|&()<>")
+_SUBSCRIPTED = re.compile(r"(?:^|[ \t\n;&|(])[A-Za-z_][A-Za-z0-9_]*\Z")
+_BODY_BREAKS = str.maketrans({char: "\n" for char in ";&|()`"})
+# Quote removal joins a word (`g"h"` is `gh`): quotes and backslashes go.
+# Other punctuation only separates words.
+_BODY_DROPS = str.maketrans({"'": None, '"': None, "\\": None, **{char: " " for char in "#<>${}"}})
+_RESERVED_WORDS = frozenset(
+    {"!", "[[", "]]", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in"}
+    | {"select", "then", "time", "until", "while"}
+)
+_EXPANSIONS = ("$((", "$(", "${", "$[")
+_CLOSERS = {"((": "))", "$[": "]", "${": "}"}
+
+
+class HereDocument(NamedTuple):
+    """One here-document, bound to the command and descriptor that own it.
+
+    Offsets are into the text the parser read; inside backticks, that is the
+    backtick body after Bash removes its escapes.
     """
-    openers = _heredoc_openers(line, initial_quote=initial_quote)
-    return None if openers is None else [(closer, strip_tabs, quoted) for closer, strip_tabs, quoted, _ in openers]
+
+    operator: int  # offset of its `<<`
+    owner: int  # offset where its simple command starts
+    descriptor: str  # the descriptor word before `<<`; "" for standard input
+    closer: str
+    quoted: bool  # a quoted delimiter: the body is literal
+    strip_tabs: bool  # `<<-`
+    lines: tuple[str, ...]  # physical body lines, leading tabs removed for `<<-`
 
 
-def _heredoc_openers(line: str, *, initial_quote: str = "") -> list[tuple[str, bool, bool, int]] | None:
-    """skippable_heredoc_delimiters, with the offset of each `<<` operator."""
-    delimiters: list[tuple[str, bool, bool, int]] = []
-    ambiguous = False
+def _ansi_c(text: str) -> str:
+    """Decode the escapes of a $'...' body so its words are what Bash runs."""
+
+    def decode(match: re.Match[str]) -> str:
+        escape = match.group(1)
+        if escape[0] in "xuU":
+            return chr(int(escape[1:], 16)) if len(escape) > 1 else escape
+        if escape[0] in "01234567":
+            return chr(int(escape, 8) & 0xFF)
+        return {"n": "\n", "t": "\t", "r": "\r", "e": "\x1b", "E": "\x1b", "a": "\a", "b": "\b"}.get(escape, escape)
+
+    return re.sub(r"\\(x[0-9A-Fa-f]{0,2}|u[0-9A-Fa-f]{0,4}|U[0-9A-Fa-f]{0,8}|[0-7]{1,3}|.)", decode, text, flags=re.S)
+
+
+def _body_words(text: str) -> list[str]:
+    """A body as plain words, one entry per command a shell could start."""
+    # A reading shell joins continuations, quoted delimiter or not.
+    text = re.sub(r"(?<!\\)((?:\\\\)*)\\\n", r"\1", text)
+    text = re.sub(r"\$'((?:[^'\\]|\\.)*)'?", lambda match: _ansi_c(match.group(1)), text, flags=re.S)
+    # A `(` right after a word character never starts a command in Bash
+    # (`name()` opens a function definition), so call syntax in code or prose
+    # (`set()`, `dict(env)`) cannot turn an argument into a command.
+    text = re.sub(r"(?<=[A-Za-z0-9_.\]])\(", " ", text)
+    # A shell reading the body expands `$NAME` and `${NAME...}`: keep the name.
+    text = re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", "\x00\\1", text)
+    text = text.translate(_BODY_BREAKS).translate(_BODY_DROPS).replace("\x00", "$")
+    words: list[str] = []
+    for line in text.split("\n"):
+        parts = line.split()
+        # A reserved word only opens syntax; the command after it is what runs.
+        while parts and parts[0] in _RESERVED_WORDS:
+            parts.pop(0)
+        if parts:
+            words.append(" ".join(parts))
+    return words
+
+
+def _tail(out: list[str], size: int = 64) -> str:
+    """The last `size` characters written to `out`, without joining all of it."""
+    parts: list[str] = []
+    count = 0
+    for part in reversed(out):
+        parts.append(part)
+        count += len(part)
+        if count >= size:
+            break
+    return "".join(reversed(parts))[-size:]
+
+
+def document_words(document: HereDocument) -> list[str]:
+    """A body as plain words, one entry per command (see the plan above).
+
+    For guards that also scan body text for their own pattern: any program,
+    not only a shell, may read the body.
+    """
+    return _body_words("\n".join(document.lines))
+
+
+def _backtick_body(command: str, index: int) -> tuple[str, int]:
+    """The command text of the backticks opening at `index`, and the offset after them."""
+    end = index + 1
+    while end < len(command) and command[end] != "`":
+        end += 2 if command[end] == "\\" else 1
+    if end >= len(command):
+        raise ShellPreprocessLimit("backtick substitution does not close")
+    return re.sub(r"\\([\\`$])", r"\1", command[index + 1 : end]), end + 1
+
+
+def _body_expansions(text: str, documents: list[HereDocument], depth: int) -> list[str]:
+    """The expansions the outer shell performs on an unquoted body, as shell text."""
+    found: list[str] = []
     index = 0
-    quote = initial_quote
-    contexts: list[str] = []
-    arithmetic_shift = False
-    while index < len(line):
-        char = line[index]
-        if quote:
-            if char == "\\" and quote == '"' and index + 1 < len(line):
+    while index < len(text):
+        if text[index] == "\\":
+            index += 2
+            continue
+        if text[index] == "`":
+            body, index = _backtick_body(text, index)
+            inner, view, _ = _parse(body, depth=depth + 1)
+            documents.extend(inner)
+            found.append("$(" + view + ")")
+            continue
+        opening = next((op for op in _EXPANSIONS if text.startswith(op, index)), "")
+        if not opening:
+            index += 1
+            continue
+        context = "cmd" if opening == "$(" else "((" if opening == "$((" else opening
+        inner, view, index = _parse(text, index + len(opening), [context], depth + 1)
+        documents.extend(inner)
+        found.append(opening + view)
+    return found
+
+
+def heredoc_view(command: str) -> str:
+    """The command as every guard reads it: continuations joined, bodies shown as above.
+
+    The `<<` operators and closer lines stay (closers as view_closer writes
+    them), so a reader can still pair a body with its command, and parsing the
+    view again yields the same plan.
+    """
+    if "<<" not in command:
+        return collapse_line_continuations(command)
+    return _parse(command)[1]
+
+
+def parse_heredocs(command: str) -> tuple[HereDocument, ...]:
+    """Every here-document in `command`, in the order Bash reads them."""
+    if "<<" not in command:
+        return ()
+    return _parse(command)[0]
+
+
+def _parse(
+    command: str, index: int = 0, inside: list[str] | None = None, depth: int = 0
+) -> tuple[tuple[HereDocument, ...], str, int]:
+    """Parse from `index`, at the top level or inside one expansion context.
+
+    Return the documents, the view, and the offset where the expansion closed
+    (the end of `command` at the top level).
+    """
+    if depth > _MAX_NESTING:
+        raise ShellPreprocessLimit("shell nesting too deep to read safely")
+    out: list[str] = []
+    documents: list[HereDocument] = []
+    pending: list[tuple[int, int, str, str, bool, bool]] = []
+    # Contexts: "cmd" (top level or `$(`), quotes, "${", "((" and "$[".
+    stack: list[str] = ["cmd", *(inside or [])]
+    base = len(stack) - 1
+    parens: list[int] = [0] * len(stack)
+    word_start = True
+    owner = index
+    length = len(command)
+
+    def close() -> bool:
+        stack.pop()
+        parens.pop()
+        return len(stack) <= base
+
+    while index < length:
+        char = command[index]
+        context = stack[-1]
+        if stack.count("cmd") > _MAX_NESTING:
+            raise ShellPreprocessLimit("shell nesting too deep to read safely")
+        if context in {"'", "$'"}:
+            if context == "$'" and char == "\\" and index + 1 < length:
+                out.append(command[index : index + 2])
                 index += 2
                 continue
-            if char == quote:
-                quote = ""
+            out.append(char)
             index += 1
+            if char == "'" and close():
+                return tuple(documents), "".join(out), index
             continue
         if char == "\\":
-            index += 2
-            continue
-        if char in "\"'":
-            quote = char
-            index += 1
-            continue
-        if line.startswith("$((", index):
-            contexts.append("arithmetic")
-            index += 3
-            continue
-        if line.startswith("$[", index):
-            contexts.append("arithmetic_bracket")
-            index += 2
-            continue
-        if char == "[" and re.search(r"[A-Za-z_][A-Za-z0-9_]*\Z", line[:index]):
-            contexts.append("arithmetic_bracket")
-            index += 1
-            continue
-        if line.startswith("${", index):
-            contexts.append("parameter")
-            index += 2
-            continue
-        if line.startswith("$(", index):
-            contexts.append("command")
-            index += 2
-            continue
-        if line.startswith("((", index):
-            contexts.append("arithmetic")
-            index += 2
-            continue
-        if contexts and contexts[-1] == "arithmetic" and line.startswith("))", index):
-            contexts.pop()
-            index += 2
-            continue
-        if contexts and contexts[-1] == "parameter" and char == "}":
-            contexts.pop()
-            index += 1
-            continue
-        if contexts and contexts[-1] == "arithmetic_bracket" and char == "]":
-            contexts.pop()
-            index += 1
-            continue
-        if contexts and contexts[-1] == "command" and char == ")":
-            contexts.pop()
-            index += 1
-            continue
-        if contexts and contexts[-1] == "command" and char == "(":
-            contexts.append("command")
-            index += 1
-            continue
-        if line.startswith("<<<", index):
-            index += 3
-            continue
-        if not line.startswith("<<", index):
-            index += 1
-            continue
-        if contexts and contexts[-1] in {"arithmetic", "arithmetic_bracket", "parameter"}:
-            arithmetic_shift = True
-            index += 2
-            continue
-
-        operator = index
-        index += 2
-        strip_tabs = index < len(line) and line[index] == "-"
-        if strip_tabs:
-            index += 1
-        while index < len(line) and line[index] in " \t":
-            index += 1
-        start = index
-        word_quote = ""
-        while index < len(line):
-            char = line[index]
-            if char == "\\" and word_quote != "'" and index + 1 < len(line):
-                index += 2
+            if command.startswith("\\\n", index):
+                index += 2  # a line continuation, joined in parser context
                 continue
-            if char in "\"'" and (not word_quote or word_quote == char):
-                word_quote = "" if word_quote else char
-            elif not word_quote and char in " \t\r\n;|&()<>":
-                break
+            out.append(command[index : index + 2])
+            index += 2
+            word_start = False
+            continue
+        if char == '"':
+            out.append(char)
             index += 1
-        closer = heredoc_closer(line[start:index])
-        if closer is None:
-            ambiguous = True
-        else:
-            delimiters.append((closer[0], strip_tabs, closer[1], operator))
-    # A later safe-looking opener must not hide lines after an exotic opener
-    # on the same command line.
-    return (
-        None
-        if ambiguous
-        or (arithmetic_shift and delimiters)
-        or any(c in {"arithmetic", "arithmetic_bracket", "parameter"} for c in contexts)
-        else delimiters
-    )
+            word_start = False
+            if context != '"':
+                stack.append('"')
+                parens.append(0)
+            elif close():
+                return tuple(documents), "".join(out), index
+            continue
+        if char == "'" and context != '"':
+            stack.append("$'" if out and out[-1] == "$" else "'")
+            parens.append(0)
+            out.append(char)
+            index += 1
+            word_start = False
+            continue
+        if char == "`":
+            body, index = _backtick_body(command, index)
+            inner, view, _ = _parse(body, depth=depth + 1)
+            documents.extend(inner)
+            out.append("$(" + view + ")")
+            word_start = False
+            continue
+        opening = next((op for op in _EXPANSIONS if command.startswith(op, index)), "")
+        if not opening and context == "cmd" and word_start and command.startswith("((", index):
+            opening = "(("
+        if not opening and context == "cmd" and char == "[" and _SUBSCRIPTED.search(_tail(out)):
+            opening = "["  # an array subscript (`x[1 << 2]=1`) is arithmetic: its `<<` is a shift
+        if opening:
+            stack.append(
+                "cmd" if opening == "$(" else "((" if opening == "$((" else "$[" if opening == "[" else opening
+            )
+            parens.append(0)
+            if opening == "$(":
+                owner = index + 2
+            out.append(opening)
+            index += len(opening)
+            word_start = True
+            continue
+        if context in _CLOSERS:
+            closing = _CLOSERS[context]
+            if context != "${" and char == "(":
+                parens[-1] += 1
+            elif context != "${" and char == ")" and parens[-1]:
+                parens[-1] -= 1
+            elif command.startswith(closing, index) and not parens[-1]:
+                out.append(closing)
+                index += len(closing)
+                word_start = False
+                if close():
+                    return tuple(documents), "".join(out), index
+                continue
+            elif char == ")" and context == "((":
+                raise ShellPreprocessLimit("arithmetic context cannot be read safely")
+            if char == "\n" and pending:
+                raise ShellPreprocessLimit("here-document opener spans an expansion")
+            out.append(char)
+            index += 1
+            continue
+        if context == '"':
+            # A newline in quotes is not the one Bash reads bodies after.
+            out.append(char)
+            index += 1
+            continue
+        # Command context: the top level or `$(...)`.
+        if char == "#" and word_start:
+            end = command.find("\n", index)
+            end = length if end < 0 else end
+            out.append(command[index:end])
+            index = end
+            continue
+        if len(stack) > 1 and word_start and re.match(r"case[ \t\n]", command[index : index + 5]):
+            raise ShellPreprocessLimit("case command inside a substitution cannot be read safely")
+        if char == "(":
+            parens[-1] += 1
+        elif char == ")":
+            if parens[-1]:
+                parens[-1] -= 1
+            elif len(stack) > 1:
+                out.append(char)
+                index += 1
+                word_start = False
+                if close():
+                    return tuple(documents), "".join(out), index
+                continue
+        if command.startswith("<<<", index):
+            out.append("<<<")
+            index += 3
+            word_start = True
+            continue
+        if command.startswith("<<", index):
+            index = _read_operator(command, index, out, pending, owner)
+            word_start = True
+            continue
+        if char == "\n":
+            out.append(char)
+            index += 1
+            if pending:
+                index = _read_bodies(command, index, out, pending, documents, depth)
+            word_start = True
+            owner = index
+            continue
+        if char in ";&|":
+            owner = index + 1
+        out.append(char)
+        index += 1
+        word_start = char in " \t;&|()<>"
+    if pending:
+        raise ShellPreprocessLimit("here-document body does not close")
+    if len(stack) > 1:
+        raise ShellPreprocessLimit("quote or substitution left open in a command with a here-document")
+    return tuple(documents), "".join(out), index
 
 
-def _quote_after(line: str, initial_quote: str) -> str:
-    quote = initial_quote
-    i = 0
-    while i < len(line):
-        char = line[i]
+def _read_operator(
+    command: str, index: int, out: list[str], pending: list[tuple[int, int, str, str, bool, bool]], owner: int
+) -> int:
+    """Read one `<<` or `<<-` operator and its delimiter word; return the next offset."""
+    operator = index
+    descriptor = re.search(r"(?:^|(?<=[ \t\n;&|()<>]))(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})\Z", _tail(out))
+    index += 2
+    strip_tabs = command.startswith("-", index)
+    index += strip_tabs
+    while index < len(command) and command[index] in " \t":
+        index += 1
+    start = index
+    quote = ""
+    while index < len(command):
+        char = command[index]
         if char == "\\" and quote != "'":
-            i += 2
+            index += 2
             continue
         if char in "\"'" and (not quote or quote == char):
             quote = "" if quote else char
-        i += 1
-    return quote
+        elif not quote and char in _DELIMITER_END:
+            break
+        index += 1
+    word = command[start:index]
+    closer = heredoc_closer(word) if "\r" not in word and "\n" not in word else None
+    if closer is None:
+        raise ShellPreprocessLimit("here-document delimiter cannot be read safely")
+    pending.append((operator, owner, descriptor.group() if descriptor else "", closer[0], closer[1], strip_tabs))
+    name = view_closer(closer[0])
+    out.append(("<<-" if strip_tabs else "<<") + (f"'{name}'" if closer[1] else name))
+    return index
 
 
-# Here-document contract, one copy for every guard. preprocess_shell_command
-# applies it through strip_skippable_heredoc_bodies; shell_redirects'
-# preprocess_branch_command refuses whatever it would leave visible.
-#
-# 1. Delimiter. A word with no `$` or backtick whose quotes close is static:
-#    its closer is the word after Bash quote removal, and a quote or backslash
-#    anywhere in it makes the body literal. Any other word is ambiguous, and
-#    every line after its opener stays visible, as before.
-# 2. Readers. Follow the body's text from the command that owns its `<<`
-#    (_reads_as_data). A pass reader (HEREDOC_PASS_READERS: cat, tee, head
-#    and so on) hands it to whatever reads its output: later pipe stages, the
-#    pipes after an enclosing group or compound command, the command a
-#    substitution is a word of (echo and printf print it on), or the command
-#    that reads a `<(` file. A sink ends it: HEREDOC_SINK_READERS, a git
-#    subcommand in _GIT_READERS, gh api/issue/pr/release (also behind env or
-#    timeout), or a Python or node program. The body is data when every
-#    reader on that path passes or sinks and is named by a literal word. Any
-#    other reader keeps it visible: a shell, any other program (sort
-#    --compress-program, awk system() and xargs run their input), an
-#    expansion such as $PY, an unreadable word, or an output process
-#    substitution `>(`. Unknown fails closed. Python and node programs are
-#    opaque to the shell guards, as their inline programs (python -c) already
-#    are; a guard with its own program reader keeps it.
-# 3. A data body is inert: it is dropped, and an unquoted body keeps only its
-#    command substitutions, which still run.
-# 4. A visible body is read as a script of its own. It must close every quote,
-#    group and nested here-document before its closer, or the command is
-#    refused (ShellPreprocessLimit): Bash ends the body at the closer, while a
-#    guard's lexer would carry the open quote over the commands that follow.
-#
-# So `{ cat <<X; } | bash` and `eval $(cat <<X ...)` keep the body visible.
-# Not covered: text written to a file or a variable and run later, the same
-# limit as any script file.
+def view_closer(closer: str) -> str:
+    """The closer heredoc_view writes for `closer`: itself when it is a plain word.
 
-# Text readers whose output carries their input on, and readers that end it.
-HEREDOC_PASS_READERS = frozenset({"base64", "cat", "column", "cut", "grep", "head", "jq", "tail", "tee", "tr", "uniq"})
-HEREDOC_SINK_READERS = frozenset({":", "echo", "let", "md5sum", "printf", "read", "sha1sum", "sha256sum", "true", "wc"})
-_PROGRAM_READER = re.compile(r"(?:python(?:[0-9]+(?:\.[0-9]+)*)?|node)\Z")
-_GIT_READERS = frozenset({"am", "apply", "commit", "commit-tree", "hash-object", "merge", "notes", "tag"})
-_GH_READERS = frozenset({"api", "issue", "pr", "release"})
-_DURATION = re.compile(r"[0-9]+(?:\.[0-9]*)?[smhd]?\Z")
-_MAX_HEREDOC_DEPTH = 16
-_REDIRECT_OPERATORS = frozenset({"<", ">", ">>", ">|", "<>", "&>", "&>>", ">&", "<&", "<<<", "<<", "<<-"})
-_PIPELINE_ENDS = frozenset({";", "&", "&&", "||", ";;", "(", ")", "\n"})
-_STAGE_PREFIXES = frozenset({"!", "time", "if", "then", "elif", "else", "while", "until", "do", "{"})
-_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+    Any other closer (`EO"F`, `END-DATA`) becomes an identifier that encodes it,
+    so the view's closer line opens no quote and parses to the same plan.
+    """
+    if re.fullmatch(r"[A-Za-z0-9_]+", closer):
+        return closer
+    return "LU_HEREDOC_" + closer.encode("utf-8").hex()
+
+
+def _read_bodies(
+    command: str,
+    index: int,
+    out: list[str],
+    pending: list[tuple[int, int, str, str, bool, bool]],
+    documents: list[HereDocument],
+    depth: int,
+) -> int:
+    """Read the pending bodies that start at `index`; return the offset after them."""
+    for operator, owner, descriptor, closer, quoted, strip_tabs in pending:
+        lines: list[str] = []
+        while True:
+            if index > len(command) or (index == len(command) and command.endswith("\n")):
+                raise ShellPreprocessLimit("here-document body does not close")
+            end = command.find("\n", index)
+            end = len(command) if end < 0 else end
+            line = command[index:end]
+            logical = line
+            # An unquoted body joins continuations before Bash compares the closer.
+            while not quoted and (len(logical) - len(logical.rstrip("\\"))) % 2 and end < len(command):
+                following = command.find("\n", end + 1)
+                following = len(command) if following < 0 else following
+                logical = logical[:-1] + command[end + 1 : following]
+                line = line + "\n" + command[end + 1 : following]
+                end = following
+            index = end + 1
+            if (logical.lstrip("\t") if strip_tabs else logical) == closer:
+                break
+            lines.extend(part.lstrip("\t") if strip_tabs else part for part in line.split("\n"))
+        documents.append(HereDocument(operator, owner, descriptor, closer, quoted, strip_tabs, tuple(lines)))
+        text = "\n".join(lines)
+        words = _body_words(text)
+        if words:
+            out.append("( " + " ; ".join(words) + " )\n")
+        if not quoted:
+            out.extend(expansion + "\n" for expansion in _body_expansions(text, documents, depth))
+        out.append(view_closer(closer) + ("\n" if index <= len(command) else ""))
+    pending.clear()
+    return min(index, len(command))
 
 
 def static_word(word: str) -> tuple[str, bool] | None:
@@ -610,471 +777,9 @@ def static_word(word: str) -> tuple[str, bool] | None:
 
 
 def heredoc_closer(word: str) -> tuple[str, bool] | None:
-    """Contract rule 1: the closer and literal flag of a static delimiter word."""
+    """The closer and literal flag of a static here-document delimiter word."""
     closer = static_word(word)
     return None if closer is None or not closer[0] else closer
-
-
-def _line_words(line: str) -> list[tuple[str, int]] | None:
-    """Whole shell words and single operators of one line, with their offsets."""
-    try:
-        tokens = split_quote_preserving(line, punctuation_chars="();<>|&\n", whitespace=" \t")
-    except ValueError:
-        return None
-    words: list[tuple[str, int]] = []
-    end = 0
-    joinable = False
-    for token in tokens:
-        start = line.find(token, end)
-        if start < 0:
-            return None
-        operator = set(token) <= _OPERATOR_CHARS
-        if operator:
-            offset = start
-            for part in split_operator_run(token):
-                words.append((part, offset))
-                offset += len(part)
-        elif joinable and start == end:
-            words[-1] = (words[-1][0] + token, words[-1][1])
-        else:
-            words.append((token, start))
-        end = start + len(token)
-        joinable = not operator
-    return words
-
-
-def _reader(stage: list[str]) -> str | None:
-    """Contract rule 2 for one simple command's words.
-
-    "pass" when its output carries the body on, "sink" when the body ends
-    there, None for any other reader.
-    """
-    words: list[str] = []
-    index = 0
-    while index < len(stage):
-        if stage[index] in _REDIRECT_OPERATORS:
-            index += 2
-            continue
-        words.append(stage[index])
-        index += 1
-    index = 0
-    while index < len(words) and words[index] in _STAGE_PREFIXES:
-        index += 1
-    while index < len(words) and _ASSIGNMENT.match(words[index]):
-        index += 1
-    # Nothing runs at all: Bash reads the body and discards it.
-    return "sink" if index >= len(words) else _program_reader(words[index:])
-
-
-def _program_name(word: str) -> str | None:
-    """The program a command word runs: its literal last path segment.
-
-    A directory may expand (`$VENV/bin/python`); the name itself may not.
-    """
-    value = static_word(word)
-    if value is not None:
-        return value[0].rsplit("/", 1)[-1] or None
-    if "/" not in word:
-        return None
-    tail = word.rsplit("/", 1)[1]
-    if word.startswith('"') and tail.endswith('"'):
-        tail = tail[:-1]
-    if any(char in tail for char in "\"'"):
-        return None
-    value = static_word(tail)
-    return value[0] if value is not None else None
-
-
-def _program_reader(words: list[str]) -> str | None:
-    """_reader for an argv. The command name must be literal, and so must every
-    argument a decision reads."""
-    name = _program_name(words[0])
-    if name is None:
-        return None
-    if name in HEREDOC_PASS_READERS:
-        return "pass"
-    if name in HEREDOC_SINK_READERS or _PROGRAM_READER.match(name):
-        return "sink"
-    args: list[str] = []
-    for word in words[1:]:
-        value = static_word(word)
-        if value is None:
-            break
-        args.append(value[0])
-    rest = words[1:]
-    if name == "git":
-        # A configuration value cannot rename a built-in subcommand.
-        while len(rest) >= 2 and rest[0] in {"-c", "-C"}:
-            rest = rest[2:]
-        subcommand = static_word(rest[0]) if rest else None
-        return "sink" if subcommand and subcommand[0] in _GIT_READERS else None
-    if name == "gh":
-        return "sink" if args and args[0] in _GH_READERS else None
-    if name == "env":
-        while args:
-            if _ASSIGNMENT.match(args[0]) or args[0] in {"-i", "--ignore-environment"}:
-                skip = 1
-            elif args[0] in {"-u", "--unset", "-C", "--chdir"}:
-                skip = 2
-            elif args[0].startswith(("--unset=", "--chdir=")):
-                skip = 1
-            else:
-                break
-            args, rest = args[skip:], rest[skip:]
-        return _program_reader(rest) if args and not args[0].startswith("-") else None
-    if name == "timeout":
-        while args and args[0] in {"--foreground", "--preserve-status", "-v", "--verbose"}:
-            args, rest = args[1:], rest[1:]
-        return _program_reader(rest[1:]) if len(args) >= 2 and _DURATION.match(args[0]) else None
-    return None
-
-
-_GROUP_OPENERS = frozenset({"{", "do", "if"})
-_GROUP_CLOSERS = frozenset({"}", "done", "fi"})
-_COMPOUND_WORDS = frozenset({"{", "(", "while", "until", "for", "select", "if", "case", "function"})
-_PIPES = frozenset({"|", "|&"})
-_STAGE_ENDS = _PIPES | _PIPELINE_ENDS
-
-
-def _reads_as_data(text: str, operators: list[int]) -> list[bool]:
-    """Contract rule 2 for each `<<` at an offset in `text`, the command lines.
-
-    A body's readers are the stage that owns its `<<`, every later stage of
-    that pipeline, and, for each group around that pipeline, whatever reads
-    the group's output: the stages a group or compound command pipes into, or
-    the command a command substitution is a word of or that reads a `<(`
-    file. An output process substitution `>(` on that path fails closed.
-    """
-    words = _line_words(text)
-    if words is None or any(word in {"case", "esac", "coproc"} for word, _ in words):
-        # Case patterns end in `)`, so groups cannot be matched safely.
-        return [False] * len(operators)
-    parents: list[int] = []
-    closes: dict[int, int] = {}
-    stack: list[int] = []
-    command_start = True
-    for index, (word, _) in enumerate(words):
-        if word == ")" or (command_start and word in _GROUP_CLOSERS):
-            if not stack:
-                return [False] * len(operators)
-            closes[stack.pop()] = index
-        parents.append(stack[-1] if stack else -1)
-        if word == "(" or (command_start and word in _GROUP_OPENERS):
-            stack.append(index)
-        command_start = word in _STAGE_ENDS or word in {"{", "do", "if", "then", "else", "elif", "!", "while", "until"}
-
-    def kind(opener: int) -> str:
-        word, offset = words[opener]
-        if word != "(":
-            return "group"
-        if opener and words[opener - 1][0] in {"<", ">"} and words[opener - 1][1] + 1 == offset:
-            return "input" if words[opener - 1][0] == "<" else "output"
-        return "command" if offset and text[offset - 1] == "$" else "group"
-
-    # `$(`, `<(` and `>(` are words of their stage, not stage boundaries.
-    inline = {index for index in closes.keys() | set(stack) if kind(index) != "group"}
-    inline |= {closes[index] for index in inline if index in closes}
-
-    def boundary(position: int, level: int) -> bool:
-        return parents[position] == level and words[position][0] in _STAGE_ENDS and position not in inline
-
-    def within(position: int, group: int) -> bool:
-        """Whether the word at `position` sits inside `group` (-1: the top)."""
-        if group < 0:
-            return True
-        parent = parents[position]
-        while parent >= 0:
-            if parent == group:
-                return True
-            parent = parents[parent]
-        return False
-
-    def stage(index: int) -> tuple[int, int]:
-        level = parents[index]
-        start = index
-        while start > 0 and within(start - 1, level) and not boundary(start - 1, level):
-            start -= 1
-        end = index
-        while end < len(words) and within(end, level) and not boundary(end, level):
-            end += 1
-        return start, end
-
-    def own_words(start: int, end: int) -> list[str]:
-        return [
-            words[position][0]
-            for position in range(start, end)
-            if parents[position] == parents[start] and position not in inline
-        ]
-
-    def stage_reader(start: int, end: int, *, owner: bool) -> str | None:
-        if any(words[position][0] == "(" and kind(position) == "output" for position in range(start, end)):
-            return None  # its output may go into the process substitution
-        own = own_words(start, end)
-        if not owner and own and own[0] in _COMPOUND_WORDS:
-            return None  # a loop or group reading the pipe runs more than one command
-        return _reader(own)
-
-    def onward(end: int) -> bool | None:
-        """Follow the body's text through pipes from a stage end.
-
-        True when a sink takes it, False for any other reader, and None
-        while it still flows when the pipeline ends.
-        """
-        while end < len(words) and words[end][0] in _PIPES:
-            following = end + 1
-            while following < len(words) and words[following][0] == "\n":
-                following += 1
-            if following >= len(words):
-                return False  # no reader follows the pipe
-            start, end = stage(following)
-            reader = stage_reader(start, end, owner=False)
-            if reader != "pass":
-                return reader == "sink"
-        return None
-
-    heredocs = {offset: index for index, (word, offset) in enumerate(words) if word in {"<<", "<<-"}}
-    flags: list[bool] = []
-    for operator in operators:
-        target = heredocs.get(operator)
-        if target is None:
-            flags.append(False)
-            continue
-        start, end = stage(target)
-        reader = stage_reader(start, end, owner=True)
-        flows = None if reader == "pass" else reader == "sink"
-        if flows is None:
-            flows = onward(end)
-        group = parents[target]
-        while flows is None and group >= 0:
-            if kind(group) == "output" or group not in closes:
-                flows = False
-            elif kind(group) == "input":
-                # The command around `<(` reads the body's text as a file.
-                start, end = stage(group)
-                reader = stage_reader(start, end, owner=True)
-                flows = onward(end) if reader == "pass" else reader == "sink"
-            elif kind(group) == "command":
-                # The body's text becomes words of the command around the
-                # substitution: echo and printf print it on, others take it.
-                start, end = stage(group)
-                reader = stage_reader(start, end, owner=True)
-                own = own_words(start, end)
-                passes = reader is not None and bool(own) and own[0] in {"echo", "printf"}
-                flows = onward(end) if passes else reader is not None
-            else:
-                flows = onward(closes[group] + 1)
-            group = parents[group]
-        # Text still flowing at the top level is printed: it is data.
-        flags.append(flows is not False)
-    return flags
-
-
-def _heredoc_script(body: str, quoted: bool) -> str:
-    """The text a shell reader receives: an unquoted body loses its escapes."""
-    if quoted:
-        return body
-    return re.sub(r"\\\n|\\([\\$`])", lambda match: match.group(1) or "", body)
-
-
-def _script_closes(script: str) -> bool:
-    """Contract rule 4: no quote, group or substitution is left open."""
-    stack: list[str] = []
-    word_start = True
-    index = 0
-    while index < len(script):
-        char = script[index]
-        top = stack[-1] if stack else ""
-        if top == "'":
-            if char == "'":
-                stack.pop()
-            index += 1
-            continue
-        if char == "\\":
-            if index + 1 >= len(script):
-                return False
-            index += 2
-            word_start = False
-            continue
-        if top == '"':
-            if char == '"':
-                stack.pop()
-            elif char == "`" or script.startswith("$(", index) or script.startswith("${", index):
-                pass
-            else:
-                index += 1
-                continue
-        if top == "#":
-            if char == "\n":
-                stack.pop()
-                word_start = True
-            index += 1
-            continue
-        if char == "#" and word_start and top != '"':
-            stack.append("#")
-            index += 1
-            continue
-        opening = next((op for op in ("$((", "$(", "${", "$[", "((") if script.startswith(op, index)), "")
-        if opening:
-            stack.append(opening)
-            index += len(opening)
-            word_start = True
-            continue
-        if char == "`":
-            if top == "`":
-                stack.pop()
-            else:
-                stack.append("`")
-        elif char in "'\"" and top != '"':
-            stack.append(char)
-        elif char == "(":
-            stack.append("(")
-        elif char == ")" and top in {"$(", "("}:
-            stack.pop()
-        elif script.startswith("))", index) and top in {"$((", "(("}:
-            stack.pop()
-            index += 2
-            word_start = False
-            continue
-        elif (char == "}" and top == "${") or (char == "]" and top == "$["):
-            stack.pop()
-        word_start = char in " \t\n;&|()"
-        index += 1
-    return not [entry for entry in stack if entry != "#"]
-
-
-def strip_skippable_heredoc_bodies(
-    command: str,
-    *,
-    opener_transform: Callable[[str], str] | None = None,
-    body_substitutions: Callable[[str], list[str] | None] | None = None,
-) -> str:
-    """Apply the here-document contract above for every hook guard.
-
-    Bash retains carriage returns in here-doc delimiters. A command containing
-    one is left intact, so a mismatched closer can never conceal later commands.
-    """
-    return _heredoc_view(command, opener_transform, body_substitutions, 0)[0]
-
-
-_Body = tuple[int, int, bool, bool, bool]  # start, closer line, strip_tabs, quoted, data
-
-
-def _heredoc_plan(
-    command: str, transform: Callable[[str], str]
-) -> tuple[list[str], list[tuple[int, bool, list[_Body]]], bool]:
-    """Find each body, and apply contract rule 2 to it.
-
-    Return the lines, one entry per line Bash reads as a command (its index,
-    whether a quote is open after it, its bodies), and whether every opener
-    was unambiguous and every body closed.
-    """
-    lines = command.split("\n")
-    plan: list[tuple[int, bool, list[list]]] = []
-    commands: list[str] = []
-    targets: list[tuple[int, int]] = []
-    complete = True
-    index = 0
-    quote = ""
-    while index < len(lines):
-        opener = transform(lines[index])
-        line_number = index
-        index += 1
-        openers = _heredoc_openers(opener, initial_quote=quote)
-        quote = _quote_after(opener, quote)
-        commands.append(opener)
-        if openers is None:
-            complete = False
-            plan.append((line_number, bool(quote), []))
-            break
-        bodies: list[list] = []
-        for closer, strip_tabs, quoted, operator in openers:
-            start = index
-            while index < len(lines) and (lines[index].lstrip("\t") if strip_tabs else lines[index]) != closer:
-                index += 1
-            if index == len(lines):
-                complete = False
-                break
-            bodies.append([start, index, strip_tabs, quoted, not quote])
-            targets.append((len(commands) - 1, operator))
-            index += 1
-        plan.append((line_number, bool(quote), bodies))
-        if not complete:
-            break
-    if not complete:
-        commands.extend(transform(line) for line in lines[index:])
-    starts = [0]
-    for line in commands:
-        starts.append(starts[-1] + len(line) + 1)
-    readers = iter(_reads_as_data("\n".join(commands), [starts[line] + operator for line, operator in targets]))
-    for _, _, bodies in plan:
-        for body in bodies:
-            # A quote open after the opener hides where Bash starts the body.
-            body[4] = next(readers) and body[4]
-    return lines, [(line, quote_open, [tuple(body) for body in bodies]) for line, quote_open, bodies in plan], complete
-
-
-def heredoc_readers_are_data(text: str, operators: list[int]) -> list[bool]:
-    """Contract rule 2 for the `<<` operators at these offsets of `text`."""
-    return _reads_as_data(strip_shell_comments(text), operators)
-
-
-def heredoc_bodies_are_data(command: str) -> bool:
-    """Whether contract rules 2 and 3 make every closed body in `command` inert.
-
-    False when any closed body stays visible. A reader that drops bodies and
-    cannot show a script must refuse then; ambiguous openers, carriage returns
-    and unclosed bodies remain that reader's own decision.
-    """
-    if "<<" not in command:
-        return True
-    _, plan, _ = _heredoc_plan(command, strip_shell_comments)
-    return all(body[4] for _, _, bodies in plan for body in bodies)
-
-
-def _heredoc_view(
-    command: str,
-    opener_transform: Callable[[str], str] | None,
-    body_substitutions: Callable[[str], list[str] | None] | None,
-    depth: int,
-) -> tuple[str, bool]:
-    """The guard view of `command`, and whether every here-doc in it closed."""
-    if "<<" not in command or "\r" in command:
-        return command, "<<" not in command
-    if depth >= _MAX_HEREDOC_DEPTH:
-        raise ShellPreprocessLimit("nested here-document depth exceeded")
-    lines, plan, complete = _heredoc_plan(command, opener_transform or (lambda text: text))
-    kept: list[str] = []
-    closed = complete
-    for position, (line_number, quote_open, bodies) in enumerate(plan):
-        kept.append(lines[line_number])
-        if position == len(plan) - 1 and not complete:
-            # An ambiguous opener or unclosed body keeps every later line.
-            kept.extend(lines[line_number + 1 :])
-            break
-        for start, end, strip_tabs, quoted, data in bodies:
-            body_lines = [line.lstrip("\t") for line in lines[start:end]] if strip_tabs else lines[start:end]
-            body = "\n".join(body_lines)
-            if data:
-                if quoted or not body_substitutions:
-                    continue
-                extracted = body_substitutions(body)
-                if extracted is None:
-                    # Undecidable expansions keep the body and its closer.
-                    kept.extend(lines[start : end + 1])
-                    closed = False
-                else:
-                    kept.extend(extracted)
-                continue
-            if quote_open:
-                # The opener's open quote would swallow the script in a lexer.
-                raise ShellPreprocessLimit("here-document script follows an open quote")
-            script, script_closed = _heredoc_view(
-                _heredoc_script(body, quoted), opener_transform, body_substitutions, depth + 1
-            )
-            if not script_closed or not _script_closes(strip_shell_comments(script)):
-                raise ShellPreprocessLimit("here-document script does not close before its delimiter")
-            kept.extend(script.split("\n"))
-    return "\n".join(kept), closed
 
 
 def split_quote_preserving(command: str, *, punctuation_chars: str | bool, whitespace: str) -> list[str]:

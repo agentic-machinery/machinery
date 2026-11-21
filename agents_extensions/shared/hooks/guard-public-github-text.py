@@ -14,7 +14,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 try:
     from agents_extensions.shared.hooks.shell_redirects import _split_scopes
-    from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, preprocess_shell_command
+    from agents_extensions.shared.hooks.shell_shlex import preprocess_shell_command
 except Exception:
     print("OPSEC: Bash publishing dependencies unavailable.", file=sys.stderr)
     raise SystemExit(2) from None
@@ -99,8 +99,7 @@ def invokes_gh(command: str) -> bool:
                         continue
                     else:
                         expecting_command = False
-    except (ValueError, ShellPreprocessLimit):
-        # A command the shared reader refuses may still run gh: route it.
+    except ValueError:
         return True
     return False
 

@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, parse_heredocs
 from lu_machinery.common.repo_root import machinery_path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -219,8 +220,9 @@ def test_issue_9102_executable_payload_stays_visible(monkeypatch, shape):
     assert _run(monkeypatch, command, failing=["Test (pytest)"]) == 2
 
 
-def test_issue_9102_real_let_heredoc_body_is_inert():
-    assert not _any_admin("let x=1<<EOF\ngh pr merge 5 --admin\nEOF")
+def test_issue_9102_real_let_heredoc_body_words_stay_visible():
+    # The `<<` of `let x=1<<EOF` is a here-document; its body words stay visible.
+    assert _any_admin("let x=1<<EOF\ngh pr merge 5 --admin\nEOF")
 
 
 @pytest.mark.parametrize(
@@ -251,7 +253,7 @@ def test_issue_9115_backtick_depth_limit_blocks_in_hook(monkeypatch):
 
 
 def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
-    assert guard._heredoc_delimiters(r'echo "a \" b" <<EOF') == [("EOF", False)]
+    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(r'echo "a \" b" <<EOF' "\nx\nEOF")] == [("EOF", False)]
 
 
 @pytest.mark.parametrize(
@@ -264,8 +266,8 @@ def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
     ],
 )
 def test_issue_9088_standard_heredoc_delimiters(opener, closer):
-    assert guard._heredoc_delimiters(f"cat {opener}") == [("EOF", opener == "<<-EOF")]
-    assert not _any_admin(f"cat {opener}\ngh pr merge 5 --admin\n{closer}")
+    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(f"cat {opener}\nx\n{closer}")] == [("EOF", opener == "<<-EOF")]
+    assert _any_admin(f"cat {opener}\ngh pr merge 5 --admin\n{closer}")
     assert _any_admin(f"cat {opener}\nnote\n{closer}\ngh pr merge 5 --admin")
 
 
@@ -281,14 +283,15 @@ def test_issue_9088_standard_heredoc_delimiters(opener, closer):
 )
 def test_issue_9088_here_strings_keep_admin_merge_visible(monkeypatch, first):
     command = f"{first}\ngh pr merge 5 --admin\nEOF"
-    assert guard._heredoc_delimiters(first) == []
+    assert parse_heredocs(first) == ()
     assert _any_admin(command)
     assert _run(monkeypatch, command, failing=["Test (pytest)"]) == 2
 
 
 def test_issue_9088_crlf_closer_keeps_admin_merge_visible(monkeypatch):
     command = "cat <<EOF\r\nEOF\r\ngh pr merge 5 --admin\nEOF"
-    assert _any_admin(command)
+    with pytest.raises(ShellPreprocessLimit):
+        _any_admin(command)
     assert _run(monkeypatch, command, failing=["Test (pytest)"]) == 2
 
 
@@ -312,14 +315,17 @@ def test_issue_9088_reviewer_heredoc_bypass_blocks(monkeypatch):
 )
 def test_issue_9088_exotic_heredoc_keeps_admin_merge_visible(monkeypatch, opener, closer):
     command = f"cat {opener}\ngh pr merge 5 --admin\n{closer}"
-    assert guard._heredoc_delimiters(f"cat {opener}") is None
-    assert _any_admin(command)
+    with pytest.raises(ShellPreprocessLimit):
+        parse_heredocs(f"cat {opener}\nx\n{closer}")
+    with pytest.raises(ShellPreprocessLimit):
+        _any_admin(command)
     assert _run(monkeypatch, command, failing=["Test (pytest)"]) == 2
 
 
 def test_issue_9088_exotic_body_cannot_skip_later_safe_opener(monkeypatch):
     command = "cat <<$'EOF'\ncat <<SAFE\ngh pr merge 5 --admin\nSAFE\nEOF"
-    assert _any_admin(command)
+    with pytest.raises(ShellPreprocessLimit):
+        _any_admin(command)
     assert _run(monkeypatch, command, failing=["Test (pytest)"]) == 2
 
 
@@ -520,8 +526,11 @@ def test_wrapper_options_do_not_hide_admin_merge_verb(cmd):
     assert _any_admin(cmd)
 
 
-def test_unclosed_heredoc_does_not_hide_admin():
-    assert _any_admin("cat <<'NOEND'\nnote\ngh pr merge 5 --admin")
+def test_unclosed_heredoc_does_not_hide_admin(monkeypatch):
+    command = "cat <<'NOEND'\nnote\ngh pr merge 5 --admin"
+    with pytest.raises(ShellPreprocessLimit):
+        _any_admin(command)
+    assert _run(monkeypatch, command, failing=[]) == 2
 
 
 # --- colorized gh output (review B1, PR #5324) ------------------------------

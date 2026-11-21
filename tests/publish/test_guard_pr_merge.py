@@ -28,14 +28,13 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+
 import pytest
+
+from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, parse_heredocs
 from lu_machinery.common.repo_root import machinery_path
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers.restore_import_state import restore_import_state
-
-
-
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HOOK_PATH = machinery_path("agents_extensions/shared/hooks/guard-pr-merge.py")
@@ -215,8 +214,9 @@ def test_issue_9102_executable_payload_stays_visible(monkeypatch, shape):
     assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
 
 
-def test_issue_9102_real_let_heredoc_body_is_inert():
-    assert not _any_judged_merge("let x=1<<EOF\ngh pr merge 5 --squash\nEOF")
+def test_issue_9102_real_let_heredoc_body_words_stay_visible():
+    # The `<<` of `let x=1<<EOF` is a here-document; its body names a merge.
+    assert _any_judged_merge("let x=1<<EOF\ngh pr merge 5 --squash\nEOF")
 
 
 @pytest.mark.parametrize(
@@ -255,7 +255,7 @@ def test_issue_9115_malformed_merge_hook_input_blocks(monkeypatch, payload):
 
 
 def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
-    assert guard._heredoc_delimiters(r'echo "a \" b" <<EOF') == [("EOF", False)]
+    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(r'echo "a \" b" <<EOF' "\nx\nEOF")] == [("EOF", False)]
 
 
 @pytest.mark.parametrize(
@@ -268,8 +268,8 @@ def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
     ],
 )
 def test_issue_9088_standard_heredoc_delimiters(opener, closer):
-    assert guard._heredoc_delimiters(f"cat {opener}") == [("EOF", opener == "<<-EOF")]
-    assert not _any_judged_merge(f"cat {opener}\ngh pr merge 5 --squash\n{closer}")
+    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(f"cat {opener}\nx\n{closer}")] == [("EOF", opener == "<<-EOF")]
+    assert _any_judged_merge(f"cat {opener}\ngh pr merge 5 --squash\n{closer}")
     assert _any_judged_merge(f"cat {opener}\nnote\n{closer}\ngh pr merge 5 --squash")
 
 
@@ -285,7 +285,7 @@ def test_issue_9088_standard_heredoc_delimiters(opener, closer):
 )
 def test_issue_9088_here_strings_keep_pr_merge_visible(monkeypatch, first):
     command = f"{first}\ngh pr merge 5 --squash\nEOF"
-    assert guard._heredoc_delimiters(first) == []
+    assert parse_heredocs(first) == ()
     assert _any_judged_merge(command)
     assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
 
@@ -316,7 +316,8 @@ def test_issue_9088_reviewer_heredoc_bypass_blocks(monkeypatch):
 )
 def test_issue_9088_exotic_heredoc_keeps_merge_visible(monkeypatch, opener, closer):
     command = f"cat {opener}\ngh pr merge 5 --admin\n{closer}"
-    assert guard._heredoc_delimiters(f"cat {opener}") is None
+    with pytest.raises(ShellPreprocessLimit):
+        parse_heredocs(f"cat {opener}\nx\n{closer}")
     assert _any_judged_merge(command)
     assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
 
@@ -1691,21 +1692,26 @@ def test_glued_operator_merge_detected(cmd):
     assert _any_merge(cmd)
 
 
-def test_heredoc_merge_mention_not_detected():
+def test_heredoc_merge_mention_is_judged_whatever_reads_it():
+    # No reader name proves a body is data (C-6334); a mention of merging is not a merge.
     cmd = "cat > /tmp/n.md <<'EOF'\nrun gh pr merge 5 --squash manually\nEOF"
-    assert not _any_merge(cmd)
+    assert _any_merge(cmd)
+    assert not _any_merge(cmd.replace("gh pr merge 5 --squash", "the merge"))
 
 
 def test_quoted_heredoc_backticks_are_data_not_unreadable_shell(monkeypatch):
     """Defect class: Markdown backticks in a quoted here-doc body refused as unreadable shell.
 
-    Bash expands nothing in a `<<'EOF'` body, so a brief that mentions a merge in
-    backticks is a plain file write. Controls: an unquoted body's backticks run,
-    a real merge after the here-doc is still judged, and a body line ending in a
-    backslash does not swallow the closer before an executed merge.
+    Backticks and apostrophes in a body never refuse as unreadable quoting: a
+    brief that only mentions merging is allowed. A body that names a merge
+    command is refused whatever reads it (C-6334: no reader name proves data).
+    Controls: an unquoted body's backticks run, a real merge after the
+    here-doc is still judged, and a body line ending in a backslash does not
+    swallow the closer before an executed merge.
     """
     brief = "cat > /tmp/brief.md <<'EOF'\nLand it with `gh pr merge`; don't merge by hand.\nEOF"
-    assert _run(monkeypatch, brief, checks=(["CI Gate"], [])) == 0
+    assert _run(monkeypatch, brief.replace("`gh pr merge`", "`the publisher`"), checks=(["CI Gate"], [])) == 0
+    assert _run(monkeypatch, brief, checks=(["CI Gate"], [])) == 2
     assert _run(monkeypatch, brief.replace("<<'EOF'", "<<EOF"), checks=(["CI Gate"], [])) == 2
     assert _run(monkeypatch, brief + "\ngh pr merge 5", checks=(["CI Gate"], [])) == 2
     assert _run(monkeypatch, "cat <<'EOF'\nx\\\nEOF\necho `gh pr merge 5`\nEOF", checks=([], [])) == 2
@@ -2597,31 +2603,31 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
         ("cat <<'EOF' | head |\ngh pr merge 5\nEOF\nbash", ["CI Gate"], 2),
         ("cat <<'EOF' | # note\ngh pr merge 5\nEOF\nbash", ["CI Gate"], 2),
         ("head <<'EOF' |\ngh pr merge 5\nEOF\nbash", ["CI Gate"], 2),
-        ("cat <<'EOF' | gh pr comment 5 --body-file -\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 0),
-        ("cat <<'EOF' | cat | gh issue comment 5 --body-file=-\nUse gh pr merge after review.\nEOF", ["CI Gate"], 0),
-        ("cat <<'EOF' | .venv/bin/python -m lu_machinery.publish pr-comment --number 5 --body-file -\nUse gh pr merge after review.\nEOF", ["CI Gate"], 0),
+        ("cat <<'EOF' | gh pr comment 5 --body-file -\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
+        ("cat <<'EOF' | cat | gh issue comment 5 --body-file=-\nUse gh pr merge after review.\nEOF", ["CI Gate"], 2),
+        ("cat <<'EOF' | .venv/bin/python -m lu_machinery.publish pr-comment --number 5 --body-file -\nUse gh pr merge after review.\nEOF", ["CI Gate"], 2),
         ("cat <<'EOF' | gh pr merge 5 --body-file -\nUse gh pr merge after review.\nEOF", ["CI Gate"], 2),
         ("cat <<'EOF' | unknown-reader\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         ("cat <<'EOF' | sort --compress-program=bash\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         ("cat <<'EOF' | gh pr comment 5 --body-file -\nmerge note\nEOF\ngh pr merge 5", ["CI Gate"], 2),
-        ("wc -l <<'EOF'\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 0),
-        ("head -n 1 <<'EOF'\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 0),
-        ("sort <<'EOF'\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 0),
-        ("cat <<\\EOF\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 0),
-        ("cat <<E'OF'\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 0),
-        ("wc -l <<E\"OF\"\nUse gh pr merge after review.\nEOF", ["CI Gate"], 0),
-        ("cat <<\\EOF | gh pr comment 5 --body-file -\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 0),
+        ("wc -l <<'EOF'\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
+        ("head -n 1 <<'EOF'\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
+        ("sort <<'EOF'\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
+        ("cat <<\\EOF\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
+        ("cat <<E'OF'\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
+        ("wc -l <<E\"OF\"\nUse gh pr merge after review.\nEOF", ["CI Gate"], 2),
+        ("cat <<\\EOF | gh pr comment 5 --body-file -\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
         ("bash <<E'OF'\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         ("unknown-reader <<\\EOF\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         ("cat <<E'OF' | bash\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         # Any static delimiter: data stays inert, a shell's body stays visible (C-6328).
-        ("cat <<'END-DATA'\nUse `gh pr merge` after review; it's manual.\nEND-DATA", ["CI Gate"], 0),
+        ("cat <<'END-DATA'\nUse `gh pr merge` after review; it's manual.\nEND-DATA", ["CI Gate"], 2),
         ("bash <<'END-DATA'\ngh pr merge 5\nEND-DATA", ["CI Gate"], 2),
         ("{ cat <<'END-DATA'; } | sh\ngh pr merge 5\nEND-DATA", ["CI Gate"], 2),
         ("gh pr merge 5 --body-file - <<\\EOF\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
         ("cat <<E'OF'\nUse gh pr merge after review.\nEOF\ngh pr merge 5", ["CI Gate"], 2),
         ("cat <<E'OF'\ngh pr merge 5\nWRONG", ["CI Gate"], 2),
-        ("cat > note.md <<'EOF'\ngh pr merge 5\nEOF\ncat note.md", ["CI Gate"], 0),
+        ("cat > note.md <<'EOF'\ngh pr merge 5\nEOF\ncat note.md", ["CI Gate"], 2),
         ("gh pr diff 5 -- agents_extensions/shared/hooks/guard-pr-merge.py | sed -n 1,50p", ["CI Gate"], 0),
         ("gh pr view 5 --json title | sort", ["CI Gate"], 0),
         ("git log --merges -1", ["CI Gate"], 0),
@@ -2643,10 +2649,10 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
         (
             ".venv/bin/python -m lu_machinery.publish pr-comment --number 7 --body-file=- <<'EOF'\nUse `gh pr merge` after review.\nEOF",
             ["CI Gate"],
-            0,
+            2,
         ),
         ("gh pr create --title t --body-file - <<'EOF'\nfix(hooks): high-risk merge path proven\nEOF", ["CI Gate"], 0),
-        ("git commit -F - <<'EOF'\nfix(hooks): refuse gh pr merge via heredoc\nEOF", ["CI Gate"], 0),
+        ("git commit -F - <<'EOF'\nfix(hooks): refuse gh pr merge via heredoc\nEOF", ["CI Gate"], 2),
         ("git commit --file=- <<'EOF'\nfix(hooks): high-risk merge path proven\nEOF", ["CI Gate"], 0),
         (
             ".venv/bin/python -m lu_machinery.publish pr-merge --number 5 --body-file - <<'EOF'\nApproved through review; merge when green.\nEOF",
@@ -2670,5 +2676,9 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
     ],
 )
 def test_interpreter_heredoc_merge_bypass_refused(monkeypatch, command, failures, expected):
-    """R33/R44/R49: distinguish executable stdin from literal text readers."""
+    """R33/R44/R49: a body that names a merge is refused, whatever reads it.
+
+    No reader name proves a body is data (C-6334): `cat`, `wc` or the publisher
+    may be a function, and Python can run the merge the body spells.
+    """
     assert _run(monkeypatch, command, checks=(failures, [])) == expected

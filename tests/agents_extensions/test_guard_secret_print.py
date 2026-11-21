@@ -26,6 +26,12 @@ from pathlib import Path
 
 import pytest
 
+from agents_extensions.shared.hooks.shell_shlex import (
+    ShellPreprocessLimit,
+    heredoc_view,
+    parse_heredocs,
+    strip_shell_comments,
+)
 from lu_machinery.common.repo_root import machinery_path
 from tests.agents_extensions.test_guard_benign_corpus import BENIGN_COMMANDS
 
@@ -338,6 +344,11 @@ def test_secret_dump_shapes_blocked(monkeypatch, capsys, cmd):
         # A body a shell reads stays visible, whatever its delimiter (C-6328).
         "sh <<'END-DATA'\ncat .env\nEND-DATA",
         "{ cat <<'EOF'; } | bash\necho $GH_TOKEN\nEOF",
+        # No reader name proves a body is data (C-6334): `cat` may be a function.
+        "cat <<'EOF'\n$(cat .env)\nEOF",
+        "cat <<EOF\ncat .env\nEOF",
+        "cat <<-EOF\n\tcat .env\n\tEOF",
+        "cat <<'EOF'\nprintenv\nEOF",
     ],
 )
 def test_issue_8896_secret_bypasses_block(monkeypatch, capsys, command):
@@ -467,7 +478,7 @@ def test_issue_9088_double_quote_escapes_keep_quote_preserving_tokens():
 
 
 def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
-    assert guard._heredoc_delimiters(r'echo "a \" b" <<EOF') == [("EOF", False, False)]
+    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(r'echo "a \" b" <<EOF' "\nx\nEOF")] == [("EOF", False)]
 
 
 @pytest.mark.parametrize(
@@ -496,8 +507,9 @@ def test_issue_9102_executable_payload_stays_visible(monkeypatch, shape):
     assert _run(monkeypatch, shape.replace("{payload}", "cat .env")) == 2
 
 
-def test_issue_9102_real_let_heredoc_body_is_inert(monkeypatch):
-    assert _run(monkeypatch, "let x=1<<EOF\ncat .env\nEOF") == 0
+def test_issue_9102_real_let_heredoc_body_words_stay_visible(monkeypatch):
+    # The `<<` of `let x=1<<EOF` is a here-document; its body words stay visible.
+    assert _run(monkeypatch, "let x=1<<EOF\ncat .env\nEOF") == 2
 
 
 @pytest.mark.parametrize(
@@ -586,9 +598,10 @@ def test_issue_9115_malformed_secret_hook_input_blocks(monkeypatch, payload):
     ],
 )
 def test_issue_9088_standard_heredoc_delimiters(opener, closer, quoted):
-    assert guard._heredoc_delimiters(f"cat {opener}") == [("EOF", opener == "<<-EOF", quoted)]
-    assert guard._strip_heredoc_bodies(f"cat {opener}\ncat .env\n{closer}\necho $GH_TOKEN") == (
-        f"cat {opener}\necho $GH_TOKEN"
+    assert [(d.closer, d.strip_tabs, d.quoted) for d in parse_heredocs(f"cat {opener}\nx\n{closer}")] == [("EOF", opener == "<<-EOF", quoted)]
+    view_opener = ("<<-" if opener.startswith("<<-") else "<<") + ("'EOF'" if quoted else "EOF")
+    assert heredoc_view(f"cat {opener}\ncat .env\n{closer}\necho $GH_TOKEN") == (
+        f"cat {view_opener}\n( cat .env )\nEOF\necho $GH_TOKEN"
     )
 
 
@@ -604,19 +617,21 @@ def test_issue_9088_standard_heredoc_delimiters(opener, closer, quoted):
 )
 def test_issue_9088_here_strings_keep_secret_dump_visible(monkeypatch, first):
     command = f"{first}\ncat .env\nEOF"
-    assert guard._heredoc_delimiters(first) == []
-    assert "cat .env" in guard._strip_heredoc_bodies(command)
+    assert parse_heredocs(first) == ()
+    assert "cat .env" in heredoc_view(command)
     assert _run(monkeypatch, command) == 2
 
 
 def test_issue_9088_crlf_closer_keeps_secret_dump_visible(monkeypatch):
     command = "cat <<EOF\r\nEOF\r\ncat .env\nEOF"
-    assert "cat .env" in guard._strip_heredoc_bodies(command)
+    with pytest.raises(ShellPreprocessLimit):
+        heredoc_view(command)
     assert _run(monkeypatch, command) == 2
 
 
-def test_issue_9088_quoted_identifier_heredoc_body_is_inert(monkeypatch):
-    assert _run(monkeypatch, "cat <<'EOF'\ncat .env\necho $GH_TOKEN\nEOF") == 0
+def test_issue_9088_quoted_identifier_heredoc_body_words_stay_visible(monkeypatch):
+    # No reader name proves a body is data: `cat` may be a function.
+    assert _run(monkeypatch, "cat <<'EOF'\ncat .env\necho $GH_TOKEN\nEOF") == 2
 
 
 @pytest.mark.parametrize(
@@ -633,13 +648,15 @@ def test_issue_9088_quoted_identifier_heredoc_body_is_inert(monkeypatch):
 )
 def test_issue_9088_exotic_heredoc_keeps_secret_dump_visible(monkeypatch, opener, closer):
     command = f"cat {opener}\ncat .env\necho $GH_TOKEN\n{closer}"
-    assert guard._heredoc_delimiters(f"cat {opener}") is None
+    with pytest.raises(ShellPreprocessLimit):
+        parse_heredocs(f"cat {opener}\nx\n{closer}")
     assert _run(monkeypatch, command) == 2
 
 
 def test_issue_9088_exotic_body_cannot_skip_later_safe_opener(monkeypatch):
     command = "cat <<$'EOF'\ncat <<SAFE\ncat .env\nSAFE\nEOF"
-    assert "cat .env" in guard._strip_heredoc_bodies(command)
+    with pytest.raises(ShellPreprocessLimit):
+        heredoc_view(command)
     assert _run(monkeypatch, command) == 2
 
 
@@ -698,7 +715,6 @@ def test_issue_8896_source_data_flow_named_residual(monkeypatch, command):
         "echo ok > /tmp/x",
         "cat <<EOF\nordinary text\nEOF",
         "cat <<-EOF\n\tordinary text\n\tEOF",
-        "cat <<'EOF'\n$(cat .env)\nEOF",
         "bash -c 'echo ok'",
         "while read l; do echo $l; done < notes.txt",
         "if [ -f x ]; then echo ok; fi",
@@ -719,8 +735,6 @@ def test_issue_8896_review_round_two_ordinary_allow(monkeypatch, command):
         "git status",
         "ls -la",
         "echo ok > /tmp/x",
-        "cat <<EOF\ncat .env\nEOF",
-        "cat <<-EOF\n\tcat .env\n\tEOF",
         "echo '$GH_TOKEN'",
         "git commit -m 'echo `cat .env`'",
         "echo \\`cat .env\\`",
@@ -827,13 +841,13 @@ def test_bash_comments_keep_executable_secret_words(monkeypatch, command):
 
 def test_bash_comment_stripping_keeps_next_line_for_secret_parser():
     # Parsing newline separators in this hook is tracked separately.
-    assert guard._strip_shell_comments("echo hi # c; cat .env\ncat .env") == "echo hi \ncat .env"
-    assert guard._strip_heredoc_bodies("echo hi # <<EOF\ncat .env") == "echo hi # <<EOF\ncat .env"
+    assert strip_shell_comments("echo hi # c; cat .env\ncat .env") == "echo hi \ncat .env"
+    assert heredoc_view("echo hi # <<EOF\ncat .env") == "echo hi # <<EOF\ncat .env"
 
 
 @pytest.mark.parametrize("operator", [";", "&", "|", "(", ")"])
 def test_bash_comment_starts_after_control_operator_in_secret_hook(operator):
-    assert guard._strip_shell_comments(f"echo hi{operator}# hidden\ncat .env") == (f"echo hi{operator}\ncat .env")
+    assert strip_shell_comments(f"echo hi{operator}# hidden\ncat .env") == (f"echo hi{operator}\ncat .env")
 
 
 @pytest.mark.parametrize(
@@ -1223,7 +1237,6 @@ def test_sensitive_file_input_denied(monkeypatch, command):
         "bash <<'EOF'\necho ordinary\nEOF",
         "sh <<EOF\ncat README.md\nEOF",
         "bash <<<'echo $PATH'",
-        "cat <<'EOF'\nprintenv\nEOF",
         "cat <<<'printenv'",
         "X=ordinary; cat <<EOF\n$X\nEOF",
         "name=PATH; cat <<EOF\n${!name}\nEOF",
