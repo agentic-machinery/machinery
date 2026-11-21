@@ -29,9 +29,8 @@ A dispatch, a branch, an open PR, green CI or "Next:" is **not** done. Deliver e
 the delivery skills: `full-send` (to MERGED and closeout, run by the briefed worker or by you),
 `full-stop` (ready-to-merge), `review-loop` (rounds and budget), entered through `takeover` or
 `modernize` for inherited or old work. A worker starts follow-ups only within its brief's cap.
-You land a PR yourself only when no brief owns it, and only when the gates of
-`workflow.md` § Merge policy hold: the recorded exact-head review the PR's tier requires (none for
-a Trivial PR, where a recorded rejection still blocks) and a green same-head CI Gate; never ask the operator to merge.
+You land a PR yourself only when no brief owns it, under `workflow.md` § Merge policy. Landing needs a green same-head CI Gate and, above the Trivial tier, the recorded exact-head APPROVE or APPROVEs its tier requires (a recorded `CHANGES_REQUESTED` blocks until a new head is approved); a Trivial PR needs no review, but a recorded rejection on its head still blocks it. `workflow.md` § Merge policy defines every exception. Never ask
+the operator to merge.
 
 At each turn end and at session end:
 

@@ -8,8 +8,8 @@ post-merge cleanup. This file keeps only what a driver still needs and no other 
 
 ## §6. Review of record
 
-Every PR above the review policy's Trivial tier needs a review of record; a Trivial PR needs none and
-lands on required CI alone, but a recorded rejection on its head still blocks landing. The tier and the branch's author families set how many reviews of record a PR needs: the resolver
+Every PR above the review policy's Trivial tier needs a review of record, and a Trivial PR needs none.
+Landing needs a green same-head CI Gate and, above the Trivial tier, the recorded exact-head APPROVE or APPROVEs its tier requires (a recorded `CHANGES_REQUESTED` blocks until a new head is approved); a Trivial PR needs no review, but a recorded rejection on its head still blocks it. `workflow.md` § Merge policy defines every exception. The tier and the branch's author families set how many reviews of record a PR needs: the resolver
 returns them for code and infra changes, and the Ukrainian profile (`review-loop/references/ukrainian.md`,
 Seats) seats learner-facing Ukrainian content, which the resolver does not. Each is independent, outside the author's model family (at the review policy's
 [Low tier](../../review-loop/references/policy.md#2-risk-tier-is-set-by-the-change) any qualified
@@ -28,7 +28,11 @@ Ukrainian content, seat it from the Ukrainian profile. Pass the same profile to 
 available branch or the explicit `--pinned-head` SHA and does not fetch or freeze the remote
 branch: verify the pushed tip before launch and before publishing the verdict. After settlement,
 the recorder uses the task's `worktree_base_sha`. Publishing the verdict is `review-loop` step 7.
-The launch and wait recipe, which the offline tests execute verbatim:
+Formal review launches follow `review-loop` step 3: the dispatch with `--pr` and `--review-mode`, a
+Low-tier pass with `--risk low` as the tier note at the top of that skill says, and bound Contract 1
+plan or Contract 2 lesson attempts by the bound-attempt procedure in that step. The fence below is
+only an ordinary cross-family code or infra launch-and-wait example, kept because the offline tests
+execute it verbatim:
 
 ```bash
 set -euo pipefail
@@ -167,8 +171,7 @@ ids for suite results. Add no test and repeat no run.
 ## §7. Landing
 
 The gates are `workflow.md` § Merge policy; the delivery steps are `full-send` and `full-stop`,
-and the briefed worker enqueues its own PR once the review its tier requires is recorded at the
-exact head (none for a Trivial PR, where a recorded rejection still blocks) and the same-head CI Gate is green. You land only a PR no brief owns, and flag another
+and the briefed worker enqueues its own PR once the Merge policy gates hold. Landing needs a green same-head CI Gate and, above the Trivial tier, the recorded exact-head APPROVE or APPROVEs its tier requires (a recorded `CHANGES_REQUESTED` blocks until a new head is approved); a Trivial PR needs no review, but a recorded rejection on its head still blocks it. `workflow.md` § Merge policy defines every exception. You land only a PR no brief owns, and flag another
 lane's PR with `needs=merge` instead of merging it. Run the core inbox drain immediately before an
 enqueue and reconcile its messages with the approved head.
 
