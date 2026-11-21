@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from prometheus_client import CollectorRegistry, Gauge, generate_latest, write_to_textfile
 
@@ -60,8 +60,9 @@ _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _ENDPOINT_SUFFIXES: dict[str, str] = {
     "code_scanning": "code-scanning/alerts?state=open&per_page=100",
     "dependabot": "dependabot/alerts?state=open&per_page=100",
-    "secret_scanning": "secret-scanning/alerts?state=open&per_page=100",
+    "secret_scanning": "secret-scanning/alerts?state=open&per_page=100&hide_secret=true",
 }
+_NUMERIC_REPO_PATH_RE = re.compile(r"^repositories/([0-9]+)/(.+)$")
 
 # Explicit GitHub REST phrases that positively identify a disabled security feature.
 # Generic 403/404 responses (permissions, rate limits, missing repository) stay API errors.
@@ -221,12 +222,16 @@ def _sanitize_md_cell(value: Any, *, max_chars: int = _MAX_MESSAGE_CHARS) -> str
     return _sanitize_text(value, max_chars=max_chars).replace("|", "\\|").replace("`", "'")
 
 
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def _safe_owned_path(raw: Any) -> str | None:
     """Validate one alert-derived repository-relative path for ``--owned-path``."""
     if not isinstance(raw, str):
         return None
     text = raw.strip()
-    if not text or text.startswith(("/", "\\", "-")) or "\\" in text or "\x00" in text:
+    if not text or text.startswith(("/", "\\", "-")) or "\\" in text or "\x00" in text or "`" in text or "|" in text:
         return None
     if any(unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in text):
         return None
@@ -316,10 +321,13 @@ def _fetch_tool_alerts(
     ``"ok"``, ``"not_enabled"``, or ``"error"``.
     """
     try:
-        endpoint: str | None = _repo_endpoint(repo, tool)
+        initial_endpoint = _repo_endpoint(repo, tool)
     except SecurityAlertsError:
         return "error", None, "invalid_repository_slug"
-    expected_path = endpoint.split("?", 1)[0]
+    expected_path = initial_endpoint.split("?", 1)[0]
+    expected_tool_suffix = _ENDPOINT_SUFFIXES[tool].split("?", 1)[0]
+    endpoint: str | None = initial_endpoint
+    pinned_repo_id: str | None = None
 
     collected: list[dict[str, Any]] = []
     seen_endpoints: set[str] = set()
@@ -353,7 +361,18 @@ def _fetch_tool_alerts(
         if next_path.startswith("api/v3/"):
             next_path = next_path.removeprefix("api/v3/")
         if next_path != expected_path:
-            return "error", None, "github_invalid_next_link"
+            numeric_match = _NUMERIC_REPO_PATH_RE.fullmatch(next_path)
+            if not numeric_match or numeric_match.group(2) != expected_tool_suffix:
+                return "error", None, "github_invalid_next_link"
+            repo_id = numeric_match.group(1)
+            if pinned_repo_id is None:
+                pinned_repo_id = repo_id
+            elif pinned_repo_id != repo_id:
+                return "error", None, "github_invalid_next_link"
+        if tool == "secret_scanning":
+            query = parse_qs(parsed_next.query, keep_blank_values=True)
+            if query.get("hide_secret") != ["true"]:
+                return "error", None, "github_invalid_next_link"
         endpoint = next_url
     return "error", None, "github_pagination_limit"
 
@@ -553,19 +572,19 @@ def select_security_worker(
 
 def _extract_code_scanning_item(alert: Mapping[str, Any]) -> tuple[dict[str, Any], str | None]:
     number = alert.get("number")
-    rule = alert.get("rule") if isinstance(alert.get("rule"), Mapping) else {}
+    rule = _as_mapping(alert.get("rule"))
     rule_id = _sanitize_text(rule.get("id") or rule.get("name") or "unknown")
-    tool = alert.get("tool") if isinstance(alert.get("tool"), Mapping) else {}
+    tool = _as_mapping(alert.get("tool"))
     tool_name = _sanitize_text(tool.get("name") or "unknown")
-    instance = alert.get("most_recent_instance") if isinstance(alert.get("most_recent_instance"), Mapping) else {}
-    location = instance.get("location") if isinstance(instance.get("location"), Mapping) else {}
+    instance = _as_mapping(alert.get("most_recent_instance"))
+    location = _as_mapping(instance.get("location"))
     raw_path = location.get("path")
     owned = _safe_owned_path(raw_path)
     start_line = location.get("start_line")
     line_str = str(start_line) if type(start_line) is int and start_line > 0 else "?"
     display_path = _sanitize_text(raw_path) if isinstance(raw_path, str) and raw_path.strip() else "unknown"
     path_line = f"{display_path}:{line_str}"
-    msg_obj = instance.get("message") if isinstance(instance.get("message"), Mapping) else {}
+    msg_obj = _as_mapping(instance.get("message"))
     message = _sanitize_text(msg_obj.get("text") or rule.get("description") or "")
     item = {
         "number": number if type(number) is int else None,
@@ -580,10 +599,10 @@ def _extract_code_scanning_item(alert: Mapping[str, Any]) -> tuple[dict[str, Any
 
 def _extract_dependabot_item(alert: Mapping[str, Any]) -> tuple[dict[str, Any], str | None]:
     number = alert.get("number")
-    advisory = alert.get("security_advisory") if isinstance(alert.get("security_advisory"), Mapping) else {}
-    vuln = alert.get("security_vulnerability") if isinstance(alert.get("security_vulnerability"), Mapping) else {}
-    dep = alert.get("dependency") if isinstance(alert.get("dependency"), Mapping) else {}
-    pkg = dep.get("package") if isinstance(dep.get("package"), Mapping) else {}
+    advisory = _as_mapping(alert.get("security_advisory"))
+    vuln = _as_mapping(alert.get("security_vulnerability"))
+    dep = _as_mapping(alert.get("dependency"))
+    pkg = _as_mapping(dep.get("package"))
     rule_id = _sanitize_text(advisory.get("ghsa_id") or advisory.get("cve_id") or "unknown")
     ecosystem = _sanitize_text(pkg.get("ecosystem") or "")
     pkg_name = _sanitize_text(pkg.get("name") or "unknown")
@@ -591,7 +610,7 @@ def _extract_dependabot_item(alert: Mapping[str, Any]) -> tuple[dict[str, Any], 
     manifest_raw = dep.get("manifest_path")
     owned = _safe_owned_path(manifest_raw)
     manifest = _sanitize_text(manifest_raw) if isinstance(manifest_raw, str) and manifest_raw.strip() else "unknown"
-    patched_obj = vuln.get("first_patched_version") if isinstance(vuln.get("first_patched_version"), Mapping) else {}
+    patched_obj = _as_mapping(vuln.get("first_patched_version"))
     patched = _sanitize_text(patched_obj.get("identifier") or "none")
     summary = _sanitize_text(advisory.get("summary") or "")
     item = {
@@ -663,15 +682,16 @@ def _render_brief_markdown(
     dep = alerts_payload["dependabot"]
     sec = alerts_payload["secret_scanning"]
 
+    routing_line = (
+        f"Catalog routing: role=`{worker.role}`, seat=`{worker.seat}/{worker.route_name}`, "
+        f"model=`{worker.model_id}` (wire `{worker.wire_id}`, family `{worker.family}`, "
+        f"route `{worker.route}`, effort `{worker.effort}`)"
+    )
     lines: list[str] = [
         f"# Security Alert Fix Brief — `{repo.key}` (`{repo.github}`)",
         "",
         f"Generated: `{generated_at}`",
-        (
-            f"Catalog routing: role=`{worker.role}`, seat=`{worker.seat}/{worker.route_name}`, "
-            f"model=`{worker.model_id}` (wire `{worker.wire_id}`, family `{worker.family}`, "
-            f"route `{worker.route}`, effort `{worker.effort}`)"
-        ),
+        routing_line,
         f"Catalog digest: `{worker.catalog_digest}`",
         "",
         "## Live Alert Summary",
@@ -741,42 +761,74 @@ def _render_brief_markdown(
                 f"| #{num} | `{_sanitize_md_cell(item['rule'])}` | `{item['severity']}` | "
                 f"`{_sanitize_md_cell(item['validity'])}` |"
             )
-        lines.extend(
-            [
-                "",
-                "OPSEC: Never print, commit, or paste secret values. Follow `docs/runbooks/secret-scanning.md` "
-                "and escalate real exposed credentials to the operator via the private channel; agents never "
-                "rotate, revoke, or rewrite Git history.",
-            ]
+        opsec_note = (
+            "OPSEC: Never print, commit, or paste secret values. Follow `docs/runbooks/secret-scanning.md` "
+            "and escalate real exposed credentials to the operator via the private channel; agents never "
+            "rotate, revoke, or rewrite Git history."
         )
+        lines.extend(["", opsec_note])
 
     lines.extend(["", "## Suggested Owned Paths", ""])
     if owned_paths:
         for path in owned_paths:
-            lines.append(f"- `{path}`")
+            lines.append(f"- `{_sanitize_md_cell(path)}`")
     else:
         lines.append("- None derived from open alerts (confirm scope before dispatch).")
+
+    rule_root_cause = (
+        "- Fix the underlying vulnerability at its root cause first. Never silence a real defect with "
+        "`# nosemgrep`, `# noqa`, ignore patterns, or a false-positive triage row."
+    )
+    rule_dependabot = "- For Dependabot alerts, upgrade or pin past the patched version and update lockfiles cleanly."
+    rule_secret = (
+        "- For secret-scanning alerts, stop on any possible real credential and escalate counts and alert "
+        "numbers to the operator through the private channel per `docs/runbooks/secret-scanning.md`."
+    )
+    rule_triage = (
+        "- Only write a triage row when positive SARIF and code-flow evidence proves an alert is a false "
+        "positive, test-only fixture, or accepted won't-fix."
+    )
+    rule_verify = (
+        "- Run targeted verification checks and Ruff, push the head, run cross-family `review-loop` with "
+        "`--risk critical`, wait for green CI Gate on the same head, land through the merge queue, and "
+        "complete closeout."
+    )
+    triage_intro = (
+        f"When a code-scanning alert is genuinely not a bug, add or revise exactly one four-column Markdown "
+        f"table row in `{_TRIAGE_RUNBOOK_PATH}` in the same PR:"
+    )
+    preflight_col13 = (
+        "- Column 1 is the plain integer alert number (no `#`), column 2 is the backticked `rule.id`, "
+        "column 3 is the backticked `path:start_line` matching every open branch instance."
+    )
+    preflight_col4 = (
+        "- Column 4 must start with `False positive.` (for reasons `false positive` and `used in tests`; "
+        "`used in tests` also requires column 3 to start with `` `tests/ ``) or `Won't fix.` (for `won't fix`)."
+    )
+    preflight_diff = (
+        "- The PR diff must add or modify that exact row; moving an unchanged row or duplicating an alert "
+        "number is refused."
+    )
+    preflight_seat = (
+        "- Workers and reviewers cannot run `code-scanning-dismiss`; after the triage PR merges, an "
+        "interactive seat runs `code-scanning-dismiss` citing `Alert #N`, a prose explanation, and the "
+        "single canonical same-repository merged PR URL."
+    )
 
     lines.extend(
         [
             "",
             "## Root-Cause Fix Rules",
             "",
-            "- Fix the underlying vulnerability at its root cause first. Never silence a real defect with "
-            "`# nosemgrep`, `# noqa`, ignore patterns, or a false-positive triage row.",
-            "- For Dependabot alerts, upgrade or pin past the patched version and update lockfiles cleanly.",
-            "- For secret-scanning alerts, stop on any possible real credential and escalate counts and alert "
-            "numbers to the operator through the private channel per `docs/runbooks/secret-scanning.md`.",
-            "- Only write a triage row when positive SARIF and code-flow evidence proves an alert is a false "
-            "positive, test-only fixture, or accepted won't-fix.",
-            "- Run targeted verification checks and Ruff, push the head, run cross-family `review-loop` with "
-            "`--risk critical`, wait for green CI Gate on the same head, land through the merge queue, and "
-            "complete closeout.",
+            rule_root_cause,
+            rule_dependabot,
+            rule_secret,
+            rule_triage,
+            rule_verify,
             "",
             "## Code-Scanning Dismissal Triage Row Format (`code-scanning-dismiss`)",
             "",
-            f"When a code-scanning alert is genuinely not a bug, add or revise exactly one four-column Markdown "
-            f"table row in `{_TRIAGE_RUNBOOK_PATH}` in the same PR:",
+            triage_intro,
             "",
             "```markdown",
             "| <alert_number> | `<rule_id>` | `<path>:<start_line>` | False positive. <concrete SARIF/code-flow evidence> |",
@@ -784,15 +836,10 @@ def _render_brief_markdown(
             "```",
             "",
             "Publisher preflight rules (`lu_machinery.publish code-scanning-dismiss`):",
-            "- Column 1 is the plain integer alert number (no `#`), column 2 is the backticked `rule.id`, "
-            "column 3 is the backticked `path:start_line` matching every open branch instance.",
-            "- Column 4 must start with `False positive.` (for reasons `false positive` and `used in tests`; "
-            "`used in tests` also requires column 3 to start with `` `tests/ ``) or `Won't fix.` (for `won't fix`).",
-            "- The PR diff must add or modify that exact row; moving an unchanged row or duplicating an alert "
-            "number is refused.",
-            "- Workers and reviewers cannot run `code-scanning-dismiss`; after the triage PR merges, an "
-            "interactive seat runs `code-scanning-dismiss` citing `Alert #N`, a prose explanation, and the "
-            "single canonical same-repository merged PR URL.",
+            preflight_col13,
+            preflight_col4,
+            preflight_diff,
+            preflight_seat,
             "",
             "## Dispatch Command (Not Executed)",
             "",
@@ -922,24 +969,17 @@ def write_brief_file(path: Path | str, content: str) -> Path:
         dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.parent.is_symlink() or not dest.parent.is_dir():
         raise SecurityAlertsError("--brief-out parent must be a real directory", exit_code=2)
-    tmp_path: Path | None = None
+    fd, raw_tmp = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp")
+    tmp_path = Path(raw_tmp)
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=dest.parent,
-            prefix=f".{dest.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            tmp_path = Path(handle.name)
+        with os.fdopen(fd, "wb") as handle:
             handle.write(content.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, dest)
-        tmp_path = None
-    finally:
-        if tmp_path is not None and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return dest
 
 

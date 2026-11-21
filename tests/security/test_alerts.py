@@ -138,6 +138,7 @@ def test_scan_feature_disabled_is_not_zero(tmp_path: Path) -> None:
                 value={"message": "Dependabot alerts are disabled for this repository."},
             )
         if "secret-scanning/alerts" in endpoint:
+            assert "hide_secret=true" in endpoint
             return Result(
                 status=404,
                 error="github_http_error",
@@ -189,13 +190,15 @@ def test_scan_opt_out_repo_skipped(tmp_path: Path) -> None:
     def respond(endpoint: str) -> Result:
         if "org/opted-out" in endpoint:
             raise AssertionError("opted-out repository must not be queried")
-        if "org/brand-new-project/code-scanning/alerts" in endpoint and "page=2" not in endpoint:
+        if "secret-scanning/alerts" in endpoint:
+            assert "hide_secret=true" in endpoint
+        if "org/brand-new-project/code-scanning/alerts" in endpoint:
             return Result(
                 status=200,
-                headers={"link": '<https://api.github.com/repos/org/brand-new-project/code-scanning/alerts?state=open&per_page=100&page=2>; rel="next"'},
+                headers={"link": '<https://api.github.com/repositories/987654/code-scanning/alerts?state=open&per_page=100&page=2>; rel="next"'},
                 value=[{"number": 1, "rule": {"id": "py/test", "security_severity_level": "high"}}],
             )
-        if "org/brand-new-project/code-scanning/alerts" in endpoint and "page=2" in endpoint:
+        if "repositories/987654/code-scanning/alerts" in endpoint and "page=2" in endpoint:
             return Result(
                 status=200,
                 value=[{"number": 2, "rule": {"id": "py/test2", "security_severity_level": "critical"}}],
@@ -296,6 +299,7 @@ def test_brief_routes_through_catalog() -> None:
                 ],
             )
         if "secret-scanning/alerts" in endpoint:
+            assert "hide_secret=true" in endpoint
             return Result(
                 status=404,
                 error="github_http_error",

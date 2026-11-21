@@ -60,8 +60,10 @@ subprocesses are never invoked.
   enforced by `lu_machinery.publish code-scanning-dismiss`
   (`docs/runbooks/secret-scanning.md`), and the shell-quoted dispatch command.
   Never dispatches a worker.
-- OPSEC: secret-scanning items never read or render the raw `secret` field; real
-  credentials are escalated to the operator through the private channel.
+- OPSEC: secret-scanning requests pass `hide_secret=true` (enforced across
+  pagination) so raw secret values are neither cached by `github_client` nor
+  rendered; real credentials are escalated to the operator through the private
+  channel.
 
 ## Prometheus metrics
 
