@@ -31,7 +31,7 @@ the delivery skills: `full-send` (to MERGED and closeout, run by the briefed wor
 `modernize` for inherited or old work. A worker starts follow-ups only within its brief's cap.
 You land a PR yourself only when no brief owns it, and only when the gates of
 `workflow.md` § Merge policy hold: the recorded exact-head review the PR's tier requires (none for
-a Trivial PR) and a green same-head CI Gate; never ask the operator to merge.
+a Trivial PR, where a recorded rejection still blocks) and a green same-head CI Gate; never ask the operator to merge.
 
 At each turn end and at session end:
 

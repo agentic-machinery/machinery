@@ -8,8 +8,8 @@ post-merge cleanup. This file keeps only what a driver still needs and no other 
 
 ## §6. Review of record
 
-Every PR above the review policy's Trivial tier needs a review of record; a Trivial PR lands on required
-CI alone. A review of record is independent, outside the author's model family (at the review policy's
+Every PR above the review policy's Trivial tier needs a review of record; a Trivial PR needs none and
+lands on required CI alone, but a recorded rejection on its head still blocks landing. A review of record is independent, outside the author's model family (at the review policy's
 [Low tier](../../review-loop/references/policy.md#2-risk-tier-is-set-by-the-change) any qualified
 non-author reviewer), toolful and **exact-head**: attested `resolved_model`, a verdict, and an
 attested SHA equal to the current PR head. A moved head makes it stale. Discussion on a thread,
@@ -167,7 +167,7 @@ ids for suite results. Add no test and repeat no run.
 
 The gates are `workflow.md` § Merge policy; the delivery steps are `full-send` and `full-stop`,
 and the briefed worker enqueues its own PR once the review its tier requires is recorded at the
-exact head (none for a Trivial PR) and the same-head CI Gate is green. You land only a PR no brief owns, and flag another
+exact head (none for a Trivial PR, where a recorded rejection still blocks) and the same-head CI Gate is green. You land only a PR no brief owns, and flag another
 lane's PR with `needs=merge` instead of merging it. Run the core inbox drain immediately before an
 enqueue and reconcile its messages with the approved head.
 
