@@ -1419,23 +1419,36 @@ def test_publish_graphql_callers_accept_valid_extensions_object(monkeypatch, tmp
             super().__init__(**kwargs)
 
     monkeypatch.setattr(github_client, "GitHubClient", IssueCountHttpClient)
-    for status_code, bad_body in (
-        (200, b'{"data":{"repository":{"issues":{"totalCount":7}}},"errors":[]}'),
-        (200, b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":[]}'),
-        (200, b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":{"cost":1e999}}'),
-        (400, b'{"errors":[{"message":"boom"}],"extensions":{"cost":1e999}}'),
-        (500, b'{"errors":[{"message":"boom"}],"errors":[]}'),
+    over_depth_err = b'{"errors":' + b"[" * 513 + b"]" * 513 + b"}"
+    gql_ct = {"Content-Type": "application/graphql-response+json; charset=utf-8"}
+    for status_code, resp_headers, bad_body in (
+        (200, {}, b'{"data":{"repository":{"issues":{"totalCount":7}}},"errors":[]}'),
+        (200, {}, b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":[]}'),
+        (200, {}, b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":{"cost":1e999}}'),
+        (400, {}, b'{"errors":[{"message":"boom"}],"extensions":{"cost":1e999}}'),
+        (500, {}, b'{"errors":[{"message":"boom"}],"errors":[]}'),
+        (400, {}, over_depth_err),
+        (400, gql_ct, over_depth_err),
+        (500, gql_ct, b'{"errors":[{"message":"boom \xff"}]}'),
+        (400, {}, b"\xff"),
+        (400, {}, b"[]"),
+        (400, {}, b'{"data":[]}'),
+        (502, gql_ct, b"<html>502 Bad Gateway</html>"),
     ):
-        http_reply["response"] = github_client.Response(status_code, {}, bad_body)
+        http_reply["response"] = github_client.Response(status_code, resp_headers, bad_body)
         for check_flag in (False, True):
             with pytest.raises(gate.PublishBlocked, match="malformed issue count response"):
                 pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=check_flag)
-    http_reply["response"] = github_client.Response(500, {}, b'{"message":"Server Error"}')
-    err_500 = pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=False)
-    assert err_500.returncode == 1 and err_500.github_result.error == "github_http_error"
-    with pytest.raises(subprocess.CalledProcessError) as exc_500:
-        pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=True)
-    assert exc_500.value.github_result.error == "github_http_error"
+    for http_status, http_body in (
+        (500, b'{"message":"Server Error"}'),
+        (502, b"<html>502 Bad Gateway</html>"),
+    ):
+        http_reply["response"] = github_client.Response(http_status, {}, http_body)
+        err_http = pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=False)
+        assert err_http.returncode == 1 and err_http.github_result.error == "github_http_error"
+        with pytest.raises(subprocess.CalledProcessError) as exc_http:
+            pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=True)
+        assert exc_http.value.github_result.error == "github_http_error"
     http_reply["response"] = github_client.Response(200, {}, b'{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}')
     rl = pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=False)
     assert rl.returncode == 75 and rl.github_result.error == "github_rate_limited"
