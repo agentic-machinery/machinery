@@ -126,8 +126,10 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 
    `true` means a merge queue and `false` none. Any other reading (a failed read, a missing or
    non-boolean field) means stop; never guess. `headRefOid` must equal the head of the recorded
-   APPROVE and of the green PR CI: the `CI Gate` check with a merge queue, every check on that
-   head without one. A pending, red or cancelled check is not green. If CI evidence that arrived
+   APPROVE and of green PR CI, which is the same in both kinds: no blocking check on that head
+   pending, red or cancelled, the `CI Gate` among them where the repository runs one.
+   `pr-merge`'s merge guard refuses otherwise before it enqueues or merges, so a queue setting
+   that changes before it runs skips no gate. If CI evidence that arrived
    after the verdict materially undermines it (for example a failure in code the review relied
    on), get the reviewer's disposition before landing (step 8), through a round `budget-check`
    admits; a fix that moves the head returns to step 4.
