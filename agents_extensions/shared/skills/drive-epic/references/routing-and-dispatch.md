@@ -12,8 +12,8 @@ linguistic and content review route only to the sanctioned language lanes), folk
 the fallback table; never block on one lane.
 
 Every agent that commits to a branch adds its model family to the branch's author families, and
-above the review policy's Low tier the reviewer must be outside all of them (`check_branch_author_families` in
-`lu_machinery/dispatcher/checks.py`). The Ukrainian review profile
+the resolver with `check_branch_author_families` (`lu_machinery/dispatcher/checks.py`) decides which
+reviewers stay eligible on a mixed branch; never pick one yourself. The Ukrainian review profile
 (`agents_extensions/shared/skills/review-loop/references/ukrainian.md`) seats only Gemini and Sol,
 so a takeover successor or helper on a Ukrainian content branch stays with the family already
 authoring it, or the branch restarts from main with one author family.
@@ -82,20 +82,20 @@ role before consuming an occurrence.
 Dispatch only when the task card and the dispatch preflight are both green (DoR); chat "ready" is
 not DoR (`docs/best-practices/task-quality.md`, `operator-expectations.md` §3b). Every brief names
 **one outcome for one PR**; apply the review-size signal in
-[workflow.md § Merge policy](../../../rules/workflow.md#merge-policy--ready-prs-must-not-sit-4703-landing-order-7450).
+`agents_extensions/shared/rules/workflow.md` § Merge policy.
 
-```bash
-.venv/bin/python -m lu_machinery.dispatch dispatch --model <catalog-model> --agent <lane> --worktree ...
-```
+The complete dispatch recipe (capacity read, then an explicit eligible provider and model with a
+prompt file and `--worktree`) is in `fleet-driver-routing.md` §2 and `model-assignment.md`; a
+write dispatch adds `--mode workspace-write`, `--task-id`, `--branch` and repeatable
+`--owned-path`, and `--dry-run` prints the plan without creating a task record.
 
 A takeover, or any worker pushing to an existing PR branch, is dispatched with
 `--branch <PR head branch>`, `--base origin/main` and the PR's files as `--owned-path`. A `--base`
 that settlement cannot verify (including a commit SHA) or that equals `--branch` is refused at
 dispatch; read-only dispatches still accept a SHA base. If frozen inputs require a tree before
 dispatch, create it with `create_worktree` from `lu_machinery.dispatcher.git` (it writes the
-creator receipt; tasks launched with `--cwd` borrow it) and remove it afterwards as the
-[helper cleanup runbook](../../../../../docs/runbooks/worktree-cleanup.md#remove-helper-created-trees-12602)
-says: `.venv/bin/python -m lu_machinery.orchestration.worktree_claims remove PATH`, preceded for
+creator receipt; tasks launched with `--cwd` borrow it) and remove it afterwards as the helper cleanup runbook
+(`docs/runbooks/worktree-cleanup.md`, "Remove helper-created trees") says: `.venv/bin/python -m lu_machinery.orchestration.worktree_claims remove PATH`, preceded for
 trees that predate receipts by
 `.venv/bin/python -m lu_machinery.orchestration.worktree_claims attribute-helper PATH --actor ACTOR --reason REASON`.
 

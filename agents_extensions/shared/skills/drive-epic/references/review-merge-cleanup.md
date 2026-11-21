@@ -17,7 +17,7 @@ ACP asks and council panels are not review; never record an APPROVE over a pipel
 `CHANGES_REQUESTED`. A review `ask-<lane> --review` or `--type review` runs a toolful native CLI
 with synchronous dispatch and wait; its legacy `--background` flag is rejected. About 1000 changed
 lines excluding tests is a review-size signal, not a finding
-([workflow.md § Merge policy](../../../rules/workflow.md#merge-policy--ready-prs-must-not-sit-4703-landing-order-7450)).
+(`agents_extensions/shared/rules/workflow.md` § Merge policy).
 
 Resolve the reviewer with the recipe in `review-loop` step 2, which first initializes the target
 and then resolves with the exact author model, review profile and risk; pass the same profile to
@@ -25,9 +25,8 @@ the dispatch. `requires_silence_timeout` is boolean: when true, pass `--silence-
 (default 3600) and confirm `silence_timeout` in the task record. Dispatch v2 resolves the locally
 available branch or the explicit `--pinned-head` SHA and does not fetch or freeze the remote
 branch: verify the pushed tip before launch and before publishing the verdict. After settlement,
-the recorder uses the task's `worktree_base_sha`. Record the verdict with
-`"$PY" -m lu_machinery.review.record_cf_verdict --task-id "$REVIEW_TASK" --pr "$PR_NUMBER"`
-(`review-loop` step 7). The launch and wait recipe, which the offline tests execute verbatim:
+the recorder uses the task's `worktree_base_sha`. Publishing the verdict is `review-loop` step 7.
+The launch and wait recipe, which the offline tests execute verbatim:
 
 ```bash
 set -euo pipefail
@@ -171,24 +170,22 @@ exact head (none for a Trivial PR, where a recorded rejection still blocks) and 
 lane's PR with `needs=merge` instead of merging it. Run the core inbox drain immediately before an
 enqueue and reconcile its messages with the approved head.
 
-- **A queue kick is same-hour work.** A CI Gate comment on the PR with a run URL means the merge
-  queue ejected it. Read the failed jobs, fix or rebase, re-run the exact-head review if the head
-  moved, and re-queue the same hour (`full-send`'s [pr-watch](../../full-send/references/pr-watch.md)
-  has the rules). A failing test node is fixed first, never re-queued unchanged (rules core P4).
-- **Diagnose pytest failures from the JUnit artifact first.** The live log truncates and stalls,
-  which has read as a silent shard death. Download the artifacts to a scratch directory (never the
-  primary checkout) and parse `<failure>`; a failed test there is a test failure, never
-  infrastructure. Jobs without that artifact use `gh run view <run> --log-failed`.
+- **Queue kicks, failing CI and a moved base** follow `full-send`'s
+  [pr-watch](../../full-send/references/pr-watch.md) (Failing CI, Merge-queue kicks, The base
+  moves): the evidence requirement, the one-recovery limit and the stop on an uncertain diagnosis
+  are stated there. The driver's part is timing and escalation: a queue kick is same-hour work,
+  never left overnight, and a second failure or an uncertain cause is reported to the CTO.
+- **Diagnose pytest failures from the JUnit artifact first** (`pr-watch` points here for the
+  command). The live log truncates and stalls, which has read as a silent shard death. Download the
+  artifacts to a scratch directory (never the primary checkout) and parse `<failure>`; a failed test
+  there is a test failure, never infrastructure. Jobs without that artifact use
+  `gh run view <run> --log-failed`.
 
   ```bash
   gh run download <run> --pattern 'pytest-junit-*' -D "$(mktemp -d)"
   ```
 - **Main red: fix main first.** Find the breaking commit and fix main, or delete the test with the
-  reason, before re-enqueueing anything. Refresh blocked PRs with
-  `.venv/bin/python -m lu_machinery.publish pr-update-branch --number <pr>` (always pass the
-  number; bare, it targets the current branch's PR), never close and reopen. Verify parent 1 equals
-  the approved head and the patch-id is unchanged, then get one batched exact-head re-review per
-  reviewer family.
+  reason, before re-enqueueing anything (rules core P4).
 - **Launchers and hooks.** Before opening a PR that touches them, run the launcher tests that
   cover the change (`tests/lib/test_launcher_contract.py` and its siblings). Most call the shared
   `run_launcher` helper rather than `subprocess`, so select on launcher names and that helper.

@@ -12,16 +12,23 @@ is the lane's handoff.
 
 ### Record work throughout the cycle
 
-Use `lu-driver-state add --lane <lane>` for every new order, commitment, goal, in-flight task,
-blocker, decision and next action, with the matching kind, an owner and a done condition. Record
-goals under their program's `operator_order` with `--parent <id>`. Every `inflight` item carries
-the task ID and the FULL run nonce (`.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>`
-compares it exactly).
+Record every new order, commitment, goal, in-flight task, blocker, decision and next action as an
+item with the matching kind, an owner and a done condition. Record goals under their program's
+`operator_order` with `--parent <id>`. Every `inflight` item carries the task ID and the FULL run
+nonce (`.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>` compares it
+exactly). The complete syntax:
 
-Update items with `link` (references), `note` (progress) and `evidence` (proof). Never delete an
-item or replace unfinished items with a session summary. Use
-`lu-driver-state status <id> done --reason <reason>` only after evidence supports the done
-condition; `dropped` needs an operator reference in its reason. Cite item IDs in cycle reports.
+```bash
+lu-driver-state add --lane <lane> --kind <operator_order|commitment|goal|inflight|blocker|next_action|decision|standing_order|handoff_note> --statement "<work>" --owner <owner> --done-when "<condition>" [--parent <id>] [--task-id <task-id>]
+lu-driver-state link <id> <issue|pr|task|branch|deploy|fleet_message|doc> <ref>
+lu-driver-state note <id> "<progress>"
+lu-driver-state evidence <id> --claim "<claim>" --command "<command>" --excerpt "<excerpt>"
+lu-driver-state status <id> <open|in_progress|blocked|done|dropped> --reason "<reason>"
+```
+
+Never delete an item or replace unfinished items with a session summary. Set `done` only after
+evidence supports the done condition; `dropped` needs an operator reference in its reason. Cite
+item IDs in cycle reports.
 
 ### Reconcile and hand off
 
@@ -30,7 +37,7 @@ condition; `dropped` needs an operator reference in its reason. Cite item IDs in
    every open order, goal, commitment, in-flight task, blocker, decision, parked item and next
    action has an item.
 3. Prepare the rollover with the `thread-rollover` skill. Add one `handoff_note` item
-   (`lu-driver-state add --lane <lane> --kind handoff_note`) with an owner and a done condition:
+   (`lu-driver-state add` with `--kind handoff_note`, syntax above) with an owner and a done condition:
    timestamp, session identity, lineage and rollover IDs, open PR heads and gates, live task IDs
    with FULL run nonces, armed waits, residual owners and resume conditions, next actions. Cite
    work item IDs; update those items rather than duplicating their history.

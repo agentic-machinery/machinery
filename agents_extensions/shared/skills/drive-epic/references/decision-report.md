@@ -42,8 +42,8 @@ that shows it is operator-only.
 
 ## Council: optional independent panel
 
-**When to use it.** Every PR gets normal review: one reviewer of record through `review-loop`,
-under the applicable tier (the review policy's Low-tier exception and the Ukrainian
+**When to use it.** Every PR above the Trivial tier gets normal review: one reviewer of record through
+`review-loop`, under the applicable tier (the review policy's Low-tier exception and the Ukrainian
 profile's Sources-backed seats stand). Add a council only for:
 
 1. a consequential, unresolved choice between materially different approaches (a decision
@@ -69,8 +69,7 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   (the ask and `discuss` rules in `fleet-comms-coordination.md`) takes up only the points where the
   members disagree. A discussion never counts as review or approval.
 - **Members:** live eligible routes only, as `model-assignment.md` seats them for the question
-  (Neon routing: [Neon](../../../rules/model-assignment.md#gemini-4-neon-advisory-routing);
-  Savant: [Savant](../../../rules/model-assignment.md#subq-savant-test-routing)). Record each
+  (`model-assignment.md`, "Gemini 4 Neon advisory routing" and "SubQ Savant test routing"). Record each
   model's exact ID with its findings and score. On Ukrainian language, culture and heritage
   questions, Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment);
   its answers are input in the council and the discussion only, never review of record or

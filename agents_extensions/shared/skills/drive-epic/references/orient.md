@@ -8,8 +8,9 @@ stated once in the core `SKILL.md` loop.
 Read the pinned provider facts in `.claude/<lane>-epic/DRIVER-STATE.md`, then run
 `lu-driver-state render --lane <lane>` for open work and `lu-driver-state check --lane <lane>`
 (your assigned lane key). `lu-driver-state` is a wrapper the launcher environment puts on `PATH`,
-not a command of the installed release; if `command -v lu-driver-state` is empty, report the
-missing tool to the CTO and do not hand-edit tracker state. Treat `UNOWNED`, `STALE` and `OVERDUE` findings as a worklist. Read the
+not a command of the installed release (full syntax in [handoff](handoff.md)); if
+`lu-driver-state render --help` fails, whether the wrapper is absent or its backing executable is
+missing, report that failure to the CTO and do not hand-edit tracker state. Treat `UNOWNED`, `STALE` and `OVERDUE` findings as a worklist. Read the
 program and plan first (the `operator_order` item and its child `goal` items; `lu-driver-state
 show <id>` gives full history), then standing orders, the latest `handoff_note`, in-flight work,
 blockers, decisions and next actions. The database is the lane's handoff; the markdown file is
