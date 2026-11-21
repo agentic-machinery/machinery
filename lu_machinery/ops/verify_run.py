@@ -242,8 +242,17 @@ def check_get(base_url: str, path: str, *, budget: float) -> dict[str, Any]:
     status, _payload, elapsed, detail = _exchange(
         url, method="GET", timeout=budget, headers=headers
     )
+    attempts = [round(elapsed, 3)]
+    if status is None and detail == "timed out":
+        status, _payload, elapsed, detail = _exchange(
+            url, method="GET", timeout=budget, headers=headers
+        )
+        attempts.append(round(elapsed, 3))
     ok, detail = _judge(status, elapsed, detail, budget=budget)
-    return _check(path, ok=ok, status=status, elapsed=elapsed, detail=detail)
+    check = _check(path, ok=ok, status=status, elapsed=elapsed, detail=detail)
+    if len(attempts) > 1:
+        check["attempt_elapsed_s"] = attempts
+    return check
 
 
 def discover_api_paths(
