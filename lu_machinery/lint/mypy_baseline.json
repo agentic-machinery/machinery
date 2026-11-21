@@ -2088,11 +2088,6 @@
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
     {
-      "path": "lu_machinery/ci/advisory_checks.py",
-      "code": "misc",
-      "message": "Cannot infer type of lambda"
-    },
-    {
       "path": "lu_machinery/ci/cache_hygiene.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"str\""

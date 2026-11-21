@@ -7,7 +7,7 @@ Exercises the pure decision logic in
     `--disable-auto` segment it deliberately leaves alone; `--admin` remains
     visible to the same draft/check protections),
   * the quote-aware tokenizer (a `gh pr merge` inside a quoted commit body is NOT a merge),
-  * failing/pending check classification against the advisory allowlist,
+  * failing/pending check classification (every named check blocks, C-6339),
   * the fail-CLOSED `main()` decision (block on draft, red checks, pending-without-auto,
     --auto on an unprotected base, and on anything undeterminable; allow on green).
 
@@ -45,21 +45,6 @@ _GH_246_CHECKS_JSON_GAP = (
     "Flags:\n"
     "      --fail-fast         Exit watch mode on first check failure\n"
 )
-
-
-
-@pytest.fixture(autouse=True)
-def _advisory_fixture_workflow(monkeypatch):
-    """The real ci.yml has no advisory job; cover the rule with a fixture workflow."""
-    from lu_machinery.ci import advisory_checks
-
-    load = advisory_checks.load_advisory_checks
-    fixture = Path(__file__).resolve().parents[2] / "tests/fixtures/ci_advisory_workflow.yml"
-    from lu_machinery.publish import merge_guard
-    def reader(path=None):
-        return load(path or fixture)
-    monkeypatch.setattr(advisory_checks, "load_advisory_checks", reader)
-    monkeypatch.setattr(merge_guard, "load_advisory_checks", reader)
 
 
 def _load_hook():
@@ -594,7 +579,8 @@ def test_quoted_merge_not_detected():
 
 
 def test_is_advisory():
-    assert guard.is_advisory("Component shadow (advisory)", workflow="CI")
+    # C-6339: the hook's import is a fail-closed stub; a continue-on-error job is not advisory.
+    assert not guard.is_advisory("Component shadow (advisory)", workflow="CI")
     assert not guard.is_advisory("Component shadow (advisory)")
     assert not guard.is_advisory("boundary-and-tests", workflow="CI")
     assert not guard.is_advisory("Test (pytest)", workflow="CI")
@@ -843,7 +829,7 @@ def test_check_states_splits_failing_and_pending(monkeypatch):
         _run_row("Component shadow (advisory)", "FAILURE"),
     ]
     _bound_gh(monkeypatch, returncode=8, stdout=rows, rollup=rollup)
-    assert guard._check_states("5") == (["boundary-and-tests"], ["Test (pytest)"], 3)
+    assert guard._check_states("5") == (["boundary-and-tests", "Component shadow (advisory)"], ["Test (pytest)"], 4)
 
 
 def test_check_states_garbage_output_is_failclosed(monkeypatch):
@@ -1071,25 +1057,20 @@ def test_missing_check_bucket_fails_closed(monkeypatch):
     assert guard._check_states("5") is None
 
 
-@pytest.mark.parametrize("identity,allowed", [
-    ({"workflow": "CI"}, True),
-    ({"workflow": "Nightly"}, False),
-    ({}, False),
-    ({"workflowName": "CI"}, False),
+@pytest.mark.parametrize("identity,workflow", [
+    ({"workflow": "CI"}, "CI"),
+    ({"workflow": "Nightly"}, "Nightly"),
+    ({}, "Nightly"),
+    ({"workflowName": "CI"}, "Nightly"),
 ])
-def test_advisory_checks_require_workflow_identity(monkeypatch, identity, allowed):
-    """gh's headless rows never decide an advisory exemption: the rollup's workflow identity does."""
+def test_advisory_checks_require_workflow_identity(monkeypatch, identity, workflow):
+    """No workflow identity exempts a failing check: a continue-on-error job's check blocks too (C-6339)."""
     name = "Component shadow (advisory)"
     rows = [{"name": name, "bucket": "fail", **identity}, {"name": "CI Gate", "bucket": "pass", "workflow": "CI"}]
-    workflow = "CI" if allowed else "Nightly"
     rollup = [_run_row(name, "FAILURE", workflowName=workflow), _run_row("CI Gate", "SUCCESS")]
     _bound_gh(monkeypatch, returncode=1, stdout=json.dumps(rows), rollup=rollup)
-    assert guard._check_states("5") == (([], [], 1) if allowed else ([name], [], 1))
-    result = guard._judge(["5", "--squash"])
-    if allowed:
-        assert result is None
-    else:
-        assert f"FAILING checks: {name}" in result
+    assert guard._check_states("5") == ([name], [], 2)
+    assert f"FAILING checks: {name}" in guard._judge(["5", "--squash"])
 
 
 def test_known_pass_buckets_are_green(monkeypatch):
@@ -1106,10 +1087,10 @@ def _rollup_states(monkeypatch, rows):
 
 
 @pytest.mark.parametrize("identity,expected", [
-    ({"workflowName": "CI"}, ([], [], 1)),
-    ({"workflowName": "Nightly"}, (["Component shadow (advisory)"], [], 1)),
-    # No workflow identity: only exact-head Actions runs could bind it, and none are readable.
-    ({}, None),
+    ({"workflowName": "CI"}, (["Component shadow (advisory)"], [], 2)),
+    ({"workflowName": "Nightly"}, (["Component shadow (advisory)"], [], 2)),
+    # No workflow identity: nothing depends on it, so no Actions-run binding is needed (C-6339).
+    ({}, (["Component shadow (advisory)"], [], 2)),
 ])
 def test_rollup_advisory_maps_workflow_name_explicitly(monkeypatch, identity, expected):
     name = "Component shadow (advisory)"
@@ -2305,7 +2286,6 @@ def test_issue_9480_consecutive_cd_matches_bash(monkeypatch, tmp_path, suffix):
 
 
 # --- OO-48 external advisory provenance (#11184) ------------------------------------------
-# The publisher/hook parity matrix (real hook subprocess) lives in tests/test_advisory_checks.py.
 
 _HEAD = "a" * 40
 _ENTIRE_ROWS = json.dumps(
@@ -2423,14 +2403,9 @@ def test_oo48_snapshot_hands_its_metadata_to_the_check_reader(monkeypatch):
     assert seen == [meta]
 
 
-_ADVISORY_ONLY = "Component shadow (advisory)"
-
-
 @pytest.mark.parametrize("checks,rollup", [
     ((1, ""), []),
     ((0, "[]"), []),
-    ((0, json.dumps([{"name": _ADVISORY_ONLY, "bucket": "pass", "workflow": "CI"}])),
-     [{"name": _ADVISORY_ONLY, "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}]),
 ])
 def test_raw_merge_of_a_zero_check_head_is_refused_like_the_publisher(monkeypatch, capsys, checks, rollup):
     """Defect class: a raw `gh pr merge` lands a head with no blocking check that pr-merge refuses (NO_CHECKS)."""
