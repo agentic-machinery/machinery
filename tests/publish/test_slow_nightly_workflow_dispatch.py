@@ -355,10 +355,10 @@ def dismissal_transport(monkeypatch, synthetic_opsec):
         f"contents/{pub._DISMISS_TRIAGE_PATH}?ref={before}": "| 1 | `py/fixture` | `sample.py:7` | False positive. Public metadata only. |\n",
         "code-scanning/alerts/1": alert,
         "code-scanning/alerts/1/instances?per_page=100": [[instance]],
-        "code-scanning/analyses?ref=refs%2Fheads%2Fmain&per_page=100": [[
+        "code-scanning/analyses?ref=refs%2Fheads%2Fmain&per_page=100&page=1": [
             {"id": aid, "commit_sha": sha, "analysis_key": "codeql", "environment": "{}", "category": "python", "error": ""}
             for aid, sha in ((3, current), (2, before))
-        ]],
+        ],
         "code-scanning/analyses/2": copy.deepcopy(sarif),
         "code-scanning/analyses/3": copy.deepcopy(sarif),
     }
@@ -475,7 +475,7 @@ def test_dismissal_refuses_missing_or_changed_reviewed_evidence(dismissal_transp
     elif fault == "flow":
         documents["code-scanning/analyses/3"]["runs"][0]["results"][0]["codeFlows"] = []
     elif fault == "analysis":
-        documents["code-scanning/analyses?ref=refs%2Fheads%2Fmain&per_page=100"][0] = []
+        documents["code-scanning/analyses?ref=refs%2Fheads%2Fmain&per_page=100&page=1"] = []
     elif fault == "tool":
         documents["code-scanning/analyses/3"]["runs"][0]["tool"]["driver"]["semanticVersion"] = "2.0.0"
     elif fault == "branch":
@@ -653,6 +653,108 @@ def test_dismissal_current_triage_requires_the_exact_branch_commit_reference(dis
     assert writes == []
     assert any("repos/unit/public/git/ref/heads/main" in argv for argv in calls)
     assert not any(any("commits/main" in item for item in argv) for argv in calls)
+
+
+def test_dismissal_paginates_analyses_until_match_on_page_n(dismissal_transport):
+    """Defect class: unbounded history fetch or missed match when the commit analysis is on page N."""
+    documents, writes, _, _, sender, comment = dismissal_transport
+    documents["code-scanning/alerts/1"]["tool"] = {"name": "CodeQL"}
+    documents["pulls/2"]["merged_at"] = "2026-11-21T01:00:00Z"
+    before, current = "a" * 40, "b" * 40
+    pages = {
+        1: [
+            {"id": 9, "commit_sha": "f" * 40, "analysis_key": "codeql", "environment": "{}", "category": "python", "error": "", "created_at": "2026-11-21T01:40:00Z"},
+            {"id": 3, "commit_sha": current, "analysis_key": "codeql", "environment": "{}", "category": "python", "error": "", "created_at": "2026-11-21T01:30:00Z"},
+        ],
+        2: [
+            {"id": 8, "commit_sha": "e" * 40, "analysis_key": "codeql", "environment": "{}", "category": "python", "error": "", "created_at": "2026-11-21T01:20:00Z"},
+            {"id": 7, "commit_sha": before, "analysis_key": "codeql", "environment": "{}", "category": "other", "error": "", "created_at": "2026-11-21T01:10:00Z"},
+        ],
+        3: [
+            {"id": 2, "commit_sha": before, "analysis_key": "codeql", "environment": "{}", "category": "python", "error": "", "created_at": "2026-11-21T01:02:00Z"},
+        ],
+    }
+    prefix = "repos/unit/public/code-scanning/analyses?ref=refs%2Fheads%2Fmain&tool_name=CodeQL&per_page=100&page="
+    analysis_calls = []
+
+    def paginated(argv, **kwargs):
+        endpoint = argv[argv.index("--method") + 2]
+        if endpoint.startswith("repos/unit/public/code-scanning/analyses?"):
+            assert "--paginate" not in argv and "--slurp" not in argv
+            assert endpoint.startswith(prefix), endpoint
+            page_num = int(endpoint.removeprefix(prefix))
+            analysis_calls.append(page_num)
+            assert page_num <= 3, f"fetched past matching page: {page_num}"
+            return subprocess.CompletedProcess(argv, 0, json.dumps(pages[page_num]), "")
+        return sender(argv, **kwargs)
+
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=paginated, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0
+    assert analysis_calls == [1, 2, 3]
+    assert len(writes) == 1
+
+
+@pytest.mark.parametrize("mode", [
+    "bound", "older-than-commit", "timeout",
+    "missing-commit-sha", "invalid-commit-sha", "missing-analysis-key", "invalid-environment", "invalid-category",
+])
+def test_dismissal_refuses_when_paginated_analyses_never_match(dismissal_transport, mode):
+    """Defect class: unbounded pagination or fail-open when analyses never match, pass the commit time, time out, or carry malformed identity fields."""
+    documents, writes, _, _, sender, comment = dismissal_transport
+    if mode == "older-than-commit":
+        documents["pulls/2"]["merged_at"] = "2026-11-21T01:00:00Z"
+    prefix = "repos/unit/public/code-scanning/analyses?ref=refs%2Fheads%2Fmain&per_page=100&page="
+    valid_rows = documents["code-scanning/analyses?ref=refs%2Fheads%2Fmain&per_page=100&page=1"]
+    analysis_calls = []
+
+    def never_matches(argv, **kwargs):
+        endpoint = argv[argv.index("--method") + 2]
+        if endpoint.startswith("repos/unit/public/code-scanning/analyses?"):
+            assert "--paginate" not in argv and "--slurp" not in argv
+            assert endpoint.startswith(prefix), endpoint
+            page_num = int(endpoint.removeprefix(prefix))
+            analysis_calls.append(page_num)
+            if mode == "timeout" and page_num == 2:
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 30))
+            if mode in {"missing-commit-sha", "invalid-commit-sha", "missing-analysis-key", "invalid-environment", "invalid-category"}:
+                bad = {"id": 99, "commit_sha": "f" * 40, "analysis_key": "codeql", "environment": "{}", "category": "python", "error": ""}
+                if mode == "missing-commit-sha":
+                    bad.pop("commit_sha")
+                elif mode == "invalid-commit-sha":
+                    bad["commit_sha"] = "not-a-sha"
+                elif mode == "missing-analysis-key":
+                    bad.pop("analysis_key")
+                elif mode == "invalid-environment":
+                    bad["environment"] = None
+                else:
+                    bad["category"] = 123
+                return subprocess.CompletedProcess(argv, 0, json.dumps([bad, *valid_rows]), "")
+            row = {
+                "id": 100 + page_num, "commit_sha": "f" * 40,
+                "analysis_key": "codeql", "environment": "{}", "category": "python", "error": "",
+            }
+            if mode == "older-than-commit":
+                row["created_at"] = "2026-11-20T00:00:00Z"
+            return subprocess.CompletedProcess(argv, 0, json.dumps([row]), "")
+        return sender(argv, **kwargs)
+
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=never_matches)
+    assert writes == []
+    expected_pages = {
+        "bound": list(range(1, pub._DISMISS_ANALYSIS_MAX_PAGES + 1)),
+        "older-than-commit": [1],
+        "timeout": [1, 2],
+        "missing-commit-sha": [1],
+        "invalid-commit-sha": [1],
+        "missing-analysis-key": [1],
+        "invalid-environment": [1],
+        "invalid-category": [1],
+    }[mode]
+    assert analysis_calls == expected_pages
 
 
 QUEUE_REF = "refs/heads/gh-readonly-queue/main/pr-7-" + "d" * 40
