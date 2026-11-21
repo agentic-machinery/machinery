@@ -1367,8 +1367,8 @@ def _pr_meta(pr: str, repo: str | None = None, cwd: str | None = None) -> dict |
     if out.returncode != 0:
         return None
     try:
-        data = json.loads(_decolorize(out.stdout or "").strip() or "{}")
-    except json.JSONDecodeError:
+        data = json_depth.loads(_decolorize(out.stdout or "").strip() or "{}", max_depth=_PAYLOAD_MAX_DEPTH)
+    except (ValueError, RecursionError):
         return None
     if (
         not isinstance(data, dict)
@@ -1378,7 +1378,6 @@ def _pr_meta(pr: str, repo: str | None = None, cwd: str | None = None) -> dict |
     ):
         return None
     return data
-
 
 
 def _status_rollup(pr: str, repo: str | None = None, cwd: str | None = None) -> dict | None:
@@ -1402,8 +1401,9 @@ def _status_rollup(pr: str, repo: str | None = None, cwd: str | None = None) -> 
     if out.returncode != 0:
         return None
     try:
-        data = json.loads(_decolorize(out.stdout or "").strip() or "{}")
-    except json.JSONDecodeError:
+        # Bounded like the publisher's reads: an over-deep document is unverifiable, not a crash.
+        data = json_depth.loads(_decolorize(out.stdout or "").strip() or "{}", max_depth=_PAYLOAD_MAX_DEPTH)
+    except (ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -1419,7 +1419,10 @@ def _gh_api_json(endpoint: str, cwd: str | None = None) -> object:
             text=True,
             timeout=8,
         )
-        return json.loads(_decolorize(out.stdout or "")) if out.returncode == 0 else None
+        return (
+            json_depth.loads(_decolorize(out.stdout or ""), max_depth=_PAYLOAD_MAX_DEPTH)
+            if out.returncode == 0 else None
+        )
     except Exception:
         return None
 
@@ -1507,12 +1510,17 @@ def _bound_states(pr: str, repo: str | None, cwd: str | None, meta, bound: dict 
     head = data.get("headRefOid") if isinstance(data, dict) else None
     if owner_repo is None or not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head):
         return None
-    return bound_rollup_judgment(
-        _status_rollup(pr, repo, cwd) if bound is None else bound,
-        head,
-        owner_repo,
-        lambda endpoint: _gh_api_json(endpoint, cwd),
-    )
+    try:
+        return bound_rollup_judgment(
+            _status_rollup(pr, repo, cwd) if bound is None else bound,
+            head,
+            owner_repo,
+            lambda endpoint: _gh_api_json(endpoint, cwd),
+        )
+    except Exception:
+        # Malformed rows (an unhashable name, a wrong-typed field) are unverifiable, as the
+        # publisher's pr-merge reads them, never a traceback.
+        return None
 
 
 def _check_states(
@@ -1555,10 +1563,13 @@ def _check_states(
     if out.returncode not in (0, 1, 8):
         return None
     try:
-        rows = json.loads(_decolorize(text))
-    except json.JSONDecodeError:
+        rows = json_depth.loads(_decolorize(text), max_depth=_PAYLOAD_MAX_DEPTH)
+    except (ValueError, RecursionError):
         return None
-    if not isinstance(rows, list) or (out.returncode == 1 and not rows):
+    # Only a list of check objects is a check collection, as the publisher reads it.
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return None
+    if out.returncode == 1 and not rows:
         return None
     return _bound_states(pr, repo, cwd, meta, None) if rows else ([], [], 0)
 
@@ -1589,8 +1600,8 @@ def _base_protected(owner_repo: str, base: str) -> bool | None:
             return False
         return None
     try:
-        data = json.loads(_decolorize(out.stdout or "").strip() or "{}")
-    except json.JSONDecodeError:
+        data = json_depth.loads(_decolorize(out.stdout or "").strip() or "{}", max_depth=_PAYLOAD_MAX_DEPTH)
+    except (ValueError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
@@ -1807,4 +1818,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        _status = main()
+    except Exception as exc:
+        # An uncaught traceback exits 1, which a PreToolUse caller treats as non-blocking:
+        # an unexpected failure must refuse, and say so.
+        sys.stderr.write(_block_msg(
+            f"guard error ({type(exc).__name__})",
+            "The merge could not be judged. Retry; if it persists, report the hook error.",
+        ))
+        _status = 2
+    sys.exit(_status)
