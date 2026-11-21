@@ -410,6 +410,9 @@ def test_provider_capacity_ends_rate_limited(sandbox):
     """Defect (FR-39): a provider out of capacity is a retryable condition, not a failed task."""
     record = sandbox.settle(sandbox.dispatch("capacity"), expected=1)
     assert (record["status"], record["returncode"]) == ("rate_limited", 1)
+    # Expire the first outcome so the write launch can reach provider settlement.
+    record.update(started_at="2000-01-01T00:00:00Z", finished_at="2000-01-01T00:00:01Z")
+    (sandbox.tasks / f"{record['task_id']}.json").write_text(json.dumps(record), encoding="utf-8")
     record = sandbox.settle(sandbox.dispatch("capacity-dirty", "--mode", "workspace-write"), expected=1)
     assert record["status"] == "rate_limited"
 

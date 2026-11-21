@@ -10,7 +10,8 @@ and live in ``scripts/curriculum/pedagogy_config.py`` (#12680).
 # Legacy dispatch admission refuses a new write-capable worker (workspace-write,
 # danger) when any check fails; read-only dispatches are exempt. An environment
 # variable with the same name overrides each default; `--force-admission
-# "<reason>"` overrides one dispatch and records the reason in its task record.
+# "<reason>"` can override host checks for one dispatch and records its reason.
+# Disk and subscription pacing refusals are mandatory.
 # The defaults below are generic and deliberately conservative; they are not
 # any deployment's values. Each host sets its real values through the
 # environment overrides or the deployment env file read by
@@ -18,6 +19,10 @@ and live in ``scripts/curriculum/pedagogy_config.py`` (#12680).
 # admission snapshots carry memory, load, and CPU steal counters for measurement.
 # Live write workers (spawning/running, pid alive) at which a new one is refused.
 DISPATCH_MAX_LIVE_WRITE_WORKERS = 2
+# Subscription pacing (#1129). The interval is measured between reservations
+# on the same subscription meter.
+DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER = 8
+DISPATCH_MIN_METER_LAUNCH_INTERVAL_S = 30.0
 # /proc/meminfo MemAvailable floor, in GiB.
 DISPATCH_MIN_MEM_AVAILABLE_GIB = 8.5
 # 1-minute load average divided by os.cpu_count(); refused above this.
