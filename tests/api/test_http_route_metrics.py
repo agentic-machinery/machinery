@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lu_machinery.api import subscriptions
+from lu_machinery.api import model_stats_router, subscriptions
 from lu_machinery.api.main import _route_template, create_app
 from lu_machinery.api.monitor_context import fixture_context
 from lu_machinery.api.product_contribution import ProductContribution
@@ -49,9 +49,11 @@ def test_route_label_is_full_template(tmp_path: Path, monkeypatch: pytest.Monkey
     """Defect class: two routes with the same suffix share a label, or a path parameter leaks into the label."""
     read_subscriptions = Mock(return_value={})
     monkeypatch.setattr(subscriptions, "subscriptions_snapshot", read_subscriptions)
+    monkeypatch.setattr(model_stats_router, "cached_snapshot", lambda _ctx: None)
     app = create_app(fixture_context(tmp_path), lifespan=_no_lifespan, product=ProductContribution())
-    app.state.metrics_snapshot.interval = float("inf")  # publish after the test traffic below
     with TestClient(app) as client:
+        assert client.get("/metrics").status_code == 503  # no snapshot until the explicit refresh
+        read_subscriptions.assert_not_called()
         for path, _template in _REQUESTS:
             client.get(path)
         # An unknown path matches the catch-all template, not its own text.
