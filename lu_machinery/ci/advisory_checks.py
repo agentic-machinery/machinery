@@ -19,6 +19,7 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import quote
 
 import yaml
@@ -191,13 +192,75 @@ def _parse_workflow(workflow: object, path: str = ".github/workflows/ci.yml") ->
     return AdvisoryChecks(frozenset(advisory_names - blocking_names), workflow_name)
 
 
+class _WorkflowLoader(yaml.SafeLoader):
+    """SafeLoader with the YAML 1.2 core schema's scalars, as GitHub Actions reads a workflow.
+
+    PyYAML's YAML 1.1 schema also reads yes, no, on, off, y and n as booleans (so an
+    unsupported ``continue-on-error: no`` would read as false), 010 as octal, 1_000 and
+    1:20 as numbers, and dates as timestamps. Here those stay strings, as in YAML 1.2; an
+    explicit ``!!bool`` or ``!!int`` tag on another spelling is a construction error.
+    """
+
+    bool_values: ClassVar[dict[str, bool]] = {"true": True, "false": False}
+
+
+_YAML_1_1_TYPES = {f"tag:yaml.org,2002:{kind}" for kind in ("bool", "int", "float", "timestamp")}
+_WorkflowLoader.yaml_implicit_resolvers = {
+    first: [(tag, regexp) for tag, regexp in resolvers if tag not in _YAML_1_1_TYPES]
+    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
+)
+_YAML_1_2_INT = re.compile(r"^(?:[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)$")
+_WorkflowLoader.add_implicit_resolver("tag:yaml.org,2002:int", _YAML_1_2_INT, list("-+0123456789"))
+_WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:float",
+    re.compile(r"^(?:[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$"),
+    list("-+.0123456789"),
+)
+
+
+def _construct_int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> int:
+    """A YAML 1.2 core integer: decimal (a leading zero is still decimal), 0o octal or 0x hex."""
+    value = loader.construct_scalar(node)
+    if not _YAML_1_2_INT.match(value):
+        raise ValueError("not a YAML 1.2 integer")
+    if value.startswith(("0o", "0x")):
+        return int(value[2:], 8 if value[1] == "o" else 16)
+    return int(value, 10)
+
+
+_WorkflowLoader.add_constructor("tag:yaml.org,2002:int", _construct_int)
+
+
+def _workflow_policy(text: str, path: str) -> AdvisoryChecks:
+    """Parse one workflow file's text; every failure is a ValueError that quotes none of the file."""
+    try:
+        loader = _WorkflowLoader(text)
+        try:
+            workflow = loader.get_single_data()
+        finally:
+            loader.dispose()
+    except Exception:
+        # Parser and constructor messages (and their KeyError or ValueError) can carry file text.
+        raise ValueError(f"{path} is not valid workflow YAML") from None
+    try:
+        return _parse_workflow(workflow, path)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{path} has an unsupported workflow shape ({type(exc).__name__})") from None
+
+
 def load_advisory_checks(path: Path | None = None) -> AdvisoryChecks:
     """Read current ci.yml, reporting failures without leaking file contents."""
     try:
-        return _parse_workflow(
-            yaml.safe_load((path or (product_root() / ".github/workflows/ci.yml")).read_text(encoding="utf-8"))
+        return _workflow_policy(
+            (path or (product_root() / ".github/workflows/ci.yml")).read_text(encoding="utf-8"),
+            ".github/workflows/ci.yml",
         )
-    except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
         reason = f"ci.yml advisory checks unavailable: {detail}; all checks treated as blocking"
         _LOG.warning(reason)
@@ -277,12 +340,12 @@ def load_repo_advisory_checks(repo: str, get_json: Callable[[str], object]) -> A
             if entries[0]["type"] != "file":
                 raise ValueError(f"{path} is not a file")
             document = get_json(f"repos/{repo}/contents/{quote(path, safe='/')}")
-            policies.append(_parse_workflow(yaml.safe_load(_workflow_text(document, entries[0])), path))
+            policies.append(_workflow_policy(_workflow_text(document, entries[0]), path))
         named = [policy for policy in policies if policy.names]
         if len(named) > 1:
             raise ValueError("advisory jobs in more than one workflow")
         return named[0] if named else AdvisoryChecks()
-    except (yaml.YAMLError, ValueError) as exc:
+    except ValueError as exc:
         # Only this module's own messages are quoted; a decoder's text could echo file bytes.
         detail = str(exc) if type(exc) is ValueError else type(exc).__name__
         reason = f"destination advisory policy unavailable: {detail}"

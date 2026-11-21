@@ -532,7 +532,11 @@ def _destination_documents(kind, scenario):
         ("" if scenario == "unnamed workflow" else f"name: {workflow}\n") + "on: pull_request\njobs:\n"
         "  build: {name: Build, continue-on-error: false, runs-on: ubuntu-24.04, steps: [{run: 'true'}]}\n"
     )
-    if scenario != "no CI Gate, continue-on-error false":
+    if scenario == "no CI Gate, continue-on-error no":
+        text = text.replace("continue-on-error: false", "continue-on-error: no")  # YAML 1.1 false, not GitHub's
+    elif scenario.startswith("YAML constructor error"):
+        text += f"  junk: !!{scenario.rsplit(' ', 1)[1]} leaked-workflow-text\n"
+    if not scenario.startswith("no CI Gate"):
         text += (
             f"  advisory: {{name: '{advisory}', continue-on-error: true, runs-on: ubuntu-24.04,"
             " steps: [{run: 'true'}]}\n"
@@ -569,6 +573,9 @@ def _destination_documents(kind, scenario):
     ("no CI Gate, continue-on-error false", "lands"),
     ("unnamed workflow", "lands"),
     ("listing at the API cap", "ADVISORY_POLICY_UNAVAILABLE"),
+    ("no CI Gate, continue-on-error no", "ADVISORY_POLICY_UNAVAILABLE"),
+    ("YAML constructor error int", "ADVISORY_POLICY_UNAVAILABLE"),
+    ("YAML constructor error bool", "ADVISORY_POLICY_UNAVAILABLE"),
     ("listing entry not an immediate child", "ADVISORY_POLICY_UNAVAILABLE"),
     ("listing unreadable", "ADVISORY_POLICY_UNAVAILABLE"),
     ("file unreadable", "ADVISORY_POLICY_UNAVAILABLE"),
@@ -586,7 +593,7 @@ def test_pr_merge_judges_by_the_destination_repository_policy(monkeypatch, kind,
         monkeypatch.setattr(merge_guard, "load_repo_advisory_checks", real)
     repo, workflow, advisory, documents = _destination_documents(kind, scenario)
     rows = [("Build", "pass"), (advisory, "fail")] if expected == "lands" else [(advisory, "pass")]
-    if scenario in {"workflow absent", "no CI Gate, continue-on-error false"}:
+    if scenario in {"workflow absent", "no CI Gate, continue-on-error false", "no CI Gate, continue-on-error no"}:
         rows = [("Build", "pass")]
     checks = [{"name": name, "bucket": bucket, "workflow": workflow} for name, bucket in rows]
     rollup = [{"__typename": "CheckRun", "name": name, "workflowName": workflow, "status": "COMPLETED",
@@ -612,6 +619,7 @@ def test_pr_merge_judges_by_the_destination_repository_policy(monkeypatch, kind,
         with pytest.raises(PublishBlocked) as refused:
             ensure_merge_ready(repo, 1, runner=runner, cwd=".", environment={}, match_head=HEAD)
         assert str(refused.value).startswith(f"OPSEC: merge refused: {expected}")
+        assert "leaked-workflow-text" not in str(refused.value)
     # The policy is read only from the default branch (no ref), never from the PR head.
     assert all("ref=" not in call[4] for call in calls if call[1] == "api")
     assert any(call[1] == "api" and call[4] == f"repos/{repo}/contents/.github/workflows" for call in calls)
