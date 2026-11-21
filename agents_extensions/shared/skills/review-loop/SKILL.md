@@ -152,6 +152,7 @@ interpreter does not select the primary checkout's Python modules.
    `run nonce mismatch`; stop and report it.
 5. **Settle.** Read the task JSON: `done`, attested reviewer model and family, and a pinned head
    equal to the current pushed tip. Read the findings themselves, not only the verdict line.
+   A dispatched worker gets the reply in that JSON's `result` (or a typed `result_unavailable`).
    Give each finding a stable id and a disposition in the ledger ([policy](references/policy.md)).
    Fixes go to the authoring lane (the worker itself when it runs the loop); a driver does not
    patch them in.
