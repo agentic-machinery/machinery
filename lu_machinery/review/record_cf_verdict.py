@@ -20,7 +20,10 @@ from datetime import UTC, datetime, timedelta
 from functools import cache, partial
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from lu_machinery.review.review_lineage import ProviderCrashRecovery, ReviewRun
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -2610,6 +2613,7 @@ class _Charging:
 
     rounds: dict[str, list[str]]
     exemption: dict[str, Any] | None
+    crash_recovery: ProviderCrashRecovery | None = None
 
 
 def _charging(
@@ -2630,7 +2634,12 @@ def _charging(
     """
     # The lineage reader builds on this module, so it is imported only when a new head is counted.
     from lu_machinery.review.capability_failure import run_started
-    from lu_machinery.review.review_lineage import capability_exemption, dispatched_rounds, lineage_runs
+    from lu_machinery.review.review_lineage import (
+        capability_exemption,
+        dispatched_rounds,
+        lineage_runs,
+        provider_crash_recovery,
+    )
 
     runs = lineage_runs(task_root, repository=repository, number=number, branch=branch)
     key = capability_exemption(runs=runs, comments=comments, login=login)
@@ -2650,7 +2659,47 @@ def _charging(
             "second_review": is_second_review_only(run.record.get("model")),
         }
     rounds = dispatched_rounds(runs=runs, comments=comments, login=login, exclude_head=sha)
-    return _Charging(rounds, exemption)
+    return _Charging(rounds, exemption, provider_crash_recovery(runs, comments, login))
+
+
+def _crash_recovery_receipt(
+    recovery: ProviderCrashRecovery | None, sha: str, recording_run: tuple[str, str] | None,
+) -> dict[str, Any] | None:
+    """Use the first subsequent dispatch as the replacement. A failed one cannot restart the allowance."""
+    if recovery is None:
+        return None
+    from lu_machinery.review.capability_failure import run_started
+
+    def evidence(run: ReviewRun) -> dict[str, Any]:
+        return {
+            "task": run.task_id,
+            "run_nonce": run.record.get("run_nonce"),
+            "started": run_started(run.record),
+            "head": run.record["worktree_base_sha"],
+        }
+
+    replacement = recovery.replacement
+    if recording_run is None and recovery.second_failure is not None:
+        raise RecordError(
+            f"PROVIDER_CRASH_RECOVERY_SPENT: review task {recovery.second_failure.task_id} also failed"
+        )
+    if replacement is not None and not recovery.replacement_finished():
+        if recording_run is None:
+            raise RecordError(
+                f"PROVIDER_CRASH_RECOVERY_UNRESOLVED: replacement {replacement.task_id} has no finished verdict "
+                f"(status {replacement.record.get('status')!r})"
+            )
+        return None
+    if recording_run is not None and (
+        replacement is None
+        or (replacement.record["worktree_base_sha"] == sha
+            and recording_run != (replacement.task_id, replacement.record.get("run_nonce")))
+    ):
+        return None
+    return {
+        "failed": evidence(recovery.failed),
+        "replacement": evidence(replacement) if replacement is not None else {"head": sha},
+    }
 
 
 def _repair_receipts(task_root: Path) -> Path:
@@ -2694,8 +2743,25 @@ def budget_admission(
     ))
     from lu_machinery.review.repair_round import repair_heads
 
+    recovery = None
+
+    @cache
+    def charged_heads() -> frozenset[str]:
+        nonlocal recovery
+        history = rounds()
+        recovery = _crash_recovery_receipt(history.crash_recovery, sha, recording_run)
+        heads = frozenset(history.rounds)
+        if recovery is not None:
+            failed = recovery["failed"]
+            if history.rounds.get(failed["head"]) == [failed["task"]]:
+                return heads - {failed["head"]}
+        return heads
+
+    if recording_run is None:
+        # A pending or failed recovery blocks new dispatches even at an already reviewed head.
+        charged_heads()
     receipts = _repair_receipts(task_root)
-    return require_review_round_within_budget(
+    receipt = require_review_round_within_budget(
         comments,
         sha,
         login,
@@ -2717,11 +2783,14 @@ def budget_admission(
             fetch=fetch,
         ),
         repair_heads=repair_heads(receipts, repository=repository, number=number, branch=branch),
-        dispatched_heads=lambda: frozenset(rounds().rounds),
+        dispatched_heads=charged_heads,
         exemption=lambda: rounds().exemption,
         recording_seat=recording_seat,
         recording_run=recording_run,
     )
+    if recovery is not None:
+        receipt["provider_crash_recovery"] = recovery
+    return receipt
 
 
 def require_no_outside_review_in_flight(task_root: Path, repository: str, sha: str) -> None:
@@ -3681,6 +3750,7 @@ def dispatch_budget_check(
         capability_candidates_only,
         dispatched_rounds,
         lineage_runs,
+        provider_crash_recovery,
         review_records,
     )
 
@@ -3695,6 +3765,9 @@ def dispatch_budget_check(
         elif number is not None and branch is None:
             branch = _pr(repository, "", number)["headRefName"]
         runs = lineage_runs(task_root, repository=repository, number=number, branch=branch, records=records)
+    # The full check must see a recovery even when the head is unchanged or the normal budget has room.
+    if number is not None and provider_crash_recovery(runs, (), "") is not None:
+        return budget_check(repository, number, task_root=task_root, head=head)
     budget = repository_review_rounds(repository, tier=None if number is not None else "medium")
     heads = dispatched_rounds(runs=runs, comments=(), login="")
     if len(heads) < budget:

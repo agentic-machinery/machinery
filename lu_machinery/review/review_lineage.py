@@ -12,9 +12,9 @@ only outcome is a published capability failure
 (``scripts/review/capability_failure.py``) has no verdict and fills no seat.
 A terminal run that is not ``done``, has no reply, and whose record proves
 no provider ran (``provider_pgid`` absent or null, and no result digest)
-carries no verdict. Any other missing reply refuses. A published verdict
-that names such a run refuses, because a verdict cannot belong to a run
-that never ran.
+carries no verdict. One supervisor-attested provider failure with no
+result can be recovered by a later, published review (#1071). Other
+missing replies refuse. Neither kind of no-result run can own a verdict.
 The approval carry-over and the repair-verification round
 (``scripts/review/repair_round.py``) both apply it before anything else. Ported from the carry-over's reviewed reader (#11907) so the two
 share one implementation.
@@ -32,6 +32,7 @@ import os
 import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ from lu_machinery.orchestration.integration_sweep import (
     SHA,
     TRUSTED_ASSOCIATIONS,
     _author_login,
+    _timestamp,
     lookup_verdict,
     parse_marker,
 )
@@ -125,9 +127,19 @@ def _read_run(path: Path, record: Mapping[str, Any]) -> ReviewRun:
     task_id = recorded if isinstance(recorded, str) and recorded else path.stem
     result = path.with_suffix(".result")
     try:
-        raw = result.read_bytes() if result.exists() else None
+        descriptor = os.open(result, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raw = None
     except OSError as exc:
         raise LineageRefused(f"review task {task_id} reply unreadable: {exc}") from None
+    else:
+        try:
+            with os.fdopen(descriptor, "rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise LineageRefused(f"review task {task_id} reply is not a regular file")
+                raw = source.read()
+        except OSError as exc:
+            raise LineageRefused(f"review task {task_id} reply unreadable: {exc}") from None
     expected = record.get("result_sha256")
     if raw is not None and expected is not None and hashlib.sha256(raw).hexdigest() != expected:
         raise LineageRefused(f"review task {task_id} reply does not match its recorded digest")
@@ -504,9 +516,93 @@ def _provider_never_ran(record: Mapping[str, Any]) -> bool:
     """Whether this task record proves no provider ran.
 
     Both are required, and a supervisor pid does not change either: ``provider_pgid``
-    is absent or null, and there is no result digest (``result_sha256`` absent or null).
+    is absent or null, there is no result digest, and there is no terminal
+    provider failure attestation that contradicts those fields.
     """
-    return record.get("provider_pgid") is None and record.get("result_sha256") is None
+    return (record.get("provider_pgid") is None and record.get("result_sha256") is None
+            and record.get("provider_terminal_failure") is not True)
+
+
+def _supervised_review_binding(run: ReviewRun) -> bool:
+    record = run.record
+    sha, nonce = record.get("worktree_base_sha"), record.get("run_nonce")
+    return (
+        record.get("schema_version") == 2
+        and record.get("task_id") == run.task_id
+        and record.get("mode") == "read-only"
+        and isinstance(sha, str) and SHA.fullmatch(sha) is not None
+        and record.get("pinned_head") in (None, sha)
+        and isinstance(nonce, str) and len(nonce) == 32
+        and all(char in "0123456789abcdef" for char in nonce)
+    )
+
+
+def _attested_provider_crash(run: ReviewRun) -> bool:
+    """Recognize the supervisor's failed provider exit, with an explicitly absent result."""
+    record = run.record
+    pgid, returncode = record.get("provider_pgid"), record.get("returncode")
+    return (
+        run.reply is None
+        and record.get("status") == record.get("provider_terminal_status") == "failed"
+        and record.get("provider_terminal_failure") is True
+        and not record.get("never_started_reason")
+        and not record.get("orphaned_child_tasks")
+        and type(pgid) is int and pgid > 0
+        and type(returncode) is int and returncode > 0
+        and "result_sha256" in record and record["result_sha256"] is None
+        and _supervised_review_binding(run)
+    )
+
+
+@dataclass(frozen=True)
+class ProviderCrashRecovery:
+    failed: ReviewRun
+    replacement: ReviewRun | None
+    second_failure: ReviewRun | None
+
+    def replacement_finished(self) -> bool:
+        run = self.replacement
+        return run is not None and _supervised_review_binding(run) and _finished_verdict(run) is not None
+
+
+def provider_crash_recovery(
+    runs: Sequence[ReviewRun], comments: Sequence[Mapping[str, Any]], login: str,
+) -> ProviderCrashRecovery | None:
+    """The first crash and its one replacement, derived from the durable attempt order."""
+    if not any(_attested_provider_crash(run) for run in runs):
+        return None
+    try:
+        attempts: dict[datetime, ReviewRun] = {}
+        for run in runs:
+            if run.record.get("mode") == "workspace-write":
+                continue
+            start = _timestamp(run.record.get("started_at"))
+            if start is None or start in attempts:
+                raise LineageRefused("provider crash recovery requires an unambiguous review attempt order")
+            attempts[start] = run
+        ordered = sorted(attempts)
+        started = next(start for start in ordered if _attested_provider_crash(attempts[start]))
+        failed = attempts[started]
+        finished = _timestamp(failed.record.get("finished_at"))
+        if finished is None or finished < started:
+            raise LineageRefused(f"provider crash {failed.task_id} has no valid settlement time")
+        later = []
+        for start in ordered:
+            attempt = attempts[start]
+            status = attempt.record.get("status")
+            terminal = isinstance(status, str) and status in TERMINAL_TASK_STATUSES
+            if started < start < finished or (start < started and not terminal):
+                raise LineageRefused(f"review task {attempt.task_id} overlaps provider crash {failed.task_id}")
+            if start > started:
+                later.append(attempt)
+    except OverflowError:
+        raise LineageRefused("provider crash recovery has an invalid review attempt timestamp") from None
+    if any(m["task"] == failed.task_id and m["started"] == _started(failed.record)
+           for _, m in _trusted_markers(comments, login)):
+        raise LineageRefused(f"provider crash {failed.task_id} has a published verdict")
+    replacement = later[0] if later else None
+    second_failure = next((run for run in later if _attested_provider_crash(run)), None)
+    return ProviderCrashRecovery(failed, replacement, second_failure)
 
 
 def check_lineage(
@@ -526,10 +622,10 @@ def check_lineage(
     must match its published marker, unless a later verdict of its seat
     supersedes it (:func:`superseded_runs`), and any other run's reply must
     carry no verdict at all. A terminal run that is not ``done`` and whose reply
-    is missing counts as carrying no verdict only when :func:`_provider_never_ran`
-    holds. Every other missing reply is refused, and a ``done`` run is unchanged.
-    A published verdict that names a run which never started a provider is
-    refused: it cannot belong to that run. A finished run may instead have exactly
+    is missing counts as carrying no verdict when :func:`_provider_never_ran`
+    holds, or when a later replacement has a published verdict. Every other
+    missing reply is refused, and a ``done`` run is unchanged. A published
+    verdict that names a run without a result is refused. A finished run may instead have exactly
     one capability-failure event that its record and reply re-derive
     (``capability_failure.require_bound``), never beside a published verdict.
     ``exclude_head`` drops the runs, verdicts and events of one later head, the
@@ -540,6 +636,14 @@ def check_lineage(
         failures = [event for event in capability_failure.events(comments, login) if event.sha != exclude_head]
     except recorder.RecordError as exc:
         raise LineageRefused(str(exc)) from None
+    recovery = provider_crash_recovery(runs, comments, login)
+    recovered = None
+    if recovery is not None and recovery.replacement is not None and recovery.replacement_finished():
+        replacement = recovery.replacement
+        if any(m["task"] == replacement.task_id and m["started"] == _started(replacement.record)
+               for _, m in markers):
+            # The normal lineage checks below must still bind the publication to the replacement's reply.
+            recovered = recovery.failed
     runs = [run for run in runs if exclude_head is None or run.record.get("worktree_base_sha") != exclude_head]
     superseded = {
         (item["task"], item["started"])
@@ -552,7 +656,7 @@ def check_lineage(
         if status not in TERMINAL_TASK_STATUSES:
             raise LineageRefused(f"review task {run.task_id} is not terminal (status {status!r})")
         if run.reply is None:
-            if status != "done" and _provider_never_ran(run.record):
+            if run is recovered or (status != "done" and _provider_never_ran(run.record)):
                 continue
             raise LineageRefused(f"review task {run.task_id} ({status}) has no reply on record")
         if status != "done":

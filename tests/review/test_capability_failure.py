@@ -5,15 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+
 import pytest
+
 from lu_machinery.guardrails.delegate_ownership import TERMINAL_TASK_STATUSES
 from lu_machinery.orchestration import integration_sweep as sweep
 from lu_machinery.review import capability_failure as cf
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.review_lineage import LineageRefused, ReviewRun, check_lineage
 from lu_machinery.review.verdict_parser import recognized_verdicts
-from tests.review.record_support import BRANCH, OTHER, SHA, recorded_verdict, setup_record
 from tests.helpers import current_sol
+from tests.review.record_support import BRANCH, OTHER, SHA, recorded_verdict, setup_record
 
 CURRENT_SOL = current_sol()
 
@@ -263,6 +265,48 @@ def test_a_published_capability_failure_lets_the_lineage_pass_and_fills_no_seat(
     approve, verdict = approving_run()
     blocked, failure = blocked_run()
     assert lineage(approve, blocked, comments=[verdict, event_comment(failure)]) == ["anthropic"]
+
+
+def provider_crash(task_id, head, hour, **updates):
+    record, _ = run_record(
+        task_id=task_id, sha=head, mode="read-only", status="failed", returncode=1,
+        started_at=f"2026-09-23T{hour}:00:00+00:00", finished_at=f"2026-09-23T{hour}:00:01+00:00",
+        provider_terminal_failure=True, provider_terminal_status="failed", provider_pgid=123,
+        run_nonce="c" * 32 if hour == "10" else "d" * 32, result_sha256=None,
+    )
+    record.update(updates)
+    return ReviewRun(task_id, record, None)
+
+
+def test_a_crash_can_be_resolved_only_by_a_later_bound_publication():
+    """Defect class: an unbound crash or a verdict attached to a resultless run passes the lineage."""
+    approve, verdict = approving_run()
+    approve.record.update(schema_version=2, mode="read-only", run_nonce="e" * 32)
+    crash = provider_crash("crashed-review", EARLIER, "10")
+    assert lineage(crash, approve, comments=[verdict]) == ["anthropic"]
+
+    with pytest.raises(LineageRefused, match=r"review task crashed-review \(failed\) has no reply on record"):
+        lineage(crash, approve, comments=[])
+    with pytest.raises(LineageRefused, match=r"review task crashed-review \(failed\) has no reply on record"):
+        lineage(provider_crash("crashed-review", EARLIER, "10", run_nonce=None), approve, comments=[verdict])
+
+    claimed = recorded_verdict(EARLIER, "APPROVED", task_id="crashed-review")
+    claimed["body"] = recorder.build_comment(
+        sha=EARLIER, task_id="crashed-review", started="2026-09-23T10:00:00.000000+00:00",
+        verdict="APPROVED", model=CURRENT_SOL, family="openai", reply="VERDICT: APPROVE",
+    )
+    with pytest.raises(LineageRefused, match="provider crash crashed-review has a published verdict"):
+        lineage(crash, approve, comments=[claimed, verdict])
+
+
+def test_a_second_no_result_crash_is_not_resolved_by_the_first_recovery():
+    """Defect class: resolving one attested no-result failure also waives a later failure."""
+    approve, verdict = approving_run()
+    approve.record.update(schema_version=2, mode="read-only", run_nonce="e" * 32)
+    first = provider_crash("first-crash", EARLIER, "10")
+    second = provider_crash("second-crash", OTHER, "12")
+    with pytest.raises(LineageRefused, match=r"review task second-crash \(failed\) has no reply on record"):
+        lineage(first, approve, second, comments=[verdict])
 
 
 def test_a_capability_failure_waives_no_required_seat():

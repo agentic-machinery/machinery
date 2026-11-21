@@ -26,6 +26,7 @@ BRANCH_AUTHOR_FAMILIES = checks.check_branch_author_families
 @pytest.fixture
 def dispatch(tmp_path, monkeypatch):
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    (tmp_path / ".git").mkdir()
     monkeypatch.setattr(git, "resolve_repo", lambda _: (tmp_path, dict(key="public", github="example/public")))
     monkeypatch.setattr(git, "review_branch_start", lambda *a, **k: "a" * 40)
     monkeypatch.setattr(git, "worktree_plan", lambda *a, **k: (tmp_path, "codex/review", "a" * 40))
