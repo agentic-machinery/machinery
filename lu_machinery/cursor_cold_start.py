@@ -37,7 +37,7 @@ def _lines_orient(orient: dict) -> list[str]:
     git_info = orient.get("git") or {}
     lines.append(
         f"- **git:** `{git_info.get('branch', '?')}` @ `{str(git_info.get('head', ''))[:10]}`"
-        f" (ahead {git_info.get('ahead_of_origin', 0)})"
+        f" (ahead {git_info.get('ahead_of_origin', 'unknown')})"
     )
     for commit in (git_info.get("recent_commits") or [])[:3]:
         sha = str(commit.get("sha", ""))[:8]
@@ -67,8 +67,8 @@ def _lines_orient(orient: dict) -> list[str]:
     lines.append(f"- **health:** {'; '.join(summary) if summary else 'all green'}")
 
     delegate = orient.get("delegate") or {}
-    active = delegate.get("active_count", 0)
-    lines.append(f"- **delegate:** {active} active")
+    active = delegate.get("active_count")
+    lines.append(f"- **delegate:** {active} active" if active is not None else "- **delegate:** active count unknown")
     for row in (delegate.get("recent") or [])[:3]:
         if row.get("status") == "done":
             continue
@@ -79,7 +79,9 @@ def _lines_orient(orient: dict) -> list[str]:
     gov = orient.get("governance") or {}
     stale = gov.get("decisions_stale", 0)
     exp = gov.get("decisions_approaching_expiry", 0)
-    if stale or exp:
+    if "governance" in orient and orient["governance"] is None:
+        lines.append("- **governance:** unknown")
+    elif stale or exp:
         lines.append(f"- **governance:** stale={stale} expiring={exp}")
 
     issues = orient.get("issues") or []

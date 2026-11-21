@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 
@@ -25,8 +26,7 @@ def _product(collector, *, ttl=0.0):
 
 
 def _join_refresh(ctx):
-    key = f"orient_pipeline{api_main._ctx_cache_scope(ctx)}"
-    thread = api_main._detached_orient_threads.get(key)
+    thread = api_main._orient_state(ctx).refresh_threads.get("pipeline")
     if thread is not None:
         thread.join(timeout=5)
         assert not thread.is_alive()
@@ -52,6 +52,77 @@ def test_fixture_app_orient_git_is_not_production(tmp_path: Path) -> None:
         pass
     if production_head:
         assert git.get("head") != production_head
+
+
+def test_fresh_orient_timeout_reports_unknown_delegate(monkeypatch, tmp_path):
+    """A timed-out delegate scan must not report a measured zero."""
+    entered, release = threading.Event(), threading.Event()
+
+    def collect(_ctx):
+        entered.set()
+        assert release.wait(5)
+        return {"active_count": 2, "recent": []}
+
+    monkeypatch.setattr(api_main, "_collect_delegate_orient_data", collect)
+    ctx = fixture_context(tmp_path)
+    client = TestClient(api_main.create_app(ctx, product=ProductContribution()))
+    try:
+        response = client.get("/api/orient?sections=delegate&fresh=true")
+        assert response.status_code == 200
+        assert entered.wait(5)
+        data = response.json()
+        assert data["meta"]["delegate"]["error"] == "section_timeout_0.4s"
+        assert data["delegate"] is None
+    finally:
+        release.set()
+        api_main.reset_detached_orient_state_for_tests(ctx)
+
+
+def test_orient_collectors_outliving_a_request_cannot_take_another_contexts_slots(monkeypatch, tmp_path):
+    """Both permits in one context may stay busy after a timeout. A new context still collects."""
+    delegate_entered, rollover_entered, release = (threading.Event() for _ in range(3))
+    ctx = fixture_context(tmp_path)
+
+    def collect_delegate(context):
+        if context is ctx:
+            delegate_entered.set()
+            assert release.wait(5)
+            raise RuntimeError("delegate scan failed")
+        return {"active_count": 2, "recent": []}
+
+    def collect_rollovers(_ctx):
+        rollover_entered.set()
+        assert release.wait(5)
+        return {"counts": {"total": 1}}
+
+    monkeypatch.setattr(api_main, "_collect_delegate_orient_data", collect_delegate)
+    monkeypatch.setattr(api_main, "_collect_rollovers_orient_data", collect_rollovers)
+    first = TestClient(api_main.create_app(ctx, product=ProductContribution()))
+    second_ctx = ctx.with_roots(batch_state_dir=tmp_path / "other-batch-state")
+    second = TestClient(api_main.create_app(second_ctx, product=ProductContribution()))
+    try:
+        saturated = first.get("/api/orient?sections=delegate,rollovers&fresh=true").json()
+        assert delegate_entered.wait(5)
+        assert rollover_entered.wait(5)
+        for key in ("delegate", "rollovers"):
+            assert saturated["meta"][key]["error"] == "section_timeout_0.4s"
+        first.close()
+
+        measured = second.get("/api/orient?sections=delegate&fresh=true").json()
+        assert measured["delegate"] == {"active_count": 2, "recent": []}
+        assert "error" not in measured["meta"]["delegate"]
+
+        release.set()
+        api_main.reset_detached_orient_state_for_tests(ctx)
+        first = TestClient(api_main.create_app(ctx, product=ProductContribution()))
+        recovered = first.get("/api/orient?sections=delegate,rollovers&fresh=true").json()
+        assert recovered["delegate"] is None
+        assert recovered["meta"]["delegate"]["error"] == "delegate scan failed"
+        assert recovered["rollovers"] == {"counts": {"total": 1}}
+    finally:
+        release.set()
+        api_main.reset_detached_orient_state_for_tests(ctx)
+        api_main.reset_detached_orient_state_for_tests(second_ctx)
 
 
 def test_no_router_owns_a_private_resolve_context_copy() -> None:
@@ -91,10 +162,12 @@ def test_blocked_async_product_refresh_returns_without_waiting_and_is_single_fli
     try:
         cold = client.get("/api/orient?sections=pipeline").json()
         assert entered.wait(5)
-        assert cold["pipeline"] == {"summary": {}, "error": "refreshing"}
+        assert cold["pipeline"] is None
+        assert cold["meta"]["pipeline"]["error"] == "refreshing"
         assert cold["meta"]["pipeline"]["refreshing"] is True
         again = client.get("/api/orient?sections=pipeline").json()
-        assert again["pipeline"]["error"] == "refreshing"
+        assert again["pipeline"] is None
+        assert again["meta"]["pipeline"]["error"] == "refreshing"
         assert calls == [ctx]
     finally:
         release.set()
@@ -225,7 +298,7 @@ def test_sparse_reader_gets_an_inline_section_at_once_and_fresh_still_collects_i
 
     monkeypatch.setattr(api_main, "_collect_session_hints_orient_data", collect)
     ctx = fixture_context(tmp_path)
-    key = f"orient_session_hints{api_main._ctx_cache_scope(ctx)}"
+    refresh_threads = api_main._orient_state(ctx).refresh_threads
     client = TestClient(api_main.create_app(ctx))
     try:
         first = client.get("/api/orient?sections=session_hints").json()
@@ -235,13 +308,13 @@ def test_sparse_reader_gets_an_inline_section_at_once_and_fresh_still_collects_i
         now[0] = 1000
         sparse = client.get("/api/orient?sections=session_hints").json()
         assert entered.wait(5)
-        assert api_main._detached_orient_threads[key].is_alive()
+        assert refresh_threads["session_hints"].is_alive()
         assert sparse["session_hints"] == {"revision": 1}
         assert sparse["meta"]["session_hints"]["stale"] is True
         assert sparse["meta"]["session_hints"]["refreshing"] is True
         assert sparse["meta"]["session_hints"]["generated_at"] == first["meta"]["session_hints"]["generated_at"]
         release.set()
-        api_main._detached_orient_threads[key].join(timeout=5)
+        refresh_threads["session_hints"].join(timeout=5)
         assert client.get("/api/orient?sections=session_hints").json()["session_hints"] == {"revision": 2}
 
         now[0] = 2000
@@ -251,7 +324,7 @@ def test_sparse_reader_gets_an_inline_section_at_once_and_fresh_still_collects_i
         assert len(calls) == 3
     finally:
         release.set()
-        thread = api_main._detached_orient_threads.get(key)
+        thread = refresh_threads.get("session_hints")
         if thread is not None:
             thread.join(timeout=5)
 
@@ -262,6 +335,7 @@ def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_val
     A fresh read collects for itself while an older background refresh is still
     running, and neither waits for nor cancels the other. When the older refresh
     finishes last it publishes nothing, and later reads keep the fresh value.
+    A later background failure also cannot mask a fresh measurement.
     """
     from lu_machinery.api import state_helpers as cache
 
@@ -270,6 +344,7 @@ def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_val
     monkeypatch.setattr(api_main, "_orient_clock", lambda: now[0])
     monkeypatch.setattr(api_main, "DETACHED_ORIENT_INLINE_WAIT_S", 10.0)
     entered, release = threading.Event(), threading.Event()
+    fresh_entered, release_fresh = threading.Event(), threading.Event()
     revision = [0]
 
     async def collect(context):
@@ -278,11 +353,16 @@ def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_val
         if mine == 2:
             entered.set()
             assert await asyncio.to_thread(release.wait, 10)
+        if mine == 4:
+            fresh_entered.set()
+            assert await asyncio.to_thread(release_fresh.wait, 10)
+        if mine == 5:
+            raise RuntimeError("background scan failed")
         return {"summary": {"revision": mine}}
 
     ctx = fixture_context(tmp_path)
     client = TestClient(api_main.create_app(ctx, product=_product(collect, ttl=10.0)))
-    key = f"orient_pipeline{api_main._ctx_cache_scope(ctx)}"
+    refresh_threads = api_main._orient_state(ctx).refresh_threads
     try:
         assert client.get("/api/orient?sections=pipeline").json()["pipeline"]["summary"] == {"revision": 1}
 
@@ -296,13 +376,28 @@ def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_val
         fresh = client.get("/api/orient?sections=pipeline&fresh=true").json()
         assert fresh["pipeline"]["summary"] == {"revision": 3}
         assert fresh["meta"]["pipeline"]["stale"] is False
-        assert api_main._detached_orient_threads[key].is_alive(), "the fresh read waited for the older refresh"
+        assert refresh_threads["pipeline"].is_alive(), "the fresh read waited for the older refresh"
 
         release.set()
         _join_refresh(ctx)
         later = client.get("/api/orient?sections=pipeline").json()
         assert later["pipeline"]["summary"] == {"revision": 3}
         assert later["meta"]["pipeline"]["generated_at"] == fresh["meta"]["pipeline"]["generated_at"]
+
+        now[0] = 100
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(client.get, "/api/orient?sections=pipeline&fresh=true")
+            try:
+                assert fresh_entered.wait(5)
+                now[0] = 101
+                stale = client.get("/api/orient?sections=pipeline").json()
+                assert stale["pipeline"] == {"summary": {"revision": 3}}
+                _join_refresh(ctx)
+            finally:
+                release_fresh.set()
+            fresh = pending.result(timeout=5).json()
+        assert fresh["pipeline"] == {"summary": {"revision": 4}}
+        assert fresh["meta"]["pipeline"]["error"] == "background scan failed"
     finally:
         release.set()
         _join_refresh(ctx)
@@ -364,7 +459,6 @@ def test_orient_warmer_skips_sections_without_recent_reads(monkeypatch, tmp_path
 
     now = [0.0]
     monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: now[0])
-    monkeypatch.setattr(api_main, "_orient_demand", {})
     ctx = fixture_context(tmp_path)
     product = _product(lambda context: {"summary": {}})
     warmer: list[list[str]] = []
