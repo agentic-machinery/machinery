@@ -25,8 +25,9 @@ version files are behind or the `CI Gate` run has not passed), it refuses
 `claude-cto` runs every cut, on the host, as one command (Cut a release). A
 worker or driver does not run it: when its change has merged, it tells
 `claude-cto` in its report. One runner means two cuts never overlap, so no
-scheduled run may start a cut: before it cuts, `claude-cto` confirms that none
-is enabled (a host change can restart one). The cut
+scheduled run may start a cut: before it cuts, `claude-cto` confirms that no
+scheduled cut is enabled or active and that none is already running (a host
+change can restart one). The cut
 tags `main`'s HEAD; there is no release PR. `main` already carries the next
 version, because each release ends by opening the post-release PR that
 records its changelog and moves the version files on.
