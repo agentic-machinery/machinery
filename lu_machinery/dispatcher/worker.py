@@ -2177,9 +2177,10 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         if child is None and not record.get("review_attempt"):
             status, error, start_refusal = "failed", f"provider_setup_refused: {type(exc).__name__}", StartRefusal.SETUP
         else:
-            status, error = "crashed", "supervisor or provider processing failed"
-    except Exception:
-        status, error = "crashed", "supervisor or provider processing failed"
+            status, error = "crashed", f"supervisor or provider processing failed ({type(exc).__name__})"
+    except Exception as exc:
+        # The type says why; the message can carry paths or provider text, so it is not recorded.
+        status, error = "crashed", f"supervisor or provider processing failed ({type(exc).__name__})"
     finally:
         if cancel_requested:
             # A cancel requested before settlement decides the run, whatever exit the work took after it.
