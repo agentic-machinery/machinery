@@ -1429,11 +1429,14 @@ def _claim_matches(claim: str, output: str) -> bool:
 
 
 def _captured_output(value: Any) -> str | None:
+    from lu_machinery.agent_runtime.tool_calls import tool_output_failed
+
+    # An MCP error result, as a mapping or as its JSON text, is error text, never Sources output.
+    if tool_output_failed(value):
+        return None
     if isinstance(value, str):
         return value
     if isinstance(value, Mapping):
-        if value.get("isError"):
-            return None
         if "content" in value:
             return _captured_output(value["content"])
         return json.dumps(value, ensure_ascii=False)
@@ -1447,7 +1450,7 @@ def _captured_output(value: Any) -> str | None:
 
 def captured_sources_events(trace: str) -> tuple[dict[str, Any], ...]:
     """Sources results in this dispatch's trace, without summary or call-count fallbacks."""
-    from lu_machinery.agent_runtime.tool_calls import normalize_tool_calls
+    from lu_machinery.agent_runtime.tool_calls import normalize_tool_calls, tool_call_failed
 
     events = []
     captured = []
@@ -1468,11 +1471,13 @@ def captured_sources_events(trace: str) -> tuple[dict[str, Any], ...]:
         params = info.get("parameters", {})
         if not isinstance(params, dict) or params.get("ServerName") != "sources":
             continue
+        # A DONE step that carries an ``error`` did not complete (the AGY provider's own call count agrees).
+        failed = tool_call_failed(step) or tool_call_failed(info)
         captured.append({
             "receipt_id": f"step-{step.get('step_index')}",
             "tool": params.get("ToolName"),
             "arguments": params.get("Arguments"),
-            "result": _captured_output(info.get("output")),
+            "result": None if failed else _captured_output(info.get("output")),
         })
     for index, call in enumerate(normalize_tool_calls(events)):
         name = call.get("name", "")

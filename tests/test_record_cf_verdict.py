@@ -2341,15 +2341,26 @@ def test_unbound_ukrainian_source_claims_refused_before_publication(
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
-@pytest.mark.parametrize("status", ["completed", "failed"])
-def test_codex_server_tool_sources_call_supports_unbound_claims(monkeypatch, tmp_path, status):
-    """Defect: a Codex mcp_tool_call names its call only by server and tool, so its Sources output went uncaptured.
+@pytest.mark.parametrize("shape", [
+    "codex_exec_completed", "codex_exec_failed",
+    "claude_ok", "claude_is_error",
+    "grok_messages_is_error", "grok_stream_completed", "grok_stream_failed", "grok_stream_in_progress",
+    "cursor_tool_result_is_error",
+    "gemini_success", "gemini_error", "gemini_cancelled",
+    "agy_done", "agy_done_with_error", "agy_mcp_is_error_text",
+    "codex_rollout_ok", "codex_rollout_ok_is_error", "codex_rollout_err", "codex_rollout_err_then_output",
+])
+def test_only_completed_sources_calls_support_unbound_claims(monkeypatch, tmp_path, shape):
+    """Defect: a failed or incomplete Sources call's error text supported a claim (C-6314).
 
-    A failed call keeps its tool-error text in ``result``; that text must never support a claim.
+    Each provider keeps a failed call's error text where a successful call keeps its output: Codex
+    ``status``/``error``, Claude and Grok ``is_error``, MCP ``isError``, ACP and Gemini ``status``, AGY
+    ``error`` on a DONE step, a Codex rollout ``Err``. One row per provider shape; ``*_ok``,
+    ``*_completed``, ``*_success`` and ``agy_done`` rows prove the completed call still supports it.
     """
     from lu_machinery.review.review_contract import build_item_packet
     from lu_machinery.review.review_contract import render_item_packet
-    from tests.helpers.codex_exec_stream import completed_stream, item_started, mcp_call
+    from tests.helpers.codex_exec_stream import completed_stream, item_started, jsonl, mcp_call
 
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     packet = build_item_packet([{"id": "item-a", "text": "example"}])
@@ -2360,21 +2371,82 @@ def test_codex_server_tool_sources_call_supports_unbound_claims(monkeypatch, tmp
         "schema": "ukrainian-item-judgments.v1",
         "items": [{"id": "item-a", "verdict": "APPROVE", "finding": claim, "sources": "none"}],
     }) + "\n```\n"
-    # The event pair `codex exec --json` writes for one MCP call, as in a real Ukrainian-profile review trace.
-    # Codex marks a tool-reported error `failed` but keeps its text in `result`, with `error` null.
     arguments = {"query": "suffix"}
-    finished = mcp_call("sources", "search_style_guide", arguments, text=claim, item_id="item_7")
-    finished["item"]["status"] = status
+    tool = "mcp__sources__search_style_guide"
+    text = [{"type": "text", "text": claim}]
+
+    def claude(**result):
+        return [
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "toolu_1", "name": tool, "input": arguments}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1", **result}]}},
+        ]
+
+    def grok_stream(status):
+        return [{"type": "tool_call", "toolCallId": "call_1", "toolName": tool, "arguments": arguments,
+                 "status": status, "output": claim}]
+
+    def gemini(status):
+        return [{"type": "gemini", "toolCalls": [
+            {"id": "g1", "name": "mcp_sources_search_style_guide", "args": arguments, "status": status,
+             "result": text}]}]
+
+    def agy(**info):
+        return [{"event": "step_update", "step_update": {
+            "state": "DONE", "step_index": 4, "tool_name": "call_mcp_tool",
+            "tool_info": {"name": "call_mcp_tool", "parameters": {
+                "ServerName": "sources", "ToolName": "search_style_guide", "Arguments": arguments}, **info}}}]
+
+    def rollout(*results):
+        call = {"type": "response_item", "payload": {
+            "type": "function_call", "name": "search_style_guide", "namespace": "mcp__sources",
+            "arguments": json.dumps(arguments), "call_id": "call_9"}}
+        return [call, *({"type": "event_msg", "payload": {
+            "type": "mcp_tool_call_end", "call_id": "call_9",
+            "invocation": {"server": "sources", "tool": "search_style_guide", "arguments": arguments},
+            "result": result}} if isinstance(result, dict) else {"type": "response_item", "payload": {
+                "type": "function_call_output", "call_id": "call_9", "output": result}}
+            for result in results)]
+
     log = tasks / "logs" / "review-one.stdout.log"
     log.parent.mkdir(exist_ok=True)
-    log.write_text(completed_stream(
-        item_started("item_7", "mcp_tool_call", server="sources", tool="search_style_guide", arguments=arguments,
-                     result=None, error=None, status="in_progress"),
-        finished,
-    ))
+    if shape.startswith("codex_exec_"):
+        # The event pair `codex exec --json` writes for one MCP call, as in a real Ukrainian-profile review trace.
+        # Codex marks a tool-reported error `failed` but keeps its text in `result`, with `error` null.
+        finished = mcp_call("sources", "search_style_guide", arguments, text=claim, item_id="item_7")
+        finished["item"]["status"] = shape.removeprefix("codex_exec_")
+        log.write_text(completed_stream(
+            item_started("item_7", "mcp_tool_call", server="sources", tool="search_style_guide", arguments=arguments,
+                         result=None, error=None, status="in_progress"),
+            finished,
+        ))
+    else:
+        events = {
+            "claude_ok": lambda: claude(content=claim, is_error=False),
+            "claude_is_error": lambda: claude(content=claim, is_error=True),
+            "grok_messages_is_error": lambda: claude(content=text, is_error=True),
+            "grok_stream_completed": lambda: grok_stream("completed"),
+            "grok_stream_failed": lambda: grok_stream("failed"),
+            "grok_stream_in_progress": lambda: grok_stream("in_progress"),
+            "cursor_tool_result_is_error": lambda: [
+                {"type": "tool_use", "id": "c1", "name": tool, "arguments": arguments},
+                {"type": "tool_result", "tool_use_id": "c1", "output": claim, "is_error": True},
+            ],
+            "gemini_success": lambda: gemini("success"),
+            "gemini_error": lambda: gemini("error"),
+            "gemini_cancelled": lambda: gemini("cancelled"),
+            "agy_done": lambda: agy(output=claim),
+            "agy_done_with_error": lambda: agy(output=claim, error={"message": "tool failed"}),
+            "agy_mcp_is_error_text": lambda: agy(output=json.dumps({"content": text, "isError": True})),
+            "codex_rollout_ok": lambda: rollout({"Ok": {"content": text, "isError": False}}),
+            "codex_rollout_ok_is_error": lambda: rollout({"Ok": {"content": text, "isError": True}}),
+            "codex_rollout_err": lambda: rollout({"Err": claim}),
+            "codex_rollout_err_then_output": lambda: rollout({"Err": "tool failed"}, "err: " + claim),
+        }[shape]()
+        log.write_text(jsonl(*events))
     write_task(tasks, reply=reply, review_profile="ukrainian", sources_mcp_call_count=1,
                prompt_file=str(prompt), prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest())
-    if status == "failed":
+    if not shape.endswith(("_ok", "_completed", "_success", "_done")):
         with pytest.raises(recorder.RecordError, match="UKRAINIAN_CLAIMS_UNSUPPORTED"):
             recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
         assert comments == [] and calls == {"posts": 0, "statuses": 0}

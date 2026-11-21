@@ -106,6 +106,11 @@ def normalize_tool_calls(events: Iterable[Mapping[str, Any]]) -> list[dict[str, 
     # Tool-result correlation is best-effort and scoped to one parse_response
     # call. Provider ids are not assumed globally unique across invocations.
     by_id: dict[str, dict[str, Any]] = {}
+    # Ids a result payload reported failed. A Codex rollout reports one failed
+    # MCP call twice, as ``mcp_tool_call_end`` with ``Err`` and as an unmarked
+    # ``function_call_output`` string, in either order: any failed result voids
+    # the call's output for good.
+    failed_ids: set[str] = set()
 
     for event in events:
         for payload in _candidate_payloads(event):
@@ -114,7 +119,7 @@ def normalize_tool_calls(events: Iterable[Mapping[str, Any]]) -> list[dict[str, 
             name = _tool_name(payload)
             if not name:
                 continue
-            output = _tool_output(payload)
+            _, output = _tool_output(payload)
             call = {
                 "name": name,
                 "arguments": _tool_arguments(payload),
@@ -132,10 +137,16 @@ def normalize_tool_calls(events: Iterable[Mapping[str, Any]]) -> list[dict[str, 
         for payload in result_payloads:
             call_id = _tool_result_id(payload)
             if call_id and call_id in by_id:
-                output = _tool_output(payload)
-                by_id[call_id]["output_summary"] = summarize_tool_output(output)
+                call = by_id[call_id]
+                failed, output = _tool_output(payload)
+                if failed:
+                    failed_ids.add(call_id)
+                if call_id in failed_ids:
+                    output = None
+                    call.pop("result", None)
+                call["output_summary"] = summarize_tool_output(output)
                 if output is not None:
-                    by_id[call_id]["result"] = output
+                    call["result"] = output
 
     return calls
 
@@ -324,18 +335,56 @@ def _coerce_arguments(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _tool_output(payload: Mapping[str, Any]) -> Any:
-    # A Codex ``mcp_tool_call`` item keeps a failed call's tool-error text in
-    # ``result`` (status ``failed``, no ``isError``), and a started item has no
-    # result yet. Only a completed, error-free item carries tool output.
-    if _payload_type(payload) == "mcp_tool_call" and (
-        payload.get("status") != "completed" or payload.get("error") is not None
-    ):
-        return None
-    for key in ("output", "result", "content", "observation"):
-        if key in payload:
-            return _coerce_tool_output(payload.get(key))
-    return None
+# The envelope statuses of a finished call: Codex and ACP ``completed``, Gemini
+# ``success``, AGY ``DONE``. Any other status (``in_progress``, ``failed``,
+# ``error``, ``cancelled``, an unknown value) is a failed or incomplete call.
+_COMPLETED_STATUSES = frozenset({"completed", "success", "done"})
+
+
+def tool_call_failed(payload: Mapping[str, Any]) -> bool:
+    """Whether a call or result envelope reports a failed or incomplete call.
+
+    Every provider keeps a failed call's error text where a successful call
+    keeps its output, so the text is never tool output: Claude and Grok mark a
+    ``tool_result`` ``is_error``, an MCP result ``isError``, Codex and AGY set
+    ``error``, and Codex, ACP and Gemini give a ``status`` other than success.
+    A Codex ``mcp_tool_call`` item always carries its status; a missing one is
+    not a completed call.
+    """
+    if payload.get("is_error") or payload.get("isError") or payload.get("error") is not None:
+        return True
+    if "status" in payload or _payload_type(payload) == "mcp_tool_call":
+        status = payload.get("status")
+        return not (isinstance(status, str) and status.strip().lower() in _COMPLETED_STATUSES)
+    return False
+
+
+def tool_output_failed(value: Any) -> bool:
+    """Whether a tool output, decoded when it is JSON text, is an MCP error result."""
+    value = _coerce_tool_output(value)
+    return isinstance(value, Mapping) and bool(value.get("isError"))
+
+
+def _tool_output(payload: Mapping[str, Any]) -> tuple[bool, Any]:
+    """Whether the payload reports a failed call, and its output (None when it failed)."""
+    if tool_call_failed(payload):
+        return True, None
+    if _payload_type(payload) == "mcp_tool_call_end":
+        # A Codex rollout wraps the MCP result as ``{"Ok": <CallToolResult>}``
+        # or ``{"Err": <message>}``; anything but ``Ok`` is no tool output.
+        result = payload.get("result")
+        if not (isinstance(result, Mapping) and set(result) == {"Ok"}):
+            return True, None
+        output = _coerce_tool_output(result["Ok"])
+    else:
+        output = next(
+            (_coerce_tool_output(payload.get(key)) for key in ("output", "result", "content", "observation")
+             if key in payload),
+            None,
+        )
+    if tool_output_failed(output):
+        return True, None
+    return False, output
 
 
 def _coerce_tool_output(value: Any) -> Any:
