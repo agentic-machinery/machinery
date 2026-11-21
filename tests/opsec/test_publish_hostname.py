@@ -955,7 +955,7 @@ def test_hook_judges_publisher_readiness(repo, state, monkeypatch, capsys):
     reads = []
     def snapshot(pr, target, cwd=None):
         reads.append((pr, target))
-        return {"isDraft": state == "draft"}, (["CI Gate"] if state == "red" else [], ["CI Gate"] if state == "pending" else [])
+        return {"isDraft": state == "draft"}, (["CI Gate"] if state == "red" else [], ["CI Gate"] if state == "pending" else [], 1)
     monkeypatch.setattr(guard, "_pr_snapshot", snapshot)
     assert guard.main() == (0 if state == "ready" else 2)
     assert reads == [("1", repo)]

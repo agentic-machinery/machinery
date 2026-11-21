@@ -199,7 +199,7 @@ class FakeAdapter:
         self.calls.append("sync-acs")
         self.observation["github"]["issue"]["body"] = body
 
-    def enqueue_pr(self, _repository: str, _pr_number: int) -> None:
+    def enqueue_pr(self, _repository: str, _pr_number: int, _head_sha: str) -> None:
         self.calls.append("arm-auto-merge")
         self.observation["github"]["pr"]["auto_merge_enabled_at"] = NOW
 
@@ -558,6 +558,31 @@ def test_auto_merge_allows_declared_lifecycle_issue_closing_reference(tmp_path: 
 
     assert result["remote_mutation_performed"] is True
     assert adapter.calls == ["arm-auto-merge"]
+
+
+def test_closeout_enqueue_pins_the_judged_head_and_queue_landing_kind(tmp_path: Path) -> None:
+    """Defect class: a closeout enqueue lands a head its gate never judged, or squash-merges a base whose queue is off."""
+    path, _ = _ledger(tmp_path)
+    observation = _observation()
+    observation["github"]["pr"]["closing_issue_numbers"] = [42]
+    adapter = FakeAdapter(observation)
+    sent: list[task_closeout.Request] = []
+
+    def run(request: task_closeout.Request, _stdin: str | None = None) -> str:
+        sent.append(request)
+        adapter.observation["github"]["pr"]["auto_merge_enabled_at"] = NOW
+        return ""
+
+    real = task_closeout.GhGitHubAdapter(tmp_path)
+    real._run = run
+    adapter.enqueue_pr = real.enqueue_pr  # type: ignore[method-assign]
+    task_closeout.perform_mutation(
+        path, adapter, action="arm-auto-merge", authorized_by="codex/6096-close-keyword-guard",
+        branch="codex/42-closeout", worktree="/repo/.worktrees/dispatch/codex/42-closeout", now=NOW,
+    )
+    assert [(request.verb, request.fields) for request in sent] == [
+        ("pr-merge", {"number": 77, "repo": "org/repo", "match_head": HEAD, "expect_queue": "true"}),
+    ]
 
 
 def test_missing_authorization_is_durable_and_nonmutating(tmp_path: Path) -> None:

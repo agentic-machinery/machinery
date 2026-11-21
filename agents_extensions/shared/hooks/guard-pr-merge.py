@@ -3,7 +3,8 @@
 
 Reads the Claude Code hook payload on stdin (JSON with `tool_input.command`) and exits
 2 (block) when a CTO seat in safe mode tries to merge, or when a `gh pr merge ...`
-targets a draft, has red or pending checks, or arms `--auto` on an unprotected branch.
+targets a draft, has red or pending checks, has no blocking check at all (NO_CHECKS, as the
+publisher refuses it), or arms `--auto` on an unprotected branch.
 
 Division of labor with guard-admin-merge.py: that hook checks whether `--admin`
 would bypass a blocking failure (#M-0.5). This hook applies the ordinary PR
@@ -148,11 +149,12 @@ try:
     from lu_machinery.ci.advisory_checks import is_advisory as is_advisory
     from lu_machinery.common.github_client import _gh_api_call
     from lu_machinery.publish.merge_guard import (
+        NO_CHECKS,
         _checks_json_unsupported,
-        _parse_status_rollup_rows,
-        bound_rollup_states,
+        _judge_status_rollup_rows,
+        bound_rollup_judgment,
         external_check_states,
-        parse_checks,
+        judge_checks,
         readiness_reason,
     )
     from lu_machinery.publish.merge_guard import (
@@ -1399,8 +1401,9 @@ _ROLLUP_PASS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
 def _status_rollup(pr: str, repo: str | None = None, cwd: str | None = None) -> dict | None:
     """One ``headRefOid,statusCheckRollup`` read: the rollup and its own head together.
 
-    It is the gh 2.46.0 ``pr checks --json`` compatibility fallback, and the head-bound
-    collection that an external advisory exemption is judged on.
+    It is the gh 2.46.0 ``pr checks --json`` compatibility fallback, the head-bound
+    collection that an external advisory exemption is judged on, and the empty collection
+    that types gh's no-output answer as NO_CHECKS.
     """
     try:
         out = subprocess.run(
@@ -1515,7 +1518,7 @@ def _bound_states(pr: str, repo: str | None, cwd: str | None, meta, bound: dict 
     owner_repo = _judged_repo(pr, repo, data)
     if owner_repo is None:
         return None
-    return bound_rollup_states(
+    return bound_rollup_judgment(
         _status_rollup(pr, repo, cwd) if bound is None else bound,
         data.get("headRefOid"),
         owner_repo,
@@ -1525,11 +1528,12 @@ def _bound_states(pr: str, repo: str | None, cwd: str | None, meta, bound: dict 
 
 def _check_states(
     pr: str, repo: str | None = None, cwd: str | None = None, meta=None
-) -> tuple[list[str], list[str]] | None:
-    """(failing, pending) non-advisory check names, or None if undeterminable.
+) -> tuple[list[str], list[str], int] | None:
+    """(failing, pending, judged): non-advisory check names and the count of blocking checks.
 
-    ``meta`` returns the PR metadata being judged. An external advisory name is judged
-    on the head-bound rollup, proven at that metadata's head, never on headless rows.
+    None if undeterminable. ``meta`` returns the PR metadata being judged. An external
+    advisory name is judged on the head-bound rollup, proven at that metadata's head, never
+    on headless rows. ``judged == 0`` is the publisher's NO_CHECKS head.
     """
     try:
         out = subprocess.run(
@@ -1544,14 +1548,20 @@ def _check_states(
         return None
     if _checks_json_unsupported(out):
         bound = _status_rollup(pr, repo, cwd)
-        rows, parse = (bound.get("statusCheckRollup") if bound is not None else None), _parse_status_rollup_rows
+        rows, parse = (bound.get("statusCheckRollup") if bound is not None else None), _judge_status_rollup_rows
     else:
         text = (out.stdout or "").strip()
         if not text:
-            # Empty output is ambiguous: a PR with zero checks (rc 0 → nothing to wait for)
-            # vs a gh error / non-existent PR (rc != 0 → fail-CLOSED block). Reading an
-            # *error* as "no failing checks" is the fail-open bug guard-admin-merge closed.
-            return ([], []) if out.returncode == 0 else None
+            # Empty output is no JSON collection: reading it as "no failing checks" is the
+            # fail-open bug guard-admin-merge closed. gh answers a head with no checks with
+            # rc 1 and no output, like other errors, so (as the publisher does) only an empty
+            # head-bound rollup at the judged head types it as NO_CHECKS.
+            if out.returncode != 1:
+                return None
+            bound = _status_rollup(pr, repo, cwd)
+            if not isinstance(bound, dict) or bound.get("statusCheckRollup") != []:
+                return None
+            return _bound_states(pr, repo, cwd, meta, bound)
         # gh exits 0, 1 (failing) or 8 (pending) after a complete read; any other code is
         # an error or cancellation even when stdout parses (the publisher's policy).
         if out.returncode not in (0, 1, 8):
@@ -1562,7 +1572,7 @@ def _check_states(
             return None
         if not isinstance(rows, list) or (out.returncode == 1 and not rows):
             return None
-        bound, parse = None, parse_checks
+        bound, parse = None, judge_checks
     return external_check_states(rows, parse, lambda: _bound_states(pr, repo, cwd, meta, bound))
 
 
@@ -1661,7 +1671,7 @@ def _judge(args: list[str], cwd: str | None = None) -> str | None:
             "An unverifiable merge is refused, not assumed safe. Re-check the PR with\n"
             "`gh pr view` and retry once gh answers.",
         )
-    reason = readiness_reason(meta, states)
+    reason = readiness_reason(meta, None if states is None else states[:2])
     if reason == "PR is a DRAFT":
         return _block_msg(
             f"PR {pr} is a DRAFT",
@@ -1676,13 +1686,20 @@ def _judge(args: list[str], cwd: str | None = None) -> str | None:
             "An unverifiable merge is refused, not assumed safe. Re-read the checks with\n"
             "`gh pr checks` and retry once gh answers.",
         )
-    failing, pending = states
+    failing, pending, judged = states
     if reason == "FAILING checks":
         return _block_msg(
             f"PR {pr} has FAILING checks: {', '.join(failing)}",
             "Every non-advisory check counts, whether or not GitHub marks it required —\n"
             "'required' is a config accident, red is red. Fix the failures and re-run;\n"
             "do not merge over them.",
+        )
+    if reason is None and not judged:
+        return _block_msg(
+            f"PR {pr}: {NO_CHECKS}",
+            "Nothing that blocks ran on this head (no checks, or only advisory ones), so no CI\n"
+            "result exists to land on; the publisher's pr-merge refuses it the same way. Wait for\n"
+            "CI to report on the head, then read `gh pr checks` and retry.",
         )
     if _flag_enabled(_classify(args)[0], "auto"):
         base = str(meta.get("baseRefName") or "")

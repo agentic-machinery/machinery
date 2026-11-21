@@ -365,7 +365,7 @@ def external_check_states(rows, parse, bound_states):
     a newer read. The headless rows must still be a well-formed collection.
     """
     duplicates_need_proof = isinstance(rows, list) and _duplicate_check_names(rows) and (
-        parse is parse_checks or any(
+        parse is judge_checks or any(
             isinstance(row, dict) and row.get("name") and not row.get("workflowName") for row in rows
         )
     )
@@ -374,12 +374,18 @@ def external_check_states(rows, parse, bound_states):
     return bound_states() if all(isinstance(row, dict) for row in rows) else None
 
 
-def parse_checks(rows):
-    """Parse gh check buckets with the hook's advisory and unknown-state policy."""
+def judge_checks(rows):
+    """``(failing, pending, judged)`` of gh check buckets with the hook's advisory and unknown-state policy.
+
+    ``judged`` counts the rows that prove a blocking check, as :func:`_judge_status_rollup_rows`
+    counts them: an advisory job, an unexpanded matrix parent, an unnamed row or a row merely
+    named like an advisory job (its workflow identity missing or another workflow's) never
+    proves one, whatever its result. None when a row is malformed or its state unknown.
+    """
     if not isinstance(rows, list):
         return None
     policy = load_advisory_checks()
-    failing, pending = [], []
+    failing, pending, judged = [], [], 0
     for row in rows:
         if not isinstance(row, dict):
             return None
@@ -395,7 +401,13 @@ def parse_checks(rows):
             pending.append(name)
         elif bucket not in _PASS_BUCKETS:
             return None
-    return failing, pending
+        if name and name not in policy.names:
+            judged += 1
+    return failing, pending, judged
+
+
+# pr-merge's refusal for a head with no blocking check; guard-pr-merge.py refuses a raw merge with it too.
+NO_CHECKS = "NO_CHECKS: the head has no blocking check"
 
 
 def readiness_reason(meta, states):
@@ -571,7 +583,7 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
         reason = readiness_reason(meta, (failing, pending))
         if not reason and not judged:
             # Nothing ran (or only advisory checks ran) on this head: no CI result exists to land on.
-            reason = "NO_CHECKS: the head has no blocking check"
+            reason = NO_CHECKS
         if match_head is not None and meta["headRefOid"].lower() != match_head.lower():
             reason = "reviewed head changed"
     except (PublishBlocked, GitHubRateLimited):

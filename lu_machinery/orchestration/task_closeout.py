@@ -584,9 +584,21 @@ class GhGitHubAdapter:
             None,
         )
 
-    def enqueue_pr(self, repository: str, pr_number: int) -> None:
+    def enqueue_pr(self, repository: str, pr_number: int, head_sha: str) -> None:
+        """Enqueue the PR at the head the mutation gate judged, through the merge queue only.
+
+        ``match_head`` refuses a head that moved after the gate's observation, and
+        ``expect_queue`` refuses a base whose merge queue was turned off instead of
+        squash-merging it directly (rules core P4: landing goes through the queue).
+        """
         self._run(
-            Request("pr-merge", number=int(str(pr_number)), repo=repository),
+            Request(
+                "pr-merge",
+                number=int(str(pr_number)),
+                repo=repository,
+                match_head=head_sha,
+                expect_queue="true",
+            ),
             None,
         )
 
@@ -933,7 +945,9 @@ def perform_mutation(
                         identity["repository"], identity["github_issue_number"], body
                     )
                 elif action == "arm-auto-merge":
-                    adapter.enqueue_pr(identity["repository"], ledger["pr"]["number"])
+                    adapter.enqueue_pr(
+                        identity["repository"], ledger["pr"]["number"], before["github"]["pr"]["head_sha"]
+                    )
                 else:
                     adapter.close_issue(identity["repository"], identity["github_issue_number"])
                 remote_performed = True
