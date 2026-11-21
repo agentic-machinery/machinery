@@ -388,7 +388,7 @@ spot-check via `X-Agent` trailers + stream issue links when CI queues back up.
 
 Thread rollover handoffs are managed by the `thread-rollover` skill. When a
 thread approaches context threshold, use the `thread-rollover` skill to prepare
-a handoff packet using `lu_machinery/orchestration/thread_handoff.py prepare --agent codex --active-thread-id <id>`.
+a packet via `python -m lu_machinery.orchestration.thread_handoff prepare --agent codex --active-thread-id <id>`.
 This creates an isolated `handoff.md` inside `.agent/thread-rollovers/codex/<lineage-id>/`.
 Do **not** write `docs/session-state/current.md` or any other git-tracked
 handoff file just to survive compaction.

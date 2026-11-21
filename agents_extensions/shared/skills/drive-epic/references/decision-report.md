@@ -70,7 +70,7 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   (the ask and `discuss` rules in `fleet-comms-coordination.md`) takes up only the points where the
   members disagree. A discussion never counts as review or approval.
 - **Members:** live eligible routes only, as `model-assignment.md` seats them for the question
-  (`model-assignment.md`, "Gemini 4 Neon advisory routing" and "SubQ Savant test routing"). Record each
+  (see that file). Record each
   model's exact ID with its findings and score. On Ukrainian language, culture and heritage
   questions, Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment);
   its answers are input in the council and the discussion only, never review of record or

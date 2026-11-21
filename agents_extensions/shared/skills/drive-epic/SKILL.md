@@ -1,6 +1,6 @@
 ---
 name: drive-epic
-description: Drive one explicitly assigned epic or track through Fleet Comms. For the core fresh lesson-based build (#7994) see §0d. Use track-completion for a single V7 module on a track that still uses V7.
+description: Drive one explicitly assigned epic or track through Fleet Comms. For the core fresh lesson-based build (#7994) see §0d.
 effort: high
 ---
 
@@ -125,7 +125,6 @@ artifact renders or runs before "ready".
 ## This skill is NOT
 
 - A restatement of the served rules (`/api/rules`) or the live roster.
-- The CTO seat (`cto` skill), a single-module writer (`$track-completion`; core fresh build: §0d)
-  or a second curriculum orchestrator.
+- The CTO seat (`cto` skill), a single-module writer or a second curriculum orchestrator.
 - Authority to flip the fleet-comms plane, self-merge a fleet-wide process change or self-review
   work you dispatched.
