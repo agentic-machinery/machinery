@@ -233,10 +233,12 @@ _BODY_TOKEN_SEPARATORS = re.compile(r"[\s\[\],]+")
 def _words_name_merge(line: str) -> bool:
     """One linear pass over a body line's tokens for a merge invocation."""
     tokens = [token for token in _BODY_TOKEN_SEPARATORS.split(line) if token]
-    for index, token in enumerate(tokens):
-        if token == "lu_machinery.publish" and tokens[index + 1 : index + 2] == ["pr-merge"]:
-            return True
-        if token != "gh":
+    if any(tokens[i] == "lu_machinery.publish" and tokens[i + 1] == "pr-merge" for i in range(len(tokens) - 1)):
+        return True
+    index = 0
+    while index < len(tokens):
+        if tokens[index] != "gh":
+            index += 1
             continue
         following = index + 1
         while following < len(tokens) and tokens[following].startswith("-"):
@@ -246,6 +248,9 @@ def _words_name_merge(line: str) -> bool:
                 following += 1
         if tokens[following : following + 2] == ["pr", "merge"]:
             return True
+        # A `gh` read above was an option value: the scan from it reaches the
+        # same token, so every token is visited a bounded number of times.
+        index = following
     return False
 
 

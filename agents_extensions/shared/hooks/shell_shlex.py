@@ -323,7 +323,9 @@ def preprocess_shell_command(command: str) -> str:
 # name). heredoc_view shows every body to the guards in two parts:
 #
 # - its words (_body_words), in one subshell line `( ... ; ... )`. Quotes,
-#   backslashes, comments, redirects and expansion punctuation are removed;
+#   backslashes, comments, output redirects, here-document operators and
+#   expansion punctuation are removed, and an input redirect stays (so its
+#   operand never stands where the command does);
 #   `;`, `&`, `|`, `)`, backticks and a `(` that does not follow a word
 #   character start a new command, and a reserved word leading a command is
 #   dropped. So any command a shell could
@@ -343,16 +345,21 @@ def preprocess_shell_command(command: str) -> str:
 _MAX_NESTING = 16
 _DELIMITER_END = frozenset(" \t\n;|&()<>")
 _SUBSCRIPTED = re.compile(r"(?:^|[ \t\n;&|(])[A-Za-z_][A-Za-z0-9_]*\Z")
-_BODY_BREAKS = str.maketrans({char: "\n" for char in ";&|()`"})
+# `&` starts a command unless it duplicates an input (`0<&3`).
+_BODY_BREAKS = re.compile(r"[;()`|]|(?<!<)&")
 # Quote removal joins a word (`g"h"` is `gh`): quotes and backslashes go.
-# Other punctuation only separates words.
-_BODY_DROPS = str.maketrans({"'": None, '"': None, "\\": None, **{char: " " for char in "#<>${}"}})
+# Other punctuation only separates words. An input redirect stays, so its
+# operand never stands where the command does (`<in tee x`).
+_BODY_DROPS = str.maketrans({"'": None, '"': None, "\\": None, **{char: " " for char in "#>${}"}})
 _RESERVED_WORDS = frozenset(
     {"!", "[[", "]]", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in"}
     | {"select", "then", "time", "until", "while"}
 )
 _EXPANSIONS = ("$((", "$(", "${", "$[")
 _CLOSERS = {"((": "))", "$[": "]", "${": "}"}
+# A pending body: operator and owner offsets, descriptor, closer, quoted,
+# strip-tabs, and the index in the view of the operator it names.
+_Pending = tuple[int, int, str, str, bool, bool, int]
 
 
 class HereDocument(NamedTuple):
@@ -368,22 +375,26 @@ class HereDocument(NamedTuple):
     closer: str
     quoted: bool  # a quoted delimiter: the body is literal
     strip_tabs: bool  # `<<-`
-    lines: tuple[str, ...]  # physical body lines, leading tabs removed for `<<-`
+    lines: tuple[str, ...]  # physical body lines; `<<-` removes leading tabs where Bash does
     name: str  # the delimiter heredoc_view writes: unique per document, in reading order
 
 
 class _Names:
     """Unique view names for one parse: `LU_HEREDOC_<n>` in reading order."""
 
-    def __init__(self, start: int) -> None:
-        self.next = start
+    def __init__(self, reserved: set[str]) -> None:
+        # Names already in the text, as strings: a fresh name never takes one.
+        self.reserved = reserved
+        self.next = 0
         self.assigned: set[str] = set()
 
     def assign(self, closer: str) -> str:
         if re.fullmatch(r"LU_HEREDOC_[0-9]+", closer) and closer not in self.assigned:
             name = closer  # a name an earlier parse wrote: reading the view again keeps it
         else:
-            name = f"LU_HEREDOC_{self.next}"
+            # Each skip passes one reserved name, so allocation is bounded by the text.
+            while (name := f"LU_HEREDOC_{self.next}") in self.reserved or name in self.assigned:
+                self.next += 1
             self.next += 1
         self.assigned.add(name)
         return name
@@ -433,9 +444,15 @@ def _body_words(text: str) -> list[str]:
     # (`name()` opens a function definition), so call syntax in code or prose
     # (`set()`, `dict(env)`) cannot turn an argument into a command.
     text = re.sub(r"(?<=[A-Za-z0-9_.\]])\(", " ", text)
+    # A process substitution's arrow is not a redirect; its `(` starts a command.
+    text = re.sub(r"[<>](?=\()", " ", text)
     # A shell reading the body expands `$NAME` and `${NAME...}`: keep the name.
     text = re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", "\x00\\1", text)
-    text = text.translate(_BODY_BREAKS).translate(_BODY_DROPS).replace("\x00", "$")
+    text = _BODY_BREAKS.sub("\n", text).translate(_BODY_DROPS).replace("\x00", "$")
+    # A here-document or here-string in the body only feeds input; its lines
+    # are already body lines. Removed after quote removal, so the view never
+    # holds an operator that would read the view's own lines as a body.
+    text = re.sub(r"<<+", " ", text)
     words: list[str] = []
     for line in text.split("\n"):
         parts = line.split()
@@ -555,14 +572,10 @@ def _may_have_heredoc(command: str) -> bool:
 
 
 def _checked_parse(command: str) -> tuple[tuple[HereDocument, ...], str, int]:
-    if "\x01" in command:
-        # The parser marks operator slots with \x01 while it reads bodies.
-        raise ShellPreprocessLimit("control character in a command with a here-document")
-    # A name the parser wrote keeps it when the view is read again; fresh
-    # numbers start above every LU_HEREDOC_<n> already in the text.
-    used = [int(number) for number in re.findall(r"LU_HEREDOC_([0-9]+)", command)]
-    names = _Names(max(used) + 1 if used else 0)
     try:
+        # A name the parser wrote keeps it when the view is read again; a
+        # fresh name is never one already in the text.
+        names = _Names(set(re.findall(r"LU_HEREDOC_[0-9]+", command)))
         return _parse(command, names=names)
     except (ValueError, RecursionError, IndexError) as exc:
         # Fail closed with a type: an unexpected reader error is a refusal.
@@ -580,15 +593,15 @@ def _parse(
 
     Return the documents, the view, and the offset where the expansion closed
     (the end of `command` at the top level). Pending bodies and the owning
-    command belong to their own `$(...)` frame, as in Bash.
+    command belong to their own `$(...)`, `<(...)` or `>(...)` frame, as in Bash.
     """
     if depth > _MAX_NESTING:
         raise ShellPreprocessLimit("shell nesting too deep to read safely")
-    names = _Names(0) if names is None else names
+    names = _Names(set()) if names is None else names
     out: list[str] = []
     documents: list[HereDocument] = []
-    pending: list[tuple[int, int, str, str, bool, bool]] = []
-    frames: list[tuple[list[tuple[int, int, str, str, bool, bool]], int]] = []
+    pending: list[_Pending] = []
+    frames: list[tuple[list[_Pending], int]] = []
     # Contexts: "cmd" (top level or `$(`), quotes, "${", "((" and "$[".
     stack: list[str] = ["cmd", *(inside or [])]
     base = len(stack) - 1
@@ -660,13 +673,14 @@ def _parse(
             opening = "(("
         if not opening and context == "cmd" and char == "[" and _SUBSCRIPTED.search(_tail(out)):
             opening = "["  # an array subscript (`x[1 << 2]=1`) is arithmetic: its `<<` is a shift
+        if not opening and context == "cmd" and look.startswith(("<(", ">(")):
+            opening = look[:2]  # a process substitution reads its own commands, as `$(` does
         if opening:
-            stack.append(
-                "cmd" if opening == "$(" else "((" if opening == "$((" else "$[" if opening == "[" else opening
-            )
+            commands = opening in {"$(", "<(", ">("}
+            stack.append("cmd" if commands else "((" if opening == "$((" else "$[" if opening == "[" else opening)
             parens.append(0)
             index = _skip(command, index, len(opening))
-            if opening == "$(":
+            if commands:
                 frames.append((pending, owner))
                 pending = []
                 owner = index
@@ -750,9 +764,7 @@ def _parse(
     return finish()
 
 
-def _read_operator(
-    command: str, index: int, out: list[str], pending: list[tuple[int, int, str, str, bool, bool]], owner: int
-) -> int:
+def _read_operator(command: str, index: int, out: list[str], pending: list[_Pending], owner: int) -> int:
     """Read one `<<` or `<<-` operator and its delimiter word; return the next offset.
 
     Continuations inside the operator, before the word and within it are joined, as Bash joins them.
@@ -786,8 +798,9 @@ def _read_operator(
     closer = heredoc_closer(text) if "\r" not in text and "\n" not in text else None
     if closer is None:
         raise ShellPreprocessLimit("here-document delimiter cannot be read safely")
-    pending.append((operator, owner, descriptor.group() if descriptor else "", closer[0], closer[1], strip_tabs))
-    out.append(("<<-" if strip_tabs else "<<") + "\x01" + str(len(pending) - 1) + "\x01")
+    descriptor_word = descriptor.group() if descriptor else ""
+    pending.append((operator, owner, descriptor_word, closer[0], closer[1], strip_tabs, len(out)))
+    out.append("<<-" if strip_tabs else "<<")  # _read_bodies adds the document's name here
     return index
 
 
@@ -795,13 +808,13 @@ def _read_bodies(
     command: str,
     index: int,
     out: list[str],
-    pending: list[tuple[int, int, str, str, bool, bool]],
+    pending: list[_Pending],
     documents: list[HereDocument],
     depth: int,
     names: _Names,
 ) -> int:
     """Read the pending bodies that start at `index`; return the offset after them."""
-    for slot, (operator, owner, descriptor, closer, quoted, strip_tabs) in enumerate(pending):
+    for operator, owner, descriptor, closer, quoted, strip_tabs, slot in pending:
         lines: list[str] = []
         while True:
             if index > len(command) or (index == len(command) and command.endswith("\n")):
@@ -822,15 +835,15 @@ def _read_bodies(
             candidate = "".join(logical)
             if (candidate.lstrip("\t") if strip_tabs else candidate) == closer:
                 break
-            lines.extend(part.lstrip("\t") if strip_tabs else part for part in physical)
+            # `<<-` strips the tabs that start a line Bash reads; a continued
+            # unquoted line keeps the tabs of its later parts, as Bash does.
+            lines.extend(
+                part.lstrip("\t") if strip_tabs and (quoted or not part_index) else part
+                for part_index, part in enumerate(physical)
+            )
         name = names.assign(closer)
         documents.append(HereDocument(operator, owner, descriptor, closer, quoted, strip_tabs, tuple(lines), name))
-        marker = "\x01" + str(slot) + "\x01"
-        # The operator was written with a slot marker; give it the document's name.
-        for position in range(len(out) - 1, -1, -1):
-            if marker in out[position]:
-                out[position] = out[position].replace(marker, f"'{name}'" if quoted else name, 1)
-                break
+        out[slot] += f"'{name}'" if quoted else name
         text = "\n".join(lines)
         words = _body_words(text)
         if words:
