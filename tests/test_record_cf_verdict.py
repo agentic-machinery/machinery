@@ -26,14 +26,19 @@ from tests.helpers import current_sol
 CURRENT_SOL = current_sol()
 
 
-@pytest.mark.usefixtures("configured_roots", "agent_runtime_roots")
+@pytest.mark.usefixtures("configured_roots", "agent_runtime_roots", "recorder_matcher")
 @pytest.mark.parametrize("rule", [
     "item-quote", "evidence-quote", "evidence-receipt", "unknown-source", "source-excerpt",
-    "finding-source", "bookkeeping", "unknown-coverage",
+    "finding-source", "bookkeeping", "unknown-coverage", "record-unknown", "record-excerpt",
 ])
-def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule):
+def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule, monkeypatch, tmp_path):
     """Defect class: reviewer instructions and recorder acceptance drift apart."""
-    from lu_machinery.review.review_contract import build_item_packet, judge_item_reply, validate_ukrainian_reply_claims
+    from lu_machinery.review.review_contract import (
+        build_item_packet,
+        judge_item_reply,
+        render_item_packet,
+        validate_ukrainian_reply_claims,
+    )
 
     reference = (Path(__file__).resolve().parents[1] / "agents_extensions/shared/skills/review-loop/references/ukrainian.md").read_text()
     phrases = {
@@ -45,6 +50,8 @@ def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule):
         "finding-source": "`finding` clause naming a source term",
         "bookkeeping": "coverage set in the reply void the chunk",
         "unknown-coverage": "coverage equals the denominator",
+        "record-unknown": "an unsupported source claim in an UNKNOWN row refuses the whole reply",
+        "record-excerpt": "On an APPROVE verdict, validated Ukrainian `sources` excerpts are checked against captured output instead",
     }
     assert phrases[rule] in reference
     packet = build_item_packet([{"id": "a", "text": "learner text"}, {"id": "b", "text": "other text"}])
@@ -54,6 +61,27 @@ def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule):
     ]
     payload = {"schema": "ukrainian-item-judgments.v1", "items": rows}
     event = {"receipt_id": "r1", "tool": "verify_word", "arguments": {}, "result": "captured output"}
+    if rule in {"record-unknown", "record-excerpt"}:
+        tasks, comments, calls = setup_record(monkeypatch, tmp_path)
+        prompt = tmp_path / "brief.md"
+        prompt.write_text(render_item_packet(packet))
+        captured_source_trace(tasks, output='captured "source excerpt"')
+        if rule == "record-unknown":
+            rows[1]["sources"] = "unsupported source claim"
+        else:
+            rows[0]["sources"] = 'captured "source excerpt"'
+        reply = "VERDICT: APPROVE\n```ukrainian-item-judgments\n" + json.dumps(payload) + "\n```\n"
+        write_task(tasks, reply=reply, review_profile="ukrainian", sources_mcp_call_count=3,
+                   prompt_file=str(prompt), prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest())
+        if rule == "record-unknown":
+            with pytest.raises(recorder.RecordError, match="UKRAINIAN_CLAIMS_UNSUPPORTED"):
+                recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+            assert comments == [] and calls["posts"] == 0 and calls["statuses"] == 0
+        else:
+            recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+            marker = sweep.parse_marker(comments[0]["body"])
+            assert marker.get("void") is None and marker["coverage"] == ["a"]
+        return
     if rule == "item-quote":
         rows[0]["quote"] = "not in item"
     elif rule == "evidence-quote":
