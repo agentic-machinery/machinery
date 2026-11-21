@@ -223,11 +223,13 @@ Before the commit, and again before landing (step 8), run `verify_run` for every
 When `budget-check` refuses the next required round at the cap, write the hand-off with the
 refusal, capped PR and full head SHA, rounds used, and every unresolved blocker. Propose the
 smallest continuation and name an owner for each blocker. Send the hand-off to the CTO and
-wait for the recorded [cap disposition](../review-loop/references/policy.md#4-convergence)
-using the exchange below. A replacement needs a new authorized brief.
+end this task with `BLOCKED review cap`. The CTO records the
+[cap disposition](../review-loop/references/policy.md#4-convergence) for the work item. A
+replacement needs a new authorized brief after this task settles. Use the exchange below
+for a coordinator question whose answer can unblock the current task.
 
 Stop, and report `BLOCKED <reason>`, when: the proof cannot be obtained; the recorder's
-`budget-check` refuses the next review round for another reason, or a dispute is unresolved after two replies
+`budget-check` refuses the next review round, or a dispute is unresolved after two replies
 (`review-loop`; a base merge, a CI fix or a conflict resolution after approval is not a stop
 while `budget-check` admits it); a breaker trips; ownership
 or stream membership is lost; the change's own checks fail a second time, or CI fails for an

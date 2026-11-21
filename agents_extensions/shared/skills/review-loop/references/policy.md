@@ -84,11 +84,15 @@ record what the work is waiting for or why it ends. Update that record if a late
 also caps. Keep the earlier decisions and ledgers linked.
 
 Continuing requires explicit CTO authorization, a fresh branch and a replacement PR. The
-replacement brief carries the ledger, rounds used and cap decision forward. Place any blocker
-outside the continuation on named work with an owner and keep it open in the parent record.
-A replacement PR or narrower scope alone grants no additional rounds. The reviewer checks any
-claimed fix or inapplicability on the replacement's exact head, which also needs its own CI
-under the [delivery gate](../../full-send/references/delivery.md#the-gate).
+replacement brief carries the ledger, predecessor rounds used and cap decision forward. The
+authorized replacement starts at round 1 of its own configured PR budget. Record earlier
+rounds as history. The capped PR remains capped.
+
+Keep blockers assigned to other named work open with their owners in the parent record. They
+still block the replacement until the reviewer confirms on its exact head that the defect is
+fixed or that the replacement neither carries the defective change nor exposes or worsens the
+defect. The rule for unresolved security findings in [Findings](#3-findings) still applies.
+The replacement needs its own CI under the [delivery gate](../../full-send/references/delivery.md#the-gate).
 
 ## 5. Recovery over gates
 

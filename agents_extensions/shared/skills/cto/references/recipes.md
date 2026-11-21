@@ -71,10 +71,13 @@ and `resolved_model_source`; never grep nested status output for these fields.
 
 When a work item hits the review cap, record the
 [cap disposition](../../review-loop/references/policy.md#4-convergence) before dispatching any
-replacement. Use the same parent record when a replacement also hits the cap. In the ordered
+replacement. Confirm the predecessor task has settled before dispatch. Use the same parent
+record when a replacement also hits the cap. In the ordered
 replacement brief, link the decision and carry every unresolved blocker with its predecessor
 PR and finding ID, owner, and where it will be resolved. State which findings the replacement
-will address and which remain open on other named work.
+will address and which remain open on other named work. When a predecessor PR already has a
+bound lifecycle ledger, follow [the existing scope transfer](../../full-send/references/delivery.md#hand-off-record)
+before dispatching the replacement.
 
 ## Test grants
 
