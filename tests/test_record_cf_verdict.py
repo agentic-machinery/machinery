@@ -51,7 +51,7 @@ def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule, monkeypatch,
         "bookkeeping": "coverage set in the reply void the chunk",
         "unknown-coverage": "coverage equals the denominator",
         "record-unknown": "an unsupported source claim in an UNKNOWN row refuses the whole reply",
-        "record-excerpt": "each excerpt must be literal captured Sources output",
+        "record-excerpt": "On an APPROVE verdict, validated Ukrainian `sources` excerpts are checked against captured output instead",
     }
     assert phrases[rule] in reference
     packet = build_item_packet([{"id": "a", "text": "learner text"}, {"id": "b", "text": "other text"}])
