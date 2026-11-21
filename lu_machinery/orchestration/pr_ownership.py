@@ -1119,7 +1119,9 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
     ``recorded_custody`` stays even when the latest observation failed: the decision
     owner is already written. ``by`` is ``keeper`` only when that attempt was written
     with this handoff. ``waiting_for_grace`` is only an unalerted episode after an
-    observation, and only attempts at or after ``since`` count. A missing tick, or a
+    observation. Attempts at or after ``since`` count. An attempt on this episode
+    whose clock cannot be read is ``unknown_evidence``; a clock before ``since``
+    does not. A missing tick, or a
     tick whose ``error`` is set, is not evidence. A tick that observed and then failed
     to deliver stays evidence: the ledger is what that observation saved. One PR is
     one row. A heal attempt with no current episode and no recorded handoff is not a row.
@@ -1168,17 +1170,26 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
         accepted = handoff.get("accepted_at")
         return isinstance(accepted, str) and attempt.get("at") == accepted
 
-    def tied_attempts(key: str, since: datetime) -> list[dict[str, Any]]:
+    def attempts_for_episode(key: str, since: datetime) -> tuple[list[dict[str, Any]], bool]:
         # The prefix ends in ":", so repo#1: does not match an attempt for repo#10.
+        # A clock that cannot be read does not prove the attempt predates this episode.
         prefix = f"{key}:"
         tied: list[dict[str, Any]] = []
+        unreadable = False
         for attempt_key, row in attempts.items():
-            if not isinstance(attempt_key, str) or not attempt_key.startswith(prefix) or not isinstance(row, dict):
+            if not isinstance(attempt_key, str) or not attempt_key.startswith(prefix):
+                continue
+            if not isinstance(row, dict):
+                unreadable = True
                 continue
             moment = attempt_time(row)
-            if moment is not None and moment >= since:
-                tied.append(row)
-        return tied
+            if moment is None:
+                unreadable = True
+                continue
+            if moment < since:
+                continue
+            tied.append(row)
+        return tied, unreadable
 
     for key in sorted(name for name in handoffs if isinstance(name, str)):
         handoff = handoffs[key]
@@ -1235,8 +1246,8 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
                 "alerted": bool(episode.get("alerted_at")),
             }
             continue
-        related = tied_attempts(key, since)
-        unverified = any(
+        related, unreadable_clock = attempts_for_episode(key, since)
+        unverified = unreadable_clock or any(
             row.get("result") in {"pending", "unverified"} or row.get("postcondition") == "unknown"
             for row in related
         )

@@ -309,6 +309,26 @@ def test_ownerless_open_pr_past_grace_records_a_decision_owner(tmp_path):
     fresh_view = own.custody_view(fresh)
     assert [row["pr"] for row in fresh_view["waiting_for_grace"]] == [KEY]
     assert fresh_view["unknown_evidence"] == [] and fresh_view["alert_outstanding"] == []
+    # A missing or unreadable clock does not prove the attempt is older than this episode.
+    fresh["heal_attempts"][f"{KEY}:{HEAD}"] = {"result": "pending", "postcondition": "unknown"}
+    clockless = own.custody_view(fresh)
+    assert clockless["waiting_for_grace"] == [] and clockless["alert_outstanding"] == []
+    assert clockless["unknown_evidence"] == [{
+        "pr": KEY, "why": "keeper attempt unverified", "alerted": False,
+    }]
+    fresh["heal_attempts"][f"{KEY}:{HEAD}"]["at"] = "not-a-time"
+    assert own.custody_view(fresh)["unknown_evidence"][0]["why"] == "keeper attempt unverified"
+    fresh["heal_attempts"][f"{KEY}:{HEAD}"] = {
+        "result": "pending", "postcondition": "unknown", "at": at(20).isoformat(),
+    }
+    assert own.custody_view(fresh)["unknown_evidence"][0]["why"] == "keeper attempt unverified"
+    fresh["episodes"][KEY]["alerted_at"] = at(25).isoformat()
+    fresh["heal_attempts"][f"{KEY}:{HEAD}"] = {"result": "refused", "postcondition": "false"}
+    alerted_clockless = own.custody_view(fresh)
+    assert alerted_clockless["alert_outstanding"] == []
+    assert alerted_clockless["unknown_evidence"][0]["alerted"] is True
+    fresh["heal_attempts"][f"{KEY}:{HEAD}"] = "nope"
+    assert own.custody_view(fresh)["unknown_evidence"][0]["why"] == "keeper attempt unverified"
     later = own._empty()
     later["last_tick"] = {"at": at(25).isoformat(), "ok": True}
     later["episodes"][KEY] = {
