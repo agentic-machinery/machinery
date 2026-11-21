@@ -1677,6 +1677,7 @@ _DISMISS_TRIAGE_PATH = "docs/runbooks/secret-scanning.md"
 _DISMISS_ANALYSIS_PER_PAGE = 100
 _DISMISS_ANALYSIS_MAX_PAGES = 20
 _DISMISS_ANALYSIS_CLOCK_SKEW = timedelta(minutes=5)
+_DISMISS_PR_BATCH_SIZE = 100
 
 
 def _parse_utc_timestamp(value):
@@ -1714,7 +1715,7 @@ def _dismiss_get(runner, endpoint, cwd, environment, *, pages=False, raw=False, 
         raise ValueError("dismissal evidence unavailable")
     value = result.stdout if raw else json_depth.loads(result.stdout, max_depth=512)
     if pages:
-        if not isinstance(value, list) or any(not isinstance(page, list) for page in value):
+        if not isinstance(value, list) or not value or any(not isinstance(page, list) for page in value):
             raise ValueError("dismissal pagination unavailable")
         value = [row for page in value for row in page]
     return value
@@ -1763,7 +1764,7 @@ def _dismiss_sarif_result(document, number):
     return matches[0]
 
 
-def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
+def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=None, raw_graphql=False):
     comment, number = fields["comment"], fields["number"]
     # Require an explanation in addition to an exact alert identifier and PR URL.
     identifier = rf"(?i)\balert\s+#{number}\b"
@@ -1815,7 +1816,11 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     current_head = head_reference["object"]["sha"]
     if not re.fullmatch(PATTERNS["sha"], current_head):
         raise ValueError("unknown current triage head")
-    current_triage = get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={current_head}", raw=True)
+    current_triage = (
+        triage
+        if current_head.lower() == merge.lower()
+        else get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={current_head}", raw=True)
+    )
     current_rows = [line for line in current_triage.splitlines() if "|" in line
                     and line.strip().removeprefix("|").split("|", 1)[0].strip() == str(number)]
     if current_rows != [triage_line]:
@@ -1901,21 +1906,128 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
             results[aid] = _dismiss_sarif_result(get(f"code-scanning/analyses/{aid}", sarif=True), number)
         return results[aid]
 
+    def pull_states(pr_numbers):
+        def strict_pairs(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError("duplicate JSON object member")
+                obj[key] = value
+            return obj
+
+        def reject_constant(token):
+            raise ValueError(f"invalid JSON constant: {token}")
+
+        owner, repo_name = gh_repo.split("/", 1)
+        ordered = sorted(set(pr_numbers))
+        states = {}
+        client = (
+            github_client.GitHubClient(
+                env={**gate.internal_environment(environment), "GH_HOST": dest.partition("/")[0]},
+                cwd=cwd,
+            )
+            if raw_graphql
+            else None
+        )
+        with (
+            contextlib.nullcontext(None)
+            if raw_graphql
+            else (
+                contextlib.nullcontext(temp)
+                if temp is not None
+                else tempfile.TemporaryDirectory(prefix="lu-dismiss-prs-", dir=ensure_scratch_root())
+            )
+        ) as query_dir:
+            query_file = None if query_dir is None else Path(query_dir) / "dismiss-pulls.json"
+            for start in range(0, len(ordered), _DISMISS_PR_BATCH_SIZE):
+                chunk = ordered[start:start + _DISMISS_PR_BATCH_SIZE]
+                aliases = " ".join(f"p{n}: pullRequest(number:{n}){{number state merged url}}" for n in chunk)
+                query = f"query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{aliases}}}}}"
+                payload = json.dumps({"query": query, "variables": {"owner": owner, "name": repo_name}}).encode("utf-8")
+                if client is not None:
+                    observation = client.request(
+                        "POST", "graphql", payload=payload, timeout=30, fresh=True, raw_response=True,
+                    )
+                    if observation.stale:
+                        raise github_client.GitHubRateLimited(observation.reset_at, observation.reason)
+                    refusal = github_client.refusal_of(observation)
+                    if refusal is not None:
+                        raise refusal
+                    if observation.error or observation.status != 200 or not isinstance(observation.value, (bytes, bytearray)):
+                        raise ValueError("dismissal PR evidence unavailable")
+                    raw_body = bytes(observation.value).decode("utf-8")
+                else:
+                    if query_file is None:
+                        raise ValueError("dismissal PR evidence unavailable")
+                    query_file.write_bytes(payload)
+                    result = runner(
+                        ["gh", "api", "--method", "POST", "graphql", "--input", str(query_file), *_hostname_flag(dest)],
+                        cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=30,
+                    )
+                    if result.returncode:
+                        raise ValueError("dismissal PR evidence unavailable")
+                    raw_body = (
+                        bytes(result.stdout).decode("utf-8")
+                        if isinstance(result.stdout, (bytes, bytearray))
+                        else result.stdout
+                    )
+                if not isinstance(raw_body, str):
+                    raise ValueError("unknown instance PR identity or state")
+                document = json_depth.loads(
+                    raw_body,
+                    max_depth=512,
+                    object_pairs_hook=strict_pairs,
+                    parse_constant=reject_constant,
+                )
+                if (
+                    not isinstance(document, dict)
+                    or "errors" in document
+                    or "data" not in document
+                    or not set(document) <= {"data", "extensions"}
+                    or not isinstance(document["data"], dict)
+                    or ("extensions" in document and not isinstance(document["extensions"], dict))
+                ):
+                    raise ValueError("unknown instance PR identity or state")
+                data = document["data"]
+                if set(data) != {"repository"}:
+                    raise ValueError("unknown instance PR identity or state")
+                repo_data = data["repository"]
+                expected_keys = {f"p{n}" for n in chunk}
+                if not isinstance(repo_data, dict) or set(repo_data) != expected_keys:
+                    raise ValueError("unknown instance PR identity or state")
+                for n in chunk:
+                    pull = repo_data[f"p{n}"]
+                    if not isinstance(pull, dict) or set(pull) != {"number", "state", "merged", "url"}:
+                        raise ValueError("unknown instance PR identity or state")
+                    state = pull["state"]
+                    merged = pull["merged"]
+                    if (
+                        type(pull["number"]) is not int or pull["number"] != n
+                        or pull["url"] != f"https://github.com/{gh_repo}/pull/{n}"
+                        or not isinstance(state, str) or state not in {"OPEN", "CLOSED", "MERGED"}
+                        or type(merged) is not bool
+                        or (state == "MERGED") != merged
+                    ):
+                        raise ValueError("unknown instance PR identity or state")
+                    states[n] = (state, merged)
+        return states
+
     baseline_ref = f"refs/heads/{base_ref}"
     if not any(instance["ref"] == baseline_ref for instance in instances):
         raise ValueError("no open triage-branch instance")
-    closed_prs = {}
+    pull_instance_nums = sorted({
+        int(match[1])
+        for instance in instances
+        if (match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]))
+    })
+    pr_states = pull_states(pull_instance_nums) if pull_instance_nums else {}
+    skipped_prs = {}
     for instance in instances:
         if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            endpoint = f"pulls/{match[1]}"
-            pull = closed_prs.get(endpoint) or get(endpoint)
-            if (type(pull.get("number")) is not int or pull["number"] != int(match[1])
-                    or pull.get("html_url") != f"https://github.com/{gh_repo}/pull/{match[1]}"
-                    or pull.get("state") not in {"open", "closed"}
-                    or type(pull.get("merged")) is not bool):
-                raise ValueError("unknown instance PR identity or state")
-            if pull["state"] == "closed" or pull["merged"] is True:
-                closed_prs[endpoint] = pull
+            pr_num = int(match[1])
+            state, merged = pr_states[pr_num]
+            if state in {"CLOSED", "MERGED"} or merged:
+                skipped_prs[pr_num] = (state, merged)
                 continue
         location = instance["location"]
         if (row[2].strip() != f"`{location['path']}:{location['start_line']}`"
@@ -1933,14 +2045,16 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     if (get(f"code-scanning/alerts/{number}") != alert
             or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
             or get(head_endpoint) != head_reference
-            or any(get(endpoint) != pull for endpoint, pull in closed_prs.items())):
+            or (skipped_prs and pull_states(skipped_prs) != skipped_prs)):
         raise ValueError("alert or triage evidence changed during preflight")
     return alert
 
 
-def _publish_code_scanning_dismiss(fields, *, gh_repo, dest, runner, cwd, environment, temp, capture_output, text):
+def _publish_code_scanning_dismiss(
+    fields, *, gh_repo, dest, runner, cwd, environment, temp, capture_output, text, raw_graphql=False,
+):
     try:
-        _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment)
+        _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, temp=temp, raw_graphql=raw_graphql)
     except github_client.GitHubRateLimited:
         raise
     except Exception:
@@ -2434,6 +2548,7 @@ def publish(
             return _publish_code_scanning_dismiss(
                 fields, gh_repo=gh_repo, dest=dest, runner=readiness_runner, cwd=cwd,
                 environment=environment, temp=temp, capture_output=capture_output, text=text,
+                raw_graphql=runner is None,
             )
         if verb in {"code-scanning-analysis-delete", "branch-delete"}:
             return (_publish_analysis_delete if verb == "code-scanning-analysis-delete" else _publish_branch_delete)(

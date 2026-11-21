@@ -363,10 +363,10 @@ def dismissal_transport(monkeypatch, synthetic_opsec):
         "code-scanning/analyses/3": copy.deepcopy(sarif),
     }
     # Stale merge refs may retain older locations after their PRs stop being active.
-    for number, merged in ((3, True), (4, False)):
+    for number, state, merged in ((3, "MERGED", True), (4, "CLOSED", False)):
         documents[f"pulls/{number}"] = {
-            "number": number, "state": "closed", "merged": merged,
-            "html_url": f"https://github.com/unit/public/pull/{number}",
+            "number": number, "state": state, "merged": merged,
+            "url": f"https://github.com/unit/public/pull/{number}",
         }
         stale = copy.deepcopy(instance)
         stale.update(ref=f"refs/pull/{number}/merge", commit_sha="c" * 40)
@@ -376,9 +376,18 @@ def dismissal_transport(monkeypatch, synthetic_opsec):
     options = {"reason": "false positive", "readback": {}, "write_error": None, "read_error": None}
 
     def sender(argv, **kwargs):
+        import re
+
         calls.append(list(argv))
         method = argv[argv.index("--method") + 1]
         endpoint = argv[argv.index("--method") + 2]
+        if method == "POST" and endpoint == "graphql":
+            body = json.loads(Path(argv[argv.index("--input") + 1]).read_text(encoding="utf-8"))
+            assert body["variables"] == {"owner": "unit", "name": "public"}
+            aliases = re.findall(r"(p\d+):\s*pullRequest\(number:(\d+)\)", body["query"])
+            assert 1 <= len(aliases) <= pub._DISMISS_PR_BATCH_SIZE
+            repo_rows = {alias: documents.get(f"pulls/{int(num)}") for alias, num in aliases}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"data": {"repository": repo_rows}}), "")
         assert endpoint.startswith(root)
         if method == "PATCH":
             assert endpoint == root + "code-scanning/alerts/1"
@@ -480,8 +489,8 @@ def test_dismissal_refuses_missing_or_changed_reviewed_evidence(dismissal_transp
         documents["code-scanning/analyses/3"]["runs"][0]["tool"]["driver"]["semanticVersion"] = "2.0.0"
     elif fault == "branch":
         documents["pulls/5"] = {
-            "number": 5, "state": "open", "merged": False,
-            "html_url": "https://github.com/unit/public/pull/5",
+            "number": 5, "state": "OPEN", "merged": False,
+            "url": "https://github.com/unit/public/pull/5",
         }
         instance = dict(documents["code-scanning/alerts/1/instances?per_page=100"][0][0],
                         ref="refs/pull/5/merge", location={"path": "sample.py", "start_line": 8})
@@ -755,6 +764,235 @@ def test_dismissal_refuses_when_paginated_analyses_never_match(dismissal_transpo
         "invalid-category": [1],
     }[mode]
     assert analysis_calls == expected_pages
+
+
+def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reopen_or_bad_graphql(dismissal_transport, tmp_path, monkeypatch):
+    """Defect class: per-PR GET amplification on closed/merged PRs, duplicate same-commit triage fetch, or fail-open on reopened, missing/404, partial, or malformed batched PR state responses."""
+    import copy
+
+    documents, writes, calls, _, sender, comment = dismissal_transport
+    before = "a" * 40
+    main_instance = copy.deepcopy(documents["code-scanning/alerts/1/instances?per_page=100"][0][0])
+    main_instance["commit_sha"] = before
+    documents["git/ref/heads/main"]["object"]["sha"] = before
+
+    def set_pr_instances(count):
+        instances = [copy.deepcopy(main_instance)]
+        for number in range(100, 100 + count):
+            state, merged = ("MERGED", True) if number % 2 == 0 else ("CLOSED", False)
+            documents[f"pulls/{number}"] = {
+                "number": number, "state": state, "merged": merged,
+                "url": f"https://github.com/unit/public/pull/{number}",
+            }
+            stale = copy.deepcopy(main_instance)
+            stale.update(ref=f"refs/pull/{number}/merge", commit_sha="c" * 40)
+            stale["location"]["start_line"] = 8
+            instances.append(stale)
+        documents["code-scanning/alerts/1/instances?per_page=100"] = [instances]
+
+    # 97 closed/merged PRs: 11 preflight REST GETs (+1 post-PATCH readback GET) + 2 GraphQL POSTs = 13 preflight requests.
+    set_pr_instances(97)
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=sender, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0
+    assert len(writes) == 1
+    get_endpoints = [argv[argv.index("--method") + 2] for argv in calls if argv[argv.index("--method") + 1] == "GET"]
+    graphql_calls = [argv for argv in calls if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql"]
+    assert len(get_endpoints) == 12  # 11 preflight GETs + 1 post-PATCH readback GET
+    assert len(graphql_calls) == 2   # 1 loop batch + 1 race re-read batch
+    assert sum(ep.startswith(f"repos/unit/public/contents/{pub._DISMISS_TRIAGE_PATH}?") for ep in get_endpoints) == 1
+    assert not any(ep.startswith("repos/unit/public/pulls/") and ep.split("/")[-1].isdigit() and ep != "repos/unit/public/pulls/2" for ep in get_endpoints)
+
+    # >100 PRs chunk cleanly at _DISMISS_PR_BATCH_SIZE (105 PRs -> 2 chunks x 2 phases = 4 GraphQL POSTs).
+    writes.clear()
+    calls.clear()
+    set_pr_instances(105)
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=sender, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0 and len(writes) == 1
+    assert sum(argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql" for argv in calls) == 4
+
+    # A skipped PR reopening during preflight must fail closed before PATCH.
+    writes.clear()
+    set_pr_instances(2)
+    gql_reads = 0
+
+    def reopened_during_preflight(argv, **kwargs):
+        nonlocal gql_reads
+        if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+            gql_reads += 1
+            if gql_reads == 2:
+                documents["pulls/101"]["state"] = "OPEN"
+        return sender(argv, **kwargs)
+
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=reopened_during_preflight)
+    assert gql_reads == 2 and writes == []
+
+    # Missing/404 PR (null), GraphQL errors (including falsey/empty error envelopes with otherwise valid rows),
+    # missing/non-object data, non-object extensions, unexpected keys, partial/extra alias keys, malformed rows,
+    # and non-zero GraphQL exit must fail closed on both initial read and pre-PATCH recheck.
+    set_pr_instances(2)
+    valid_repo = {"p100": documents["pulls/100"], "p101": documents["pulls/101"]}
+    bad_gql_responses = [
+        (1, "{}"),
+        (0, json.dumps([])),
+        (0, json.dumps({"extensions": {}})),
+        (0, json.dumps({"data": None})),
+        (0, json.dumps({"data": []})),
+        (0, json.dumps({"data": {"repository": valid_repo, "extra": 1}})),
+        (0, json.dumps({"errors": [{"type": "NOT_FOUND"}], "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": [], "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": None, "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": False, "data": {"repository": valid_repo}})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "unexpected": True})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": []})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": None})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": False})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": "invalid"})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": 1})),
+        (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"], "p101": None}}})),
+        (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"], "p101": documents["pulls/101"], "p102": documents["pulls/100"]}}})),
+        (0, json.dumps({"data": {"repository": None}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "extra": 1}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "OPEN", "merged": True}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "CLOSED", "merged": True}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "MERGED", "merged": False}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "closed"}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": []}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "url": "https://github.com/other/public/pull/100"}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "number": 999}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "number": True}, "p101": documents["pulls/101"]}}})),
+    ]
+    for code, payload in bad_gql_responses:
+        def bad_graphql(argv, code=code, payload=payload, **kwargs):
+            if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+                return subprocess.CompletedProcess(argv, code, payload, "")
+            return sender(argv, **kwargs)
+
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=bad_graphql)
+        assert writes == []
+
+    # Wrong-typed extensions on the pre-PATCH recheck also fails closed with zero writes;
+    # a spec-compliant object-valued extensions envelope is accepted.
+    recheck_calls = 0
+
+    def bad_extensions_on_recheck(argv, **kwargs):
+        nonlocal recheck_calls
+        if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+            recheck_calls += 1
+            if recheck_calls == 2:
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"data": {"repository": valid_repo}, "extensions": []}), "",
+                )
+        return sender(argv, **kwargs)
+
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=bad_extensions_on_recheck)
+    assert recheck_calls == 2 and writes == []
+
+    def valid_extensions_object(argv, **kwargs):
+        if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"data": {"repository": valid_repo}, "extensions": {"warnings": []}}), "",
+            )
+        return sender(argv, **kwargs)
+
+    answer = pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=valid_extensions_object, capture_output=True, text=True)
+    assert answer.returncode == 0 and len(writes) == 1
+    writes.clear()
+
+    # Exercise the real GitHubClient raw-response HTTP seam (runner=None) on both initial read and pre-PATCH recheck:
+    # top-level JSON strings, duplicate object members, and non-JSON constants must not be normalized away,
+    # while valid responses succeed and GraphQL rate-limit answers preserve GitHubRateLimited.
+    import re
+
+    real_client_cls = github_client.GitHubClient
+    http_writes = []
+    http_state = {"gql_calls": 0, "phase": None, "override": None}
+
+    def http_transport(method, endpoint, headers, body, timeout):
+        if method == "POST" and endpoint == "graphql":
+            http_state["gql_calls"] += 1
+            if http_state["override"] is not None and http_state["gql_calls"] == http_state["phase"]:
+                return http_state["override"]
+            parsed = json.loads(body.decode("utf-8"))
+            aliases = re.findall(r"(p\d+):\s*pullRequest\(number:(\d+)\)", parsed["query"])
+            repo_rows = {alias: documents.get(f"pulls/{int(num)}") for alias, num in aliases}
+            return github_client.Response(200, {}, json.dumps({"data": {"repository": repo_rows}}).encode("utf-8"))
+        suffix = endpoint.removeprefix("repos/unit/public/")
+        if method == "PATCH":
+            assert suffix == "code-scanning/alerts/1"
+            http_writes.append(body)
+            return github_client.Response(200, {}, b"{}")
+        assert method == "GET"
+        if suffix == "code-scanning/alerts/1" and http_writes:
+            doc = {**documents["code-scanning/alerts/1"], "state": "dismissed", "dismissed_reason": "false positive", "dismissed_comment": comment}
+        elif suffix in {"pulls/2/files?per_page=100", "code-scanning/alerts/1/instances?per_page=100"}:
+            doc = documents[suffix][0]
+        else:
+            doc = documents[suffix]
+        raw_bytes = doc.encode("utf-8") if isinstance(doc, str) else json.dumps(doc).encode("utf-8")
+        return github_client.Response(200, {}, raw_bytes)
+
+    class RawHttpClient(real_client_cls):
+        def __init__(self, **kwargs):
+            kwargs["cache_dir"] = tmp_path / "gh-cache"
+            kwargs["transport"] = http_transport
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(github_client, "GitHubClient", RawHttpClient)
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=None, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0 and len(http_writes) == 1 and http_state["gql_calls"] == 2
+    http_writes.clear()
+
+    valid_repo_json = json.dumps(valid_repo)
+    p100_json = json.dumps(documents["pulls/100"])
+    raw_http_bad_bodies = [
+        json.dumps(json.dumps({"data": {"repository": valid_repo}})).encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":[],"extensions":{}}').encode("utf-8"),
+        ('{"data":{"repository":{"p100":' + p100_json + ',"p101":{"number":101,"state":"OPEN","state":"CLOSED","merged":false,"url":"https://github.com/unit/public/pull/101"}}}}').encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":{"cost":NaN}}').encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":{"cost":Infinity}}').encode("utf-8"),
+        b'\xef\xbb\xbf{"data":{"repository":' + valid_repo_json.encode("utf-8") + b"}}",
+        b"\xff",
+    ]
+    for phase in (1, 2):
+        for raw_body in raw_http_bad_bodies:
+            http_state.update(gql_calls=0, phase=phase, override=github_client.Response(200, {}, raw_body))
+            with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+                pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=None)
+            assert http_state["gql_calls"] == phase and http_writes == []
+
+    # Typed rate-limit handling stays intact across the raw-response GraphQL seam (exit 75, zero writes).
+    http_state.update(
+        gql_calls=0,
+        phase=1,
+        override=github_client.Response(200, {}, json.dumps({"errors": [{"type": "RATE_LIMIT", "message": "API rate limit exceeded"}]}).encode("utf-8")),
+    )
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=None, capture_output=True, text=True,
+    )
+    assert answer.returncode == 75
+    assert json.loads(answer.stdout)["error"] == "github_rate_limited"
+    assert http_state["gql_calls"] == 1 and http_writes == []
+    monkeypatch.setattr(github_client, "GitHubClient", real_client_cls)
+
+    # Zero-page paginated REST response ([]) must also fail closed.
+    documents["pulls/2/files?per_page=100"] = []
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=sender)
+    assert writes == []
 
 
 QUEUE_REF = "refs/heads/gh-readonly-queue/main/pr-7-" + "d" * 40
