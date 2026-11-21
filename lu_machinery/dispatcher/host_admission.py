@@ -5,6 +5,7 @@ The retained admission scanner and ownership ledger read the same hold format.
 """
 
 import contextlib
+import http.client
 import subprocess
 import sys
 import uuid
@@ -69,7 +70,24 @@ def _head(root):
         return None
 
 
-def evaluate(mode, *, sweep, thresholds=None, disk_guard=True):
+def _meter_budget(spec):
+    """Read the existing cache outside the admission lock, for a metered write."""
+    if spec is None or spec.mode not in legacy.WRITE_CAPABLE_MODES:
+        return None, None
+    meter = legacy.subscription_meter(
+        spec.agent, model=spec.model, claude_account=spec.claude_account, codex_account=spec.codex_account,
+    )
+    if meter is None:
+        return None, None
+    from lu_machinery.dispatcher.pool_selector import read_budget
+
+    try:
+        return meter, read_budget()
+    except (OSError, ValueError, http.client.HTTPException):
+        return meter, None
+
+
+def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None):
     """Copy-adapted from delegate._evaluate_dispatch_admission, including v2 liveness.
 
     Disk admission measures, alerts and refuses; it never removes anything. Each task's creator
@@ -79,12 +97,15 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True):
         mode, tasks_dir(), pid_alive=legacy.process_alive,
         record_liveness=lambda record: worker_liveness(record, pid_alive=legacy.process_alive),
         on_dead=heal_dead if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
+        meter=meter, meter_budget=budget,
     )
 
 
 def allows(decision, force_reason):
-    """Force may override host checks, never disk refusal."""
-    return decision.exempt or decision.admitted or (force_reason is not None and not decision.disk_refused)
+    """Force may override host checks, except the disk and subscription meter."""
+    return decision.exempt or decision.admitted or (
+        force_reason is not None and not (decision.disk_refused or decision.meter_refused)
+    )
 
 
 def report(decision, *, force_reason=None):
@@ -113,9 +134,10 @@ def precheck(mode, *, force_reason=None):
         report(decision)
 
 
-def check(mode, *, dry_run, disk_guard, force_reason=None):
+def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None):
     try:
-        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard)
+        meter, budget = _meter_budget(spec)
+        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard, meter=meter, budget=budget)
     except ValueError as exc:
         raise Refused(f"❌ invalid dispatch admission threshold: {exc}", 2) from exc
     report(decision, force_reason=force_reason)
@@ -140,19 +162,23 @@ def check_credit(agent, model, codex_account=None):
 
 
 @contextlib.contextmanager
-def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None):
+def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, spec=None):
     """Publish a creation hold for either mode; release unused setup only when its tree is absent."""
     hold = None
+    meter, budget = _meter_budget(spec)
     try:
         refusal = None
         try:
             with legacy.admission_lock(tasks_dir()):
-                current = evaluate(mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard())
+                current = evaluate(mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard(),
+                                   meter=meter, budget=budget)
                 if allows(current, force_reason):
                     nonce = uuid.uuid4().hex
                     owner = legacy.new_admission_hold(nonce)
                     hold = dict(schema_version=2, task_id=task_id, agent=agent, run_nonce=nonce, status="spawning", pid=None,
                                 mode=mode, started_at=owner["admitted_at"], finished_at=None, admission_hold=owner)
+                    if spec is not None and meter is not None:
+                        hold.update(model=spec.model, claude_account=spec.claude_account, codex_account=spec.codex_account)
                     if not current.exempt:
                         hold["admission"] = current.to_record(force_reason=force_reason)
                     path = store.record_path(task_id)

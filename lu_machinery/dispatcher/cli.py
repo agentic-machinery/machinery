@@ -182,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Bound review access; full needs --full-checkout (default: isolated for bound attempts)")
     dispatch.add_argument(
         "--force-admission", metavar="REASON",
-        help="Override host admission with a recorded non-empty reason; never overrides a full worktree disk (default: off)",
+        help="Override host admission with a recorded non-empty reason, except disk and subscription pacing (default: off)",
     )
     dispatch.add_argument(
         "--task-card", metavar="CARD",
@@ -688,6 +688,7 @@ def _dispatch(args) -> int:
         decision = host_admission.check(
             args.mode, dry_run=args.dry_run, disk_guard=not (args.worktree is not None and (worktree / ".git").exists()),
             force_reason=force_reason,
+            spec=spec,
         )
     if args.dry_run:
         # The real run re-checks child_env after worktree creation in worker.py.
@@ -725,6 +726,7 @@ def _dispatch(args) -> int:
         with admission.record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
             hold = stack.enter_context(host_admission.reserve(
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,
+                spec=spec,
                 disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
             ))
         with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
