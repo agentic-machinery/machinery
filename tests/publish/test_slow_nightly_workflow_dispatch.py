@@ -766,7 +766,7 @@ def test_dismissal_refuses_when_paginated_analyses_never_match(dismissal_transpo
     assert analysis_calls == expected_pages
 
 
-def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reopen_or_bad_graphql(dismissal_transport):
+def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reopen_or_bad_graphql(dismissal_transport, tmp_path, monkeypatch):
     """Defect class: per-PR GET amplification on closed/merged PRs, duplicate same-commit triage fetch, or fail-open on reopened, missing/404, partial, or malformed batched PR state responses."""
     import copy
 
@@ -907,6 +907,86 @@ def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reo
     answer = pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=valid_extensions_object, capture_output=True, text=True)
     assert answer.returncode == 0 and len(writes) == 1
     writes.clear()
+
+    # Exercise the real GitHubClient raw-response HTTP seam (runner=None) on both initial read and pre-PATCH recheck:
+    # top-level JSON strings, duplicate object members, and non-JSON constants must not be normalized away,
+    # while valid responses succeed and GraphQL rate-limit answers preserve GitHubRateLimited.
+    import re
+
+    real_client_cls = github_client.GitHubClient
+    http_writes = []
+    http_state = {"gql_calls": 0, "phase": None, "override": None}
+
+    def http_transport(method, endpoint, headers, body, timeout):
+        if method == "POST" and endpoint == "graphql":
+            http_state["gql_calls"] += 1
+            if http_state["override"] is not None and http_state["gql_calls"] == http_state["phase"]:
+                return http_state["override"]
+            parsed = json.loads(body.decode("utf-8"))
+            aliases = re.findall(r"(p\d+):\s*pullRequest\(number:(\d+)\)", parsed["query"])
+            repo_rows = {alias: documents.get(f"pulls/{int(num)}") for alias, num in aliases}
+            return github_client.Response(200, {}, json.dumps({"data": {"repository": repo_rows}}).encode("utf-8"))
+        suffix = endpoint.removeprefix("repos/unit/public/")
+        if method == "PATCH":
+            assert suffix == "code-scanning/alerts/1"
+            http_writes.append(body)
+            return github_client.Response(200, {}, b"{}")
+        assert method == "GET"
+        if suffix == "code-scanning/alerts/1" and http_writes:
+            doc = {**documents["code-scanning/alerts/1"], "state": "dismissed", "dismissed_reason": "false positive", "dismissed_comment": comment}
+        elif suffix in {"pulls/2/files?per_page=100", "code-scanning/alerts/1/instances?per_page=100"}:
+            doc = documents[suffix][0]
+        else:
+            doc = documents[suffix]
+        raw_bytes = doc.encode("utf-8") if isinstance(doc, str) else json.dumps(doc).encode("utf-8")
+        return github_client.Response(200, {}, raw_bytes)
+
+    class RawHttpClient(real_client_cls):
+        def __init__(self, **kwargs):
+            kwargs["cache_dir"] = tmp_path / "gh-cache"
+            kwargs["transport"] = http_transport
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(github_client, "GitHubClient", RawHttpClient)
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=None, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0 and len(http_writes) == 1 and http_state["gql_calls"] == 2
+    http_writes.clear()
+
+    valid_repo_json = json.dumps(valid_repo)
+    p100_json = json.dumps(documents["pulls/100"])
+    raw_http_bad_bodies = [
+        json.dumps(json.dumps({"data": {"repository": valid_repo}})).encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":[],"extensions":{}}').encode("utf-8"),
+        ('{"data":{"repository":{"p100":' + p100_json + ',"p101":{"number":101,"state":"OPEN","state":"CLOSED","merged":false,"url":"https://github.com/unit/public/pull/101"}}}}').encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":{"cost":NaN}}').encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":{"cost":Infinity}}').encode("utf-8"),
+        b'\xef\xbb\xbf{"data":{"repository":' + valid_repo_json.encode("utf-8") + b"}}",
+        b"\xff",
+    ]
+    for phase in (1, 2):
+        for raw_body in raw_http_bad_bodies:
+            http_state.update(gql_calls=0, phase=phase, override=github_client.Response(200, {}, raw_body))
+            with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+                pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=None)
+            assert http_state["gql_calls"] == phase and http_writes == []
+
+    # Typed rate-limit handling stays intact across the raw-response GraphQL seam (exit 75, zero writes).
+    http_state.update(
+        gql_calls=0,
+        phase=1,
+        override=github_client.Response(200, {}, json.dumps({"errors": [{"type": "RATE_LIMIT", "message": "API rate limit exceeded"}]}).encode("utf-8")),
+    )
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=None, capture_output=True, text=True,
+    )
+    assert answer.returncode == 75
+    assert json.loads(answer.stdout)["error"] == "github_rate_limited"
+    assert http_state["gql_calls"] == 1 and http_writes == []
+    monkeypatch.setattr(github_client, "GitHubClient", real_client_cls)
 
     # Zero-page paginated REST response ([]) must also fail closed.
     documents["pulls/2/files?per_page=100"] = []

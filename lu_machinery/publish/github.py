@@ -1764,7 +1764,7 @@ def _dismiss_sarif_result(document, number):
     return matches[0]
 
 
-def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=None):
+def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=None, raw_graphql=False):
     comment, number = fields["comment"], fields["number"]
     # Require an explanation in addition to an exact alert identifier and PR URL.
     identifier = rf"(?i)\balert\s+#{number}\b"
@@ -1907,29 +1907,78 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
         return results[aid]
 
     def pull_states(pr_numbers):
+        def strict_pairs(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError("duplicate JSON object member")
+                obj[key] = value
+            return obj
+
+        def reject_constant(token):
+            raise ValueError(f"invalid JSON constant: {token}")
+
         owner, repo_name = gh_repo.split("/", 1)
         ordered = sorted(set(pr_numbers))
         states = {}
+        client = (
+            github_client.GitHubClient(
+                env={**gate.internal_environment(environment), "GH_HOST": dest.partition("/")[0]},
+                cwd=cwd,
+            )
+            if raw_graphql
+            else None
+        )
         with (
-            contextlib.nullcontext(temp)
-            if temp is not None
-            else tempfile.TemporaryDirectory(prefix="lu-dismiss-prs-", dir=ensure_scratch_root())
+            contextlib.nullcontext(None)
+            if raw_graphql
+            else (
+                contextlib.nullcontext(temp)
+                if temp is not None
+                else tempfile.TemporaryDirectory(prefix="lu-dismiss-prs-", dir=ensure_scratch_root())
+            )
         ) as query_dir:
-            query_file = Path(query_dir) / "dismiss-pulls.json"
+            query_file = None if query_dir is None else Path(query_dir) / "dismiss-pulls.json"
             for start in range(0, len(ordered), _DISMISS_PR_BATCH_SIZE):
                 chunk = ordered[start:start + _DISMISS_PR_BATCH_SIZE]
                 aliases = " ".join(f"p{n}: pullRequest(number:{n}){{number state merged url}}" for n in chunk)
                 query = f"query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{aliases}}}}}"
-                query_file.write_bytes(
-                    json.dumps({"query": query, "variables": {"owner": owner, "name": repo_name}}).encode("utf-8")
+                payload = json.dumps({"query": query, "variables": {"owner": owner, "name": repo_name}}).encode("utf-8")
+                if client is not None:
+                    observation = client.request(
+                        "POST", "graphql", payload=payload, timeout=30, fresh=True, raw_response=True,
+                    )
+                    if observation.stale:
+                        raise github_client.GitHubRateLimited(observation.reset_at, observation.reason)
+                    refusal = github_client.refusal_of(observation)
+                    if refusal is not None:
+                        raise refusal
+                    if observation.error or observation.status != 200 or not isinstance(observation.value, (bytes, bytearray)):
+                        raise ValueError("dismissal PR evidence unavailable")
+                    raw_body = bytes(observation.value).decode("utf-8")
+                else:
+                    if query_file is None:
+                        raise ValueError("dismissal PR evidence unavailable")
+                    query_file.write_bytes(payload)
+                    result = runner(
+                        ["gh", "api", "--method", "POST", "graphql", "--input", str(query_file), *_hostname_flag(dest)],
+                        cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=30,
+                    )
+                    if result.returncode:
+                        raise ValueError("dismissal PR evidence unavailable")
+                    raw_body = (
+                        bytes(result.stdout).decode("utf-8")
+                        if isinstance(result.stdout, (bytes, bytearray))
+                        else result.stdout
+                    )
+                if not isinstance(raw_body, str):
+                    raise ValueError("unknown instance PR identity or state")
+                document = json_depth.loads(
+                    raw_body,
+                    max_depth=512,
+                    object_pairs_hook=strict_pairs,
+                    parse_constant=reject_constant,
                 )
-                result = runner(
-                    ["gh", "api", "--method", "POST", "graphql", "--input", str(query_file), *_hostname_flag(dest)],
-                    cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=30,
-                )
-                if result.returncode:
-                    raise ValueError("dismissal PR evidence unavailable")
-                document = json_depth.loads(result.stdout, max_depth=512)
                 if (
                     not isinstance(document, dict)
                     or "errors" in document
@@ -2001,9 +2050,11 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     return alert
 
 
-def _publish_code_scanning_dismiss(fields, *, gh_repo, dest, runner, cwd, environment, temp, capture_output, text):
+def _publish_code_scanning_dismiss(
+    fields, *, gh_repo, dest, runner, cwd, environment, temp, capture_output, text, raw_graphql=False,
+):
     try:
-        _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, temp=temp)
+        _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, temp=temp, raw_graphql=raw_graphql)
     except github_client.GitHubRateLimited:
         raise
     except Exception:
@@ -2497,6 +2548,7 @@ def publish(
             return _publish_code_scanning_dismiss(
                 fields, gh_repo=gh_repo, dest=dest, runner=readiness_runner, cwd=cwd,
                 environment=environment, temp=temp, capture_output=capture_output, text=text,
+                raw_graphql=runner is None,
             )
         if verb in {"code-scanning-analysis-delete", "branch-delete"}:
             return (_publish_analysis_delete if verb == "code-scanning-analysis-delete" else _publish_branch_delete)(
