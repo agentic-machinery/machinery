@@ -697,13 +697,17 @@ def test_dismissal_paginates_analyses_until_match_on_page_n(dismissal_transport)
     assert len(writes) == 1
 
 
-@pytest.mark.parametrize("mode", ["bound", "older-than-commit", "timeout"])
+@pytest.mark.parametrize("mode", [
+    "bound", "older-than-commit", "timeout",
+    "missing-commit-sha", "invalid-commit-sha", "missing-analysis-key", "invalid-environment", "invalid-category",
+])
 def test_dismissal_refuses_when_paginated_analyses_never_match(dismissal_transport, mode):
-    """Defect class: unbounded pagination or fail-open when analyses never match, pass the commit time, or time out."""
+    """Defect class: unbounded pagination or fail-open when analyses never match, pass the commit time, time out, or carry malformed identity fields."""
     documents, writes, _, _, sender, comment = dismissal_transport
     if mode == "older-than-commit":
         documents["pulls/2"]["merged_at"] = "2026-11-21T01:00:00Z"
     prefix = "repos/unit/public/code-scanning/analyses?ref=refs%2Fheads%2Fmain&per_page=100&page="
+    valid_rows = documents["code-scanning/analyses?ref=refs%2Fheads%2Fmain&per_page=100&page=1"]
     analysis_calls = []
 
     def never_matches(argv, **kwargs):
@@ -715,6 +719,19 @@ def test_dismissal_refuses_when_paginated_analyses_never_match(dismissal_transpo
             analysis_calls.append(page_num)
             if mode == "timeout" and page_num == 2:
                 raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 30))
+            if mode in {"missing-commit-sha", "invalid-commit-sha", "missing-analysis-key", "invalid-environment", "invalid-category"}:
+                bad = {"id": 99, "commit_sha": "f" * 40, "analysis_key": "codeql", "environment": "{}", "category": "python", "error": ""}
+                if mode == "missing-commit-sha":
+                    bad.pop("commit_sha")
+                elif mode == "invalid-commit-sha":
+                    bad["commit_sha"] = "not-a-sha"
+                elif mode == "missing-analysis-key":
+                    bad.pop("analysis_key")
+                elif mode == "invalid-environment":
+                    bad["environment"] = None
+                else:
+                    bad["category"] = 123
+                return subprocess.CompletedProcess(argv, 0, json.dumps([bad, *valid_rows]), "")
             row = {
                 "id": 100 + page_num, "commit_sha": "f" * 40,
                 "analysis_key": "codeql", "environment": "{}", "category": "python", "error": "",
@@ -731,6 +748,11 @@ def test_dismissal_refuses_when_paginated_analyses_never_match(dismissal_transpo
         "bound": list(range(1, pub._DISMISS_ANALYSIS_MAX_PAGES + 1)),
         "older-than-commit": [1],
         "timeout": [1, 2],
+        "missing-commit-sha": [1],
+        "invalid-commit-sha": [1],
+        "missing-analysis-key": [1],
+        "invalid-environment": [1],
+        "invalid-category": [1],
     }[mode]
     assert analysis_calls == expected_pages
 

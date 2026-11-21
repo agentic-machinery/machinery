@@ -1850,7 +1850,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     def match_analysis(rows, sha, instance):
         for analysis in rows:
             if (
-                analysis.get("commit_sha") == sha
+                analysis["commit_sha"] == sha
                 and all(analysis.get(key) == instance.get(key) for key in ("analysis_key", "environment", "category"))
             ):
                 return analysis
@@ -1876,6 +1876,15 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
                 state["exhausted"] = True
                 break
             for item in page:
+                row_sha = item.get("commit_sha")
+                if (
+                    not isinstance(row_sha, str)
+                    or not re.fullmatch(PATTERNS["sha"], row_sha)
+                    or not isinstance(item.get("analysis_key"), str)
+                    or not isinstance(item.get("environment"), str)
+                    or ("category" in item and item["category"] is not None and not isinstance(item["category"], str))
+                ):
+                    raise ValueError("invalid analysis identity")
                 if "created_at" in item:
                     created = _parse_utc_timestamp(item["created_at"])
                     if state["oldest_created_at"] is None or created < state["oldest_created_at"]:
