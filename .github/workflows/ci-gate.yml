@@ -119,9 +119,6 @@ env:
   TRUFFLEHOG_VERSION: "3.99.0"
   TRUFFLEHOG_RELEASE_ASSET_ID: "616256576"
   TRUFFLEHOG_LINUX_AMD64_SHA256: e35ae3fd1e4b7a0c1699d0fda1814282bf906d03379bd4337b092b3a84c6740b
-  TRIVY_VERSION: "0.76.2"
-  TRIVY_RELEASE_ASSET_ID: "713401165"
-  TRIVY_LINUX_64BIT_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
   SEMGREP_VERSION: "1.183.0"
   SEMGREP_RULES_COMMIT: 16b9e6d45f10649f6a531ec4838ed9924372c3bc
 
@@ -288,18 +285,6 @@ jobs:
           asset-id: ${{ env.ZIZMOR_RELEASE_ASSET_ID }}
           token: ${{ github.token }}
           member: zizmor
-
-      - name: Restore verified Trivy
-        if: steps.match.outputs.run_id != ''
-        uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
-        with:
-          tool: trivy
-          version: ${{ env.TRIVY_VERSION }}
-          sha256: ${{ env.TRIVY_LINUX_64BIT_SHA256 }}
-          repository: aquasecurity/trivy
-          asset-id: ${{ env.TRIVY_RELEASE_ASSET_ID }}
-          token: ${{ github.token }}
-          member: trivy
 
       - name: Record reused CI Gate proof
         id: proof

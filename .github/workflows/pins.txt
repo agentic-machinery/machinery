@@ -64,9 +64,11 @@ SEMGREP_RULES_COMMIT=16b9e6d45f10649f6a531ec4838ed9924372c3bc
 #   permits scanning one's own code.
 SEMGREP_CONFIGS=python/lang python/correctness python/jinja2 python/jwt python/requests python/sh generic/secrets bash/lang yaml/github-actions yaml/kubernetes
 
-# Release archives use GitHub's official asset API and application/octet-stream,
-# with the read-only job token. IDs above/below identify the same versioned assets;
-# archive SHA-256 verification remains mandatory before extraction, even on hits.
+# Release archives in cached-release-tool use GitHub's official asset API with
+# the read-only job token. fleet-security.yml downloads public GitHub release
+# archives directly over HTTPS without sending github.token (avoiding 403
+# integration refusals on external org release assets such as aquasecurity/trivy).
+# Archive SHA-256 verification remains mandatory before extraction, even on cache hits.
 # https://docs.github.com/en/rest/releases/assets#get-a-release-asset
 
 # GitHub actions used by the workflow

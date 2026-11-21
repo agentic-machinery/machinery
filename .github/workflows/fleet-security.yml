@@ -198,19 +198,14 @@ permissions: {}
 # Upstream evidence lives in .github/workflows/pins.txt; bump them together.
 env:
   ACTIONLINT_VERSION: "1.7.12"
-  ACTIONLINT_RELEASE_ASSET_ID: "384924896"
   ACTIONLINT_LINUX_AMD64_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
   SHELLCHECK_VERSION: "0.11.0"
-  SHELLCHECK_RELEASE_ASSET_ID: "336391469"
   SHELLCHECK_LINUX_X86_64_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
   ZIZMOR_VERSION: "1.31.1"
-  ZIZMOR_RELEASE_ASSET_ID: "645467284"
   ZIZMOR_LINUX_X86_64_SHA256: d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99
   TRUFFLEHOG_VERSION: "3.99.0"
-  TRUFFLEHOG_RELEASE_ASSET_ID: "616256576"
   TRUFFLEHOG_LINUX_AMD64_SHA256: e35ae3fd1e4b7a0c1699d0fda1814282bf906d03379bd4337b092b3a84c6740b
   TRIVY_VERSION: "0.76.2"
-  TRIVY_RELEASE_ASSET_ID: "713401165"
   TRIVY_LINUX_64BIT_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
   TRIVY_DB_REPOSITORY: "mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
   TRIVY_CHECKS_BUNDLE_DIGEST: "sha256:b591e9190cff4aa4e385b1a25bccfd9ecf178d3c77fd194e1410b7ce7e1df058"
@@ -240,19 +235,15 @@ jobs:
 
       - name: Download actionlint archive on cache miss
         if: steps.cache-actionlint.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-cache/actionlint/archive.tar.gz"
           mkdir -p "$(dirname "$archive")"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 30 --retry-all-errors --retry-delay 10 --retry-max-time 300 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
             --connect-timeout 20 --max-time 60 \
-            --header 'Accept: application/octet-stream' \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --output "$archive" \
-            "https://api.github.com/repos/rhysd/actionlint/releases/assets/${ACTIONLINT_RELEASE_ASSET_ID}"
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
 
       - name: Verify and extract actionlint
         run: |
@@ -284,19 +275,15 @@ jobs:
 
       - name: Download ShellCheck archive on cache miss
         if: steps.cache-shellcheck.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-cache/shellcheck/archive.tar.gz"
           mkdir -p "$(dirname "$archive")"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 30 --retry-all-errors --retry-delay 10 --retry-max-time 300 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
             --connect-timeout 20 --max-time 60 \
-            --header 'Accept: application/octet-stream' \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --output "$archive" \
-            "https://api.github.com/repos/koalaman/shellcheck/releases/assets/${SHELLCHECK_RELEASE_ASSET_ID}"
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
 
       - name: Verify and extract ShellCheck
         run: |
@@ -348,6 +335,16 @@ jobs:
 
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
 
           def emit(receipt: dict, rc: int) -> None:
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -436,10 +433,10 @@ jobs:
               if not isinstance(item, dict):
                   continue
               fp = clean_log(item.get("filepath", "?"))
-              line = item.get("line", 0)
-              col = item.get("column", 0)
+              line = int_or_zero(item.get("line", 0))
+              col = int_or_zero(item.get("column", 0))
               kind = clean_log(item.get("kind", "unknown"))
-              print(f"::error file={fp},line={line},col={col}::actionlint [{kind}] at {fp}:{line}:{col}")
+              print(f"::error file={esc_prop(fp)},line={line},col={col}::actionlint [{kind}] at {fp}:{line}:{col}")
           status = "clean" if not findings and proc.returncode == 0 else "finding"
           emit(
               {
@@ -482,19 +479,15 @@ jobs:
 
       - name: Download ShellCheck archive on cache miss
         if: steps.cache-shellcheck.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-cache/shellcheck/archive.tar.gz"
           mkdir -p "$(dirname "$archive")"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 30 --retry-all-errors --retry-delay 10 --retry-max-time 300 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
             --connect-timeout 20 --max-time 60 \
-            --header 'Accept: application/octet-stream' \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --output "$archive" \
-            "https://api.github.com/repos/koalaman/shellcheck/releases/assets/${SHELLCHECK_RELEASE_ASSET_ID}"
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
 
       - name: Verify and extract ShellCheck
         run: |
@@ -547,6 +540,16 @@ jobs:
 
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
 
           def emit(receipt: dict, rc: int) -> None:
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -682,11 +685,11 @@ jobs:
                   if not isinstance(c, dict):
                       continue
                   fp = clean_log(c.get("file", "?"))
-                  line = c.get("line", 0)
-                  col = c.get("column", 0)
+                  line = int_or_zero(c.get("line", 0))
+                  col = int_or_zero(c.get("column", 0))
                   level = clean_log(c.get("level", "unknown"))
                   code = clean_log(c.get("code", "?"))
-                  print(f"::error file={fp},line={line},col={col}::ShellCheck SC{code} ({level}) at {fp}:{line}:{col}")
+                  print(f"::error file={esc_prop(fp)},line={line},col={col}::ShellCheck SC{code} ({level}) at {fp}:{line}:{col}")
               t_status = "clean" if proc.returncode == 0 and not comments else "finding"
               if t_status != "clean":
                   failed = True
@@ -730,19 +733,15 @@ jobs:
 
       - name: Download zizmor archive on cache miss
         if: steps.cache-zizmor.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-cache/zizmor/archive.tar.gz"
           mkdir -p "$(dirname "$archive")"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 30 --retry-all-errors --retry-delay 10 --retry-max-time 300 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
             --connect-timeout 20 --max-time 60 \
-            --header 'Accept: application/octet-stream' \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --output "$archive" \
-            "https://api.github.com/repos/zizmorcore/zizmor/releases/assets/${ZIZMOR_RELEASE_ASSET_ID}"
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
 
       - name: Verify and extract zizmor
         run: |
@@ -791,6 +790,16 @@ jobs:
 
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
 
           def emit(receipt: dict, rc: int) -> None:
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -912,7 +921,7 @@ jobs:
                       local = sym.get("Local")
                       if isinstance(local, dict) and isinstance(local.get("verbatim_path"), str):
                           fp = clean_log(local["verbatim_path"])
-              print(f"::error file={fp}::zizmor {ident} severity={sev} confidence={conf} at {fp}")
+              print(f"::error file={esc_prop(fp)}::zizmor {ident} severity={sev} confidence={conf} at {fp}")
           status = "clean" if proc.returncode == 0 and not findings else "finding"
           emit(
               {
@@ -955,19 +964,15 @@ jobs:
 
       - name: Download TruffleHog archive on cache miss
         if: steps.cache-trufflehog.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-cache/trufflehog/archive.tar.gz"
           mkdir -p "$(dirname "$archive")"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 30 --retry-all-errors --retry-delay 10 --retry-max-time 300 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
             --connect-timeout 20 --max-time 60 \
-            --header 'Accept: application/octet-stream' \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --output "$archive" \
-            "https://api.github.com/repos/trufflesecurity/trufflehog/releases/assets/${TRUFFLEHOG_RELEASE_ASSET_ID}"
+            "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
 
       - name: Verify and extract TruffleHog
         run: |
@@ -1272,19 +1277,15 @@ jobs:
 
       - name: Download Trivy archive on cache miss
         if: steps.cache-trivy.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
           mkdir -p "$(dirname "$archive")"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 30 --retry-all-errors --retry-delay 10 --retry-max-time 300 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
             --connect-timeout 20 --max-time 60 \
-            --header 'Accept: application/octet-stream' \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --output "$archive" \
-            "https://api.github.com/repos/aquasecurity/trivy/releases/assets/${TRIVY_RELEASE_ASSET_ID}"
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
 
       - name: Verify and extract Trivy
         run: |
@@ -1343,6 +1344,16 @@ jobs:
 
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
 
           def emit(receipt: dict, rc: int) -> None:
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -1417,6 +1428,7 @@ jobs:
                   db_proc = subprocess.run(
                       [
                           trivy, "fs", "--download-db-only",
+                          "--config", "",
                           "--cache-dir", str(work / "cache"),
                           "--db-repository", db_repo,
                           "--disable-telemetry", "--skip-version-check", "--quiet", "--no-progress",
@@ -1453,6 +1465,7 @@ jobs:
               err_log = work / f"target-{idx}.stderr.log"
               cmd = [
                   trivy, "fs",
+                  "--config", "",
                   "--cache-dir", str(work / "cache"),
                   "--disable-telemetry", "--skip-version-check", "--quiet", "--no-progress",
                   "--scanners", ",".join(scanners),
@@ -1614,19 +1627,15 @@ jobs:
 
       - name: Download Trivy archive on cache miss
         if: steps.cache-trivy.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
           mkdir -p "$(dirname "$archive")"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 30 --retry-all-errors --retry-delay 10 --retry-max-time 300 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
             --connect-timeout 20 --max-time 60 \
-            --header 'Accept: application/octet-stream' \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --output "$archive" \
-            "https://api.github.com/repos/aquasecurity/trivy/releases/assets/${TRIVY_RELEASE_ASSET_ID}"
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
 
       - name: Verify and extract Trivy
         run: |
@@ -1683,6 +1692,16 @@ jobs:
 
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
 
           def emit(receipt: dict, rc: int) -> None:
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -1776,6 +1795,7 @@ jobs:
               err_log = work / f"iac-{idx}.stderr.log"
               cmd = [
                   trivy, "config",
+                  "--config", "",
                   "--cache-dir", str(work / "cache"),
                   "--checks-bundle-repository", checks_repo,
                   "--disable-telemetry", "--skip-version-check", "--quiet",
@@ -1844,9 +1864,9 @@ jobs:
                       mid = clean_log(m.get("ID", "?"))
                       sev = clean_log(m.get("Severity", "?"))
                       cause = m.get("CauseMetadata") if isinstance(m.get("CauseMetadata"), dict) else {}
-                      line = cause.get("StartLine", 0)
+                      line = int_or_zero(cause.get("StartLine", 0))
                       # Redacted diagnostics: rule ID, severity, target path and line only (never Code.Lines).
-                      print(f"::error file={r_target},line={line}::Trivy IaC {mid} ({sev}) at {r_target}:{line}")
+                      print(f"::error file={esc_prop(r_target)},line={line}::Trivy IaC {mid} ({sev}) at {r_target}:{line}")
 
               if configs == 0:
                   print(f"::error::trivy config detected zero config files for '{raw_target}'; failing closed")
@@ -1906,19 +1926,15 @@ jobs:
 
       - name: Download Trivy archive on cache miss
         if: steps.cache-trivy.outputs.cache-hit != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
           mkdir -p "$(dirname "$archive")"
           curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-            --retry 30 --retry-all-errors --retry-delay 10 --retry-max-time 300 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
             --connect-timeout 20 --max-time 60 \
-            --header 'Accept: application/octet-stream' \
-            --header "Authorization: Bearer $GH_TOKEN" \
             --output "$archive" \
-            "https://api.github.com/repos/aquasecurity/trivy/releases/assets/${TRIVY_RELEASE_ASSET_ID}"
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
 
       - name: Verify and extract Trivy
         run: |
@@ -1974,6 +1990,16 @@ jobs:
 
           def clean_log(val: object) -> str:
               return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
 
           def emit(receipt: dict, rc: int) -> None:
               encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -2047,6 +2073,7 @@ jobs:
                   db_proc = subprocess.run(
                       [
                           trivy, "image", "--download-db-only",
+                          "--config", "",
                           "--cache-dir", str(work / "cache"),
                           "--db-repository", db_repo,
                           "--disable-telemetry", "--skip-version-check", "--quiet", "--no-progress",
@@ -2144,6 +2171,7 @@ jobs:
                   err_log = work / f"image-{idx}.stderr.log"
                   cmd = [
                       trivy, "image",
+                      "--config", "",
                       "--cache-dir", str(work / "cache"),
                       "--disable-telemetry", "--skip-version-check", "--quiet", "--no-progress",
                       "--scanners", ",".join(scanners),
