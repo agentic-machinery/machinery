@@ -4102,6 +4102,21 @@ def _validate_catalog_model(
         raise InterAgentTransportError(f"ACP participant {participant!r} refuses {refusal}")
 
 
+def validate_inter_agent_effort(participant: str, effort: str | None) -> str | None:
+    """Validate the effort for a resolved ACP participant and return its registered pin."""
+    pinned_effort = ACPX_PARTICIPANT_EFFORTS.get(participant)
+    if effort is not None and effort != pinned_effort:
+        if pinned_effort is None:
+            raise InterAgentTransportError(
+                f"ACP participant {participant!r} supported effort values: default (omit --effort); "
+                "the ACPX one-shot exec interface has no reasoning-effort flag"
+            )
+        raise InterAgentTransportError(
+            f"ACP participant {participant!r} only supports its registered effort pin {pinned_effort!r}; got {effort!r}"
+        )
+    return pinned_effort
+
+
 def resolve_inter_agent_route(
     agent: str,
     *,
@@ -4151,22 +4166,12 @@ def resolve_inter_agent_route(
     else:
         _validate_catalog_model(participant=participant, model=pinned_model)
 
-    pinned_effort = ACPX_PARTICIPANT_EFFORTS.get(participant)
-    if effort is not None and effort != pinned_effort:
-        if pinned_effort is None:
-            raise InterAgentTransportError(
-                f"ACP participant {participant!r} supported effort values: default (omit --effort); "
-                "the ACPX one-shot exec interface has no reasoning-effort flag"
-            )
-        raise InterAgentTransportError(
-            f"ACP participant {participant!r} only supports its registered effort pin {pinned_effort!r}; got {effort!r}"
-        )
     return InterAgentRoute(
         participant=participant,
         seat=seat,
         target_agent=target_agent,
         model=selected_model,
-        effort=pinned_effort,
+        effort=validate_inter_agent_effort(participant, effort),
     )
 
 

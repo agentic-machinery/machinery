@@ -24,7 +24,6 @@ from unittest.mock import Mock
 
 import pytest
 
-
 from lu_machinery.agent_runtime.adapters.acpx import AcpxAdapter
 from lu_machinery.agent_runtime.errors import RateLimitedError
 from lu_machinery.agent_runtime.result import ParseResult, Result
@@ -404,16 +403,17 @@ def test_quota_substitution_drops_explicit_model_and_effort_overrides(
     invoke = _wire(
         monkeypatch,
         authority,
-        {"codex": _capacity_result("codex"), "cursor": _ok_result("cursor")},
+        {"claude": _capacity_result("claude"), "codex": _ok_result("codex")},
         tmp_path=tmp_path,
     )
 
     result = _acp_compat._run_compat_ask_impl(
-        "codex", "question", task_id="quota-sub-overrides", model="gpt-6.1-sol", effort="high"
+        "claude", "question", task_id="quota-sub-overrides", model="claude-opus-5-5", effort="high"
     )
 
     assert result.ok is True
-    assert invoke.call_args_list[0].kwargs["model"] == "gpt-6.1-sol"
+    assert [call.args[0] for call in invoke.call_args_list] == ["claude", "codex"]
+    assert invoke.call_args_list[0].kwargs["model"] == "claude-opus-5-5"
     assert invoke.call_args_list[0].kwargs["effort"] == "high"
     # Pins are per-seat: the substitute runs on its registered pin.
     assert invoke.call_args_list[1].kwargs["model"] is None
