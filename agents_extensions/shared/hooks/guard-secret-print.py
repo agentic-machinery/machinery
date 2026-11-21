@@ -465,9 +465,9 @@ def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
 
     The non-POSIX lexer honours a quote only at the start of a token, so after an
     unquoted `\\'` (as in `'it'\\''s'`) it reads the reopening quote as a plain
-    character and every later quote inverted. An escaped quote becomes a quoted
-    marker instead: its closing quote ends the lexer token, so the next quote
-    opens one again.
+    character and every later quote inverted. An escaped quote before a quote
+    becomes a quoted marker instead: its closing quote ends the lexer token, so
+    the next quote opens one again.
     """
     substitutions = {start: end for start, end, _ in _substitution_spans(command)}
     parameters: dict[str, str] = {}
@@ -491,7 +491,9 @@ def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
         char = command[i]
         if char == "\\" and quote != "'" and i + 1 < len(command):
             if not quote and command[i + 1] in {"'", '"'}:
-                protect(command[i : i + 2], wrap="'")
+                # Only a reopening quote needs a lexer word boundary; adjacent
+                # unquoted text stays in the escaped quote's word.
+                protect(command[i : i + 2], wrap="'" if command[i + 2 : i + 3] in {"'", '"'} else "")
             else:
                 out.append(command[i : i + 2])
             i += 2
