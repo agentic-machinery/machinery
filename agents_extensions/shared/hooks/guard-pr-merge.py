@@ -134,7 +134,7 @@ try:
 except ImportError:
     # An installed release older than this hook lacks the helper: read every
     # body as before, which can only refuse more.
-    def drop_literal_cat_bodies(command: str, directories: object = ()) -> str:
+    def drop_literal_cat_bodies(command: str, directories: object = (), resolve: object = None) -> str:
         return command
 try:
     from lu_machinery.common import json_depth as json_depth
@@ -1778,7 +1778,7 @@ def main() -> int:
         payload.get("working_directory"),
         os.getcwd(),
     )
-    command = drop_literal_cat_bodies(raw, directories).strip()
+    command = drop_literal_cat_bodies(raw, directories, os.path.realpath).strip()
     if not _merge_candidate(raw):
         return 0
     # Each segment arrives carrying the cwd it runs in, so a PR number is judged in the

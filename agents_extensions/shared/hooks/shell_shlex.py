@@ -708,19 +708,27 @@ def _directories_after(directories: list[str] | None, item: list[tuple[str, str]
     return [*directories, operand] if operand.startswith("/") and "$" not in operand else None
 
 
-def _live_target(word: str, directories: list[str] | None) -> bool:
+def _live_target(word: str, directories: list[str] | None, resolve: Callable[[str], str]) -> bool:
     """Whether a `cat` target's static spelling may name a stream, not a file.
 
     A target spelled with `$NAME` or `~` is the script-file residual (owner
     claude-cto): its value is not known here. A relative target is checked in
-    every directory `cat` may start in, and refused when none is known.
+    every directory `cat` may start in, and refused when none is known. Each
+    path is checked as spelled and as ``resolve`` returns it, so a symbolic
+    link to a device directory counts as that directory.
     """
     path = word.replace("'", "").replace('"', "")
     if _device_path(path):
         return True
-    if "$" in path or path.startswith(("~", "/")):
+    if "$" in path or path.startswith("~"):
         return False
-    return directories is None or any(_device_path(f"{directory}/{path}") for directory in directories)
+    if path.startswith("/"):
+        paths = [path]
+    elif directories is None:
+        return True
+    else:
+        paths = [f"{directory}/{path}" for directory in directories]
+    return any(_device_path(candidate) or _device_path(resolve(candidate)) for candidate in paths)
 
 
 def _setup_item(item: list[tuple[str, str]]) -> bool:
@@ -736,7 +744,9 @@ def _setup_item(item: list[tuple[str, str]]) -> bool:
     return len(words) == 1 and end is not None and end <= _SETUP_NAME_MAX and words[0][end : end + 1] == "="
 
 
-def _cat_document(item: list[tuple[str, str]], directories: list[str] | None) -> tuple[str, str] | None:
+def _cat_document(
+    item: list[tuple[str, str]], directories: list[str] | None, resolve: Callable[[str], str]
+) -> tuple[str, str] | None:
     """(operator, delimiter) of `cat [>|>> WORD] <<'ID'`, in any order, else None."""
     if item[:1] != [("word", "cat")]:
         return None
@@ -744,12 +754,14 @@ def _cat_document(item: list[tuple[str, str]], directories: list[str] | None) ->
     outputs = [token for token in item[1:] if token[0] in (">", ">>")]
     if len(documents) != 1 or len(outputs) > 1 or len(documents) + len(outputs) != len(item) - 1:
         return None
-    if outputs and _live_target(outputs[0][1], directories):
+    if outputs and _live_target(outputs[0][1], directories, resolve):
         return None
     return documents[0]
 
 
-def drop_literal_cat_bodies(command: str, directories: Iterable[object] = ()) -> str:
+def drop_literal_cat_bodies(
+    command: str, directories: Iterable[object] = (), resolve: Callable[[str], str] = str
+) -> str:
     """Drop the bodies Bash certainly hands, unread, to a top-level `cat` (C-6323).
 
     Only the leading lines of ``command`` are read, and only while each one is
@@ -771,8 +783,11 @@ def drop_literal_cat_bodies(command: str, directories: Iterable[object] = ()) ->
     ``directories`` are the directories the command may start in (the hook
     payload's and the hook's own working directories). A `cd` operand or
     `cat` target that may name a stream rather than a file (a `dev` or `proc`
-    path component, also reached through these directories or a `cd`) keeps
-    the command as it was.
+    path component, also reached through these directories, a `cd`, or a
+    symbolic link that ``resolve`` follows; the hooks pass os.path.realpath)
+    keeps the command as it was. So does any other here-document operator
+    (`<<`) left in the rest of the command: the guards' readers of it may
+    depend on words in the dropped bodies.
     """
     if "<<" not in command or "\r" in command or "\0" in command:
         return command
@@ -794,7 +809,7 @@ def drop_literal_cat_bodies(command: str, directories: Iterable[object] = ()) ->
             kept.append(lines[index])
             index += 1
             continue
-        document = _cat_document(items[-1], current)
+        document = _cat_document(items[-1], current, resolve)
         if document is None:
             break
         operator, closer = document
@@ -806,7 +821,9 @@ def drop_literal_cat_bodies(command: str, directories: Iterable[object] = ()) ->
         kept.extend((lines[index], lines[end]))
         index = end + 1
         dropped = True
-    return "\n".join(kept + lines[index:]) if dropped else command
+    if not dropped or "<<" in "\n".join(lines[index:]):
+        return command
+    return "\n".join(kept + lines[index:])
 
 
 def split_quote_preserving(command: str, *, punctuation_chars: str | bool, whitespace: str) -> list[str]:

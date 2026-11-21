@@ -112,11 +112,11 @@ _CAT_FORM_ROWS = [
         ),
         (f'cat <<-"EOF" >>${{T}}/b\n\t{_PROSE}\n\tEOF', 'cat <<-"EOF" >>${T}/b\n\tEOF'),
         (f"cat >'b.md'<<'A'\n{_PROSE}\nA\n\ncat <<'B'\n{_MERGE}\nB", "cat >'b.md'<<'A'\nA\n\ncat <<'B'\nB"),
-        # The head ends at the first other command; a later body is read as before.
-        (
-            f"cat > a <<'A'\nx\nA\nalias cat=bash\ncat <<'B'\n{_MERGE}\nB",
-            f"cat > a <<'A'\nA\nalias cat=bash\ncat <<'B'\n{_MERGE}\nB",
-        ),
+        # The head ends at the first other command; any later here-document
+        # keeps the whole command as it was.
+        (f"cat > a <<'A'\nx\nA\nalias cat=bash\ncat <<'B'\n{_MERGE}\nB", None),
+        (f"cat > a <<'A'\n{_MERGE}\nA\necho done; cat <<'A-B'\nx\nA-B", None),
+        (f"cat > a <<'A'\n{_MERGE}\nA\npython3 - <<'EOF'\nprint(1)\nEOF", None),
         # Every other construct leaves the command unchanged (None).
         (f"X=$(case y in y) echo;; esac); cat <<'EOF'\n{_MERGE}\nEOF", None),
         (f"cat > \"$(if true; then echo f; fi)\" <<'EOF'\n{_MERGE}\nEOF", None),
@@ -175,7 +175,12 @@ _DIRECTORY_ROWS = [
     (f"cd \"$W\" && cat > n.md <<'EOF'\n{_MERGE}\nEOF", _START, None),
     (f"cd /tmp && cat > n.md <<'EOF'\n{_MERGE}\nEOF", ("/home/x",), "cd /tmp && cat > n.md <<'EOF'\nEOF"),
     (f"cat > \"$A/n.md\" <<'EOF'\n{_MERGE}\nEOF", (), "cat > \"$A/n.md\" <<'EOF'\nEOF"),
+    # A symbolic link to a device directory, as the resolver reports it.
+    (f"cat > fd/3 <<'EOF'\n{_MERGE}\nEOF", ("/tmp/devlink",), None),
+    (f"cat > /tmp/devlink/fd/3 <<'EOF'\n{_MERGE}\nEOF", (), None),
+    (f"cd /tmp/devlink && cat > fd/3 <<'EOF'\n{_MERGE}\nEOF", _START, None),
 ]
+_ALIASES = {"/tmp/devlink/fd/3": "/dev/fd/3"}
 
 
 @pytest.mark.parametrize(
@@ -191,4 +196,5 @@ def test_c6323_body_dropped_only_in_the_certain_cat_form(
     data; any other shape stays as the guards read it before, so no command
     Bash could run from the text is hidden.
     """
-    assert drop_literal_cat_bodies(command, directories) == (command if expected is None else expected)
+    resolved = drop_literal_cat_bodies(command, directories, lambda path: _ALIASES.get(path, path))
+    assert resolved == (command if expected is None else expected)
