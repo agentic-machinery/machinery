@@ -670,6 +670,45 @@ def test_auth_token_flag_spellings_refused(flag, tmp_path):
             admit(args, cwd=tmp_path, environment={})
 
 
+@pytest.mark.usefixtures("catalog", "configured_roots", "synthetic_opsec")
+def test_issue_create_epic_admits_only_an_explicit_cto_root(monkeypatch, capsys):
+    for name in ("GH_HOST", "GH_REPO", "SESSION_EPIC", "LEARN_UKRAINIAN_DISPATCH_TASK_ID", pub.BROKER_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+    title = "[EPIC][new-stream] Coordination"
+    body = "New stream root"
+    sent = []
+
+    def send(argv, **_kwargs):
+        body_file = Path(argv[argv.index("--body-file") + 1])
+        sent.append((argv[:5], body_file.read_text(), argv[5]))
+        return subprocess.CompletedProcess(argv, 0, "https://github.com/unit/public/issues/23", "")
+
+    for repo, issue_title, flags, diagnostic in (
+        ("unit/public", title, [], "issue-create requires --parent"),
+        ("unit/public", title, ["--no-epic"], "issue-create requires --parent"),
+        ("unit/public", "Ordinary issue", ["--epic"], "EPIC_REFUSED"),
+        ("unit/public", "[EPIC][x] \nTitle", ["--epic"], "EPIC_REFUSED"),
+        ("unit/public", title, ["--epic", "--parent", "14"], "EPIC_REFUSED"),
+        ("unit/private", title, ["--epic"], "EPIC_REFUSED"),
+        ("other.example/unit/public", title, ["--epic"], "EPIC_REFUSED"),
+        ("outside/unknown", title, ["--epic"], "REPO_REFUSED"),
+    ):
+        args = ["issue-create", "--repo", repo, "--title", issue_title, "--body", body, *flags]
+        assert pub.main(args, runner=send) == 2
+        assert diagnostic in capsys.readouterr().err
+
+    args = ["issue-create", "--repo", "unit/public", "--title", title, "--body", body, "--epic"]
+    with monkeypatch.context() as worker:
+        worker.setenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "test-worker")
+        assert pub.main(args, runner=send) == 2
+        assert "requires the CTO seat" in capsys.readouterr().err
+
+    assert sent == []
+    assert pub.main(args, runner=send) == 0
+    assert sent == [(["gh", "issue", "create", "--repo", "unit/public"], body, f"--title={title}")]
+
+
 @pytest.mark.usefixtures('configured_roots', 'catalog')
 @pytest.mark.parametrize("repo", ["unit/public", "unit/private"])
 @pytest.mark.parametrize("state", ["draft", "red", "pending", "unknown", "ready"])

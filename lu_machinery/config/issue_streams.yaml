@@ -7,6 +7,8 @@
 # - Every OPEN issue must be a member of EXACTLY ONE stream (native descendant of a
 #   stream epic, or a #N reference in the epic body while migration is pending).
 # - New issues link their stream epic at creation time.
+# - Epic numbers identify issues in the default fleet repository. Lifecycle membership
+#   for a sibling repository uses a direct native link to a registered epic with the same owner.
 # - Active root epics themselves are exempt from membership. Closed epics may
 #   stay registered for launcher/session consumers but are not audit roots.
 # - An optional `retired: true` marker (boolean; rejected otherwise) likewise
@@ -16,7 +18,7 @@ schema_version: 1
 streams:
   epics:
     title: "Epic coordination"
-    epics: [10453, 12239, 12504]  # #12239 and #12504 overflow epics for the existing stream (#10453 and #12239 are at GitHub's 100 native sub-issue limit)
+    epics: [10453, 12239, 12504, 13276]  # The first three roots reached GitHub's 100 native sub-issue limit.
   atlas-practice:
     title: "Word Atlas + Practice Hub product"
     epics: [4387, 12166]  # umbrella (closed #4700 UX-quality + intake #4220/#4378/#5224 folded into #4387; closed #5331 removed); #12166 overflow epic for the existing stream (#4387 is at GitHub's 100 native sub-issue limit)
@@ -67,6 +69,9 @@ streams:
   hramatka:
     title: "Hramatka teacher lesson service — product qualification & release"
     epics: [4542]
+  ukrainian-llm-eval:
+    title: "Ukrainian LLM evaluation"
+    epics: [13277]
   kube-dojo:
     title: "kube-dojo lane — coordinating stream for kube-dojo/kube-dojo.github.io#2272"
     epics: [12556]  # learn-ukrainian coordinating epic (hramatka pattern); the work is kube-dojo#2272
