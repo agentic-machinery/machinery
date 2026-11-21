@@ -44,7 +44,7 @@ def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule, monkeypatch,
     phrases = {
         "item-quote": "row-level `quote` and `quotes` fields quote the frozen item",
         "evidence-quote": "`quote` inside an item `evidence` entry quotes captured Sources output",
-        "evidence-receipt": "Every item `evidence` entry must have a receipt id and a non-empty `quote`",
+        "evidence-receipt": "Every item `evidence` entry must have a receipt id (`receipt_id`) and a non-empty `quote`",
         "unknown-source": "Source-claim checks also apply to UNKNOWN rows in an APPROVED mixed reply",
         "source-excerpt": "each excerpt must be literal captured Sources output",
         "finding-source": "`finding` clause naming a source term",
@@ -53,7 +53,7 @@ def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule, monkeypatch,
         "record-unknown": "an unsupported source claim in an UNKNOWN row refuses the whole reply",
         "record-excerpt": "On an APPROVE verdict, validated Ukrainian `sources` excerpts are checked against captured output instead",
     }
-    assert phrases[rule] in reference
+    assert phrases[rule] in " ".join(reference.split())
     packet = build_item_packet([{"id": "a", "text": "learner text"}, {"id": "b", "text": "other text"}])
     rows = [
         {"id": "a", "verdict": "APPROVE", "finding": "none", "sources": "none"},
@@ -1606,6 +1606,8 @@ def recorder_matcher(synthetic_opsec):
 )
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_ukrainian_review_with_sources_calls_accepted(monkeypatch, tmp_path, count, classification):
+    from lu_machinery.dispatcher.worker import _receipt_failure
+
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     statuses = []
     original_status = recorder.post_commit_status
@@ -1615,7 +1617,15 @@ def test_ukrainian_review_with_sources_calls_accepted(monkeypatch, tmp_path, cou
         original_status(**kwargs)
 
     monkeypatch.setattr(recorder, "post_commit_status", capture_status)
-    write_task(tasks, sources_mcp_call_count=count, **classification)
+    excerpt = 'VESUM fixture tag: "example".'
+    captured_source_trace(tasks, output=excerpt)
+    reply = (
+        "VERDICT: APPROVE\n\n```json\n"
+        + json.dumps({"summary": "The edited examples are correct.", "sources": excerpt})
+        + "\n```\n"
+    )
+    assert _receipt_failure({"schema_version": 2, "require_review_verdict": True, **classification}, reply) is None
+    write_task(tasks, reply=reply, sources_mcp_call_count=count, **classification)
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert result["verdict"] == "APPROVED"
     assert result["status"] == "posted"
@@ -1624,6 +1634,8 @@ def test_ukrainian_review_with_sources_calls_accepted(monkeypatch, tmp_path, cou
     assert f"Sources MCP calls: {count}\n" in comments[0]["body"].split("<details>", 1)[0]
     assert f"sources_calls={count}" in comments[0]["body"].splitlines()[-1]
     marker = recorder.parse_marker(comments[0]["body"])
+    assert marker["verdict"] == "APPROVED"
+    assert "coverage" not in marker and "denominator" not in marker
     assert marker["sources_calls"] == count
     assert marker["review_profile"] == "ukrainian"
     assert f"sources={count}" in statuses[0]["description"]
@@ -2178,15 +2190,16 @@ def test_quote_mismatch_voids_chunk_coverage(monkeypatch, tmp_path):
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_block_only_ukrainian_reply_records_full_coverage(monkeypatch, tmp_path):
     """Defect class (#12417): a contract-only judgment block with a frozen packet is refused for lack of a verdict line."""
-    from lu_machinery.review.review_contract import build_item_packet
-    from lu_machinery.review.review_contract import render_item_packet
+    from lu_machinery.dispatcher.worker import _receipt_failure
+    from lu_machinery.review.review_contract import build_item_packet, render_item_packet
 
-    tasks, comments, _ = setup_record(monkeypatch, tmp_path)
+    tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     packet = build_item_packet([{"id": "card-a", "text": "привіт"}, {"id": "card-b", "text": "друг"}])
     prompt = tmp_path / "brief.md"
     prompt.write_bytes(render_item_packet(packet).encode())
+    excerpt = 'VESUM fixture tag: "example".'
     items = [
-        {"id": item_id, "verdict": "APPROVE", "finding": "", "sources": "VESUM", "quote": text}
+        {"id": item_id, "verdict": "APPROVE", "finding": "none", "sources": excerpt, "quote": text}
         for item_id, text in (("card-a", "привіт"), ("card-b", "друг"))
     ]
     reply = (
@@ -2194,15 +2207,20 @@ def test_block_only_ukrainian_reply_records_full_coverage(monkeypatch, tmp_path)
         + json.dumps({"schema": "ukrainian-item-judgments.v1", "items": items}, ensure_ascii=False)
         + "\n```\n"
     )
-    write_task(
-        tasks,
-        reply=reply,
-        review_profile="ukrainian",
-        sources_mcp_call_count=3,
-        prompt_file=str(prompt),
-        prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
-    )
-    captured_source_trace(tasks)
+    review = {
+        "review_profile": "ukrainian",
+        "sources_mcp_call_count": 1,
+        "prompt_file": str(prompt),
+        "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
+    }
+    captured_source_trace(tasks, output=excerpt)
+    write_task(tasks, reply=reply + '```json\n{"summary":"Extra payload"}\n```\n', **review)
+    with pytest.raises(recorder.RecordError, match="CLAIM_PAYLOAD_COUNT"):
+        recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert comments == [] and calls == {"posts": 0, "statuses": 0}
+
+    assert _receipt_failure({"schema_version": 2, "require_review_verdict": True, **review}, reply) is None
+    write_task(tasks, reply=reply, **review)
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     marker = sweep.parse_marker(comments[0]["body"])
     assert result["verdict"] == marker["verdict"] == "APPROVED"
