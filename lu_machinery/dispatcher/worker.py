@@ -22,7 +22,11 @@ from pathlib import Path
 import psutil
 
 from lu_machinery.agent_runtime import bounded_advisory, model_pause
-from lu_machinery.agent_runtime.codex_accounts import CodexAccountRefused, resolve_codex_account_label
+from lu_machinery.agent_runtime.codex_accounts import (
+    CodexAccountRefused,
+    default_codex_home,
+    resolve_codex_account_label,
+)
 from lu_machinery.agent_runtime.env_sanitize import CLAUDE_LAUNCH_GUARD_EXIT
 from lu_machinery.agent_runtime.read_only_tmp import create_dispatch_lease, discard_dispatch_lease, dispatch_lease
 from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
@@ -1929,6 +1933,12 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                         parsed = _agy_unfinished(parsed)
                     text = parsed.text
                     break
+            rollout_home = None
+            rollout_policy = getattr(provider, "terminal_rollout_policy_code", None)
+            if rollout_policy is not None and spec.mode == "workspace-write":
+                with contextlib.suppress(OSError, ValueError, RuntimeError):
+                    home = invocation.env.get("CODEX_HOME") or default_codex_home(invocation.env)
+                    rollout_home = (spec.worktree / home).resolve()
             with tempfile.TemporaryFile(dir=ensure_scratch_root()) as stdin, stdout_path.open("wb") as out, stderr_path.open(
                 "wb" if pending_conversation else "ab"
             ) as err:
@@ -2004,6 +2014,11 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 {"output_schema": schema} if spec.agent in {"agy", "claude"} and schema is not None else {}
             )
             parsed = provider.parse(stdout, stderr, exit_code, final_text, **parse_options)
+            if (
+                rollout_policy is not None and rollout_home is not None and exit_code >= 0 and parsed.error
+                and (code := rollout_policy(stdout, rollout_home))
+            ):
+                parsed = replace(parsed, error=f"codex: provider_policy_refusal ({code})", rate_limited=False)
             text, usage, sources_calls = parsed.text, parsed.usage, parsed.sources_mcp_call_count
             # Once parsed, the whole stream decides the model, whatever settlement follows (not the running value).
             resolved_model = parsed.resolved_model
