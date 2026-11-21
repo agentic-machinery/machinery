@@ -9,8 +9,9 @@ Owner order, 2026-11-21: release when a change is ready, not on a schedule.
 1. A machinery release is cut as soon as a ready change is on a green `main`.
    Ready means a change has merged (a post-release PR alone does not count),
    the previous release's post-release PR has merged too, and the newest
-   `CI Gate` push run on `main`'s HEAD has passed. These are the conditions
-   of the cut's preflight.
+   `CI Gate` push run on `main`'s HEAD has passed with its CI evidence
+   receipt. The complete list is the cut's preflight in `docs/release.md`
+   (Cut a release, step 1).
 2. There is no release schedule and no fixed window.
 3. `claude-cto` runs every cut, so cuts never overlap. Workers and drivers
    report a merged change to `claude-cto` instead of running the cut.

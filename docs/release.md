@@ -15,8 +15,9 @@ A machinery release is cut as soon as a ready change is on a green `main`.
 There is no schedule and nobody waits for a window. A change is ready when it
 has merged (a post-release PR alone does not count), the previous release's
 post-release PR has also merged (so `main` carries the next version), and the
-newest `CI Gate` push run on `main`'s HEAD has passed. The cut's preflight
-checks these conditions (see Cut a release). When nothing but a post-release
+newest `CI Gate` push run on `main`'s HEAD has passed with its CI evidence
+receipt. The complete list is the preflight in Cut a release (step 1), which
+the command checks itself. When nothing but a post-release
 PR has merged since the last full release, the command skips (exit 0,
 `unchanged`). Otherwise, when a condition is not met yet (for example the
 version files are behind or the `CI Gate` run has not passed), it refuses
@@ -247,6 +248,8 @@ order:
    - The newest `CI Gate` push run on `$SHA`
      (`gh run list --commit "$SHA" --workflow "CI Gate"`) has completed with
      `success`.
+   - That run attempt's CI evidence receipt (the artifact
+     `ci-gate-evidence-<attempt>`) is present and valid.
    - The uv on `PATH` satisfies `[tool.uv] required-version` in the machinery
      candidate and in the product `main` checkout used for adoption and test
      collection. This check also applies to dry runs that proceed to a build.
