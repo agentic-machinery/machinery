@@ -1133,9 +1133,12 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
     else:
         known = False
         why = "no successful keeper tick"
-    handoffs = data.get("handoffs") if isinstance(data.get("handoffs"), dict) else {}
-    episodes = data.get("episodes") if isinstance(data.get("episodes"), dict) else {}
-    attempts = data.get("heal_attempts") if isinstance(data.get("heal_attempts"), dict) else {}
+    handoffs_raw = data.get("handoffs")
+    episodes_raw = data.get("episodes")
+    attempts_raw = data.get("heal_attempts")
+    handoffs: dict[Any, Any] = handoffs_raw if isinstance(handoffs_raw, dict) else {}
+    episodes: dict[Any, Any] = episodes_raw if isinstance(episodes_raw, dict) else {}
+    attempts: dict[Any, Any] = attempts_raw if isinstance(attempts_raw, dict) else {}
     recorded: dict[str, dict[str, Any]] = {}
     unknown: dict[str, dict[str, Any]] = {}
     waiting: dict[str, dict[str, Any]] = {}
