@@ -186,12 +186,37 @@ def _fresh_sub_lane(
     expected_pct: float | None = None,
     stale: bool = False,
     status_source: str = "weekly_pace",
+    window_minutes: int | None = 10080,
+    primary_remaining_pct: float | None = None,
 ) -> dict:
     resets_at = (
         (_PACE_NOW + timedelta(hours=hours_to_reset)).isoformat().replace("+00:00", "Z")
         if hours_to_reset is not None
         else None
     )
+    codexbar: dict = {
+        "weekly_used_pct": round(100.0 - remaining_pct, 2),
+        "weekly_remaining_pct": remaining_pct,
+        "weekly_resets_at": resets_at,
+        "will_last_to_reset": will_last,
+        "weekly_pace_delta_pct": pace_delta,
+        "weekly_expected_pct": expected_pct,
+        "freshness": "stale_last_good" if stale else "fresh",
+        "age_s": 1200.0 if stale else 30.0,
+        "stale": stale,
+    }
+    if window_minutes is not None:
+        codexbar["windows"] = {
+            "secondary": {
+                "used_pct": round(100.0 - remaining_pct, 2),
+                "remaining_pct": remaining_pct,
+                "resets_at": resets_at,
+                "window_minutes": window_minutes,
+            }
+        }
+    if primary_remaining_pct is not None:
+        codexbar["primary_remaining_pct"] = primary_remaining_pct
+        codexbar["primary_used_pct"] = round(100.0 - primary_remaining_pct, 2)
     record: dict = {
         "status": status,
         "status_source": status_source,
@@ -204,17 +229,7 @@ def _fresh_sub_lane(
         "fetched_at": (_PACE_NOW - timedelta(seconds=1200 if stale else 30)).isoformat().replace("+00:00", "Z"),
         "eligible": True,
         "health": {"healthy": True},
-        "codexbar": {
-            "weekly_used_pct": round(100.0 - remaining_pct, 2),
-            "weekly_remaining_pct": remaining_pct,
-            "weekly_resets_at": resets_at,
-            "will_last_to_reset": will_last,
-            "weekly_pace_delta_pct": pace_delta,
-            "weekly_expected_pct": expected_pct,
-            "freshness": "stale_last_good" if stale else "fresh",
-            "age_s": 1200.0 if stale else 30.0,
-            "stale": stale,
-        },
+        "codexbar": codexbar,
     }
     if burn_pct_per_hour is not None:
         record["burn_pct_per_hour"] = burn_pct_per_hour
@@ -245,11 +260,18 @@ def test_pace_order_24pct_35h_outranks_92pct_6_5d_at_equal_burn():
 
 def test_pace_order_40pct_projected_surplus_outranks_on_target():
     """Defect class (#1120 AC-01): a route projected to leave 40% at reset must outrank one projected on target."""
-    # claude: 70% remaining, 84h left (30% used in 84h) -> projected 40% left at reset (+0.476%/h).
+    # claude: 70% remaining, 84h left (30% used in 84h) -> projected 40% left at reset (+0.476%/h),
+    # even when its 5h primary session window is tighter (20% left) than its weekly window.
     # codex:  80% remaining, 134.4h left (20% used in 33.6h) -> projected 0% left (on target, 0.0%/h),
     # even though codex has higher raw remaining_pct (80% > 70%).
     agents = {
-        "claude": _fresh_sub_lane(remaining_pct=70.0, hours_to_reset=84.0, status="cool", will_last=True),
+        "claude": _fresh_sub_lane(
+            remaining_pct=70.0,
+            hours_to_reset=84.0,
+            status="cool",
+            will_last=True,
+            primary_remaining_pct=20.0,
+        ),
         "codex": _fresh_sub_lane(remaining_pct=80.0, hours_to_reset=134.4, status="cool", will_last=True),
     }
     budget = {"agents": agents, "in_flight": {"claude": 0, "codex": 0}, "diagnostics": {"stale": False}}
@@ -258,6 +280,7 @@ def test_pace_order_40pct_projected_surplus_outranks_on_target():
     claude_row = next(row for row in report["rows"] if row["lane"] == "claude")
     codex_row = next(row for row in report["rows"] if row["lane"] == "codex")
     assert claude_row["pace_forecast"]["projected_surplus_pct"] == pytest.approx(40.0, abs=0.1)
+    assert claude_row["pace_forecast"]["will_last_to_reset"] is True
     assert codex_row["pace_forecast"]["projected_surplus_pct"] == pytest.approx(0.0, abs=0.1)
     assert ranked[:2] == ["claude", "codex"]
 
@@ -297,14 +320,36 @@ def test_over_pace_lane_lasting_to_reset_is_not_avoid_while_near_cap_stays_avoid
     assert rows["codex"]["avoid"] is True
     assert picks["codex"] == "AVOID"
 
+    # Missing telemetry (unknown snapshot or probe freshness) and non-weekly-pace hot labels stay AVOID.
+    no_snap = credit_lane.routing_facts("agy", agents["agy"], model=None, snapshot_metadata=None, now=_PACE_NOW)
+    assert no_snap.capacity == credit_lane.CAPACITY_AVOID
+    no_probe_record = copy.deepcopy(agents["agy"])
+    no_probe_record.pop("freshness", None)
+    no_probe_record.pop("age_s", None)
+    no_probe_record["codexbar"].pop("freshness", None)
+    no_probe_record["codexbar"].pop("age_s", None)
+    no_probe = credit_lane.routing_facts(
+        "agy", no_probe_record, model=None, snapshot_metadata={"stale": False}, now=_PACE_NOW
+    )
+    assert no_probe.capacity == credit_lane.CAPACITY_AVOID
+    ledger_hot = {**agents["agy"], "status_source": "ledger"}
+    assert (
+        credit_lane.routing_facts("agy", ledger_hot, model=None, snapshot_metadata={"stale": False}, now=_PACE_NOW).capacity
+        == credit_lane.CAPACITY_AVOID
+    )
+
 
 def test_grok_and_cursor_return_one_meter_row_with_summed_in_flight():
     """Defect class (#1120 AC-03): verified Grok and Cursor return one meter row with summed in-flight."""
+    # Grok holds the tighter remaining (60%) without codexbar/reset; Cursor holds reset/window/will_last evidence.
+    grok = {"status": "cool", "remaining_pct": 60.0, "eligible": True, "health": {"healthy": True}}
+    cursor = _fresh_sub_lane(remaining_pct=62.0, hours_to_reset=60.0, status="cool", will_last=True)
     agents = {
-        "grok": _fresh_sub_lane(remaining_pct=60.0, hours_to_reset=60.0, status="cool", burn_pct_per_hour=0.4),
-        "cursor": _fresh_sub_lane(remaining_pct=62.0, hours_to_reset=60.0, status="cool", burn_pct_per_hour=0.4),
-        "codex": _fresh_sub_lane(remaining_pct=80.0, hours_to_reset=120.0, status="cool", burn_pct_per_hour=0.4),
+        "grok": grok,
+        "cursor": cursor,
+        "codex": _fresh_sub_lane(remaining_pct=80.0, hours_to_reset=120.0, status="cool", will_last=True),
     }
+    snapshot = copy.deepcopy(agents)
     budget = {
         "agents": agents,
         "in_flight": {"grok": 2, "cursor": 1, "codex": 0},
@@ -316,7 +361,11 @@ def test_grok_and_cursor_return_one_meter_row_with_summed_in_flight():
     assert gc_rows[0]["lane"] == "cursor"
     assert gc_rows[0]["in_flight"] == 3
     assert gc_rows[0]["remaining_pct"] == 60.0  # tighter reading wins
+    assert gc_rows[0]["will_last"] is True  # preserved from cursor
+    assert gc_rows[0]["pace_forecast"]["available"] is True
+    assert gc_rows[0]["pace_forecast"]["remaining_pct"] == 60.0  # clamped to tighter reading
     assert "meter:grok+cursor" in gc_rows[0]["notes"]
+    assert agents == snapshot  # caller inputs not mutated
 
 
 def test_deepseek_is_absent_from_subscription_pace_order():
@@ -360,6 +409,7 @@ def test_deepseek_is_absent_from_subscription_pace_order():
         ("stale_snapshot", "stale"),
         ("stale_probe", "stale"),
         ("missing_reset", "missing"),
+        ("missing_window_minutes", "window_minutes"),
         ("reset_crossing", "reset-crossing"),
     ],
 )
@@ -369,14 +419,15 @@ def test_stale_missing_or_reset_crossing_forecast_keeps_headroom_order_and_names
         remaining_pct=24.0,
         hours_to_reset=-1.0 if mode == "reset_crossing" else (None if mode == "missing_reset" else 35.0),
         status="warm",
-        burn_pct_per_hour=0.4,
+        burn_pct_per_hour=None if mode == "missing_window_minutes" else 0.4,
         stale=(mode == "stale_probe"),
+        window_minutes=None if mode == "missing_window_minutes" else 10080,
     )
     codex = _fresh_sub_lane(
         remaining_pct=92.0,
         hours_to_reset=156.0,
         status="cool",
-        burn_pct_per_hour=0.4,
+        burn_pct_per_hour=None if mode == "missing_window_minutes" else 0.4,
     )
     budget = {
         "agents": {"claude": claude, "codex": codex},

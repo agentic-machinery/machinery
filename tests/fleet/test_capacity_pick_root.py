@@ -115,6 +115,7 @@ def test_lane_rows_mark_avoid():
     # #1120 AC-03: verified Grok and Cursor merge into one cursor meter row using the tighter reading.
     assert "grok" not in rows
     assert rows["cursor"]["remaining_pct"] == 80.0
+    assert rows["cursor"]["will_last"] is True
     assert "meter:grok+cursor" in rows["cursor"]["notes"]
     # glm's z.ai subscription is retired (operator 2026-09-03): AVOID even
     # when the budget snapshot itself still reports the lane as cool/wrong.

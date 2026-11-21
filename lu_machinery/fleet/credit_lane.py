@@ -34,6 +34,7 @@ retirement, transport, wave configuration). Missing data stays ``unknown``.
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import sys
@@ -835,51 +836,169 @@ def _natural_reset(info: Mapping[str, Any]) -> datetime | None:
     return None
 
 
-def _raw_reset_value(info: Mapping[str, Any], fc: Mapping[str, Any] | None = None) -> Any:
-    """First non-empty raw reset timestamp present on a forecast or lane record."""
-    if isinstance(fc, Mapping):
-        for key in ("reset_at", "resets_at"):
-            value = fc.get(key)
-            if value not in (None, ""):
-                return value
-    native = _sub_mapping(info, "codexbar")
-    windows = _sub_mapping(native, "windows")
-    secondary = _sub_mapping(windows, "secondary")
-    auto = _auto_window(info)
-    for value in (
-        native.get("weekly_resets_at"),
-        secondary.get("resets_at"),
-        info.get("resets_at"),
-        info.get("reset_at"),
-        auto.get("resets_at"),
-    ):
+def _block_remaining(block: Mapping[str, Any]) -> float | None:
+    """Remaining percentage read from a single window block."""
+    rem = _number(block.get("remaining_pct"))
+    if rem is not None and 0.0 <= rem <= 100.0:
+        return rem
+    used = _number(block.get("used_pct"))
+    if used is not None and 0.0 <= used <= 100.0:
+        return 100.0 - used
+    return None
+
+
+def _block_reset(block: Mapping[str, Any]) -> Any:
+    """First non-empty reset timestamp present on a single window block."""
+    for key in ("resets_at", "reset_at", "resetsAt"):
+        value = block.get(key)
         if value not in (None, ""):
             return value
     return None
 
 
-def _window_minutes_reading(info: Mapping[str, Any], fc: Mapping[str, Any] | None = None) -> tuple[int | None, bool]:
-    """Positive window length in minutes when explicitly supplied, else ``(None, True)``.
+def _parse_window_minutes(source: Mapping[str, Any]) -> tuple[int | None, bool]:
+    """Positive window length in minutes from one mapping, or ``(None, True)`` if absent.
 
-    Returns ``(None, False)`` when an explicit window_minutes field is malformed
-    or non-positive (fail closed).
+    Returns ``(None, False)`` when an explicit ``window_minutes`` / ``windowMinutes``
+    value is malformed or non-positive (fail closed).
+    """
+    for key in ("window_minutes", "windowMinutes"):
+        if key not in source or source.get(key) is None:
+            continue
+        value = _number(source.get(key))
+        if value is None or value <= 0:
+            return None, False
+        return int(value), True
+    return None, True
+
+
+def _first_window_minutes(*sources: Mapping[str, Any]) -> tuple[int | None, bool]:
+    """First explicit window_minutes reading across ordered mappings (fail closed on malformed)."""
+    for source in sources:
+        minutes, ok = _parse_window_minutes(source)
+        if not ok:
+            return None, False
+        if minutes is not None:
+            return minutes, True
+    return None, True
+
+
+def _matched_pace_window(
+    info: Mapping[str, Any],
+    fc: Mapping[str, Any] | None = None,
+) -> tuple[float | None, Any, int | None, bool, str | None]:
+    """Resolve ``(remaining_pct, raw_reset, window_minutes, window_ok, error_reason)`` from one matched window.
+
+    Never pairs one window's remaining-% (such as a 5h ``primary_remaining_pct``)
+    with another window's reset or duration (such as ``weekly_resets_at``).
     """
     native = _sub_mapping(info, "codexbar")
     windows = _sub_mapping(native, "windows")
     secondary = _sub_mapping(windows, "secondary")
-    sources: list[Mapping[str, Any]] = []
+    primary = _sub_mapping(windows, "primary")
+    auto = _auto_window(info)
+
+    weekly_rem = next(
+        (
+            val
+            for val in (
+                _number(native.get("weekly_remaining_pct")),
+                _number(native.get("secondary_remaining_pct")),
+                _number(info.get("remaining_pct")),
+            )
+            if val is not None and 0.0 <= val <= 100.0
+        ),
+        None,
+    )
+    weekly_reset = next(
+        (
+            val
+            for val in (
+                native.get("weekly_resets_at"),
+                info.get("resets_at"),
+                info.get("reset_at"),
+            )
+            if val not in (None, "")
+        ),
+        None,
+    )
+
+    sec_rem = _block_remaining(secondary)
+    sec_reset = _block_reset(secondary)
+    sec_mins, sec_ok = _parse_window_minutes(secondary)
+    if not sec_ok:
+        return None, None, None, False, "missing forecast: invalid window_minutes"
+    has_secondary = sec_rem is not None or sec_reset is not None or sec_mins is not None
+
+    auto_rem = _block_remaining(auto)
+    auto_reset = _block_reset(auto)
+    auto_mins, auto_ok = _parse_window_minutes(auto)
+    if not auto_ok:
+        return None, None, None, False, "missing forecast: invalid window_minutes"
+    has_auto = auto_rem is not None or auto_reset is not None or auto_mins is not None
+
+    pri_rem = _block_remaining(primary)
+    pri_reset = _block_reset(primary)
+    pri_mins, pri_ok = _parse_window_minutes(primary)
+    if not pri_ok:
+        return None, None, None, False, "missing forecast: invalid window_minutes"
+    has_primary = pri_rem is not None or pri_reset is not None or pri_mins is not None
+
+    # Explicit planning forecast block takes precedence for its own reset/remaining/window.
     if isinstance(fc, Mapping):
-        sources.append(fc)
-    sources.extend((info, native, secondary))
-    for source in sources:
-        for key in ("window_minutes", "windowMinutes"):
-            if key not in source or source.get(key) is None:
-                continue
-            value = _number(source.get(key))
-            if value is None or value <= 0:
-                return None, False
-            return int(value), True
-    return None, True
+        fc_mins, fc_ok = _parse_window_minutes(fc)
+        if not fc_ok:
+            return None, None, None, False, "missing forecast: invalid window_minutes"
+        fc_reset = _block_reset(fc)
+        fc_rem = _block_remaining(fc)
+        if fc_reset is not None or fc_rem is not None:
+            rem = fc_rem if fc_rem is not None else (
+                sec_rem if sec_rem is not None else (weekly_rem if weekly_rem is not None else auto_rem)
+            )
+            reset = fc_reset if fc_reset is not None else (
+                sec_reset if sec_reset is not None else (weekly_reset if weekly_reset is not None else auto_reset)
+            )
+            if fc_mins is not None:
+                return rem, reset, fc_mins, True, None
+            fallback_mins, fallback_ok = _first_window_minutes(secondary, auto, native, info)
+            return rem, reset, fallback_mins, fallback_ok, None
+
+    # 1. Subscription secondary/weekly window (Claude/Codex weekly, Cursor monthly).
+    if has_secondary:
+        rem = sec_rem if sec_rem is not None else weekly_rem
+        reset = sec_reset if sec_reset is not None else weekly_reset
+        if sec_mins is not None:
+            return rem, reset, sec_mins, True, None
+        fallback_mins, fallback_ok = _first_window_minutes(native, info)
+        return rem, reset, fallback_mins, fallback_ok, None
+
+    # 2. Cursor Auto monthly window.
+    if has_auto:
+        rem = auto_rem if auto_rem is not None else (
+            _number(info.get("remaining_pct")) if info.get("status_source") == "cursor_auto" else None
+        )
+        reset = auto_reset
+        if auto_mins is not None:
+            return rem, reset, auto_mins, True, None
+        fallback_mins, fallback_ok = _first_window_minutes(native, info)
+        return rem, reset, fallback_mins, fallback_ok, None
+
+    # 3. Single-window primary meter (e.g. 5h-only AGY lane when no secondary/auto exists).
+    if has_primary and weekly_reset is None:
+        rem = pri_rem if pri_rem is not None else _number(native.get("primary_remaining_pct"))
+        reset = pri_reset
+        if pri_mins is not None:
+            return rem, reset, pri_mins, True, None
+        fallback_mins, fallback_ok = _first_window_minutes(native, info)
+        return rem, reset, fallback_mins, fallback_ok, None
+
+    # 4. Flat record / flat codexbar (strictly weekly/secondary/top-level; never primary_remaining_pct).
+    flat_mins, flat_ok = _first_window_minutes(native, info)
+    if not flat_ok:
+        return None, None, None, False, "missing forecast: invalid window_minutes"
+    if weekly_rem is None and weekly_reset is not None and _number(native.get("primary_remaining_pct")) is not None:
+        return None, weekly_reset, flat_mins, True, "missing forecast: window mismatch between primary remaining and reset"
+    return weekly_rem, weekly_reset, flat_mins, True, None
 
 
 def pace_forecast(
@@ -894,11 +1013,12 @@ def pace_forecast(
     Accepts either an explicit planning forecast (``burn_pct_per_hour`` or
     ``unused_pct`` with ``reset_at``/``resets_at``, top-level or under
     ``forecast``) or a standard subscription record evaluated through
-    :func:`lu_machinery.api.subscription_usage.compute_usage_pace`.
+    :func:`lu_machinery.api.subscription_usage.compute_usage_pace` on one
+    window-matched ``(remaining_pct, resets_at, window_minutes)`` tuple.
 
     Fails closed (``available=False`` with a typed ``reason``) on stale
-    snapshots/probes, missing allowance/reset inputs, early hidden windows, or
-    reset-crossing timestamps.
+    snapshots/probes, missing allowance/reset/window_minutes inputs, cross-window
+    mismatches, early hidden windows, or reset-crossing timestamps.
     """
     from lu_machinery.api.subscription_usage import compute_usage_pace, pace_is_visible
 
@@ -947,13 +1067,13 @@ def pace_forecast(
         ):
             return unavailable("stale forecast: forecast observation stale or invalid")
 
-    remaining = plan_remaining_pct(record)
-    if remaining is None and fc is not None:
-        remaining = _number(fc.get("remaining_pct"))
+    remaining, raw_reset, window_minutes, window_ok, match_err = _matched_pace_window(record, fc)
+    if match_err is not None:
+        return unavailable(match_err)
+    if not window_ok:
+        return unavailable("missing forecast: invalid window_minutes")
     if remaining is None or not 0.0 <= remaining <= 100.0:
         return unavailable("missing forecast: remaining allowance unavailable")
-
-    raw_reset = _raw_reset_value(record, fc)
     if raw_reset is None:
         return unavailable("missing forecast: reset time unavailable")
     reset_at = _reset_time(raw_reset)
@@ -963,13 +1083,10 @@ def pace_forecast(
     if not math.isfinite(seconds_to_reset) or seconds_to_reset <= 0:
         return unavailable("reset-crossing forecast: reset time has passed")
     hours_to_reset = seconds_to_reset / 3600.0
-
-    # Path A: explicit planning.forecast() burn rate or unused projection.
-    window_minutes, window_ok = _window_minutes_reading(record, fc)
-    if not window_ok:
-        return unavailable("missing forecast: invalid window_minutes")
     if window_minutes is not None and seconds_to_reset > window_minutes * 60.0:
         return unavailable("reset-crossing forecast: reset outside active window")
+
+    # Path A: explicit planning.forecast() burn rate or unused projection.
     burn_container = fc if (fc is not None and "burn_pct_per_hour" in fc) else record
     if "burn_pct_per_hour" in burn_container and burn_container.get("burn_pct_per_hour") is not None:
         burn = _number(burn_container.get("burn_pct_per_hour"))
@@ -1013,7 +1130,10 @@ def pace_forecast(
             "will_last_to_reset": will_last,
         }
 
-    # Path B: elapsed-window linear forecast from subscription_usage.compute_usage_pace.
+    # Path B: elapsed-window linear forecast requires an explicit window_minutes
+    # from the matched window (never silently assume a 7-day weekly duration).
+    if window_minutes is None:
+        return unavailable("missing forecast: window_minutes unavailable")
     pace = compute_usage_pace(
         100.0 - remaining,
         reset_at.isoformat(),
@@ -1111,19 +1231,88 @@ def merge_grok_cursor_record(
 
     merged = dict(base)
     if isinstance(merged.get("codexbar"), Mapping):
-        merged["codexbar"] = dict(merged["codexbar"])
+        merged["codexbar"] = copy.deepcopy(dict(merged["codexbar"]))
 
     base_status = str(merged.get("status") or "unknown")
     other_status = str(other.get("status") or "unknown")
-    if _GROK_CURSOR_SEVERITY.get(other_status, -1) > _GROK_CURSOR_SEVERITY.get(base_status, -1):
+    base_sev = _GROK_CURSOR_SEVERITY.get(base_status, -1)
+    other_sev = _GROK_CURSOR_SEVERITY.get(other_status, -1)
+    if other_sev > base_sev:
         merged["status"] = other_status
         if "status_source" in other:
             merged["status_source"] = other["status_source"]
         # Do not mix a more severe status with the other reading's pace flags.
         if isinstance(other.get("codexbar"), Mapping):
-            merged["codexbar"] = dict(other["codexbar"])
+            merged["codexbar"] = copy.deepcopy(dict(other["codexbar"]))
         else:
             merged.pop("codexbar", None)
+    else:
+        # Preserve reset, window, and pace evidence observed on the other transport
+        # when base lacks it, without mutating inputs or weakening base's tighter remaining.
+        base_rem = plan_remaining_pct(base)
+        for key in ("resets_at", "reset_at", "window_minutes", "windowMinutes"):
+            if merged.get(key) in (None, "") and other.get(key) not in (None, ""):
+                merged[key] = other[key]
+
+        def _clamp_window_block(block: dict[str, Any]) -> None:
+            if base_rem is None:
+                return
+            win_rem = _block_remaining(block)
+            if win_rem is not None and base_rem < win_rem:
+                block["remaining_pct"] = base_rem
+                if "used_pct" in block:
+                    block["used_pct"] = round(100.0 - base_rem, 4)
+
+        if merged.get("provider_windows") is None and isinstance(other.get("provider_windows"), Mapping):
+            cloned_pw = copy.deepcopy(dict(other["provider_windows"]))
+            if isinstance(cloned_pw.get("auto"), dict):
+                _clamp_window_block(cloned_pw["auto"])
+            merged["provider_windows"] = cloned_pw
+
+        other_cb = other.get("codexbar")
+        if isinstance(other_cb, Mapping):
+            base_cb: dict[str, Any] = (
+                merged["codexbar"] if isinstance(merged.get("codexbar"), dict) else {}
+            )
+            for key in (
+                "weekly_resets_at",
+                "resets_at",
+                "window_minutes",
+                "windowMinutes",
+                "pace_summary",
+                "weekly_expected_pct",
+                "weekly_pace_delta_pct",
+                "trend",
+                "headroom_pct",
+            ):
+                if base_cb.get(key) in (None, "") and other_cb.get(key) not in (None, ""):
+                    base_cb[key] = other_cb[key]
+            if not isinstance(base_cb.get("provider_windows"), Mapping) and isinstance(
+                other_cb.get("provider_windows"), Mapping
+            ):
+                cloned_cb_pw = copy.deepcopy(dict(other_cb["provider_windows"]))
+                if isinstance(cloned_cb_pw.get("auto"), dict):
+                    _clamp_window_block(cloned_cb_pw["auto"])
+                base_cb["provider_windows"] = cloned_cb_pw
+            if not isinstance(base_cb.get("windows"), Mapping) and isinstance(other_cb.get("windows"), Mapping):
+                cloned_windows = copy.deepcopy(dict(other_cb["windows"]))
+                for win_name in ("secondary", "primary"):
+                    win_block = cloned_windows.get(win_name)
+                    if isinstance(win_block, dict):
+                        _clamp_window_block(win_block)
+                base_cb["windows"] = cloned_windows
+            # Conservative will_last_to_reset carry: False always wins; True carries only
+            # when base has no reading and base's status is not worse than other's.
+            if other_cb.get("will_last_to_reset") is False:
+                base_cb["will_last_to_reset"] = False
+            elif (
+                base_cb.get("will_last_to_reset") is None
+                and other_cb.get("will_last_to_reset") is True
+                and base_sev <= other_sev
+            ):
+                base_cb["will_last_to_reset"] = True
+            if base_cb:
+                merged["codexbar"] = base_cb
 
     max_age_s = probe_max_age_s(policy)
     if probe_freshness(other, max_age_s)[0] == STALE:
@@ -1504,15 +1693,17 @@ def _capacity_class(
     credit_relief: bool,
     credit_reason: str,
     lasts_to_reset: bool | None = None,
+    probe: str = UNKNOWN,
 ) -> tuple[str, str]:
     """Capacity class and reason; the ordering is the routing rule (A2, #9740).
 
     Hard reasons (ineligible, unhealthy, NEED_LOGIN), near cap without credit
     relief and runtime-blocked hot stay ``avoid`` whatever the freshness. Only
     then does a stale observation turn a raw pace deficit or a weekly-pace hot
-    label into ``unknown_stale``. An over-pace (``hot``) subscription lane that
-    still lasts to reset is ``verified`` (sorts lower, not AVOID); near cap and
-    real exhaustion stay ``avoid``.
+    label into ``unknown_stale``. A positively fresh weekly-pace over-pace
+    (``hot``) subscription lane that still lasts to reset is ``verified`` (sorts
+    lower, not AVOID); missing telemetry (unknown snapshot or probe freshness),
+    non-weekly-pace hot labels, near cap, and real exhaustion stay ``avoid``.
     """
     if record.get("eligible") is False:
         return CAPACITY_AVOID, "ineligible"
@@ -1546,9 +1737,11 @@ def _capacity_class(
         )
     if (
         status == "hot"
-        and record.get("status_source") != "cursor_auto"
-        and freshness != STALE
+        and record.get("status_source") == "weekly_pace"
+        and freshness == FRESH
+        and probe == FRESH
         and lasts_to_reset is True
+        and pace["uncovered"] is not True
     ):
         return CAPACITY_VERIFIED, "over-pace; lasts to reset"
     if status == "hot" or pace["uncovered"] is True:
@@ -1710,6 +1903,7 @@ def routing_facts(
         credit_relief=credit_present and permission is not False,
         credit_reason=f"credit {credit.get('state')}: {credit.get('reason') or ''}".rstrip(": "),
         lasts_to_reset=lasts_to_reset,
+        probe=probe,
     )
     return RoutingFacts(
         lane=lane_key,
