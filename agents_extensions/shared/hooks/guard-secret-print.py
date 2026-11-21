@@ -75,14 +75,11 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 
 from __future__ import annotations
 
-import ast
 import codecs
-import io
 import os
 import re
 import shlex
 import sys
-import tokenize
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -1178,6 +1175,18 @@ _PROGRAM_STRINGS = re.compile(
     r"(?P<quote>\"\"\"|'''|\"|'|`)(?P<value>.*?)(?P=quote)",
     re.DOTALL,
 )
+# Python comments and string literals, read left to right as Python's tokenizer reads
+# them: a comment hides its quotes, and an escaped delimiter does not end its literal.
+# Possessive runs never backtrack, and an unterminated literal still consumes the rest
+# of its line (or of the program, for triple quotes) without a value, so the scan is linear.
+_PYTHON_LITERALS = re.compile(
+    r"#[^\n]*"
+    r"|(?i:(?<!\w)(?:rb|br|rf|fr|f|r|u|b))?(?:"
+    r"(?P<long>\"\"\"|''')(?P<long_value>(?:\\[\s\S]|(?!(?P=long))[^\\])*+)(?:(?P<long_end>(?P=long))|\Z)"
+    r"|(?P<short>[\"'])(?P<short_value>(?:\\[\s\S]|(?!(?P=short))[^\\\n])*+)(?:(?P<short_end>(?P=short))|$)"
+    r")",
+    re.MULTILINE,
+)
 _ENV_IDENTIFIERS = re.compile(
     "(?:"
     + "|".join(spelling for _, _, kind, spelling in ENVIRONMENT_API_INVENTORY if kind == "identifier")
@@ -1345,32 +1354,17 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     if reason:
         return reason
     if dumped_files and _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
-        paths = _python_string_values(program)
-        if paths is None:
-            return "inline program reading a file could not be tokenized safely"
+        # The quote-agnostic pairs, plus Python's own literals, which an apostrophe inside
+        # "it's" cannot shift. Either reading can name the dumped path.
+        paths = re.findall(r"[\"']([^\"']+)[\"']", program)
+        for match in _PYTHON_LITERALS.finditer(program):
+            if match["long_end"] is not None:
+                paths.append(match["long_value"])
+            elif match["short_end"] is not None:
+                paths.append(match["short_value"])
         if any(_normalized_path(path) in dumped_files for path in paths):
             return "inline program would display a redirected environment dump"
     return None
-
-
-def _python_string_values(program: str) -> list[str] | None:
-    """Return the values of a Python program's string literals, or None when it cannot be tokenized.
-
-    Python's own tokenizer pairs each literal with its delimiter, so an apostrophe
-    inside "it's", a comment or an escaped quote cannot hide a later path.
-    """
-    values: list[str] = []
-    try:
-        for token in tokenize.generate_tokens(io.StringIO(program).readline):
-            if token.type == tokenize.STRING:
-                value = ast.literal_eval(token.string)
-                values.append(value.decode("utf-8", "surrogateescape") if isinstance(value, bytes) else value)
-            elif tokenize.tok_name[token.type].endswith("STRING_MIDDLE"):
-                # An f-string or t-string's literal text (Python 3.12+ tokenizes it in parts).
-                values.append(token.string)
-    except (tokenize.TokenError, SyntaxError, ValueError):
-        return None
-    return values
 
 
 def _heredoc_inputs(command: str) -> dict[str, list[tuple[str, bool]]]:
