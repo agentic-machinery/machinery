@@ -9,6 +9,34 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.46"></a>
+## [0.1.46] - 2026-11-21
+
+### Added
+
+- Admit Gemini 4 Neon as peer authority and persist refusal reasons (NEON-SOLTIER-1120) ([#1032](https://github.com/learn-ukrainian/machinery/pull/1032))
+
+### Changed
+
+- Ground model qualification in current evidence ([#1037](https://github.com/learn-ukrainian/machinery/pull/1037))
+- Clarify Ukrainian review source excerpts ([#1045](https://github.com/learn-ukrainian/machinery/pull/1045))
+- Align Ukrainian review reference with recorder ([#1048](https://github.com/learn-ukrainian/machinery/pull/1048))
+
+### Fixed
+
+- Isolate packaged Python module launches ([#1029](https://github.com/learn-ukrainian/machinery/pull/1029))
+- Say why a read-only launch has no final delivery ([#1030](https://github.com/learn-ukrainian/machinery/pull/1030))
+- Read a registered repository prefix as that repository ([#1031](https://github.com/learn-ukrainian/machinery/pull/1031))
+- Isolate AGY read-only task records ([#1033](https://github.com/learn-ukrainian/machinery/pull/1033))
+- Name Codex MCP calls from their server and tool ([#1034](https://github.com/learn-ukrainian/machinery/pull/1034))
+- Say why a denied task record refuses the lineage ([#1035](https://github.com/learn-ukrainian/machinery/pull/1035))
+- Preserve unknown orient values and isolate collectors ([#1036](https://github.com/learn-ukrainian/machinery/pull/1036))
+- A failed or incomplete tool call never supports a claim (C-6314) ([#1038](https://github.com/learn-ukrainian/machinery/pull/1038))
+- Paginate dismissal analysis preflight with bounded pages ([#1039](https://github.com/learn-ukrainian/machinery/pull/1039))
+- Batch dismissal PR state checks and validate GraphQL envelope ([#1044](https://github.com/learn-ukrainian/machinery/pull/1044))
+- Pin the landing kind with pr-merge --expect-queue ([#1043](https://github.com/learn-ukrainian/machinery/pull/1043))
+- Enforce one strict GraphQL envelope check across client and publish (#1047) ([#1053](https://github.com/learn-ukrainian/machinery/pull/1053))
+
 <a id="v0.1.45"></a>
 ## [0.1.45] - 2026-11-20
 
@@ -1152,7 +1180,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.45...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.46...HEAD
+[0.1.46]: https://github.com/learn-ukrainian/machinery/compare/v0.1.45...v0.1.46
 [0.1.45]: https://github.com/learn-ukrainian/machinery/compare/v0.1.44...v0.1.45
 [0.1.44]: https://github.com/learn-ukrainian/machinery/compare/v0.1.43...v0.1.44
 [0.1.43]: https://github.com/learn-ukrainian/machinery/compare/v0.1.42...v0.1.43
