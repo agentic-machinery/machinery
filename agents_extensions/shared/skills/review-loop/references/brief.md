@@ -54,6 +54,14 @@ Every Ukrainian-profile brief identifies these contracts and their applicability
 
 ## Reply format
 
+For a Ukrainian review, copy exactly one reply section from the profile into the brief.
+Use [the frozen-item reply](ukrainian.md#ukrainian-review-with-a-frozen-item-packet) when
+the brief includes a frozen item packet. Otherwise use
+[the generic reply](ukrainian.md#ukrainian-review-without-a-frozen-item-packet).
+The selected section supplies every reply instruction, including where to put the verdict.
+
+### Code or infra
+
 Every code or infra brief includes this **Reply format** section. It is the reply contract
 `verify_review` and the verdict recorder both accept. The reply is one JSON object and
 nothing else. The object matches
@@ -92,9 +100,6 @@ council's anchored rubric
 ([decision report](../../drive-epic/references/decision-report.md#council-optional-independent-panel),
 "Findings and score") never gates a merge. The recorder stores a score when a reply still
 carries a well-formed one, or records it as absent.
-
-A Ukrainian-profile review does not use this object. It returns the
-`ukrainian-item-judgments` block named in [ukrainian](ukrainian.md).
 
 ## Delta rounds (round 2 and later)
 
