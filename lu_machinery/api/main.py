@@ -405,7 +405,7 @@ class _OrientState:
 
     lock: threading.Lock = field(default_factory=threading.Lock)
     slots: threading.BoundedSemaphore = field(
-        default_factory=lambda: threading.BoundedSemaphore(DETACHED_ORIENT_COLLECT_LIMIT),
+        default_factory=functools.partial(threading.BoundedSemaphore, DETACHED_ORIENT_COLLECT_LIMIT),
     )
     refresh_threads: dict[str, threading.Thread] = field(default_factory=dict)
     fresh_threads: dict[str, threading.Thread] = field(default_factory=dict)
@@ -951,27 +951,25 @@ async def _cached_detached_orient_section(
     state = _orient_state(resolve_context(ctx))
     meta: dict[str, Any] = {"stale_after_s": ttl, "source": source, "cache": "miss"}
     read_started = _orient_clock()
-    failure: str | None = None
-    if fresh:
-        worker = _schedule_detached_orient_refresh(key, compute, state, collect_slot=collect_slot, fresh=True)
+    with state.lock:
+        before = state.values.get(key)
+    if not fresh and before is not None and read_started - before[2] < ttl:
+        return before[0], {**meta, "generated_at": before[1], "cache": "hit"}
+
+    worker = _schedule_detached_orient_refresh(key, compute, state, collect_slot=collect_slot, fresh=fresh)
+    if fresh or before is None:
         await _await_thread(worker, wait_s)
-        if worker.is_alive():
-            failure = f"section_timeout_{wait_s}s"
-    else:
-        with state.lock:
-            stored = state.values.get(key)
-        if stored is not None and read_started - stored[2] < ttl:
-            return stored[0], {**meta, "generated_at": stored[1], "cache": "hit"}
-        worker = _schedule_detached_orient_refresh(key, compute, state, collect_slot=collect_slot)
-        if stored is None:
-            await _await_thread(worker, wait_s)
+    timeout = f"section_timeout_{wait_s}s" if fresh and worker.is_alive() else None
 
     with state.lock:
         stored = state.values.get(key)
         last_error = state.errors.get(key)
-        error = failure or (last_error[0] if last_error is not None else None)
+        error = timeout or (last_error[0] if last_error is not None else None)
         refreshing = key in state.pending
-    if stored is not None and (not fresh or error is None):
+    # A concurrent background failure can coexist with a newly published
+    # measurement, including one awaited by several fresh requests.
+    fresh_unavailable = fresh and (timeout is not None or (error is not None and stored is before))
+    if stored is not None and not fresh_unavailable:
         value, generated_at, stamp = stored
         current = stamp >= read_started or _orient_clock() - stamp < ttl
         meta.update(generated_at=generated_at, stale=not current, refreshing=refreshing)

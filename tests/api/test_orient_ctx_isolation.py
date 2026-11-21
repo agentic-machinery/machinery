@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
 
@@ -334,6 +335,7 @@ def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_val
     A fresh read collects for itself while an older background refresh is still
     running, and neither waits for nor cancels the other. When the older refresh
     finishes last it publishes nothing, and later reads keep the fresh value.
+    A later background failure also cannot mask a fresh measurement.
     """
     from lu_machinery.api import state_helpers as cache
 
@@ -342,6 +344,7 @@ def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_val
     monkeypatch.setattr(api_main, "_orient_clock", lambda: now[0])
     monkeypatch.setattr(api_main, "DETACHED_ORIENT_INLINE_WAIT_S", 10.0)
     entered, release = threading.Event(), threading.Event()
+    fresh_entered, release_fresh = threading.Event(), threading.Event()
     revision = [0]
 
     async def collect(context):
@@ -350,6 +353,11 @@ def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_val
         if mine == 2:
             entered.set()
             assert await asyncio.to_thread(release.wait, 10)
+        if mine == 4:
+            fresh_entered.set()
+            assert await asyncio.to_thread(release_fresh.wait, 10)
+        if mine == 5:
+            raise RuntimeError("background scan failed")
         return {"summary": {"revision": mine}}
 
     ctx = fixture_context(tmp_path)
@@ -375,6 +383,21 @@ def test_a_refresh_that_finishes_after_a_newer_fresh_read_never_replaces_its_val
         later = client.get("/api/orient?sections=pipeline").json()
         assert later["pipeline"]["summary"] == {"revision": 3}
         assert later["meta"]["pipeline"]["generated_at"] == fresh["meta"]["pipeline"]["generated_at"]
+
+        now[0] = 100
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            pending = executor.submit(client.get, "/api/orient?sections=pipeline&fresh=true")
+            try:
+                assert fresh_entered.wait(5)
+                now[0] = 101
+                stale = client.get("/api/orient?sections=pipeline").json()
+                assert stale["pipeline"] == {"summary": {"revision": 3}}
+                _join_refresh(ctx)
+            finally:
+                release_fresh.set()
+            fresh = pending.result(timeout=5).json()
+        assert fresh["pipeline"] == {"summary": {"revision": 4}}
+        assert fresh["meta"]["pipeline"]["error"] == "background scan failed"
     finally:
         release.set()
         _join_refresh(ctx)
