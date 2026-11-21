@@ -1978,13 +1978,14 @@ def create_app(
     ``product`` is the product contribution; when omitted it is loaded through
     the configured product entry (``load_product``). Its routers are included
     ahead of the machinery routers and the core catch-all stays last.
+
+    A supplied ``lifespan`` replaces the default, including metrics collection.
     """
-    factory_lifespan = _lifespan if lifespan is None else lifespan
     metrics = PrometheusMetricsMiddleware(context)
 
     @asynccontextmanager
     async def lifespan_with_metrics(app: FastAPI):
-        async with factory_lifespan(app) as state, app.state.metrics_snapshot.lifespan():
+        async with _lifespan(app) as state, app.state.metrics_snapshot.lifespan():
             yield state
 
     product = load_product(context) if product is None else product
@@ -2002,7 +2003,7 @@ def create_app(
             "Powers ops dashboards (root /), cold-start, state, comms, delegate, "
             "build events, and operational tooling."
         ),
-        lifespan=lifespan_with_metrics,
+        lifespan=lifespan_with_metrics if lifespan is None else lifespan,
     )
     factory_app.state.ctx = context
     factory_app.state.product = product
