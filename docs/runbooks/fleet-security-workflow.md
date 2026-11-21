@@ -102,7 +102,7 @@ The target receipt lists each accepted finding's tuple in `accepted_license_find
 
 On `pull_request` and `merge_group`, scanner config and ignore files come from the event's base commit. This covers Actionlint and Zizmor config files, ShellCheck configuration in the source directory hierarchy, and the Trivy and TruffleHog ignore files. Explicit repo-relative config and ignore paths also resolve at the base commit.
 
-Each enabled scanner job records the base commit in `scanner-policy.base_sha` and lists changed policy paths in `scanner-policy.changed`. If the candidate adds a policy file, the scan reports the addition and scans without that file's settings. If the candidate edits or removes an existing policy file, the scan uses the base version. A candidate policy addition or edit that is a symlink or another nonregular Git entry fails the job. Other events use the checked-out policy.
+Each enabled scanner job records the base commit in `scanner-policy.base_sha` and lists changed policy paths in `scanner-policy.changed`. If the candidate adds a policy file, the scan reports the addition and scans without that file's settings. If the candidate edits or removes an existing policy file, the scan uses the base version. For ShellCheck, pre-existing base directories named `.shellcheckrc` or `shellcheckrc` are skipped during policy export; adding or converting a policy path to a symlink, directory, or other nonregular Git entry in the candidate still fails the job. Other events use the checked-out policy.
 
 ## Output receipt (`fleet-security-receipt.v1`)
 

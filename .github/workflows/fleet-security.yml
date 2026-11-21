@@ -305,6 +305,7 @@ jobs:
           directory = Path(os.environ["RUNNER_TEMP"]) / "fleet-scanner-policy"
           git_env = {"PATH": os.environ["PATH"], "HOME": str(directory), "GIT_CONFIG_NOSYSTEM": "1"}
           regular_modes = (b"100644", b"100755")
+          tree_mode = b"040000"
 
           selected = set(defaults)
           if explicit:
@@ -332,7 +333,7 @@ jobs:
                   if not valid_path(path):
                       sys.exit("::error::Invalid scanner policy path in Git tree")
                   mode, _, oid = metadata.split()
-                  entries[path] = (mode, oid)
+                  entries[path] = (mode, b"" if shellcheck and mode == tree_mode else oid)
               return entries
 
           try:
@@ -351,7 +352,7 @@ jobs:
 
               value = ""
               if shellcheck:
-                  materialize = trusted
+                  materialize = {path: entry for path, entry in trusted.items() if entry[0] != tree_mode}
                   value = str(directory)
               else:
                   choices = (explicit,) if explicit else defaults
