@@ -238,11 +238,26 @@ def _join_line_continuations(text: str) -> str:
 # (quotes removed) hold `gh`, then only options and their values, then
 # `pr merge`, or the publisher's `pr-merge`. Prose that only mentions merging
 # ("we use gh ... the phrase pr merge") is not an invocation.
-_SEP = r"[\s\[\],]+"
-_BODY_MERGE = re.compile(
-    rf"(?:^|[\s\[,])gh(?:{_SEP}-[^\s\[\],]*(?:{_SEP}[^\s\[\],-][^\s\[\],]*)?)*{_SEP}pr{_SEP}merge(?:[\s\],]|$)"
-    r"|lu_machinery\.publish[\s\],]+pr-merge\b"
-)
+_BODY_TOKEN_SEPARATORS = re.compile(r"[\s\[\],]+")
+
+
+def _words_name_merge(line: str) -> bool:
+    """One linear pass over a body line's tokens for a merge invocation."""
+    tokens = [token for token in _BODY_TOKEN_SEPARATORS.split(line) if token]
+    for index, token in enumerate(tokens):
+        if token == "lu_machinery.publish" and tokens[index + 1 : index + 2] == ["pr-merge"]:
+            return True
+        if token != "gh":
+            continue
+        following = index + 1
+        while following < len(tokens) and tokens[following].startswith("-"):
+            following += 1
+            # An option may take one value (`-R owner/repo`).
+            if following < len(tokens) and not tokens[following].startswith("-") and tokens[following] != "pr":
+                following += 1
+        if tokens[following : following + 2] == ["pr", "merge"]:
+            return True
+    return False
 
 
 def _body_names_merge(command: str) -> bool:
@@ -252,7 +267,7 @@ def _body_names_merge(command: str) -> bool:
     stand behind any name), and a program such as Python can run the merge
     the body spells, so such a body is never dismissed as text.
     """
-    return any(_BODY_MERGE.search(line) for document in parse_heredocs(command) for line in document_words(document))
+    return any(_words_name_merge(line) for document in parse_heredocs(command) for line in document_words(document))
 
 
 def _scope_events(command: str, *, mark_redirect_unreadable: bool = True) -> list[tuple[str, list[str]]]:
