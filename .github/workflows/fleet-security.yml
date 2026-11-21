@@ -831,14 +831,20 @@ jobs:
                       cmd.append(f"--rcfile={rc}" if rc else "--norc")
                   # Keep the full input set available for shell source resolution.
                   cmd.extend(["--", *files])
-                  with open(out_json, "wb") as out_fh, open(err_log, "wb") as err_fh:
-                      proc = subprocess.run(
-                          cmd,
-                          env={"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")},
-                          stdout=out_fh,
-                          stderr=err_fh,
-                          check=False,
-                      )
+                  try:
+                      with open(out_json, "wb") as out_fh, open(err_log, "wb") as err_fh:
+                          proc = subprocess.run(
+                              cmd,
+                              env={"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")},
+                              stdout=out_fh,
+                              stderr=err_fh,
+                              check=False,
+                              timeout=600,
+                          )
+                  except subprocess.TimeoutExpired:
+                      print(f"::error::ShellCheck timed out scanning '{path_str}'; failing closed")
+                      scan_error = True
+                      break
                   err_lines = sum(1 for _ in open(err_log, "rb"))
                   print(f"ShellCheck target={path_str} severity={sev}: {len(matching_files)} file(s), exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
                   try:
