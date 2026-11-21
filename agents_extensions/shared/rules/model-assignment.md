@@ -56,6 +56,15 @@ requested role equally, Opus's authority tier wins. The resolver's returned
 `suitability_rank` and selection trace are the authority: inspect them rather than
 inferring eligibility or priority from rung position or from this text.
 
+**Model identity during a run.** Claude Code can continue on an older model after
+a safeguard intervention. Record the intervention and verify the effective
+model for the affected output. If its identity is unknown, withhold that evidence.
+Before accepting evidence from a changed model, re-establish any model-dependent
+qualification, including review eligibility and independence. For subsequent
+permitted work in Claude Code, use `/model` to restore the approved model and
+verify the selection. Report suspected false positives with `/feedback` under
+the applicable data-sharing rules.
+
 Match the EXACT command — not a principle. Memory does not enforce; the dispatch tool does. Established 2026-05-06 after repeated drift on cost discipline.
 
 ## CTO role bans and shadow trials
@@ -216,6 +225,13 @@ official model documentation, checking local bakeoff deltas, updating `reviewed_
 .venv/bin/python -m lu_machinery.lint.lint_model_catalog
 ```
 
+**Upgrade qualification.** Note the upstream version or change and the capabilities
+it affects. Rerun representative cases on the affected route before relying on
+any affected capability. When relevant, check that an in-flight task follows the
+steering update, resume preserves state and usage, compaction preserves context
+needed for the next step, and required tools are still discoverable and callable.
+For an image-encoding fix, rerun the affected image-input cases and check their results.
+
 Selection order is binding: **independence and hard gates → primary before last resort → semantic suitability → review quality tier → health/quota within
 that tier → cost among equivalent fits**. Formal code review uses the catalog's `review_ladders`
 and the reviewer resolver for current routine and authority seat order; do not reconstruct a ladder
@@ -230,6 +246,11 @@ the former GPT-6 Astra advisory seat. Review, critique and design input use
 accountable driving, advisory and approval work and hard coding, and at `medium` for well-specified
 bounded coding. Astra 6.2 runs at `high` only. Dispatch and the Codex launcher refuse `xhigh` and
 `max` for both models; nothing maps them to another effort.
+When qualifying a run, record the effective model, reasoning effort, execution-mode
+toggles, and speed tier as separate fields. Claude Code's Ultracode toggle is
+independent of effort. Claude Fast and OpenAI Ultrafast are examples of premium
+speed tiers. Paid options require explicit operator authorization.
+
 **GPT-6.2 Astra (`gpt-6.2-astra`) is request-only** (operator 2026-11-17), like Fable 5.2: no seat,
 ladder, endpoint, council, substitution or default routes it, and it holds no review, advisory or
 approval role. Its documented use is security review: an extra pinned read-only reviewer on a
@@ -259,6 +280,14 @@ runtime attestation rules (#9488).
 
 **Measuring a model change** ("Which Claude model should you build with?", Addy Osmani, claude.dev blog, 2026-11-09): use real tasks with an outcome check, each candidate at two or three effort levels in separate sessions; score outcomes independently; take cost from each run's `usage`, with subscription consumption recorded apart from estimated API dollars; keep a mixed setup only if it beats every single-model point on score per spend within the same task family; shadow-test before cutover. Cost never overrides the selection order above or the authority, security, review and Ukrainian-quality gates.
 
+Use one measurement record per task and candidate. Record the acceptance outcome
+and final artifact, model, effort, harness, fresh input, cache reads and separately
+billed cache writes, output including thinking, retry count, elapsed time, and
+total cost. Include failed attempts, subagents, and follow-up turns in the totals.
+Report failures alongside accepted outcomes and include their spend in cost per
+accepted task. Keep subscription usage, actual API charges, and list-price API
+estimates separate. Mark missing usage or cost as unknown.
+
 A dispatch is review-typed when it passes any of `--require-review-verdict`,
 `--review-attempt`, `--review-profile`, `--review-author-model` or `--risk`
 (#9538). Review-typed dispatches judge an explicitly requested reviewer by the resolver's
@@ -276,7 +305,7 @@ review; it does not automatically dispatch a fallback. Writer routing is unchang
 
 ### Historical routing evidence
 
-The [Wave 1 scorecard](../../../docs/decisions/agent-rules-routing-history.md)
+The [Wave 1 scorecard](https://github.com/learn-ukrainian/learn-ukrainian.github.io/blob/main/docs/decisions/agent-rules-routing-history.md)
 is historical evidence only; live seats and ladders come from the catalog.
 
 **Cursor Auto authors:** the resolver attributes Auto authors to the Cursor family,
@@ -482,7 +511,7 @@ or count as a formal review.
 | Content Review with VESUM verification (load-bearing) | **LANGUAGE-LANES RULE binds (operator 2026-09-27)** — dispatch the reviewer from the review-loop ukrainian seats: Gemini (AGY) and Sol for an Anthropic author or any author outside OpenAI and Google, Gemini (AGY) alone for an OpenAI author, Sol alone for a Google author, and no Claude seat, with the `sources` MCP (`verify_words`, `query_cefr_level`, `check_russian_shadow`). Grok holds no Ukrainian seat (C-5307). Grok-authored work needs a non-xAI reviewer. ~~deepseek-v4-pro default (#4358)~~ RETIRED for language seats by the same order; the #2112/# 4358 validation history stands as evidence only |
 | Wiki and content work on AGY | Dispatch Hydrogen Medium for writing. Dispatch Neon High with the Sources MCP for content, pedagogy, and factual review. Use `ask-agy` for consultation. |
 | Ukrainian CONTENT (authoring · russicism/quality review) — **we AUTHOR UK content, we do NOT translate EN→UK** | Written in Ukrainian, immersion-first, grounded in VESUM/`sources` MCP. **Per-profile authoring — BAKEOFF-BACKED (2026-07-04, `audit/2026-07-04-uk-writing-probe/`, deterministic VESUM + russian-shadow, 5 candidates):** all of codex (historical benchmark models: gpt-5.6-terra and gpt-5.5)/agy/claude/deepseek/cursor wrote **0-russicism, 95-100%-VESUM** content on all 3 profiles → **gpt-5.5 is not uniquely best; it can and should delegate.** A1-A2 English-support → **agy** (best immersion teaching-voice) ≈ **codex**; B1-C2 pure → **codex ≈ agy ≈ claude**. **Seminars — FACT-CHECKED (2026-07-04, `audit/2026-07-04-uk-writing-probe/SEMINAR-SCORECARD.md`; tool-backed vs uk.wikipedia + VESUM, cross-verified by an independent 3-family review codex/agy/deepseek):** the probe can't rank seminar content (all clean), so the «Веснянки» sample was fact-verified. **Writers → codex + claude + agy** (all factually clean, mutually cross-family). **deepseek + cursor are NOT seminar writers:** deepseek made 1 hard error (царинні conflated with юр'ївські cattle-drive songs — confident scholarly specificity that was wrong; it conceded on review), cursor made 2 (веснянки «від хати до хати» = over-generalised риндзівки/волочебні; «мелодії легкі, м'які, співочі» = inverted musicology). **Seminar review uses the review-loop ukrainian seats: Gemini (AGY) and Sol for an Anthropic author or any author outside OpenAI and Google, Gemini (AGY) alone for an OpenAI author, Sol alone for a Google author, and no Claude seat (LANGUAGE-LANES RULE, operator 2026-09-27; the former deepseek seat is retired — its царинні hard error stands as supporting evidence)**, **always paired with a source-enforced fact-check gate** (`seminar-content-review` skill + `sources` MCP) — never a bare LLM pass. FOLK review uses those same seats, with no Claude seat (`docs/folk-epic/folk-review-rubric.md`). **Lesson: "sounds scholarly" ≠ "is accurate" — verify confident specificity, don't trust it.** **Review (russicism/surzhyk/CEFR):** the review-loop ukrainian seats, with the Sources tools (`verify_words`, `check_russian_shadow`, `query_cefr_level`); agy strong here. ⚠️ **cursor: EXCLUDED from all language seats (LANGUAGE-LANES RULE)** — its bakeoff history (non-canonical apostrophes U+2019, text-dependent russicism «перекатні») stands as supporting evidence only. **Never pool/glm/gemma/kimi/deepseek for UK content either** (same rule). Grok holds no language seat (C-5307); for its council and discussion advice see the LANGUAGE-LANES RULE (2026-11-16 amendment). cursor, pool, glm, gemma, kimi and deepseek stay excluded. |
-| Adversarial review of design / ADR / architecture / code — the **Claude reviewer seat** | **Prefer IN-SESSION INLINE for cost** — the interactive orchestrator reads the artifact, verifies claims, writes the verdict + fix notes on the main quota (cheapest path; economics below). Use Opus / Sol. Dispatching Claude (`claude -p` / `--agent claude` / `review-deep` / an `Agent` review subagent) **is permitted when it adds value or inline isn't feasible** — the `-p` sunset was cancelled (user 2026-06-22). For routine reviews still prefer inline or a non-Claude lane; reserve dispatched Claude for catches that need it. Context heavy → DEFER to the next interactive session, or dispatch if it must clear now. |
+| Adversarial review of design / ADR / architecture / code — the **Claude reviewer seat** | Use Opus / Sol within the applicable qualification rules. Claude can review in session when eligible or by dispatch. See [Claude reviewer-seat economics](#claude-reviewer-seat-economics-2026-06-12) for the evidence needed to choose on cost. |
 | Ukrainian Q&A | Use the Sources MCP. Use `ask-agy` with Neon High for consultation. |
 | Live web fact-check (current version / pricing / URL & citation currency, "is this API still live") | **opencode + lightpanda-MCP HARNESS capability — any opencode-hosted model browses** (kubedojo-verified incl. deepseek); it is NOT model-specific. Route by fit: `ask-deepseek` is consult-only for non-language questions; DeepSeek V4.1 Flash coding through opencode is allowed; review-of-record and Ukrainian work need measured evidence first. |
 | Search / grep / "find me X" across files | Explicit Luna scouting profiles remain available. Generic Codex `multi_agent_v2` children default to Terra 6.1 @ `high` with owned paths and an objective scope ceiling; pin Sol for reserved roles. Delegated Luna work follows its existing brief or advisory-envelope contract. |
@@ -539,6 +568,17 @@ OpenRouter account balance requires a management key (env, OpenCode's explicit
 The CLI reports `balance: needs management key` when it cannot read that balance.
 Follow-up naming debt: retain `CODEXBAR_*` environment and `codexbar` payload keys
 for compatibility; a global rename is outside this change.
+
+Subscription headroom measures lane capacity. The subscription dollar figures in
+`agent_budgets.yaml` and vendor estimates such as a Daybreak estimated cost limit
+are planning figures. The DeepSeek dispatch floor checks the selected endpoint's
+remaining funds before spawn. A configured OpenRouter key cap applies to charges
+counted against that key. Its coverage depends on provider settings, including
+whether usage on your own provider keys counts. For a custom API loop, enforce a
+per-run budget by reserving worst-case cost before each request and reconciling
+actual charges afterward. Account explicitly for hosted or separately billed
+tools and fees, and stop before a request whose full cost cannot be bounded or
+reserved. If the actual charge is unknown, keep the reservation and end the run.
 
 **Model-by-harness intent:** operator-authorized orchestration from Hermes (historically Grok; Grok 4.7 is not a driver seat)
 keeps model family, model ID, harness, and functional role as separate axes. Hermes
@@ -1139,26 +1179,23 @@ cannot independently review OpenAI-authored commits.
 
 ## Claude reviewer-seat economics (2026-06-12)
 
-There is ONE Claude Code quota. A dispatched / headless / subagent Claude competes with the interactive
-orchestrator's own seat, AND a subagent starts a fresh context that **reloads the full project (~2–3M tokens,
-~1000:1 overhead per the global `code-editing-safety` §7 rule)** to return a verdict that inline costs
-~15–25k. A subagent therefore *duplicates a session boot you pay for anyway* → ~50–150× the tokens for the
-identical verdict. So **prefer** fulfilling the Claude reviewer seat IN-SESSION (dispatching Claude is
-permitted — the `-p` sunset was cancelled, user 2026-06-22 — but it costs the multiple above, so route by need):
+The June 2026 policy reported roughly 2–3M tokens for a fresh subagent review
+that reloaded project context, versus 15–25k for a verdict in an existing
+session. Its 50–150× figure was an estimate for that comparison. The record
+gives neither the cache split nor the cost of completing the review. Claude Code
+later enabled fork subagents by default on additional surfaces, including
+`claude -p` and the Agent SDK.
 
-1. **Default: review INLINE, early in the session** while context is light — cheapest, full faculties, and you
-   reuse the read to write the fix.
-2. **Context heavy + a Claude review is still needed: DEFER** to the next MANUAL interactive session's start
-   (record a top-of-handoff `Claude review PENDING: <artifact>` so cold-start picks it up first). That
-   artifact's merge waits one session. Prefer this over cramming it into a depleted session or spawning a
-   subagent (cost) — though dispatch IS available when the review must clear now.
-3. **Inline-now despite heavy context** only when latency is unacceptable (the review must clear THIS session
-   to unblock something).
+Before using cost to choose a review route or justify a deferral allowed by the
+workflow, compare eligible routes on the same review task and acceptance
+criteria with current versions and settings. Record the context and fork
+behavior, fresh and cached input, completed-task cost, and elapsed time.
 
-Non-Claude reviewers are UNAFFECTED for NON-LANGUAGE work (LANGUAGE-LANES RULE binds for anything judging Ukrainian text) — resolve CODE/infra reviews through `closeout_cli resolve-reviewer` on a qualified outside-family route. DeepSeek V4.1 Flash coding through opencode is allowed; review-of-record and Ukrainian work need measured evidence first; `ask-deepseek` is consult-only for non-language work. (VESUM/content review = language work → the review-loop ukrainian seats, never a Claude seat. Grok holds no Ukrainian seat (C-5307).) The *Claude* seat is **preferred** in-session for cost.
-(The headless `--agent claude` / `claude -p` lane is AVAILABLE again — the mid-June 2026 sunset / "native binary not
-installed" fiasco was cancelled, user 2026-06-22; Claude may be used for ANY task, incl. dispatched review, when needed.
-The cost economics above stand regardless: dispatched Claude is far pricier than inline, so route by need, not by ban.)
+Resolve code and infra reviews through `closeout_cli resolve-reviewer` under
+the applicable independence rules. Use the `review-loop` Ukrainian seats for
+VESUM and content review. Grok holds no Ukrainian seat (C-5307). DeepSeek V4.1
+Flash coding through opencode is allowed. Review of record and Ukrainian work
+need measured evidence first. `ask-deepseek` is consult-only for non-language work.
 
 The same table lives in `agents_extensions/shared/memory/MEMORY.md` rule #M0. This file is served at `GET /api/rules`; it is a Claude autoload exclude and is not deployed into `.claude/rules/`.
 
@@ -1168,6 +1205,15 @@ The same table lives in `agents_extensions/shared/memory/MEMORY.md` rule #M0. Th
 
 Review rounds, settlement and recording: the `review-loop` skill; landing and cleanup:
 `full-send` and `workflow.md` § Merge policy. This file keeps only the routing policy.
+
+**Reviewer evaluation.** The existing review evaluation protocol uses verified
+defects and clean controls. When qualifying a change to the reviewer's model,
+prompt, or tools, compare the candidate and baseline on the same held-out
+incident-producing changes with confirmed defects and known-clean changes.
+Count missed defects, recommendations on clean changes that would cause harm,
+and rounds to a supported verdict, with denominators and any cases that fail
+to converge. Use the results as qualification evidence under the existing
+exact-head review rules.
 
 **Mixed Anthropic/OpenAI code and infra branches (#10712, approved 2026-11-03).**
 The resolver returns a pair using existing qualified seats: one Anthropic reviewer for the
