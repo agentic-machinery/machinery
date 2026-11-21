@@ -203,9 +203,9 @@ with `review-loop` for review rounds and the budget.
    evidence that materially undermines the recorded verdict needs reviewer disposition before
    enqueue. PR CI runs Frontend, the admission checks and the affected
    tests (changed test files, tests that import or read changed files, the guards and
-   the `repo_wide` invariants), not the pytest shards. The real merge-group candidate
-   must pass the required **CI Gate**, which runs the full supported pytest suite,
-   before landing; nightly and opt-in `workflow_dispatch` runs run the full suite too.
+   the `repo_wide` invariants), not the pytest shards. Where the base branch has a merge
+   queue, the real merge-group candidate must pass the required **CI Gate**, which runs the
+   full supported pytest suite, before landing; nightly and opt-in `workflow_dispatch` runs run the full suite too.
 3. Only then enqueue: a recorded exact-head APPROVE and a green PR CI Gate, both bound to the
    current PR head. Never arm auto-merge ahead of either gate —
 early-armed auto-merge is how #7447–#7449 landed with empty reviews, and a moved head
@@ -219,6 +219,11 @@ Only non-draft PRs with no unresolved BLOCKING finding may enqueue. Pending
 or cancelled required checks fail the gate; never use `--admin` to bypass CI.
 Queued is not MERGED: diagnose conflicts, changed bases, failed checks or queue
 ejection, and re-establish the gates before re-enqueueing.
+**No merge queue:** where `read queue-status` reports `isMergeQueueEnabled: false` for the
+base branch, no merge-group run exists. The same `pr-merge` squash-merges the PR directly,
+pinned to the approved head, after a recorded exact-head APPROVE and every same-head check
+green (none pending, failing or cancelled), never with `--admin`; an unreadable flag stops
+the landing.
 **Priority line (#12019):** only the CTO seat applies the `merge-priority` label, to a
 machinery fix, after the exact-head approval is recorded; `pr-merge` (and so the keeper)
 then enqueues that head at the front of the queue, while every gate, including the

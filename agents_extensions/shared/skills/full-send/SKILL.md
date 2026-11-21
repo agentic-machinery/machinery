@@ -115,40 +115,42 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    head. A failing test node is never rerun: fix it, or delete the test with the reason in the
    commit and a note on its issue. One evidenced rerun for an infrastructure failure (no test
    node failed), never more.
-7. **Check the gate on the live head** ([delivery](references/delivery.md#the-gate)):
+7. **Check the gate on the live head** ([delivery](references/delivery.md#the-gate)). First
+   read the base branch's landing kind from `data.repository.pullRequest.isMergeQueueEnabled`
+   (`$BASE` is the PR's `baseRefName`):
 
    ```bash
-   gh pr view "$PR" --json state,isDraft,headRefOid,mergeable,mergeStateStatus,autoMergeRequest
+   gh pr view "$PR" --json state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus,autoMergeRequest
+   "$PY" -m lu_machinery.publish read queue-status --repo "$REPO" --number "$PR" --branch "$BASE"
    ```
 
-   `headRefOid` must equal the head of the recorded APPROVE and of the green PR CI Gate; a
-   pending, red or cancelled gate is not green. If CI evidence that arrived after the verdict
-   materially undermines it (for example a failure in code the review relied on), get the
-   reviewer's disposition before landing (step 8), through a round `budget-check` admits; a fix that
-   moves the head returns to step 4.
+   `true` means a merge queue and `false` none. Any other reading (a failed read, a missing or
+   non-boolean field) means stop; never guess. `headRefOid` must equal the head of the recorded
+   APPROVE and of the green PR CI: the `CI Gate` check with a merge queue, every check on that
+   head without one. A pending, red or cancelled check is not green. If CI evidence that arrived
+   after the verdict materially undermines it (for example a failure in code the review relied
+   on), get the reviewer's disposition before landing (step 8), through a round `budget-check`
+   admits; a fix that moves the head returns to step 4.
    Send follow-ups to the CTO through Fleet Comms
    (`"$PY" -I -m lu_machinery.fleet_comms channel publish … --recipient claude-cto`; the CTO's one durable recipient, never a `claude-cto-<id>` name).
-8. **Drain the inbox, then land** at the approved head. Read which landing applies from
-   `data.repository.pullRequest.isMergeQueueEnabled` (`$BASE` is the PR's `baseRefName`; `pr-merge`
-   re-reads the flag itself and acts on its own reading):
+8. **Drain the inbox, then land** at the approved head, once step 7 holds for the kind you read.
+
+   - Merge queue: the merge-queue keeper may already have queued the PR, so check
+     `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json`
+     first. `pr-merge` enqueues, and landing also needs a green merge-group CI Gate on the real
+     candidate. Queued is not merged. A PR the CTO labelled `merge-priority` after its
+     exact-head approval enqueues at the front of the queue on its own (`workflow.md` § Merge
+     policy, priority line); never apply that label yourself.
+   - No merge queue: `pr-merge` squash-merges the PR directly, pinned to the approved head.
+     Step 7 is the whole landing gate; no merge-group run exists to wait for, so its absence is
+     no reason to stop.
 
    ```bash
-   "$PY" -m lu_machinery.publish read queue-status --repo "$REPO" --number "$PR" --branch "$BASE"
    "$PY" -m lu_machinery.publish pr-merge --repo "$REPO" --number "$PR" --match-head "$HEAD_SHA"
    ```
 
-   - `true` (merge queue): `pr-merge` enqueues. The merge-queue keeper may already have queued
-     it: check `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --json` first. Landing also
-     needs a green merge-group CI Gate on the real candidate. Queued is not merged. A PR the CTO
-     labelled `merge-priority` after its exact-head approval enqueues at the front of the queue
-     on its own (`workflow.md` § Merge policy, priority line); never apply that label yourself.
-   - `false` (no merge queue): `pr-merge` squash-merges the PR directly, pinned to the approved
-     head. The step 7 gate (exact-head APPROVE; every check on that head green, none pending,
-     failing or cancelled) is the whole landing gate; no merge-group run exists to wait for, so
-     its absence is no reason to stop.
-   - Any other reading (a failed read, a missing or non-boolean field): stop; never guess.
-
-   Never `--auto`, `--delete-branch` or `--admin`.
+   `pr-merge` re-reads the flag and takes its own path. Never `--auto`, `--delete-branch` or
+   `--admin`.
 9. **Confirm `MERGED`** and the merge SHA: `gh pr view "$PR" --json state,mergeCommit`. If the
    queue ejects the PR, follow the kick recipe in [pr-watch](references/pr-watch.md). If
    waiting in the queue is the only step left and the integration owner has accepted queue
