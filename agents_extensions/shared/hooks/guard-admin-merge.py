@@ -35,8 +35,6 @@ sys.dont_write_bytecode = True
 try:
     from agents_extensions.shared.hooks.shell_shlex import (
         ShellPreprocessLimit,
-        skippable_heredoc_delimiters,
-        strip_skippable_heredoc_bodies,
     )
 except Exception as exc:
     print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
@@ -136,22 +134,6 @@ def _flag_enabled(args: list[str], name: str) -> bool:
 # so the helpers are copied, not imported. Keep the three active copies in
 # guard-branch-switch-in-main.py, guard-admin-merge.py, and guard-pr-merge.py
 # in sync.
-
-
-def _heredoc_delimiters(line: str) -> list[tuple[str, bool]] | None:
-    """Keep only the shared parser's unambiguous here-doc delimiters."""
-    parsed = skippable_heredoc_delimiters(line)
-    return None if parsed is None else [(delimiter, strip_tabs) for delimiter, strip_tabs, _ in parsed]
-
-
-def _strip_heredoc_bodies(command: str) -> str:
-    """Drop heredoc BODY lines — document text is data, not commands.
-
-    Fail-CLOSED on an unclosed heredoc (#4877): a never-closing / mis-parsed
-    opener must not make trailing real `gh pr merge --admin` vanish. Only a
-    heredoc that actually closes has its body + closer dropped.
-    """
-    return strip_skippable_heredoc_bodies(command)
 
 
 def _join_line_continuations(text: str) -> str:

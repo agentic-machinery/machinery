@@ -181,9 +181,7 @@ try:
         ShellPreprocessLimit,
         normalize_io_descriptors,
         preprocess_shell_command,
-        skippable_heredoc_delimiters,
         split_operator_run,
-        strip_skippable_heredoc_bodies,
     )
 except Exception as exc:
     print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
@@ -406,68 +404,6 @@ _FILE_REDIRECTS = frozenset({">", ">>", ">|", "&>", "&>>", ">&", "<>"})
 _REDIRECT_OPS = _FILE_REDIRECTS | {"<", "<<", "<<-", "<<<", "<&"}
 
 
-def _heredoc_delimiters(line: str) -> list[tuple[str, bool, bool]] | None:
-    """Keep only the shared parser's unambiguous here-doc delimiters."""
-    return skippable_heredoc_delimiters(line)
-
-
-def _strip_heredoc_bodies(command: str) -> str:
-    """Drop heredoc BODY lines before tokenizing (#4538 / #4855).
-
-    Content between ``<<'MARKER'`` and ``MARKER`` is document DATA, not shell
-    syntax. Without this, body text like ``>15%`` or markdown backtick spans
-    is tokenized as redirects and misread as write targets — the recurring
-    false-positive class. Pattern shared with guard-secret-print.py.
-
-    Fail-CLOSED on an unclosed heredoc (#4877): if a delimiter never appears
-    before EOF, the buffered lines were NOT a real body — a crafted or
-    malformed opener must not make trailing REAL writes vanish from the
-    tokenized view. Those lines are kept; only a heredoc that actually
-    closes has its body + closer dropped.
-    """
-    return strip_skippable_heredoc_bodies(
-        command, opener_transform=_strip_shell_comments, body_substitutions=_heredoc_substitutions
-    )
-
-
-def _heredoc_substitutions(line: str) -> list[str]:
-    """Executable substitutions in one unquoted heredoc body line."""
-    found: list[str] = []
-    i = 0
-    while i < len(line):
-        if line[i] == "\\":
-            i += 2
-            continue
-        if line.startswith("$((", i):
-            i += 3
-            continue
-        if line.startswith("$(", i):
-            start = i
-            depth = 1
-            i += 2
-            while i < len(line) and depth:
-                if line[i] == "\\":
-                    i += 2
-                    continue
-                if line[i] == "(":
-                    depth += 1
-                elif line[i] == ")":
-                    depth -= 1
-                i += 1
-            found.append(line[start:i])
-            continue
-        if line[i] == "`":
-            start = i
-            i += 1
-            while i < len(line) and line[i] != "`":
-                i += 2 if line[i] == "\\" else 1
-            i = min(i + 1, len(line))
-            found.append("$(" + line[start + 1 : i - 1] + ")")
-            continue
-        i += 1
-    return found
-
-
 def _collapse_shell_line_continuations(command: str) -> str:
     """Remove shell ``\\`` + newline continuations outside single quotes.
 
@@ -577,66 +513,6 @@ _UNMASK = str.maketrans({**{v: k for k, v in _LITERAL_SENTINELS.items()}, _ANSI_
 # Shared shell_shlex.split_operator_run separates punctuation runs before
 # this guard tracks scopes and redirections.
 _MAX_SHELL_DEPTH = 8
-
-
-def _strip_shell_comments(command: str) -> str:
-    """Remove Bash comments at word boundaries, retaining each newline.
-
-    Keep hashes inside words, quotes, command substitutions, and backticks for
-    the existing tokenizer. Heredoc bodies are removed before this is called
-    on the complete command.
-    """
-    out: list[str] = []
-    quote = ""
-    in_backticks = False
-    substitution_depth = 0
-    substitution_outer_quote = ""
-    word_start = True
-    i = 0
-    while i < len(command):
-        char = command[i]
-        if char == "\\" and quote != "'" and i + 1 < len(command):
-            out.append(command[i : i + 2])
-            if command[i + 1] != "\n":
-                word_start = False
-            i += 2
-            continue
-        if char == "'" and quote != '"' and not in_backticks:
-            quote = "" if quote == "'" else "'"
-            word_start = False
-        elif char == '"' and quote != "'" and not in_backticks:
-            quote = "" if quote == '"' else '"'
-            word_start = False
-        elif char == "`" and quote != "'":
-            in_backticks = not in_backticks
-            word_start = False
-        elif quote != "'" and not in_backticks and command.startswith("$(", i):
-            if not substitution_depth:
-                substitution_outer_quote = quote
-                quote = ""
-            substitution_depth += 1
-            out.append("$(")
-            word_start = False
-            i += 2
-            continue
-        elif substitution_depth and not quote and not in_backticks and char == "(":
-            substitution_depth += 1
-        elif substitution_depth and not quote and not in_backticks and char == ")":
-            substitution_depth -= 1
-            if not substitution_depth:
-                quote = substitution_outer_quote
-        elif not quote and not in_backticks and not substitution_depth:
-            if char == "#" and word_start:
-                end = command.find("\n", i)
-                if end < 0:
-                    break
-                i = end
-                continue
-            # Bash blanks are ASCII; keep # after redirects as a filename for the guard.
-            word_start = char in " \t\n;&|()"
-        out.append(char)
-        i += 1
-    return "".join(out)
 
 
 def _mask_quoted_literals(command: str) -> str:
