@@ -398,8 +398,13 @@ def comparison_effort(value: object) -> str:
     return effort if VARIANT_SUFFIX.fullmatch(effort) else UNKNOWN_EFFORT
 
 
-def _typed_review(record: Mapping[str, Any]) -> bool:
-    """Whether ``review_typed`` types this task, including a flag stored only on its options."""
+def _review_flags(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy of ``record`` whose empty review flags are filled from its options.
+
+    Precedence for each :data:`REVIEW_TASK_FLAG_FIELDS` name is a non-empty top-level value,
+    then the same key on options. ``review_risk`` also accepts ``options.risk`` when
+    ``options.review_risk`` is empty. A present null is empty: ``dict.get``'s default is not.
+    """
     subject = dict(record)
     options = _options(record)
     for name in REVIEW_TASK_FLAG_FIELDS:
@@ -409,7 +414,12 @@ def _typed_review(record: Mapping[str, Any]) -> bool:
                 value = options.get("risk")
             if value not in (None, False, "", []):
                 subject[name] = value
-    return review_typed(subject)
+    return subject
+
+
+def _typed_review(record: Mapping[str, Any]) -> bool:
+    """Whether ``review_typed`` types this task, including a flag stored only on its options."""
+    return review_typed(_review_flags(record))
 
 
 def _validated_review(review: Mapping[str, Any] | None) -> bool:
@@ -423,10 +433,14 @@ def _validated_review(review: Mapping[str, Any] | None) -> bool:
 def role_of(record: Mapping[str, Any], review: Mapping[str, Any] | None = None) -> str:
     """Review only when the dispatch classifier types the task, or its reply is a validated review.
 
-    Read-only mode and a task id that contains ``review`` are not a review. ``review`` is the
-    parsed reply from :func:`_review`, when the caller has one.
+    Read-only mode and a task id that contains ``review`` are not a review. A workspace-write
+    result is that task's own closeout, so a verdict line in it is not review evidence.
+    ``review`` is the parsed reply from :func:`_review`, when the caller has one.
     """
-    if _typed_review(record) or _validated_review(review):
+    if _typed_review(record):
+        return "review"
+    mode = record.get("mode") or _options(record).get("mode")
+    if mode != "workspace-write" and _validated_review(review):
         return "review"
     return "write"
 
@@ -751,19 +765,24 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         return None
     refusal = start_refusal(record)
     options = _options(record)
-    # A typed review that did not finish has no reply to read. Any other settled task is read
-    # once, so a legacy record keeps review attribution only when the reply validates.
-    typed = _typed_review(record)
-    reading = None if refusal or (typed and status != "done") else _review(path, record)
-    role = role_of(record, reading)
+    # One resolved copy drives typing, class, PR association and reply parsing. A typed review
+    # that did not finish has no reply to read. A workspace-write closeout is not a review reply.
+    # Any other settled task is read once, so a legacy record keeps review attribution only when
+    # the reply validates.
+    resolved = _review_flags(record)
+    typed = review_typed(resolved)
+    mode = record.get("mode") or options.get("mode")
+    reading = None if refusal or (typed and status != "done") or (
+        not typed and mode == "workspace-write") else _review(path, resolved)
+    role = role_of(resolved, reading)
     if role == "review":
-        task_class = (f"{label(record.get('review_profile') or options.get('review_profile'), 'code')}/"
-                      f"{label(record.get('review_risk') or options.get('risk'))}")
+        task_class = (f"{label(resolved.get('review_profile'), 'code')}/"
+                      f"{label(resolved.get('review_risk'))}")
     else:
         task_class = label(record.get("research_task_family"), "unclassified")
-    pr = record.get("pr", options.get("pr"))
+    pr = resolved.get("pr")
     head = record.get("pinned_head") or options.get("pinned_head") or record.get("worktree_base_ref")
-    author = record.get("review_author_model") or options.get("review_author_model")
+    author = resolved.get("review_author_model")
     raw_repo = record.get("repo") if record.get("repo") is not None else options.get("repo")
     repo = "public" if raw_repo is None else label(raw_repo, "unknown")
     raw_class = record.get("data_class") if record.get("data_class") is not None else options.get("data_class")
@@ -1230,9 +1249,10 @@ def backfill(tasks_dir: Path, batch_state_dir: Path, *, dry_run: bool = False) -
         written = []
         for source, record, row in candidates:
             stored = present.get(row["task_id"])
-            if row["review"] is not None and _stale(stored, row):
-                # Another writer may have stored a newer reading since: every review row written is read under the lock.
-                row = summary_row(source, record, row["source_mtime_ns"]) or row  # the same record gives a row again
+            if _stale(stored, row):
+                # Role and the payload can both follow the sidecar, including when the unlocked
+                # payload is null. Re-read under the lock before this row replaces a stored one.
+                row = summary_row(source, record, row["source_mtime_ns"]) or row
             if _stale(stored, row):
                 written.append(row)
         counts["added"] = sum(row["task_id"] not in present for row in written)
