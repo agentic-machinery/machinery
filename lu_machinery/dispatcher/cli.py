@@ -258,6 +258,9 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "wait":
             sub.add_argument("--timeout", type=float, default=0, help="Wait seconds; 0 is unlimited (default: 0)")
             sub.add_argument("--poll-interval", type=float, default=1, help="Read interval in seconds (default: 1)")
+            sub.add_argument("--reply", action="store_true",
+                             help="Add the sealed reply of a done review this task dispatched, as result, or a typed "
+                                  "result_unavailable (needs --run-nonce; default: the record only)")
     sof = subs.add_parser(
         "status-or-fail",
         help="Exit 0 only for a confirmed running task",
@@ -925,7 +928,7 @@ def main(argv=None) -> int:
         elif args.command == "wait":
             if args.timeout < 0 or args.poll_interval <= 0:
                 raise ValueError("timeout must be nonnegative and poll interval positive")
-            result, code = worker.wait(args.task_id, args.run_nonce, args.timeout, args.poll_interval)
+            result, code = worker.wait(args.task_id, args.run_nonce, args.timeout, args.poll_interval, reply=args.reply)
         elif args.command == "cancel":
             result = worker.cancel(args.task_id, args.run_nonce)
         else:

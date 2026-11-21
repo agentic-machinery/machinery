@@ -336,6 +336,7 @@ def _review_of_takeover(tmp_path, monkeypatch):
                          worktree_path=str(tree)),
         "author-review": dict(status="done", run_nonce="r1", parent_task_id="author", mode="read-only",
                               review_branch="codex/inherited", pinned_head=head,
+                              result_file=str(tmp_path / "tasks/author-review.result"),
                               result_sha256=hashlib.sha256(REPLY.encode()).hexdigest()),
     }.items():
         (tmp_path / "tasks" / f"{task_id}.json").write_text(json.dumps(dict(common, task_id=task_id, **record)))
@@ -347,15 +348,17 @@ def test_takeover_author_reads_its_own_exact_head_review_reply(tmp_path, monkeyp
     """Defect (#1075): a takeover worker's wait returned its review's metadata without the sealed reply."""
     _review_of_takeover(tmp_path, monkeypatch)
     monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
-    record, code = worker.wait("author-review", "r1")
+    record, code = worker.wait("author-review", "r1", reply=True)
     assert (code, record["result"], record.get("result_unavailable")) == (0, REPLY, None)
+    # Without --reply the output stays an exact copy of the record (saved wait output, task_record_store).
+    assert worker.wait("author-review", "r1")[0] == json.loads((tmp_path / "tasks/author-review.json").read_text())
 
 
 def test_unrelated_worker_gets_no_review_reply(tmp_path, monkeypatch):
     """Control: a running task that did not dispatch the review is refused its reply, even on the same branch."""
     _review_of_takeover(tmp_path, monkeypatch)
     monkeypatch.setenv(ownership.TASK_ID_ENV, "stranger")
-    record, _code = worker.wait("author-review", "r1")
+    record, _code = worker.wait("author-review", "r1", reply=True)
     assert ("result" in record, record["result_unavailable"]) == (False, "caller_not_parent")
 
 
@@ -364,9 +367,9 @@ def test_stale_nonce_or_moved_head_gets_no_review_reply(tmp_path, monkeypatch):
     tree = _review_of_takeover(tmp_path, monkeypatch)
     monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
     with pytest.raises(ValueError, match="run nonce mismatch"):
-        worker.wait("author-review", "stale")
+        worker.wait("author-review", "stale", reply=True)
     run_git(tree, "-c", "user.email=s@example.invalid", "-c", "user.name=S", "commit", "--allow-empty", "-m", "fix")
-    record, _code = worker.wait("author-review", "r1")
+    record, _code = worker.wait("author-review", "r1", reply=True)
     assert ("result" in record, record["result_unavailable"]) == (False, "head_moved")
 
 
