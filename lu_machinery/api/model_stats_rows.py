@@ -54,7 +54,7 @@ from lu_machinery.fleet_comms.review_publication import (
 )
 from lu_machinery.model_families import canonical_cursor_model
 from lu_machinery.orchestration.fleet_repos import FleetRepo, clear_repository_cache, load_fleet_repos
-from lu_machinery.orchestration.task_record_store import iter_task_records
+from lu_machinery.orchestration.task_record_store import REVIEW_TASK_FLAG_FIELDS, iter_task_records
 from lu_machinery.review.model_catalog import VARIANT_SUFFIX, canonical_model_id, load_model_catalog
 from lu_machinery.review.review_contract import SCHEMA_VERSION, ContractError, parse_reviewer_json
 from lu_machinery.review.verdict_parser import (
@@ -398,10 +398,37 @@ def comparison_effort(value: object) -> str:
     return effort if VARIANT_SUFFIX.fullmatch(effort) else UNKNOWN_EFFORT
 
 
-def role_of(record: Mapping[str, Any]) -> str:
+def _typed_review(record: Mapping[str, Any]) -> bool:
+    """Whether ``review_typed`` types this task, including a flag stored only on its options."""
+    subject = dict(record)
     options = _options(record)
-    mode = record.get("mode") or options.get("mode")
-    return "review" if mode == "read-only" or "review" in str(record.get("task_id", "")) else "write"
+    for name in REVIEW_TASK_FLAG_FIELDS:
+        if subject.get(name) in (None, False, "", []):
+            value = options.get(name)
+            if value in (None, False, "", []) and name == "review_risk":
+                value = options.get("risk")
+            if value not in (None, False, "", []):
+                subject[name] = value
+    return review_typed(subject)
+
+
+def _validated_review(review: Mapping[str, Any] | None) -> bool:
+    """A parsed verdict is review evidence. An unparsed or missing reply is not."""
+    if not isinstance(review, Mapping):
+        return False
+    verdict = review.get("verdict")
+    return isinstance(verdict, str) and verdict in VERDICTS[:3]
+
+
+def role_of(record: Mapping[str, Any], review: Mapping[str, Any] | None = None) -> str:
+    """Review only when the dispatch classifier types the task, or its reply is a validated review.
+
+    Read-only mode and a task id that contains ``review`` are not a review. ``review`` is the
+    parsed reply from :func:`_review`, when the caller has one.
+    """
+    if _typed_review(record) or _validated_review(review):
+        return "review"
+    return "write"
 
 
 @lru_cache(maxsize=1)
@@ -724,7 +751,11 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         return None
     refusal = start_refusal(record)
     options = _options(record)
-    role = role_of(record)
+    # A typed review that did not finish has no reply to read. Any other settled task is read
+    # once, so a legacy record keeps review attribution only when the reply validates.
+    typed = _typed_review(record)
+    reading = None if refusal or (typed and status != "done") else _review(path, record)
+    role = role_of(record, reading)
     if role == "review":
         task_class = (f"{label(record.get('review_profile') or options.get('review_profile'), 'code')}/"
                       f"{label(record.get('review_risk') or options.get('risk'))}")
@@ -737,19 +768,9 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     repo = "public" if raw_repo is None else label(raw_repo, "unknown")
     raw_class = record.get("data_class") if record.get("data_class") is not None else options.get("data_class")
     fresh, cached, output = tokens(record.get("usage"))
-    review = None
-    evidence_absent = False
-    if role == "review" and not refusal:
-        expected = review_typed(dict(record)) or pr is not None or (
-            options.get("review_profile") in ("code", "infra", "ukrainian")
-            or record.get("research_role") in ("review", "reviewer")
-        )
-        # Untyped failures can still have a readable review reply. It establishes
-        # what the task did, while its terminal status still decides success.
-        reading = _review(path, record) if status == "done" or not expected else None
-        evidence_absent = not expected and (reading is None or reading["verdict"] == "unparsed")
-        if status == "done":
-            review = reading
+    # Terminal status still decides whether a verdict is stored. A review that is typed, or
+    # whose reply validated, is not reported as missing review evidence.
+    review = reading if role == "review" and not refusal and status == "done" else None
     return {
         "schema": ROW_SCHEMA,
         "task_id": task_id,
@@ -766,7 +787,6 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "tokens": {"fresh_input": fresh, "cached_input": cached, "output": output},
         "allowance": None if refusal else _allowance(record),
         "review": review,
-        **({"review_evidence_absent": True} if evidence_absent else {}),
         "repo": repo,
         "data_class": None if raw_class is None else label(raw_class),
         "pr": int(pr) if isinstance(pr, int | str) and not isinstance(pr, bool) and str(pr).isdigit() else None,
@@ -1181,7 +1201,7 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
     if not isinstance(stored, int) or stored < source:
         return True
     return stored == source and any(present.get(key) != candidate.get(key) for key in (
-        "review", "effort", "pinned_head", "never_started_reason", "review_evidence_absent",
+        "role", "class", "review", "effort", "pinned_head", "never_started_reason", "review_evidence_absent",
     ))
 
 
