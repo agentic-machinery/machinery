@@ -27,9 +27,9 @@ subprocesses are never invoked.
 ```
 
 - Prints a sorted JSON summary (`schema_version: "security-alerts-scan.v1"`) on
-  stdout with per-repository `source_ok` and per-tool status (`ok`,
-  `not_enabled`, or `error`), counts, and severities (`critical`, `high`,
-  `medium`, `low`, `unknown`).
+  stdout with per-repository `source_ok`, per-tool status (`ok`,
+  `not_enabled`, or `error`), counts, severities (`critical`, `high`,
+  `medium`, `low`, `unknown`), and a `fleet_security` object.
 - When `--metrics-file` is passed, writes Prometheus text 0.0.4 metrics
   atomically via `prometheus_client.write_to_textfile` (refusing symlink or
   directory targets).
@@ -73,5 +73,24 @@ subprocesses are never invoked.
 | `lu_security_alerts_feature_enabled` | `repo`, `tool` | `1` when the feature is enabled (`status="ok"`), `0` when GitHub reports it disabled (`status="not_enabled"`). Omitted on API error. |
 | `lu_security_alerts_source_ok` | `repo` | `1` when every tool query for the repository succeeded or positively reported `not_enabled`; `0` when any tool errored. |
 | `lu_security_alerts_scan_timestamp_seconds` | — | Unix epoch timestamp when the scan completed. |
+| `lu_security_alerts_fleet_security_state` | `repo`, `state` | `1` for the one observed fleet-security state. The state label is `missing_enrollment`, `inaccessible_evidence`, `zero_findings`, or `findings`. The other states are omitted, so a missing series is not a zero. |
+| `lu_security_alerts_fleet_security_findings` | `repo`, `scanner`, `severity` | OSS finding count. Emitted only when `state="findings"`. |
+
+`source_ok` and the process exit code still describe the three GitHub alert APIs. A missing caller or an unreadable fleet-security run does not by itself set `source_ok` to `0`. Alert on the fleet-security state series.
+
+## Fleet-security enrollment
+
+For every repository the scan already watches, the same GitHub client reads the default branch and the latest completed Actions run. No separate credential is used. A private registry row is read as `repos/<owner>/<name>` from `fleet_repos.yaml`; if that request is not readable, the state is `inaccessible_evidence`.
+
+Enrolled means a workflow file on the default branch calls `learn-ukrainian/machinery/.github/workflows/fleet-security.yml` at a full 40-character lowercase SHA. A branch, tag, or short SHA is `missing_enrollment`.
+
+| State | When it is recorded |
+| --- | --- |
+| `missing_enrollment` | The repository was readable and no workflow on the default branch calls the reusable workflow at a full SHA. An absent `.github/workflows` directory is this state. |
+| `inaccessible_evidence` | The repository, a listed workflow file, or the CI evidence could not be read, or the Fleet security gate did not succeed with a readable annotation list. A scanner job that failed without a finding annotation, succeeded with one, or was cancelled or timed out is this state too, even when another job reported findings. So is a run with findings whose gate was not `failure` or did not name each failed scanner job with a `Job <name> finished with result failure, expected success` line. A 404 on the repository itself is this state, including a private repository the token cannot see. |
+| `zero_findings` | A full-SHA caller exists, the latest completed run on the default branch belongs to that repository (`push`, `schedule`, or `workflow_dispatch`), it has exactly one Fleet security gate, that gate succeeded, and its fleet-security jobs produced no OSS finding annotations. Warning and notice annotations are not findings. |
+| `findings` | Those jobs produced redacted finding annotations (ShellCheck, actionlint, zizmor, TruffleHog, Trivy). `brief` adds a fix table and any safe repo-relative path to the dispatch command. Image targets and a missing-file marker are shown and are not owned paths. The runner's `Process completed with exit code N.` line, the gate's `Job <name> finished with result failure, expected success` line and the TruffleHog count header are not findings. A line number of `0` means the scanner gave no line. It still does not dispatch. |
+
+`brief` keeps the existing code-scanning, Dependabot, and secret-scanning sections and adds a Fleet Security section that names the state above.
 
 Host timers and Prometheus alert rules are wired separately in `infra-private`.

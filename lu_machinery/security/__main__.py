@@ -25,7 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="python -m lu_machinery.security",
         description=(
             "Watch GitHub security alerts across every repository in fleet_repos.yaml and render routed fix briefs.\n"
-            "Use scan to collect JSON and Prometheus textfile metrics, or brief to prepare a fix brief and dispatch command without dispatching."
+            "Scan also records fleet-security enrollment and OSS findings. Brief prepares a fix brief and dispatch command without dispatching."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -38,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Exit codes: 0 success (all scanned repos source_ok=1); 1 GitHub API or catalog routing error\n"
             "  (scan still emits JSON and writes --metrics-file with source_ok=0); 2 invalid arguments,\n"
             "  registry error, opted-out repository, or unsafe output path.\n"
-            "Related: docs/runbooks/security-alerts.md; docs/runbooks/secret-scanning.md; issue #1077."
+            "Related: docs/runbooks/security-alerts.md; docs/runbooks/secret-scanning.md; issues #1077 and #1081."
         ),
         allow_abbrev=False,
     )
@@ -49,6 +49,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Scan open code-scanning, Dependabot, and secret-scanning alerts across fleet_repos.yaml",
         description=(
             "Read fleet_repos.yaml, query the three GitHub alert APIs via github_client, print JSON, and optionally write a Prometheus textfile.\n"
+            "The same read records fleet-security enrollment: missing_enrollment, inaccessible_evidence, zero_findings, and findings stay distinct.\n"
             "Use for scheduled watching or on-demand fleet checks; API errors and disabled features stay distinct from zero."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -58,7 +59,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "  .venv/bin/python -m lu_machinery.security scan --metrics-file /path/to/security_alerts.prom\n"
             "Outputs: JSON report on stdout; atomic Prometheus textfile when --metrics-file is given.\n"
             "Exit codes: 0 all scanned repositories source_ok=1; 1 one or more alert API errors (metrics still written); 2 invalid input or registry.\n"
-            "Related: docs/runbooks/security-alerts.md; issue #1077."
+            "fleet_security state does not change source_ok. Alert on lu_security_alerts_fleet_security_state.\n"
+            "Related: docs/runbooks/security-alerts.md; issues #1077 and #1081."
         ),
         allow_abbrev=False,
     )
@@ -86,7 +88,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Render a catalog-routed fix brief and dispatch command from one repository's live alerts (never dispatches)",
         description=(
             "Fetch live open security alerts for one registered repository and render a fix brief plus dispatch command.\n"
-            "Use when preparing a security fix dispatch; selects the worker from model_catalog.yaml and never dispatches."
+            "The brief includes the fleet-security state. OSS findings add owned paths. The command never dispatches."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -95,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  .venv/bin/python -m lu_machinery.security brief --repo example-repo --brief-out fix.prompt.md --json\n"
             "Outputs: Markdown fix brief with dispatch command on stdout (or JSON with --json); writes brief file when --brief-out is set.\n"
             "Exit codes: 0 brief rendered; 1 alert API error or catalog routing failure; 2 invalid arguments, unknown or opted-out repo, or unsafe output path.\n"
-            "Related: docs/runbooks/security-alerts.md; docs/runbooks/secret-scanning.md; issue #1077."
+            "Related: docs/runbooks/security-alerts.md; docs/runbooks/secret-scanning.md; issues #1077 and #1081."
         ),
         allow_abbrev=False,
     )

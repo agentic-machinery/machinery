@@ -4,10 +4,15 @@ Reads the fleet repository registry (``fleet_repos.yaml``), queries the three
 GitHub security alert APIs strictly through ``lu_machinery.common.github_client``,
 emits JSON and Prometheus textfile metrics, and renders a fix brief + dispatch
 command routed through the model catalog without ever dispatching.
+
+The same read also records fleet-security enrollment (machinery#1081): whether
+the default branch calls the pinned reusable workflow, whether that call's CI
+evidence could be read, and any OSS findings the workflow annotations expose.
 """
 
 from __future__ import annotations
 
+import base64
 import math
 import os
 import re
@@ -22,6 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
+import yaml
 from prometheus_client import CollectorRegistry, Gauge, generate_latest, write_to_textfile
 
 from lu_machinery.common import github_client
@@ -45,6 +51,32 @@ METRIC_OPEN_ALERTS = "lu_security_alerts_open"
 METRIC_FEATURE_ENABLED = "lu_security_alerts_feature_enabled"
 METRIC_SOURCE_OK = "lu_security_alerts_source_ok"
 METRIC_SCAN_TIMESTAMP = "lu_security_alerts_scan_timestamp_seconds"
+# New series (machinery#1081). Existing metric names stay stable.
+METRIC_FLEET_SECURITY_STATE = "lu_security_alerts_fleet_security_state"
+METRIC_FLEET_SECURITY_FINDINGS = "lu_security_alerts_fleet_security_findings"
+
+# A default-branch workflow is enrolled only when it calls this reusable workflow at a full SHA.
+_FLEET_SECURITY_WORKFLOW = "learn-ukrainian/machinery/.github/workflows/fleet-security.yml"
+FLEET_SECURITY_STATES: tuple[str, ...] = (
+    "missing_enrollment",
+    "inaccessible_evidence",
+    "zero_findings",
+    "findings",
+)
+_FLEET_GATE_JOB = "Fleet security gate"
+_FLEET_JOB_NAMES: tuple[str, ...] = (
+    "actionlint",
+    "ShellCheck",
+    "zizmor",
+    "Secret scan (TruffleHog)",
+    "Trivy dependencies and licences",
+    "Trivy IaC and misconfiguration",
+    "Trivy container image",
+    _FLEET_GATE_JOB,
+)
+_MAX_WORKFLOW_FILES = 100
+_MAX_WORKFLOW_BYTES = 1_048_576
+_MAX_OSS_FINDINGS = 500
 
 _SCAN_SCHEMA_VERSION = "security-alerts-scan.v1"
 _BRIEF_SCHEMA_VERSION = "security-alerts-brief.v1"
@@ -89,6 +121,15 @@ _TOOL_DISABLED_PHRASES: dict[str, tuple[str, ...]] = {
         "secret scanning is not enabled",
     ),
 }
+
+_FLEET_USES_PREFIX = _FLEET_SECURITY_WORKFLOW + "@"
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+_ALLOWED_RUN_EVENTS = frozenset({"push", "schedule", "workflow_dispatch"})
+_WORKFLOW_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml\Z")
+_YAML_NAME_RE = re.compile(r"\.ya?ml\Z", re.IGNORECASE)
+_BRANCH_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]{0,250}\Z")
+_REF_RE = re.compile(r"[A-Za-z0-9._/-]{1,128}\Z")
+_CHECK_RUN_URL_RE = re.compile(r"^https://api\.github\.com/repos/([^/]+)/([^/]+)/check-runs/([0-9]+)/?\Z")
 
 _SEVERITY_MAP: dict[str, str] = {
     "critical": "critical",
@@ -147,6 +188,7 @@ class BriefResult:
     generated_at: str
     worker: WorkerSelection
     alerts: Mapping[str, Any]
+    fleet_security: Mapping[str, Any]
     owned_paths: tuple[str, ...]
     dispatch_argv: tuple[str, ...]
     dispatch_command: str
@@ -160,6 +202,7 @@ class BriefResult:
             "generated_at": self.generated_at,
             "worker": self.worker.to_dict(),
             "alerts": dict(self.alerts),
+            "fleet_security": dict(self.fleet_security),
             "owned_paths": list(self.owned_paths),
             "dispatch_argv": list(self.dispatch_argv),
             "dispatch_command": self.dispatch_command,
@@ -231,7 +274,15 @@ def _safe_owned_path(raw: Any) -> str | None:
     if not isinstance(raw, str):
         return None
     text = raw.strip()
-    if not text or text.startswith(("/", "\\", "-")) or "\\" in text or "\x00" in text or "`" in text or "|" in text:
+    if (
+        not text
+        or text in {"?"}
+        or text.startswith(("/", "\\", "-"))
+        or "\\" in text
+        or "\x00" in text
+        or "`" in text
+        or "|" in text
+    ):
         return None
     if any(unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in text):
         return None
@@ -327,7 +378,8 @@ def _fetch_tool_alerts(
     expected_path = initial_endpoint.split("?", 1)[0]
     expected_tool_suffix = _ENDPOINT_SUFFIXES[tool].split("?", 1)[0]
     endpoint: str | None = initial_endpoint
-    pinned_repo_id: str | None = None
+    known_repo_id: str | None = None
+    repo_id_loaded = False
 
     collected: list[dict[str, Any]] = []
     seen_endpoints: set[str] = set()
@@ -356,24 +408,24 @@ def _fetch_tool_alerts(
         next_url = github_client.next_link(headers)
         if not next_url:
             return "ok", collected, None
-        parsed_next = urlsplit(next_url)
-        next_path = parsed_next.path.lstrip("/")
-        if next_path.startswith("api/v3/"):
-            next_path = next_path.removeprefix("api/v3/")
+        split = _split_next_link(next_url)
+        if split is None:
+            return "error", None, "github_invalid_next_link"
+        next_path, next_query = split
         if next_path != expected_path:
             numeric_match = _NUMERIC_REPO_PATH_RE.fullmatch(next_path)
             if not numeric_match or numeric_match.group(2) != expected_tool_suffix:
                 return "error", None, "github_invalid_next_link"
-            repo_id = numeric_match.group(1)
-            if pinned_repo_id is None:
-                pinned_repo_id = repo_id
-            elif pinned_repo_id != repo_id:
+            if not repo_id_loaded:
+                known_repo_id = _load_repo_numeric_id(client, repo, timeout)
+                repo_id_loaded = True
+            if known_repo_id is None or numeric_match.group(1) != known_repo_id:
                 return "error", None, "github_invalid_next_link"
         if tool == "secret_scanning":
-            query = parse_qs(parsed_next.query, keep_blank_values=True)
+            query = parse_qs(next_query, keep_blank_values=True)
             if query.get("hide_secret") != ["true"]:
                 return "error", None, "github_invalid_next_link"
-        endpoint = next_url
+        endpoint = f"{next_path}?{next_query}" if next_query else next_path
     return "error", None, "github_pagination_limit"
 
 
@@ -386,6 +438,760 @@ def _summarize_alerts(tool: str, alerts: Sequence[Mapping[str, Any]]) -> dict[st
         "total": len(alerts),
         "by_severity": counts,
     }
+
+
+def _fleet_record(
+    state: str,
+    *,
+    reason: str | None = None,
+    callers: Sequence[Mapping[str, str]] | None = None,
+    rejected_pins: Sequence[Mapping[str, str]] | None = None,
+    runs: Sequence[Mapping[str, Any]] | None = None,
+    findings: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "reason": reason,
+        "callers": [dict(item) for item in callers or ()],
+        "rejected_pins": [dict(item) for item in rejected_pins or ()],
+        "runs": [dict(item) for item in runs or ()],
+        "findings": [dict(item) for item in findings or ()],
+    }
+
+
+def _github_get(client: Any, endpoint: str, timeout: float) -> github_client.Result:
+    try:
+        result = client.request("GET", endpoint, timeout=timeout, fresh=True)
+    except github_client.GitHubRateLimited as exc:
+        return github_client.Result(status=429, error="github_rate_limited", reason=exc.reason)
+    except Exception as exc:
+        return github_client.Result(status=0, error=f"github_client_error:{type(exc).__name__}")
+    if not isinstance(result, github_client.Result):
+        return github_client.Result(status=0, error="github_invalid_result")
+    return result
+
+
+def _split_github_slug(repo: FleetRepo) -> tuple[str, str] | None:
+    parts = repo.github.split("/")
+    if len(parts) != 2 or not all(_SLUG_SEGMENT_RE.fullmatch(part) and part not in {".", ".."} for part in parts):
+        return None
+    return parts[0], parts[1]
+
+
+def _repo_numeric_id(document: Mapping[str, Any]) -> str | None:
+    repo_id = document.get("id")
+    if type(repo_id) is not int or repo_id <= 0:
+        return None
+    return str(repo_id)
+
+
+def _load_repo_numeric_id(client: Any, repo: FleetRepo, timeout: float) -> str | None:
+    slug = _split_github_slug(repo)
+    if slug is None:
+        return None
+    owner, name = slug
+    described = _github_get(client, _repo_api(owner, name, "").rstrip("/"), timeout)
+    if described.error or described.status not in {200, 304} or not isinstance(described.value, Mapping):
+        return None
+    return _repo_numeric_id(described.value)
+
+
+def _safe_branch(value: Any) -> str | None:
+    if not isinstance(value, str) or not _BRANCH_RE.fullmatch(value):
+        return None
+    if value.startswith("/") or value.endswith("/") or "//" in value or ".." in value.split("/"):
+        return None
+    return value
+
+
+def _repo_api(owner: str, name: str, suffix: str) -> str:
+    return f"repos/{quote(owner, safe='')}/{quote(name, safe='')}/{suffix}"
+
+
+def _split_next_link(next_url: str) -> tuple[str, str] | None:
+    """Return ``(path, query)`` for a GitHub API link, or None when it must not be followed."""
+    if not isinstance(next_url, str) or not next_url or any(ch in next_url for ch in "\\\n\r\t "):
+        return None
+    try:
+        parsed = urlsplit(next_url)
+    except ValueError:
+        return None
+    if parsed.fragment or parsed.scheme != "https" or parsed.netloc != "api.github.com":
+        return None
+    path = parsed.path.lstrip("/")
+    if path.startswith("api/v3/"):
+        path = path.removeprefix("api/v3/")
+    if not path or ".." in path.split("/"):
+        return None
+    return path, parsed.query
+
+
+def _accept_next_link(
+    owner: str,
+    name: str,
+    next_url: str,
+    expected_path: str,
+    required_repo_id: str | None,
+) -> str | None:
+    """Return the next endpoint, or None when the link is not this repository's page."""
+    split = _split_next_link(next_url)
+    if split is None:
+        return None
+    path, query = split
+    suffix = expected_path.removeprefix(f"repos/{owner}/{name}/")
+    numeric = _NUMERIC_REPO_PATH_RE.fullmatch(path)
+    if numeric:
+        if numeric.group(2) != suffix or required_repo_id is None or numeric.group(1) != required_repo_id:
+            return None
+    elif path != expected_path:
+        return None
+    return f"{path}?{query}" if query else path
+
+
+def _collect_pages(
+    client: Any,
+    endpoint: str,
+    *,
+    timeout: float,
+    owner: str,
+    name: str,
+    expected_path: str,
+    required_repo_id: str | None,
+) -> tuple[list[github_client.Result], str | None]:
+    pages: list[github_client.Result] = []
+    seen: set[str] = set()
+    current: str | None = endpoint
+    for _ in range(_MAX_PAGES):
+        if current is None or current in seen:
+            return [], "github_pagination_loop"
+        seen.add(current)
+        result = _github_get(client, current, timeout)
+        if result.error or result.status not in {200, 304}:
+            return [], _error_code(result)
+        pages.append(result)
+        headers = {key.lower(): value for key, value in (result.headers or {}).items()}
+        next_url = github_client.next_link(headers)
+        if not next_url:
+            return pages, None
+        current = _accept_next_link(owner, name, next_url, expected_path, required_repo_id)
+        if current is None:
+            return [], "github_invalid_next_link"
+    return [], "github_pagination_limit"
+
+
+def _oss_severity(raw: str) -> str:
+    lowered = raw.strip().lower()
+    if lowered in {"info", "style"}:
+        return "low"
+    return _SEVERITY_MAP.get(lowered, "unknown")
+
+
+class _UnreadableAnnotation(Exception):
+    """An annotation looked like a finding but its location could not be read."""
+
+
+# Failure annotations that are not findings: the runner's line for a failed step, the gate's
+# line for a scanner job that failed, and the TruffleHog count header. They are skipped only
+# because _read_caller_evidence checks every job conclusion against its findings and the
+# gate's failure lines against the failed scanner jobs.
+_GATE_FAILURE_LINE_RE = re.compile(r"Job [A-Za-z0-9_-]+ finished with result failure, expected success")
+_CONTEXT_ANNOTATION_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Process completed with exit code [0-9]{1,3}\."),
+    _GATE_FAILURE_LINE_RE,
+    re.compile(r"TruffleHog reported [0-9]+ finding\(s\)\. Secret values are redacted from this log\."),
+)
+
+
+def _is_context_annotation(message: Any) -> bool:
+    return isinstance(message, str) and any(pattern.fullmatch(message) for pattern in _CONTEXT_ANNOTATION_RES)
+
+
+def _split_licence_target(body: str) -> tuple[str, bool]:
+    """Return the target and whether it is unambiguous.
+
+    A package and a path can both contain `` in ``. One separator is the
+    workflow's package/target split. More than one is shown in full and is
+    not an owned path.
+    """
+    package, separator, target = body.partition(" in ")
+    if not separator or not package or not target:
+        raise _UnreadableAnnotation
+    return target, " in " not in target
+
+
+def _line_number(raw: str) -> int | None:
+    """Return a 1-based line, or None for ``0``.
+
+    The workflow writes ``0`` when the scanner gave no line (``int_or_zero``),
+    so ``0`` is a finding without a line, not an unreadable one.
+    """
+    if not raw.isascii() or not raw.isdecimal() or len(raw) > 9:
+        raise _UnreadableAnnotation
+    number = int(raw)
+    return number if number >= 1 else None
+
+
+def _finding(
+    *,
+    scanner: str,
+    rule: str,
+    severity: str,
+    raw_path: str,
+    line: int | None,
+    message: str,
+    repository_file: bool,
+) -> dict[str, Any]:
+    safe_path = _safe_owned_path(raw_path) if repository_file else None
+    location = _sanitize_text(raw_path) or "unknown"
+    if line is not None:
+        location = f"{location}:{line}"
+    return {
+        "scanner": scanner,
+        "rule": _sanitize_text(rule) or "unknown",
+        "severity": severity if severity in SEVERITIES else "unknown",
+        "path": safe_path,
+        "line": line,
+        "location": location,
+        "message": _sanitize_text(message),
+    }
+
+
+def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
+    """Parse one redacted fleet-security annotation. Unrecognized text is not a finding."""
+    if not isinstance(message, str) or not message.strip():
+        return None
+    if any(unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in message):
+        return None
+    text = message.strip()
+    matched = re.fullmatch(r"actionlint \[([^\]]+)\] at (.+):([^:\s]+):([^:\s]+)", text)
+    if matched:
+        _line_number(matched.group(4))
+        return _finding(
+            scanner="actionlint",
+            rule=matched.group(1),
+            severity="unknown",
+            raw_path=matched.group(2),
+            line=_line_number(matched.group(3)),
+            message=text,
+            repository_file=True,
+        )
+    matched = re.fullmatch(r"ShellCheck (SC\S+) \(([^)]+)\) at (.+):([^:\s]+):([^:\s]+)", text)
+    if matched:
+        _line_number(matched.group(5))
+        return _finding(
+            scanner="shellcheck",
+            rule=matched.group(1),
+            severity=_oss_severity(matched.group(2)),
+            raw_path=matched.group(3),
+            line=_line_number(matched.group(4)),
+            message=text,
+            repository_file=True,
+        )
+    matched = re.fullmatch(r"zizmor (\S+) severity=(\S+) confidence=\S+ at (.+)", text)
+    if matched:
+        return _finding(
+            scanner="zizmor",
+            rule=matched.group(1),
+            severity=_oss_severity(matched.group(2)),
+            raw_path=matched.group(3),
+            line=None,
+            message=text,
+            repository_file=True,
+        )
+    matched = re.fullmatch(r"TruffleHog (\S+) verified=(\S+) (.+):([^:\s]+) commit=\S+", text)
+    if matched:
+        verified = matched.group(2).strip().lower()
+        severity = "critical" if verified == "true" else "high" if verified == "false" else "unknown"
+        line_raw = matched.group(4)
+        return _finding(
+            scanner="trufflehog",
+            rule=matched.group(1),
+            severity=severity,
+            raw_path=matched.group(3),
+            line=None if line_raw == "?" else _line_number(line_raw),
+            message=text,
+            repository_file=True,
+        )
+    matched = re.fullmatch(
+        r"Trivy vuln (\S+) \(([^)]+)\) (\S+) (\S*) \(fixed: [^)]*\) in (.+)",
+        text,
+    )
+    if matched:
+        return _finding(
+            scanner="trivy-fs",
+            rule=matched.group(1),
+            severity=_oss_severity(matched.group(2)),
+            raw_path=matched.group(5),
+            line=None,
+            message=text,
+            repository_file=True,
+        )
+    matched = re.fullmatch(r"Trivy licence (.+?) \(([^/\s]+)/([^)]+)\) (.+)", text)
+    if matched:
+        target, own_path = _split_licence_target(matched.group(4))
+        return _finding(
+            scanner="trivy-fs",
+            rule=matched.group(1),
+            severity=_oss_severity(matched.group(3)),
+            raw_path=target,
+            line=None,
+            message=text,
+            repository_file=own_path,
+        )
+    matched = re.fullmatch(r"Trivy misconfig (\S+) \(([^)]+)\) in (.+)", text)
+    if matched:
+        return _finding(
+            scanner="trivy-fs",
+            rule=matched.group(1),
+            severity=_oss_severity(matched.group(2)),
+            raw_path=matched.group(3),
+            line=None,
+            message=text,
+            repository_file=True,
+        )
+    matched = re.fullmatch(r"Trivy IaC (\S+) \(([^)]+)\) at (.+):([^:\s]+)", text)
+    if matched:
+        return _finding(
+            scanner="trivy-iac",
+            rule=matched.group(1),
+            severity=_oss_severity(matched.group(2)),
+            raw_path=matched.group(3),
+            line=_line_number(matched.group(4)),
+            message=text,
+            repository_file=True,
+        )
+    matched = re.fullmatch(
+        r"Trivy image vuln (\S+) \(([^)]+)\) (\S+) (\S*) \(fixed: [^)]*\) in (.+)",
+        text,
+    )
+    if matched:
+        return _finding(
+            scanner="trivy-image",
+            rule=matched.group(1),
+            severity=_oss_severity(matched.group(2)),
+            raw_path=matched.group(5),
+            line=None,
+            message=text,
+            repository_file=False,
+        )
+    matched = re.fullmatch(r"Trivy image licence (.+?) \(([^/\s]+)/([^)]+)\) (.+)", text)
+    if matched:
+        target, _own_path = _split_licence_target(matched.group(4))
+        return _finding(
+            scanner="trivy-image",
+            rule=matched.group(1),
+            severity=_oss_severity(matched.group(3)),
+            raw_path=target,
+            line=None,
+            message=text,
+            repository_file=False,
+        )
+    return None
+
+
+def _is_fleet_job(name: str, job_name: str) -> bool:
+    return name == job_name or name.endswith(f" / {job_name}")
+
+
+def _decode_workflow(document: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    if document.get("type") != "file" or document.get("encoding") != "base64":
+        return None, "workflow_file_unreadable"
+    size = document.get("size")
+    if type(size) is not int or size < 0:
+        return None, "workflow_file_unreadable"
+    if size > _MAX_WORKFLOW_BYTES:
+        return None, "pagination_limit"
+    content = document.get("content")
+    if not isinstance(content, str) or len(content) > _MAX_WORKFLOW_BYTES * 2:
+        return None, "workflow_file_unreadable"
+    try:
+        raw = base64.b64decode("".join(content.split()), validate=True)
+    except (ValueError, TypeError):
+        return None, "workflow_file_unreadable"
+    if len(raw) != size:
+        return None, "workflow_file_unreadable"
+    if len(raw) > _MAX_WORKFLOW_BYTES:
+        return None, "pagination_limit"
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        return None, "workflow_file_unreadable"
+
+
+def _read_workflow_callers(
+    client: Any,
+    owner: str,
+    name: str,
+    branch: str,
+    timeout: float,
+) -> tuple[list[dict[str, str]], list[dict[str, str]], str | None]:
+    """Return ``(callers, rejected_pins, error)``. A 404 directory is an empty caller list."""
+    endpoint = _repo_api(owner, name, f"contents/.github/workflows?ref={quote(branch, safe='')}")
+    listed = _github_get(client, endpoint, timeout)
+    # A 404 from the contents API carries github_http_error. The repository was already
+    # readable, so a missing workflows directory is missing enrollment, not an API failure.
+    if listed.status == 404 and listed.error != "github_rate_limited":
+        return [], [], None
+    if listed.error or listed.status not in {200, 304} or not isinstance(listed.value, list):
+        reason = _error_code(listed) if listed.error or listed.status not in {200, 304} else "github_invalid_payload"
+        return [], [], reason
+    files: list[str] = []
+    seen: set[str] = set()
+    for item in listed.value:
+        if not isinstance(item, Mapping):
+            return [], [], "github_invalid_payload"
+        filename = item.get("name")
+        path = item.get("path")
+        kind = item.get("type")
+        if not isinstance(filename, str) or not isinstance(path, str) or not isinstance(kind, str):
+            return [], [], "github_invalid_payload"
+        if not _YAML_NAME_RE.search(filename):
+            continue
+        expected = f".github/workflows/{filename}"
+        if filename in seen or not _WORKFLOW_NAME_RE.fullmatch(filename) or kind != "file" or path != expected:
+            return [], [], "workflow_file_unreadable"
+        seen.add(filename)
+        files.append(filename)
+    if len(files) > _MAX_WORKFLOW_FILES:
+        return [], [], "pagination_limit"
+
+    callers: list[dict[str, str]] = []
+    rejected: list[dict[str, str]] = []
+    total_decoded = 0
+    for filename in files:
+        file_endpoint = _repo_api(
+            owner,
+            name,
+            f"contents/.github/workflows/{quote(filename, safe='')}?ref={quote(branch, safe='')}",
+        )
+        document = _github_get(client, file_endpoint, timeout)
+        if document.error or document.status not in {200, 304} or not isinstance(document.value, Mapping):
+            return [], [], "workflow_file_unreadable"
+        text, decode_error = _decode_workflow(document.value)
+        if text is None:
+            return [], [], decode_error or "workflow_file_unreadable"
+        total_decoded += len(text.encode("utf-8"))
+        if total_decoded > _MAX_WORKFLOW_BYTES:
+            return [], [], "pagination_limit"
+        workflow_path = f".github/workflows/{filename}"
+        file_callers, file_rejected, pin_error = _pins_in_workflow(text, workflow_path)
+        if pin_error:
+            return [], [], pin_error
+        for row in file_callers:
+            if row not in callers:
+                callers.append(row)
+        for row in file_rejected:
+            if row not in rejected:
+                rejected.append(row)
+    return callers, rejected, None
+
+
+def _pins_in_workflow(
+    text: str, workflow_path: str
+) -> tuple[list[dict[str, str]], list[dict[str, str]], str | None]:
+    """Read job-level ``uses`` values. A line inside a script is not a caller."""
+    try:
+        document = yaml.safe_load(text)
+    except Exception:
+        return [], [], "workflow_file_unreadable"
+    if document is None:
+        return [], [], None
+    if not isinstance(document, Mapping):
+        return [], [], "workflow_file_unreadable"
+    jobs = document.get("jobs")
+    if jobs is None:
+        return [], [], None
+    if not isinstance(jobs, Mapping):
+        return [], [], "workflow_file_unreadable"
+    callers: list[dict[str, str]] = []
+    rejected: list[dict[str, str]] = []
+    for job in jobs.values():
+        if not isinstance(job, Mapping):
+            return [], [], "workflow_file_unreadable"
+        uses = job.get("uses")
+        if uses is None:
+            continue
+        if not isinstance(uses, str):
+            return [], [], "workflow_file_unreadable"
+        if not uses.startswith(_FLEET_USES_PREFIX):
+            continue
+        ref = uses[len(_FLEET_USES_PREFIX) :]
+        if _FULL_SHA_RE.fullmatch(ref):
+            callers.append({"path": workflow_path, "pin": ref})
+        else:
+            shown = ref if _REF_RE.fullmatch(ref) else "unparsed-ref"
+            rejected.append({"path": workflow_path, "ref": shown})
+    return callers, rejected, None
+
+
+def _workflow_run_path_matches(path: Any, filename: str) -> bool:
+    expected = f".github/workflows/{filename}"
+    if not isinstance(path, str):
+        return False
+    if path == expected:
+        return True
+    prefix = expected + "@"
+    if not path.startswith(prefix):
+        return False
+    return _REF_RE.fullmatch(path[len(prefix) :]) is not None
+
+
+def _run_record(
+    owner: str, name: str, filename: str, run: Mapping[str, Any], branch: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    run_id = run.get("id")
+    if type(run_id) is not int or run_id <= 0:
+        return None, "github_invalid_payload"
+    if not _workflow_run_path_matches(run.get("path"), filename) or run.get("head_branch") != branch:
+        return None, "github_invalid_payload"
+    if run.get("status") != "completed":
+        return None, "github_invalid_payload"
+    event = run.get("event")
+    head_repository = run.get("head_repository")
+    full_name = head_repository.get("full_name") if isinstance(head_repository, Mapping) else None
+    if not isinstance(event, str) or not isinstance(full_name, str):
+        return None, "github_invalid_payload"
+    if event not in _ALLOWED_RUN_EVENTS or full_name != f"{owner}/{name}":
+        return None, "run_not_on_default_branch"
+    head_sha = run.get("head_sha")
+    safe_sha = head_sha if isinstance(head_sha, str) and _FULL_SHA_RE.fullmatch(head_sha) else None
+    html_url = run.get("html_url")
+    expected_url = f"https://github.com/{owner}/{name}/actions/runs/{run_id}"
+    return {
+        "path": f".github/workflows/{filename}",
+        "run_id": run_id,
+        "head_sha": safe_sha,
+        "conclusion": _sanitize_text(run.get("conclusion")) or None,
+        "html_url": html_url if html_url == expected_url else None,
+    }, None
+
+
+def _annotation_endpoint(owner: str, name: str, check_run_url: Any) -> str | None:
+    if not isinstance(check_run_url, str):
+        return None
+    matched = _CHECK_RUN_URL_RE.fullmatch(check_run_url)
+    if not matched or matched.group(1) != owner or matched.group(2) != name:
+        return None
+    return _repo_api(owner, name, f"check-runs/{matched.group(3)}/annotations?per_page=100")
+
+
+def _read_caller_evidence(
+    client: Any,
+    owner: str,
+    name: str,
+    branch: str,
+    caller: Mapping[str, str],
+    timeout: float,
+    required_repo_id: str | None,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None]:
+    filename = caller["path"].rsplit("/", 1)[-1]
+    runs_endpoint = _repo_api(
+        owner,
+        name,
+        "actions/workflows/"
+        f"{quote(filename, safe='')}/runs?branch={quote(branch, safe='')}&status=completed&per_page=1",
+    )
+    runs_result = _github_get(client, runs_endpoint, timeout)
+    if runs_result.error or runs_result.status not in {200, 304} or not isinstance(runs_result.value, Mapping):
+        reason = _error_code(runs_result) if runs_result.error or runs_result.status not in {200, 304} else "github_invalid_payload"
+        return None, [], reason
+    total = runs_result.value.get("total_count")
+    workflow_runs = runs_result.value.get("workflow_runs")
+    if type(total) is not int or total < 0 or not isinstance(workflow_runs, list):
+        return None, [], "github_invalid_payload"
+    if total == 0:
+        if workflow_runs:
+            return None, [], "github_invalid_payload"
+        return None, [], "no_completed_run"
+    if not workflow_runs or not isinstance(workflow_runs[0], Mapping):
+        return None, [], "github_invalid_payload"
+    record, run_error = _run_record(owner, name, filename, workflow_runs[0], branch)
+    if run_error or record is None:
+        return None, [], run_error or "github_invalid_payload"
+    run_id = record["run_id"]
+    jobs_path = _repo_api(owner, name, f"actions/runs/{run_id}/jobs")
+    pages, page_error = _collect_pages(
+        client,
+        f"{jobs_path}?per_page=100",
+        timeout=timeout,
+        owner=owner,
+        name=name,
+        expected_path=jobs_path,
+        required_repo_id=required_repo_id,
+    )
+    if page_error:
+        return None, [], page_error
+    jobs: list[Mapping[str, Any]] = []
+    declared_total: int | None = None
+    for page in pages:
+        body = page.value
+        if not isinstance(body, Mapping) or not isinstance(body.get("jobs"), list):
+            return None, [], "github_invalid_payload"
+        page_total = body.get("total_count")
+        if type(page_total) is not int or page_total < 0:
+            return None, [], "github_invalid_payload"
+        if declared_total is None:
+            declared_total = page_total
+        elif declared_total != page_total:
+            return None, [], "github_invalid_payload"
+        for job in body["jobs"]:
+            if not isinstance(job, Mapping):
+                return None, [], "github_invalid_payload"
+            jobs.append(job)
+    if declared_total is None or len(jobs) != declared_total:
+        return None, [], "github_invalid_payload"
+    seen_job_ids: set[int] = set()
+    for job in jobs:
+        job_id = job.get("id")
+        if type(job_id) is not int or job_id in seen_job_ids:
+            return None, [], "github_invalid_payload"
+        seen_job_ids.add(job_id)
+    gates = [job for job in jobs if isinstance(job.get("name"), str) and _is_fleet_job(job["name"], _FLEET_GATE_JOB)]
+    if len(gates) != 1:
+        return record, [], "no_fleet_security_jobs"
+    gate_conclusion = gates[0].get("conclusion")
+    if not isinstance(gate_conclusion, str):
+        return None, [], "github_invalid_payload"
+    record = {**record, "gate_conclusion": gate_conclusion}
+    # A cancelled, timed-out or skipped gate never checked the scanner jobs.
+    if gate_conclusion not in {"success", "failure"}:
+        return record, [], "run_not_success"
+    findings: list[dict[str, Any]] = []
+    failed_scanners = 0
+    gate_failure_lines = 0
+    for job in jobs:
+        job_name = job.get("name")
+        if not isinstance(job_name, str) or not any(_is_fleet_job(job_name, expected) for expected in _FLEET_JOB_NAMES):
+            continue
+        is_gate = _is_fleet_job(job_name, _FLEET_GATE_JOB)
+        conclusion = job.get("conclusion")
+        if not is_gate:
+            # A skipped scanner did not run. The gate's result lines say whether that skip was expected.
+            if conclusion == "skipped":
+                continue
+            # A cancelled, timed-out or unfinished scanner may have stopped part-way through its targets.
+            if conclusion not in {"success", "failure"}:
+                return record, [], "scanner_incomplete"
+            if conclusion == "failure":
+                failed_scanners += 1
+        annotations_endpoint = _annotation_endpoint(owner, name, job.get("check_run_url"))
+        if annotations_endpoint is None:
+            return None, [], "annotations_unreadable"
+        expected_annotations = annotations_endpoint.split("?", 1)[0]
+        annotation_pages, annotation_error = _collect_pages(
+            client,
+            annotations_endpoint,
+            timeout=timeout,
+            owner=owner,
+            name=name,
+            expected_path=expected_annotations,
+            required_repo_id=required_repo_id,
+        )
+        if annotation_error:
+            return None, [], annotation_error
+        job_findings = 0
+        for annotation_page in annotation_pages:
+            rows = annotation_page.value
+            if not isinstance(rows, list):
+                return None, [], "github_invalid_payload"
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    return None, [], "github_invalid_payload"
+                level = row.get("annotation_level", "")
+                if not isinstance(level, str):
+                    return None, [], "annotations_unreadable"
+                if level in {"warning", "notice"}:
+                    continue
+                if _is_context_annotation(row.get("message")):
+                    if is_gate and _GATE_FAILURE_LINE_RE.fullmatch(row["message"]):
+                        gate_failure_lines += 1
+                    continue
+                try:
+                    parsed = _parse_oss_finding(row.get("message"))
+                except _UnreadableAnnotation:
+                    parsed = None
+                if parsed is None:
+                    return record, [], "annotations_unreadable"
+                findings.append(parsed)
+                job_findings += 1
+                if len(findings) > _MAX_OSS_FINDINGS:
+                    return None, [], "pagination_limit"
+        # A scanner that failed without a finding line failed for another reason. Its evidence is
+        # missing, so another job's findings must not read as the complete list.
+        if not is_gate and conclusion == "failure" and job_findings == 0:
+            return record, [], "scanner_failed_without_findings"
+        # Every fleet scanner exits non-zero on a finding, so a successful job with one is inconsistent.
+        if not is_gate and conclusion == "success" and job_findings:
+            return record, [], "scanner_conclusion_mismatch"
+    if findings:
+        # The gate must have run its check and named each failed scanner, which also confirms
+        # that every skipped scanner was expected to skip.
+        if gate_conclusion != "failure" or gate_failure_lines != failed_scanners:
+            return record, [], "run_not_success"
+        return record, findings, None
+    if gate_conclusion != "success":
+        return record, [], "run_not_success"
+    return record, [], None
+
+
+def read_fleet_security(client: Any, repo: FleetRepo, *, timeout: float) -> dict[str, Any]:
+    """Read one repository's fleet-security enrollment and CI evidence.
+
+    ``missing_enrollment``, ``inaccessible_evidence`` and ``zero_findings`` are
+    distinct. A 404 on the repository itself is inaccessible evidence: the
+    caller could not be shown to be absent. Findings come only from redacted
+    annotations the workflow already emits.
+    """
+    slug = _split_github_slug(repo)
+    if slug is None:
+        return _fleet_record("inaccessible_evidence", reason="invalid_repository")
+    owner, name = slug
+    described = _github_get(client, _repo_api(owner, name, "").rstrip("/"), timeout)
+    if described.error or described.status not in {200, 304} or not isinstance(described.value, Mapping):
+        reason = _error_code(described) if described.error or described.status not in {200, 304} else "github_invalid_payload"
+        return _fleet_record("inaccessible_evidence", reason=reason)
+    branch = _safe_branch(described.value.get("default_branch"))
+    if branch is None:
+        return _fleet_record("inaccessible_evidence", reason="invalid_default_branch")
+    repo_id = _repo_numeric_id(described.value)
+    callers, rejected, list_error = _read_workflow_callers(client, owner, name, branch, timeout)
+    if list_error:
+        return _fleet_record("inaccessible_evidence", reason=list_error, rejected_pins=rejected)
+    if not callers:
+        return _fleet_record("missing_enrollment", rejected_pins=rejected)
+    runs: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for caller in callers:
+        # Two pins in one workflow file share one Actions run. Read that run once.
+        if caller["path"] in seen_paths:
+            continue
+        seen_paths.add(caller["path"])
+        record, caller_findings, evidence_error = _read_caller_evidence(
+            client, owner, name, branch, caller, timeout, repo_id
+        )
+        if evidence_error:
+            return _fleet_record(
+                "inaccessible_evidence",
+                reason=evidence_error,
+                callers=callers,
+                rejected_pins=rejected,
+                runs=[*runs, record] if record is not None else runs,
+            )
+        if record is not None:
+            runs.append(record)
+        findings.extend(caller_findings)
+        if len(findings) > _MAX_OSS_FINDINGS:
+            return _fleet_record(
+                "inaccessible_evidence",
+                reason="pagination_limit",
+                callers=callers,
+                rejected_pins=rejected,
+                runs=runs,
+            )
+    if findings:
+        return _fleet_record("findings", callers=callers, rejected_pins=rejected, runs=runs, findings=findings)
+    return _fleet_record("zero_findings", callers=callers, rejected_pins=rejected, runs=runs)
 
 
 def scan_fleet_alerts(
@@ -434,6 +1240,7 @@ def scan_fleet_alerts(
             "github": repo.github,
             "source_ok": repo_ok,
             "tools": tools_payload,
+            "fleet_security": read_fleet_security(gh, repo, timeout=checked_timeout),
         }
 
     return {
@@ -470,6 +1277,18 @@ def _build_prometheus_registry(scan_result: Mapping[str, Any]) -> CollectorRegis
         "Unix epoch timestamp of the last completed fleet security-alert scan.",
         registry=registry,
     )
+    fleet_state_gauge = Gauge(
+        METRIC_FLEET_SECURITY_STATE,
+        "Fleet-security enrollment state for a repository (1 for the observed state only).",
+        ("repo", "state"),
+        registry=registry,
+    )
+    fleet_findings_gauge = Gauge(
+        METRIC_FLEET_SECURITY_FINDINGS,
+        "OSS findings from the latest fleet-security run. Omitted unless the state is findings.",
+        ("repo", "scanner", "severity"),
+        registry=registry,
+    )
     scanned_epoch = scan_result.get("scanned_epoch")
     if isinstance(scanned_epoch, (int, float)) and not isinstance(scanned_epoch, bool) and math.isfinite(scanned_epoch):
         ts_gauge.set(float(scanned_epoch))
@@ -503,6 +1322,33 @@ def _build_prometheus_registry(scan_result: Mapping[str, Any]) -> CollectorRegis
             elif status == "not_enabled":
                 enabled_gauge.labels(repo=repo_key, tool=tool).set(0)
             # On "error": emit neither open count nor feature_enabled so errors are never read as 0.
+        fleet = repo_entry.get("fleet_security")
+        if isinstance(fleet, Mapping) and fleet.get("state") in FLEET_SECURITY_STATES:
+            fleet_state_gauge.labels(repo=repo_key, state=str(fleet["state"])).set(1)
+            if fleet.get("state") == "findings" and isinstance(fleet.get("findings"), list):
+                counts: dict[tuple[str, str], int] = {}
+                for item in fleet["findings"]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    scanner_name = item.get("scanner")
+                    finding_severity = item.get("severity")
+                    if not isinstance(scanner_name, str) or scanner_name not in {
+                        "actionlint",
+                        "shellcheck",
+                        "zizmor",
+                        "trufflehog",
+                        "trivy-fs",
+                        "trivy-iac",
+                        "trivy-image",
+                    }:
+                        continue
+                    if not isinstance(finding_severity, str) or finding_severity not in SEVERITIES:
+                        continue
+                    counts[(scanner_name, finding_severity)] = counts.get((scanner_name, finding_severity), 0) + 1
+                for (scanner_name, finding_severity), count in sorted(counts.items()):
+                    fleet_findings_gauge.labels(
+                        repo=repo_key, scanner=scanner_name, severity=finding_severity
+                    ).set(count)
     return registry
 
 
@@ -669,12 +1515,97 @@ def _build_dispatch_argv(
     return tuple(argv)
 
 
+def _render_fleet_section(fleet: Mapping[str, Any]) -> list[str]:
+    state = fleet.get("state")
+    lines = ["", "## Fleet Security", ""]
+    if state == "missing_enrollment":
+        lines.append("State: `missing_enrollment`.")
+        lines.append(
+            "The default branch has no workflow that calls "
+            f"`{_FLEET_SECURITY_WORKFLOW}` at a full 40-character SHA."
+        )
+        rejected = fleet.get("rejected_pins")
+        if isinstance(rejected, list) and rejected:
+            lines.append("These refs are not enrollment:")
+            for item in rejected:
+                if isinstance(item, Mapping):
+                    lines.append(
+                        f"- `{_sanitize_md_cell(item.get('path'))}` at `{_sanitize_md_cell(item.get('ref'))}`"
+                    )
+        return lines
+    if state == "inaccessible_evidence":
+        lines.append("State: `inaccessible_evidence`.")
+        lines.append(
+            f"Enrollment or CI evidence could not be read (`{_sanitize_md_cell(fleet.get('reason'))}`)."
+        )
+        callers = fleet.get("callers")
+        if isinstance(callers, list):
+            for caller in callers:
+                if isinstance(caller, Mapping):
+                    lines.append(
+                        f"- Caller `{_sanitize_md_cell(caller.get('path'))}` pin "
+                        f"`{_sanitize_md_cell(caller.get('pin'))}`"
+                    )
+        return lines
+    if state == "zero_findings":
+        lines.append("State: `zero_findings`.")
+        lines.append(
+            "The Fleet security gate on the latest completed default-branch run succeeded and "
+            "recorded no OSS finding annotations."
+        )
+    elif state == "findings":
+        lines.append("State: `findings`.")
+        lines.append("OSS scanner annotations from the latest completed default-branch run:")
+    else:
+        lines.append("State: `inaccessible_evidence`.")
+        lines.append("The fleet-security record was missing or malformed.")
+        return lines
+    callers = fleet.get("callers")
+    if isinstance(callers, list):
+        for caller in callers:
+            if isinstance(caller, Mapping):
+                lines.append(
+                    f"- Caller `{_sanitize_md_cell(caller.get('path'))}` pin `{_sanitize_md_cell(caller.get('pin'))}`"
+                )
+    runs = fleet.get("runs")
+    if isinstance(runs, list):
+        for run in runs:
+            if not isinstance(run, Mapping):
+                continue
+            url = run.get("html_url")
+            url_text = f" {url}" if isinstance(url, str) and url.startswith("https://github.com/") else ""
+            lines.append(
+                f"- Run `{run.get('run_id')}` gate `{_sanitize_md_cell(run.get('gate_conclusion'))}` "
+                f"head `{_sanitize_md_cell(run.get('head_sha'))}`{url_text}"
+            )
+    finding_rows = fleet.get("findings") if state == "findings" else []
+    if state == "findings":
+        lines.extend(
+            [
+                "",
+                "| Scanner | Rule | Severity | Location | Message |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        if isinstance(finding_rows, list):
+            for item in finding_rows:
+                if not isinstance(item, Mapping):
+                    continue
+                lines.append(
+                    f"| `{_sanitize_md_cell(item.get('scanner'))}` | `{_sanitize_md_cell(item.get('rule'))}` | "
+                    f"`{_sanitize_md_cell(item.get('severity'))}` | `{_sanitize_md_cell(item.get('location'))}` | "
+                    f"{_sanitize_md_cell(item.get('message'))} |"
+                )
+    return lines
+
+
 def _render_brief_markdown(
     *,
     repo: FleetRepo,
     generated_at: str,
     worker: WorkerSelection,
     alerts_payload: Mapping[str, Any],
+    fleet_security: Mapping[str, Any],
     owned_paths: Sequence[str],
     dispatch_command: str,
 ) -> str:
@@ -768,6 +1699,8 @@ def _render_brief_markdown(
         )
         lines.extend(["", opsec_note])
 
+    lines.extend(_render_fleet_section(fleet_security))
+
     lines.extend(["", "## Suggested Owned Paths", ""])
     if owned_paths:
         for path in owned_paths:
@@ -778,6 +1711,10 @@ def _render_brief_markdown(
     rule_root_cause = (
         "- Fix the underlying vulnerability at its root cause first. Never silence a real defect with "
         "`# nosemgrep`, `# noqa`, ignore patterns, or a false-positive triage row."
+    )
+    rule_fleet = (
+        "- For a fleet-security finding, fix the cited file at the cited line. Do not weaken the scanner "
+        "or add a blanket ignore. A missing caller and an unreadable run are not a clean scan."
     )
     rule_dependabot = "- For Dependabot alerts, upgrade or pin past the patched version and update lockfiles cleanly."
     rule_secret = (
@@ -821,6 +1758,7 @@ def _render_brief_markdown(
             "## Root-Cause Fix Rules",
             "",
             rule_root_cause,
+            rule_fleet,
             rule_dependabot,
             rule_secret,
             rule_triage,
@@ -932,6 +1870,13 @@ def build_fix_brief(
             f"refusing to generate fix brief for {resolved_key!r}: alert API error ({', '.join(errors)})"
         )
 
+    fleet_security = read_fleet_security(gh, repo, timeout=checked_timeout)
+    if fleet_security.get("state") == "findings":
+        for item in fleet_security.get("findings", ()):
+            path = item.get("path") if isinstance(item, Mapping) else None
+            if isinstance(path, str):
+                owned.add(path)
+
     owned_paths = tuple(sorted(owned))
     dispatch_argv = _build_dispatch_argv(
         worker,
@@ -946,6 +1891,7 @@ def build_fix_brief(
         generated_at=generated_at,
         worker=worker,
         alerts_payload=alerts_payload,
+        fleet_security=fleet_security,
         owned_paths=owned_paths,
         dispatch_command=dispatch_command,
     )
@@ -955,6 +1901,7 @@ def build_fix_brief(
         generated_at=generated_at,
         worker=worker,
         alerts=alerts_payload,
+        fleet_security=fleet_security,
         owned_paths=owned_paths,
         dispatch_argv=dispatch_argv,
         dispatch_command=dispatch_command,
@@ -985,7 +1932,10 @@ def write_brief_file(path: Path | str, content: str) -> Path:
 
 __all__ = [
     "DEFAULT_SECURITY_ROLE",
+    "FLEET_SECURITY_STATES",
     "METRIC_FEATURE_ENABLED",
+    "METRIC_FLEET_SECURITY_FINDINGS",
+    "METRIC_FLEET_SECURITY_STATE",
     "METRIC_OPEN_ALERTS",
     "METRIC_SCAN_TIMESTAMP",
     "METRIC_SOURCE_OK",
