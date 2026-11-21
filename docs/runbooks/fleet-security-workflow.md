@@ -65,6 +65,7 @@ Every caller receives the exact same scanner binaries, GitHub Action SHAs and ru
 | `trivy-include-dev-deps` | boolean | `true` | Include dev dependencies in `trivy fs` (`npm`, `yarn`, `gradle`). |
 | `trivy-ignorefile` | string | `''` | Optional repo-relative `.trivyignore` file (empty uses root `.trivyignore` if present, else disables loading). |
 | `trivy-ignored-licenses` | string | `''` | Optional comma-separated SPDX licence IDs to ignore. |
+| `trivy-fs-license-dispositions` | string | `''` | Optional exact licence dispositions, one `target\|PkgName\|Name` tuple per line. Applies to `trivy fs`. |
 | `run-trivy-iac` | boolean | `false` | Run pinned `trivy config` with the SHA-256-pinned `trivy-checks` bundle. |
 | `trivy-iac-targets` | string | `''` | Newline-separated repo-relative IaC files or directories. Required when `run-trivy-iac: true`. |
 | `trivy-iac-severity` | string | `HIGH,CRITICAL` | Comma-separated severities for `trivy config`. |
@@ -76,6 +77,14 @@ Every caller receives the exact same scanner binaries, GitHub Action SHAs and ru
 | `trivy-image-severity` | string | `HIGH,CRITICAL` | Comma-separated severities for `trivy image`. |
 | `trivy-image-scanners` | string | `vuln` | Comma-separated subset of `vuln,license` (defaults to `vuln` so Linux base-OS GPL utilities do not false-fail image scans). |
 | `trivy-image-ignore-unfixed` | boolean | `false` | Ignore unfixed vulnerabilities in `trivy image`. |
+
+## Trivy filesystem licence dispositions
+
+Use a reviewed tuple to accept a licence finding for one scan target and package. Copy the target from `trivy-fs-targets` and the package name and full SPDX expression from the finding's `PkgName` and `Name` fields. For example, `package-lock.json|example-package|GPL-3.0-only`.
+
+All three fields match literally, including case and spaces within an expression. Blank lines are allowed. Each tuple must have three nonempty fields, with no surrounding whitespace, control characters, or extra separators. Use a repo-relative target path or `.`. Repeated tuples count as one disposition. A malformed tuple fails the step before Trivy runs.
+
+The target receipt lists each accepted finding's tuple in `accepted_license_findings` and includes those findings in the `licenses` total. Findings without a match still fail the step. The scan warns about unused tuples and lists them in `stale_license_dispositions` in the job receipt.
 
 ## Output receipt (`fleet-security-receipt.v1`)
 

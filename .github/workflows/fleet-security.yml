@@ -136,6 +136,12 @@ on:
         description: Optional comma-separated SPDX licence IDs to ignore in trivy fs
         type: string
         default: ''
+      trivy-fs-license-dispositions:
+        description: >-
+          Optional newline-separated target|PkgName|Name tuples for exact Trivy fs
+          licence dispositions. Accepted findings and unused tuples are recorded.
+        type: string
+        default: ''
 
       run-trivy-iac:
         description: Run pinned Trivy config scan for IaC and container misconfigurations
@@ -1326,6 +1332,7 @@ jobs:
           INPUT_INCLUDE_DEV: ${{ inputs.trivy-include-dev-deps }}
           INPUT_IGNOREFILE: ${{ inputs.trivy-ignorefile }}
           INPUT_IGNORED_LICENSES: ${{ inputs.trivy-ignored-licenses }}
+          INPUT_LICENSE_DISPOSITIONS: ${{ inputs.trivy-fs-license-dispositions }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/trivy-fs-work"
@@ -1410,6 +1417,26 @@ jobs:
           if ignored_licenses and not re.fullmatch(r"[A-Za-z0-9.+-]+(,[A-Za-z0-9.+-]+)*", ignored_licenses):
               print("::error::Invalid trivy-ignored-licenses syntax; failing closed")
               emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
+
+          dispositions: set[tuple[str, str, str]] = set()
+          disposition_lines = os.environ.get("INPUT_LICENSE_DISPOSITIONS", "").replace("\r\n", "\n").split("\n")
+          for line_number, line in enumerate(disposition_lines, start=1):
+              if not line:
+                  continue
+              fields = line.split("|")
+              target = fields[0]
+              if (
+                  len(fields) != 3
+                  or any(not field or field != field.strip() for field in fields)
+                  or any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp") for c in line)
+                  or target.startswith(("/", "-"))
+                  or (target != "." and any(part in ("", ".", "..") for part in target.split("/")))
+              ):
+                  print(f"::error::Invalid trivy-fs-license-dispositions tuple on line {line_number}; failing closed")
+                  emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
+              target, package, expression = fields
+              dispositions.add((target, package, expression))
+          unused_dispositions = dispositions.copy()
 
           raw_ignorefile = os.environ.get("INPUT_IGNOREFILE", "").strip()
           if raw_ignorefile:
@@ -1534,6 +1561,7 @@ jobs:
               lics = 0
               misconfigs = 0
               configs_seen = 0
+              accepted_licenses = []
               for res in results:
                   if not isinstance(res, dict):
                       continue
@@ -1551,8 +1579,16 @@ jobs:
                       print(f"::error::Trivy vuln {vid} ({sev}) {pkg} {inst} (fixed: {fix}) in {r_target}")
                   for lic in res.get("Licenses") or []:
                       lics += 1
-                      lname = clean_log(lic.get("Name", "?"))
-                      pkg = clean_log(lic.get("PkgName", "?"))
+                      name = lic.get("Name")
+                      package = lic.get("PkgName")
+                      if isinstance(name, str) and isinstance(package, str):
+                          finding = (raw_target, package, name)
+                          if finding in dispositions:
+                              accepted_licenses.append(finding)
+                              unused_dispositions.discard(finding)
+                              continue
+                      lname = clean_log(name if name is not None else "?")
+                      pkg = clean_log(package if package is not None else "?")
                       cat = clean_log(lic.get("Category", "?"))
                       sev = clean_log(lic.get("Severity", "?"))
                       print(f"::error::Trivy licence {lname} ({cat}/{sev}) {pkg} in {r_target}")
@@ -1563,48 +1599,46 @@ jobs:
                           sev = clean_log(m.get("Severity", "?"))
                           print(f"::error::Trivy misconfig {mid} ({sev}) in {r_target}")
 
+              blocking_findings = vulns + lics - len(accepted_licenses) + misconfigs
+              t_status = "finding" if blocking_findings else "clean"
               if "vuln" in scanners and pkgs == 0:
                   print(f"::error::trivy fs inventoried zero packages for '{clean_log(raw_target)}'; failing closed")
-                  target_receipts.append({"target": raw_target, "status": "missing_target", "packages": 0, "vulns": 0, "licenses": 0, "misconfigs": 0})
-                  failed = True
-                  continue
-              if "misconfig" in scanners and "vuln" not in scanners and configs_seen == 0:
+                  t_status = "missing_target"
+              elif "misconfig" in scanners and "vuln" not in scanners and configs_seen == 0:
                   print(f"::error::trivy fs detected zero config files for '{clean_log(raw_target)}'; failing closed")
-                  target_receipts.append({"target": raw_target, "status": "missing_target", "packages": pkgs, "vulns": 0, "licenses": 0, "misconfigs": 0})
-                  failed = True
-                  continue
-              if scanners == ["license"] and not results:
+                  t_status = "missing_target"
+              elif scanners == ["license"] and not results:
                   print(f"::error::trivy fs detected zero licence targets for '{clean_log(raw_target)}'; failing closed")
-                  target_receipts.append({"target": raw_target, "status": "missing_target", "packages": 0, "vulns": 0, "licenses": 0, "misconfigs": 0})
-                  failed = True
-                  continue
+                  t_status = "missing_target"
 
-              total_findings = vulns + lics + misconfigs
-              t_status = "clean" if total_findings == 0 else "finding"
               if t_status != "clean":
                   failed = True
-              target_receipts.append(
-                  {
-                      "target": raw_target,
-                      "status": t_status,
-                      "packages": pkgs,
-                      "vulns": vulns,
-                      "licenses": lics,
-                      "misconfigs": misconfigs,
-                  }
-              )
+              if t_status == "missing_target" and not accepted_licenses:
+                  vulns = lics = misconfigs = 0
+              target_receipt = {
+                  "target": raw_target,
+                  "status": t_status,
+                  "packages": pkgs,
+                  "vulns": vulns,
+                  "licenses": lics,
+                  "misconfigs": misconfigs,
+              }
+              if accepted_licenses:
+                  target_receipt["accepted_license_findings"] = accepted_licenses
+              target_receipts.append(target_receipt)
 
-          emit(
-              {
-                  "tool": "trivy-fs",
-                  "version": version,
-                  "scanners": scanners,
-                  "severity": severities,
-                  "status": "clean" if not failed else "failed",
-                  "targets": target_receipts,
-              },
-              0 if not failed else 1,
-          )
+          receipt = {
+              "tool": "trivy-fs",
+              "version": version,
+              "scanners": scanners,
+              "severity": severities,
+              "status": "clean" if not failed else "failed",
+              "targets": target_receipts,
+          }
+          if unused_dispositions:
+              print(f"::warning::{len(unused_dispositions)} trivy-fs licence disposition(s) matched no finding")
+              receipt["stale_license_dispositions"] = sorted(unused_dispositions)
+          emit(receipt, 1 if failed else 0)
           PY
 
       - name: Remove tools and scan results
