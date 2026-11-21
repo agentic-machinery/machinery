@@ -2322,7 +2322,7 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
     try:
         if not isinstance(tree, str) or not Path(tree).is_absolute():
             raise ValueError("worktree path is not absolute")
-        top, head = git._git(Path(tree), "rev-parse", "--path-format=absolute", "--show-toplevel", "HEAD^{commit}",
+        top, head = git._git(Path(tree), "rev-parse", "--path-format=absolute", "--show-toplevel", "--verify", "HEAD^{commit}",
                              isolate=True).split("\n")
         if Path(top).resolve(strict=True) != Path(tree).resolve(strict=True):
             raise ValueError("Git resolved another worktree")
