@@ -69,6 +69,16 @@ Name the commands the review route can run. See the [review brief's route table]
 Read attestation from the task JSON's top-level `resolved_model_known`, `resolved_model`
 and `resolved_model_source`; never grep nested status output for these fields.
 
+When a work item hits the review cap, record the
+[cap disposition](../../review-loop/references/policy.md#4-convergence) before dispatching any
+replacement. Confirm the predecessor task has settled before dispatch. Use the same parent
+record when a replacement also hits the cap. In the ordered
+replacement brief, link the decision and carry every unresolved blocker with its predecessor
+PR and finding ID, owner, and where it will be resolved. State which findings the replacement
+will address and which remain open on other named work. When a predecessor PR already has a
+bound lifecycle ledger, follow [the existing scope transfer](../../full-send/references/delivery.md#hand-off-record)
+before dispatching the replacement.
+
 ## Test grants
 
 A grant names each approved test function and its file, the defect class in the test name or
@@ -102,6 +112,9 @@ guarded remover.
 ## Dispatch helpers
 
 - Before dispatching an issue, read its latest comments for holds and decisions, not only the body.
+- In each brief for a reviewed change, state the reader-facing outcome. Check the issue's linked
+  and referencing PRs. List the open PRs for the same issue, or record that a successful lookup
+  found none. Explain how the brief relates to any overlapping work.
 - Read the provider's full docs (`llms-full.txt` or equivalent) before the first paid call and put its request and response rules in the brief.
 - Before amending a live worker's brief, check its PR and put the change in a separate task if review has started.
 - Get a PR's branch with `gh pr view <PR> --json headRefName` in the same script that writes the brief.
@@ -119,11 +132,13 @@ scripts/dispatch.py dispatch ... --claude-account <label>`: the launcher exports
 while that ambient value is set (`claude_account_ambient_conflict`).
 CTO dispatches omit `--claude-account` unless a current order names an exception: the saved
 dispatch default account carries the active account order, and an explicit account overrides it.
-Dispatch every takeover successor with `--branch <the PR's head branch>` together with
+Dispatch a takeover that continues the existing PR with `--branch <the PR's head branch>` together with
 `--base origin/main`, never the PR branch as base; the `takeover` skill checks out the PR branch.
-A successor dispatched without `--branch` is refused by `lu_machinery.orchestration.pr_ownership accept`
+A same-PR successor dispatched without `--branch` is refused by `lu_machinery.orchestration.pr_ownership accept`
 with `publish_branch_required` and stops.
-The successor's owned paths must cover the original PR's full diff against `origin/main`,
+For a replacement authorized after the cap, dispatch on a fresh branch. Grant the paths the
+replacement will change relative to `origin/main`, including any inherited changes it keeps.
+The same-PR successor's owned paths must cover the original PR's full diff against `origin/main`,
 not only its own fixes, because `delivered_paths` counts the PR's inherited commits as the
 successor's changes.
 `delivered_paths` in `lu_machinery/dispatcher/ownership.py` excludes commits reachable from the

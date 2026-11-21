@@ -20,11 +20,17 @@ typed publisher (`docs/dev/agent-public-text.md`), which scans every field befor
 3. **Proof**, one line: the check or reproduction that shows it works, with the run id.
 4. The public-safe subset of the hand-off record ([delivery](delivery.md#hand-off-record)):
    acceptance ids and their proof, catalog risk and the rounds used of the review budget, and
-   the finding ledger.
+   the finding ledger. For a replacement, name each superseded PR and its predecessor head
+   from the hand-off. For a capped PR, use the full head SHA in the cap disposition.
+   List every inherited blocker by source PR and finding ID. Give its owner and disposition,
+   with evidence from the replacement head for any claimed fix or inapplicability. For a
+   blocker that remains open elsewhere, also name its public work item. Distinguish predecessor
+   rounds and findings from the replacement's own.
 5. A size justification when the PR is above the size signal (`workflow.md` § Merge
    policy).
 6. `Refs #N` or `Fixes #N` for the issue. `Fixes` closes the whole issue, so use it only when
-   every acceptance criterion is delivered (`workflow.md` § Work intake).
+   every acceptance criterion is delivered (`workflow.md` § Work intake). Use `Refs` while the
+   issue still owns an unresolved blocker.
 7. **Credit**: original contributors (after `takeover`), and the model and harness that wrote
    the change, as the harness reports them. Never guess a model name.
 
