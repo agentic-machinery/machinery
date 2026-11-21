@@ -90,6 +90,7 @@ SCHEMAS = {
             "body": "text",
             "body_file": "file",
             "match_head": "sha",
+            "expect_queue": "queue_mode",
         },
     ),
     "pr-update-branch": ({"number"}, {**COMMON, "number": "number"}),
@@ -204,6 +205,8 @@ ENUMS = {
     "status": {"success", "failure", "error", "pending"},
     "grouping_strategy": {"ALLGREEN", "HEADGREEN"},
     "merge_method": {"MERGE", "SQUASH", "REBASE"},
+    # The landing kind a caller checked its gate for: pr-merge refuses when the base differs.
+    "queue_mode": {"true", "false"},
 }
 _MERGE_QUEUE_FIELDS = frozenset(MERGE_QUEUE_INT_BOUNDS) | frozenset({"grouping_strategy", "merge_method"})
 # Keys a repository ruleset GET returns that PUT must not send back. A key in neither
@@ -2375,6 +2378,12 @@ def publish(
             # a merge queue ignores explicit text, so its defaults are scanned too.
             default = _squash_text(gh_repo, fields, dest, temp, readiness_runner, cwd, environment)
             recovery_queue = default["queue"]
+            if "expect_queue" in fields and (fields["expect_queue"] == "true") is not recovery_queue:
+                raise gate.PublishBlocked(
+                    "QUEUE_MODE_CHANGED: merge refused before publication: the base branch merge queue is "
+                    + ("on" if recovery_queue else "off") + " but --expect-queue was " + fields["expect_queue"]
+                    + "; re-read queue-status and re-check the landing gate for that kind."
+                )
             if recovery_queue:
                 try:
                     before = queue_probe()
@@ -2930,6 +2939,11 @@ def main(argv=None, *, runner=None):
                         "not a PR number; no default"
                     ),
                 }[key]
+            if verb == "pr-merge" and key == "expect_queue":
+                kwargs["help"] = (
+                    "true or false: the merge queue state the landing gate was checked for; "
+                    "refused before any write when the base branch differs; omitted skips the check"
+                )
             if kind == "bool":
                 kwargs["action"] = argparse.BooleanOptionalAction
             elif kind in {"texts", "assets"}:

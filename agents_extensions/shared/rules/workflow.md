@@ -224,8 +224,9 @@ base branch, no merge-group run exists. The same `pr-merge` squash-merges the PR
 pinned to the approved head, after a recorded exact-head APPROVE with no blocking check on
 that head pending, failing or cancelled, never with `--admin`; an unreadable flag stops the
 landing. The PR-side CI rule is the same in both cases (the publisher's merge guard applies it
-before enqueue and before a direct merge), so a queue setting that changes mid-landing skips
-no gate.
+before enqueue and before a direct merge). `pr-merge --expect-queue` carries the flag the
+landing gate was checked for, and the publisher refuses before any write when the base branch
+now reports the other kind, so a queue setting that changes mid-landing skips no gate.
 **Priority line (#12019):** only the CTO seat applies the `merge-priority` label, to a
 machinery fix, after the exact-head approval is recorded; `pr-merge` (and so the keeper)
 then enqueues that head at the front of the queue, while every gate, including the

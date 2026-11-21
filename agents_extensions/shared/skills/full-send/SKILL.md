@@ -124,12 +124,12 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    "$PY" -m lu_machinery.publish read queue-status --repo "$REPO" --number "$PR" --branch "$BASE"
    ```
 
-   `true` means a merge queue and `false` none. Any other reading (a failed read, a missing or
-   non-boolean field) means stop; never guess. `headRefOid` must equal the head of the recorded
-   APPROVE and of green PR CI, which is the same in both kinds: no blocking check on that head
-   pending, red or cancelled, the `CI Gate` among them where the repository runs one.
-   `pr-merge`'s merge guard refuses otherwise before it enqueues or merges, so a queue setting
-   that changes before it runs skips no gate. If CI evidence that arrived
+   `true` means a merge queue and `false` none; keep it as `$QUEUE` for step 8. Any other
+   reading (a failed read, a missing or non-boolean field) means stop; never guess. `headRefOid`
+   must equal the head of the recorded APPROVE and of green PR CI, which is the same in both
+   kinds: no blocking check on that head pending, red or cancelled, the `CI Gate` among them
+   where the repository runs one. `pr-merge`'s merge guard refuses otherwise before it enqueues
+   or merges. If CI evidence that arrived
    after the verdict materially undermines it (for example a failure in code the review relied
    on), get the reviewer's disposition before landing (step 8), through a round `budget-check`
    admits; a fix that moves the head returns to step 4.
@@ -148,11 +148,14 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
      no reason to stop.
 
    ```bash
-   "$PY" -m lu_machinery.publish pr-merge --repo "$REPO" --number "$PR" --match-head "$HEAD_SHA"
+   "$PY" -m lu_machinery.publish pr-merge --repo "$REPO" --number "$PR" --match-head "$HEAD_SHA" \
+     --expect-queue "$QUEUE"
    ```
 
-   `pr-merge` re-reads the flag and takes its own path. Never `--auto`, `--delete-branch` or
-   `--admin`.
+   `--expect-queue` is required here. `pr-merge` re-reads the flag before any write and refuses
+   with `QUEUE_MODE_CHANGED` when it differs from `$QUEUE`, the way `--match-head` pins the head;
+   then return to step 7 and check the gate for the kind it now reports. Never `--auto`,
+   `--delete-branch` or `--admin`.
 9. **Confirm `MERGED`** and the merge SHA: `gh pr view "$PR" --json state,mergeCommit`. If the
    queue ejects the PR, follow the kick recipe in [pr-watch](references/pr-watch.md). If
    waiting in the queue is the only step left and the integration owner has accepted queue

@@ -120,7 +120,8 @@ Every item must hold on the **current** head. A moved head voids the verdict and
 5. The PR is open, not a draft, mergeable and not BEHIND or DIRTY against its base.
 
 After the gate, `full-send` lands through `pr-merge` (`full-send` step 8), which enqueues where
-the base branch has a merge queue and merges directly where it has none.
+the base branch has a merge queue and merges directly where it has none. `--expect-queue` pins
+the kind the gate was checked for: `pr-merge` refuses before any write when the base differs.
 `full-stop` reports READY_TO_MERGE at the gate; in a merge-queue repository the future
 merge-group CI is not yet proven at that point.
 
