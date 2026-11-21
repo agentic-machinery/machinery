@@ -438,12 +438,6 @@ def _checkout_repository(repo_root: Path) -> str:
     return match.group(1)
 
 
-def _checkout_task_root(repo_root: Path) -> Path:
-    """The primary checkout's dispatch task records, shared by every linked worktree."""
-    common = Path(_checkout_git(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    return common.parent / "batch_state" / "tasks"
-
-
 def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
     if args.domain.strip().casefold() not in VALID_REVIEW_PROFILES:
         print(
@@ -796,6 +790,9 @@ def _proof_author_attributions(
 ) -> list[dict[str, str]]:
     """Model and harness pairs from this change's own ``X-Agent`` trailers.
 
+    Task ids in those trailers resolve in the dispatcher's configured task
+    store, not in the reviewed checkout.
+
     The frozen ``base_sha..head_sha`` range also lists commits merged in from
     the default branch after that base was recorded. Those commits belong to
     other changes. While this head is not yet on that branch, ``git rev-list``
@@ -830,7 +827,8 @@ def _proof_author_attributions(
     if not shas:
         shas = [head]
     repository = _checkout_repository(repo_root)
-    task_root = _checkout_task_root(repo_root)
+    # The dispatcher's configured store, the same resolver resolve-reviewer uses.
+    task_root = tasks_dir().absolute()
     pairs: dict[str, str] = {}
     for sha in shas:
         message = _checkout_git(repo_root, "log", "-1", "--format=%B", sha)
