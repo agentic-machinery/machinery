@@ -1228,6 +1228,9 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "attested-claude-mismatched-executor": dict(agent="claude", model="sonnet",
                                                     resolved_model="claude-sonnet-4-6",
                                                     resolved_model_known=True, effort="high"),
+        "attested-claude-alias-only": dict(agent="claude", model="sonnet",
+                                           resolved_model="sonnet",
+                                           resolved_model_known=True, effort="high"),
         "attested-runtime-variant-missing-agent": dict(agent=None, model="gemini-4-hydrogen",
                                                        resolved_model="gemini-4-neon-medium",
                                                        resolved_model_known=True, effort="high"),
@@ -1278,6 +1281,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "attested-missing-agent-with-effort": ("gemini-4-hydrogen", "unset"),
         "attested-malformed-agent-options-effort": ("gemini-4-hydrogen", "unset"),
         "attested-claude-mismatched-executor": ("claude-sonnet-4.6-thinking", "unset"),
+        "attested-claude-alias-only": ("sonnet", "unset"),
         "attested-runtime-variant-missing-agent": ("gemini-4-neon", "medium"),
         "attested-opencode-deepseek-with-effort": ("deepseek-v4.1-flash", "unset"),
         "attested-cursor-high-with-suffixed-request": ("grok-4.7", "high"),
@@ -1292,11 +1296,11 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         ("opus", "high"), ("claude-opus-5-5", "unknown"), ("claude-opus-5-6", "high"),
         ("gpt-6.1-sol", "unknown"), ("unknown", "unknown"), ("unrecognized", "unknown"),
         ("gemini-4-hydrogen", "unknown"), ("gemini-4-neon", "medium"), ("gemini-4-neon", "unknown"),
-        ("claude-sonnet-4.6-thinking", "unknown"), ("composer-2.5", "unknown"),
+        ("claude-sonnet-4.6-thinking", "unknown"), ("sonnet", "unknown"), ("composer-2.5", "unknown"),
         ("deepseek-v4-flash", "unknown"), ("deepseek-v4.1-flash", "unknown"),
     }
     for model_name in ("unrecognized", "gemini-4-hydrogen", "claude-sonnet-4.6-thinking",
-                       "composer-2.5", "deepseek-v4.1-flash"):
+                       "sonnet", "composer-2.5", "deepseek-v4.1-flash"):
         assert _row(window, model_name, "write")["tasks"] == 0
     neon = _row(window, "gemini-4-neon", "write")
     assert (neon["tasks"], neon["efforts"]) == (1, ["medium"])

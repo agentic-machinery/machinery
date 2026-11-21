@@ -345,7 +345,7 @@ def _uses_effort_flag(record: Mapping[str, Any]) -> bool:
 
 
 def _observed_matches_request(record: Mapping[str, Any], observed_id: str, requested_id: str) -> bool:
-    if requested_id == "unknown":
+    if requested_id == "unknown" or observed_id.casefold() in NATIVE_ALIASES:
         return False
     if observed_id == requested_id:
         return True
