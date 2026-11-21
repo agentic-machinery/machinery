@@ -31,7 +31,7 @@
 | UI / visual product design | Claude Opus 5.5 / GPT-6.2 Sol | Cursor or Sonnet implements the approved design. Kimi is retired (OO-58) and is not an implementer. | `high` | provisional |
 | Code/security CF review | **Author-family-conditional** (see §3); for security-sensitive diffs (hooks/guards, launchers, credential or secret handling, dispatch admission, sandbox/permission logic), the resolver raises the review to `--risk critical` whatever risk is passed (`lu_machinery/review/security_paths.py`, #9125), which excludes Sonnet 5.5 | — | `high`+ | provisional |
 | Critical CF review | GPT-6.2 Sol ↔ Opus 5.5 ↔ Gemini 4 Neon High **cross-family** (peer seat, operator 2026-11-20, NEON-SOLTIER-1120) | — | `high` | provisional |
-| Ukrainian language | Gemini 3.8 Flash High (AGY) | LANGUAGE-LANES: GPT-6.2 Sol / Claude Opus 5.5 + sources | `high` | provisional (morphology remains VESUM-gated) |
+| Ukrainian language | Fresh-build writer: `gemini-4-neon-high` (AGY) | Writer alternatives: GPT-6.2 Sol / Claude Opus 5.5; review follows LANGUAGE-LANES with `sources` | `high` | provisional (morphology remains VESUM-gated) |
 | Recon / triage | GPT-6 Luna, Claude Haiku, Gemini 4 Hydrogen | — | Luna `high` with exact owned paths + objective scope ceiling, from a Sol advisory envelope (always required, #9275); others by task fit; never sole release | provisional |
 
 **One orchestrator per stream.** Advisors recommend; orchestrator owns terminal disposition.
@@ -161,7 +161,7 @@ Ukrainian curriculum      → sanctioned language lanes; Opus 5.5 for Claude (ne
 Hard code                 → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High; Opus/Sol advice
 Orchestrate stream        → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High (exactly one)
 UI / visual product       → Opus/Sol design → K3 or Sol/Opus/Grok implement web/UI code → Opus/Sol first if systems-hard
-UA language                 → Gemini 3.8 Flash High (AGY) + VESUM/sources (3.1 Pro is retired, not subscribed, operator 2026-10-23)
+UA language                 → fresh-build writer gemini-4-neon-high (AGY); writer alternatives Sol 6.2 / Opus 5.5; review per LANGUAGE-LANES + VESUM/sources
 Security/bug CF             → author-family-conditional (Grok/GLM/Opus/…)
 Architecture decision       → Opus/Sol advice → designated approval (operator, or Opus 5.5 + Sol 6.2: the non-author's approval when one authored it, both otherwise) → orchestrator integrates
 Recon                     → GPT-6 Luna high (Sol envelope) | Claude Haiku | Gemini 4 Hydrogen (Sol envelope)
