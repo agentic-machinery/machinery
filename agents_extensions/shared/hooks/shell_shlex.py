@@ -323,9 +323,12 @@ def preprocess_shell_command(command: str) -> str:
 # name). heredoc_view shows every body to the guards in two parts:
 #
 # - its words (_body_words), in one subshell line `( ... ; ... )`. Quotes,
-#   backslashes, comments, output redirects, here-document operators and
-#   expansion punctuation are removed, and an input redirect stays (so its
-#   operand never stands where the command does);
+#   backslashes, comments and expansion punctuation are removed; every
+#   redirect at a word start (here-documents and here-strings included) is
+#   shown as one input redirect `<` before its operand, so the operand never
+#   stands where the command does and no write target is invented (output
+#   targets are not shown, a known limit); a `<` or `>` inside a word
+#   is data;
 #   `;`, `&`, `|`, `)`, backticks and a `(` that does not follow a word
 #   character start a new command, and a reserved word leading a command is
 #   dropped. So any command a shell could
@@ -345,12 +348,15 @@ def preprocess_shell_command(command: str) -> str:
 _MAX_NESTING = 16
 _DELIMITER_END = frozenset(" \t\n;|&()<>")
 _SUBSCRIPTED = re.compile(r"(?:^|[ \t\n;&|(])[A-Za-z_][A-Za-z0-9_]*\Z")
-# `&` starts a command unless it duplicates an input (`0<&3`).
-_BODY_BREAKS = re.compile(r"[;()`|]|(?<!<)&")
+# A redirect operator at a word start, with its descriptor: `<`, `<<`, `<<-`,
+# `<<<`, `<&`, `<>`, `>`, `>>`, `>|`, `>&`, `&>`, `&>>`.
+_BODY_REDIRECT = re.compile(
+    r"(?:(?<=[\s;&|()`])|^)(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<-|<{1,3}[&>]?|>{1,2}[|&]?|&>{1,2})", re.M
+)
+_BODY_BREAKS = re.compile(r"[;&|()`]")
 # Quote removal joins a word (`g"h"` is `gh`): quotes and backslashes go.
-# Other punctuation only separates words. An input redirect stays, so its
-# operand never stands where the command does (`<in tee x`).
-_BODY_DROPS = str.maketrans({"'": None, '"': None, "\\": None, **{char: " " for char in "#>${}"}})
+# Other punctuation, a `<` or `>` inside a word included, only separates words.
+_BODY_DROPS = str.maketrans({"'": None, '"': None, "\\": None, **{char: " " for char in "#<>${}"}})
 _RESERVED_WORDS = frozenset(
     {"!", "[[", "]]", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for", "function", "if", "in"}
     | {"select", "then", "time", "until", "while"}
@@ -446,22 +452,41 @@ def _body_words(text: str) -> list[str]:
     text = re.sub(r"(?<=[A-Za-z0-9_.\]])\(", " ", text)
     # A process substitution's arrow is not a redirect; its `(` starts a command.
     text = re.sub(r"[<>](?=\()", " ", text)
+    # A redirect at a word start takes the next word as its operand. Each is
+    # shown as one input redirect `<` (\x02 until quote removal is done): its
+    # descriptor, a `-` and a here-document's operator never stand where the
+    # command does, its operand is skipped as Bash skips it, no write target
+    # is invented, and the view never holds a here-document operator.
+    text = _BODY_REDIRECT.sub("\x02", text.replace("\x02", " "))
     # A shell reading the body expands `$NAME` and `${NAME...}`: keep the name.
     text = re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", "\x00\\1", text)
     text = _BODY_BREAKS.sub("\n", text).translate(_BODY_DROPS).replace("\x00", "$")
-    # A here-document or here-string in the body only feeds input; its lines
-    # are already body lines. Removed after quote removal, so the view never
-    # holds an operator that would read the view's own lines as a body.
-    text = re.sub(r"<<+", " ", text)
     words: list[str] = []
     for line in text.split("\n"):
-        parts = line.split()
+        # Repeated redirects read as one; one with no operand is dropped.
+        parts = re.sub(r"\x02[\s\x02]*", " \x02", line).split()
+        while parts and parts[-1] == "\x02":
+            parts.pop()
+        parts = [part.replace("\x02", "<") for part in parts]
         # A reserved word only opens syntax; the command after it is what runs.
         while parts and parts[0] in _RESERVED_WORDS:
             parts.pop(0)
         if parts:
             words.append(" ".join(parts))
     return words
+
+
+def _at_command_position(out: list[str]) -> bool:
+    """Whether the next word starts a command, where Bash reads reserved words.
+
+    True after an operator, an opening, a reserved word or at a frame start,
+    and whenever the written text does not show what came before.
+    """
+    tail = _tail(out).rstrip(" \t")
+    if not tail or tail[-1] in ";&|()\n{}":
+        return True
+    word = re.split(r"[ \t\n;&|()]", tail)[-1]
+    return word in _RESERVED_WORDS or word in {"{", "}"}
 
 
 def _tail(out: list[str], size: int = 64) -> str:
@@ -719,7 +744,7 @@ def _parse(
             out.append(command[index:end])
             index = end
             continue
-        if len(stack) > 1 and word_start and re.match(r"case[ \t\n]", look):
+        if len(stack) > 1 and word_start and re.match(r"case[ \t\n]", look) and _at_command_position(out):
             raise ShellPreprocessLimit("case command inside a substitution cannot be read safely")
         if char == "(":
             parens[-1] += 1
@@ -832,15 +857,18 @@ def _read_bodies(
                 physical.append(command[end + 1 : following])
                 end = following
             index = end + 1
-            candidate = "".join(logical)
-            if (candidate.lstrip("\t") if strip_tabs else candidate) == closer:
+            if strip_tabs:
+                # `<<-` strips the tabs that start the line Bash reads: for a
+                # continued unquoted line, the joined line. Stripping goes on
+                # into a later part only while the earlier parts are empty.
+                for part_index, part in enumerate(logical):
+                    logical[part_index] = part.lstrip("\t")
+                    if logical[part_index]:
+                        break
+                physical = [part + "\\" for part in logical[:-1]] + logical[-1:]
+            if "".join(logical) == closer:
                 break
-            # `<<-` strips the tabs that start a line Bash reads; a continued
-            # unquoted line keeps the tabs of its later parts, as Bash does.
-            lines.extend(
-                part.lstrip("\t") if strip_tabs and (quoted or not part_index) else part
-                for part_index, part in enumerate(physical)
-            )
+            lines.extend(physical)
         name = names.assign(closer)
         documents.append(HereDocument(operator, owner, descriptor, closer, quoted, strip_tabs, tuple(lines), name))
         out[slot] += f"'{name}'" if quoted else name
