@@ -242,7 +242,7 @@ and reconcile its messages with the approved head and landing decision.
 **Merge-queue visibility after enqueue (#7814 item 13).** After `.venv/bin/python -m lu_machinery.publish pr-merge --number <N> --match-head <approved head> --expect-queue <reading>` (`full-send` step 8) in a merge-queue repository, GitHub
 prints `! The merge strategy for main is set by the merge queue` while the PR stays
 `OPEN` / `CLEAN`. Do not stall or query raw GraphQL by hand — run
-`.venv/bin/python -m lu_machinery.gh_merge_queue_status <pr> --repo <owner/name> --branch <base>` (or `--line` / `--json`) to
+`.venv/bin/python -m lu_machinery.gh_merge_queue_status <pr>` (or `--line` / `--json`) to
 inspect queue membership (`queued=yes/no`), position in line, ETA, and the active
 `merge_group` CI run URL if building (or clear `in queue, position unknown`).
 
