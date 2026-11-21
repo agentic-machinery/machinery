@@ -151,7 +151,7 @@ def test_retired_kimi_cannot_win_budget_recommendation_or_capacity_pick():
 
 def test_capacity_picker_lists_each_cool_usage_pool_once(shared_pool):
     rows = capacity_pick.build_lane_rows(snapshot(80, 95), reset_reserve={"enabled": False})
-    assert capacity_pick.cooler_lanes(rows) == ["codex", "grok"]
+    assert capacity_pick.cooler_lanes(rows) == ["codex", "cursor"]
 
 
 def test_route_runtime_failure_does_not_block_the_other_shared_transport(shared_pool):

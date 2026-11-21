@@ -43,7 +43,7 @@ from lu_machinery.fleet.reset_reserve import (
     load_reset_reserve,
     unavailable_reserve,
 )
-from lu_machinery.fleet.routing_policy import projected_unused_pct
+from lu_machinery.fleet.routing_policy import API_KEY_LANES, projected_unused_pct
 from lu_machinery.orchestration import dispatch_admission, task_record_store
 
 # The machinery package's import name, which is also the directory its files have in checkout
@@ -52,11 +52,11 @@ _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
 # This CLI as it was started: by its import name under ``-m``, else by its file.
 _ENTRY = f"-m {__spec__.name}" if __spec__ is not None else os.fspath(__file__)
 
-# Subscription + free seats drivers may pick for code implement. "gemini" and
-# "glm" are kept here for budget-row VISIBILITY (their quota/status still
-# shows in the table) but are force-AVOID via RETIRED_AGENT_ALIASES below —
-# the gemini CLI is retired (operator 2026-08-18) and the z.ai GLM
-# subscription is retired (operator 2026-09-03); neither may ever be a `pick`.
+# Subscription seats drivers may pick for code implement. "gemini" and "glm"
+# are kept here for budget-row VISIBILITY (their quota/status still shows in
+# the table) but are force-AVOID via RETIRED_AGENT_ALIASES below — neither may
+# ever be a `pick`. API-credit routes (DeepSeek) do not sit in the subscription
+# pace order (#1120).
 CODE_LANES: tuple[str, ...] = (
     "claude",
     "codex",
@@ -64,24 +64,29 @@ CODE_LANES: tuple[str, ...] = (
     "grok",
     "cursor",
     "agy",
-    "deepseek",
     "glm",
 )
+API_CREDIT_LANES: frozenset[str] = API_KEY_LANES | frozenset({"openrouter"})
 
-_AVOID_STATUSES = frozenset({"hot", "near_cap", "need_login"})
+_AVOID_STATUSES = frozenset({"near_cap", "need_login"})
 _COOL_STATUSES = frozenset({"cool", "warm", "idle"})
 # Retired lanes (gemini, glm) rank alongside each other near the bottom —
 # is_avoid_lane() already force-excludes them from `pick`, this ordering only
 # affects stable table/tie-break display among AVOID rows.
 _CODE_LANE_PRIORITY = {
     "codex": 0,
+    "codex:a": 0,
     "codex:b": 0,
     "claude": 1,
+    "claude:a": 1,
+    "claude:b": 1,
     "cursor": 2,
     "grok": 3,
     "gemini": 5,
     "glm": 6,
     "agy": 7,
+    "agy:gemini": 7,
+    "agy:claude_gpt": 7,
     "deepseek": 8,
 }
 # Plan remaining-% is compared in bands this wide, so lanes with similar headroom
@@ -309,13 +314,22 @@ def build_lane_rows(
     ``policy_error`` (plan state applies) and leaves every other lane unchanged.
     ``in_flight`` is None when no active-work observation exists.
     """
-    agents = credit_lane.shared_usage_agents(budget.get("agents") if isinstance(budget.get("agents"), dict) else {})
+    raw_agents_val = budget.get("agents")
+    raw_agents: dict[str, Any] = cast(dict[str, Any], raw_agents_val) if isinstance(raw_agents_val, dict) else {}
+    agents = credit_lane.shared_usage_agents(raw_agents)
     raw_accounts = budget.get("codex_accounts")
     accounts = cast(dict[str, Any], raw_accounts) if isinstance(raw_accounts, dict) else {}
     lane_list = list(lanes)
     if "codex:b" not in lane_list and isinstance(accounts.get("codex:b"), dict):
         insert_at = lane_list.index("codex") + 1 if "codex" in lane_list else len(lane_list)
         lane_list.insert(insert_at, "codex:b")
+    merged_grok_cursor = (
+        "grok" in lane_list
+        and "cursor" in lane_list
+        and credit_lane.grok_cursor_bindings_verified(raw_agents.get("grok"), raw_agents.get("cursor"))
+    )
+    if merged_grok_cursor:
+        lane_list = [lane for lane in lane_list if lane != "grok"]
 
     def _account_reserve(label: str, info: dict[str, Any]) -> dict[str, Any]:
         """The reserve that names this account. The other account's assertion does not apply."""
@@ -339,7 +353,9 @@ def build_lane_rows(
     for lane in lane_list:
         info = agents.get(lane) if isinstance(agents.get(lane), dict) else {}
         quota_source: str | None = None
-        if lane == "deepseek":
+        if merged_grok_cursor and lane == "cursor":
+            info = credit_lane.merge_grok_cursor_record(agents["grok"], agents["cursor"], policy=credit_policy)
+        elif lane == "deepseek":
             from lu_machinery.fleet.prepaid_status import api_lane_status_from_account
 
             account = (budget.get("api_accounts") or {}).get(lane) or {}
@@ -359,7 +375,7 @@ def build_lane_rows(
         else:
             info, quota_source = _mirror_retired_quota(agents, lane, info)
         if lane == "codex:b":
-            picked: Any | None | dict[Any, Any] = accounts.get("codex:b")
+            picked: Any | dict[Any, Any] | None = accounts.get("codex:b")
             info = picked if isinstance(picked, dict) else info
             quota_source = None
         if budget.get("transport") == "acp" and info.get("eligible") is not True:
@@ -367,6 +383,22 @@ def build_lane_rows(
         facts = credit_lane.routing_facts(
             lane, info, model=None, snapshot_metadata=diagnostics, policy=credit_policy, now=now
         )
+        if lane in API_CREDIT_LANES:
+            forecast: dict[str, Any] = {
+                "available": False,
+                "reason": "api credit route: no subscription pace score",
+                "source": None,
+                "remaining_pct": None,
+                "hours_to_reset": None,
+                "burn_pct_per_hour": None,
+                "projected_surplus_pct": None,
+                "projected_surplus_per_hour": None,
+                "will_last_to_reset": None,
+            }
+        else:
+            forecast = credit_lane.pace_forecast(
+                info, snapshot_metadata=diagnostics, policy=credit_policy, now=now
+            )
         retired_target = RETIRED_AGENT_ALIASES.get(lane)
         lane_reserve = (
             _account_reserve("b-sub" if lane == "codex:b" else "sub", cast(dict[str, Any], info))
@@ -390,7 +422,12 @@ def build_lane_rows(
         else:
             status = lane_status({**info, "status": facts.status})
         will_last = will_last_to_reset(info)
-        unused = projected_unused_pct(remaining_pct(info), will_last)
+        if will_last is None and isinstance(forecast.get("will_last_to_reset"), bool):
+            will_last = forecast["will_last_to_reset"]
+        if forecast.get("available") and isinstance(forecast.get("projected_surplus_pct"), (int, float)):
+            unused: float | None = max(0.0, round(float(forecast["projected_surplus_pct"]), 2))
+        else:
+            unused = projected_unused_pct(remaining_pct(info), will_last)
         cb = info.get("codexbar") if isinstance(info.get("codexbar"), dict) else None
         pace_deficit = facts.uncovered is True
         # The reserve needs the owner's verified capacity (#9740), so it only ranks Codex first and
@@ -407,8 +444,16 @@ def build_lane_rows(
             capacity = {"state": credit_lane.CAPACITY_VERIFIED, "reason": facts.capacity_reason}
         else:
             capacity = {"state": facts.capacity, "reason": facts.capacity_reason}
-        in_flight = _in_flight(lane, active_in_flight, budget)
+        if merged_grok_cursor and lane == "cursor":
+            in_flight = credit_lane.sum_in_flight(
+                _in_flight("cursor", active_in_flight, budget),
+                _in_flight("grok", active_in_flight, budget),
+            )
+        else:
+            in_flight = _in_flight(lane, active_in_flight, budget)
         notes: list[str] = []
+        if merged_grok_cursor and lane == "cursor":
+            notes.append("meter:grok+cursor")
         if facts.covered_by:
             notes.append(facts.pace_reason)
         if quota_source:
@@ -448,10 +493,12 @@ def build_lane_rows(
                 notes.append(f"retired→{retired_target}")
             if pace_deficit:
                 notes.append("deficit")
-            if status in _AVOID_STATUSES:
+            if status in _AVOID_STATUSES or status == "hot":
                 notes.append(status)
             elif facts.capacity_reason.startswith("near cap"):
                 notes.append(facts.capacity_reason.split(";")[0])
+        elif status == "hot" and facts.capacity == credit_lane.CAPACITY_VERIFIED:
+            notes.append(facts.capacity_reason)
         elif in_flight == 0 and status in _COOL_STATUSES:
             notes.append("idle")
         elif in_flight is not None and in_flight > 0:
@@ -465,6 +512,7 @@ def build_lane_rows(
                 "will_last": will_last,
                 "projected_unused_pct": unused,
                 "pace": pace_summary(info),
+                "pace_forecast": forecast,
                 "in_flight": in_flight,
                 "avoid": avoid,
                 "capacity": capacity,
@@ -596,14 +644,58 @@ def _write_success_demoted(row: Mapping[str, Any]) -> bool:
     return isinstance(stats, Mapping) and stats.get("demoted") is True
 
 
-def build_pick_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Cool/idle first; AVOID lanes last with pick=AVOID.
+def _is_api_credit_row(row: Mapping[str, Any]) -> bool:
+    lane = str(row.get("lane") or "").strip().lower()
+    return lane in API_CREDIT_LANES or row.get("type") == "api"
 
-    Within a status, every lane ranks by routing-budget plan headroom in
-    :data:`_HEADROOM_BAND_PCT` bands, per the 2026-10-09 resource-policy order
-    (one band lower when its row carries a ``write_success`` demotion), then by
-    fewest in flight, then by the static lane priority.
+
+def _row_forecast(row: Mapping[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    existing = row.get("pace_forecast")
+    if isinstance(existing, Mapping):
+        return dict(existing)
+    if _is_api_credit_row(row):
+        return {"available": False, "reason": "api credit route: no subscription pace score"}
+    return credit_lane.pace_forecast(row, now=now)
+
+
+def pick_order_rationale(rows: list[dict[str, Any]], *, now: datetime | None = None) -> tuple[bool, str]:
+    """Whether projected-surplus-per-hour pace ordering applies, and the reason when it falls back."""
+    sub_rows = [row for row in rows if not _is_api_credit_row(row)]
+    active_sub_rows = [
+        row
+        for row in sub_rows
+        if not row.get("avoid")
+        and str(row.get("status") or "unknown") in {"cool", "warm", "idle", "hot"}
+        and row.get("remaining_pct") is not None
+    ]
+    if not active_sub_rows:
+        return False, "missing forecast: no eligible subscription meter with allowance reading"
+    missing: list[str] = []
+    for row in active_sub_rows:
+        fc = _row_forecast(row, now=now)
+        if not fc.get("available"):
+            lane = str(row.get("lane") or "unknown")
+            reason = str(fc.get("reason") or "missing forecast")
+            missing.append(f"{lane}: {reason}")
+    if missing:
+        return False, "; ".join(missing)
+    return True, "projected surplus per hour to reset"
+
+
+def build_pick_order(rows: list[dict[str, Any]], *, now: datetime | None = None) -> list[dict[str, Any]]:
+    """Order subscription meters by projected surplus per hour to reset, or fall back to headroom bands.
+
+    API-credit routes (e.g. DeepSeek) are excluded from the subscription pace
+    order. Within equal eligibility, quality (``write_success`` demotion) and
+    provider limits, verified subscription routes rank by projected surplus per
+    hour to reset when every comparable active subscription meter has a fresh,
+    in-window forecast; stale, missing or reset-crossing forecasts fall back to
+    the 10-point headroom-band order. An over-pace (``hot``) route that still
+    lasts to reset is not AVOID and sorts below ``cool``/``warm`` meters.
     """
+    sub_rows = [row for row in rows if not _is_api_credit_row(row)]
+    forecasts = {id(row): _row_forecast(row, now=now) for row in sub_rows}
+    use_pace, _ = pick_order_rationale(sub_rows, now=now)
 
     def _sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
         avoid = bool(row.get("avoid"))
@@ -619,18 +711,52 @@ def build_pick_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         lane_rank = _CODE_LANE_PRIORITY.get(lane_name, 50)
         status_rank: float = {
             "cool": 0,
+            "idle": 0,
             "warm": 1,
             "unknown": 2,
             "pre_launch": 3,
             # Credit balance present (draw not verified by the router): after every plan-backed seat.
             credit_lane.CREDIT_BALANCE_PRESENT: 7,
-            "hot": 8,
+            "hot": 1.5 if not avoid else 8,
             "near_cap": 9,
         }.get(status, 5)
         if (row.get("capacity") or {}).get("state") == credit_lane.CAPACITY_UNKNOWN_STALE:
             # UNKNOWN — stale/advisory: after every row with verified capacity (A5, #9740).
             status_rank = 7.5
         reserve_priority = 0 if row.get("reset_reserve_eligible") else 1
+        if use_pace:
+            fc = forecasts.get(id(row), {})
+            pace_tier: float = (
+                7.5
+                if (row.get("capacity") or {}).get("state") == credit_lane.CAPACITY_UNKNOWN_STALE
+                else {
+                    "cool": 0,
+                    "warm": 0,
+                    "idle": 0,
+                    "hot": 1 if not avoid else 8,
+                    "unknown": 2,
+                    "pre_launch": 3,
+                    credit_lane.CREDIT_BALANCE_PRESENT: 7,
+                    "near_cap": 9,
+                }.get(status, 5)
+            )
+            quality_demoted = 1 if _write_success_demoted(row) else 0
+            surplus_per_hour = fc.get("projected_surplus_per_hour") if fc.get("available") else None
+            surplus_pct = fc.get("projected_surplus_pct") if fc.get("available") else None
+            return (
+                avoid,
+                reserve_priority,
+                pace_tier,
+                quality_demoted,
+                surplus_per_hour is None,
+                -float(surplus_per_hour) if isinstance(surplus_per_hour, (int, float)) else 0.0,
+                status_rank,
+                flight_key,
+                -float(surplus_pct) if isinstance(surplus_pct, (int, float)) else 0.0,
+                lane_rank,
+                rem_key,
+                lane_name,
+            )
         return (
             avoid,
             reserve_priority,
@@ -643,7 +769,7 @@ def build_pick_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             lane_name,
         )
 
-    ordered = sorted(rows, key=_sort_key)
+    ordered = sorted(sub_rows, key=_sort_key)
     out: list[dict[str, Any]] = []
     rank = 1
     for row in ordered:
@@ -716,6 +842,10 @@ def cooler_lanes(rows: list[dict[str, Any]]) -> list[str]:
             and pool not in seen
             and (
                 row.get("status") in _COOL_STATUSES
+                or (
+                    row.get("status") == "hot"
+                    and (row.get("capacity") or {}).get("state") == credit_lane.CAPACITY_VERIFIED
+                )
                 or row.get("reset_reserve_eligible")
                 or row.get("status") == credit_lane.CREDIT_BALANCE_PRESENT
             )
@@ -744,10 +874,28 @@ def admission_status(tasks_dir: Path | None = None) -> dict[str, Any]:
 def _attach_write_success(rows: list[dict[str, Any]], write_success: Mapping[str, Mapping[str, Any]]) -> None:
     """Copy each lane's write record onto its row; a demoted lane gets a note naming the measured share."""
     for row in rows:
-        stats = write_success.get(str(row.get("lane") or ""))
-        if not isinstance(stats, Mapping):
-            row["write_success"] = {"attempts": 0, "done": 0, "rate": None, "demoted": False}
-            continue
+        lane = str(row.get("lane") or "")
+        if lane == "cursor" and "meter:grok+cursor" in str(row.get("notes") or ""):
+            attempts = 0
+            done = 0
+            for member in ("cursor", "grok"):
+                member_stats = write_success.get(member)
+                if isinstance(member_stats, Mapping):
+                    attempts += int(member_stats.get("attempts") or 0)
+                    done += int(member_stats.get("done") or 0)
+            rate = done / attempts if attempts else None
+            stats: Mapping[str, Any] = {
+                "attempts": attempts,
+                "done": done,
+                "rate": rate,
+                "demoted": attempts >= WRITE_SUCCESS_MIN_ATTEMPTS and rate is not None and rate < WRITE_SUCCESS_MIN_RATE,
+            }
+        else:
+            raw_stats = write_success.get(lane)
+            if not isinstance(raw_stats, Mapping):
+                row["write_success"] = {"attempts": 0, "done": 0, "rate": None, "demoted": False}
+                continue
+            stats = raw_stats
         row["write_success"] = dict(stats)
         if stats.get("demoted") is True and not row.get("avoid"):
             note = (
@@ -777,7 +925,8 @@ def build_report(
     )
     if write_success is not None:
         _attach_write_success(rows, write_success)
-    pick_order = build_pick_order(rows)
+    use_pace, pace_reason = pick_order_rationale(rows, now=now)
+    pick_order = build_pick_order(rows, now=now)
     rec = budget.get("recommendation") if isinstance(budget.get("recommendation"), dict) else {}
     warnings = list(rec.get("warnings") or [])
     primary = rec.get("primary_agent_for_code")
@@ -811,16 +960,29 @@ def build_report(
             )
             + "; other lanes unaffected"
         )
+    raw_rationale = str(rec.get("rationale") or "").strip()
+    if not use_pace:
+        fallback_note = f"pace forecast fallback ({pace_reason}): using headroom-band order"
+        if not raw_rationale:
+            rationale: str | None = fallback_note
+        elif "pace forecast fallback" not in raw_rationale:
+            rationale = f"{raw_rationale} ({fallback_note})"
+        else:
+            rationale = raw_rationale
+    else:
+        rationale = raw_rationale or "Ranked by projected surplus per hour to reset."
     return {
         "transport": budget.get("transport", "dispatch"),
         "generated_at": budget.get("generated_at"),
         "source": budget.get("source", "unknown"),
         "rows": rows,
         "pick_order": pick_order,
+        "pace_order_mode": "surplus_per_hour" if use_pace else "headroom_fallback",
+        "pace_order_reason": pace_reason,
         "cooler_lanes": cooler_lanes(rows),
         "recommendation": {
             "primary_agent_for_code": primary,
-            "rationale": rec.get("rationale"),
+            "rationale": rationale,
             "warnings": warnings,
         },
         "diagnostics": budget.get("diagnostics") or {},
@@ -932,9 +1094,13 @@ def main(argv: list[str] | None = None) -> int:
             "(healthy | unhealthy | unknown). `remaining%` is the tightest plan window. A pace deficit read\n"
             "from a stale snapshot shows `unknown` with `UNKNOWN — stale/advisory`: ranked after every\n"
             "verified row, never a cooler seat, never --strict success. Unknown load prints `—` (JSON null).\n"
-            "Pick order: heat first; then plan headroom in 10-point bands, fewest in flight, static lane\n"
-            "rank (Codex, Claude, Cursor first). A lane with >=3 write dispatches in 7 days and <60% done drops one band\n"
-            "(JSON `write_success`). DeepSeek (prepaid API) is eligible for Flash coding through opencode.\n"
+            "Pick order: verified subscription meters rank by projected surplus per hour to reset when all\n"
+            "comparable active meters have fresh, in-window forecasts (an over-pace lane that lasts to reset\n"
+            "sorts lower without AVOID; Grok and Cursor merge into one cursor meter with summed in-flight\n"
+            "where both bindings are verified; API-credit DeepSeek stays outside the subscription pace order).\n"
+            "Stale, missing or reset-crossing forecasts fall back to 10-point headroom bands with the reason\n"
+            "in the rationale. A lane with >=3 write dispatches in 7 days and <60% done ranks lower\n"
+            "(JSON `write_success`).\n"
             "Exit codes: 0 success; 2 invalid arguments or no admissible lane with --strict.\n"
             f"Related: /api/state/routing-budget?transport=acp; {_MACHINERY}/orchestration/dispatch_admission.py;\n"
             "issues #7812, #8645, #9518, #9615, #9740, #10776."

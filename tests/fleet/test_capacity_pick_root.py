@@ -94,8 +94,12 @@ def test_on_pace_band_is_not_avoid_but_real_deficit_is():
         },
     }
     rows = {r["lane"]: r for r in capacity_pick.build_lane_rows(budget)}
-    assert rows["grok"]["avoid"] is False
-    assert "deficit" not in rows["grok"]["notes"]
+    # #1120 AC-03: verified grok+cursor bindings merge into the live cursor meter row.
+    assert "grok" not in rows
+    assert rows["cursor"]["avoid"] is False
+    assert rows["cursor"]["remaining_pct"] == 58.5
+    assert "meter:grok+cursor" in rows["cursor"]["notes"]
+    assert "deficit" not in rows["cursor"]["notes"]
     assert rows["agy"]["avoid"] is True
     assert "deficit" in rows["agy"]["notes"]
 
@@ -108,9 +112,10 @@ def test_lane_rows_mark_avoid():
     assert rows["claude"]["avoid"] is True
     assert rows["cursor"]["avoid"] is False
     assert rows["cursor"]["status"] == "cool"
-    # The shared grok_cursor meter was removed with Grok (GROK-CANCEL-1110): each lane reads its own row.
-    assert rows["cursor"]["will_last"] is True
-    assert rows["grok"]["will_last"] is None
+    # #1120 AC-03: verified Grok and Cursor merge into one cursor meter row using the tighter reading.
+    assert "grok" not in rows
+    assert rows["cursor"]["remaining_pct"] == 80.0
+    assert "meter:grok+cursor" in rows["cursor"]["notes"]
     # glm's z.ai subscription is retired (operator 2026-09-03): AVOID even
     # when the budget snapshot itself still reports the lane as cool/wrong.
     assert rows["glm"]["avoid"] is True
@@ -390,11 +395,12 @@ def test_prepaid_deepseek_avoid(change):
     budget = _fixture_budget()
     budget["api_accounts"]["deepseek"].update(change)
     budget["recommendation"]["primary_agent_for_code"] = "deepseek"
+    row = next(r for r in capacity_pick.build_lane_rows(budget, lanes=("deepseek",)) if r["lane"] == "deepseek")
+    assert row["avoid"] is True
+    assert row["remaining_pct"] is None
+    # #1120 AC-03: DeepSeek (API credit) is absent from the subscription pace order.
     report = capacity_pick.build_report(budget)
-    deepseek = next(row for row in report["pick_order"] if row["lane"] == "deepseek")
-    assert deepseek["pick"] == "AVOID"
-    assert deepseek["remaining_pct"] is None
-    assert report["recommendation"]["primary_agent_for_code"] is None
+    assert all(entry["lane"] != "deepseek" for entry in report["pick_order"])
 
 
 def test_unhealthy_deepseek_account_row_is_avoid():
@@ -404,25 +410,24 @@ def test_unhealthy_deepseek_account_row_is_avoid():
         "healthy": False,
         "last_error": "provider config lost (#8514)",
     }
-    row = next(r for r in capacity_pick.build_lane_rows(budget) if r["lane"] == "deepseek")
+    row = next(r for r in capacity_pick.build_lane_rows(budget, lanes=("deepseek",)) if r["lane"] == "deepseek")
     assert row["avoid"] is True
     assert "AVOID" in row["notes"]
     assert "unhealthy: provider config lost (#8514)" in row["notes"]
     report = capacity_pick.build_report(budget)
-    pick = next(p for p in report["pick_order"] if p["lane"] == "deepseek")
-    assert pick["pick"] == "AVOID"
+    assert all(entry["lane"] != "deepseek" for entry in report["pick_order"])
 
 
 def test_deepseek_prepaid_lane_is_a_coding_pick():
-    """A cool, funded, healthy DeepSeek account is eligible for coding."""
+    """A cool, funded, healthy DeepSeek account is usable via explicit API-lane inspection, outside subscription pace."""
     budget = _fixture_budget()
     budget["api_accounts"]["deepseek"]["health"] = {"healthy": True}
     budget["recommendation"]["primary_agent_for_code"] = "deepseek"
-    report = capacity_pick.build_report(budget)
-    row = next(r for r in report["pick_order"] if r["lane"] == "deepseek")
-    assert row["pick"] != "AVOID"
+    row = next(r for r in capacity_pick.build_lane_rows(budget, lanes=("deepseek",)) if r["lane"] == "deepseek")
+    assert row["avoid"] is False
     assert row["capacity"]["state"] == credit_lane.CAPACITY_VERIFIED
-    assert "deepseek" in report["cooler_lanes"]
+    report = capacity_pick.build_report(budget)
+    assert all(entry["lane"] != "deepseek" for entry in report["pick_order"])
     assert report["recommendation"]["primary_agent_for_code"] == "deepseek"
 
 
@@ -538,7 +543,7 @@ def test_build_report_attaches_write_success_and_notes_the_demotion():
     assert rows["cursor"]["write_success"]["demoted"] is True
     assert "write success 1/4 in 7d (<60%): one headroom band down" in rows["cursor"]["notes"]
     assert rows["agy"]["write_success"]["demoted"] is False
-    assert rows["grok"]["write_success"] == {"attempts": 0, "done": 0, "rate": None, "demoted": False}
+    assert "grok" not in rows
     assert report["write_success"]["cursor"]["attempts"] == 4
     without = capacity_pick.build_report(budget, active_in_flight={})
     assert all("write_success" not in row for row in without["rows"])
@@ -765,8 +770,9 @@ def test_rows_carry_owner_facts_and_remaining_reading():
     budget = _fixture_budget()
     budget["agents"]["grok"]["codexbar"] = {"primary_remaining_pct": 3.0}
     rows = {row["lane"]: row for row in capacity_pick.build_lane_rows(budget, reset_reserve={"available": False})}
-    assert rows["grok"]["remaining_pct"] == 3.0
-    assert rows["grok"]["remaining_source"] == "codexbar.primary_remaining_pct"
+    assert "grok" not in rows
+    assert rows["cursor"]["remaining_pct"] == 3.0
+    assert rows["cursor"]["remaining_source"] == "codexbar.primary_remaining_pct"
     for row in rows.values():
         assert row["routing_facts"]["plan_remaining_pct"] == row["remaining_pct"]
         assert row["capacity"]["state"] in {"verified", "unknown", "unknown_stale", "avoid"}

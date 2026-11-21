@@ -812,15 +812,354 @@ def allowlist_applies(state: dict[str, Any]) -> bool:
     return state.get("allowlist_applies") is True
 
 
-def _natural_reset(info: dict[str, Any]) -> datetime | None:
-    native = info.get("codexbar") if isinstance(info.get("codexbar"), dict) else {}
-    windows = native.get("windows") if isinstance(native.get("windows"), dict) else {}
-    secondary = windows.get("secondary") if isinstance(windows.get("secondary"), dict) else {}
-    for value in (native.get("weekly_resets_at"), secondary.get("resets_at"), info.get("resets_at")):
+def _sub_mapping(source: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    val = source.get(key)
+    return val if isinstance(val, Mapping) else {}
+
+
+def _natural_reset(info: Mapping[str, Any]) -> datetime | None:
+    native = _sub_mapping(info, "codexbar")
+    windows = _sub_mapping(native, "windows")
+    secondary = _sub_mapping(windows, "secondary")
+    auto = _auto_window(info)
+    for value in (
+        native.get("weekly_resets_at"),
+        secondary.get("resets_at"),
+        info.get("resets_at"),
+        info.get("reset_at"),
+        auto.get("resets_at"),
+    ):
         parsed = _reset_time(value)
         if parsed is not None:
             return parsed
     return None
+
+
+def _raw_reset_value(info: Mapping[str, Any], fc: Mapping[str, Any] | None = None) -> Any:
+    """First non-empty raw reset timestamp present on a forecast or lane record."""
+    if isinstance(fc, Mapping):
+        for key in ("reset_at", "resets_at"):
+            value = fc.get(key)
+            if value not in (None, ""):
+                return value
+    native = _sub_mapping(info, "codexbar")
+    windows = _sub_mapping(native, "windows")
+    secondary = _sub_mapping(windows, "secondary")
+    auto = _auto_window(info)
+    for value in (
+        native.get("weekly_resets_at"),
+        secondary.get("resets_at"),
+        info.get("resets_at"),
+        info.get("reset_at"),
+        auto.get("resets_at"),
+    ):
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _window_minutes_reading(info: Mapping[str, Any], fc: Mapping[str, Any] | None = None) -> tuple[int | None, bool]:
+    """Positive window length in minutes when explicitly supplied, else ``(None, True)``.
+
+    Returns ``(None, False)`` when an explicit window_minutes field is malformed
+    or non-positive (fail closed).
+    """
+    native = _sub_mapping(info, "codexbar")
+    windows = _sub_mapping(native, "windows")
+    secondary = _sub_mapping(windows, "secondary")
+    sources: list[Mapping[str, Any]] = []
+    if isinstance(fc, Mapping):
+        sources.append(fc)
+    sources.extend((info, native, secondary))
+    for source in sources:
+        for key in ("window_minutes", "windowMinutes"):
+            if key not in source or source.get(key) is None:
+                continue
+            value = _number(source.get(key))
+            if value is None or value <= 0:
+                return None, False
+            return int(value), True
+    return None, True
+
+
+def pace_forecast(
+    record: Mapping[str, Any] | None,
+    *,
+    snapshot_metadata: Mapping[str, Any] | None = None,
+    policy: CreditPolicy | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Projected surplus and surplus-per-hour to reset, reusing the existing pace/planning forecasts.
+
+    Accepts either an explicit planning forecast (``burn_pct_per_hour`` or
+    ``unused_pct`` with ``reset_at``/``resets_at``, top-level or under
+    ``forecast``) or a standard subscription record evaluated through
+    :func:`lu_machinery.api.subscription_usage.compute_usage_pace`.
+
+    Fails closed (``available=False`` with a typed ``reason``) on stale
+    snapshots/probes, missing allowance/reset inputs, early hidden windows, or
+    reset-crossing timestamps.
+    """
+    from lu_machinery.api.subscription_usage import compute_usage_pace, pace_is_visible
+
+    def unavailable(reason: str) -> dict[str, Any]:
+        return {
+            "available": False,
+            "reason": reason,
+            "source": None,
+            "remaining_pct": None,
+            "hours_to_reset": None,
+            "burn_pct_per_hour": None,
+            "projected_surplus_pct": None,
+            "projected_surplus_per_hour": None,
+            "will_last_to_reset": None,
+        }
+
+    if not isinstance(record, Mapping):
+        return unavailable("missing forecast: lane record missing")
+
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    max_age_s = probe_max_age_s(policy)
+    snap_state, snap_reason = snapshot_freshness(snapshot_metadata)
+    if snap_state == STALE:
+        return unavailable(f"stale forecast: {snap_reason}")
+    probe_state, probe_reason = probe_freshness(record, max_age_s)
+    if probe_state == STALE:
+        return unavailable(f"stale forecast: {probe_reason}")
+
+    native = _sub_mapping(record, "codexbar")
+    capacity_block = _sub_mapping(record, "capacity")
+    if capacity_block.get("state") == CAPACITY_UNKNOWN_STALE:
+        return unavailable("stale forecast: capacity marked unknown_stale")
+    if record.get("freshness") == "unavailable" or native.get("freshness") == "unavailable":
+        return unavailable("missing forecast: usage probe unavailable")
+
+    raw_fc = record.get("forecast")
+    fc: Mapping[str, Any] | None = raw_fc if isinstance(raw_fc, Mapping) else None
+    if fc is not None:
+        fc_freshness = fc.get("freshness")
+        if fc.get("stale") is True or (isinstance(fc_freshness, str) and fc_freshness.startswith("stale")):
+            return unavailable("stale forecast: forecast marked stale")
+        if (
+            "observed_at" in fc
+            and fc.get("observed_at") is not None
+            and _fresh_at(fc.get("observed_at"), current, max_age_s) is None
+        ):
+            return unavailable("stale forecast: forecast observation stale or invalid")
+
+    remaining = plan_remaining_pct(record)
+    if remaining is None and fc is not None:
+        remaining = _number(fc.get("remaining_pct"))
+    if remaining is None or not 0.0 <= remaining <= 100.0:
+        return unavailable("missing forecast: remaining allowance unavailable")
+
+    raw_reset = _raw_reset_value(record, fc)
+    if raw_reset is None:
+        return unavailable("missing forecast: reset time unavailable")
+    reset_at = _reset_time(raw_reset)
+    if reset_at is None:
+        return unavailable("missing forecast: reset time unparseable")
+    seconds_to_reset = (reset_at - current).total_seconds()
+    if not math.isfinite(seconds_to_reset) or seconds_to_reset <= 0:
+        return unavailable("reset-crossing forecast: reset time has passed")
+    hours_to_reset = seconds_to_reset / 3600.0
+
+    # Path A: explicit planning.forecast() burn rate or unused projection.
+    window_minutes, window_ok = _window_minutes_reading(record, fc)
+    if not window_ok:
+        return unavailable("missing forecast: invalid window_minutes")
+    if window_minutes is not None and seconds_to_reset > window_minutes * 60.0:
+        return unavailable("reset-crossing forecast: reset outside active window")
+    burn_container = fc if (fc is not None and "burn_pct_per_hour" in fc) else record
+    if "burn_pct_per_hour" in burn_container and burn_container.get("burn_pct_per_hour") is not None:
+        burn = _number(burn_container.get("burn_pct_per_hour"))
+        if burn is None or burn < 0.0:
+            return unavailable("reset-crossing forecast: invalid burn rate")
+        surplus_pct = remaining - burn * hours_to_reset
+        surplus_per_hour = surplus_pct / hours_to_reset
+        if not (math.isfinite(surplus_pct) and math.isfinite(surplus_per_hour)):
+            return unavailable("missing forecast: non-finite projection")
+        return {
+            "available": True,
+            "reason": "",
+            "source": "planning_forecast",
+            "remaining_pct": remaining,
+            "hours_to_reset": round(hours_to_reset, 4),
+            "burn_pct_per_hour": round(burn, 6),
+            "projected_surplus_pct": round(surplus_pct, 4),
+            "projected_surplus_per_hour": round(surplus_per_hour, 6),
+            "will_last_to_reset": surplus_pct >= 0.0,
+        }
+
+    unused_container = fc if (fc is not None and "unused_pct" in fc) else record
+    if "unused_pct" in unused_container and unused_container.get("unused_pct") is not None:
+        unused = _number(unused_container.get("unused_pct"))
+        if unused is None or unused < 0.0 or unused > remaining + 1e-6:
+            return unavailable("missing forecast: invalid unused projection")
+        surplus_per_hour = unused / hours_to_reset
+        if not math.isfinite(surplus_per_hour):
+            return unavailable("missing forecast: non-finite projection")
+        raw_lasts = native.get("will_last_to_reset", record.get("will_last"))
+        will_last = True if unused > 0.0 else (raw_lasts if isinstance(raw_lasts, bool) else None)
+        return {
+            "available": True,
+            "reason": "",
+            "source": "planning_forecast",
+            "remaining_pct": remaining,
+            "hours_to_reset": round(hours_to_reset, 4),
+            "burn_pct_per_hour": None,
+            "projected_surplus_pct": round(unused, 4),
+            "projected_surplus_per_hour": round(surplus_per_hour, 6),
+            "will_last_to_reset": will_last,
+        }
+
+    # Path B: elapsed-window linear forecast from subscription_usage.compute_usage_pace.
+    pace = compute_usage_pace(
+        100.0 - remaining,
+        reset_at.isoformat(),
+        window_minutes=window_minutes,
+        now=current,
+    )
+    if pace is None:
+        return unavailable("reset-crossing forecast: reset outside active window")
+    if not pace_is_visible(pace):
+        return unavailable("missing forecast: window too early for pace")
+    expected_pct = _number(pace.get("expected_pct"))
+    actual_pct = _number(pace.get("actual_pct"))
+    if expected_pct is None or actual_pct is None or not 0.0 < expected_pct < 100.0:
+        return unavailable("missing forecast: invalid pace window")
+    elapsed_hours = hours_to_reset * expected_pct / (100.0 - expected_pct)
+    if not math.isfinite(elapsed_hours) or elapsed_hours <= 0.0:
+        return unavailable("missing forecast: invalid elapsed window")
+    burn = actual_pct / elapsed_hours
+    surplus_pct = remaining - burn * hours_to_reset
+    surplus_per_hour = surplus_pct / hours_to_reset
+    if not (math.isfinite(burn) and math.isfinite(surplus_pct) and math.isfinite(surplus_per_hour)):
+        return unavailable("missing forecast: non-finite projection")
+    return {
+        "available": True,
+        "reason": "",
+        "source": "usage_pace",
+        "remaining_pct": remaining,
+        "hours_to_reset": round(hours_to_reset, 4),
+        "burn_pct_per_hour": round(burn, 6),
+        "projected_surplus_pct": round(surplus_pct, 4),
+        "projected_surplus_per_hour": round(surplus_per_hour, 6),
+        "will_last_to_reset": bool(pace.get("will_last_to_reset")),
+    }
+
+
+_GROK_CURSOR_SEVERITY = {"idle": 0, "cool": 0, "warm": 1, "hot": 2, "near_cap": 3}
+
+
+def _has_verified_binding_signal(info: Mapping[str, Any]) -> bool:
+    status = str(info.get("status") or "").strip().lower()
+    if status and status not in {"unknown", "unavailable", "need_login"}:
+        return True
+    return plan_remaining_pct(info) is not None
+
+
+def grok_cursor_bindings_verified(
+    grok_info: Mapping[str, Any] | None,
+    cursor_info: Mapping[str, Any] | None,
+) -> bool:
+    """True when both Grok and Cursor have verified bindings on their shared meter.
+
+    Missing records, NEED_LOGIN, explicit ineligibility, transport-specific
+    unhealthy / headroom_blocked states, malformed runtime telemetry, or a
+    Cursor-only Auto monthly hot cap keep the rows separate instead of hiding
+    a per-transport failure.
+    """
+    if not isinstance(grok_info, Mapping) or not isinstance(cursor_info, Mapping):
+        return False
+    if not grok_info or not cursor_info:
+        return False
+    for record in (grok_info, cursor_info):
+        if _need_login(record) or record.get("eligible") is False:
+            return False
+        if health_fact(record)[0] == UNHEALTHY:
+            return False
+        runtime = record.get("runtime")
+        if runtime is not None and not isinstance(runtime, Mapping):
+            return False
+        if isinstance(runtime, Mapping) and runtime.get("headroom_blocked") is True:
+            return False
+        if not _has_verified_binding_signal(record):
+            return False
+    return not (cursor_info.get("status_source") == "cursor_auto" and cursor_info.get("status") == "hot")
+
+
+def merge_grok_cursor_record(
+    grok_info: Mapping[str, Any],
+    cursor_info: Mapping[str, Any],
+    *,
+    policy: CreditPolicy | None = None,
+) -> dict[str, Any]:
+    """Combine verified Grok and Cursor records into one conservative meter reading.
+
+    Uses the tighter remaining allowance, fails closed on stale freshness and
+    higher status severity, and preserves health honesty without mutating inputs.
+    """
+    grok_rem = plan_remaining_pct(grok_info)
+    cursor_rem = plan_remaining_pct(cursor_info)
+    if grok_rem is not None and cursor_rem is not None:
+        base, other = (grok_info, cursor_info) if grok_rem < cursor_rem else (cursor_info, grok_info)
+    elif grok_rem is not None:
+        base, other = grok_info, cursor_info
+    else:
+        base, other = cursor_info, grok_info
+
+    merged = dict(base)
+    if isinstance(merged.get("codexbar"), Mapping):
+        merged["codexbar"] = dict(merged["codexbar"])
+
+    base_status = str(merged.get("status") or "unknown")
+    other_status = str(other.get("status") or "unknown")
+    if _GROK_CURSOR_SEVERITY.get(other_status, -1) > _GROK_CURSOR_SEVERITY.get(base_status, -1):
+        merged["status"] = other_status
+        if "status_source" in other:
+            merged["status_source"] = other["status_source"]
+        # Do not mix a more severe status with the other reading's pace flags.
+        if isinstance(other.get("codexbar"), Mapping):
+            merged["codexbar"] = dict(other["codexbar"])
+        else:
+            merged.pop("codexbar", None)
+
+    max_age_s = probe_max_age_s(policy)
+    if probe_freshness(other, max_age_s)[0] == STALE:
+        other_native = _sub_mapping(other, "codexbar")
+        for key in ("freshness", "age_s", "stale", "fetched_at"):
+            val = other.get(key, other_native.get(key))
+            if val is not None:
+                merged[key] = val
+                if isinstance(merged.get("codexbar"), dict):
+                    merged["codexbar"][key] = val
+
+    grok_health, _ = health_fact(grok_info)
+    cursor_health, _ = health_fact(cursor_info)
+    if grok_health == HEALTHY and cursor_health == HEALTHY:
+        merged["health"] = dict(cursor_info.get("health") or grok_info.get("health") or {"healthy": True})
+    elif grok_health == UNHEALTHY or cursor_health == UNHEALTHY:
+        bad = grok_info if grok_health == UNHEALTHY else cursor_info
+        merged["health"] = dict(bad.get("health") or {"healthy": False})
+    else:
+        merged.pop("health", None)
+
+    return merged
+
+
+def sum_in_flight(first: Any, second: Any) -> int | None:
+    """Sum two observed non-negative integer in-flight counts; None when either is missing or invalid."""
+    if (
+        isinstance(first, bool)
+        or isinstance(second, bool)
+        or not isinstance(first, int)
+        or not isinstance(second, int)
+        or first < 0
+        or second < 0
+    ):
+        return None
+    return first + second
 
 
 def _projected_runout(info: dict[str, Any], pace: dict[str, Any] | None, now: datetime) -> datetime | None:
@@ -1164,14 +1503,16 @@ def _capacity_class(
     window_exhausted: bool,
     credit_relief: bool,
     credit_reason: str,
+    lasts_to_reset: bool | None = None,
 ) -> tuple[str, str]:
     """Capacity class and reason; the ordering is the routing rule (A2, #9740).
 
     Hard reasons (ineligible, unhealthy, NEED_LOGIN), near cap without credit
     relief and runtime-blocked hot stay ``avoid`` whatever the freshness. Only
     then does a stale observation turn a raw pace deficit or a weekly-pace hot
-    label into ``unknown_stale``. Near cap is the ``near_cap`` status or
-    :func:`plan_window_exhausted`.
+    label into ``unknown_stale``. An over-pace (``hot``) subscription lane that
+    still lasts to reset is ``verified`` (sorts lower, not AVOID); near cap and
+    real exhaustion stay ``avoid``.
     """
     if record.get("eligible") is False:
         return CAPACITY_AVOID, "ineligible"
@@ -1180,7 +1521,12 @@ def _capacity_class(
     if _need_login(record):
         return CAPACITY_AVOID, "NEED_LOGIN"
     runtime = record.get("runtime") if isinstance(record.get("runtime"), Mapping) else {}
-    if status == "near_cap" or window_exhausted:
+    at_near_cap = (
+        status == "near_cap"
+        or window_exhausted
+        or (remaining is not None and remaining <= _NEAR_CAP_REMAINING_PCT)
+    )
+    if at_near_cap:
         if credit_relief:
             return CAPACITY_VERIFIED, f"near cap; {credit_reason}"
         where = f"{remaining:g}% remaining" if remaining is not None else "status near_cap"
@@ -1198,6 +1544,13 @@ def _capacity_class(
             CAPACITY_UNKNOWN_STALE,
             f"{STALE_ADVISORY_LABEL}: pace deficit read from stale evidence ({freshness_reason})",
         )
+    if (
+        status == "hot"
+        and record.get("status_source") != "cursor_auto"
+        and freshness != STALE
+        and lasts_to_reset is True
+    ):
+        return CAPACITY_VERIFIED, "over-pace; lasts to reset"
     if status == "hot" or pace["uncovered"] is True:
         return CAPACITY_AVOID, pace["reason"] if pace["uncovered"] is True else "status hot"
     if status in {"cool", "warm", "idle"}:
@@ -1235,7 +1588,7 @@ def routing_facts(
     fresh probe: a missing probe age or an unknown probe freshness keeps the
     label hot. A hot label from any other source stays hot.
     """
-    from lu_machinery.api.subscription_usage import pace_expected_pct, pace_is_visible
+    from lu_machinery.api.subscription_usage import ON_PACE_BAND_PCT, pace_expected_pct, pace_is_visible
 
     lane_key = lane.strip().lower()
     data: dict[str, Any] = dict(record) if isinstance(record, Mapping) else {}
@@ -1279,6 +1632,39 @@ def routing_facts(
         usage_dir=usage_dir,
         rate_limit_reader=reader,
     )
+    forecast = pace_forecast(data, snapshot_metadata=snapshot_metadata, policy=policy, now=current)
+    raw_lasts = (
+        pace_record.get("will_last_to_reset", pace_record.get("willLastToReset"))
+        if isinstance(pace_record, Mapping)
+        else None
+    )
+    if forecast["available"] and forecast["source"] == "planning_forecast" and isinstance(
+        forecast.get("will_last_to_reset"), bool
+    ):
+        lasts_to_reset: bool | None = forecast["will_last_to_reset"]
+    elif isinstance(raw_lasts, bool):
+        lasts_to_reset = raw_lasts
+    elif isinstance(data.get("will_last"), bool):
+        lasts_to_reset = data["will_last"]
+    elif forecast["available"] and isinstance(forecast.get("will_last_to_reset"), bool):
+        lasts_to_reset = forecast["will_last_to_reset"]
+    else:
+        lasts_to_reset = None
+
+    raw_delta = (
+        next(
+            (
+                val
+                for key in ("delta_pct", "weekly_pace_delta_pct", "deltaPercent")
+                if (val := _number(pace_record.get(key))) is not None
+            ),
+            None,
+        )
+        if isinstance(pace_record, Mapping)
+        else None
+    )
+    over_pace_lasts = lasts_to_reset is True and raw_delta is not None and raw_delta > ON_PACE_BAND_PCT
+
     expected = pace_expected_pct(pace_record, now=current) if isinstance(pace_record, dict) else None
     visible = None if expected is None else pace_is_visible({"expected_pct": expected})
     status = str(pace["status"] or UNKNOWN)
@@ -1287,7 +1673,7 @@ def routing_facts(
         cleared_by = None
         if pace["raw_deficit"] is None and visible is False:
             cleared_by = "pace hidden below the visibility floor"
-        elif pace["raw_deficit"] is False and freshness == FRESH and probe == FRESH:
+        elif pace["raw_deficit"] is False and freshness == FRESH and probe == FRESH and not over_pace_lasts:
             # The label is the probe's own pace reading: a fresh snapshot alone (which covers a
             # probe-less ledger lane) does not verify it, so the probe must be positively fresh.
             cleared_by = "no pace deficit on a fresh observation"
@@ -1323,6 +1709,7 @@ def routing_facts(
         window_exhausted=plan_window_exhausted(lane_key, data, policy),
         credit_relief=credit_present and permission is not False,
         credit_reason=f"credit {credit.get('state')}: {credit.get('reason') or ''}".rstrip(": "),
+        lasts_to_reset=lasts_to_reset,
     )
     return RoutingFacts(
         lane=lane_key,
