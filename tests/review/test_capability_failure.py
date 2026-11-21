@@ -295,7 +295,7 @@ def test_a_crash_can_be_resolved_only_by_a_later_bound_publication():
         sha=EARLIER, task_id="crashed-review", started="2026-09-23T10:00:00.000000+00:00",
         verdict="APPROVED", model=CURRENT_SOL, family="openai", reply="VERDICT: APPROVE",
     )
-    with pytest.raises(LineageRefused, match="provider crash crashed-review has a published verdict"):
+    with pytest.raises(LineageRefused, match=r"review task crashed-review \(failed\) has no reply on record"):
         lineage(crash, approve, comments=[claimed, verdict])
 
 

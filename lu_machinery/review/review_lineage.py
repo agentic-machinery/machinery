@@ -558,7 +558,6 @@ def _attested_provider_crash(run: ReviewRun) -> bool:
 class ProviderCrashRecovery:
     failed: ReviewRun
     replacement: ReviewRun | None
-    second_failure: ReviewRun | None
 
     def replacement_finished(self) -> bool:
         run = self.replacement
@@ -568,7 +567,7 @@ class ProviderCrashRecovery:
 def provider_crash_recovery(
     runs: Sequence[ReviewRun], comments: Sequence[Mapping[str, Any]], login: str,
 ) -> ProviderCrashRecovery | None:
-    """The first crash and its one replacement, derived from the durable attempt order."""
+    """The first crash and its one replacement, if the durable evidence establishes their order."""
     if not any(_attested_provider_crash(run) for run in runs):
         return None
     try:
@@ -578,31 +577,31 @@ def provider_crash_recovery(
                 continue
             start = _timestamp(run.record.get("started_at"))
             if start is None or start in attempts:
-                raise LineageRefused("provider crash recovery requires an unambiguous review attempt order")
+                return None
             attempts[start] = run
         ordered = sorted(attempts)
         started = next(start for start in ordered if _attested_provider_crash(attempts[start]))
         failed = attempts[started]
         finished = _timestamp(failed.record.get("finished_at"))
         if finished is None or finished < started:
-            raise LineageRefused(f"provider crash {failed.task_id} has no valid settlement time")
-        later = []
+            return None
+        replacement = None
         for start in ordered:
             attempt = attempts[start]
             status = attempt.record.get("status")
             terminal = isinstance(status, str) and status in TERMINAL_TASK_STATUSES
             if started < start < finished or (start < started and not terminal):
-                raise LineageRefused(f"review task {attempt.task_id} overlaps provider crash {failed.task_id}")
-            if start > started:
-                later.append(attempt)
-    except OverflowError:
-        raise LineageRefused("provider crash recovery has an invalid review attempt timestamp") from None
+                return None
+            if start > started and replacement is None:
+                replacement = attempt
+        markers = _trusted_markers(comments, login)
+    except (LineageRefused, OverflowError):
+        # Ambiguous evidence denies the allowance. Ordinary budget decisions still apply.
+        return None
     if any(m["task"] == failed.task_id and m["started"] == _started(failed.record)
-           for _, m in _trusted_markers(comments, login)):
-        raise LineageRefused(f"provider crash {failed.task_id} has a published verdict")
-    replacement = later[0] if later else None
-    second_failure = next((run for run in later if _attested_provider_crash(run)), None)
-    return ProviderCrashRecovery(failed, replacement, second_failure)
+           for _, m in markers):
+        return None
+    return ProviderCrashRecovery(failed, replacement)
 
 
 def check_lineage(

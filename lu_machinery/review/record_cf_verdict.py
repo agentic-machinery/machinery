@@ -2679,15 +2679,11 @@ def _crash_recovery_receipt(
         }
 
     replacement = recovery.replacement
-    if recording_run is None and recovery.second_failure is not None:
-        raise RecordError(
-            f"PROVIDER_CRASH_RECOVERY_SPENT: review task {recovery.second_failure.task_id} also failed"
-        )
     if replacement is not None and not recovery.replacement_finished():
-        if recording_run is None:
+        status = replacement.record.get("status")
+        if recording_run is None and status in ("spawning", "running"):
             raise RecordError(
-                f"PROVIDER_CRASH_RECOVERY_UNRESOLVED: replacement {replacement.task_id} has no finished verdict "
-                f"(status {replacement.record.get('status')!r})"
+                f"PROVIDER_CRASH_RECOVERY_UNRESOLVED: replacement {replacement.task_id} is still {status}"
             )
         return None
     if recording_run is not None and (
@@ -2758,7 +2754,7 @@ def budget_admission(
         return heads
 
     if recording_run is None:
-        # A pending or failed recovery blocks new dispatches even at an already reviewed head.
+        # A live recovery blocks a duplicate dispatch even at an already reviewed head.
         charged_heads()
     receipts = _repair_receipts(task_root)
     receipt = require_review_round_within_budget(

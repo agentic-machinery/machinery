@@ -394,6 +394,10 @@ def test_provider_crash_opens_one_recovery_at_the_current_head(crash_budget, hea
             admit(H3)
         with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
             record(head, {**replacement, "run_nonce": "0" * 32})
+    else:
+        # A same-head sibling started before crash settlement is ordinary review, not recovery.
+        attempt(3, H3, finished_at="2026-09-23T10:05:00+00:00")
+        assert record(head, replacement) == {}
 
 
 @pytest.mark.parametrize(
@@ -425,10 +429,15 @@ def test_a_dispatched_replacement_blocks_a_second_recovery(crash_budget, status)
     attempt(3, H3)
     assert admit(NEXT)["admitted"]
     attempt(4, NEXT, status=status)
-    code = "UNRESOLVED" if status == "running" else "SPENT"
+    code = "PROVIDER_CRASH_RECOVERY_UNRESOLVED" if status == "running" else "REVIEW_BUDGET_EXHAUSTED"
     for head in (H3, NEXT, "5" * 40):
-        with pytest.raises(recorder.RecordError, match=f"PROVIDER_CRASH_RECOVERY_{code}"):
+        with pytest.raises(recorder.RecordError, match=code):
             admit(head)
+    if status == "failed":
+        # Two failed attempts at a previously charged head add no allowance and use no new head.
+        attempt(3, H2)
+        attempt(4, H2)
+        assert "provider_crash_recovery" not in admit(H3)
 
 
 # 4. Security refusals.
