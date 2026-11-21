@@ -249,11 +249,15 @@ def test_ownerless_open_pr_past_grace_records_a_decision_owner(tmp_path):
         "since": at(0).isoformat(), "alerted_at": at(15).isoformat(), "notified_at": at(15).isoformat(),
         "reminders": 0, "branch": "codex/x", "reason": "r", "last_task": "old",
     }
-    refused["heal_attempts"][f"{KEY}:{HEAD}"] = {"result": "refused", "postcondition": "false"}
+    refused["heal_attempts"][f"{KEY}:{HEAD}"] = {
+        "result": "refused", "postcondition": "false", "at": at(15).isoformat(),
+    }
     assert own.custody_view(refused)["alert_outstanding"] == [{
         "pr": KEY, "since": at(0).isoformat(), "keeper": "refused",
     }]
-    refused["heal_attempts"][f"{KEY}:{HEAD}"] = {"result": "pending", "postcondition": "unknown"}
+    refused["heal_attempts"][f"{KEY}:{HEAD}"] = {
+        "result": "pending", "postcondition": "unknown", "at": at(15).isoformat(),
+    }
     unverified = own.custody_view(refused)
     assert unverified["unknown_evidence"][0]["why"] == "keeper attempt unverified"
     assert unverified["recorded_custody"] == [] and unverified["waiting_for_grace"] == []
@@ -261,7 +265,9 @@ def test_ownerless_open_pr_past_grace_records_a_decision_owner(tmp_path):
     stale = own._empty()
     stale["last_tick"] = {"at": at(20).isoformat(), "ok": False, "error": "RuntimeError"}
     stale["handoffs"][KEY] = dict(handoff)
-    stale["heal_attempts"][f"{KEY}:{HEAD}"] = {"result": "recorded", "postcondition": "true"}
+    stale["heal_attempts"][f"{KEY}:{HEAD}"] = {
+        "result": "recorded", "postcondition": "true", "at": handoff["accepted_at"],
+    }
     stale["episodes"][own.pr_key(REPO, 43)] = {
         "since": at(0).isoformat(), "alerted_at": at(15).isoformat(), "notified_at": at(15).isoformat(),
         "reminders": 0, "branch": "codex/y", "reason": "r", "last_task": "old",
@@ -273,6 +279,87 @@ def test_ownerless_open_pr_past_grace_records_a_decision_owner(tmp_path):
     }]
     assert stale_view["alert_outstanding"] == [] and stale_view["waiting_for_grace"] == []
     assert stale_view["unknown_evidence"] == [{"pr": other, "why": "last keeper tick is not evidence", "alerted": True}]
+    # An earlier keeper attempt does not name a later decision owner, hide a new grace
+    # period, or label a later alert. A closed PR's leftover attempt is not a row.
+    replaced = own._empty()
+    replaced["last_tick"] = {"at": at(40).isoformat(), "ok": True}
+    replaced["handoffs"][KEY] = {
+        **handoff, "decision_owner": "other-coordinator", "successor": "other-coordinator",
+        "accepted_at": at(40).isoformat(),
+    }
+    replaced["heal_attempts"][f"{KEY}:{HEAD}"] = {
+        "result": "recorded", "postcondition": "true", "at": handoff["accepted_at"],
+    }
+    assert own.custody_view(replaced)["recorded_custody"] == [{
+        "pr": KEY, "decision_owner": "other-coordinator", "head": HEAD, "by": "coordinator",
+    }]
+    replaced["heal_attempts"][KEY] = {"result": "pending", "postcondition": "unknown"}
+    replaced_view = own.custody_view(replaced)
+    assert replaced_view["recorded_custody"][0]["by"] == "coordinator"
+    assert replaced_view["unknown_evidence"] == [] and replaced_view["waiting_for_grace"] == []
+    fresh = own._empty()
+    fresh["last_tick"] = {"at": at(25).isoformat(), "ok": True}
+    fresh["episodes"][KEY] = {
+        "since": at(20).isoformat(), "alerted_at": None, "notified_at": None,
+        "reminders": 0, "branch": "codex/x", "reason": "r", "last_task": "old",
+    }
+    fresh["heal_attempts"][f"{KEY}:{HEAD}"] = {
+        "result": "pending", "postcondition": "unknown", "at": at(0).isoformat(),
+    }
+    fresh_view = own.custody_view(fresh)
+    assert [row["pr"] for row in fresh_view["waiting_for_grace"]] == [KEY]
+    assert fresh_view["unknown_evidence"] == [] and fresh_view["alert_outstanding"] == []
+    later = own._empty()
+    later["last_tick"] = {"at": at(25).isoformat(), "ok": True}
+    later["episodes"][KEY] = {
+        "since": at(20).isoformat(), "alerted_at": at(25).isoformat(), "notified_at": at(25).isoformat(),
+        "reminders": 0, "branch": "codex/x", "reason": "r", "last_task": "old",
+    }
+    later["heal_attempts"][f"{KEY}:{'c' * 40}"] = {
+        "result": "pending", "postcondition": "unknown", "at": at(0).isoformat(),
+    }
+    later["heal_attempts"][f"{KEY}:{HEAD}"] = {
+        "result": "refused", "postcondition": "false", "at": at(25).isoformat(),
+    }
+    neighbour = own.pr_key(REPO, 420)
+    later["heal_attempts"][f"{neighbour}:{HEAD}"] = {
+        "result": "pending", "postcondition": "unknown", "at": at(25).isoformat(),
+    }
+    assert own.custody_view(later)["alert_outstanding"] == [{
+        "pr": KEY, "since": at(20).isoformat(), "keeper": "refused",
+    }]
+    assert own.custody_view(later)["unknown_evidence"] == []
+    closed = own._empty()
+    closed["last_tick"] = {"at": at(30).isoformat(), "ok": True}
+    closed["heal_attempts"][f"{KEY}:{HEAD}"] = {
+        "result": "recorded", "postcondition": "true", "at": at(15).isoformat(),
+    }
+    closed_view = own.custody_view(closed)
+    assert closed_view["unknown_evidence"] == [] and closed_view["recorded_custody"] == []
+    assert closed_view["waiting_for_grace"] == [] and closed_view["alert_outstanding"] == []
+    # A heal-attempt key with no head shares the episode's name and must not also be waiting.
+    both = own._empty()
+    both["last_tick"] = {"at": at(5).isoformat(), "ok": True}
+    both["episodes"][KEY] = {
+        "since": at(0).isoformat(), "alerted_at": None, "notified_at": None,
+        "reminders": 0, "branch": "codex/x", "reason": "r", "last_task": "old",
+    }
+    both["heal_attempts"][KEY] = {"result": "pending", "postcondition": "unknown"}
+    both_view = own.custody_view(both)
+    assert both_view["waiting_for_grace"] == [] and both_view["recorded_custody"] == []
+    assert both_view["unknown_evidence"] == [{
+        "pr": KEY, "why": "heal attempt key is unreadable", "alerted": False,
+    }]
+    bad_clock = own._empty()
+    bad_clock["last_tick"] = {"at": at(5).isoformat(), "ok": True}
+    bad_clock["episodes"][KEY] = {"since": "not-a-time", "alerted_at": at(5).isoformat()}
+    assert own.custody_view(bad_clock)["unknown_evidence"] == [{
+        "pr": KEY, "why": "episode clock is unreadable", "alerted": True,
+    }]
+    bad_clock["episodes"][KEY] = None
+    assert own.custody_view(bad_clock)["unknown_evidence"] == [{
+        "pr": KEY, "why": "episode is unreadable", "alerted": False,
+    }]
     attempt = state["heal_attempts"][f"{KEY}:{HEAD}"]
     assert attempt["result"] == "recorded" and attempt["postcondition"] == "true"
     assert KEY not in state["episodes"] and other not in state["handoffs"]
@@ -573,6 +660,15 @@ def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["usage"] == [own.RELEASE_CUSTODY_USAGE]
     assert own.main(["accept", "--pr", "42", "--repo", REPO, "--reason", "held"]) == 1
     assert json.loads(capsys.readouterr().out)["usage"] == [own.RECORDED_CUSTODY_USAGE]
+    # A supplied empty or blank --from is the queue form, including next to release or recorded custody.
+    for extra in (["--from", ""], ["--from", " "], ["--decision-owner", ""]):
+        assert own.main(["accept", "--pr", "42", "--repo", REPO, "--release", *extra]) == 1
+        assert json.loads(capsys.readouterr().out)["usage"] == [own.RELEASE_CUSTODY_USAGE]
+    assert own.main([
+        "accept", "--pr", "42", "--repo", REPO, "--from", "",
+        "--reason", "worker crashed after approval", "--decision-owner", "claude-cto",
+    ]) == 1
+    assert json.loads(capsys.readouterr().out)["usage"] == [own.QUEUE_CUSTODY_USAGE, own.RECORDED_CUSTODY_USAGE]
     assert not world.exists()
     monkeypatch.setattr(store, "list_tasks", lambda *a, **k: [task("old", status="timeout")])
     assert own.main([
@@ -589,6 +685,9 @@ def test_cli_accept_then_queue_exit(world, monkeypatch, capsys):
         "pr": KEY, "decision_owner": "claude-cto", "head": HEAD, "by": "coordinator",
     }]
     assert seated["waiting_for_grace"] == [] and seated["evidence"] == "unknown"
+    assert own.main(["accept", "--pr", "42", "--repo", REPO, "--release", "--from", ""]) == 1
+    assert json.loads(capsys.readouterr().out)["usage"] == [own.RELEASE_CUSTODY_USAGE]
+    assert KEY in own.load(world)["handoffs"]
     assert own.main(["accept", "--pr", "42", "--repo", REPO, "--release"]) == 0
     assert own.load(world)["handoffs"] == {}
     monkeypatch.setattr(store, "list_tasks", lambda *a, **k: [task("waiter"), task("integration", "claude/queue")])

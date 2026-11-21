@@ -22,9 +22,11 @@ handoff also names the predecessor whose only remaining step is waiting in the m
 queue; ``queue-exit`` then lets that predecessor end cleanly, but only while the
 keeper's ownership check is running. ``status`` names each saved PR
 ``waiting_for_grace``, ``recorded_custody`` (``by`` ``keeper`` or ``coordinator``)
-or ``unknown_evidence``. A missing tick, or a tick that names an ``error``, is
-``evidence`` ``unknown`` even when a recorded decision owner remains. Neither
-custody form changes review, CI, enqueue or merge.
+or ``unknown_evidence``. ``by`` ``keeper`` requires the heal attempt's clock to
+match this handoff. An earlier attempt, or one left after the PR closed, stays
+in the raw ledger and does not add a row. A missing tick, or a tick that names
+an ``error``, is ``evidence`` ``unknown`` even when a recorded decision owner
+remains. Neither custody form changes review, CI, enqueue or merge.
 
 State is one JSON file next to the shared dispatch task store, written under a lock.
 """
@@ -1115,10 +1117,12 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
     """One disposition per PR the ledger can name. Derived for ``status``; not stored.
 
     ``recorded_custody`` stays even when the latest observation failed: the decision
-    owner is already written. ``waiting_for_grace`` is only an unalerted episode after
-    an observation. A missing tick, or a tick whose ``error`` is set, is not evidence.
-    A tick that observed and then failed to deliver stays evidence: the ledger is what
-    that observation saved.
+    owner is already written. ``by`` is ``keeper`` only when that attempt was written
+    with this handoff. ``waiting_for_grace`` is only an unalerted episode after an
+    observation, and only attempts at or after ``since`` count. A missing tick, or a
+    tick whose ``error`` is set, is not evidence. A tick that observed and then failed
+    to deliver stays evidence: the ledger is what that observation saved. One PR is
+    one row. A heal attempt with no current episode and no recorded handoff is not a row.
     """
     last = data.get("last_tick")
     error = last.get("error") if isinstance(last, dict) else None
@@ -1144,12 +1148,37 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
     waiting: dict[str, dict[str, Any]] = {}
     alerts: dict[str, dict[str, Any]] = {}
 
-    def attempts_for(key: str) -> list[dict[str, Any]]:
+    def attempt_time(row: Mapping[str, Any]) -> datetime | None:
+        raw = row.get("at")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return _at(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def describes_handoff(attempt: Any, handoff: Mapping[str, Any]) -> bool:
+        # The keeper writes the attempt clock and accepted_at from the same instant.
+        if not isinstance(attempt, dict):
+            return False
+        if attempt.get("result") != "recorded" or attempt.get("postcondition") != "true":
+            return False
+        if handoff.get("decision_owner") != CTO_INBOX:
+            return False
+        accepted = handoff.get("accepted_at")
+        return isinstance(accepted, str) and attempt.get("at") == accepted
+
+    def tied_attempts(key: str, since: datetime) -> list[dict[str, Any]]:
+        # The prefix ends in ":", so repo#1: does not match an attempt for repo#10.
         prefix = f"{key}:"
-        return [
-            row for attempt_key, row in attempts.items()
-            if isinstance(attempt_key, str) and attempt_key.startswith(prefix) and isinstance(row, dict)
-        ]
+        tied: list[dict[str, Any]] = []
+        for attempt_key, row in attempts.items():
+            if not isinstance(attempt_key, str) or not attempt_key.startswith(prefix) or not isinstance(row, dict):
+                continue
+            moment = attempt_time(row)
+            if moment is not None and moment >= since:
+                tied.append(row)
+        return tied
 
     for key in sorted(name for name in handoffs if isinstance(name, str)):
         handoff = handoffs[key]
@@ -1160,47 +1189,55 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
             continue
         head = handoff.get("head")
         matched = attempts.get(f"{key}:{head}") if isinstance(head, str) else None
-        by = (
-            "keeper"
-            if isinstance(matched, dict) and matched.get("result") == "recorded" and matched.get("postcondition") == "true"
-            else "coordinator"
-        )
         recorded[key] = {
-            "pr": key, "decision_owner": handoff.get("decision_owner"), "head": head, "by": by,
+            "pr": key,
+            "decision_owner": handoff.get("decision_owner"),
+            "head": head,
+            "by": "keeper" if describes_handoff(matched, handoff) else "coordinator",
+        }
+
+    for attempt_key in attempts:
+        if isinstance(attempt_key, str) and ":" in attempt_key:
+            continue
+        label = attempt_key if isinstance(attempt_key, str) and attempt_key else "?"
+        if label in recorded or label in unknown:
+            continue
+        episode_row = episodes.get(label)
+        unknown[label] = {
+            "pr": label,
+            "why": "heal attempt key is unreadable",
+            "alerted": bool(isinstance(episode_row, dict) and episode_row.get("alerted_at")),
         }
 
     claimed = set(recorded) | set(unknown)
-    keys: set[str] = set()
-    for name in episodes:
-        if isinstance(name, str) and name not in claimed:
-            keys.add(name)
-    for attempt_key in attempts:
-        if not isinstance(attempt_key, str) or ":" not in attempt_key:
-            label = attempt_key if isinstance(attempt_key, str) and attempt_key else "?"
-            if label not in recorded:
-                unknown[label] = {"pr": label, "why": "heal attempt key is unreadable", "alerted": False}
-            continue
-        name = attempt_key.rpartition(":")[0]
-        if name and name not in claimed:
-            keys.add(name)
+    keys = {name for name in episodes if isinstance(name, str) and name not in claimed}
 
     for key in sorted(keys):
         episode = episodes.get(key)
-        episode = episode if isinstance(episode, dict) else None
-        related = attempts_for(key)
+        if not isinstance(episode, dict):
+            unknown[key] = {"pr": key, "why": "episode is unreadable", "alerted": False}
+            continue
+        since_raw = episode.get("since")
+        try:
+            if not isinstance(since_raw, str):
+                raise ValueError(since_raw)
+            since = _at(since_raw)
+        except (TypeError, ValueError):
+            unknown[key] = {
+                "pr": key, "why": "episode clock is unreadable",
+                "alerted": bool(episode.get("alerted_at")),
+            }
+            continue
+        related = tied_attempts(key, since)
         unverified = any(
             row.get("result") in {"pending", "unverified"} or row.get("postcondition") == "unknown"
             for row in related
         )
-        alerted = bool(episode and episode.get("alerted_at"))
-        if unverified or not known or episode is None:
+        alerted = bool(episode.get("alerted_at"))
+        if unverified or not known:
             unknown[key] = {
                 "pr": key,
-                "why": (
-                    "keeper attempt unverified" if unverified
-                    else "last keeper tick is not evidence" if not known
-                    else "keeper attempt has no episode or recorded custody"
-                ),
+                "why": "keeper attempt unverified" if unverified else "last keeper tick is not evidence",
                 "alerted": alerted,
             }
             continue
@@ -1328,7 +1365,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
     """Record or release decision custody. Does not require a dispatch task id."""
-    queue_form = bool(args.custody or args.predecessor)
+    # An empty --from is still supplied. Truthiness would treat it as absent and run the other form.
+    queue_form = bool(args.custody) or args.predecessor is not None
     recorded_form = args.reason is not None or args.decision_owner is not None
     if args.release and (queue_form or recorded_form):
         return _usage_refusal("release recorded custody on its own", [RELEASE_CUSTODY_USAGE])

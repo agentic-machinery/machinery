@@ -87,7 +87,10 @@ never fine.
    already written; `by: keeper` means the keeper wrote it after grace, `by: coordinator` means this
    seat did. Do not record custody again when that row is already there. `unknown_evidence` is a PR
    this file cannot classify. `alert_outstanding` is an alert the keeper raised and did not turn
-   into recorded custody. `check` exit 2 is a live unknown owner; status does not repeat that scan.
+   into recorded custody. `check` prints one JSON row per PR it cannot treat as owned.
+   Exit 1 means at least one of those rows is ownerless, even when another row is an
+   unknown owner. Exit 2 means the check could not observe (stderr starts with `UNKNOWN`)
+   or every printed row is an unknown owner. Read the rows. Status does not repeat that scan.
    Two accept forms, and they do not combine. A mixed call prints the usage of each form and writes
    nothing. Neither form changes review, CI, enqueue or merge.
    Queue custody is only for a predecessor that is still live and waiting in the merge queue. The
