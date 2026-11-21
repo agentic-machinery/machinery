@@ -18,8 +18,9 @@ import subprocess
 import sys
 
 import pytest
+
 from lu_machinery.ai_agent_bridge import _acp_compat, _cli, _dispatch_wrappers
-from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots", "bridge_wake_dir")
 
@@ -128,7 +129,10 @@ def test_ask_pr_routes_to_headless_dispatch_not_acp(
     same_repo_pr_gh: None,
 ) -> None:
     args = _cli._build_parser().parse_args(
-        ["ask-claude", "review this change", "--task-id", "review-7010", "--pr", "7010", "--from", "test"]
+        [
+            "ask-claude", "review this change", "--task-id", "review-7010", "--pr", "7010", "--from", "test",
+            "--effort", "xhigh",
+        ]
     )
 
     _cli._handle_ask_claude(args)
@@ -136,6 +140,7 @@ def test_ask_pr_routes_to_headless_dispatch_not_acp(
     assert acp_guard["count"] == 0
     assert captured_dispatch["agent"] == "claude"
     assert captured_dispatch["task_id"] == "review-7010"
+    assert captured_dispatch["effort"] == "xhigh"
     # Target folded into the prompt.
     assert "PR #7010" in captured_dispatch["content"]
     assert "gh pr diff 7010" in captured_dispatch["content"]
@@ -150,12 +155,16 @@ def test_ask_branch_routes_to_headless_dispatch_not_acp(
     acp_guard: dict[str, int], captured_dispatch: dict[str, object]
 ) -> None:
     args = _cli._build_parser().parse_args(
-        ["ask-codex", "review this change", "--task-id", "review-branch", "--branch", "feat-x", "--from", "test"]
+        [
+            "ask-codex", "review this change", "--task-id", "review-branch", "--branch", "feat-x", "--from", "test",
+            "--effort", "high",
+        ]
     )
 
     _cli._handle_ask_codex(args)
 
     assert acp_guard["count"] == 0
+    assert captured_dispatch["effort"] == "high"
     assert "origin/feat-x" in captured_dispatch["content"]
 
 
@@ -273,7 +282,6 @@ def test_ask_review_refuses_a_fable_pin_before_any_dispatch(monkeypatch, target,
 def registered_histories(tmp_path, monkeypatch, configured_roots):
     from lu_machinery.dispatcher import git as dispatch_git
     from lu_machinery.orchestration import fleet_repos
-
     from tests.ai_agent_bridge.review_target_git import _git, _init_repo, _publish_pr_branch
 
     # The dispatcher resolves the default repository to the product checkout and every other

@@ -732,6 +732,9 @@ def _run_compat_ask_impl(
     target = admit_compat_target(command_target, model=model, data=data)
     if not task_id or not task_id.strip():
         raise ValueError("ACP ask requires a non-empty task_id")
+    from lu_machinery.agent_runtime.runner import validate_inter_agent_effort
+
+    validate_inter_agent_effort(target.recipient, effort)
     if hard_timeout is None:
         hard_timeout = ask_hard_timeout(command_target)
 

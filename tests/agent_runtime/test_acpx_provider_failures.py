@@ -217,16 +217,36 @@ def test_shared_parser_closes_provider_rpc_errors_for_all_participant_paths(adap
     assert result.failure_code
 
 
-def test_codex_effort_high_refusal_names_supported_default():
+def test_codex_effort_high_refusal_names_supported_default(tmp_path, monkeypatch):
+    from lu_machinery.fleet_comms.authority import AuthorityService
+
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(tmp_path / "fleet-comms"))
+    invocations = []
+
+    def invoke(participant, _prompt, **kwargs):
+        invocations.append(participant)
+        runner.resolve_inter_agent_route(participant, effort=kwargs["effort"])
+
+    @contextmanager
+    def execution_cwd(*args, **kwargs):
+        yield tmp_path
+
+    monkeypatch.setattr(runner, "invoke_inter_agent", invoke)
+    monkeypatch.setattr(acpx, "probe_participant_reachability", lambda participant: None)
+    monkeypatch.setattr("lu_machinery.ai_agent_bridge._acp_execution.acp_execution_cwd", execution_cwd)
+
     with pytest.raises(
         runner.InterAgentTransportError, match=r"supported effort values: default \(omit --effort\)"
     ) as exc:
-        runner.resolve_inter_agent_route("codex", effort="high")
+        _acp_compat._run_compat_ask_impl("codex", "question", task_id="unsupported-pin", effort="high")
     assert _acp_compat._failure_metadata(error=exc.value) == {
         "phase": "admission",
         "code": "route_effort_conflict",
         "retryable": False,
     }
+    with AuthorityService() as service:
+        assert service.store.connection.execute("SELECT COUNT(*) FROM authority_jobs").fetchone()[0] == 0
+    assert invocations == []
 
 
 def test_installed_codex_resolution_and_version(monkeypatch):
