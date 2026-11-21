@@ -4,20 +4,36 @@ Consumers install `lu-machinery` from a released wheel, pinned by version and
 SHA-256 in their own `requirements-machinery.lock`. There is no editable
 install and no machinery checkout on `PYTHONPATH`.
 
-## Release train
+## Release when ready
 
-Owner decisions C-5345 (ONE-REVIEW-FAST-RELEASE-1112, 2026-11-12) and
-RELEASE-8H-CANARY-AT-CUT-1115 (2026-11-15, revised to 12 hours). A machinery
-release is cut every 12 hours, at 06:00 and 18:00 UTC, by one command (Cut a
-release) that a host timer or an agent runs. It tags `main`'s HEAD; there is
-no release PR. `main` already carries the next version, because each release
-ends by opening the post-release PR that records its changelog and moves the
-version files on. A window is skipped when nothing but that PR has merged
-since the last full release. An urgent bug gets an immediate hotfix release: the same
-command, as soon as the fix is on a green `main`, without waiting for the next
-window. Any other bug is fixed in a follow-up PR and rides the next train. Do
-not rebuild or replace a version that was already published, and do not move
-a tag.
+Owner decision RELEASE-ASAP-1121 (2026-11-21). It replaces the fixed release
+train of C-5345 (ONE-REVIEW-FAST-RELEASE-1112) and
+RELEASE-8H-CANARY-AT-CUT-1115. See
+[the decision record](decisions/2026-11-21-release-when-ready.md).
+
+A machinery release is cut as soon as a ready change is on a green `main`.
+There is no schedule and nobody waits for a window. A change is ready when it
+has merged (a post-release PR alone does not count), the previous release's
+post-release PR has also merged (so `main` carries the next version), and the
+newest `CI Gate` push run on `main`'s HEAD has passed with its CI evidence
+receipt. The complete list is the preflight in Cut a release (step 1), which
+the command checks itself. When nothing but a post-release
+PR has merged since the last full release, the command skips (exit 0,
+`unchanged`). Otherwise, when a condition is not met yet (for example the
+version files are behind or the `CI Gate` run has not passed), it refuses
+(exit 1) and publishes nothing.
+
+`claude-cto` runs every cut, on the host, as one command (Cut a release). A
+worker or driver does not run it: when its change has merged, it tells
+`claude-cto` in its report. One runner means two cuts never overlap. The cut
+tags `main`'s HEAD; there is no release PR. `main` already carries the next
+version, because each release ends by opening the post-release PR that
+records its changelog and moves the version files on.
+
+An urgent bug gets a hotfix release the same way: the same command, as soon
+as the fix is on a green `main`. Any other bug is fixed in a follow-up PR,
+and that PR is released as soon as it is ready too. Do not rebuild or
+replace a version that was already published, and do not move a tag.
 
 ## Rollout gate drill
 
@@ -211,8 +227,11 @@ parsing.
 ```
 
 `cut --dry-run` runs everything except the tag, the publish, the two PRs and
-the live canary (it prints the canary's plan). Run it two hours before a
-window so the product can land fixes first. The command does these steps in
+the live canary (it prints the canary's plan). It is an optional
+diagnostic for the build and acceptance steps, never a readiness check and
+never a step before every cut: it can go on to build after the preflight
+would have refused the live cut. Cut as soon as readiness is established
+(see Release when ready). The command does these steps in
 order:
 
 1. **Preflight**, on a fresh clone of machinery `main`, whose HEAD is `$SHA`
@@ -229,6 +248,8 @@ order:
    - The newest `CI Gate` push run on `$SHA`
      (`gh run list --commit "$SHA" --workflow "CI Gate"`) has completed with
      `success`.
+   - That run attempt's CI evidence receipt (the artifact
+     `ci-gate-evidence-<attempt>`) is present and valid.
    - The uv on `PATH` satisfies `[tool.uv] required-version` in the machinery
      candidate and in the product `main` checkout used for adoption and test
      collection. This check also applies to dry runs that proceed to a build.
@@ -351,7 +372,7 @@ steps instead. When the tag is on the remote and its release is absent or
 still a pre-release, the version is consumed. In that case the command marks
 the pre-release **Withdrawn** (it keeps its files), closes the open adopt PRs
 and opens the post-release PR, which records `[$V] [YANKED]` and moves `main`
-on so the next window cuts the next version. Each of these steps runs even if
+on so the next release can be cut as soon as it is ready. Each of these steps runs even if
 an earlier one fails. The host installs only versions the product has adopted.
 
 The annotated tag and every commit in the command's fresh clones pass the
