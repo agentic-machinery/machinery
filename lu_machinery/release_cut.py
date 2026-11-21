@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -1307,6 +1308,33 @@ def execute(cut: Cut) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    arguments = sys.argv[1:] if argv is None else argv
+    if not arguments or arguments[0] not in {"cut", "post-release"}:
+        return _main(argv)
+
+    from lu_machinery.dispatcher.git import resolve_repo
+
+    try:
+        checkout, _ = resolve_repo("machinery")
+        common = subprocess.run(
+            ["git", "-C", str(checkout), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            check=True, capture_output=True, text=True, env=sanitized_git_env(),
+        ).stdout.strip()
+        lock_path = Path(common) / "release-cut.lock"
+        lock = lock_path.open("a")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"release cut refused: cannot acquire release-cut.lock: {exc}", file=sys.stderr)
+        return 1
+    with lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            print(f"release cut refused: cannot acquire {lock_path}: {exc}", file=sys.stderr)
+            return 1
+        return _main(argv)
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m lu_machinery.release_cut",
         description=__doc__.splitlines()[0] + "\nRun on the host with gh and push credentials, outside a worker.",

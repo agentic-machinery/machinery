@@ -233,7 +233,15 @@ def test_notes_are_generated_from_every_merged_title_except_the_bump():
     )
 
 
-def test_missing_x_agent_is_refused(capsys):
+@pytest.fixture
+def machinery_checkout(monkeypatch, tmp_path):
+    checkout = tmp_path / "machinery"
+    _init_repo(checkout)
+    monkeypatch.setattr(git_module, "resolve_repo", lambda name=None: (checkout, {}))
+    return checkout
+
+
+def test_missing_x_agent_is_refused(capsys, machinery_checkout):
     """Defect class: a release command with no X-Agent value writes a commit review cannot attribute."""
     for command in ("cut", "post-release"):
         with pytest.raises(SystemExit) as caught:
@@ -248,7 +256,7 @@ def test_missing_x_agent_is_refused(capsys):
 
 
 @pytest.mark.usefixtures("unconfigured_primary")
-def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, capsys):
+def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, capsys, machinery_checkout):
     """Defect class: syntactically valid release trailers leave the PR author unresolved."""
     monkeypatch.delenv("LU_TASKS_DIR", raising=False)
     monkeypatch.delenv("LU_PRODUCT_ROOT", raising=False)
@@ -264,8 +272,8 @@ def test_unresolvable_x_agent_is_refused_at_parse_time(monkeypatch, capsys):
 
 
 @pytest.mark.usefixtures("unconfigured_primary")
-def test_resolvable_x_agent_reaches_release_runner(monkeypatch):
-    """Defect class: parse-time attribution rejects an explicit model without a checkout."""
+def test_resolvable_x_agent_reaches_release_runner(monkeypatch, machinery_checkout):
+    """Defect class: parse-time attribution rejects an explicit model without a primary checkout."""
     monkeypatch.delenv("LU_TASKS_DIR", raising=False)
     monkeypatch.delenv("LU_PRODUCT_ROOT", raising=False)
     parsed = []
@@ -291,6 +299,46 @@ def _init_repo(path):
     _git(path, "config", "user.email", "release-cut@example.invalid")
     _git(path, "add", ".")
     _git(path, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--allow-empty", "-m", "seed")
+
+
+def test_concurrent_release_cuts_cannot_overlap(tmp_path):
+    """Defect class: concurrent release cuts overlap across worktrees."""
+    primary = tmp_path / "primary"
+    linked = tmp_path / "linked"
+    _init_repo(primary)
+    _git(primary, "worktree", "add", "-b", "worker", str(linked))
+    script = """
+import sys
+from pathlib import Path
+from lu_machinery import release_cut
+from lu_machinery.dispatcher import git
+git.resolve_repo = lambda name=None: (Path(sys.argv[1]), {})
+release_cut.x_agent_value = lambda value, **kwargs: value
+def run(args):
+    print('entered', flush=True)
+    sys.stdin.readline()
+    return 0
+release_cut._run = run
+raise SystemExit(release_cut.main(['cut', '--x-agent', 'fixture/worker']))
+"""
+    first = subprocess.Popen([sys.executable, "-c", script, str(primary)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert first.stdout.readline().strip() == "entered"
+        second = subprocess.run([sys.executable, "-c", script, str(linked)], input="\n", text=True,
+                                capture_output=True, timeout=10)
+        assert second.returncode != 0
+        assert "release-cut.lock" in second.stderr
+        first.kill()
+        assert first.wait(timeout=10) != 0
+        third = subprocess.run([sys.executable, "-c", script, str(linked)], input="\n", text=True,
+                               capture_output=True, timeout=10)
+        assert third.returncode == 0
+        assert third.stdout.strip() == "entered"
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait()
 
 
 def _bare_checkout(seed, bare, checkout):
