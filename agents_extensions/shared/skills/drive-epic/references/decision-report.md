@@ -42,8 +42,9 @@ that shows it is operator-only.
 
 ## Council: optional independent panel
 
-**When to use it.** Every PR gets normal review: one reviewer of record through `review-loop`,
-under the applicable tier (the review policy's Low-tier exception and the Ukrainian
+**When to use it.** Every PR above the Trivial tier gets normal review: the reviewer or reviewers of record that the
+applicable tier and the branch's author families require (the resolver for code and infra, the Ukrainian profile's Seats for Ukrainian content), run through
+`review-loop`, (the review policy's Low-tier exception and the Ukrainian
 profile's Sources-backed seats stand). Add a council only for:
 
 1. a consequential, unresolved choice between materially different approaches (a decision
@@ -66,23 +67,18 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
 
 - **Order:** the council comes first: each member answers the frozen question on its own,
   read-only and scored (below). Then at most one ACP `discuss` round with 2 to 4 seats
-  ([review-merge-cleanup](review-merge-cleanup.md)) takes up only the points where the
+  (the ask and `discuss` rules in `fleet-comms-coordination.md`) takes up only the points where the
   members disagree. A discussion never counts as review or approval.
-- **Members:** live eligible routes only: Opus 5.5 via Claude, Sol 6.2 via Codex, Grok 4.7
-  via Cursor, plus Gemini 4 Neon and SubQ Savant for non-Ukrainian questions. Seat Neon and
-  Savant in the independent read-only dispatch round using the [Neon](../../../rules/model-assignment.md#gemini-4-neon-advisory-routing)
-  and [Savant](../../../rules/model-assignment.md#subq-savant-test-routing) routing rules.
-  Savant requires an explicit public or private data class. Record each model's exact ID with its
-  findings and score, and record Savant's resolved effort. On Ukrainian language, culture and heritage questions,
-  Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment); its
-  Ukrainian council answers are input in the council and the discussion only, never review
-  of record or designated approval. An unavailable member is reported, never substituted, and the panel is then not called
-  complete. A member from the author's model family, the author's own model included, stays
-  on the panel (operator order 2026-11-16; the council's exception to pool-minus-author in
-  `model-assignment.md`): it reviews and scores, and its findings are handled like any
-  member's. The exact-head review of record follows the applicable tier, and designated
-  approval stays outside the author's family.
-- **Read-only** comes from the harness (`dispatch.py --mode read-only`), not from prompt wording.
+- **Members:** live eligible routes only, as `model-assignment.md` seats them for the question
+  (`model-assignment.md`, "Gemini 4 Neon advisory routing" and "SubQ Savant test routing"). Record each
+  model's exact ID with its findings and score. On Ukrainian language, culture and heritage
+  questions, Grok also advises (`model-assignment.md`, LANGUAGE-LANES RULE, 2026-11-16 amendment);
+  its answers are input in the council and the discussion only, never review of record or
+  designated approval. An unavailable member is reported, never substituted, and the panel is then
+  not called complete. A member from the author's model family stays on the panel (operator order
+  2026-11-16): it reviews and scores like any member, while the exact-head review of record
+  follows the applicable tier and designated approval stays outside the author's family.
+- **Read-only** comes from the harness (the dispatch's `--mode read-only`), not from prompt wording.
 - **Freeze before dispatch:** the question, context, roles and stop condition. Panel rounds
   count against the same `review-loop` budget as any review
   ([policy](../../review-loop/references/policy.md)); never "until all members are satisfied".
@@ -102,7 +98,7 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   second head, settle the design, and keep the third head for fixes and the reviewer of
   record's verdict. A council at a new third head uses the last round and authorizes no
   fourth head, and council consensus never clears a recorded rejection. `review-loop` keeps the
-  single exact-head review of record, so the panel adds no second review path. Designated
+  exact-head review of record the tier requires, so the panel adds no second review path. Designated
   approval and `full-send` are unchanged.
   Before a panel round, bring the head up to date as `review-loop` step 0 says, except for
   the council after round 2: it reads the unchanged second head and the open ledger before
