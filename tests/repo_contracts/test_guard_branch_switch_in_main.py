@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, parse_heredocs
+from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, document_words, parse_heredocs
 from lu_machinery.common.repo_root import machinery_path
 from tests.helpers.restore_import_state import restore_import_state
 
@@ -1412,7 +1412,13 @@ def test_issue_9479_r8_quoted_branch_prose_is_data_bash(
     if prefix:
         expected.insert(0, ["git", str(repos[start]), "switch", "-c", "fixture"])
     assert records == expected
-    assert (guard._command_danger_reason(command, repos[start]) is not None) == (bool(prefix) and start == "public")
+    # No reader name proves a body is data (C-6334): its words are judged as
+    # commands, so a branch operation the body spells counts in the primary.
+    words = "\n".join(document_words(parse_heredocs(command)[0]))
+    spelled = guard._command_danger_reason(words, repos[start]) is not None
+    assert (guard._command_danger_reason(command, repos[start]) is not None) == (
+        start == "public" and (bool(prefix) or spelled)
+    )
 
 
 @pytest.mark.parametrize("start", ["public", "public_worktree"])
