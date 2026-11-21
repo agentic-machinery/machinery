@@ -556,7 +556,7 @@ def complete_author_families(inputs: ResolverInputs, single_family: str) -> froz
 
 # Author family sets that take the mixed-family pair: Anthropic/OpenAI, and all three critical-tier
 # families (NEON-SOLTIER-1120), which leave no critical seat outside the authors. Every other set
-# keeps its single outside-family reviewer. integration_sweep's marker reader admits the same sets.
+# keeps its single outside-family reviewer. integration_sweep's marker reader imports this constant.
 MIXED_REVIEW_SETS = frozenset({frozenset({"anthropic", "openai"}), frozenset({"anthropic", "google", "openai"})})
 _FAMILY_NAMES = {"anthropic": "Anthropic", "google": "Google", "openai": "OpenAI"}
 

@@ -62,6 +62,7 @@ from lu_machinery.common.repo_root import MachineryConfigError, ProductRootError
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.publish.github import CF_VERDICT_MARKER_PREFIX, Request, request_run
 from lu_machinery.review.language_lane import is_ukrainian_review
+from lu_machinery.review.reviewer_resolver import MIXED_REVIEW_SETS
 from lu_machinery.review.ukrainian_seats import (
     UKRAINIAN_SEAT_FAMILIES,
     UKRAINIAN_SEAT_ROUTES,
@@ -363,7 +364,7 @@ def parse_marker(body: str) -> dict[str, Any] | None:
     second = item.pop("second_review")
     raw_scope = item.pop("scope_commits")
     scope = raw_scope.split(",") if raw_scope is not None else None
-    # A pair token names the sorted author families (reviewer_resolver.MIXED_REVIEW_SETS).
+    # A pair token names the sorted author families of a MIXED_REVIEW_SETS member.
     pair_families = frozenset(pair.split("_")) if pair is not None else frozenset()
     if scope is not None and (
         scope != sorted(set(scope)) or item["family"] not in pair_families
@@ -649,10 +650,6 @@ def _coverage_decision(
     return (state, winner[2], seats, None, winner[1][1], winner[0])
 
 
-# The author family sets of a mixed-family pair, as reviewer_resolver.MIXED_REVIEW_SETS.
-_PAIR_FAMILY_SETS = frozenset({frozenset({"anthropic", "openai"}), frozenset({"anthropic", "google", "openai"})})
-
-
 def _mixed_pair_pending(candidates: Sequence[tuple[datetime, tuple[datetime, int], dict[str, Any]]]) -> bool:
     """A trusted mixed-family code record needs scoped exact-head approvals covering every author family."""
     markers = [item[2] for item in candidates]
@@ -661,7 +658,7 @@ def _mixed_pair_pending(candidates: Sequence[tuple[datetime, tuple[datetime, int
         for marker in markers
         if not is_ukrainian_review(marker)
         and marker.get("review_mode", "cross_family") == "cross_family"
-        and (families := attested_author_families([marker])) in _PAIR_FAMILY_SETS
+        and (families := attested_author_families([marker])) in MIXED_REVIEW_SETS
     }
     if not tokens:
         return False
