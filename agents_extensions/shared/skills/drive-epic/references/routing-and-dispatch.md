@@ -84,8 +84,9 @@ not DoR (`docs/best-practices/task-quality.md`, `operator-expectations.md` §3b)
 **one outcome for one PR**; apply the review-size signal in
 `agents_extensions/shared/rules/workflow.md` § Merge policy.
 
-The complete dispatch recipe (capacity read, then an explicit eligible provider and model with a
-prompt file and `--worktree`) is in `fleet-driver-routing.md` §2 and `model-assignment.md`; a
+The complete worker dispatch recipe (capacity read, then an explicit eligible provider and model
+with a prompt file and `--worktree`) is in `fleet-driver-routing.md` §1b; §2 of that file holds
+bounded-work admission and advisory envelopes, and `model-assignment.md` holds seat eligibility. A
 write dispatch adds `--mode workspace-write`, `--task-id`, `--branch` and repeatable
 `--owned-path`, and `--dry-run` prints the plan without creating a task record.
 

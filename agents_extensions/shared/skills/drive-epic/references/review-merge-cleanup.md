@@ -9,7 +9,8 @@ post-merge cleanup. This file keeps only what a driver still needs and no other 
 ## §6. Review of record
 
 Every PR above the review policy's Trivial tier needs a review of record; a Trivial PR needs none and
-lands on required CI alone, but a recorded rejection on its head still blocks landing. A review of record is independent, outside the author's model family (at the review policy's
+lands on required CI alone, but a recorded rejection on its head still blocks landing. The tier and the branch's author families set how many reviews of record a PR needs; the resolver
+returns them. Each is independent, outside the author's model family (at the review policy's
 [Low tier](../../review-loop/references/policy.md#2-risk-tier-is-set-by-the-change) any qualified
 non-author reviewer), toolful and **exact-head**: attested `resolved_model`, a verdict, and an
 attested SHA equal to the current PR head. A moved head makes it stale. Discussion on a thread,

@@ -42,8 +42,9 @@ that shows it is operator-only.
 
 ## Council: optional independent panel
 
-**When to use it.** Every PR above the Trivial tier gets normal review: one reviewer of record through
-`review-loop`, under the applicable tier (the review policy's Low-tier exception and the Ukrainian
+**When to use it.** Every PR above the Trivial tier gets normal review: the reviewer or reviewers of record that the
+applicable tier and the branch's author families require (the resolver decides), run through
+`review-loop`, (the review policy's Low-tier exception and the Ukrainian
 profile's Sources-backed seats stand). Add a council only for:
 
 1. a consequential, unresolved choice between materially different approaches (a decision
@@ -97,7 +98,7 @@ avoided; after about 20 councils this rule is tightened or loosened from that da
   second head, settle the design, and keep the third head for fixes and the reviewer of
   record's verdict. A council at a new third head uses the last round and authorizes no
   fourth head, and council consensus never clears a recorded rejection. `review-loop` keeps the
-  single exact-head review of record, so the panel adds no second review path. Designated
+  exact-head review of record the tier requires, so the panel adds no second review path. Designated
   approval and `full-send` are unchanged.
   Before a panel round, bring the head up to date as `review-loop` step 0 says, except for
   the council after round 2: it reads the unchanged second head and the open ledger before
