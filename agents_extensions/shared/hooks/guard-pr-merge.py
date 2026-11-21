@@ -148,30 +148,23 @@ try:
     from lu_machinery import cto_safe_mode
     from lu_machinery.ci.advisory_checks import is_advisory as is_advisory
     from lu_machinery.common.github_client import _gh_api_call
-    from lu_machinery.publish.merge_guard import (
-        NO_CHECKS,
-        _checks_json_unsupported,
-        _judge_status_rollup_rows,
-        bound_rollup_judgment,
-        external_check_states,
-        judge_checks,
-        readiness_reason,
-    )
-    from lu_machinery.publish.merge_guard import (
-        _latest_rollup_rows as _latest_rollup_rows,
-    )
-    from lu_machinery.publish.merge_guard import (
-        _rollup_name as _rollup_name,
-    )
-    from lu_machinery.publish.merge_guard import (
-        _rollup_timestamp as _rollup_timestamp,
-    )
-    from lu_machinery.publish.merge_guard import (
-        _rollup_value as _rollup_value,
-    )
 except (ImportError, ValueError):
     print("guard dependency unavailable: merge readiness or product root", file=sys.stderr)
     raise SystemExit(2) from None
+try:
+    from lu_machinery.publish.merge_guard import (
+        NO_CHECKS,
+        _checks_json_unsupported,
+        bound_rollup_judgment,
+        readiness_reason,
+    )
+except (ImportError, ValueError):
+    # An installed release older than this hook lacks the readiness rules it judges with.
+    # Only a merge needs them: every command is still read, and each merge this hook would
+    # judge is refused with this reason (_judge) instead of every command being refused.
+    _READINESS_UNAVAILABLE: str | None = "guard dependency unavailable: merge readiness (merge_guard)"
+else:
+    _READINESS_UNAVAILABLE = None
 
 
 # Agent harnesses export CLICOLOR_FORCE/FORCE_COLOR, which beat NO_COLOR and make
@@ -191,12 +184,6 @@ def _gh_env() -> dict[str, str]:
 def _decolorize(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
-
-_FAIL_BUCKETS = {"fail", "failure", "error", "cancel", "canceled", "cancelled", "timed_out", "action_required"}
-_PENDING_BUCKETS = {"pending", "queued", "in_progress", "waiting", "expected"}
-# Only these mean "done and fine". A non-advisory check in ANY other state — including a
-# bucket gh grows later, or a row with no bucket at all — is undeterminable, not green.
-_PASS_BUCKETS = {"pass", "success", "skipping", "skipped", "neutral"}
 
 # strconv.ParseBool's false spellings (lowercased). gh is cobra/pflag, so every boolean
 # flag also accepts `--flag=value`: `gh pr list --draft=notabool` fails with
@@ -1393,17 +1380,13 @@ def _pr_meta(pr: str, repo: str | None = None, cwd: str | None = None) -> dict |
     return data
 
 
-_ROLLUP_FAIL = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "ERROR", "STARTUP_FAILURE"}
-_ROLLUP_PENDING = {"IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "EXPECTED", "REQUESTED", "STALE"}
-_ROLLUP_PASS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
-
 
 def _status_rollup(pr: str, repo: str | None = None, cwd: str | None = None) -> dict | None:
     """One ``headRefOid,statusCheckRollup`` read: the rollup and its own head together.
 
-    It is the gh 2.46.0 ``pr checks --json`` compatibility fallback, the head-bound
-    collection that an external advisory exemption is judged on, and the empty collection
-    that types gh's no-output answer as NO_CHECKS.
+    Every check verdict is judged on it, as the publisher's pr-merge judges it: the
+    collection behind any non-empty ``gh pr checks`` answer and gh 2.46.0's answer without
+    ``--json``, and the empty collection that types gh's no-output answer as NO_CHECKS.
     """
     try:
         out = subprocess.run(
@@ -1513,14 +1496,20 @@ def _judged_repo(pr: str, repo: str | None, data: object) -> str | None:
 
 
 def _bound_states(pr: str, repo: str | None, cwd: str | None, meta, bound: dict | None):
-    """Judge the head-bound rollup at the head of the PR metadata being judged."""
+    """Judge the head-bound rollup at the head of the PR metadata being judged.
+
+    The publisher's judgment (merge_guard.bound_rollup_judgment): ``(failing, pending,
+    judged)`` of a ``headRefOid,statusCheckRollup`` read whose own head is the metadata's
+    full commit ID, or None when the metadata, the read or that head cannot be proven.
+    """
     data = meta() if meta is not None else _pr_meta(pr, repo, cwd)
     owner_repo = _judged_repo(pr, repo, data)
-    if owner_repo is None:
+    head = data.get("headRefOid") if isinstance(data, dict) else None
+    if owner_repo is None or not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head):
         return None
     return bound_rollup_judgment(
         _status_rollup(pr, repo, cwd) if bound is None else bound,
-        data.get("headRefOid"),
+        head,
         owner_repo,
         lambda endpoint: _gh_api_json(endpoint, cwd),
     )
@@ -1529,11 +1518,12 @@ def _bound_states(pr: str, repo: str | None, cwd: str | None, meta, bound: dict 
 def _check_states(
     pr: str, repo: str | None = None, cwd: str | None = None, meta=None
 ) -> tuple[list[str], list[str], int] | None:
-    """(failing, pending, judged): non-advisory check names and the count of blocking checks.
+    """(failing, pending, judged): blocking check names and the count of blocking checks.
 
-    None if undeterminable. ``meta`` returns the PR metadata being judged. An external
-    advisory name is judged on the head-bound rollup, proven at that metadata's head, never
-    on headless rows. ``judged == 0`` is the publisher's NO_CHECKS head.
+    None if undeterminable. The publisher's pr-merge order (merge_guard.ensure_merge_ready):
+    ``gh pr checks`` only shows whether the head has checks at all; any non-empty answer,
+    and gh 2.46's answer without ``--json``, is judged on the head-bound rollup at the head
+    of the PR metadata (``meta`` returns it) being judged. ``judged == 0`` is NO_CHECKS.
     """
     try:
         out = subprocess.run(
@@ -1547,33 +1537,30 @@ def _check_states(
     except Exception:
         return None
     if _checks_json_unsupported(out):
+        return _bound_states(pr, repo, cwd, meta, None)
+    text = (out.stdout or "").strip()
+    if not text:
+        # Empty output is no JSON collection: reading it as "no failing checks" is the
+        # fail-open bug guard-admin-merge closed. gh answers a head with no checks with
+        # rc 1 and no output, like other errors, so only an empty head-bound rollup at the
+        # judged head types it as NO_CHECKS.
+        if out.returncode != 1:
+            return None
         bound = _status_rollup(pr, repo, cwd)
-        rows, parse = (bound.get("statusCheckRollup") if bound is not None else None), _judge_status_rollup_rows
-    else:
-        text = (out.stdout or "").strip()
-        if not text:
-            # Empty output is no JSON collection: reading it as "no failing checks" is the
-            # fail-open bug guard-admin-merge closed. gh answers a head with no checks with
-            # rc 1 and no output, like other errors, so (as the publisher does) only an empty
-            # head-bound rollup at the judged head types it as NO_CHECKS.
-            if out.returncode != 1:
-                return None
-            bound = _status_rollup(pr, repo, cwd)
-            if not isinstance(bound, dict) or bound.get("statusCheckRollup") != []:
-                return None
-            return _bound_states(pr, repo, cwd, meta, bound)
-        # gh exits 0, 1 (failing) or 8 (pending) after a complete read; any other code is
-        # an error or cancellation even when stdout parses (the publisher's policy).
-        if out.returncode not in (0, 1, 8):
+        if not isinstance(bound, dict) or bound.get("statusCheckRollup") != []:
             return None
-        try:
-            rows = json.loads(_decolorize(text))
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(rows, list) or (out.returncode == 1 and not rows):
-            return None
-        bound, parse = None, judge_checks
-    return external_check_states(rows, parse, lambda: _bound_states(pr, repo, cwd, meta, bound))
+        return _bound_states(pr, repo, cwd, meta, bound)
+    # gh exits 0, 1 (failing) or 8 (pending) after a complete read; any other code is
+    # an error or cancellation even when stdout parses (the publisher's policy).
+    if out.returncode not in (0, 1, 8):
+        return None
+    try:
+        rows = json.loads(_decolorize(text))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(rows, list) or (out.returncode == 1 and not rows):
+        return None
+    return _bound_states(pr, repo, cwd, meta, None) if rows else ([], [], 0)
 
 
 def _base_protected(owner_repo: str, base: str) -> bool | None:
@@ -1641,6 +1628,12 @@ def _block_msg(reason: str, guidance: str) -> str:
 
 def _judge(args: list[str], cwd: str | None = None) -> str | None:
     """Block message for this `gh pr merge`, or None to allow."""
+    if _READINESS_UNAVAILABLE is not None:
+        return _block_msg(
+            _READINESS_UNAVAILABLE,
+            "The installed lu-machinery release does not match this hook, so the merge cannot be\n"
+            "judged. Install the release this hook ships with, then retry.",
+        )
     if _UNREADABLE_MARKER in args:
         return _block_msg(
             "this merge's target cannot be read from the command itself",

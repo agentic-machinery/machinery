@@ -25,9 +25,6 @@ from lu_machinery.github_check_rollup import (
 )
 from lu_machinery.opsec.prepublish import PublishBlocked
 
-_FAIL_BUCKETS = {"fail", "failure", "error", "cancel", "canceled", "cancelled", "timed_out", "action_required"}
-_PENDING_BUCKETS = {"pending", "queued", "in_progress", "waiting", "expected"}
-_PASS_BUCKETS = {"pass", "success", "skipping", "skipped", "neutral"}
 _ROLLUP_FAIL = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "ERROR", "STARTUP_FAILURE"}
 _ROLLUP_PENDING = {"IN_PROGRESS", "QUEUED", "PENDING", "WAITING", "EXPECTED", "REQUESTED", "STALE"}
 _ROLLUP_PASS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
@@ -225,14 +222,6 @@ def _exempt(row: dict, advisory: frozenset[str]) -> bool | None:
     return True if clean and isinstance(name, str) and name in advisory else None
 
 
-def _parse_status_rollup_rows(
-    rows: object, *, advisory: frozenset[str] = frozenset()
-) -> tuple[list[str], list[str]] | None:
-    """Parse old-client rollup rows; ``advisory`` holds only proven external names."""
-    judged = _judge_status_rollup_rows(rows, advisory=advisory)
-    return None if judged is None else (judged[0], judged[1])
-
-
 def _judge_status_rollup_rows(
     rows: object, *, advisory: frozenset[str] = frozenset()
 ) -> tuple[list[str], list[str], int] | None:
@@ -281,14 +270,6 @@ def _judge_status_rollup_rows(
         elif result == "PENDING":
             pending.append(name)
     return failing, pending, sum(1 for row in latest if _rollup_name(row) not in policy.names)
-
-
-def bound_rollup_states(
-    bound: object, head: object, repo: object, get_json: Callable[[str], object]
-) -> tuple[list[str], list[str]] | None:
-    """``(failing, pending)`` of :func:`bound_rollup_judgment`, or None."""
-    judged = bound_rollup_judgment(bound, head, repo, get_json)
-    return None if judged is None else (judged[0], judged[1])
 
 
 def bound_rollup_judgment(
@@ -355,55 +336,6 @@ def bound_rollup_judgment(
 def _duplicate_check_names(rows):
     names = [row.get("name") for row in rows if isinstance(row, dict) and row.get("name")]
     return len(set(names)) != len(names)
-
-
-def external_check_states(rows, parse, bound_states):
-    """``parse(rows)``, or ``bound_states()`` when a row names an operator entry.
-
-    Ordinary check rows carry no head, so they never grant an exemption themselves: an
-    entry name switches the judgment to :func:`bound_rollup_states` at the judged head,
-    a newer read. The headless rows must still be a well-formed collection.
-    """
-    duplicates_need_proof = isinstance(rows, list) and _duplicate_check_names(rows) and (
-        parse is judge_checks or any(
-            isinstance(row, dict) and row.get("name") and not row.get("workflowName") for row in rows
-        )
-    )
-    if not external_advisory_names(rows) and not duplicates_need_proof:
-        return parse(rows)
-    return bound_states() if all(isinstance(row, dict) for row in rows) else None
-
-
-def judge_checks(rows):
-    """``(failing, pending, judged)`` of gh check buckets with the hook's advisory and unknown-state policy.
-
-    ``judged`` counts the rows that prove a blocking check, as :func:`_judge_status_rollup_rows`
-    counts them: an advisory job, an unexpanded matrix parent, an unnamed row or a row merely
-    named like an advisory job (its workflow identity missing or another workflow's) never
-    proves one, whatever its result. None when a row is malformed or its state unknown.
-    """
-    if not isinstance(rows, list):
-        return None
-    policy = load_advisory_checks()
-    failing, pending, judged = [], [], 0
-    for row in rows:
-        if not isinstance(row, dict):
-            return None
-        name = str(row.get("name") or "")
-        if "${{" in name or is_advisory(
-            name, workflow=row.get("workflow"), policy=policy
-        ):
-            continue
-        bucket = str(row.get("bucket") or row.get("state") or "").lower()
-        if bucket in _FAIL_BUCKETS:
-            failing.append(name)
-        elif bucket in _PENDING_BUCKETS:
-            pending.append(name)
-        elif bucket not in _PASS_BUCKETS:
-            return None
-        if name and name not in policy.names:
-            judged += 1
-    return failing, pending, judged
 
 
 # pr-merge's refusal for a head with no blocking check; guard-pr-merge.py refuses a raw merge with it too.

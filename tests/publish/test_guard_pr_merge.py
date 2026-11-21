@@ -147,7 +147,11 @@ runpy.run_path(sys.argv[1], run_name="__main__")
     )
     assert result.returncode == expected, result.stderr
     if expected == 2:
-        assert "guard dependency unavailable" in result.stderr
+        # The readiness module is needed only where a merge is judged, so a merge the shell
+        # reader refuses first keeps that reason; either way the merge is refused.
+        assert "guard dependency unavailable" in result.stderr or (
+            dependency.endswith("merge_guard") and "cannot be read safely" in result.stderr
+        )
 
 
 @pytest.mark.parametrize(
@@ -762,6 +766,31 @@ def _fake_gh(monkeypatch, *, returncode: int, stdout: str, stderr: str = ""):
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
 
 
+def _bound_gh(monkeypatch, *, returncode: int, stdout: str, rollup: object, stderr: str = ""):
+    """Answer ``gh pr checks`` as given, the head-bound rollup read with ``rollup`` at _HEAD,
+    and the metadata read with a ready PR at _HEAD; any other read fails."""
+    meta = {"isDraft": False, "baseRefName": "main", "body": "", "headRefOid": _HEAD, "number": 5, "url": _URL}
+
+    def fake_run(args, **_k):
+        if args[1:3] == ["pr", "checks"]:
+            return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+        if args[1:3] == ["pr", "view"] and args[-1] == "headRefOid,statusCheckRollup":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"headRefOid": _HEAD, "statusCheckRollup": rollup}), "")
+        if args[1:3] == ["pr", "view"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps(meta), "")
+        return subprocess.CompletedProcess(args, 1, "", "unexpected")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+
+
+def _run_row(name: str, conclusion: str, **extra) -> dict:
+    """One completed (or, with ``conclusion=""``, in-progress) CI check run in a rollup."""
+    status = "COMPLETED" if conclusion else "IN_PROGRESS"
+    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion,
+            "workflowName": "CI", **extra}
+
+
 def test_pr_meta_parses_draft(monkeypatch):
     payload = {"isDraft": True, "baseRefName": "main", "body": "", "number": 5}
     _fake_gh(monkeypatch, returncode=0, stdout=json.dumps(payload))
@@ -805,13 +834,15 @@ def test_check_states_empty_output_with_ok_rc_is_unverifiable(monkeypatch):
 
 
 def test_check_states_splits_failing_and_pending(monkeypatch):
-    rows = (
-        '[{"name":"boundary-and-tests","bucket":"fail"},'
-        '{"name":"Test (pytest)","bucket":"pending"},'
-        '{"name":"Lint (ruff)","bucket":"pass"},'
-        '{"name":"Component shadow (advisory)","bucket":"fail","workflow":"CI"}]'
-    )
-    _fake_gh(monkeypatch, returncode=8, stdout=rows)
+    # gh's own buckets only show that checks exist; the head-bound rollup is judged.
+    rows = '[{"name":"boundary-and-tests","bucket":"pass"}]'
+    rollup = [
+        _run_row("boundary-and-tests", "FAILURE"),
+        _run_row("Test (pytest)", ""),
+        _run_row("Lint (ruff)", "SUCCESS"),
+        _run_row("Component shadow (advisory)", "FAILURE"),
+    ]
+    _bound_gh(monkeypatch, returncode=8, stdout=rows, rollup=rollup)
     assert guard._check_states("5") == (["boundary-and-tests"], ["Test (pytest)"], 3)
 
 
@@ -1047,15 +1078,12 @@ def test_missing_check_bucket_fails_closed(monkeypatch):
     ({"workflowName": "CI"}, False),
 ])
 def test_advisory_checks_require_workflow_identity(monkeypatch, identity, allowed):
+    """gh's headless rows never decide an advisory exemption: the rollup's workflow identity does."""
     name = "Component shadow (advisory)"
     rows = [{"name": name, "bucket": "fail", **identity}, {"name": "CI Gate", "bucket": "pass", "workflow": "CI"}]
-
-    def fake_run(cmd, **kwargs):
-        assert cmd == ["gh", "pr", "checks", "5", "--json", "name,bucket,state,workflow"]
-        return subprocess.CompletedProcess(cmd, 1, json.dumps(rows), "")
-
-    monkeypatch.setattr(guard.subprocess, "run", fake_run)
-    monkeypatch.setattr(guard, "_pr_meta", lambda *_a, **_k: {"isDraft": False})
+    workflow = "CI" if allowed else "Nightly"
+    rollup = [_run_row(name, "FAILURE", workflowName=workflow), _run_row("CI Gate", "SUCCESS")]
+    _bound_gh(monkeypatch, returncode=1, stdout=json.dumps(rows), rollup=rollup)
     assert guard._check_states("5") == (([], [], 1) if allowed else ([name], [], 1))
     result = guard._judge(["5", "--squash"])
     if allowed:
@@ -1065,34 +1093,29 @@ def test_advisory_checks_require_workflow_identity(monkeypatch, identity, allowe
 
 
 def test_known_pass_buckets_are_green(monkeypatch):
-    rows = '[{"name":"CI Gate","bucket":"pass"},{"name":"Flaky","bucket":"skipping"},{"name":"N","bucket":"neutral"}]'
-    _fake_gh(monkeypatch, returncode=0, stdout=rows)
+    rows = '[{"name":"CI Gate","bucket":"pass"}]'
+    rollup = [_run_row("CI Gate", "SUCCESS"), _run_row("Flaky", "SKIPPED"), _run_row("N", "NEUTRAL")]
+    _bound_gh(monkeypatch, returncode=0, stdout=rows, rollup=rollup)
     assert guard._check_states("5") == ([], [], 3)
 
 
 def _rollup_states(monkeypatch, rows):
-    import types
-
-    def fake_run(cmd, **_k):
-        if cmd[:4] == ["gh", "pr", "checks", "5"]:
-            return types.SimpleNamespace(returncode=1, stdout="", stderr=_GH_246_CHECKS_JSON_GAP)
-        assert cmd[:4] == ["gh", "pr", "view", "5"]
-        return types.SimpleNamespace(returncode=0, stdout=json.dumps({"statusCheckRollup": rows}), stderr="")
-
-    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    """The gh 2.46 path: no ``--json`` checks, so the head-bound rollup is the whole answer."""
+    _bound_gh(monkeypatch, returncode=1, stdout="", rollup=rows, stderr=_GH_246_CHECKS_JSON_GAP)
     return guard._check_states("5")
 
 
-@pytest.mark.parametrize("identity,allowed", [
-    ({"workflowName": "CI"}, True),
-    ({"workflowName": "Nightly"}, False),
-    ({}, False),
+@pytest.mark.parametrize("identity,expected", [
+    ({"workflowName": "CI"}, ([], [], 1)),
+    ({"workflowName": "Nightly"}, (["Component shadow (advisory)"], [], 1)),
+    # No workflow identity: only exact-head Actions runs could bind it, and none are readable.
+    ({}, None),
 ])
-def test_rollup_advisory_maps_workflow_name_explicitly(monkeypatch, identity, allowed):
+def test_rollup_advisory_maps_workflow_name_explicitly(monkeypatch, identity, expected):
     name = "Component shadow (advisory)"
     row = {"name": name, "status": "COMPLETED", "conclusion": "FAILURE", **identity}
     gate = {"name": "CI Gate", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI"}
-    assert _rollup_states(monkeypatch, [row, gate]) == (([], [], 1) if allowed else ([name], [], 1))
+    assert _rollup_states(monkeypatch, [row, gate]) == expected
 
 
 @pytest.mark.parametrize(
@@ -1203,7 +1226,6 @@ def test_cancelled_matrix_parent_does_not_hide_real_job_failures(monkeypatch, fa
     # Newest-first also proves selection does not depend on response order.
     states = _rollup_states(monkeypatch, list(reversed(rows)))
     assert states == ([failed_job] if failed_job else [], [], len(jobs))
-    monkeypatch.setattr(guard, "_pr_meta", lambda *_a, **_k: {"isDraft": False})
     result = guard._judge(["5", "--squash"])
     if failed_job:
         assert f"FAILING checks: {failed_job}" in result
@@ -1212,17 +1234,12 @@ def test_cancelled_matrix_parent_does_not_hide_real_job_failures(monkeypatch, fa
 
 
 def test_checks_json_ignores_unexpanded_matrix_parent(monkeypatch):
-    _fake_gh(
-        monkeypatch,
-        returncode=0,
-        stdout=json.dumps(
-            [
-                {"name": "pytest (${{ matrix.shard }})", "bucket": "fail", "state": "CANCELLED"},
-                {"name": "CI Gate", "bucket": "pass", "state": "SUCCESS"},
-                {"name": "pytest (1)", "bucket": "fail", "state": "CANCELLED"},
-            ]
-        ),
-    )
+    rollup = [
+        _run_row("pytest (${{ matrix.shard }})", "CANCELLED"),
+        _run_row("CI Gate", "SUCCESS"),
+        _run_row("pytest (1)", "CANCELLED"),
+    ]
+    _bound_gh(monkeypatch, returncode=1, stdout='[{"name": "pytest (1)", "bucket": "fail"}]', rollup=rollup)
     assert guard._check_states("5") == (["pytest (1)"], [], 2)
 
 
@@ -1800,8 +1817,7 @@ def test_colorized_check_rows_still_judged(monkeypatch):
     """End-to-end through _check_states' parser: colorized rows must not read as
     undeterminable (which would block every green merge)."""
     rows = '\x1b[1;37m[{"name": "pytest", "bucket": "pass", "state": "SUCCESS"}]\x1b[m'
-    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=rows, stderr="")
-    monkeypatch.setattr(guard.subprocess, "run", lambda *a, **k: completed)
+    _bound_gh(monkeypatch, returncode=0, stdout=rows, rollup=[_run_row("pytest", "SUCCESS")])
     failing, pending, judged = guard._check_states("5")
     assert failing == [] and pending == [] and judged == 1
 
@@ -2492,11 +2508,12 @@ def test_check_states_failing_exit_without_rows_is_unverifiable(monkeypatch):
     assert guard._check_states("5") is None
 
 
-@pytest.mark.parametrize("returncode,bucket,expected", [
-    (0, "pass", ([], [], 1)), (1, "fail", (["CI Gate"], [], 1)), (8, "pending", ([], ["CI Gate"], 1)),
+@pytest.mark.parametrize("returncode,conclusion,expected", [
+    (0, "SUCCESS", ([], [], 1)), (1, "FAILURE", (["CI Gate"], [], 1)), (8, "", ([], ["CI Gate"], 1)),
 ])
-def test_check_states_supported_exits_still_parse(monkeypatch, returncode, bucket, expected):
-    _fake_gh(monkeypatch, returncode=returncode, stdout=json.dumps([{"name": "CI Gate", "bucket": bucket}]))
+def test_check_states_supported_exits_still_parse(monkeypatch, returncode, conclusion, expected):
+    rows = json.dumps([{"name": "CI Gate", "bucket": "pass"}])
+    _bound_gh(monkeypatch, returncode=returncode, stdout=rows, rollup=[_run_row("CI Gate", conclusion)])
     assert guard._check_states("5") == expected
 
 
