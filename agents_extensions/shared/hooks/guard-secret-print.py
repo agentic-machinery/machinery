@@ -75,6 +75,7 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 
 from __future__ import annotations
 
+import ast
 import codecs
 import os
 import re
@@ -1353,18 +1354,41 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     reason = _program_reason(cmd, program)
     if reason:
         return reason
-    if dumped_files and _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
-        # The quote-agnostic pairs, plus Python's own literals, which an apostrophe inside
-        # "it's" cannot shift. Either reading can name the dumped path.
+    reads = re.compile(r"\b(?:open|read_text|read_bytes)\s*\(")
+    if dumped_files and _is_python_command(cmd) and reads.search(program):
         paths = re.findall(r"[\"']([^\"']+)[\"']", program)
-        for match in _PYTHON_LITERALS.finditer(program):
-            if match["long_end"] is not None:
-                paths.append(match["long_value"])
-            elif match["short_end"] is not None:
-                paths.append(match["short_value"])
+        # Main could not read a word holding a '\'' apostrophe at all. Read the literals
+        # of such a word that itself reads a file as Python does, so an apostrophe inside
+        # "it's" cannot shift the pairs above past the dumped path.
+        for arg in args:
+            if "'\\''" in _protect_parameters(arg)[1].values():
+                source = "".join(shlex.split(arg, posix=True))
+                if reads.search(source):
+                    paths += _python_literal_values(source)
         if any(_normalized_path(path) in dumped_files for path in paths):
             return "inline program would display a redirected environment dump"
     return None
+
+
+def _python_literal_values(source: str) -> list[str]:
+    """Return the exact values of the complete constant string literals in Python source."""
+    values: list[str] = []
+    for match in _PYTHON_LITERALS.finditer(source):
+        if match["long_end"] is None and match["short_end"] is None:
+            continue  # a comment, or an unterminated literal
+        literal = match[0]
+        prefix = literal[: len(literal) - len(literal.lstrip("rRbBuUfF"))]
+        if "f" in prefix.lower():
+            body = match["long_value"] if match["long_end"] is not None else match["short_value"]
+            if "{" in body or "}" in body:
+                continue  # a formatted value is not known statically
+            literal = prefix.replace("f", "").replace("F", "") + literal[len(prefix) :]
+        try:
+            value = ast.literal_eval(literal)
+        except (SyntaxError, ValueError):
+            continue
+        values.append(value.decode("utf-8", "surrogateescape") if isinstance(value, bytes) else value)
+    return values
 
 
 def _heredoc_inputs(command: str) -> dict[str, list[tuple[str, bool]]]:
