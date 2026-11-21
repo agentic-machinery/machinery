@@ -75,11 +75,14 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 
 from __future__ import annotations
 
+import ast
 import codecs
+import io
 import os
 import re
 import shlex
 import sys
+import tokenize
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -461,42 +464,40 @@ def _tokenize(command: str, *, shell_words: bool = False) -> list[str]:
 
 
 def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
-    """Keep complete Bash ${...} words and unquoted escaped quotes intact while shlex splits operators.
+    """Keep complete Bash ${...} words and `'\\''` apostrophes intact while shlex splits operators.
 
-    The non-POSIX lexer honours a quote only at the start of a token, so after an
-    unquoted `\\'` (as in `'it'\\''s'`) it reads the reopening quote as a plain
-    character and every later quote inverted. An escaped quote before a quote
-    becomes a quoted marker instead: its closing quote ends the lexer token, so
-    the next quote opens one again.
+    Inside single quotes, `'\\''` closes the quote, adds an escaped apostrophe and
+    reopens it. The non-POSIX lexer honours a quote only at the start of a word, so
+    it would read the reopening quote as a plain character and every later quote
+    inverted. A marker keeps the word one single-quoted fragment instead.
     """
     substitutions = {start: end for start, end, _ in _substitution_spans(command)}
     parameters: dict[str, str] = {}
-    markers: dict[tuple[str, str], str] = {}
+    markers: dict[str, str] = {}
     out: list[str] = []
     quote = ""
     i = 0
 
-    def protect(text: str, *, wrap: str = "") -> None:
-        # One marker per distinct text keeps restoring linear in the escape count.
-        marker = markers.get((wrap, text))
+    def protect(text: str) -> None:
+        # One marker per distinct text keeps restoring linear in the apostrophe count.
+        marker = markers.get(text)
         if marker is None:
-            marker = f"{wrap}\ue000{len(parameters)}\ue001{wrap}"
+            marker = f"\ue000{len(parameters)}\ue001"
             while marker in command:
-                marker = marker.removesuffix(wrap) + "\ue002" + wrap
+                marker += "\ue002"
             parameters[marker] = text
-            markers[wrap, text] = marker
+            markers[text] = marker
         out.append(marker)
 
     while i < len(command):
         char = command[i]
         if char == "\\" and quote != "'" and i + 1 < len(command):
-            if not quote and command[i + 1] in {"'", '"'}:
-                # Only a reopening quote needs a lexer word boundary; adjacent
-                # unquoted text stays in the escaped quote's word.
-                protect(command[i : i + 2], wrap="'" if command[i + 2 : i + 3] in {"'", '"'} else "")
-            else:
-                out.append(command[i : i + 2])
+            out.append(command[i : i + 2])
             i += 2
+            continue
+        if quote == "'" and command.startswith("'\\''", i):
+            protect("'\\''")
+            i += 4
             continue
         if char == "'" and quote != '"':
             quote = "" if quote else "'"
@@ -1343,12 +1344,33 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     reason = _program_reason(cmd, program)
     if reason:
         return reason
-    if _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
-        # Pair each literal with its own delimiter: an apostrophe inside "it's" must not end it.
-        paths = [match["value"] for match in _PROGRAM_STRINGS.finditer(program)]
+    if dumped_files and _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
+        paths = _python_string_values(program)
+        if paths is None:
+            return "inline program reading a file could not be tokenized safely"
         if any(_normalized_path(path) in dumped_files for path in paths):
             return "inline program would display a redirected environment dump"
     return None
+
+
+def _python_string_values(program: str) -> list[str] | None:
+    """Return the values of a Python program's string literals, or None when it cannot be tokenized.
+
+    Python's own tokenizer pairs each literal with its delimiter, so an apostrophe
+    inside "it's", a comment or an escaped quote cannot hide a later path.
+    """
+    values: list[str] = []
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(program).readline):
+            if token.type == tokenize.STRING:
+                value = ast.literal_eval(token.string)
+                values.append(value.decode("utf-8", "surrogateescape") if isinstance(value, bytes) else value)
+            elif tokenize.tok_name[token.type].endswith("STRING_MIDDLE"):
+                # An f-string or t-string's literal text (Python 3.12+ tokenizes it in parts).
+                values.append(token.string)
+    except (tokenize.TokenError, SyntaxError, ValueError):
+        return None
+    return values
 
 
 def _heredoc_inputs(command: str) -> dict[str, list[tuple[str, bool]]]:
@@ -2011,31 +2033,7 @@ def _scan_command(
     # parser cannot strip an exotic here-doc on a second pass.
     executable = preprocess_shell_command(command)
     executable, substitutions = _hide_substitutions(executable)
-    # Scan both tokenizations, as _process_facts does. Quote fragments show an
-    # expansion inside a mixed-quote word (`'a'\'"$X"'b'`); shell words keep one
-    # operand per redirect, here-string or option value (`env 2> \''err'`).
-    fragments = _pipelines(executable)
-    words = _pipelines(executable, shell_words=True)
-    passes = [(fragments, copied, named)]
-    if words != fragments:
-        passes.append((words, set(copied), dict(named)))
-    for pipelines, pass_copied, pass_named in passes:
-        reason = _scan_pipelines(pipelines, pass_copied, pass_named, dumped_files, documents, substitutions, depth)
-        if reason:
-            return reason
-    return None
-
-
-def _scan_pipelines(
-    pipelines: list[list[list[str]]],
-    copied: set[str],
-    named: dict[str, str],
-    dumped_files: set[str],
-    documents: dict[str, list[tuple[str, bool]]],
-    substitutions: dict[str, tuple[str, str]],
-    depth: int,
-) -> str | None:
-    for pipeline in pipelines:
+    for pipeline in _pipelines(executable):
         reason = _danger_reason(pipeline, copied, named, dumped_files, documents, substitutions, depth)
         if reason:
             return reason
