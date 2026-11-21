@@ -84,7 +84,7 @@ Use a reviewed tuple to accept a licence finding for one scan target and package
 
 All three fields match literally, including case and spaces within an expression. Blank lines are allowed. Each tuple must have three nonempty fields, with no surrounding whitespace, control characters, or extra separators. Use a repo-relative target path or `.`. Repeated tuples count as one disposition. A malformed tuple fails the step before Trivy runs.
 
-The target receipt counts every reported licence in `licenses` and includes each accepted finding's tuple in `accepted_license_findings`. Findings without a match still fail the step. The scan warns about unused tuples and lists them in `stale_license_dispositions` in the job receipt.
+The target receipt lists each accepted finding's tuple in `accepted_license_findings` and includes those findings in the `licenses` total. Findings without a match still fail the step. The scan warns about unused tuples and lists them in `stale_license_dispositions` in the job receipt.
 
 ## Output receipt (`fleet-security-receipt.v1`)
 
