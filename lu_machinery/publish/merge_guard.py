@@ -398,6 +398,10 @@ def parse_checks(rows):
     return failing, pending
 
 
+# pr-merge's refusal for a head with no blocking check; guard-pr-merge.py refuses a raw merge with it too.
+NO_CHECKS = "NO_CHECKS: the head has no blocking check"
+
+
 def readiness_reason(meta, states):
     """A reason to refuse, or None for a ready PR; applies to every repository."""
     if not isinstance(meta, dict) or type(meta.get("isDraft")) is not bool:
@@ -545,7 +549,7 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
             # code is an error or cancellation even when stdout parses.
             if checks.returncode in {0, 1, 8} and isinstance(raw_checks, list) and (
                 checks.returncode != 1 or raw_checks
-            ):
+            ) and all(isinstance(row, dict) for row in raw_checks):
                 # Modern gh can itself omit historical/same-named runs. Its
                 # headless buckets cannot prove workflow/app isolation, even
                 # when the returned names are unique. Judge the bound snapshot.
@@ -571,7 +575,7 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
         reason = readiness_reason(meta, (failing, pending))
         if not reason and not judged:
             # Nothing ran (or only advisory checks ran) on this head: no CI result exists to land on.
-            reason = "NO_CHECKS: the head has no blocking check"
+            reason = NO_CHECKS
         if match_head is not None and meta["headRefOid"].lower() != match_head.lower():
             reason = "reviewed head changed"
     except (PublishBlocked, GitHubRateLimited):
