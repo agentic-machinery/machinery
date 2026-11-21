@@ -1677,6 +1677,7 @@ _DISMISS_TRIAGE_PATH = "docs/runbooks/secret-scanning.md"
 _DISMISS_ANALYSIS_PER_PAGE = 100
 _DISMISS_ANALYSIS_MAX_PAGES = 20
 _DISMISS_ANALYSIS_CLOCK_SKEW = timedelta(minutes=5)
+_DISMISS_PR_BATCH_SIZE = 100
 
 
 def _parse_utc_timestamp(value):
@@ -1763,7 +1764,7 @@ def _dismiss_sarif_result(document, number):
     return matches[0]
 
 
-def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
+def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=None):
     comment, number = fields["comment"], fields["number"]
     # Require an explanation in addition to an exact alert identifier and PR URL.
     identifier = rf"(?i)\balert\s+#{number}\b"
@@ -1905,36 +1906,70 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
             results[aid] = _dismiss_sarif_result(get(f"code-scanning/analyses/{aid}", sarif=True), number)
         return results[aid]
 
-    def open_pr_numbers():
-        pulls = get("pulls?state=open&per_page=100", pages=True)
-        numbers = set()
-        for pull in pulls:
-            if not isinstance(pull, dict):
-                raise ValueError("unknown open PR identity or state")
-            pr_num = pull.get("number")
-            if (
-                type(pr_num) is not int or pr_num <= 0
-                or pull.get("state") != "open"
-                or ("merged" in pull and pull["merged"] is not False)
-                or pull.get("merged_at") is not None
-                or pull.get("html_url") != f"https://github.com/{gh_repo}/pull/{pr_num}"
-            ):
-                raise ValueError("unknown open PR identity or state")
-            numbers.add(pr_num)
-        return numbers
+    def pull_states(pr_numbers):
+        owner, repo_name = gh_repo.split("/", 1)
+        ordered = sorted(set(pr_numbers))
+        states = {}
+        with (
+            contextlib.nullcontext(temp)
+            if temp is not None
+            else tempfile.TemporaryDirectory(prefix="lu-dismiss-prs-", dir=ensure_scratch_root())
+        ) as query_dir:
+            query_file = Path(query_dir) / "dismiss-pulls.json"
+            for start in range(0, len(ordered), _DISMISS_PR_BATCH_SIZE):
+                chunk = ordered[start:start + _DISMISS_PR_BATCH_SIZE]
+                aliases = " ".join(f"p{n}: pullRequest(number:{n}){{number state merged url}}" for n in chunk)
+                query = f"query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{aliases}}}}}"
+                query_file.write_bytes(
+                    json.dumps({"query": query, "variables": {"owner": owner, "name": repo_name}}).encode("utf-8")
+                )
+                result = runner(
+                    ["gh", "api", "--method", "POST", "graphql", "--input", str(query_file), *_hostname_flag(dest)],
+                    cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=30,
+                )
+                if result.returncode:
+                    raise ValueError("dismissal PR evidence unavailable")
+                document = json_depth.loads(result.stdout, max_depth=512)
+                if not isinstance(document, dict) or document.get("errors"):
+                    raise ValueError("unknown instance PR identity or state")
+                data = document.get("data")
+                repo_data = data.get("repository") if isinstance(data, dict) else None
+                expected_keys = {f"p{n}" for n in chunk}
+                if not isinstance(repo_data, dict) or set(repo_data) != expected_keys:
+                    raise ValueError("unknown instance PR identity or state")
+                for n in chunk:
+                    pull = repo_data[f"p{n}"]
+                    if not isinstance(pull, dict):
+                        raise ValueError("unknown instance PR identity or state")
+                    state = pull.get("state")
+                    merged = pull.get("merged")
+                    if (
+                        type(pull.get("number")) is not int or pull["number"] != n
+                        or pull.get("url") != f"https://github.com/{gh_repo}/pull/{n}"
+                        or state not in {"OPEN", "CLOSED", "MERGED"}
+                        or type(merged) is not bool
+                        or (state == "MERGED") != merged
+                    ):
+                        raise ValueError("unknown instance PR identity or state")
+                    states[n] = (state, merged)
+        return states
 
     baseline_ref = f"refs/heads/{base_ref}"
     if not any(instance["ref"] == baseline_ref for instance in instances):
         raise ValueError("no open triage-branch instance")
-    open_prs = None
-    skipped_prs = set()
+    pull_instance_nums = sorted({
+        int(match[1])
+        for instance in instances
+        if (match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]))
+    })
+    pr_states = pull_states(pull_instance_nums) if pull_instance_nums else {}
+    skipped_prs = {}
     for instance in instances:
         if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            if open_prs is None:
-                open_prs = open_pr_numbers()
             pr_num = int(match[1])
-            if pr_num not in open_prs:
-                skipped_prs.add(pr_num)
+            state, merged = pr_states[pr_num]
+            if state in {"CLOSED", "MERGED"} or merged:
+                skipped_prs[pr_num] = (state, merged)
                 continue
         location = instance["location"]
         if (row[2].strip() != f"`{location['path']}:{location['start_line']}`"
@@ -1952,14 +1987,14 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     if (get(f"code-scanning/alerts/{number}") != alert
             or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
             or get(head_endpoint) != head_reference
-            or (skipped_prs and bool(skipped_prs & open_pr_numbers()))):
+            or (skipped_prs and pull_states(skipped_prs) != skipped_prs)):
         raise ValueError("alert or triage evidence changed during preflight")
     return alert
 
 
 def _publish_code_scanning_dismiss(fields, *, gh_repo, dest, runner, cwd, environment, temp, capture_output, text):
     try:
-        _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment)
+        _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, temp=temp)
     except github_client.GitHubRateLimited:
         raise
     except Exception:
