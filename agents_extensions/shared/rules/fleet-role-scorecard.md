@@ -161,7 +161,7 @@ Ukrainian curriculum      → sanctioned language lanes; Opus 5.5 for Claude (ne
 Hard code                 → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High; Opus/Sol advice
 Orchestrate stream        → GPT-6.2 Sol high | Claude Opus 5.5 high | Gemini 4 Neon High (exactly one)
 UI / visual product       → Opus/Sol design → K3 or Sol/Opus/Grok implement web/UI code → Opus/Sol first if systems-hard
-UA language                 → Gemini 3.8 Flash High (AGY) + VESUM/sources (3.1 Pro is retired, not subscribed, operator 2026-10-23)
+UA language                 → fresh-build writer gemini-4-neon-high (AGY); writer alternatives Sol 6.2 / Opus 5.5; review per LANGUAGE-LANES + VESUM/sources
 Security/bug CF             → author-family-conditional (Grok/GLM/Opus/…)
 Architecture decision       → Opus/Sol advice → designated approval (operator, or Opus 5.5 + Sol 6.2: the non-author's approval when one authored it, both otherwise) → orchestrator integrates
 Recon                     → GPT-6 Luna high (Sol envelope) | Claude Haiku | Gemini 4 Hydrogen (Sol envelope)
