@@ -197,14 +197,15 @@ class _WorkflowLoader(yaml.SafeLoader):
 
     PyYAML's YAML 1.1 schema also reads yes, no, on, off, y and n as booleans (so an
     unsupported ``continue-on-error: no`` would read as false), 010 as octal, 1_000 and
-    1:20 as numbers, and dates as timestamps. Here those stay strings, as in YAML 1.2; an
+    1:20 as numbers, dates as timestamps, ``<<`` as a merge key and ``=`` as a value.
+    Here those stay strings, as in YAML 1.2; an
     explicit ``!!bool`` or ``!!int`` tag on another spelling is a construction error.
     """
 
     bool_values: ClassVar[dict[str, bool]] = {"true": True, "false": False}
 
 
-_YAML_1_1_TYPES = {f"tag:yaml.org,2002:{kind}" for kind in ("bool", "int", "float", "timestamp")}
+_YAML_1_1_TYPES = {f"tag:yaml.org,2002:{kind}" for kind in ("bool", "int", "float", "timestamp", "merge", "value")}
 _WorkflowLoader.yaml_implicit_resolvers = {
     first: [(tag, regexp) for tag, regexp in resolvers if tag not in _YAML_1_1_TYPES]
     for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
