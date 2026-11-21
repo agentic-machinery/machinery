@@ -1,11 +1,12 @@
 """Approved #12192 admission and mid-run record-damage defect classes."""
 
+import hashlib
 import json
 import re
 import signal
 from pathlib import Path
 import pytest
-from lu_machinery.dispatcher import store, worker
+from lu_machinery.dispatcher import ownership, store, worker
 from lu_machinery.dispatcher.types import ReviewAttempt, TaskSpec
 from lu_machinery.orchestration.task_record_store import read_task_record
 from lu_machinery.review import record_cf_verdict as recorder
@@ -312,6 +313,64 @@ def test_failed_record_recovery_types_os_errors_and_keeps_a_removed_tree(tmp_pat
     terminal = json.loads(reaped.read_text())
     assert (terminal["status"], terminal["error"]) == ("crashed", "TASK_RECORD_DAMAGED")
     assert (terminal["worktree_disposition"], terminal["worktree_disposition_reason"]) == ("removed", "merged")
+
+
+REPLY = '{"verdict": "REQUEST_CHANGES", "findings": [{"id": "F1"}]}\n'
+
+
+def _review_of_takeover(tmp_path, monkeypatch):
+    """A running takeover author (publish branch unlike its worktree branch) and its done review at its head."""
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.delenv(worker.write_boundary.BROKER_ENV, raising=False)
+    (tmp_path / "tasks").mkdir()
+    tree = tmp_path / "author-tree"
+    tree.mkdir()
+    run_git(tree, "init", "-b", "codex/author")
+    run_git(tree, "-c", "user.email=s@example.invalid", "-c", "user.name=S", "commit", "--allow-empty", "-m", "head")
+    head = run_git(tree, "rev-parse", "HEAD")
+    common = dict(schema_version=2, repository_id="org/repo")
+    for task_id, record in {
+        "author": dict(status="running", run_nonce="p1", worktree_branch="codex/author",
+                       publish_branch="codex/inherited", worktree_path=str(tree)),
+        "stranger": dict(status="running", run_nonce="s1", worktree_branch="codex/inherited",
+                         worktree_path=str(tree)),
+        "author-review": dict(status="done", run_nonce="r1", parent_task_id="author", mode="read-only",
+                              review_branch="codex/inherited", pinned_head=head,
+                              result_file=str(tmp_path / "tasks/author-review.result"),
+                              result_sha256=hashlib.sha256(REPLY.encode()).hexdigest()),
+    }.items():
+        (tmp_path / "tasks" / f"{task_id}.json").write_text(json.dumps(dict(common, task_id=task_id, **record)))
+    (tmp_path / "tasks/author-review.result").write_text(REPLY)
+    return tree
+
+
+def test_takeover_author_reads_its_own_exact_head_review_reply(tmp_path, monkeypatch):
+    """Defect (#1075): a takeover worker's wait returned its review's metadata without the sealed reply."""
+    _review_of_takeover(tmp_path, monkeypatch)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
+    record, code = worker.wait("author-review", "r1", reply=True)
+    assert (code, record["result"], record.get("result_unavailable")) == (0, REPLY, None)
+    # Without --reply the output stays an exact copy of the record (saved wait output, task_record_store).
+    assert worker.wait("author-review", "r1")[0] == json.loads((tmp_path / "tasks/author-review.json").read_text())
+
+
+def test_unrelated_worker_gets_no_review_reply(tmp_path, monkeypatch):
+    """Control: a running task that did not dispatch the review is refused its reply, even on the same branch."""
+    _review_of_takeover(tmp_path, monkeypatch)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "stranger")
+    record, _code = worker.wait("author-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, "caller_not_parent")
+
+
+def test_stale_nonce_or_moved_head_gets_no_review_reply(tmp_path, monkeypatch):
+    """Control: the parent's wait under another run's nonce, or after its head moved, is refused the reply."""
+    tree = _review_of_takeover(tmp_path, monkeypatch)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
+    with pytest.raises(ValueError, match="run nonce mismatch"):
+        worker.wait("author-review", "stale", reply=True)
+    run_git(tree, "-c", "user.email=s@example.invalid", "-c", "user.name=S", "commit", "--allow-empty", "-m", "fix")
+    record, _code = worker.wait("author-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, "head_moved")
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

@@ -2289,7 +2289,57 @@ def _read_only(record: dict | None) -> dict:
     return record
 
 
-def wait(task_id: str, nonce: str | None = None, timeout: float = 0, poll_interval: float = 1) -> tuple[dict, int]:
+def _own_review_reply(record: dict, nonce: str | None) -> dict:
+    """A done review's sealed reply, for the run that dispatched it on its own exact head (#1075).
+
+    Write workers run outside the write boundary (#619), whose broker no longer hands an author its review's reply,
+    and their launch context forbids reading another task's records. So ``wait --reply`` returns the reply (its
+    digest checked by the recorder) to that author only: the caller is the review's running parent, the wait names
+    the review's run nonce, the review is of the parent's PR branch (its publish branch on a takeover, else its
+    worktree branch) and the parent's worktree is still at the reviewed head. Anyone else gets a typed reason, no
+    reply. Opt-in, so plain ``wait`` output stays an exact copy of the record (task_record_store.is_identical_copy).
+    """
+    if record.get("status") != "done" or not record.get("review_branch"):
+        return {"result_unavailable": "not_a_done_review"}
+    caller = os.environ.get(ownership.TASK_ID_ENV)
+    if not caller or caller != record.get("parent_task_id"):
+        return {"result_unavailable": "caller_not_parent"}
+    if nonce is None:
+        return {"result_unavailable": "run_nonce_required"}
+    try:
+        parent = store.read(caller)
+    except (OSError, ValueError):
+        parent = None
+    if not isinstance(parent, dict) or not isinstance(parent.get("status"), str):
+        return {"result_unavailable": "parent_record_unavailable"}
+    if parent["status"] not in store.ACTIVE:
+        return {"result_unavailable": "parent_not_running"}
+    branch = parent.get("publish_branch") or parent.get("worktree_branch")
+    if parent.get("repository_id") != record.get("repository_id") or record["review_branch"] != branch:
+        return {"result_unavailable": "review_not_of_parent_branch"}
+    # Git walks up from a directory that lost its own repository, so the top level it names must be the tree.
+    tree = parent.get("worktree_path")
+    try:
+        if not isinstance(tree, str) or not Path(tree).is_absolute():
+            raise ValueError("worktree path is not absolute")
+        top, head = git._git(Path(tree), "rev-parse", "--path-format=absolute", "--show-toplevel", "HEAD^{commit}",
+                             isolate=True).split("\n")
+        if Path(top).resolve(strict=True) != Path(tree).resolve(strict=True):
+            raise ValueError("Git resolved another worktree")
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError):
+        return {"result_unavailable": "parent_head_unavailable"}
+    if not record.get("pinned_head") or head != record["pinned_head"]:
+        return {"result_unavailable": "head_moved"}
+    from lu_machinery.review import record_cf_verdict as recorder
+
+    try:
+        return {"result": recorder._task(record["task_id"], store.tasks_dir())[1]}
+    except (recorder.RecordError, OSError, ValueError) as exc:
+        return {"result_unavailable": f"result_unreadable: {exc}"[:200]}
+
+
+def wait(task_id: str, nonce: str | None = None, timeout: float = 0, poll_interval: float = 1, *,
+         reply: bool = False) -> tuple[dict, int]:
     deadline = time.monotonic() + timeout if timeout else None
     # Inside a write boundary (#423) the task store is read-only and host processes are in another PID namespace,
     # so a waiter there only reads: settling a crashed supervisor stays with the host's own observers.
@@ -2306,6 +2356,9 @@ def wait(task_id: str, nonce: str | None = None, timeout: float = 0, poll_interv
                 if record.get("worktree_disposition") != "removed":
                     reason = _text(record.get("worktree_disposition_reason"))
                 record["closeout_missing_reason"] = reason or _text(record.get("merged_delivery_lookup")) or "receipt_unavailable"
+            if reply:
+                record.update({"result_unavailable": "inside_write_boundary"} if inside
+                              else _own_review_reply(record, nonce))
             return record, 0 if record["status"] == "done" else 1
         remaining = deadline - time.monotonic() if deadline else None
         if remaining is not None and remaining <= 0:
