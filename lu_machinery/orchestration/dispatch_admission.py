@@ -122,9 +122,7 @@ from typing import Any
 if __package__ in (None, ""):  # run as a file: put the repository root on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery import config
-from lu_machinery.agent_runtime.usage import LANE_RUNTIME_WINDOW_S
 from lu_machinery.common import json_depth, test_slots
-from lu_machinery.fleet import credit_lane
 from lu_machinery.orchestration import admission_shadow, pool_headroom, product_policy, task_record_store, worktree_prep
 from lu_machinery.orchestration.dispatch_isolation import slice_usage_clause
 
@@ -1129,6 +1127,8 @@ def _meter_observation(meter: str, budget: Mapping[str, Any]) -> tuple[Mapping[s
             record = _mapping(agents.get("codex"))
         return record, (record,)
     if meter == "grok+cursor":
+        from lu_machinery.fleet import credit_lane
+
         grok, cursor = _mapping(agents.get("grok")), _mapping(agents.get("cursor"))
         record = (
             credit_lane.merge_grok_cursor_record(grok, cursor)
@@ -1171,6 +1171,8 @@ def _meter_rate_limited(record: Mapping[str, Any], meter: str) -> bool:
 
 
 def _meter_defer(meter: str, budget: Mapping[str, Any], now: datetime) -> MeterDefer | None:
+    from lu_machinery.fleet import credit_lane
+
     diagnostics = _mapping(budget.get("diagnostics"))
     max_age = credit_lane.probe_max_age_s()
     age = _age_s(budget.get("generated_at"), now)
@@ -1309,7 +1311,13 @@ def scan_task_records(
     live_on_meter = 0
     last_meter_launch_age_s: float | None = None
     meter_recently_rate_limited = False
-    recent_since = clock.timestamp() - max(min_interval_s, LANE_RUNTIME_WINDOW_S) if meter is not None else None
+    rate_limit_window_s = 0.0
+    recent_since = None
+    if meter is not None:
+        from lu_machinery.agent_runtime.usage import LANE_RUNTIME_WINDOW_S
+
+        rate_limit_window_s = LANE_RUNTIME_WINDOW_S
+        recent_since = clock.timestamp() - max(min_interval_s, rate_limit_window_s)
     for path, state in iter_active_records(tasks_dir, recent_since=recent_since):
         task_id = str(state.get("task_id") or path.stem)
         mode = state.get("mode")
@@ -1324,7 +1332,7 @@ def scan_task_records(
                     last_meter_launch_age_s = launch_age
         if matches_meter and state.get("status") == "rate_limited":
             finished_age = _age_s(state.get("finished_at"), clock)
-            if finished_age is not None and 0 <= finished_age < LANE_RUNTIME_WINDOW_S:
+            if finished_age is not None and 0 <= finished_age < rate_limit_window_s:
                 meter_recently_rate_limited = True
         if state.get("status") not in ACTIVE_STATUSES:
             continue
