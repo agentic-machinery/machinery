@@ -20,6 +20,11 @@
 # whose failed PR or merge-queue run is the CI evidence for a repair-verification review round
 # (lu_machinery/review/repair_round.py); a failure of any one listed workflow is evidence. Default
 # `.github/workflows/ci.yml`.
+#
+# `security_alerts` (optional, boolean, default true) controls whether
+# `lu_machinery.security scan` watches GitHub code-scanning, Dependabot and
+# secret-scanning alerts for this repository. Set `security_alerts: false` to
+# opt a repository out of scanning and metrics.
 
 version: 1
 

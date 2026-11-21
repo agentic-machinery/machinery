@@ -27,6 +27,7 @@ class FleetRepo:
     local_name: str
     role: str
     default: bool = False
+    security_alerts: bool = True
 
     @property
     def owner(self) -> str:
@@ -62,10 +63,13 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
         local_name = body.get("local_name")
         role = body.get("role") or ""
         default = bool(body.get("default", False))
+        security_alerts = body.get("security_alerts", True)
         if not isinstance(github, str) or "/" not in github:
             raise FleetRepoError(f"fleet_repos[{key!r}].github must be owner/name")
         if not isinstance(local_name, str) or not local_name.strip():
             raise FleetRepoError(f"fleet_repos[{key!r}].local_name must be a non-empty string")
+        if type(security_alerts) is not bool:
+            raise FleetRepoError(f"fleet_repos[{key!r}].security_alerts must be a boolean")
         if default:
             defaults += 1
         out[key] = FleetRepo(
@@ -74,6 +78,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
             local_name=local_name.strip(),
             role=str(role),
             default=default,
+            security_alerts=security_alerts,
         )
     if defaults != 1:
         raise FleetRepoError("fleet_repos must mark exactly one default repo")

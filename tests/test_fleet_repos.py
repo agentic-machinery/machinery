@@ -118,5 +118,6 @@ def test_every_registered_repository_resolves_to_a_sibling_checkout_path(tmp_pat
         expected = primary.resolve() if row.default else (tmp_path / row.local_name).resolve()
         assert checkout == expected, key
         assert checkout not in seen, f"{key} and {seen.get(checkout)} share a checkout"
+        assert row.security_alerts is True, key
         seen[checkout] = key
     assert {"kube-dojo", "kubedojo-labs", "machinery"} <= set(catalog)
