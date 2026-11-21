@@ -15,6 +15,8 @@ Owner order, 2026-11-21: release when a change is ready, not on a schedule.
    safety-net run is part of the procedure.
 3. `claude-cto` runs every cut, so cuts never overlap. Workers and drivers
    report a merged change to `claude-cto` instead of running the cut.
+   No scheduled run may start a cut; `claude-cto` confirms none is enabled
+   before it cuts.
 4. The urgent-hotfix rule stays: an urgent fix is released at once. Other
    fixes are no longer held for a later window; they are released when ready
    too.

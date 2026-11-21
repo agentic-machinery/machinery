@@ -24,7 +24,9 @@ version files are behind or the `CI Gate` run has not passed), it refuses
 
 `claude-cto` runs every cut, on the host, as one command (Cut a release). A
 worker or driver does not run it: when its change has merged, it tells
-`claude-cto` in its report. One runner means two cuts never overlap. The cut
+`claude-cto` in its report. One runner means two cuts never overlap, so no
+scheduled run may start a cut: before it cuts, `claude-cto` confirms that none
+is enabled (a host change can restart one). The cut
 tags `main`'s HEAD; there is no release PR. `main` already carries the next
 version, because each release ends by opening the post-release PR that
 records its changelog and moves the version files on.
@@ -226,8 +228,11 @@ parsing.
 ```
 
 `cut --dry-run` runs everything except the tag, the publish, the two PRs and
-the live canary (it prints the canary's plan). Run it before a real cut to
-see what the cut would do. The command does these steps in
+the live canary (it prints the canary's plan). It is an optional
+diagnostic for the build and acceptance steps, never a readiness check and
+never a step before every cut: it can go on to build after the preflight
+would have refused the live cut. Cut as soon as readiness is established
+(see Release when ready). The command does these steps in
 order:
 
 1. **Preflight**, on a fresh clone of machinery `main`, whose HEAD is `$SHA`
