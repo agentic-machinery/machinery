@@ -378,6 +378,48 @@ def test_copies_of_other_repository_and_non_review_records_do_not_refuse(tmp_pat
     assert [path.name for path, _ in review_records(tasks, repository="owner/repo")] == ["review-one.json"]
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_owner_unreadable_record_of_another_task_refuses_and_names_its_mode(tmp_path, monkeypatch):
+    """Defect class: a record another process made unreadable is skipped, or refuses without saying why."""
+    from lu_machinery.review import review_lineage
+    from lu_machinery.review.review_lineage import LineageRefused, review_records
+
+    tasks = tmp_path / "tasks"
+    write_task(tasks, schema_version=2, pr=42, run_nonce="nonce-1")
+    write_task(tasks, task_id="b4-hidden", schema_version=2, run_nonce="nonce-2", repository="owner/other",
+               research_role="evaluation", mode="read-only")
+    hidden = tasks / "b4-hidden.json"
+    hidden.chmod(0o400)
+    assert [path.name for path, _ in review_records(tasks, repository="owner/repo")] == ["review-one.json"]
+    hidden.chmod(0o000)
+    try:
+        with pytest.raises(LineageRefused, match=r"b4-hidden\.json unreadable: Permission denied \(mode 000: another "
+                                                 r"process removed the owner's read permission\).*review run of this PR"):
+            review_records(tasks, repository="owner/repo")
+        with monkeypatch.context() as patch:
+            patch.setattr(review_lineage.os, "geteuid", lambda: hidden.stat().st_uid + 1)
+            with pytest.raises(LineageRefused, match=r"\(mode 000, owned by uid \d+, not this process\)"):
+                review_records(tasks, repository="owner/repo")
+        # Archived between the scan's stat and its read: the mode is the denied counterpart's own.
+        read_bytes = Path.read_bytes
+        archived = tasks / "archive" / hidden.name
+        archived.parent.mkdir()
+
+        def archive_first(path, *args, **kwargs):
+            if path == hidden and hidden.exists():
+                hidden.rename(archived)
+            return read_bytes(path, *args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "read_bytes", archive_first)
+            with pytest.raises(LineageRefused, match=r"b4-hidden\.json unreadable: Permission denied \(mode 000:"):
+                review_records(tasks, repository="owner/repo")
+        archived.rename(hidden)
+    finally:
+        hidden.chmod(0o600)
+    assert [path.name for path, _ in review_records(tasks, repository="owner/repo")] == ["review-one.json"]
+
+
 @pytest.mark.parametrize("failure", ["missing", "linked", "symlink-loop"])
 @pytest.mark.parametrize("form", ["file", "module"])
 @pytest.mark.parametrize("entry", ["review.record_cf_verdict", "dispatch", "dispatcher.cli"])
