@@ -62,7 +62,7 @@ from lu_machinery.common.repo_root import MachineryConfigError, ProductRootError
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.publish.github import CF_VERDICT_MARKER_PREFIX, Request, request_run
 from lu_machinery.review.language_lane import is_ukrainian_review
-from lu_machinery.review.reviewer_resolver import MIXED_REVIEW_SETS
+from lu_machinery.review.mixed_review_sets import MIXED_REVIEW_SETS
 from lu_machinery.review.ukrainian_seats import (
     UKRAINIAN_SEAT_FAMILIES,
     UKRAINIAN_SEAT_ROUTES,
