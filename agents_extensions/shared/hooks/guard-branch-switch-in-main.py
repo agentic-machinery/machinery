@@ -54,7 +54,10 @@ _MACHINERY = _ROOTS_READER_MODULE.partition(".")[0]
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
 try:
-    from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, preprocess_shell_command
+    from agents_extensions.shared.hooks.shell_shlex import (
+        skippable_heredoc_delimiters,
+        strip_skippable_heredoc_bodies,
+    )
 except Exception as exc:
     print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
@@ -62,6 +65,7 @@ except Exception as exc:
 try:
     from agents_extensions.shared.hooks.shell_redirects import (
         command_repository_unknown,
+        preprocess_branch_command,
         scope_events,
         segments_with_following_operator,
         unknown_repository_segments,
@@ -206,6 +210,25 @@ def _in_main_worktree(project_root: Path) -> bool:
 # Bash guards). Hooks are standalone by design, so the helpers are copied,
 # not imported. Keep the three active copies in guard-branch-switch-in-main.py,
 # guard-admin-merge.py, and guard-pr-merge.py in sync.
+
+
+def _heredoc_delimiters(line: str) -> list[tuple[str, bool]] | None:
+    """Keep only the shared parser's unambiguous here-doc delimiters."""
+    parsed = skippable_heredoc_delimiters(line)
+    return None if parsed is None else [(delimiter, strip_tabs) for delimiter, strip_tabs, _ in parsed]
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Drop heredoc BODY lines — document text is data, not commands.
+
+    Fail-CLOSED on an unclosed heredoc (#4877): if a delimiter never appears
+    before EOF, the buffered lines were NOT a real heredoc body — a crafted
+    or malformed opener (never-closing marker, mis-parsed ``<<-``) must not
+    make trailing REAL commands/writes vanish from the parsed view. Those
+    lines are kept and inspected; only a heredoc that actually closes has
+    its body + closer dropped.
+    """
+    return strip_skippable_heredoc_bodies(command)
 
 
 def _join_line_continuations(text: str) -> str:
@@ -599,17 +622,7 @@ def _gh_pr_checkout_reason(seg: list[str], effective_cwd: Path | None) -> str | 
 
 
 def _command_danger_reason(command: str, session_cwd: Path | None = None) -> str | None:
-    """Return a block reason only for a command targeting a protected root.
-
-    A command the shared reader cannot read is refused with its reason.
-    """
-    try:
-        return _danger_reason(command, session_cwd)
-    except ShellPreprocessLimit as exc:
-        return f"command could not be read safely ({exc})"
-
-
-def _danger_reason(command: str, session_cwd: Path | None) -> str | None:
+    """Return a block reason only for a command targeting a protected root."""
     effective_cwd = (session_cwd or Path.cwd()).resolve()
     # Deliberate rare over-block: case or parameter-expansion parentheses make
     # EVERY branch operation in this command unknown, even in a worktree, before
@@ -619,10 +632,10 @@ def _danger_reason(command: str, session_cwd: Path | None) -> str | None:
             if _segment_is_dangerous(segment) or _gh_pr_checkout_reason(segment, None):
                 return "branch-switch target could not be parsed safely"
         return None
-    # Read every here-document before the line scope reader: the shared view
-    # shows each body as plain words (shell_shlex.heredoc_view).
+    # Preprocess every heredoc before the line scope reader: quoted bodies are
+    # data, while real expansions in unquoted bodies remain executable syntax.
     if "<<" in command:
-        command = preprocess_shell_command(command)
+        command = preprocess_branch_command(command)
     events = scope_events(
         command,
         mark_redirect_unreadable=True,

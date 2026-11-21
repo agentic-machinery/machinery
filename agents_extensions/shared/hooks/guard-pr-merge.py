@@ -121,15 +121,21 @@ sys.dont_write_bytecode = True
 try:
     from agents_extensions.shared.hooks.shell_shlex import (
         ShellPreprocessLimit,
-        document_words,
-        heredoc_view,
-        parse_heredocs,
         preprocess_shell_command,
+        skippable_heredoc_delimiters,
         strip_shell_comments,
+        strip_skippable_heredoc_bodies,
     )
 except Exception as exc:
     print(f"guard dependency unavailable: shell_shlex ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
+try:
+    from agents_extensions.shared.hooks.shell_shlex import drop_literal_cat_bodies
+except ImportError:
+    # An installed release older than this hook lacks the helper: read every
+    # body as before, which can only refuse more.
+    def drop_literal_cat_bodies(command: str) -> str:
+        return command
 try:
     from lu_machinery.common import json_depth as json_depth
 except Exception as exc:
@@ -137,7 +143,7 @@ except Exception as exc:
     raise SystemExit(2) from exc
 
 try:
-    from agents_extensions.shared.hooks.shell_redirects import literal_lines, scope_events
+    from agents_extensions.shared.hooks.shell_redirects import literal_lines, preprocess_branch_command, scope_events
 except Exception as exc:
     print(f"guard dependency unavailable: shell_redirects ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
@@ -216,6 +222,22 @@ def _flag_enabled(args: list[str], name: str) -> bool:
 # Redirect tokenization is shared with the two sibling target guards.
 
 
+def _heredoc_delimiters(line: str) -> list[tuple[str, bool]] | None:
+    """Keep only the shared parser's unambiguous here-doc delimiters."""
+    parsed = skippable_heredoc_delimiters(line)
+    return None if parsed is None else [(delimiter, strip_tabs) for delimiter, strip_tabs, _ in parsed]
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Drop heredoc BODY lines — document text is data, not commands.
+
+    Fail-CLOSED on an unclosed heredoc (#4877): a never-closing / mis-parsed
+    opener must not make a trailing real `gh pr merge` vanish. Only a heredoc
+    that actually closes has its body + closer dropped.
+    """
+    return strip_skippable_heredoc_bodies(command)
+
+
 def _join_line_continuations(text: str) -> str:
     r"""Fold `\<newline>` into one logical line, as the shell does — so a
     `\`-continued `gh pr merge` is not split across physical lines and missed.
@@ -223,53 +245,10 @@ def _join_line_continuations(text: str) -> str:
     return text.replace("\\\n", "")
 
 
-# A merge a here-document body names, in any program's spelling: its words
-# (quotes removed) hold `gh`, then only options and their values, then
-# `pr merge`, or the publisher's `pr-merge`. Prose that only mentions merging
-# ("we use gh ... the phrase pr merge") is not an invocation.
-_BODY_TOKEN_SEPARATORS = re.compile(r"[\s\[\],]+")
-
-
-def _words_name_merge(line: str) -> bool:
-    """One linear pass over a body line's tokens for a merge invocation."""
-    tokens = [token for token in _BODY_TOKEN_SEPARATORS.split(line) if token]
-    if any(tokens[i] == "lu_machinery.publish" and tokens[i + 1] == "pr-merge" for i in range(len(tokens) - 1)):
-        return True
-    index = 0
-    while index < len(tokens):
-        if tokens[index] != "gh":
-            index += 1
-            continue
-        following = index + 1
-        while following < len(tokens) and tokens[following].startswith("-"):
-            following += 1
-            # An option may take one value (`-R owner/repo`).
-            if following < len(tokens) and not tokens[following].startswith("-") and tokens[following] != "pr":
-                following += 1
-        if tokens[following : following + 2] == ["pr", "merge"]:
-            return True
-        # A `gh` read above was an option value: the scan from it reaches the
-        # same token, so every token is visited a bounded number of times.
-        index = following
-    return False
-
-
-def _body_names_merge(command: str) -> bool:
-    """Whether any here-document body names a merge, whatever reads it.
-
-    No reader name proves a body is data (a function, alias or PATH entry can
-    stand behind any name), and a program such as Python can run the merge
-    the body spells, so such a body is never dismissed as text.
-    """
-    return any(_words_name_merge(line) for document in parse_heredocs(command) for line in document_words(document))
-
-
 def _scope_events(command: str, *, mark_redirect_unreadable: bool = True) -> list[tuple[str, list[str]]]:
     """Preserve the PR guard's existing event and unreadability policy."""
     try:
-        if _body_names_merge(command):
-            return [("segment", list(_UNPARSED))]
-        visible = heredoc_view(command)
+        visible = _without_quoted_heredoc_data(command, executable=True)
     except ShellPreprocessLimit:
         return [("segment", list(_UNPARSED))]
     return scope_events(
@@ -664,6 +643,224 @@ class _SplitQuoting(ShellPreprocessLimit):
     """A merge candidate whose quoting the line reader cannot group as Bash does."""
 
 
+def _quote_after_line(line: str, quote: str) -> str:
+    """The quote still open after ``line`` when it starts inside ``quote``."""
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if char == "\\" and quote != "'":
+            index += 2
+            continue
+        if char in "\"'" and (not quote or quote == char):
+            quote = "" if quote else char
+        index += 1
+    return quote
+
+
+def _literal_heredoc_data_reader(line: str) -> bool:
+    """Prove wrapper-free commands consume stdin as literal data."""
+    if any(char in line for char in ";&()$`"):
+        return False
+    if any(char in line for char in "|<>"):
+        readers = scope_events(
+            line,
+            mark_redirect_unreadable=False,
+            unreadable_marker=_UNREADABLE_MARKER,
+            unparsed=_UNPARSED,
+            may_match=_merge_candidate,
+            keep_separators=True,
+        )
+        # A trailing pipe continues after the closer; its reader is not on
+        # this line. Require alternating, complete data-reader stages.
+        return len(readers) % 2 == 1 and all(
+            (kind == "separator" and argv == ["|"])
+            if index % 2 else (
+                kind == "segment" and not any(char in arg for arg in argv for char in "|<>")
+                and _literal_heredoc_data_reader(shlex.join(argv))
+            )
+            for index, (kind, argv) in enumerate(readers)
+        )
+    try:
+        argv = shlex.split(line)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    if argv[0] in {"cat", "tee", "wc", "head"} or argv == ["sort"]:
+        return True
+
+    def stdin_option(options: set[str]) -> bool:
+        return any(
+            (arg in options and argv[index + 1 : index + 2] == ["-"])
+            or any(arg == option + "=-" for option in options if option.startswith("--"))
+            or ("-F" in options and arg == "-F-")
+            for index, arg in enumerate(argv)
+        )
+
+    if argv[:2] == ["git", "commit"]:
+        return stdin_option({"-F", "--file"})
+    if argv[:2] in (["gh", "pr"], ["gh", "issue"]) and argv[2:3] in (
+        ["create"],
+        ["comment"],
+        ["edit"],
+        ["merge"],
+    ):
+        return stdin_option({"--body-file", "-F"})
+    return (
+        re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(argv[0]).name) is not None
+        and argv[1:3] == ["-m", _PUBLISHER]
+        and argv[3:4]
+        in (
+            ["pr-create"],
+            ["pr-edit"],
+            ["pr-comment"],
+            ["pr-merge"],
+            ["issue-create"],
+            ["issue-edit"],
+            ["issue-comment"],
+            ["comment-edit"],
+        )
+        and stdin_option({"--body-file"})
+    )
+
+
+def _without_quoted_heredoc_data(command: str, *, executable: bool = False) -> str:
+    """Prove literal data input, or expose a shell stdin script as a -c payload.
+
+    The executable view feeds the existing nested-command walker. Unknown
+    interpreters and uncertain execution contexts are refused.
+
+    Bash expands nothing in such a body and reads it by physical lines, so its
+    backticks and `$(` are text and a trailing backslash does not join the closer.
+    The whole command is kept, for the raw check to read, whenever a body's start
+    or end is not certain: an ambiguous opener (the shared parser's rule), an
+    unquoted delimiter, an opener line ending inside a quote or with a backslash
+    continuation (Bash then starts the body after a later line), an unclosed
+    body, an ANSI-C `$'` quote, or a carriage return. For one proven data reader,
+    the shared quote-aware reader also admits backslash/partially quoted delimiters.
+    """
+
+    def uncertain() -> str:
+        if executable and _merge_candidate(command):
+            raise ShellPreprocessLimit("heredoc boundaries cannot be read safely")
+        return command
+
+    if "<<" not in command:
+        return command
+    if "\r" in command or "$'" in command:
+        return uncertain()
+    lines = command.split("\n")
+    kept: list[str] = []
+    body_free: list[str] = []
+    bodies: list[str] = []
+    data_only = True
+    prefix_data_only = True
+    quote = ""
+    joined = False  # this line continues the previous one (`cat <\` + `<<'EOF'` is `<<<`)
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        body_free.append(line)
+        index += 1
+        if quote:
+            quote = _quote_after_line(line, quote)
+            joined = not quote and (len(line) - len(line.rstrip("\\"))) % 2 == 1
+            continue
+        if joined and "<<" in line:
+            return uncertain()
+        opener = strip_shell_comments(line)
+        joined = (len(line) - len(line.rstrip("\\"))) % 2 == 1
+        delimiters = skippable_heredoc_delimiters(opener) if "<<" in opener else []
+        if delimiters is None:
+            # The quote-aware reader also understands \\EOF and E'OF'. Only
+            # use its body removal for a single proven data-consuming command;
+            # executable readers and later commands retain the refusal below.
+            if prefix_data_only and _literal_heredoc_data_reader(opener):
+                visible = preprocess_branch_command(command)
+                commands = [line for line in visible.splitlines() if line.strip()]
+                if len(commands) == 1 and _literal_heredoc_data_reader(commands[0]):
+                    return visible
+            return uncertain()
+        if not delimiters:
+            quote = _quote_after_line(opener, "")
+            if opener.strip():
+                prefix_data_only = False
+            continue
+        if (
+            _quote_after_line(opener, "")
+            or joined
+            or (not executable and not all(quoted for _, _, quoted in delimiters))
+        ):
+            return uncertain()
+        reader_is_data = prefix_data_only and _literal_heredoc_data_reader(opener)
+        for delimiter, strip_tabs, _ in delimiters:
+            start = index
+            while index < len(lines) and (lines[index].lstrip("\t") if strip_tabs else lines[index]) != delimiter:
+                index += 1
+            if index == len(lines):
+                return uncertain()
+            body = "\n".join(lines[start:index])
+            bodies.append(body)
+            data_only = data_only and reader_is_data
+            # Preserve an empty, closed heredoc in the executable view. Without
+            # its closer, shared preprocessing could swallow later commands.
+            body_free.append(lines[index])
+            index += 1
+        prefix_data_only = reader_is_data
+    if executable and bodies and any(_merge_candidate(body) for body in bodies):
+        # Only the data-reader proof for every pipeline stage can dismiss a body.
+        # A shell stdin script uses the same nested-command walk as bash -c.
+        # Other readers (including Python) require a parser we do not have.
+        if data_only:
+            return "\n".join(body_free)
+        openers = [text for line in kept if (text := strip_shell_comments(line).strip())]
+        if len(openers) != 1:
+            raise ShellPreprocessLimit("heredoc execution context cannot be read safely")
+        readers = scope_events(
+            openers[0],
+            mark_redirect_unreadable=False,
+            unreadable_marker=_UNREADABLE_MARKER,
+            unparsed=_UNPARSED,
+            may_match=_merge_candidate,
+        )
+        shell_readers = 0
+        for kind, argv in readers:
+            if kind != "segment":
+                raise ShellPreprocessLimit("heredoc reader cannot be read safely")
+            invoked, _ = _invoked_start(argv)
+            args = argv[invoked:]
+            if invoked:
+                raise ShellPreprocessLimit("heredoc reader wrapper cannot be read safely")
+            if (
+                args
+                and args[0].rsplit("/", 1)[-1] in _SHELLS
+                and all(arg in {"-", "-s", "--", "--noprofile", "--norc"} for arg in args[1:])
+            ):
+                shell_readers += 1
+            elif (
+                not args
+                or args[0] not in {"cat", "tee", ":", "let", "echo", "printf", "true", "false"}
+                or (args[0] == "cat" and args[1:])
+            ):
+                raise ShellPreprocessLimit("heredoc interpreter cannot be read safely")
+        if shell_readers > 1:
+            raise ShellPreprocessLimit("heredoc pipeline reinterprets generated output")
+        if shell_readers:
+            return "\n".join("bash -c " + shlex.quote(body) for body in bodies)
+        # Unquoted literal cat/tee input remains data; expansions are checked
+        # by the raw-quoting tripwire and the shared preprocessor.
+        return command
+    # A quoted delimiter prevents expansion by the outer shell, not execution by
+    # the reader. Only proven literal data consumers at every stage make these bodies
+    # inert: interpreters, pipelines, prior function definitions and later script
+    # execution must keep the raw check's existing refusal.
+    commands = [text for line in kept if (text := strip_shell_comments(line).strip())]
+    if len(commands) != 1 or not _literal_heredoc_data_reader(commands[0]):
+        return command
+    return "\n".join(kept)
+
+
 def _unmodeled_quoting(command: str) -> bool:
     """Stop before Bash-only quote contexts can desynchronize shlex."""
     # Comments, heredoc data and continuing quotes can disagree about state
@@ -742,10 +939,9 @@ def _may_merge(command: str, depth: int = 0) -> bool:
     """
     # Keep both representations: preprocessing may expose split syntax or
     # remove quote-bearing data, and may rewrite Bash-only syntax itself.
-    # Here-document bodies are plain words in both (shell_shlex.heredoc_view):
-    # Markdown backticks in a brief are not quote syntax, and a merge the body
-    # names is judged like any other command.
-    literal_view = heredoc_view(command)
+    # Quoted here-doc bodies are data in both: a brief that mentions a merge in
+    # Markdown backticks is not shell syntax.
+    literal_view = _without_quoted_heredoc_data(command)
     if _merge_candidate(command) and (
         _unmodeled_quoting(literal_view)
         or _unmodeled_quoting(preprocess_shell_command(literal_view))
@@ -1564,7 +1760,9 @@ def main() -> int:
     if not isinstance(payload.get("tool_input", {}).get("command", ""), str):
         sys.stderr.write(_block_msg("malformed hook command", "Provide a literal Bash command for review."))
         return 2
-    command = _command(payload)
+    # A body that Bash certainly hands to `cat` is data (C-6323); every other
+    # body stays in the text the checks below read.
+    command = drop_literal_cat_bodies(_command(payload))
     if not _merge_candidate(command):
         return 0
     # Each segment arrives carrying the cwd it runs in, so a PR number is judged in the

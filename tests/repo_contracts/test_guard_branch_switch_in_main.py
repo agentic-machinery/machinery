@@ -28,7 +28,6 @@ from pathlib import Path
 
 import pytest
 
-from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, document_words, parse_heredocs
 from lu_machinery.common.repo_root import machinery_path
 from tests.helpers.restore_import_state import restore_import_state
 
@@ -184,9 +183,8 @@ def test_issue_9102_executable_payload_stays_visible(repos, shape):
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
-def test_issue_9102_real_let_heredoc_body_words_stay_visible():
-    # The `<<` of `let x=1<<EOF` is a here-document; its body words stay visible.
-    assert _dangerous("let x=1<<EOF\ngit checkout -b feature\nEOF") is not None
+def test_issue_9102_real_let_heredoc_body_is_inert():
+    assert _dangerous("let x=1<<EOF\ngit checkout -b feature\nEOF") is None
 
 
 @pytest.mark.parametrize(
@@ -221,7 +219,7 @@ def test_issue_9115_backtick_depth_limit_blocks_branch_hook(repos, monkeypatch):
 
 
 def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
-    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(r'echo "a \" b" <<EOF' "\nx\nEOF")] == [("EOF", False)]
+    assert guard._heredoc_delimiters(r'echo "a \" b" <<EOF') == [("EOF", False)]
 
 
 @pytest.mark.parametrize(
@@ -234,8 +232,8 @@ def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
     ],
 )
 def test_issue_9088_standard_heredoc_delimiters(opener, closer):
-    assert [(d.closer, d.strip_tabs) for d in parse_heredocs(f"cat {opener}\nx\n{closer}")] == [("EOF", opener == "<<-EOF")]
-    assert _dangerous(f"cat {opener}\ngit checkout -b feature\n{closer}") is not None
+    assert guard._heredoc_delimiters(f"cat {opener}") == [("EOF", opener == "<<-EOF")]
+    assert _dangerous(f"cat {opener}\ngit checkout -b feature\n{closer}") is None
     assert _dangerous(f"cat {opener}\nnote\n{closer}\ngit checkout -b feature") is not None
 
 
@@ -251,15 +249,14 @@ def test_issue_9088_standard_heredoc_delimiters(opener, closer):
 )
 def test_issue_9088_here_strings_keep_branch_switch_visible(repos, first):
     command = f"{first}\ngit checkout -b feature\nEOF"
-    assert parse_heredocs(first) == ()
+    assert guard._heredoc_delimiters(first) == []
     assert _dangerous(command) is not None
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
 def test_issue_9088_crlf_closer_keeps_branch_switch_visible(repos):
     command = "cat <<EOF\r\nEOF\r\ngit checkout -b feature\nEOF"
-    with pytest.raises(ShellPreprocessLimit):
-        _dangerous(command)
+    assert _dangerous(command) is not None
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
@@ -275,10 +272,12 @@ def test_issue_9088_reviewer_heredoc_bypass_blocks(repos, monkeypatch):
 @pytest.mark.parametrize(
     "opener,closer",
     [
+        (r'<<"EO\"F"', 'EO"F'),
         (r"<<$'EOF'", "EOF"),
         ('<<$"EOF"', "EOF"),
         (r"<<$'EO\x22F'", 'EO"F'),
         (r"<<EO$'F'", "EOF"),
+        (r"<<E\OF", "EOF"),
         (r"<<-$'EOF'", "\tEOF"),
         (r"<<$'EOF' <<SAFE", "EOF\nSAFE"),
         (r"<<SAFE <<$'EOF'", "SAFE\nEOF"),
@@ -286,17 +285,14 @@ def test_issue_9088_reviewer_heredoc_bypass_blocks(repos, monkeypatch):
 )
 def test_issue_9088_exotic_heredoc_keeps_branch_switch_visible(repos, opener, closer):
     command = f"cat {opener}\ngit checkout -b x\n{closer}"
-    with pytest.raises(ShellPreprocessLimit):
-        parse_heredocs(f"cat {opener}\nx\n{closer}")
-    with pytest.raises(ShellPreprocessLimit):
-        _dangerous(command)
+    assert guard._heredoc_delimiters(f"cat {opener}") is None
+    assert _dangerous(command) is not None
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
 def test_issue_9088_exotic_body_cannot_skip_later_safe_opener(repos):
     command = "cat <<$'EOF'\ncat <<SAFE\ngit checkout -b x\nSAFE\nEOF"
-    with pytest.raises(ShellPreprocessLimit):
-        _dangerous(command)
+    assert _dangerous(command) is not None
     assert guard._command_danger_reason(command, repos["public"]) is not None
 
 
@@ -606,21 +602,16 @@ def test_wrapper_options_do_not_hide_branch_verb(cmd):
 def test_unclosed_heredoc_does_not_hide_trailing_danger():
     # A never-closing marker must NOT drop the real command after it (#4877
     # fail-open): the buffered lines were not a real heredoc body.
-    command = "cat <<'NOEND'\nbody > fake\ngit branch -D main"
-    with pytest.raises(ShellPreprocessLimit):
-        _dangerous(command)
-    assert guard._command_danger_reason(command) is not None
+    assert _dangerous("cat <<'NOEND'\nbody > fake\ngit branch -D main") is not None
 
 
-def test_attached_dash_heredoc_closes_and_body_words_stay_visible():
-    # `<<-EOF` with a tab-indented closer is a REAL heredoc: it closes, the
-    # trailing command is still scanned, and no reader name proves its body is
-    # data (C-6334), so the body's words stay visible too.
+def test_attached_dash_heredoc_closes_and_body_dropped():
+    # `<<-EOF` with a tab-indented closer is a REAL heredoc: body dropped
+    # (no false positive on body content), trailing command still scanned.
     cmd = "cat <<-EOF\n\tgit branch -D fake\n\tEOF\ngit branch -D main"
     assert _dangerous(cmd) is not None  # the trailing real one
-    assert [d.closer for d in parse_heredocs(cmd)] == ["EOF"]
-    assert _dangerous("cat <<-EOF\n\tgit branch -D fake\n\tEOF") is None  # not a protected branch
-    assert _dangerous("cat <<-EOF\n\tgit branch -D main\n\tEOF") is not None
+    # body-only (properly closed) must not trip:
+    assert _dangerous("cat <<-EOF\n\tgit branch -D fake\n\tEOF") is None
 
 
 # --- #4899: target-repo-aware protected-root matching ----------------------
@@ -1413,13 +1404,7 @@ def test_issue_9479_r8_quoted_branch_prose_is_data_bash(
     if prefix:
         expected.insert(0, ["git", str(repos[start]), "switch", "-c", "fixture"])
     assert records == expected
-    # No reader name proves a body is data (C-6334): its words are judged as
-    # commands, so a branch operation the body spells counts in the primary.
-    words = "\n".join(document_words(parse_heredocs(command)[0]))
-    spelled = guard._command_danger_reason(words, repos[start]) is not None
-    assert (guard._command_danger_reason(command, repos[start]) is not None) == (
-        start == "public" and (bool(prefix) or spelled)
-    )
+    assert (guard._command_danger_reason(command, repos[start]) is not None) == (bool(prefix) and start == "public")
 
 
 @pytest.mark.parametrize("start", ["public", "public_worktree"])

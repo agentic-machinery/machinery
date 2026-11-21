@@ -149,27 +149,22 @@ def _probe_child(hook_dir: Path, commands: list[str]) -> dict[str, list[bool]]:
         spec.loader.exec_module(module)
         modules[name] = module
 
-    from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit
-
-    admin = modules["admin_merge"]
-    pr = modules["pr_merge"]
-    branch = modules["branch_switch_in_main"]
-    secret = modules["secret_print"]
-    write = modules["primary_checkout_write"]
-    deciders = {
-        "admin_merge": lambda c: any(admin._admin_merge_args(s) is not None for s in admin._segments(c)),
-        "pr_merge": lambda c: any(pr._merge_args(s) is not None for s in pr._segments(c)),
-        "branch_switch_in_main": lambda c: any(branch._segment_is_dangerous(s) is not None for s in branch._segments(c)),
-        "secret_print": lambda c: secret._scan_command(c, set()),
-        "primary_checkout_write": lambda c: write.bash_write_targets(c),
-    }
     verdicts: dict[str, list[bool]] = {name: [] for name in GUARDS}
     for command in commands:
-        for name, decide in deciders.items():
-            try:
-                verdicts[name].append(bool(decide(command)))
-            except ShellPreprocessLimit:  # the shared reader's typed refusal is a block
-                verdicts[name].append(True)
+        admin = modules["admin_merge"]
+        verdicts["admin_merge"].append(
+            any(admin._admin_merge_args(segment) is not None for segment in admin._segments(command))
+        )
+        pr = modules["pr_merge"]
+        verdicts["pr_merge"].append(any(pr._merge_args(segment) is not None for segment in pr._segments(command)))
+        branch = modules["branch_switch_in_main"]
+        verdicts["branch_switch_in_main"].append(
+            any(branch._segment_is_dangerous(segment) is not None for segment in branch._segments(command))
+        )
+        secret = modules["secret_print"]
+        verdicts["secret_print"].append(bool(secret._scan_command(command, set())))
+        write = modules["primary_checkout_write"]
+        verdicts["primary_checkout_write"].append(bool(write.bash_write_targets(command)))
     return verdicts
 
 
