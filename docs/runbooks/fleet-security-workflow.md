@@ -37,7 +37,7 @@ with:
   runs-on: ${{ toJSON(vars.SECURITY_RUNNER) }}
 ```
 
-The runner needs Git, Bash, curl, tar, Python 3, jq, and sha256sum. The workflow downloads and verifies its scanner binaries. On a runner without Docker, leave `run-trivy-image` disabled. Use self-hosted runners with private repositories. [GitHub runner guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
+The runner needs Git, Bash, curl, tar, Python 3.10 or later at `/usr/bin/python3`, jq, and sha256sum. The workflow downloads and verifies its scanner binaries. On a runner without Docker, leave `run-trivy-image` disabled. Use self-hosted runners with private repositories. [GitHub runner guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
 
 ## Security and private-repository guarantees
 
