@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from tests.helpers.product_tree import configured_roots as configured_roots
+from lu_machinery.common import json_depth
+from lu_machinery.dispatcher import host_admission, pool_selector
 from lu_machinery.orchestration import dispatch_admission as adm
 from lu_machinery.orchestration import worktree_prep
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 _GIB = 1024**3
 _LIMITS = adm.Thresholds(max_live_write_workers=2, min_mem_available_gib=3.5, max_load_per_cpu=1.5)
@@ -63,6 +67,117 @@ def test_cap_reached_is_refused(tmp_path, probe):
     [failure] = decision.failures
     assert "live write workers 2/2 reached the cap (DISPATCH_MAX_LIVE_WRITE_WORKERS=2)" in failure
     assert "--force-admission" in decision.refusal_line()
+
+
+def test_meter_cap_defers_only_the_meter_at_its_limit(tmp_path, probe):
+    """Defect class: a full meter admits another write or blocks a different account."""
+    tasks = tmp_path / "tasks"
+    now = datetime.now(UTC)
+    _record(tasks, "codex-b", agent="codex", codex_account="b-sub")
+    limits = adm.load_thresholds({
+        "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER": "1",
+        "DISPATCH_MIN_METER_LAUNCH_INTERVAL_S": "0",
+    })
+    blocked = adm.evaluate("workspace-write", tasks, thresholds=limits,
+                           pid_alive=lambda _pid: True, meter="codex:b", now=now)
+    admitted = adm.evaluate("workspace-write", tasks, thresholds=limits,
+                            pid_alive=lambda _pid: True, meter="codex:a", now=now)
+
+    assert not blocked.admitted
+    assert blocked.meter is not None and blocked.meter.defer == adm.MeterDefer.CAP
+    assert "meter codex:b: live write workers 1/1" in blocked.refusal_line()
+    assert "subscription_meter_defer=cap" in blocked.refusal_line()
+    assert admitted.admitted
+    assert "meter codex:a: live write workers 0/1" in admitted.summary()
+
+
+def test_meter_cadence_measures_from_the_last_launch_even_if_it_finished(tmp_path, probe):
+    """Defect class: a meter relaunches inside its minimum interval."""
+    tasks = tmp_path / "tasks"
+    now = datetime.now(UTC)
+    _record(tasks, "finished", status="done", agent="claude", started_at=now.isoformat())
+    # A refusal does not extend the interval.
+    _record(tasks, "refused", status="failed", agent="claude", never_started_reason="admission_capacity",
+            started_at=(now + timedelta(seconds=4)).isoformat())
+    limits = replace(_LIMITS, min_meter_launch_interval_s=5)
+    blocked = adm.evaluate("workspace-write", tasks, thresholds=limits, meter="claude:a",
+                           now=now + timedelta(seconds=4))
+    admitted = adm.evaluate("workspace-write", tasks, thresholds=limits, meter="claude:a",
+                            now=now + timedelta(seconds=5))
+
+    assert not blocked.admitted
+    assert blocked.meter is not None and blocked.meter.defer == adm.MeterDefer.CADENCE
+    assert "launch interval 5s, subscription_meter_defer=cadence (retry in 1.00s)" in blocked.refusal_line()
+    assert admitted.admitted
+
+
+def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, probe, monkeypatch):
+    """Defect class: throttled or depleted meters admit writes, or unknown pace raises the ceiling."""
+    tasks = tmp_path / "tasks"
+    now = datetime.now(UTC)
+    limits = replace(adm.load_thresholds({}), max_live_write_workers=10, min_meter_launch_interval_s=0)
+    assert limits.max_live_write_workers_per_meter == 8
+    for index in range(8):
+        _record(tasks, f"worker-{index}", agent="codex")
+
+    def decide(row, *, stale=False):
+        budget = {"diagnostics": {"stale": stale}, "generated_at": now.isoformat(),
+                  "codex_accounts": {"codex:a": row}}
+        return adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                            meter="codex:a", meter_budget=budget, now=now)
+
+    for row, reason in (
+        ({"status": "rate_limited"}, "rate_limited"),
+        ({"status": "cool", "runtime": {"rate_limited": 1}}, "rate_limited"),
+        ({"status": "near_cap"}, "near_cap"),
+        ({"remaining_pct": 0}, "exhausted"),
+    ):
+        decision = decide(row)
+        assert not decision.admitted
+        assert f"subscription_meter_defer={reason}" in decision.refusal_line()
+    fresh = {
+        "status": "cool", "freshness": "fresh", "age_s": 0,
+        "forecast": {"remaining_pct": 20, "reset_at": (now + timedelta(hours=2)).isoformat(),
+                     "burn_pct_per_hour": 20},
+    }
+    for result in (decide({}), decide(fresh, stale=True), decide(fresh)):
+        assert not result.admitted
+        assert result.meter is not None and result.meter.cap == 8
+        assert result.meter.defer == adm.MeterDefer.CAP
+    _record(tasks, "claude-b-limited", status="rate_limited", agent="claude", claude_account="b",
+            finished_at=now.isoformat())
+    for account, expected in (("b", adm.MeterDefer.RATE_LIMITED), ("a", None)):
+        result = adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                              meter=f"claude:{account}", now=now)
+        assert result.meter is not None and result.meter.defer == expected
+        assert result.admitted == (expected is None)
+
+    def overdeep_budget():
+        return json_depth.loads("[" * 600 + "]" * 600, max_depth=512)
+
+    monkeypatch.setattr(pool_selector, "read_budget", overdeep_budget)
+    monkeypatch.setattr(host_admission, "tasks_dir", lambda: tmp_path / "overdeep-tasks")
+    monkeypatch.setattr(adm, "load_thresholds", lambda: limits)
+    spec = SimpleNamespace(mode="workspace-write", agent="codex", model="gpt-6.2-sol",
+                           claude_account=None, codex_account="b-sub")
+    result = host_admission.check(spec.mode, dry_run=True, disk_guard=False, spec=spec)
+    assert result.admitted
+    assert "meter codex:b: live write workers 0/8 (fixed cap)" in result.summary()
+
+
+def test_grok_and_cursor_share_one_meter(tmp_path, probe):
+    """Defect class: Grok and Cursor each spend a slot on a different meter."""
+    tasks = tmp_path / "tasks"
+    _record(tasks, "grok", agent="grok")
+    _record(tasks, "cursor", agent="cursor")
+    limits = replace(_LIMITS, max_live_write_workers=5, max_live_write_workers_per_meter=2)
+
+    for agent in ("cursor", "grok"):
+        decision = adm.evaluate("workspace-write", tasks, thresholds=limits,
+                                pid_alive=lambda _pid: True, meter=adm.subscription_meter(agent))
+        assert not decision.admitted
+        assert "meter grok+cursor: live write workers 2/2" in decision.refusal_line()
+        assert "subscription_meter_defer=cap" in decision.refusal_line()
 
 
 def test_read_only_and_terminal_records_do_not_hold_write_slots(tmp_path, probe):

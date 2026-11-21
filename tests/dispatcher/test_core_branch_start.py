@@ -684,6 +684,9 @@ def test_canonical_origins_does_not_reject_same_identity_when_clone_transport_di
 def test_prior_worker_origin_poisoning_refuses_dispatch_and_fails_closed(sandbox):
     """Shared config poisoned before dispatch cannot certify a forged empty range."""
     earlier = sandbox.settle(sandbox.dispatch("unpushed", "--mode", "workspace-write"), expected=1)
+    # Expire the previous reservation so the next dispatch reaches the origin check.
+    earlier["started_at"] = "2000-01-01T00:00:00Z"
+    (sandbox.tasks / f"{earlier['task_id']}.json").write_text(json.dumps(earlier), encoding="utf-8")
     fake = sandbox.repo.parent / "forged.git"
     tree = Path(earlier["cwd"])
     run_git(tree, "clone", "--bare", str(sandbox.remote), str(fake))
