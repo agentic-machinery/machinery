@@ -2420,7 +2420,7 @@ def publish(
             if fields.get("epic"):
                 if not cto_safe_mode.is_cto_caller(os.environ):
                     raise gate.PublishBlocked("EPIC_REFUSED: --epic requires the CTO seat; nothing was created.")
-                if policy != "stream" or not dest.startswith("github.com/") or "parent" in fields:
+                if policy != "stream" or environment["GH_HOST"] != "github.com" or "parent" in fields:
                     raise gate.PublishBlocked(
                         "EPIC_REFUSED: use --epic without --parent in the stream registry repository on github.com; "
                         "nothing was created."
