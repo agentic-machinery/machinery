@@ -15,17 +15,21 @@
 #   new errors fail, the baseline only shrinks); the test-wait lint L4
 #   (lu_machinery.lint.lint_test_waits: a new sleep, timer poll, flaky or rerun
 #   mark, rerun option, or non-strict xfail fails, and the baseline only shrinks);
-#   actionlint (with a pinned ShellCheck) and zizmor (offline) over
-#   .github/workflows/; the TruffleHog secret scan and the Semgrep SAST scan;
-#   dependency-audit (pip-audit of the uv.lock runtime closure, npm audit of
-#   package-lock.json). The secret-scan and sast jobs below are the only
-#   definition of each scan for the machinery repository; CodeQL code scanning
-#   is codeql.yml beside this file, outside the gate. installed-wheel builds the release wheel
-#   from the tracked tree, installs it offline with the uv.lock runtime export
-#   (pip --require-hashes) into clean core and per-extra venvs and imports
-#   every lu_machinery module on the pinned Python. On PRs and merge groups it
-#   checks the wheel against the product commit in product-consumer.pin. It runs
-#   release_cut consumer-collection and the pin's key consumer tests.
+#   fleet-security (calls reusable fleet-security.yml for actionlint, ShellCheck
+#   over .github/ at style plus tracked shell trees at error, zizmor offline and
+#   Trivy dependency/licence scanning over package-lock.json and uv.lock);
+#   secret-scan (calls reusable fleet-security.yml for the TruffleHog history
+#   scan, running on every event including reuse pushes) and the Semgrep SAST
+#   scan; dependency-audit (pip-audit of the uv.lock runtime closure, npm audit
+#   of package-lock.json with pinned Node/npm). The secret-scan and sast jobs
+#   below are the only definition of each scan for the machinery repository;
+#   CodeQL code scanning is codeql.yml beside this file, outside the gate.
+#   installed-wheel builds the release wheel from the tracked tree, installs it
+#   offline with the uv.lock runtime export (pip --require-hashes) into clean
+#   core and per-extra venvs and imports every lu_machinery module on the pinned
+#   Python. On PRs and merge groups it checks the wheel against the product
+#   commit in product-consumer.pin. It runs release_cut consumer-collection and
+#   the pin's key consumer tests.
 #   pytest calls tests.yml for the full six-shard suite on
 #   merge_group, unmatched push and workflow_dispatch. pull_request calls that workflow
 #   as pr-affected and does not run the full suite.
@@ -50,14 +54,14 @@
 #   `needs` and the gate's expected list; nothing else catches a job left out of both.
 # - Hosted runners only (ubuntu-24.04). Every tool is downloaded at a pinned
 #   version and checked against a pinned SHA-256 before it runs: release
-#   tarballs for actionlint, ShellCheck and uv; uv-managed CPython (uv checks
-#   each download against the hash it ships); `uv sync --locked` from uv.lock,
-#   which checks the SHA-256 of every wheel, for Ruff, mypy, zizmor,
-#   pip-audit and Semgrep. The build tools use hash-pinned PyPI wheels
-#   (pip --require-hashes --only-binary=:all:). npm audit uses the
-#   hosted runner's npm. Every venv lives in the job temp directory. Installers
-#   that run Python use isolated interpreters (python -I), so no Python module
-#   in the checkout is imported while installing.
+#   tarballs for actionlint, ShellCheck, zizmor, TruffleHog, Trivy and uv;
+#   uv-managed CPython (uv checks each download against the hash it ships);
+#   `uv sync --locked` from uv.lock, which checks the SHA-256 of every wheel,
+#   for Ruff, mypy, pip-audit and Semgrep. The build tools use hash-pinned PyPI
+#   wheels (pip --require-hashes --only-binary=:all:). npm audit uses the pinned
+#   Node/npm release via actions/setup-node. Every venv lives in the job temp
+#   directory. Installers that run Python use isolated interpreters (python -I),
+#   so no Python module in the checkout is imported while installing.
 # - Read-only contents permission, no kept checkout token,
 #   no secrets. Scanners and zizmor run under `env -i`, so no runner credential
 #   reaches them. zizmor runs offline: its online audits (impostor commits,
@@ -98,9 +102,13 @@ env:
   UV_LINUX_X86_64_SHA256: a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5
   # uv-managed CPython only, the build the host runs; never the runner's own.
   UV_PYTHON_PREFERENCE: only-managed
+  NODE_VERSION: "22.23.4"
+  NPM_VERSION: "10.9.9"
   RUFF_VERSION: "0.15.21"
   MYPY_VERSION: "2.4.0"
   ZIZMOR_VERSION: "1.31.1"
+  ZIZMOR_RELEASE_ASSET_ID: "645467284"
+  ZIZMOR_LINUX_X86_64_SHA256: d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99
   PIP_AUDIT_VERSION: "2.10.1"
   ACTIONLINT_VERSION: "1.7.12"
   ACTIONLINT_RELEASE_ASSET_ID: "384924896"
@@ -159,10 +167,23 @@ jobs:
           scanned="$(jq -r .commit <<< "$source")"
           jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/attempts/$attempt/jobs?per_page=100")"
           jq -e --arg sha "$scanned" '
-            . as $jobs | ["Secret scan (TruffleHog)", "Verified trailer"] | all(.[];
-              . as $name | $jobs.jobs | any(.[];
-                .name == $name and .head_sha == $sha
+            . as $jobs
+            | ($jobs.jobs | any(.[];
+                .name == "Verified trailer" and .head_sha == $sha
                 and .status == "completed" and .conclusion == "success"))
+            and (
+              ($jobs.jobs | any(.[];
+                .name == "Secret scan (TruffleHog)" and .head_sha == $sha
+                and .status == "completed" and .conclusion == "success"))
+              or (
+                ($jobs.jobs | any(.[];
+                  .name == "Secret scan / Secret scan (TruffleHog)" and .head_sha == $sha
+                  and .status == "completed" and .conclusion == "success"))
+                and ($jobs.jobs | any(.[];
+                  .name == "Secret scan / Fleet security gate" and .head_sha == $sha
+                  and .status == "completed" and .conclusion == "success"))
+              )
+            )
             ' <<< "$jobs" > /dev/null
           # Merge-base also covers every commit reachable only from this head
           # after a divergent push. Only immutable SHAs go to the compare API.
@@ -252,6 +273,18 @@ jobs:
           asset-id: ${{ env.TRUFFLEHOG_RELEASE_ASSET_ID }}
           token: ${{ github.token }}
           member: trufflehog
+
+      - name: Restore verified zizmor
+        if: steps.match.outputs.run_id != ''
+        uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+        with:
+          tool: zizmor
+          version: ${{ env.ZIZMOR_VERSION }}
+          sha256: ${{ env.ZIZMOR_LINUX_X86_64_SHA256 }}
+          repository: zizmorcore/zizmor
+          asset-id: ${{ env.ZIZMOR_RELEASE_ASSET_ID }}
+          token: ${{ github.token }}
+          member: zizmor
 
       - name: Record reused CI Gate proof
         id: proof
@@ -535,400 +568,51 @@ jobs:
           fi
           python -m lu_machinery.lint.lint_test_waits
 
-  actionlint:
+  fleet-security:
+    name: Fleet security
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
-    name: actionlint
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+    uses: ./.github/workflows/fleet-security.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+    with:
+      run-actionlint: true
+      run-shellcheck: true
+      shellcheck-paths: |
+        .github
+        .githooks|error
+        lu_machinery|error
+        packaging|error
+        agents_extensions|error
+      shellcheck-severity: style
+      run-zizmor: true
+      zizmor-paths: |
+        .github/workflows
+        .github/actions
+      run-trivy-fs: true
+      trivy-fs-targets: |
+        package-lock.json
+        uv.lock
+      trivy-scanners: vuln,license
+      trivy-severity: HIGH,CRITICAL
+      trivy-include-dev-deps: true
 
-      - name: Restore verified actionlint
-        uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
-        with:
-          tool: actionlint
-          version: ${{ env.ACTIONLINT_VERSION }}
-          sha256: ${{ env.ACTIONLINT_LINUX_AMD64_SHA256 }}
-          repository: rhysd/actionlint
-          asset-id: ${{ env.ACTIONLINT_RELEASE_ASSET_ID }}
-          token: ${{ github.token }}
-          member: actionlint
-
-      - name: Restore verified ShellCheck
-        uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
-        with:
-          tool: shellcheck
-          version: ${{ env.SHELLCHECK_VERSION }}
-          sha256: ${{ env.SHELLCHECK_LINUX_X86_64_SHA256 }}
-          repository: koalaman/shellcheck
-          asset-id: ${{ env.SHELLCHECK_RELEASE_ASSET_ID }}
-          token: ${{ github.token }}
-          member: shellcheck-v${{ env.SHELLCHECK_VERSION }}/shellcheck
-          strip-components: '1'
-
-      - name: Verify actionlint and ShellCheck versions
-        run: |
-          set -euo pipefail
-          tool="$RUNNER_TEMP/actionlint"
-          reported="$("$tool/actionlint" -version | head -n 1)"
-          if [ "$reported" != "$ACTIONLINT_VERSION" ]; then
-            echo "::error::Expected actionlint ${ACTIONLINT_VERSION}, got: ${reported}"
-            exit 1
-          fi
-          reported="$("$RUNNER_TEMP/shellcheck/shellcheck" --version | sed -n 's/^version: //p')"
-          if [ "$reported" != "$SHELLCHECK_VERSION" ]; then
-            echo "::error::Expected shellcheck ${SHELLCHECK_VERSION}, got: ${reported}"
-            exit 1
-          fi
-
-      - name: actionlint .github/workflows/
-        run: |
-          set -euo pipefail
-          tool="$RUNNER_TEMP/actionlint"
-          if [ ! -d .github/workflows ]; then
-            echo "::error::.github/workflows/ is missing; nothing would be linted"
-            exit 1
-          fi
-          mapfile -t files < <(find .github/workflows -maxdepth 1 -type f \
-            \( -name '*.yml' -o -name '*.yaml' \) | LC_ALL=C sort)
-          echo "actionlint inspects ${#files[@]} workflow file(s)."
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::.github/workflows/ holds no workflow files"
-            exit 1
-          fi
-          printf '  %s\n' "${files[@]}"
-          # The pinned ShellCheck lints every run: script; pyflakes is disabled
-          # so the result never depends on what the runner image ships.
-          "$tool/actionlint" -shellcheck="$RUNNER_TEMP/shellcheck/shellcheck" -pyflakes= "${files[@]}"
-
-      - name: ShellCheck .github/ shell scripts
-        run: |
-          set -euo pipefail
-          mapfile -t scripts < <(find .github -type f -name '*.sh' | LC_ALL=C sort)
-          echo "ShellCheck inspects ${#scripts[@]} shell script(s)."
-          if [ "${#scripts[@]}" -eq 0 ]; then
-            echo "::error::.github/ holds no shell scripts; nothing would be checked"
-            exit 1
-          fi
-          printf '  %s\n' "${scripts[@]}"
-          "$RUNNER_TEMP/shellcheck/shellcheck" "${scripts[@]}"
-
-      - name: Remove tools
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/actionlint" "$RUNNER_TEMP/shellcheck"
-
-  zizmor:
-    needs: [main-proof]
-    if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
-    name: zizmor
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
-        id: python
-        with:
-          uv-version: ${{ env.UV_VERSION }}
-          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
-
-      - name: Install zizmor (uv.lock lint group)
-        run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/zizmor-venv"
-          rm -rf "$venv"
-          UV_PROJECT_ENVIRONMENT="$venv" uv sync --locked --no-build --only-group lint
-          reported="$("$venv/bin/zizmor" --version)"
-          if [ "$reported" != "zizmor ${ZIZMOR_VERSION}" ]; then
-            echo "::error::Expected zizmor ${ZIZMOR_VERSION}, got: ${reported}"
-            exit 1
-          fi
-
-      - name: zizmor workflows and local actions
-        run: |
-          set -euo pipefail
-          venv="$RUNNER_TEMP/zizmor-venv"
-          if [ ! -d .github/workflows ]; then
-            echo "::error::.github/workflows/ is missing; nothing would be audited"
-            exit 1
-          fi
-          mapfile -t files < <(find .github/workflows .github/actions -type f \
-            \( -name '*.yml' -o -name '*.yaml' \) | LC_ALL=C sort)
-          echo "zizmor audits ${#files[@]} workflow/action file(s) offline."
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "::error::.github/workflows/ holds no workflow/action files"
-            exit 1
-          fi
-          printf '  %s\n' "${files[@]}"
-          work="$RUNNER_TEMP/zizmor"
-          rm -rf "$work"
-          mkdir -p "$work/home"
-          # Any finding (exit 10 and above) or tool error fails the job.
-          env -i PATH=/usr/bin:/bin HOME="$work/home" \
-            "$venv/bin/zizmor" --offline --no-progress --format=github "${files[@]}"
-
-      - name: Remove tools
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/zizmor" "$RUNNER_TEMP/zizmor-venv"
-
-  # Blocking secret scan with the pinned TruffleHog CLI (pins.txt).
-  # - pull_request, merge_group and main pushes scan the commits between base and head;
-  #   workflow_dispatch scans the full history of the dispatched ref.
-  # - Verified, unknown and unverified results are reported (pins.txt records
-  #   why). Findings fail the job (exit 183), and so do scanner errors
-  #   (--fail-on-scan-errors), any other non-zero exit, unparsable output and
-  #   results arriving with a zero exit.
-  # - The CLI is the checksum-verified release binary, not a container, run
-  #   with the command line of the pinned upstream action script (pins.txt).
-  # - The job also fails when the range holds no commit, or when the root
-  #   .trufflehogignore is missing or leaves no Python or workflow file in scope.
+  # Blocking secret scan with the pinned TruffleHog CLI via fleet-security.yml.
+  # Runs on every event including matched main reuse pushes so commit history
+  # scans are never skipped.
   secret-scan:
+    name: Secret scan
     needs: [main-proof]
     if: always() && !cancelled()
-    name: Secret scan (TruffleHog)
-    runs-on: ubuntu-24.04
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 120 || 20 }}
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      # For the exclusion coverage check only; the scanner is a Go binary.
-      - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
-        id: python
-        with:
-          uv-version: ${{ env.UV_VERSION }}
-          uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
-
-      - name: Restore verified TruffleHog
-        uses: ./.github/actions/cached-release-tool # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
-        with:
-          tool: trufflehog
-          version: ${{ env.TRUFFLEHOG_VERSION }}
-          sha256: ${{ env.TRUFFLEHOG_LINUX_AMD64_SHA256 }}
-          repository: trufflesecurity/trufflehog
-          asset-id: ${{ env.TRUFFLEHOG_RELEASE_ASSET_ID }}
-          token: ${{ github.token }}
-          member: trufflehog
-
-      - name: Verify TruffleHog version
-        run: |
-          set -euo pipefail
-          tool="$RUNNER_TEMP/trufflehog"
-          reported="$("$tool/trufflehog" --version 2>&1)"
-          if [ "$reported" != "trufflehog ${TRUFFLEHOG_VERSION}" ]; then
-            echo "::error::Expected trufflehog ${TRUFFLEHOG_VERSION}, got: ${reported}"
-            exit 1
-          fi
-
-      - name: Scan for secrets
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD: ${{ github.event.pull_request.head.sha }}
-          MQ_BASE: ${{ github.event.merge_group.base_sha }}
-          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
-          PUSH_BASE: ${{ needs.main-proof.outputs.history-base }}
-          PUSH_HEAD: ${{ github.event.after }}
-        run: |
-          set -euo pipefail
-          case "$EVENT_NAME" in
-            pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
-            merge_group) base="$MQ_BASE"; head="$MQ_HEAD" ;;
-            push)
-              base="$PUSH_BASE"; head="$PUSH_HEAD"
-              [[ "$base" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::Missing successful main history checkpoint'; exit 1; }
-              ;;
-            workflow_dispatch) base=""; head="$(git rev-parse HEAD)" ;;
-            *) echo "::error::Unsupported event ${EVENT_NAME}"; exit 1 ;;
-          esac
-          for rev in $base $head; do
-            if ! git cat-file -e "${rev}^{commit}"; then
-              echo "::error::Commit ${rev} is not in the checkout; nothing was scanned"
-              exit 1
-            fi
-          done
-          if [ -n "$base" ] && [ "$base" = "$head" ]; then
-            echo "::error::Base and head are the same commit; nothing would be scanned"
-            exit 1
-          fi
-          if [ -n "$base" ]; then
-            commits="$(git rev-list --count "${base}..${head}")"
-          else
-            commits="$(git rev-list --count "$head")"
-          fi
-          echo "Scanning ${commits} commit(s) up to ${head}."
-          if [ "$commits" -eq 0 ]; then
-            echo "::error::No commits between base and head; nothing would be scanned"
-            exit 1
-          fi
-
-          work="$RUNNER_TEMP/secret-scan"
-          rm -rf "$work"
-          mkdir -p "$work/home" "$work/tmp"
-          findings="$work/findings.jsonl"
-
-          # Exclusion coverage. TruffleHog reports no per-file coverage, so the
-          # exclusions are applied here to the head tree the way TruffleHog
-          # 3.99.0 applies them (pkg/common/filter.go and pkg/sources/git/git.go:
-          # comment and blank lines are skipped, every other line is a regular
-          # expression searched in the repository-relative path, and a match
-          # skips the file). The job fails unless Python and workflow files
-          # remain in scope. Patterns are limited to a syntax subset that
-          # Python's re (ASCII mode) and Go's regexp read the same way; any
-          # other pattern fails the job. Only counts and line numbers are
-          # printed. Files changed in the scanned range are counted for the
-          # log only: a pull request that changes only documentation, or only
-          # deletes files, is still scanned and can pass.
-          ignore="${GITHUB_WORKSPACE}/.trufflehogignore"
-          if [ ! -f "$ignore" ]; then
-            echo "::error::.trufflehogignore is missing at the repository root; the scan cannot run"
-            exit 1
-          fi
-          git ls-tree -r -z --name-only "$head" > "$work/head-paths"
-          if [ -n "$base" ]; then
-            git diff -z --name-only --no-renames --diff-filter=d "$base" "$head" > "$work/range-paths"
-          else
-            : > "$work/range-paths"
-          fi
-          python -I - "$ignore" "$work/head-paths" "$work/range-paths" "${base:+range}" <<'PY'
-          import re
-          import sys
-
-          # Escapes both engines read alike; groups with flags, POSIX classes,
-          # {,n} (a quantifier in Python, a literal in Go), \s and \S (Python's
-          # ASCII \s also matches \v, Go's does not) and non-ASCII text are
-          # refused.
-          ESCAPES = set(".^$*+?()[]{}|\\/-dDwW")
-          # Go's \s is [\t\n\f\r ]; Go's line scanner drops one trailing \r.
-          SKIP = re.compile(r"[\t\n\f\r ]*(#|$)")
-
-          def supported(line):
-              if any(not " " <= c <= "~" for c in line) or "(?" in line or "[:" in line or "{," in line:
-                  return False
-              i = 0
-              while i < len(line):
-                  if line[i] == "\\":
-                      if i + 1 == len(line) or line[i + 1] not in ESCAPES:
-                          return False
-                      i += 2
-                  else:
-                      i += 1
-              return True
-
-          rules = []
-          with open(sys.argv[1], encoding="utf-8") as stream:
-              lines = stream.read().split("\n")
-          for number, line in enumerate(lines, 1):
-              line = line.removesuffix("\r")
-              if SKIP.match(line):
-                  continue
-              rule = None
-              if supported(line):
-                  try:
-                      rule = re.compile(line, re.ASCII)
-                  except re.error:
-                      rule = None
-              if rule is None:
-                  print(f"::error::.trufflehogignore line {number} uses regular expression syntax this check does not support")
-                  sys.exit(1)
-              rules.append(rule)
-
-          def paths(name):
-              with open(name, "rb") as stream:
-                  return [p.decode("utf-8", "surrogateescape") for p in stream.read().split(b"\0") if p]
-
-          def kept(items):
-              return [p for p in items if not any(rule.search(p) for rule in rules)]
-
-          tree = paths(sys.argv[2])
-          python = [p for p in tree if p.endswith(".py")]
-          workflows = [p for p in tree if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", p)]
-          kept_python, kept_workflows = kept(python), kept(workflows)
-          print(f"Exclusions: {len(rules)} pattern(s). In scope at head: {len(kept_python)} of"
-                f" {len(python)} Python file(s), {len(kept_workflows)} of {len(workflows)} workflow file(s).")
-          if sys.argv[4]:
-              changed = paths(sys.argv[3])
-              print(f"Files added or modified in the range: {len(kept(changed))} of {len(changed)} in scope.")
-          if not kept_python or not kept_workflows:
-              print("::error::The exclusions leave no Python or no workflow files in scope; failing closed")
-              sys.exit(1)
-          PY
-          args=(
-            git "file://${GITHUB_WORKSPACE}"
-            --branch "$head"
-            --fail --no-update --json
-            "--results=verified,unknown,unverified"
-            --exclude-detectors=Lob
-            --fail-on-scan-errors
-            --exclude-paths="${GITHUB_WORKSPACE}/.trufflehogignore"
-          )
-          if [ -n "$base" ]; then
-            args+=(--since-commit "$base")
-          fi
-
-          diagnostics="$work/stderr.log"
-          # Scanner stderr can quote repository content (an ignore-file entry,
-          # for example), so it goes to a file that is never printed. Only its
-          # line count and the numeric fields of the final summary reach the log.
-          set +e
-          env -i PATH=/usr/bin:/bin HOME="$work/home" TMPDIR="$work/tmp" \
-            "$RUNNER_TEMP/trufflehog/trufflehog" "${args[@]}" > "$findings" 2> "$diagnostics"
-          rc=$?
-          set -e
-          echo "TruffleHog exited ${rc}; $(wc -l < "$diagnostics") stderr line(s) withheld from this log."
-          jq -R -r 'fromjson? | select(type == "object" and .msg == "finished scanning")
-            | [("chunks", "bytes", "verified_secrets", "unverified_secrets") as $k
-               | "\($k)=\(.[$k] | if type == "number" then tostring else "?" end)"]
-            | "Scan summary: " + join(" ")' "$diagnostics" 2> /dev/null || true
-
-          # jq's own error text can quote the input, so it is discarded.
-          if ! count="$(jq -s 'length' "$findings" 2> /dev/null)"; then
-            echo "::error::TruffleHog output is not valid JSON (exit ${rc}); failing closed"
-            exit 1
-          fi
-          if [ "$count" -gt 0 ]; then
-            echo "::error::TruffleHog reported ${count} finding(s). Secret values are redacted from this log."
-            # Location fields only, each a string, number or boolean; Raw, RawV2,
-            # Redacted and ExtraData never reach the log.
-            jq -r 'def s: if type == "string" or type == "number" or type == "boolean" then tostring else "?" end;
-              .SourceMetadata.Data.Git as $git
-              | "::error::TruffleHog \(.DetectorName | s) verified=\(.Verified | s)"
-              + " \($git.file | s):\($git.line | s) commit=\($git.commit | s)"' \
-              "$findings" 2> /dev/null || echo "::error::Finding locations could not be summarized"
-          fi
-          case "$rc" in
-            0)
-              if [ "$count" -ne 0 ]; then
-                echo "::error::Findings were reported with exit 0; failing closed"
-                exit 1
-              fi
-              echo "No secrets found."
-              ;;
-            183)
-              exit 1
-              ;;
-            *)
-              echo "::error::TruffleHog exited ${rc} (scan error); failing closed"
-              exit 1
-              ;;
-          esac
-
-      - name: Remove scan results
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/secret-scan" "$RUNNER_TEMP/trufflehog"
+    uses: ./.github/workflows/fleet-security.yml # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
+    with:
+      run-secret-scan: true
+      secret-scan-base: ${{ needs.main-proof.outputs.history-base }}
+      secret-scan-require-base: ${{ github.event_name == 'push' }}
+      require-trufflehog-ignore: true
+      secret-scan-required-extensions: .py
 
   # Blocking SAST with the pinned Semgrep CE and the semgrep/semgrep-rules
   # checkout at the pinned commit (pins.txt).
@@ -1125,7 +809,8 @@ jobs:
   #   locked package with no --omit (a lock's dev flag cannot hide one), and
   #   fails on a high or critical advisory, or on any audit error.
   # - pip-audit and its dependency closure come from uv.lock (audit group);
-  #   npm is the hosted runner's. Both run under `env -i`.
+  #   npm comes from the pinned Node release installed via actions/setup-node
+  #   and version-checked before auditing. Both run under `env -i`.
   # - A suppression is an `--ignore-vuln ID` argument below with its reason,
   #   reviewed in the diff like every other suppression.
   dependency-audit:
@@ -1146,6 +831,12 @@ jobs:
         with:
           uv-version: ${{ env.UV_VERSION }}
           uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+          package-manager-cache: false
 
       - name: Install pip-audit (uv.lock audit group)
         run: |
@@ -1251,7 +942,17 @@ jobs:
           fi
           npm_bin="$(command -v npm)"
           node_dir="$(dirname "$(command -v node)")"
-          echo "$("$npm_bin" --version) (npm), $(node --version) (node)"
+          reported_node="$(node --version)"
+          reported_npm="$("$npm_bin" --version)"
+          echo "${reported_npm} (npm), ${reported_node} (node)"
+          if [ "$reported_node" != "v${NODE_VERSION}" ]; then
+            echo "::error::Expected node v${NODE_VERSION}, got: ${reported_node}"
+            exit 1
+          fi
+          if [ "$reported_npm" != "${NPM_VERSION}" ]; then
+            echo "::error::Expected npm ${NPM_VERSION}, got: ${reported_npm}"
+            exit 1
+          fi
           work="$RUNNER_TEMP/npm-audit"
           rm -rf "$work"
           mkdir -p "$work/home"
@@ -1761,7 +1462,7 @@ jobs:
     # always(): a job skipped because a dependency failed would otherwise count
     # as a passing required check.
     if: always()
-    needs: [main-proof, ruff, compileall, mypy, test-waits, actionlint, zizmor, secret-scan, sast, dependency-audit, installed-wheel, verified-trailer, pytest, pr-affected]
+    needs: [main-proof, ruff, compileall, mypy, test-waits, fleet-security, secret-scan, sast, dependency-audit, installed-wheel, verified-trailer, pytest, pr-affected]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -1778,10 +1479,11 @@ jobs:
           # unmatched push and workflow_dispatch, pytest is tests.yml's full six-shard
           # suite and must succeed; pr-affected must be skipped. On pull_request
           # the reverse holds. Failed, cancelled, skipped and missing required
-          # results all fail this gate. A matched push requires only main-proof;
-          # it has already checked the run/tree and preserved main-scope archives.
+          # results all fail this gate. A matched push requires only main-proof,
+          # secret-scan and verified-trailer; main-proof has already checked the
+          # run/tree and preserved main-scope archives.
           optional=()
-          common=(actionlint compileall dependency-audit installed-wheel mypy ruff sast secret-scan test-waits verified-trailer zizmor)
+          common=(compileall dependency-audit fleet-security installed-wheel mypy ruff sast secret-scan test-waits verified-trailer)
           case "$EVENT_NAME" in
             pull_request)
               must_succeed=(pr-affected "${common[@]}")
@@ -1790,7 +1492,7 @@ jobs:
             push)
               if [ "$REUSE" = true ]; then
                 must_succeed=(main-proof secret-scan verified-trailer)
-                must_skip=(pytest pr-affected actionlint compileall dependency-audit installed-wheel mypy ruff sast test-waits zizmor)
+                must_skip=(pytest pr-affected compileall dependency-audit fleet-security installed-wheel mypy ruff sast test-waits)
               else
                 must_succeed=(pytest "${common[@]}")
                 must_skip=(pr-affected)

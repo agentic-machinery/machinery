@@ -1,0 +1,2399 @@
+# Pinned reusable fleet security workflow (learn-ukrainian/machinery#1080).
+#
+# One SHA-pinned entry point for public and private fleet repositories:
+#   uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@<40-char-SHA>
+#
+# - Self-contained: uses no caller-local .github/actions/, no caller uv.lock,
+#   no secrets, no paid GitHub Advanced Security features and no repository-name
+#   branches. All tool, action and rule pins live here and in pins.txt beside
+#   this file; bump them together.
+# - Least privilege: workflow permissions are empty; every job takes only
+#   contents: read, checks out with persist-credentials: false, and runs every
+#   scanner under env -i so no runner credential reaches a scanner.
+# - Redacted evidence: raw scanner stderr is withheld to a temp file and never
+#   printed. Logs, annotations and step-summary receipts emit only counts,
+#   repo-relative paths, line/column numbers, rule/detector/CVE/AVD/license IDs
+#   and severities, never secret values or source snippets.
+# - Fail closed: missing targets, invalid paths, zero matched files/packages/
+#   configs, floating image tags, malformed scanner JSON, scanner errors and an
+#   invocation enabling zero checks all fail the workflow.
+name: Fleet Security
+
+on:
+  workflow_call:
+    inputs:
+      run-actionlint:
+        description: Run pinned actionlint (with pinned ShellCheck) over workflow files
+        type: boolean
+        default: false
+      workflow-dir:
+        description: Repository-relative workflow directory for actionlint
+        type: string
+        default: .github/workflows
+
+      run-shellcheck:
+        description: Run pinned ShellCheck over configured tracked shell paths
+        type: boolean
+        default: false
+      shellcheck-paths:
+        description: >-
+          Newline-separated repo-relative file or directory paths for ShellCheck.
+          Append |<severity> (error, warning, info, style) to override the default
+          severity for one target. Required when run-shellcheck is true.
+        type: string
+        default: ''
+      shellcheck-severity:
+        description: Default ShellCheck minimum severity (error, warning, info, style)
+        type: string
+        default: style
+      shellcheck-exclude-paths:
+        description: >-
+          Optional newline-separated repo-relative file or directory paths to exclude
+          from ShellCheck (reviewed fixture exceptions only)
+        type: string
+        default: ''
+
+      run-zizmor:
+        description: Run pinned zizmor offline over workflow and action YAML files
+        type: boolean
+        default: false
+      zizmor-paths:
+        description: >-
+          Optional newline-separated repo-relative paths for zizmor. When empty,
+          audits .github/workflows (required) plus .github/actions if present.
+          When non-empty, every listed path must exist and hold YAML files.
+        type: string
+        default: ''
+      zizmor-config:
+        description: Optional repo-relative zizmor config file path (must exist if set)
+        type: string
+        default: ''
+
+      run-secret-scan:
+        description: Run pinned TruffleHog secret scan over the event commit range
+        type: boolean
+        default: false
+      secret-scan-base:
+        description: Optional explicit 40-hex base commit SHA for push events
+        type: string
+        default: ''
+      secret-scan-require-base:
+        description: >-
+          When true on push events, require an explicit secret-scan-base instead of
+          falling back to github.event.before
+        type: boolean
+        default: false
+      trufflehog-exclude-paths:
+        description: Repo-relative TruffleHog exclusion file path
+        type: string
+        default: .trufflehogignore
+      require-trufflehog-ignore:
+        description: >-
+          Fail closed when the default .trufflehogignore is missing. An explicit
+          non-default trufflehog-exclude-paths always fails closed when missing.
+        type: boolean
+        default: false
+      secret-scan-required-extensions:
+        description: >-
+          Optional comma-separated file extensions (for example .py) that must keep
+          at least one tracked file in scope after TruffleHog exclusions
+        type: string
+        default: ''
+
+      run-trivy-fs:
+        description: Run pinned Trivy filesystem scan for dependencies and licences
+        type: boolean
+        default: false
+      trivy-fs-targets:
+        description: >-
+          Newline-separated repo-relative file or directory targets for trivy fs.
+          Required when run-trivy-fs is true.
+        type: string
+        default: ''
+      trivy-scanners:
+        description: Comma-separated Trivy fs scanners (subset of vuln,license,misconfig)
+        type: string
+        default: vuln,license
+      trivy-severity:
+        description: Comma-separated Trivy fs severities (UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL)
+        type: string
+        default: HIGH,CRITICAL
+      trivy-ignore-unfixed:
+        description: Ignore unfixed vulnerabilities in trivy fs
+        type: boolean
+        default: false
+      trivy-include-dev-deps:
+        description: Include development dependencies in trivy fs (npm, yarn, gradle)
+        type: boolean
+        default: true
+      trivy-ignorefile:
+        description: >-
+          Optional repo-relative .trivyignore path (must exist if set; when empty,
+          uses root .trivyignore if present, otherwise disables ignorefile loading)
+        type: string
+        default: ''
+      trivy-ignored-licenses:
+        description: Optional comma-separated SPDX licence IDs to ignore in trivy fs
+        type: string
+        default: ''
+
+      run-trivy-iac:
+        description: Run pinned Trivy config scan for IaC and container misconfigurations
+        type: boolean
+        default: false
+      trivy-iac-targets:
+        description: >-
+          Newline-separated repo-relative file or directory targets for trivy config.
+          Required when run-trivy-iac is true.
+        type: string
+        default: ''
+      trivy-iac-severity:
+        description: Comma-separated Trivy config severities (UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL)
+        type: string
+        default: HIGH,CRITICAL
+      trivy-iac-scanners:
+        description: Comma-separated Trivy misconfig scanners
+        type: string
+        default: azure-arm,cloudformation,dockerfile,helm,kubernetes,terraform,terraformplan-json,terraformplan-snapshot,ansible
+      trivy-iac-skip-dirs:
+        description: Optional newline-separated repo-relative directories to skip in trivy config
+        type: string
+        default: ''
+      trivy-iac-skip-files:
+        description: Optional newline-separated repo-relative files to skip in trivy config
+        type: string
+        default: ''
+
+      run-trivy-image:
+        description: Run pinned Trivy container image scan on built or digest-pinned images
+        type: boolean
+        default: false
+      trivy-image-targets:
+        description: >-
+          Newline-separated image target specs: build|<dockerfile>|<context>[|<stage>]
+          or image|<ref@sha256:64-hex>. Floating tags are refused.
+        type: string
+        default: ''
+      trivy-image-severity:
+        description: Comma-separated Trivy image severities (UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL)
+        type: string
+        default: HIGH,CRITICAL
+      trivy-image-scanners:
+        description: Comma-separated Trivy image scanners (subset of vuln,license)
+        type: string
+        default: vuln
+      trivy-image-ignore-unfixed:
+        description: Ignore unfixed vulnerabilities in trivy image
+        type: boolean
+        default: false
+
+    outputs:
+      receipt:
+        description: Redacted JSON summary receipt (schema fleet-security-receipt.v1)
+        value: ${{ jobs.security-gate.outputs.receipt }}
+
+permissions: {}
+
+# Single source of pinned scanner releases and rule bundles for every caller.
+# Upstream evidence lives in .github/workflows/pins.txt; bump them together.
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_LINUX_AMD64_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+  SHELLCHECK_VERSION: "0.11.0"
+  SHELLCHECK_LINUX_X86_64_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+  ZIZMOR_VERSION: "1.31.1"
+  ZIZMOR_LINUX_X86_64_SHA256: d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99
+  TRUFFLEHOG_VERSION: "3.99.0"
+  TRUFFLEHOG_LINUX_AMD64_SHA256: e35ae3fd1e4b7a0c1699d0fda1814282bf906d03379bd4337b092b3a84c6740b
+  TRIVY_VERSION: "0.76.2"
+  TRIVY_LINUX_64BIT_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+  TRIVY_DB_REPOSITORY: "mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
+  TRIVY_CHECKS_BUNDLE_DIGEST: "sha256:b591e9190cff4aa4e385b1a25bccfd9ecf178d3c77fd194e1410b7ce7e1df058"
+  TRIVY_CHECKS_BUNDLE_REPOSITORY: "mirror.gcr.io/aquasec/trivy-checks@sha256:b591e9190cff4aa4e385b1a25bccfd9ecf178d3c77fd194e1410b7ce7e1df058"
+
+jobs:
+  actionlint:
+    name: actionlint
+    if: ${{ inputs.run-actionlint }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.scan.outputs.receipt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cached actionlint archive
+        id: cache-actionlint
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/actionlint/archive.tar.gz
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-actionlint-${{ env.ACTIONLINT_VERSION }}-${{ env.ACTIONLINT_LINUX_AMD64_SHA256 }}
+
+      - name: Download actionlint archive on cache miss
+        if: steps.cache-actionlint.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/actionlint/archive.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 20 --max-time 60 \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+
+      - name: Verify and extract actionlint
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/actionlint/archive.tar.gz"
+          printf '%s  %s\n' "$ACTIONLINT_LINUX_AMD64_SHA256" "$archive" | sha256sum --check --strict
+          rm -rf "$RUNNER_TEMP/actionlint"
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/actionlint" actionlint
+          reported="$("$RUNNER_TEMP/actionlint/actionlint" -version | head -n 1)"
+          if [ "$reported" != "$ACTIONLINT_VERSION" ]; then
+            echo "::error::Expected actionlint ${ACTIONLINT_VERSION}, got: ${reported}"
+            exit 1
+          fi
+
+      - name: Save verified actionlint archive
+        if: steps.cache-actionlint.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/actionlint/archive.tar.gz
+          key: ${{ steps.cache-actionlint.outputs.cache-primary-key }}
+
+      - name: Restore cached ShellCheck archive
+        id: cache-shellcheck
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/shellcheck/archive.tar.gz
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-shellcheck-${{ env.SHELLCHECK_VERSION }}-${{ env.SHELLCHECK_LINUX_X86_64_SHA256 }}
+
+      - name: Download ShellCheck archive on cache miss
+        if: steps.cache-shellcheck.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/shellcheck/archive.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 20 --max-time 60 \
+            --output "$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+
+      - name: Verify and extract ShellCheck
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/shellcheck/archive.tar.gz"
+          printf '%s  %s\n' "$SHELLCHECK_LINUX_X86_64_SHA256" "$archive" | sha256sum --check --strict
+          rm -rf "$RUNNER_TEMP/shellcheck"
+          mkdir -p "$RUNNER_TEMP/shellcheck"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/shellcheck" --strip-components=1 \
+            "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          reported="$("$RUNNER_TEMP/shellcheck/shellcheck" --version | sed -n 's/^version: //p')"
+          if [ "$reported" != "$SHELLCHECK_VERSION" ]; then
+            echo "::error::Expected shellcheck ${SHELLCHECK_VERSION}, got: ${reported}"
+            exit 1
+          fi
+
+      - name: Save verified ShellCheck archive
+        if: steps.cache-shellcheck.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/shellcheck/archive.tar.gz
+          key: ${{ steps.cache-shellcheck.outputs.cache-primary-key }}
+
+      - name: Lint workflow files with actionlint
+        id: scan
+        env:
+          WORKFLOW_DIR: ${{ inputs.workflow-dir }}
+          ACTIONLINT_BIN: ${{ runner.temp }}/actionlint/actionlint
+          SHELLCHECK_BIN: ${{ runner.temp }}/shellcheck/shellcheck
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/actionlint-work"
+          rm -rf "$work"
+          mkdir -p "$work/home" "$work/tmp"
+          /usr/bin/python3 -I -B - "$work" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          work = Path(sys.argv[1])
+          root = Path.cwd().resolve()
+          raw_dir = os.environ.get("WORKFLOW_DIR", "").strip()
+          version = os.environ["ACTIONLINT_VERSION"]
+          sc_version = os.environ["SHELLCHECK_VERSION"]
+
+          def clean_log(val: object) -> str:
+              return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
+
+          def emit(receipt: dict, rc: int) -> None:
+              encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+              print(f"actionlint receipt: {encoded}")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as handle:
+                      handle.write(f"### actionlint ({version} + shellcheck {sc_version})\n```json\n{encoded}\n```\n")
+              out = os.environ.get("GITHUB_OUTPUT")
+              if out:
+                  with open(out, "a", encoding="utf-8") as handle:
+                      handle.write(f"receipt={encoded}\n")
+              sys.exit(rc)
+
+          def valid_rel(value: str) -> Path | None:
+              if not value or value.startswith(("/", "-")) or "\0" in value:
+                  return None
+              if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value):
+                  return None
+              parts = value.split("/")
+              if any(part in ("", ".", "..") for part in parts):
+                  return None
+              raw = root
+              for part in parts:
+                  raw = raw / part
+                  if raw.is_symlink():
+                      return None
+              candidate = raw.resolve()
+              if not candidate.is_relative_to(root):
+                  return None
+              return candidate
+
+          target_dir = valid_rel(raw_dir)
+          if target_dir is None:
+              print("::error::workflow-dir is invalid; failing closed")
+              emit({"tool": "actionlint", "version": version, "status": "invalid_target", "files": 0, "findings": 0}, 1)
+          if not target_dir.is_dir():
+              print(f"::error::{clean_log(raw_dir)} is missing; nothing would be linted")
+              emit({"tool": "actionlint", "version": version, "target": raw_dir, "status": "missing_target", "files": 0, "findings": 0}, 1)
+
+          files = sorted(
+              str(path.relative_to(root))
+              for path in target_dir.iterdir()
+              if path.is_file() and not path.is_symlink() and path.suffix in (".yml", ".yaml")
+          )
+          if not files:
+              print(f"::error::{clean_log(raw_dir)} holds no workflow files; failing closed")
+              emit({"tool": "actionlint", "version": version, "target": raw_dir, "status": "missing_target", "files": 0, "findings": 0}, 1)
+
+          stdout_file = work / "stdout.json"
+          stderr_file = work / "stderr.log"
+          # Run under env -i; pyflakes disabled so results never depend on runner packages.
+          cmd = [
+              os.environ["ACTIONLINT_BIN"],
+              f"-shellcheck={os.environ['SHELLCHECK_BIN']}",
+              "-pyflakes=",
+              "-format",
+              "{{json .}}",
+              "--",
+              *files,
+          ]
+          with open(stdout_file, "wb") as out_fh, open(stderr_file, "wb") as err_fh:
+              proc = subprocess.run(
+                  cmd,
+                  env={"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")},
+                  stdout=out_fh,
+                  stderr=err_fh,
+                  check=False,
+              )
+          err_lines = sum(1 for _ in open(stderr_file, "rb"))
+          print(f"actionlint exited {proc.returncode} over {len(files)} file(s); {err_lines} stderr line(s) withheld.")
+          try:
+              findings = json.loads(stdout_file.read_text(encoding="utf-8"))
+          except (OSError, ValueError):
+              print("::error::actionlint output is missing or malformed JSON; failing closed")
+              emit({"tool": "actionlint", "version": version, "target": raw_dir, "status": "error", "files": len(files), "findings": 0}, 1)
+          if not isinstance(findings, list) or proc.returncode not in (0, 1):
+              print(f"::error::actionlint exited {proc.returncode} or returned non-list JSON; failing closed")
+              emit({"tool": "actionlint", "version": version, "target": raw_dir, "status": "error", "files": len(files), "findings": 0}, 1)
+          if proc.returncode == 0 and findings:
+              print("::error::actionlint reported findings with exit 0; failing closed")
+              emit({"tool": "actionlint", "version": version, "target": raw_dir, "status": "error", "files": len(files), "findings": len(findings)}, 1)
+
+          # Redacted diagnostics: filepath, line, column and rule kind only; never snippet or raw source.
+          for item in findings:
+              if not isinstance(item, dict):
+                  continue
+              fp = clean_log(item.get("filepath", "?"))
+              line = int_or_zero(item.get("line", 0))
+              col = int_or_zero(item.get("column", 0))
+              kind = clean_log(item.get("kind", "unknown"))
+              print(f"::error file={esc_prop(fp)},line={line},col={col}::actionlint [{kind}] at {fp}:{line}:{col}")
+          status = "clean" if not findings and proc.returncode == 0 else "finding"
+          emit(
+              {
+                  "tool": "actionlint",
+                  "version": version,
+                  "shellcheck_version": sc_version,
+                  "target": raw_dir,
+                  "status": status,
+                  "files": len(files),
+                  "findings": len(findings),
+              },
+              0 if status == "clean" else 1,
+          )
+          PY
+
+      - name: Remove tools and scan results
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/actionlint" "$RUNNER_TEMP/shellcheck" "$RUNNER_TEMP/actionlint-work"
+
+  shellcheck:
+    name: ShellCheck
+    if: ${{ inputs.run-shellcheck }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.scan.outputs.receipt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cached ShellCheck archive
+        id: cache-shellcheck
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/shellcheck/archive.tar.gz
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-shellcheck-${{ env.SHELLCHECK_VERSION }}-${{ env.SHELLCHECK_LINUX_X86_64_SHA256 }}
+
+      - name: Download ShellCheck archive on cache miss
+        if: steps.cache-shellcheck.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/shellcheck/archive.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 20 --max-time 60 \
+            --output "$archive" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+
+      - name: Verify and extract ShellCheck
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/shellcheck/archive.tar.gz"
+          printf '%s  %s\n' "$SHELLCHECK_LINUX_X86_64_SHA256" "$archive" | sha256sum --check --strict
+          rm -rf "$RUNNER_TEMP/shellcheck"
+          mkdir -p "$RUNNER_TEMP/shellcheck"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/shellcheck" --strip-components=1 \
+            "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          reported="$("$RUNNER_TEMP/shellcheck/shellcheck" --version | sed -n 's/^version: //p')"
+          if [ "$reported" != "$SHELLCHECK_VERSION" ]; then
+            echo "::error::Expected shellcheck ${SHELLCHECK_VERSION}, got: ${reported}"
+            exit 1
+          fi
+
+      - name: Save verified ShellCheck archive
+        if: steps.cache-shellcheck.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/shellcheck/archive.tar.gz
+          key: ${{ steps.cache-shellcheck.outputs.cache-primary-key }}
+
+      - name: Run ShellCheck over configured targets
+        id: scan
+        env:
+          SHELLCHECK_BIN: ${{ runner.temp }}/shellcheck/shellcheck
+          INPUT_PATHS: ${{ inputs.shellcheck-paths }}
+          INPUT_SEVERITY: ${{ inputs.shellcheck-severity }}
+          INPUT_EXCLUDES: ${{ inputs.shellcheck-exclude-paths }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/shellcheck-work"
+          rm -rf "$work"
+          mkdir -p "$work/home" "$work/tmp"
+          /usr/bin/python3 -I -B - "$work" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          work = Path(sys.argv[1])
+          root = Path.cwd().resolve()
+          version = os.environ["SHELLCHECK_VERSION"]
+          default_sev = os.environ.get("INPUT_SEVERITY", "style").strip()
+          VALID_SEV = {"error", "warning", "info", "style"}
+
+          def clean_log(val: object) -> str:
+              return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
+
+          def emit(receipt: dict, rc: int) -> None:
+              encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+              print(f"shellcheck receipt: {encoded}")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as handle:
+                      handle.write(f"### ShellCheck ({version})\n```json\n{encoded}\n```\n")
+              out = os.environ.get("GITHUB_OUTPUT")
+              if out:
+                  with open(out, "a", encoding="utf-8") as handle:
+                      handle.write(f"receipt={encoded}\n")
+              sys.exit(rc)
+
+          def valid_rel(value: str) -> Path | None:
+              if not value or value.startswith(("/", "-")) or "\0" in value:
+                  return None
+              if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value):
+                  return None
+              parts = value.split("/")
+              if any(part in ("", ".", "..") for part in parts):
+                  return None
+              raw = root
+              for part in parts:
+                  raw = raw / part
+                  if raw.is_symlink():
+                      return None
+              candidate = raw.resolve()
+              if not candidate.is_relative_to(root):
+                  return None
+              return candidate
+
+          if default_sev not in VALID_SEV:
+              print(f"::error::Unsupported shellcheck-severity '{default_sev}'; failing closed")
+              emit({"tool": "shellcheck", "version": version, "status": "error", "targets": []}, 1)
+
+          excludes: list[str] = []
+          for raw in os.environ.get("INPUT_EXCLUDES", "").splitlines():
+              item = raw.strip()
+              if not item:
+                  continue
+              if valid_rel(item) is None:
+                  print("::error::Invalid path in shellcheck-exclude-paths; failing closed")
+                  emit({"tool": "shellcheck", "version": version, "status": "error", "targets": []}, 1)
+              excludes.append(item.rstrip("/"))
+
+          def is_excluded(rel: str) -> bool:
+              return any(rel == ex or rel.startswith(ex + "/") for ex in excludes)
+
+          specs: list[tuple[str, str]] = []
+          for raw in os.environ.get("INPUT_PATHS", "").splitlines():
+              item = raw.strip()
+              if not item:
+                  continue
+              if "|" in item:
+                  path_str, sev = item.rsplit("|", 1)
+                  path_str, sev = path_str.strip(), sev.strip()
+              else:
+                  path_str, sev = item, default_sev
+              if sev not in VALID_SEV:
+                  print(f"::error::Unsupported severity '{sev}' in shellcheck-paths; failing closed")
+                  emit({"tool": "shellcheck", "version": version, "status": "error", "targets": []}, 1)
+              specs.append((path_str, sev))
+
+          if not specs:
+              print("::error::shellcheck-paths is empty while run-shellcheck is true; failing closed")
+              emit({"tool": "shellcheck", "version": version, "status": "missing_target", "targets": []}, 1)
+
+          failed = False
+          target_receipts = []
+          for idx, (path_str, sev) in enumerate(specs):
+              resolved = valid_rel(path_str)
+              if resolved is None:
+                  print(f"::error::Invalid shellcheck target path '{path_str}'; failing closed")
+                  target_receipts.append({"target": path_str, "severity": sev, "status": "invalid_target", "files": 0, "findings": 0})
+                  failed = True
+                  continue
+              if not resolved.exists():
+                  print(f"::error::ShellCheck target '{path_str}' is missing; failing closed")
+                  target_receipts.append({"target": path_str, "severity": sev, "status": "missing_target", "files": 0, "findings": 0})
+                  failed = True
+                  continue
+              if resolved.is_file() and not resolved.is_symlink():
+                  rel = str(resolved.relative_to(root))
+                  files = [] if is_excluded(rel) else [rel]
+              elif resolved.is_dir():
+                  files = sorted(
+                      str(p.relative_to(root))
+                      for p in resolved.rglob("*.sh")
+                      if p.is_file() and not p.is_symlink() and not is_excluded(str(p.relative_to(root)))
+                  )
+              else:
+                  files = []
+              if not files:
+                  print(f"::error::ShellCheck target '{path_str}' matched zero shell scripts; failing closed")
+                  target_receipts.append({"target": path_str, "severity": sev, "status": "missing_target", "files": 0, "findings": 0})
+                  failed = True
+                  continue
+
+              out_json = work / f"out-{idx}.json"
+              err_log = work / f"err-{idx}.log"
+              cmd = [os.environ["SHELLCHECK_BIN"], f"--severity={sev}", "--format=json1", "--", *files]
+              with open(out_json, "wb") as out_fh, open(err_log, "wb") as err_fh:
+                  proc = subprocess.run(
+                      cmd,
+                      env={"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")},
+                      stdout=out_fh,
+                      stderr=err_fh,
+                      check=False,
+                  )
+              err_lines = sum(1 for _ in open(err_log, "rb"))
+              print(f"ShellCheck target={path_str} severity={sev}: {len(files)} file(s), exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
+              try:
+                  payload = json.loads(out_json.read_text(encoding="utf-8"))
+              except (OSError, ValueError):
+                  print(f"::error::ShellCheck output for '{path_str}' is malformed JSON; failing closed")
+                  target_receipts.append({"target": path_str, "severity": sev, "status": "error", "files": len(files), "findings": 0})
+                  failed = True
+                  continue
+              comments = payload.get("comments") if isinstance(payload, dict) else None
+              if not isinstance(comments, list) or proc.returncode not in (0, 1):
+                  print(f"::error::ShellCheck exited {proc.returncode} for '{path_str}'; failing closed")
+                  target_receipts.append({"target": path_str, "severity": sev, "status": "error", "files": len(files), "findings": 0})
+                  failed = True
+                  continue
+              if proc.returncode == 0 and comments:
+                  print(f"::error::ShellCheck reported findings with exit 0 for '{path_str}'; failing closed")
+                  target_receipts.append({"target": path_str, "severity": sev, "status": "error", "files": len(files), "findings": len(comments)})
+                  failed = True
+                  continue
+              # Redacted diagnostics: file, line, column, level and SC code only (never source text).
+              for c in comments:
+                  if not isinstance(c, dict):
+                      continue
+                  fp = clean_log(c.get("file", "?"))
+                  line = int_or_zero(c.get("line", 0))
+                  col = int_or_zero(c.get("column", 0))
+                  level = clean_log(c.get("level", "unknown"))
+                  code = clean_log(c.get("code", "?"))
+                  print(f"::error file={esc_prop(fp)},line={line},col={col}::ShellCheck SC{code} ({level}) at {fp}:{line}:{col}")
+              t_status = "clean" if proc.returncode == 0 and not comments else "finding"
+              if t_status != "clean":
+                  failed = True
+              target_receipts.append({"target": path_str, "severity": sev, "status": t_status, "files": len(files), "findings": len(comments)})
+
+          emit(
+              {
+                  "tool": "shellcheck",
+                  "version": version,
+                  "status": "clean" if not failed else "failed",
+                  "targets": target_receipts,
+              },
+              0 if not failed else 1,
+          )
+          PY
+
+      - name: Remove tools and scan results
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/shellcheck" "$RUNNER_TEMP/shellcheck-work"
+
+  zizmor:
+    name: zizmor
+    if: ${{ inputs.run-zizmor }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.scan.outputs.receipt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cached zizmor archive
+        id: cache-zizmor
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/zizmor/archive.tar.gz
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-zizmor-${{ env.ZIZMOR_VERSION }}-${{ env.ZIZMOR_LINUX_X86_64_SHA256 }}
+
+      - name: Download zizmor archive on cache miss
+        if: steps.cache-zizmor.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/zizmor/archive.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 20 --max-time 60 \
+            --output "$archive" \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+
+      - name: Verify and extract zizmor
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/zizmor/archive.tar.gz"
+          printf '%s  %s\n' "$ZIZMOR_LINUX_X86_64_SHA256" "$archive" | sha256sum --check --strict
+          rm -rf "$RUNNER_TEMP/zizmor"
+          mkdir -p "$RUNNER_TEMP/zizmor"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/zizmor" zizmor
+          reported="$("$RUNNER_TEMP/zizmor/zizmor" --version)"
+          if [ "$reported" != "zizmor ${ZIZMOR_VERSION}" ]; then
+            echo "::error::Expected zizmor ${ZIZMOR_VERSION}, got: ${reported}"
+            exit 1
+          fi
+
+      - name: Save verified zizmor archive
+        if: steps.cache-zizmor.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/zizmor/archive.tar.gz
+          key: ${{ steps.cache-zizmor.outputs.cache-primary-key }}
+
+      - name: Audit workflows and actions with zizmor (offline)
+        id: scan
+        env:
+          ZIZMOR_BIN: ${{ runner.temp }}/zizmor/zizmor
+          INPUT_PATHS: ${{ inputs.zizmor-paths }}
+          INPUT_CONFIG: ${{ inputs.zizmor-config }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/zizmor-work"
+          rm -rf "$work"
+          mkdir -p "$work/home" "$work/tmp"
+          /usr/bin/python3 -I -B - "$work" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          work = Path(sys.argv[1])
+          root = Path.cwd().resolve()
+          version = os.environ["ZIZMOR_VERSION"]
+
+          def clean_log(val: object) -> str:
+              return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
+
+          def emit(receipt: dict, rc: int) -> None:
+              encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+              print(f"zizmor receipt: {encoded}")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as handle:
+                      handle.write(f"### zizmor ({version}, offline)\n```json\n{encoded}\n```\n")
+              out = os.environ.get("GITHUB_OUTPUT")
+              if out:
+                  with open(out, "a", encoding="utf-8") as handle:
+                      handle.write(f"receipt={encoded}\n")
+              sys.exit(rc)
+
+          def valid_rel(value: str) -> Path | None:
+              if not value or value.startswith(("/", "-")) or "\0" in value:
+                  return None
+              if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value):
+                  return None
+              parts = value.split("/")
+              if any(part in ("", ".", "..") for part in parts):
+                  return None
+              raw = root
+              for part in parts:
+                  raw = raw / part
+                  if raw.is_symlink():
+                      return None
+              candidate = raw.resolve()
+              if not candidate.is_relative_to(root):
+                  return None
+              return candidate
+
+          raw_paths = [line.strip() for line in os.environ.get("INPUT_PATHS", "").splitlines() if line.strip()]
+          explicit = bool(raw_paths)
+          if not raw_paths:
+              raw_paths = [".github/workflows"]
+              if (root / ".github/actions").is_dir():
+                  raw_paths.append(".github/actions")
+
+          files: list[str] = []
+          for raw in raw_paths:
+              resolved = valid_rel(raw)
+              if resolved is None:
+                  print(f"::error::Invalid zizmor target path '{raw}'; failing closed")
+                  emit({"tool": "zizmor", "version": version, "status": "invalid_target", "files": 0, "findings": 0}, 1)
+              if not resolved.exists():
+                  print(f"::error::zizmor target '{raw}' is missing; failing closed")
+                  emit({"tool": "zizmor", "version": version, "target": raw, "status": "missing_target", "files": 0, "findings": 0}, 1)
+              found: list[str] = []
+              if resolved.is_file() and not resolved.is_symlink():
+                  if resolved.suffix in (".yml", ".yaml"):
+                      found.append(str(resolved.relative_to(root)))
+              elif resolved.is_dir():
+                  found = sorted(
+                      str(p.relative_to(root))
+                      for p in resolved.rglob("*")
+                      if p.is_file() and not p.is_symlink() and p.suffix in (".yml", ".yaml")
+                  )
+              if explicit and not found:
+                  print(f"::error::zizmor target '{raw}' holds no YAML files; failing closed")
+                  emit({"tool": "zizmor", "version": version, "target": raw, "status": "missing_target", "files": 0, "findings": 0}, 1)
+              files.extend(found)
+
+          files = sorted(set(files))
+          if not files:
+              print("::error::zizmor found no workflow or action YAML files; failing closed")
+              emit({"tool": "zizmor", "version": version, "status": "missing_target", "files": 0, "findings": 0}, 1)
+
+          cmd = [os.environ["ZIZMOR_BIN"], "--offline", "--no-progress", "--format=json"]
+          cfg = os.environ.get("INPUT_CONFIG", "").strip()
+          if cfg:
+              cfg_path = valid_rel(cfg)
+              if cfg_path is None or not cfg_path.is_file():
+                  print(f"::error::zizmor-config '{cfg}' is invalid or missing; failing closed")
+                  emit({"tool": "zizmor", "version": version, "status": "missing_target", "files": len(files), "findings": 0}, 1)
+              cmd.extend(["--config", str(cfg_path.relative_to(root))])
+          cmd.extend(["--", *files])
+
+          out_json = work / "results.json"
+          err_log = work / "stderr.log"
+          with open(out_json, "wb") as out_fh, open(err_log, "wb") as err_fh:
+              proc = subprocess.run(
+                  cmd,
+                  env={"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")},
+                  stdout=out_fh,
+                  stderr=err_fh,
+                  check=False,
+              )
+          err_lines = sum(1 for _ in open(err_log, "rb"))
+          print(f"zizmor exited {proc.returncode} over {len(files)} file(s); {err_lines} stderr line(s) withheld.")
+          try:
+              findings = json.loads(out_json.read_text(encoding="utf-8"))
+          except (OSError, ValueError):
+              print("::error::zizmor output is missing or malformed JSON; failing closed")
+              emit({"tool": "zizmor", "version": version, "status": "error", "files": len(files), "findings": 0}, 1)
+          if not isinstance(findings, list):
+              print("::error::zizmor JSON root is not a list; failing closed")
+              emit({"tool": "zizmor", "version": version, "status": "error", "files": len(files), "findings": 0}, 1)
+          if proc.returncode == 0 and findings:
+              print("::error::zizmor reported findings with exit 0; failing closed")
+              emit({"tool": "zizmor", "version": version, "status": "error", "files": len(files), "findings": len(findings)}, 1)
+          if proc.returncode != 0 and not findings:
+              print(f"::error::zizmor exited {proc.returncode} without findings (tool error); failing closed")
+              emit({"tool": "zizmor", "version": version, "status": "error", "files": len(files), "findings": 0}, 1)
+
+          # Redacted diagnostics: rule ident, severity, confidence and file path only; never code snippets.
+          for item in findings:
+              if not isinstance(item, dict):
+                  continue
+              ident = clean_log(item.get("ident", "unknown"))
+              det = item.get("determinations") if isinstance(item.get("determinations"), dict) else {}
+              sev = clean_log(det.get("severity", "unknown"))
+              conf = clean_log(det.get("confidence", "unknown"))
+              fp = "?"
+              locs = item.get("locations")
+              if isinstance(locs, list) and locs and isinstance(locs[0], dict):
+                  sym = locs[0].get("symbolic")
+                  if isinstance(sym, dict):
+                      local = sym.get("Local")
+                      if isinstance(local, dict) and isinstance(local.get("verbatim_path"), str):
+                          fp = clean_log(local["verbatim_path"])
+              print(f"::error file={esc_prop(fp)}::zizmor {ident} severity={sev} confidence={conf} at {fp}")
+          status = "clean" if proc.returncode == 0 and not findings else "finding"
+          emit(
+              {
+                  "tool": "zizmor",
+                  "version": version,
+                  "status": status,
+                  "targets": raw_paths,
+                  "files": len(files),
+                  "findings": len(findings),
+              },
+              0 if status == "clean" else 1,
+          )
+          PY
+
+      - name: Remove tools and scan results
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/zizmor" "$RUNNER_TEMP/zizmor-work"
+
+  secret-scan:
+    name: Secret scan (TruffleHog)
+    if: ${{ inputs.run-secret-scan }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && 120 || 20 }}
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.scan.outputs.receipt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Restore cached TruffleHog archive
+        id: cache-trufflehog
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/trufflehog/archive.tar.gz
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-trufflehog-${{ env.TRUFFLEHOG_VERSION }}-${{ env.TRUFFLEHOG_LINUX_AMD64_SHA256 }}
+
+      - name: Download TruffleHog archive on cache miss
+        if: steps.cache-trufflehog.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/trufflehog/archive.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 20 --max-time 60 \
+            --output "$archive" \
+            "https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
+
+      - name: Verify and extract TruffleHog
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/trufflehog/archive.tar.gz"
+          printf '%s  %s\n' "$TRUFFLEHOG_LINUX_AMD64_SHA256" "$archive" | sha256sum --check --strict
+          rm -rf "$RUNNER_TEMP/trufflehog"
+          mkdir -p "$RUNNER_TEMP/trufflehog"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/trufflehog" trufflehog
+          reported="$("$RUNNER_TEMP/trufflehog/trufflehog" --version 2>&1)"
+          if [ "$reported" != "trufflehog ${TRUFFLEHOG_VERSION}" ]; then
+            echo "::error::Expected trufflehog ${TRUFFLEHOG_VERSION}, got: ${reported}"
+            exit 1
+          fi
+
+      - name: Save verified TruffleHog archive
+        if: steps.cache-trufflehog.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/trufflehog/archive.tar.gz
+          key: ${{ steps.cache-trufflehog.outputs.cache-primary-key }}
+
+      - name: Scan for secrets
+        id: scan
+        env:
+          TRUFFLEHOG_BIN: ${{ runner.temp }}/trufflehog/trufflehog
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+          INPUT_BASE: ${{ inputs.secret-scan-base }}
+          INPUT_REQUIRE_BASE: ${{ inputs.secret-scan-require-base }}
+          INPUT_EXCLUDE_PATHS: ${{ inputs.trufflehog-exclude-paths }}
+          INPUT_REQUIRE_IGNORE: ${{ inputs.require-trufflehog-ignore }}
+          INPUT_REQUIRED_EXTS: ${{ inputs.secret-scan-required-extensions }}
+        run: |
+          set -euo pipefail
+          ZERO_SHA="0000000000000000000000000000000000000000"
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
+            merge_group) base="$MQ_BASE"; head="$MQ_HEAD" ;;
+            push)
+              head="$PUSH_AFTER"
+              if [ -n "$INPUT_BASE" ]; then
+                base="$INPUT_BASE"
+              elif [ "$INPUT_REQUIRE_BASE" = true ]; then
+                echo '::error::Missing required secret-scan-base checkpoint for push event'
+                exit 1
+              else
+                base="$PUSH_BEFORE"
+              fi
+              if ! [[ "$base" =~ ^[0-9a-f]{40}$ ]] || [ "$base" = "$ZERO_SHA" ]; then
+                echo '::error::Invalid or zero base commit for push secret scan; failing closed'
+                exit 1
+              fi
+              ;;
+            workflow_dispatch|schedule) base=""; head="$(git rev-parse HEAD)" ;;
+            *) echo "::error::Unsupported event ${EVENT_NAME}"; exit 1 ;;
+          esac
+          for rev in $base $head; do
+            if ! [[ "$rev" =~ ^[0-9a-f]{40}$ ]] || ! git cat-file -e "${rev}^{commit}"; then
+              echo "::error::Commit ${rev} is not in the checkout; nothing was scanned"
+              exit 1
+            fi
+          done
+          if [ -n "$base" ] && [ "$base" = "$head" ]; then
+            echo "::error::Base and head are the same commit; nothing would be scanned"
+            exit 1
+          fi
+          if [ -n "$base" ]; then
+            commits="$(git rev-list --count "${base}..${head}")"
+          else
+            commits="$(git rev-list --count "$head")"
+          fi
+          echo "Scanning ${commits} commit(s) up to ${head}."
+          if [ "$commits" -eq 0 ]; then
+            echo "::error::No commits between base and head; nothing would be scanned"
+            exit 1
+          fi
+
+          work="$RUNNER_TEMP/secret-scan"
+          rm -rf "$work"
+          mkdir -p "$work/home" "$work/tmp"
+          findings="$work/findings.jsonl"
+          git ls-tree -r -z --name-only "$head" > "$work/head-paths"
+          if [ -n "$base" ]; then
+            git diff -z --name-only --no-renames --diff-filter=d "$base" "$head" > "$work/range-paths"
+          else
+            : > "$work/range-paths"
+          fi
+
+          ignore_arg=""
+          if /usr/bin/python3 -I -B - "$work/head-paths" "$work/range-paths" "${base:+range}" "$work/ignore-resolved" <<'PY'
+          import os
+          import re
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          head_paths_file, range_paths_file, has_range, out_resolved = sys.argv[1:]
+          root = Path.cwd().resolve()
+          raw_ignore = os.environ.get("INPUT_EXCLUDE_PATHS", ".trufflehogignore").strip()
+          require_ignore = os.environ.get("INPUT_REQUIRE_IGNORE", "false").lower() == "true"
+          req_exts = [ext.strip() for ext in os.environ.get("INPUT_REQUIRED_EXTS", "").split(",") if ext.strip()]
+
+          def valid_rel(value: str) -> Path | None:
+              if not value or value.startswith(("/", "-")) or "\0" in value:
+                  return None
+              if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value):
+                  return None
+              parts = value.split("/")
+              if any(part in ("", ".", "..") for part in parts):
+                  return None
+              raw = root
+              for part in parts:
+                  raw = raw / part
+                  if raw.is_symlink():
+                      return None
+              candidate = raw.resolve()
+              if not candidate.is_relative_to(root):
+                  return None
+              return candidate
+
+          ignore_path = None
+          if raw_ignore:
+              candidate = valid_rel(raw_ignore)
+              if candidate is None:
+                  print(f"::error::Invalid trufflehog-exclude-paths '{raw_ignore}'; failing closed")
+                  sys.exit(1)
+              if candidate.is_file() and not candidate.is_symlink():
+                  ignore_path = candidate
+              elif require_ignore or raw_ignore != ".trufflehogignore":
+                  print(f"::error::{raw_ignore} is missing; failing closed")
+                  sys.exit(1)
+
+          ESCAPES = set(".^$*+?()[]{}|\\/-dDwW")
+          SKIP = re.compile(r"[\t\n\f\r ]*(#|$)")
+
+          def supported(line: str) -> bool:
+              if any(not " " <= c <= "~" for c in line) or "(?" in line or "[:" in line or "{," in line:
+                  return False
+              i = 0
+              while i < len(line):
+                  if line[i] == "\\":
+                      if i + 1 == len(line) or line[i + 1] not in ESCAPES:
+                          return False
+                      i += 2
+                  else:
+                      i += 1
+              return True
+
+          rules = []
+          if ignore_path is not None:
+              lines = ignore_path.read_text(encoding="utf-8").split("\n")
+              for number, line in enumerate(lines, 1):
+                  line = line.removesuffix("\r")
+                  if SKIP.match(line):
+                      continue
+                  rule = None
+                  if supported(line):
+                      try:
+                          rule = re.compile(line, re.ASCII)
+                      except re.error:
+                          rule = None
+                  if rule is None:
+                      print(f"::error::{raw_ignore} line {number} uses regular expression syntax this check does not support")
+                      sys.exit(1)
+                  rules.append(rule)
+
+          def read_paths(name: str) -> list[str]:
+              raw = Path(name).read_bytes()
+              return [p.decode("utf-8", "surrogateescape") for p in raw.split(b"\0") if p]
+
+          def kept(items: list[str]) -> list[str]:
+              return [p for p in items if not any(rule.search(p) for rule in rules)]
+
+          tree = read_paths(head_paths_file)
+          kept_tree = kept(tree)
+          workflows = [p for p in tree if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", p)]
+          kept_workflows = kept(workflows)
+          print(f"Exclusions: {len(rules)} pattern(s). In scope at head: {len(kept_tree)} of {len(tree)} file(s).")
+          if has_range:
+              changed = read_paths(range_paths_file)
+              print(f"Files added or modified in the range: {len(kept(changed))} of {len(changed)} in scope.")
+          if not kept_tree:
+              print("::error::The exclusions leave zero tracked files in scope; failing closed")
+              sys.exit(1)
+          if workflows and not kept_workflows:
+              print("::error::The exclusions leave zero workflow files in scope; failing closed")
+              sys.exit(1)
+          for ext in req_exts:
+              matched = [p for p in tree if p.endswith(ext)]
+              kept_matched = kept(matched)
+              print(f"Required extension {ext}: {len(kept_matched)} of {len(matched)} file(s) in scope.")
+              if not kept_matched:
+                  print(f"::error::The exclusions leave zero {ext} files in scope; failing closed")
+                  sys.exit(1)
+          Path(out_resolved).write_text(str(ignore_path) if ignore_path is not None else "", encoding="utf-8")
+          PY
+          then
+            ignore_arg="$(cat "$work/ignore-resolved")"
+          else
+            exit 1
+          fi
+
+          args=(
+            git "file://${GITHUB_WORKSPACE}"
+            --branch "$head"
+            --fail --no-update --json
+            "--results=verified,unknown,unverified"
+            --exclude-detectors=Lob
+            --fail-on-scan-errors
+          )
+          if [ -n "$ignore_arg" ]; then
+            args+=(--exclude-paths="$ignore_arg")
+          fi
+          if [ -n "$base" ]; then
+            args+=(--since-commit "$base")
+          fi
+
+          diagnostics="$work/stderr.log"
+          set +e
+          env -i PATH=/usr/bin:/bin HOME="$work/home" TMPDIR="$work/tmp" \
+            "$TRUFFLEHOG_BIN" "${args[@]}" > "$findings" 2> "$diagnostics"
+          rc=$?
+          set -e
+          echo "TruffleHog exited ${rc}; $(wc -l < "$diagnostics") stderr line(s) withheld from this log."
+          jq -R -r 'fromjson? | select(type == "object" and .msg == "finished scanning")
+            | [("chunks", "bytes", "verified_secrets", "unverified_secrets") as $k
+               | "\($k)=\(.[$k] | if type == "number" then tostring else "?" end)"]
+            | "Scan summary: " + join(" ")' "$diagnostics" 2> /dev/null || true
+
+          if ! count="$(jq -s 'length' "$findings" 2> /dev/null)"; then
+            echo "::error::TruffleHog output is not valid JSON (exit ${rc}); failing closed"
+            exit 1
+          fi
+          if [ "$count" -gt 0 ]; then
+            echo "::error::TruffleHog reported ${count} finding(s). Secret values are redacted from this log."
+            jq -r 'def s: if type == "string" or type == "number" or type == "boolean" then (tostring | gsub("[\r\n\u0000-\u001f\u007f]+"; " ")) else "?" end;
+              .SourceMetadata.Data.Git as $git
+              | "::error::TruffleHog \(.DetectorName | s) verified=\(.Verified | s)"
+              + " \($git.file | s):\($git.line | s) commit=\($git.commit | s)"' \
+              "$findings" 2> /dev/null || echo "::error::Finding locations could not be summarized"
+          fi
+
+          status="error"
+          case "$rc" in
+            0)
+              if [ "$count" -ne 0 ]; then
+                echo "::error::Findings were reported with exit 0; failing closed"
+                status="error"
+              else
+                echo "No secrets found."
+                status="clean"
+              fi
+              ;;
+            183)
+              status="finding"
+              ;;
+            *)
+              echo "::error::TruffleHog exited ${rc} (scan error); failing closed"
+              status="error"
+              ;;
+          esac
+          receipt="$(jq -nc --arg version "$TRUFFLEHOG_VERSION" --arg event "$EVENT_NAME" \
+            --arg status "$status" --argjson commits "$commits" --argjson findings "$count" \
+            '{tool: "trufflehog", version: $version, event: $event, status: $status, commits: $commits, findings: $findings}')"
+          echo "secret-scan receipt: ${receipt}"
+          printf '### Secret scan (TruffleHog %s)\n\140\140\140json\n%s\n\140\140\140\n' "$TRUFFLEHOG_VERSION" "$receipt" >> "$GITHUB_STEP_SUMMARY"
+          printf 'receipt=%s\n' "$receipt" >> "$GITHUB_OUTPUT"
+          if [ "$status" != "clean" ]; then
+            exit 1
+          fi
+
+      - name: Remove tools and scan results
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/secret-scan" "$RUNNER_TEMP/trufflehog"
+
+  trivy-fs:
+    name: Trivy dependencies and licences
+    if: ${{ inputs.run-trivy-fs }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.scan.outputs.receipt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cached Trivy archive
+        id: cache-trivy
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/trivy/archive.tar.gz
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-trivy-${{ env.TRIVY_VERSION }}-${{ env.TRIVY_LINUX_64BIT_SHA256 }}
+
+      - name: Download Trivy archive on cache miss
+        if: steps.cache-trivy.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 20 --max-time 60 \
+            --output "$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+      - name: Verify and extract Trivy
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
+          printf '%s  %s\n' "$TRIVY_LINUX_64BIT_SHA256" "$archive" | sha256sum --check --strict
+          rm -rf "$RUNNER_TEMP/trivy"
+          mkdir -p "$RUNNER_TEMP/trivy"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/trivy" trivy
+          ver_out="$RUNNER_TEMP/trivy/version.out"
+          ver_err="$RUNNER_TEMP/trivy/version.err"
+          if ! (cd "$RUNNER_TEMP/trivy" && env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/trivy" \
+            "$RUNNER_TEMP/trivy/trivy" --config "" --version >"$ver_out" 2>"$ver_err"); then
+            echo "::error::Trivy version check failed ($(wc -l < "$ver_err") stderr line(s) withheld)"
+            exit 1
+          fi
+          IFS= read -r reported < "$ver_out" || reported=""
+          if [ "$reported" != "Version: ${TRIVY_VERSION}" ]; then
+            echo "::error::Expected trivy Version: ${TRIVY_VERSION}, got: ${reported}"
+            exit 1
+          fi
+
+      - name: Save verified Trivy archive
+        if: steps.cache-trivy.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/trivy/archive.tar.gz
+          key: ${{ steps.cache-trivy.outputs.cache-primary-key }}
+
+      - name: Scan dependency and licence targets with Trivy
+        id: scan
+        env:
+          TRIVY_BIN: ${{ runner.temp }}/trivy/trivy
+          INPUT_TARGETS: ${{ inputs.trivy-fs-targets }}
+          INPUT_SCANNERS: ${{ inputs.trivy-scanners }}
+          INPUT_SEVERITY: ${{ inputs.trivy-severity }}
+          INPUT_IGNORE_UNFIXED: ${{ inputs.trivy-ignore-unfixed }}
+          INPUT_INCLUDE_DEV: ${{ inputs.trivy-include-dev-deps }}
+          INPUT_IGNOREFILE: ${{ inputs.trivy-ignorefile }}
+          INPUT_IGNORED_LICENSES: ${{ inputs.trivy-ignored-licenses }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/trivy-fs-work"
+          rm -rf "$work"
+          mkdir -p "$work/home" "$work/tmp" "$work/cache"
+          /usr/bin/python3 -I -B - "$work" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          work = Path(sys.argv[1])
+          root = Path.cwd().resolve()
+          version = os.environ["TRIVY_VERSION"]
+          trivy = os.environ["TRIVY_BIN"]
+          db_repo = os.environ["TRIVY_DB_REPOSITORY"]
+          checks_repo = os.environ["TRIVY_CHECKS_BUNDLE_REPOSITORY"]
+          checks_digest = os.environ["TRIVY_CHECKS_BUNDLE_DIGEST"]
+          clean_env = {"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")}
+
+          def clean_log(val: object) -> str:
+              return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
+
+          def emit(receipt: dict, rc: int) -> None:
+              encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+              print(f"trivy-fs receipt: {encoded}")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as handle:
+                      handle.write(f"### Trivy fs ({version})\n```json\n{encoded}\n```\n")
+              out = os.environ.get("GITHUB_OUTPUT")
+              if out:
+                  with open(out, "a", encoding="utf-8") as handle:
+                      handle.write(f"receipt={encoded}\n")
+              sys.exit(rc)
+
+          def valid_rel(value: str) -> Path | None:
+              if value == ".":
+                  return root
+              if not value or value.startswith(("/", "-")) or "\0" in value:
+                  return None
+              if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value):
+                  return None
+              parts = value.split("/")
+              if any(part in ("", ".", "..") for part in parts):
+                  return None
+              raw = root
+              for part in parts:
+                  raw = raw / part
+                  if raw.is_symlink():
+                      return None
+              candidate = raw.resolve()
+              if not candidate.is_relative_to(root):
+                  return None
+              return candidate
+
+          VALID_SCANNERS = {"vuln", "license", "misconfig"}
+          VALID_SEV = {"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
+          scanners = [s.strip() for s in os.environ.get("INPUT_SCANNERS", "vuln,license").split(",") if s.strip()]
+          severities = [s.strip() for s in os.environ.get("INPUT_SEVERITY", "HIGH,CRITICAL").split(",") if s.strip()]
+          if not scanners or any(s not in VALID_SCANNERS for s in scanners):
+              print("::error::Invalid trivy-scanners value; failing closed")
+              emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
+          if not severities or any(s not in VALID_SEV for s in severities):
+              print("::error::Invalid trivy-severity value; failing closed")
+              emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
+
+          ignored_licenses = os.environ.get("INPUT_IGNORED_LICENSES", "").strip()
+          if ignored_licenses and not re.fullmatch(r"[A-Za-z0-9.+-]+(,[A-Za-z0-9.+-]+)*", ignored_licenses):
+              print("::error::Invalid trivy-ignored-licenses syntax; failing closed")
+              emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
+
+          raw_ignorefile = os.environ.get("INPUT_IGNOREFILE", "").strip()
+          if raw_ignorefile:
+              ig_path = valid_rel(raw_ignorefile)
+              if ig_path is None or not ig_path.is_file() or ig_path.is_symlink():
+                  print(f"::error::trivy-ignorefile '{raw_ignorefile}' is invalid or missing; failing closed")
+                  emit({"tool": "trivy-fs", "version": version, "status": "missing_target", "targets": []}, 1)
+              ignorefile_arg = str(ig_path.relative_to(root))
+          elif (root / ".trivyignore").is_file() and not (root / ".trivyignore").is_symlink():
+              ignorefile_arg = ".trivyignore"
+          else:
+              ignorefile_arg = ""
+
+          targets = [line.strip() for line in os.environ.get("INPUT_TARGETS", "").splitlines() if line.strip()]
+          if not targets:
+              print("::error::trivy-fs-targets is empty while run-trivy-fs is true; failing closed")
+              emit({"tool": "trivy-fs", "version": version, "status": "missing_target", "targets": []}, 1)
+
+          # Download vulnerability DB once before scanning targets.
+          if "vuln" in scanners:
+              db_err = work / "db-stderr.log"
+              with open(db_err, "wb") as err_fh:
+                  db_proc = subprocess.run(
+                      [
+                          trivy, "fs", "--download-db-only",
+                          "--config", "",
+                          "--cache-dir", str(work / "cache"),
+                          "--db-repository", db_repo,
+                          "--disable-telemetry", "--skip-version-check", "--quiet", "--no-progress",
+                      ],
+                      env=clean_env,
+                      stdout=subprocess.DEVNULL,
+                      stderr=err_fh,
+                      check=False,
+                  )
+              if db_proc.returncode != 0:
+                  print(f"::error::Trivy vulnerability DB download failed (exit {db_proc.returncode}); failing closed")
+                  emit({"tool": "trivy-fs", "version": version, "status": "error", "targets": []}, 1)
+
+          include_dev = os.environ.get("INPUT_INCLUDE_DEV", "true").lower() == "true"
+          ignore_unfixed = os.environ.get("INPUT_IGNORE_UNFIXED", "false").lower() == "true"
+          failed = False
+          target_receipts = []
+          checks_downloaded = False
+
+          for idx, raw_target in enumerate(targets):
+              resolved = valid_rel(raw_target)
+              if resolved is None:
+                  print(f"::error::Invalid trivy-fs target path '{raw_target}'; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "invalid_target"})
+                  failed = True
+                  continue
+              if not resolved.exists() or resolved.is_symlink():
+                  print(f"::error::trivy-fs target '{raw_target}' is missing; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "missing_target"})
+                  failed = True
+                  continue
+
+              out_json = work / f"target-{idx}.json"
+              err_log = work / f"target-{idx}.stderr.log"
+              cmd = [
+                  trivy, "fs",
+                  "--config", "",
+                  "--cache-dir", str(work / "cache"),
+                  "--disable-telemetry", "--skip-version-check", "--quiet", "--no-progress",
+                  "--scanners", ",".join(scanners),
+                  "--severity", ",".join(severities),
+                  "--list-all-pkgs",
+                  "--ignorefile", ignorefile_arg,
+                  "--format", "json",
+                  "--output", str(out_json),
+              ]
+              if "vuln" in scanners:
+                  cmd.extend(["--skip-db-update", "--db-repository", db_repo])
+              if "misconfig" in scanners:
+                  cmd.extend(["--checks-bundle-repository", checks_repo, "--include-non-failures"])
+                  if checks_downloaded:
+                      cmd.append("--skip-check-update")
+              if include_dev:
+                  cmd.append("--include-dev-deps")
+              if ignore_unfixed:
+                  cmd.append("--ignore-unfixed")
+              if ignored_licenses:
+                  cmd.extend(["--ignored-licenses", ignored_licenses])
+              cmd.append(raw_target)
+
+              with open(err_log, "wb") as err_fh:
+                  proc = subprocess.run(cmd, env=clean_env, stdout=subprocess.DEVNULL, stderr=err_fh, check=False)
+              err_lines = sum(1 for _ in open(err_log, "rb"))
+              print(f"trivy fs target={raw_target}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
+              if "misconfig" in scanners and not checks_downloaded:
+                  meta_file = work / "cache" / "policy" / "metadata.json"
+                  try:
+                      meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                  except (OSError, ValueError):
+                      meta = {}
+                  if meta.get("Digest") != checks_digest:
+                      print("::error::Trivy checks bundle digest mismatch; failing closed")
+                      target_receipts.append({"target": raw_target, "status": "error"})
+                      failed = True
+                      continue
+                  checks_downloaded = True
+
+              if proc.returncode != 0:
+                  print(f"::error::trivy fs exited {proc.returncode} on '{raw_target}'; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "error"})
+                  failed = True
+                  continue
+              try:
+                  report = json.loads(out_json.read_text(encoding="utf-8"))
+              except (OSError, ValueError):
+                  print(f"::error::trivy fs output for '{raw_target}' is missing or malformed JSON; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "error"})
+                  failed = True
+                  continue
+              results = report.get("Results") if isinstance(report, dict) else None
+              if not isinstance(results, list):
+                  results = []
+
+              pkgs = 0
+              vulns = 0
+              lics = 0
+              misconfigs = 0
+              configs_seen = 0
+              for res in results:
+                  if not isinstance(res, dict):
+                      continue
+                  r_target = clean_log(res.get("Target", raw_target))
+                  pkgs += len(res.get("Packages") or [])
+                  if res.get("Class") == "config":
+                      configs_seen += 1
+                  for v in res.get("Vulnerabilities") or []:
+                      vulns += 1
+                      vid = clean_log(v.get("VulnerabilityID", "?"))
+                      pkg = clean_log(v.get("PkgName", "?"))
+                      inst = clean_log(v.get("InstalledVersion", "?"))
+                      fix = clean_log(v.get("FixedVersion", "") or "unfixed")
+                      sev = clean_log(v.get("Severity", "?"))
+                      print(f"::error::Trivy vuln {vid} ({sev}) {pkg} {inst} (fixed: {fix}) in {r_target}")
+                  for lic in res.get("Licenses") or []:
+                      lics += 1
+                      lname = clean_log(lic.get("Name", "?"))
+                      pkg = clean_log(lic.get("PkgName", "?"))
+                      cat = clean_log(lic.get("Category", "?"))
+                      sev = clean_log(lic.get("Severity", "?"))
+                      print(f"::error::Trivy licence {lname} ({cat}/{sev}) {pkg} in {r_target}")
+                  for m in res.get("Misconfigurations") or []:
+                      if m.get("Status") == "FAIL":
+                          misconfigs += 1
+                          mid = clean_log(m.get("ID", "?"))
+                          sev = clean_log(m.get("Severity", "?"))
+                          print(f"::error::Trivy misconfig {mid} ({sev}) in {r_target}")
+
+              if "vuln" in scanners and pkgs == 0:
+                  print(f"::error::trivy fs inventoried zero packages for '{clean_log(raw_target)}'; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "missing_target", "packages": 0, "vulns": 0, "licenses": 0, "misconfigs": 0})
+                  failed = True
+                  continue
+              if "misconfig" in scanners and "vuln" not in scanners and configs_seen == 0:
+                  print(f"::error::trivy fs detected zero config files for '{clean_log(raw_target)}'; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "missing_target", "packages": pkgs, "vulns": 0, "licenses": 0, "misconfigs": 0})
+                  failed = True
+                  continue
+              if scanners == ["license"] and not results:
+                  print(f"::error::trivy fs detected zero licence targets for '{clean_log(raw_target)}'; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "missing_target", "packages": 0, "vulns": 0, "licenses": 0, "misconfigs": 0})
+                  failed = True
+                  continue
+
+              total_findings = vulns + lics + misconfigs
+              t_status = "clean" if total_findings == 0 else "finding"
+              if t_status != "clean":
+                  failed = True
+              target_receipts.append(
+                  {
+                      "target": raw_target,
+                      "status": t_status,
+                      "packages": pkgs,
+                      "vulns": vulns,
+                      "licenses": lics,
+                      "misconfigs": misconfigs,
+                  }
+              )
+
+          emit(
+              {
+                  "tool": "trivy-fs",
+                  "version": version,
+                  "scanners": scanners,
+                  "severity": severities,
+                  "status": "clean" if not failed else "failed",
+                  "targets": target_receipts,
+              },
+              0 if not failed else 1,
+          )
+          PY
+
+      - name: Remove tools and scan results
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-fs-work"
+
+  trivy-iac:
+    name: Trivy IaC and misconfiguration
+    if: ${{ inputs.run-trivy-iac }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.scan.outputs.receipt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cached Trivy archive
+        id: cache-trivy
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/trivy/archive.tar.gz
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-trivy-${{ env.TRIVY_VERSION }}-${{ env.TRIVY_LINUX_64BIT_SHA256 }}
+
+      - name: Download Trivy archive on cache miss
+        if: steps.cache-trivy.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 20 --max-time 60 \
+            --output "$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+      - name: Verify and extract Trivy
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
+          printf '%s  %s\n' "$TRIVY_LINUX_64BIT_SHA256" "$archive" | sha256sum --check --strict
+          rm -rf "$RUNNER_TEMP/trivy"
+          mkdir -p "$RUNNER_TEMP/trivy"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/trivy" trivy
+          ver_out="$RUNNER_TEMP/trivy/version.out"
+          ver_err="$RUNNER_TEMP/trivy/version.err"
+          if ! (cd "$RUNNER_TEMP/trivy" && env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/trivy" \
+            "$RUNNER_TEMP/trivy/trivy" --config "" --version >"$ver_out" 2>"$ver_err"); then
+            echo "::error::Trivy version check failed ($(wc -l < "$ver_err") stderr line(s) withheld)"
+            exit 1
+          fi
+          IFS= read -r reported < "$ver_out" || reported=""
+          if [ "$reported" != "Version: ${TRIVY_VERSION}" ]; then
+            echo "::error::Expected trivy Version: ${TRIVY_VERSION}, got: ${reported}"
+            exit 1
+          fi
+
+      - name: Save verified Trivy archive
+        if: steps.cache-trivy.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/trivy/archive.tar.gz
+          key: ${{ steps.cache-trivy.outputs.cache-primary-key }}
+
+      - name: Scan IaC and Dockerfile targets with Trivy config
+        id: scan
+        env:
+          TRIVY_BIN: ${{ runner.temp }}/trivy/trivy
+          INPUT_TARGETS: ${{ inputs.trivy-iac-targets }}
+          INPUT_SEVERITY: ${{ inputs.trivy-iac-severity }}
+          INPUT_SCANNERS: ${{ inputs.trivy-iac-scanners }}
+          INPUT_SKIP_DIRS: ${{ inputs.trivy-iac-skip-dirs }}
+          INPUT_SKIP_FILES: ${{ inputs.trivy-iac-skip-files }}
+          INPUT_IGNOREFILE: ${{ inputs.trivy-ignorefile }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/trivy-iac-work"
+          rm -rf "$work"
+          mkdir -p "$work/home" "$work/tmp" "$work/cache"
+          /usr/bin/python3 -I -B - "$work" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          work = Path(sys.argv[1])
+          root = Path.cwd().resolve()
+          version = os.environ["TRIVY_VERSION"]
+          trivy = os.environ["TRIVY_BIN"]
+          checks_repo = os.environ["TRIVY_CHECKS_BUNDLE_REPOSITORY"]
+          checks_digest = os.environ["TRIVY_CHECKS_BUNDLE_DIGEST"]
+          clean_env = {"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")}
+
+          def clean_log(val: object) -> str:
+              return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
+
+          def emit(receipt: dict, rc: int) -> None:
+              encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+              print(f"trivy-iac receipt: {encoded}")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as handle:
+                      handle.write(f"### Trivy IaC ({version})\n```json\n{encoded}\n```\n")
+              out = os.environ.get("GITHUB_OUTPUT")
+              if out:
+                  with open(out, "a", encoding="utf-8") as handle:
+                      handle.write(f"receipt={encoded}\n")
+              sys.exit(rc)
+
+          def valid_rel(value: str) -> Path | None:
+              if value == ".":
+                  return root
+              if not value or value.startswith(("/", "-")) or "\0" in value:
+                  return None
+              if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value):
+                  return None
+              parts = value.split("/")
+              if any(part in ("", ".", "..") for part in parts):
+                  return None
+              raw = root
+              for part in parts:
+                  raw = raw / part
+                  if raw.is_symlink():
+                      return None
+              candidate = raw.resolve()
+              if not candidate.is_relative_to(root):
+                  return None
+              return candidate
+
+          VALID_SEV = {"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
+          VALID_SCANNERS = {
+              "azure-arm", "cloudformation", "dockerfile", "helm", "kubernetes",
+              "terraform", "terraformplan-json", "terraformplan-snapshot", "ansible",
+          }
+          severities = [s.strip() for s in os.environ.get("INPUT_SEVERITY", "HIGH,CRITICAL").split(",") if s.strip()]
+          scanners = [s.strip() for s in os.environ.get("INPUT_SCANNERS", "").split(",") if s.strip()]
+          if not severities or any(s not in VALID_SEV for s in severities):
+              print("::error::Invalid trivy-iac-severity value; failing closed")
+              emit({"tool": "trivy-iac", "version": version, "status": "error", "targets": []}, 1)
+          if not scanners or any(s not in VALID_SCANNERS for s in scanners):
+              print("::error::Invalid trivy-iac-scanners value; failing closed")
+              emit({"tool": "trivy-iac", "version": version, "status": "error", "targets": []}, 1)
+
+          skip_dirs = [line.strip() for line in os.environ.get("INPUT_SKIP_DIRS", "").splitlines() if line.strip()]
+          skip_files = [line.strip() for line in os.environ.get("INPUT_SKIP_FILES", "").splitlines() if line.strip()]
+          for raw in skip_dirs + skip_files:
+              if valid_rel(raw) is None:
+                  print(f"::error::Invalid skip path '{raw}'; failing closed")
+                  emit({"tool": "trivy-iac", "version": version, "status": "error", "targets": []}, 1)
+
+          raw_ignorefile = os.environ.get("INPUT_IGNOREFILE", "").strip()
+          if raw_ignorefile:
+              ig_path = valid_rel(raw_ignorefile)
+              if ig_path is None or not ig_path.is_file() or ig_path.is_symlink():
+                  print(f"::error::trivy-ignorefile '{raw_ignorefile}' is invalid or missing; failing closed")
+                  emit({"tool": "trivy-iac", "version": version, "status": "missing_target", "targets": []}, 1)
+              ignorefile_arg = str(ig_path.relative_to(root))
+          elif (root / ".trivyignore").is_file() and not (root / ".trivyignore").is_symlink():
+              ignorefile_arg = ".trivyignore"
+          else:
+              ignorefile_arg = ""
+
+          targets = [line.strip() for line in os.environ.get("INPUT_TARGETS", "").splitlines() if line.strip()]
+          if not targets:
+              print("::error::trivy-iac-targets is empty while run-trivy-iac is true; failing closed")
+              emit({"tool": "trivy-iac", "version": version, "status": "missing_target", "targets": []}, 1)
+
+          failed = False
+          target_receipts = []
+          checks_verified = False
+
+          for idx, raw_target in enumerate(targets):
+              resolved = valid_rel(raw_target)
+              if resolved is None:
+                  print(f"::error::Invalid trivy-iac target path '{raw_target}'; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "invalid_target"})
+                  failed = True
+                  continue
+              if not resolved.exists() or resolved.is_symlink():
+                  print(f"::error::trivy-iac target '{raw_target}' is missing; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "missing_target"})
+                  failed = True
+                  continue
+
+              out_json = work / f"iac-{idx}.json"
+              err_log = work / f"iac-{idx}.stderr.log"
+              cmd = [
+                  trivy, "config",
+                  "--config", "",
+                  "--cache-dir", str(work / "cache"),
+                  "--checks-bundle-repository", checks_repo,
+                  "--disable-telemetry", "--skip-version-check", "--quiet",
+                  "--include-non-failures",
+                  "--misconfig-scanners", ",".join(scanners),
+                  "--severity", ",".join(severities),
+                  "--ignorefile", ignorefile_arg,
+                  "--format", "json",
+                  "--output", str(out_json),
+              ]
+              if checks_verified:
+                  cmd.append("--skip-check-update")
+              for d in skip_dirs:
+                  cmd.extend(["--skip-dirs", d])
+              for f in skip_files:
+                  cmd.extend(["--skip-files", f])
+              cmd.append(raw_target)
+
+              with open(err_log, "wb") as err_fh:
+                  proc = subprocess.run(cmd, env=clean_env, stdout=subprocess.DEVNULL, stderr=err_fh, check=False)
+              err_lines = sum(1 for _ in open(err_log, "rb"))
+              print(f"trivy config target={raw_target}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
+              if not checks_verified:
+                  meta_file = work / "cache" / "policy" / "metadata.json"
+                  try:
+                      meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                  except (OSError, ValueError):
+                      meta = {}
+                  if meta.get("Digest") != checks_digest:
+                      print("::error::Trivy checks bundle digest mismatch; failing closed")
+                      target_receipts.append({"target": raw_target, "status": "error"})
+                      failed = True
+                      continue
+                  checks_verified = True
+
+              if proc.returncode != 0:
+                  print(f"::error::trivy config exited {proc.returncode} on '{raw_target}'; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "error"})
+                  failed = True
+                  continue
+              try:
+                  report = json.loads(out_json.read_text(encoding="utf-8"))
+              except (OSError, ValueError):
+                  print(f"::error::trivy config output for '{raw_target}' is missing or malformed JSON; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "error"})
+                  failed = True
+                  continue
+              results = report.get("Results") if isinstance(report, dict) else None
+              if not isinstance(results, list):
+                  results = []
+
+              configs = 0
+              passed_checks = 0
+              failures = 0
+              for res in results:
+                  if not isinstance(res, dict) or res.get("Class") != "config":
+                      continue
+                  configs += 1
+                  summary = res.get("MisconfSummary") or {}
+                  passed_checks += int(summary.get("Successes", 0))
+                  r_target = clean_log(res.get("Target", raw_target))
+                  for m in res.get("Misconfigurations") or []:
+                      if m.get("Status") != "FAIL":
+                          continue
+                      failures += 1
+                      mid = clean_log(m.get("ID", "?"))
+                      sev = clean_log(m.get("Severity", "?"))
+                      cause = m.get("CauseMetadata") if isinstance(m.get("CauseMetadata"), dict) else {}
+                      line = int_or_zero(cause.get("StartLine", 0))
+                      # Redacted diagnostics: rule ID, severity, target path and line only (never Code.Lines).
+                      print(f"::error file={esc_prop(r_target)},line={line}::Trivy IaC {mid} ({sev}) at {r_target}:{line}")
+
+              if configs == 0:
+                  print(f"::error::trivy config detected zero config files for '{raw_target}'; failing closed")
+                  target_receipts.append({"target": raw_target, "status": "missing_target", "configs": 0, "passed": 0, "failures": 0})
+                  failed = True
+                  continue
+              t_status = "clean" if failures == 0 else "finding"
+              if t_status != "clean":
+                  failed = True
+              target_receipts.append(
+                  {
+                      "target": raw_target,
+                      "status": t_status,
+                      "configs": configs,
+                      "passed": passed_checks,
+                      "failures": failures,
+                  }
+              )
+
+          emit(
+              {
+                  "tool": "trivy-iac",
+                  "version": version,
+                  "checks_digest": checks_digest,
+                  "severity": severities,
+                  "status": "clean" if not failed else "failed",
+                  "targets": target_receipts,
+              },
+              0 if not failed else 1,
+          )
+          PY
+
+      - name: Remove tools and scan results
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-iac-work"
+
+  trivy-image:
+    name: Trivy container image
+    if: ${{ inputs.run-trivy-image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      receipt: ${{ steps.scan.outputs.receipt }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore cached Trivy archive
+        id: cache-trivy
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/trivy/archive.tar.gz
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-trivy-${{ env.TRIVY_VERSION }}-${{ env.TRIVY_LINUX_64BIT_SHA256 }}
+
+      - name: Download Trivy archive on cache miss
+        if: steps.cache-trivy.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
+          mkdir -p "$(dirname "$archive")"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 5 --retry-max-time 120 \
+            --connect-timeout 20 --max-time 60 \
+            --output "$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+
+      - name: Verify and extract Trivy
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-cache/trivy/archive.tar.gz"
+          printf '%s  %s\n' "$TRIVY_LINUX_64BIT_SHA256" "$archive" | sha256sum --check --strict
+          rm -rf "$RUNNER_TEMP/trivy"
+          mkdir -p "$RUNNER_TEMP/trivy"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/trivy" trivy
+          ver_out="$RUNNER_TEMP/trivy/version.out"
+          ver_err="$RUNNER_TEMP/trivy/version.err"
+          if ! (cd "$RUNNER_TEMP/trivy" && env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/trivy" \
+            "$RUNNER_TEMP/trivy/trivy" --config "" --version >"$ver_out" 2>"$ver_err"); then
+            echo "::error::Trivy version check failed ($(wc -l < "$ver_err") stderr line(s) withheld)"
+            exit 1
+          fi
+          IFS= read -r reported < "$ver_out" || reported=""
+          if [ "$reported" != "Version: ${TRIVY_VERSION}" ]; then
+            echo "::error::Expected trivy Version: ${TRIVY_VERSION}, got: ${reported}"
+            exit 1
+          fi
+
+      - name: Save verified Trivy archive
+        if: steps.cache-trivy.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/trivy/archive.tar.gz
+          key: ${{ steps.cache-trivy.outputs.cache-primary-key }}
+
+      - name: Scan container image targets with Trivy
+        id: scan
+        env:
+          TRIVY_BIN: ${{ runner.temp }}/trivy/trivy
+          INPUT_TARGETS: ${{ inputs.trivy-image-targets }}
+          INPUT_SEVERITY: ${{ inputs.trivy-image-severity }}
+          INPUT_SCANNERS: ${{ inputs.trivy-image-scanners }}
+          INPUT_IGNORE_UNFIXED: ${{ inputs.trivy-image-ignore-unfixed }}
+          INPUT_IGNOREFILE: ${{ inputs.trivy-ignorefile }}
+          INPUT_IGNORED_LICENSES: ${{ inputs.trivy-ignored-licenses }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/trivy-image-work"
+          rm -rf "$work"
+          mkdir -p "$work/home" "$work/tmp" "$work/cache"
+          /usr/bin/python3 -I -B - "$work" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          work = Path(sys.argv[1])
+          root = Path.cwd().resolve()
+          version = os.environ["TRIVY_VERSION"]
+          trivy = os.environ["TRIVY_BIN"]
+          db_repo = os.environ["TRIVY_DB_REPOSITORY"]
+          clean_env = {"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")}
+
+          def clean_log(val: object) -> str:
+              return re.sub(r"[\r\n\x00-\x1f\x7f]+", " ", str(val))
+
+          def esc_prop(val: object) -> str:
+              s = clean_log(val)
+              return s.replace("%", "%25").replace(":", "%3A").replace(",", "%2C")
+
+          def int_or_zero(val: object) -> int:
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return 0
+
+          def emit(receipt: dict, rc: int) -> None:
+              encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+              print(f"trivy-image receipt: {encoded}")
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as handle:
+                      handle.write(f"### Trivy image ({version})\n```json\n{encoded}\n```\n")
+              out = os.environ.get("GITHUB_OUTPUT")
+              if out:
+                  with open(out, "a", encoding="utf-8") as handle:
+                      handle.write(f"receipt={encoded}\n")
+              sys.exit(rc)
+
+          def valid_rel(value: str) -> Path | None:
+              if value == ".":
+                  return root
+              if not value or value.startswith(("/", "-")) or "\0" in value:
+                  return None
+              if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in value):
+                  return None
+              parts = value.split("/")
+              if any(part in ("", ".", "..") for part in parts):
+                  return None
+              raw = root
+              for part in parts:
+                  raw = raw / part
+                  if raw.is_symlink():
+                      return None
+              candidate = raw.resolve()
+              if not candidate.is_relative_to(root):
+                  return None
+              return candidate
+
+          VALID_SCANNERS = {"vuln", "license"}
+          VALID_SEV = {"UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
+          scanners = [s.strip() for s in os.environ.get("INPUT_SCANNERS", "vuln").split(",") if s.strip()]
+          severities = [s.strip() for s in os.environ.get("INPUT_SEVERITY", "HIGH,CRITICAL").split(",") if s.strip()]
+          if not scanners or any(s not in VALID_SCANNERS for s in scanners):
+              print("::error::Invalid trivy-image-scanners value; failing closed")
+              emit({"tool": "trivy-image", "version": version, "status": "error", "targets": []}, 1)
+          if not severities or any(s not in VALID_SEV for s in severities):
+              print("::error::Invalid trivy-image-severity value; failing closed")
+              emit({"tool": "trivy-image", "version": version, "status": "error", "targets": []}, 1)
+
+          ignored_licenses = os.environ.get("INPUT_IGNORED_LICENSES", "").strip()
+          if ignored_licenses and not re.fullmatch(r"[A-Za-z0-9.+-]+(,[A-Za-z0-9.+-]+)*", ignored_licenses):
+              print("::error::Invalid trivy-ignored-licenses syntax; failing closed")
+              emit({"tool": "trivy-image", "version": version, "status": "error", "targets": []}, 1)
+
+          raw_ignorefile = os.environ.get("INPUT_IGNOREFILE", "").strip()
+          if raw_ignorefile:
+              ig_path = valid_rel(raw_ignorefile)
+              if ig_path is None or not ig_path.is_file() or ig_path.is_symlink():
+                  print(f"::error::trivy-ignorefile '{raw_ignorefile}' is invalid or missing; failing closed")
+                  emit({"tool": "trivy-image", "version": version, "status": "missing_target", "targets": []}, 1)
+              ignorefile_arg = str(ig_path.relative_to(root))
+          elif (root / ".trivyignore").is_file() and not (root / ".trivyignore").is_symlink():
+              ignorefile_arg = ".trivyignore"
+          else:
+              ignorefile_arg = ""
+
+          targets = [line.strip() for line in os.environ.get("INPUT_TARGETS", "").splitlines() if line.strip()]
+          if not targets:
+              print("::error::trivy-image-targets is empty while run-trivy-image is true; failing closed")
+              emit({"tool": "trivy-image", "version": version, "status": "missing_target", "targets": []}, 1)
+
+          if "vuln" in scanners:
+              db_err = work / "db-stderr.log"
+              with open(db_err, "wb") as err_fh:
+                  db_proc = subprocess.run(
+                      [
+                          trivy, "image", "--download-db-only",
+                          "--config", "",
+                          "--cache-dir", str(work / "cache"),
+                          "--db-repository", db_repo,
+                          "--disable-telemetry", "--skip-version-check", "--quiet", "--no-progress",
+                      ],
+                      env=clean_env,
+                      stdout=subprocess.DEVNULL,
+                      stderr=err_fh,
+                      check=False,
+                  )
+              if db_proc.returncode != 0:
+                  print(f"::error::Trivy vulnerability DB download failed (exit {db_proc.returncode}); failing closed")
+                  emit({"tool": "trivy-image", "version": version, "status": "error", "targets": []}, 1)
+
+          ignore_unfixed = os.environ.get("INPUT_IGNORE_UNFIXED", "false").lower() == "true"
+          DIGEST_REF = re.compile(r"^[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}$")
+          STAGE_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+          failed = False
+          target_receipts = []
+
+          for idx, spec in enumerate(targets):
+              parts = [p.strip() for p in spec.split("|")]
+              kind = parts[0] if parts else ""
+              built_tag = None
+              tarball = None
+              image_id = ""
+              label = spec
+              try:
+                  if kind == "build" and len(parts) in (3, 4):
+                      dockerfile_raw, context_raw = parts[1], parts[2]
+                      stage = parts[3] if len(parts) == 4 else ""
+                      df_path = valid_rel(dockerfile_raw)
+                      ctx_path = valid_rel(context_raw)
+                      if df_path is None or ctx_path is None:
+                          print(f"::error::Invalid build target paths in '{spec}'; failing closed")
+                          target_receipts.append({"target": spec, "status": "invalid_target"})
+                          failed = True
+                          continue
+                      if not df_path.is_file() or df_path.is_symlink() or not ctx_path.is_dir() or ctx_path.is_symlink():
+                          print(f"::error::Dockerfile or context missing for '{spec}'; failing closed")
+                          target_receipts.append({"target": spec, "status": "missing_target"})
+                          failed = True
+                          continue
+                      if stage and not STAGE_NAME.fullmatch(stage):
+                          print(f"::error::Invalid build stage name in '{spec}'; failing closed")
+                          target_receipts.append({"target": spec, "status": "invalid_target"})
+                          failed = True
+                          continue
+                      built_tag = f"fleet-security-scan:target-{idx}"
+                      build_cmd = ["docker", "build", "--no-cache", "--file", str(df_path), "--tag", built_tag]
+                      if stage:
+                          build_cmd.extend(["--target", stage])
+                      build_cmd.append(str(ctx_path))
+                      build_log = work / f"docker-build-{idx}.log"
+                      with open(build_log, "wb") as log_fh:
+                          bproc = subprocess.run(build_cmd, stdout=log_fh, stderr=subprocess.STDOUT, check=False)
+                      if bproc.returncode != 0:
+                          print(f"::error::docker build failed (exit {bproc.returncode}) for '{spec}'; build output withheld")
+                          target_receipts.append({"target": spec, "status": "error"})
+                          failed = True
+                          continue
+                      insp = subprocess.run(
+                          ["docker", "image", "inspect", "--format", "{{.Id}}", built_tag],
+                          capture_output=True, text=True, check=False,
+                      )
+                      image_id = insp.stdout.strip()
+                      tarball = work / f"image-{idx}.tar"
+                      sproc = subprocess.run(
+                          ["docker", "save", "--output", str(tarball), built_tag],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+                      )
+                      if sproc.returncode != 0 or not tarball.is_file():
+                          print(f"::error::docker save failed for '{spec}'; failing closed")
+                          target_receipts.append({"target": spec, "status": "error"})
+                          failed = True
+                          continue
+                      scan_args = ["--input", str(tarball)]
+                      label = f"{dockerfile_raw} ({context_raw})"
+                  elif kind == "image" and len(parts) == 2:
+                      ref = parts[1]
+                      if not DIGEST_REF.fullmatch(ref):
+                          print(f"::error::Image target '{ref}' must be digest-pinned (@sha256:...); failing closed")
+                          target_receipts.append({"target": ref, "status": "invalid_target"})
+                          failed = True
+                          continue
+                      scan_args = [ref]
+                      image_id = ref.split("@", 1)[1]
+                      label = ref
+                  else:
+                      print(f"::error::Malformed trivy-image-targets entry '{spec}'; failing closed")
+                      target_receipts.append({"target": spec, "status": "invalid_target"})
+                      failed = True
+                      continue
+
+                  out_json = work / f"image-{idx}.json"
+                  err_log = work / f"image-{idx}.stderr.log"
+                  cmd = [
+                      trivy, "image",
+                      "--config", "",
+                      "--cache-dir", str(work / "cache"),
+                      "--disable-telemetry", "--skip-version-check", "--quiet", "--no-progress",
+                      "--scanners", ",".join(scanners),
+                      "--severity", ",".join(severities),
+                      "--list-all-pkgs",
+                      "--ignorefile", ignorefile_arg,
+                      "--format", "json",
+                      "--output", str(out_json),
+                  ]
+                  if "vuln" in scanners:
+                      cmd.extend(["--skip-db-update", "--db-repository", db_repo])
+                  if ignore_unfixed:
+                      cmd.append("--ignore-unfixed")
+                  if ignored_licenses:
+                      cmd.extend(["--ignored-licenses", ignored_licenses])
+                  cmd.extend(scan_args)
+
+                  with open(err_log, "wb") as err_fh:
+                      proc = subprocess.run(cmd, env=clean_env, stdout=subprocess.DEVNULL, stderr=err_fh, check=False)
+                  err_lines = sum(1 for _ in open(err_log, "rb"))
+                  print(f"trivy image target={label}: exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
+                  if proc.returncode != 0:
+                      print(f"::error::trivy image exited {proc.returncode} on '{label}'; failing closed")
+                      target_receipts.append({"target": label, "image_id": image_id, "status": "error"})
+                      failed = True
+                      continue
+                  try:
+                      report = json.loads(out_json.read_text(encoding="utf-8"))
+                  except (OSError, ValueError):
+                      print(f"::error::trivy image output for '{label}' is malformed JSON; failing closed")
+                      target_receipts.append({"target": label, "image_id": image_id, "status": "error"})
+                      failed = True
+                      continue
+                  results = report.get("Results") if isinstance(report, dict) else None
+                  if not isinstance(results, list):
+                      results = []
+                  pkgs = 0
+                  vulns = 0
+                  lics = 0
+                  for res in results:
+                      if not isinstance(res, dict):
+                          continue
+                      r_target = clean_log(res.get("Target", label))
+                      pkgs += len(res.get("Packages") or [])
+                      for v in res.get("Vulnerabilities") or []:
+                          vulns += 1
+                          vid = clean_log(v.get("VulnerabilityID", "?"))
+                          pkg = clean_log(v.get("PkgName", "?"))
+                          inst = clean_log(v.get("InstalledVersion", "?"))
+                          fix = clean_log(v.get("FixedVersion", "") or "unfixed")
+                          sev = clean_log(v.get("Severity", "?"))
+                          print(f"::error::Trivy image vuln {vid} ({sev}) {pkg} {inst} (fixed: {fix}) in {r_target}")
+                      for lic in res.get("Licenses") or []:
+                          lics += 1
+                          lname = clean_log(lic.get("Name", "?"))
+                          pkg = clean_log(lic.get("PkgName", "?"))
+                          cat = clean_log(lic.get("Category", "?"))
+                          sev = clean_log(lic.get("Severity", "?"))
+                          print(f"::error::Trivy image licence {lname} ({cat}/{sev}) {pkg} in {r_target}")
+                  if pkgs == 0:
+                      print(f"::error::trivy image inventoried zero packages for '{label}'; failing closed")
+                      target_receipts.append({"target": label, "image_id": image_id, "status": "missing_target", "packages": 0, "vulns": 0, "licenses": 0})
+                      failed = True
+                      continue
+                  t_status = "clean" if (vulns + lics) == 0 else "finding"
+                  if t_status != "clean":
+                      failed = True
+                  target_receipts.append(
+                      {
+                          "target": label,
+                          "image_id": image_id,
+                          "status": t_status,
+                          "packages": pkgs,
+                          "vulns": vulns,
+                          "licenses": lics,
+                      }
+                  )
+              finally:
+                  if tarball and tarball.exists():
+                      tarball.unlink(missing_ok=True)
+                  if built_tag:
+                      subprocess.run(["docker", "image", "rm", "-f", built_tag], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+          emit(
+              {
+                  "tool": "trivy-image",
+                  "version": version,
+                  "scanners": scanners,
+                  "severity": severities,
+                  "status": "clean" if not failed else "failed",
+                  "targets": target_receipts,
+              },
+              0 if not failed else 1,
+          )
+          PY
+
+      - name: Remove tools and scan results
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-image-work"
+
+  security-gate:
+    name: Fleet security gate
+    if: always()
+    needs: [actionlint, shellcheck, zizmor, secret-scan, trivy-fs, trivy-iac, trivy-image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      receipt: ${{ steps.gate.outputs.receipt }}
+    steps:
+      - name: Verify every enabled security check succeeded
+        id: gate
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_ACTIONLINT: ${{ inputs.run-actionlint }}
+          RUN_SHELLCHECK: ${{ inputs.run-shellcheck }}
+          RUN_ZIZMOR: ${{ inputs.run-zizmor }}
+          RUN_SECRET_SCAN: ${{ inputs.run-secret-scan }}
+          RUN_TRIVY_FS: ${{ inputs.run-trivy-fs }}
+          RUN_TRIVY_IAC: ${{ inputs.run-trivy-iac }}
+          RUN_TRIVY_IMAGE: ${{ inputs.run-trivy-image }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -B - <<'PY'
+          import json
+          import os
+          import sys
+
+          try:
+              needs = json.loads(os.environ["NEEDS_JSON"])
+          except ValueError:
+              print("::error::needs payload is not valid JSON; failing closed")
+              sys.exit(1)
+          if not isinstance(needs, dict):
+              print("::error::needs payload is not an object; failing closed")
+              sys.exit(1)
+
+          toggles = {
+              "actionlint": os.environ.get("RUN_ACTIONLINT", "false").lower() == "true",
+              "shellcheck": os.environ.get("RUN_SHELLCHECK", "false").lower() == "true",
+              "zizmor": os.environ.get("RUN_ZIZMOR", "false").lower() == "true",
+              "secret-scan": os.environ.get("RUN_SECRET_SCAN", "false").lower() == "true",
+              "trivy-fs": os.environ.get("RUN_TRIVY_FS", "false").lower() == "true",
+              "trivy-iac": os.environ.get("RUN_TRIVY_IAC", "false").lower() == "true",
+              "trivy-image": os.environ.get("RUN_TRIVY_IMAGE", "false").lower() == "true",
+          }
+
+          enabled = [name for name, on in toggles.items() if on]
+          failed = False
+          if not enabled:
+              print("::error::Fleet security workflow invoked with zero checks enabled; failing closed")
+              failed = True
+
+          jobs_summary = {}
+          for name, on in toggles.items():
+              entry = needs.get(name)
+              result = entry.get("result") if isinstance(entry, dict) else "missing"
+              expected = "success" if on else "skipped"
+              print(f"{name}: {result} (required {expected})")
+              if result != expected:
+                  print(f"::error::Job {name} finished with result {result}, expected {expected}")
+                  failed = True
+              rec = None
+              if isinstance(entry, dict) and isinstance(entry.get("outputs"), dict):
+                  raw_rec = entry["outputs"].get("receipt")
+                  if isinstance(raw_rec, str) and raw_rec:
+                      try:
+                          rec = json.loads(raw_rec)
+                      except ValueError:
+                          print(f"::error::Job {name} emitted malformed receipt JSON; failing closed")
+                          failed = True
+              jobs_summary[name] = {"enabled": on, "result": result, "receipt": rec}
+
+          unexpected = sorted(set(needs) - set(toggles))
+          for extra in unexpected:
+              print(f"::error::Unexpected job {extra} in security-gate needs")
+              failed = True
+
+          summary_doc = {
+              "schema": "fleet-security-receipt.v1",
+              "status": "pass" if not failed else "fail",
+              "pins": {
+                  "actionlint": os.environ["ACTIONLINT_VERSION"],
+                  "shellcheck": os.environ["SHELLCHECK_VERSION"],
+                  "zizmor": os.environ["ZIZMOR_VERSION"],
+                  "trufflehog": os.environ["TRUFFLEHOG_VERSION"],
+                  "trivy": os.environ["TRIVY_VERSION"],
+                  "trivy_checks_digest": os.environ["TRIVY_CHECKS_BUNDLE_DIGEST"],
+              },
+              "jobs": jobs_summary,
+          }
+          encoded = json.dumps(summary_doc, sort_keys=True, separators=(",", ":"))
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as handle:
+                  handle.write(f"## Fleet Security Gate ({summary_doc['status']})\n```json\n{encoded}\n```\n")
+          output_path = os.environ.get("GITHUB_OUTPUT")
+          if output_path:
+              with open(output_path, "a", encoding="utf-8") as handle:
+                  handle.write(f"receipt={encoded}\n")
+          if failed:
+              sys.exit(1)
+          print(f"Fleet security gate green: {len(enabled)} enabled check(s) succeeded.")
+          PY
