@@ -616,6 +616,7 @@ tests/review/test_capability_charge.py
 tests/review/test_capability_failure.py
 tests/review/test_findings_db.py
 tests/review/test_luna_max_routing_contract.py
+tests/review/test_mixed_review_sets.py
 tests/review/test_model_catalog_roles.py
 tests/review/test_review_cursor_grok_reviewer.py
 tests/review/test_review_findings_ledger.py
