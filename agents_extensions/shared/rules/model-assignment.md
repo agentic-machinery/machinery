@@ -227,9 +227,9 @@ official model documentation, checking local bakeoff deltas, updating `reviewed_
 
 **Upgrade qualification.** Note the upstream version or change and the capabilities
 it affects. Rerun representative cases on the affected route before relying on
-the new behavior. When relevant, check that an in-flight turn applies steering
-once, resume preserves state and usage, compaction preserves the context needed
-for the next step, and required tools are still discoverable and callable.
+any affected capability. When relevant, check that an in-flight task follows the
+steering update, resume preserves state and usage, compaction preserves context
+needed for the next step, and required tools are still discoverable and callable.
 For an image-encoding fix, rerun the affected image-input cases and check their results.
 
 Selection order is binding: **independence and hard gates → primary before last resort → semantic suitability → review quality tier → health/quota within
@@ -578,7 +578,7 @@ whether usage on your own provider keys counts. For a custom API loop, enforce a
 per-run budget by reserving worst-case cost before each request and reconciling
 actual charges afterward. Account explicitly for hosted or separately billed
 tools and fees, and stop before a request whose full cost cannot be bounded or
-reserved. Keep a reservation in place when the actual charge is unknown.
+reserved. If the actual charge is unknown, keep the reservation and end the run.
 
 **Model-by-harness intent:** operator-authorized orchestration from Hermes (historically Grok; Grok 4.7 is not a driver seat)
 keeps model family, model ID, harness, and functional role as separate axes. Hermes
