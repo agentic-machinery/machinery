@@ -76,7 +76,7 @@ def test_ukrainian_reference_and_recorder_agree_on_item_rules(rule, monkeypatch,
         if rule == "record-unknown":
             with pytest.raises(recorder.RecordError, match="UKRAINIAN_CLAIMS_UNSUPPORTED"):
                 recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
-            assert comments == [] and calls["posts"] == 0
+            assert comments == [] and calls["posts"] == 0 and calls["statuses"] == 0
         else:
             recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
             marker = sweep.parse_marker(comments[0]["body"])
