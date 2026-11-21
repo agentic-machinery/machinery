@@ -161,10 +161,10 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    waiting in the queue is the only step left and the integration owner has accepted queue
    custody, `pr_ownership queue-exit` may release you. Then report `QUEUED_UNDER_CUSTODY`, and
    the custodian does steps 9 to 11 ([pr-watch](references/pr-watch.md#queue-custody)).
-10. **Close out.** A dispatched worker reports the verified merge SHA, checks that
-    `git status --porcelain` is empty, and ends its run. The supervisor removes the worktree
-    at settlement and runs `merge_closeout`. The driver reads the terminal result from
-    `dispatch wait <task-id> --run-nonce <nonce>` and requires the expected
+10. **Close out.** A dispatched worker that confirms `MERGED` reports the verified merge
+    SHA, checks that `git status --porcelain` is empty, and ends its run. The supervisor
+    removes the worktree at settlement and runs `merge_closeout`. The driver reads the
+    terminal result from `dispatch wait <task-id> --run-nonce <nonce>` and requires the expected
     `delivery_merge_sha`, `worktree_disposition: removed`, and a
     residue-free `closeout` receipt with `returncode: 0`. If the result lists multiple
     `closeouts`, check them all. That receipt completes cleanup.
@@ -175,8 +175,13 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
     retained or errored worktrees through `workflow.md` § Post-merge cleanup, after
     confirming publication and process exit. Never force removal.
 
-    For a merge without a settling dispatcher, wait for all worker and reviewer processes
-    on the PR's worktrees to exit, then run from outside those worktrees:
+    Use the manual recipe if no dispatcher will settle the merged PR. This includes a PR
+    that merges after its delivering task settled, as can happen after a queue custody
+    handoff, a full-stop handoff, or a timeout without a successor settling the merge.
+    If a delivering task was involved, confirm it settled before the merge and has no
+    closeout receipt for it.
+    Wait for all worker and reviewer processes on the PR's worktrees to exit, then run from
+    outside those worktrees:
 
     ```bash
     "$PY" -m lu_machinery.orchestration.merge_closeout "$PR" --repo <owner/name> --repo-root <checkout> --apply
@@ -184,9 +189,10 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 
     Require exit 0 and a residue-free receipt. `merge_closeout` checks worktree and branch
     residue and removes no worktree.
-11. **Dispose of the linked issues.** The worker reports the evidence it has on the
-    merged SHA before it exits. Once all required evidence is in, close each named issue
-    as completed, or record the remaining work, owner and dependency (rules core P4).
+11. **Dispose of the linked issues.** The worker reports the evidence it has on the merged
+    SHA before it exits. The driver or custodian closes each named issue as completed once
+    it has the step-10 receipt and the remaining acceptance evidence. If evidence is
+    missing, record the remaining work, owner and dependency (rules core P4).
 
 ## Optional DeepSeek author pre-check (DS-PRECHECK-1101)
 
