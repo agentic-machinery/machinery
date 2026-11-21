@@ -1935,23 +1935,27 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
                     or "errors" in document
                     or "data" not in document
                     or not set(document) <= {"data", "extensions"}
+                    or not isinstance(document["data"], dict)
+                    or ("extensions" in document and not isinstance(document["extensions"], dict))
                 ):
                     raise ValueError("unknown instance PR identity or state")
-                data = document.get("data")
-                repo_data = data.get("repository") if isinstance(data, dict) else None
+                data = document["data"]
+                if set(data) != {"repository"}:
+                    raise ValueError("unknown instance PR identity or state")
+                repo_data = data["repository"]
                 expected_keys = {f"p{n}" for n in chunk}
                 if not isinstance(repo_data, dict) or set(repo_data) != expected_keys:
                     raise ValueError("unknown instance PR identity or state")
                 for n in chunk:
                     pull = repo_data[f"p{n}"]
-                    if not isinstance(pull, dict):
+                    if not isinstance(pull, dict) or set(pull) != {"number", "state", "merged", "url"}:
                         raise ValueError("unknown instance PR identity or state")
-                    state = pull.get("state")
-                    merged = pull.get("merged")
+                    state = pull["state"]
+                    merged = pull["merged"]
                     if (
-                        type(pull.get("number")) is not int or pull["number"] != n
-                        or pull.get("url") != f"https://github.com/{gh_repo}/pull/{n}"
-                        or state not in {"OPEN", "CLOSED", "MERGED"}
+                        type(pull["number"]) is not int or pull["number"] != n
+                        or pull["url"] != f"https://github.com/{gh_repo}/pull/{n}"
+                        or not isinstance(state, str) or state not in {"OPEN", "CLOSED", "MERGED"}
                         or type(merged) is not bool
                         or (state == "MERGED") != merged
                     ):

@@ -834,24 +834,37 @@ def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reo
     assert gql_reads == 2 and writes == []
 
     # Missing/404 PR (null), GraphQL errors (including falsey/empty error envelopes with otherwise valid rows),
-    # unexpected top-level keys, partial/extra alias keys, malformed rows, and non-zero GraphQL exit must fail closed.
+    # missing/non-object data, non-object extensions, unexpected keys, partial/extra alias keys, malformed rows,
+    # and non-zero GraphQL exit must fail closed on both initial read and pre-PATCH recheck.
     set_pr_instances(2)
     valid_repo = {"p100": documents["pulls/100"], "p101": documents["pulls/101"]}
     bad_gql_responses = [
         (1, "{}"),
+        (0, json.dumps([])),
+        (0, json.dumps({"extensions": {}})),
+        (0, json.dumps({"data": None})),
+        (0, json.dumps({"data": []})),
+        (0, json.dumps({"data": {"repository": valid_repo, "extra": 1}})),
         (0, json.dumps({"errors": [{"type": "NOT_FOUND"}], "data": {"repository": valid_repo}})),
         (0, json.dumps({"errors": [], "data": {"repository": valid_repo}})),
         (0, json.dumps({"errors": None, "data": {"repository": valid_repo}})),
         (0, json.dumps({"errors": False, "data": {"repository": valid_repo}})),
         (0, json.dumps({"data": {"repository": valid_repo}, "unexpected": True})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": []})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": None})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": False})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": "invalid"})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": 1})),
         (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"], "p101": None}}})),
         (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"], "p101": documents["pulls/101"], "p102": documents["pulls/100"]}}})),
         (0, json.dumps({"data": {"repository": None}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "extra": 1}, "p101": documents["pulls/101"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "OPEN", "merged": True}, "p101": documents["pulls/101"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "CLOSED", "merged": True}, "p101": documents["pulls/101"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "MERGED", "merged": False}, "p101": documents["pulls/101"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "closed"}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": []}, "p101": documents["pulls/101"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "url": "https://github.com/other/public/pull/100"}, "p101": documents["pulls/101"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "number": 999}, "p101": documents["pulls/101"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "number": True}, "p101": documents["pulls/101"]}}})),
@@ -865,6 +878,35 @@ def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reo
         with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
             pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=bad_graphql)
         assert writes == []
+
+    # Wrong-typed extensions on the pre-PATCH recheck also fails closed with zero writes;
+    # a spec-compliant object-valued extensions envelope is accepted.
+    recheck_calls = 0
+
+    def bad_extensions_on_recheck(argv, **kwargs):
+        nonlocal recheck_calls
+        if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+            recheck_calls += 1
+            if recheck_calls == 2:
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"data": {"repository": valid_repo}, "extensions": []}), "",
+                )
+        return sender(argv, **kwargs)
+
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=bad_extensions_on_recheck)
+    assert recheck_calls == 2 and writes == []
+
+    def valid_extensions_object(argv, **kwargs):
+        if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"data": {"repository": valid_repo}, "extensions": {"warnings": []}}), "",
+            )
+        return sender(argv, **kwargs)
+
+    answer = pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=valid_extensions_object, capture_output=True, text=True)
+    assert answer.returncode == 0 and len(writes) == 1
+    writes.clear()
 
     # Zero-page paginated REST response ([]) must also fail closed.
     documents["pulls/2/files?per_page=100"] = []
