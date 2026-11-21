@@ -131,7 +131,7 @@ statement of these defaults; other rules and skills point here.
 - **Code:** a Claude author, Sonnet 5.5 by default and Opus 5.5 for hard or security work,
   with a Sol 6.2 reviewer. The reviewer resolver still returns the reviewer of record and
   applies every exclusion and risk floor; at low, medium and high risk it ranks Sol first.
-- **Ukrainian content:** a Sol 6.2 author. Review seats come from the `review-loop` `ukrainian` profile: an Anthropic author, or any author outside OpenAI and Google, is reviewed by Gemini (AGY) and Sol; an OpenAI author by Gemini (AGY) alone; a Google author by Sol alone. No Claude seat. Every seat keeps the Sources tools and the exact-head recording rule.
+- **Ukrainian content:** a Sol 6.2 author, except the fresh-build lesson writer, which defaults to `gemini-4-neon-high` via AGY (operator order UK-WRITER-NEON-1121, 2026-11-21). Review seats come from the `review-loop` `ukrainian` profile: an Anthropic author, or any author outside OpenAI and Google, is reviewed by Gemini (AGY) and Sol; an OpenAI author by Gemini (AGY) alone; a Google author by Sol alone. No Claude seat. Every seat keeps the Sources tools and the exact-head recording rule.
 
 These defaults replace the 2026-10-09 Sol-first code-worker default. When the routing card
 sends coding to Codex, GPT-6.1 Terra (`gpt-6.1-terra`) @ high is the routine non-security
