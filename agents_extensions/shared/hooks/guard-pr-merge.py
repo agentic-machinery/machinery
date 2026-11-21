@@ -1131,6 +1131,14 @@ def _judged_segments(
     return out
 
 
+# Every flag of the publisher's pr-merge, each with a value; any other token is unreadable.
+# A test pins this set to the pr-merge schema, so a new publisher flag is judged here before
+# it can be used, never refused as unreadable by surprise or passed through unjudged.
+_PUBLISHER_MERGE_FLAGS = frozenset({
+    "--number", "--repo", "--subject", "--body", "--body-file", "--match-head", "--expect-queue",
+})
+
+
 def _merge_args(seg: list[str]) -> list[str] | None:
     """Return the args of a `gh pr merge ...` segment this hook judges, else None.
 
@@ -1159,9 +1167,7 @@ def _merge_args(seg: list[str]) -> list[str] | None:
         j = 0
         while j < len(rest):
             key, sep, value = rest[j].partition("=")
-            if key not in {
-                "--number", "--repo", "--subject", "--body", "--body-file", "--match-head", "--expect-queue",
-            }:
+            if key not in _PUBLISHER_MERGE_FLAGS:
                 return [_UNREADABLE_MARKER]
             if not sep:
                 j += 1

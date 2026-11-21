@@ -356,8 +356,12 @@ class GitHub:
         return False
 
     def enqueue(self, number: int, head: str) -> bool:
-        """Enqueue through pr-merge; True when the publisher put the PR at the front of the queue."""
-        self.call(Request("pr-merge", repo=self.repository, number=number, match_head=head))
+        """Enqueue through pr-merge; True when the publisher put the PR at the front of the queue.
+
+        ``expect_queue`` pins the landing kind: the keeper only ever enqueues, so a base
+        branch whose merge queue was turned off is refused instead of squash-merged directly.
+        """
+        self.call(Request("pr-merge", repo=self.repository, number=number, match_head=head, expect_queue="true"))
         return self.queue_jump
 
     def dequeue(self, node_id: str) -> None:

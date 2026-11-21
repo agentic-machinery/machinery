@@ -400,9 +400,11 @@ def test_merge_readiness_reads_and_the_merge_receive_no_override(synthetic_opsec
         calls.append((args, kwargs["env"]))
         if args[:3] == ["gh", "pr", "view"]:
             out = json.dumps({"id": "PR_node", "number": 1, "isDraft": False, "headRefOid": head, "mergeStateStatus": "CLEAN",
-                              "isCrossRepository": False, "baseRefName": "main", "labels": []})
+                              "isCrossRepository": False, "baseRefName": "main", "labels": [],
+                              "statusCheckRollup": [{"__typename": "CheckRun", "name": "CI Gate", "workflowName": "CI",
+                                                     "status": "COMPLETED", "conclusion": "SUCCESS"}]})
         elif args[:3] == ["gh", "pr", "checks"]:
-            out = "[]"
+            out = json.dumps([{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}])
         elif args[:4] == ["gh", "api", "--method", "GET"]:
             if args[4] == "repos/unit/public/issues/1/comments?per_page=100":
                 out = json.dumps([[recorded_approval(head)]])

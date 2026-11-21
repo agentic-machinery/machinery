@@ -85,6 +85,17 @@ def loaded_guard(configured_roots):  # noqa: F811 - imported pytest fixture
         yield
 
 
+def test_hook_accepts_exactly_the_publisher_pr_merge_flags():
+    """Defect class: a new publisher pr-merge flag the hook refuses as unreadable (or reads as a value-less token)."""
+    from lu_machinery.publish.github import SCHEMAS
+
+    schema = SCHEMAS["pr-merge"][1]
+    schema_flags = {"--" + key.replace("_", "-") for key in schema}
+    assert schema_flags == guard._PUBLISHER_MERGE_FLAGS
+    # The hook consumes one value per flag, so a boolean flag would shift every later token.
+    assert "bool" not in schema.values()
+
+
 _ISSUE_9461_MERGES = [
     "gh pr merge 5",
     "python -m lu_machinery.publish pr-merge --number 5 --match-head " + "a" * 40,

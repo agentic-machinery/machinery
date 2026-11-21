@@ -41,14 +41,15 @@ def transport(calls, *, subject="clean (#1)", body="* clean", queue=True, head=H
         pull = {
             "id": "PR_node", "number": 1, "isDraft": False, "headRefOid": HEAD, "state": "OPEN",
             "baseRefName": "main", "isCrossRepository": False, "headRefName": "codex/fixture",
-            "statusCheckRollup": [], "mergeStateStatus": "CLEAN", "labels": [],
+            "statusCheckRollup": [{"__typename": "CheckRun", "name": "CI Gate", "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}],
+            "mergeStateStatus": "CLEAN", "labels": [],
             "isInMergeQueue": bool(queued), "isMergeQueueEnabled": queue,
             "viewerMergeHeadlineText": subject, "viewerMergeBodyText": body,
         }
         if args[:3] == ["gh", "pr", "view"]:
             value = pull
         elif args[:3] == ["gh", "pr", "checks"]:
-            value = []
+            value = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}]
         elif args[:4] == ["gh", "api", "--method", "GET"]:
             value = ([[{"filename": "scripts/example.py", "status": "modified"}]] if "/pulls/1/files" in args[4]
                      else [[recorded_approval(HEAD)]] if "/issues/1/comments" in args[4]

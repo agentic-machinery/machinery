@@ -1625,9 +1625,11 @@ def merge(monkeypatch, comments, *, files=None):
 
     def spy(args, **kwargs):
         if args[1:3] == ["pr", "view"]:
-            body = {"number": 42, "isDraft": False, "headRefOid": SHA, "mergeStateStatus": "CLEAN"}
+            body = {"number": 42, "isDraft": False, "headRefOid": SHA, "mergeStateStatus": "CLEAN",
+                    "statusCheckRollup": [{"__typename": "CheckRun", "name": "CI Gate", "workflowName": "CI",
+                                           "status": "COMPLETED", "conclusion": "SUCCESS"}]}
         elif args[1:3] == ["pr", "checks"]:
-            body = []
+            body = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}]
         elif args[1:5] == ["api", "--method", "POST", "graphql"]:
             body = {"data": {"repository": {"pullRequest": {
                 "id": "PR_fixture_42", "headRefOid": SHA, "isMergeQueueEnabled": False,

@@ -229,11 +229,26 @@ def _parse_status_rollup_rows(
     rows: object, *, advisory: frozenset[str] = frozenset()
 ) -> tuple[list[str], list[str]] | None:
     """Parse old-client rollup rows; ``advisory`` holds only proven external names."""
+    judged = _judge_status_rollup_rows(rows, advisory=advisory)
+    return None if judged is None else (judged[0], judged[1])
+
+
+def _judge_status_rollup_rows(
+    rows: object, *, advisory: frozenset[str] = frozenset()
+) -> tuple[list[str], list[str], int] | None:
+    """``(failing, pending, judged)``: ``judged`` counts the checks proven blocking, whatever their result.
+
+    Advisory checks, proven external advisory runs and unexpanded matrix parents are
+    not judged, so a head carrying only those has ``judged == 0``. A judged row named
+    like an advisory job (its workflow identity missing or another workflow's) still
+    blocks on failure but proves no blocking check. With the advisory policy unavailable
+    (no product checkout, or an unreadable ci.yml) every row is blocking, as the loader states.
+    """
     # Only a list is a check collection; null, {}, "" or false establish nothing.
     if not isinstance(rows, list):
         return None
     if not rows:
-        return [], []
+        return [], [], 0
     policy = load_advisory_checks()
     named = []
     for row in rows:
@@ -265,12 +280,20 @@ def _parse_status_rollup_rows(
             failing.append(name)
         elif result == "PENDING":
             pending.append(name)
-    return failing, pending
+    return failing, pending, sum(1 for row in latest if _rollup_name(row) not in policy.names)
 
 
 def bound_rollup_states(
     bound: object, head: object, repo: object, get_json: Callable[[str], object]
 ) -> tuple[list[str], list[str]] | None:
+    """``(failing, pending)`` of :func:`bound_rollup_judgment`, or None."""
+    judged = bound_rollup_judgment(bound, head, repo, get_json)
+    return None if judged is None else (judged[0], judged[1])
+
+
+def bound_rollup_judgment(
+    bound: object, head: object, repo: object, get_json: Callable[[str], object]
+) -> tuple[list[str], list[str], int] | None:
     """Judge a ``headRefOid,statusCheckRollup`` read whose own head is the judged ``head``.
 
     The rollup and its head arrive in one response, so the judged rows, the App
@@ -326,7 +349,7 @@ def bound_rollup_states(
         rows = project_check_runs(runs) + [row for row in rows if row.get("__typename") != "CheckRun"]
         if external_advisory_names(rows) != names:
             advisory = prove_external_advisory(repo, head, external_advisory_names(rows), get_json)
-    return None if advisory is None else _parse_status_rollup_rows(rows, advisory=advisory)
+    return None if advisory is None else _judge_status_rollup_rows(rows, advisory=advisory)
 
 
 def _duplicate_check_names(rows):
@@ -480,7 +503,7 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
         )
 
     def bound_states(bound):
-        return bound_rollup_states(bound, meta["headRefOid"], repo, get_json)
+        return bound_rollup_judgment(bound, meta["headRefOid"], repo, get_json)
 
     def detail(fallback):
         return f" ({failed[0]})" if failed else f" ({fallback})"
@@ -526,9 +549,16 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
                 # Modern gh can itself omit historical/same-named runs. Its
                 # headless buckets cannot prove workflow/app isolation, even
                 # when the returned names are unique. Judge the bound snapshot.
-                states = bound_states(bound_view()) if raw_checks else parse_checks(raw_checks)
+                # A complete empty list judges no check at all.
+                states = bound_states(bound_view()) if raw_checks else ([], [], 0)
             elif checks.returncode not in {0, 1, 8} or (checks.returncode and not parsed):
                 failed.append(f"pr checks: {_read_failure(checks)}")
+                if checks.returncode == 1 and not (checks.stdout or "").strip():
+                    # gh answers a head with no checks with exit 1 and no output, like
+                    # other errors. Only an empty head-bound rollup types the refusal.
+                    bound = bound_view()
+                    if isinstance(bound, dict) and bound.get("statusCheckRollup") == []:
+                        states = bound_states(bound)
             else:
                 failed.append("pr checks: " + (
                     "malformed JSON" if not parsed else "empty failing list" if raw_checks == [] else "invalid shape"
@@ -537,7 +567,11 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
             raise PublishBlocked(
                 "OPSEC: merge refused: cannot establish check state" + detail("no read failed; check rows unverifiable") + "."
             )
-        reason = readiness_reason(meta, states)
+        failing, pending, judged = states
+        reason = readiness_reason(meta, (failing, pending))
+        if not reason and not judged:
+            # Nothing ran (or only advisory checks ran) on this head: no CI result exists to land on.
+            reason = "NO_CHECKS: the head has no blocking check"
         if match_head is not None and meta["headRefOid"].lower() != match_head.lower():
             reason = "reviewed head changed"
     except (PublishBlocked, GitHubRateLimited):
