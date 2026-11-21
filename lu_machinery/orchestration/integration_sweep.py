@@ -51,7 +51,6 @@ import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -100,7 +99,7 @@ MARKER = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
     r"(?: review_profile=(?P<review_profile>ukrainian))?(?: sources_calls=(?P<sources_calls>[0-9]+))?"
     rf"(?: denominator=(?P<denominator>{_ITEM_LIST}))?(?: coverage=(?P<coverage>-|{_ITEM_LIST}))?"
     rf"(?: void=(?P<void>{VOID_QUOTE_MISMATCH}|{VOID_REVIEWER_BOOKKEEPING}))?"
-    r"(?: review_pair=(?P<review_pair>anthropic_google_openai|anthropic_google|anthropic_openai|google_openai)"
+    r"(?: review_pair=(?P<review_pair>anthropic_google_openai|anthropic_openai)"
     r" scope_commits=(?P<scope_commits>[0-9a-f]{40}(?:,[0-9a-f]{40})*))?"
     r"(?: second_review=(?P<second_review>carbon))? -->\Z"
 )
@@ -364,10 +363,11 @@ def parse_marker(body: str) -> dict[str, Any] | None:
     second = item.pop("second_review")
     raw_scope = item.pop("scope_commits")
     scope = raw_scope.split(",") if raw_scope is not None else None
-    # A pair token names the sorted critical-tier author families (reviewer_resolver.MIXED_REVIEW_FAMILIES).
+    # A pair token names the sorted author families (reviewer_resolver.MIXED_REVIEW_SETS).
     pair_families = frozenset(pair.split("_")) if pair is not None else frozenset()
     if scope is not None and (
         scope != sorted(set(scope)) or item["family"] not in pair_families
+        or model_family(item["model"]) != item["family"]
         or item["review_mode"] is not None or profile is not None or raw_denominator is not None
     ):
         return None
@@ -649,6 +649,10 @@ def _coverage_decision(
     return (state, winner[2], seats, None, winner[1][1], winner[0])
 
 
+# The author family sets of a mixed-family pair, as reviewer_resolver.MIXED_REVIEW_SETS.
+_PAIR_FAMILY_SETS = frozenset({frozenset({"anthropic", "openai"}), frozenset({"anthropic", "google", "openai"})})
+
+
 def _mixed_pair_pending(candidates: Sequence[tuple[datetime, tuple[datetime, int], dict[str, Any]]]) -> bool:
     """A trusted mixed-family code record needs scoped exact-head approvals covering every author family."""
     markers = [item[2] for item in candidates]
@@ -657,8 +661,7 @@ def _mixed_pair_pending(candidates: Sequence[tuple[datetime, tuple[datetime, int
         for marker in markers
         if not is_ukrainian_review(marker)
         and marker.get("review_mode", "cross_family") == "cross_family"
-        and len(families := attested_author_families([marker])) >= 2
-        and families <= {"anthropic", "google", "openai"}
+        and (families := attested_author_families([marker])) in _PAIR_FAMILY_SETS
     }
     if not tokens:
         return False
@@ -676,12 +679,17 @@ def _mixed_pair_pending(candidates: Sequence[tuple[datetime, tuple[datetime, int
     }
     if any(len(family_scopes) > 1 for family_scopes in scopes.values()):
         return True
-    approved = {family: set(next(iter(found))) for family, found in scopes.items() if found}
+    approved = {family: frozenset(next(iter(found))) for family, found in scopes.items() if found}
     if len(approved) < 2:
         return True
-    # Two seats' scopes share exactly the commits of the families neither seat is from.
-    shared = len(families) > 2
-    return any(bool(approved[one] & approved[two]) != shared for one, two in combinations(sorted(approved), 2))
+    # Each scope is the scoped commits minus its own family's, so the scopes fix every family's
+    # commits: an approving family owns the union minus its scope, a family not yet approved the
+    # rest. They must partition the union with no family empty, or the scopes are inconsistent.
+    union = frozenset().union(*approved.values())
+    owned = [union - scope for scope in approved.values()]
+    owned += [union.difference(*owned)] * len(families - set(approved))
+    partition = sum(map(len, owned)) == len(union) == len(frozenset().union(*owned))
+    return not partition or any(not commits for commits in owned)
 
 
 def lookup_verdict(

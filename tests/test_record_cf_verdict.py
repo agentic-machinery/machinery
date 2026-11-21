@@ -2801,9 +2801,21 @@ def test_three_family_head_needs_an_outside_approval_for_every_family(tmp_path, 
     write_task(tasks, task_id="review-two", agent="claude", model="claude-opus-5-5",
                worktree_base_sha=head, review_risk="critical")
     recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    scoped = ",".join(sorted((openai, head)))
     assert sweep.parse_marker(comments[1]["body"])["scope_commits"] == tuple(sorted((openai, head)))
     assert statuses == ["pending", "success"] and sweep.lookup_verdict(comments, head, "fleet").state == "APPROVED"
     github._refuse_incomplete_seats(REPOSITORY, 42, head, None, tmp_path, {})
+    # A second record whose scope drops OpenAI's commit, or a relabelled copy of the OpenAI record,
+    # leaves OpenAI's commit without an outside-family approval.
+    forged = [
+        {**comments[1], "id": 90, "body": comments[1]["body"].replace(scoped, head)},
+        {**comments[0], "id": 91, "body": comments[0]["body"].replace("family=openai", "family=anthropic")
+         .replace("Reviewer family: openai", "Reviewer family: anthropic")
+         .replace("Scope author family: anthropic,google", "Scope author family: google,openai")},
+    ]
+    assert sweep.parse_marker(forged[1]["body"]) is None
+    for extra in forged:
+        assert sweep.lookup_verdict([comments[0], extra], head, "fleet").state != "APPROVED"
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
@@ -2830,16 +2842,17 @@ def test_anthropic_openai_pair_resolves_as_before(tmp_path, monkeypatch):
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_single_google_branch_still_excludes_google(tmp_path, monkeypatch):
-    """Control: adding Google to the pair families admits a Google seat to review a Google-only branch."""
-    from tests.agent_runtime.test_authoring_review_feasibility import mini_repo
+    """Control: the three-family pair admits a Google seat to a Google-only branch, or pairs Anthropic/Google."""
+    from tests.agent_runtime.test_authoring_review_feasibility import OPUS, mini_repo
 
     repo = mini_repo(tmp_path, monkeypatch)
-    head = repo.commit(NEON, message="Google change")
-    facts = _branch_facts(repo, head, tmp_path / "tasks")
-    assert not facts.mixed_family
-    result = _resolve(facts)
-    assert result.selected is not None and result.selected.family != "google"
-    assert not result.quorum and not result.review_scopes
+    google = repo.commit(NEON, message="Google change")
+    for head, authors in ((google, {"google"}), (repo.commit(OPUS, message="Anthropic change"), {"anthropic", "google"})):
+        facts = _branch_facts(repo, head, tmp_path / "tasks")
+        assert facts.existing_families == authors and not facts.mixed_family
+        result = _resolve(facts)
+        assert result.selected is not None and result.selected.family not in authors
+        assert not result.quorum and not result.review_scopes
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')

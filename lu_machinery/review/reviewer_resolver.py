@@ -554,16 +554,16 @@ def complete_author_families(inputs: ResolverInputs, single_family: str) -> froz
     return frozenset(members)
 
 
-# The critical-tier families (NEON-SOLTIER-1120). A branch authored by two or three of them gets
-# the mixed-family pair; integration_sweep's marker reader keeps the same set for the gate.
-MIXED_REVIEW_FAMILIES = frozenset({"anthropic", "google", "openai"})
+# Author family sets that take the mixed-family pair: Anthropic/OpenAI, and all three critical-tier
+# families (NEON-SOLTIER-1120), which leave no critical seat outside the authors. Every other set
+# keeps its single outside-family reviewer. integration_sweep's marker reader admits the same sets.
+MIXED_REVIEW_SETS = frozenset({frozenset({"anthropic", "openai"}), frozenset({"anthropic", "google", "openai"})})
 _FAMILY_NAMES = {"anthropic": "Anthropic", "google": "Google", "openai": "OpenAI"}
 
 
 def is_mixed_family_set(families: Iterable[str]) -> bool:
-    """Two or three critical-tier families, and nothing else (a verified app bot is not a family)."""
-    members = frozenset(families) - {VERIFIED_APP_BOT}
-    return len(members) >= 2 and members <= MIXED_REVIEW_FAMILIES
+    """An approved pair set, and nothing else (a verified app bot is not a family)."""
+    return frozenset(families) - {VERIFIED_APP_BOT} in MIXED_REVIEW_SETS
 
 
 def mixed_family_review(inputs: ResolverInputs) -> bool:
@@ -586,7 +586,7 @@ def mixed_family_scope(author_commits: Iterable[tuple[str, str]], reviewer_famil
     commits = tuple(author_commits)
     families = frozenset(family for _sha, family in commits) - {VERIFIED_APP_BOT}
     if not is_mixed_family_set(families) or reviewer_family not in families:
-        names = [_FAMILY_NAMES.get(family, family) for family in sorted(families & MIXED_REVIEW_FAMILIES)]
+        names = [_FAMILY_NAMES[family] for family in sorted(families & _FAMILY_NAMES.keys())]
         named = " or ".join(names) if len(names) <= 2 else f"{', '.join(names[:-1])} or {names[-1]}"
         raise ValueError(f"mixed-family review requires an {named or 'author-family'} seat")
     attributed = [(sha, family) for sha, family in commits if family in families]
