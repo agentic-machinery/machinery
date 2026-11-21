@@ -363,10 +363,10 @@ def dismissal_transport(monkeypatch, synthetic_opsec):
         "code-scanning/analyses/3": copy.deepcopy(sarif),
     }
     # Stale merge refs may retain older locations after their PRs stop being active.
-    for number, merged in ((3, True), (4, False)):
+    for number, state, merged in ((3, "MERGED", True), (4, "CLOSED", False)):
         documents[f"pulls/{number}"] = {
-            "number": number, "state": "closed", "merged": merged,
-            "html_url": f"https://github.com/unit/public/pull/{number}",
+            "number": number, "state": state, "merged": merged,
+            "url": f"https://github.com/unit/public/pull/{number}",
         }
         stale = copy.deepcopy(instance)
         stale.update(ref=f"refs/pull/{number}/merge", commit_sha="c" * 40)
@@ -376,9 +376,18 @@ def dismissal_transport(monkeypatch, synthetic_opsec):
     options = {"reason": "false positive", "readback": {}, "write_error": None, "read_error": None}
 
     def sender(argv, **kwargs):
+        import re
+
         calls.append(list(argv))
         method = argv[argv.index("--method") + 1]
         endpoint = argv[argv.index("--method") + 2]
+        if method == "POST" and endpoint == "graphql":
+            body = json.loads(Path(argv[argv.index("--input") + 1]).read_text(encoding="utf-8"))
+            assert body["variables"] == {"owner": "unit", "name": "public"}
+            aliases = re.findall(r"(p\d+):\s*pullRequest\(number:(\d+)\)", body["query"])
+            assert 1 <= len(aliases) <= pub._DISMISS_PR_BATCH_SIZE
+            repo_rows = {alias: documents.get(f"pulls/{int(num)}") for alias, num in aliases}
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"data": {"repository": repo_rows}}), "")
         assert endpoint.startswith(root)
         if method == "PATCH":
             assert endpoint == root + "code-scanning/alerts/1"
@@ -480,8 +489,8 @@ def test_dismissal_refuses_missing_or_changed_reviewed_evidence(dismissal_transp
         documents["code-scanning/analyses/3"]["runs"][0]["tool"]["driver"]["semanticVersion"] = "2.0.0"
     elif fault == "branch":
         documents["pulls/5"] = {
-            "number": 5, "state": "open", "merged": False,
-            "html_url": "https://github.com/unit/public/pull/5",
+            "number": 5, "state": "OPEN", "merged": False,
+            "url": "https://github.com/unit/public/pull/5",
         }
         instance = dict(documents["code-scanning/alerts/1/instances?per_page=100"][0][0],
                         ref="refs/pull/5/merge", location={"path": "sample.py", "start_line": 8})
@@ -757,6 +766,309 @@ def test_dismissal_refuses_when_paginated_analyses_never_match(dismissal_transpo
     assert analysis_calls == expected_pages
 
 
+def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reopen_or_bad_graphql(dismissal_transport, tmp_path, monkeypatch):
+    """Defect class: per-PR GET amplification on closed/merged PRs, duplicate same-commit triage fetch, or fail-open on reopened, missing/404, partial, or malformed batched PR state responses."""
+    import copy
+
+    documents, writes, calls, _, sender, comment = dismissal_transport
+    before = "a" * 40
+    main_instance = copy.deepcopy(documents["code-scanning/alerts/1/instances?per_page=100"][0][0])
+    main_instance["commit_sha"] = before
+    documents["git/ref/heads/main"]["object"]["sha"] = before
+
+    def set_pr_instances(count):
+        instances = [copy.deepcopy(main_instance)]
+        for number in range(100, 100 + count):
+            state, merged = ("MERGED", True) if number % 2 == 0 else ("CLOSED", False)
+            documents[f"pulls/{number}"] = {
+                "number": number, "state": state, "merged": merged,
+                "url": f"https://github.com/unit/public/pull/{number}",
+            }
+            stale = copy.deepcopy(main_instance)
+            stale.update(ref=f"refs/pull/{number}/merge", commit_sha="c" * 40)
+            stale["location"]["start_line"] = 8
+            instances.append(stale)
+        documents["code-scanning/alerts/1/instances?per_page=100"] = [instances]
+
+    # 97 closed/merged PRs: 11 preflight REST GETs (+1 post-PATCH readback GET) + 2 GraphQL POSTs = 13 preflight requests.
+    set_pr_instances(97)
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=sender, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0
+    assert len(writes) == 1
+    get_endpoints = [argv[argv.index("--method") + 2] for argv in calls if argv[argv.index("--method") + 1] == "GET"]
+    graphql_calls = [argv for argv in calls if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql"]
+    assert len(get_endpoints) == 12  # 11 preflight GETs + 1 post-PATCH readback GET
+    assert len(graphql_calls) == 2   # 1 loop batch + 1 race re-read batch
+    assert sum(ep.startswith(f"repos/unit/public/contents/{pub._DISMISS_TRIAGE_PATH}?") for ep in get_endpoints) == 1
+    assert not any(ep.startswith("repos/unit/public/pulls/") and ep.split("/")[-1].isdigit() and ep != "repos/unit/public/pulls/2" for ep in get_endpoints)
+
+    # >100 PRs chunk cleanly at _DISMISS_PR_BATCH_SIZE (105 PRs -> 2 chunks x 2 phases = 4 GraphQL POSTs).
+    writes.clear()
+    calls.clear()
+    set_pr_instances(105)
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=sender, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0 and len(writes) == 1
+    assert sum(argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql" for argv in calls) == 4
+
+    # A skipped PR reopening during preflight must fail closed before PATCH.
+    writes.clear()
+    set_pr_instances(2)
+    gql_reads = 0
+
+    def reopened_during_preflight(argv, **kwargs):
+        nonlocal gql_reads
+        if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+            gql_reads += 1
+            if gql_reads == 2:
+                documents["pulls/101"]["state"] = "OPEN"
+        return sender(argv, **kwargs)
+
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=reopened_during_preflight)
+    assert gql_reads == 2 and writes == []
+
+    # Missing/404 PR (null), GraphQL errors (including falsey/empty error envelopes with otherwise valid rows),
+    # missing/non-object data, non-object extensions, unexpected keys, partial/extra alias keys, malformed rows,
+    # and non-zero GraphQL exit must fail closed on both initial read and pre-PATCH recheck.
+    set_pr_instances(2)
+    valid_repo = {"p100": documents["pulls/100"], "p101": documents["pulls/101"]}
+    bad_gql_responses = [
+        (1, "{}"),
+        (0, json.dumps([])),
+        (0, json.dumps({"extensions": {}})),
+        (0, json.dumps({"data": None})),
+        (0, json.dumps({"data": []})),
+        (0, json.dumps({"data": {"repository": valid_repo, "extra": 1}})),
+        (0, json.dumps({"errors": [{"type": "NOT_FOUND"}], "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": [], "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": None, "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": False, "data": {"repository": valid_repo}})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "unexpected": True})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": []})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": None})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": False})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": "invalid"})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "extensions": 1})),
+        (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"], "p101": None}}})),
+        (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"], "p101": documents["pulls/101"], "p102": documents["pulls/100"]}}})),
+        (0, json.dumps({"data": {"repository": None}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "extra": 1}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "OPEN", "merged": True}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "CLOSED", "merged": True}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "MERGED", "merged": False}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": "closed"}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "state": []}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "url": "https://github.com/other/public/pull/100"}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "number": 999}, "p101": documents["pulls/101"]}}})),
+        (0, json.dumps({"data": {"repository": {"p100": {**documents["pulls/100"], "number": True}, "p101": documents["pulls/101"]}}})),
+    ]
+    for code, payload in bad_gql_responses:
+        def bad_graphql(argv, code=code, payload=payload, **kwargs):
+            if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+                return subprocess.CompletedProcess(argv, code, payload, "")
+            return sender(argv, **kwargs)
+
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=bad_graphql)
+        assert writes == []
+
+    # Wrong-typed extensions on the pre-PATCH recheck also fails closed with zero writes;
+    # a spec-compliant object-valued extensions envelope is accepted.
+    recheck_calls = 0
+
+    def bad_extensions_on_recheck(argv, **kwargs):
+        nonlocal recheck_calls
+        if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+            recheck_calls += 1
+            if recheck_calls == 2:
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"data": {"repository": valid_repo}, "extensions": []}), "",
+                )
+        return sender(argv, **kwargs)
+
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=bad_extensions_on_recheck)
+    assert recheck_calls == 2 and writes == []
+
+    def valid_extensions_object(argv, **kwargs):
+        if argv[argv.index("--method") + 1] == "POST" and argv[argv.index("--method") + 2] == "graphql":
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"data": {"repository": valid_repo}, "extensions": {"warnings": []}}), "",
+            )
+        return sender(argv, **kwargs)
+
+    answer = pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=valid_extensions_object, capture_output=True, text=True)
+    assert answer.returncode == 0 and len(writes) == 1
+    writes.clear()
+
+    # Exercise the real GitHubClient raw-response HTTP seam (runner=None) on both initial read and pre-PATCH recheck:
+    # top-level JSON strings, duplicate object members, and non-JSON constants must not be normalized away,
+    # while valid responses succeed and GraphQL rate-limit answers preserve GitHubRateLimited.
+    import re
+
+    real_client_cls = github_client.GitHubClient
+    http_writes = []
+    http_state = {"gql_calls": 0, "phase": None, "override": None}
+
+    def http_transport(method, endpoint, headers, body, timeout):
+        if method == "POST" and endpoint == "graphql":
+            http_state["gql_calls"] += 1
+            if http_state["override"] is not None and http_state["gql_calls"] == http_state["phase"]:
+                return http_state["override"]
+            parsed = json.loads(body.decode("utf-8"))
+            aliases = re.findall(r"(p\d+):\s*pullRequest\(number:(\d+)\)", parsed["query"])
+            repo_rows = {alias: documents.get(f"pulls/{int(num)}") for alias, num in aliases}
+            return github_client.Response(200, {}, json.dumps({"data": {"repository": repo_rows}}).encode("utf-8"))
+        suffix = endpoint.removeprefix("repos/unit/public/")
+        if method == "PATCH":
+            assert suffix == "code-scanning/alerts/1"
+            http_writes.append(body)
+            return github_client.Response(200, {}, b"{}")
+        assert method == "GET"
+        if suffix == "code-scanning/alerts/1" and http_writes:
+            doc = {**documents["code-scanning/alerts/1"], "state": "dismissed", "dismissed_reason": "false positive", "dismissed_comment": comment}
+        elif suffix in {"pulls/2/files?per_page=100", "code-scanning/alerts/1/instances?per_page=100"}:
+            doc = documents[suffix][0]
+        else:
+            doc = documents[suffix]
+        raw_bytes = doc.encode("utf-8") if isinstance(doc, str) else json.dumps(doc).encode("utf-8")
+        return github_client.Response(200, {}, raw_bytes)
+
+    class RawHttpClient(real_client_cls):
+        def __init__(self, **kwargs):
+            kwargs["cache_dir"] = tmp_path / "gh-cache"
+            kwargs["transport"] = http_transport
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(github_client, "GitHubClient", RawHttpClient)
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=None, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0 and len(http_writes) == 1 and http_state["gql_calls"] == 2
+    http_writes.clear()
+
+    valid_repo_json = json.dumps(valid_repo)
+    p100_json = json.dumps(documents["pulls/100"])
+    raw_http_bad_bodies = [
+        json.dumps(json.dumps({"data": {"repository": valid_repo}})).encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":[],"extensions":{}}').encode("utf-8"),
+        ('{"data":{"repository":{"p100":' + p100_json + ',"p101":{"number":101,"state":"OPEN","state":"CLOSED","merged":false,"url":"https://github.com/unit/public/pull/101"}}}}').encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":{"cost":NaN}}').encode("utf-8"),
+        ('{"data":{"repository":' + valid_repo_json + '},"extensions":{"cost":Infinity}}').encode("utf-8"),
+        b'\xef\xbb\xbf{"data":{"repository":' + valid_repo_json.encode("utf-8") + b"}}",
+        b"\xff",
+    ]
+    for phase in (1, 2):
+        for raw_body in raw_http_bad_bodies:
+            http_state.update(gql_calls=0, phase=phase, override=github_client.Response(200, {}, raw_body))
+            with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+                pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=None)
+            assert http_state["gql_calls"] == phase and http_writes == []
+
+    # Typed rate-limit handling stays intact across the raw-response GraphQL seam (exit 75, zero writes).
+    http_state.update(
+        gql_calls=0,
+        phase=1,
+        override=github_client.Response(200, {}, json.dumps({"errors": [{"type": "RATE_LIMIT", "message": "API rate limit exceeded"}]}).encode("utf-8")),
+    )
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=None, capture_output=True, text=True,
+    )
+    assert answer.returncode == 75
+    assert json.loads(answer.stdout)["error"] == "github_rate_limited"
+    assert http_state["gql_calls"] == 1 and http_writes == []
+
+    # AC-02: _dismiss_get decodes REST JSON strictly on both real GitHubClient (runner=None) and injected runner:
+    # duplicate keys, NaN/Infinity, UTF-8 BOM, invalid UTF-8, top-level JSON strings, and bad paginated pages refuse with zero writes.
+    http_state.update(gql_calls=0, phase=None, override=None)
+    valid_alert_json = json.dumps(documents["code-scanning/alerts/1"])
+    bad_rest_bodies = [
+        b'{"number":1,"state":"closed","state":"open","rule":{"id":"py/test"},"tool":{"name":"CodeQL"}}',
+        b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":NaN}',
+        b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":Infinity}',
+        b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":1e999}',
+        b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":-1e999}',
+        b"\xef\xbb\xbf" + valid_alert_json.encode("utf-8"),
+        b"\xff",
+        json.dumps(valid_alert_json).encode("utf-8"),
+        b"not json",
+    ]
+    for bad_rest in bad_rest_bodies:
+        def rest_override_transport(method, endpoint, headers, body, timeout, bad_rest=bad_rest):
+            if method == "GET" and endpoint == "repos/unit/public/code-scanning/alerts/1":
+                return github_client.Response(200, {}, bad_rest)
+            return http_transport(method, endpoint, headers, body, timeout)
+
+        class BadRestHttpClient(real_client_cls):
+            def __init__(self, **kwargs):
+                kwargs["cache_dir"] = tmp_path / "gh-cache-rest"
+                kwargs["transport"] = rest_override_transport
+                super().__init__(**kwargs)
+
+        monkeypatch.setattr(github_client, "GitHubClient", BadRestHttpClient)
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=None)
+        assert http_writes == []
+
+    # Post-PATCH readback via _dismiss_get also decodes strictly (duplicate key -> exit 3 UNKNOWN, never exit 0).
+    def bad_readback_transport(method, endpoint, headers, body, timeout):
+        if method == "GET" and endpoint == "repos/unit/public/code-scanning/alerts/1" and http_writes:
+            return github_client.Response(
+                200,
+                {},
+                b'{"number":1,"state":"open","state":"dismissed","dismissed_reason":"false positive","dismissed_comment":"' + comment.encode("utf-8") + b'"}',
+            )
+        return http_transport(method, endpoint, headers, body, timeout)
+
+    class BadReadbackHttpClient(real_client_cls):
+        def __init__(self, **kwargs):
+            kwargs["cache_dir"] = tmp_path / "gh-cache-readback"
+            kwargs["transport"] = bad_readback_transport
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(github_client, "GitHubClient", BadReadbackHttpClient)
+    readback_answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=None, capture_output=True, text=True,
+    )
+    assert readback_answer.returncode == 3 and len(http_writes) == 1
+    http_writes.clear()
+    monkeypatch.setattr(github_client, "GitHubClient", real_client_cls)
+
+    for bad_rest_text in (
+        '{"number":1,"state":"closed","state":"open","rule":{"id":"py/test"},"tool":{"name":"CodeQL"}}',
+        '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":NaN}',
+        '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":-Infinity}',
+        '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":1e999}',
+        '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":-1e999}',
+        "\ufeff" + valid_alert_json,
+        json.dumps(valid_alert_json),
+    ):
+        def bad_rest_runner(argv, bad_rest_text=bad_rest_text, **kwargs):
+            if argv[argv.index("--method") + 1] == "GET" and argv[argv.index("--method") + 2] == "repos/unit/public/code-scanning/alerts/1":
+                return subprocess.CompletedProcess(argv, 0, bad_rest_text, "")
+            return sender(argv, **kwargs)
+
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=bad_rest_runner)
+        assert writes == []
+
+    # Zero-page paginated REST response ([]) must also fail closed.
+    documents["pulls/2/files?per_page=100"] = []
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=sender)
+    assert writes == []
+
+
 QUEUE_REF = "refs/heads/gh-readonly-queue/main/pr-7-" + "d" * 40
 LAST_OF_SET = "Analysis is last of its type and deletion may cause alert deletion. To delete this analysis, set the confirm_delete parameter to true."
 
@@ -946,3 +1258,198 @@ def test_rate_limited_delete_exits_75_without_another_delete(delete_transport, v
     assert answer.returncode == 75
     assert json.loads(answer.stdout)["error"] == "github_rate_limited"
     assert len(deletes) == len(before) + 1
+
+
+def _malformed_envelopes_for(valid_data: dict) -> list[tuple[str, str]]:
+    """Every wrong-typed, falsey-error, unknown-member, and non-strict JSON envelope class paired with valid data."""
+    valid_json = json.dumps(valid_data)
+    return [
+        ("errors-empty-list", json.dumps({"data": valid_data, "errors": []})),
+        ("errors-null", json.dumps({"data": valid_data, "errors": None})),
+        ("errors-false", json.dumps({"data": valid_data, "errors": False})),
+        ("errors-empty-str", json.dumps({"data": valid_data, "errors": ""})),
+        ("errors-zero", json.dumps({"data": valid_data, "errors": 0})),
+        ("errors-dict", json.dumps({"data": valid_data, "errors": {}})),
+        ("errors-str", json.dumps({"data": valid_data, "errors": "err"})),
+        ("errors-non-dict-entry", json.dumps({"data": valid_data, "errors": [1]})),
+        ("errors-populated", json.dumps({"data": valid_data, "errors": [{"message": "boom"}]})),
+        ("data-missing", json.dumps({})),
+        ("data-missing-with-extensions", json.dumps({"extensions": {}})),
+        ("data-null", json.dumps({"data": None})),
+        ("data-list", json.dumps({"data": []})),
+        ("data-false", json.dumps({"data": False})),
+        ("data-str", json.dumps({"data": "ok"})),
+        ("extensions-null", json.dumps({"data": valid_data, "extensions": None})),
+        ("extensions-list", json.dumps({"data": valid_data, "extensions": []})),
+        ("extensions-false", json.dumps({"data": valid_data, "extensions": False})),
+        ("extensions-true", json.dumps({"data": valid_data, "extensions": True})),
+        ("extensions-str", json.dumps({"data": valid_data, "extensions": "bad"})),
+        ("extensions-int", json.dumps({"data": valid_data, "extensions": 1})),
+        ("unknown-top-level-key", json.dumps({"data": valid_data, "unexpected": True})),
+        ("top-level-list", json.dumps([])),
+        ("top-level-json-string", json.dumps(json.dumps({"data": valid_data}))),
+        ("duplicate-key", '{"data":' + valid_json + ',"extensions":[],"extensions":{}}'),
+        ("nan-constant", '{"data":' + valid_json + ',"extensions":{"cost":NaN}}'),
+        ("infinity-constant", '{"data":' + valid_json + ',"extensions":{"cost":Infinity}}'),
+        ("float-overflow-pos", '{"data":' + valid_json + ',"extensions":{"cost":1e999}}'),
+        ("float-overflow-neg", '{"data":' + valid_json + ',"extensions":{"cost":-1e999}}'),
+        ("utf8-bom", '\ufeff{"data":' + valid_json + "}"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "case_id",
+    [name for name, _ in _malformed_envelopes_for({})],
+)
+def test_publish_graphql_callers_refuse_malformed_envelopes_with_zero_writes(monkeypatch, tmp_path, synthetic_opsec, case_id):
+    """Defect class: _confirm_enqueued, _transfer_label_connection, and read('issue-count') accept falsey/wrong-typed errors, non-object data/extensions, unknown keys, or non-strict JSON."""
+    monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
+    head = "a" * 40
+
+    # 1. _confirm_enqueued refuses with ENQUEUE_UNVERIFIED and sends zero writes (no --disable-auto).
+    confirm_valid_data = {"repository": {"pullRequest": {"headRefOid": head, "isInMergeQueue": True, "autoMergeRequest": {"enabledAt": "2026-11-21T00:00:00Z"}}}}
+    confirm_payload = dict(_malformed_envelopes_for(confirm_valid_data))[case_id]
+    writes = []
+
+    def confirm_read(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, confirm_payload, "")
+
+    def confirm_write(argv, **kwargs):
+        writes.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    with pytest.raises(gate.PublishBlocked, match="ENQUEUE_UNVERIFIED"):
+        pub._confirm_enqueued("unit/public", 1, head, "github.com/unit/public", tmp_path, (confirm_read, confirm_write), tmp_path, {})
+    assert writes == []
+
+    # 2. _transfer_label_connection refuses with ValueError (and issue-transfer refuses with zero mutations).
+    transfer_valid_data = {
+        "repository": {
+            "id": "R_1",
+            "nameWithOwner": "unit/public",
+            "visibility": "PUBLIC",
+            "viewerPermission": "ADMIN",
+            "isArchived": False,
+            "labels": {"totalCount": 0, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []},
+        }
+    }
+    transfer_payload = dict(_malformed_envelopes_for(transfer_valid_data))[case_id]
+
+    def transfer_read(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, transfer_payload, "")
+
+    with pytest.raises(ValueError):
+        pub._transfer_label_connection(
+            pub.TRANSFER_REPOSITORY_QUERY,
+            {"owner": "unit", "name": "public"},
+            lambda repo: ({"id": repo["id"]}, repo["labels"]),
+            transfer_read,
+            tmp_path,
+            {},
+            tmp_path,
+        )
+
+    # 3. read("issue-count") refuses with OPSEC: malformed issue count response.
+    count_valid_data = {"repository": {"issues": {"totalCount": 7}}}
+    count_payload = dict(_malformed_envelopes_for(count_valid_data))[case_id]
+    with pytest.raises(gate.PublishBlocked, match="malformed issue count response"):
+        pub.read(
+            "issue-count",
+            repo="unit/public",
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, count_payload, ""),
+            cwd=tmp_path,
+            env={},
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_publish_graphql_callers_accept_valid_extensions_object(monkeypatch, tmp_path, synthetic_opsec):
+    """Defect class: strict GraphQL envelope check rejects spec-compliant object-valued extensions."""
+    monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
+    head = "a" * 40
+    ext = {"cost": 1}
+
+    confirm_ok = json.dumps({
+        "data": {"repository": {"pullRequest": {"headRefOid": head, "isInMergeQueue": True, "autoMergeRequest": None}}},
+        "extensions": ext,
+    })
+    pub._confirm_enqueued(
+        "unit/public", 1, head, "github.com/unit/public", tmp_path,
+        (lambda argv, **kw: subprocess.CompletedProcess(argv, 0, confirm_ok, ""), lambda *a, **kw: pytest.fail("no write")),
+        tmp_path, {},
+    )
+
+    transfer_ok = json.dumps({
+        "data": {
+            "repository": {
+                "id": "R_1",
+                "labels": {"totalCount": 1, "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": [{"name": "bug"}]},
+            }
+        },
+        "extensions": ext,
+    })
+    identity, labels = pub._transfer_label_connection(
+        pub.TRANSFER_REPOSITORY_QUERY,
+        {"owner": "unit", "name": "public"},
+        lambda repo: ({"id": repo["id"]}, repo["labels"]),
+        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, transfer_ok, ""),
+        tmp_path, {}, tmp_path,
+    )
+    assert identity == {"id": "R_1"} and labels == ["bug"]
+
+    count_ok = json.dumps({"data": {"repository": {"issues": {"totalCount": 42}}}, "extensions": ext})
+    result = pub.read(
+        "issue-count",
+        repo="unit/public",
+        runner=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, count_ok, ""),
+        cwd=tmp_path, env={}, capture_output=True, text=True,
+    )
+    assert result.returncode == 0 and json.loads(result.stdout)["data"]["repository"]["issues"]["totalCount"] == 42
+
+    # F3: production read("issue-count") (runner=None) raises PublishBlocked for malformed GraphQL envelopes
+    # regardless of check=False/True, while preserving exit 75 rate limits and HTTP 500 errors.
+    real_client_cls = github_client.GitHubClient
+    http_reply = {"response": github_client.Response(200, {}, count_ok.encode("utf-8"))}
+
+    class IssueCountHttpClient(real_client_cls):
+        def __init__(self, **kwargs):
+            kwargs["cache_dir"] = tmp_path / "issue-count-cache"
+            kwargs["transport"] = lambda *a: http_reply["response"]
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(github_client, "GitHubClient", IssueCountHttpClient)
+    over_depth_err = b'{"errors":' + b"[" * 513 + b"]" * 513 + b"}"
+    gql_ct = {"Content-Type": "application/graphql-response+json; charset=utf-8"}
+    for status_code, resp_headers, bad_body in (
+        (200, {}, b'{"data":{"repository":{"issues":{"totalCount":7}}},"errors":[]}'),
+        (200, {}, b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":[]}'),
+        (200, {}, b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":{"cost":1e999}}'),
+        (400, {}, b'{"errors":[{"message":"boom"}],"extensions":{"cost":1e999}}'),
+        (500, {}, b'{"errors":[{"message":"boom"}],"errors":[]}'),
+        (400, {}, over_depth_err),
+        (400, gql_ct, over_depth_err),
+        (500, gql_ct, b'{"errors":[{"message":"boom \xff"}]}'),
+        (400, {}, b"\xff"),
+        (400, {}, b"[]"),
+        (400, {}, b'{"data":[]}'),
+        (502, gql_ct, b"<html>502 Bad Gateway</html>"),
+    ):
+        http_reply["response"] = github_client.Response(status_code, resp_headers, bad_body)
+        for check_flag in (False, True):
+            with pytest.raises(gate.PublishBlocked, match="malformed issue count response"):
+                pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=check_flag)
+    for http_status, http_body in (
+        (500, b'{"message":"Server Error"}'),
+        (502, b"<html>502 Bad Gateway</html>"),
+    ):
+        http_reply["response"] = github_client.Response(http_status, {}, http_body)
+        err_http = pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=False)
+        assert err_http.returncode == 1 and err_http.github_result.error == "github_http_error"
+        with pytest.raises(subprocess.CalledProcessError) as exc_http:
+            pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=True)
+        assert exc_http.value.github_result.error == "github_http_error"
+    http_reply["response"] = github_client.Response(200, {}, b'{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}')
+    rl = pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=False)
+    assert rl.returncode == 75 and rl.github_result.error == "github_rate_limited"
+    monkeypatch.setattr(github_client, "GitHubClient", real_client_cls)

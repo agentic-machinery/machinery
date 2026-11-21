@@ -90,6 +90,7 @@ SCHEMAS = {
             "body": "text",
             "body_file": "file",
             "match_head": "sha",
+            "expect_queue": "queue_mode",
         },
     ),
     "pr-update-branch": ({"number"}, {**COMMON, "number": "number"}),
@@ -204,6 +205,8 @@ ENUMS = {
     "status": {"success", "failure", "error", "pending"},
     "grouping_strategy": {"ALLGREEN", "HEADGREEN"},
     "merge_method": {"MERGE", "SQUASH", "REBASE"},
+    # The landing kind a caller checked its gate for: pr-merge refuses when the base differs.
+    "queue_mode": {"true", "false"},
 }
 _MERGE_QUEUE_FIELDS = frozenset(MERGE_QUEUE_INT_BOUNDS) | frozenset({"grouping_strategy", "merge_method"})
 # Keys a repository ruleset GET returns that PUT must not send back. A key in neither
@@ -540,7 +543,10 @@ def _squash_text(gh_repo, fields, dest, temp, runner, cwd, environment):
             check=False,
             timeout=15,
         )
-        pull = json_depth.loads(result.stdout, max_depth=512)["data"]["repository"]["pullRequest"] if result.returncode == 0 else None
+        if result.returncode != 0:
+            raise ValueError
+        document = github_client.parse_graphql_envelope(result.stdout)
+        pull = document["data"]["repository"]["pullRequest"]
         subject, body = pull["viewerMergeHeadlineText"], pull["viewerMergeBodyText"]
         if not (
             isinstance(subject, str)
@@ -582,9 +588,11 @@ def _confirm_enqueued(gh_repo, number, head, dest, temp, readers, cwd, environme
             ["gh", "api", "--method", "POST", "graphql", "--input", str(query), *_hostname_flag(dest)],
             cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=15,
         )
-        document = json_depth.loads(result.stdout, max_depth=512) if result.returncode == 0 else None
+        if result.returncode != 0:
+            raise ValueError
+        document = github_client.parse_graphql_envelope(result.stdout)
         pull = document["data"]["repository"]["pullRequest"]
-        if document.get("errors") or type(pull["isInMergeQueue"]) is not bool or not isinstance(pull["headRefOid"], str):
+        if not isinstance(pull, dict) or type(pull["isInMergeQueue"]) is not bool or not isinstance(pull["headRefOid"], str):
             raise ValueError
     except github_client.GitHubRateLimited:
         raise
@@ -1218,9 +1226,7 @@ def _transfer_label_connection(query, variables, select, reader, cwd, environmen
         )
         if result.returncode:
             raise ValueError("label read unreadable")
-        document = json_depth.loads(result.stdout, max_depth=512)
-        if not isinstance(document, dict) or document.get("errors"):
-            raise ValueError("label read errors")
+        document = github_client.parse_graphql_envelope(result.stdout)
         current, page = select(document["data"]["repository"])
         if identity is None:
             identity, total = current, page["totalCount"]
@@ -1476,9 +1482,11 @@ def _transfer_checked(fields, source, destination, receipt, sink, temp, *, runne
             environment=environment, runner=runner, cwd=cwd, capture_output=True, text=True, check=False,
             timeout=60,
         )
-        document = json_depth.loads(result.stdout, max_depth=512) if result.returncode == 0 else None
-        moved = document["data"]["transferIssue"]["issue"] if isinstance(document, dict) else None
-        if not isinstance(document, dict) or document.get("errors") or not isinstance(moved, dict):
+        if result.returncode != 0:
+            raise ValueError
+        document = github_client.parse_graphql_envelope(result.stdout)
+        moved = document["data"]["transferIssue"]["issue"]
+        if not isinstance(moved, dict):
             raise ValueError
     except Exception:
         return settle("ambiguous", TRANSFER_UNSETTLED, "the transfer mutation's result is unknown")
@@ -1677,6 +1685,7 @@ _DISMISS_TRIAGE_PATH = "docs/runbooks/secret-scanning.md"
 _DISMISS_ANALYSIS_PER_PAGE = 100
 _DISMISS_ANALYSIS_MAX_PAGES = 20
 _DISMISS_ANALYSIS_CLOCK_SKEW = timedelta(minutes=5)
+_DISMISS_PR_BATCH_SIZE = 100
 
 
 def _parse_utc_timestamp(value):
@@ -1703,7 +1712,57 @@ def _refuse_dispatched_dismissal(environment):
             raise gate.PublishBlocked("DISMISSAL_BOUNDARY_REFUSED: interactive seats only; nothing was sent.")
 
 
-def _dismiss_get(runner, endpoint, cwd, environment, *, pages=False, raw=False, sarif=False):
+def _dismiss_get(runner, endpoint, cwd, environment, *, pages=False, raw=False, sarif=False, raw_http=False):
+    if raw_http:
+        client = github_client.GitHubClient(env=gate.internal_environment(environment), cwd=cwd)
+        headers = (
+            {"Accept": "application/sarif+json" if sarif else "application/vnd.github.raw+json"}
+            if (raw or sarif)
+            else None
+        )
+        if not pages:
+            observation = client.request(
+                "GET", endpoint, headers=headers, timeout=30, fresh=True, raw_response=True,
+            )
+            if observation.stale:
+                raise github_client.GitHubRateLimited(observation.reset_at, observation.reason)
+            refusal = github_client.refusal_of(observation)
+            if refusal is not None:
+                raise refusal
+            if (
+                observation.error
+                or not (200 <= observation.status < 300)
+                or not isinstance(observation.value, (bytes, bytearray))
+            ):
+                raise ValueError("dismissal evidence unavailable")
+            if raw:
+                return bytes(observation.value).decode("utf-8")
+            return github_client.loads_strict_json(observation.value)
+        rows = []
+        next_endpoint = endpoint
+        for _ in range(100):
+            observation = client.request(
+                "GET", next_endpoint, headers=headers, timeout=30, fresh=True, raw_response=True,
+            )
+            if observation.stale:
+                raise github_client.GitHubRateLimited(observation.reset_at, observation.reason)
+            refusal = github_client.refusal_of(observation)
+            if refusal is not None:
+                raise refusal
+            if (
+                observation.error
+                or not (200 <= observation.status < 300)
+                or not isinstance(observation.value, (bytes, bytearray))
+            ):
+                raise ValueError("dismissal evidence unavailable")
+            page = github_client.loads_strict_json(observation.value)
+            if not isinstance(page, list):
+                raise ValueError("dismissal pagination unavailable")
+            rows.extend(page)
+            next_endpoint = github_client.next_link(observation.headers)
+            if not next_endpoint:
+                return rows
+        raise ValueError("dismissal pagination unavailable")
     argv = ["gh", "api", "--method", "GET", endpoint]
     if pages:
         argv += ["--paginate", "--slurp"]
@@ -1712,9 +1771,15 @@ def _dismiss_get(runner, endpoint, cwd, environment, *, pages=False, raw=False, 
     result = runner(argv, cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=30)
     if result.returncode:
         raise ValueError("dismissal evidence unavailable")
-    value = result.stdout if raw else json_depth.loads(result.stdout, max_depth=512)
+    if raw:
+        if isinstance(result.stdout, (bytes, bytearray)):
+            return bytes(result.stdout).decode("utf-8")
+        if not isinstance(result.stdout, str):
+            raise ValueError("dismissal evidence unavailable")
+        return result.stdout
+    value = github_client.loads_strict_json(result.stdout)
     if pages:
-        if not isinstance(value, list) or any(not isinstance(page, list) for page in value):
+        if not isinstance(value, list) or not value or any(not isinstance(page, list) for page in value):
             raise ValueError("dismissal pagination unavailable")
         value = [row for page in value for row in page]
     return value
@@ -1763,7 +1828,7 @@ def _dismiss_sarif_result(document, number):
     return matches[0]
 
 
-def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
+def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=None, raw_graphql=False):
     comment, number = fields["comment"], fields["number"]
     # Require an explanation in addition to an exact alert identifier and PR URL.
     identifier = rf"(?i)\balert\s+#{number}\b"
@@ -1778,7 +1843,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     root = f"repos/{gh_repo}"
 
     def get(suffix, **options):
-        return _dismiss_get(runner, f"{root}/{suffix}", cwd, environment, **options)
+        return _dismiss_get(runner, f"{root}/{suffix}", cwd, environment, raw_http=raw_graphql, **options)
 
     pr_number = prs.pop()
     pr = get(f"pulls/{pr_number}")
@@ -1815,7 +1880,11 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     current_head = head_reference["object"]["sha"]
     if not re.fullmatch(PATTERNS["sha"], current_head):
         raise ValueError("unknown current triage head")
-    current_triage = get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={current_head}", raw=True)
+    current_triage = (
+        triage
+        if current_head.lower() == merge.lower()
+        else get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={current_head}", raw=True)
+    )
     current_rows = [line for line in current_triage.splitlines() if "|" in line
                     and line.strip().removeprefix("|").split("|", 1)[0].strip() == str(number)]
     if current_rows != [triage_line]:
@@ -1901,21 +1970,97 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
             results[aid] = _dismiss_sarif_result(get(f"code-scanning/analyses/{aid}", sarif=True), number)
         return results[aid]
 
+    def pull_states(pr_numbers):
+        owner, repo_name = gh_repo.split("/", 1)
+        ordered = sorted(set(pr_numbers))
+        states = {}
+        client = (
+            github_client.GitHubClient(
+                env={**gate.internal_environment(environment), "GH_HOST": dest.partition("/")[0]},
+                cwd=cwd,
+            )
+            if raw_graphql
+            else None
+        )
+        with (
+            contextlib.nullcontext(None)
+            if raw_graphql
+            else (
+                contextlib.nullcontext(temp)
+                if temp is not None
+                else tempfile.TemporaryDirectory(prefix="lu-dismiss-prs-", dir=ensure_scratch_root())
+            )
+        ) as query_dir:
+            query_file = None if query_dir is None else Path(query_dir) / "dismiss-pulls.json"
+            for start in range(0, len(ordered), _DISMISS_PR_BATCH_SIZE):
+                chunk = ordered[start:start + _DISMISS_PR_BATCH_SIZE]
+                aliases = " ".join(f"p{n}: pullRequest(number:{n}){{number state merged url}}" for n in chunk)
+                query = f"query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{aliases}}}}}"
+                payload = json.dumps({"query": query, "variables": {"owner": owner, "name": repo_name}}).encode("utf-8")
+                if client is not None:
+                    observation = client.request(
+                        "POST", "graphql", payload=payload, timeout=30, fresh=True, raw_response=True,
+                    )
+                    if observation.stale:
+                        raise github_client.GitHubRateLimited(observation.reset_at, observation.reason)
+                    refusal = github_client.refusal_of(observation)
+                    if refusal is not None:
+                        raise refusal
+                    if observation.error or observation.status != 200 or not isinstance(observation.value, (bytes, bytearray)):
+                        raise ValueError("dismissal PR evidence unavailable")
+                    raw_body = bytes(observation.value).decode("utf-8")
+                else:
+                    if query_file is None:
+                        raise ValueError("dismissal PR evidence unavailable")
+                    query_file.write_bytes(payload)
+                    result = runner(
+                        ["gh", "api", "--method", "POST", "graphql", "--input", str(query_file), *_hostname_flag(dest)],
+                        cwd=cwd, env=dict(environment), capture_output=True, text=True, check=False, timeout=30,
+                    )
+                    if result.returncode:
+                        raise ValueError("dismissal PR evidence unavailable")
+                    raw_body = result.stdout
+                document = github_client.parse_graphql_envelope(raw_body)
+                data = document["data"]
+                if set(data) != {"repository"}:
+                    raise ValueError("unknown instance PR identity or state")
+                repo_data = data["repository"]
+                expected_keys = {f"p{n}" for n in chunk}
+                if not isinstance(repo_data, dict) or set(repo_data) != expected_keys:
+                    raise ValueError("unknown instance PR identity or state")
+                for n in chunk:
+                    pull = repo_data[f"p{n}"]
+                    if not isinstance(pull, dict) or set(pull) != {"number", "state", "merged", "url"}:
+                        raise ValueError("unknown instance PR identity or state")
+                    state = pull["state"]
+                    merged = pull["merged"]
+                    if (
+                        type(pull["number"]) is not int or pull["number"] != n
+                        or pull["url"] != f"https://github.com/{gh_repo}/pull/{n}"
+                        or not isinstance(state, str) or state not in {"OPEN", "CLOSED", "MERGED"}
+                        or type(merged) is not bool
+                        or (state == "MERGED") != merged
+                    ):
+                        raise ValueError("unknown instance PR identity or state")
+                    states[n] = (state, merged)
+        return states
+
     baseline_ref = f"refs/heads/{base_ref}"
     if not any(instance["ref"] == baseline_ref for instance in instances):
         raise ValueError("no open triage-branch instance")
-    closed_prs = {}
+    pull_instance_nums = sorted({
+        int(match[1])
+        for instance in instances
+        if (match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]))
+    })
+    pr_states = pull_states(pull_instance_nums) if pull_instance_nums else {}
+    skipped_prs = {}
     for instance in instances:
         if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            endpoint = f"pulls/{match[1]}"
-            pull = closed_prs.get(endpoint) or get(endpoint)
-            if (type(pull.get("number")) is not int or pull["number"] != int(match[1])
-                    or pull.get("html_url") != f"https://github.com/{gh_repo}/pull/{match[1]}"
-                    or pull.get("state") not in {"open", "closed"}
-                    or type(pull.get("merged")) is not bool):
-                raise ValueError("unknown instance PR identity or state")
-            if pull["state"] == "closed" or pull["merged"] is True:
-                closed_prs[endpoint] = pull
+            pr_num = int(match[1])
+            state, merged = pr_states[pr_num]
+            if state in {"CLOSED", "MERGED"} or merged:
+                skipped_prs[pr_num] = (state, merged)
                 continue
         location = instance["location"]
         if (row[2].strip() != f"`{location['path']}:{location['start_line']}`"
@@ -1933,14 +2078,16 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     if (get(f"code-scanning/alerts/{number}") != alert
             or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
             or get(head_endpoint) != head_reference
-            or any(get(endpoint) != pull for endpoint, pull in closed_prs.items())):
+            or (skipped_prs and pull_states(skipped_prs) != skipped_prs)):
         raise ValueError("alert or triage evidence changed during preflight")
     return alert
 
 
-def _publish_code_scanning_dismiss(fields, *, gh_repo, dest, runner, cwd, environment, temp, capture_output, text):
+def _publish_code_scanning_dismiss(
+    fields, *, gh_repo, dest, runner, cwd, environment, temp, capture_output, text, raw_graphql=False,
+):
     try:
-        _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment)
+        _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, temp=temp, raw_graphql=raw_graphql)
     except github_client.GitHubRateLimited:
         raise
     except Exception:
@@ -1967,7 +2114,7 @@ def _publish_code_scanning_dismiss(fields, *, gh_repo, dest, runner, cwd, enviro
             return subprocess.CompletedProcess(argv, result.returncode, "" if text else b"", refusal if text else refusal.encode())  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     if result is not None and not result.returncode:
         try:
-            after = _dismiss_get(runner, endpoint, cwd, environment)
+            after = _dismiss_get(runner, endpoint, cwd, environment, raw_http=raw_graphql)
             if (type(after.get("number")) is int and after["number"] == fields["number"]
                     and after.get("state") == "dismissed" and after.get("dismissed_reason") == fields["reason"]
                     and after.get("dismissed_comment") == fields["comment"]):
@@ -2038,7 +2185,7 @@ def _send_delete(runner, argv, cwd, environment):
         return None
 
 
-def _publish_analysis_delete(fields, *, gh_repo, runner, cwd, environment, capture_output, text):
+def _publish_analysis_delete(fields, *, gh_repo, runner, cwd, environment, capture_output, text, raw_http=False):
     """Delete one code-scanning analysis of an obsolete main merge-queue ref, newest of its set first.
 
     GitHub refuses the last analysis of a ref/tool/category set without ``confirm_delete``
@@ -2052,7 +2199,7 @@ def _publish_analysis_delete(fields, *, gh_repo, runner, cwd, environment, captu
         raise gate.PublishBlocked(f"ANALYSIS_DELETE_REFUSED: {reason}; nothing was sent.")
 
     try:
-        analysis = _dismiss_get(runner, endpoint, cwd, environment)
+        analysis = _dismiss_get(runner, endpoint, cwd, environment, raw_http=raw_http)
         ref = analysis["ref"]
         if type(analysis["id"]) is not int or analysis["id"] != aid or not isinstance(ref, str):
             raise ValueError("analysis identity")
@@ -2099,7 +2246,7 @@ def _publish_analysis_delete(fields, *, gh_repo, runner, cwd, environment, captu
     )
 
 
-def _publish_branch_delete(fields, *, gh_repo, runner, cwd, environment, capture_output, text):
+def _publish_branch_delete(fields, *, gh_repo, runner, cwd, environment, capture_output, text, raw_http=False):
     """Delete one exact branch that is not default, protected, ruleset-covered or used by an open PR."""
     branch = fields["branch"]
     name = quote(branch, safe="/")
@@ -2109,7 +2256,7 @@ def _publish_branch_delete(fields, *, gh_repo, runner, cwd, environment, capture
         raise gate.PublishBlocked(f"BRANCH_DELETE_REFUSED: {reason}; nothing was sent.")
 
     try:
-        repo = _dismiss_get(runner, root, cwd, environment)
+        repo = _dismiss_get(runner, root, cwd, environment, raw_http=raw_http)
         default = repo["default_branch"]
         if not isinstance(default, str) or not default or str(repo["full_name"]).lower() != gh_repo.lower():
             raise ValueError("repository identity")
@@ -2120,12 +2267,12 @@ def _publish_branch_delete(fields, *, gh_repo, runner, cwd, environment, capture
     if branch == default:
         refuse("it is the default branch")
     try:
-        info = _dismiss_get(runner, f"{root}/branches/{name}", cwd, environment)
+        info = _dismiss_get(runner, f"{root}/branches/{name}", cwd, environment, raw_http=raw_http)
         sha, protected = info["commit"]["sha"], info["protected"]
         if info["name"] != branch or type(protected) is not bool or not re.fullmatch(PATTERNS["sha"], sha):
             raise ValueError("branch identity")
-        rules = _dismiss_get(runner, f"{root}/rules/branches/{name}?per_page=100", cwd, environment, pages=True)
-        pulls = _dismiss_get(runner, f"{root}/pulls?state=open&per_page=100", cwd, environment, pages=True)
+        rules = _dismiss_get(runner, f"{root}/rules/branches/{name}?per_page=100", cwd, environment, pages=True, raw_http=raw_http)
+        pulls = _dismiss_get(runner, f"{root}/pulls?state=open&per_page=100", cwd, environment, pages=True, raw_http=raw_http)
         users = []
         for pull in pulls:
             head, base = pull["head"], pull["base"]
@@ -2298,9 +2445,9 @@ def publish(
             refusal = github_client.refusal_of(result, injected=runner is not None)
             if result.returncode or refusal is not None or (observation is not None and observation.stale):
                 raise ValueError("queue state unavailable")
-            document = json_depth.loads(result.stdout, max_depth=512)
+            document = github_client.parse_graphql_envelope(result.stdout)
             current = document["data"]["repository"]["pullRequest"]
-            if document.get("errors") or not isinstance(current, dict) or current.get("headRefOid") != identity["headRefOid"]:
+            if not isinstance(current, dict) or current.get("headRefOid") != identity["headRefOid"]:
                 raise ValueError("queue state unavailable or head changed")
             return {
                 **current,
@@ -2375,6 +2522,12 @@ def publish(
             # a merge queue ignores explicit text, so its defaults are scanned too.
             default = _squash_text(gh_repo, fields, dest, temp, readiness_runner, cwd, environment)
             recovery_queue = default["queue"]
+            if "expect_queue" in fields and (fields["expect_queue"] == "true") is not recovery_queue:
+                raise gate.PublishBlocked(
+                    "QUEUE_MODE_CHANGED: merge refused before publication: the base branch merge queue is "
+                    + ("on" if recovery_queue else "off") + " but --expect-queue was " + fields["expect_queue"]
+                    + "; re-read queue-status and re-check the landing gate for that kind."
+                )
             if recovery_queue:
                 try:
                     before = queue_probe()
@@ -2434,11 +2587,12 @@ def publish(
             return _publish_code_scanning_dismiss(
                 fields, gh_repo=gh_repo, dest=dest, runner=readiness_runner, cwd=cwd,
                 environment=environment, temp=temp, capture_output=capture_output, text=text,
+                raw_graphql=runner is None,
             )
         if verb in {"code-scanning-analysis-delete", "branch-delete"}:
             return (_publish_analysis_delete if verb == "code-scanning-analysis-delete" else _publish_branch_delete)(
                 fields, gh_repo=gh_repo, runner=readiness_runner, cwd=cwd, environment=environment,
-                capture_output=capture_output, text=text,
+                capture_output=capture_output, text=text, raw_http=runner is None,
             )
         if verb == "ruleset-merge-queue":
             return _publish_ruleset_merge_queue(
@@ -2930,6 +3084,11 @@ def main(argv=None, *, runner=None):
                         "not a PR number; no default"
                     ),
                 }[key]
+            if verb == "pr-merge" and key == "expect_queue":
+                kwargs["help"] = (
+                    "true or false: the merge queue state the landing gate was checked for; "
+                    "refused before any write when the base branch differs; omitted skips the check"
+                )
             if kind == "bool":
                 kwargs["action"] = argparse.BooleanOptionalAction
             elif kind in {"texts", "assets"}:
@@ -3292,20 +3451,30 @@ def read(
             result = _send(
                 ["gh", "api", "--method", "POST", "graphql", "--input", str(frozen), *_hostname_flag(dest)],
                 environment=environment, runner=runner, cwd=cwd, capture_output=True, text=True,
-                check=check, timeout=timeout,
+                check=False, timeout=timeout,
             )
+        observation = getattr(result, "github_result", None)
+        if observation is not None and observation.error == "github_graphql_error":
+            raise gate.PublishBlocked("OPSEC: malformed issue count response.")
         if result.returncode == 0:
             try:
-                document = json_depth.loads(result.stdout, max_depth=512)
+                document = github_client.parse_graphql_envelope(result.stdout)
                 count = document["data"]["repository"]["issues"]["totalCount"]
-                if document.get("errors") or type(count) is not int or count < 0:
+                if type(count) is not int or count < 0:
                     raise ValueError
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError, RecursionError):
                 raise gate.PublishBlocked("OPSEC: malformed issue count response.") from None
             return github_client._result_process(
                 ["github", operation], github_client.Result(value=document), {},
                 {"capture_output": capture_output, "text": text, "stdout": stdout, "stderr": stderr, "check": check},
             )
+        if check:
+            failure = subprocess.CalledProcessError(
+                result.returncode, result.args, output=result.stdout, stderr=result.stderr,
+            )
+            if observation is not None:
+                failure.github_result = observation
+            raise failure
         return result
     for key in ("number",):
         if key in fields and (type(fields[key]) is not int or fields[key] <= 0):

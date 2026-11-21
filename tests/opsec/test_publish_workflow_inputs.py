@@ -845,7 +845,7 @@ def test_keeper_and_closeout_native_refusal_types(monkeypatch, tmp_path, github_
     with pytest.raises(keeper.KeeperError, match="publish_blocked"):
         keeper.GitHub(tmp_path, "unit/public").enqueue(1, "a" * 40)
     with pytest.raises(task_lifecycle.LifecycleError, match="publish_blocked"):
-        closeout.GhGitHubAdapter(tmp_path).enqueue_pr("unit/public", 1)
+        closeout.GhGitHubAdapter(tmp_path).enqueue_pr("unit/public", 1, "a" * 40)
     assert calls == []
 
 

@@ -107,16 +107,22 @@ Every item must hold on the **current** head. A moved head voids the verdict and
 2. A recorded exact-head APPROVE from the reviewer of record (`review-loop`), with no open
    blocker in the ledger. The optional DeepSeek pre-check (DS-PRECHECK-1101) is never a review of
    record and never satisfies or waives this gate.
-3. Same-head PR CI Gate green, which includes the affected tests and Frontend, not the full suite.
-   It may have finished before or after the review round, but it is green on the live head;
-   pending, red or cancelled is not green. Later CI evidence that materially undermines the
-   recorded verdict needs reviewer disposition before enqueue. PR CI never replaces the
-   merge-group CI Gate on the real queue candidate (`workflow.md` § Merge policy).
+3. Same-head PR CI green, the same with or without a merge queue: no blocking check on the live
+   head pending, red or cancelled, including the PR `CI Gate` (affected tests and Frontend, not
+   the full suite) where the repository runs one. It may have finished before or after the
+   review round. `pr-merge`'s merge guard enforces this before it enqueues or merges. Later CI
+   evidence that materially undermines the recorded verdict needs reviewer disposition before
+   landing. Where the base branch has a merge queue (`isMergeQueueEnabled`, `full-send` step 7),
+   PR CI never replaces the merge-group CI Gate on the real queue candidate (`workflow.md` §
+   Merge policy); without one, these same-head checks are the last CI gate.
 4. Follow-ups sent to the CTO through Fleet Comms, or recorded on the parent issue when they
    share its outcome. A non-blocking follow-up never holds the merge.
 5. The PR is open, not a draft, mergeable and not BEHIND or DIRTY against its base.
 
-`full-send` enqueues after the gate. `full-stop` reports READY_TO_MERGE at the gate; the future
+After the gate, `full-send` lands through `pr-merge` (`full-send` step 8), which enqueues where
+the base branch has a merge queue and merges directly where it has none. `--expect-queue` pins
+the kind the gate was checked for: `pr-merge` refuses before any write when the base differs.
+`full-stop` reports READY_TO_MERGE at the gate; in a merge-queue repository the future
 merge-group CI is not yet proven at that point.
 
 ## Terminal states

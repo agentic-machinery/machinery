@@ -420,7 +420,21 @@ def _budget_headers(headers):
         return None
 
 
-def _limit_hold(response, now):
+def _graphql_403_body_rate_limited(result) -> bool:
+    """True only when a strictly decoded 403 GraphQL response carries a rate-limit error message."""
+    if result.error == "github_graphql_error" and result.reason == "graphql_errors":
+        return any(
+            isinstance(entry.get("message"), str) and "rate limit" in entry["message"].lower()
+            for entry in _graphql_errors(result.value)
+            if isinstance(entry, dict)
+        )
+    if result.error == "github_http_error" and isinstance(result.value, dict):
+        message = result.value.get("message")
+        return isinstance(message, str) and "rate limit" in message.lower()
+    return False
+
+
+def _limit_hold(response, now, *, graphql=False, result=None):
     """The hold GitHub's limit response asks for: ``(holds, reset, reason)``, else ``None``.
 
     Every request path that sees GitHub's status and headers decides through this. Only its
@@ -428,16 +442,33 @@ def _limit_hold(response, now):
     (remaining ``0`` with GitHub's reset) holds nothing: the caller stores that remaining and
     reset as the pool's budget, which ordinary calls honour and landing calls do not. Any other
     limit response is this client's inference: a synthetic hold that never refuses landing.
+    Body-only 403 GraphQL holds require strictly validated response evidence rather than a raw
+    substring match on undecodable or malformed payloads.
     """
     h = {key.lower(): value for key, value in response.headers.items()}
-    if not (
-        response.status == 429
-        or (
-            response.status == 403
-            and (h.get("x-ratelimit-remaining") == "0" or "retry-after" in h or b"rate limit" in response.body.lower())
-        )
-    ):
-        return None
+    header_limit = response.status == 429 or (
+        response.status == 403 and (h.get("x-ratelimit-remaining") == "0" or "retry-after" in h)
+    )
+    if not header_limit:
+        if response.status != 403:
+            return None
+        if graphql:
+            budget = _budget_headers(h)
+            classified = (
+                result
+                if result is not None
+                else _classify_graphql_response(
+                    response,
+                    h,
+                    raw_response=False,
+                    reset_at=budget[1] if budget else None,
+                    now=now,
+                )
+            )
+            if not _graphql_403_body_rate_limited(classified):
+                return None
+        elif b"rate limit" not in response.body.lower():
+            return None
     retry = _retry_after_expiry(h.get("retry-after"), now)
     if retry is not None:
         return [_AUTHENTIC_HOLD], retry, "retry_after"
@@ -1060,8 +1091,12 @@ def parse_http(raw):
     return framed[0]
 
 
-def _cached_value(cached):
-    return cached[0] if json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH).get("_github_binary") else json_depth.loads(cached[0], max_depth=_JSON_MAX_DEPTH)
+def _cached_value(cached, *, graphql=False):
+    if json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH).get("_github_binary"):
+        return cached[0]
+    if graphql:
+        return parse_graphql_envelope(cached[0])
+    return json_depth.loads(cached[0], max_depth=_JSON_MAX_DEPTH)
 
 
 def _store_budget(db, scope, resource, remaining, reset, now=None):
@@ -1569,6 +1604,11 @@ class GitHubClient:
             )
             if not cacheable or (cached and json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH).get("_github_binary")):
                 cached = None
+            elif cached and graphql:
+                try:
+                    parse_graphql_envelope(cached[0])
+                except GitHubGraphQLEnvelopeError:
+                    cached = None
             return cached, _admit(db, self.scope, normalized, now)
 
         try:
@@ -1581,7 +1621,7 @@ class GitHubClient:
                 return _limited(
                     reason,
                     reset,
-                    value=_cached_value(cached),
+                    value=_cached_value(cached, graphql=graphql),
                     stale=True,
                     age_seconds=max(0, now - cached[2]),
                     headers=json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH),
@@ -1599,7 +1639,6 @@ class GitHubClient:
         h = {k.lower(): v for k, v in response.headers.items()}
         budget = _budget_headers(h)
         reset = None
-        limit = _limit_hold(response, now)
         result = _response_result(
             response,
             h,
@@ -1608,6 +1647,7 @@ class GitHubClient:
             reset_at=budget[1] if budget else None,
             now=now,
         )
+        limit = _limit_hold(response, now, graphql=graphql, result=result)
         if cacheable and method == "GET" and response.status == 200 and not response.body:
             # Keep a missing JSON document distinct from a valid JSON null.
             result.value = response.body
@@ -1629,7 +1669,7 @@ class GitHubClient:
                 if not cached or self.clock() - cached[2] >= self.cache_ttl_seconds:
                     return Result(status=304, error="github_cache_miss", headers=h)
                 merged = {**json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH), **h}
-                return Result(_cached_value(cached), status=304, headers=merged)
+                return Result(_cached_value(cached, graphql=graphql), status=304, headers=merged)
             if result.error == "github_rate_limited":
                 return deferred("pool_exhausted", result.reset_at)
             return result
@@ -1659,7 +1699,7 @@ class GitHubClient:
                                 "AND at=? AND body=? AND headers=?",
                                 (now, json.dumps(h), self.scope, key, now, cached[2], cached[0], cached[1]),
                             )
-                            return Result(_cached_value(cached), status=304, headers=h)
+                            return Result(_cached_value(cached, graphql=graphql), status=304, headers=h)
                         if result.error == "github_rate_limited":
                             reset = result.reset_at
                             _store_budget(db, self.scope, resource, 0, reset, now=now)
@@ -3515,7 +3555,7 @@ def _native_command(args, client, runner, kwargs, *, preserve_argv=False):
         now = client.clock()
         if response is not None:
             # GitHub's own status and headers: decide as request() does.
-            limit = _limit_hold(response, now)
+            limit = _limit_hold(response, now, graphql=request.path == "graphql")
         elif b"rate limit" in error.lower():
             # gh's stderr carries no Retry-After: a synthetic hold, never binding on landing.
             limit = [_SYNTHETIC_HOLD], int(now + 60), "secondary_hold"
@@ -4108,28 +4148,221 @@ def _graphql_errors(value):
     return errors if isinstance(errors, list) else []
 
 
+GRAPHQL_ENVELOPE_KEYS = frozenset({"data", "errors", "extensions"})
+"""Top-level keys permitted by the GraphQL over HTTP response specification."""
+GRAPHQL_ERROR_REASONS = frozenset(
+    {
+        "invalid_json",
+        "invalid_envelope",
+        "invalid_errors",
+        "invalid_data",
+        "invalid_extensions",
+        "graphql_errors",
+    }
+)
+"""The closed set of typed reasons a GraphQL response is refused."""
+
+
+class GitHubGraphQLEnvelopeError(ValueError):
+    """A GitHub GraphQL response failed strict JSON decoding or envelope validation."""
+
+    code = "github_graphql_error"
+
+    def __init__(self, reason: str):
+        if reason not in GRAPHQL_ERROR_REASONS:
+            raise AssertionError(f"untyped GitHub GraphQL envelope error: {reason!r}")
+        self.reason = reason
+        super().__init__(f"{self.code} reason={reason}")
+
+
+def _strict_object_pairs(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError("duplicate JSON object member")
+        obj[key] = value
+    return obj
+
+
+def _strict_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number: {token}")
+    return value
+
+
+def loads_strict_json(raw, *, max_depth=_JSON_MAX_DEPTH):
+    """Decode UTF-8 JSON strictly: no BOM, no duplicate object keys, no non-finite numbers, bounded depth."""
+    if isinstance(raw, (bytes, bytearray)):
+        text = bytes(raw).decode("utf-8")
+    elif isinstance(raw, str):
+        text = raw
+    else:
+        raise ValueError("JSON payload must be str or bytes")
+    return json_depth.loads(
+        text,
+        max_depth=max_depth,
+        object_pairs_hook=_strict_object_pairs,
+        parse_float=_strict_float,
+        parse_constant=_reject_constant,
+    )
+
+
+def validate_graphql_envelope(document):
+    """Require a spec-compliant success GraphQL response envelope (GraphQL over HTTP §7.1).
+
+    Allowed top-level members are ``{"data", "errors", "extensions"}``. Any ``errors``
+    member (including empty or falsey values), any unknown top-level member, a missing or
+    non-object ``data`` member, or a non-object ``extensions`` member raises
+    :class:`GitHubGraphQLEnvelopeError` with a closed-set reason.
+    """
+    if not isinstance(document, dict) or not set(document) <= GRAPHQL_ENVELOPE_KEYS:
+        raise GitHubGraphQLEnvelopeError("invalid_envelope")
+    if "extensions" in document and not isinstance(document["extensions"], dict):
+        raise GitHubGraphQLEnvelopeError("invalid_extensions")
+    if "data" in document and document["data"] is not None and not isinstance(document["data"], dict):
+        raise GitHubGraphQLEnvelopeError("invalid_data")
+    if "errors" in document:
+        errors = document["errors"]
+        if not isinstance(errors, list) or not errors or any(not isinstance(entry, dict) for entry in errors):
+            raise GitHubGraphQLEnvelopeError("invalid_errors")
+        raise GitHubGraphQLEnvelopeError("graphql_errors")
+    if "data" not in document or not isinstance(document["data"], dict):
+        raise GitHubGraphQLEnvelopeError("invalid_data")
+    return document
+
+
+def parse_graphql_envelope(raw, *, max_depth=_JSON_MAX_DEPTH):
+    """Strictly decode ``raw`` as JSON and validate its GraphQL response envelope."""
+    try:
+        document = loads_strict_json(raw, max_depth=max_depth)
+    except (ValueError, RecursionError):
+        raise GitHubGraphQLEnvelopeError("invalid_json") from None
+    return validate_graphql_envelope(document)
+
+
+def _is_graphql_rate_limited(document):
+    """True when a validated GraphQL error document reports a primary GraphQL rate limit."""
+    return any(
+        isinstance(entry.get("type"), str) and entry["type"] in {"RATE_LIMIT", "RATE_LIMITED"}
+        for entry in document["errors"]
+    )
+
+
+def _media_type(headers) -> str:
+    raw = headers.get("content-type")
+    if not isinstance(raw, str):
+        return ""
+    return raw.split(";", 1)[0].strip().lower()
+
+
+def _is_graphql_media_type(headers) -> bool:
+    return _media_type(headers) == "application/graphql-response+json"
+
+
+def _is_json_media_type(headers) -> bool:
+    media = _media_type(headers)
+    return media == "application/json" or media.endswith("+json")
+
+
+def _is_plain_http_error_body(body: bytes, headers: dict, exc: BaseException) -> bool:
+    """True only for non-JSON HTTP gateway/proxy text (e.g. 502 HTML), never undecodable JSON/UTF-8."""
+    if _is_json_media_type(headers) or not isinstance(exc, json.JSONDecodeError) or exc.msg == "Extra data":
+        return False
+    stripped = body.lstrip(b" \t\r\n")
+    if not stripped or body.startswith(b"\xef\xbb\xbf") or stripped.startswith(b"\xef\xbb\xbf"):
+        return False
+    return stripped[0] not in (ord("{"), ord("["), ord('"'))
+
+
+def _classify_graphql_response(response, headers, *, raw_response, reset_at, now):
+    """Single classifier for every GraphQL HTTP response (2xx and non-2xx)."""
+    success = 200 <= response.status < 300
+    if not response.body:
+        if not success and (response.status == 304 or not _is_graphql_media_type(headers)):
+            return Result(None, status=response.status, error="github_http_error", reset_at=reset_at, headers=headers)
+        return Result(
+            response.body,
+            status=response.status,
+            error="github_graphql_error",
+            headers=headers,
+            reason="invalid_json",
+            empty_body=True,
+        )
+    try:
+        value = loads_strict_json(response.body)
+    except (ValueError, RecursionError) as exc:
+        if not success and _is_plain_http_error_body(response.body, headers, exc):
+            return Result(
+                response.body, status=response.status, error="github_http_error", reset_at=reset_at, headers=headers
+            )
+        return Result(
+            response.body,
+            status=response.status,
+            error="github_graphql_error",
+            headers=headers,
+            reason="invalid_json",
+            empty_body=False,
+        )
+    if (
+        not success
+        and isinstance(value, dict)
+        and not _is_graphql_media_type(headers)
+        and not (set(value) & GRAPHQL_ENVELOPE_KEYS)
+        and isinstance(value.get("message"), str)
+    ):
+        return Result(value, status=response.status, error="github_http_error", reset_at=reset_at, headers=headers)
+    try:
+        validate_graphql_envelope(value)
+    except GitHubGraphQLEnvelopeError as exc:
+        if exc.reason == "graphql_errors" and _is_graphql_rate_limited(value):
+            return _limited("pool_exhausted", reset_at or int(now + 60))
+        return Result(
+            value,
+            status=response.status,
+            error="github_graphql_error",
+            headers=headers,
+            reason=exc.reason,
+        )
+    if not success:
+        return Result(
+            value,
+            status=response.status,
+            error="github_graphql_error",
+            headers=headers,
+            reason="invalid_envelope",
+        )
+    return Result(
+        response.body if raw_response else value,
+        status=response.status,
+        headers=headers,
+        empty_body=False,
+    )
+
+
 def _response_result(response, headers, *, graphql, raw_response, reset_at, now):
     """Classify a response independently of budget/cache persistence."""
     success = 200 <= response.status < 300
     if raw_response and success and not graphql:
         return Result(response.body, status=response.status, headers=headers, empty_body=not response.body)
+    if graphql:
+        return _classify_graphql_response(
+            response,
+            headers,
+            raw_response=raw_response,
+            reset_at=reset_at,
+            now=now,
+        )
     try:
         value = json_depth.loads(response.body, max_depth=_JSON_MAX_DEPTH) if response.body else None
     except ValueError:
         value = response.body
-    if graphql and isinstance(value, dict):
-        if any(
-            entry.get("type") in {"RATE_LIMIT", "RATE_LIMITED"}
-            for entry in _graphql_errors(value)
-            if isinstance(entry, dict)
-        ):
-            return _limited("pool_exhausted", reset_at or int(now + 60))
-        if value.get("errors") or ("errors" in value and value.get("data") is None):
-            return Result(value, status=response.status, error="github_graphql_error", headers=headers)
     if not success:
         return Result(value, status=response.status, error="github_http_error", reset_at=reset_at, headers=headers)
     return Result(
-        response.body if raw_response else value, status=response.status, headers=headers,
+        response.body if raw_response else value,
+        status=response.status,
+        headers=headers,
         empty_body=not response.body,
     )
 
@@ -4165,6 +4398,8 @@ def _result_process(args, result, options, kwargs, *, api=True):
             detail["reason"] = result.reason
         elif result.error == "github_graphql_error":
             detail["errors"] = _graphql_error_detail(result.value)
+            if result.reason:
+                detail["reason"] = result.reason
         output = json.dumps(detail).encode()
         error = output
         code = 75 if result.error == "github_rate_limited" else 1

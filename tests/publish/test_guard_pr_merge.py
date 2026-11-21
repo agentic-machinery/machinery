@@ -84,9 +84,21 @@ def loaded_guard(configured_roots):  # noqa: F811 - imported pytest fixture
         yield
 
 
+def test_hook_accepts_exactly_the_publisher_pr_merge_flags():
+    """Defect class: a new publisher pr-merge flag the hook refuses as unreadable (or reads as a value-less token)."""
+    from lu_machinery.publish.github import SCHEMAS
+
+    schema = SCHEMAS["pr-merge"][1]
+    schema_flags = {"--" + key.replace("_", "-") for key in schema}
+    assert schema_flags == guard._PUBLISHER_MERGE_FLAGS
+    # The hook consumes one value per flag, so a boolean flag would shift every later token.
+    assert "bool" not in schema.values()
+
+
 _ISSUE_9461_MERGES = [
     "gh pr merge 5",
     "python -m lu_machinery.publish pr-merge --number 5 --match-head " + "a" * 40,
+    "python -m lu_machinery.publish pr-merge --number 5 --match-head " + "a" * 40 + " --expect-queue false",
 ]
 _ISSUE_9461_SUFFIXES = [
     "",
@@ -134,7 +146,11 @@ runpy.run_path(sys.argv[1], run_name="__main__")
     )
     assert result.returncode == expected, result.stderr
     if expected == 2:
-        assert "guard dependency unavailable" in result.stderr
+        # The readiness module is needed only where a merge is judged, so a merge the shell
+        # reader refuses first keeps that reason; either way the merge is refused.
+        assert "guard dependency unavailable" in result.stderr or (
+            dependency.endswith("merge_guard") and "cannot be read safely" in result.stderr
+        )
 
 
 @pytest.mark.parametrize(
@@ -211,7 +227,7 @@ def test_multiline_jq_fields_do_not_fabricate_an_unreadable_merge(monkeypatch, c
 def test_issue_9102_executable_payload_stays_visible(monkeypatch, shape):
     command = shape.replace("{payload}", "gh pr merge 5 --squash")
     assert _any_judged_merge(command)
-    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [], 1)) == 2
 
 
 def test_issue_9102_real_let_heredoc_body_words_stay_visible():
@@ -231,13 +247,13 @@ def test_issue_9102_real_let_heredoc_body_words_stay_visible():
 )
 def test_issue_9115_nested_and_backtick_merges_blocked(monkeypatch, command):
     assert _any_judged_merge(command)
-    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [], 1)) == 2
 
 
 def test_issue_9115_escaped_nested_backtick_merge_is_visible(monkeypatch):
     command = r"echo `echo \`gh pr merge 5 --admin\``"
     assert _any_judged_merge(command)
-    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [], 1)) == 2
 
 
 def test_issue_9115_backtick_depth_limit_blocks_merge_hook(monkeypatch):
@@ -287,19 +303,19 @@ def test_issue_9088_here_strings_keep_pr_merge_visible(monkeypatch, first):
     command = f"{first}\ngh pr merge 5 --squash\nEOF"
     assert parse_heredocs(first) == ()
     assert _any_judged_merge(command)
-    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [], 1)) == 2
 
 
 def test_issue_9088_crlf_closer_keeps_pr_merge_visible(monkeypatch):
     command = "cat <<EOF\r\nEOF\r\ngh pr merge 5 --squash\nEOF"
     assert _any_judged_merge(command)
-    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [], 1)) == 2
 
 
 def test_issue_9088_reviewer_heredoc_bypass_blocks(monkeypatch):
     command = 'cat <<"EO\\"F"\nnote\nEO"F\ngh pr merge 1 --admin\ngit checkout -b feature\ntee AGENTS.md\necho $GH_TOKEN\ncat .env\nEO\\"F'
     assert _any_judged_merge(command)
-    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [], 1)) == 2
 
 
 @pytest.mark.parametrize(
@@ -319,13 +335,13 @@ def test_issue_9088_exotic_heredoc_keeps_merge_visible(monkeypatch, opener, clos
     with pytest.raises(ShellPreprocessLimit):
         parse_heredocs(f"cat {opener}\nx\n{closer}")
     assert _any_judged_merge(command)
-    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [], 1)) == 2
 
 
 def test_issue_9088_exotic_body_cannot_skip_later_safe_opener(monkeypatch):
     command = "cat <<$'EOF'\ncat <<SAFE\ngh pr merge 5 --admin\nSAFE\nEOF"
     assert _any_judged_merge(command)
-    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["Test (pytest)"], [], 1)) == 2
 
 
 def test_issue_9088_missing_shell_helper_blocks(tmp_path):
@@ -354,7 +370,7 @@ def _run(
     *,
     pr: str | None = "5",
     meta: dict | None = None,
-    checks: tuple[list[str], list[str]] | None = ([], []),
+    checks: tuple[list[str], list[str], int] | None = ([], [], 1),
     owner_repo: str | None = "owner/repo",
     protected: bool | None = False,
 ) -> int:
@@ -392,7 +408,7 @@ def _run(
 
 @pytest.mark.parametrize("command", _ISSUE_9461_MERGES)
 @pytest.mark.parametrize("suffix", _ISSUE_9461_SUFFIXES)
-@pytest.mark.parametrize("checks,expected", [(([], []), 0), ((["CI Gate"], []), 2)])
+@pytest.mark.parametrize("checks,expected", [(([], [], 1), 0), ((["CI Gate"], [], 1), 2)])
 def test_issue_9461_redirect_matrix_uses_pr_state(monkeypatch, capsys, command, suffix, checks, expected):
     original_ref = guard._pr_ref
     # Set up the existing fake state seam without replacing the real selector.
@@ -480,7 +496,7 @@ def test_issue_9461_dynamic_or_malformed_redirect_blocks(monkeypatch, command, r
 def test_issue_9461_no_merge_text_redirects_do_not_create_merges(monkeypatch, command):
     assert not _any_judged_merge(command)
     assert not _any_merge(command)
-    assert _run(monkeypatch, command, checks=(["CI Gate"], [])) == 0
+    assert _run(monkeypatch, command, checks=(["CI Gate"], [], 1)) == 0
 
 
 @pytest.mark.parametrize(
@@ -524,7 +540,7 @@ def test_issue_9461_redirect_marker_uses_entire_raw_command(mention, separator):
 
 
 @pytest.mark.parametrize("command", _ISSUE_9461_MERGES)
-@pytest.mark.parametrize("checks,expected", [(([], []), 0), ((["CI Gate"], []), 2)])
+@pytest.mark.parametrize("checks,expected", [(([], [], 1), 0), ((["CI Gate"], [], 1), 2)])
 def test_issue_9461_literal_here_string_still_judges_pr(monkeypatch, capsys, command, checks, expected):
     # A literal here-string is readable in round 1; it still judges PR 5.
     test_issue_9461_redirect_matrix_uses_pr_state(monkeypatch, capsys, command, " <<< 'fixture text'", checks, expected)
@@ -547,7 +563,7 @@ def test_issue_9461_cd_scope_unchanged(monkeypatch, suffix):
 
 
 def test_issue_9461_piped_into_merge_is_judged(monkeypatch):
-    assert _run(monkeypatch, "true | gh pr merge 5 2>&1", checks=(["CI Gate"], [])) == 2
+    assert _run(monkeypatch, "true | gh pr merge 5 2>&1", checks=(["CI Gate"], [], 1)) == 2
     assert _judged_cwds(monkeypatch, "gh pr merge 5 2>&1 | gh pr merge 6") == [("5", None), ("6", None)]
 
 
@@ -619,22 +635,22 @@ def test_unrelated_command_is_untouched(monkeypatch):
 def test_admin_merge_is_judged_by_pr_guard(monkeypatch):
     judged: list[list[str]] = []
     monkeypatch.setattr(guard, "_judge", lambda args, cwd=None: judged.append(args) or "blocked")
-    assert _run(monkeypatch, "gh pr merge 5 --admin", checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, "gh pr merge 5 --admin", checks=(["Test (pytest)"], [], 1)) == 2
     assert judged == [["5", "--admin"]]
 
 
 @pytest.mark.parametrize(
     "command,checks,protected",
     [
-        ("gh pr merge 5 --auto --squash", ([], []), False),
-        ("gh pr comment 5 --body note && gh pr merge --auto 5 --squash", ([], []), False),
-        ("gh pr comment 5 --body note; gh pr merge 5 --squash", (["boundary-and-tests"], []), False),
-        ("printf ready | gh pr merge 5 --squash", ([], ["Test (pytest)"]), False),
-        ("gh pr comment 5 --body note\ngh pr merge 5 --squash", ([], ["Test (pytest)"]), False),
-        (r"echo $'\'' ; gh pr merge 5 ; echo \'", ([], []), False),
-        ('x="$(echo "\'")"; gh pr merge 5; x="$(echo "\'")"', ([], []), False),
-        ('x="\n"; gh pr merge 5; echo "\n"', ([], []), False),
-        ("# it's\necho 'a\nb' $'\\'' ; gh pr merge 5 ; echo \\'", ([], []), False),
+        ("gh pr merge 5 --auto --squash", ([], [], 1), False),
+        ("gh pr comment 5 --body note && gh pr merge --auto 5 --squash", ([], [], 1), False),
+        ("gh pr comment 5 --body note; gh pr merge 5 --squash", (["boundary-and-tests"], [], 1), False),
+        ("printf ready | gh pr merge 5 --squash", ([], ["Test (pytest)"], 1), False),
+        ("gh pr comment 5 --body note\ngh pr merge 5 --squash", ([], ["Test (pytest)"], 1), False),
+        (r"echo $'\'' ; gh pr merge 5 ; echo \'", ([], [], 1), False),
+        ('x="$(echo "\'")"; gh pr merge 5; x="$(echo "\'")"', ([], [], 1), False),
+        ('x="\n"; gh pr merge 5; echo "\n"', ([], [], 1), False),
+        ("# it's\necho 'a\nb' $'\\'' ; gh pr merge 5 ; echo \\'", ([], [], 1), False),
     ],
 )
 def test_compound_merge_segments_are_judged(monkeypatch, command, checks, protected):
@@ -645,7 +661,7 @@ def test_compound_admin_merge_is_judged(monkeypatch):
     judged: list[list[str]] = []
     monkeypatch.setattr(guard, "_judge", lambda args, cwd=None: judged.append(args) or "blocked")
     command = "gh pr comment 5 --body note && gh pr merge 5 --admin"
-    assert _run(monkeypatch, command, checks=(["boundary-and-tests"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["boundary-and-tests"], [], 1)) == 2
     assert judged == [["5", "--admin"]]
 
 
@@ -662,7 +678,7 @@ def test_draft_is_blocked(monkeypatch):
 
 
 def test_red_non_advisory_check_is_blocked(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --squash", checks=(["boundary-and-tests"], [])) == 2
+    assert _run(monkeypatch, "gh pr merge 5 --squash", checks=(["boundary-and-tests"], [], 1)) == 2
 
 
 @pytest.mark.parametrize(
@@ -699,12 +715,12 @@ def test_green_is_allowed(monkeypatch, tmp_path, capsys, seat, safe_mode, expect
 
 
 def test_pending_without_auto_is_blocked(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --squash", checks=([], ["Test (pytest)"])) == 2
+    assert _run(monkeypatch, "gh pr merge 5 --squash", checks=([], ["Test (pytest)"], 1)) == 2
 
 
 def test_auto_on_protected_base_is_allowed(monkeypatch):
     # Protection with required status checks → --auto waits for them, as advertised.
-    assert _run(monkeypatch, "gh pr merge 5 --auto --squash", checks=([], ["Test (pytest)"]), protected=True) == 0
+    assert _run(monkeypatch, "gh pr merge 5 --auto --squash", checks=([], ["Test (pytest)"], 1), protected=True) == 0
 
 
 def test_auto_on_unprotected_base_is_blocked(monkeypatch):
@@ -749,6 +765,31 @@ def _fake_gh(monkeypatch, *, returncode: int, stdout: str, stderr: str = ""):
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
 
 
+def _bound_gh(monkeypatch, *, returncode: int, stdout: str, rollup: object, stderr: str = ""):
+    """Answer ``gh pr checks`` as given, the head-bound rollup read with ``rollup`` at _HEAD,
+    and the metadata read with a ready PR at _HEAD; any other read fails."""
+    meta = {"isDraft": False, "baseRefName": "main", "body": "", "headRefOid": _HEAD, "number": 5, "url": _URL}
+
+    def fake_run(args, **_k):
+        if args[1:3] == ["pr", "checks"]:
+            return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+        if args[1:3] == ["pr", "view"] and args[-1] == "headRefOid,statusCheckRollup":
+            return subprocess.CompletedProcess(
+                args, 0, json.dumps({"headRefOid": _HEAD, "statusCheckRollup": rollup}), "")
+        if args[1:3] == ["pr", "view"]:
+            return subprocess.CompletedProcess(args, 0, json.dumps(meta), "")
+        return subprocess.CompletedProcess(args, 1, "", "unexpected")
+
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+
+
+def _run_row(name: str, conclusion: str, **extra) -> dict:
+    """One completed (or, with ``conclusion=""``, in-progress) CI check run in a rollup."""
+    status = "COMPLETED" if conclusion else "IN_PROGRESS"
+    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion,
+            "workflowName": "CI", **extra}
+
+
 def test_pr_meta_parses_draft(monkeypatch):
     payload = {"isDraft": True, "baseRefName": "main", "body": "", "number": 5}
     _fake_gh(monkeypatch, returncode=0, stdout=json.dumps(payload))
@@ -785,20 +826,23 @@ def test_check_states_empty_output_with_error_rc_is_failclosed(monkeypatch):
     assert guard._check_states("99999") is None
 
 
-def test_check_states_empty_output_with_ok_rc_is_no_checks(monkeypatch):
+def test_check_states_empty_output_with_ok_rc_is_unverifiable(monkeypatch):
+    # No JSON collection at all; the publisher refuses it as malformed, never as zero checks.
     _fake_gh(monkeypatch, returncode=0, stdout="")
-    assert guard._check_states("5") == ([], [])
+    assert guard._check_states("5") is None
 
 
 def test_check_states_splits_failing_and_pending(monkeypatch):
-    rows = (
-        '[{"name":"boundary-and-tests","bucket":"fail"},'
-        '{"name":"Test (pytest)","bucket":"pending"},'
-        '{"name":"Lint (ruff)","bucket":"pass"},'
-        '{"name":"Component shadow (advisory)","bucket":"fail","workflow":"CI"}]'
-    )
-    _fake_gh(monkeypatch, returncode=8, stdout=rows)
-    assert guard._check_states("5") == (["boundary-and-tests"], ["Test (pytest)"])
+    # gh's own buckets only show that checks exist; the head-bound rollup is judged.
+    rows = '[{"name":"boundary-and-tests","bucket":"pass"}]'
+    rollup = [
+        _run_row("boundary-and-tests", "FAILURE"),
+        _run_row("Test (pytest)", ""),
+        _run_row("Lint (ruff)", "SUCCESS"),
+        _run_row("Component shadow (advisory)", "FAILURE"),
+    ]
+    _bound_gh(monkeypatch, returncode=8, stdout=rows, rollup=rollup)
+    assert guard._check_states("5") == (["boundary-and-tests"], ["Test (pytest)"], 3)
 
 
 def test_check_states_garbage_output_is_failclosed(monkeypatch):
@@ -850,7 +894,7 @@ def test_auto_on_base_with_empty_required_checks_is_blocked(monkeypatch):
     monkeypatch.setattr(
         guard, "_pr_meta", lambda p, repo=None, cwd=None: {"isDraft": False, "baseRefName": "main", "url": _URL}
     )
-    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], []))
+    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], [], 1))
     monkeypatch.setattr(guard, "_owner_repo_from_url", lambda u: "owner/repo")
     assert guard.main() == 2
 
@@ -895,7 +939,7 @@ def test_auto_equals_true_on_unprotected_base_is_blocked(monkeypatch):
 def test_auto_equals_false_is_a_normal_merge(monkeypatch):
     # Not an auto-merge → judged as a manual merge: green passes, pending blocks.
     assert _run(monkeypatch, "gh pr merge 5 --auto=false --squash", protected=False) == 0
-    assert _run(monkeypatch, "gh pr merge 5 --auto=false --squash", checks=([], ["Test (pytest)"])) == 2
+    assert _run(monkeypatch, "gh pr merge 5 --auto=false --squash", checks=([], ["Test (pytest)"], 1)) == 2
 
 
 def test_disable_auto_equals_true_is_not_a_merge(monkeypatch):
@@ -911,7 +955,7 @@ def test_disable_auto_equals_true_is_not_a_merge(monkeypatch):
 def test_admin_equals_true_is_judged_by_pr_guard(monkeypatch):
     judged: list[list[str]] = []
     monkeypatch.setattr(guard, "_judge", lambda args, cwd=None: judged.append(args) or "blocked")
-    assert _run(monkeypatch, "gh pr merge 5 --admin=true", checks=(["Test (pytest)"], [])) == 2
+    assert _run(monkeypatch, "gh pr merge 5 --admin=true", checks=(["Test (pytest)"], [], 1)) == 2
     assert judged == [["5", "--admin=true"]]
 
 
@@ -984,7 +1028,7 @@ def test_wrapper_with_options_is_still_judged(monkeypatch, cmd):
     # F002: _skip_command_prefix consumed the wrapper but not its options, so the
     # `['gh','pr','merge']` match failed and the merge was never judged.
     assert _any_judged_merge(cmd)
-    assert _run(monkeypatch, cmd, checks=(["CI Gate"], [])) == 2
+    assert _run(monkeypatch, cmd, checks=(["CI Gate"], [], 1)) == 2
 
 
 @pytest.mark.parametrize(
@@ -1033,16 +1077,13 @@ def test_missing_check_bucket_fails_closed(monkeypatch):
     ({"workflowName": "CI"}, False),
 ])
 def test_advisory_checks_require_workflow_identity(monkeypatch, identity, allowed):
+    """gh's headless rows never decide an advisory exemption: the rollup's workflow identity does."""
     name = "Component shadow (advisory)"
-    rows = [{"name": name, "bucket": "fail", **identity}]
-
-    def fake_run(cmd, **kwargs):
-        assert cmd == ["gh", "pr", "checks", "5", "--json", "name,bucket,state,workflow"]
-        return subprocess.CompletedProcess(cmd, 1, json.dumps(rows), "")
-
-    monkeypatch.setattr(guard.subprocess, "run", fake_run)
-    monkeypatch.setattr(guard, "_pr_meta", lambda *_a, **_k: {"isDraft": False})
-    assert guard._check_states("5") == (([], []) if allowed else ([name], []))
+    rows = [{"name": name, "bucket": "fail", **identity}, {"name": "CI Gate", "bucket": "pass", "workflow": "CI"}]
+    workflow = "CI" if allowed else "Nightly"
+    rollup = [_run_row(name, "FAILURE", workflowName=workflow), _run_row("CI Gate", "SUCCESS")]
+    _bound_gh(monkeypatch, returncode=1, stdout=json.dumps(rows), rollup=rollup)
+    assert guard._check_states("5") == (([], [], 1) if allowed else ([name], [], 1))
     result = guard._judge(["5", "--squash"])
     if allowed:
         assert result is None
@@ -1051,44 +1092,40 @@ def test_advisory_checks_require_workflow_identity(monkeypatch, identity, allowe
 
 
 def test_known_pass_buckets_are_green(monkeypatch):
-    rows = '[{"name":"CI Gate","bucket":"pass"},{"name":"Flaky","bucket":"skipping"},{"name":"N","bucket":"neutral"}]'
-    _fake_gh(monkeypatch, returncode=0, stdout=rows)
-    assert guard._check_states("5") == ([], [])
+    rows = '[{"name":"CI Gate","bucket":"pass"}]'
+    rollup = [_run_row("CI Gate", "SUCCESS"), _run_row("Flaky", "SKIPPED"), _run_row("N", "NEUTRAL")]
+    _bound_gh(monkeypatch, returncode=0, stdout=rows, rollup=rollup)
+    assert guard._check_states("5") == ([], [], 3)
 
 
 def _rollup_states(monkeypatch, rows):
-    import types
-
-    def fake_run(cmd, **_k):
-        if cmd[:4] == ["gh", "pr", "checks", "5"]:
-            return types.SimpleNamespace(returncode=1, stdout="", stderr=_GH_246_CHECKS_JSON_GAP)
-        assert cmd[:4] == ["gh", "pr", "view", "5"]
-        return types.SimpleNamespace(returncode=0, stdout=json.dumps({"statusCheckRollup": rows}), stderr="")
-
-    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+    """The gh 2.46 path: no ``--json`` checks, so the head-bound rollup is the whole answer."""
+    _bound_gh(monkeypatch, returncode=1, stdout="", rollup=rows, stderr=_GH_246_CHECKS_JSON_GAP)
     return guard._check_states("5")
 
 
-@pytest.mark.parametrize("identity,allowed", [
-    ({"workflowName": "CI"}, True),
-    ({"workflowName": "Nightly"}, False),
-    ({}, False),
+@pytest.mark.parametrize("identity,expected", [
+    ({"workflowName": "CI"}, ([], [], 1)),
+    ({"workflowName": "Nightly"}, (["Component shadow (advisory)"], [], 1)),
+    # No workflow identity: only exact-head Actions runs could bind it, and none are readable.
+    ({}, None),
 ])
-def test_rollup_advisory_maps_workflow_name_explicitly(monkeypatch, identity, allowed):
+def test_rollup_advisory_maps_workflow_name_explicitly(monkeypatch, identity, expected):
     name = "Component shadow (advisory)"
     row = {"name": name, "status": "COMPLETED", "conclusion": "FAILURE", **identity}
-    assert _rollup_states(monkeypatch, [row]) == (([], []) if allowed else ([name], []))
+    gate = {"name": "CI Gate", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI"}
+    assert _rollup_states(monkeypatch, [row, gate]) == expected
 
 
 @pytest.mark.parametrize(
     "rows,expected",
     [
-        ([], ([], [])),
-        ([{"name": "CI Gate", "status": "COMPLETED", "conclusion": "SUCCESS"}], ([], [])),
-        ([{"name": "CI Gate", "status": "COMPLETED", "conclusion": "FAILURE"}], (["CI Gate"], [])),
-        ([{"name": "CI Gate", "state": "ERROR"}], (["CI Gate"], [])),
-        ([{"name": "CI Gate", "status": "COMPLETED", "conclusion": "STARTUP_FAILURE"}], (["CI Gate"], [])),
-        ([{"name": "CI Gate", "status": "IN_PROGRESS", "conclusion": ""}], ([], ["CI Gate"])),
+        ([], ([], [], 0)),
+        ([{"name": "CI Gate", "status": "COMPLETED", "conclusion": "SUCCESS"}], ([], [], 1)),
+        ([{"name": "CI Gate", "status": "COMPLETED", "conclusion": "FAILURE"}], (["CI Gate"], [], 1)),
+        ([{"name": "CI Gate", "state": "ERROR"}], (["CI Gate"], [], 1)),
+        ([{"name": "CI Gate", "status": "COMPLETED", "conclusion": "STARTUP_FAILURE"}], (["CI Gate"], [], 1)),
+        ([{"name": "CI Gate", "status": "IN_PROGRESS", "conclusion": ""}], ([], ["CI Gate"], 1)),
         ([{"name": "CI Gate", "status": "COMPLETED", "conclusion": "UNKNOWN"}], None),
         ([{"name": "CI Gate"}], None),
         (
@@ -1108,7 +1145,7 @@ def test_rollup_advisory_maps_workflow_name_explicitly(monkeypatch, identity, al
                     "conclusion": "SUCCESS",
                 },
             ],
-            ([], []),
+            ([], [], 1),
         ),
         (
             [
@@ -1163,7 +1200,8 @@ def test_rollup_fallback_allows_only_unambiguous_green(monkeypatch, rows, expect
             "url": _URL,
         },
     )
-    assert (guard._judge(["5", "--squash"]) is None) == (expected == ([], []))
+    # Only a green head that judged a blocking check merges; an empty rollup is NO_CHECKS.
+    assert (guard._judge(["5", "--squash"]) is None) == (expected == ([], [], 1))
 
 
 @pytest.mark.parametrize("failed_job", [None, "pytest (1)", "Frontend", "CI Gate"])
@@ -1186,8 +1224,7 @@ def test_cancelled_matrix_parent_does_not_hide_real_job_failures(monkeypatch, fa
         rows.append(row(failed_job, conclusion, "40"))
     # Newest-first also proves selection does not depend on response order.
     states = _rollup_states(monkeypatch, list(reversed(rows)))
-    assert states == ([failed_job] if failed_job else [], [])
-    monkeypatch.setattr(guard, "_pr_meta", lambda *_a, **_k: {"isDraft": False})
+    assert states == ([failed_job] if failed_job else [], [], len(jobs))
     result = guard._judge(["5", "--squash"])
     if failed_job:
         assert f"FAILING checks: {failed_job}" in result
@@ -1196,18 +1233,13 @@ def test_cancelled_matrix_parent_does_not_hide_real_job_failures(monkeypatch, fa
 
 
 def test_checks_json_ignores_unexpanded_matrix_parent(monkeypatch):
-    _fake_gh(
-        monkeypatch,
-        returncode=0,
-        stdout=json.dumps(
-            [
-                {"name": "pytest (${{ matrix.shard }})", "bucket": "fail", "state": "CANCELLED"},
-                {"name": "CI Gate", "bucket": "pass", "state": "SUCCESS"},
-                {"name": "pytest (1)", "bucket": "fail", "state": "CANCELLED"},
-            ]
-        ),
-    )
-    assert guard._check_states("5") == (["pytest (1)"], [])
+    rollup = [
+        _run_row("pytest (${{ matrix.shard }})", "CANCELLED"),
+        _run_row("CI Gate", "SUCCESS"),
+        _run_row("pytest (1)", "CANCELLED"),
+    ]
+    _bound_gh(monkeypatch, returncode=1, stdout='[{"name": "pytest (1)", "bucket": "fail"}]', rollup=rollup)
+    assert guard._check_states("5") == (["pytest (1)"], [], 2)
 
 
 @pytest.mark.parametrize(
@@ -1229,7 +1261,10 @@ def test_checks_json_fallback_requires_the_246_gap_shape(monkeypatch, returncode
 
     monkeypatch.setattr(guard.subprocess, "run", fake_run)
     guard._check_states("5")
-    assert len(calls) == 1
+    # rc 1 with no output is also how gh answers a head with no checks: like the publisher,
+    # the guard then reads only the head-bound rollup, never the 2.46 fallback parser.
+    bound = ["gh", "pr", "view", "5", "--json", "headRefOid,statusCheckRollup"]
+    assert calls == ([calls[0], bound] if (returncode, stdout) == (1, "") else [calls[0]])
 
 
 @pytest.mark.parametrize("draft", ["null", '"false"', "0"])
@@ -1280,7 +1315,7 @@ def test_shell_c_without_merge_is_not_judged():
 
 
 def test_shell_c_merge_blocks_end_to_end(monkeypatch):
-    assert _run(monkeypatch, "bash -c 'gh pr merge 5 --squash'", checks=(["boundary-and-tests"], [])) == 2
+    assert _run(monkeypatch, "bash -c 'gh pr merge 5 --squash'", checks=(["boundary-and-tests"], [], 1)) == 2
 
 
 @pytest.mark.parametrize(
@@ -1340,7 +1375,7 @@ def test_cross_repo_url_selector_uses_that_repo(monkeypatch):
             "url": "https://github.com/other/repo/pull/9",
         },
     )
-    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], []))
+    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], [], 1))
     monkeypatch.setattr(guard, "_base_protected", lambda o, b: seen.setdefault("repo", o) and True)
     payload = json.dumps({"tool_input": {"command": "gh pr merge https://github.com/other/repo/pull/9 --auto"}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
@@ -1406,7 +1441,7 @@ def test_recursion_cap_fails_closed(monkeypatch):
     monkeypatch.setattr(
         guard, "_pr_meta", lambda p, repo=None, cwd=None: {"isDraft": False, "baseRefName": "main", "url": _URL}
     )
-    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], []))  # all green
+    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], [], 1))  # all green
     assert guard._judge([guard._UNREADABLE_MARKER]) is not None
 
 
@@ -1493,7 +1528,7 @@ def test_repo_is_propagated_to_every_gh_lookup(monkeypatch):
                 "baseRefName": "main",
                 "url": "https://github.com/learn-ukrainian/learn-ukrainian-infra-private/pull/689",
             },
-            ([], []),
+            ([], [], 1),
             0,
         ),
         (
@@ -1502,7 +1537,7 @@ def test_repo_is_propagated_to_every_gh_lookup(monkeypatch):
                 "baseRefName": "main",
                 "url": "https://github.com/learn-ukrainian/learn-ukrainian-infra-private/pull/689",
             },
-            ([], []),
+            ([], [], 1),
             2,
         ),
         (
@@ -1511,7 +1546,7 @@ def test_repo_is_propagated_to_every_gh_lookup(monkeypatch):
                 "baseRefName": "main",
                 "url": "https://github.com/learn-ukrainian/learn-ukrainian-infra-private/pull/689",
             },
-            (["CI Gate"], []),
+            (["CI Gate"], [], 1),
             2,
         ),
     ],
@@ -1536,8 +1571,8 @@ def test_escaped_gh_still_reaches_the_parser(monkeypatch):
     # The shell strips the backslash BEFORE running the command: `bash -c 'g\h --version'`
     # prints gh's version. A fast path over raw source let `g\h pr merge` past the early
     # return entirely. Normalizing quotes/backslashes first closes it.
-    assert _run(monkeypatch, r"g\h pr merge 5 --squash", checks=(["boundary-and-tests"], [])) == 2
-    assert _run(monkeypatch, "g'h' pr merge 5 --squash", checks=(["boundary-and-tests"], [])) == 2
+    assert _run(monkeypatch, r"g\h pr merge 5 --squash", checks=(["boundary-and-tests"], [], 1)) == 2
+    assert _run(monkeypatch, "g'h' pr merge 5 --squash", checks=(["boundary-and-tests"], [], 1)) == 2
 
 
 def test_fast_path_still_ignores_unrelated_commands(monkeypatch):
@@ -1576,7 +1611,7 @@ def test_help_is_not_a_merge(monkeypatch, cmd):
 )
 def test_ordinary_commands_are_untouched(monkeypatch, cmd):
     # The guard must be invisible in normal use; a red PR is the harshest setting here.
-    assert _run(monkeypatch, cmd, checks=(["boundary-and-tests"], [])) == 0
+    assert _run(monkeypatch, cmd, checks=(["boundary-and-tests"], [], 1)) == 0
 
 
 @pytest.mark.parametrize(
@@ -1634,18 +1669,18 @@ def test_xargs_fed_selector_fails_closed(monkeypatch):
     # `printf '5' | xargs gh pr merge --squash` runs `gh pr merge --squash 5`, but 5 is
     # on stdin. Falling back to the current branch's PR would verify one PR while gh
     # merges another — so refuse. Green current branch must NOT rescue it.
-    assert _run(monkeypatch, "printf '5' | xargs gh pr merge --squash", checks=([], [])) == 2
+    assert _run(monkeypatch, "printf '5' | xargs gh pr merge --squash", checks=([], [], 1)) == 2
 
 
 def test_xargs_with_explicit_selector_is_judged_normally(monkeypatch):
-    assert _run(monkeypatch, "printf '' | xargs gh pr merge 5 --squash", checks=(["boundary-and-tests"], [])) == 2
-    assert _run(monkeypatch, "printf '' | xargs gh pr merge 5 --squash", checks=([], [])) == 0
+    assert _run(monkeypatch, "printf '' | xargs gh pr merge 5 --squash", checks=(["boundary-and-tests"], [], 1)) == 2
+    assert _run(monkeypatch, "printf '' | xargs gh pr merge 5 --squash", checks=([], [], 1)) == 0
 
 
 def test_xargs_options_are_stepped_over(monkeypatch):
     # -n1 / -I{} carry their own values; the invoked command still starts at gh.
-    assert _run(monkeypatch, "printf '' | xargs -n1 gh pr merge 5 --squash", checks=(["x"], [])) == 2
-    assert _run(monkeypatch, "printf '' | xargs -t -n 1 gh pr merge 5", checks=(["x"], [])) == 2
+    assert _run(monkeypatch, "printf '' | xargs -n1 gh pr merge 5 --squash", checks=(["x"], [], 1)) == 2
+    assert _run(monkeypatch, "printf '' | xargs -t -n 1 gh pr merge 5", checks=(["x"], [], 1)) == 2
 
 
 @pytest.mark.parametrize(
@@ -1710,19 +1745,19 @@ def test_quoted_heredoc_backticks_are_data_not_unreadable_shell(monkeypatch):
     swallow the closer before an executed merge.
     """
     brief = "cat > /tmp/brief.md <<'EOF'\nLand it with `gh pr merge`; don't merge by hand.\nEOF"
-    assert _run(monkeypatch, brief.replace("`gh pr merge`", "`the publisher`"), checks=(["CI Gate"], [])) == 0
-    assert _run(monkeypatch, brief, checks=(["CI Gate"], [])) == 2
-    assert _run(monkeypatch, brief.replace("<<'EOF'", "<<EOF"), checks=(["CI Gate"], [])) == 2
-    assert _run(monkeypatch, brief + "\ngh pr merge 5", checks=(["CI Gate"], [])) == 2
-    assert _run(monkeypatch, "cat <<'EOF'\nx\\\nEOF\necho `gh pr merge 5`\nEOF", checks=([], [])) == 2
+    assert _run(monkeypatch, brief.replace("`gh pr merge`", "`the publisher`"), checks=(["CI Gate"], [], 1)) == 0
+    assert _run(monkeypatch, brief, checks=(["CI Gate"], [], 1)) == 2
+    assert _run(monkeypatch, brief.replace("<<'EOF'", "<<EOF"), checks=(["CI Gate"], [], 1)) == 2
+    assert _run(monkeypatch, brief + "\ngh pr merge 5", checks=(["CI Gate"], [], 1)) == 2
+    assert _run(monkeypatch, "cat <<'EOF'\nx\\\nEOF\necho `gh pr merge 5`\nEOF", checks=([], [], 1)) == 2
 
     # Quoting the delimiter does not make a shell/interpreter reader's stdin inert.
     for reader in ("bash", "sh", "cat | bash", "bash -s", "source /dev/stdin", f"{sys.executable} -"):
         body = "import os; os.system('echo `gh pr merge 5`')" if reader.endswith(" -") else "echo `gh pr merge 5`"
-        assert _run(monkeypatch, f"{reader} <<'EOF'\n{body}\nEOF", checks=(["CI Gate"], [])) == 2, reader
-    assert _run(monkeypatch, "cat <<'EOF' | bash\necho `gh pr merge 5`\nEOF", checks=(["CI Gate"], [])) == 2
-    assert _run(monkeypatch, brief + "\nbash brief.md", checks=(["CI Gate"], [])) == 2
-    assert _run(monkeypatch, "function cat { bash; }\n" + brief, checks=(["CI Gate"], [])) == 2
+        assert _run(monkeypatch, f"{reader} <<'EOF'\n{body}\nEOF", checks=(["CI Gate"], [], 1)) == 2, reader
+    assert _run(monkeypatch, "cat <<'EOF' | bash\necho `gh pr merge 5`\nEOF", checks=(["CI Gate"], [], 1)) == 2
+    assert _run(monkeypatch, brief + "\nbash brief.md", checks=(["CI Gate"], [], 1)) == 2
+    assert _run(monkeypatch, "function cat { bash; }\n" + brief, checks=(["CI Gate"], [], 1)) == 2
 
 
 def test_unclosed_heredoc_does_not_hide_merge():
@@ -1740,7 +1775,7 @@ def test_unclosed_heredoc_does_not_hide_merge():
 )
 def test_backslash_continuation_merge_detected(monkeypatch, command):
     assert _any_merge(command)
-    assert _run(monkeypatch, command, checks=(["CI Gate"], [])) == 2
+    assert _run(monkeypatch, command, checks=(["CI Gate"], [], 1)) == 2
 
 
 # --- colorized gh output (review B1, PR #5324) ------------------------------
@@ -1786,10 +1821,9 @@ def test_colorized_check_rows_still_judged(monkeypatch):
     """End-to-end through _check_states' parser: colorized rows must not read as
     undeterminable (which would block every green merge)."""
     rows = '\x1b[1;37m[{"name": "pytest", "bucket": "pass", "state": "SUCCESS"}]\x1b[m'
-    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=rows, stderr="")
-    monkeypatch.setattr(guard.subprocess, "run", lambda *a, **k: completed)
-    failing, pending = guard._check_states("5")
-    assert failing == [] and pending == []
+    _bound_gh(monkeypatch, returncode=0, stdout=rows, rollup=[_run_row("pytest", "SUCCESS")])
+    failing, pending, judged = guard._check_states("5")
+    assert failing == [] and pending == [] and judged == 1
 
 
 def test_colorized_pr_meta_still_parses(monkeypatch):
@@ -2168,7 +2202,7 @@ def test_bare_unmatched_paren_still_fails_closed(monkeypatch):
 
 
 @pytest.mark.parametrize("command", ["cd /tmp &&>file gh pr merge 5 --admin", "{fd}>file gh pr merge 5 --admin"])
-@pytest.mark.parametrize("checks,expected", [(([], []), 0), ((["CI Gate"], []), 2)])
+@pytest.mark.parametrize("checks,expected", [(([], [], 1), 0), ((["CI Gate"], [], 1), 2)])
 def test_issue_9479_r2_redirect_merge_decision(monkeypatch, command, checks, expected):
     assert _run(monkeypatch, command, checks=checks) == expected
     assert ["gh", "pr", "merge", "5", "--admin"] in guard._segments(command)
@@ -2206,7 +2240,7 @@ def test_issue_9480_target_argv_matches_bash(monkeypatch, tmp_path, command, exp
     monkeypatch.setattr(
         guard,
         "_pr_snapshot",
-        lambda pr, repo=None, cwd=None: judged.append(pr) or ({"isDraft": False}, (["CI Gate"], [])),
+        lambda pr, repo=None, cwd=None: judged.append(pr) or ({"isDraft": False}, (["CI Gate"], [], 1)),
     )
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": command + suffix}})))
     assert guard.main() == 2
@@ -2346,7 +2380,7 @@ def test_oo48_check_states_prove_at_the_judged_metadata_head(monkeypatch):
     replies[("api", "--method", "GET", "repos/owner/repo/actions/runs/11")] = (
         0, json.dumps({"id": 11, "head_sha": _HEAD, "check_suite_id": 1, "workflow_id": 7, "name": "Body guard"}))
     calls = _scripted_gh(monkeypatch, replies)
-    assert guard._check_states("5", None, None, lambda: _META) == ([], [])
+    assert guard._check_states("5", None, None, lambda: _META) == ([], [], 2)
     assert [call[:2] for call in calls] == [["pr", "checks"], ["pr", "view"], *[["api", "--method"]] * 5]
     assert tuple(calls[1]) == _BOUND
 
@@ -2380,7 +2414,7 @@ def test_oo48_without_snapshot_metadata_reads_the_pr_itself(monkeypatch):
     replies[("pr", "view")] = (0, json.dumps({"isDraft": False, "body": "", "number": 5, "headRefOid": _HEAD,
                                               "url": _URL}))
     calls = _scripted_gh(monkeypatch, replies)
-    assert guard._check_states("5") == ([], [])
+    assert guard._check_states("5") == ([], [], 1)
     assert ["pr", "view", "5", "--json", "isDraft,baseRefName,body,headRefOid,number,url"] in calls
 
 
@@ -2388,9 +2422,39 @@ def test_oo48_snapshot_hands_its_metadata_to_the_check_reader(monkeypatch):
     meta = {"isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": _HEAD, "url": _URL}
     seen = []
     monkeypatch.setattr(guard, "_pr_meta", lambda *_args: meta)
-    monkeypatch.setattr(guard, "_check_states", lambda pr, repo, cwd, read: seen.append(read()) or ([], []))
-    assert guard._pr_snapshot("5") == (meta, ([], []))
+    monkeypatch.setattr(guard, "_check_states", lambda pr, repo, cwd, read: seen.append(read()) or ([], [], 1))
+    assert guard._pr_snapshot("5") == (meta, ([], [], 1))
     assert seen == [meta]
+
+
+_ADVISORY_ONLY = "Component shadow (advisory)"
+
+
+@pytest.mark.parametrize("checks,rollup", [
+    ((1, ""), []),
+    ((0, "[]"), []),
+    ((0, json.dumps([{"name": _ADVISORY_ONLY, "bucket": "pass", "workflow": "CI"}])),
+     [{"name": _ADVISORY_ONLY, "workflowName": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}]),
+])
+def test_raw_merge_of_a_zero_check_head_is_refused_like_the_publisher(monkeypatch, capsys, checks, rollup):
+    """Defect class: a raw `gh pr merge` lands a head with no blocking check that pr-merge refuses (NO_CHECKS)."""
+    from lu_machinery.publish import merge_guard
+
+    meta = {"isDraft": False, "baseRefName": "main", "body": "", "headRefOid": _HEAD, "number": 5, "url": _URL}
+    _scripted_gh(monkeypatch, {
+        ("pr", "checks"): checks,
+        _BOUND: (0, json.dumps({"headRefOid": _HEAD, "statusCheckRollup": rollup})),
+        ("pr", "view", "5", "--json", "number,isDraft,headRefOid,mergeStateStatus"): (
+            0, json.dumps({**meta, "mergeStateStatus": "CLEAN"})),
+        ("pr", "view", "5", "--json"): (0, json.dumps(meta)),
+    })
+    with pytest.raises(merge_guard.PublishBlocked) as refused:
+        merge_guard.ensure_merge_ready("owner/repo", 5, runner=guard.subprocess.run, cwd=None, environment={})
+    reason = str(refused.value).removeprefix("OPSEC: merge refused: ").removesuffix(".")
+    assert reason.startswith("NO_CHECKS")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": "gh pr merge 5 --squash"}})))
+    assert guard.main() == 2
+    assert f"PR 5: {reason}." in capsys.readouterr().err
 
 
 def test_oo48_api_failure_or_garbage_is_unproven(monkeypatch):
@@ -2448,11 +2512,12 @@ def test_check_states_failing_exit_without_rows_is_unverifiable(monkeypatch):
     assert guard._check_states("5") is None
 
 
-@pytest.mark.parametrize("returncode,bucket,expected", [
-    (0, "pass", ([], [])), (1, "fail", (["CI Gate"], [])), (8, "pending", ([], ["CI Gate"])),
+@pytest.mark.parametrize("returncode,conclusion,expected", [
+    (0, "SUCCESS", ([], [], 1)), (1, "FAILURE", (["CI Gate"], [], 1)), (8, "", ([], ["CI Gate"], 1)),
 ])
-def test_check_states_supported_exits_still_parse(monkeypatch, returncode, bucket, expected):
-    _fake_gh(monkeypatch, returncode=returncode, stdout=json.dumps([{"name": "CI Gate", "bucket": bucket}]))
+def test_check_states_supported_exits_still_parse(monkeypatch, returncode, conclusion, expected):
+    rows = json.dumps([{"name": "CI Gate", "bucket": "pass"}])
+    _bound_gh(monkeypatch, returncode=returncode, stdout=rows, rollup=[_run_row("CI Gate", conclusion)])
     assert guard._check_states("5") == expected
 
 
@@ -2684,4 +2749,4 @@ def test_interpreter_heredoc_merge_bypass_refused(monkeypatch, command, failures
     No reader name proves a body is data (C-6334): `cat`, `wc` or the publisher
     may be a function, and Python can run the merge the body spells.
     """
-    assert _run(monkeypatch, command, checks=(failures, [])) == expected
+    assert _run(monkeypatch, command, checks=(failures, [], 1)) == expected

@@ -203,15 +203,16 @@ with `review-loop` for review rounds and the budget.
    evidence that materially undermines the recorded verdict needs reviewer disposition before
    enqueue. PR CI runs Frontend, the admission checks and the affected
    tests (changed test files, tests that import or read changed files, the guards and
-   the `repo_wide` invariants), not the pytest shards. The real merge-group candidate
-   must pass the required **CI Gate**, which runs the full supported pytest suite,
-   before landing; nightly and opt-in `workflow_dispatch` runs run the full suite too.
+   the `repo_wide` invariants), not the pytest shards. Where the base branch has a merge
+   queue, the real merge-group candidate must pass the required **CI Gate**, which runs the
+   full supported pytest suite, before landing; nightly and opt-in `workflow_dispatch` runs run the full suite too.
 3. Only then enqueue: a recorded exact-head APPROVE and a green PR CI Gate, both bound to the
    current PR head. Never arm auto-merge ahead of either gate —
 early-armed auto-merge is how #7447–#7449 landed with empty reviews, and a moved head
-voids both approval and CI; re-establish both on the new head. Automated merge pipelines cannot replace review gates; enqueue
-with the task-prescribed interpreter and `-m lu_machinery.publish pr-merge --number <N>` after both gates (never `--auto` as a
-substitute for review). Do **not** pass `--delete-branch` while this repo uses a
+voids both approval and CI; re-establish both on the new head. Automated merge pipelines cannot replace review gates; land
+with the task-prescribed interpreter and `-m lu_machinery.publish pr-merge --number <N> --match-head <approved head>
+--expect-queue <true|false>` after both gates, passing the `isMergeQueueEnabled` reading the gate was checked for
+(`full-send` steps 7 and 8; never `--auto` as a substitute for review). Do **not** pass `--delete-branch` while this repo uses a
 merge queue (head deletion mid-queue can close without landing); delete the remote branch
 only after `MERGED`. Dispatched agents still do NOT self-enable auto-merge or apply merge-automation labels.
 `--auto` never bypasses blocking checks (#M-0.5 semantics unchanged).
@@ -219,6 +220,14 @@ Only non-draft PRs with no unresolved BLOCKING finding may enqueue. Pending
 or cancelled required checks fail the gate; never use `--admin` to bypass CI.
 Queued is not MERGED: diagnose conflicts, changed bases, failed checks or queue
 ejection, and re-establish the gates before re-enqueueing.
+**No merge queue:** where `read queue-status` reports `isMergeQueueEnabled: false` for the
+base branch, no merge-group run exists. The same `pr-merge` squash-merges the PR directly,
+pinned to the approved head, after a recorded exact-head APPROVE with no blocking check on
+that head pending, failing or cancelled, never with `--admin`; an unreadable flag stops the
+landing. The PR-side CI rule is the same in both cases (the publisher's merge guard applies it
+before enqueue and before a direct merge). `pr-merge --expect-queue` carries the flag the
+landing gate was checked for, and the publisher refuses before any write when the base branch
+now reports the other kind, so a queue setting that changes mid-landing skips no gate.
 **Priority line (#12019):** only the CTO seat applies the `merge-priority` label, to a
 machinery fix, after the exact-head approval is recorded; `pr-merge` (and so the keeper)
 then enqueues that head at the front of the queue, while every gate, including the

@@ -35,7 +35,8 @@ def seeded(tmp_path, exhausted, remaining=0, *, host="github.com"):
 
     def transport(method, endpoint, headers, body, timeout):
         translated.append(endpoint)
-        return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, b"[]")
+        body_bytes = b'{"data":{}}' if gh._resource_path(endpoint) == "graphql" else b"[]"
+        return gh.Response(200, {"X-RateLimit-Remaining": "100", "X-RateLimit-Reset": "9000"}, body_bytes)
 
     def runner(command, **kw):
         native.append(command)
@@ -148,14 +149,22 @@ def test_jq_on_an_empty_200_body_prints_nothing_instead_of_raising_typeerror(tmp
     args = ["gh", "api", "repos/o/r/x", "--jq", ".x", "-H", "Accept: application/octet-stream"]
     result = gh.run(args, client=store, capture_output=True)
     assert (result.returncode, result.stdout) == (0, b"")
-    # Class: an empty 200 on a non-cacheable call (HEAD, POST) printed JSON ``null`` instead of nothing.
+    # Class: an empty 200 on a non-cacheable REST call (HEAD, POST) printed JSON ``null`` instead of nothing.
     for other in (
         ["gh", "api", "repos/o/r/x", "-X", "HEAD", "--jq", "."],
         ["gh", "api", "repos/o/r/x", "-X", "POST", "--jq", "."],
-        ["gh", "api", "graphql", "-f", "query=query { viewer { login } }", "--jq", "."],
     ):
         result = gh.run(other, client=store, capture_output=True)
         assert (result.returncode, result.stdout) == (0, b""), other
+    # Strict GraphQL envelope validation refuses an empty 200 GraphQL body with a typed error.
+    gql_empty = gh.run(
+        ["gh", "api", "graphql", "-f", "query=query { viewer { login } }", "--jq", "."],
+        client=store,
+        capture_output=True,
+    )
+    assert gql_empty.returncode == 1
+    assert gql_empty.github_result.error == "github_graphql_error"
+    assert gql_empty.github_result.reason == "invalid_json"
 
 
 def test_jq_on_a_non_json_200_body_is_a_typed_refusal_not_a_traceback(tmp_path):
