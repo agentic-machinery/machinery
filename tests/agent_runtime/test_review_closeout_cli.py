@@ -981,6 +981,33 @@ def test_resolve_reviewer_uses_the_configured_store_for_known_authors(tmp_path, 
     assert json.loads(configured.stdout) == expected
 
 
+def test_behavior_proof_reads_author_records_from_the_shared_task_store(tmp_path, monkeypatch):
+    """Defect class: a linked worktree's own task record replaces the shared store.
+
+    Run from a linked worktree whose checkout-derived ``batch_state/tasks`` holds
+    a different author record, the proof attributes that local record instead of
+    the dispatcher's configured task store. The worktree directory's own copy is
+    a second local store of the same class.
+    """
+    from lu_machinery.review.closeout_cli import _proof_author_attributions
+    from tests.agent_runtime.test_authoring_review_feasibility import mini_repo, task_record
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    head = repo.commit("claude/proof-author-task", message="proof author")
+    worktree = tmp_path / "linked-worktree"
+    repo.git("worktree", "add", "--detach", "-q", str(worktree), head)
+    shared = tmp_path / "dispatch" / "tasks"
+    monkeypatch.setenv("LU_TASKS_DIR", str(shared))
+    task_record(shared, "proof-author-task", agent="claude", model="claude-opus-5-5")
+    # The checkout git-common-dir resolves to, and the worktree directory itself.
+    task_record(repo.root / "batch_state" / "tasks", "proof-author-task", agent="claude", model="claude-sonnet-5-5")
+    task_record(worktree / "batch_state" / "tasks", "proof-author-task", agent="claude", model="claude-haiku-5-5")
+
+    attributions = _proof_author_attributions(worktree, {"head_sha": head})
+
+    assert attributions == [{"harness": "claude", "model": "claude-opus-5-5"}]
+
+
 def _point_origin_head(repo) -> None:
     repo.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
 
