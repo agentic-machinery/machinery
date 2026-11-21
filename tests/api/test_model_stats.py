@@ -1196,6 +1196,21 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "attested-fast-over-request": dict(agent="cursor", model="grok-4.7",
                                            resolved_model="Grok 4.7 256K High Fast",
                                            resolved_model_known=True, effort=None),
+        "attested-fast-over-suffixed-request": dict(agent="cursor", model="grok-4.7-high",
+                                                    resolved_model="Grok 4.7 256K High Fast",
+                                                    resolved_model_known=True, effort="high"),
+        "attested-unrecognized-over-request": dict(agent="agy", model="gemini-4-neon-high",
+                                                   resolved_model="unrecognized",
+                                                   resolved_model_known=True, effort="high"),
+        "attested-other-model-over-suffixed-request": dict(agent="agy", model="gemini-4-neon-high",
+                                                           resolved_model="gemini-4-hydrogen",
+                                                           resolved_model_known=True, effort="high"),
+        "attested-bare-over-suffixed-request": dict(agent="agy", model="gemini-4-neon-high",
+                                                    resolved_model="gemini-4-neon",
+                                                    resolved_model_known=True, effort="high"),
+        "attested-cursor-high-with-suffixed-request": dict(agent="cursor", model="grok-4.7-high",
+                                                           resolved_model="Grok 4.7 256K High",
+                                                           resolved_model_known=True, effort=None),
         "attested-kimi-over-request": dict(agent="kimi", model="k3", resolved_model="kimi-code/k3-256k",
                                            resolved_model_known=True, effort=None),
     }
@@ -1226,6 +1241,11 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "deepseek-prefix": ("deepseek-v4-flash", "unset"),
         "attested-over-auto": ("grok-4.7", "unset"),
         "attested-fast-over-request": ("unknown", "unset"),
+        "attested-fast-over-suffixed-request": ("unknown", "unset"),
+        "attested-unrecognized-over-request": ("unrecognized", "unset"),
+        "attested-other-model-over-suffixed-request": ("gemini-4-hydrogen", "unset"),
+        "attested-bare-over-suffixed-request": ("gemini-4-neon", "unset"),
+        "attested-cursor-high-with-suffixed-request": ("grok-4.7", "high"),
         "attested-kimi-over-request": ("kimi-code/k3-256k", "unset"),
     }
     flash = _row(window, "gemini-3.8-flash-high", "write")
@@ -1235,9 +1255,12 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         ("grok-4.7", "high"), ("grok-4.7", "unknown"), ("gemini-3.8-flash-high", "medium"),
         ("gemini-3.8-flash-high", "unknown"), ("opus", "unknown"), ("claude-opus-5-5", "xhigh"),
         ("opus", "high"), ("claude-opus-5-5", "unknown"), ("claude-opus-5-6", "high"),
-        ("gpt-6.1-sol", "unknown"), ("unknown", "unknown"), ("composer-2.5", "unknown"),
-        ("deepseek-v4-flash", "unknown"),
+        ("gpt-6.1-sol", "unknown"), ("unknown", "unknown"), ("unrecognized", "unknown"),
+        ("gemini-4-hydrogen", "unknown"), ("gemini-4-neon", "unknown"),
+        ("composer-2.5", "unknown"), ("deepseek-v4-flash", "unknown"),
     }
+    for model_name in ("unrecognized", "gemini-4-hydrogen", "gemini-4-neon"):
+        assert _row(window, model_name, "write")["tasks"] == 0
     sol = _row(window, "gpt-6.1-sol", "write")
     assert sol["tasks"] == 0
     assert [(e["effort"], [c["class"] for c in e["by_class"]]) for e in sol["by_effort"]] == [("unknown", ["docs"])]
@@ -1796,6 +1819,10 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     _findings_review(tasks, "p13a-review", "incorrect", [("P1", "src/a.py")], pr=13, pinned_head=h1, **blocked)
     # A rejection dispatched by branch alone with no publication: of unknown publication too.
     _findings_review(tasks, "p14a-review", "incorrect", [("P1", "src/a.py")], pinned_head=h1, **blocked)
+    # PR 15: a published blocking review with unknown effort stays out of reviewer accuracy and head_pairs.
+    _findings_review(tasks, "p15a-review", "incorrect", [("P1", "src/a.py")], pr=15, pinned_head=h2,
+                     effort=None, **blocked)
+    _findings_review(tasks, "p15b-review", "correct", [], pr=15, pinned_head=h1, **approved)
     rows.backfill(tasks, batch_state)
     assert "src/a.py" not in rows.rows_path(batch_state).read_text()
     blocked_by, approved_by = "CHANGES_REQUESTED", "APPROVED"
@@ -1810,8 +1837,9 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
         ("p8a-review", 8, h2, blocked_by), ("p8b-review", 8, h1, approved_by),
         ("p9b-review", 9, h2, approved_by), ("p10a-review", 10, h2, blocked_by), ("p11a-review", 11, h1, blocked_by),
     ]
-    published += [("p12a-review", 12, h1, blocked_by), ("p12b-review", 12, h2, approved_by)]
-    assert _publish(batch_state, *published) == 21
+    published += [("p12a-review", 12, h1, blocked_by), ("p12b-review", 12, h2, approved_by),
+                  ("p15a-review", 15, h2, blocked_by), ("p15b-review", 15, h1, approved_by)]
+    assert _publish(batch_state, *published) == 23
     assert _publish(batch_state, ("p13a-review", 13, h1, blocked_by),
                     repository="learn-ukrainian/learn-ukrainian.github.io") == 1
     # The ledger holds each publication once: a recorder rerun adds nothing.
@@ -1820,9 +1848,9 @@ def test_finding_precision_follows_the_files_the_author_changed_before_the_same_
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
 
     # Distinct (repository, blocked, approved) heads with finding paths: PR 1 and PR 7 share h1 to h2 (PR 5 keeps no
-    # paths, so it needs no pair); PR 4's blocked head is missing.
+    # paths, so it needs no pair); PR 4's blocked head is missing; PR 15 has unknown effort and adds no pair.
     assert snapshot["coverage"]["finding_heads"] == {"pairs": 2, "read": 1}
-    assert snapshot["coverage"]["publications"] == {"lines": 22, "tasks": 22}
+    assert snapshot["coverage"]["publications"] == {"lines": 24, "tasks": 24}
     opus = {
         "model": "claude-opus-5-5", "identity": "catalog", "efforts": ["high"],
         "blocking_reviews": 8, "reviews_unknown_publication": 4,

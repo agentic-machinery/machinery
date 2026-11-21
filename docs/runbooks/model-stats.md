@@ -114,8 +114,11 @@ it raised (a timeout inside the collect included), answers 503 and the page show
   not `retired`) that ran no task in the window, so a routed model never silently drops off the page. It is
   `null` when the model catalog cannot be read, and the page then says the list is unknown.
 - **Effort** comes from the observed runtime variant, the matching requested variant, or the recorded effort
-  field. A catalog ID ending in an effort word carries no implied effort. Missing values and legacy markers such
-  as `unset` and `not-exposed` appear as `unknown` in the API and dashboard.
+  field. When `resolved_model_known` is true, an unmapped or `unrecognized` runtime attestation never inherits a
+  requested variant or effort field, and a bare or different attested model never inherits a requested variant
+  selector (except a mapped Cursor display name carrying that variant word, such as `Grok 4.7 256K High` for
+  `grok-4.7-high`). A catalog ID ending in an effort word carries no implied effort. Missing values and legacy
+  markers such as `unset` and `not-exposed` appear as `unknown` in the API and dashboard.
   Model totals (`effort: all`) and comparisons count known effort only and report the levels they include.
   The `by_effort` entries include the separate unknown group. In `view=full`, each group splits by task class
   in `by_class`.
@@ -380,8 +383,8 @@ Reviews older than the import stay of unknown publication.
 
 `precision` is `fixed / (fixed + dismissed)` with its 95% Wilson interval (`precision_ci`); it is `low_sample`
 below 10 settled findings. The collector reads the changed files with one `git cat-file --batch-check` and one
-`git diff-tree --stdin --raw` per repository over every (blocked head, approved head) pair, from local objects only
-(`GIT_NO_LAZY_FETCH=1`); `coverage.finding_heads` counts the distinct pairs of all history and how many were
+`git diff-tree --stdin --raw` per repository over every known-effort (blocked head, approved head) pair, from local objects only
+(`GIT_NO_LAZY_FETCH=1`); `coverage.finding_heads` counts the distinct known-effort pairs of all history and how many were
 read (the page's note uses the per-reviewer window counts instead). Measured on
 2026-11-19 on a backfilled copy of the store (29,274 rows, 625 pairs, host load 10): the read took 0.7 s and the
 whole collect 13.3 s against 11.9 s before.

@@ -306,11 +306,24 @@ def variant_effort(raw: object) -> str | None:
 
 def effective_effort(record: Mapping[str, Any]) -> str:
     """Use the runtime selector when observed, then the requested selector or recorded effort."""
-    observed = _spelling(record.get("resolved_model")) if record.get("resolved_model_known") is True else ""
+    observed_known = record.get("resolved_model_known") is True
+    observed = _spelling(record.get("resolved_model")) if observed_known else ""
     requested = record.get("model")
     if level := variant_effort(observed):
         return level
-    if model_id(observed) in {"unknown", model_id(requested)} and (level := variant_effort(requested)):
+    if observed_known:
+        observed_id = model_id(observed)
+        if observed_id.casefold() in {"unknown", "unrecognized"}:
+            return UNSET
+        if (level := variant_effort(requested)) is not None:
+            # A mapped Cursor display name (such as "Grok 4.7 256K High") carries the variant as a
+            # trailing space-separated word rather than a hyphen suffix; any other bare attestation
+            # or a different attested model never inherits the requested selector's effort.
+            if (canonical_cursor_model(observed) != observed and observed_id == model_id(requested)
+                    and re.search(rf"[ \t]{re.escape(level)}\Z", observed, re.ASCII | re.IGNORECASE)):
+                return level
+            return UNSET
+    elif level := variant_effort(requested):
         return level
     options = _options(record)
     for value in (record.get("effort"), options.get("effort")):
