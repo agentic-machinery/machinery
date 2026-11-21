@@ -2014,11 +2014,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 {"output_schema": schema} if spec.agent in {"agy", "claude"} and schema is not None else {}
             )
             parsed = provider.parse(stdout, stderr, exit_code, final_text, **parse_options)
-            if (
-                rollout_policy is not None and rollout_home is not None and exit_code >= 0 and parsed.error
-                and (code := rollout_policy(stdout, rollout_home))
-            ):
-                parsed = replace(parsed, error=f"codex: provider_policy_refusal ({code})", rate_limited=False)
             text, usage, sources_calls = parsed.text, parsed.usage, parsed.sources_mcp_call_count
             # Once parsed, the whole stream decides the model, whatever settlement follows (not the running value).
             resolved_model = parsed.resolved_model
@@ -2061,6 +2056,15 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             count = evidence.get("completed") if isinstance(evidence, dict) else None
             if type(count) is int and count >= 0:
                 sources_calls = count
+        if rollout_policy is not None and exit_code >= 0 and parsed.error:
+            # A typed policy refusal is only in the fresh thread's rollout. A contained run's task-local home goes
+            # with the boundary's scratch, so its launcher records the code before removing it (#1083).
+            if _in_boundary(spec):
+                code = provider.recorded_policy_code(stdout, record["write_boundary"].get("codex_policy"))
+            else:
+                code = rollout_policy(stdout, rollout_home) if rollout_home is not None else None
+            if code:
+                parsed = replace(parsed, error=f"codex: provider_policy_refusal ({code})", rate_limited=False)
         if spec.agent == "agy" and spec.mode == "read-only":
             # Only the boundary's receipt, written outside the sandbox, proves the run read-only and
             # supplies its Sources count (C-3027); without a verified one the run fails.

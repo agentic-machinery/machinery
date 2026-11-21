@@ -411,7 +411,7 @@ def verify(task_file: Path, task_id: str, mode: str = "read-only") -> tuple[dict
         return {"status": "missing"}, "write_boundary_unproven: the boundary receipt is not an object"
     summary = {key: receipt.get(key) for key in (
         "status", "reason", "mode", "argv_sha256", "bwrap", "returncode", "import", "cleanup", "broker",
-        "sources", "test_slots")}
+        "sources", "test_slots", "codex_policy")}
     canary = receipt.get("canary")
     # Only the launcher's Boolean true proves containment; any other value, however truthy, does not.
     summary["canary_passed"] = isinstance(canary, dict) and canary.get("passed") is True
@@ -1862,6 +1862,13 @@ class _Boundary:
         self.receipt["status"] = "ran"
         returncode = process.wait()
         self.receipt["returncode"] = returncode
+        if self.args.codex_auth is not None and returncode != 0:
+            from lu_machinery.dispatcher.providers.codex import task_home_policy
+
+            # The sandbox has stopped, and its task-local CODEX_HOME goes with this scratch: a typed policy
+            # refusal survives only here (#1083). The supervisor binds the thread to the run's own stdout.
+            if (policy := task_home_policy(self.base / _CODEX_HOME)) is not None:
+                self.receipt["codex_policy"] = policy
         self.receipt["import"] = {"status": "unchanged", "before": self.tip, "after": self.tip}
         if self.manifest is not None and init is not None:
             try:
