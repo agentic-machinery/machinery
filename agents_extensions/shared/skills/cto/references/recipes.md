@@ -57,7 +57,7 @@ diff; follow `docs/runbooks/ci-gate.md` for the one evidenced recovery attempt.
 
 ## Host changes
 
-- Stop or skip the machinery release-cut timer before applying `loopback_services`, because the role starts the timer and it fires immediately.
+- The machinery release-cut timer stays stopped and disabled: releases are cut when ready by `claude-cto` (`docs/release.md`, PR #1105). A role apply such as `loopback_services` starts it, so stop and disable it again right after the apply.
 - After swapping a venv's Python, restart every running unit that uses that venv and confirm no process still runs the old interpreter.
 
 ## Reviews
