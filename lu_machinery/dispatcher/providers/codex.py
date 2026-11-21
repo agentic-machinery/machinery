@@ -2,7 +2,6 @@
 
 import contextlib
 import copy
-import functools
 import hashlib
 import io
 import json
@@ -25,16 +24,16 @@ from lu_machinery.common.jsonl import jsonl_lines
 from lu_machinery.dispatcher.providers import is_ukrainian_content_task, load_product_sources_server
 from lu_machinery.dispatcher.providers.stream_json import SOURCES_SERVER
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
-from lu_machinery.review.product_hooks import attempt_hooks
 
 _LOG = logging.getLogger(__name__)
 
-
-@functools.cache
-def _openai_structured_output_forbidden_keywords() -> frozenset[str]:
-    """The product's review-output keywords OpenAI strict mode refuses, read when first needed."""
-    product: frozenset[str] = attempt_hooks().openai_structured_output_forbidden_keywords()
-    return product | frozenset({"$schema", "$id"})
+# JSON Schema keywords that OpenAI strict structured output refuses; a schema with any of them is normalized
+# before Codex receives it. A fact of the provider's API, so the provider owns it: building a launch must not
+# import product modules, which a machinery-only runtime cannot (the 0.1.48 contract canary).
+_OPENAI_STRICT_FORBIDDEN_KEYWORDS = frozenset({
+    "allOf", "oneOf", "not", "if", "then", "else", "dependentRequired", "dependentSchemas", "propertyNames",
+    "patternProperties", "minProperties", "maxProperties", "uniqueItems", "$schema", "$id",
+})
 
 
 # Failure codes (agent_runtime) for a provider that cannot take the run now: usage limits and no capacity.
@@ -104,7 +103,7 @@ def _normalize_codex_strict_node(value: object) -> None:
         return
     if "oneOf" in value and "anyOf" not in value:
         value["anyOf"] = value.pop("oneOf")
-    for keyword in _openai_structured_output_forbidden_keywords():
+    for keyword in _OPENAI_STRICT_FORBIDDEN_KEYWORDS:
         value.pop(keyword, None)
     if "$ref" in value:
         reference = value["$ref"]
@@ -126,7 +125,7 @@ def _normalize_codex_strict_node(value: object) -> None:
 
 def _needs_openai_strict(node: object) -> bool:
     if isinstance(node, dict):
-        if bool(_openai_structured_output_forbidden_keywords() & node.keys()):
+        if bool(_OPENAI_STRICT_FORBIDDEN_KEYWORDS & node.keys()):
             return True
         for key, value in node.items():
             if key in {"properties", "$defs"} and isinstance(value, Mapping):

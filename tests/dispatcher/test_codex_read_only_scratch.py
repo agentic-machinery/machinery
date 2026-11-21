@@ -208,7 +208,7 @@ def dispatch(tmp_path, monkeypatch):
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("absolute", [False, True])
 @pytest.mark.parametrize("agent", ["sol", "agy"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_schema_loss_record_and_real_codex_argv(dispatch, absolute, agent):
     spec, record = dispatch.invoke(dispatch.schema if absolute else "schema.json", agent=agent)
     assert record["output_schema_path"] == str(dispatch.schema)
@@ -225,7 +225,7 @@ def test_schema_loss_record_and_real_codex_argv(dispatch, absolute, agent):
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_explicit_external_absolute_schema_allowed(dispatch):
     """An absolute schema outside the checkout is bound as given, and the task stays read-only.
 
@@ -245,7 +245,7 @@ def test_explicit_external_absolute_schema_allowed(dispatch):
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_claude_review_binds_findings_schema(dispatch):
     """Case 4: a native Claude code review must bind the findings schema.
 
@@ -349,7 +349,7 @@ def test_claude_review_binds_findings_schema(dispatch):
 
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("agent", ["cursor", "muse", "opencode"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_unsupported_schema_refused_before_launch(dispatch, capsys, agent):
     dispatch.invoke(agent=agent, expected=2)
     assert "--output-schema is supported only with the effective codex, agy, or claude agent" in capsys.readouterr().err
@@ -358,7 +358,7 @@ def test_unsupported_schema_refused_before_launch(dispatch, capsys, agent):
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("kind", ["missing", "non-json", "non-object", "invalid-schema", "symlink", "relative-escape"])
 @pytest.mark.parametrize("agent", ["sol", "agy"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_unsafe_schema_refused_before_launch(dispatch, capsys, kind, agent):
     path = dispatch.schema
     if kind == "missing":
@@ -379,7 +379,7 @@ def test_unsafe_schema_refused_before_launch(dispatch, capsys, kind, agent):
 
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("agent", ["sol", "agy"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_schema_symlink_substitution_after_binding_refused(dispatch, agent):
     spec, _record = dispatch.invoke(agent=agent)
     target = dispatch.schema.with_name("target.json")
@@ -392,8 +392,11 @@ def test_schema_symlink_substitution_after_binding_refused(dispatch, agent):
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("output,status", [('{}', "failed"), ('prose', "failed"), ('{"verdict":"APPROVE"}', "done")])
 @pytest.mark.parametrize("agent", ["sol", "agy"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_invalid_schema_result_cannot_settle_done(dispatch, monkeypatch, output, status, agent):
+    """Defect classes: a schema-bound read-only review settles done on output its schema refuses; and a read-only
+    Codex review crashes in the supervisor before its provider starts because building the launch depends on a
+    product module, which a machinery-only runtime cannot import (the stand-in product tree here has no such hook)."""
     spec, _record = dispatch.invoke(agent=agent)
     path = store.record_path(spec.task_id)
     (path.parent / "logs").mkdir()
@@ -442,7 +445,7 @@ _THREAD = "01a1ffab-2851-7251-9966-9ba9d341eb62"  # UUIDv7, as codex-cli 0.171.0
     ({"thread_id": _THREAD, "code": "provider text"}, "codex: exited with status 1"),
     (None, "codex: exited with status 1"),
 ], ids=["bound", "other-thread", "unknown-code", "plain-exit"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_read_only_codex_policy_refusal_is_the_recorded_terminal_cause(dispatch, monkeypatch, capsys, recorded, error):
     """Defect class: a read-only Codex run's typed policy refusal is lost with the boundary's scratch and reported
     as a plain exit, so the driver re-dispatches to the refused route (#1083). Only the boundary's code for this
@@ -477,7 +480,7 @@ def test_read_only_codex_policy_refusal_is_the_recorded_terminal_cause(dispatch,
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_codex_stderr_excerpt_redacts_secret_and_home_path():
     secret = "key_" + "aB09" * 16
     home_path = "/home/fixture/.codex/config.toml"
@@ -493,7 +496,7 @@ def test_codex_stderr_excerpt_redacts_secret_and_home_path():
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("character", ["\x00", "\x1b", "\x7f", "\x85", "\u200b", "\u202e", "\u2066", "\ufeff", "\t", "\r", "\n", "\r\n"])
 @pytest.mark.parametrize("placement", ["split_token", "split_key", "separated", "trailing"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_control_format_characters_removed_from_stderr_excerpt(character, placement):
     secret = "key_" + "aB09" * 16
     if placement == "split_token":
@@ -517,7 +520,7 @@ def test_control_format_characters_removed_from_stderr_excerpt(character, placem
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 @pytest.mark.parametrize(("diagnostic", "cause"), [
     ("You've hit your usage limit", "rate_limit"),
     ("rate limit exceeded", "rate_limit"),
@@ -554,7 +557,7 @@ def test_codex_withheld_stderr_records_only_a_fixed_cause(diagnostic, cause):
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("signal", ["credit balance is too low", "insufficient_quota", "billing error 429"])
 @pytest.mark.parametrize("structured", [False, True])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_stderr_text_alone_cannot_mark_pool_exhausted(tmp_path, monkeypatch, signal, structured):
     from lu_machinery.dispatcher import pool_selector
 
@@ -569,7 +572,7 @@ def test_stderr_text_alone_cannot_mark_pool_exhausted(tmp_path, monkeypatch, sig
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_agy_review_binds_findings_schema(dispatch):
     """Defect class: review dispatch silently omits its structured verdict schema."""
     spec, record = dispatch.invoke(path=None, agent="agy", review=True)
@@ -582,7 +585,7 @@ def test_agy_review_binds_findings_schema(dispatch):
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_agy_ukrainian_review_omits_findings_schema(dispatch):
     """Defect class: Ukrainian review is forced to bind the code-review findings schema."""
     spec, record = dispatch.invoke(path=None, agent="agy", review=True, review_profile="ukrainian")
@@ -595,7 +598,7 @@ def test_agy_ukrainian_review_omits_findings_schema(dispatch):
 
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("case", ["valid", "missing-block", "malformed-json", "wrong-schema"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_agy_ukrainian_review_preserves_item_judgments_and_refuses_malformed(case):
     """Defect class: Ukrainian item judgments are dropped by schema enforcement, or invalid blocks are accepted."""
     from lu_machinery.review.review_contract import ContractError
@@ -652,7 +655,7 @@ def _item_review_record(tmp_path, profile="ukrainian"):
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_verdict_gate_accepts_ukrainian_item_judgments_block(tmp_path):
     """Defect class (#12417): a contract-only Ukrainian item-judgments reply fails the verdict gate."""
     reply = (
@@ -665,7 +668,7 @@ def test_verdict_gate_accepts_ukrainian_item_judgments_block(tmp_path):
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_verdict_gate_refuses_ukrainian_reply_without_block_or_verdict(tmp_path):
     """Defect class (#12417): a Ukrainian reply with neither a valid block nor a verdict passes the gate."""
     reply = "```ukrainian-item-judgments\n{not valid json\n```\n"
@@ -673,7 +676,7 @@ def test_verdict_gate_refuses_ukrainian_reply_without_block_or_verdict(tmp_path)
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_verdict_gate_code_review_without_verdict_still_fails(tmp_path):
     """Defect class (#12417): the item-judgments path leaks into code-review profiles."""
     reply = (
@@ -688,7 +691,7 @@ def test_verdict_gate_code_review_without_verdict_still_fails(tmp_path):
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("case", ["valid", "conflicting-response", "missing", "null", "invalid",
                                  "terminal-error", "duplicate-terminal", "exit-failure"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_agy_structured_terminal_not_response(case):
     """Defect class: response prose or an unsuccessful terminal substitutes for structured findings."""
     from lu_machinery.review.review_contract import load_schema
@@ -721,7 +724,7 @@ def test_agy_structured_terminal_not_response(case):
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_agy_schema_argument_too_large_refused(dispatch, capsys):
     """Defect class: an oversized inline schema reaches process spawn rather than a typed refusal."""
     dispatch.schema.write_text(json.dumps({"type": "object", "description": "x" * (128 * 1024)}))
@@ -730,7 +733,7 @@ def test_agy_schema_argument_too_large_refused(dispatch, capsys):
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_agy_structured_missing_capability_preserved():
     """Defect class: native schema erases an existing capability-failure declaration."""
     from lu_machinery.review.review_contract import load_schema
@@ -764,7 +767,7 @@ def test_agy_structured_missing_capability_preserved():
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_review_path_pattern_portable_equivalence():
     """Defect class: a portable-schema rewrite changes which repository paths are accepted."""
     from lu_machinery.review.review_contract import load_schema
@@ -787,7 +790,7 @@ def test_review_path_pattern_portable_equivalence():
 
 @pytest.mark.usefixtures('configured_roots')
 @pytest.mark.parametrize("phase", ["before-init", "after-init", "success"])
-@pytest.mark.usefixtures("output_schema_hooks")
+@pytest.mark.usefixtures("agent_runtime_roots")
 def test_agy_schema_rejection_is_typed_before_model_init(phase):
     """Defect class: a native schema refusal loses its reason or is misclassified after initialization."""
     from lu_machinery.review.review_contract import load_schema
@@ -814,12 +817,5 @@ def test_agy_schema_rejection_is_typed_before_model_init(phase):
     else:
         assert parsed.error is None and json.loads(parsed.text) == payload
 
-
-
-
-@pytest.fixture
-def output_schema_hooks(agent_runtime_roots, monkeypatch):
-    from lu_machinery.review.product_hooks import attempt_hooks
-    monkeypatch.setattr(attempt_hooks(), "openai_structured_output_forbidden_keywords", lambda: frozenset({"allOf", "oneOf", "not", "if", "then", "else", "dependentRequired", "dependentSchemas", "propertyNames", "patternProperties", "minProperties", "maxProperties", "uniqueItems"}), raising=False)
 
 pytestmark = [pytest.mark.usefixtures('configured_roots')]
