@@ -1,12 +1,14 @@
 # Scanner pins for the learn-ukrainian/machinery security scans (issue
 # #12682, machinery move contract v3 section 5), its pre-publication gate
-# (amendment PUBLIC-1104 item 3) and its bootstrap CI Gate (machinery move
-# plan v1 section 4 step 4). This file is the record; ci-gate.yml (whose
-# secret-scan and sast jobs are the repository's security scans) and
-# prepublication-gate.sh carry the same values and are not read from here.
-# Bump a pin by changing it here, in ci-gate.yml and, where it carries the
-# pin, in prepublication-gate.sh together, with the new upstream evidence. Never move to an older release to clear a finding.
-# Upstream checks below were made on 2026-11-03.
+# (amendment PUBLIC-1104 item 3), its bootstrap CI Gate (machinery move
+# plan v1 section 4 step 4) and the shared fleet security workflow
+# (fleet-security.yml, machinery #1080). This file is the record;
+# fleet-security.yml, ci-gate.yml and prepublication-gate.sh carry the same
+# values and are not read from here.
+# Bump a pin by changing it here, in fleet-security.yml, in ci-gate.yml and,
+# where it carries the pin, in prepublication-gate.sh together, with the new
+# upstream evidence. Never move to an older release to clear a finding.
+# Upstream checks below were made on 2026-11-03 (fleet security pins checked 2026-11-21).
 
 # TruffleHog (secret scan)
 TRUFFLEHOG_VERSION=3.99.0
@@ -70,6 +72,16 @@ SEMGREP_CONFIGS=python/lang python/correctness python/jinja2 python/jwt python/r
 # GitHub actions used by the workflow
 ACTIONS_CHECKOUT=3d3c42e5aac5ba805825da76410c181273ba90b1
 #   actions/checkout tag v7.0.1 (the latest release; rechecked 2026-11-05)
+ACTIONS_SETUP_NODE=949feb2413d6458794dcd2491c4babbbce0c15c1
+#   actions/setup-node tag v7.1.0 (published 2026-10-08; checked 2026-11-21 with
+#   `gh api repos/actions/setup-node/git/ref/tags/v7.1.0`). Used by tests.yml
+#   and ci-gate.yml dependency-audit.
+NODE_VERSION=22.23.4
+NODE_LINUX_X64_SHA256=1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce
+NPM_VERSION=10.9.9
+#   Pinned Node/npm for ci-gate.yml dependency-audit (checked 2026-11-21 against
+#   https://nodejs.org/dist/v22.23.4/SHASUMS256.txt and actions/node-versions
+#   tag 22.23.4-39619033003; replaces the floating hosted runner npm).
 ACTIONS_SETUP_UV=c18668ad3cf93ea998bef934396af7bb5c839dc7
 #   astral-sh/setup-uv tag v10.2.0, the commit the source repository's
 #   .github/actions/python-ci-env pins; checked 2026-11-17 with
@@ -125,11 +137,27 @@ MYPY_VERSION=2.4.0
 #   matched the baseline in that environment on CPython 3.14.8, with mypy's
 #   python_version still 3.12. Bump these pins together with the baseline.
 ZIZMOR_VERSION=1.31.1
+ZIZMOR_RELEASE_ASSET_ID=645467284
 #   Release v1.31.1, published 2026-10-15, tag commit effdb35fa7868863f11655db256d9008922fa427
 #   https://github.com/zizmorcore/zizmor/releases/tag/v1.31.1
 #   v1.32.0 (published 2026-11-02) was still inside the 7-day cooldown that
 #   the source repository's .github/dependabot.yml applies to new releases.
-#   uv.lock (lint group) holds its wheel hashes.
+ZIZMOR_LINUX_X86_64_SHA256=d185f726bdaf92df78273217dfdd24ebcd6b0ef48cf3ce776ff5762b6e138c99
+#   zizmor-x86_64-unknown-linux-gnu.tar.gz of that release (checked 2026-11-21
+#   via GitHub release asset API and sha256sum). Used by fleet-security.yml so
+#   every caller runs the standalone verified binary without machinery's uv.lock.
+TRIVY_VERSION=0.76.2
+TRIVY_RELEASE_ASSET_ID=713401165
+#   Release v0.76.2, published 2026-11-05, tag commit 3f6334d223b52188324af3b9923b4249cd206652
+#   https://github.com/aquasecurity/trivy/releases/tag/v0.76.2 (past 7-day cooldown).
+TRIVY_LINUX_64BIT_SHA256=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+#   trivy_0.76.2_Linux-64bit.tar.gz; equals the entry in trivy_0.76.2_checksums.txt
+#   (asset 713401828) and the GitHub release asset digest (checked 2026-11-21).
+TRIVY_DB_REPOSITORY=mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2
+TRIVY_CHECKS_BUNDLE_DIGEST=sha256:b591e9190cff4aa4e385b1a25bccfd9ecf178d3c77fd194e1410b7ce7e1df058
+TRIVY_CHECKS_BUNDLE_REPOSITORY=mirror.gcr.io/aquasec/trivy-checks@sha256:b591e9190cff4aa4e385b1a25bccfd9ecf178d3c77fd194e1410b7ce7e1df058
+#   Digest-pinned OCI checks bundle (resolved from mirror.gcr.io/aquasec/trivy-checks:2
+#   on 2026-11-21); fleet-security.yml verifies policy/metadata.json Digest matches.
 ACTIONLINT_VERSION=1.7.12
 ACTIONLINT_RELEASE_ASSET_ID=384924896
 #   Release v1.7.12, published 2026-03-30, tag commit 914e7df21a07ef503a81201c76d2b11c789d3fca
@@ -162,8 +190,9 @@ PIP_AUDIT_VERSION=2.10.1
 #   release. uv.lock (audit group) holds it and its dependency closure.
 #   pip-audit runs with --disable-pip --require-hashes --strict on the
 #   runtime closure exported from uv.lock; its default vulnerability service is the
-#   PyPI JSON API (OSV data). npm audit uses the hosted runner's npm and the npm
-#   registry's advisory database.
+#   PyPI JSON API (OSV data). npm audit uses the pinned Node/npm release via
+#   actions/setup-node (NODE_VERSION/NPM_VERSION above) and the npm registry's
+#   advisory database.
 
 # Pre-publication gate (prepublication-gate.sh beside this file)
 #   Run once on the rewritten clone before the first content push, with the
