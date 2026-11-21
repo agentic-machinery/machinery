@@ -1208,6 +1208,16 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "attested-bare-over-suffixed-request": dict(agent="agy", model="gemini-4-neon-high",
                                                     resolved_model="gemini-4-neon",
                                                     resolved_model_known=True, effort="high"),
+        "attested-agy-alias-other-model": dict(agent="agy", model="gemini-4-neon",
+                                               resolved_model="gemini-4-hydrogen",
+                                               resolved_model_known=True, effort="high"),
+        "attested-agy-alias-bare-options-effort": dict(agent="agy", model="gemini-4-neon",
+                                                       resolved_model="gemini-4-neon",
+                                                       resolved_model_known=True, effort=None,
+                                                       options={"effort": "high"}),
+        "attested-cursor-auto-with-effort": dict(agent="cursor", model="auto",
+                                                 resolved_model="Composer 2.5",
+                                                 resolved_model_known=True, effort="high"),
         "attested-cursor-high-with-suffixed-request": dict(agent="cursor", model="grok-4.7-high",
                                                            resolved_model="Grok 4.7 256K High",
                                                            resolved_model_known=True, effort=None),
@@ -1245,6 +1255,9 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         "attested-unrecognized-over-request": ("unrecognized", "unset"),
         "attested-other-model-over-suffixed-request": ("gemini-4-hydrogen", "unset"),
         "attested-bare-over-suffixed-request": ("gemini-4-neon", "unset"),
+        "attested-agy-alias-other-model": ("gemini-4-hydrogen", "unset"),
+        "attested-agy-alias-bare-options-effort": ("gemini-4-neon", "unset"),
+        "attested-cursor-auto-with-effort": ("composer-2.5", "unset"),
         "attested-cursor-high-with-suffixed-request": ("grok-4.7", "high"),
         "attested-kimi-over-request": ("kimi-code/k3-256k", "unset"),
     }
@@ -1259,7 +1272,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
         ("gemini-4-hydrogen", "unknown"), ("gemini-4-neon", "unknown"),
         ("composer-2.5", "unknown"), ("deepseek-v4-flash", "unknown"),
     }
-    for model_name in ("unrecognized", "gemini-4-hydrogen", "gemini-4-neon"):
+    for model_name in ("unrecognized", "gemini-4-hydrogen", "gemini-4-neon", "composer-2.5"):
         assert _row(window, model_name, "write")["tasks"] == 0
     sol = _row(window, "gpt-6.1-sol", "write")
     assert sol["tasks"] == 0

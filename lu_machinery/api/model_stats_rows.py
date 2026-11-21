@@ -304,6 +304,10 @@ def variant_effort(raw: object) -> str | None:
     return None
 
 
+# Providers that encode effort only in the model selector and never pass a separate --effort flag.
+_SELECTOR_ONLY_AGENTS = frozenset({"agy", "gemini", "cursor"})
+
+
 def effective_effort(record: Mapping[str, Any]) -> str:
     """Use the runtime selector when observed, then the requested selector or recorded effort."""
     observed_known = record.get("resolved_model_known") is True
@@ -315,13 +319,17 @@ def effective_effort(record: Mapping[str, Any]) -> str:
         observed_id = model_id(observed)
         if observed_id.casefold() in {"unknown", "unrecognized"}:
             return UNSET
-        if (level := variant_effort(requested)) is not None:
+        req_level = variant_effort(requested)
+        if req_level is not None:
             # A mapped Cursor display name (such as "Grok 4.7 256K High") carries the variant as a
             # trailing space-separated word rather than a hyphen suffix; any other bare attestation
             # or a different attested model never inherits the requested selector's effort.
             if (canonical_cursor_model(observed) != observed and observed_id == model_id(requested)
-                    and re.search(rf"[ \t]{re.escape(level)}\Z", observed, re.ASCII | re.IGNORECASE)):
-                return level
+                    and re.search(rf"[ \t]{re.escape(req_level)}\Z", observed, re.ASCII | re.IGNORECASE)):
+                return req_level
+            return UNSET
+        agent = str(record.get("agent") or "").strip().lower()
+        if agent in _SELECTOR_ONLY_AGENTS:
             return UNSET
     elif level := variant_effort(requested):
         return level
