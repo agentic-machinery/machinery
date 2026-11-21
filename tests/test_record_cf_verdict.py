@@ -2718,6 +2718,130 @@ def test_mixed_family_head_needs_both_family_approvals(tmp_path, monkeypatch):
         recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
 
 
+NEON = "agy/gemini-4-neon-high"
+
+
+def _branch_facts(repo, head, tasks):
+    from tests.agent_runtime.test_authoring_review_feasibility import REPOSITORY
+
+    return recorder.collect_branch_review_facts(
+        repository=REPOSITORY, repo_root=repo.root, base_tip_sha=repo.sha("origin/main"), head_sha=head, task_root=tasks,
+    )
+
+
+def _resolve(facts):
+    from lu_machinery.review.reviewer_resolver import resolve_reviewer
+    from tests.claude_route_accounts import HOST_ACCOUNT
+
+    return resolve_reviewer(
+        facts.resolver_inputs(risk="critical", review_profile="infra", claude_account=HOST_ACCOUNT, structural=True)
+    )
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_three_family_branch_resolves_a_pair_covering_every_commit(tmp_path, monkeypatch):
+    """Defect: a branch authored by all three critical-tier families has no eligible reviewer."""
+    from tests.agent_runtime.test_authoring_review_feasibility import OPUS, SOL, mini_repo
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    by_family = {
+        "openai": repo.commit(SOL, message="OpenAI change"),
+        "anthropic": repo.commit(OPUS, message="Anthropic change"),
+        "google": repo.commit(NEON, message="Google change"),
+    }
+    facts = _branch_facts(repo, by_family["google"], tmp_path / "tasks")
+    assert facts.mixed_family
+    result = _resolve(facts)
+    assert result.selected is None and result.fail_closed_reason is None
+    seats = {seat.family for seat in result.quorum}
+    assert len(result.quorum) == 2 and len(seats) == 2 and seats <= set(by_family)
+    scopes = {scope.reviewer_family: scope for scope in result.review_scopes}
+    assert set(scopes) == seats
+    for reviewer, scope in scopes.items():
+        assert set(scope.commits) == {sha for family, sha in by_family.items() if family != reviewer}
+        assert scope.author_family == ",".join(sorted(set(by_family) - {reviewer}))
+        assert {commit.sha for commit in facts.reviewer_scope(reviewer).commits} == set(scope.commits)
+    assert set().union(*(scope.commits for scope in scopes.values())) == set(by_family.values())
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_three_family_head_needs_an_outside_approval_for_every_family(tmp_path, monkeypatch):
+    """Defect: a three-family head lands while one family's commits have no outside-family approval."""
+    from lu_machinery.publish import github
+    from tests.agent_runtime.test_authoring_review_feasibility import OPUS, SOL, mini_repo
+    from tests.review.record_support import REPOSITORY
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    anthropic = repo.commit(OPUS, message="Anthropic change")
+    openai = repo.commit(SOL, message="OpenAI change")
+    head = repo.commit(NEON, message="Google change")
+    tasks, comments, _calls = setup_record(monkeypatch, tmp_path, head=head)
+    facts = _branch_facts(repo, head, tasks)
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda *_a, **_k: facts)
+    statuses = []
+    monkeypatch.setattr(recorder, "post_commit_status", lambda **fields: statuses.append(fields["state"]))
+    monkeypatch.setattr(github.gate, "catalog", lambda: {"unit": {"github": REPOSITORY, "verdict_recorder": True}})
+
+    def reads(operation, **_kwargs):
+        value = {"comments": [comments], "pr-files": [[{"filename": "docs/a.md"}]], "identity": {"login": "fleet"}}
+        return subprocess.CompletedProcess([], 0, stdout=json.dumps(value[operation]), stderr="")
+
+    monkeypatch.setattr(github, "read", reads)
+    write_task(tasks, worktree_base_sha=head, review_risk="critical")
+    recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    marker = sweep.parse_marker(comments[0]["body"])
+    assert marker["review_pair"] == "anthropic_google_openai"
+    assert marker["scope_commits"] == tuple(sorted((anthropic, head)))
+    # The OpenAI seat cannot cover OpenAI's own commit, so the gate stays shut.
+    assert statuses == ["pending"] and sweep.lookup_verdict(comments, head, "fleet").state == sweep.NEEDS_SEAT
+    with pytest.raises(github.gate.PublishBlocked):
+        github._refuse_incomplete_seats(REPOSITORY, 42, head, None, tmp_path, {})
+    write_task(tasks, task_id="review-two", agent="claude", model="claude-opus-5-5",
+               worktree_base_sha=head, review_risk="critical")
+    recorder.record("review-two", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
+    assert sweep.parse_marker(comments[1]["body"])["scope_commits"] == tuple(sorted((openai, head)))
+    assert statuses == ["pending", "success"] and sweep.lookup_verdict(comments, head, "fleet").state == "APPROVED"
+    github._refuse_incomplete_seats(REPOSITORY, 42, head, None, tmp_path, {})
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_anthropic_openai_pair_resolves_as_before(tmp_path, monkeypatch):
+    """Control: widening the pair to the critical tier changes the Anthropic/OpenAI pair or admits Neon to it."""
+    from tests.agent_runtime.test_authoring_review_feasibility import OPUS, SOL, mini_repo
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    anthropic = repo.commit(OPUS, message="Anthropic change")
+    openai = repo.commit(SOL, message="OpenAI change")
+    facts = _branch_facts(repo, openai, tmp_path / "tasks")
+    result = _resolve(facts)
+    assert {seat.family for seat in result.quorum} == {"anthropic", "openai"}
+    assert {scope.reviewer_family: (scope.author_family, scope.commits) for scope in result.review_scopes} == {
+        "anthropic": ("openai", (openai,)), "openai": ("anthropic", (anthropic,)),
+    }
+    neon = [entry for entry in result.trace if entry.family == "google"]
+    assert neon and all(entry.status == "excluded" for entry in neon)
+    with pytest.raises(recorder.RecordError, match="requires an Anthropic or OpenAI seat"):
+        facts.reviewer_scope("google")
+
+
+@pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
+@pytest.mark.usefixtures("agent_runtime_roots")
+def test_single_google_branch_still_excludes_google(tmp_path, monkeypatch):
+    """Control: adding Google to the pair families admits a Google seat to review a Google-only branch."""
+    from tests.agent_runtime.test_authoring_review_feasibility import mini_repo
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    head = repo.commit(NEON, message="Google change")
+    facts = _branch_facts(repo, head, tmp_path / "tasks")
+    assert not facts.mixed_family
+    result = _resolve(facts)
+    assert result.selected is not None and result.selected.family != "google"
+    assert not result.quorum and not result.review_scopes
+
+
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_single_family_branch_resolution_unchanged(tmp_path, monkeypatch):
