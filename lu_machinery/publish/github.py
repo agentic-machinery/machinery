@@ -1930,7 +1930,12 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
                 if result.returncode:
                     raise ValueError("dismissal PR evidence unavailable")
                 document = json_depth.loads(result.stdout, max_depth=512)
-                if not isinstance(document, dict) or document.get("errors"):
+                if (
+                    not isinstance(document, dict)
+                    or "errors" in document
+                    or "data" not in document
+                    or not set(document) <= {"data", "extensions"}
+                ):
                     raise ValueError("unknown instance PR identity or state")
                 data = document.get("data")
                 repo_data = data.get("repository") if isinstance(data, dict) else None

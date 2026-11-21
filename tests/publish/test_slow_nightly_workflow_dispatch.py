@@ -833,11 +833,17 @@ def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reo
         pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=reopened_during_preflight)
     assert gql_reads == 2 and writes == []
 
-    # Missing/404 PR (null), GraphQL errors, partial/extra alias keys, malformed rows, and non-zero GraphQL exit must fail closed.
+    # Missing/404 PR (null), GraphQL errors (including falsey/empty error envelopes with otherwise valid rows),
+    # unexpected top-level keys, partial/extra alias keys, malformed rows, and non-zero GraphQL exit must fail closed.
     set_pr_instances(2)
+    valid_repo = {"p100": documents["pulls/100"], "p101": documents["pulls/101"]}
     bad_gql_responses = [
         (1, "{}"),
-        (0, json.dumps({"errors": [{"type": "NOT_FOUND"}], "data": {"repository": {"p100": documents["pulls/100"], "p101": None}}})),
+        (0, json.dumps({"errors": [{"type": "NOT_FOUND"}], "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": [], "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": None, "data": {"repository": valid_repo}})),
+        (0, json.dumps({"errors": False, "data": {"repository": valid_repo}})),
+        (0, json.dumps({"data": {"repository": valid_repo}, "unexpected": True})),
         (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"], "p101": None}}})),
         (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"]}}})),
         (0, json.dumps({"data": {"repository": {"p100": documents["pulls/100"], "p101": documents["pulls/101"], "p102": documents["pulls/100"]}}})),
