@@ -88,11 +88,13 @@ try:
     from agents_extensions.shared.hooks.shell_redirects import _redirect_target_dynamic
     from agents_extensions.shared.hooks.shell_shlex import (
         ShellPreprocessLimit,
+        heredoc_closer,
         normalize_io_descriptors,
         preprocess_shell_command,
         skippable_heredoc_delimiters,
         split_operator_run,
         split_quote_preserving,
+        static_word,
         strip_skippable_heredoc_bodies,
     )
     from agents_extensions.shared.hooks.shell_shlex import (
@@ -524,6 +526,21 @@ def _strip_quotes(token: str) -> str:
     if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
         return token[1:-1]
     return token
+
+
+def _literal_word(token: str) -> str:
+    """A file or redirect operand after Bash quote removal (`.e'n'v` is `.env`).
+
+    A word that may expand (`$`, backticks) keeps the outer-quote strip.
+    """
+    value = static_word(token)
+    return value[0] if value is not None else _strip_quotes(token)
+
+
+def _document_key(token: str) -> str:
+    """The here-document closer a delimiter word names (shared contract rule 1)."""
+    closer = heredoc_closer(token)
+    return closer[0] if closer is not None else _strip_quotes(token)
 
 
 def _command_word(token: str) -> str:
@@ -1070,7 +1087,7 @@ def _stdout_target(args: list[str]) -> str | None:
     destinations: dict[str, str | None] = {"1": None, "2": "/dev/stderr"}
     for index, token in enumerate(args[:-1]):
         raw = args[index + 1]
-        target = "/dev/stderr" if _redirect_target_dynamic(raw) else _strip_quotes(raw)
+        target = "/dev/stderr" if _redirect_target_dynamic(raw) else _literal_word(raw)
         if token in {"&>", "&>>"}:
             destinations["1"] = destinations["2"] = target
             continue
@@ -1387,7 +1404,7 @@ def _heredoc_reason(
         if token == "<<<":
             inputs = [(body, True) for body in _script_words(args, index + 1)]
         elif token in {"<<", "<<-"}:
-            pending = documents.get(_strip_quotes(args[index + 1]), [])
+            pending = documents.get(_document_key(args[index + 1]), [])
             inputs = [pending.pop(0)] if pending else []
         else:
             continue
@@ -1583,6 +1600,7 @@ def _danger_reason(
     documents: dict[str, list[tuple[str, bool]]],
     substitutions: dict[str, tuple[str, str]],
     depth: int,
+    nested: _Nested | None = None,
 ) -> str | None:
     if not pipeline:
         return None
@@ -1591,7 +1609,7 @@ def _danger_reason(
         # Consume them so a later owner reusing a delimiter gets its own body.
         for segment in pipeline:
             for index, token in enumerate(segment[:-1]):
-                pending = documents.get(_strip_quotes(segment[index + 1]), [])
+                pending = documents.get(_document_key(segment[index + 1]), [])
                 if token in {"<<", "<<-"} and pending:
                     pending.pop(0)
         return None
@@ -1603,7 +1621,7 @@ def _danger_reason(
     for i, segment in enumerate(pipeline):
         for token in segment:
             for marker, (_, body) in substitutions.items():
-                if marker in token:
+                if marker in token and (nested is None or nested.new(body)):
                     reason = _scan_command(body, set(copied), dict(named), depth=depth + 1, dumped_files=dumped_files)
                     if reason:
                         return reason
@@ -1633,7 +1651,7 @@ def _danger_reason(
 
 
 def _normalized_path(path: str) -> str:
-    clean = os.path.normpath(_strip_quotes(path))
+    clean = os.path.normpath(_literal_word(path))
     if clean.startswith("//"):
         clean = clean[1:]
     return clean
@@ -1683,12 +1701,13 @@ def _sensitive_file_reason(pipeline: list[list[str]], index: int, dumped_files: 
         if re.fullmatch(r"(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<|<>)", token)
     ]
     # Named file operands (e.g. dd's if=) and long options carry the same path.
-    operands += [_strip_quotes(arg).split("=", 1)[1] for arg in args if "=" in arg and not _redirection_skip_count(arg)]
-    paths = [_strip_quotes(arg) for arg in operands]
+    operands += [_literal_word(arg).split("=", 1)[1] for arg in args if "=" in arg and not _redirection_skip_count(arg)]
+    # Bash removes quotes before the program sees a path: `.e'n'v` is `.env`.
+    paths = [_literal_word(arg) for arg in operands]
     sensitive = [path for path in paths if _sensitive_path(path) or _normalized_path(path) in dumped_files]
     if not sensitive:
         return None
-    options = [arg for arg in _without_redirects(args) if arg not in sensitive]
+    options = [arg for arg in _without_redirects(args) if _literal_word(arg) not in sensitive]
     if _non_printing_command(cmd, options) or _is_safe_transform([cmd, *options]):
         return None
     if cmd in GREP_COMMANDS and _grep_has_safe_flag(cmd, args):
@@ -2006,8 +2025,63 @@ def _scan_command(
     # parser cannot strip an exotic here-doc on a second pass.
     executable = preprocess_shell_command(command)
     executable, substitutions = _hide_substitutions(executable)
-    for pipeline in _pipelines(executable):
-        reason = _danger_reason(pipeline, copied, named, dumped_files, documents, substitutions, depth)
+    # Read both tokenizations, each from the same starting state. Shell words
+    # show a command word or file spliced from quote fragments ('ec'"ho",
+    # '.e'nv); fragments show words the readers only know unquoted.
+    start = (set(copied), dict(named), set(dumped_files))
+    # Nested scripts the first pass read are not read again: each nesting
+    # level would otherwise double the work.
+    scanned: set[str] = set()
+    for shell_words in (False, True):
+        if shell_words:
+            copied, named = set(start[0]), dict(start[1])
+            documents = _heredoc_inputs(command)
+            files, dumped_files = dumped_files, set(start[2])
+        reason = _scan_pipelines(
+            _pipelines(executable, shell_words=shell_words),
+            copied,
+            named,
+            dumped_files,
+            documents,
+            substitutions,
+            depth,
+            _Nested(scanned, skip=shell_words),
+        )
+        if shell_words:
+            files |= dumped_files
+            dumped_files = files
+        if reason:
+            return reason
+    return None
+
+
+class _Nested:
+    """Nested scripts read by the first pass; the second pass skips them."""
+
+    def __init__(self, scanned: set[str], *, skip: bool) -> None:
+        self.scanned = scanned
+        self.skip = skip
+
+    def new(self, script: str) -> bool:
+        if self.skip:
+            return script not in self.scanned
+        self.scanned.add(script)
+        return True
+
+
+def _scan_pipelines(
+    pipelines: list[list[list[str]]],
+    copied: set[str],
+    named: dict[str, str],
+    dumped_files: set[str],
+    documents: dict[str, list[tuple[str, bool]]],
+    substitutions: dict[str, tuple[str, str]],
+    depth: int,
+    nested: _Nested,
+) -> str | None:
+    """_scan_command's statement walk over one tokenization."""
+    for pipeline in pipelines:
+        reason = _danger_reason(pipeline, copied, named, dumped_files, documents, substitutions, depth, nested)
         if reason:
             return reason
         for segment in pipeline:
@@ -2024,17 +2098,15 @@ def _scan_command(
             if cmd == "eval" and args:
                 if any(_substitution_bodies(arg) for arg in args) and _eval_secret_source(args, copied, named):
                     return "dynamic eval can reach a known secret source"
-                reason = _scan_command(
-                    " ".join(_strip_quotes(arg) for arg in args),
-                    set(copied),
-                    dict(named),
-                    depth=depth + 1,
-                    dumped_files=dumped_files,
-                )
-                if reason:
-                    return reason
+                script = " ".join(_strip_quotes(arg) for arg in args)
+                if nested.new(script):
+                    reason = _scan_command(script, set(copied), dict(named), depth=depth + 1, dumped_files=dumped_files)
+                    if reason:
+                        return reason
             elif cmd in {"bash", "sh", "dash", "zsh", "ksh"}:
                 for script in _shell_script(args):
+                    if not nested.new(script):
+                        continue
                     reason = _scan_command(script, set(copied), dict(named), depth=depth + 1, dumped_files=dumped_files)
                     if reason:
                         return reason

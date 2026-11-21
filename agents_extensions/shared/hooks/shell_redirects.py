@@ -14,6 +14,10 @@ from collections.abc import Callable
 
 from agents_extensions.shared.hooks.shell_shlex import (
     ShellPreprocessLimit,
+    collapse_line_continuations,
+    heredoc_bodies_are_data,
+    heredoc_closer,
+    heredoc_readers_are_data,
     preprocess_shell_command,
 )
 
@@ -281,6 +285,10 @@ def preprocess_branch_command(command: str) -> str:
     """
     if "<<" not in command:
         return preprocess_shell_command(command)
+    # This reader drops every body it consumes, so a body the shared contract
+    # keeps visible (a shell or unknown reader) refuses here instead.
+    if not heredoc_bodies_are_data(collapse_line_continuations(command)):
+        raise ShellPreprocessLimit("here-document body may be read as a script")
 
     def scan(index: int, closer: str = "", *, data: bool = False, depth: int = 0) -> tuple[str, int]:
         if depth >= 16:
@@ -289,6 +297,8 @@ def preprocess_branch_command(command: str) -> str:
         quote = ""
         word_start = True
         pending: list[tuple[str, bool, bool]] = []
+        operators: list[int] = []
+        line_start = index
         while index < len(command):
             ch = command[index]
             if ch == "\\" and quote != "'":
@@ -359,6 +369,7 @@ def preprocess_branch_command(command: str) -> str:
                 word_start = True
                 continue
             elif command.startswith("<<", index):
+                operators.append(index - line_start)
                 index += 2
                 strip_tabs = command.startswith("-", index)
                 index += int(strip_tabs)
@@ -366,42 +377,34 @@ def preprocess_branch_command(command: str) -> str:
                     index += 1
                 start = index
                 delimiter_quote = ""
-                quoted = False
-                delimiter: list[str] = []
                 while index < len(command):
                     char = command[index]
                     if char == "\\" and delimiter_quote != "'":
-                        quoted = True
                         if index + 1 >= len(command):
                             raise ShellPreprocessLimit("unterminated heredoc delimiter")
-                        delimiter.append(command[index + 1])
                         index += 2
                         continue
                     if char in "\"'" and (not delimiter_quote or delimiter_quote == char):
-                        quoted = True
                         delimiter_quote = "" if delimiter_quote else char
                     elif not delimiter_quote and char in " \t\r\n;|&()<>":
                         break
-                    else:
-                        delimiter.append(char)
                     index += 1
-                # Preserve conservative delimiter admission: CR belongs to
-                # Bash's word; interior escapes remain exotic (#9088). The
-                # supported leading escape is \EOF.
-                raw_delimiter = command[start:index]
-                if command[index : index + 1] == "\r" or (
-                    "\\" in raw_delimiter and not re.fullmatch(r"\\[A-Za-z_][A-Za-z0-9_]*", raw_delimiter)
-                ):
+                # The shared contract's rule 1 reads the word; CR belongs to
+                # Bash's word, so a delimiter followed by one stays ambiguous.
+                delimiter = heredoc_closer(command[start:index])
+                if command[index : index + 1] == "\r" or delimiter is None:
                     raise ShellPreprocessLimit("ambiguous heredoc delimiter")
-                name = "".join(delimiter)
-                if delimiter_quote or index == start or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
-                    raise ShellPreprocessLimit("ambiguous heredoc delimiter")
+                name, quoted = delimiter
                 pending.append((name, strip_tabs, quoted))
                 # Avoid a second heredoc pass in shared preprocessing.
                 out.append("</dev/null")
                 word_start = True
                 continue
             elif ch == "\n" and pending:
+                # Inside a substitution the pre-check above cannot see the
+                # readers, so apply contract rule 2 to this line here.
+                if closer and not all(heredoc_readers_are_data(command[line_start:index], operators)):
+                    raise ShellPreprocessLimit("here-document body may be read as a script")
                 index += 1
                 expansions: list[str] = []
                 for delimiter, strip_tabs, quoted in pending:
@@ -419,6 +422,8 @@ def preprocess_branch_command(command: str) -> str:
                     else:
                         raise ShellPreprocessLimit("unterminated heredoc body")
                 pending.clear()
+                operators.clear()
+                line_start = index
                 # The introducing newline ends a statement even inside a
                 # substitution. Keep its boundary after the removed bodies
                 # and their executable expansions; otherwise a later command

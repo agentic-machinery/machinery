@@ -201,6 +201,16 @@ def test_issue_9479_missing_shell_redirects_namespace_fails_closed(tmp_path, hoo
         ": <<EOF\n$(echo ')'; {payload})\nEOF",
         "x[1 << EOF ]=1\n{payload}\nEOF",
         "echo $[1 << EOF ]\n{payload}\nEOF",
+        # A body a shell reads stays visible, whatever its delimiter (C-6328).
+        "bash <<'EOF'\n{payload}\nEOF",
+        "bash <<'END-DATA'\n{payload}\nEND-DATA",
+        "sh <<END-DATA\n{payload}\nEND-DATA",
+        "bash <<'END'DATA\n{payload}\nENDDATA",
+        'bash <<"EO\\"F"\n{payload}\nEO"F',
+        "sh <<E\\OF\n{payload}\nEOF",
+        "cat <<'END-DATA' | bash\n{payload}\nEND-DATA",
+        "{ cat <<'END-DATA'; } | sh\n{payload}\nEND-DATA",
+        "eval $(cat <<'END-DATA'\n{payload}\nEND-DATA\n)",
     ],
 )
 def test_issue_9102_executable_payload_stays_visible(monkeypatch, shape):
@@ -291,12 +301,10 @@ def test_issue_9088_reviewer_heredoc_bypass_blocks(monkeypatch):
 @pytest.mark.parametrize(
     "opener,closer",
     [
-        (r'<<"EO\"F"', 'EO"F'),
         (r"<<$'EOF'", "EOF"),
         ('<<$"EOF"', "EOF"),
         (r"<<$'EO\x22F'", 'EO"F'),
         (r"<<EO$'F'", "EOF"),
-        (r"<<E\OF", "EOF"),
         (r"<<-$'EOF'", "\tEOF"),
         (r"<<$'EOF' <<SAFE", "EOF\nSAFE"),
         (r"<<SAFE <<$'EOF'", "SAFE\nEOF"),

@@ -330,6 +330,14 @@ def test_secret_dump_shapes_blocked(monkeypatch, capsys, cmd):
         "echo a' 'b ; cat .env ; echo 'c'",
         'echo a" "b ; cat .env ; echo "c"',
         "e'cho' $GH_TOKEN",
+        # Command words and file operands are read after quote removal (C-6328).
+        "'ec'\"ho\" $GH_TOKEN",
+        "cat .e'n'v",
+        "cat '.e'nv",
+        "cat x'/.env'",
+        # A body a shell reads stays visible, whatever its delimiter (C-6328).
+        "sh <<'END-DATA'\ncat .env\nEND-DATA",
+        "{ cat <<'EOF'; } | bash\necho $GH_TOKEN\nEOF",
     ],
 )
 def test_issue_8896_secret_bypasses_block(monkeypatch, capsys, command):
@@ -614,12 +622,10 @@ def test_issue_9088_quoted_identifier_heredoc_body_is_inert(monkeypatch):
 @pytest.mark.parametrize(
     "opener,closer",
     [
-        (r'<<"EO\"F"', 'EO"F'),
         (r"<<$'EOF'", "EOF"),
         ('<<$"EOF"', "EOF"),
         (r"<<$'EO\x22F'", 'EO"F'),
         (r"<<EO$'F'", "EOF"),
-        (r"<<E\OF", "EOF"),
         (r"<<-$'EOF'", "\tEOF"),
         (r"<<$'EOF' <<SAFE", "EOF\nSAFE"),
         (r"<<SAFE <<$'EOF'", "SAFE\nEOF"),
@@ -732,6 +738,13 @@ def test_issue_8896_review_round_two_ordinary_allow(monkeypatch, command):
         r" --comment $'The bot\'s probe no longer reads ops/.env any more'",
         r"echo 'a'\'' ; cat .env ; echo '\''b'",
         r"echo a\ b\;cat .env",
+        # A data body stays inert, whatever its delimiter (C-6328).
+        "cat <<'END-DATA'\nit's fine\nEND-DATA",
+        "cat <<END-DATA\nit's fine\nEND-DATA",
+        "gh pr create --body-file - <<'END-DATA'\nit's fine\nEND-DATA",
+        'cat <<"EO\\"F"\nit\'s fine\nEO"F',
+        "git commit -F - <<E\\OF\nit's fine\nEOF",
+        "x=$(cat <<'END'DATA\nit's fine\nENDDATA\n)",
     ],
 )
 def test_issue_8896_ordinary_commands_allow(monkeypatch, command):

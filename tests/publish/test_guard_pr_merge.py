@@ -305,12 +305,10 @@ def test_issue_9088_reviewer_heredoc_bypass_blocks(monkeypatch):
 @pytest.mark.parametrize(
     "opener,closer",
     [
-        (r'<<"EO\"F"', 'EO"F'),
         (r"<<$'EOF'", "EOF"),
         ('<<$"EOF"', "EOF"),
         (r"<<$'EO\x22F'", 'EO"F'),
         (r"<<EO$'F'", "EOF"),
-        (r"<<E\OF", "EOF"),
         (r"<<-$'EOF'", "\tEOF"),
         (r"<<$'EOF' <<SAFE", "EOF\nSAFE"),
         (r"<<SAFE <<$'EOF'", "SAFE\nEOF"),
@@ -2616,6 +2614,10 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
         ("bash <<E'OF'\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         ("unknown-reader <<\\EOF\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         ("cat <<E'OF' | bash\ngh pr merge 5\nEOF", ["CI Gate"], 2),
+        # Any static delimiter: data stays inert, a shell's body stays visible (C-6328).
+        ("cat <<'END-DATA'\nUse `gh pr merge` after review; it's manual.\nEND-DATA", ["CI Gate"], 0),
+        ("bash <<'END-DATA'\ngh pr merge 5\nEND-DATA", ["CI Gate"], 2),
+        ("{ cat <<'END-DATA'; } | sh\ngh pr merge 5\nEND-DATA", ["CI Gate"], 2),
         ("gh pr merge 5 --body-file - <<\\EOF\nUse `gh pr merge` after review.\nEOF", ["CI Gate"], 2),
         ("cat <<E'OF'\nUse gh pr merge after review.\nEOF\ngh pr merge 5", ["CI Gate"], 2),
         ("cat <<E'OF'\ngh pr merge 5\nWRONG", ["CI Gate"], 2),

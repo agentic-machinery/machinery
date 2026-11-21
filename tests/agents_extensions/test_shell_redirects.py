@@ -269,7 +269,7 @@ def test_branch_preprocessing_does_not_consume_array_arithmetic_as_a_heredoc():
     assert "git checkout -b fixture" in preprocess_branch_command(command)
 
 
-@pytest.mark.parametrize("opener", ["<<EOF\r", r"<<E\OF"])
+@pytest.mark.parametrize("opener", ["<<EOF\r", r"<<E$'O'F"])
 def test_branch_preprocessing_preserves_conservative_exotic_delimiter_refusal(opener):
     command = f"cat {opener}\ngit checkout -b fixture\nEOF"
     with pytest.raises(ShellPreprocessLimit, match="ambiguous heredoc delimiter"):

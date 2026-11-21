@@ -272,12 +272,10 @@ def test_issue_9088_reviewer_heredoc_bypass_blocks(repos, monkeypatch):
 @pytest.mark.parametrize(
     "opener,closer",
     [
-        (r'<<"EO\"F"', 'EO"F'),
         (r"<<$'EOF'", "EOF"),
         ('<<$"EOF"', "EOF"),
         (r"<<$'EO\x22F'", 'EO"F'),
         (r"<<EO$'F'", "EOF"),
-        (r"<<E\OF", "EOF"),
         (r"<<-$'EOF'", "\tEOF"),
         (r"<<$'EOF' <<SAFE", "EOF\nSAFE"),
         (r"<<SAFE <<$'EOF'", "SAFE\nEOF"),
