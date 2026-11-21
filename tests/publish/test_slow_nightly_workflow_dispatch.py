@@ -361,13 +361,10 @@ def dismissal_transport(monkeypatch, synthetic_opsec):
         ],
         "code-scanning/analyses/2": copy.deepcopy(sarif),
         "code-scanning/analyses/3": copy.deepcopy(sarif),
+        "pulls?state=open&per_page=100": [[]],
     }
     # Stale merge refs may retain older locations after their PRs stop being active.
-    for number, merged in ((3, True), (4, False)):
-        documents[f"pulls/{number}"] = {
-            "number": number, "state": "closed", "merged": merged,
-            "html_url": f"https://github.com/unit/public/pull/{number}",
-        }
+    for number in (3, 4):
         stale = copy.deepcopy(instance)
         stale.update(ref=f"refs/pull/{number}/merge", commit_sha="c" * 40)
         stale["location"]["start_line"] = 8
@@ -479,10 +476,10 @@ def test_dismissal_refuses_missing_or_changed_reviewed_evidence(dismissal_transp
     elif fault == "tool":
         documents["code-scanning/analyses/3"]["runs"][0]["tool"]["driver"]["semanticVersion"] = "2.0.0"
     elif fault == "branch":
-        documents["pulls/5"] = {
-            "number": 5, "state": "open", "merged": False,
+        documents["pulls?state=open&per_page=100"] = [[{
+            "number": 5, "state": "open", "merged_at": None,
             "html_url": "https://github.com/unit/public/pull/5",
-        }
+        }]]
         instance = dict(documents["code-scanning/alerts/1/instances?per_page=100"][0][0],
                         ref="refs/pull/5/merge", location={"path": "sample.py", "start_line": 8})
         documents["code-scanning/alerts/1/instances?per_page=100"][0].append(instance)
@@ -755,6 +752,88 @@ def test_dismissal_refuses_when_paginated_analyses_never_match(dismissal_transpo
         "invalid-category": [1],
     }[mode]
     assert analysis_calls == expected_pages
+
+
+def test_dismissal_skips_closed_prs_with_bounded_gets_and_fails_closed_on_reopen_or_bad_open_list(dismissal_transport):
+    """Defect class: per-PR GET amplification on closed PR instances, duplicate same-commit triage fetch, or fail-open on reopened PRs or malformed open-PR listings."""
+    import copy
+
+    documents, writes, calls, _, sender, comment = dismissal_transport
+    before = "a" * 40
+    main_instance = copy.deepcopy(documents["code-scanning/alerts/1/instances?per_page=100"][0][0])
+    main_instance["commit_sha"] = before
+    documents["git/ref/heads/main"]["object"]["sha"] = before
+    instances = [main_instance]
+    for number in range(100, 197):
+        stale = copy.deepcopy(main_instance)
+        stale.update(ref=f"refs/pull/{number}/merge", commit_sha="c" * 40)
+        stale["location"]["start_line"] = 8
+        instances.append(stale)
+    documents["code-scanning/alerts/1/instances?per_page=100"] = [instances]
+
+    # 97 closed-PR instances + an unrelated open PR appearing before race re-read still pass in 13 preflight GETs (+1 readback GET).
+    open_reads = 0
+
+    def with_unrelated_open_on_reread(argv, **kwargs):
+        nonlocal open_reads
+        endpoint = argv[argv.index("--method") + 2]
+        if endpoint == "repos/unit/public/pulls?state=open&per_page=100":
+            open_reads += 1
+            if open_reads == 2:
+                calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, json.dumps([[{
+                    "number": 999, "state": "open", "merged_at": None,
+                    "html_url": "https://github.com/unit/public/pull/999",
+                }]]), "")
+        return sender(argv, **kwargs)
+
+    answer = pub.publish(
+        "code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+        comment=comment, runner=with_unrelated_open_on_reread, capture_output=True, text=True,
+    )
+    assert answer.returncode == 0
+    assert len(writes) == 1
+    get_endpoints = [argv[argv.index("--method") + 2] for argv in calls if argv[argv.index("--method") + 1] == "GET"]
+    assert len(get_endpoints) == 14  # 13 preflight GETs + 1 post-PATCH readback GET
+    assert sum(ep == "repos/unit/public/pulls?state=open&per_page=100" for ep in get_endpoints) == 2
+    assert sum(ep.startswith(f"repos/unit/public/contents/{pub._DISMISS_TRIAGE_PATH}?") for ep in get_endpoints) == 1
+    assert not any(ep.startswith("repos/unit/public/pulls/") and ep.split("/")[-1].isdigit() and ep != "repos/unit/public/pulls/2" for ep in get_endpoints)
+
+    # A skipped PR reopening during preflight must fail closed before PATCH.
+    writes.clear()
+    reopen_reads = 0
+
+    def reopened_during_preflight(argv, **kwargs):
+        nonlocal reopen_reads
+        endpoint = argv[argv.index("--method") + 2]
+        if endpoint == "repos/unit/public/pulls?state=open&per_page=100":
+            reopen_reads += 1
+            if reopen_reads == 2:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([[{
+                    "number": 100, "state": "open", "merged_at": None,
+                    "html_url": "https://github.com/unit/public/pull/100",
+                }]]), "")
+        return sender(argv, **kwargs)
+
+    with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+        pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=reopened_during_preflight)
+    assert reopen_reads == 2 and writes == []
+
+    # Malformed open-PR listings (zero pages, closed/merged rows, wrong repo URL, bad number) must fail closed.
+    bad_payloads = [
+        [],
+        [[{"number": 5, "state": "closed", "merged_at": None, "html_url": "https://github.com/unit/public/pull/5"}]],
+        [[{"number": 5, "state": "open", "merged": True, "merged_at": None, "html_url": "https://github.com/unit/public/pull/5"}]],
+        [[{"number": 5, "state": "open", "merged_at": "2026-11-21T00:00:00Z", "html_url": "https://github.com/unit/public/pull/5"}]],
+        [[{"number": 5, "state": "open", "merged_at": None, "html_url": "https://github.com/other/public/pull/5"}]],
+        [[{"number": True, "state": "open", "merged_at": None, "html_url": "https://github.com/unit/public/pull/True"}]],
+        [["not-a-dict"]],
+    ]
+    for bad in bad_payloads:
+        documents["pulls?state=open&per_page=100"] = bad
+        with pytest.raises(gate.PublishBlocked, match="DISMISSAL_TRIAGE_REFUSED"):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive", comment=comment, runner=sender)
+        assert writes == []
 
 
 QUEUE_REF = "refs/heads/gh-readonly-queue/main/pr-7-" + "d" * 40

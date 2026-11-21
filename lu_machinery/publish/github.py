@@ -1714,7 +1714,7 @@ def _dismiss_get(runner, endpoint, cwd, environment, *, pages=False, raw=False, 
         raise ValueError("dismissal evidence unavailable")
     value = result.stdout if raw else json_depth.loads(result.stdout, max_depth=512)
     if pages:
-        if not isinstance(value, list) or any(not isinstance(page, list) for page in value):
+        if not isinstance(value, list) or not value or any(not isinstance(page, list) for page in value):
             raise ValueError("dismissal pagination unavailable")
         value = [row for page in value for row in page]
     return value
@@ -1815,7 +1815,11 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     current_head = head_reference["object"]["sha"]
     if not re.fullmatch(PATTERNS["sha"], current_head):
         raise ValueError("unknown current triage head")
-    current_triage = get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={current_head}", raw=True)
+    current_triage = (
+        triage
+        if current_head.lower() == merge.lower()
+        else get(f"contents/{_DISMISS_TRIAGE_PATH}?ref={current_head}", raw=True)
+    )
     current_rows = [line for line in current_triage.splitlines() if "|" in line
                     and line.strip().removeprefix("|").split("|", 1)[0].strip() == str(number)]
     if current_rows != [triage_line]:
@@ -1901,21 +1905,36 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
             results[aid] = _dismiss_sarif_result(get(f"code-scanning/analyses/{aid}", sarif=True), number)
         return results[aid]
 
+    def open_pr_numbers():
+        pulls = get("pulls?state=open&per_page=100", pages=True)
+        numbers = set()
+        for pull in pulls:
+            if not isinstance(pull, dict):
+                raise ValueError("unknown open PR identity or state")
+            pr_num = pull.get("number")
+            if (
+                type(pr_num) is not int or pr_num <= 0
+                or pull.get("state") != "open"
+                or ("merged" in pull and pull["merged"] is not False)
+                or pull.get("merged_at") is not None
+                or pull.get("html_url") != f"https://github.com/{gh_repo}/pull/{pr_num}"
+            ):
+                raise ValueError("unknown open PR identity or state")
+            numbers.add(pr_num)
+        return numbers
+
     baseline_ref = f"refs/heads/{base_ref}"
     if not any(instance["ref"] == baseline_ref for instance in instances):
         raise ValueError("no open triage-branch instance")
-    closed_prs = {}
+    open_prs = None
+    skipped_prs = set()
     for instance in instances:
         if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            endpoint = f"pulls/{match[1]}"
-            pull = closed_prs.get(endpoint) or get(endpoint)
-            if (type(pull.get("number")) is not int or pull["number"] != int(match[1])
-                    or pull.get("html_url") != f"https://github.com/{gh_repo}/pull/{match[1]}"
-                    or pull.get("state") not in {"open", "closed"}
-                    or type(pull.get("merged")) is not bool):
-                raise ValueError("unknown instance PR identity or state")
-            if pull["state"] == "closed" or pull["merged"] is True:
-                closed_prs[endpoint] = pull
+            if open_prs is None:
+                open_prs = open_pr_numbers()
+            pr_num = int(match[1])
+            if pr_num not in open_prs:
+                skipped_prs.add(pr_num)
                 continue
         location = instance["location"]
         if (row[2].strip() != f"`{location['path']}:{location['start_line']}`"
@@ -1933,7 +1952,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     if (get(f"code-scanning/alerts/{number}") != alert
             or get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True) != get_instances
             or get(head_endpoint) != head_reference
-            or any(get(endpoint) != pull for endpoint, pull in closed_prs.items())):
+            or (skipped_prs and bool(skipped_prs & open_pr_numbers()))):
         raise ValueError("alert or triage evidence changed during preflight")
     return alert
 
