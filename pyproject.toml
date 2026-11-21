@@ -65,9 +65,12 @@ exclude-newer-package = { lu-machinery = false }
 # Semgrep 1.183.0 pins vulnerable MCP and OpenTelemetry releases. Scope the
 # patched versions to that wheel and keep the entire scanner hash-locked.
 # The OpenTelemetry SDK, exporter and instrumentations share version pins.
+# Its wcmatch~=8.3 is vulnerable to GHSA-53pm-wgxf-c6qf (ReDoS); 11.2 is the
+# first patched release. Semgrep calls only glob.globmatch(GLOBSTAR | DOTGLOB).
 override-dependencies = [
     { package = { name = "semgrep", version = "1.183.0" }, dependencies = [
         "mcp==1.30.0",
+        "wcmatch>=11.2",
         "opentelemetry-api==1.45.2",
         "opentelemetry-sdk==1.45.2",
         "opentelemetry-exporter-otlp-proto-http==1.45.2",

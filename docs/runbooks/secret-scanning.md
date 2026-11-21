@@ -337,6 +337,8 @@ Rows #27 to #33 trace the Python and Actions analyses on main commit
 that commit.
 Row #41 traces Python analysis `2209383055` on main commit
 `e3f9a8b271959791e079316188adb734f1bb6295` (2026-11-19).
+Row #42 traces Python analysis `2220196117` on main commit
+`37b29d1ba171d5e03a4be0b52717f443c979a131` (2026-11-21).
 
 | Alert | Rule | Reviewed location | Disposition and data-flow evidence |
 | --- | --- | --- | --- |
@@ -372,6 +374,7 @@ Row #41 traces Python analysis `2209383055` on main commit
 | 32 | `py/command-line-injection` | `lu_machinery/common/github_client.py:3581` | Fixed at the source in #767, as #29. This sink is `_run_command`'s pass-through for `gh --version`. |
 | 33 | `py/polynomial-redos` | `lu_machinery/common/github_client.py:1717` | Fixed in #767. The source of #29 reached `_canonical_endpoint`'s scheme pattern. `re.match` tries only position 0, so the run was already linear (one million `A` characters take 2 ms; the same pattern unanchored is quadratic), but the analysis treated the pattern as unanchored. The pattern now begins with `^`, and the source no longer reaches it. |
 | 41 | `py/clear-text-storage-sensitive-data` | `lu_machinery/dispatcher/store.py:339` | False positive. All three SARIF flows start at `trusted_core_context()` in `tests/agent_runtime/test_attempt_network.py:403`. The helper returns public rules Markdown and provenance that contains repository-relative source names and SHA-256 digests (`lu_machinery/review/render_contract.py:64-83`). The test appends fixture text and passes the rendered prompt to `store.create()` (`test_attempt_network.py:404-415`). The prompt enters at `store.py:325` and is written to an exclusive `0600` file at `store.py:338-339`. The reported flows contain public rules, provenance and fixture text. |
+| 42 | `py/clear-text-storage-sensitive-data` | `lu_machinery/dispatcher/store.py:339` | False positive. This is #41's result, given a new alert number. The same analysis marked #41 fixed and opened #42 at 2026-11-20T23:06:29Z, after #1032 edited `store.py` beside `create()`. All three SARIF flows match #41's: `trusted_core_context()` at `tests/agent_runtime/test_attempt_network.py:403`, then `prefix` and `rendered` (lines 403-415), then `prompt` at `store.py:325` and the `stream.write(prompt)` sink at line 339. CodeQL treats the call as a secret only because of its name: the shared `SensitiveDataHeuristics.qll` `maybeSecret()` pattern classifies any name containing `trusted` as secret, except `untrusted` and `is_trusted`. The function returns public rules Markdown with a provenance block of repository-relative source names and SHA-256 digests (`lu_machinery/review/render_contract.py:64-83`), and the test appends fixture text. In production, `create()` writes the dispatch prompt that the model provider receives in full. Briefs must not contain credentials, so this local copy is not the exposure boundary. `create()` writes it once, at `<task>.prompt` beside the task record (`lu_machinery/dispatcher/cli.py:576`), with `O_CREAT`/`O_EXCL` (which also refuses a planted symlink) and mode `0600`, in a task directory created with mode `0700` when absent. |
 
 ### Queue-ref instances still block dismissal
 
