@@ -166,14 +166,15 @@ def test_unregistered_recipient_admitted_publish_refuses_names_no_drain_reads(pl
 
 
 def test_declared_external_recipients_are_admitted_and_unknown_names_still_refused(plane, tasks, monkeypatch, tmp_path):
-    """Defect class: an external agent declared for an external drain (eggbot, dot, mac-agent) is refused as unregistered."""
+    """Defect class: an external agent declared for an external drain (eggbot, dot, mac-agent, jean) is refused as unregistered."""
     from lu_machinery import agent_identity
 
-    external = ("eggbot", "dot", "mac-agent")
+    external = ("eggbot", "dot", "mac-agent", "jean")
     with AuthorityService(root=plane) as service:
         service.publish_message(sender="claude-cto", body="b", recipients=external)
-        with pytest.raises(AuthorityRecipientRefused, match=r"^recipient_not_registered: eggbot-2 "):
-            service.publish_message(sender="claude-cto", body="b", recipients=("eggbot-2",))
+        for unknown in ("eggbot-2", "jean-2"):
+            with pytest.raises(AuthorityRecipientRefused, match=rf"^recipient_not_registered: {unknown} "):
+                service.publish_message(sender="claude-cto", body="b", recipients=(unknown,))
     assert sorted(tuple(row) for row in backlog(plane)) == sorted((name, "queued") for name in external)
 
     # Admission comes from the declared list, not a name in code: without it, the same name is refused.
@@ -181,11 +182,10 @@ def test_declared_external_recipients_are_admitted_and_unknown_names_still_refus
     stripped = tmp_path / "area_assignments.yaml"
     stripped.write_text(text.replace("external_recipients:", "unused_external_recipients:"), encoding="utf-8")
     monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", stripped)
-    with (
-        AuthorityService(root=plane) as service,
-        pytest.raises(AuthorityRecipientRefused, match=r"^recipient_not_registered: dot "),
-    ):
-        service.publish_message(sender="claude-cto", body="b", recipients=("dot",))
+    with AuthorityService(root=plane) as service:
+        for name in external:
+            with pytest.raises(AuthorityRecipientRefused, match=rf"^recipient_not_registered: {name} "):
+                service.publish_message(sender="claude-cto", body="b", recipients=(name,))
 
 
 def test_settled_task_delivery_left_queued_expires_on_the_next_claim_and_hygiene_clears_the_rest(
