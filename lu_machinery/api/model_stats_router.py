@@ -16,7 +16,7 @@ splits by the concrete model id and the effective effort. Unknown effort is show
 A bare Claude alias
 (``opus``) counts as the catalog model it ran only where the rows make that unambiguous. A task is a review
 when dispatch types it as one (``review_typed``) or its reply validates as a review. Read-only mode and a task
-id that contains ``review`` are a write, and a workspace-write closeout is not a review reply. Reviewer totals include structured results from every lane. Author
+id that contains ``review`` are a write. A validated reply is review evidence in either mode. Reviewer totals include structured results from every lane. Author
 figures use reviews of record (reviews that name a PR and the author's model). Only counts and model, effort, class, pool and repository
 labels leave ``view=page``. The per-reason counts stay on every HTTP view. Up to 200 escaped characters of the
 first failing reply per model and reason leave only on ``view=full`` and ``view=samples``: never prompts, parsed

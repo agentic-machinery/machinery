@@ -433,14 +433,11 @@ def _validated_review(review: Mapping[str, Any] | None) -> bool:
 def role_of(record: Mapping[str, Any], review: Mapping[str, Any] | None = None) -> str:
     """Review only when the dispatch classifier types the task, or its reply is a validated review.
 
-    Read-only mode and a task id that contains ``review`` are not a review. A workspace-write
-    result is that task's own closeout, so a verdict line in it is not review evidence.
-    ``review`` is the parsed reply from :func:`_review`, when the caller has one.
+    Read-only mode and a task id that contains ``review`` are not a review. A validated reply
+    is review evidence on its own, whichever mode the record has. ``review`` is the parsed
+    reply from :func:`_review`, when the caller has one.
     """
-    if _typed_review(record):
-        return "review"
-    mode = record.get("mode") or _options(record).get("mode")
-    if mode != "workspace-write" and _validated_review(review):
+    if _typed_review(record) or _validated_review(review):
         return "review"
     return "write"
 
@@ -766,14 +763,11 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     refusal = start_refusal(record)
     options = _options(record)
     # One resolved copy drives typing, class, PR association and reply parsing. A typed review
-    # that did not finish has no reply to read. A workspace-write closeout is not a review reply.
-    # Any other settled task is read once, so a legacy record keeps review attribution only when
-    # the reply validates.
+    # that did not finish has no reply to read. Any other settled task is read once, so a legacy
+    # record keeps review attribution only when the reply validates, in either mode.
     resolved = _review_flags(record)
     typed = review_typed(resolved)
-    mode = record.get("mode") or options.get("mode")
-    reading = None if refusal or (typed and status != "done") or (
-        not typed and mode == "workspace-write") else _review(path, resolved)
+    reading = None if refusal or (typed and status != "done") else _review(path, resolved)
     role = role_of(resolved, reading)
     if role == "review":
         task_class = (f"{label(resolved.get('review_profile'), 'code')}/"
