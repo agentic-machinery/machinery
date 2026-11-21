@@ -19,9 +19,10 @@ branch. No eligible reviewer is handled in step 2; nobody substitutes a reviewer
 choosing.
 
 **When it starts.** Right after the PR is opened or updated on the pushed head: review runs in
-parallel with PR CI on that immutable head and never waits for the `CI Gate`. Pending CI is not
-successful CI, so the verdict never rests on a result that has not arrived. Enqueue still needs
-this recorded exact-head verdict and a green PR `CI Gate` on the same head
+parallel with PR CI on that immutable head and never waits for it. Pending CI is not
+successful CI, so the verdict never rests on a result that has not arrived. Landing still needs
+this recorded exact-head verdict and green PR CI on the same head (the `CI Gate` where the
+repository runs one), with or without a merge queue
 ([delivery](../full-send/references/delivery.md#the-gate)).
 
 **Inputs.** The hand-off record ([delivery](../full-send/references/delivery.md#hand-off-record)):

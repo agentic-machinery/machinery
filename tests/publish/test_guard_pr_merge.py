@@ -88,6 +88,7 @@ def loaded_guard(configured_roots):  # noqa: F811 - imported pytest fixture
 _ISSUE_9461_MERGES = [
     "gh pr merge 5",
     "python -m lu_machinery.publish pr-merge --number 5 --match-head " + "a" * 40,
+    "python -m lu_machinery.publish pr-merge --number 5 --match-head " + "a" * 40 + " --expect-queue false",
 ]
 _ISSUE_9461_SUFFIXES = [
     "",

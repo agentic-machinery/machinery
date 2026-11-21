@@ -239,7 +239,7 @@ those skills point to.
 Immediately before enqueue, run the [core inbox drain](../SKILL.md#the-loop--run-it-every-cycle)
 and reconcile its messages with the approved head and landing decision.
 
-**Merge-queue visibility after enqueue (#7814 item 13).** After `.venv/bin/python -m lu_machinery.publish pr-merge --number <N>`, GitHub
+**Merge-queue visibility after enqueue (#7814 item 13).** After `.venv/bin/python -m lu_machinery.publish pr-merge --number <N> --match-head <approved head> --expect-queue <reading>` (`full-send` step 8) in a merge-queue repository, GitHub
 prints `! The merge strategy for main is set by the merge queue` while the PR stays
 `OPEN` / `CLEAN`. Do not stall or query raw GraphQL by hand — run
 `.venv/bin/python -m lu_machinery.gh_merge_queue_status <pr>` (or `--line` / `--json`) to

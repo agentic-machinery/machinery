@@ -24,8 +24,8 @@ to do any of these. You may commit, push and rebase this task's own branch, usin
 `--force-with-lease=<branch>:<observed head>` after a rebase.
 
 Everything before the merge stays yours: a worker runs `review-loop` itself, and the resolver
-picks its reviewer (rules core P1). Only the enqueue and what follows belong to the receiving
-driver.
+picks its reviewer (rules core P1). Only the landing (an enqueue or, without a merge queue, a
+direct `pr-merge`) and what follows belong to the receiving driver.
 
 ## Protect the PR before any work
 
@@ -35,7 +35,7 @@ On an existing PR, before the first edit:
 "$PY" -m lu_machinery.publish pr-edit --number "$PR" --add-labels hold
 "$PY" -m lu_machinery.publish pr-disarm --number "$PR"
 gh pr view "$PR" --json id,labels,autoMergeRequest
-"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --json
+"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json
 "$PY" -m lu_machinery.publish pr-dequeue --node-id "$PR_NODE_ID"   # only if queued
 ```
 
@@ -58,8 +58,11 @@ then add the `hold` label and verify it before any approval is recorded:
 Check the gate in [delivery](../full-send/references/delivery.md#the-gate) on the live head.
 Fetch the base, then read the live PR's state, head, base, checks, reviews and mergeability.
 `READY_TO_MERGE` means all of these hold on the current head: a recorded exact-head APPROVE,
-same-head green PR CI Gate (affected tests, not the full suite), proof complete, and protection verified. The future merge-group
-CI is not yet proven; say so.
+same-head green PR CI (no blocking check pending, red or cancelled, the PR `CI Gate` among them
+where the repository runs one; affected tests, not the full suite), proof complete, and
+protection verified. Report the base branch's `isMergeQueueEnabled` reading (`full-send`
+step 7) so the receiving driver lands with `--expect-queue` set to it. Where the base has a
+merge queue, the future merge-group CI is not yet proven; say so.
 
 End in exactly one of these states, naming the receiving driver:
 
