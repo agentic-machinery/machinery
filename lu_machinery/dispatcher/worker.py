@@ -2308,15 +2308,24 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
     try:
         parent = store.read(caller)
     except (OSError, ValueError):
+        parent = None
+    if not isinstance(parent, dict) or not isinstance(parent.get("status"), str):
         return {"result_unavailable": "parent_record_unavailable"}
-    if parent.get("status") not in store.ACTIVE:
+    if parent["status"] not in store.ACTIVE:
         return {"result_unavailable": "parent_not_running"}
     branch = parent.get("publish_branch") or parent.get("worktree_branch")
     if parent.get("repository_id") != record.get("repository_id") or record["review_branch"] != branch:
         return {"result_unavailable": "review_not_of_parent_branch"}
+    # Git walks up from a directory that lost its own repository, so the top level it names must be the tree.
+    tree = parent.get("worktree_path")
     try:
-        head = git._git(Path(parent["worktree_path"]), "rev-parse", "--verify", "HEAD^{commit}", isolate=True)
-    except (KeyError, TypeError, OSError, subprocess.SubprocessError):
+        if not isinstance(tree, str) or not Path(tree).is_absolute():
+            raise ValueError("worktree path is not absolute")
+        top, head = git._git(Path(tree), "rev-parse", "--path-format=absolute", "--show-toplevel", "HEAD^{commit}",
+                             isolate=True).split("\n")
+        if Path(top).resolve(strict=True) != Path(tree).resolve(strict=True):
+            raise ValueError("Git resolved another worktree")
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError):
         return {"result_unavailable": "parent_head_unavailable"}
     if not record.get("pinned_head") or head != record["pinned_head"]:
         return {"result_unavailable": "head_moved"}
