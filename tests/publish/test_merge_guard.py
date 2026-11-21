@@ -526,16 +526,27 @@ def _destination_documents(kind, scenario):
     import base64
 
     repo, path, workflow, advisory = _KINDS[kind]
+    if scenario == "unnamed workflow":
+        workflow = path  # GitHub names a workflow without `name` by its repository-relative path.
     text = (
-        f"name: {workflow}\non: pull_request\njobs:\n"
-        "  build: {name: Build, runs-on: ubuntu-24.04, steps: [{run: 'true'}]}\n"
-        f"  advisory: {{name: '{advisory}', continue-on-error: true, runs-on: ubuntu-24.04, steps: [{{run: 'true'}}]}}\n"
-        "  gate: {name: CI Gate, if: always(), needs: [build], runs-on: ubuntu-24.04, steps: [{run: 'true'}]}\n"
+        ("" if scenario == "unnamed workflow" else f"name: {workflow}\n") + "on: pull_request\njobs:\n"
+        "  build: {name: Build, continue-on-error: false, runs-on: ubuntu-24.04, steps: [{run: 'true'}]}\n"
     )
+    if scenario != "no CI Gate, continue-on-error false":
+        text += (
+            f"  advisory: {{name: '{advisory}', continue-on-error: true, runs-on: ubuntu-24.04,"
+            " steps: [{run: 'true'}]}\n"
+            "  gate: {name: CI Gate, if: always(), needs: [build], runs-on: ubuntu-24.04, steps: [{run: 'true'}]}\n"
+        )
     encoded = base64.b64encode(text.encode()).decode()
     content = "\n".join(encoded[i:i + 60] for i in range(0, len(encoded), 60)) + "\n"
     listing = [{"name": "codeql.yml", "path": ".github/workflows/codeql.yml", "type": "file", "sha": "1" * 40}]
-    if scenario != "workflow absent":
+    if scenario == "listing at the API cap":
+        listing = [{"name": f"w{i}.yml", "path": f".github/workflows/w{i}.yml", "type": "file", "sha": "1" * 40}
+                   for i in range(1000)]
+    elif scenario == "listing entry not an immediate child":
+        listing.append({"name": "", "path": "", "type": "file", "sha": "1" * 40})
+    if scenario not in {"workflow absent", "listing at the API cap", "listing entry not an immediate child"}:
         listing.append({"name": path.rsplit("/", 1)[1], "path": path, "type": "file", "sha": "2" * 40})
     file = {"type": "file", "path": path, "sha": "2" * 40, "encoding": "base64", "content": content}
     documents = {f"repos/{repo}/contents/.github/workflows": listing, f"repos/{repo}/contents/{path}": file}
@@ -555,6 +566,10 @@ def _destination_documents(kind, scenario):
     ("advisory-only head", "NO_CHECKS"),
     ("blocking check passes, advisory fails", "lands"),
     ("workflow absent", "lands"),
+    ("no CI Gate, continue-on-error false", "lands"),
+    ("unnamed workflow", "lands"),
+    ("listing at the API cap", "ADVISORY_POLICY_UNAVAILABLE"),
+    ("listing entry not an immediate child", "ADVISORY_POLICY_UNAVAILABLE"),
     ("listing unreadable", "ADVISORY_POLICY_UNAVAILABLE"),
     ("file unreadable", "ADVISORY_POLICY_UNAVAILABLE"),
     ("file changed since listing", "ADVISORY_POLICY_UNAVAILABLE"),
@@ -571,7 +586,7 @@ def test_pr_merge_judges_by_the_destination_repository_policy(monkeypatch, kind,
         monkeypatch.setattr(merge_guard, "load_repo_advisory_checks", real)
     repo, workflow, advisory, documents = _destination_documents(kind, scenario)
     rows = [("Build", "pass"), (advisory, "fail")] if expected == "lands" else [(advisory, "pass")]
-    if scenario == "workflow absent":
+    if scenario in {"workflow absent", "no CI Gate, continue-on-error false"}:
         rows = [("Build", "pass")]
     checks = [{"name": name, "bucket": bucket, "workflow": workflow} for name, bucket in rows]
     rollup = [{"__typename": "CheckRun", "name": name, "workflowName": workflow, "status": "COMPLETED",

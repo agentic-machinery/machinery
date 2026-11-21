@@ -159,8 +159,12 @@ def _job_names(key: str, job: dict) -> set[str]:
     return {_EXPRESSION.sub(lambda expression, row=row: render(expression, row), name) for row in rows}
 
 
-def _parse_workflow(workflow: object) -> AdvisoryChecks:
-    """The advisory allowlist one parsed workflow declares; ValueError for an unsupported shape."""
+def _parse_workflow(workflow: object, path: str = ".github/workflows/ci.yml") -> AdvisoryChecks:
+    """The advisory allowlist one parsed workflow declares; ValueError for an unsupported shape.
+
+    ``path`` is the workflow file, whose repository-relative path GitHub shows as the
+    workflow name when the file sets none.
+    """
     if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict):
         raise ValueError("workflow jobs must be a mapping")
     jobs = workflow["jobs"]
@@ -168,13 +172,14 @@ def _parse_workflow(workflow: object) -> AdvisoryChecks:
         raise ValueError("invalid workflow job")
     if any(dependency not in jobs for job in jobs.values() for dependency in _needs(job)):
         raise ValueError("unknown workflow dependency")
-    workflow_name = workflow.get("name", ".github/workflows/ci.yml")
+    workflow_name = workflow.get("name", path)
     if not isinstance(workflow_name, str) or not workflow_name or "${{" in workflow_name:
         raise ValueError("invalid workflow name")
-    if not any(job.get("name", key) == "CI Gate" for key, job in jobs.items()) and not any(
-        "continue-on-error" in job for job in jobs.values()
+    if not any(job.get("name", key) == "CI Gate" for key, job in jobs.items()) and all(
+        job.get("continue-on-error", False) is False for job in jobs.values()
     ):
-        # Advisory needs continue-on-error, so a workflow with no such job and no CI Gate declares none.
+        # Advisory needs continue-on-error, so a workflow whose every job omits it or sets it to
+        # false, and that has no CI Gate, declares none. Any other value still needs the gate.
         return AdvisoryChecks(workflow=workflow_name)
     required = _required_jobs(jobs)
     blocking_names: set[str] = set()
@@ -201,6 +206,23 @@ def load_advisory_checks(path: Path | None = None) -> AdvisoryChecks:
 
 _REPOSITORY = re.compile(r"[\w.-]+/[\w.-]+", re.ASCII)
 _WORKFLOW_DIRECTORY = ".github/workflows"
+# The contents API returns at most this many entries of a directory, so a listing that long
+# may be truncated and cannot prove a file absent.
+_LISTING_CAP = 1000
+
+
+def _listing_entry(entry: object) -> bool:
+    """Whether a directory-listing entry names one immediate child of the workflow directory."""
+    if not isinstance(entry, dict):
+        return False
+    name, path = entry.get("name"), entry.get("path")
+    return (
+        isinstance(name, str)
+        and name not in {"", ".", ".."}
+        and "/" not in name
+        and path == f"{_WORKFLOW_DIRECTORY}/{name}"
+        and isinstance(entry.get("type"), str)
+    )
 
 
 def _workflow_text(document: object, entry: dict) -> str:
@@ -225,7 +247,8 @@ def load_repo_advisory_checks(repo: str, get_json: Callable[[str], object]) -> A
     The workflows are the repository's ``required_workflow`` setting (lu_machinery/config/
     fleet_repos.yaml, default ci.yml), read at the default branch, never the PR head, through
     ``get_json(endpoint)`` (the caller's GitHub client; None on failure). The directory
-    listing proves which of them exist; one it proves absent declares no advisory job. An
+    listing proves which of them exist; one a complete, well-formed listing proves absent
+    declares no advisory job. A listing at the API's entry cap proves nothing absent. An
     unreadable listing or file, a file that changed between the two reads, an unsupported
     workflow shape, or advisory jobs in more than one workflow is ``reason``: the caller refuses.
     Errors the caller's reads raise (a refusal, a rate limit) propagate.
@@ -240,19 +263,21 @@ def load_repo_advisory_checks(repo: str, get_json: Callable[[str], object]) -> A
         except RepairRefused as exc:
             raise ValueError(exc.detail) from None
         listing = get_json(f"repos/{repo}/contents/{_WORKFLOW_DIRECTORY}")
-        if not isinstance(listing, list) or not all(
-            isinstance(entry, dict) and isinstance(entry.get("path"), str) for entry in listing
-        ):
+        if not isinstance(listing, list) or not all(_listing_entry(entry) for entry in listing):
             raise ValueError("workflow directory unreadable")
+        if len({entry["path"] for entry in listing}) != len(listing):
+            raise ValueError("workflow directory lists a path twice")
         policies = []
         for path in paths:
             entries = [entry for entry in listing if entry["path"] == path]
             if not entries:
+                if len(listing) >= _LISTING_CAP:
+                    raise ValueError(f"{path} missing from a workflow directory listing that may be truncated")
                 continue
-            if len(entries) != 1 or entries[0].get("type") != "file":
-                raise ValueError(f"{path} is not one file")
+            if entries[0]["type"] != "file":
+                raise ValueError(f"{path} is not a file")
             document = get_json(f"repos/{repo}/contents/{quote(path, safe='/')}")
-            policies.append(_parse_workflow(yaml.safe_load(_workflow_text(document, entries[0]))))
+            policies.append(_parse_workflow(yaml.safe_load(_workflow_text(document, entries[0])), path))
         named = [policy for policy in policies if policy.names]
         if len(named) > 1:
             raise ValueError("advisory jobs in more than one workflow")
