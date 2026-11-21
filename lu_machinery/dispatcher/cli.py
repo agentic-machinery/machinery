@@ -619,7 +619,7 @@ def _dispatch(args) -> int:
     with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         checks.check_private_input(spec, info["key"])
         if agent == "opencode" and (refusal := opencode.endpoint_refusal(
-            spec.provider, probe_env(spec), worktree=worktree, repo=None if args.cwd else repo, sha=sha,
+            spec.provider, probe_env(spec), effort=spec.effort, worktree=worktree, repo=None if args.cwd else repo, sha=sha,
         )):
             raise ValueError(refusal)
     with admission.record_refusal(args, agent, StartRefusal.BOUNDARY):
