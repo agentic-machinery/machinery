@@ -72,10 +72,12 @@ Start with one standalone verdict line. Use `VERDICT: APPROVE`, `VERDICT: REQUES
 or `VERDICT: BLOCKED`. Follow it with one fenced `json` object. Put findings and their
 repository-relative citations, or the reason the review is blocked, in the `summary` string.
 Put literal captured Sources excerpts, separated by semicolons, in the `sources` string.
-Use `none` for that string when the reply makes no source claim. Keep source claims in
-`sources` and retain the excerpts' punctuation. A bound attempt can cite the captured
-receipt in an `evidence` array. Each entry contains `receipt_id` and a literal `quote`
-from that receipt's output.
+Use `none` for that string when the reply makes no source claim. Keep source excerpts in
+`sources` and retain their punctuation. Any semicolon-separated clause in `summary`
+that names a source term such as CEFR, a dictionary, a rule, a tag, a paradigm or
+a Sources tool must also occur literally in captured output.
+A bound attempt can cite the captured receipt in an `evidence` array. Each entry contains
+`receipt_id` and a literal `quote` from that receipt's output.
 The verdict line and this object are the entire reply.
 
 ## Findings
