@@ -24,6 +24,8 @@ def _advisory_fixture_workflow(monkeypatch):
         return load(path or fixture)
     monkeypatch.setattr(advisory_checks, "load_advisory_checks", reader)
     monkeypatch.setattr(merge_guard, "load_advisory_checks", reader)
+    # pr-merge reads the destination repository's policy; these fakes judge by the fixture.
+    monkeypatch.setattr(merge_guard, "load_repo_advisory_checks", lambda repo, get_json: load(fixture), raising=False)
 
 
 def merge_with_checks(stdout, returncode=0):
@@ -502,3 +504,99 @@ def test_refusal_names_a_status_read_of_the_wrong_shape():
     with pytest.raises(PublishBlocked) as refused:
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
     assert str(refused.value) == "OPSEC: merge refused: cannot establish check state (commit statuses: invalid shape)."
+
+
+# --- the destination repository's advisory policy (#1054) ------------------------------------
+# pr-merge judges by the advisory policy on the default branch of the repository it lands
+# into, read through its own GitHub reads; another repository's ci.yml (or none) never decides.
+
+_KINDS = {
+    # kind: (repository, its configured CI workflow in fleet_repos.yaml, workflow name, advisory job)
+    "machinery": ("learn-ukrainian/machinery", ".github/workflows/ci-gate.yml", "CI Gate", "Docs preview (advisory)"),
+    "product": ("learn-ukrainian/learn-ukrainian.github.io", ".github/workflows/ci.yml", "CI", "Lesson lint (advisory)"),
+    "infra-private": ("learn-ukrainian/learn-ukrainian-infra-private", ".github/workflows/ci.yml", "Private CI",
+                      "Boundary drift (advisory)"),
+    "ukrainian-llm-eval": ("learn-ukrainian/ukrainian-llm-eval", ".github/workflows/ci.yml", "CI",
+                           "Study smoke (advisory)"),
+}
+
+
+def _destination_documents(kind, scenario):
+    """Default-branch contents replies for one repository kind's fixture workflow."""
+    import base64
+
+    repo, path, workflow, advisory = _KINDS[kind]
+    text = (
+        f"name: {workflow}\non: pull_request\njobs:\n"
+        "  build: {name: Build, runs-on: ubuntu-24.04, steps: [{run: 'true'}]}\n"
+        f"  advisory: {{name: '{advisory}', continue-on-error: true, runs-on: ubuntu-24.04, steps: [{{run: 'true'}}]}}\n"
+        "  gate: {name: CI Gate, if: always(), needs: [build], runs-on: ubuntu-24.04, steps: [{run: 'true'}]}\n"
+    )
+    encoded = base64.b64encode(text.encode()).decode()
+    content = "\n".join(encoded[i:i + 60] for i in range(0, len(encoded), 60)) + "\n"
+    listing = [{"name": "codeql.yml", "path": ".github/workflows/codeql.yml", "type": "file", "sha": "1" * 40}]
+    if scenario != "workflow absent":
+        listing.append({"name": path.rsplit("/", 1)[1], "path": path, "type": "file", "sha": "2" * 40})
+    file = {"type": "file", "path": path, "sha": "2" * 40, "encoding": "base64", "content": content}
+    documents = {f"repos/{repo}/contents/.github/workflows": listing, f"repos/{repo}/contents/{path}": file}
+    if scenario == "listing unreadable":
+        del documents[f"repos/{repo}/contents/.github/workflows"]
+    elif scenario == "file unreadable":
+        del documents[f"repos/{repo}/contents/{path}"]
+    elif scenario == "file changed since listing":
+        file["sha"] = "3" * 40
+    elif scenario == "file not base64":
+        file["content"] = "not base64!"
+    return repo, workflow, advisory, documents
+
+
+@pytest.mark.parametrize("kind", sorted(_KINDS))
+@pytest.mark.parametrize("scenario,expected", [
+    ("advisory-only head", "NO_CHECKS"),
+    ("blocking check passes, advisory fails", "lands"),
+    ("workflow absent", "lands"),
+    ("listing unreadable", "ADVISORY_POLICY_UNAVAILABLE"),
+    ("file unreadable", "ADVISORY_POLICY_UNAVAILABLE"),
+    ("file changed since listing", "ADVISORY_POLICY_UNAVAILABLE"),
+    ("file not base64", "ADVISORY_POLICY_UNAVAILABLE"),
+])
+def test_pr_merge_judges_by_the_destination_repository_policy(monkeypatch, kind, scenario, expected):
+    """Defect class: the advisory policy came from the product checkout's ci.yml (or none), so an
+    advisory-only head passed NO_CHECKS in a repository whose own CI declares that job advisory."""
+    from lu_machinery.ci import advisory_checks
+    from lu_machinery.publish import merge_guard
+
+    real = getattr(advisory_checks, "load_repo_advisory_checks", None)
+    if real is not None:
+        monkeypatch.setattr(merge_guard, "load_repo_advisory_checks", real)
+    repo, workflow, advisory, documents = _destination_documents(kind, scenario)
+    rows = [("Build", "pass"), (advisory, "fail")] if expected == "lands" else [(advisory, "pass")]
+    if scenario == "workflow absent":
+        rows = [("Build", "pass")]
+    checks = [{"name": name, "bucket": bucket, "workflow": workflow} for name, bucket in rows]
+    rollup = [{"__typename": "CheckRun", "name": name, "workflowName": workflow, "status": "COMPLETED",
+               "conclusion": "SUCCESS" if bucket == "pass" else "FAILURE"} for name, bucket in rows]
+    calls = []
+
+    def runner(args, **kwargs):
+        calls.append(args)
+        if args[1] == "api":
+            if args[4] in documents:
+                return subprocess.CompletedProcess(args, 0, json.dumps(documents[args[4]]), "")
+            return subprocess.CompletedProcess(args, 1, "", "gh: Not Found (HTTP 404)")
+        if args[2] == "checks":
+            return subprocess.CompletedProcess(args, 1 if "fail" in dict(rows).values() else 0, json.dumps(checks), "")
+        if "headRefOid,statusCheckRollup" in args:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"headRefOid": HEAD, "statusCheckRollup": rollup}), "")
+        meta = {"number": 1, "isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": HEAD}
+        return subprocess.CompletedProcess(args, 0, json.dumps(meta), "")
+
+    if expected == "lands":
+        assert ensure_merge_ready(repo, 1, runner=runner, cwd=".", environment={}, match_head=HEAD) == HEAD
+    else:
+        with pytest.raises(PublishBlocked) as refused:
+            ensure_merge_ready(repo, 1, runner=runner, cwd=".", environment={}, match_head=HEAD)
+        assert str(refused.value).startswith(f"OPSEC: merge refused: {expected}")
+    # The policy is read only from the default branch (no ref), never from the PR head.
+    assert all("ref=" not in call[4] for call in calls if call[1] == "api")
+    assert any(call[1] == "api" and call[4] == f"repos/{repo}/contents/.github/workflows" for call in calls)

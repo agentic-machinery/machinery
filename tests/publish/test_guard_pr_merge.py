@@ -60,6 +60,8 @@ def _advisory_fixture_workflow(monkeypatch):
         return load(path or fixture)
     monkeypatch.setattr(advisory_checks, "load_advisory_checks", reader)
     monkeypatch.setattr(merge_guard, "load_advisory_checks", reader)
+    # pr-merge reads the destination repository's policy; these fakes judge by the fixture.
+    monkeypatch.setattr(merge_guard, "load_repo_advisory_checks", lambda repo, get_json: load(fixture), raising=False)
 
 
 def _load_hook():

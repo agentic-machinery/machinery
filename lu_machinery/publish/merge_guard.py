@@ -9,10 +9,12 @@ from collections.abc import Callable
 from urllib.parse import parse_qs, quote
 
 from lu_machinery.ci.advisory_checks import (
+    AdvisoryChecks,
     external_advisory_check,
     is_advisory,
     is_external_advisory_run,
     load_advisory_checks,
+    load_repo_advisory_checks,
 )
 from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
@@ -234,22 +236,23 @@ def _parse_status_rollup_rows(
 
 
 def _judge_status_rollup_rows(
-    rows: object, *, advisory: frozenset[str] = frozenset()
+    rows: object, *, advisory: frozenset[str] = frozenset(), policy: AdvisoryChecks | None = None
 ) -> tuple[list[str], list[str], int] | None:
     """``(failing, pending, judged)``: ``judged`` counts the checks proven blocking, whatever their result.
 
     Advisory checks, proven external advisory runs and unexpanded matrix parents are
     not judged, so a head carrying only those has ``judged == 0``. A judged row named
     like an advisory job (its workflow identity missing or another workflow's) still
-    blocks on failure but proves no blocking check. With the advisory policy unavailable
-    (no product checkout, or an unreadable ci.yml) every row is blocking, as the loader states.
+    blocks on failure but proves no blocking check. ``policy`` is the advisory policy to judge
+    by (pr-merge passes the destination repository's); without one, the local ci.yml's, and
+    with that unavailable every row is blocking, as the loader states.
     """
     # Only a list is a check collection; null, {}, "" or false establish nothing.
     if not isinstance(rows, list):
         return None
     if not rows:
         return [], [], 0
-    policy = load_advisory_checks()
+    policy = load_advisory_checks() if policy is None else policy
     named = []
     for row in rows:
         if not isinstance(row, dict):
@@ -292,13 +295,15 @@ def bound_rollup_states(
 
 
 def bound_rollup_judgment(
-    bound: object, head: object, repo: object, get_json: Callable[[str], object]
+    bound: object, head: object, repo: object, get_json: Callable[[str], object],
+    *, policy: AdvisoryChecks | None = None,
 ) -> tuple[list[str], list[str], int] | None:
     """Judge a ``headRefOid,statusCheckRollup`` read whose own head is the judged ``head``.
 
     The rollup and its head arrive in one response, so the judged rows, the App
     provenance and the judged PR head are one commit. A missing, malformed or different
-    head (the PR moved since its metadata was read) is unverifiable, never proof.
+    head (the PR moved since its metadata was read) is unverifiable, never proof. ``policy``
+    is as in :func:`_judge_status_rollup_rows`.
     """
     if (
         not isinstance(bound, dict)
@@ -314,7 +319,7 @@ def bound_rollup_judgment(
         return None
     # gh's rollup omits workflow/app identity. Both supersession and a single
     # advisory candidate need check runs joined to exact-head Actions runs.
-    policy = load_advisory_checks()
+    policy = load_advisory_checks() if policy is None else policy
     if isinstance(rows, list) and any(
         isinstance(row, dict) and row.get("name") and not row.get("workflowName")
         and (_duplicate_check_names(rows) or row["name"] in policy.names) for row in rows
@@ -349,7 +354,7 @@ def bound_rollup_judgment(
         rows = project_check_runs(runs) + [row for row in rows if row.get("__typename") != "CheckRun"]
         if external_advisory_names(rows) != names:
             advisory = prove_external_advisory(repo, head, external_advisory_names(rows), get_json)
-    return None if advisory is None else _judge_status_rollup_rows(rows, advisory=advisory)
+    return None if advisory is None else _judge_status_rollup_rows(rows, advisory=advisory, policy=policy)
 
 
 def _duplicate_check_names(rows):
@@ -400,6 +405,8 @@ def parse_checks(rows):
 
 # pr-merge's refusal for a head with no blocking check; guard-pr-merge.py refuses a raw merge with it too.
 NO_CHECKS = "NO_CHECKS: the head has no blocking check"
+# pr-merge's refusal when the destination repository's advisory policy cannot be read.
+ADVISORY_POLICY_UNAVAILABLE = "ADVISORY_POLICY_UNAVAILABLE"
 
 
 def readiness_reason(meta, states):
@@ -422,7 +429,11 @@ def _read_label(endpoint: str) -> str:
     """The class of a guard REST read, without its repository or head."""
     path, _, query = endpoint.partition("?")
     params = parse_qs(query)
-    if path.endswith("/status"):
+    if re.search(r"/contents/\.github/workflows$", path):
+        label = "workflow directory"
+    elif "/contents/.github/workflows/" in path:
+        label = "workflow file"
+    elif path.endswith("/status"):
         label = "commit statuses"
     elif path.endswith("/check-runs"):
         label = "named check runs" if "check_name" in params else "check runs"
@@ -450,6 +461,8 @@ def _collection_shape(label: str) -> Callable[[object], bool]:
     key = {"check runs": "check_runs", "named check runs": "check_runs", "commit statuses": "statuses"}.get(
         label.split(" page ")[0]
     )
+    if label == "workflow directory":
+        return lambda value: isinstance(value, list)
     if key is None:
         return lambda value: isinstance(value, dict)
     return lambda value: (
@@ -507,7 +520,15 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
         )
 
     def bound_states(bound):
-        return bound_rollup_judgment(bound, meta["headRefOid"], repo, get_json)
+        # Judge by the advisory policy of the repository being landed, from its default branch.
+        start = len(failed)
+        policy = load_repo_advisory_checks(repo, get_json)
+        if policy.reason is not None:
+            raise PublishBlocked(
+                f"OPSEC: merge refused: {ADVISORY_POLICY_UNAVAILABLE}: {policy.reason}"
+                + (f" ({failed[start]})" if len(failed) > start else "") + "."
+            )
+        return bound_rollup_judgment(bound, meta["headRefOid"], repo, get_json, policy=policy)
 
     def detail(fallback):
         return f" ({failed[0]})" if failed else f" ({fallback})"

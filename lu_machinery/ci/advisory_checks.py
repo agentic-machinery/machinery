@@ -12,11 +12,14 @@ GitHub App on the exact head; the display name alone grants nothing.
 
 from __future__ import annotations
 
+import base64
 import itertools
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 import yaml
 
@@ -156,31 +159,108 @@ def _job_names(key: str, job: dict) -> set[str]:
     return {_EXPRESSION.sub(lambda expression, row=row: render(expression, row), name) for row in rows}
 
 
+def _parse_workflow(workflow: object) -> AdvisoryChecks:
+    """The advisory allowlist one parsed workflow declares; ValueError for an unsupported shape."""
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict):
+        raise ValueError("workflow jobs must be a mapping")
+    jobs = workflow["jobs"]
+    if any(not isinstance(key, str) or not isinstance(job, dict) for key, job in jobs.items()):
+        raise ValueError("invalid workflow job")
+    if any(dependency not in jobs for job in jobs.values() for dependency in _needs(job)):
+        raise ValueError("unknown workflow dependency")
+    workflow_name = workflow.get("name", ".github/workflows/ci.yml")
+    if not isinstance(workflow_name, str) or not workflow_name or "${{" in workflow_name:
+        raise ValueError("invalid workflow name")
+    if not any(job.get("name", key) == "CI Gate" for key, job in jobs.items()) and not any(
+        "continue-on-error" in job for job in jobs.values()
+    ):
+        # Advisory needs continue-on-error, so a workflow with no such job and no CI Gate declares none.
+        return AdvisoryChecks(workflow=workflow_name)
+    required = _required_jobs(jobs)
+    blocking_names: set[str] = set()
+    advisory_names: set[str] = set()
+    for key, job in jobs.items():
+        names = _job_names(key, job)
+        target = advisory_names if job.get("continue-on-error") is True and key not in required else blocking_names
+        target.update(names)
+    return AdvisoryChecks(frozenset(advisory_names - blocking_names), workflow_name)
+
+
 def load_advisory_checks(path: Path | None = None) -> AdvisoryChecks:
     """Read current ci.yml, reporting failures without leaking file contents."""
     try:
-        workflow = yaml.safe_load((path or (product_root() / ".github/workflows/ci.yml")).read_text(encoding="utf-8"))
-        if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict):
-            raise ValueError("workflow jobs must be a mapping")
-        jobs = workflow["jobs"]
-        if any(not isinstance(key, str) or not isinstance(job, dict) for key, job in jobs.items()):
-            raise ValueError("invalid workflow job")
-        if any(dependency not in jobs for job in jobs.values() for dependency in _needs(job)):
-            raise ValueError("unknown workflow dependency")
-        workflow_name = workflow.get("name", ".github/workflows/ci.yml")
-        if not isinstance(workflow_name, str) or not workflow_name or "${{" in workflow_name:
-            raise ValueError("invalid workflow name")
-        required = _required_jobs(jobs)
-        blocking_names: set[str] = set()
-        advisory_names: set[str] = set()
-        for key, job in jobs.items():
-            names = _job_names(key, job)
-            target = advisory_names if job.get("continue-on-error") is True and key not in required else blocking_names
-            target.update(names)
-        return AdvisoryChecks(frozenset(advisory_names - blocking_names), workflow_name)
+        return _parse_workflow(
+            yaml.safe_load((path or (product_root() / ".github/workflows/ci.yml")).read_text(encoding="utf-8"))
+        )
     except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
         detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
         reason = f"ci.yml advisory checks unavailable: {detail}; all checks treated as blocking"
+        _LOG.warning(reason)
+        return AdvisoryChecks(reason=reason)
+
+
+_REPOSITORY = re.compile(r"[\w.-]+/[\w.-]+", re.ASCII)
+_WORKFLOW_DIRECTORY = ".github/workflows"
+
+
+def _workflow_text(document: object, entry: dict) -> str:
+    """The decoded default-branch file the directory listing named; ValueError otherwise."""
+    if (
+        not isinstance(document, dict)
+        or document.get("type") != "file"
+        or document.get("path") != entry["path"]
+        or not isinstance(entry.get("sha"), str)
+        or not re.fullmatch(r"[0-9a-f]{40}", entry["sha"])
+        or document.get("sha") != entry["sha"]
+        or document.get("encoding") != "base64"
+        or not isinstance(document.get("content"), str)
+    ):
+        raise ValueError(f"{entry['path']} unreadable or changed since the directory listing")
+    return base64.b64decode("".join(document["content"].split()), validate=True).decode("utf-8")
+
+
+def load_repo_advisory_checks(repo: str, get_json: Callable[[str], object]) -> AdvisoryChecks:
+    """The destination repository's policy, from its default-branch CI workflow, or a reason.
+
+    The workflows are the repository's ``required_workflow`` setting (lu_machinery/config/
+    fleet_repos.yaml, default ci.yml), read at the default branch, never the PR head, through
+    ``get_json(endpoint)`` (the caller's GitHub client; None on failure). The directory
+    listing proves which of them exist; one it proves absent declares no advisory job. An
+    unreadable listing or file, a file that changed between the two reads, an unsupported
+    workflow shape, or advisory jobs in more than one workflow is ``reason``: the caller refuses.
+    Errors the caller's reads raise (a refusal, a rate limit) propagate.
+    """
+    try:
+        if not isinstance(repo, str) or not _REPOSITORY.fullmatch(repo) or {".", ".."} & set(repo.split("/")):
+            raise ValueError("invalid repository")
+        from lu_machinery.review.repair_round import RepairRefused, required_workflows
+
+        try:
+            paths = required_workflows(repo)
+        except RepairRefused as exc:
+            raise ValueError(exc.detail) from None
+        listing = get_json(f"repos/{repo}/contents/{_WORKFLOW_DIRECTORY}")
+        if not isinstance(listing, list) or not all(
+            isinstance(entry, dict) and isinstance(entry.get("path"), str) for entry in listing
+        ):
+            raise ValueError("workflow directory unreadable")
+        policies = []
+        for path in paths:
+            entries = [entry for entry in listing if entry["path"] == path]
+            if not entries:
+                continue
+            if len(entries) != 1 or entries[0].get("type") != "file":
+                raise ValueError(f"{path} is not one file")
+            document = get_json(f"repos/{repo}/contents/{quote(path, safe='/')}")
+            policies.append(_parse_workflow(yaml.safe_load(_workflow_text(document, entries[0]))))
+        named = [policy for policy in policies if policy.names]
+        if len(named) > 1:
+            raise ValueError("advisory jobs in more than one workflow")
+        return named[0] if named else AdvisoryChecks()
+    except (yaml.YAMLError, ValueError) as exc:
+        # Only this module's own messages are quoted; a decoder's text could echo file bytes.
+        detail = str(exc) if type(exc) is ValueError else type(exc).__name__
+        reason = f"destination advisory policy unavailable: {detail}"
         _LOG.warning(reason)
         return AdvisoryChecks(reason=reason)
 
