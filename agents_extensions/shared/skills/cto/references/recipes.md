@@ -57,7 +57,7 @@ diff; follow `docs/runbooks/ci-gate.md` for the one evidenced recovery attempt.
 
 ## Host changes
 
-- The machinery release-cut timer stays stopped and disabled: releases are cut when ready by `claude-cto` (`docs/release.md`, PR #1105). A role apply such as `loopback_services` starts it and it fires at once, and the release tool has no lock: apply only while no manual cut is running, then stop and disable the timer again right after the apply.
+- The machinery release-cut timer stays stopped and disabled: releases are cut when ready by `claude-cto` (`docs/release.md`, PR #1105). A role apply such as `loopback_services` starts it and it fires at once, and the release tool has no lock. Skip the timer start before or during the apply; if the apply cannot skip it, defer the apply while a manual cut is running. Then stop and disable the timer again right after the apply, and hold manual cuts until any cut service it started has exited.
 - After swapping a venv's Python, restart every running unit that uses that venv and confirm no process still runs the old interpreter.
 
 ## Reviews
