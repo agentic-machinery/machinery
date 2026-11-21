@@ -676,10 +676,22 @@ def _line_items(line: str) -> list[list[tuple[str, str]]] | None:
             items[-1].append(("word", line[index:end]))
         if end < len(line) and line[end] not in " \t;&<>":
             return None
+        # Bash reads digits glued to `<` or `>` as a descriptor (`>1<<'X'`).
+        if line[end : end + 1] in ("<", ">") and items[-1][-1][1].isdigit():
+            return None
         index = _blank_end(line, end)
     if not items[-1] and len(items) > 1:
         return None
     return items
+
+
+def _device_path(word: str) -> bool:
+    """Whether the word's static spelling has a `dev` or `proc` path component.
+
+    Such a path can be a live stream (`/dev/fd/3`, `/dev/tcp/...`,
+    `/proc/self/fd/1`) rather than a file, also when reached through `cd`.
+    """
+    return any(part in ("dev", "proc") for part in word.replace("'", "").replace('"', "").split("/"))
 
 
 def _setup_item(item: list[tuple[str, str]]) -> bool:
@@ -688,7 +700,7 @@ def _setup_item(item: list[tuple[str, str]]) -> bool:
         return False
     words = [text for _, text in item]
     if words[0] == "cd":
-        return len(words) == 2
+        return len(words) == 2 and not _device_path(words[1])
     if words[0] == "mkdir":
         return len(words) > 1 and all(word == "-p" or not word.startswith("-") for word in words[1:])
     end = _name_end(words[0], 0)
@@ -702,6 +714,8 @@ def _cat_document(item: list[tuple[str, str]]) -> tuple[str, str] | None:
     documents = [token for token in item[1:] if token[0] in ("<<", "<<-")]
     outputs = [token for token in item[1:] if token[0] in (">", ">>")]
     if len(documents) != 1 or len(outputs) > 1 or len(documents) + len(outputs) != len(item) - 1:
+        return None
+    if outputs and _device_path(outputs[0][1]):
         return None
     return documents[0]
 

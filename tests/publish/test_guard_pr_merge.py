@@ -2724,6 +2724,8 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
         ("A=/tmp/a; sh -s <<EOF\ngh pr merge 5\nEOF", ["CI Gate"], 2),
         ("A=/tmp/a; python3 - <<'EOF'\nimport os; os.system('gh pr merge 5')\nEOF", ["CI Gate"], 2),
         ("A=/tmp/a; cat <<'EOF' | bash\ngh pr merge 5\nEOF", ["CI Gate"], 2),
+        # A closer with a trailing blank is not a closer, even at the end of the text.
+        ("A=/tmp/a; cat > \"$A/b.md\" <<'EOF'\nLand with `gh pr merge 5` now.\nEOF ", ["CI Gate"], 2),
     ],
 )
 def test_interpreter_heredoc_merge_bypass_refused(monkeypatch, command, failures, expected):

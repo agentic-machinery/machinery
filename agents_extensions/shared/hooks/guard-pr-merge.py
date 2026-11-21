@@ -1761,8 +1761,9 @@ def main() -> int:
         sys.stderr.write(_block_msg("malformed hook command", "Provide a literal Bash command for review."))
         return 2
     # A body that Bash certainly hands to `cat` is data (C-6323); every other
-    # body stays in the text the checks below read.
-    command = drop_literal_cat_bodies(_command(payload))
+    # body stays in the text the checks below read. The helper reads the raw
+    # text, before _command's strip, so trimming cannot complete a closer.
+    command = drop_literal_cat_bodies((payload.get("tool_input") or {}).get("command") or "").strip()
     if not _merge_candidate(command):
         return 0
     # Each segment arrives carrying the cwd it runs in, so a PR number is judged in the
