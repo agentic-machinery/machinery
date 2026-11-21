@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import base64
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -1015,3 +1015,147 @@ def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path) -> None:
     for repo in private:
         assert allowed_report["repositories"][repo.key]["fleet_security"]["state"] == "missing_enrollment"
         assert any(f"repos/{repo.github}/contents/.github/workflows" in call for call in allowed.calls)
+
+
+# The job names and conclusions of one real run whose workflow file calls fleet-security from two
+# caller jobs, "Fleet security" and "Python dependencies" (16 jobs, two gates, all annotation lists empty).
+_TWO_CALLER_JOBS: tuple[tuple[str, str], ...] = (
+    ("Fleet security / actionlint", "success"),
+    ("Fleet security / ShellCheck", "success"),
+    ("Fleet security / Trivy dependencies and licences", "success"),
+    ("Fleet security / Secret scan (TruffleHog)", "success"),
+    ("Python dependencies / Trivy dependencies and licences", "success"),
+    ("Fleet security / zizmor", "success"),
+    ("Python dependencies / actionlint", "skipped"),
+    ("Python dependencies / Trivy IaC and misconfiguration", "skipped"),
+    ("Python dependencies / ShellCheck", "skipped"),
+    ("Fleet security / Trivy IaC and misconfiguration", "skipped"),
+    ("Python dependencies / zizmor", "skipped"),
+    ("Python dependencies / Trivy container image", "skipped"),
+    ("Fleet security / Trivy container image", "skipped"),
+    ("Python dependencies / Secret scan (TruffleHog)", "skipped"),
+    ("Fleet security / Fleet security gate", "success"),
+    ("Python dependencies / Fleet security gate", "success"),
+)
+_TWO_CALLER_WORKFLOW = (
+    "name: Security\n"
+    "on: [push]\n"
+    "jobs:\n"
+    "  fleet-security:\n"
+    "    name: Fleet security\n"
+    f"    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{_PIN}\n"
+    "  python-dependencies:\n"
+    "    name: Python dependencies\n"
+    f"    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{_PIN}\n"
+)
+
+
+def _caller_run_scan(
+    jobs: Sequence[tuple[str, str]],
+    annotations: dict[str, list[dict[str, Any]]],
+    *,
+    workflow: str = _TWO_CALLER_WORKFLOW,
+) -> dict[str, Any]:
+    """Read one enrolled repository whose latest run has ``jobs``; ``annotations`` is keyed by job name."""
+    repo = FleetRepo(key="fixture", github="org/fixture", local_name="fixture", role="public-app", default=True)
+    check_ids = {name: 100 + index for index, (name, _conclusion) in enumerate(jobs)}
+    rows_by_check = {check_ids[name]: rows for name, rows in annotations.items()}
+
+    def respond(endpoint: str) -> Result:
+        path = endpoint.split("?", 1)[0]
+        if path == "repos/org/fixture/contents/.github/workflows/security.yml":
+            return Result(status=200, value=_workflow_file(workflow))
+        if path == "repos/org/fixture/actions/runs/5/jobs":
+            job_rows = [
+                {
+                    "id": check_ids[name],
+                    "name": name,
+                    "conclusion": conclusion,
+                    "check_run_url": f"https://api.github.com/repos/org/fixture/check-runs/{check_ids[name]}",
+                }
+                for name, conclusion in jobs
+            ]
+            return Result(status=200, value={"total_count": len(job_rows), "jobs": job_rows})
+        if path.startswith("repos/org/fixture/check-runs/") and path.endswith("/annotations"):
+            return Result(status=200, value=rows_by_check.get(int(path.split("/")[4]), []))
+        response = _clean_fleet(endpoint, repo.github)
+        assert response is not None, endpoint
+        return response
+
+    return read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0)
+
+
+def test_two_caller_run_with_clean_gates_reads_zero_findings() -> None:
+    """Defect class: a run with two fleet-security callers, each with one successful gate, refused as no_fleet_security_jobs."""
+    evidence = _caller_run_scan(_TWO_CALLER_JOBS, {})
+    assert (evidence["state"], evidence["reason"]) == ("zero_findings", None)
+    assert evidence["findings"] == []
+    assert [run["gate_conclusion"] for run in evidence["runs"]] == ["success"]
+
+
+def test_two_caller_run_attributes_findings_to_their_caller() -> None:
+    """Defect class: one caller's findings dropped, refused, or attributed to the other caller of the same run."""
+    jobs = tuple(
+        (name, "failure")
+        if name in {"Python dependencies / ShellCheck", "Python dependencies / Fleet security gate"}
+        else (name, conclusion)
+        for name, conclusion in _TWO_CALLER_JOBS
+    )
+    runner_line = {"annotation_level": "failure", "path": ".github", "message": "Process completed with exit code 1."}
+    evidence = _caller_run_scan(
+        jobs,
+        {
+            "Python dependencies / ShellCheck": [
+                {"annotation_level": "failure", "message": "ShellCheck SC2086 (warning) at scripts/run.sh:10:1"},
+                runner_line,
+            ],
+            "Python dependencies / Fleet security gate": [
+                {
+                    "annotation_level": "failure",
+                    "message": "Job shellcheck finished with result failure, expected success",
+                },
+                runner_line,
+            ],
+        },
+    )
+    assert (evidence["state"], evidence["reason"]) == ("findings", None)
+    gate_job_id = next(index for index, (name, _) in enumerate(jobs) if name == "Python dependencies / Fleet security gate")
+    assert [
+        (item["caller"], item["caller_gate_job_id"], item["scanner"], item["rule"], item["location"])
+        for item in evidence["findings"]
+    ] == [("Python dependencies", 100 + gate_job_id, "shellcheck", "SC2086", "scripts/run.sh:10")]
+    assert [run["gate_conclusion"] for run in evidence["runs"]] == ["failure"]
+    table_row = next(
+        line for line in alerts_module._render_fleet_section(evidence) if "SC2086" in line and line.startswith("|")
+    )
+    assert table_row.startswith(f"| `Python dependencies` gate job `{100 + gate_job_id}` | `shellcheck` |")
+
+
+@pytest.mark.parametrize("finding", [False, True], ids=["clean", "finding"])
+def test_single_caller_run_keeps_its_state(finding: bool) -> None:
+    """Control: a run with one fleet-security caller reads the same state as before per-caller grouping."""
+    jobs = tuple((name, conclusion) for name, conclusion in _TWO_CALLER_JOBS if name.startswith("Fleet security / "))
+    annotations: dict[str, list[dict[str, Any]]] = {}
+    if finding:
+        jobs = tuple(
+            (name, "failure")
+            if name in {"Fleet security / ShellCheck", "Fleet security / Fleet security gate"}
+            else (name, conclusion)
+            for name, conclusion in jobs
+        )
+        annotations = {
+            "Fleet security / ShellCheck": [
+                {"annotation_level": "failure", "message": "ShellCheck SC2086 (warning) at scripts/run.sh:10:1"}
+            ],
+            "Fleet security / Fleet security gate": [
+                {
+                    "annotation_level": "failure",
+                    "message": "Job shellcheck finished with result failure, expected success",
+                }
+            ],
+        }
+    evidence = _caller_run_scan(jobs, annotations, workflow=_enrolled_workflow())
+    assert evidence["state"] == ("findings" if finding else "zero_findings")
+    assert evidence["reason"] is None
+    assert [item["caller"] for item in evidence["findings"]] == (["Fleet security"] if finding else [])
+    assert [run["gate_conclusion"] for run in evidence["runs"]] == ["failure" if finding else "success"]
