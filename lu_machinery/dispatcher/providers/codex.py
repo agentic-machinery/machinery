@@ -3,6 +3,7 @@
 import copy
 import functools
 import hashlib
+import io
 import json
 import logging
 import os
@@ -10,10 +11,13 @@ import re
 import time
 import unicodedata
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from uuid import UUID
 
 from lu_machinery.agent_runtime.adapters.codex import _sources_read_only_flags
-from lu_machinery.agent_runtime.adapters.codex_events import classify_provider_message
-from lu_machinery.agent_runtime.attempt_safe_read import safe_read_attempt_file
+from lu_machinery.agent_runtime.adapters.codex_events import classify_provider_message, codex_outcome, parse_exec_stream
+from lu_machinery.agent_runtime.attempt_safe_read import AttemptReadError, safe_read_attempt_file
 from lu_machinery.agent_runtime.sources_read_only import sources_tool_sets
 from lu_machinery.common import json_depth
 from lu_machinery.common.jsonl import jsonl_lines
@@ -34,6 +38,7 @@ def _openai_structured_output_forbidden_keywords() -> frozenset[str]:
 
 # Failure codes (agent_runtime) for a provider that cannot take the run now: usage limits and no capacity.
 _OUT_OF_CAPACITY = frozenset({"rate_limited", "provider_overloaded"})
+_POLICY_REFUSALS = frozenset({"cyber_policy", "bio_policy", "misalignment_policy_violation"})
 _STDERR_EXCERPT = 500
 # A terminal style prefix can end immediately before the first diagnostic word.
 _STDERR_CAUSE_START = r"(?:\b|(?:\x1b\[|\x9b)[0-9;:]*m)"
@@ -271,6 +276,69 @@ def build(spec: TaskSpec, env: dict[str, str]) -> Invocation:
     else:
         raise ValueError(f"codex: unsupported mode {spec.mode!r}")
     return Invocation(argv, spec.prompt_file.read_bytes(), child_env, spec.final_file)
+
+
+def terminal_rollout_policy_code(stdout: str, codex_home: Path) -> str | None:
+    """Read the typed policy refusal for the one fresh turn bound to this exec stream."""
+    stream = parse_exec_stream(stdout)
+    outcome = codex_outcome(stream, resumed_session_id=None)
+    if outcome.state != "failed" or outcome.thread_id is None or stream.turns_started != 1:
+        return None
+    thread = UUID(outcome.thread_id)
+    if thread.version != 7:
+        return None
+
+    # Codex names the rollout by local creation date and the fresh thread ID.
+    # The high 48 bits of UUIDv7 give UTC milliseconds (RFC 9562 §5.7).
+    try:
+        created = datetime.fromtimestamp((thread.int >> 80) / 1000, UTC).date()
+        rollout = None
+        for day_offset in (-1, 0, 1):
+            day = created + timedelta(days=day_offset)
+            directory = codex_home / "sessions" / f"{day:%Y/%m/%d}"
+            for candidate in directory.glob(f"rollout-*-{thread}.jsonl"):
+                if rollout is not None:
+                    return None
+                rollout = candidate
+        if rollout is None:
+            return None
+        body = safe_read_attempt_file(rollout, trusted_root=codex_home)
+        return _rollout_policy_code(body, str(thread))
+    except (AttemptReadError, OSError, OverflowError, ValueError, RecursionError):
+        return None
+
+
+def _rollout_policy_code(body: bytes, thread_id: str) -> str | None:
+    # Require the one complete turn of the fresh thread. A later resume can append
+    # to this file even though its output is absent from this invocation's stdout.
+    if not body.endswith(b"\n"):
+        return None
+    turn_id: str | None = None
+    code: object = None
+    terminal_seen = False
+    for index, line in enumerate(io.BytesIO(body)):
+        if terminal_seen:
+            return None
+        event = json_depth.loads(line, max_depth=512)
+        payload = event.get("payload") if isinstance(event, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        if index == 0:
+            if event.get("type") != "session_meta" or payload.get("id") != thread_id:
+                return None
+        elif event.get("type") == "event_msg":
+            kind = payload.get("type")
+            if kind in ("task_started", "turn_started"):
+                if turn_id is not None or not isinstance(payload.get("turn_id"), str):
+                    return None
+                turn_id = payload["turn_id"]
+            elif kind in ("task_complete", "turn_complete"):
+                if turn_id is None or payload.get("turn_id") != turn_id:
+                    return None
+                terminal_seen = True
+                error = payload.get("error")
+                code = error.get("codex_error_info") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and code in _POLICY_REFUSALS else None
 
 
 def parse(stdout: str, stderr: str, returncode: int, final_text: str | None) -> ParsedResult:
