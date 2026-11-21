@@ -1344,7 +1344,8 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     if reason:
         return reason
     if _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
-        paths = re.findall(r"[\"']([^\"']+)[\"']", program)
+        # Pair each literal with its own delimiter: an apostrophe inside "it's" must not end it.
+        paths = [match["value"] for match in _PROGRAM_STRINGS.finditer(program)]
         if any(_normalized_path(path) in dumped_files for path in paths):
             return "inline program would display a redirected environment dump"
     return None
@@ -2010,7 +2011,31 @@ def _scan_command(
     # parser cannot strip an exotic here-doc on a second pass.
     executable = preprocess_shell_command(command)
     executable, substitutions = _hide_substitutions(executable)
-    for pipeline in _pipelines(executable):
+    # Scan both tokenizations, as _process_facts does. Quote fragments show an
+    # expansion inside a mixed-quote word (`'a'\'"$X"'b'`); shell words keep one
+    # operand per redirect, here-string or option value (`env 2> \''err'`).
+    fragments = _pipelines(executable)
+    words = _pipelines(executable, shell_words=True)
+    passes = [(fragments, copied, named)]
+    if words != fragments:
+        passes.append((words, set(copied), dict(named)))
+    for pipelines, pass_copied, pass_named in passes:
+        reason = _scan_pipelines(pipelines, pass_copied, pass_named, dumped_files, documents, substitutions, depth)
+        if reason:
+            return reason
+    return None
+
+
+def _scan_pipelines(
+    pipelines: list[list[list[str]]],
+    copied: set[str],
+    named: dict[str, str],
+    dumped_files: set[str],
+    documents: dict[str, list[tuple[str, bool]]],
+    substitutions: dict[str, tuple[str, str]],
+    depth: int,
+) -> str | None:
+    for pipeline in pipelines:
         reason = _danger_reason(pipeline, copied, named, dumped_files, documents, substitutions, depth)
         if reason:
             return reason
