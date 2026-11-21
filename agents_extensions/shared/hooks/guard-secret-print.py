@@ -81,6 +81,7 @@ import os
 import re
 import shlex
 import sys
+from collections.abc import Callable
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -107,7 +108,7 @@ except Exception as exc:
     print(f"guard dependency unavailable: json_depth ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
 # Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
-# Set only while _folded_simple_command_reason rescans a command main could not parse.
+# Set only while _folded_simple_command_check rereads a command main could not parse.
 _FOLD_APOSTROPHES: contextvars.ContextVar[bool] = contextvars.ContextVar("fold_apostrophes", default=False)
 _PAYLOAD_MAX_DEPTH = 512
 
@@ -2057,43 +2058,63 @@ _PYTHON_PLAIN_OPTIONS = frozenset({"-B", "-E", "-I", "-O", "-OO", "-P", "-q", "-
 
 
 def _runs_no_inline_program(cmd: str, args: list[str]) -> bool:
-    """Whether an interpreter runs a module or script file rather than program text from its words."""
+    """Whether an interpreter runs a module or script file rather than program text from its words.
+
+    Every word up to and including the module or script name must be literal: an
+    expansion there (`"$DOC"`) could become an option that selects program text.
+    """
     if not _is_python_command(cmd):
         return False
-    for arg in (_strip_quotes(arg) for arg in args):
-        if arg == "-m" or not arg.startswith("-"):
+    for index, raw in enumerate(args):
+        if not _is_single_quoted(raw) and re.search(r"[$`\\*?\[\]{}~!]", raw):
+            return False
+        arg = _strip_quotes(raw)
+        if arg == "-m":
+            return index + 1 < len(args) and (
+                _is_single_quoted(args[index + 1]) or not re.search(r"[$`\\*?\[\]{}~!]", args[index + 1])
+            )
+        if not arg.startswith("-"):
             return True
         if arg not in _PYTHON_PLAIN_OPTIONS:
             return False
     return False  # no module or script: the program comes from stdin
 
 
-def _folded_simple_command_reason(command: str) -> tuple[bool, str | None]:
-    """Rescan a command main could not parse with `'\\''` apostrophes folded.
+def _is_folded_simple_command(command: str) -> bool:
+    """Whether command, read with `'\\''` folded, is one simple command that reads no word as code.
 
-    Return (False, None) unless the folded command is one simple command whose
-    quote fragments are its exact shell words, with no wrapper, assignment,
+    Its quote fragments must be its exact shell words, with no wrapper, assignment,
     redirect, substitution or here-document, and no word the guard reads as code
-    (no shell, eval or source, no interpreter program text). Otherwise return
-    (True, reason) from the ordinary scan of the folded words. Everything else
-    keeps main's refusal: its readers are not exact once such a command parses.
+    (no shell, eval or source, no interpreter program text). Call with the fold on.
+    """
+    try:
+        executable, substitutions = _hide_substitutions(preprocess_shell_command(command))
+    except ShellPreprocessLimit:
+        return False
+    if substitutions or _heredoc_inputs(command):
+        return False
+    words = _pipelines(executable, shell_words=True)
+    if _pipelines(executable) != words or len(words) != 1 or len(words[0]) != 1:
+        return False
+    segment = words[0][0]
+    found = _command_at(segment)
+    if found is None or found[2] != 0 or _raw_without_redirects(segment) != segment:
+        return False
+    cmd, args, _ = found
+    return not (cmd in SHELL_COMMANDS or (_is_interpreter_command(cmd) and not _runs_no_inline_program(cmd, args)))
+
+
+def _folded_simple_command_check[T](command: str, check: Callable[[str], T]) -> tuple[bool, T | None]:
+    """Run check on command with `'\\''` folded, when it is a folded simple command.
+
+    Main's readers are not exact once any other command with `'\\''` parses, so
+    every other command keeps main's result; (False, None) says so.
     """
     token = _FOLD_APOSTROPHES.set(True)
     try:
-        executable, substitutions = _hide_substitutions(preprocess_shell_command(command))
-        if substitutions or _heredoc_inputs(command):
+        if not _is_folded_simple_command(command):
             return False, None
-        words = _pipelines(executable, shell_words=True)
-        if _pipelines(executable) != words or len(words) != 1 or len(words[0]) != 1:
-            return False, None
-        segment = words[0][0]
-        found = _command_at(segment)
-        if found is None or found[2] != 0 or _raw_without_redirects(segment) != segment:
-            return False, None
-        cmd, args, _ = found
-        if cmd in SHELL_COMMANDS or (_is_interpreter_command(cmd) and not _runs_no_inline_program(cmd, args)):
-            return False, None
-        return True, _scan_command(command, set())
+        return True, check(command)
     finally:
         _FOLD_APOSTROPHES.reset(token)
 
@@ -2147,6 +2168,10 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
 
     process_facts = _process_facts(command)
+    if "limit" in process_facts:
+        folded, folded_facts = _folded_simple_command_check(command, _process_facts)
+        if folded and folded_facts is not None:
+            process_facts = folded_facts
     if "pkill" in process_facts or {"pgrep", "kill"} <= process_facts:
         sys.stderr.write(_process_block_msg("full-command-line process kills can match the invoking shell"))
         return 2
@@ -2160,7 +2185,7 @@ def _main(argv: list[str] | None = None) -> int:
     try:
         reason = _scan_command(command, set())
         if reason in _UNPARSEABLE:
-            folded, folded_reason = _folded_simple_command_reason(command)
+            folded, folded_reason = _folded_simple_command_check(command, lambda text: _scan_command(text, set()))
             if folded:
                 reason = folded_reason
     except ShellPreprocessLimit:
