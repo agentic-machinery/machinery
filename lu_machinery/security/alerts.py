@@ -592,10 +592,12 @@ class _UnreadableAnnotation(Exception):
 
 # Failure annotations that are not findings: the runner's line for a failed step, the gate's
 # line for a scanner job that failed, and the TruffleHog count header. They are skipped only
-# because a failed scanner job must still yield at least one finding (_read_caller_evidence).
+# because _read_caller_evidence checks every job conclusion against its findings and the
+# gate's failure lines against the failed scanner jobs.
+_GATE_FAILURE_LINE_RE = re.compile(r"Job [A-Za-z0-9_-]+ finished with result failure, expected success")
 _CONTEXT_ANNOTATION_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"Process completed with exit code [0-9]{1,3}\."),
-    re.compile(r"Job [A-Za-z0-9_-]+ finished with result failure, expected success"),
+    _GATE_FAILURE_LINE_RE,
     re.compile(r"TruffleHog reported [0-9]+ finding\(s\)\. Secret values are redacted from this log\."),
 )
 
@@ -1051,14 +1053,27 @@ def _read_caller_evidence(
     if not isinstance(gate_conclusion, str):
         return None, [], "github_invalid_payload"
     record = {**record, "gate_conclusion": gate_conclusion}
+    # A cancelled, timed-out or skipped gate never checked the scanner jobs.
+    if gate_conclusion not in {"success", "failure"}:
+        return record, [], "run_not_success"
     findings: list[dict[str, Any]] = []
+    failed_scanners = 0
+    gate_failure_lines = 0
     for job in jobs:
         job_name = job.get("name")
         if not isinstance(job_name, str) or not any(_is_fleet_job(job_name, expected) for expected in _FLEET_JOB_NAMES):
             continue
-        # A skipped scanner did not run. The gate conclusion is what says whether that skip was expected.
-        if job.get("conclusion") == "skipped":
-            continue
+        is_gate = _is_fleet_job(job_name, _FLEET_GATE_JOB)
+        conclusion = job.get("conclusion")
+        if not is_gate:
+            # A skipped scanner did not run. The gate's result lines say whether that skip was expected.
+            if conclusion == "skipped":
+                continue
+            # A cancelled, timed-out or unfinished scanner may have stopped part-way through its targets.
+            if conclusion not in {"success", "failure"}:
+                return record, [], "scanner_incomplete"
+            if conclusion == "failure":
+                failed_scanners += 1
         annotations_endpoint = _annotation_endpoint(owner, name, job.get("check_run_url"))
         if annotations_endpoint is None:
             return None, [], "annotations_unreadable"
@@ -1085,7 +1100,11 @@ def _read_caller_evidence(
                 level = row.get("annotation_level", "")
                 if not isinstance(level, str):
                     return None, [], "annotations_unreadable"
-                if level in {"warning", "notice"} or _is_context_annotation(row.get("message")):
+                if level in {"warning", "notice"}:
+                    continue
+                if _is_context_annotation(row.get("message")):
+                    if is_gate and _GATE_FAILURE_LINE_RE.fullmatch(row["message"]):
+                        gate_failure_lines += 1
                     continue
                 try:
                     parsed = _parse_oss_finding(row.get("message"))
@@ -1099,13 +1118,16 @@ def _read_caller_evidence(
                     return None, [], "pagination_limit"
         # A scanner that failed without a finding line failed for another reason. Its evidence is
         # missing, so another job's findings must not read as the complete list.
-        if (
-            not _is_fleet_job(job_name, _FLEET_GATE_JOB)
-            and job.get("conclusion") != "success"
-            and job_findings == 0
-        ):
+        if not is_gate and conclusion == "failure" and job_findings == 0:
             return record, [], "scanner_failed_without_findings"
+        # Every fleet scanner exits non-zero on a finding, so a successful job with one is inconsistent.
+        if not is_gate and conclusion == "success" and job_findings:
+            return record, [], "scanner_conclusion_mismatch"
     if findings:
+        # The gate must have run its check and named each failed scanner, which also confirms
+        # that every skipped scanner was expected to skip.
+        if gate_conclusion != "failure" or gate_failure_lines != failed_scanners:
+            return record, [], "run_not_success"
         return record, findings, None
     if gate_conclusion != "success":
         return record, [], "run_not_success"

@@ -550,10 +550,23 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
             "noisy": _repo_row("org/noisy"),
             "foreign": _repo_row("org/foreign"),
             "partial": _repo_row("org/partial"),
+            "cancelled": _repo_row("org/cancelled"),
+            "unconfirmed": _repo_row("org/unconfirmed"),
+            "midway": _repo_row("org/midway"),
+            "contradiction": _repo_row("org/contradiction"),
         },
     )
     # GitHub adds this failure annotation to every failed step (observed on real fleet-security jobs).
     runner_line = {"annotation_level": "failure", "path": ".github", "message": "Process completed with exit code 1."}
+    gate_failure = {"annotation_level": "failure", "message": "Job shellcheck finished with result failure, expected success"}
+    # Conclusion class: (ShellCheck conclusion, gate conclusion, gate annotations, expected reason).
+    # One ShellCheck finding is served each time; none of these runs is a complete finding list.
+    conclusion_cases: dict[str, tuple[str, str, list[dict[str, Any]], str]] = {
+        "cancelled": ("failure", "cancelled", [], "run_not_success"),
+        "unconfirmed": ("failure", "failure", [runner_line], "run_not_success"),
+        "midway": ("timed_out", "failure", [gate_failure, runner_line], "scanner_incomplete"),
+        "contradiction": ("success", "success", [], "scanner_conclusion_mismatch"),
+    }
     dirty_annotations = [
         {"message": "ShellCheck SC2086 (warning) at scripts/run.sh:10:1"},
         {"message": "ShellCheck SC2000 (error) at ../secrets.sh:1:1"},
@@ -620,6 +633,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
             "repos/org/noisy",
             "repos/org/foreign",
             "repos/org/partial",
+            *(f"repos/org/{key}" for key in conclusion_cases),
         }:
             return Result(status=200, value={"default_branch": "main"})
         if path == "repos/org/missing/contents/.github/workflows":
@@ -653,6 +667,24 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
                     _job("org/dirty", 9, "fleet-security / Fleet security gate", "failure", 9),
                 ],
             )
+        case_key = path.split("/")[2] if path.startswith("repos/org/") else ""
+        if case_key in conclusion_cases:
+            scanner_conclusion, gate_conclusion, gate_rows, _reason = conclusion_cases[case_key]
+            slug = f"org/{case_key}"
+            if path == f"repos/{slug}/actions/runs/5/jobs":
+                return _jobs(
+                    slug,
+                    conclusion=gate_conclusion,
+                    total=2,
+                    jobs=[
+                        _job(slug, 20, "fleet-security / ShellCheck", scanner_conclusion, 20),
+                        _job(slug, 21, "fleet-security / Fleet security gate", gate_conclusion, 21),
+                    ],
+                )
+            if path == f"repos/{slug}/check-runs/20/annotations":
+                return Result(status=200, value=[{"message": "ShellCheck SC2086 (warning) at scripts/run.sh:10:1"}])
+            if path == f"repos/{slug}/check-runs/21/annotations":
+                return Result(status=200, value=gate_rows)
         if path == "repos/org/partial/actions/runs/5/jobs":
             return _jobs(
                 "org/partial",
@@ -690,8 +722,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         if path == "repos/org/dirty/check-runs/8/annotations":
             return Result(status=200, value=dirty_annotations)
         if path == "repos/org/dirty/check-runs/9/annotations":
-            gate_line = {"annotation_level": "failure", "message": "Job shellcheck finished with result failure, expected success"}
-            return Result(status=200, value=[gate_line, runner_line])
+            return Result(status=200, value=[gate_failure, runner_line])
         if path == "repos/org/broken/check-runs/11/annotations":
             return Result(status=200, value=[runner_line])
         if path == "repos/org/noisy/check-runs/12/annotations":
@@ -713,6 +744,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         "noisy": "inaccessible_evidence",
         "foreign": "inaccessible_evidence",
         "partial": "inaccessible_evidence",
+        **dict.fromkeys(conclusion_cases, "inaccessible_evidence"),
     }
     assert report["source_ok"] is True
     missing = report["repositories"]["missing"]["fleet_security"]
@@ -732,6 +764,9 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     assert report["repositories"]["foreign"]["fleet_security"]["reason"] == "github_invalid_next_link"
     assert report["repositories"]["partial"]["fleet_security"]["reason"] == "scanner_failed_without_findings"
     assert report["repositories"]["partial"]["fleet_security"]["findings"] == []
+    for key, (*_conclusions, reason) in conclusion_cases.items():
+        assert report["repositories"][key]["fleet_security"]["reason"] == reason, key
+        assert report["repositories"][key]["fleet_security"]["findings"] == [], key
     assert not any("evil/other" in call for call in client.calls)
     findings = report["repositories"]["dirty"]["fleet_security"]["findings"]
     assert [item["rule"] for item in findings] == [
