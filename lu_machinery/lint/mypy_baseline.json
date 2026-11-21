@@ -1724,11 +1724,6 @@
     },
     {
       "path": "lu_machinery/api/state_router.py",
-      "code": "return-value",
-      "message": "Incompatible return value type (got \"dict[str, Any] | dict[str, None | bool | str] | str\", expected \"float\")"
-    },
-    {
-      "path": "lu_machinery/api/state_router.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | bool | dict[Any, Any] | str\" has no attribute \"get\""
     },
@@ -3990,11 +3985,6 @@
     {
       "path": "lu_machinery/fleet/capacity_pick.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"shared_usage_agents\" has incompatible type \"Any | None | dict[str, Any]\"; expected \"Mapping[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/fleet/capacity_pick.py",
-      "code": "arg-type",
       "message": "Argument 3 to \"_mirror_retired_quota\" has incompatible type \"Any | None | dict[Any, Any]\"; expected \"dict[str, Any]\""
     },
     {
@@ -4046,21 +4036,6 @@
       "path": "lu_machinery/fleet/credit_lane.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"dict[str, Any]\""
-    },
-    {
-      "path": "lu_machinery/fleet/credit_lane.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/fleet/credit_lane.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/fleet/credit_lane.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
     {
       "path": "lu_machinery/fleet/credit_lane.py",

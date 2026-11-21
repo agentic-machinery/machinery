@@ -824,18 +824,17 @@ def _scenario_info(scenario: str) -> dict:
 
 
 def _origin_main_row(lane: str, scenario: str) -> dict:
-    """Captured 2026-10-02 rows, with the #10959 DeepSeek coding-policy update."""
+    """Captured 2026-10-02 rows, updated for #1120 AC-03 (Grok+Cursor one meter; DeepSeek out of CODE_LANES)."""
     healthy = scenario == "plan_healthy"
     retired = {"gemini": "agy", "glm": "cursor"}.get(lane)
-    if lane == "deepseek":
-        # #10959: fresh prepaid funding supplies the status independently of plan scenarios.
-        status, avoid, notes = "cool", False, "idle"
-    elif healthy:
+    if healthy:
         status, avoid = "cool", retired is not None
         notes = f"AVOID; retired→{retired}" if retired else "idle"
     else:
         status, avoid = "near_cap", True
         notes = f"AVOID; retired→{retired}; near_cap" if retired else "AVOID; near_cap"
+    if lane == "cursor":
+        notes = f"meter:grok+cursor; {notes}"
     return {
         "lane": lane,
         "status": status,
@@ -869,13 +868,15 @@ def test_lanes_without_credit_policy_keep_origin_main_rows(scenario):
         row["lane"]: row
         for row in capacity_pick.build_lane_rows(budget, active_in_flight={}, reset_reserve=unavailable_reserve())
     }
-    assert set(rows) == set(capacity_pick.CODE_LANES)
-    for lane in capacity_pick.CODE_LANES:
+    expected_lanes = set(capacity_pick.CODE_LANES) - {"grok"}
+    assert set(rows) == expected_lanes
+    for lane in expected_lanes:
         if lane == "codex":
             continue
         row = dict(rows[lane])
         assert row.pop("credit") == {"state": "not_configured"}
         assert row.pop("projected_unused_pct") == projected_unused_pct(row["remaining_pct"], row["will_last"])
+        row.pop("pace_forecast")
         # #9740 additive row facts; the origin/main fields stay byte-identical.
         facts = row.pop("routing_facts")
         assert row.pop("capacity")["state"] == ("avoid" if row["avoid"] else "verified")

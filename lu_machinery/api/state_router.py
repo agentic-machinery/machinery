@@ -37,6 +37,7 @@ from lu_machinery.fleet.reset_reserve import (
     codex_reset_reserve_eligible,
     load_reset_reserve,
 )
+from lu_machinery.fleet.routing_policy import API_KEY_LANES
 from lu_machinery.research.registry import research_manifest_component
 from lu_machinery.telemetry.cost_report import CostRecord, load_cost_records
 
@@ -459,13 +460,32 @@ def _recommend_agent(
     """
     # Use the picker's live inventory and shared-subscription mirror: Gemini
     # telemetry belongs to AGY, while GLM must never supply Cursor quota.
-    agents = credit_lane.shared_usage_agents(agents)
+    # API-credit routes stay outside subscription pace order and only serve as
+    # fallback when no subscription lane is usable.
+    raw_agents = dict(agents)
+    agents = credit_lane.shared_usage_agents(raw_agents)
     lane_inventory = {}
-    for lane in capacity_pick.CODE_LANES:
+    for lane in (*capacity_pick.CODE_LANES, *API_KEY_LANES):
         info, quota_source = capacity_pick._mirror_retired_quota(agents, lane, agents.get(lane, {}))
         if (lane in agents or quota_source) and info.get("eligible", True):
             lane_inventory[lane] = info
+    merged_grok_cursor = (
+        "grok" in lane_inventory
+        and "cursor" in lane_inventory
+        and credit_lane.grok_cursor_bindings_verified(raw_agents.get("grok"), raw_agents.get("cursor"))
+    )
+    if merged_grok_cursor:
+        lane_inventory["cursor"] = credit_lane.merge_grok_cursor_record(
+            lane_inventory["grok"], lane_inventory["cursor"]
+        )
+        lane_inventory.pop("grok", None)
     agents = lane_inventory
+    effective_in_flight = dict(in_flight) if in_flight is not None else None
+    if merged_grok_cursor and effective_in_flight is not None:
+        effective_in_flight["cursor"] = credit_lane.sum_in_flight(
+            effective_in_flight.get("cursor", 0), effective_in_flight.get("grok", 0)
+        )  # type: ignore[assignment]
+        effective_in_flight.pop("grok", None)
     if is_stale:
         warnings.append("snapshot stale (>15min old data) — advisory only, verify manually before trusting numbers")
 
@@ -514,8 +534,8 @@ def _recommend_agent(
         burn_by_agent[a] = br
         resets_by[a] = agents[a].get("resets_at")
 
-    # include extra subs if they have data (stale-advisory relabelling below covers both)
-    for a in capacity_pick.CODE_LANES:
+    # include extra subs (and API-credit fallback) if they have data
+    for a in (*capacity_pick.CODE_LANES, *API_KEY_LANES):
         if a in core or a not in agents:
             continue
         st = agents[a].get("status", "unknown")
@@ -538,9 +558,14 @@ def _recommend_agent(
             status_by_agent[a] = facts.status
             warnings.append(f"lane {a}: hot label cleared ({facts.pace_reason})")
 
-    # Only claim inline_orchestrator if at least one lane is actually observed AND all observed lanes are hot/near_cap.
-    # An empty observation set (all unknown/unavailable) must NEVER satisfy this.
-    observed_statuses = [s for s in status_by_agent.values() if s not in {"unknown", "unavailable"}]
+    avoid_by_lane = {
+        lane: capacity_pick.is_avoid_lane(agents.get(lane), lane=lane, facts=owner_facts(lane))
+        for lane in status_by_agent
+    }
+
+    # Only claim inline_orchestrator if at least one lane is actually observed AND every observed lane
+    # is hot/near_cap AND avoided (an over-pace lane that lasts to reset is not avoided).
+    observed_lanes = [a for a, s in status_by_agent.items() if s not in {"unknown", "unavailable"}]
     credit_models: dict[str, tuple[str, ...]] = {}
     for a, s in status_by_agent.items():
         if s in {"cool", "warm"}:
@@ -549,7 +574,15 @@ def _recommend_agent(
         if models is not None:
             credit_models[a] = models
     credit_lanes = set(credit_models)
-    if observed_statuses and all(s in {"hot", "near_cap"} for s in observed_statuses) and not credit_lanes:
+    if (
+        observed_lanes
+        and all(
+            status_by_agent[a] in {"hot", "near_cap"}
+            and owner_facts(a).capacity != credit_lane.CAPACITY_VERIFIED
+            for a in observed_lanes
+        )
+        and not credit_lanes
+    ):
         warnings.append("all agents near cap — orchestrator inline-mode contingency may be needed soon")
         return {
             "primary_agent_for_code": "inline_orchestrator",
@@ -575,37 +608,61 @@ def _recommend_agent(
             f"lanes resetting soon (within {reset_imminent_hours}h): {', '.join(imminent)} — defer large batches on these if possible"
         )
 
-    avoid_by_lane = {
-        lane: capacity_pick.is_avoid_lane(agents.get(lane), lane=lane, facts=owner_facts(lane))
-        for lane in status_by_agent
-    }
-
     def select_agent(status_map, burn_map):
         # Share the picker's ordering; neither provider burn percentages nor a
         # separate Claude pool establish comparable code-worker headroom.
-        rows = []
+        sub_rows = []
+        api_rows = []
         for lane, status in status_map.items():
             facts = owner_facts(lane)
-            rows.append({
+            row = {
                 "lane": lane,
                 "status": credit_lane.CREDIT_BALANCE_PRESENT if lane in credit_lanes else status,
                 "remaining_pct": facts.plan_remaining_pct,
-                "in_flight": in_flight.get(lane, 0) if in_flight is not None else None,
+                "in_flight": effective_in_flight.get(lane, 0) if effective_in_flight is not None else None,
                 "capacity": {"state": facts.capacity},
                 "avoid": avoid_by_lane[lane],
-            })
+            }
+            if lane in capacity_pick.API_CREDIT_LANES:
+                api_rows.append(row)
+            else:
+                row["pace_forecast"] = credit_lane.pace_forecast(
+                    agents.get(lane),
+                    snapshot_metadata={"stale": is_stale},
+                    now=current_time,
+                )
+                sub_rows.append(row)
         # Preserve the credit-relief fallback: unknown telemetry does not
         # establish a plan-backed alternative to a verified credit lane.
-        plan_rows = [row for row in rows if row["status"] in {"cool", "warm"} and not row["avoid"]]
-        credit_rows = [row for row in rows if row["lane"] in credit_lanes and not row["avoid"]]
+        plan_rows = [row for row in sub_rows if row["status"] in {"cool", "warm", "hot"} and not row["avoid"]]
+        credit_rows = [row for row in sub_rows if row["lane"] in credit_lanes and not row["avoid"]]
         # AVOID rows remain visible in the picker but never receive a pick rank.
-        usable_rows = [row for row in rows if not row["avoid"]]
-        ordered = capacity_pick.build_pick_order(plan_rows or credit_rows or usable_rows)
+        usable_sub_rows = [row for row in sub_rows if not row["avoid"]]
+        candidate_sub_rows = plan_rows or credit_rows or usable_sub_rows
+        use_pace, pace_reason = capacity_pick.pick_order_rationale(candidate_sub_rows, now=current_time)
+        ordered = capacity_pick.build_pick_order(candidate_sub_rows, now=current_time)
         if not ordered:
-            return {
-                "primary_agent_for_code": None,
-                "rationale": "No usable subscription lane headroom data for confident recommendation (stale/empty/unknowns).",
-            }
+            usable_api_rows = [row for row in api_rows if not row["avoid"]]
+            if not usable_api_rows:
+                return {
+                    "primary_agent_for_code": None,
+                    "rationale": "No usable subscription lane headroom data for confident recommendation (stale/empty/unknowns).",
+                }
+            chosen = sorted(
+                usable_api_rows,
+                key=lambda row: (
+                    row["status"] not in {"cool", "warm"},
+                    row["in_flight"] is None,
+                    int(row["in_flight"] or 0),
+                    row["lane"],
+                ),
+            )[0]
+            recommended = chosen["lane"]
+            rationale = (
+                f"No usable subscription lane; falling back to API-credit route {recommended} "
+                "(no subscription pace score)."
+            )
+            return {"primary_agent_for_code": recommended, "rationale": rationale}
         chosen = ordered[0]
         recommended = chosen["lane"]
         if recommended in credit_lanes:
@@ -619,10 +676,17 @@ def _recommend_agent(
                 f"Capacity data unavailable for subscription lanes (partly blind); fallback recommendation "
                 f"{recommended} based on lane health and in-flight signals."
             )
+        elif use_pace:
+            surplus_h = (chosen.get("pace_forecast") or {}).get("projected_surplus_per_hour")
+            surplus_text = f"{float(surplus_h):+.2f}%/h" if isinstance(surplus_h, (int, float)) else "unknown"
+            rationale = (
+                f"{recommended} leads the capacity picker order by projected surplus per hour to reset "
+                f"({surplus_text}; 7d burn {_format_pct(burn_map.get(recommended))}%)."
+            )
         else:
             rationale = (
-                f"{recommended} leads the capacity picker order: heat, plan headroom, "
-                f"in-flight load, then lane priority (7d burn {_format_pct(burn_map.get(recommended))}%)."
+                f"{recommended} leads the capacity picker order (pace forecast fallback — {pace_reason}): "
+                f"heat, plan headroom, in-flight load, then lane priority (7d burn {_format_pct(burn_map.get(recommended))}%)."
             )
         return {"primary_agent_for_code": recommended, "rationale": rationale}
 
@@ -1720,17 +1784,30 @@ def _compute_dispatch_routing_budget(
             "provider windows, runtime headroom, and lane health were freshly verified."
         )
 
-    # Build ranked view: subscription by remaining headroom (low burn = high remaining first), API always unknown
-    def _rank_key(lane: str) -> float:
-        a = agents.get(lane, {})
-        b = a.get("burn_pct_7d")
-        if b is None:
-            return 999.0
-        return b
-
+    # Build ranked view: subscription meters by projected surplus per hour to reset
+    # (falling back to remaining headroom / low burn when forecasts are stale/missing),
+    # merging verified Grok+Cursor into one meter with summed in-flight; API stays separate.
+    merged_gc = credit_lane.grok_cursor_bindings_verified(agents.get("grok"), agents.get("cursor"))
     ranked_subs = []
+    sub_forecasts: dict[str, dict[str, Any]] = {}
     for lane in SUBSCRIPTION_LANES:
-        a = agents.get(lane, {})
+        if merged_gc and lane == "grok":
+            continue
+        if merged_gc and lane == "cursor":
+            a = credit_lane.merge_grok_cursor_record(agents["grok"], agents["cursor"])
+            flight = (
+                None
+                if in_flight_by_agent is None
+                else credit_lane.sum_in_flight(
+                    in_flight_by_agent.get("cursor", 0), in_flight_by_agent.get("grok", 0)
+                )
+            )
+        else:
+            a = agents.get(lane, {})
+            flight = None if in_flight_by_agent is None else in_flight_by_agent.get(lane, 0)
+        sub_forecasts[lane] = credit_lane.pace_forecast(
+            a, snapshot_metadata={"stale": is_stale}, now=current_time
+        )
         ranked_subs.append(
             {
                 "lane": lane,
@@ -1739,16 +1816,39 @@ def _compute_dispatch_routing_budget(
                 "burn_pct_7d": a.get("burn_pct_7d"),
                 "remaining_pct": a.get("remaining_pct"),
                 "resets_at": a.get("resets_at"),
-                "in_flight": None if in_flight_by_agent is None else in_flight_by_agent.get(lane, 0),
+                "in_flight": flight,
                 "health": a.get("health") or _lane_health_record(None, lane),
             }
         )
-    ranked_subs.sort(
-        key=lambda x: (
-            x["status"] in ("unknown", "unavailable"),
-            x.get("burn_pct_7d") if isinstance(x.get("burn_pct_7d"), (int, float)) else 999.0,
-        )
+    active_ranked_subs = [
+        item
+        for item in ranked_subs
+        if item["status"] not in ("unknown", "unavailable", "near_cap", "need_login")
+        and item.get("remaining_pct") is not None
+    ]
+    use_sub_pace = bool(active_ranked_subs) and all(
+        sub_forecasts[str(item["lane"])].get("available") for item in active_ranked_subs
     )
+    if use_sub_pace:
+        ranked_subs.sort(
+            key=lambda x: (
+                x["status"] in ("unknown", "unavailable"),
+                x["status"] in ("near_cap", "need_login"),
+                x["status"] == "hot",
+                not sub_forecasts[str(x["lane"])].get("available"),
+                -float(sub_forecasts[str(x["lane"])]["projected_surplus_per_hour"])
+                if isinstance(sub_forecasts[str(x["lane"])].get("projected_surplus_per_hour"), (int, float))
+                else 0.0,
+                x.get("burn_pct_7d") if isinstance(x.get("burn_pct_7d"), (int, float)) else 999.0,
+            )
+        )
+    else:
+        ranked_subs.sort(
+            key=lambda x: (
+                x["status"] in ("unknown", "unavailable"),
+                x.get("burn_pct_7d") if isinstance(x.get("burn_pct_7d"), (int, float)) else 999.0,
+            )
+        )
 
     ranked_apis = _ranked_api_entries(api_accounts, health_records, in_flight_by_agent, budgets)
     # per one design note treat absent as full, but AC requires status unknown NOT cool for ranked view
