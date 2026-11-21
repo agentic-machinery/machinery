@@ -1355,18 +1355,19 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     A failed closeout is visible to the waiting dispatching seat as a failed task, with the receipt retained.
     """
     _stop_task_services(record)
-    # Attribution needs the checkout's origin, so take it before removal. Closeout itself runs afterward.
+    # Attribution needs the checkout's origin. Keep it even when removal is refused.
     request = merged = None
     if record.get("mode") == "workspace-write" and "closeout" not in record:
         merged = git.merged_delivery(record)
+    if merged:
+        deliveries = merged.get("pull_requests", [merged])
+        record["delivery_pr"] = f"{merged['repo']}#{merged['number']}"
+        record["delivery_merge_sha"] = merged["merge_sha"]
+        record["delivery_prs"] = [f"{pr['repo']}#{pr['number']}" for pr in deliveries]
     _reap_worktree(record, patience=patience, salvage=salvage,
                    verified_merged_head=record.get("head_sha") if merged else None)
     if record.get("worktree_disposition") == "removed":
         if merged:
-            record["delivery_pr"] = f"{merged['repo']}#{merged['number']}"
-            record["delivery_merge_sha"] = merged["merge_sha"]
-            deliveries = merged.get("pull_requests", [merged])
-            record["delivery_prs"] = [f"{pr['repo']}#{pr['number']}" for pr in deliveries]
             try:
                 root, _repository = git.resolve_repo(record.get("repo"))
                 request = [{"pr": pr["number"], "repo": pr["repo"], "repo_root": str(root)} for pr in deliveries]
@@ -2281,6 +2282,11 @@ def wait(task_id: str, nonce: str | None = None, timeout: float = 0, poll_interv
                 # Crash recovery settles a terminal task under this lock; report it only after that ends.
                 with store.task_state_lock(store.record_path(task_id)):
                     record = store.read(task_id, nonce)
+            if _text(record.get("delivery_pr")) and not isinstance(record.get("closeout"), dict):
+                reason = None
+                if record.get("worktree_disposition") != "removed":
+                    reason = _text(record.get("worktree_disposition_reason"))
+                record["closeout_missing_reason"] = reason or _text(record.get("merged_delivery_lookup")) or "receipt_unavailable"
             return record, 0 if record["status"] == "done" else 1
         remaining = deadline - time.monotonic() if deadline else None
         if remaining is not None and remaining <= 0:

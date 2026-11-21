@@ -38,6 +38,7 @@ handoff:
   worktree: "<dispatch worktree>"
   scope:
     outcome: "<user-visible outcome>"
+    open_prs: [] # List open PRs for the same issue (empty after checking for them).
     owned_paths: ["<path>"]
     non_goals: ["<non-goal>"]
     denominator: "<what counts as all of it>"
@@ -52,6 +53,7 @@ handoff:
     profile: code|infra
     rounds_used: {full: 0, delta: 0}
     ledger: []
+    cap_disposition: "<CTO decision reference, if replacing a capped PR>"
   landing_state: {hold: false, queued: false, auto_merge: false}
 ```
 
@@ -78,14 +80,27 @@ or CI gate. Reuse then requires the corrected policy. See the
 for typed refusals, replay and retained-history checks.
 
 **Public-safe subset.** Only these fields go into the PR body: target, acceptance ids and their
-proof, catalog risk and the rounds used of the review budget, the finding ledger (including any optional DeepSeek
-pre-check dispositions), and credit. Everything else, such as worktree paths, host details and
-private task metadata, stays in the task result (rules core P8).
+proof, catalog risk and rounds used, the finding ledger (including any optional DeepSeek
+pre-check dispositions), public predecessor PRs and heads, and credit. Worktree paths, host
+details and private task metadata stay in the task result (rules core P8).
 
-The ledger and budget follow the work: a replacement PR, a new reviewer, a new session or an
-accepted successor (`pr_ownership accept`) carries them forward, along with the head's CI rerun
-allowance (infrastructure failures only, never a failing test node). A handoff never resets a
-budget.
+On the same PR, each hand-off preserves the ledger, the rounds used and the head's CI rerun
+allowance (infrastructure failures only, never a failing test node). A new reviewer, session or
+accepted successor (`pr_ownership accept`) inherits those limits.
+
+For a replacement after the cap, the decision reference points to the existing parent record.
+Carry every unresolved blocker in `review.ledger`, identified by its source PR and finding ID,
+with its owner and disposition. Keep findings assigned elsewhere open in the parent record.
+The new reviewer verifies the disposition of the inherited blockers against the replacement
+scope before approval. Use source PR and finding ID together in the review brief and reply
+(for example, `PR1055-F1`) to distinguish inherited findings from new ones. Record review and
+CI evidence for the replacement's own head.
+
+If the predecessor has a lifecycle ledger bound to its PR, keep it intact. `bind-successor`
+keeps that PR binding. The CTO uses the existing
+[remaining-scope transfer](../../../contracts/task-lifecycle-closeout.md#remaining-scope)
+to a linked issue with a fresh ledger and names it in the replacement brief. If that transfer
+is unavailable, record the lifecycle blocker in the cap disposition and wait for the CTO.
 
 ## Proof
 
@@ -105,8 +120,11 @@ Every item must hold on the **current** head. A moved head voids the verdict and
 
 1. Proof covers every change in the diff.
 2. A recorded exact-head APPROVE from the reviewer of record (`review-loop`), with no open
-   blocker in the ledger. The optional DeepSeek pre-check (DS-PRECHECK-1101) is never a review of
-   record and never satisfies or waives this gate.
+   blocker applicable to that head. For an inherited blocker assigned elsewhere, approval
+   requires exact-head evidence and the reviewer's confirmation under the
+   [review policy](../../review-loop/references/policy.md#4-convergence). A missing or unverified
+   disposition still blocks. The optional DeepSeek pre-check (DS-PRECHECK-1101) is never a review
+   of record and never satisfies or waives this gate.
 3. Same-head PR CI green, the same with or without a merge queue: no blocking check on the live
    head pending, red or cancelled, including the PR `CI Gate` (affected tests and Frontend, not
    the full suite) where the repository runs one. It may have finished before or after the

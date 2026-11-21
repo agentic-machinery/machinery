@@ -9,30 +9,128 @@ pins:
     owner: Infra
     review_by: "2026-10-30"
     note: No exact install pin. Minimums only, in lu_machinery/review/isolation.py (2.1.116) and acpx.py (2.1.280 for Opus).
+    cli_health:
+      cli: claude
+      version_argv: ["claude", "--version"]
+      env_passthrough: ["CLAUDE_CONFIG_DIR"]
+      latest:
+        kind: npm
+        package: "@anthropic-ai/claude-code"
+      auth:
+        kind: command
+        argv: ["claude", "auth", "status", "--json"]
+        parser: json_bool
+        field: loggedIn
+        allow_nonzero_false: true
   - name: codex
     pinned: unknown
     source: host
     owner: Infra
     review_by: "2026-10-30"
     note: Resolved by shutil.which in scripts/ai_agent_bridge/_config.py. The repo does not pin a version.
+    cli_health:
+      cli: codex
+      version_argv: ["codex", "--version"]
+      env_passthrough: ["CODEX_HOME"]
+      latest:
+        kind: npm
+        package: "@openai/codex"
+      auth:
+        kind: command
+        argv: ["codex", "login", "status"]
+        parser: text_match
+        signed_in_pattern: "Logged in"
+        signed_out_pattern: "Not logged in"
+        allow_nonzero_for_signed_out: true
+  - name: codexbar
+    pinned: unknown
+    source: host
+    owner: Infra
+    review_by: "2026-11-21"
+    note: Local usage and quota probe CLI. The repo does not pin a version.
+    cli_health:
+      cli: codexbar
+      version_argv: ["codexbar", "--version"]
+      latest:
+        kind: github
+        repo: steipete/CodexBar
+      auth:
+        kind: none
   - name: grok
     pinned: unknown
     source: host
     owner: Infra
     review_by: "2026-10-30"
     note: No CLI version pin. Admitted model grok-4.7 is in scripts/agent_runtime/adapters/grok_build.py.
+    cli_health:
+      cli: grok
+      version_argv: ["grok", "--version"]
+      latest:
+        kind: npm
+        package: "@xai-official/grok"
+      auth:
+        kind: command
+        argv: ["grok", "models"]
+        parser: text_match
+        signed_in_pattern: "You are logged in"
+        signed_out_pattern: "You are not authenticated"
+        allow_nonzero_for_signed_out: true
   - name: cursor-agent
     pinned: unknown
     source: host
     owner: Infra
     review_by: "2026-10-30"
     note: Executable name only, in scripts/orchestration/worker_leftovers.py. The install version is not pinned.
+    cli_health:
+      cli: cursor-agent
+      version_argv: ["cursor-agent", "--version"]
+      latest:
+        kind: url_regex
+        url: "https://cursor.com/install"
+        pattern: 'https://downloads\.cursor\.com/lab/([0-9]{4}\.[0-9]{2}\.[0-9]{2}-[A-Za-z0-9]+)/'
+      auth:
+        kind: command
+        argv: ["cursor-agent", "status", "--format", "json"]
+        parser: json_bool
+        field: isAuthenticated
+        allow_nonzero_false: true
   - name: agy
     pinned: unknown
     source: host
     owner: Infra
     review_by: "2026-10-30"
     note: No install pin. Background-wait floor is 1.2.9 in scripts/agent_runtime/adapters/agy.py.
+    cli_health:
+      cli: agy
+      version_argv: ["agy", "--version"]
+      env_passthrough: ["AGY_APP_DATA_DIR"]
+      latest:
+        kind: url_json
+        url: "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json"
+        field: version
+      auth:
+        kind: command
+        argv: ["agy", "models"]
+        parser: text_match
+        signed_in_pattern: '^[a-z0-9][a-z0-9._-]+\t'
+        signed_out_pattern: "Please sign in"
+        allow_nonzero_for_signed_out: true
+  - name: opencode
+    pinned: unknown
+    source: host
+    owner: Infra
+    review_by: "2026-11-21"
+    note: Native opencode CLI used for OpenRouter, DeepSeek and Gemma routes. The repo does not pin a version.
+    cli_health:
+      cli: opencode
+      version_argv: ["opencode", "--version"]
+      latest:
+        kind: npm
+        package: opencode-ai
+      auth:
+        kind: command
+        argv: ["opencode", "auth", "list"]
+        parser: credential_count
   - name: gh
     pinned: unknown
     source: host

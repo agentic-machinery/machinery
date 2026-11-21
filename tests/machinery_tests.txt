@@ -314,6 +314,7 @@ tests/ci/test_semgrep_baseline.py
 tests/ci/test_test_env_sh.py
 tests/ci/test_test_source_cache.py
 tests/ci/test_verified_trailer.py
+tests/cli_health/test_check.py
 tests/common/test_check_primary_integrity.py
 tests/common/test_conftest_task_store_guard.py
 tests/common/test_conftest_telemetry_guard.py
@@ -701,6 +702,8 @@ tests/test_pg_skip_guard.py
 tests/bakeoff/test_review_eval.py
 # Clean-machine release drill kit (drill/clean-machine): rows, receipts, origin oracle, OPSEC.
 tests/drill/test_clean_machine_kit.py
+# Security-alert watcher and routed fix brief (#1077).
+tests/security/test_alerts.py
 # [support]
 tests/property/conftest.py
 tests/fixtures/product_tree/agents_extensions/codex-home/AGENTS.md
