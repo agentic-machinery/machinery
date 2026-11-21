@@ -22,6 +22,10 @@ name: Fleet Security
 on:
   workflow_call:
     inputs:
+      runs-on:
+        description: JSON runner label or label array for every job (Linux x64)
+        type: string
+        default: '"ubuntu-24.04"'
       run-actionlint:
         description: Run pinned actionlint (with pinned ShellCheck) over workflow files
         type: boolean
@@ -221,16 +225,157 @@ jobs:
   actionlint:
     name: actionlint
     if: ${{ inputs.run-actionlint }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 15
     permissions:
       contents: read
     outputs:
       receipt: ${{ steps.scan.outputs.receipt }}
+      scanner-policy: ${{ steps.scanner-policy.outputs.receipt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '0' || '1' }}
           persist-credentials: false
+      - &prepare-scanner-policy
+        name: Read scanner policy from the trusted base
+        id: scanner-policy
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
+        env:
+          POLICY_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha }}
+          TRIVY_POLICY_INPUT: ${{ inputs.trivy-ignorefile }}
+          ZIZMOR_POLICY_INPUT: ${{ inputs.zizmor-config }}
+          TRUFFLEHOG_POLICY_INPUT: ${{ inputs.trufflehog-exclude-paths }}
+          TRUFFLEHOG_REQUIRE_POLICY: ${{ inputs.require-trufflehog-ignore }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -I -B - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import unicodedata
+          from pathlib import Path
+
+          base = os.environ["POLICY_BASE_SHA"]
+          if re.fullmatch(r"[0-9a-f]{40}", base) is None:
+              sys.exit("::error::Missing or invalid event base SHA for scanner policy")
+
+          def valid_path(path: str) -> bool:
+              return (
+                  not path.startswith(("/", "-"))
+                  and all(part not in ("", ".", "..") for part in path.split("/"))
+                  and not any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp") for c in path)
+              )
+
+          scanner = os.environ["GITHUB_JOB"]
+          shellcheck = scanner == "shellcheck"
+          explicit = ""
+          required = False
+          if scanner == "actionlint":
+              defaults = (".github/actionlint.yaml", ".github/actionlint.yml")
+              output_var = "TRUSTED_ACTIONLINT_CONFIG"
+          elif scanner == "zizmor":
+              defaults = (".github/zizmor.yml", ".github/zizmor.yaml", "zizmor.yml", "zizmor.yaml")
+              explicit = os.environ["ZIZMOR_POLICY_INPUT"].strip()
+              required = bool(explicit)
+              output_var = "TRUSTED_ZIZMOR_CONFIG"
+          elif scanner == "secret-scan":
+              defaults = (".trufflehogignore",)
+              explicit = os.environ["TRUFFLEHOG_POLICY_INPUT"].strip()
+              required = bool(explicit) and (
+                  explicit != defaults[0] or os.environ["TRUFFLEHOG_REQUIRE_POLICY"].lower() == "true"
+              )
+              output_var = "TRUSTED_TRUFFLEHOG_IGNORE"
+          elif scanner.startswith("trivy-"):
+              defaults = (".trivyignore",)
+              explicit = os.environ["TRIVY_POLICY_INPUT"].strip()
+              required = bool(explicit)
+              output_var = "TRUSTED_TRIVY_IGNORE"
+          elif shellcheck:
+              defaults = ()
+              output_var = "TRUSTED_SHELLCHECK_ROOT"
+          else:
+              sys.exit("::error::Unknown job for trusted scanner policy")
+
+          if explicit and not valid_path(explicit):
+              sys.exit("::error::Invalid repository-relative scanner policy path")
+
+          directory = Path(os.environ["RUNNER_TEMP"]) / "fleet-scanner-policy"
+          git_env = {"PATH": os.environ["PATH"], "HOME": str(directory), "GIT_CONFIG_NOSYSTEM": "1"}
+
+          selected = set(defaults)
+          if explicit:
+              selected.add(explicit)
+          if scanner == "zizmor":
+              selected.update((".zizmor.yml", ".zizmor.yaml"))
+
+          def git(*args: str) -> bytes:
+              return subprocess.run(
+                  ["git", "--no-replace-objects", *args],
+                  env=git_env, capture_output=True, check=True, timeout=60,
+              ).stdout
+
+          def policy_entries(revision: str) -> dict[str, tuple[bytes, bytes]]:
+              entries = {}
+              for row in git("ls-tree", "-rz", "--full-tree", revision).split(b"\0"):
+                  if not row:
+                      continue
+                  metadata, raw_path = row.split(b"\t", 1)
+                  path = os.fsdecode(raw_path)
+                  if path not in selected and not (
+                      shellcheck and path.rsplit("/", 1)[-1] in (".shellcheckrc", "shellcheckrc")
+                  ):
+                      continue
+                  if not valid_path(path):
+                      sys.exit("::error::Invalid scanner policy path in Git tree")
+                  mode, _, oid = metadata.split()
+                  entries[path] = (mode, oid)
+              return entries
+
+          try:
+              directory.mkdir(mode=0o700)
+              git("merge-base", "--is-ancestor", base, "HEAD")
+              trusted = policy_entries(base)
+              candidate = policy_entries("HEAD")
+              changed = sorted(path for path in trusted.keys() | candidate.keys() if trusted.get(path) != candidate.get(path))
+              encoded = json.dumps({"base_sha": base, "changed": changed}, separators=(",", ":"))
+              print(f"Trusted scanner policy: {encoded}")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+                  out.write(f"receipt={encoded}\n")
+
+              value = ""
+              if shellcheck:
+                  materialize = trusted
+                  value = str(directory)
+              else:
+                  choices = (explicit,) if explicit else defaults
+                  if scanner == "secret-scan" and not explicit:
+                      choices = ()
+                  name = next((path for path in choices if path in trusted), "")
+                  materialize = {name: trusted[name]} if name else {}
+                  if name:
+                      value = str(directory / name)
+                  elif required and not any(path in candidate for path in choices):
+                      sys.exit("::error::Required scanner policy file absent at base and candidate")
+                  elif scanner == "actionlint":
+                      empty_config = directory / "empty-actionlint.yml"
+                      empty_config.write_text("{}\n", encoding="utf-8")
+                      value = str(empty_config)
+
+              for path, (mode, oid) in materialize.items():
+                  if mode not in (b"100644", b"100755"):
+                      sys.exit("::error::Trusted scanner policy must be a regular Git file")
+                  destination = directory / path
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(git("cat-file", "blob", oid.decode("ascii")))
+          except (OSError, subprocess.SubprocessError):
+              sys.exit("::error::Could not read scanner policy from the trusted event base")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"{output_var}={value}\n")
+          PY
 
       - name: Restore cached actionlint archive
         id: cache-actionlint
@@ -409,9 +554,10 @@ jobs:
               "-pyflakes=",
               "-format",
               "{{json .}}",
-              "--",
-              *files,
           ]
+          if os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "merge_group"):
+              cmd.extend(["-config-file", os.environ["TRUSTED_ACTIONLINT_CONFIG"]])
+          cmd.extend(["--", *files])
           with open(stdout_file, "wb") as out_fh, open(stderr_file, "wb") as err_fh:
               proc = subprocess.run(
                   cmd,
@@ -460,21 +606,24 @@ jobs:
 
       - name: Remove tools and scan results
         if: always()
-        run: rm -rf "$RUNNER_TEMP/actionlint" "$RUNNER_TEMP/shellcheck" "$RUNNER_TEMP/actionlint-work"
+        run: rm -rf "$RUNNER_TEMP/actionlint" "$RUNNER_TEMP/shellcheck" "$RUNNER_TEMP/actionlint-work" "$RUNNER_TEMP/fleet-scanner-policy"
 
   shellcheck:
     name: ShellCheck
     if: ${{ inputs.run-shellcheck }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 15
     permissions:
       contents: read
     outputs:
       receipt: ${{ steps.scan.outputs.receipt }}
+      scanner-policy: ${{ steps.scanner-policy.outputs.receipt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '0' || '1' }}
           persist-credentials: false
+      - *prepare-scanner-policy
 
       - name: Restore cached ShellCheck archive
         id: cache-shellcheck
@@ -624,6 +773,22 @@ jobs:
               print("::error::shellcheck-paths is empty while run-shellcheck is true; failing closed")
               emit({"tool": "shellcheck", "version": version, "status": "missing_target", "targets": []}, 1)
 
+          def policy_groups(files: list[str]) -> dict[str | None, set[str]]:
+              if os.environ.get("GITHUB_EVENT_NAME") not in ("pull_request", "merge_group"):
+                  return {None: set(files)}
+              trusted_root = Path(os.environ["TRUSTED_SHELLCHECK_ROOT"])
+              groups: dict[str | None, set[str]] = {}
+              for file in files:
+                  rc = next(
+                      (str(candidate)
+                       for parent in Path(file).parents
+                       for name in (".shellcheckrc", "shellcheckrc")
+                       if (candidate := trusted_root / parent / name).is_file()),
+                      "",
+                  )
+                  groups.setdefault(rc, set()).add(file)
+              return groups
+
           failed = False
           target_receipts = []
           for idx, (path_str, sev) in enumerate(specs):
@@ -655,34 +820,45 @@ jobs:
                   failed = True
                   continue
 
-              out_json = work / f"out-{idx}.json"
-              err_log = work / f"err-{idx}.log"
-              cmd = [os.environ["SHELLCHECK_BIN"], f"--severity={sev}", "--format=json1", "--", *files]
-              with open(out_json, "wb") as out_fh, open(err_log, "wb") as err_fh:
-                  proc = subprocess.run(
-                      cmd,
-                      env={"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")},
-                      stdout=out_fh,
-                      stderr=err_fh,
-                      check=False,
+              comments = []
+              scan_error = False
+              all_files = set(files)
+              for group, (rc, matching_files) in enumerate(policy_groups(files).items()):
+                  out_json = work / f"out-{idx}-{group}.json"
+                  err_log = work / f"err-{idx}-{group}.log"
+                  cmd = [os.environ["SHELLCHECK_BIN"], f"--severity={sev}", "--format=json1"]
+                  if rc is not None:
+                      cmd.append(f"--rcfile={rc}" if rc else "--norc")
+                  # Keep the full input set available for shell source resolution.
+                  cmd.extend(["--", *files])
+                  with open(out_json, "wb") as out_fh, open(err_log, "wb") as err_fh:
+                      proc = subprocess.run(
+                          cmd,
+                          env={"PATH": "/usr/bin:/bin", "HOME": str(work / "home"), "TMPDIR": str(work / "tmp")},
+                          stdout=out_fh,
+                          stderr=err_fh,
+                          check=False,
+                      )
+                  err_lines = sum(1 for _ in open(err_log, "rb"))
+                  print(f"ShellCheck target={path_str} severity={sev}: {len(matching_files)} file(s), exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
+                  try:
+                      payload = json.loads(out_json.read_text(encoding="utf-8"))
+                  except (OSError, ValueError):
+                      payload = None
+                  reported = payload.get("comments") if isinstance(payload, dict) else None
+                  if (
+                      not isinstance(reported, list)
+                      or proc.returncode != int(bool(reported))
+                      or any(not isinstance(item, dict) or not isinstance(item.get("file"), str) for item in reported)
+                  ):
+                      print(f"::error::ShellCheck returned an invalid report for '{path_str}'; failing closed")
+                      scan_error = True
+                      break
+                  comments.extend(
+                      item for item in reported
+                      if item["file"] in matching_files or item["file"] not in all_files
                   )
-              err_lines = sum(1 for _ in open(err_log, "rb"))
-              print(f"ShellCheck target={path_str} severity={sev}: {len(files)} file(s), exit={proc.returncode}, {err_lines} stderr line(s) withheld.")
-              try:
-                  payload = json.loads(out_json.read_text(encoding="utf-8"))
-              except (OSError, ValueError):
-                  print(f"::error::ShellCheck output for '{path_str}' is malformed JSON; failing closed")
-                  target_receipts.append({"target": path_str, "severity": sev, "status": "error", "files": len(files), "findings": 0})
-                  failed = True
-                  continue
-              comments = payload.get("comments") if isinstance(payload, dict) else None
-              if not isinstance(comments, list) or proc.returncode not in (0, 1):
-                  print(f"::error::ShellCheck exited {proc.returncode} for '{path_str}'; failing closed")
-                  target_receipts.append({"target": path_str, "severity": sev, "status": "error", "files": len(files), "findings": 0})
-                  failed = True
-                  continue
-              if proc.returncode == 0 and comments:
-                  print(f"::error::ShellCheck reported findings with exit 0 for '{path_str}'; failing closed")
+              if scan_error:
                   target_receipts.append({"target": path_str, "severity": sev, "status": "error", "files": len(files), "findings": len(comments)})
                   failed = True
                   continue
@@ -696,7 +872,7 @@ jobs:
                   level = clean_log(c.get("level", "unknown"))
                   code = clean_log(c.get("code", "?"))
                   print(f"::error file={esc_prop(fp)},line={line},col={col}::ShellCheck SC{code} ({level}) at {fp}:{line}:{col}")
-              t_status = "clean" if proc.returncode == 0 and not comments else "finding"
+              t_status = "finding" if comments else "clean"
               if t_status != "clean":
                   failed = True
               target_receipts.append({"target": path_str, "severity": sev, "status": t_status, "files": len(files), "findings": len(comments)})
@@ -714,21 +890,24 @@ jobs:
 
       - name: Remove tools and scan results
         if: always()
-        run: rm -rf "$RUNNER_TEMP/shellcheck" "$RUNNER_TEMP/shellcheck-work"
+        run: rm -rf "$RUNNER_TEMP/shellcheck" "$RUNNER_TEMP/shellcheck-work" "$RUNNER_TEMP/fleet-scanner-policy"
 
   zizmor:
     name: zizmor
     if: ${{ inputs.run-zizmor }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 10
     permissions:
       contents: read
     outputs:
       receipt: ${{ steps.scan.outputs.receipt }}
+      scanner-policy: ${{ steps.scanner-policy.outputs.receipt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '0' || '1' }}
           persist-credentials: false
+      - *prepare-scanner-policy
 
       - name: Restore cached zizmor archive
         id: cache-zizmor
@@ -876,7 +1055,10 @@ jobs:
 
           cmd = [os.environ["ZIZMOR_BIN"], "--offline", "--no-progress", "--format=json"]
           cfg = os.environ.get("INPUT_CONFIG", "").strip()
-          if cfg:
+          if os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "merge_group"):
+              trusted_config = os.environ["TRUSTED_ZIZMOR_CONFIG"]
+              cmd.extend(["--config", trusted_config] if trusted_config else ["--no-config"])
+          elif cfg:
               cfg_path = valid_rel(cfg)
               if cfg_path is None or not cfg_path.is_file():
                   print(f"::error::zizmor-config '{cfg}' is invalid or missing; failing closed")
@@ -944,22 +1126,24 @@ jobs:
 
       - name: Remove tools and scan results
         if: always()
-        run: rm -rf "$RUNNER_TEMP/zizmor" "$RUNNER_TEMP/zizmor-work"
+        run: rm -rf "$RUNNER_TEMP/zizmor" "$RUNNER_TEMP/zizmor-work" "$RUNNER_TEMP/fleet-scanner-policy"
 
   secret-scan:
     name: Secret scan (TruffleHog)
     if: ${{ inputs.run-secret-scan }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && 120 || 20 }}
     permissions:
       contents: read
     outputs:
       receipt: ${{ steps.scan.outputs.receipt }}
+      scanner-policy: ${{ steps.scanner-policy.outputs.receipt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - *prepare-scanner-policy
 
       - name: Restore cached TruffleHog archive
         id: cache-trufflehog
@@ -1106,7 +1290,11 @@ jobs:
               return candidate
 
           ignore_path = None
-          if raw_ignore:
+          if os.environ["EVENT_NAME"] in ("pull_request", "merge_group"):
+              trusted_ignore = os.environ["TRUSTED_TRUFFLEHOG_IGNORE"]
+              if trusted_ignore:
+                  ignore_path = Path(trusted_ignore)
+          elif raw_ignore:
               candidate = valid_rel(raw_ignore)
               if candidate is None:
                   print(f"::error::Invalid trufflehog-exclude-paths '{raw_ignore}'; failing closed")
@@ -1258,21 +1446,24 @@ jobs:
 
       - name: Remove tools and scan results
         if: always()
-        run: rm -rf "$RUNNER_TEMP/secret-scan" "$RUNNER_TEMP/trufflehog"
+        run: rm -rf "$RUNNER_TEMP/secret-scan" "$RUNNER_TEMP/trufflehog" "$RUNNER_TEMP/fleet-scanner-policy"
 
   trivy-fs:
     name: Trivy dependencies and licences
     if: ${{ inputs.run-trivy-fs }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
     permissions:
       contents: read
     outputs:
       receipt: ${{ steps.scan.outputs.receipt }}
+      scanner-policy: ${{ steps.scanner-policy.outputs.receipt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '0' || '1' }}
           persist-credentials: false
+      - *prepare-scanner-policy
 
       - name: Restore cached Trivy archive
         id: cache-trivy
@@ -1439,7 +1630,9 @@ jobs:
           unused_dispositions = dispositions.copy()
 
           raw_ignorefile = os.environ.get("INPUT_IGNOREFILE", "").strip()
-          if raw_ignorefile:
+          if os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "merge_group"):
+              ignorefile_arg = os.environ["TRUSTED_TRIVY_IGNORE"]
+          elif raw_ignorefile:
               ig_path = valid_rel(raw_ignorefile)
               if ig_path is None or not ig_path.is_file() or ig_path.is_symlink():
                   print(f"::error::trivy-ignorefile '{raw_ignorefile}' is invalid or missing; failing closed")
@@ -1643,21 +1836,24 @@ jobs:
 
       - name: Remove tools and scan results
         if: always()
-        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-fs-work"
+        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-fs-work" "$RUNNER_TEMP/fleet-scanner-policy"
 
   trivy-iac:
     name: Trivy IaC and misconfiguration
     if: ${{ inputs.run-trivy-iac }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 20
     permissions:
       contents: read
     outputs:
       receipt: ${{ steps.scan.outputs.receipt }}
+      scanner-policy: ${{ steps.scanner-policy.outputs.receipt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '0' || '1' }}
           persist-credentials: false
+      - *prepare-scanner-policy
 
       - name: Restore cached Trivy archive
         id: cache-trivy
@@ -1806,7 +2002,9 @@ jobs:
                   emit({"tool": "trivy-iac", "version": version, "status": "error", "targets": []}, 1)
 
           raw_ignorefile = os.environ.get("INPUT_IGNOREFILE", "").strip()
-          if raw_ignorefile:
+          if os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "merge_group"):
+              ignorefile_arg = os.environ["TRUSTED_TRIVY_IGNORE"]
+          elif raw_ignorefile:
               ig_path = valid_rel(raw_ignorefile)
               if ig_path is None or not ig_path.is_file() or ig_path.is_symlink():
                   print(f"::error::trivy-ignorefile '{raw_ignorefile}' is invalid or missing; failing closed")
@@ -1949,21 +2147,24 @@ jobs:
 
       - name: Remove tools and scan results
         if: always()
-        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-iac-work"
+        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-iac-work" "$RUNNER_TEMP/fleet-scanner-policy"
 
   trivy-image:
     name: Trivy container image
     if: ${{ inputs.run-trivy-image }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 30
     permissions:
       contents: read
     outputs:
       receipt: ${{ steps.scan.outputs.receipt }}
+      scanner-policy: ${{ steps.scanner-policy.outputs.receipt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '0' || '1' }}
           persist-credentials: false
+      - *prepare-scanner-policy
 
       - name: Restore cached Trivy archive
         id: cache-trivy
@@ -2106,7 +2307,9 @@ jobs:
               emit({"tool": "trivy-image", "version": version, "status": "error", "targets": []}, 1)
 
           raw_ignorefile = os.environ.get("INPUT_IGNOREFILE", "").strip()
-          if raw_ignorefile:
+          if os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "merge_group"):
+              ignorefile_arg = os.environ["TRUSTED_TRIVY_IGNORE"]
+          elif raw_ignorefile:
               ig_path = valid_rel(raw_ignorefile)
               if ig_path is None or not ig_path.is_file() or ig_path.is_symlink():
                   print(f"::error::trivy-ignorefile '{raw_ignorefile}' is invalid or missing; failing closed")
@@ -2325,13 +2528,13 @@ jobs:
 
       - name: Remove tools and scan results
         if: always()
-        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-image-work"
+        run: rm -rf "$RUNNER_TEMP/trivy" "$RUNNER_TEMP/trivy-image-work" "$RUNNER_TEMP/fleet-scanner-policy"
 
   security-gate:
     name: Fleet security gate
     if: always()
     needs: [actionlint, shellcheck, zizmor, secret-scan, trivy-fs, trivy-iac, trivy-image]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
     permissions: {}
     outputs:
@@ -2341,6 +2544,7 @@ jobs:
         id: gate
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          POLICY_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha }}
           RUN_ACTIONLINT: ${{ inputs.run-actionlint }}
           RUN_SHELLCHECK: ${{ inputs.run-shellcheck }}
           RUN_ZIZMOR: ${{ inputs.run-zizmor }}
@@ -2380,6 +2584,7 @@ jobs:
               print("::error::Fleet security workflow invoked with zero checks enabled; failing closed")
               failed = True
 
+          protected_event = os.environ.get("GITHUB_EVENT_NAME") in ("pull_request", "merge_group")
           jobs_summary = {}
           for name, on in toggles.items():
               entry = needs.get(name)
@@ -2389,16 +2594,27 @@ jobs:
               if result != expected:
                   print(f"::error::Job {name} finished with result {result}, expected {expected}")
                   failed = True
-              rec = None
-              if isinstance(entry, dict) and isinstance(entry.get("outputs"), dict):
-                  raw_rec = entry["outputs"].get("receipt")
-                  if isinstance(raw_rec, str) and raw_rec:
-                      try:
-                          rec = json.loads(raw_rec)
-                      except ValueError:
-                          print(f"::error::Job {name} emitted malformed receipt JSON; failing closed")
-                          failed = True
-              jobs_summary[name] = {"enabled": on, "result": result, "receipt": rec}
+              job_summary = {"enabled": on, "result": result, "receipt": None}
+              outputs = entry.get("outputs") if isinstance(entry, dict) else None
+              if isinstance(outputs, dict):
+                  for field in ("receipt", "scanner-policy"):
+                      raw = outputs.get(field)
+                      if isinstance(raw, str) and raw:
+                          try:
+                              job_summary[field] = json.loads(raw)
+                          except ValueError:
+                              print(f"::error::Job {name} emitted malformed {field} JSON; failing closed")
+                              failed = True
+              if protected_event and on and result == "success":
+                  policy = job_summary.get("scanner-policy")
+                  if (
+                      not isinstance(policy, dict)
+                      or policy.get("base_sha") != os.environ["POLICY_BASE_SHA"]
+                      or not isinstance(policy.get("changed"), list)
+                  ):
+                      print(f"::error::Job {name} has no receipt for the trusted scanner policy base; failing closed")
+                      failed = True
+              jobs_summary[name] = job_summary
 
           unexpected = sorted(set(needs) - set(toggles))
           for extra in unexpected:
