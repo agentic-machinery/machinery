@@ -78,15 +78,33 @@ never fine.
    alerts the CTO inbox when a PR has had no live owning task for 15 minutes, and repeats the
    alert hourly. Re-seat each alerted PR this cycle with one successor (the integration owner
    for queue work in CTO-only mode). Start the successor's brief with
-   `lu_machinery.orchestration.pr_ownership accept --pr <N> --repo <owner/name>`. A PR waiting on a named decision,
-   with no live task, is recorded from this seat with no dispatch task:
-   `accept --pr <N> --repo <owner/name> --reason "<why>" --decision-owner "<who>"`. The alert clears on that
-   acceptance or custody, or when the PR closes; `--release` ends recorded custody, and
-   `pr_ownership status` lists the alerts still outstanding. The successor inherits the PR's
-   review budget and the head's rerun allowance (infrastructure failures only, never a failing
-   test node).
-   A queue custodian also covers ejection, stale approval, merge confirmation and closeout for
-   the owners it releases ([pr-watch](../../full-send/references/pr-watch.md#queue-custody)).
+   `lu_machinery.orchestration.pr_ownership accept --pr <N> --repo <owner/name>`.
+   Before choosing a custody command, run `pr_ownership status`. `custody.evidence` is `known` or
+   `unknown`. Unknown means no keeper tick has been saved, or the last tick could not observe
+   (`last_tick.error` is set): do not treat the PR as untouched. A tick that observed and failed
+   to deliver stays `known`; `last_tick.ok` is still false.
+   `waiting_for_grace` means the keeper has not acted. `recorded_custody` means a decision owner is
+   already written; `by: keeper` means the keeper wrote it after grace, `by: coordinator` means this
+   seat did. Do not record custody again when that row is already there. `unknown_evidence` is a PR
+   this file cannot classify. `alert_outstanding` is an alert the keeper raised and did not turn
+   into recorded custody. `check` prints one JSON row per PR it cannot treat as owned.
+   Exit 1 means at least one of those rows is ownerless, even when another row is an
+   unknown owner. Exit 2 means the check could not observe (stderr starts with `UNKNOWN`)
+   or every printed row is an unknown owner. Read the rows. Status does not repeat that scan.
+   Two accept forms, and they do not combine. A mixed call prints the usage of each form and writes
+   nothing. Neither form changes review, CI, enqueue or merge.
+   Queue custody is only for a predecessor that is still live and waiting in the merge queue. The
+   successor runs `accept --pr <N> --repo <owner/name> --custody --from <predecessor-task>`. That
+   hands ejection, stale approval, merge confirmation and closeout to the successor
+   ([pr-watch](../../full-send/references/pr-watch.md#queue-custody)).
+   Recorded custody is for an open PR with no live task, including a worker that crashed after
+   approval, or a PR held for a named decision. This seat records it with no dispatch task:
+   `accept --pr <N> --repo <owner/name> --reason "<why>" --decision-owner "<who>"`. Do not pass
+   `--custody` on that command. The keeper records the same custody itself after grace when the PR
+   is open, the head is readable, and the owner is ownerless rather than unknown. The alert clears
+   on acceptance or custody, or when the PR closes. `--release` alone ends recorded custody and
+   starts grace over. The successor inherits the PR's review budget and the head's rerun allowance
+   (infrastructure failures only, never a failing test node).
 5. **Live workers.** Active dispatches from the Monitor API, then
    `.venv/bin/python -m lu_machinery.dispatch status <task-id> --run-nonce <nonce>` for each task
    the handoff or the view names; task files outrank a partial view. Every running worker

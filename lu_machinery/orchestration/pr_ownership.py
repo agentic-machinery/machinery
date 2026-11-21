@@ -20,7 +20,13 @@ PR left the ownerless set. A missing head, an unknown owner, a refused write or 
 check leaves the alert outstanding and does not try that same head again. A queue-custody
 handoff also names the predecessor whose only remaining step is waiting in the merge
 queue; ``queue-exit`` then lets that predecessor end cleanly, but only while the
-keeper's ownership check is running.
+keeper's ownership check is running. ``status`` names each saved PR
+``waiting_for_grace``, ``recorded_custody`` (``by`` ``keeper`` or ``coordinator``)
+or ``unknown_evidence``. ``by`` ``keeper`` requires the heal attempt's clock to
+match this handoff. An earlier attempt, or one left after the PR closed, stays
+in the raw ledger and does not add a row. A missing tick, or a tick that names
+an ``error``, is ``evidence`` ``unknown`` even when a recorded decision owner
+remains. Neither custody form changes review, CI, enqueue or merge.
 
 State is one JSON file next to the shared dispatch task store, written under a lock.
 """
@@ -68,6 +74,27 @@ CTO_CHANNEL = "cto"
 SENDER = "merge-queue-keeper"
 TASK_ENV = "LEARN_UKRAINIAN_DISPATCH_TASK_ID"
 HISTORY_LIMIT = 200
+# Help and a mixed accept print these lines. Queue custody and recorded custody do not combine.
+QUEUE_CUSTODY_USAGE = (
+    "queue custody (a live predecessor waiting in the merge queue hands the remaining "
+    "queue steps to a successor task; ownership only, never a merge gate): "
+    f"python -m {_MODULE} accept --pr N --repo OWNER/NAME --custody --from TASK"
+)
+RECORDED_CUSTODY_USAGE = (
+    "recorded custody (name who decides for an open PR with no dispatch task; "
+    "the keeper records this itself after grace when the head is readable; "
+    "ownership only, never a merge gate): "
+    f"python -m {_MODULE} accept --pr N --repo OWNER/NAME --reason REASON --decision-owner OWNER"
+)
+RELEASE_CUSTODY_USAGE = (
+    "release recorded custody (drop that decision owner and start grace over; "
+    "ownership only, never a merge gate): "
+    f"python -m {_MODULE} accept --pr N --repo OWNER/NAME --release"
+)
+_OWNERSHIP_FIELDS = frozenset({
+    "successor", "predecessor", "accepted_at", "head", "custody",
+    "rerun_allowance", "reason", "decision_owner", "pr_state",
+})
 # Compiled at the call. A module-level ``re.compile`` plus a later method call is one
 # Semgrep match spanning every byte in between, so an edit in that span is a new finding.
 
@@ -1086,6 +1113,179 @@ def release_decision_custody(
     return {"released": True, "pr": key, "how": how}
 
 
+def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
+    """One disposition per PR the ledger can name. Derived for ``status``; not stored.
+
+    ``recorded_custody`` stays even when the latest observation failed: the decision
+    owner is already written. ``by`` is ``keeper`` only when that attempt was written
+    with this handoff. ``waiting_for_grace`` is only an unalerted episode after an
+    observation. Attempts at or after ``since`` count. An attempt on this episode
+    whose clock cannot be read is ``unknown_evidence``; a clock before ``since``
+    does not. A missing tick, or a
+    tick whose ``error`` is set, is not evidence. A tick that observed and then failed
+    to deliver stays evidence: the ledger is what that observation saved. One PR is
+    one row. A heal attempt with no current episode and no recorded handoff is not a row.
+    """
+    last = data.get("last_tick")
+    error = last.get("error") if isinstance(last, dict) else None
+    # An error key means the observation failed, even if ok was also set. ok false with
+    # no error is a tick that observed and then failed to deliver: the ledger is evidence.
+    if isinstance(last, dict) and "error" in last:
+        known = False
+        why = error if isinstance(error, str) and error else "keeper tick error is unreadable"
+    elif isinstance(last, dict) and last.get("ok") in (True, False):
+        known = True
+        why = None
+    else:
+        known = False
+        why = "no successful keeper tick"
+    handoffs_raw = data.get("handoffs")
+    episodes_raw = data.get("episodes")
+    attempts_raw = data.get("heal_attempts")
+    handoffs: dict[Any, Any] = handoffs_raw if isinstance(handoffs_raw, dict) else {}
+    episodes: dict[Any, Any] = episodes_raw if isinstance(episodes_raw, dict) else {}
+    attempts: dict[Any, Any] = attempts_raw if isinstance(attempts_raw, dict) else {}
+    recorded: dict[str, dict[str, Any]] = {}
+    unknown: dict[str, dict[str, Any]] = {}
+    waiting: dict[str, dict[str, Any]] = {}
+    alerts: dict[str, dict[str, Any]] = {}
+
+    def attempt_time(row: Mapping[str, Any]) -> datetime | None:
+        raw = row.get("at")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return _at(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def describes_handoff(attempt: Any, handoff: Mapping[str, Any]) -> bool:
+        # The keeper writes the attempt clock and accepted_at from the same instant.
+        if not isinstance(attempt, dict):
+            return False
+        if attempt.get("result") != "recorded" or attempt.get("postcondition") != "true":
+            return False
+        if handoff.get("decision_owner") != CTO_INBOX:
+            return False
+        accepted = handoff.get("accepted_at")
+        return isinstance(accepted, str) and attempt.get("at") == accepted
+
+    def attempts_for_episode(key: str, since: datetime) -> tuple[list[dict[str, Any]], bool]:
+        # The prefix ends in ":", so repo#1: does not match an attempt for repo#10.
+        # A clock that cannot be read does not prove the attempt predates this episode.
+        prefix = f"{key}:"
+        tied: list[dict[str, Any]] = []
+        unreadable = False
+        for attempt_key, row in attempts.items():
+            if not isinstance(attempt_key, str) or not attempt_key.startswith(prefix):
+                continue
+            if not isinstance(row, dict):
+                unreadable = True
+                continue
+            moment = attempt_time(row)
+            if moment is None:
+                unreadable = True
+                continue
+            if moment < since:
+                continue
+            tied.append(row)
+        return tied, unreadable
+
+    for key in sorted(name for name in handoffs if isinstance(name, str)):
+        handoff = handoffs[key]
+        if not isinstance(handoff, dict) or not decision_custody(handoff):
+            continue
+        if not set(handoff) <= _OWNERSHIP_FIELDS:
+            unknown[key] = {"pr": key, "why": "handoff has fields outside ownership", "alerted": False}
+            continue
+        head = handoff.get("head")
+        matched = attempts.get(f"{key}:{head}") if isinstance(head, str) else None
+        recorded[key] = {
+            "pr": key,
+            "decision_owner": handoff.get("decision_owner"),
+            "head": head,
+            "by": "keeper" if describes_handoff(matched, handoff) else "coordinator",
+        }
+
+    for attempt_key in attempts:
+        # A key with no PR name (missing, or ":" with nothing before it) cannot name a row of its own.
+        if not isinstance(attempt_key, str) or not attempt_key:
+            label = "?"
+        elif ":" not in attempt_key:
+            label = attempt_key
+        else:
+            name = attempt_key.rpartition(":")[0]
+            if name:
+                continue
+            label = "?"
+        if label in recorded or label in unknown:
+            continue
+        episode_row = episodes.get(label)
+        unknown[label] = {
+            "pr": label,
+            "why": "heal attempt key is unreadable",
+            "alerted": bool(isinstance(episode_row, dict) and episode_row.get("alerted_at")),
+        }
+
+    claimed = set(recorded) | set(unknown)
+    keys = {name for name in episodes if isinstance(name, str) and name not in claimed}
+
+    for key in sorted(keys):
+        episode = episodes.get(key)
+        if not isinstance(episode, dict):
+            unknown[key] = {"pr": key, "why": "episode is unreadable", "alerted": False}
+            continue
+        since_raw = episode.get("since")
+        try:
+            if not isinstance(since_raw, str):
+                raise ValueError(since_raw)
+            since = _at(since_raw)
+        except (TypeError, ValueError):
+            unknown[key] = {
+                "pr": key, "why": "episode clock is unreadable",
+                "alerted": bool(episode.get("alerted_at")),
+            }
+            continue
+        related, unreadable_clock = attempts_for_episode(key, since)
+        unverified = unreadable_clock or any(
+            row.get("result") in {"pending", "unverified"} or row.get("postcondition") == "unknown"
+            for row in related
+        )
+        alerted = bool(episode.get("alerted_at"))
+        if unverified or not known:
+            unknown[key] = {
+                "pr": key,
+                "why": "keeper attempt unverified" if unverified else "last keeper tick is not evidence",
+                "alerted": alerted,
+            }
+            continue
+        if not alerted:
+            waiting[key] = {"pr": key, "since": episode.get("since")}
+            continue
+        refused = any(row.get("result") == "refused" for row in related)
+        alerts[key] = {
+            "pr": key, "since": episode.get("since"), "keeper": "refused" if refused else "not_recorded",
+        }
+
+    view: dict[str, Any] = {
+        "evidence": "known" if known else "unknown",
+        "waiting_for_grace": [waiting[key] for key in sorted(waiting)],
+        "recorded_custody": [recorded[key] for key in sorted(recorded)],
+        "unknown_evidence": [unknown[key] for key in sorted(unknown)],
+        "alert_outstanding": [alerts[key] for key in sorted(alerts)],
+    }
+    if why is not None:
+        view["why"] = why
+    return view
+
+
+def status_report(data: Mapping[str, Any]) -> dict[str, Any]:
+    """The saved ledger plus ``custody``, which is not written back."""
+    report = dict(data)
+    report["custody"] = custody_view(data)
+    return report
+
+
 def _repo_slug(text: str) -> str:
     """The repository exactly as named: ``owner/name``.
 
@@ -1097,28 +1297,36 @@ def _repo_slug(text: str) -> str:
     return text
 
 
+def _usage_refusal(reason: str, usage: list[str]) -> int:
+    print(json.dumps({"accepted": False, "reason": reason, "usage": usage}, sort_keys=True))
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Record PR ownership handoffs and queue custody, and check whether a queue-waiting "
-            "owner may exit.\nThe merge-queue keeper runs the ownerless-PR alert itself; use this "
-            "CLI as the successor, custodian or waiting owner. Not for judging review or CI state."
+            "Record who owns an open PR, or show whether the keeper already recorded custody.\n"
+            "Use one accept form at a time. Not for enqueue, merge, review or CI."
         ),
         epilog=(
             "Examples:\n"
             f"  python -m {_MODULE} check\n"
             f"  python -m {_MODULE} status\n"
             f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME\n"
-            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --custody --from TASK\n"
-            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --reason REASON --decision-owner OWNER\n"
-            f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME --release\n"
+            f"  {QUEUE_CUSTODY_USAGE}\n"
+            f"  {RECORDED_CUSTODY_USAGE}\n"
+            f"  {RELEASE_CUSTODY_USAGE}\n"
             f"  python -m {_MODULE} queue-exit --pr 42 --repo OWNER/NAME\n\n"
-            "accept --reason and --decision-owner records coordinator custody with no dispatch task.\n"
-            "--release drops that custody. The PR is not alerted again while it stays open.\n"
-            "Other accept and queue-exit act as the dispatch task named by LEARN_UKRAINIAN_DISPATCH_TASK_ID.\n"
+            "status custody.evidence is known or unknown. "
+            "waiting_for_grace: the keeper has not acted. "
+            "recorded_custody: a decision owner is recorded (by is keeper or coordinator). "
+            "unknown_evidence: this tick cannot tell you. "
+            "A mixed accept prints usage and writes nothing.\n"
+            "accept without those flags, and queue-exit, act as the dispatch task named by "
+            "LEARN_UKRAINIAN_DISPATCH_TASK_ID.\n"
             "accept and queue-exit need --repo OWNER/NAME: they never act on a repository they were not told.\n"
             "Outputs: JSON on stdout (check: one line per PR without a live owner);\n"
-            "  only accept writes the shared ownership state.\n"
+            "  only accept writes the shared ownership state. status adds custody and does not write it.\n"
             "Exit codes: 0 accepted / may exit / every PR owned / status printed;\n"
             "  1 refused / keep waiting / a PR is ownerless;\n"
             "  2 GitHub, task records or ownership state unreadable, an owner unobservable (unknown), or a usage\n"
@@ -1129,39 +1337,67 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subs = parser.add_subparsers(dest="command", required=True)
-    subs.add_parser("status", help="Print outstanding alerts, handoffs and the last keeper tick")
+    subs.add_parser(
+        "status",
+        help="Show waiting_for_grace, recorded_custody, unknown_evidence and outstanding alerts",
+    )
     subs.add_parser("check", help="List open PRs with no live owner, counting accepted handoffs (read-only)")
-    for name, text in (("accept", "Accept ownership of a PR as its named successor"),
-                       ("queue-exit", "Exit 0 when this waiting owner may end under queue custody")):
-        sub = subs.add_parser(name, help=text)
+    accept = subs.add_parser(
+        "accept",
+        help="Accept one owner: a successor task, queue custody, or recorded custody",
+        description="Queue custody and recorded custody are different commands and do not combine.",
+        epilog=f"{QUEUE_CUSTODY_USAGE}\n{RECORDED_CUSTODY_USAGE}\n{RELEASE_CUSTODY_USAGE}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    queue_exit = subs.add_parser(
+        "queue-exit", help="Exit 0 when this waiting owner may end under queue custody",
+    )
+    for sub in (accept, queue_exit):
         sub.add_argument("--pr", type=int, required=True, help="PR number, e.g. 42")
         sub.add_argument("--repo", required=True, type=_repo_slug,
                          help="owner/name of the PR's repository; never inferred from the checkout")
-        if name == "accept":
-            sub.add_argument("--custody", action="store_true",
-                             help="Accept queue custody: ejection, stale approval, merge confirmation, closeout")
-            sub.add_argument("--from", dest="predecessor",
-                             help="Live predecessor task waiting in the queue; needs --custody")
-            sub.add_argument("--reason", default=None,
-                             help="Why the PR is held. With --decision-owner, records custody without a dispatch task")
-            sub.add_argument("--decision-owner", default=None,
-                             help="Who decides. With --reason, records custody without a dispatch task")
-            sub.add_argument("--release", action="store_true",
-                             help="Release recorded custody so an ownerless PR can alert again")
+    accept.add_argument(
+        "--custody", action="store_true",
+        help="Queue custody only, with --from: take the live predecessor's remaining queue steps. "
+             "Not recorded custody. Does not change merge gates",
+    )
+    accept.add_argument(
+        "--from", dest="predecessor",
+        help="Task id of the live predecessor waiting in the queue. Requires --custody. Example: waiter",
+    )
+    accept.add_argument(
+        "--reason", default=None,
+        help="Why recorded custody is held. With --decision-owner and without --custody. "
+             "Example: worker crashed after approval",
+    )
+    accept.add_argument(
+        "--decision-owner", default=None,
+        help="Who decides for recorded custody. With --reason and without --custody. Example: claude-cto",
+    )
+    accept.add_argument(
+        "--release", action="store_true",
+        help="Drop recorded custody alone so grace starts over. Does not change merge gates",
+    )
     return parser
 
 
 def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
     """Record or release decision custody. Does not require a dispatch task id."""
-    if args.release and (args.reason is not None or args.decision_owner is not None or args.custody or args.predecessor):
-        print(json.dumps({"accepted": False, "reason": "release recorded custody on its own"}))
-        return 1
-    if not args.release and (args.custody or args.predecessor or not args.reason or not args.decision_owner):
-        print(json.dumps({
-            "accepted": False,
-            "reason": "recorded custody needs --reason and --decision-owner, and not --custody",
-        }))
-        return 1
+    # An empty --from is still supplied. Truthiness would treat it as absent and run the other form.
+    queue_form = bool(args.custody) or args.predecessor is not None
+    recorded_form = args.reason is not None or args.decision_owner is not None
+    if args.release and (queue_form or recorded_form):
+        return _usage_refusal("release recorded custody on its own", [RELEASE_CUSTODY_USAGE])
+    if queue_form and recorded_form:
+        return _usage_refusal(
+            "queue custody and recorded custody are different commands",
+            [QUEUE_CUSTODY_USAGE, RECORDED_CUSTODY_USAGE],
+        )
+    if not args.release and (not args.reason or not args.decision_owner):
+        return _usage_refusal(
+            "recorded custody needs --reason and --decision-owner, and not --custody",
+            [RECORDED_CUSTODY_USAGE],
+        )
     from lu_machinery.dispatcher import store
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
@@ -1193,7 +1429,7 @@ def main(argv: list[str] | None = None) -> int:
     path = state_path()
     try:
         if args.command == "status":
-            print(json.dumps(load(path), indent=2, sort_keys=True))
+            print(json.dumps(status_report(load(path)), indent=2, sort_keys=True))
             return 0
         if args.command == "check":
             data = load(path)
