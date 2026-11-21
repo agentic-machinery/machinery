@@ -18,10 +18,8 @@ cards, dataset rows). What blocks, reporting by class and evidence stay in
 
 - No Claude seat for any author.
 - Every seat keeps the Sources tools and the exact-head recording rule.
-- For an APPROVE item, `finding` may be `none` or free prose. Separate `sources` excerpts with semicolons, or write `none`; each excerpt must be literal captured Sources output, retaining its quote marks and backticks. For a bound review attempt, give its receipt id and literal `quote` in `evidence`; for an unbound review, omit `evidence` unless the captured receipt id is known. Every item `evidence` entry must have a receipt id and a non-empty `quote` from that receipt's captured output. A semicolon-separated `finding` clause naming a source term (including CEFR, a dictionary, a rule, a tag, a paradigm or a Sources tool) must also be a literal excerpt of captured output. Source-claim checks also apply to UNKNOWN rows in an APPROVED mixed reply. Avoid such clauses in `finding` when their quote marks or backticks do not quote the item; put those excerpts in `sources` instead. Query text, call counts, uncaptured outputs and paraphrases do not support source claims.
 - A reply too long for one answer is split into chunks of at most 250 answer rows, never splitting an activity. The seat's verdict is the union of its chunks. Further chunks of a head that was already dispatched open no new budget round.
-- When the brief declares an item denominator, build each chunk with `split_item_chunks` and `build_item_packet` (`lu_machinery.review.review_contract`) and put `render_item_packet` in the brief. That packet is the per-item literal table, character offsets, pointers, state counts and coverage set. The reviewer returns only a `ukrainian-item-judgments` block: for each tool-issued id, a verdict, a finding and Sources evidence. The recorder stores that coverage and the denominator on the verdict. A quoted or backtick-delimited span in the finding, a `quote` or `quotes` field, or the reply outside the block must be a literal substring of the frozen item, or an approval of the chunk is void (`quote-mismatch`) and its coverage does not count. On an APPROVE verdict, validated Ukrainian `sources` excerpts are checked against captured output instead. Only a Ukrainian-profile chunk adds coverage toward a seat. Offsets, counts, pointers, tables or a coverage set in the reply void the chunk (`reviewer-bookkeeping`) and do not count. The gate approves the head only when every required seat's recorded APPROVE coverage equals the denominator and no non-void rejection is recorded at that head. A review with no item denominator is unchanged.
-- The row-level `quote` and `quotes` fields quote the frozen item. The `quote` inside an item `evidence` entry quotes captured Sources output instead. In an APPROVED reply, an unsupported source claim in an UNKNOWN row refuses the whole reply (`UKRAINIAN_CLAIMS_UNSUPPORTED`).
+- When the brief declares an item denominator, build each chunk with `split_item_chunks` and `build_item_packet` (`lu_machinery.review.review_contract`) and put the output of `render_item_packet` in the brief. The packet supplies the frozen item text, character offsets, pointers, state counts and coverage set. The recorder stores coverage and the denominator with each verdict. Only a Ukrainian-profile chunk adds coverage toward a seat. The gate approves the head only when every required seat's recorded APPROVE coverage equals the denominator and no non-void rejection is recorded at that head.
 - Grok is not a language seat. Native Grok dispatch is retired. Cursor `grok-4.7-high`
   stays off language seats (`model-assignment.md`, Grok language routing;
   `lu_machinery/config/model_catalog.yaml` review profiles). Admitting Grok via Cursor for Ukrainian needs a
@@ -37,6 +35,48 @@ cards, dataset rows). What blocks, reporting by class and evidence stay in
   seat is complete only when its chunk union equals the denominator. The
   receipt target SHA is the PR head. Learner-page execution on a local merge of
   that head is recorded separately.
+
+## Ukrainian review with a frozen item packet
+
+Return one fenced `ukrainian-item-judgments` block and leave the rest of the reply empty.
+The recorder derives the verdict from the item rows. The block contains a JSON object
+with `"schema": "ukrainian-item-judgments.v1"` and an `items` array. Include one row for
+each id in the packet's coverage set. Each row has four string fields.
+
+- `id` is the exact id from the packet.
+- `verdict` is `APPROVE`, `REQUEST_CHANGES`, `BLOCKED` or `UNKNOWN`. An `UNKNOWN` row adds no coverage.
+- `finding` states the finding, or `none` when there is none. A semicolon-separated
+  `finding` clause naming a source term such as CEFR, a dictionary, a rule, a tag, a paradigm
+  or a Sources tool must be a literal excerpt of captured output. Put source excerpts in `sources`.
+- `sources` contains semicolon-separated excerpts, or `none`. Keep punctuation, quote marks
+  and backticks as captured. For an approval, each excerpt must be literal captured Sources output.
+
+For a bound attempt, include an `evidence` array on the row. Every item `evidence` entry must
+have a receipt id (`receipt_id`) and a non-empty `quote`. The `quote` inside an item `evidence`
+entry quotes captured Sources output from that receipt. For an unbound review, omit
+`evidence` unless you know the captured receipt id. Query text, call counts, uncaptured
+outputs and paraphrases do not support claims. Source-claim checks also apply to UNKNOWN
+rows in an APPROVED mixed reply. In that case, an unsupported source claim in an UNKNOWN
+row refuses the whole reply (`UKRAINIAN_CLAIMS_UNSUPPORTED`).
+
+The row-level `quote` and `quotes` fields quote the frozen item. Quoted or backtick-delimited
+spans in a finding must also occur literally in that item. A mismatch voids an approval's
+coverage (`quote-mismatch`). On an APPROVE verdict, validated Ukrainian `sources` excerpts
+are checked against captured output instead.
+Offsets, counts, pointers, tables or a coverage set in the reply void the chunk
+(`reviewer-bookkeeping`) and do not count.
+
+## Ukrainian review without a frozen item packet
+
+Start with one standalone verdict line. Use `VERDICT: APPROVE`, `VERDICT: REQUEST_CHANGES`
+or `VERDICT: BLOCKED`. Follow it with one fenced `json` object. Put findings and their
+repository-relative citations, or the reason the review is blocked, in the `summary` string.
+Put literal captured Sources excerpts, separated by semicolons, in the `sources` string.
+Use `none` for that string when the reply makes no source claim. Keep source claims in
+`sources` and retain the excerpts' punctuation. A bound attempt can cite the captured
+receipt in an `evidence` array. Each entry contains `receipt_id` and a literal `quote`
+from that receipt's output.
+The verdict line and this object are the entire reply.
 
 ## Findings
 
