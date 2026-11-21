@@ -1295,7 +1295,14 @@ jobs:
           rm -rf "$RUNNER_TEMP/trivy"
           mkdir -p "$RUNNER_TEMP/trivy"
           tar -xzf "$archive" -C "$RUNNER_TEMP/trivy" trivy
-          reported="$("$RUNNER_TEMP/trivy/trivy" --version | head -n 1)"
+          ver_out="$RUNNER_TEMP/trivy/version.out"
+          ver_err="$RUNNER_TEMP/trivy/version.err"
+          if ! (cd "$RUNNER_TEMP/trivy" && env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/trivy" \
+            "$RUNNER_TEMP/trivy/trivy" --config "" --version >"$ver_out" 2>"$ver_err"); then
+            echo "::error::Trivy version check failed ($(wc -l < "$ver_err") stderr line(s) withheld)"
+            exit 1
+          fi
+          IFS= read -r reported < "$ver_out" || reported=""
           if [ "$reported" != "Version: ${TRIVY_VERSION}" ]; then
             echo "::error::Expected trivy Version: ${TRIVY_VERSION}, got: ${reported}"
             exit 1
@@ -1645,7 +1652,14 @@ jobs:
           rm -rf "$RUNNER_TEMP/trivy"
           mkdir -p "$RUNNER_TEMP/trivy"
           tar -xzf "$archive" -C "$RUNNER_TEMP/trivy" trivy
-          reported="$("$RUNNER_TEMP/trivy/trivy" --version | head -n 1)"
+          ver_out="$RUNNER_TEMP/trivy/version.out"
+          ver_err="$RUNNER_TEMP/trivy/version.err"
+          if ! (cd "$RUNNER_TEMP/trivy" && env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/trivy" \
+            "$RUNNER_TEMP/trivy/trivy" --config "" --version >"$ver_out" 2>"$ver_err"); then
+            echo "::error::Trivy version check failed ($(wc -l < "$ver_err") stderr line(s) withheld)"
+            exit 1
+          fi
+          IFS= read -r reported < "$ver_out" || reported=""
           if [ "$reported" != "Version: ${TRIVY_VERSION}" ]; then
             echo "::error::Expected trivy Version: ${TRIVY_VERSION}, got: ${reported}"
             exit 1
@@ -1944,7 +1958,14 @@ jobs:
           rm -rf "$RUNNER_TEMP/trivy"
           mkdir -p "$RUNNER_TEMP/trivy"
           tar -xzf "$archive" -C "$RUNNER_TEMP/trivy" trivy
-          reported="$("$RUNNER_TEMP/trivy/trivy" --version | head -n 1)"
+          ver_out="$RUNNER_TEMP/trivy/version.out"
+          ver_err="$RUNNER_TEMP/trivy/version.err"
+          if ! (cd "$RUNNER_TEMP/trivy" && env -i PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/trivy" \
+            "$RUNNER_TEMP/trivy/trivy" --config "" --version >"$ver_out" 2>"$ver_err"); then
+            echo "::error::Trivy version check failed ($(wc -l < "$ver_err") stderr line(s) withheld)"
+            exit 1
+          fi
+          IFS= read -r reported < "$ver_out" || reported=""
           if [ "$reported" != "Version: ${TRIVY_VERSION}" ]; then
             echo "::error::Expected trivy Version: ${TRIVY_VERSION}, got: ${reported}"
             exit 1
