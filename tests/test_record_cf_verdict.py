@@ -2742,6 +2742,9 @@ def _resolve(facts):
 @pytest.mark.usefixtures("agent_runtime_roots")
 def test_three_family_branch_resolves_a_pair_covering_every_commit(tmp_path, monkeypatch):
     """Defect: a branch authored by all three critical-tier families has no eligible reviewer."""
+    from dataclasses import replace
+
+    from lu_machinery.review.app_bot_authorship import VERIFIED_APP_BOT
     from tests.agent_runtime.test_authoring_review_feasibility import OPUS, SOL, mini_repo
 
     repo = mini_repo(tmp_path, monkeypatch)
@@ -2763,6 +2766,10 @@ def test_three_family_branch_resolves_a_pair_covering_every_commit(tmp_path, mon
         assert scope.author_family == ",".join(sorted(set(by_family) - {reviewer}))
         assert {commit.sha for commit in facts.reviewer_scope(reviewer).commits} == set(scope.commits)
     assert set().union(*(scope.commits for scope in scopes.values())) == set(by_family.values())
+    # No three-family seat is scoped to a verified bot commit, so such a branch fails closed.
+    bot = recorder.CommitAttribution("f" * 40, VERIFIED_APP_BOT, VERIFIED_APP_BOT, authorship=VERIFIED_APP_BOT)
+    with_bot = _resolve(replace(facts, commits=(*facts.commits, bot)))
+    assert not with_bot.quorum and "verified app-bot commit" in with_bot.fail_closed_reason
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')

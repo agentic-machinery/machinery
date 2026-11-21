@@ -589,6 +589,9 @@ def mixed_family_scope(author_commits: Iterable[tuple[str, str]], reviewer_famil
         names = [_FAMILY_NAMES[family] for family in sorted(families & _FAMILY_NAMES.keys())]
         named = " or ".join(names) if len(names) <= 2 else f"{', '.join(names[:-1])} or {names[-1]}"
         raise ValueError(f"mixed-family review requires an {named or 'author-family'} seat")
+    if len(families) > 2 and any(family == VERIFIED_APP_BOT for _sha, family in commits):
+        # The Anthropic/OpenAI pair keeps bot commits as whole-head context; the three-family pair has no seat scoped to them.
+        raise ValueError("three-family review cannot scope a verified app-bot commit")
     attributed = [(sha, family) for sha, family in commits if family in families]
     if any(not re.fullmatch(r"[0-9a-f]{40}", sha) for sha, _family in attributed):
         raise ValueError("mixed-family review requires complete commit scopes for both families")

@@ -3865,9 +3865,14 @@ def republish_withheld(
     )
     reply = repository_relative_reply(reply, task=task, primary_root=review_root)
 
-    def rendered(second: bool, verdict: str) -> tuple[str, list[str]]:
-        """Known forms of this recorded comment, and the full form to publish."""
-        mixed_pair = review_mode == "cross_family" and not review.ukrainian and not second and facts.mixed_family
+    def rendered(second: bool, verdict: str, scoped: bool) -> tuple[str, list[str]]:
+        """Known forms of this recorded comment, and the full form to publish.
+
+        ``scoped`` is the recorded marker's own form: a Low-tier record is unscoped even on a pair branch.
+        """
+        mixed_pair = (
+            scoped and review_mode == "cross_family" and not review.ukrainian and not second and facts.mixed_family
+        )
         scope = facts.reviewer_scope(review.family) if mixed_pair else facts
         chunk = _item_chunk(
             task, reply, review.verdict, source_claims_validated=review.ukrainian and review.verdict == "APPROVED",
@@ -3936,7 +3941,7 @@ def republish_withheld(
             not second and not reviews_of_record(review.model)
         ):
             raise RecordError("a recorded verdict of this task does not match its record and sealed reply")
-        withheld, full_forms = rendered(second, verdict)
+        withheld, full_forms = rendered(second, verdict, scoped=bool(marker.get("review_pair")))
         if any(item["body"] != withheld and item["body"] not in full_forms for item in own):
             raise RecordError("a recorded verdict of this task does not match its record and sealed reply")
         comment = full_forms[0]
