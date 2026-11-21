@@ -1119,14 +1119,16 @@ def test_two_caller_run_attributes_findings_to_their_caller() -> None:
         },
     )
     assert (evidence["state"], evidence["reason"]) == ("findings", None)
-    assert [(item["caller"], item["scanner"], item["rule"], item["location"]) for item in evidence["findings"]] == [
-        ("Python dependencies", "shellcheck", "SC2086", "scripts/run.sh:10")
-    ]
+    gate_job_id = next(index for index, (name, _) in enumerate(jobs) if name == "Python dependencies / Fleet security gate")
+    assert [
+        (item["caller"], item["caller_gate_job_id"], item["scanner"], item["rule"], item["location"])
+        for item in evidence["findings"]
+    ] == [("Python dependencies", 100 + gate_job_id, "shellcheck", "SC2086", "scripts/run.sh:10")]
     assert [run["gate_conclusion"] for run in evidence["runs"]] == ["failure"]
     table_row = next(
         line for line in alerts_module._render_fleet_section(evidence) if "SC2086" in line and line.startswith("|")
     )
-    assert table_row.startswith("| `Python dependencies` | `shellcheck` |")
+    assert table_row.startswith(f"| `Python dependencies` gate job `{100 + gate_job_id}` | `shellcheck` |")
 
 
 @pytest.mark.parametrize("finding", [False, True], ids=["clean", "finding"])

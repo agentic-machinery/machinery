@@ -270,6 +270,11 @@ def _caller_cell(value: Any) -> str:
     return _sanitize_md_cell(value) or "-"
 
 
+def _gate_job_cell(value: Any) -> str:
+    """Render the gate job id that identifies a finding's caller; anything but an id is ``-``."""
+    return str(value) if type(value) is int and value > 0 else "-"
+
+
 def _as_mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
@@ -1072,34 +1077,38 @@ def _read_caller_evidence(
         matched = _fleet_job_caller(job_name) if isinstance(job_name, str) else None
         if matched is not None:
             groups.setdefault(matched[0], []).append((matched[1], job))
+    # Job names alone cannot tell a mangled gate name from another workflow's job that shares a
+    # scanner's name, so every set needs its own gate or the run is refused.
     gate_conclusions: dict[str | None, str] = {}
+    gate_job_ids: dict[str | None, int] = {}
     for caller_name, group in groups.items():
         gates = [job for job_name, job in group if job_name == _FLEET_GATE_JOB]
-        # fleet-security always creates its gate job (``if: always()``), so a set of jobs without
-        # one is not a fleet-security caller: another workflow's job that shares a scanner's name.
-        if not gates:
-            continue
         if len(gates) != 1:
             return record, [], "no_fleet_security_jobs"
         conclusion = gates[0].get("conclusion")
         if not isinstance(conclusion, str):
             return None, [], "github_invalid_payload"
         gate_conclusions[caller_name] = conclusion
+        # Job ids were checked above to be distinct integers, so each caller has its own id.
+        gate_job_ids[caller_name] = gates[0]["id"]
     if not gate_conclusions:
         return record, [], "no_fleet_security_jobs"
-    # Each finding names its caller. Two callers whose names read the same once sanitized, in
-    # the record or in a Markdown cell, could not be told apart, so the run is refused. So is a
-    # caller whose name is empty once sanitized: it reads as a bare job name.
+    # Each finding names its caller by its gate job id, which no name can imitate, and by its
+    # sanitized name. Two callers whose names read the same once sanitized, in the record or in
+    # a Markdown cell, are refused all the same, and so is a caller whose name is empty once
+    # sanitized: it reads as a bare job name.
     caller_labels = {caller_name: _sanitize_text(caller_name) for caller_name in gate_conclusions}
     if any(caller_name is not None and not label for caller_name, label in caller_labels.items()) or len(
         {_caller_cell(label) for label in caller_labels.values()}
     ) != len(caller_labels):
         return record, [], "caller_names_ambiguous"
-    # The run's gate result is success only when every caller's gate succeeded.
-    run_gate = next((value for value in gate_conclusions.values() if value != "success"), "success")
+    # The run's gate result is success only when every caller's gate succeeded. Otherwise it is
+    # the first, in sorted order, of the conclusions that refuse the run, else failure.
+    refusing = sorted(value for value in gate_conclusions.values() if value not in {"success", "failure"})
+    run_gate = refusing[0] if refusing else "failure" if "failure" in gate_conclusions.values() else "success"
     record = {**record, "gate_conclusion": run_gate}
     # A cancelled, timed-out or skipped gate never checked the scanner jobs.
-    if any(value not in {"success", "failure"} for value in gate_conclusions.values()):
+    if refusing:
         return record, [], "run_not_success"
     findings: list[dict[str, Any]] = []
     for caller_name, gate_conclusion in gate_conclusions.items():
@@ -1157,7 +1166,13 @@ def _read_caller_evidence(
                         parsed = None
                     if parsed is None:
                         return record, [], "annotations_unreadable"
-                    caller_findings.append({**parsed, "caller": caller_labels[caller_name] or None})
+                    caller_findings.append(
+                        {
+                            **parsed,
+                            "caller": caller_labels[caller_name] or None,
+                            "caller_gate_job_id": gate_job_ids[caller_name],
+                        }
+                    )
                     job_findings += 1
                     if len(findings) + len(caller_findings) > _MAX_OSS_FINDINGS:
                         return None, [], "pagination_limit"
@@ -1637,7 +1652,7 @@ def _render_fleet_section(fleet: Mapping[str, Any]) -> list[str]:
                 if not isinstance(item, Mapping):
                     continue
                 lines.append(
-                    f"| `{_caller_cell(item.get('caller'))}` | "
+                    f"| `{_caller_cell(item.get('caller'))}` gate job `{_gate_job_cell(item.get('caller_gate_job_id'))}` | "
                     f"`{_sanitize_md_cell(item.get('scanner'))}` | `{_sanitize_md_cell(item.get('rule'))}` | "
                     f"`{_sanitize_md_cell(item.get('severity'))}` | `{_sanitize_md_cell(item.get('location'))}` | "
                     f"{_sanitize_md_cell(item.get('message'))} |"
