@@ -86,10 +86,12 @@ def dispatch(tmp_path, monkeypatch):
     return invoke
 
 
-def test_openrouter_build_pins_v41_flash_and_allow_list(spec, funded, dispatch):
-    invocation = opencode.build(replace(spec, provider="openrouter"), {})
+@pytest.mark.parametrize("effort", [None, "high"])
+def test_openrouter_build_pins_v41_flash_and_allow_list(spec, funded, dispatch, effort):
+    invocation = runtime_context.build(replace(spec, provider="openrouter", effort=effort), {})
     argv = invocation.argv
     assert argv[argv.index("--model") + 1] == OPENROUTER_MODEL
+    assert argv[argv.index("--variant") + 1] == "high"
     config = json.loads(invocation.env["OPENCODE_CONFIG_CONTENT"])
     assert config["small_model"] == OPENROUTER_MODEL  # the title call never reaches another model
     assert config["enabled_providers"] == ["openrouter"]  # no other provider is reachable
@@ -104,12 +106,25 @@ def test_openrouter_build_pins_v41_flash_and_allow_list(spec, funded, dispatch):
     assert dispatch("--provider", "openrouter")["provider"] == "openrouter"
 
 
-def test_default_build_stays_direct_api(spec, funded, dispatch):
+@pytest.mark.parametrize(("effort", "variant"), [(None, "high"), ("low", "low"), ("high", "high"), ("max", "max")])
+def test_direct_api_build_selects_requested_variant(spec, funded, dispatch, effort, variant):
+    flags = () if effort is None else ("--effort", effort)
+    record = dispatch(*flags)
+    assert (record["provider"], record["effort"]) == ("deepseek", effort)
     for provider in (None, "deepseek"):
-        invocation = opencode.build(replace(spec, provider=provider), {})
+        invocation = runtime_context.build(replace(spec, provider=provider, effort=record["effort"]), {})
         assert invocation.argv[invocation.argv.index("--model") + 1] == "deepseek/deepseek-flash"
+        assert invocation.argv[invocation.argv.index("--variant") + 1] == variant
         assert "provider" not in json.loads(invocation.env.get("OPENCODE_CONFIG_CONTENT", "{}"))
-    assert dispatch()["provider"] == "deepseek"
+
+
+@pytest.mark.parametrize(("provider", "effort"), [
+    ("deepseek", "medium"), ("deepseek", ""), ("deepseek", "HIGH"), ("deepseek", "high\n"),
+    ("openrouter", "medium"), ("openrouter", "none"), ("openrouter", "low"), ("openrouter", "max"),
+])
+def test_opencode_build_refuses_effort_without_an_allowed_variant(spec, provider, effort):
+    with pytest.raises(ValueError, match=f"opencode_effort_refused: {provider} does not offer effort"):
+        runtime_context.build(replace(spec, provider=provider, effort=effort), {})
 
 
 @pytest.mark.parametrize("provider", ["deepseek", "openrouter"])
