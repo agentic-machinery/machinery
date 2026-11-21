@@ -911,7 +911,7 @@ def test_authorship_exclusion_requires_a_real_commit(repo, tasks, exclude):
     assert refused.value.code == recorder.FACTS_TARGET_UNKNOWN
 
 
-def test_closeout_unknown_history_preview_preserves_default_refusal(repo, tasks, tmp_path):
+def test_closeout_refuses_unknown_history_in_both_review_modes(repo, tasks, tmp_path):
     historical = repo.commit(None, message="historical conflict resolution")
     repo.commit(SOL, message="validated current author")
     state = tmp_path / "resolution.json"
@@ -955,11 +955,14 @@ def test_closeout_unknown_history_preview_preserves_default_refusal(repo, tasks,
         f"commit {historical[:12]}: author model unknown: missing explicit X-Agent model trailer"
         in refusal["fail_closed_reason"]
     )
-    assert main([*args, "--review-mode", "red_team"]) == 0
-    resolved = json.loads(state.read_text())["resolved_reviewer"]
-    assert resolved["selected"]["concrete_model"] == "claude-opus-5-5"
-    assert resolved["review_mode"] == "red_team" and resolved["limitation"]
-    facts = resolved["branch_facts"]
+    assert main([*args, "--review-mode", "red_team"]) == 1
+    refusal = json.loads(state.read_text())["resolved_reviewer"]
+    assert refusal["selected"] is None
+    assert refusal["quorum"] == []
+    assert refusal["reason_code"] == "AUTHOR_UNRESOLVED"
+    assert historical in refusal["fail_closed_reason"]
+    assert str(tasks) in refusal["fail_closed_reason"]
+    facts = refusal["branch_facts"]
     assert facts["unknown_history"] == [historical]
     assert {"anthropic", "openai", "google", "xai"} <= set(facts["excluded_families"])
     assert not list(tasks.glob("*.json"))
