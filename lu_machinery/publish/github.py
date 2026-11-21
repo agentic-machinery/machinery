@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -1673,6 +1674,21 @@ def _publish_ruleset_merge_queue(
 
 
 _DISMISS_TRIAGE_PATH = "docs/runbooks/secret-scanning.md"
+_DISMISS_ANALYSIS_PER_PAGE = 100
+_DISMISS_ANALYSIS_MAX_PAGES = 20
+_DISMISS_ANALYSIS_CLOCK_SKEW = timedelta(minutes=5)
+
+
+def _parse_utc_timestamp(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError("invalid timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise ValueError("invalid timestamp") from None
+    if parsed.tzinfo is None:
+        raise ValueError("invalid timestamp")
+    return parsed.astimezone(UTC)
 
 
 def _refuse_dispatched_dismissal(environment):
@@ -1769,6 +1785,10 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
     merge = pr["merge_commit_sha"]
     if pr.get("merged") is not True or not re.fullmatch(PATTERNS["sha"], merge):
         raise ValueError("PR is not merged")
+    merge_cutoff = (
+        _parse_utc_timestamp(pr["merged_at"]) - _DISMISS_ANALYSIS_CLOCK_SKEW
+        if "merged_at" in pr else None
+    )
     if pr["html_url"] != f"https://github.com/{gh_repo}/pull/{pr_number}":
         raise ValueError("PR identity changed")
     files = get(f"pulls/{pr_number}/files?per_page=100", pages=True)
@@ -1814,23 +1834,58 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
         raise ValueError("alert identity or state changed")
     if row[1].strip() != f"`{alert['rule']['id']}`":
         raise ValueError("rule changed")
+    tool_query = ""
+    if "tool" in alert:
+        tool = alert["tool"]
+        tool_name = tool.get("name") if isinstance(tool, dict) else None
+        if not isinstance(tool_name, str) or not tool_name.strip() or any(ord(c) < 32 or ord(c) == 127 for c in tool_name):
+            raise ValueError("invalid alert tool")
+        tool_query = f"&tool_name={quote(tool_name, safe='')}"
     get_instances = get(f"code-scanning/alerts/{number}/instances?per_page=100", pages=True)
     instances = [item for item in get_instances if item["state"] == "open"]
     if not instances:
         raise ValueError("no open instances")
     analyses, results = {}, {}
 
-    def evidence(ref, sha, instance):
+    def match_analysis(rows, sha, instance):
+        for analysis in rows:
+            if (
+                analysis.get("commit_sha") == sha
+                and all(analysis.get(key) == instance.get(key) for key in ("analysis_key", "environment", "category"))
+            ):
+                return analysis
+        return None
+
+    def evidence(ref, sha, instance, *, not_before=None):
         if not re.fullmatch(PATTERNS["sha"], sha) or not re.fullmatch(PATTERNS["ref"], ref):
             raise ValueError("invalid analysis identity")
-        if ref not in analyses:
-            analyses[ref] = get(f"code-scanning/analyses?ref={quote(ref, safe='')}&per_page=100", pages=True)
-        candidates = [analysis for analysis in analyses[ref] if analysis["commit_sha"] == sha
-                      and all(analysis.get(key) == instance.get(key) for key in ("analysis_key", "environment", "category"))]
-        if not candidates:
+        state = analyses.setdefault(ref, {"rows": [], "next_page": 1, "exhausted": False, "oldest_created_at": None})
+        analysis = match_analysis(state["rows"], sha, instance)
+        while analysis is None and not state["exhausted"] and state["next_page"] <= _DISMISS_ANALYSIS_MAX_PAGES:
+            if not_before is not None and state["oldest_created_at"] is not None and state["oldest_created_at"] < not_before:
+                break
+            page_num = state["next_page"]
+            page = get(
+                f"code-scanning/analyses?ref={quote(ref, safe='')}{tool_query}"
+                f"&per_page={_DISMISS_ANALYSIS_PER_PAGE}&page={page_num}"
+            )
+            if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+                raise ValueError("dismissal pagination unavailable")
+            state["next_page"] += 1
+            if not page:
+                state["exhausted"] = True
+                break
+            for item in page:
+                if "created_at" in item:
+                    created = _parse_utc_timestamp(item["created_at"])
+                    if state["oldest_created_at"] is None or created < state["oldest_created_at"]:
+                        state["oldest_created_at"] = created
+            state["rows"].extend(page)
+            analysis = match_analysis(page, sha, instance)
+        if analysis is None:
             raise ValueError("analysis evidence unavailable")
-        analysis = candidates[0]  # GitHub lists newest first; never use an older scan of this commit.
-        aid = analysis["id"]
+        # GitHub lists newest first; never use an older scan of this commit.
+        aid = analysis.get("id")
         if type(aid) is not int or aid <= 0 or analysis.get("error"):
             raise ValueError("analysis failed")
         if aid not in results:
@@ -1857,7 +1912,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment):
         if (row[2].strip() != f"`{location['path']}:{location['start_line']}`"
                 or not instance.get("message", {}).get("text")):
             raise ValueError("location or flow unknown or changed")
-        before = evidence(baseline_ref, merge, instance)
+        before = evidence(baseline_ref, merge, instance, not_before=merge_cutoff)
         current = evidence(instance["ref"], instance["commit_sha"], instance)
         if before != current or current["result"]["ruleId"] != alert["rule"]["id"]:
             raise ValueError("rule, location or flow changed")
