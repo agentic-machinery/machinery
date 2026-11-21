@@ -274,7 +274,7 @@ def test_resolvable_x_agent_reaches_release_runner(monkeypatch):
         parsed.append((args.command, args.x_agent))
         return 0
 
-    monkeypatch.setattr(release_cut, "_run", run)
+    monkeypatch.setattr(release_cut, "_locked_run", run)
     for command in ("cut", "post-release"):
         assert main([command, "--x-agent", "claude/claude-opus-5-5"]) == 0
     assert parsed == [("cut", "claude/claude-opus-5-5"), ("post-release", "claude/claude-opus-5-5")]
@@ -291,6 +291,46 @@ def _init_repo(path):
     _git(path, "config", "user.email", "release-cut@example.invalid")
     _git(path, "add", ".")
     _git(path, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--allow-empty", "-m", "seed")
+
+
+def test_concurrent_release_cuts_cannot_overlap(tmp_path):
+    """Defect class: concurrent release cuts overlap across worktrees."""
+    primary = tmp_path / "primary"
+    linked = tmp_path / "linked"
+    _init_repo(primary)
+    _git(primary, "worktree", "add", "-b", "worker", str(linked))
+    script = """
+import sys
+from pathlib import Path
+from lu_machinery import release_cut
+from lu_machinery.dispatcher import git
+git.resolve_repo = lambda name=None: (Path(sys.argv[1]), {})
+release_cut.x_agent_value = lambda value, **kwargs: value
+def run(args):
+    print('entered', flush=True)
+    sys.stdin.readline()
+    return 0
+release_cut._run = run
+raise SystemExit(release_cut.main(['cut', '--x-agent', 'fixture/worker']))
+"""
+    first = subprocess.Popen([sys.executable, "-c", script, str(primary)], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert first.stdout.readline().strip() == "entered"
+        second = subprocess.run([sys.executable, "-c", script, str(linked)], input="\n", text=True,
+                                capture_output=True, timeout=10)
+        assert second.returncode != 0
+        assert "release-cut.lock" in second.stderr
+        first.kill()
+        assert first.wait(timeout=10) != 0
+        third = subprocess.run([sys.executable, "-c", script, str(linked)], input="\n", text=True,
+                               capture_output=True, timeout=10)
+        assert third.returncode == 0
+        assert third.stdout.strip() == "entered"
+    finally:
+        if first.poll() is None:
+            first.kill()
+            first.wait()
 
 
 def _bare_checkout(seed, bare, checkout):
