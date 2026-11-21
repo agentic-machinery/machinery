@@ -70,7 +70,8 @@ Use a Linux x64 runner with glibc, Bash, curl, jq, and standard GNU utilities, i
 | `require-trufflehog-ignore` | boolean | `false` | Fail closed when `.trufflehogignore` is missing. Explicit non-default paths always fail closed if missing. |
 | `secret-scan-required-extensions` | string | `''` | Comma-separated extensions (e.g. `.py`) that must remain in scope after exclusions. |
 | `run-trivy-fs` | boolean | `false` | Run pinned `trivy fs` for dependency CVEs and licences. |
-| `trivy-fs-targets` | string | `''` | Newline-separated repo-relative files or directories. Required when `run-trivy-fs: true`. |
+| `trivy-fs-targets` | string | `''` | Newline-separated repo-relative files or directories. Required when `run-trivy-fs: true` unless pip lock files are supplied. |
+| `trivy-fs-pip-lock-files` | string | `''` | Optional newline-separated repo-relative pip lock files with exact version pins. Each file gets its own target receipt. |
 | `trivy-scanners` | string | `vuln,license` | Comma-separated subset of `vuln,license,misconfig`. |
 | `trivy-severity` | string | `HIGH,CRITICAL` | Comma-separated severities (`UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL`). |
 | `trivy-ignore-unfixed` | boolean | `false` | Ignore unfixed vulnerabilities in `trivy fs`. |
@@ -90,9 +91,32 @@ Use a Linux x64 runner with glibc, Bash, curl, jq, and standard GNU utilities, i
 | `trivy-image-scanners` | string | `vuln` | Comma-separated subset of `vuln,license` (defaults to `vuln` so Linux base-OS GPL utilities do not false-fail image scans). |
 | `trivy-image-ignore-unfixed` | boolean | `false` | Ignore unfixed vulnerabilities in `trivy image`. |
 
+## Scan pip lock files
+
+When your resolved Python dependencies live in a custom-named pip lock file, set
+`trivy-fs-pip-lock-files`. You can also scan ordinary targets in the same job.
+
+```yaml
+with:
+  run-trivy-fs: true
+  trivy-fs-targets: |
+    package-lock.json
+  trivy-fs-pip-lock-files: |
+    requirements-machinery.lock
+    tools/requirements-dev.lock
+```
+
+List one repo-relative regular file per line. The workflow rejects missing files,
+directories, symlinks, and paths that traverse outside the checkout. Trivy uses
+its pip parser for each listed file and reports the package count and findings
+in that file's receipt. A file with zero detected pip packages fails the scan.
+A `requirements.txt` with only lower bounds such as `package>=1.2` has no
+resolved packages to scan. Supply the lock file with exact pins such as
+`package==1.2`.
+
 ## Trivy filesystem licence dispositions
 
-Use a reviewed tuple to accept a licence finding for one scan target and package. Copy the target from `trivy-fs-targets` and the package name and full SPDX expression from the finding's `PkgName` and `Name` fields. For example, `package-lock.json|example-package|GPL-3.0-only`.
+Use a reviewed tuple to accept a licence finding for one scan target and package. Copy the target path from `trivy-fs-targets` or `trivy-fs-pip-lock-files`. Copy the package name and full SPDX expression from the finding's `PkgName` and `Name` fields. For example, `package-lock.json|example-package|GPL-3.0-only`.
 
 All three fields match literally, including case and spaces within an expression. Blank lines are allowed. Each tuple must have three nonempty fields, with no surrounding whitespace, control characters, or extra separators. Use a repo-relative target path or `.`. Repeated tuples count as one disposition. A malformed tuple fails the step before Trivy runs.
 
@@ -102,7 +126,7 @@ The target receipt lists each accepted finding's tuple in `accepted_license_find
 
 On `pull_request` and `merge_group`, scanner config and ignore files come from the event's base commit. This covers Actionlint and Zizmor config files, ShellCheck configuration in the source directory hierarchy, and the Trivy and TruffleHog ignore files. Explicit repo-relative config and ignore paths also resolve at the base commit.
 
-Each enabled scanner job records the base commit in `scanner-policy.base_sha` and lists changed policy paths in `scanner-policy.changed`. If the candidate adds a policy file, the scan reports the addition and scans without that file's settings. If the candidate edits or removes an existing policy file, the scan uses the base version. A candidate policy addition or edit that is a symlink or another nonregular Git entry fails the job. Other events use the checked-out policy.
+Each enabled scanner job records the base commit in `scanner-policy.base_sha` and lists changed policy paths in `scanner-policy.changed`. If the candidate adds a policy file, the scan reports the addition and scans without that file's settings. If the candidate edits or removes an existing policy file, the scan uses the base version. For ShellCheck, pre-existing base directories named `.shellcheckrc` or `shellcheckrc` are skipped during policy export; adding or converting a policy path to a symlink, directory, or other nonregular Git entry in the candidate still fails the job. Other events use the checked-out policy.
 
 ## Output receipt (`fleet-security-receipt.v1`)
 
