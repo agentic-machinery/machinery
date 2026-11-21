@@ -373,4 +373,16 @@ def test_stale_nonce_or_moved_head_gets_no_review_reply(tmp_path, monkeypatch):
     assert ("result" in record, record["result_unavailable"]) == (False, "head_moved")
 
 
+def test_unborn_head_with_revision_named_path_gets_no_review_reply(tmp_path, monkeypatch):
+    """Defect: an unborn HEAD with a path named HEAD^{commit} is reported as a moved head."""
+    tree = _review_of_takeover(tmp_path, monkeypatch)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
+    run_git(tree, "update-ref", "-d", "HEAD")
+    (tree / "HEAD^{commit}").touch()
+
+    record, _code = worker.wait("author-review", "r1", reply=True)
+
+    assert ("result" in record, record["result_unavailable"]) == (False, "parent_head_unavailable")
+
+
 pytestmark = pytest.mark.usefixtures("configured_roots")

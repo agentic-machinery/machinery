@@ -554,31 +554,50 @@ def complete_author_families(inputs: ResolverInputs, single_family: str) -> froz
     return frozenset(members)
 
 
-MIXED_REVIEW_FAMILIES = frozenset({"anthropic", "openai"})
+# Author family sets that take the mixed-family pair: Anthropic/OpenAI, and all three critical-tier
+# families (NEON-SOLTIER-1120), which leave no critical seat outside the authors. Every other set
+# keeps its single outside-family reviewer. integration_sweep's marker reader admits the same sets.
+MIXED_REVIEW_SETS = frozenset({frozenset({"anthropic", "openai"}), frozenset({"anthropic", "google", "openai"})})
+_FAMILY_NAMES = {"anthropic": "Anthropic", "google": "Google", "openai": "OpenAI"}
+
+
+def is_mixed_family_set(families: Iterable[str]) -> bool:
+    """An approved pair set, and nothing else (a verified app bot is not a family)."""
+    return frozenset(families) - {VERIFIED_APP_BOT} in MIXED_REVIEW_SETS
 
 
 def mixed_family_review(inputs: ResolverInputs) -> bool:
-    """The approved two-family code/infra plan, never a red-team or unattested plan."""
+    """The approved mixed-family code/infra plan, never a red-team or unattested plan."""
     authors = complete_author_families(inputs, resolve_author_family(inputs.author_model, inputs.author_family))
+    committed = frozenset(family for _sha, family in inputs.author_commits) - {VERIFIED_APP_BOT}
     return (
         inputs.review_profile in {"code", "infra"}
-        and frozenset(family for _sha, family in inputs.author_commits) - {VERIFIED_APP_BOT} == MIXED_REVIEW_FAMILIES
-        and authors is not None and authors - {VERIFIED_APP_BOT} == MIXED_REVIEW_FAMILIES
+        and is_mixed_family_set(committed)
+        and authors is not None and authors - {VERIFIED_APP_BOT} == committed
     )
 
 
 def mixed_family_scope(author_commits: Iterable[tuple[str, str]], reviewer_family: str) -> tuple[str, ...]:
-    """Partition whole commits; a commit authored by both families has no independent seat."""
-    if reviewer_family not in MIXED_REVIEW_FAMILIES:
-        raise ValueError("mixed-family review requires an Anthropic or OpenAI seat")
+    """Every commit outside the reviewer's family; a commit two families authored has no partition.
+
+    Rule: each commit is reviewed by a seat outside its family, each seat's scope is the commits
+    its own family did not author, and the gate needs an approval covering every author family.
+    """
     commits = tuple(author_commits)
-    own = {sha for sha, family in commits if family == reviewer_family}
-    other = {sha for sha, family in commits if family in MIXED_REVIEW_FAMILIES - {reviewer_family}}
-    if not own or not other or any(not re.fullmatch(r"[0-9a-f]{40}", sha) for sha in own | other):
+    families = frozenset(family for _sha, family in commits) - {VERIFIED_APP_BOT}
+    if not is_mixed_family_set(families) or reviewer_family not in families:
+        names = [_FAMILY_NAMES[family] for family in sorted(families & _FAMILY_NAMES.keys())]
+        named = " or ".join(names) if len(names) <= 2 else f"{', '.join(names[:-1])} or {names[-1]}"
+        raise ValueError(f"mixed-family review requires an {named or 'author-family'} seat")
+    if len(families) > 2 and any(family == VERIFIED_APP_BOT for _sha, family in commits):
+        # The Anthropic/OpenAI pair keeps bot commits as whole-head context; the three-family pair has no seat scoped to them.
+        raise ValueError("three-family review cannot scope a verified app-bot commit")
+    attributed = [(sha, family) for sha, family in commits if family in families]
+    if any(not re.fullmatch(r"[0-9a-f]{40}", sha) for sha, _family in attributed):
         raise ValueError("mixed-family review requires complete commit scopes for both families")
-    if own & other:
+    if len({sha for sha, _family in attributed}) != len(set(attributed)):
         raise ValueError("mixed-family review cannot partition a commit authored by both families")
-    return tuple(sorted(other))
+    return tuple(sorted({sha for sha, family in attributed if family != reviewer_family}))
 
 
 @dataclass(frozen=True)
@@ -674,7 +693,7 @@ class ReviewerResolution:
     # reviewer selected, since there is nothing reliable to diff a
     # candidate's family against.
     fail_closed_reason: str | None = None
-    # Two-seat plan. Mixed Anthropic/OpenAI authors carry review_scopes; the existing
+    # Two-seat plan. Mixed critical-tier authors carry review_scopes; the existing
     # generic unattested-harness plan does not. ``selected`` stays None — there
     # is no single reviewer of record; BOTH quorum seats must independently
     # return an exact-head PASS verdict. Because the seats are from distinct
@@ -1179,12 +1198,12 @@ def _evaluate_candidate(
             capacity=capacity,
         )
     if review_mode == "cross_family" and mixed_family_review(inputs):
-        if candidate.family not in MIXED_REVIEW_FAMILIES:
+        if candidate.family not in authors:
             return CandidateResult(
                 name=candidate.name, concrete_model=candidate.concrete_model, family=candidate.family,
                 route=candidate.route, transport=candidate.transport, invocation=candidate.invocation,
                 quality_tier=candidate.quality_tier, requires_silence_timeout=candidate.requires_silence_timeout,
-                status="excluded", reason="mixed-family review requires one Anthropic and one OpenAI seat",
+                status="excluded", reason="mixed-family review requires seats from two author families",
                 health=health, capacity=capacity,
             )
         # Independence applies to the other family's commits; all paths still set the risk floor.
@@ -1539,7 +1558,7 @@ def resolve_reviewer(
     mixed_pair = review_mode == "cross_family" and mixed_family_review(inputs)
     if mixed_pair:
         try:
-            for reviewer_family in sorted(MIXED_REVIEW_FAMILIES):
+            for reviewer_family in sorted({family for _sha, family in inputs.author_commits} - {VERIFIED_APP_BOT}):
                 mixed_family_scope(inputs.author_commits, reviewer_family)
         except ValueError as exc:
             return resolution_type(
@@ -1763,10 +1782,11 @@ def resolve_reviewer(
                     break
             quorum_results.append(promoted)
         quorum_type = MixedFamilyResolution if mixed_pair else resolution_type
+        committed = {family for _sha, family in inputs.author_commits} - {VERIFIED_APP_BOT}
         scopes = tuple(
             CommitReviewScope(
                 reviewer_family=seat.family,
-                author_family=next(iter(MIXED_REVIEW_FAMILIES - {seat.family})),
+                author_family=",".join(sorted(committed - {seat.family})),
                 commits=mixed_family_scope(inputs.author_commits, seat.family),
                 context_head=inputs.exact_head,
             )
@@ -1782,7 +1802,7 @@ def resolve_reviewer(
             resolved_risk=risk,
             quorum=tuple(quorum_results),
             quorum_rule=(
-                "Anthropic/OpenAI pair: each seat reviews the other family's commits with the whole diff "
+                "mixed-family pair: each seat reviews the commits outside its own family with the whole diff "
                 "as context; both must APPROVE this exact head; one pair counts as one round"
                 if mixed_pair else _DUAL_FAMILY_QUORUM_RULE
             ),
