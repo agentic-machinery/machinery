@@ -15,18 +15,19 @@ A machinery release is cut as soon as a ready change is on a green `main`.
 There is no schedule and nobody waits for a window. A change is ready when it
 has merged (a post-release PR alone does not count), the previous release's
 post-release PR has also merged (so `main` carries the next version), and the
-newest `CI Gate` push run on `main`'s HEAD has passed. These are the
-conditions the cut's preflight checks (see Cut a release); a cut that starts
-earlier is refused.
+newest `CI Gate` push run on `main`'s HEAD has passed. The cut's preflight
+checks these conditions (see Cut a release). When nothing but a post-release
+PR has merged since the last full release, the command skips (exit 0,
+`unchanged`). Otherwise, when a condition is not met yet (for example the
+version files are behind or the `CI Gate` run has not passed), it refuses
+(exit 1) and publishes nothing.
 
 `claude-cto` runs every cut, on the host, as one command (Cut a release). A
 worker or driver does not run it: when its change has merged, it tells
 `claude-cto` in its report. One runner means two cuts never overlap. The cut
 tags `main`'s HEAD; there is no release PR. `main` already carries the next
 version, because each release ends by opening the post-release PR that
-records its changelog and moves the version files on. The command skips
-(exit 0, `unchanged`) when nothing but the post-release PR has merged since
-the last full release.
+records its changelog and moves the version files on.
 
 An urgent bug gets a hotfix release the same way: the same command, as soon
 as the fix is on a green `main`. Any other bug is fixed in a follow-up PR,
