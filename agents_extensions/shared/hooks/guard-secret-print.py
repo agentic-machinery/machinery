@@ -75,14 +75,12 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 
 from __future__ import annotations
 
-import ast
 import codecs
-import io
+import contextvars
 import os
 import re
 import shlex
 import sys
-import tokenize
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -109,6 +107,8 @@ except Exception as exc:
     print(f"guard dependency unavailable: json_depth ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
 # Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
+# Set only while _folded_simple_command_reason rescans a command main could not parse.
+_FOLD_APOSTROPHES: contextvars.ContextVar[bool] = contextvars.ContextVar("fold_apostrophes", default=False)
 _PAYLOAD_MAX_DEPTH = 512
 
 SEPARATORS = {"&&", "||", ";", "&", "\n"}
@@ -464,16 +464,17 @@ def _tokenize(command: str, *, shell_words: bool = False) -> list[str]:
 
 
 def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
-    """Keep complete Bash ${...} words and `'\\''` apostrophes intact while shlex splits operators.
+    """Keep complete Bash ${...} words intact while shlex splits operators.
 
-    Inside single quotes, `'\\''` closes the quote, adds an escaped apostrophe and
-    reopens it. The non-POSIX lexer honours a quote only at the start of a word, so
-    it would read the reopening quote as a plain character and every later quote
-    inverted. A marker keeps the word one single-quoted fragment instead.
+    While _FOLD_APOSTROPHES is set, `'\\''` inside single quotes (close, escaped
+    apostrophe, reopen) is kept too. The non-POSIX lexer honours a quote only at
+    the start of a word, so it would read the reopening quote as a plain character
+    and every later quote inverted; as a marker the word stays one fragment.
     """
     substitutions = {start: end for start, end, _ in _substitution_spans(command)}
     parameters: dict[str, str] = {}
     markers: dict[str, str] = {}
+    fold = _FOLD_APOSTROPHES.get()
     out: list[str] = []
     quote = ""
     i = 0
@@ -495,7 +496,7 @@ def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
             out.append(command[i : i + 2])
             i += 2
             continue
-        if quote == "'" and command.startswith("'\\''", i):
+        if fold and quote == "'" and command.startswith("'\\''", i):
             protect("'\\''")
             i += 4
             continue
@@ -543,7 +544,7 @@ def _restore_parameters(token: str, parameters: dict[str, str]) -> str:
 
 def _strip_quotes(token: str) -> str:
     if len(token) >= 2 and token[0] == token[-1] == "'":
-        # A lexer single-quoted token holds '\'' only where _protect_parameters folded it.
+        # A lexer single-quoted token holds '\\'' only where _protect_parameters folded it.
         return token[1:-1].replace("'\\''", "'")
     if len(token) >= 2 and token[0] == token[-1] == '"':
         return token[1:-1]
@@ -1347,61 +1348,11 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     reason = _program_reason(cmd, program)
     if reason:
         return reason
-    reads = re.compile(r"\b(?:open|read_text|read_bytes)\s*\(")
-    if dumped_files and _is_python_command(cmd) and reads.search(program):
+    if _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
         paths = re.findall(r"[\"']([^\"']+)[\"']", program)
-        # Main could not read a command holding a '\'' apostrophe at all. Read the literals
-        # of its arguments that read a file as Python does, so an apostrophe inside "it's"
-        # cannot shift the pairs above past the dumped path.
-        # Each argument is also read on its own, so a quote or `#` in one (`-X 'it'\''s'`)
-        # cannot swallow another.
-        if any("'\\''" in _protect_parameters(arg)[1].values() for arg in args):
-            paths += _python_literal_values(program)
-            for arg in args:
-                source = "".join(shlex.split(arg, posix=True))
-                if reads.search(source):
-                    paths += _python_literal_values(source)
         if any(_normalized_path(path) in dumped_files for path in paths):
             return "inline program would display a redirected environment dump"
     return None
-
-
-def _python_literal_values(source: str, depth: int = 0) -> list[str]:
-    """Return the constant string values Python's tokenizer reads in source, up to any unreadable part.
-
-    Comments, escapes, raw and bytes prefixes and quotes nested in f-string fields
-    are read exactly as Python reads them. A formatted string with fields has no
-    static value; the literals inside its fields still count. A string holding
-    braces is also read as source, since an older tokenizer returns an f-string or
-    t-string whole.
-    """
-    values: list[str] = []
-    formatted: list[list[str] | None] = []  # per open f-/t-string: its static parts, or None once it has a field
-    try:
-        for token in tokenize.generate_tokens(io.StringIO(source).readline):
-            kind = tokenize.tok_name[token.type]
-            if token.type == tokenize.STRING:
-                try:
-                    value = ast.literal_eval(token.string)
-                except (SyntaxError, ValueError):
-                    continue
-                value = value.decode("utf-8", "surrogateescape") if isinstance(value, bytes) else value
-                values.append(value)
-                if "{" in value and depth < 4:
-                    values += _python_literal_values(value.replace("{", "\n").replace("}", "\n"), depth + 1)
-            elif kind.endswith("STRING_START"):
-                formatted.append([])
-            elif kind.endswith("STRING_MIDDLE") and formatted and formatted[-1] is not None:
-                formatted[-1].append(token.string)
-            elif token.type == tokenize.OP and token.string == "{" and formatted:
-                formatted[-1] = None
-            elif kind.endswith("STRING_END") and formatted:
-                parts = formatted.pop()
-                if parts is not None:
-                    values.append("".join(parts))
-    except (tokenize.TokenError, SyntaxError, ValueError):
-        pass
-    return values
 
 
 def _heredoc_inputs(command: str) -> dict[str, list[tuple[str, bool]]]:
@@ -1443,9 +1394,7 @@ def _heredoc_reason(
     cmd, args, _ = found
     for index, token in enumerate(args[:-1]):
         if token == "<<<":
-            # Read the operand alone as well: glued to later words it can hide its script (`bash <<< '...' -s`).
-            bodies = _script_words(args, index + 1) + _script_words(args[index + 1 : index + 2], 0)
-            inputs = [(body, True) for body in dict.fromkeys(bodies)]
+            inputs = [(body, True) for body in _script_words(args, index + 1)]
         elif token in {"<<", "<<-"}:
             pending = documents.get(_strip_quotes(args[index + 1]), [])
             inputs = [pending.pop(0)] if pending else []
@@ -2101,6 +2050,54 @@ def _scan_command(
     return None
 
 
+# Main's parse refusals, the only results the folded rescan may replace.
+_UNPARSEABLE = frozenset({"shell command could not be parsed safely", "interpreter arguments could not be parsed safely"})
+# Python options that take no value and select no program text.
+_PYTHON_PLAIN_OPTIONS = frozenset({"-B", "-E", "-I", "-O", "-OO", "-P", "-q", "-s", "-S", "-u", "-b", "-bb"})
+
+
+def _runs_no_inline_program(cmd: str, args: list[str]) -> bool:
+    """Whether an interpreter runs a module or script file rather than program text from its words."""
+    if not _is_python_command(cmd):
+        return False
+    for arg in (_strip_quotes(arg) for arg in args):
+        if arg == "-m" or not arg.startswith("-"):
+            return True
+        if arg not in _PYTHON_PLAIN_OPTIONS:
+            return False
+    return False  # no module or script: the program comes from stdin
+
+
+def _folded_simple_command_reason(command: str) -> tuple[bool, str | None]:
+    """Rescan a command main could not parse with `'\\''` apostrophes folded.
+
+    Return (False, None) unless the folded command is one simple command whose
+    quote fragments are its exact shell words, with no wrapper, assignment,
+    redirect, substitution or here-document, and no word the guard reads as code
+    (no shell, eval or source, no interpreter program text). Otherwise return
+    (True, reason) from the ordinary scan of the folded words. Everything else
+    keeps main's refusal: its readers are not exact once such a command parses.
+    """
+    token = _FOLD_APOSTROPHES.set(True)
+    try:
+        executable, substitutions = _hide_substitutions(preprocess_shell_command(command))
+        if substitutions or _heredoc_inputs(command):
+            return False, None
+        words = _pipelines(executable, shell_words=True)
+        if _pipelines(executable) != words or len(words) != 1 or len(words[0]) != 1:
+            return False, None
+        segment = words[0][0]
+        found = _command_at(segment)
+        if found is None or found[2] != 0 or _raw_without_redirects(segment) != segment:
+            return False, None
+        cmd, args, _ = found
+        if cmd in SHELL_COMMANDS or (_is_interpreter_command(cmd) and not _runs_no_inline_program(cmd, args)):
+            return False, None
+        return True, _scan_command(command, set())
+    finally:
+        _FOLD_APOSTROPHES.reset(token)
+
+
 def _block_msg(reason: str) -> str:
     return (
         f"BLOCKED by guard-secret-print (#M-5): {reason}.\n\n"
@@ -2162,6 +2159,10 @@ def _main(argv: list[str] | None = None) -> int:
 
     try:
         reason = _scan_command(command, set())
+        if reason in _UNPARSEABLE:
+            folded, folded_reason = _folded_simple_command_reason(command)
+            if folded:
+                reason = folded_reason
     except ShellPreprocessLimit:
         reason = "nested shell command could not be parsed safely"
     if reason:
