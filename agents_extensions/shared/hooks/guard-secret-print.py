@@ -461,16 +461,39 @@ def _tokenize(command: str, *, shell_words: bool = False) -> list[str]:
 
 
 def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
-    """Keep complete Bash ${...} words intact while shlex splits operators."""
+    """Keep complete Bash ${...} words and unquoted escaped quotes intact while shlex splits operators.
+
+    The non-POSIX lexer honours a quote only at the start of a token, so after an
+    unquoted `\\'` (as in `'it'\\''s'`) it reads the reopening quote as a plain
+    character and every later quote inverted. An escaped quote becomes a quoted
+    marker instead: its closing quote ends the lexer token, so the next quote
+    opens one again.
+    """
     substitutions = {start: end for start, end, _ in _substitution_spans(command)}
     parameters: dict[str, str] = {}
+    markers: dict[tuple[str, str], str] = {}
     out: list[str] = []
     quote = ""
     i = 0
+
+    def protect(text: str, *, wrap: str = "") -> None:
+        # One marker per distinct text keeps restoring linear in the escape count.
+        marker = markers.get((wrap, text))
+        if marker is None:
+            marker = f"{wrap}\ue000{len(parameters)}\ue001{wrap}"
+            while marker in command:
+                marker = marker.removesuffix(wrap) + "\ue002" + wrap
+            parameters[marker] = text
+            markers[wrap, text] = marker
+        out.append(marker)
+
     while i < len(command):
         char = command[i]
         if char == "\\" and quote != "'" and i + 1 < len(command):
-            out.append(command[i : i + 2])
+            if not quote and command[i + 1] in {"'", '"'}:
+                protect(command[i : i + 2], wrap="'")
+            else:
+                out.append(command[i : i + 2])
             i += 2
             continue
         if char == "'" and quote != '"':
@@ -501,11 +524,7 @@ def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
                     depth -= 1
                 end += 1
             if not depth:
-                marker = f"\ue000{len(parameters)}\ue001"
-                while marker in command:
-                    marker += "\ue002"
-                parameters[marker] = command[i:end]
-                out.append(marker)
+                protect(command[i:end])
                 i = end
                 continue
         out.append(char)

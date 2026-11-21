@@ -1751,3 +1751,40 @@ def test_round_six_shell_fragment_boundaries(command, code):
     result = _subprocess_guard(command)
     assert SENTINEL not in result.stdout + result.stderr
     assert result.returncode == code
+
+
+def _shell_single_quote(value: str) -> str:
+    """Quote one argument the way the REPL shell helper does: close, escaped quote, reopen."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+@pytest.mark.parametrize(
+    "verb,flag", [("issue-close", "--comment"), ("pr-comment", "--body")], ids=["issue-close", "pr-comment"]
+)
+def test_escaped_apostrophe_in_single_quoted_value_is_allowed(monkeypatch, verb: str, flag: str):
+    """Defect class: an unquoted `\\'` between single-quoted fragments inverts the lexer's quote state.
+
+    The value's later operators then read as unbalanced shell syntax, and a publisher
+    call that prints no secret is refused as unparseable (ML-30CB-APOSTROPHE).
+    """
+    words = ["/venv/bin/python", "-m", "lu_machinery.publish", verb, "--number", "12", flag]
+    words.append("the PR's content (see #12); it's done | next")
+    command = " ".join(_shell_single_quote(word) for word in words)
+    assert "'\\''" in command
+    assert _run(monkeypatch, command) == 0
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["echo", "the PR's token:", "$GH_TOKEN"],
+        ["cat", ".env", "it's"],
+        ["printenv", "GH_TOKEN", "it's"],
+    ],
+    ids=["echo-secret-var", "cat-dotenv", "printenv-secret"],
+)
+def test_escaped_apostrophe_quoting_keeps_secret_print_refusals(monkeypatch, words: list[str]):
+    """Defect class: shielding escaped quotes must not hide a real secret print in the same command."""
+    command = " ".join(f'"{word}"' if word.startswith("$") else _shell_single_quote(word) for word in words)
+    assert "'\\''" in command
+    assert _run(monkeypatch, command) == 2
