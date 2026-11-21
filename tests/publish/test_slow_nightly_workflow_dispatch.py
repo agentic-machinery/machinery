@@ -995,6 +995,8 @@ def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reo
         b'{"number":1,"state":"closed","state":"open","rule":{"id":"py/test"},"tool":{"name":"CodeQL"}}',
         b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":NaN}',
         b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":Infinity}',
+        b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":1e999}',
+        b'{"number":1,"state":"open","rule":{"id":"py/test"},"extra":-1e999}',
         b"\xef\xbb\xbf" + valid_alert_json.encode("utf-8"),
         b"\xff",
         json.dumps(valid_alert_json).encode("utf-8"),
@@ -1046,6 +1048,8 @@ def test_dismissal_batches_pr_states_in_bounded_requests_and_fails_closed_on_reo
         '{"number":1,"state":"closed","state":"open","rule":{"id":"py/test"},"tool":{"name":"CodeQL"}}',
         '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":NaN}',
         '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":-Infinity}',
+        '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":1e999}',
+        '{"number":1,"state":"open","rule":{"id":"py/test"},"extra":-1e999}',
         "\ufeff" + valid_alert_json,
         json.dumps(valid_alert_json),
     ):
@@ -1287,6 +1291,8 @@ def _malformed_envelopes_for(valid_data: dict) -> list[tuple[str, str]]:
         ("duplicate-key", '{"data":' + valid_json + ',"extensions":[],"extensions":{}}'),
         ("nan-constant", '{"data":' + valid_json + ',"extensions":{"cost":NaN}}'),
         ("infinity-constant", '{"data":' + valid_json + ',"extensions":{"cost":Infinity}}'),
+        ("float-overflow-pos", '{"data":' + valid_json + ',"extensions":{"cost":1e999}}'),
+        ("float-overflow-neg", '{"data":' + valid_json + ',"extensions":{"cost":-1e999}}'),
         ("utf8-bom", '\ufeff{"data":' + valid_json + "}"),
     ]
 
@@ -1400,3 +1406,35 @@ def test_publish_graphql_callers_accept_valid_extensions_object(monkeypatch, tmp
         cwd=tmp_path, env={}, capture_output=True, text=True,
     )
     assert result.returncode == 0 and json.loads(result.stdout)["data"]["repository"]["issues"]["totalCount"] == 42
+
+    # F3: production read("issue-count") (runner=None) raises PublishBlocked for malformed GraphQL envelopes
+    # regardless of check=False/True, while preserving exit 75 rate limits and HTTP 500 errors.
+    real_client_cls = github_client.GitHubClient
+    http_reply = {"response": github_client.Response(200, {}, count_ok.encode("utf-8"))}
+
+    class IssueCountHttpClient(real_client_cls):
+        def __init__(self, **kwargs):
+            kwargs["cache_dir"] = tmp_path / "issue-count-cache"
+            kwargs["transport"] = lambda *a: http_reply["response"]
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(github_client, "GitHubClient", IssueCountHttpClient)
+    for bad_body in (
+        b'{"data":{"repository":{"issues":{"totalCount":7}}},"errors":[]}',
+        b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":[]}',
+        b'{"data":{"repository":{"issues":{"totalCount":7}}},"extensions":{"cost":1e999}}',
+    ):
+        http_reply["response"] = github_client.Response(200, {}, bad_body)
+        for check_flag in (False, True):
+            with pytest.raises(gate.PublishBlocked, match="malformed issue count response"):
+                pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=check_flag)
+    http_reply["response"] = github_client.Response(500, {}, b'{"message":"Server Error"}')
+    err_500 = pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=False)
+    assert err_500.returncode == 1 and err_500.github_result.error == "github_http_error"
+    with pytest.raises(subprocess.CalledProcessError) as exc_500:
+        pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=True)
+    assert exc_500.value.github_result.error == "github_http_error"
+    http_reply["response"] = github_client.Response(200, {}, b'{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}')
+    rl = pub.read("issue-count", repo="unit/public", runner=None, cwd=tmp_path, env={}, capture_output=True, text=True, check=False)
+    assert rl.returncode == 75 and rl.github_result.error == "github_rate_limited"
+    monkeypatch.setattr(github_client, "GitHubClient", real_client_cls)

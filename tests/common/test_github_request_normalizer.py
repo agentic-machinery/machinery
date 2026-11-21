@@ -1737,9 +1737,16 @@ _VALID_GQL_DATA = {"viewer": {"login": "octocat"}}
         (json.dumps({"data": _VALID_GQL_DATA, "errors": ["err"]}).encode(), "invalid_errors"),
         (json.dumps({"data": _VALID_GQL_DATA, "errors": [None]}).encode(), "invalid_errors"),
         (json.dumps({"data": _VALID_GQL_DATA, "errors": [{"message": "ok"}, "bad"]}).encode(), "invalid_errors"),
-        # Populated GraphQL errors lists.
+        # Populated GraphQL errors lists (including unhashable/non-string type fields, F1).
         (json.dumps({"data": _VALID_GQL_DATA, "errors": [{"message": "boom"}]}).encode(), "graphql_errors"),
         (json.dumps({"data": None, "errors": [{"message": "boom"}]}).encode(), "graphql_errors"),
+        (json.dumps({"errors": [{"type": []}]}).encode(), "graphql_errors"),
+        (json.dumps({"errors": [{"type": {}}]}).encode(), "graphql_errors"),
+        # Malformed envelopes carrying rate-limit markers must not bypass validation or poison budgets (F1).
+        (json.dumps({"errors": [1, {"type": "RATE_LIMITED"}]}).encode(), "invalid_errors"),
+        (json.dumps({"errors": [{"type": "RATE_LIMITED"}], "unexpected": True}).encode(), "invalid_envelope"),
+        (json.dumps({"errors": [{"type": "RATE_LIMITED"}], "extensions": []}).encode(), "invalid_extensions"),
+        (json.dumps({"errors": [{"type": "RATE_LIMITED"}], "data": []}).encode(), "invalid_data"),
         # Missing or non-object data members.
         (json.dumps({}).encode(), "invalid_data"),
         (json.dumps({"extensions": {}}).encode(), "invalid_data"),
@@ -1775,6 +1782,8 @@ _VALID_GQL_DATA = {"viewer": {"login": "octocat"}}
         (b'{"data":{"viewer":{"login":"octocat"}},"extensions":[],"extensions":{}}', "invalid_json"),
         (b'{"data":{"viewer":{"login":"octocat"}},"extensions":{"cost":NaN}}', "invalid_json"),
         (b'{"data":{"viewer":{"login":"octocat"}},"extensions":{"cost":Infinity}}', "invalid_json"),
+        (b'{"data":{"measurement":1e999}}', "invalid_json"),
+        (b'{"data":{"measurement":-1e999}}', "invalid_json"),
         (b'{"data":' + b"[" * 513 + b"]" * 513 + b"}", "invalid_json"),
     ],
 )
@@ -1838,7 +1847,37 @@ def test_graphql_envelope_accepts_valid_envelopes_and_preserves_rate_limits_and_
         (502, b"<html>502 Bad Gateway</html>", "github_http_error", None),
         (400, b'{"errors":[{"message":"syntax error"}]}', "github_graphql_error", "graphql_errors"),
         (400, b'{"errors":[]}', "github_graphql_error", "invalid_errors"),
+        (400, b'{"errors":[{"type":[]}]}', "github_graphql_error", "graphql_errors"),
     ):
         context.wire.reply = lambda s=status, b=body: gh.Response(s, {}, b)
         res = context.client.request("POST", "graphql", payload={"query": R})
         assert (res.status, res.error, res.reason) == (status, expected_error, expected_reason)
+
+    # F2: legacy cached malformed GraphQL entries are never returned on 304 or allow_stale=True fallback.
+    legacy_cache_dir = context.tmp / "legacy-gql-cache"
+    legacy_payload = {"query": R}
+    legacy_raw = gh._payload_bytes(legacy_payload)
+    legacy_key = hashlib.sha256(
+        ("POST\0graphql\0" + json.dumps({}, sort_keys=True) + "json").encode() + (legacy_raw or b"")
+    ).hexdigest()
+    legacy_body = json.dumps({"data": _VALID_GQL_DATA, "errors": []}).encode()
+    replies = [gh.Response(304, {"etag": '"v2"'}, b"")]
+    legacy_client = gh.GitHubClient(
+        cache_dir=legacy_cache_dir,
+        transport=lambda *a: replies.pop(0),
+        clock=lambda: context.now,
+        env={"GH_TOKEN": TOKEN},
+        allow_stale=True,
+    )
+    with legacy_client._db() as db:
+        gh._store_cache(db, legacy_client.scope, legacy_key, legacy_body, {"etag": '"v1"'}, context.now - 10)
+    # 304 on a legacy malformed GraphQL entry must miss, not return 304 success or refresh its timestamp.
+    not_modified = legacy_client.request("POST", "graphql", payload=legacy_payload)
+    assert (not_modified.status, not_modified.error) == (304, "github_cache_miss")
+    with legacy_client._db() as db:
+        row = db.execute("SELECT at FROM cache WHERE scope=? AND key=?", (legacy_client.scope, legacy_key)).fetchone()
+        assert row == (context.now - 10,)
+        gh._store_budget(db, legacy_client.scope, "graphql", 0, OPEN)
+    # allow_stale=True under a rate limit must refuse rather than serve the legacy malformed entry.
+    stale_refused = legacy_client.request("POST", "graphql", payload=legacy_payload, allow_stale=True)
+    assert (stale_refused.error, stale_refused.stale, stale_refused.reason) == ("github_rate_limited", False, "pool_exhausted")

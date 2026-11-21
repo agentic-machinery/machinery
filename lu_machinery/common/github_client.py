@@ -1569,6 +1569,11 @@ class GitHubClient:
             )
             if not cacheable or (cached and json_depth.loads(cached[1], max_depth=_JSON_MAX_DEPTH).get("_github_binary")):
                 cached = None
+            elif cached and graphql:
+                try:
+                    parse_graphql_envelope(cached[0])
+                except GitHubGraphQLEnvelopeError:
+                    cached = None
             return cached, _admit(db, self.scope, normalized, now)
 
         try:
@@ -4144,8 +4149,15 @@ def _strict_object_pairs(pairs):
     return obj
 
 
+def _strict_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number: {token}")
+    return value
+
+
 def loads_strict_json(raw, *, max_depth=_JSON_MAX_DEPTH):
-    """Decode UTF-8 JSON strictly: no BOM, no duplicate object keys, no NaN/Infinity, bounded depth."""
+    """Decode UTF-8 JSON strictly: no BOM, no duplicate object keys, no non-finite numbers, bounded depth."""
     if isinstance(raw, (bytes, bytearray)):
         text = bytes(raw).decode("utf-8")
     elif isinstance(raw, str):
@@ -4156,6 +4168,7 @@ def loads_strict_json(raw, *, max_depth=_JSON_MAX_DEPTH):
         text,
         max_depth=max_depth,
         object_pairs_hook=_strict_object_pairs,
+        parse_float=_strict_float,
         parse_constant=_reject_constant,
     )
 
@@ -4172,6 +4185,8 @@ def validate_graphql_envelope(document):
         raise GitHubGraphQLEnvelopeError("invalid_envelope")
     if "extensions" in document and not isinstance(document["extensions"], dict):
         raise GitHubGraphQLEnvelopeError("invalid_extensions")
+    if "data" in document and document["data"] is not None and not isinstance(document["data"], dict):
+        raise GitHubGraphQLEnvelopeError("invalid_data")
     if "errors" in document:
         errors = document["errors"]
         if not isinstance(errors, list) or not errors or any(not isinstance(entry, dict) for entry in errors):
@@ -4191,14 +4206,35 @@ def parse_graphql_envelope(raw, *, max_depth=_JSON_MAX_DEPTH):
     return validate_graphql_envelope(document)
 
 
+def _is_graphql_rate_limited(document):
+    """True when a validated GraphQL error document reports a primary GraphQL rate limit."""
+    return any(
+        isinstance(entry.get("type"), str) and entry["type"] in {"RATE_LIMIT", "RATE_LIMITED"}
+        for entry in document["errors"]
+    )
+
+
 def _response_result(response, headers, *, graphql, raw_response, reset_at, now):
     """Classify a response independently of budget/cache persistence."""
     success = 200 <= response.status < 300
     if raw_response and success and not graphql:
         return Result(response.body, status=response.status, headers=headers, empty_body=not response.body)
     if graphql:
+        if not response.body:
+            if not success:
+                return Result(
+                    None, status=response.status, error="github_http_error", reset_at=reset_at, headers=headers
+                )
+            return Result(
+                response.body,
+                status=response.status,
+                error="github_graphql_error",
+                headers=headers,
+                reason="invalid_json",
+                empty_body=True,
+            )
         try:
-            value = loads_strict_json(response.body) if response.body else None
+            value = loads_strict_json(response.body)
         except (ValueError, RecursionError):
             if not success:
                 try:
@@ -4214,39 +4250,15 @@ def _response_result(response, headers, *, graphql, raw_response, reset_at, now)
                 error="github_graphql_error",
                 headers=headers,
                 reason="invalid_json",
-                empty_body=not response.body,
+                empty_body=False,
             )
-        if isinstance(value, dict) and any(
-            entry.get("type") in {"RATE_LIMIT", "RATE_LIMITED"}
-            for entry in _graphql_errors(value)
-            if isinstance(entry, dict)
-        ):
-            return _limited("pool_exhausted", reset_at or int(now + 60))
-        if not success:
-            if isinstance(value, dict) and "errors" in value:
-                try:
-                    validate_graphql_envelope(value)
-                except GitHubGraphQLEnvelopeError as exc:
-                    return Result(
-                        value,
-                        status=response.status,
-                        error="github_graphql_error",
-                        headers=headers,
-                        reason=exc.reason,
-                    )
+        if not success and not (isinstance(value, dict) and "errors" in value):
             return Result(value, status=response.status, error="github_http_error", reset_at=reset_at, headers=headers)
-        if not response.body:
-            return Result(
-                response.body,
-                status=response.status,
-                error="github_graphql_error",
-                headers=headers,
-                reason="invalid_json",
-                empty_body=True,
-            )
         try:
             validate_graphql_envelope(value)
         except GitHubGraphQLEnvelopeError as exc:
+            if exc.reason == "graphql_errors" and _is_graphql_rate_limited(value):
+                return _limited("pool_exhausted", reset_at or int(now + 60))
             return Result(
                 value,
                 status=response.status,

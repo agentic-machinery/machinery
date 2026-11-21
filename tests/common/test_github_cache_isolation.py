@@ -427,7 +427,7 @@ def test_post_response_pruning_commits_before_connection_close(tmp_path, monkeyp
         cache_dir=tmp_path,
         env={},
         clock=lambda: 1000,
-        cache_max_bytes=10,
+        cache_max_bytes=6,
         transport=lambda *_args: gh.Response(200, {}, b'{"data":{}}'),
     )
     # GraphQL is not core usage-counted: no later counting transaction can

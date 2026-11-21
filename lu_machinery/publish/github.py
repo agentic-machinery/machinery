@@ -3451,8 +3451,11 @@ def read(
             result = _send(
                 ["gh", "api", "--method", "POST", "graphql", "--input", str(frozen), *_hostname_flag(dest)],
                 environment=environment, runner=runner, cwd=cwd, capture_output=True, text=True,
-                check=check, timeout=timeout,
+                check=False, timeout=timeout,
             )
+        observation = getattr(result, "github_result", None)
+        if observation is not None and observation.error == "github_graphql_error":
+            raise gate.PublishBlocked("OPSEC: malformed issue count response.")
         if result.returncode == 0:
             try:
                 document = github_client.parse_graphql_envelope(result.stdout)
@@ -3465,6 +3468,13 @@ def read(
                 ["github", operation], github_client.Result(value=document), {},
                 {"capture_output": capture_output, "text": text, "stdout": stdout, "stderr": stderr, "check": check},
             )
+        if check:
+            failure = subprocess.CalledProcessError(
+                result.returncode, result.args, output=result.stdout, stderr=result.stderr,
+            )
+            if observation is not None:
+                failure.github_result = observation
+            raise failure
         return result
     for key in ("number",):
         if key in fields and (type(fields[key]) is not int or fields[key] <= 0):
