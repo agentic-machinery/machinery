@@ -8,7 +8,8 @@ post-merge cleanup. This file keeps only what a driver still needs and no other 
 
 ## §6. Review of record
 
-A review of record is independent, outside the author's model family (at the review policy's
+Every PR above the review policy's Trivial tier needs a review of record; a Trivial PR lands on required
+CI alone. A review of record is independent, outside the author's model family (at the review policy's
 [Low tier](../../review-loop/references/policy.md#2-risk-tier-is-set-by-the-change) any qualified
 non-author reviewer), toolful and **exact-head**: attested `resolved_model`, a verdict, and an
 attested SHA equal to the current PR head. A moved head makes it stale. Discussion on a thread,
@@ -18,9 +19,9 @@ with synchronous dispatch and wait; its legacy `--background` flag is rejected. 
 lines excluding tests is a review-size signal, not a finding
 ([workflow.md § Merge policy](../../../rules/workflow.md#merge-policy--ready-prs-must-not-sit-4703-landing-order-7450)).
 
-Resolve the reviewer with `.venv/bin/python -m lu_machinery.review.closeout_cli --state-file <file>
-resolve-reviewer` (exact `--author-model`, `--review-profile`, `--risk`; step 2 of `review-loop`) and pass the same profile to the dispatch.
-`requires_silence_timeout` is boolean: when true, pass `--silence-timeout <seconds>` explicitly
+Resolve the reviewer with the recipe in `review-loop` step 2, which first initializes the target
+and then resolves with the exact author model, review profile and risk; pass the same profile to
+the dispatch. `requires_silence_timeout` is boolean: when true, pass `--silence-timeout <seconds>` explicitly
 (default 3600) and confirm `silence_timeout` in the task record. Dispatch v2 resolves the locally
 available branch or the explicit `--pinned-head` SHA and does not fetch or freeze the remote
 branch: verify the pushed tip before launch and before publishing the verdict. After settlement,
@@ -134,8 +135,9 @@ read-only dispatch (#8703; [accepted wording](../../review-loop/references/brief
    [`review-loop`'s Reply format](../../review-loop/references/brief.md#reply-format),
    included verbatim in the brief. That section alone defines the literal reply lines and
    how a structured findings request refers to the canonical schema.
-8. **Reliability checklist** — the `brief_section` that `lu_machinery.review.closeout_cli checklist` prints for
-   this round's exact head, verbatim: the checklist items the diff triggers, the owner of
+8. **Reliability checklist** — the `brief_section` printed by
+   `.venv/bin/python -P -m lu_machinery.review.closeout_cli --state-file <file> checklist --base origin/<base> --head <sha> --repo-root .`
+   for this round's exact head, verbatim: the checklist items the diff triggers, the owner of
    every area it touches, and the rule that judge inputs are read from the merge-base
    ([`review-loop` brief](../../review-loop/references/brief.md#judge-inputs-come-from-the-merge-base)).
 
@@ -164,8 +166,8 @@ ids for suite results. Add no test and repeat no run.
 ## §7. Landing
 
 The gates are `workflow.md` § Merge policy; the delivery steps are `full-send` and `full-stop`,
-and the briefed worker enqueues its own PR once the exact-head APPROVE is recorded and the same-head CI
-Gate is green. You land only a PR no brief owns, and flag another
+and the briefed worker enqueues its own PR once the review its tier requires is recorded at the
+exact head (none for a Trivial PR) and the same-head CI Gate is green. You land only a PR no brief owns, and flag another
 lane's PR with `needs=merge` instead of merging it. Run the core inbox drain immediately before an
 enqueue and reconcile its messages with the approved head.
 

@@ -95,8 +95,8 @@ dispatch; read-only dispatches still accept a SHA base. If frozen inputs require
 dispatch, create it with `create_worktree` from `lu_machinery.dispatcher.git` (it writes the
 creator receipt; tasks launched with `--cwd` borrow it) and remove it afterwards as the
 [helper cleanup runbook](../../../../../docs/runbooks/worktree-cleanup.md#remove-helper-created-trees-12602)
-says (`worktree_claims remove PATH`, or `attribute-helper PATH --actor ACTOR --reason REASON` first
-for trees that predate receipts).
+says (`.venv/bin/python -m lu_machinery.orchestration.worktree_claims remove PATH`, preceded for
+trees that predate receipts by `... worktree_claims attribute-helper PATH --actor ACTOR --reason REASON`).
 
 Dispatch v2 has no budget substitution guard: choose the lane from live capacity evidence, record
 substitutions, and verify the task record's actual agent and model before attributing work. Before

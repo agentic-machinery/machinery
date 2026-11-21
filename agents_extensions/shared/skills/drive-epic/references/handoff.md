@@ -15,8 +15,8 @@ is the lane's handoff.
 Use `lu-driver-state add --lane <lane>` for every new order, commitment, goal, in-flight task,
 blocker, decision and next action, with the matching kind, an owner and a done condition. Record
 goals under their program's `operator_order` with `--parent <id>`. Every `inflight` item carries
-the task ID and the FULL run nonce (`lu_machinery.dispatch wait --run-nonce` compares it
-exactly).
+the task ID and the FULL run nonce (`.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <nonce>`
+compares it exactly).
 
 Update items with `link` (references), `note` (progress) and `evidence` (proof). Never delete an
 item or replace unfinished items with a session summary. Use
@@ -40,9 +40,9 @@ condition; `dropped` needs an operator reference in its reason. Cite item IDs in
    briefs follow rules core P8; private detail stays in the driver-state database or the private
    repository.
 
-On a Hramatka drive, run `hramatka_hygiene_check` before declaring the handoff verified-clean
+On a Hramatka drive, run the Hramatka hygiene check before declaring the handoff verified-clean
 ([epic-specific](epic-specific.md#0c-hramatka-epic--dual-repo-queue-epic-4542-only)). Attach the
-`driver_breadth_report` output ([routing-and-dispatch](routing-and-dispatch.md#3-routing-mandatory-routing_card_v1--breadth-operator-go-2026-08-06)).
+driver breadth report output ([routing-and-dispatch](routing-and-dispatch.md#3-routing-mandatory-routing_card_v1--breadth-operator-go-2026-08-06)).
 
 **Skill source of truth is git.** Edit only `agents_extensions/shared/skills/drive-epic/`; deploy
 copies such as `.claude/skills/` are overwritten on the next deploy.

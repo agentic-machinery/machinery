@@ -29,8 +29,9 @@ A dispatch, a branch, an open PR, green CI or "Next:" is **not** done. Deliver e
 the delivery skills: `full-send` (to MERGED and closeout, run by the briefed worker or by you),
 `full-stop` (ready-to-merge), `review-loop` (rounds and budget), entered through `takeover` or
 `modernize` for inherited or old work. A worker starts follow-ups only within its brief's cap.
-You land a PR yourself only when no brief owns it, and only with a recorded exact-head APPROVE
-and a green same-head CI Gate (`workflow.md` § Merge policy); never ask the operator to merge.
+You land a PR yourself only when no brief owns it, and only when the gates of
+`workflow.md` § Merge policy hold: the recorded exact-head review the PR's tier requires (none for
+a Trivial PR) and a green same-head CI Gate; never ask the operator to merge.
 
 At each turn end and at session end:
 
@@ -63,10 +64,10 @@ Record every order, in-flight task (with its full run nonce), blocker, decision 
 as a lane tracker item (`lu-driver-state add|note|evidence|status`; never delete items; done
 needs evidence, dropped needs an operator reference): [handoff](references/handoff.md).
 
-1. **§0 Orient.** Cold-start board, lean orient, Work API projection, the stream's `next` list and
-   `plane-status`; read your lane with `lu-driver-state render --lane <lane>` and
+1. **§0 Orient.** Run the cold-start board, lean orient, Work API projection, stream `next` list and
+   plane status commands in [orient](references/orient.md); read your lane with `lu-driver-state render --lane <lane>` and
    `lu-driver-state check --lane <lane>` (a launcher-provisioned wrapper, not part of the
-   release). The launcher holds your lease; never claim it: [orient](references/orient.md).
+   release). The launcher holds your lease; never claim it.
 2. **§0a Inbox drain.** A CTO demand (an URGENT order or blocker-report request) outranks all
    lane work. Answer within its deadline (default 10 minutes), one blocker line per named
    deliverable ([lane-report](references/lane-report.md)). Then work the named deliverables and
@@ -75,8 +76,8 @@ needs evidence, dropped needs an operator reference): [handoff](references/hando
    deliverables cannot use. Report again on every change.
 3. **§0c / §0d Epic-specific rules.** Hramatka (#4542) and the core fresh build (#7994) add
    binding rules: [epic-specific](references/epic-specific.md).
-4. **§1 Topology and metrics.** Query `fleet_comms metrics`, `backlog`, `dead-letters`; never hold
-   fleet state in context ([orient](references/orient.md)).
+4. **§1 Topology and metrics.** Query the metrics, backlog and dead-letter commands in
+   [orient](references/orient.md); never hold fleet state in context.
 5. **§2 Pick the next action and dispose every open issue**: in flight, dispatched now, or on a
    named §2c hold. Before dispatching, look for a sibling PR
    (`gh pr list --state all --search "<issue>"`). While review or CI runs, dispatch the next

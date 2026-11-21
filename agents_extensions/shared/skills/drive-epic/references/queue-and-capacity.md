@@ -32,7 +32,7 @@ Every cycle advances the epic's open issue set:
 
 1. **Inventory** the epic's open issues (plus Work API `/next`); quote the count.
 2. **Disposition each one**: **in_flight** (task id and head), **dispatch now** (ROUTING_CARD,
-   `capacity_pick`, explicit model) or a **named hold** with one §2c code.
+   the capacity pick, explicit model) or a **named hold** with one §2c code.
 3. An open epic issue with no disposition is a driver failure. While review or CI runs on unit
    N, dispatch the next ready child or emit a §2c code in the same turn; re-read checks and
    finish merge hygiene on the next live turn for any clean approved PR.
