@@ -28,6 +28,17 @@ jobs:
 
 Every caller receives the exact same scanner binaries, GitHub Action SHAs and rule-bundle pins without any repository-name branching.
 
+## Select a runner
+
+The workflow uses `ubuntu-24.04` by default. Set `runs-on` to a JSON string or list of labels to use another Linux x64 runner. This example uses a repository variable for one label and defaults to `ubuntu-24.04` when the variable is unset.
+
+```yaml
+with:
+  runs-on: ${{ toJSON(vars.SECURITY_RUNNER || 'ubuntu-24.04') }}
+```
+
+Use a Linux x64 runner with glibc, Bash, curl, jq, and standard GNU utilities, including coreutils, gzip, sed, and tar. Make Git available in `/usr/bin` or `/bin` and Python 3.10 or later at `/usr/bin/python3`. The workflow downloads and verifies its scanner binaries. On a runner without Docker, leave `run-trivy-image` disabled. Use self-hosted runners with private repositories. [GitHub runner guidance](https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/add-runners)
+
 ## Security and private-repository guarantees
 
 - **Self-contained:** requires no caller-local `.github/actions/`, no caller `uv.lock`, no secrets and no paid GitHub Advanced Security features (no `security-events: write`, no SARIF upload).
@@ -42,6 +53,7 @@ Every caller receives the exact same scanner binaries, GitHub Action SHAs and ru
 
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
+| `runs-on` | string | `'"ubuntu-24.04"'` | JSON runner label or label array for every job. |
 | `run-actionlint` | boolean | `false` | Lint workflows under `workflow-dir` with pinned `actionlint` + `shellcheck`. |
 | `workflow-dir` | string | `.github/workflows` | Repo-relative workflow directory for `actionlint`. |
 | `run-shellcheck` | boolean | `false` | Run pinned `shellcheck` over `shellcheck-paths`. |
@@ -85,6 +97,12 @@ Use a reviewed tuple to accept a licence finding for one scan target and package
 All three fields match literally, including case and spaces within an expression. Blank lines are allowed. Each tuple must have three nonempty fields, with no surrounding whitespace, control characters, or extra separators. Use a repo-relative target path or `.`. Repeated tuples count as one disposition. A malformed tuple fails the step before Trivy runs.
 
 The target receipt lists each accepted finding's tuple in `accepted_license_findings` and includes those findings in the `licenses` total. Findings without a match still fail the step. The scan warns about unused tuples and lists them in `stale_license_dispositions` in the job receipt.
+
+## Scanner policy on pull requests and merge groups
+
+On `pull_request` and `merge_group`, scanner config and ignore files come from the event's base commit. This covers Actionlint and Zizmor config files, ShellCheck configuration in the source directory hierarchy, and the Trivy and TruffleHog ignore files. Explicit repo-relative config and ignore paths also resolve at the base commit.
+
+Each enabled scanner job records the base commit in `scanner-policy.base_sha` and lists changed policy paths in `scanner-policy.changed`. If the candidate adds a policy file, the scan reports the addition and scans without that file's settings. If the candidate edits or removes an existing policy file, the scan uses the base version. A candidate policy addition or edit that is a symlink or another nonregular Git entry fails the job. Other events use the checked-out policy.
 
 ## Output receipt (`fleet-security-receipt.v1`)
 
