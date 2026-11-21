@@ -516,9 +516,7 @@ def _split_next_link(next_url: str) -> tuple[str, str] | None:
         parsed = urlsplit(next_url)
     except ValueError:
         return None
-    if parsed.fragment or parsed.scheme not in {"", "https"}:
-        return None
-    if parsed.netloc not in {"", "api.github.com"} or (parsed.scheme == "https" and parsed.netloc != "api.github.com"):
+    if parsed.fragment or parsed.scheme != "https" or parsed.netloc != "api.github.com":
         return None
     path = parsed.path.lstrip("/")
     if path.startswith("api/v3/"):
@@ -592,6 +590,19 @@ class _UnreadableAnnotation(Exception):
     """An annotation looked like a finding but its location could not be read."""
 
 
+def _split_licence_target(body: str) -> tuple[str, bool]:
+    """Return the target and whether it is unambiguous.
+
+    A package and a path can both contain `` in ``. One separator is the
+    workflow's package/target split. More than one is shown in full and is
+    not an owned path.
+    """
+    package, separator, target = body.partition(" in ")
+    if not separator or not package or not target:
+        return body, False
+    return target, " in " not in target
+
+
 def _line_number(raw: str) -> int:
     if not raw.isdigit() or len(raw) > 9:
         raise _UnreadableAnnotation
@@ -630,10 +641,10 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
     """Parse one redacted fleet-security annotation. Unrecognized text is not a finding."""
     if not isinstance(message, str) or not message.strip():
         return None
-    text = message.strip()
-    if any(unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in text):
+    if any(unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in message):
         return None
-    matched = re.fullmatch(r"actionlint \[([^\]]+)\] at (.+):(\d+):(\d+)", text)
+    text = message.strip()
+    matched = re.fullmatch(r"actionlint \[([^\]]+)\] at (.+):([^:\s]+):([^:\s]+)", text)
     if matched:
         return _finding(
             scanner="actionlint",
@@ -644,7 +655,7 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
             message=text,
             repository_file=True,
         )
-    matched = re.fullmatch(r"ShellCheck (SC\S+) \(([^)]+)\) at (.+):(\d+):(\d+)", text)
+    matched = re.fullmatch(r"ShellCheck (SC\S+) \(([^)]+)\) at (.+):([^:\s]+):([^:\s]+)", text)
     if matched:
         return _finding(
             scanner="shellcheck",
@@ -666,7 +677,7 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
             message=text,
             repository_file=True,
         )
-    matched = re.fullmatch(r"TruffleHog (\S+) verified=(\S+) (.+):(\d+|\?) commit=\S+", text)
+    matched = re.fullmatch(r"TruffleHog (\S+) verified=(\S+) (.+):([^:\s]+) commit=\S+", text)
     if matched:
         verified = matched.group(2).strip().lower()
         severity = "critical" if verified == "true" else "high" if verified == "false" else "unknown"
@@ -694,16 +705,17 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
             message=text,
             repository_file=True,
         )
-    matched = re.fullmatch(r"Trivy licence (.+?) \(([^/\s]+)/([^)]+)\) (.+) in (.+)", text)
+    matched = re.fullmatch(r"Trivy licence (.+?) \(([^/\s]+)/([^)]+)\) (.+)", text)
     if matched:
+        target, own_path = _split_licence_target(matched.group(4))
         return _finding(
             scanner="trivy-fs",
             rule=matched.group(1),
             severity=_oss_severity(matched.group(3)),
-            raw_path=matched.group(5),
+            raw_path=target,
             line=None,
             message=text,
-            repository_file=True,
+            repository_file=own_path,
         )
     matched = re.fullmatch(r"Trivy misconfig (\S+) \(([^)]+)\) in (.+)", text)
     if matched:
@@ -716,7 +728,7 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
             message=text,
             repository_file=True,
         )
-    matched = re.fullmatch(r"Trivy IaC (\S+) \(([^)]+)\) at (.+):(\d+)", text)
+    matched = re.fullmatch(r"Trivy IaC (\S+) \(([^)]+)\) at (.+):([^:\s]+)", text)
     if matched:
         return _finding(
             scanner="trivy-iac",
@@ -741,13 +753,14 @@ def _parse_oss_finding(message: Any) -> dict[str, Any] | None:
             message=text,
             repository_file=False,
         )
-    matched = re.fullmatch(r"Trivy image licence (.+?) \(([^/\s]+)/([^)]+)\) (.+) in (.+)", text)
+    matched = re.fullmatch(r"Trivy image licence (.+?) \(([^/\s]+)/([^)]+)\) (.+)", text)
     if matched:
+        target, _own_path = _split_licence_target(matched.group(4))
         return _finding(
             scanner="trivy-image",
             rule=matched.group(1),
             severity=_oss_severity(matched.group(3)),
-            raw_path=matched.group(5),
+            raw_path=target,
             line=None,
             message=text,
             repository_file=False,
@@ -763,8 +776,10 @@ def _decode_workflow(document: Mapping[str, Any]) -> tuple[str | None, str | Non
     if document.get("type") != "file" or document.get("encoding") != "base64":
         return None, "workflow_file_unreadable"
     size = document.get("size")
-    if type(size) is not int or size < 0 or size > _MAX_WORKFLOW_BYTES:
+    if type(size) is not int or size < 0:
         return None, "workflow_file_unreadable"
+    if size > _MAX_WORKFLOW_BYTES:
+        return None, "pagination_limit"
     content = document.get("content")
     if not isinstance(content, str) or len(content) > _MAX_WORKFLOW_BYTES * 2:
         return None, "workflow_file_unreadable"
@@ -772,8 +787,10 @@ def _decode_workflow(document: Mapping[str, Any]) -> tuple[str | None, str | Non
         raw = base64.b64decode("".join(content.split()), validate=True)
     except (ValueError, TypeError):
         return None, "workflow_file_unreadable"
-    if len(raw) != size or len(raw) > _MAX_WORKFLOW_BYTES:
+    if len(raw) != size:
         return None, "workflow_file_unreadable"
+    if len(raw) > _MAX_WORKFLOW_BYTES:
+        return None, "pagination_limit"
     try:
         return raw.decode("utf-8"), None
     except UnicodeDecodeError:
@@ -854,7 +871,7 @@ def _pins_in_workflow(
     """Read job-level ``uses`` values. A line inside a script is not a caller."""
     try:
         document = yaml.safe_load(text)
-    except yaml.YAMLError:
+    except (yaml.YAMLError, ValueError):
         return [], [], "workflow_file_unreadable"
     if document is None:
         return [], [], None
@@ -875,7 +892,6 @@ def _pins_in_workflow(
             continue
         if not isinstance(uses, str):
             return [], [], "workflow_file_unreadable"
-        uses = uses.strip()
         if not uses.startswith(_FLEET_USES_PREFIX):
             continue
         ref = uses[len(_FLEET_USES_PREFIX) :]
@@ -912,6 +928,8 @@ def _run_record(
     event = run.get("event")
     head_repository = run.get("head_repository")
     full_name = head_repository.get("full_name") if isinstance(head_repository, Mapping) else None
+    if not isinstance(event, str) or not isinstance(full_name, str):
+        return None, "github_invalid_payload"
     if event not in _ALLOWED_RUN_EVENTS or full_name != f"{owner}/{name}":
         return None, "run_not_on_default_branch"
     head_sha = run.get("head_sha")
@@ -1046,6 +1064,8 @@ def _read_caller_evidence(
                 if not isinstance(row, Mapping):
                     return None, [], "github_invalid_payload"
                 level = row.get("annotation_level")
+                if level is not None and not isinstance(level, str):
+                    return None, [], "annotations_unreadable"
                 if level in {"warning", "notice"}:
                     continue
                 try:

@@ -791,9 +791,43 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
             {"security.yml": wide, "extra.yml": wide},
         )
         assert oversized["repositories"]["limited"]["fleet_security"]["reason"] == "pagination_limit"
+        single = _limit_scan(
+            [{"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"}],
+            {"security.yml": "name: security\n" + ("# " + ("y" * 80) + "\n")},
+        )
+        assert single["repositories"]["limited"]["fleet_security"]["reason"] == "pagination_limit"
     finally:
         alerts_module._MAX_WORKFLOW_FILES = previous_files
         alerts_module._MAX_WORKFLOW_BYTES = previous_bytes
+
+    dated = _limit_scan(
+        [{"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"}],
+        {"security.yml": f"RELEASE_DATE: 2025-02-30\n{_enrolled_workflow()}"},
+    )
+    assert dated["repositories"]["limited"]["fleet_security"]["reason"] == "workflow_file_unreadable"
+    padded = _limit_scan(
+        [{"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"}],
+        {
+            "security.yml": (
+                "name: security\non: [push]\njobs:\n  fleet-security:\n"
+                f'    uses: "learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{_PIN} "\n'
+            )
+        },
+    )
+    assert padded["repositories"]["limited"]["fleet_security"]["state"] == "missing_enrollment"
+    assert padded["repositories"]["limited"]["fleet_security"]["rejected_pins"]
+    licence = alerts_module._parse_oss_finding(
+        "Trivy licence GPL-2.0 (restricted/HIGH) libc in build/config in progress/package.lock"
+    )
+    assert licence is not None
+    assert licence["path"] is None
+    assert licence["location"] == "build/config in progress/package.lock"
+    with pytest.raises(alerts_module._UnreadableAnnotation):
+        alerts_module._parse_oss_finding("actionlint [syntax] at file.yml:3a:1")
+    assert alerts_module._split_next_link("/repos/org/fixture/actions/runs/5/jobs?page=2") is None
+    assert alerts_module._split_next_link(
+        "https://api.github.com/repos/org/fixture/actions/runs/5/jobs?page=2"
+    ) == ("repos/org/fixture/actions/runs/5/jobs", "page=2")
 
 
 def test_fixture_registry_addition_needs_no_code_change(tmp_path: Path) -> None:
