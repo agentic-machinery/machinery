@@ -9,6 +9,8 @@ Owner, 2026-11-12:
 3. The merge queue groups changes: wait about 10 minutes to collect entries so several PRs build and test together (fewer full CI runs).
 4. UI changes: the local pages are the test copy; the Grok QA bot tests them after landing locally, before anything public.
 
-The release train is the runbook in `docs/release.md`.
+Superseded in part by [RELEASE-ASAP-1121](2026-11-21-release-when-ready.md): item 2's release cadence is replaced by release when ready.
+
+The release runbook is `docs/release.md`.
 
 Decision 3 is GitHub's merge-queue parameter `min_entries_to_merge_wait_minutes`, which is 0. This repository does not write rulesets: the publisher's ruleset verbs are check, list and view, and there is no ruleset definition in the tree. The wait was not changed. It has to be set on `learn-ukrainian/machinery` and `learn-ukrainian/learn-ukrainian` by a ruleset edit this repo cannot make.

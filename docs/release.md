@@ -4,20 +4,31 @@ Consumers install `lu-machinery` from a released wheel, pinned by version and
 SHA-256 in their own `requirements-machinery.lock`. There is no editable
 install and no machinery checkout on `PYTHONPATH`.
 
-## Release train
+## Release when ready
 
-Owner decisions C-5345 (ONE-REVIEW-FAST-RELEASE-1112, 2026-11-12) and
-RELEASE-8H-CANARY-AT-CUT-1115 (2026-11-15, revised to 12 hours). A machinery
-release is cut every 12 hours, at 06:00 and 18:00 UTC, by one command (Cut a
-release) that a host timer or an agent runs. It tags `main`'s HEAD; there is
-no release PR. `main` already carries the next version, because each release
-ends by opening the post-release PR that records its changelog and moves the
-version files on. A window is skipped when nothing but that PR has merged
-since the last full release. An urgent bug gets an immediate hotfix release: the same
-command, as soon as the fix is on a green `main`, without waiting for the next
-window. Any other bug is fixed in a follow-up PR and rides the next train. Do
-not rebuild or replace a version that was already published, and do not move
-a tag.
+Owner decision RELEASE-ASAP-1121 (2026-11-21). It replaces the fixed release
+train of C-5345 (ONE-REVIEW-FAST-RELEASE-1112) and
+RELEASE-8H-CANARY-AT-CUT-1115. See
+[the decision record](decisions/2026-11-21-release-when-ready.md).
+
+A machinery release is cut as soon as a ready change is on a green `main`.
+Nobody waits for a window. A change is ready when it has merged (a
+post-release PR alone does not count) and the newest `CI Gate` push run on
+`main`'s HEAD has passed. The release is one command (Cut a release) that an
+agent or a host timer runs. It tags `main`'s HEAD; there is no release PR.
+`main` already carries the next version, because each release ends by
+opening the post-release PR that records its changelog and moves the version
+files on.
+
+The timer at 06:00 and 18:00 UTC stays as a safety net, not as the schedule.
+It runs the same command and catches a change that nobody cut right away. It
+skips (exit 0, `unchanged`) when nothing but the post-release PR has merged
+since the last full release, so it does nothing on a quiet day.
+
+An urgent bug gets a hotfix release the same way: the same command, as soon
+as the fix is on a green `main`. Any other bug is fixed in a follow-up PR,
+and that PR is released as soon as it is ready too. Do not rebuild or
+replace a version that was already published, and do not move a tag.
 
 ## Rollout gate drill
 
@@ -211,8 +222,8 @@ parsing.
 ```
 
 `cut --dry-run` runs everything except the tag, the publish, the two PRs and
-the live canary (it prints the canary's plan). Run it two hours before a
-window so the product can land fixes first. The command does these steps in
+the live canary (it prints the canary's plan). Run it before a real cut to
+see what the cut would do. The command does these steps in
 order:
 
 1. **Preflight**, on a fresh clone of machinery `main`, whose HEAD is `$SHA`
@@ -351,7 +362,7 @@ steps instead. When the tag is on the remote and its release is absent or
 still a pre-release, the version is consumed. In that case the command marks
 the pre-release **Withdrawn** (it keeps its files), closes the open adopt PRs
 and opens the post-release PR, which records `[$V] [YANKED]` and moves `main`
-on so the next window cuts the next version. Each of these steps runs even if
+on so the next release can be cut as soon as it is ready. Each of these steps runs even if
 an earlier one fails. The host installs only versions the product has adopted.
 
 The annotated tag and every commit in the command's fresh clones pass the
