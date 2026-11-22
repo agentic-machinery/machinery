@@ -326,8 +326,8 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
   .stacked thead { display: none; }
   .stacked tr { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; padding: 4px 8px; }
   .stacked tr.group { border: 0; padding: 0; margin: 10px 0 4px; }
-  .stacked th[colspan] { border: 0; padding: 0; }
-  .stacked td { display: flex; gap: 8px; padding: 2px 0; border: 0; min-width: 0; overflow-wrap: anywhere; }
+  .stacked th[colspan], .stacked table.subs th[colspan] { border: 0; padding: 0; }
+  .stacked td, .stacked table.subs td { display: flex; gap: 8px; padding: 2px 0; border: 0; min-width: 0; overflow-wrap: anywhere; }
   .stacked td::before { content: attr(data-label); flex: 0 0 7.5em; color: var(--muted); font-size: 12px; }
   .stacked td:first-child { font-weight: 600; }
   .stacked td:first-child::before { display: none; }

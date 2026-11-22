@@ -214,13 +214,18 @@ const SEATS_URL = "/api/fleet/seats";
 const DELIVERIES_URL = "/api/fleet/deliveries";
 const LOG_DOWN = new Set(["db_unavailable", "db_missing", "plane_root_unavailable", "authority_unsupported_component"]);
 
-function deliveryUrl() {
+function deliveryQuery() {
   const query = new URLSearchParams();
+  const page = pageQuery();
   for (const key of ["seat", "state", "since", "limit", "offset"]) {
-    const value = pageQuery().get(key);
+    const value = page.get(key);
     if (value) query.set(key, value);
   }
-  const text = query.toString();
+  return query;
+}
+
+function deliveryUrl() {
+  const text = deliveryQuery().toString();
   return text ? `${DELIVERIES_URL}?${text}` : DELIVERIES_URL;
 }
 
@@ -242,6 +247,14 @@ function waitingSeats(payload) {
 }
 
 function notice(sentence, panelId, label) {
+  // The runner announces a successful response as loaded. Say the visible failure after that.
+  if (typeof queueMicrotask === "function") {
+    queueMicrotask(() => {
+      const region = typeof document === "object" && document && typeof document.getElementById === "function"
+        ? document.getElementById(`${panelId}-status`) : null;
+      if (region) region.textContent = sentence;
+    });
+  }
   return `<p class="error">${escapeHtml(sentence)}</p>`
     + `<p><button type="button" class="retry" data-retry-panel="${escapeHtml(panelId)}" aria-label="Retry ${escapeHtml(label)}">Retry</button></p>`;
 }
@@ -335,7 +348,7 @@ function stateCell(row) {
   if (typeof row.lease_state !== "string" || !row.lease_state) return text("?", "warn");
   if (row.lease_reason != null && typeof row.lease_reason !== "string") return text("?", "warn");
   const reason = typeof row.lease_reason === "string" && row.lease_reason ? row.lease_reason : "";
-  const tone = row.lease_state === "unknown" ? "warn" : row.lease_state === "live" ? "ok" : "";
+  const tone = row.lease_state === "live" ? "ok" : "";
   return text(reason ? `${row.lease_state} · ${reason}` : row.lease_state, tone);
 }
 
@@ -359,7 +372,7 @@ function emptyDeliveries(since) {
   const sentence = since === "24h"
     ? "No deliveries for this filter in the last 24 h"
     : since === "all"
-      ? "No deliveries for this filter"
+      ? "No deliveries for this filter in the available history"
       : "No deliveries for this filter in the last 7 d";
   return `<p>${escapeHtml(sentence)} <button type="button" class="retry" data-clear-filters>Clear filters</button></p>`;
 }
@@ -375,11 +388,28 @@ function asNumber(value) {
 }
 
 function pageHref(offset) {
-  const params = pageQuery();
+  const params = deliveryQuery();
   if (offset) params.set("offset", String(offset));
   else params.delete("offset");
   const text = params.toString();
   return `${text ? `?${text}` : "?"}#messages`;
+}
+
+let revealedMessages = false;
+
+function revealMessages() {
+  if (revealedMessages) return;
+  if (typeof location !== "object" || !location || location.hash !== "#messages") return;
+  if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return;
+  const target = document.getElementById("messages");
+  if (!target || typeof target.getBoundingClientRect !== "function") return;
+  const header = typeof document.querySelector === "function" ? document.querySelector("header") : null;
+  const headerHeight = header && typeof header.getBoundingClientRect === "function"
+    ? header.getBoundingClientRect().height : 0;
+  const scrolled = typeof window === "object" && window && typeof window.scrollY === "number" ? window.scrollY : 0;
+  if (typeof window !== "object" || !window || typeof window.scrollTo !== "function") return;
+  window.scrollTo(0, Math.max(0, target.getBoundingClientRect().top + scrolled - headerHeight));
+  revealedMessages = true;
 }
 
 function renderMessages(payload) {
@@ -402,7 +432,7 @@ function renderMessages(payload) {
   }
   const built = [];
   for (const row of rows) {
-    if (!row || typeof row !== "object") return notice("Message log unavailable", "messages", "Messages");
+    if (!row || typeof row !== "object" || Array.isArray(row)) return notice("Message log unavailable", "messages", "Messages");
     const from = asText(row.sender);
     const to = asText(row.recipient);
     const kind = asText(row.kind);
@@ -415,7 +445,8 @@ function renderMessages(payload) {
       if (typeof row.message_id !== "string") return notice("Message log unavailable", "messages", "Messages");
       messageId = row.message_id;
     }
-    if ([from, to, kind, state, attempts, waited, created].includes(undefined)) {
+    if (typeof from !== "string" || typeof to !== "string" || typeof kind !== "string" || typeof state !== "string"
+      || [attempts, waited, created].includes(undefined)) {
       return notice("Message log unavailable", "messages", "Messages");
     }
     const when = created ? relative(created) : "";
@@ -490,7 +521,7 @@ const PANELS = [
   {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs(), onTick: expireWorkerPrsIfStale, onError: () => { latestPrsReading = null; }},
   {id: "recent", label: "Recently finished", urls: ["/api/delegate/recent"], render: renderRecent},
   {id: "comms", label: "Fleet Comms", urls: ["/api/comms/v1/metrics"], render: renderComms},
-  {id: "seats", label: "Seats", urls: [SEATS_URL], render: renderSeats, onData: () => fillSeatOptions()},
+  {id: "seats", label: "Seats", urls: [SEATS_URL], render: renderSeats, onData: () => { fillSeatOptions(); revealMessages(); }},
   {id: "messages", label: "Messages", urls: [deliveryUrl()], render: renderMessages},
 ];
 
