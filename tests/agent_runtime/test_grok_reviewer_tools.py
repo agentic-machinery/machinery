@@ -104,14 +104,12 @@ def _tokens_include_read_command(tokens: list[str], commands: tuple[str, ...]) -
     )
 
 
-def _starts_shell_word(text: str, index: int) -> bool:
-    return index == 0 or text[index - 1] in _WORD_BREAKS
-
-
 def _prepare_shell_script(script: str) -> str:
     """Join line continuations and blank comments. Refuse a real bash special quote.
 
     ``#`` starts a comment only at the beginning of a word, so ``ok#tag`` stays
+    one word. A backslash-newline is removed before that decision, and the word
+    boundary stays where the joined word was, so ``ok\\<newline>#tag`` is still
     one word. ``$'...'`` and ``$"..."`` count only outside quotes and comments:
     bash runs them, and ``shlex`` collapses them to a different word.
     """
@@ -119,10 +117,17 @@ def _prepare_shell_script(script: str) -> str:
     index = 0
     limit = len(script)
     state = "normal"
+    at_word_start = True
+
+    def emit(text: str) -> None:
+        nonlocal at_word_start
+        out.append(text)
+        at_word_start = text[-1] in _WORD_BREAKS
+
     while index < limit:
         char = script[index]
         if state == "single":
-            out.append(char)
+            emit(char)
             if char == "'":
                 state = "normal"
             index += 1
@@ -133,51 +138,122 @@ def _prepare_shell_script(script: str) -> str:
                 if nxt == "\n":
                     index += 2
                     continue
-                out.append(char)
-                out.append(nxt)
+                emit(char + nxt)
                 index += 2
                 continue
-            out.append(char)
+            emit(char)
             if char == '"':
                 state = "normal"
             index += 1
             continue
         if state == "comment":
             if char == "\n":
-                out.append("\n")
+                emit("\n")
                 state = "normal"
             else:
-                out.append(" ")
+                emit(" ")
             index += 1
             continue
         if char == "\\" and index + 1 < limit and script[index + 1] == "\n":
             index += 2
             continue
         if char == "\\" and index + 1 < limit:
-            out.append(char)
-            out.append(script[index + 1])
+            emit(char + script[index + 1])
             index += 2
             continue
         if char == "'":
             state = "single"
-            out.append(char)
+            emit(char)
             index += 1
             continue
         if char == '"':
             state = "double"
-            out.append(char)
+            emit(char)
             index += 1
             continue
         if char == "$" and index + 1 < limit and script[index + 1] in "'\"":
             raise _UnparsedHookShell(script[index : index + 2])
-        if char == "#" and _starts_shell_word(script, index):
+        if char == "#" and at_word_start:
             state = "comment"
-            out.append(" ")
+            emit(" ")
             index += 1
             continue
-        out.append(char)
+        emit(char)
         index += 1
     return "".join(out)
+
+
+_QUOTED_OPERATOR = "\ue000"
+_OPERATOR_CHARS = frozenset(";|&()<>\n`")
+
+
+def _mask_quoted_operators(script: str) -> tuple[str, list[str]]:
+    """Hide operator characters that appear inside quotes.
+
+    ``shlex`` drops the quotes before a later check can see them, so a quoted
+    ``'|'`` would otherwise look like a pipeline. The hidden characters are
+    restored onto the word after operator splitting.
+    """
+    out: list[str] = []
+    masked: list[str] = []
+    index = 0
+    limit = len(script)
+    state = "normal"
+    while index < limit:
+        char = script[index]
+        if state == "single":
+            if char == "'":
+                state = "normal"
+                out.append(char)
+            elif char in _OPERATOR_CHARS:
+                masked.append(char)
+                out.append(_QUOTED_OPERATOR)
+            else:
+                out.append(char)
+            index += 1
+            continue
+        if state == "double":
+            if char == "\\" and index + 1 < limit:
+                nxt = script[index + 1]
+                out.append(char)
+                if nxt in _OPERATOR_CHARS:
+                    masked.append(nxt)
+                    out.append(_QUOTED_OPERATOR)
+                else:
+                    out.append(nxt)
+                index += 2
+                continue
+            if char == '"':
+                state = "normal"
+                out.append(char)
+            elif char in _OPERATOR_CHARS:
+                masked.append(char)
+                out.append(_QUOTED_OPERATOR)
+            else:
+                out.append(char)
+            index += 1
+            continue
+        if char == "'":
+            state = "single"
+        elif char == '"':
+            state = "double"
+        out.append(char)
+        index += 1
+    return "".join(out), masked
+
+
+def _restore_quoted_operators(token: str, masked: list[str]) -> str:
+    if _QUOTED_OPERATOR not in token:
+        return token
+    chars: list[str] = []
+    for char in token:
+        if char == _QUOTED_OPERATOR:
+            if not masked:
+                raise _UnparsedHookShell(token)
+            chars.append(masked.pop(0))
+            continue
+        chars.append(char)
+    return "".join(chars)
 
 
 def _operator_parts(token: str) -> list[str] | None:
@@ -211,7 +287,8 @@ def _shell_script_segments(script: str) -> list[list[str]]:
     is one word. A comment starts at ``#`` only when ``#`` starts a word.
     """
     prepared = _prepare_shell_script(script)
-    lexer = shlex.shlex(prepared, posix=True, punctuation_chars=";&|()<>\n`")
+    masked_script, quoted_operators = _mask_quoted_operators(prepared)
+    lexer = shlex.shlex(masked_script, posix=True, punctuation_chars=";&|()<>\n`")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -230,10 +307,15 @@ def _shell_script_segments(script: str) -> list[list[str]]:
         if groups:
             groups[-1] = True
 
-    for token in lexer:
+    for raw in lexer:
+        if _QUOTED_OPERATOR in raw:
+            token = _restore_quoted_operators(raw, quoted_operators)
+            parts = None
+        else:
+            token = raw
+            parts = _operator_parts(token)
         if "\n" in token and token != "\n":
             raise _UnparsedHookShell(token)
-        parts = _operator_parts(token)
         if parts is None:
             # Reserved words are syntax only in command position. ``echo done`` is one command.
             if not current and token in _UNPARSED_SHELL_WORDS:
@@ -254,6 +336,8 @@ def _shell_script_segments(script: str) -> list[list[str]]:
                     raise _UnparsedHookShell(op)
                 continue
             if op in _PIPELINE_OPERATORS:
+                if needs_command:
+                    raise _UnparsedHookShell(op)
                 flush()
                 needs_command = True
                 continue
@@ -261,7 +345,7 @@ def _shell_script_segments(script: str) -> list[list[str]]:
                 raise _UnparsedHookShell(op)
             flush()
     flush()
-    if needs_command or groups:
+    if needs_command or groups or quoted_operators:
         raise _UnparsedHookShell(script)
     return segments
 
@@ -579,6 +663,9 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
         "sh -c 'printf ok&&pwd'",
         "sh -c 'printf ok||pwd'",
         "sh -c 'printf ok; p\\\nwd'",
+        "sh -c 'printf ok\\\n#tag; pwd'",
+        "sh -c 'printf ok | | echo done'",
+        "sh -c 'printf ok && && echo done'",
         # Syntax this checker cannot parse fails closed, including when no read
         # command word is visible yet.
         "sh -c 'printf ok; if'",
@@ -619,6 +706,8 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
         "sh -c 'printf ok; echo \"$\"'",
         "sh -c 'echo \"$pwd\"'",
         "sh -c 'echo bash -c'",
+        "sh -c \"printf ok; echo '|'\"",
+        'sh -c \'printf ok; echo "|"\'',
         "sh -c \"echo done # $'pwd'\"",
         "sh -c 'echo done;'",
         "sh -c 'pwd#not'",
