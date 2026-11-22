@@ -2095,7 +2095,7 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
             with pytest.raises(ValueError, match="repository identity unavailable"):
                 issue_stream_audit._repo_owner_name(audit_root, repo_slug=active_slug)
 
-        # Malformed open-issue rows fail closed with ValueError / CLI exit 2 (F4).
+        # Malformed open-issue rows fail closed with ValueError / CLI exit 2 (F4, F6).
         for bad_rows in (
             [None],
             [{"number": 10.0, "title": "root"}],
@@ -2104,17 +2104,117 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
             [{"number": 10, "title": None}],
             [{"number": 10}],
         ):
-            monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=bad_rows, **k: payload)
+
+            def _bad_issue_list(args, *, payload=bad_rows, **_k):
+                if isinstance(args, list) and args[:2] == ["repo", "view"]:
+                    return {"owner": {"login": owner}, "name": name}
+                if isinstance(args, list) and args[:2] == ["issue", "list"]:
+                    return payload
+                raise AssertionError(f"unexpected _gh_json call: {args}")
+
+            monkeypatch.setattr(issue_stream_audit, "_gh_json", _bad_issue_list)
             with pytest.raises(ValueError, match="open issues payload unavailable"):
                 issue_stream_audit.fetch_open_issues(audit_root, repo_slug=active_slug)
             assert issue_stream_audit.main(["--repo", "machinery", "--check", "--json"]) == 2
-            capsys.readouterr()
+            assert "open issues payload unavailable" in capsys.readouterr().err
 
-        # Malformed GraphQL sub-issue batch payloads degrade to INCOMPLETE_NODE instead of crashing.
-        for bad_batch in ([], {"data": None}, {"data": {"repository": {"i10": "not-a-dict"}}}):
+        # Malformed or omitted GraphQL sub-issue batch payloads degrade to INCOMPLETE_NODE (F5).
+        for bad_batch in (
+            [],
+            {"data": None},
+            {"data": {"repository": {}}},  # omitted alias != explicit null
+            {"data": {"repository": {"i10": "not-a-dict"}}},
+            {"data": {"repository": {"i10": {}}}},  # missing subIssues
+            {"data": {"repository": {"i10": {"body": True, "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}},
+            {"data": {"repository": {"i10": {"body": "", "subIssues": "bad"}}}},
+            {"data": {"repository": {"i10": {"body": "", "subIssues": {"nodes": "bad", "pageInfo": {"hasNextPage": False}}}}}},
+            {"data": {"repository": {"i10": {"body": "", "subIssues": {"nodes": [], "pageInfo": "bad"}}}}},
+            {
+                "data": {
+                    "repository": {
+                        "i10": {
+                            "body": "",
+                            "subIssues": {
+                                "nodes": [{"number": 42, "subIssuesSummary": {"total": False}}],
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            },
+                        }
+                    }
+                }
+            },
+            # Leading-zero and unrequested-alias NOT_FOUND must not be trusted.
+            {"data": {"repository": {"i10": None}}, "errors": [{"type": "NOT_FOUND", "path": ["repository", "i010"]}]},
+            {"data": {"repository": {"i10": None}}, "errors": [{"type": "NOT_FOUND", "path": ["repository", "i999"]}]},
+        ):
             monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=bad_batch, **k: payload)
             batch_result = issue_stream_audit._fetch_subissue_batch({10: None}, audit_root, repo_slug=active_slug)
             assert batch_result == {10: issue_stream_audit.INCOMPLETE_NODE}
+
+        # Explicit null and exact-alias NOT_FOUND return None (genuinely absent).
+        for absent_batch in (
+            {"data": {"repository": {"i10": None}}},
+            {"data": {"repository": {"i10": None}}, "errors": [{"type": "NOT_FOUND", "path": ["repository", "i10"]}]},
+        ):
+            monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=absent_batch, **k: payload)
+            assert issue_stream_audit._fetch_subissue_batch({10: None}, audit_root, repo_slug=active_slug) == {10: None}
+
+        # Single-page sub-issue reader fails closed with ValueError on missing envelope or malformed page (F5).
+        for bad_single in (
+            {},
+            {"data": None},
+            {"data": {}},
+            {"data": {"repository": {}}},
+            {"data": {"repository": {"issue": {}}}},
+            {"data": {"repository": {"issue": {"body": True, "subIssues": None}}}},
+            {"data": {"repository": {"issue": {"subIssues": "bad"}}}},
+            {"data": {"repository": {"issue": {"subIssues": {"nodes": [{"number": 42, "subIssuesSummary": {"total": False}}], "pageInfo": {"hasNextPage": False}}}}}},
+            {"data": {"repository": {"issue": None}}, "errors": [{"type": "FORBIDDEN", "path": ["repository", "issue"]}]},
+        ):
+            monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=bad_single, **k: payload)
+            with pytest.raises(ValueError, match="sub-issues payload unavailable"):
+                issue_stream_audit._fetch_subissues_page(10, None, audit_root, repo_slug=active_slug)
+        with pytest.raises(ValueError, match="sub-issues payload unavailable"):
+            _paginate_subissues(10, lambda _e, _c: {"subIssues": "bad"})
+
+        # End-to-end CLI check: bool total=False or omitted alias fails closed with exit 1 & membership_complete=False (F5).
+        for bad_graph in (
+            {"data": {"repository": {}}},
+            {
+                "data": {
+                    "repository": {
+                        "i10": {
+                            "body": "",
+                            "subIssues": {
+                                "nodes": [
+                                    {
+                                        "number": 42,
+                                        "repository": {"nameWithOwner": active_slug},
+                                        "subIssuesSummary": {"total": False},
+                                    }
+                                ],
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            },
+                        }
+                    }
+                }
+            },
+        ):
+
+            def _bad_subissue_cli(args, *, payload=bad_graph, **_k):
+                if isinstance(args, list) and args[:2] == ["repo", "view"]:
+                    return {"owner": {"login": owner}, "name": name}
+                if isinstance(args, list) and args[:2] == ["issue", "list"]:
+                    return [{"number": 10, "title": "Root"}, {"number": 42, "title": "Child"}]
+                if isinstance(args, issue_stream_audit.Request) and args.verb == "read-subissue-batch":
+                    return payload
+                raise AssertionError(f"unexpected _gh_json call: {args}")
+
+            monkeypatch.setattr(issue_stream_audit, "_gh_json", _bad_subissue_cli)
+            assert issue_stream_audit.main(["--repo", "machinery", "--check", "--json"]) == 1
+            bad_report = json.loads(capsys.readouterr().out)
+            assert bad_report["membership_complete"] is False
+            assert bad_report["ok"] is False
+            assert 10 in bad_report["incomplete_nodes"]
 
         # Missing/broken fleet catalog default fails closed instead of substituting 'public' (F1 sibling).
         monkeypatch.setattr(

@@ -827,9 +827,9 @@ def load_closed_epics(path: Path = REGISTRY_PATH, *, repo: str | None = None) ->
     """
     doc = _load_registry_doc(path)
     streams_raw, allow_empty = _resolve_repo_section(doc, repo)
+    _parse_streams(streams_raw, allow_empty_epics=allow_empty, audit_only=False)
     if not isinstance(streams_raw, dict):
         return {}
-    _parse_streams(streams_raw, allow_empty_epics=allow_empty, audit_only=False)
     return {
         key: [int(n) for n in (spec.get("closed_epics") or [])]
         for key, spec in streams_raw.items()
@@ -1060,8 +1060,8 @@ def fetch_issue_states(
             continue
         resolved_number = issue.get("number") if isinstance(issue, dict) else None
         state = issue.get("state") if isinstance(issue, dict) else None
-        if isinstance(resolved_number, int) and not isinstance(resolved_number, bool) and resolved_number > 0 and isinstance(state, str):
-            states[resolved_number] = state
+        if _is_positive_int(resolved_number) and resolved_number == number and isinstance(state, str) and state.strip():
+            states[number] = state
         else:
             unavailable.add(number)
     return states, unavailable
@@ -1077,7 +1077,14 @@ def _extract_repo_owner_name(data: object) -> tuple[str, str]:
     owner = data.get("owner") if isinstance(data, dict) else None
     login = owner.get("login") if isinstance(owner, dict) else None
     name = data.get("name") if isinstance(data, dict) else None
-    if not (isinstance(login, str) and login.strip() and isinstance(name, str) and name.strip()):
+    if not (
+        isinstance(login, str)
+        and login.strip()
+        and "/" not in login
+        and isinstance(name, str)
+        and name.strip()
+        and "/" not in name
+    ):
         raise ValueError("repository identity unavailable")
     return (login, name)
 
@@ -1141,6 +1148,70 @@ class _RetryBudget:
         self.remaining = limit
 
 
+def _is_nonneg_int(value: object) -> bool:
+    """True for a JSON int >= 0, explicitly excluding ``bool``."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_valid_subissue_page(page: object, *, allow_zero_number: bool = False) -> bool:
+    """Validate every field consumed from a GraphQL/REST sub-issue page.
+
+    Accepts ``body`` (``str | None``), ``subIssues`` (``dict | None``; key must be
+    present), ``nodes`` (``list | None``), ``pageInfo`` (``dict | None``), and
+    per-node ``number``, ``repository.nameWithOwner``, and
+    ``subIssuesSummary.total`` (non-negative ``int``, excluding ``bool``).
+    """
+    if not isinstance(page, dict):
+        return False
+    body = page.get("body")
+    if body is not None and not isinstance(body, str):
+        return False
+    if "subIssues" not in page:
+        return False
+    sub_issues = page["subIssues"]
+    if sub_issues is None:
+        return True
+    if not isinstance(sub_issues, dict):
+        return False
+    if "nodes" not in sub_issues or "pageInfo" not in sub_issues:
+        return False
+    nodes = sub_issues["nodes"]
+    if nodes is not None:
+        if not isinstance(nodes, list):
+            return False
+        for node in nodes:
+            if not isinstance(node, dict):
+                return False
+            num = node.get("number")
+            if not (_is_nonneg_int(num) if allow_zero_number else _is_positive_int(num)):
+                return False
+            repo_obj = node.get("repository")
+            if repo_obj is not None:
+                if not isinstance(repo_obj, dict):
+                    return False
+                nwo = repo_obj.get("nameWithOwner")
+                if nwo is not None and not isinstance(nwo, str):
+                    return False
+            summary = node.get("subIssuesSummary")
+            if summary is not None:
+                if not isinstance(summary, dict):
+                    return False
+                total = summary.get("total")
+                if total is not None and not _is_nonneg_int(total):
+                    return False
+    page_info = sub_issues["pageInfo"]
+    if page_info is not None:
+        if not isinstance(page_info, dict):
+            return False
+        has_next = page_info.get("hasNextPage")
+        if has_next is not None and not isinstance(has_next, bool):
+            return False
+        end_cursor = page_info.get("endCursor")
+        if end_cursor is not None and not isinstance(end_cursor, str):
+            return False
+    return True
+
+
 def _fetch_subissues_page(
     epic: int,
     cursor: str | None,
@@ -1161,20 +1232,36 @@ def _fetch_subissues_page(
     )
     if not isinstance(data, dict):
         raise ValueError("sub-issues payload unavailable")
-    data_obj = data.get("data")
-    if data_obj is None:
-        return {}
-    if not isinstance(data_obj, dict):
+    raw_errors = data.get("errors")
+    not_found = False
+    if raw_errors is not None:
+        if not isinstance(raw_errors, list):
+            raise ValueError("sub-issues payload unavailable")
+        for err in raw_errors:
+            if (
+                isinstance(err, dict)
+                and err.get("type") == "NOT_FOUND"
+                and err.get("path") == ["repository", "issue"]
+            ):
+                not_found = True
+            else:
+                raise ValueError("sub-issues payload unavailable")
+    if "data" not in data or not isinstance(data["data"], dict):
         raise ValueError("sub-issues payload unavailable")
-    repo_obj = data_obj.get("repository")
-    if repo_obj is None:
-        return {}
-    if not isinstance(repo_obj, dict):
+    data_obj = data["data"]
+    if "repository" not in data_obj or not isinstance(data_obj["repository"], dict):
         raise ValueError("sub-issues payload unavailable")
-    issue_obj = repo_obj.get("issue")
+    repo_obj = data_obj["repository"]
+    if not_found:
+        if "issue" in repo_obj and repo_obj["issue"] is not None:
+            raise ValueError("sub-issues payload unavailable")
+        return {"body": None, "subIssues": None}
+    if "issue" not in repo_obj:
+        raise ValueError("sub-issues payload unavailable")
+    issue_obj = repo_obj["issue"]
     if issue_obj is None:
-        return {}
-    if not isinstance(issue_obj, dict):
+        return {"body": None, "subIssues": None}
+    if not isinstance(issue_obj, dict) or not _is_valid_subissue_page(issue_obj):
         raise ValueError("sub-issues payload unavailable")
     return issue_obj
 
@@ -1193,14 +1280,12 @@ def _paginate_subissues(epic: int, fetch_page: Callable[[int, str | None], dict]
     cursor: str | None = None
     for page in range(_MAX_SUBISSUE_PAGES):
         issue = fetch_page(epic, cursor)
+        if not _is_valid_subissue_page(issue, allow_zero_number=True):
+            raise ValueError("sub-issues payload unavailable")
         if page == 0:
             body = issue.get("body") or ""
         sub_issues = issue.get("subIssues") or {}
-        native.update(
-            n["number"]
-            for n in (sub_issues.get("nodes") or [])
-            if isinstance(n, dict) and isinstance(n.get("number"), int) and not isinstance(n.get("number"), bool)
-        )
+        native.update(n["number"] for n in (sub_issues.get("nodes") or []))
         page_info = sub_issues.get("pageInfo") or {}
         next_cursor = page_info.get("endCursor")
         if not page_info.get("hasNextPage") or not next_cursor:
@@ -1287,6 +1372,7 @@ def _fetch_subissue_batch(
             )
         return pages
 
+    expected_aliases = {f"i{number}": number for number in cursors}
     raw_errors = data.get("errors")
     errors = raw_errors if isinstance(raw_errors, list) else []
     not_found_numbers: set[int] = set()
@@ -1302,10 +1388,9 @@ def _fetch_subissue_batch(
             and len(path) == 2
             and path[0] == "repository"
             and isinstance(path[1], str)
-            and path[1].startswith("i")
-            and path[1][1:].isdigit()
+            and path[1] in expected_aliases
         ):
-            not_found_numbers.add(int(path[1][1:]))
+            not_found_numbers.add(expected_aliases[path[1]])
         else:
             has_untrusted_errors = True
 
@@ -1335,11 +1420,19 @@ def _fetch_subissue_batch(
         return {number: INCOMPLETE_NODE for number in cursors}
     pages = {}
     for number in cursors:
+        alias = f"i{number}"
         if number in not_found_numbers:
-            pages[number] = None
+            pages[number] = INCOMPLETE_NODE if (alias in repository and repository[alias] is not None) else None
+        elif alias not in repository:
+            pages[number] = INCOMPLETE_NODE
         else:
-            node_val = repository.get(f"i{number}")
-            pages[number] = node_val if (node_val is None or isinstance(node_val, dict)) else INCOMPLETE_NODE
+            node_val = repository[alias]
+            if node_val is None:
+                pages[number] = None
+            elif _is_valid_subissue_page(node_val):
+                pages[number] = node_val
+            else:
+                pages[number] = INCOMPLETE_NODE
     return pages
 
 
@@ -1386,17 +1479,18 @@ def _tree_membership(
                     break
                 issues = fetch_batch(pending)
                 next_pending = {}
-                for number, issue in issues.items():
-                    if issue is INCOMPLETE_NODE:
+                for number in pending:
+                    issue = issues.get(number, INCOMPLETE_NODE) if isinstance(issues, dict) else INCOMPLETE_NODE
+                    if issue is None:
+                        if warnings is not None:
+                            warnings.append({"code": "unresolved_subissue", "issue": number})
+                        children.setdefault(number, set())
+                        continue
+                    if not isinstance(issue, dict) or not _is_valid_subissue_page(issue):
                         if warnings is not None and not any(
                             w.get("code") == "traversal_incomplete" and w.get("issue") == number for w in warnings
                         ):
                             warnings.append({"code": "traversal_incomplete", "issue": number})
-                        children.setdefault(number, set())
-                        continue
-                    if issue is None:
-                        if warnings is not None:
-                            warnings.append({"code": "unresolved_subissue", "issue": number})
                         children.setdefault(number, set())
                         continue
                     if page == 0 and number in roots:
@@ -1419,7 +1513,7 @@ def _tree_membership(
                                 )
                             continue
                         total = (node.get("subIssuesSummary") or {}).get("total")
-                        if isinstance(total, int) and total >= 0:
+                        if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
                             child_totals[node["number"]] = total
                         own_children.add(node["number"])
                     children.setdefault(number, set()).update(own_children)
@@ -1686,6 +1780,7 @@ def membership_root_results(report: dict, registry: dict[str, list[int]]) -> dic
     numbers = report.get("open_issue_numbers")
     if (
         not isinstance(numbers, list)
+        or not _valid_open_numbers(numbers)
         or len(numbers) >= 500
         or len(set(numbers)) != len(numbers)
         or type(report.get("open_total")) is not int
@@ -1774,7 +1869,7 @@ def run_audit(
             report["ok"] = False
             report["membership_complete"] = False
             report["incomplete_nodes"] = incomplete_nodes
-        open_issue_numbers = {issue["number"] for issue in open_issues if isinstance(issue.get("number"), int)}
+        open_issue_numbers = {issue["number"] for issue in open_issues if _is_positive_int(issue.get("number"))}
         report["warnings"] = traversal_warnings + hygiene_warnings(
             root, open_issue_numbers, max_confirmed_age_days=max_confirmed_age_days
         )
@@ -1807,7 +1902,7 @@ def run_audit(
         report["ok"] = False
         report["membership_complete"] = False
         report["incomplete_nodes"] = incomplete_nodes
-    open_issue_numbers = {issue["number"] for issue in open_issues if isinstance(issue.get("number"), int)}
+    open_issue_numbers = {issue["number"] for issue in open_issues if _is_positive_int(issue.get("number"))}
     report["warnings"] = traversal_warnings + hygiene_warnings(
         audit_cwd if is_default else None,
         open_issue_numbers,
@@ -1827,7 +1922,17 @@ def read_cache(max_age_s: int) -> dict | None:
         report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return None
-    if time.time() - report.get("generated_at", 0) > max_age_s:
+    if not isinstance(report, dict):
+        return None
+    generated_at = report.get("generated_at")
+    if (
+        isinstance(generated_at, bool)
+        or not isinstance(generated_at, (int, float))
+        or not math.isfinite(generated_at)
+        or generated_at < 0
+    ):
+        return None
+    if time.time() - generated_at > max_age_s:
         return None
     return report
 

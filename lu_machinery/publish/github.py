@@ -907,6 +907,15 @@ def _issue_node(read_runner, gh_repo, number, cwd, environment):
     return document["node_id"]
 
 
+def _github_slug_or_none(value):
+    """Return lowercase ``owner/name`` when *value* normalizes to host ``github.com``, else None."""
+    normalized = gate.normalize_repository(value)
+    host, sep, slug = normalized.partition("/")
+    if host != "github.com" or not sep or not slug:
+        return None
+    return slug
+
+
 def _catalog_fleet_repos():
     """Convert ``gate.catalog()`` rows into validated ``FleetRepo`` objects for the A01 resolver.
 
@@ -926,10 +935,9 @@ def _catalog_fleet_repos():
         github = row.get("github")
         if not isinstance(github, str):
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
-        normalized = gate.normalize_repository(github)
-        if not normalized.startswith("github.com/"):
+        slug = _github_slug_or_none(github)
+        if slug is None:
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
-        slug = normalized.split("/", 1)[1]
         default_raw = row.get("default", False)
         if type(default_raw) is not bool:
             raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
@@ -946,10 +954,9 @@ def _catalog_fleet_repos():
         if alt_raw is not None:
             if not isinstance(alt_raw, str):
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
-            alt_norm = gate.normalize_repository(alt_raw)
-            if not alt_norm.startswith("github.com/"):
+            alt_slug = _github_slug_or_none(alt_raw)
+            if alt_slug is None:
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
-            alt_slug = alt_norm.split("/", 1)[1]
             if alt_slug.casefold() == slug.casefold() or repo_id is None or visibility is None:
                 raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         repos[key] = fleet_repos.FleetRepo(
@@ -971,10 +978,9 @@ def _fleet_catalog_row(gh_repo, *, env=None):
     """Resolve *gh_repo* through the A01 active-slug resolver, or None when unregistered."""
     from lu_machinery.orchestration import fleet_repos
 
-    normalized = gate.normalize_repository(gh_repo)
-    if normalized == "unknown":
+    slug = _github_slug_or_none(gh_repo)
+    if slug is None:
         return None
-    slug = normalized.split("/", 1)[1]
     repos = _catalog_fleet_repos()
     try:
         fleet_repos.resolve_fleet_repo_by_slug(slug, repos=repos)
@@ -1030,13 +1036,13 @@ def _cli_keeps_stream_parent_refusal(explicit):
     that omits ``--repo`` still prints it. A resolved repository with no stream registry, and
     a resolved unregistered or inactive repository, fall through to ``publish``.
     """
-    slug = None
+    destination = None
     if isinstance(explicit, str) and explicit.strip():
         normalized = gate.normalize_repository(explicit)
         if normalized != "unknown":
-            slug = normalized.split("/", 1)[1]
+            destination = normalized
     environment = None
-    if slug is None:
+    if destination is None:
         try:
             environment = _validated_environment(None)
             dest = repository(Path.cwd(), environment, explicit)
@@ -1044,14 +1050,14 @@ def _cli_keeps_stream_parent_refusal(explicit):
             return True
         if dest == "unknown":
             return True
-        slug = dest.split("/", 1)[1]
+        destination = dest
     else:
         try:
             environment = _validated_environment(None)
         except gate.PublishBlocked:
             return False
     try:
-        return _issue_create_parent_policy(slug, env=environment) == "stream"
+        return _issue_create_parent_policy(destination, env=environment) == "stream"
     except gate.PublishBlocked:
         return False
 

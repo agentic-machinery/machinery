@@ -931,8 +931,15 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
         )
         assert "REPO_REFUSED" in capsys.readouterr().err
 
-        # Malformed alternate_github in catalog fails closed instead of downgrading to selector-free single-slug (F2).
-        for bad_alt in (123, "agentic-machinery/machïnery", ["agentic-machinery/machinery"], ""):
+        # Malformed alternate_github (and non-github.com hosts) fail closed (F2 + CodeQL host partition).
+        for bad_alt in (
+            123,
+            "agentic-machinery/machïnery",
+            ["agentic-machinery/machinery"],
+            "",
+            "https://github.com.evil.com/agentic-machinery/machinery",
+            "https://gitlab.com/agentic-machinery/machinery",
+        ):
             bad_catalog = {
                 "public": {"github": public_slug, "default": True, "local_name": "p", "role": "public-monorepo"},
                 "machinery": {
@@ -948,6 +955,10 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
                 ctx.setattr(gate, "catalog", lambda rows=bad_catalog: rows)
                 with pytest.raises(gate.PublishBlocked, match="allowlist malformed"):
                     pub._fleet_catalog_row("learn-ukrainian/machinery", env={})
+
+        # Foreign-host repository with matching slug is never treated as a registered GitHub fleet repo.
+        assert pub._fleet_catalog_row(f"https://gitlab.com/{active_slug}", env={}) is None
+        assert pub._fleet_catalog_row(f"https://github.com.evil.com/{active_slug}", env={}) is None
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)
