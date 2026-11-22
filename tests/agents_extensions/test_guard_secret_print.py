@@ -1951,6 +1951,7 @@ LEXER_CASES = [
     ("$'caf\u00e9 \\x41'", ["caf\u00e9 A"]),
     ("\\$'a\\b'{}", ["$a\\b{}"]),
     ("{}x,y} a{}x,y} x{a..b..c},y} {{-},x},1}", ["{}x,y}", "a}x", "ay", "x{a..b..c},y}", "{-},1}", "x,1}"]),
+    ("{a..z..c}{}x,y} {a..b..c{d,e}} {1..2..x}{a,b}", ["{a..z..c}{}x,y}", "{a..b..c{d,e}}", "{1..2..x}a", "{1..2..x}b"]),
 ]
 
 
@@ -1976,7 +1977,7 @@ def test_lexer_word_values_match_bash(text, values):
 
 @pytest.mark.parametrize(
     "command",
-    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", "echo inert #\x00", 'bash -c "$CMD"', "echo x\\"],
+    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", "echo inert #\x00", 'bash -c "$CMD"', "echo x\\", "echo {+1..3}"],
 )
 @pytest.mark.parametrize("override", [False, True])
 def test_unparseable_text_is_refused(monkeypatch, command, override):
