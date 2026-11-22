@@ -65,8 +65,33 @@ _SHELL_BASENAMES = frozenset({"ash", "bash", "busybox", "dash", "ksh", "mksh", "
 _SHELL_NO_ARG_SHORT = frozenset("efilnprstuvx")
 _SHELL_NO_ARG_LONG = frozenset({"--login", "--noprofile", "--norc", "--posix"})
 _SHELL_ARG_LONG = frozenset({"--rcfile"})
-_SHELL_SEPARATORS = frozenset({";", "&", "|", "&&", "||", "\n", "(", ")", "`"})
+_PIPELINE_OPERATORS = frozenset({"|", "&&", "||"})
 _MAX_SHELL_SCRIPT_DEPTH = 8
+_COMMAND_WRAPPERS = frozenset({"command", "env", "exec"})
+_UNPARSED_SHELL_WORDS = frozenset(
+    {
+        "((",
+        "))",
+        "[[",
+        "]]",
+        "case",
+        "coproc",
+        "do",
+        "done",
+        "elif",
+        "else",
+        "esac",
+        "fi",
+        "for",
+        "function",
+        "if",
+        "select",
+        "then",
+        "until",
+        "while",
+    }
+)
+_WORD_BREAKS = frozenset(" \t\r\n;&|()<>`")
 
 
 class _UnparsedHookShell(Exception):
@@ -79,27 +104,165 @@ def _tokens_include_read_command(tokens: list[str], commands: tuple[str, ...]) -
     )
 
 
+def _starts_shell_word(text: str, index: int) -> bool:
+    return index == 0 or text[index - 1] in _WORD_BREAKS
+
+
+def _prepare_shell_script(script: str) -> str:
+    """Join line continuations and blank comments. Refuse a real bash special quote.
+
+    ``#`` starts a comment only at the beginning of a word, so ``ok#tag`` stays
+    one word. ``$'...'`` and ``$"..."`` count only outside quotes and comments:
+    bash runs them, and ``shlex`` collapses them to a different word.
+    """
+    out: list[str] = []
+    index = 0
+    limit = len(script)
+    state = "normal"
+    while index < limit:
+        char = script[index]
+        if state == "single":
+            out.append(char)
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+        if state == "double":
+            if char == "\\" and index + 1 < limit:
+                nxt = script[index + 1]
+                if nxt == "\n":
+                    index += 2
+                    continue
+                out.append(char)
+                out.append(nxt)
+                index += 2
+                continue
+            out.append(char)
+            if char == '"':
+                state = "normal"
+            index += 1
+            continue
+        if state == "comment":
+            if char == "\n":
+                out.append("\n")
+                state = "normal"
+            else:
+                out.append(" ")
+            index += 1
+            continue
+        if char == "\\" and index + 1 < limit and script[index + 1] == "\n":
+            index += 2
+            continue
+        if char == "\\" and index + 1 < limit:
+            out.append(char)
+            out.append(script[index + 1])
+            index += 2
+            continue
+        if char == "'":
+            state = "single"
+            out.append(char)
+            index += 1
+            continue
+        if char == '"':
+            state = "double"
+            out.append(char)
+            index += 1
+            continue
+        if char == "$" and index + 1 < limit and script[index + 1] in "'\"":
+            raise _UnparsedHookShell(script[index : index + 2])
+        if char == "#" and _starts_shell_word(script, index):
+            state = "comment"
+            out.append(" ")
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _operator_parts(token: str) -> list[str] | None:
+    """Split a token that is only shell operators, such as ``;(`` into ``;`` and ``(``."""
+    parts: list[str] = []
+    index = 0
+    while index < len(token):
+        pair = token[index : index + 2]
+        if pair in {"&&", "||"}:
+            parts.append(pair)
+            index += 2
+            continue
+        if token[index] in ";|&()\n`":
+            parts.append(token[index])
+            index += 1
+            continue
+        return None
+    return parts or None
+
+
+def _is_assignment(token: str) -> bool:
+    name, sep, _value = token.partition("=")
+    return bool(sep) and name.isascii() and name.isidentifier()
+
+
 def _shell_script_segments(script: str) -> list[list[str]]:
     """Split a shell script into simple-command word lists.
 
     Operators and newlines are separators, including when they are glued to a
-    word (``ok;pwd``). Quotes stay quoted, so ``'not;pwd'`` is one word.
+    word (``ok;pwd``, ``ok;(/bin/pwd)``). Quotes stay quoted, so ``'not;pwd'``
+    is one word. A comment starts at ``#`` only when ``#`` starts a word.
     """
-    lexer = shlex.shlex(script, posix=True, punctuation_chars=";&|()<>\n`")
+    prepared = _prepare_shell_script(script)
+    lexer = shlex.shlex(prepared, posix=True, punctuation_chars=";&|()<>\n`")
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
-    lexer.commenters = "#"
+    lexer.commenters = ""
     segments: list[list[str]] = []
     current: list[str] = []
-    for token in lexer:
-        if token in _SHELL_SEPARATORS:
-            if current:
-                segments.append(current)
-                current = []
-            continue
-        current.append(token)
-    if current:
+    needs_command = False
+    groups: list[bool] = []
+
+    def flush() -> None:
+        nonlocal current, needs_command
+        if not current:
+            return
         segments.append(current)
+        current = []
+        needs_command = False
+        if groups:
+            groups[-1] = True
+
+    for token in lexer:
+        if "\n" in token and token != "\n":
+            raise _UnparsedHookShell(token)
+        parts = _operator_parts(token)
+        if parts is None:
+            # Reserved words are syntax only in command position. ``echo done`` is one command.
+            if not current and token in _UNPARSED_SHELL_WORDS:
+                raise _UnparsedHookShell(token)
+            current.append(token)
+            needs_command = False
+            if groups:
+                groups[-1] = True
+            continue
+        for op in parts:
+            if op == "(":
+                flush()
+                groups.append(False)
+                continue
+            if op == ")":
+                flush()
+                if not groups or not groups.pop():
+                    raise _UnparsedHookShell(op)
+                continue
+            if op in _PIPELINE_OPERATORS:
+                flush()
+                needs_command = True
+                continue
+            if needs_command:
+                raise _UnparsedHookShell(op)
+            flush()
+    flush()
+    if needs_command or groups:
+        raise _UnparsedHookShell(script)
     return segments
 
 
@@ -151,74 +314,65 @@ def _shell_c_script(tokens: list[str], shell_index: int) -> str | None:
     return None
 
 
-def _bash_special_quotes(text: str) -> bool:
-    """True for bash ``$'...'`` and ``$"..."`` quotes.
-
-    ``shlex`` turns ``$'pwd'`` into the word ``$pwd``, which is not the read
-    command, but bash runs ``pwd``. The quote marks are the part that can be
-    seen before that collapse. Dash does not run this form; bash does.
-    """
-    return "$'" in text or '$"' in text
-
-
-def _dollar_word_hides_read_command(token: str, commands: tuple[str, ...]) -> bool:
-    """True when a collapsed ``$'pwd'`` / ``$pwd`` word is exactly a one-word read command."""
-    if len(token) < 2 or not token.startswith("$") or token.startswith(("${", "$(")):
-        return False
-    return token[1:] in commands
-
-
 def _hook_tokens_hide_read_command(
     tokens: list[str],
     commands: tuple[str, ...],
     *,
     depth: int = 0,
 ) -> bool:
-    """True when these words run a reviewer read command, including inside a shell ``-c`` script."""
+    """True when these words run a reviewer read command, including inside a shell ``-c`` script.
+
+    A shell, ``eval`` or wrapper is inspected only in command position, so an
+    argument such as ``echo bash -c`` is not itself a shell invocation.
+    """
     if depth > _MAX_SHELL_SCRIPT_DEPTH:
         return True
     if _tokens_include_read_command(tokens, commands):
         return True
-    if any(_dollar_word_hides_read_command(token, commands) for token in tokens):
-        return True
-    for index, token in enumerate(tokens):
-        if Path(token).name not in _SHELL_BASENAMES:
-            continue
+    index = 0
+    while index < len(tokens) and _is_assignment(tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return False
+    name = Path(tokens[index]).name
+    if name in _SHELL_BASENAMES:
         try:
             script = _shell_c_script(tokens, index)
         except _UnparsedHookShell:
             return True
-        if script is None:
-            continue
-        if _hook_script_hides_read_command(script, commands, depth=depth):
+        if script is not None:
+            return _hook_script_hides_read_command(script, commands, depth=depth)
+        if name == "busybox" and index + 1 < len(tokens):
+            return _hook_tokens_hide_read_command(tokens[index + 1 :], commands, depth=depth)
+        return False
+    if name in _COMMAND_WRAPPERS and index + 1 < len(tokens):
+        rest = tokens[index + 1 :]
+        cursor = 0
+        while cursor < len(rest) and _is_assignment(rest[cursor]):
+            cursor += 1
+        if cursor < len(rest) and rest[cursor].startswith("-"):
             return True
-    for index, token in enumerate(tokens):
-        if Path(token).name != "eval" or index + 1 >= len(tokens):
-            continue
+        return _hook_tokens_hide_read_command(rest[cursor:], commands, depth=depth)
+    if name == "eval" and index + 1 < len(tokens):
         # eval joins its remaining words into one script, the same way a shell -c argument does.
-        if _hook_script_hides_read_command(" ".join(tokens[index + 1 :]), commands, depth=depth):
-            return True
+        return _hook_script_hides_read_command(" ".join(tokens[index + 1 :]), commands, depth=depth)
     return False
 
 
 def _hook_script_hides_read_command(script: str, commands: tuple[str, ...], *, depth: int) -> bool:
-    if _bash_special_quotes(script):
+    if depth + 1 > _MAX_SHELL_SCRIPT_DEPTH:
         return True
     try:
         segments = _shell_script_segments(script)
-    except ValueError:
+    except (ValueError, _UnparsedHookShell):
         return True
-    return any(
-        _hook_tokens_hide_read_command(segment, commands, depth=depth + 1) for segment in segments
-    )
+    return any(_hook_tokens_hide_read_command(segment, commands, depth=depth + 1) for segment in segments)
 
 
 def _hook_command_hides_read_command(hook_command: str, commands: tuple[str, ...]) -> bool:
-    if _bash_special_quotes(hook_command):
-        return True
     try:
-        tokens = shlex.split(hook_command)
-    except ValueError:
+        tokens = shlex.split(_prepare_shell_script(hook_command))
+    except (ValueError, _UnparsedHookShell):
         return True
     return _hook_tokens_hide_read_command(tokens, commands)
 
@@ -372,9 +526,13 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
 
     Defect class: hook checks that look only at outer argv tokens, contiguous
     slices and the argv[0] basename miss a read command that is a word of a
-    ``sh -c`` / ``bash -c`` script. The seeded definition is refused. A compound
-    shell script that does not run a read command, and the generated definition
-    in ``test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads``, pass.
+    ``sh -c`` / ``bash -c`` script. Re-tokenizing that script includes a ``#``
+    that does not start a word, operators glued together, and a backslash
+    newline. A shell word is an invocation only in command position. Unparsed
+    shell syntax, and a nest past eight shells even when the last script is
+    empty, fail closed. The seeded definition is refused. A compound shell
+    script that does not run a read command, and the generated definition in
+    ``test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads``, pass.
     """
     from lu_machinery.agent_runtime.grok_reviewer_permissions import (
         GROK_REVIEWER_READ_COMMANDS,
@@ -414,11 +572,31 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
         'sh -c "printf \'ok"',
         "bash --not-a-real-flag -c 'printf ok'",
         "bash -c'printf ok; pwd'",
+        # A hash inside a word is not a comment, glued operators still split, and
+        # a backslash-newline joins the continued command name.
+        "sh -c 'printf ok#tag; pwd'",
+        "sh -c 'printf ok;(/bin/pwd)'",
+        "sh -c 'printf ok&&pwd'",
+        "sh -c 'printf ok||pwd'",
+        "sh -c 'printf ok; p\\\nwd'",
+        # Syntax this checker cannot parse fails closed, including when no read
+        # command word is visible yet.
+        "sh -c 'printf ok; if'",
+        "sh -c 'printf ok |'",
+        "sh -c 'printf ok &&'",
+        "sh -c 'printf ok ||'",
+        "sh -c 'printf ok; then'",
+        "sh -c '()'",
     ]
     nested = "echo done"
     for _ in range(_MAX_SHELL_SCRIPT_DEPTH + 1):
         nested = "sh -c " + shlex.quote(nested)
     hidden.append(nested)
+    for innermost in ("", "   ", "# pwd"):
+        nested_blank = innermost
+        for _ in range(_MAX_SHELL_SCRIPT_DEPTH + 1):
+            nested_blank = "sh -c " + shlex.quote(nested_blank)
+        hidden.append(nested_blank)
     clean = [
         "sh -c 'printf ok; echo done'",
         "eval 'echo done'",
@@ -435,7 +613,22 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
         'sh -c \'printf "not a command: pwd"\'',
         "sh -c 'echo pytest.pwds69p6'",
         "sh -c 'echo $HOME'",
+        # A literal dollar, a parameter in argument position, and a shell word
+        # that is not the command are not invocations. A trailing semicolon and
+        # a hash inside a command name are ordinary words.
+        "sh -c 'printf ok; echo \"$\"'",
+        "sh -c 'echo \"$pwd\"'",
+        "sh -c 'echo bash -c'",
+        "sh -c \"echo done # $'pwd'\"",
+        "sh -c 'echo done;'",
+        "sh -c 'pwd#not'",
+        "sh -c '# pwd'",
+        "sh -c '   '",
     ]
+    eight = ""
+    for _ in range(_MAX_SHELL_SCRIPT_DEPTH):
+        eight = "sh -c " + shlex.quote(eight)
+    clean.append(eight)
     for hook_command in hidden:
         command = _definition_hook_commands(_seeded_reviewer_definition(hook_command))
         assert command == [hook_command]
