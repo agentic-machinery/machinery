@@ -11,9 +11,9 @@ import hashlib
 import json
 import os
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,9 @@ UNPUSHED_STATUSES = frozenset({"needs_finalize", "failed", "timeout", "timed_out
 TERMINAL = RELEASED_TASK_STATUSES | UNPUSHED_STATUSES
 MAX_AGE_DAYS = 14
 GRACE_SECONDS = 2 * 3600
+# A persistent scan error stays in the journal without a line on every keeper minute.
+_SUMMARY = timedelta(hours=1)
+_CHECKPOINT_KEYS = frozenset({"report", "route"})
 
 
 def owner_lanes() -> dict[str, str]:
@@ -347,29 +350,165 @@ def run(args, *, now: datetime) -> dict[str, Any]:
     return report
 
 
-def tick(args, *, now: datetime) -> dict[str, Any]:
-    """Serialize keeper invocations and checkpoint only a complete successful cycle."""
+def _empty_journal() -> dict[str, Any]:
+    return {"errors": [], "errors_at": None, "rows": None}
+
+
+def _parse_stamp(value: object) -> datetime | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise ValueError("cadence checkpoint malformed")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("cadence checkpoint malformed") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("cadence checkpoint malformed")
+    return parsed
+
+
+def _journal_from(value: object) -> dict[str, Any]:
+    if value is None:
+        return _empty_journal()
+    if type(value) is not dict or any(key not in {"errors", "errors_at", "rows"} for key in value):
+        raise ValueError("cadence checkpoint malformed")
+    errors = value.get("errors", [])
+    if type(errors) is not list or any(type(item) is not str for item in errors) or errors != sorted(errors):
+        raise ValueError("cadence checkpoint malformed")
+    _parse_stamp(value.get("errors_at"))
+    rows = value.get("rows")
+    if rows is not None and type(rows) is not str:
+        raise ValueError("cadence checkpoint malformed")
+    return {"errors": list(errors), "errors_at": value.get("errors_at"), "rows": rows}
+
+
+def _load_checkpoint(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"journal": _empty_journal()}
+    last = json_depth.loads(path.read_text(), max_depth=512)
+    if type(last) is not dict:
+        raise ValueError("cadence checkpoint malformed")
+    for key, value in last.items():
+        if key == "journal":
+            continue
+        if key not in _CHECKPOINT_KEYS or type(value) is not int or value < 0:
+            raise ValueError("cadence checkpoint malformed")
+    last["journal"] = _journal_from(last.get("journal"))
+    return last
+
+
+def _write_checkpoint(path: Path, last: dict[str, Any]) -> None:
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w") as state:
+        json.dump(last, state)
+        state.flush()
+        os.fsync(state.fileno())
+    temporary.replace(path)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _row_digest(report: Mapping[str, Any]) -> str:
+    rows = []
+    raw = report.get("rows") or []
+    if type(raw) is not list:
+        raw = []
+    for row in raw:
+        if isinstance(row, dict):
+            rows.append({key: value for key, value in row.items() if key != "age_hours"})
+        else:
+            rows.append(row)
+    payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def journal_lines(
+    report: Mapping[str, Any], journal: Mapping[str, Any], now: datetime
+) -> tuple[list[str], dict[str, Any]]:
+    """Lines for one keeper tick: new or changed errors now, the same errors again after an hour.
+
+    A cadence skip and an unchanged clean report print nothing. Exit status stays with the report.
+    """
+    state = {
+        "errors": list(journal.get("errors") or []),
+        "errors_at": journal.get("errors_at"),
+        "rows": journal.get("rows"),
+    }
+    if report.get("skipped") == "cadence":
+        return [], state
+    raw = report.get("errors") or []
+    if type(raw) is not list:
+        current = ["stalled scan failed (ValueError)"]
+    else:
+        current = sorted(
+            _one_line(item if type(item) is str else f"stalled scan failed ({type(item).__name__})") for item in raw
+        )
+    if current:
+        lines: list[str] = []
+        if current != state["errors"]:
+            previous, seen = Counter(state["errors"]), Counter(current)
+            for text, count in sorted(seen.items()):
+                lines.extend(f"stalled-work: error: {text}" for _ in range(count - previous.get(text, 0)))
+            for text, count in sorted(previous.items()):
+                lines.extend(f"stalled-work: cleared: {text}" for _ in range(count - seen.get(text, 0)))
+            state["errors"] = current
+            state["errors_at"] = now.isoformat()
+        else:
+            stamp = _parse_stamp(state["errors_at"])
+            if stamp is None or now - stamp >= _SUMMARY:
+                lines.append(f"stalled-work: summary: {len(current)} error(s): {'; '.join(current)}")
+                state["errors_at"] = now.isoformat()
+        return lines, state
+    lines = [f"stalled-work: cleared: {text}" for text in state["errors"]]
+    state["errors"] = []
+    state["errors_at"] = None
+    digest = _row_digest(report)
+    count = len(report.get("rows") or []) if type(report.get("rows") or []) is list else 0
+    if digest != state["rows"] and (state["rows"] is not None or count):
+        lines.append(f"stalled-work: rows={count}")
+    state["rows"] = digest
+    return lines, state
+
+
+def _remember_failure(args, report: Mapping[str, Any], now: datetime) -> list[str]:
+    """Record a scan failure the tick did not get to write. A malformed checkpoint is left untouched."""
     args.state_file.parent.mkdir(parents=True, exist_ok=True)
     with args.state_file.with_suffix(".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        last = json_depth.loads(args.state_file.read_text(), max_depth=512) if args.state_file.exists() else {}
-        if not isinstance(last, dict) or any(
-            key not in {"report", "route"} or type(value) is not int or value < 0 for key, value in last.items()
-        ):
-            raise ValueError("cadence checkpoint malformed")
+        last = _load_checkpoint(args.state_file)
+        lines, journal = journal_lines(report, last["journal"], now)
+        last["journal"] = journal
+        _write_checkpoint(args.state_file, last)
+        return lines
+
+
+def tick(args, *, now: datetime) -> dict[str, Any]:
+    """Serialize keeper invocations and checkpoint only a complete successful cycle.
+
+    Errors leave the cycle open so the next minute retries the scan. The journal in the same
+    file remembers which of those errors were already printed.
+    """
+    args.journal_lines = []
+    args.state_file.parent.mkdir(parents=True, exist_ok=True)
+    with args.state_file.with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        last = _load_checkpoint(args.state_file)
         cycle = int(now.timestamp()) // args.cadence_seconds
         mode = "route" if args.route else "report"
         if last.get(mode) == cycle:
             return {"skipped": "cadence", "cycle": cycle}
         report = run(args, now=now)
-        if not report["errors"]:
+        if type(report) is not dict:
+            report = {"errors": ["stalled scan failed (ValueError)"]}
+        lines, journal = journal_lines(report, last["journal"], now)
+        last["journal"] = journal
+        if not report.get("errors"):
             last[mode] = cycle
-            temporary = args.state_file.with_suffix(".tmp")
-            with temporary.open("w") as state:
-                json.dump(last, state)
-                state.flush()
-                os.fsync(state.fileno())
-            temporary.replace(args.state_file)
+        _write_checkpoint(args.state_file, last)
+        args.journal_lines = lines
         return report
 
 
@@ -381,7 +520,8 @@ def main(argv: list[str] | None = None) -> int:
   .venv/bin/python -m {_MODULE} stalled
   .venv/bin/python -m {_MODULE} stalled --route
   .venv/bin/python -m {_MODULE} stalled --tick
-Outputs: JSON on stdout; --route enqueues Fleet requests; --tick writes cadence state.
+Outputs: JSON on stdout. --tick prints nothing on a cadence skip or an unchanged clean report;
+it prints each new or changed error at once, repeats a summary once an hour, and still exits 1.
 Git reads remote heads without fetching scan refs or changing task records or dispatch branches.
 Exit codes: 0 complete or cadence skip; 1 incomplete evidence; 2 invalid usage/config.
 Related: #11212; docs/runbooks/stalled-work.md; stale_task_records.py
@@ -427,11 +567,21 @@ Related: #11212; docs/runbooks/stalled-work.md; stale_task_records.py
         parser.error("LU_STALLED_WORK_ROUTE_ENABLED must be 0 or 1")
     args.route = args.route or (args.tick and enabled == "1")
     args.cadence_seconds = args.cadence_minutes * 60
+    now = datetime.now(UTC)
     try:
-        report = tick(args, now=datetime.now(UTC)) if args.tick else run(args, now=datetime.now(UTC))
+        report = tick(args, now=now) if args.tick else run(args, now=now)
     except (OSError, RuntimeError, ValueError) as exc:
         report = {"errors": [f"stalled scan failed ({type(exc).__name__})"]}
-    print(json.dumps(report, indent=2, sort_keys=True))
+        if args.tick:
+            try:
+                args.journal_lines = _remember_failure(args, report, now)
+            except (OSError, RuntimeError, ValueError):
+                args.journal_lines = [f"stalled-work: error: {report['errors'][0]}"]
+    if args.tick:
+        for line in args.journal_lines:
+            print(line)
+    else:
+        print(json.dumps(report, indent=2, sort_keys=True))
     return 1 if report.get("errors") else 0
 
 
