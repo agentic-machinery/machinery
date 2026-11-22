@@ -74,6 +74,7 @@ SCHEMAS = {
     # Owner-approved cleanup deletions: one obsolete merge-queue analysis, or one exact unused branch.
     "code-scanning-analysis-delete": ({"repo", "analysis_id"}, {**COMMON, "analysis_id": "number"}),
     "branch-delete": ({"repo", "branch"}, {**COMMON, "branch": "ref"}),
+    "repo-fork": ({"repo"}, COMMON),
     "pr-create": (
         {"title", "body", "base", "head"},
         {**COMMON, **TEXT, "base": "text", "head": "text", "draft": "bool"},
@@ -2391,6 +2392,10 @@ def publish(
     if dest != "unknown":
         environment["GH_HOST"] = dest.split("/", 1)[0]
     gh_repo = dest.split("/", 1)[1] if dest != "unknown" else ""
+    if verb == "repo-fork" and (
+        not dest.startswith("github.com/") or any(part in {".", ".."} for part in gh_repo.split("/"))
+    ):
+        raise gate.PublishBlocked("OPSEC: repo-fork requires a github.com repository owner/name.")
     texts, names = [], []
 
     def scan(name, value):
@@ -2574,6 +2579,8 @@ def publish(
         for key, value in fields.items():
             if schema[key] == "text":
                 scan(key, value)
+            elif verb == "repo-fork":
+                scan(key, gh_repo)
             elif schema[key] == "texts":
                 for index, item in enumerate(value):
                     scan(f"{key}[{index}]", item)
@@ -2743,7 +2750,10 @@ def publish(
             argv += ["--", fields["name"]]
         else:
             payload = {}
-            if verb == "commit-status":
+            if verb == "repo-fork":
+                endpoint, method = f"repos/{gh_repo}/forks", "POST"
+                payload = {"default_branch_only": True}
+            elif verb == "commit-status":
                 endpoint = f"repos/{gh_repo}/statuses/{fields['sha']}"
                 payload = {key: fields[key] for key in ("state", "context", "description")}
                 method = "POST"
@@ -2785,6 +2795,8 @@ def publish(
             argv = ["gh", "api", "--method", method, endpoint, "--input", str(frozen)]
             if endpoint == "graphql":
                 argv += _hostname_flag(dest)
+            if verb == "repo-fork":
+                argv += ["--jq", ".html_url"]
         if verb == "pr-merge":
             _refuse_incomplete_seats(
                 dest, fields["number"], fields["match_head"], readiness_runner, cwd, environment,
@@ -2892,6 +2904,20 @@ def main(argv=None, *, runner=None):
                 "3 UNKNOWN after an ambiguous write or read-back, do not retry; "
                 "75 rate-limit refusal before a dismissal is processed, including at PATCH.\n"
                 "Related: docs/runbooks/secret-scanning.md; GitHub REST code-scanning alert update."
+            )
+        if verb == "repo-fork":
+            sub.description = (
+                "Fork one GitHub repository into the authenticated user's account.\n"
+                "Use when a change needs a fork. The publisher creates no local checkout."
+            )
+            sub.formatter_class = argparse.RawDescriptionHelpFormatter
+            sub.epilog = (
+                "Example:\n"
+                f"  .venv/bin/python -m {_PUBLISHER} repo-fork --repo kube-dojo/kubedojo-labs\n"
+                "Outputs: the fork URL after GitHub accepts the default-branch fork request.\n"
+                "GitHub creates the fork asynchronously. Wait for it to be available before pushing.\n"
+                "Exit codes: 0 accepted, 1 GitHub failure, 2 invalid input or publishing refusal, 75 rate limit.\n"
+                "Related: pr-create --head owner:branch."
             )
         if verb == "code-scanning-analysis-delete":
             sub.description = (
@@ -3064,6 +3090,9 @@ def main(argv=None, *, runner=None):
             )
         for key, kind in schema.items():
             kwargs = {"default": argparse.SUPPRESS, "help": f"{key.replace('_', ' ')} ({kind}); omitted by default"}
+            if verb == "repo-fork":
+                kwargs["action"] = StoreOnce
+                kwargs["help"] = "Required GitHub owner/name, such as kube-dojo/kubedojo-labs. No default."
             if verb == "issue-create" and key == "parent":
                 kwargs["help"] = "Open registered epic number, such as 123. Required for ordinary issues in the registry repository."
             if verb == "issue-create" and key == "epic":

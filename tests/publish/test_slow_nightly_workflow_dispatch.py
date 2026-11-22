@@ -3,17 +3,16 @@
 import json
 import subprocess
 from pathlib import Path
+
 import pytest
+
 from lu_machinery.common import github_client
+from lu_machinery.opsec import gh_snapshot
 from lu_machinery.opsec import prepublish as gate
 from lu_machinery.publish import github as pub
 from tests.common.github_cache_isolation import isolate_github_client_cache
-from tests.opsec_fixtures import CATALOG
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-
-
-
-
+from tests.opsec_fixtures import CATALOG, synthetic_rules
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +48,31 @@ def test_missing_registration_or_wrong_dispatch_request(dispatch_calls, workflow
             "--repo", "unit/public", "--ref=reviewed/workflow",
         ],
     ]
+
+
+def test_repo_fork_scans_source_and_sends_only_the_authenticated_user_request(
+    monkeypatch, synthetic_opsec, tmp_path, capsys,
+):
+    """A raw fork or a blocked selector must never reach GitHub."""
+    (synthetic_opsec / "rules.json").write_text(json.dumps(synthetic_rules(pattern="blocked-repo")))
+    monkeypatch.setenv("GH_HOST", "github.com")
+    monkeypatch.setenv("GH_REPO", "other/inherited")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh-config"))
+    calls = []
+
+    def send(client, method, endpoint, headers, body, timeout):
+        calls.append((client.host, method, endpoint, json.loads(body)))
+        return github_client.Response(202, {}, b'{"html_url":"https://github.com/fleet/source"}')
+
+    monkeypatch.setattr(github_client.GitHubClient, "_send", send)
+    with pytest.raises(gate.PublishBlocked, match="raw write"):
+        gh_snapshot.admit(["repo", "fork", "unit/source"], cwd=tmp_path, environment={})
+    assert pub.main(["repo-fork", "--repo", "unit/blocked-repo"]) == 2
+    assert "field=repo" in capsys.readouterr().err
+    assert calls == []
+    assert pub.main(["repo-fork", "--repo", "Unit/Source"]) == 0
+    assert calls == [("github.com", "POST", "repos/unit/source/forks", {"default_branch_only": True})]
+    assert capsys.readouterr().out == "https://github.com/fleet/source\n"
 
 
 @pytest.mark.parametrize("workflow", ["pytest-slow-nightly.yaml", "security.yaml"])
