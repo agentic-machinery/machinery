@@ -229,15 +229,18 @@ def entire_destination(remote: list[str]) -> str:
     PRIVATE only when ``git_push.main`` would exempt the same push (``prepublish.is_private`` names the
     destination and ``git_push.trusted_route`` verifies the route, with the same Git) and the URL is also
     one of the ``PRIVATE_ENTIRE_URL`` spellings. PUBLIC when a ``public-`` fleet row names it by its current
-    or alternate slug. Anything else is UNKNOWN or UNVERIFIED, and every class except PRIVATE is refused.
+    or alternate slug. Anything else is UNKNOWN or UNVERIFIED, and every class except PRIVATE is refused; so is
+    every destination while the validated fleet loader (``load_fleet_repos``) rejects the registry.
     """
     if len(remote) != 2:
         return "UNKNOWN"
     try:
         from lu_machinery.opsec import git_push, prepublish
+        from lu_machinery.orchestration.fleet_repos import load_fleet_repos
     except ImportError:
         return "UNKNOWN"
     try:
+        load_fleet_repos()  # A registry the validated loader rejects never classifies a destination (F4).
         identity = git_push.destination(remote[1])
         if identity == "unknown":
             return "UNKNOWN"
