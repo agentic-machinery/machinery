@@ -1978,7 +1978,7 @@ def test_lexer_word_values_match_bash(text, values):
 
 @pytest.mark.parametrize(
     "command",
-    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", "echo inert #\x00", 'bash -c "$CMD"', "echo x\\", "echo {+1..3}", "echo {a..b..c{d,e}}"],
+    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", "echo inert #\x00", 'bash -c "$CMD"', "echo x\\", "echo {+1..3}", "echo {a..b..c{d,e}}", 'echo {x..","y}'],
 )
 @pytest.mark.parametrize("override", [False, True])
 def test_unparseable_text_is_refused(monkeypatch, command, override):
@@ -1998,8 +1998,23 @@ def test_unparseable_text_is_refused(monkeypatch, command, override):
         "echo ${x:-$'\\''}; env; echo \\' }",
         "bash -c x='1; pkill -f target'",
         "env -a name",
+        "echo $$'a\\' $(env) ''",
+        "echo \"${x:-$$'a\\'}\" ; env ; echo \"'}\"",
+        "X=\"'$GH_TOKEN'\"; echo \"$X\"",
+        "python3 -uc'import os; os.system(\"e\" # c\n \"nv\")'",
     ],
-    ids=["parameter-boundary", "assignment-newline", "quotes-in-parameter", "ansi-c-in-parameter", "assignment-script", "env-argv0"],
+    ids=[
+        "parameter-boundary",
+        "assignment-newline",
+        "quotes-in-parameter",
+        "ansi-c-in-parameter",
+        "assignment-script",
+        "env-argv0",
+        "double-dollar-before-quote",
+        "double-dollar-in-parameter",
+        "assignment-value-quotes",
+        "python-flag-cluster",
+    ],
 )
 def test_round_one_reader_classes_are_refused(monkeypatch, command):
     """Defect classes: a reader that lost the shell's word, name or quoting boundary.
@@ -2007,6 +2022,8 @@ def test_round_one_reader_classes_are_refused(monkeypatch, command):
     A parameter name ends where Bash ends it, a prefix assignment may hold a
     newline, quoting inside a double-quoted `${...}` does not hide `$(...)`,
     `$'...'` inside `${...}` keeps its escapes, a script word with a `NAME=`
-    prefix reads as its value, and `env -a` takes a value.
+    prefix reads as its value, and `env -a` takes a value. `$$` is one token
+    before a quote, an assignment's secret check reads its spelling, not its
+    value, and Python's `-c` may follow other options in one word.
     """
     assert _run(monkeypatch, command) == 2

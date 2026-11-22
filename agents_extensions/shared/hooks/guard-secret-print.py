@@ -90,6 +90,7 @@ try:
     from agents_extensions.shared.hooks.shell_redirects import _redirect_target_dynamic
     from agents_extensions.shared.hooks.shell_shlex import (
         ShellPreprocessLimit,
+        match_double_dollar,
         preprocess_shell_command,
         skippable_heredoc_delimiters,
         strip_skippable_heredoc_bodies,
@@ -376,6 +377,8 @@ _PLAIN_VALUE = re.compile(r"[A-Za-z0-9_./:=,+@%-]+")
 _DESCRIPTOR = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\}")
 _NAME_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _PARAMETER_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
+# A Python program glued to `-c` after Python's options that take no value (3.12 to 3.14).
+_PYTHON_GLUED_PROGRAM = re.compile(r"-[bBdEhiIOPqRsSuvVx]*c(.+)\Z", re.DOTALL)
 # Operators after which the next word is a redirection target, not a command word.
 _REDIRECT_OPERATORS = frozenset({"<", ">", ">>", "<>", ">|", "&>", "&>>", "<<", "<<-", "<<<", ">&", "<&"})
 # Of those, the ones whose word Bash never brace-expands (here-strings and here-document delimiters).
@@ -419,6 +422,10 @@ def _expansion_end(text: str, start: int) -> int:
         char = text[end]
         if char == "\\" and quote != "'":
             end += 2
+            continue
+        # Bash reads `$$` as one token before `$'`, `$(` or `${`.
+        if quote != "'" and (pid_end := match_double_dollar(text, end)) is not None:
+            end = pid_end
             continue
         if quote:
             if char == quote:
@@ -627,6 +634,9 @@ def _brace_expand(
             bounds = [start, *commas, end]
             alternatives = [units[left + 1 : right] for left, right in itertools.pairwise(bounds)]
         else:
+            # Bash 5.2 drops the braces of `{x..","y}` and 5.3 keeps them.
+            if ("lit", ",") in units[start + 1 : end]:
+                raise ValueError("quoted comma in a brace with `..`, which Bash versions read differently")
             # Quoted characters and expansions never form a sequence field.
             spelled = "".join(char if kind == "src" else "\0" for kind, char in units[start + 1 : end])
             if _SEQUENCE_UNMODELLED.search(spelled):
@@ -1800,8 +1810,9 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     if split != programs[0]:
         programs.append(split)
     for program in programs:
-        # Python's program may also be glued to its `-c` option.
-        glued = tuple(value[2:] for value in values if value.startswith("-c") and len(value) > 2)
+        # Python's program may also be glued to its `-c` option, after any run of
+        # Python's options that take no value (`-uc'...'`, `-OOBc'...'`).
+        glued = tuple(match[1] for value in values if (match := _PYTHON_GLUED_PROGRAM.match(value)))
         reason = _program_reason(cmd, program, (*values, *glued))
         if reason:
             return reason
@@ -2030,7 +2041,11 @@ def _track_secret_copies(seg: list[str], copied: set[str], named: dict[str, str]
         if not _is_assignment(clean):
             continue
         name, value = clean.split("=", 1)
-        if _expanded_secret_var(value, copied, named) or (nameref and (_is_secret_var_name(value) or value in copied)):
+        # The expansion check reads shell spelling, never the value: in `X="'$T'"` the
+        # value's quotes are data. Keep the word's own opening quote on the text after `=`.
+        before, _, spelled = token.partition("=")
+        spelled = before[0] + spelled if before[:1] in {"'", '"'} else spelled
+        if _expanded_secret_var(spelled, copied, named) or (nameref and (_is_secret_var_name(value) or value in copied)):
             copied.add(name)
             named.pop(name, None)
         else:
@@ -2197,6 +2212,11 @@ def _substitution_spans(command: str, *, heredoc: bool = False) -> list[tuple[in
         top = stack[-1] if stack else ""
         if char == "\\":
             index += 2
+            continue
+        # Bash reads `$$` as one token before `$'`, `$(` or `${`. Every context this
+        # scanner stands in reads `$`: single-quoted text outside a "}q" is skipped whole.
+        if (pid_end := match_double_dollar(command, index)) is not None:
+            index = pid_end
             continue
         if top == "'q":
             if char == "'":
