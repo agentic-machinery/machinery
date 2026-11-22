@@ -28,7 +28,7 @@ import unicodedata
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 # The package directory, from the unresolved file location. A literal scripts/
 # join is the machinery package name (design-v1 amendment 1). It and its parent go
@@ -455,7 +455,7 @@ def _phase_snapshots(snap_fd: int) -> tuple[dict[str, str], dict[str, str]] | No
             return None
         try:
             payload = json_depth.loads(raw, max_depth=512)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, TypeError):
             return None
         if not isinstance(payload, dict):
             return None
@@ -501,7 +501,7 @@ def _read_record_at(parent_fd: int, record_name: str) -> dict[str, Any] | None:
         return None
     try:
         loaded = json_depth.loads(raw, max_depth=512)
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, TypeError):
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -585,7 +585,7 @@ def _apply_one(
                     return {"action": "skipped", "skip_reason": "worktree path state unknown"}
                 if current.get("status") != observed_status or current.get("run_nonce") != observed_nonce:
                     return None
-                if not _eligible(current, info, min_age_days=min_age_days, now=now):
+                if info is None or not _eligible(current, info, min_age_days=min_age_days, now=now):
                     return None
                 phases = _phase_snapshots(snap_fd)
                 if phases is None:
@@ -599,16 +599,17 @@ def _apply_one(
                 if not _hot_pair(parent_fd, record_name, snapshot_name, snap_fd):
                     return None
                 current["read_only_snapshot_retention"] = _READ_ONLY_SNAPSHOT_RETENTION_DIGEST
-                _write_bytes_at(
-                    parent_fd,
-                    record_name,
-                    json.dumps(current, indent=2, default=str).encode("utf-8"),
-                )
+                written = json.dumps(current, indent=2, default=str).encode("utf-8")
+                _write_bytes_at(parent_fd, record_name, written)
                 if crash_after == "record":
                     raise RuntimeError("crash after record")
                 for phase in _PHASES:
                     _unlink_regular_at(snap_fd, f"read_only_checkout_{phase}.json")
-                return {"action": "digested"}
+                return {
+                    "action": "digested",
+                    "preserved_mtime_ns": str(info.st_mtime_ns),
+                    "written_sha256": hashlib.sha256(written).hexdigest(),
+                }
             finally:
                 os.close(snap_fd)
     except WorktreeLockError:
@@ -695,6 +696,9 @@ def _measure_candidate(
         if outcome["action"] == "error":
             row["error"] = outcome["error"]
             return row, 0
+        if outcome.get("preserved_mtime_ns") and outcome.get("written_sha256"):
+            row["preserved_mtime_ns"] = outcome["preserved_mtime_ns"]
+            row["written_sha256"] = outcome["written_sha256"]
     return row, reclaimed
 
 
@@ -750,9 +754,10 @@ def _artifact_eligible(
     """True when the record exists, is terminal, and is old enough.
 
     Artifact directories do not need the snapshot clean-checkout verdict.
-    ``finished_at`` sets the age; a missing or unparseable value uses
-    ``age_mtime_ns`` when this sweep captured it before a snapshot rewrite,
-    otherwise the record file's current mtime.
+    ``finished_at`` sets the age. A missing or unparseable value uses
+    ``age_mtime_ns`` only when this sweep rewrote that exact record and the
+    file still matches the bytes it wrote. Otherwise the record's current
+    mtime is the age.
     """
     if record is None or info is None or not stat.S_ISREG(info.st_mode):
         return False
@@ -787,28 +792,32 @@ def _same_mount(parent_fd: int, child_fd: int) -> bool:
 def _inventory_artifacts(dir_fd: int, *, root_dev: int, root_mount: int, prefix: str = "") -> _ArtifactTree | None:
     """Map regular files to sizes and list directories. None when the tree is not safe to pack.
 
-    Symlinks, special files, another filesystem or mount, a failed listing, and
-    names with control or format characters make the whole directory ineligible.
-    Nothing is followed. Empty directories are kept so they can be removed.
+    Symlinks, special files, another filesystem or mount, and names with control
+    or format characters make the whole directory ineligible. A regular file on
+    another mount is the same refusal. A failed listing or stat propagates, so
+    the caller can report that candidate and continue. Nothing is followed.
+    Empty directories are kept so they can be removed.
     """
-    names = _directory_names(dir_fd)
-    if names is None:
-        return None
+    names = sorted(os.listdir(dir_fd))
     found: dict[str, int] = {}
     directories: list[str] = []
     for name in names:
         if _unsafe_component(name):
             return None
-        info = _lstat_at(dir_fd, name)
-        if info is None or info.st_dev != root_dev:
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        if info.st_dev != root_dev:
             return None
         relative = f"{prefix}/{name}" if prefix else name
         if stat.S_ISREG(info.st_mode):
-            found[relative] = info.st_size
+            file_fd = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+            try:
+                if fd_mount_id(file_fd) != root_mount:
+                    return None
+                found[relative] = os.fstat(file_fd).st_size
+            finally:
+                os.close(file_fd)
         elif stat.S_ISDIR(info.st_mode):
-            child = _open_dir(dir_fd, name)
-            if child is None:
-                return None
+            child = os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
             try:
                 if fd_mount_id(child) != root_mount:
                     return None
@@ -853,7 +862,11 @@ def _member_name(name: str) -> str | None:
     return relative
 
 
-def _consume_member(stream: Any, size: int) -> bool:
+class _BinaryChunk(Protocol):
+    def read(self, size: int = -1, /) -> bytes: ...
+
+
+def _consume_member(stream: _BinaryChunk, size: int) -> bool:
     remaining = size
     while remaining:
         chunk = stream.read(min(1024 * 1024, remaining))
@@ -863,7 +876,7 @@ def _consume_member(stream: Any, size: int) -> bool:
     return stream.read(1) == b""
 
 
-def _member_matches_file(loose_fd: int, relative: str, stream: Any, size: int) -> bool:
+def _member_matches_file(loose_fd: int, relative: str, stream: _BinaryChunk, size: int) -> bool:
     descriptor = _open_relative(loose_fd, relative, _READ_FLAGS)
     if descriptor is None:
         return False
@@ -886,24 +899,117 @@ def _member_matches_file(loose_fd: int, relative: str, stream: Any, size: int) -
         os.close(descriptor)
 
 
-def _xz_stream_complete(descriptor: int) -> bool:
-    """True when the xz stream reads to a clean end, including its footer."""
+def _octal_field(field: bytes) -> int | None:
+    """Tar octal field, or None for a binary size or a non-numeric field."""
+    if field[:1] in (b"\x80", b"\xff"):
+        return None
+    text = field.replace(b"\x00", b" ").strip()
+    if not text:
+        return 0
+    try:
+        return int(text, 8)
+    except ValueError:
+        return None
+
+
+def _tar_checksum_ok(block: bytes) -> bool:
+    """True when ``block`` carries a signed or unsigned tar header checksum."""
+    recorded = _octal_field(block[148:156])
+    if recorded is None:
+        return False
+    unsigned = 256 + sum(block[:148]) + sum(block[156:])
+    signed = 256 + sum(byte - 256 if byte > 127 else byte for byte in block[:148])
+    signed += sum(byte - 256 if byte > 127 else byte for byte in block[156:])
+    return recorded in {unsigned, signed}
+
+
+class _TarFraming:
+    """Streaming check that a tar ends at two zero blocks and every header sums."""
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._data_left = 0
+        self._phase = "header"
+        self._ok = True
+
+    def feed(self, data: bytes) -> bool:
+        if not self._ok:
+            return False
+        self._buf.extend(data)
+        while self._ok and self._phase != "done":
+            if self._phase == "pad":
+                if self._buf.strip(b"\x00"):
+                    self._ok = False
+                else:
+                    self._buf.clear()
+                break
+            if self._phase == "data":
+                take = min(self._data_left, len(self._buf))
+                del self._buf[:take]
+                self._data_left -= take
+                if self._data_left:
+                    break
+                self._phase = "header"
+                continue
+            if len(self._buf) < 512:
+                break
+            block = bytes(self._buf[:512])
+            if block == b"\x00" * 512:
+                if len(self._buf) < 1024:
+                    break
+                if self._buf[512:1024] != b"\x00" * 512:
+                    self._ok = False
+                    break
+                del self._buf[:1024]
+                self._phase = "pad"
+                continue
+            if not _tar_checksum_ok(block):
+                self._ok = False
+                break
+            size = _octal_field(block[124:136])
+            if size is None or size < 0:
+                self._ok = False
+                break
+            del self._buf[:512]
+            self._data_left = (size + 511) // 512 * 512
+            self._phase = "data"
+        return self._ok
+
+    def finish(self) -> bool:
+        return self._ok and self._phase == "pad" and not self._buf.strip(b"\x00")
+
+
+def _compressed_framing_intact(descriptor: int) -> bool:
+    """True when ``descriptor`` is one xz stream of a tar that ends cleanly.
+
+    The tar reader stops at a bad header as if the archive had ended, and the
+    xz reader stops at the stream footer. Both leave a matching prefix looking
+    complete. This walk requires every header checksum, the two zero end
+    blocks, and no bytes after the xz stream.
+    """
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
-        duped = os.dup(descriptor)
     except OSError:
         return False
+    decompressor = lzma.LZMADecompressor()
+    framing = _TarFraming()
+    first = True
     try:
-        with os.fdopen(duped, "rb", closefd=True) as handle:
-            try:
-                with lzma.open(handle, "rb") as decoded:
-                    while decoded.read(1024 * 1024):
-                        pass
-            except (lzma.LZMAError, EOFError, OSError):
+        while not decompressor.eof:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
                 return False
-    except OSError:
+            if first:
+                if not chunk.startswith(b"\xfd7zXZ\x00"):
+                    return False
+                first = False
+            if not framing.feed(decompressor.decompress(chunk)):
+                return False
+    except (lzma.LZMAError, EOFError, OSError):
         return False
-    return True
+    if decompressor.unused_data or os.read(descriptor, 1):
+        return False
+    return framing.finish()
 
 
 def _verify_archive_at(
@@ -917,10 +1023,11 @@ def _verify_archive_at(
 ) -> bool:
     """True when ``name`` is a mode-0600 xz archive of the loose tree.
 
-    Every member is read, and the xz stream must finish cleanly. File payloads
-    are compared with the loose files, not just header sizes. ``subset`` is the
-    resume case: the recorded archive may still hold files already removed,
-    and every file and directory still on disk must match it.
+    Every member is read and compared with the loose bytes. The xz stream must
+    be the whole file, and the tar inside it must end at two zero blocks with
+    a valid checksum on every header. ``subset`` is the resume case: the
+    recorded archive may still hold files already removed, and every file and
+    directory still on disk must match it.
     """
     try:
         descriptor = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
@@ -973,7 +1080,7 @@ def _verify_archive_at(
                         archived_files[relative] = member.size
         except (tarfile.TarError, OSError, EOFError, lzma.LZMAError):
             return False
-        if not _xz_stream_complete(descriptor):
+        if not _compressed_framing_intact(descriptor):
             return False
         if subset:
             return set(files) <= set(archived_files) and set(directories) <= archived_dirs
@@ -1002,14 +1109,16 @@ def _sha256_at(dir_fd: int, name: str) -> str | None:
         os.close(descriptor)
 
 
-def _add_archived_file(archive: tarfile.TarFile, root_fd: int, relative: str, size: int) -> None:
+def _add_archived_file(
+    archive: tarfile.TarFile, root_fd: int, relative: str, size: int, *, root_mount: int
+) -> None:
     descriptor = _open_relative(root_fd, relative, _READ_FLAGS)
     if descriptor is None:
         raise OSError(errno.EINVAL, "refusing to archive an entry that is not a regular file")
     try:
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
-            raise OSError(errno.EINVAL, "artifact entry changed while packing")
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size or fd_mount_id(descriptor) != root_mount:
+            raise OSError(errno.EXDEV, "artifact entry changed or is on another mount")
         member = tarfile.TarInfo(name=relative)
         member.size = info.st_size
         member.mode = 0o600
@@ -1043,6 +1152,8 @@ def _write_xz_archive(
     root_fd: int,
     files: Mapping[str, int],
     directories: tuple[str, ...],
+    *,
+    root_mount: int,
 ) -> None:
     """Create ``tmp_name`` mode 0600. On failure the temp name is removed; a finished archive is not."""
     descriptor = os.open(
@@ -1058,7 +1169,7 @@ def _write_xz_archive(
                 for relative in directories:
                     _add_archived_dir(archive, relative)
                 for relative in sorted(files):
-                    _add_archived_file(archive, root_fd, relative, files[relative])
+                    _add_archived_file(archive, root_fd, relative, files[relative], root_mount=root_mount)
             raw.flush()
             os.fsync(raw.fileno())
     except (OSError, tarfile.TarError):
@@ -1068,7 +1179,7 @@ def _write_xz_archive(
     os.close(descriptor)
 
 
-def _unlink_relative_file(root_fd: int, relative: str, size: int) -> bool:
+def _unlink_relative_file(root_fd: int, relative: str, size: int, *, root_mount: int) -> bool:
     parts = relative.split("/")
     if not parts or any(not _component(part) for part in parts):
         return False
@@ -1083,9 +1194,13 @@ def _unlink_relative_file(root_fd: int, relative: str, size: int) -> bool:
                 return False
             opened.append(parent_fd)
             parent = parent_fd
-        info = _lstat_at(parent, name)
-        if info is None or not stat.S_ISREG(info.st_mode) or info.st_size != size:
-            return False
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=parent)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != size or fd_mount_id(descriptor) != root_mount:
+                return False
+        finally:
+            os.close(descriptor)
         os.unlink(name, dir_fd=parent)
         return True
     except OSError:
@@ -1152,7 +1267,7 @@ def _remove_archived_directory(
         if current is None or current.files != dict(files) or current.directories != directories:
             return False
         for relative, size in sorted(files.items(), key=lambda item: (item[0].count("/"), item[0]), reverse=True):
-            if not _unlink_relative_file(dir_fd, relative, size):
+            if not _unlink_relative_file(dir_fd, relative, size, root_mount=root_mount):
                 return False
         for relative in sorted(directories, key=lambda item: (item.count("/"), item), reverse=True):
             if not _rmdir_relative(dir_fd, relative):
@@ -1349,7 +1464,7 @@ def _publish_new_archive(
     """
     tmp_name = _temp_name(archive_name)
     try:
-        _write_xz_archive(parent_fd, tmp_name, root_fd, tree.files, tree.directories)
+        _write_xz_archive(parent_fd, tmp_name, root_fd, tree.files, tree.directories, root_mount=root_mount)
         if fd_mount_id(root_fd) != root_mount:
             return "archive verification failed"
         dir_info = os.fstat(root_fd)
@@ -1386,7 +1501,7 @@ def _apply_one_artifact(
     min_age_days: float,
     now: datetime,
     identity: tuple[int, int],
-    age_mtime_ns: int | None = None,
+    rewritten: Mapping[str, tuple[int, str]] | None = None,
 ) -> dict[str, Any] | None:
     """Pack one artifact directory. None means it disappeared or was redispatched."""
     try:
@@ -1413,7 +1528,12 @@ def _apply_one_artifact(
                     return None
                 current = _read_record_at(parent_fd, record_name)
                 record_info = _lstat_at(parent_fd, record_name)
-                if current is None or not _artifact_eligible(
+                if current is None:
+                    if record_info is not None and stat.S_ISREG(record_info.st_mode):
+                        return {"action": "error", "error": "record unreadable"}
+                    return None
+                age_mtime_ns = _rewritten_mtime(parent_fd, record_name, {} if rewritten is None else rewritten)
+                if not _artifact_eligible(
                     current, record_info, min_age_days=min_age_days, now=now, age_mtime_ns=age_mtime_ns
                 ):
                     return None
@@ -1478,6 +1598,34 @@ def _artifact_failure(rel_dir: str, directory_name: str, stem: str, reason: str)
     }
 
 
+def _rewritten_mtime(
+    parent_fd: int, record_name: str, rewritten: Mapping[str, tuple[int, str]]
+) -> int | None:
+    """Pre-rewrite mtime, only while the file is still the bytes this sweep wrote."""
+    saved = rewritten.get(record_name)
+    if saved is None:
+        return None
+    mtime_ns, digest = saved
+    if _sha256_at(parent_fd, record_name) != digest:
+        return None
+    return mtime_ns
+
+
+def _take_rewrite(row: dict[str, Any]) -> tuple[str, int, str] | None:
+    """Remove rewrite bookkeeping from a public snapshot row."""
+    stamp = row.pop("preserved_mtime_ns", None)
+    digest = row.pop("written_sha256", None)
+    snapshot_dir = row.get("snapshot_dir")
+    if not isinstance(stamp, str) or not stamp.isdecimal() or not isinstance(digest, str) or not digest:
+        return None
+    if not isinstance(snapshot_dir, str) or snapshot_dir.count("/") != 1 or not snapshot_dir.startswith("tasks/"):
+        return None
+    base = snapshot_dir.split("/", 1)[1]
+    if not base.endswith(".snapshots"):
+        return None
+    return base[: -len(".snapshots")] + ".json", int(stamp), digest
+
+
 def _measure_artifact_dirs(
     parent_fd: int,
     rel_dir: str,
@@ -1486,7 +1634,7 @@ def _measure_artifact_dirs(
     min_age_days: float,
     now: datetime,
     apply: bool,
-    age_mtime_ns: Mapping[str, int] | None = None,
+    rewritten: Mapping[str, tuple[int, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Plan or pack ``tasks/*.artifacts``. Returns rows and reclaimable loose bytes.
 
@@ -1498,7 +1646,7 @@ def _measure_artifact_dirs(
     names = _directory_names(parent_fd)
     if names is None:
         return [_artifact_failure(rel_dir, "*.artifacts", rel_dir, "OSError")], 0
-    saved_mtime = {} if age_mtime_ns is None else age_mtime_ns
+    saved_rewrite = {} if rewritten is None else rewritten
     for directory_name in names:
         stem = _artifact_stem(directory_name)
         info = _lstat_at(parent_fd, directory_name)
@@ -1525,7 +1673,7 @@ def _measure_artifact_dirs(
             record_info,
             min_age_days=min_age_days,
             now=now,
-            age_mtime_ns=saved_mtime.get(record_name),
+            age_mtime_ns=_rewritten_mtime(parent_fd, record_name, saved_rewrite),
         ):
             continue
         logical = Path(os.path.abspath(os.path.join(os.fspath(root), rel_dir, record_name)))
@@ -1618,7 +1766,7 @@ def _measure_artifact_dirs(
             min_age_days=min_age_days,
             now=now,
             identity=(info.st_dev, info.st_ino),
-            age_mtime_ns=saved_mtime.get(record_name),
+            rewritten=saved_rewrite,
         )
         if outcome is None:
             continue
@@ -1694,13 +1842,7 @@ def _plan_open(
             archive_fd = _open_dir(tasks_fd, ARCHIVE_DIR_NAME)
             if archive_fd is not None:
                 parents.append((f"tasks/{ARCHIVE_DIR_NAME}", archive_fd))
-            age_mtime_ns: dict[str, int] = {}
-            for name in _directory_names(tasks_fd) or []:
-                if not name.endswith(".json") or not _component(name):
-                    continue
-                record_info = _lstat_at(tasks_fd, name)
-                if record_info is not None and stat.S_ISREG(record_info.st_mode):
-                    age_mtime_ns[name] = record_info.st_mtime_ns
+            rewritten: dict[str, tuple[int, str]] = {}
             try:
                 for rel_dir, parent_fd in parents:
                     _collect_own_temps(temps_removed, temps_would_remove, parent_fd, rel_dir, now=now, apply=apply)
@@ -1740,6 +1882,9 @@ def _plan_open(
                         if measured is None:
                             continue
                         row, reclaimed = measured
+                        kept = _take_rewrite(row)
+                        if kept is not None and rel_dir == "tasks":
+                            rewritten[kept[0]] = (kept[1], kept[2])
                         selected.append(row)
                         reclaimable_by_top["tasks"] = reclaimable_by_top.get("tasks", 0) + reclaimed
                     if rel_dir == "tasks":
@@ -1750,7 +1895,7 @@ def _plan_open(
                             min_age_days=min_age_days,
                             now=now,
                             apply=apply,
-                            age_mtime_ns=age_mtime_ns,
+                            rewritten=rewritten,
                         )
                         selected.extend(artifact_rows)
                         artifacts_reclaimable += artifact_bytes
@@ -1836,7 +1981,9 @@ def _parser() -> argparse.ArgumentParser:
             '  read_only_snapshot_retention field becomes "digest".\n'
             "  With --apply, an eligible tasks/<id>.artifacts directory is packed to\n"
             "  tasks/<id>.artifacts.tar.xz (mode 0600) only after every archive member and the\n"
-            "  xz stream have been read and each file matches the loose bytes. The task record\n"
+            "  whole xz stream have been read, every tar header checksum holds, the tar ends\n"
+            "  at two zero blocks, and each file matches the loose bytes. Bytes after the xz\n"
+            "  stream are a failed check. The task record\n"
             "  gains artifacts_retention \"archived\" and artifacts_archive_sha256. The loose\n"
             "  directory is then removed. An existing archive is never deleted or replaced.\n"
             "  It is reused only when it is mode 0600 and its bytes match. A live process, a held\n"

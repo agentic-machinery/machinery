@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import io
 import json
+import lzma
 import os
 import stat
 import subprocess
@@ -959,17 +960,20 @@ def test_live_or_nonterminal_artifact_dir_is_skipped(tmp_path: Path, monkeypatch
     _write_record(tasks, "mounted", status="timeout", age_days=10)
     mounted = _write_artifact_tree(tasks, "mounted")
     mounted_inode = mounted.stat().st_ino
+    _write_record(tasks, "filemount", status="done", age_days=10)
+    filemount = _write_artifact_tree(tasks, "filemount")
+    file_inode = (filemount / "note.txt").stat().st_ino
     lock_fd = os.open(tasks / "locked.json.lock", os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
     monkeypatch.setattr(retention, "worker_liveness", lambda record: True if record.get("task_id") == "live-done" else None)
     real_mount = retention.fd_mount_id
 
-    def mounted_id(fd: int, _real=real_mount, _inode=mounted_inode) -> int | None:
+    def mounted_id(fd: int, _real=real_mount, _dir=mounted_inode, _file=file_inode) -> int | None:
         found = _real(fd)
         if found is None:
             return None
         try:
-            if os.fstat(fd).st_ino == _inode:
+            if os.fstat(fd).st_ino in {_dir, _file}:
                 return found + 1
         except OSError:
             return None
@@ -991,15 +995,16 @@ def test_live_or_nonterminal_artifact_dir_is_skipped(tmp_path: Path, monkeypatch
     assert by_dir["tasks/linked.artifacts"]["skip_reason"] == "unsupported entry"
     assert by_dir["tasks/control.artifacts"]["skip_reason"] == "unsupported entry"
     assert by_dir["tasks/mounted.artifacts"]["skip_reason"] == "unsupported entry"
+    assert by_dir["tasks/filemount.artifacts"]["skip_reason"] == "unsupported entry"
     assert report["artifacts_reclaimable_bytes"] == 0
-    for directory in (running, live, unknown, locked, linked, control, mounted):
+    for directory in (running, live, unknown, locked, linked, control, mounted, filemount):
         assert directory.is_dir()
         assert (directory / "note.txt").read_bytes() == b"hello"
     assert outside.read_bytes() == b"do-not-follow"
     assert (linked / "leak").is_symlink()
     assert not list(tasks.glob("*.artifacts.tar.xz"))
     assert (control / "note\u0085.txt").read_bytes() == b"x"
-    for name in ("still-running", "live-done", "unknown-pid", "locked", "linked", "control", "mounted"):
+    for name in ("still-running", "live-done", "unknown-pid", "locked", "linked", "control", "mounted", "filemount"):
         record = json.loads((tasks / f"{name}.json").read_text(encoding="utf-8"))
         assert "artifacts_retention" not in record
 
@@ -1024,6 +1029,26 @@ def test_young_artifact_dir_is_skipped(tmp_path: Path) -> None:
     assert young.is_dir() and mtime_dir.is_dir()
     assert not list(tasks.glob("*.tar.xz"))
     assert "artifacts_retention" not in json.loads((tasks / "young-done.json").read_text(encoding="utf-8"))
+
+    _write_record(tasks, "anchor", status="done", age_days=10)
+    _write_full_sidecars(tasks, "anchor", entries=1)
+    refreshed = tasks / "refreshed.json"
+    refreshed.write_text(
+        json.dumps({"task_id": "refreshed", "status": "done", "finished_at": "bad"}),
+        encoding="utf-8",
+    )
+    os.utime(refreshed, ((NOW - timedelta(days=9)).timestamp(),) * 2)
+    refreshed_dir = _write_artifact_tree(tasks, "refreshed")
+
+    def touch_refreshed() -> None:
+        os.utime(refreshed, (NOW.timestamp(), NOW.timestamp()))
+
+    touched = plan_retention(root, min_age_days=1, apply=True, now=NOW, on_after_digest=touch_refreshed)
+    assert [row for row in touched["selected"] if row.get("artifacts_dir") == "tasks/refreshed.artifacts"] == []
+    assert refreshed_dir.is_dir()
+    assert (refreshed_dir / "note.txt").read_bytes() == b"hello"
+    assert not (tasks / "refreshed.artifacts.tar.xz").exists()
+    assert "artifacts_retention" not in json.loads(refreshed.read_text(encoding="utf-8"))
 
 
 def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1100,6 +1125,31 @@ def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monke
     wide_archive.write_bytes(wide_payload.getvalue())
     wide_archive.chmod(0o644)
     wide_before = wide_archive.read_bytes()
+    valid_xz = wide_payload.getvalue()
+    _write_record(tasks, "bad-header", status="done", age_days=10)
+    bad_dir = tasks / "bad-header.artifacts"
+    bad_dir.mkdir()
+    (bad_dir / "note.txt").write_bytes(b"hello")
+    decoded = bytearray(lzma.decompress(valid_xz))
+    zero = b"\x00" * 512
+    end = next(
+        offset
+        for offset in range(0, len(decoded) - 1023, 512)
+        if decoded[offset : offset + 1024] == zero * 2
+    )
+    decoded[end] = 1
+    bad_archive = tasks / "bad-header.artifacts.tar.xz"
+    bad_archive.write_bytes(lzma.compress(bytes(decoded)))
+    bad_archive.chmod(0o600)
+    bad_before = bad_archive.read_bytes()
+    _write_record(tasks, "trailing", status="done", age_days=10)
+    trailing_dir = tasks / "trailing.artifacts"
+    trailing_dir.mkdir()
+    (trailing_dir / "note.txt").write_bytes(b"hello")
+    trailing_archive = tasks / "trailing.artifacts.tar.xz"
+    trailing_archive.write_bytes(valid_xz + b"trailing")
+    trailing_archive.chmod(0o600)
+    trailing_before = trailing_archive.read_bytes()
 
     refused = plan_retention(root, min_age_days=0, apply=True, now=NOW)
 
@@ -1107,7 +1157,7 @@ def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monke
     assert by_dir["tasks/mismatch.artifacts"]["action"] == "error"
     assert by_dir["tasks/mismatch.artifacts"]["error"] == "archive verification failed"
     assert by_dir["tasks/alias.artifacts"]["error"] == "archive exists"
-    for name in ("same-size", "truncated", "extra-dir", "wide"):
+    for name in ("same-size", "truncated", "extra-dir", "wide", "bad-header", "trailing"):
         assert by_dir[f"tasks/{name}.artifacts"]["error"] == "archive verification failed"
         assert (tasks / f"{name}.artifacts" / "note.txt").read_bytes() == b"hello"
         assert "artifacts_retention" not in json.loads((tasks / f"{name}.json").read_text(encoding="utf-8"))
@@ -1115,6 +1165,8 @@ def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monke
     assert truncated_archive.read_bytes() == truncated_before
     assert extra_archive.read_bytes() == extra_before
     assert wide_archive.read_bytes() == wide_before
+    assert bad_archive.read_bytes() == bad_before
+    assert trailing_archive.read_bytes() == trailing_before
     assert stat.S_IMODE(wide_archive.stat().st_mode) == 0o644
     assert (mismatch / "note.txt").read_bytes() == b"hello"
     assert (alias_dir / "note.txt").read_bytes() == b"hello"
@@ -1136,6 +1188,65 @@ def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monke
     assert continued_rows["tasks/sibling.artifacts"]["action"] == "archived"
     assert (broken_dir / "note.txt").read_bytes() == b"hello"
     assert not sibling.exists()
+
+    limit = sys.get_int_max_str_digits()
+    huge_digits = (limit or 4300) + 1
+    (tasks / "huge.json").write_text(
+        '{"task_id":"huge","status":"done","finished_at":"2020-01-01T00:00:00+00:00","n":' + ("1" * huge_digits) + "}",
+        encoding="utf-8",
+    )
+    _write_full_sidecars(tasks, "huge", entries=1)
+    huge_dir = tasks / "huge.artifacts"
+    huge_dir.mkdir()
+    (huge_dir / "note.txt").write_bytes(b"hello")
+    _write_record(tasks, "unlisted", status="done", age_days=4)
+    unlisted = _write_artifact_tree(tasks, "unlisted")
+    unlisted_inode = unlisted.stat().st_ino
+    _write_record(tasks, "keeps-going", status="done", age_days=4)
+    keeps = _write_artifact_tree(tasks, "keeps-going")
+    real_list = os.listdir
+
+    def fail_unlisted(fd: int, _real=real_list, _inode=unlisted_inode) -> list[str]:
+        try:
+            if os.fstat(fd).st_ino == _inode:
+                raise OSError(errno.EIO, "listing failed")
+        except OSError as exc:
+            if exc.errno == errno.EIO:
+                raise
+        return _real(fd)
+
+    monkeypatch.setattr(os, "listdir", fail_unlisted)
+    isolated = plan_retention(root, min_age_days=0, apply=True, now=NOW)
+    monkeypatch.setattr(os, "listdir", real_list)
+    isolated_rows = {row["artifacts_dir"]: row for row in isolated["selected"] if row.get("artifacts_dir")}
+    assert isolated_rows["tasks/huge.artifacts"]["error"] == "record unreadable"
+    assert isolated_rows["tasks/unlisted.artifacts"]["error"] == "EIO"
+    assert isolated_rows["tasks/keeps-going.artifacts"]["action"] == "archived"
+    assert (huge_dir / "note.txt").read_bytes() == b"hello"
+    assert (unlisted / "note.txt").read_bytes() == b"hello"
+    assert not keeps.exists()
+    assert not (tasks / "huge.artifacts.tar.xz").exists()
+    assert not (tasks / "unlisted.artifacts.tar.xz").exists()
+
+    _write_record(tasks, "flaky", status="done", age_days=4)
+    flaky_dir = _write_artifact_tree(tasks, "flaky")
+    real_read = retention._read_record_at
+    seen = {"n": 0}
+
+    def flaky_read(parent_fd: int, name: str, _real=real_read) -> dict | None:
+        if name == "flaky.json":
+            seen["n"] += 1
+            if seen["n"] >= 2:
+                return None
+        return _real(parent_fd, name)
+
+    monkeypatch.setattr(retention, "_read_record_at", flaky_read)
+    reread = plan_retention(root, min_age_days=0, apply=True, now=NOW)
+    monkeypatch.undo()
+    flaky_row = next(row for row in reread["selected"] if row.get("artifacts_dir") == "tasks/flaky.artifacts")
+    assert flaky_row["error"] == "record unreadable"
+    assert (flaky_dir / "note.txt").read_bytes() == b"hello"
+    assert not (tasks / "flaky.artifacts.tar.xz").exists()
 
     _write_record(tasks, "fresh", status="crashed", age_days=4)
     fresh = _write_artifact_tree(tasks, "fresh")
