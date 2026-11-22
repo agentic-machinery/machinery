@@ -611,11 +611,13 @@ loose size minus the archive size.
 ```
 
 `--apply` writes `tasks/<id>.artifacts.tar.xz` with mode 0600. It removes the
-loose directory only after the archive lists every file at the same size, then
-sets the task record's `artifacts_retention` to `archived` and
-`artifacts_archive_sha256` to the archive's sha256. One directory is packed at
-a time, so free space must hold that archive until the loose copy is removed.
-A failed check leaves the directory where it is.
+loose directory only after every archive member and the xz stream have been
+read and each remaining file matches the loose bytes, then sets the task
+record's `artifacts_retention` to `archived` and `artifacts_archive_sha256` to
+the archive's sha256. One directory is packed at a time, so free space must
+hold that archive until the loose copy is removed. A failed check leaves the
+directory where it is. An existing archive is reused only at mode 0600 when
+the recorded digest matches and every file still on disk matches the archive.
 
 A directory is eligible when its task record exists, its status is one of
 `done`, `failed`, `timeout`, `rate_limited`, `cancelled`, `crashed`,
@@ -623,9 +625,10 @@ A directory is eligible when its task record exists, its status is one of
 when `finished_at` is missing) is at least `--min-age-days` (default 1). It is
 skipped when a recorded process is live or its liveness cannot be shown, when
 the task or checkout lock is held, or when the tree contains a symlink, a
-special file, or another filesystem. An existing archive is never deleted or
-replaced. Nothing outside `tasks/*.artifacts` and those two record fields is
-rewritten. `tasks/archive/` is left untouched.
+special file, a control or format character in a name, or another filesystem
+or mount. An existing archive is never deleted or replaced. Nothing outside
+`tasks/*.artifacts` and those two record fields is rewritten. `tasks/archive/`
+is left untouched.
 
 ### Explicit batch_state scratch expiry (#11365)
 
