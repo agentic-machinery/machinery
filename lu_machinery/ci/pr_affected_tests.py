@@ -223,58 +223,62 @@ def selecting(sources: dict[str, bytes]) -> set[str]:
     return {path for path in sources if TEST.fullmatch(path) or PurePosixPath(path).name == "conftest.py"}
 
 
-# Import-time contracts of this package, checked on every PR candidate (`import_time_violations`):
-# a label, the modules a contract test imports (a root with the modules its code path imports
-# lazily), the third-party names their imports may reach, the module and arguments the test runs
-# as ``python -m`` (none: imports only) and the variables the test sets, given scratch values
-# (LEARN_UKRAINIAN_PYTHON is the probe's interpreter). The tests that pin them run the
-# code in a subprocess, which the import scan cannot see, so before this check a broken
-# contract first failed in the merge group (PR 1130: yaml reached the hook; PR 1134: jsonschema
-# reached the receipt gate).
-IMPORT_TIME_ROOTS: tuple[tuple[str, tuple[str, ...], frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
-    # tests/githooks/test_ownership_fail_closed.py and test_owned_paths_hook.py: the commit and
-    # push hooks run `python -m <package>.dispatcher.ownership` from a wheel installed without
-    # its dependencies; the check reads its task record and matches paths through lazy imports.
-    # Run without a task id, the entry point returns at once.
+# Import-time contracts of this package, checked on every PR candidate (`import_time_contracts`):
+# a label, the modules its contract tests' subprocesses import (with the modules their code paths
+# import lazily, as traced from those tests), the third-party names their imports may reach, the
+# other tracked files those tests run (a path, or a directory ending in "/") and the contract
+# tests. Those tests run the code in a subprocess, which the import scan cannot see,
+# so before this check a broken contract first failed in the merge group (PR 1130: yaml reached
+# the hook; PR 1134: jsonschema reached the receipt gate). The probe refuses a new third-party
+# name at import time and reports the package files the roots load; a candidate that changes one
+# of those files runs the contract's tests, which exercise every stage, variable and lazy path.
+_HOOK_SCRIPTS = (".githooks/", f"{_PACKAGE_DIR.name}/lib/project_interpreter.sh")
+IMPORT_TIME_CONTRACTS: tuple[tuple[str, tuple[str, ...], frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
+    # The installed commit and push hooks' owned-path checker, with its task-record and grant
+    # lookups, from a wheel installed without its dependencies. The tests copy this checkout's
+    # hooks, which find their interpreter through the package's shell helper.
     ("installed ownership hook",
      ("dispatcher.ownership", "dispatcher.store", "guardrails.delegate_ownership", "secret_redactor"),
-     frozenset(), ("dispatcher.ownership", "--worktree", "{scratch}", "staged"),
-     ("LEARN_UKRAINIAN_PYTHON", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")),
-    # tests/ops/test_verify_run.py: the loopback target is read from a wheel installed without
-    # its dependencies.
-    ("installed verify_run loopback probe", ("ops.verify_run", "common.repo_root"), frozenset(), (), ()),
-    # tests/test_installed_root_contract.py, top_module and head_move: a checkout-top jsonschema.py
-    # shadows the installed distribution while the canary imports the dispatcher and attests its
-    # checkout (`worker._dispatcher_code`), then settles a receipt, whose gate imports
-    # review_contract (`contract_canary._receipt_gated`) and its schema lookup's modules.
+     frozenset(), _HOOK_SCRIPTS, ("tests/githooks/test_ownership_fail_closed.py", "tests/githooks/test_owned_paths_hook.py")),
+    # The installed commit-msg delegator's message gate and the product plan-version hook, from a
+    # wheel installed with its dependencies: the allowance is what main reaches, a ratchet.
+    ("installed commit-msg hooks", ("opsec.git_push", "opsec.prepublish", "pre_commit.check_plan_immutability"),
+     frozenset({"yaml"}), _HOOK_SCRIPTS, ("tests/githooks/test_owned_paths_hook.py",)),
+    # The loopback target, read from a wheel installed without its dependencies.
+    ("installed verify_run loopback probe", ("ops.verify_run", "common.repo_root"), frozenset(), (),
+     ("tests/ops/test_verify_run.py",)),
+    # top_module and head_move: a checkout-top jsonschema.py shadows the installed distribution
+    # while the canary imports the dispatcher and attests its checkout (`worker._dispatcher_code`),
+    # then settles a receipt, whose gate imports review_contract (`contract_canary._receipt_gated`)
+    # and its schema lookup's modules.
     ("canary dispatcher attestation", ("dispatcher.worker", "common.git_context"),
-     frozenset({"psutil", "yaml"}), (), ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",)),
+     frozenset({"psutil", "yaml"}), (), ("tests/test_installed_root_contract.py",)),
     ("contract canary receipt gate",
      ("review.contract_canary", "review.review_contract", "review.language_lane", "common.repo_root"),
-     frozenset({"yaml"}), (), ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",)),
-    # The same test's sealed scenarios settle a qualifying receipt, which reaches the formal
-    # reviewer catalog and resolver (`_formal_candidates`), the AGY transport model
-    # (`_route_models`) and the recorder's attestation (`_attested_model`) through lazy imports.
-    # These modules are not dependency-free: the allowance is what main reaches, a ratchet.
+     frozenset({"yaml"}), (), ("tests/test_installed_root_contract.py",)),
+    # The sealed scenarios settle a qualifying receipt, which reaches the formal reviewer catalog
+    # and resolver (`_formal_candidates`), the provider transport models (`_route_models`) and the
+    # recorder's attestation (`_attested_model`) through lazy imports. These modules are not
+    # dependency-free: the allowance is what main reaches, a ratchet.
     ("contract canary sealed receipt",
      ("review.contract_canary", "review.model_catalog", "review.reviewer_resolver", "dispatcher.providers.agy",
-      "review.record_cf_verdict"),
-     frozenset({"jsonschema", "psutil", "yaml"}), (), ("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",)),
+      "dispatcher.providers.codex", "review.record_cf_verdict"),
+     frozenset({"jsonschema", "psutil", "yaml"}), (), ("tests/test_installed_root_contract.py",)),
 )
 IMPORT_PROBE_TIMEOUT = 60
 # Imports one contract's roots in a fresh interpreter (-I -S: no site hooks, no preloaded
-# distributions), with the candidate's package first on the path. A contract with an allowance
-# gets the caller's site-packages after it (which -S would not find in a virtual environment);
-# one without gets none, as in a wheel installed without its dependencies. A top-level name
-# outside the standard library, the package and the allowance is refused and recorded when
-# first-party or standard-library code imports it; an allowed distribution's own dependencies
-# load, and it is imported first, so a name it brings adds no requirement. A lookup alone
-# (`importlib.util.find_spec`) is not an import: it finds what the path holds. The entry module,
-# if any, then runs as __main__ with its arguments; exit status 0 is success.
+# distributions), with the candidate's package first on the path, and reports the package files
+# loaded. A contract with an allowance gets the caller's site-packages after it (which -S would
+# not find in a virtual environment); one without gets none, as in a wheel installed without
+# its dependencies. A top-level name outside the standard library, the package and the
+# allowance is refused and recorded when first-party or standard-library code imports it; an
+# allowed distribution's own dependencies load, and it is imported first, so a name it brings
+# adds no requirement. A lookup alone (`importlib.util.find_spec`) is not an import: it finds
+# what the path holds. A dotted lookup imports the parent package first; that load is an import.
 _CONTRACT_PROBE = r"""
-import importlib, json, runpy, sys
-tree, package, report, allowed, roots, entry, *sites = sys.argv[1:]
-allowed, roots, entry = frozenset(filter(None, allowed.split(","))), roots.split(","), entry.split("\x1f") if entry else []
+import importlib, json, sys
+tree, package, report, allowed, roots, *sites = sys.argv[1:]
+allowed, roots = frozenset(filter(None, allowed.split(","))), roots.split(",")
 sys.path[:0] = [tree]
 sys.path.extend(sites)
 inside = tuple(site.rstrip("/") + "/" for site in sites)
@@ -287,9 +291,11 @@ class Contract:
     def find_spec(name, path=None, target=None):
         if path is not None or name.partition(".")[0] in known:
             return None
-        frame, lookup = sys._getframe(1), False
+        frame, loading, lookup = sys._getframe(1), False, False
         while frame is not None and str(frame.f_globals.get("__name__")).startswith(("importlib", "_frozen_importlib")):
-            lookup = lookup or (frame.f_globals.get("__name__") == "importlib.util" and frame.f_code.co_name == "find_spec")
+            loading = loading or frame.f_code.co_name == "_find_and_load"
+            lookup = lookup or (not loading and frame.f_globals.get("__name__") == "importlib.util"
+                                and frame.f_code.co_name == "find_spec")
             frame = frame.f_back
         file, line = (frame.f_code.co_filename, frame.f_lineno) if frame is not None else ("<unknown>", 0)
         if lookup or file.startswith(inside):
@@ -304,17 +310,11 @@ for name in [*sorted(allowed), *roots]:
         importlib.import_module(name)
     except BaseException as exc:
         failed.append({"module": name, "error": f"{type(exc).__name__}: {exc}"[:300]})
-if entry and not failed:
-    sys.argv = [entry[0], *entry[1:]]
-    try:
-        runpy.run_module(entry[0], run_name="__main__", alter_sys=True)
-    except SystemExit as exc:
-        if exc.code not in (0, None):
-            failed.append({"module": entry[0], "error": f"exited {exc.code!r} as __main__"[:300]})
-    except BaseException as exc:
-        failed.append({"module": entry[0], "error": f"as __main__: {type(exc).__name__}: {exc}"[:300]})
+prefix = tree.rstrip("/") + "/"
+closure = sorted({file[len(prefix):] for module in list(sys.modules.values())
+                  if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)})
 with open(report, "w", encoding="utf-8") as stream:
-    json.dump({"refused": refused, "failed": failed}, stream)
+    json.dump({"refused": refused, "failed": failed, "closure": closure}, stream)
 """
 
 
@@ -347,43 +347,38 @@ def _materialize(candidate: str, package: str, into: Path) -> list[str]:
     return unsupported
 
 
-def import_time_violations(candidate: str) -> list[str]:
-    """Each broken `IMPORT_TIME_ROOTS` contract in ``candidate``, with the import that breaks it.
+def import_time_contracts(candidate: str) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """Each broken `IMPORT_TIME_CONTRACTS` contract in ``candidate``, and each contract's closure.
 
     Python itself decides what runs: each contract's roots are imported from the candidate's
     committed package files in a fresh interpreter (`_CONTRACT_PROBE`), which runs only what an
     import runs. A refused name, a root that fails to import, an unwritable entry and a probe
-    that times out, exits nonzero or leaves no readable report each break the contract. A
-    checkout whose candidate does not track this package's ``__init__.py`` (a product, with its
-    own tree) is not checked.
+    that times out, exits nonzero or leaves no readable report each break the contract. The
+    closure is the repository paths of the package files the roots loaded. A checkout whose
+    candidate does not track this package's ``__init__.py`` (a product, with its own tree) is
+    not checked and has no closures.
     """
     import sysconfig
     import tempfile
 
     package = _PACKAGE_DIR.name
     if f"{package}/__init__.py" not in tree_entries(candidate, f"{package}/__init__.py"):
-        return []
+        return [], {}
     problems: list[str] = []
+    closures: dict[str, frozenset[str]] = {}
     sites = list(dict.fromkeys(sysconfig.get_path(key) for key in ("purelib", "platlib")))
     with tempfile.TemporaryDirectory(prefix="import-contracts-") as scratch:
         work = Path(scratch)
         tree = work / "candidate"
         problems.extend(f"import-time contracts: {why}" for why in _materialize(candidate, package, tree))
-        primary = work / "primary"
-        primary.mkdir()
-        values = {"LEARN_UKRAINIAN_PYTHON": sys.executable, "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary)}
-        for label, roots, allowed, entry, variables in IMPORT_TIME_ROOTS:
+        for label, roots, allowed, _scripts, _tests in IMPORT_TIME_CONTRACTS:
             report = work / "report.json"
             report.unlink(missing_ok=True)
-            main = "\x1f".join(
-                [f"{package}.{entry[0]}", *(arg.replace("{scratch}", scratch) for arg in entry[1:])]
-            ) if entry else ""
             # A fixed interpreter and probe; the arguments are module names and paths, never a shell.
             command = [sys.executable, "-I", "-S", "-B", "-c", _CONTRACT_PROBE, str(tree), package, str(report),
-                       ",".join(sorted(allowed)), ",".join(f"{package}.{root}" for root in roots), main,
+                       ",".join(sorted(allowed)), ",".join(f"{package}.{root}" for root in roots),
                        *(sites if allowed else ())]
-            env = {"PATH": os.defpath, "HOME": scratch, "TMPDIR": scratch, "LC_ALL": "C.UTF-8",
-                   **{name: values[name] for name in variables}}
+            env = {"PATH": os.defpath, "HOME": scratch, "TMPDIR": scratch, "LC_ALL": "C.UTF-8"}
             try:
                 result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                     command, cwd=work, env=env, capture_output=True, text=True,
@@ -394,9 +389,10 @@ def import_time_violations(candidate: str) -> list[str]:
                 continue
             try:
                 found = json_depth.loads(report.read_text(encoding="utf-8"), max_depth=8)
-                refused, failed = found["refused"], found["failed"]
-                if result.returncode or not isinstance(refused, list) or not isinstance(failed, list):
+                refused, failed, closure = found["refused"], found["failed"], found["closure"]
+                if result.returncode or not all(isinstance(value, list) for value in (refused, failed, closure)):
                     raise ValueError
+                closures[label] = frozenset(safe_path(path) for path in closure)
                 for entry in refused:
                     where = f"{Path(entry['file']).relative_to(tree).as_posix()}:{int(entry['line'])}" if (
                         Path(entry["file"]).is_relative_to(tree)) else f"{entry['file']}:{int(entry['line'])}"
@@ -406,7 +402,7 @@ def import_time_violations(candidate: str) -> list[str]:
             except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
                 detail = (result.stderr.strip().splitlines() or ["no output"])[-1][:300]
                 problems.append(f"{label}: the import probe exited {result.returncode} without a readable report ({detail})")
-    return list(dict.fromkeys(problems))
+    return list(dict.fromkeys(problems)), closures
 
 
 @lru_cache(maxsize=2)
@@ -539,7 +535,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     entries = {name: meta[0] for name, meta in tree_entries(candidate, "tests").items()}
     changed = changed_files(base, candidate)
     # Contract tests run the code in subprocesses, out of the scan's sight: check the contracts here.
-    broken = import_time_violations(candidate)
+    broken, closures = import_time_contracts(candidate)
     if broken:
         raise ValueError("import-time dependency contract broken: " + "; ".join(broken))
     guards = [safe_path(line, node=True) for line in product_tree_path(*GUARDS.parts).read_text(encoding="utf-8").splitlines()]
@@ -549,7 +545,19 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     runnable = manifest_run_files(candidate, entries)
     selectable = entries if runnable is None else {name: mode for name, mode in entries.items() if name in runnable}
     tests = sorted(p for p in changed if TEST.fullmatch(p) and p in selectable)
-    for name in {guard_file(g) for g in guards} | set(tests):
+    # A contract whose closure the candidate changes runs its tests as the guards run: always.
+    # Every contract test must be one the job runs, so a rename or a manifest edit cannot drop it.
+    contract_files = {name for *_, files in IMPORT_TIME_CONTRACTS for name in files} if closures else set()
+    if not contract_files <= set(selectable):
+        raise ValueError("import-time contract test is not a test file the pytest job runs")
+    contracts = sorted({
+        name for label, _roots, _allowed, scripts, files in IMPORT_TIME_CONTRACTS
+        if label in closures and any(path in closures[label] or any(
+            path == script or (script.endswith("/") and path.startswith(script)) for script in scripts) for path in changed)
+        for name in files
+    })
+    mandatory = sorted(set(guards) | set(contracts))
+    for name in {guard_file(g) for g in guards} | set(tests) | contract_files:
         if not TEST.fullmatch(name) or entries.get(name) not in {"100644", "100755"}:
             raise ValueError("test is not a tracked regular file")
         path = Path(name)
@@ -562,7 +570,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     if not isinstance(durations, dict):
         raise ValueError("invalid duration record")
     # A pinned id always runs: its whole file may be deferred by cost even when it changed.
-    selected = sorted(set(guards) | set(tests))
+    selected = sorted(set(mandatory) | set(tests))
     unknown = [p for p in selected if p not in durations and "::" not in p]
     for p in selected:
         value = durations.get(p)
@@ -592,7 +600,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
 
     estimate = 60 + sum(cost(p) for p in selected)
     infrastructure = infrastructure_changed(changed)
-    guard_estimate = 60 + sum(cost(p, set(guards)) for p in guards)
+    guard_estimate = 60 + sum(cost(p, set(mandatory)) for p in mandatory)
     reason = (
         "pytest infrastructure changed"
         if infrastructure
@@ -602,12 +610,12 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         if estimate > SAFE_SECONDS
         else None
     )
-    run = set(guards) if reason else set(selected)
+    run = set(mandatory) if reason else set(selected)
     if reason and not infrastructure:
-        # Over the safe budget: changed tests fill what the guards leave, cheapest
-        # first, so the same rule bounds the mandatory selection and the importers.
+        # Over the safe budget: changed tests fill what the guards and contract tests
+        # leave, cheapest first, so the same rule bounds the mandatory selection and the importers.
         used = guard_estimate
-        for p in sorted(set(tests) - set(guards), key=lambda p: (cost(p), p)):
+        for p in sorted(set(tests) - set(mandatory), key=lambda p: (cost(p), p)):
             if used + cost(p) <= SAFE_SECONDS:
                 run.add(p)
                 used += cost(p)
@@ -663,6 +671,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         "base": base,
         "guards": guards,
         "changed_test_files": tests,
+        "contract_test_files": contracts,
         "importing_test_files": imported,
         "text_reading_test_files": readers,
         "run_files": run,
