@@ -611,6 +611,22 @@ def test_lu_and_legacy_root_names_resolve_alike_and_a_conflict_refuses(unconfigu
         assert project_interpreter(env={name: str(primary)}) == venv_python
     with pytest.raises(rr.StateRootError, match=rr.LU_PRIMARY_ROOT_ENV):
         rr.state_root(env={})
+    # A missing primary anchor never hides an invalid state setting from any resolver.
+    for invalid in (
+        {rr.LU_STATE_ROOT_ENV: str(primary), rr.STATE_ROOT_ENV: str(other)},
+        {rr.LU_STATE_ROOT_ENV: "relative"},
+        {rr.STATE_ROOT_ENV: "relative"},
+    ):
+        for call in (
+            lambda e: rr.state_root(env=e),
+            rr.github_slug,
+            rr.configured_github_slug,
+            lambda e: profile.load_profile(env=e),
+            lambda e: profile.config_path("fleet_repos", env=e),
+        ):
+            with pytest.raises(rr.MachineryConfigError) as refused:
+                call(invalid)
+            assert not isinstance(refused.value, rr.StateRootError), refused.value
     # The native hook boundary refuses a conflict before it runs the shell rule.
     monkeypatch.setenv(rr.LU_PRIMARY_ROOT_ENV, str(primary))
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(other))
@@ -620,16 +636,25 @@ def test_lu_and_legacy_root_names_resolve_alike_and_a_conflict_refuses(unconfigu
     assert _tree(tmp_path) == before
 
 
-def test_an_absent_profile_keeps_the_compatibility_slug_and_refuses_consumer_config(unconfigured, tmp_path):
+def test_an_absent_profile_keeps_the_compatibility_slug_and_refuses_consumer_config(unconfigured, tmp_path, monkeypatch):
     """Defect class: silent fallback to packaged consumer data, or a behaviour change without a profile.
 
     A plane owner with no profile (learn-ukrainian today, configured with the legacy names) keeps
-    today's slug; every consumer config name refuses, naming the name and the profile path.
+    today's slug; every consumer config name refuses, naming the name and the profile path. A
+    by-file copy of the resolver, which has no profile reader beside it, keeps today's slug for an
+    owner without a profile directory and refuses for one that has a profile directory.
     """
     owner = _primary_checkout(tmp_path / "owner")
     (owner / profile.PROFILE_DIR).mkdir()  # a profile directory without the profile is no profile
+    bare = _primary_checkout(tmp_path / "bare-owner")
+    copy = _load_copy(monkeypatch, tmp_path / "copy-package")
     where = re.escape(str(owner / profile.PROFILE_REL))
     before = _tree(tmp_path)
+    for name in (rr.PRIMARY_ROOT_ENV, rr.LU_PRIMARY_ROOT_ENV):
+        assert copy.github_slug({name: str(bare)}) == rr.DEFAULT_GITHUB_SLUG
+        assert copy.github_slug({name: str(bare), rr.GITHUB_SLUG_ENV: "demo-org/x"}) == "demo-org/x"
+        with pytest.raises(copy.MachineryConfigError, match="profile reader beside this resolver is unavailable"):
+            copy.github_slug({name: str(owner)})
     for env in ({rr.PRIMARY_ROOT_ENV: str(owner)}, {rr.LU_PRIMARY_ROOT_ENV: str(owner)}, {}):
         assert profile.load_profile(env=env) is None
         assert rr.configured_github_slug(env) is None
@@ -667,6 +692,9 @@ def test_a_profile_binds_slug_and_config_paths_to_the_plane_owner(unconfigured, 
         {rr.LU_PRIMARY_ROOT_ENV: str(owner)},
         {rr.PRIMARY_ROOT_ENV: str(owner)},
         {rr.PRIMARY_ROOT_ENV: str(owner), rr.LU_STATE_ROOT_ENV: str(owner)},
+        # A relative object-directory override names a place below the working directory (which
+        # has no objects/ here), not a property of the plane owner: it never decides the answer.
+        {rr.PRIMARY_ROOT_ENV: str(owner), "GIT_OBJECT_DIRECTORY": "objects"},
     ):
         loaded = profile.load_profile(env=env)
         assert loaded is not None

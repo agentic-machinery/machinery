@@ -57,7 +57,7 @@ from typing import Any
 from . import json_depth, repo_root
 from .safe_open import UnsafeEntryError, safe_open_below
 
-PROFILE_DIR = ".lu-machinery"
+PROFILE_DIR = repo_root.CONSUMER_PROFILE_DIR
 PROFILE_NAME = "profile.v1.json"
 PROFILE_REL = f"{PROFILE_DIR}/{PROFILE_NAME}"
 PROFILE_SCHEMA = "lu-machinery.profile"

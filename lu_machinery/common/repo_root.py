@@ -161,6 +161,8 @@ MACHINERY_ENV_VARS = (
     *ENV_ALIASES,
 )
 DEFAULT_GITHUB_SLUG = "learn-ukrainian/learn-ukrainian.github.io"
+# The plane owner's consumer profile directory (``common/profile.py`` reads the profile inside it).
+CONSUMER_PROFILE_DIR = ".lu-machinery"
 RULES_DIR_REL = "agents_extensions/shared/rules"
 RUNTIME_ROOT = Path(__file__).resolve().parents[2]
 _MACHINERY_ROOT = Path(__file__).resolve().parents[1]
@@ -274,8 +276,11 @@ def _is_primary_git_layout(checkout: Path, env: Mapping[str, str] | None = None)
 
     A Git directory passes Git's own test (``is_git_directory`` in Git's ``setup.c``): a
     valid ``HEAD`` (:func:`_valid_git_head`), an object directory (``objects``, or
-    ``GIT_OBJECT_DIRECTORY`` when the environment names one) and ``refs``. An empty or
-    stray ``.git`` is not one.
+    ``GIT_OBJECT_DIRECTORY`` when the environment names an absolute one) and ``refs``. An
+    empty or stray ``.git`` is not one. A relative ``GIT_OBJECT_DIRECTORY`` names a directory
+    below whatever the caller's working directory is, not a property of this checkout, so it
+    is ignored and the checkout's own ``objects`` decides: the answer never depends on the
+    working directory.
     """
     git_dir = checkout / ".git"
     try:
@@ -285,7 +290,8 @@ def _is_primary_git_layout(checkout: Path, env: Mapping[str, str] | None = None)
         return False
     if os.path.lexists(git_dir / "commondir"):
         return False
-    objects = _env(env).get(_GIT_OBJECT_DIRECTORY_ENV) or git_dir / "objects"
+    override = _env(env).get(_GIT_OBJECT_DIRECTORY_ENV, "")
+    objects = override if os.path.isabs(override) else git_dir / "objects"
     return _valid_git_head(git_dir / "HEAD") and os.path.isdir(objects) and os.path.isdir(git_dir / "refs")
 
 
@@ -358,7 +364,7 @@ def env_github_slug(env: Mapping[str, str] | None = None) -> str | None:
 
 
 def _profile_reader():
-    """The consumer profile module beside this resolver, imported only when a slug is resolved.
+    """The consumer profile module beside this resolver, imported only when a plane owner may hold a profile.
 
     It is a sibling in the same package, whatever the package is called. A by-file copy of this
     resolver outside a package has no profile reader and refuses, rather than ignoring a profile.
@@ -371,17 +377,37 @@ def _profile_reader():
         raise MachineryConfigError(f"the consumer profile reader beside this resolver is unavailable: {exc}") from None
 
 
+def _may_hold_profile(env: Mapping[str, str] | None) -> bool:
+    """False only when the plane owner provably has no profile: no owner is configured, or it has no ``.lu-machinery``.
+
+    Anything else, an unreadable owner included, goes to the profile reader, which decides or refuses.
+    """
+    try:
+        owner = state_root(env=env)
+    except StateRootError:
+        return False
+    try:
+        os.lstat(owner / CONSUMER_PROFILE_DIR)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def configured_github_slug(env: Mapping[str, str] | None = None) -> str | None:
     """The one authoritative ``owner/name`` slug: the plane owner's profile, else the environment.
 
     The profile (:mod:`.profile`) and ``LU_GITHUB_SLUG`` (or its alias) may both name the slug only
     when they agree; a conflict refuses before any caller acts on either. ``None`` when neither
-    names one.
+    names one. A plane owner without a ``.lu-machinery`` entry has no profile, so the profile
+    reader is not needed for it.
     """
-    selected = _profile_reader().load_profile(env=env)
-    if selected is not None:
-        slug: str = selected.github_slug
-        return slug
+    if _may_hold_profile(env):
+        selected = _profile_reader().load_profile(env=env)
+        if selected is not None:
+            slug: str = selected.github_slug
+            return slug
     return env_github_slug(env)
 
 
@@ -404,8 +430,10 @@ def state_root(start: Path | None = None, env: Mapping[str, str] | None = None) 
     ``LU_PRIMARY_REPO_ROOT`` or its alias (see :func:`primary_root`): a configured state
     root alone does not stand in for it.
     """
-    primary = primary_root(start, env)
+    # The state setting is validated first (alias conflict, relative path), so a missing primary
+    # anchor can never hide an invalid one.
     setting = _configured_path(LU_STATE_ROOT_ENV, env)
+    primary = primary_root(start, env)
     if setting is None:
         return primary
     name, configured = setting
