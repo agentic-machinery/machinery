@@ -327,11 +327,11 @@ def candidate_spec(name, path, target):
     cand = [tree] if path is None else [p for p in path if p == tree or p.startswith(prefix)]
     spec = path_finder.find_spec(name, cand, target) if cand else None
     if spec is not None and spec.loader is None and spec.submodule_search_locations is not None:
-        # Pin namespace search locations to a plain candidate-only list so _NamespacePath cannot re-scan sites.
-        locs = [p for p in spec.submodule_search_locations if p == tree or p.startswith(prefix)]
-        if not locs:
-            return None
-        spec.submodule_search_locations = locs
+        # Keep _NamespacePath (required by importlib.resources.NamespaceReader), but bind its
+        # recalculation finder to candidate_spec so invalidation or sys.path edits never re-scan sites.
+        locs = spec.submodule_search_locations
+        if hasattr(locs, "_path_finder"):
+            locs._path_finder = lambda mod, paths: candidate_spec(mod, paths, None)
     return spec
 
 
@@ -461,7 +461,7 @@ def import_time_contracts(candidate: str, base: str | None = None) -> tuple[list
                 if result.returncode or not all(isinstance(value, list) for value in (refused, failed, closure)):
                     raise ValueError
                 closures[label] = frozenset(
-                    safe_path(path[:-1]) + "/" if path.endswith("/") else safe_path(path)
+                    safe_path(path[:-1]) + "/" if isinstance(path, str) and path.endswith("/") else safe_path(path)
                     for path in closure
                 )
                 for entry in refused:
