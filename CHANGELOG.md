@@ -9,6 +9,29 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.50"></a>
+## [0.1.50] - 2026-11-22
+
+### Changed
+
+- Keep one definition of the mixed-family pair sets ([#1134](https://github.com/learn-ukrainian/machinery/pull/1134))
+- Compare parsed hook command words in Grok reviewer test ([#1152](https://github.com/learn-ukrainian/machinery/pull/1152))
+- Run the pinned mypy offline in machinery worktrees ([#1151](https://github.com/learn-ukrainian/machinery/pull/1151))
+- Record the agent source contract and ignore deployer outputs ([#1159](https://github.com/learn-ukrainian/machinery/pull/1159))
+- Authenticate github.com fetches and enable uv mirror in CI ([#1162](https://github.com/learn-ukrainian/machinery/pull/1162))
+- Pin the uv manifest away from the unauthenticated fetch ([#1166](https://github.com/learn-ukrainian/machinery/pull/1166))
+- Name every pin a UV_VERSION bump must change ([#1168](https://github.com/learn-ukrainian/machinery/pull/1168))
+- Restore seven-day cooldown for uv and Dependabot ([#1170](https://github.com/learn-ukrainian/machinery/pull/1170))
+
+### Fixed
+
+- Read behavior-proof authors from the shared task store ([#1146](https://github.com/learn-ukrainian/machinery/pull/1146))
+- Target current checkout and fail closed in mypy_ratchet ([#1147](https://github.com/learn-ukrainian/machinery/pull/1147))
+- Read '\'' apostrophes inside quoted values in the print guard ([#1153](https://github.com/learn-ukrainian/machinery/pull/1153))
+- Run import-time contract tests on closure change and preserve namespace path ([#1160](https://github.com/learn-ukrainian/machinery/pull/1160))
+- Run PR test selection from the base commit ([#1165](https://github.com/learn-ukrainian/machinery/pull/1165))
+- Model Bash ANSI-C quoting in shared shell preprocessors ([#1167](https://github.com/learn-ukrainian/machinery/pull/1167))
+
 <a id="v0.1.49"></a>
 ## [0.1.49] - 2026-11-22
 
@@ -1294,7 +1317,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.49...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.50...HEAD
+[0.1.50]: https://github.com/learn-ukrainian/machinery/compare/v0.1.49...v0.1.50
 [0.1.49]: https://github.com/learn-ukrainian/machinery/compare/v0.1.47...v0.1.49
 [0.1.48]: https://github.com/learn-ukrainian/machinery/compare/v0.1.47...v0.1.48
 [0.1.47]: https://github.com/learn-ukrainian/machinery/compare/v0.1.46...v0.1.47
