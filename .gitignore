@@ -16,3 +16,10 @@ dist/
 /.worktrees/
 /.agent/
 /batch_state/
+# Agent deployer output roots and ownership manifest (docs/release.md, Agent
+# source contract): generated copies, never sources. .agents/ and /.agent/ above.
+/.claude/
+/.codex/
+/.cursor/
+/.deploy-state/
+/.gemini/
