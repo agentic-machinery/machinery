@@ -609,8 +609,12 @@ def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
     assert control.returncode == 0 and "entire_destination" not in control.stderr, control.stderr
     for crafted in ("https://evil.example#@github.com/unit/private", "https://evil.example?@github.com/unit/private"):
         refused_entire = entire_push(crafted)
+        # The scanner's destination parser or the URL allowlist may refuse it first; either typed refusal holds.
         assert refused_entire.returncode == 1, refused_entire.stderr
-        assert "(entire_destination_unverified)" in refused_entire.stderr, refused_entire.stderr
+        assert any(
+            reason in refused_entire.stderr
+            for reason in ("(entire_destination_unverified)", "(entire_destination_unknown)")
+        ), refused_entire.stderr
 
     (repo / "lu_machinery/opsec/git_push.py").unlink()
     (repo / "file.txt").write_text("clean\nagain\n", encoding="utf-8")
