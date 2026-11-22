@@ -9,6 +9,7 @@ import http.client
 import subprocess
 import sys
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from lu_machinery.common.task_store_paths import tasks_dir
@@ -91,7 +92,7 @@ def _meter_budget(spec):
     return meter, _monitor_json(read_budget)
 
 
-def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None):
+def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None, orchestrator=False):
     """Copy-adapted from delegate._evaluate_dispatch_admission, including v2 liveness.
 
     Disk admission measures, alerts and refuses; it never removes anything. Each task's creator
@@ -101,7 +102,7 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budge
         mode, tasks_dir(), pid_alive=legacy.process_alive,
         record_liveness=lambda record: worker_liveness(record, pid_alive=legacy.process_alive),
         on_dead=heal_dead if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
-        meter=meter, meter_budget=budget,
+        meter=meter, meter_budget=budget, orchestrator=orchestrator,
     )
 
 
@@ -138,14 +139,92 @@ def precheck(mode, *, force_reason=None):
         report(decision)
 
 
-def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None):
+def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None, orchestrator=None):
     try:
         meter, budget = _meter_budget(spec)
-        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard, meter=meter, budget=budget)
+        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard, meter=meter, budget=budget,
+                            orchestrator=orchestrator is not None)
     except ValueError as exc:
         raise Refused(f"❌ invalid dispatch admission threshold: {exc}", 2) from exc
     report(decision, force_reason=force_reason)
     return decision
+
+
+def _orchestrator_marked(raw: bytes) -> bool:
+    return f'"{legacy.ORCHESTRATOR_KEY}"'.encode() in raw
+
+
+def stream_holders(stream, task_id):
+    """The other orchestrator turns that may still run on ``stream`` (DRIVERS-1122).
+
+    A turn holds its stream while its record is active (an admission hold included) and,
+    after a supervisor crash, until its provider is proven gone. An unknown status, a
+    malformed orchestrator record and an unreadable record that names an orchestrator
+    each hold every stream: the reservation fails closed. Reads hot records only; a
+    record that names no orchestrator is never parsed.
+    """
+    from lu_machinery.dispatcher.worker import _provider_alive
+    from lu_machinery.orchestration.task_record_store import iter_task_records, parse_task_record
+
+    holders = []
+    for path in iter_task_records(tasks_dir(), include_archive=False):
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            continue  # settled and archived since it was listed
+        except OSError:
+            holders.append(f"{path.stem} (record unreadable)")
+            continue
+        if not _orchestrator_marked(raw):
+            continue
+        try:
+            record = parse_task_record(path, raw)
+            other = legacy.orchestrator_stream(record) if isinstance(record, dict) else None
+        except ValueError:
+            holders.append(f"{path.stem} (orchestrator record malformed)")
+            continue
+        if other is None or record.get("task_id") == task_id or other != stream:
+            continue
+        status = record.get("status")
+        if status in store.ACTIVE or status not in store.TERMINAL:
+            holders.append(str(record.get("task_id")))
+        elif status == "crashed" and _provider_alive(record) is not False:
+            holders.append(f"{record.get('task_id')} (crashed; provider not proven gone)")
+    return holders
+
+
+def legacy_lease_refusal(stream):
+    """Why a live legacy driver lease on ``stream`` refuses an orchestrator turn, or None when there is none.
+
+    Monitor is the lease authority (a local process never proves a remote lease gone); an
+    unreachable, refused or malformed answer refuses, as does an active lease of an open or
+    rolling session that has not expired.
+    """
+    from lu_machinery.session_streams.model import parse_timestamp
+    from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError
+
+    try:
+        response = RemoteEpicClient().stream(stream, digest_limit=1)
+    except (RemoteSupervisorError, ValueError, RecursionError) as exc:
+        return f"orchestrator_lease_unknown: the Monitor stream lease probe failed ({type(exc).__name__})"
+    if not isinstance(response, dict) or response.get("stream_id") != stream:
+        return "orchestrator_lease_unknown: the Monitor answer names another stream"
+    lease = response.get("lease")
+    if lease is None:
+        return None
+    if not isinstance(lease, dict):
+        return "orchestrator_lease_unknown: the Monitor lease is malformed"
+    if lease.get("state") != "active" or lease.get("session_state") not in ("open", "rolling"):
+        return None
+    try:
+        expired = datetime.now(UTC) >= parse_timestamp(lease["expires_at"])
+    except (KeyError, TypeError, ValueError):
+        return "orchestrator_lease_unknown: the Monitor lease expiry is unreadable"
+    if expired:
+        return None
+    holder = lease.get("holder") if isinstance(lease.get("holder"), dict) else {}
+    return (f"orchestrator_stream_leased: {stream} has a live legacy driver lease "
+            f"(holder {holder.get('agent')!s:.64}, expires {lease['expires_at']!s:.40})")
 
 
 def credit_period_refusal(agent, model, *, codex_account=None):
@@ -166,8 +245,16 @@ def check_credit(agent, model, codex_account=None):
 
 
 @contextlib.contextmanager
-def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, spec=None):
-    """Publish a creation hold for either mode; release unused setup only when its tree is absent."""
+def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, spec=None, orchestrator=None,
+            linkage=None):
+    """Publish a creation hold for either mode; release unused setup only when its tree is absent.
+
+    An orchestrator turn (``orchestrator`` is its ``{"stream": ...}`` record field) reserves its stream
+    in the same step: under the admission lock, after the sweep settles dead records, another turn that
+    may still run on the stream refuses it, and the hold it publishes names the stream, so a concurrent
+    dispatch sees it. No ``--force-admission`` reason overrides the reservation. ``linkage`` (the parent
+    fields of a task dispatched from inside another run) is in the hold before anything spawns.
+    """
     hold = None
     meter, budget = _meter_budget(spec)
     try:
@@ -175,12 +262,19 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
         try:
             with legacy.admission_lock(tasks_dir()):
                 current = evaluate(mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard(),
-                                   meter=meter, budget=budget)
-                if allows(current, force_reason):
+                                   meter=meter, budget=budget, orchestrator=orchestrator is not None)
+                holders = stream_holders(orchestrator["stream"], task_id) if orchestrator is not None else []
+                if holders:
+                    refusal = Refused(f"❌ orchestrator_stream_busy: {orchestrator['stream']} has another orchestrator "
+                                      f"turn that may still run: {', '.join(holders[:10])}", 3)
+                elif allows(current, force_reason):
                     nonce = uuid.uuid4().hex
                     owner = legacy.new_admission_hold(nonce)
                     hold = dict(schema_version=2, task_id=task_id, agent=agent, run_nonce=nonce, status="spawning", pid=None,
-                                mode=mode, started_at=owner["admitted_at"], finished_at=None, admission_hold=owner)
+                                mode=mode, started_at=owner["admitted_at"], finished_at=None, admission_hold=owner,
+                                **(linkage or {}))
+                    if orchestrator is not None:
+                        hold[legacy.ORCHESTRATOR_KEY] = orchestrator
                     if spec is not None and meter is not None:
                         hold.update(model=spec.model, claude_account=spec.claude_account, codex_account=spec.codex_account)
                     if not current.exempt:

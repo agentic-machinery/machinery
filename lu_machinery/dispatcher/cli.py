@@ -64,6 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
         f"  .venv/bin/python {_DISPATCH} grant-paths TASK --run-nonce NONCE --owned-path tests/fix.py "
         "--reason 'Approved fixture change' --approval-ref message-id\n"
         f"  .venv/bin/python {_DISPATCH} retain-worktree TASK --set\n"
+        f"  .venv/bin/python {_DISPATCH} dispatch --agent claude --model claude-sonnet-5-5 --mode orchestrator "
+        "--stream epic:1122 --initiator claude-cto --prompt-file turn.md --worktree\n"
         "Outputs: task JSON, prompt, result and logs; new branch/worktree on dispatch.\n"
         "Exit codes: 0 success, 1 terminal failure, 2 invalid/refused request,\n"
         "  3 host admission refused (retryable), 4 worktree disk full, 124 client timeout.\n"
@@ -144,9 +146,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dispatch.add_argument(
         "--mode",
-        choices=("read-only", "workspace-write"),
+        choices=("read-only", "workspace-write", "orchestrator"),
         default="read-only",
-        help="Mode (default: read-only)",
+        help="Mode; orchestrator is a CTO-started stream turn that dispatches workers and writes no product change "
+             "(needs --stream and --initiator claude-cto; default: read-only)",
+    )
+    # Absent unless given (SUPPRESS), so every other dispatch's advisory binding stays unchanged.
+    dispatch.add_argument(
+        "--stream", metavar="STREAM", default=argparse.SUPPRESS,
+        help="Canonical stream an orchestrator turn reserves, e.g. epic:1122; refused while another turn on it may "
+             "run or a live legacy driver lease holds it; needs --mode orchestrator (default: none)",
     )
     dispatch.add_argument(
         "--input", action="append", default=[], metavar="PATH",
@@ -247,6 +256,25 @@ def build_parser() -> argparse.ArgumentParser:
     grant.add_argument("--reason", required=True, help="Nonempty reason for the approved scope addition")
     grant.add_argument("--approval-ref", required=True,
                        help="Fleet Comms message ID or comment URL; stored as given, never fetched")
+    handoff = subs.add_parser(
+        "handoff-receipt", help="Record a running orchestrator turn's one handoff receipt",
+        description="Record the handoff receipt an orchestrator turn needs to settle done.\n"
+        "Run by the turn itself while it runs; an identical retry returns the first receipt.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"Examples:\n  .venv/bin/python {_DISPATCH} handoff-receipt \"$LEARN_UKRAINIAN_DISPATCH_TASK_ID\" "
+        "--run-nonce NONCE --stream epic:1122 --handoff-ref 4711\n"
+        f"Outputs: JSON receipt (schema {store.HANDOFF_RECEIPT_SCHEMA}) with receipt_id, stream, task_id,\n"
+        "  run_nonce, handoff_ref and recorded_at.\n"
+        "Side effects: writes the receipt into the turn's own task record, once.\n"
+        "Exit codes: 0 receipt recorded or identical retry; 2 refused or failed: another task's id, another\n"
+        "  stream or run, a different receipt, a turn that is not running or already settling, or a store error.\n"
+        "Related: dispatch --mode orchestrator.",
+    )
+    handoff.add_argument("task_id", help="The turn's own dispatch task ID, e.g. drive-practice-1")
+    handoff.add_argument("--run-nonce", required=True, help="The turn's run nonce, returned by dispatch")
+    handoff.add_argument("--stream", required=True, help="The stream the turn reserved, e.g. epic:1122")
+    handoff.add_argument("--handoff-ref", required=True,
+                         help="ID of the turn's one handoff note, e.g. 4711 (1-256 of letters, digits, ._:#/-)")
     for name in ("wait", "status", "cancel", "list"):
         sub = subs.add_parser(name, help=f"{name.capitalize()} task records")
         if name == "list":
@@ -354,7 +382,82 @@ def _worktrees(repo_key: str | None, include_archive: bool) -> list[dict]:
     return rows
 
 
+# What an orchestrator turn never takes: product scope, a branch or tree to write, review typing,
+# advisory envelopes and inputs mounted for other modes (DRIVERS-1122).
+_ORCHESTRATOR_REFUSED = (
+    "owned_path", "research_owned_path", "branch", "pinned_head", "cwd", "pr", "review_author_model", "review_profile",
+    "risk", "review_mode", "language_lane", "require_review_verdict", "subject_seat", "subject_family", "review_id",
+    "attempt_id", "review_attempt", "review_access", "advisory_task", "advisory_role", "advisory_binding",
+    "verify_command", "trial_role", "trial_qualified_task", "input", "read_path", "output_schema",
+    "print_advisory_binding",
+)
+
+
+def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
+    """The record field of an orchestrator turn, ``{"stream": "epic:<N>"}``, or a typed refusal.
+
+    Only the CTO seat enters the mode: ``--initiator claude-cto`` from a process that is no dispatched
+    task (so a turn never starts another turn), with a canonical epic stream.
+    """
+    from lu_machinery.session_streams.model import validate_stream_id
+
+    requested_stream = getattr(args, "stream", None)
+    if not requested or not requested_stream:
+        raise ValueError("orchestrator_entry_refused: --mode orchestrator and --stream go together")
+    try:
+        stream = validate_stream_id(requested_stream)
+    except ValueError:
+        stream = None
+    if stream is None or not stream.startswith("epic:"):
+        raise ValueError("orchestrator_entry_refused: --stream must be a canonical epic:<N> stream id")
+    if args.initiator != cto_safe_mode.CTO_SEAT or not cto_safe_mode.is_cto_caller(os.environ, args.initiator):
+        raise ValueError("orchestrator_entry_refused: only the CTO seat starts an orchestrator turn "
+                         "(--initiator claude-cto, from outside any dispatched task)")
+    if agent == "opencode" and args.provider == SAVANT_PROVIDER:
+        raise ValueError("orchestrator_entry_refused: a Savant run cannot be an orchestrator turn")
+    given = [name for name in _ORCHESTRATOR_REFUSED if getattr(args, name, None) not in (None, False, [])]
+    if given:
+        flags = ", ".join("--" + name.replace("_", "-") for name in given)
+        raise ValueError(f"orchestrator_entry_refused: an orchestrator turn takes no {flags}")
+    return {"stream": stream}
+
+
+def _parent_linkage(task_id: str) -> dict:
+    """The parent fields of a task dispatched from inside another task's run.
+
+    A child of an orchestrator turn also names the turn's run nonce and stream, so the CTO can find
+    it after a crash; a turn that is not running (settled or settling) dispatches nothing.
+    """
+    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+
+    parent = os.environ.get(ownership.TASK_ID_ENV)
+    if not parent or parent == task_id:
+        return {}
+    fields: dict[str, str | None] = {"parent_task_id": parent}
+    try:
+        store.record_path(parent)
+    except ValueError:
+        return fields  # no task could have this id; recorded as given, as before
+    try:
+        record = store.read(parent, missing_ok=True)
+        stream = None if record is None else orchestrator_stream(record)
+    except (OSError, ValueError, RecursionError):
+        raise ValueError("parent_task_unreadable: the dispatching task's record cannot be read, so whether it "
+                         "is an orchestrator turn is unknown") from None
+    if record is not None and stream is not None:
+        if record.get("status") not in store.ACTIVE or record.get("settling_at"):
+            raise ValueError("orchestrator_parent_not_running: an orchestrator turn that has settled, or is "
+                             "settling, dispatches nothing")
+        fields.update(parent_run_nonce=record.get("run_nonce"), parent_stream=stream)
+    return fields
+
+
 def _dispatch(args) -> int:
+    # An orchestrator turn runs as a workspace-write task whose record names its stream; every check
+    # treats it as a write task, and its own rules key on that record field (DRIVERS-1122).
+    orchestrator_requested = args.mode == "orchestrator"
+    if orchestrator_requested:
+        args.mode = "workspace-write"
     if binding := store.review_binding(vars(args)):
         # Bound attempts have their own accounting; PR selectors would also charge their records to a PR budget.
         if args.branch is not None or args.pr is not None:
@@ -403,6 +506,10 @@ def _dispatch(args) -> int:
             refusal := cto_safe_mode.refusal("write dispatch", os.environ, args.initiator)
         ):
             raise host_admission.Refused(f"❌ {refusal}", 2)
+    orchestrator = None
+    if orchestrator_requested or getattr(args, "stream", None) is not None:
+        with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+            orchestrator = _orchestrator_entry(args, agent, requested=orchestrator_requested)
     if agent == "agy":
         # The requested Claude id is the catalog's AGY wire id, not the bare catalog id.
         from lu_machinery.dispatcher.providers.agy import transport_model
@@ -454,6 +561,8 @@ def _dispatch(args) -> int:
     path = store.record_path(task_id)
     if store.read(task_id, missing_ok=True) is not None:
         raise ValueError("task id already exists; choose a new task id")
+    with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+        linkage = _parent_linkage(task_id)
     repo, info = git.resolve_repo(args.repo)
     # Absent unless given, so an omitted --read-path leaves every other route's advisory binding unchanged.
     read_paths = getattr(args, "read_path", [])
@@ -688,8 +797,17 @@ def _dispatch(args) -> int:
         decision = host_admission.check(
             args.mode, dry_run=args.dry_run, disk_guard=not (args.worktree is not None and (worktree / ".git").exists()),
             force_reason=force_reason,
-            spec=spec,
+            spec=spec, orchestrator=orchestrator,
         )
+    if orchestrator is not None:
+        # Monitor holds the legacy leases, so this probe runs outside the admission lock; the turn's own
+        # reservation is atomic in reserve(). A dry run also reports a busy stream, without a lock.
+        with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
+            if refusal := host_admission.legacy_lease_refusal(orchestrator["stream"]):
+                raise host_admission.Refused(f"❌ {refusal}", 3)
+            if args.dry_run and (holders := host_admission.stream_holders(orchestrator["stream"], task_id)):
+                raise host_admission.Refused(f"❌ orchestrator_stream_busy: {orchestrator['stream']} has another "
+                                             f"orchestrator turn that may still run: {', '.join(holders[:10])}", 3)
     if args.dry_run:
         # The real run re-checks child_env after worktree creation in worker.py.
         invocation = runtime_context.build(spec, child_env(spec))
@@ -699,6 +817,8 @@ def _dispatch(args) -> int:
                         max_tokens=args.max_tokens)
         if binding:
             plan.update(review_attempt=binding, review_access=args.review_access or "isolated")
+        if orchestrator is not None:
+            plan["orchestrator"] = orchestrator
         print(json.dumps(plan, indent=2))
         return 0
     with admission.record_refusal(args, agent, StartRefusal.HEADROOM):
@@ -728,6 +848,7 @@ def _dispatch(args) -> int:
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,
                 spec=spec,
                 disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
+                orchestrator=orchestrator, linkage=linkage,
             ))
         with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
             if binding:
@@ -748,8 +869,9 @@ def _dispatch(args) -> int:
             record = store.new_record(spec, info, branch, sha, vars(args), binding=binding, admission_hold=hold)
             # A task dispatched from inside another task's run names that run, whose settlement then names it while
             # it still runs (worker._running_children, #12156).
-            if (parent := os.environ.get(ownership.TASK_ID_ENV)) and parent != task_id:
-                record["parent_task_id"] = parent
+            record.update(linkage)
+            if orchestrator is not None:
+                record["orchestrator"] = orchestrator
             if review_contract is not None:
                 record["review_contract"] = review_contract
             if publish_remote is not None:
@@ -919,6 +1041,10 @@ def main(argv=None) -> int:
                 print(f"dispatcher: grant failed ({type(exc).__name__})", file=sys.stderr)
                 return 1
             print(json.dumps(result, indent=2))
+            return 0
+        if args.command == "handoff-receipt":
+            receipt = store.record_handoff_receipt(args.task_id, args.run_nonce, args.stream, args.handoff_ref)
+            print(json.dumps(receipt, indent=2))
             return 0
         code = 0
         if args.command == "worktrees":
