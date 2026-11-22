@@ -26,7 +26,7 @@ and the tools that run it, and are sealed.  A missing, extra or altered field
 refuses reuse, as does a dirty tree.  ``git push --no-verify`` remains the
 explicit operator bypass.
 
-Stdlib only: the hook must run before any project import is trustworthy.
+Legacy validation uses the standard library until an Entire update needs the fleet registry.
 """
 
 from __future__ import annotations
@@ -195,47 +195,43 @@ def worktree_records(*args: str, root: Path) -> list[str] | None:
 
 
 def parse_updates(text: str) -> list[Update]:
+    if not text:
+        return []
     updates = []
-    for line in text.splitlines():
-        fields = line.split()
+    for line in text.removesuffix("\n").split("\n"):
+        # Git separates fields with spaces. A local revision expression can itself contain spaces.
+        fields = line.rsplit(" ", 3)
         if len(fields) != 4:
-            raise GateOutcome("invalid_ref_updates", f"could not read a valid ref update from Git: {line!r}")
+            raise GateOutcome("invalid_ref_updates", "Could not read a valid ref update from Git.")
         updates.append(Update(*fields))
     return updates
 
 
 def entire_destination(remote: list[str]) -> str:
-    """Classify the protected origin; KNOWN_NONPUBLIC does not assert private visibility.
-
-    Mirror the pure grammar in scripts.opsec.git_push.destination and prepublish.normalize_repository
-    without importing mutable project code before validation. Only canonical GitHub two-segment paths
-    can select an exemption here; all other destinations are UNKNOWN.
-    """
+    """Classify a GitHub destination by its unique, explicitly public or private fleet entry."""
     if len(remote) != 2:
         return "UNKNOWN"
-    value = remote[1].strip()
-    colon, slash = value.find(":"), value.find("/")
-    if not value or colon < 0 or 0 <= slash < colon:
+    try:
+        from lu_machinery.opsec.git_push import destination
+        from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+    except ImportError:
         return "UNKNOWN"
-    match = re.fullmatch(r"(?:https?|ssh|git|git\+ssh|ssh\+git)://(?:[^@/]+@)?([^/:@]+)(?::\d*)?/(.+)", value, re.I)
-    if match is None and "://" not in value:
-        match = re.fullmatch(r"(?:[^@/]+@)?([^/:@]+):([^:].*)", value)
-    if match is None:
+    host, _, slug = destination(remote[1]).partition("/")
+    if host != "github.com":
         return "UNKNOWN"
-    host, path = match.groups()
-    path = path.strip("/")
-    if len(path.split("/")) != 2:
+    try:
+        repos = load_fleet_repos()
+    except FleetRepoError:
         return "UNKNOWN"
-    identity = f"{host}/{path}".strip()
-    if not identity.isascii():
+    matches = [repo for repo in repos.values() if repo.github.isascii() and repo.github.lower() == slug]
+    if len(matches) != 1:
         return "UNKNOWN"
-    identity = identity.lower().removesuffix(".git")
-    if identity.endswith(".git"):
-        return "UNKNOWN"
-    host, owner, repository = identity.split("/")
-    if host != "github.com" or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in (owner, repository)):
-        return "UNKNOWN"
-    return "PUBLIC" if identity == "github.com/learn-ukrainian/learn-ukrainian.github.io" else "KNOWN_NONPUBLIC"
+    repo = matches[0]
+    if repo.role.startswith("public-"):
+        return "PUBLIC"
+    if repo.role.startswith("private-") and not repo.default:
+        return "KNOWN_NONPUBLIC"
+    return "UNKNOWN"
 
 
 def refuse_public_entire_refs(updates: list[Update], remote: list[str]) -> None:
@@ -251,11 +247,20 @@ def refuse_public_entire_refs(updates: list[Update], remote: list[str]) -> None:
     if not classes:
         return
     destination = entire_destination(remote)
-    if destination == "KNOWN_NONPUBLIC":
-        return
     detail = f"Entire destination ref classes: {', '.join(classes)}. "
     if destination == "PUBLIC":
-        raise GateOutcome("public_entire_ref", detail + "Public origin updates are refused.")
+        raise GateOutcome("public_entire_ref", detail + "Updates to public repositories are refused.")
+    if destination == "KNOWN_NONPUBLIC":
+        from lu_machinery.opsec import git_push, prepublish
+
+        environment = dict(os.environ)
+        executable = shutil.which(git_push.real_git(environment))
+        try:
+            if executable and git_push.trusted_route(git_push.Repository(executable, environment), *remote):
+                return
+        except (OSError, subprocess.SubprocessError, prepublish.PublishBlocked):
+            pass
+        raise GateOutcome("entire_destination_unverified", detail + "The private destination route could not be verified.")
     raise GateOutcome("entire_destination_unknown", detail + "Destination is unknown; Entire updates are refused.")
 
 
@@ -1949,6 +1954,12 @@ def message_gate(arguments: list[str]) -> int:
         return EXIT_REFUSED
     try:
         if arguments[0] == "--push-messages":
+            data = sys.stdin.buffer.read()
+            try:
+                refuse_public_entire_refs(parse_updates(data.decode("utf-8", "surrogateescape")), arguments[1:])
+            except GateOutcome as error:
+                print(f"PRE-PUSH GATE: push refused ({error.reason}). {error.detail}", file=sys.stderr)
+                return EXIT_REFUSED
             environment = dict(os.environ)
             # Object reads pin hooksPath to /dev/null. Only this fixed metadata
             # query must observe the push's inherited hook selection.
@@ -1968,7 +1979,7 @@ def message_gate(arguments: list[str]) -> int:
             # command-scoped false-positive override twice.
             if hooks.returncode == 0 and Path(hooks.stdout.decode().rstrip("\n")).resolve() in scanner_hooks:
                 return 0
-            return git_push.main(arguments[1:], chain=lambda *_: 0)
+            return git_push.main(arguments[1:], stdin=data, chain=lambda *_: 0)
         with git_push.deadline(git_push.scan_timeout(dict(os.environ))):
             repository = git_push.Repository(git_push.real_git(dict(os.environ)), dict(os.environ))
             message = Path(arguments[1]).read_text(encoding="utf-8")

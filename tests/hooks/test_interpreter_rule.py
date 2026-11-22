@@ -506,6 +506,7 @@ def test_routed_scripts_do_not_build_a_venv_interpreter_path() -> None:
 def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
     """Defect class: a tracked pre-push hook that skips machinery's scanner, or pushes when that scanner cannot start.
 
+    A public non-product fleet repository must also refuse an Entire checkpoint push.
     A temporary repository, synthetic matcher fixtures, and a local bare remote. The planted value is the
     fixture token, never a credential.
     """
@@ -516,7 +517,11 @@ def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
     shutil.copytree(machinery_root(), repo / "lu_machinery", ignore=shutil.ignore_patterns("__pycache__"))
-    (repo / "lu_machinery/config/fleet_repos.yaml").write_text(json.dumps({"repos": CATALOG}), encoding="utf-8")
+    catalog = {
+        **CATALOG,
+        "machinery": {"github": "unit/machinery", "local_name": "machinery-fixture", "role": "public-machinery"},
+    }
+    (repo / "lu_machinery/config/fleet_repos.yaml").write_text(json.dumps({"repos": catalog}), encoding="utf-8")
     shutil.copytree(_checkout() / ".githooks", repo / ".githooks", ignore=shutil.ignore_patterns("__pycache__"))
     (repo / ".venv").symlink_to(Path(sys.executable).resolve().parents[1], target_is_directory=True)
     make_tooling(tmp_path / "private-fixture/tools/public_opsec_scan")
@@ -572,6 +577,19 @@ def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
     allowed = git("push", "origin", "HEAD:refs/heads/feature", check=False)
     assert allowed.returncode == 0, allowed.stderr
     assert remote_has(clean)
+
+    entire = subprocess.run(
+        [sys.executable, str(repo / ".githooks/pre_push_gate.py"), "--push-messages",
+         "receiver", "git@github.com:unit/machinery.git"],
+        cwd=repo,
+        env={**env, "AGENT_REAL_GH": "/bin/false"},
+        input=f"HEAD {clean} refs/heads/entire/checkpoints/v1 {'0' * len(clean)}\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert entire.returncode == 1 and "(public_entire_ref)" in entire.stderr, entire.stderr
 
     (repo / "lu_machinery/opsec/git_push.py").unlink()
     (repo / "file.txt").write_text("clean\nagain\n", encoding="utf-8")
