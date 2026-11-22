@@ -186,11 +186,24 @@ def stream_holders(stream, task_id):
         if other is None or record.get("task_id") == task_id or other != stream:
             continue
         status = record.get("status")
-        if status in store.ACTIVE or status not in store.TERMINAL:
+        if not isinstance(status, str) or status in store.ACTIVE or status not in store.TERMINAL:
             holders.append(str(record.get("task_id")))
-        elif status == "crashed" and _provider_alive(record) is not False:
+        elif status == "crashed" and not _provider_gone(_provider_alive, record):
             holders.append(f"{record.get('task_id')} (crashed; provider not proven gone)")
     return holders
+
+
+def _provider_gone(provider_alive, record):
+    """True only when the provider's process tree is proven gone; a damaged liveness field is not proof."""
+    try:
+        return provider_alive(record) is False
+    except Exception:  # a malformed liveness field never ends the scan or frees the stream
+        return False
+
+
+# The states Monitor's /api/epics/v1 projection names (epics_router._lease_payload; SessionState).
+_LEASE_STATES = frozenset({"active", "released", "expired"})
+_SESSION_STATES = frozenset({"open", "rolling", "closed", "expired"})
 
 
 def legacy_lease_refusal(stream):
@@ -205,16 +218,20 @@ def legacy_lease_refusal(stream):
 
     try:
         response = RemoteEpicClient().stream(stream, digest_limit=1)
-    except (RemoteSupervisorError, ValueError, RecursionError) as exc:
+    except (RemoteSupervisorError, http.client.HTTPException, ValueError, RecursionError) as exc:
         return f"orchestrator_lease_unknown: the Monitor stream lease probe failed ({type(exc).__name__})"
     if not isinstance(response, dict) or response.get("stream_id") != stream:
         return "orchestrator_lease_unknown: the Monitor answer names another stream"
-    lease = response.get("lease")
-    if lease is None:
+    if "lease" not in response:
+        return "orchestrator_lease_unknown: the Monitor answer has no lease field"
+    lease = response["lease"]
+    if lease is None:  # the projection's explicit "no lease"
         return None
-    if not isinstance(lease, dict):
-        return "orchestrator_lease_unknown: the Monitor lease is malformed"
-    if lease.get("state") != "active" or lease.get("session_state") not in ("open", "rolling"):
+    state = lease.get("state") if isinstance(lease, dict) else None
+    session = lease.get("session_state") if isinstance(lease, dict) else None
+    if not (isinstance(state, str) and state in _LEASE_STATES and isinstance(session, str) and session in _SESSION_STATES):
+        return "orchestrator_lease_unknown: the Monitor lease or its session state is malformed"
+    if state != "active" or session not in ("open", "rolling"):
         return None
     try:
         expired = datetime.now(UTC) >= parse_timestamp(lease["expires_at"])

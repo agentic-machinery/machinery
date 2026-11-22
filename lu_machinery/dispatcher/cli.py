@@ -399,6 +399,7 @@ def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
     Only the CTO seat enters the mode: ``--initiator claude-cto`` from a process that is no dispatched
     task (so a turn never starts another turn), with a canonical epic stream.
     """
+    from lu_machinery.orchestration import task_record_store
     from lu_machinery.session_streams.model import validate_stream_id
 
     requested_stream = getattr(args, "stream", None)
@@ -410,15 +411,28 @@ def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
         stream = None
     if stream is None or not stream.startswith("epic:"):
         raise ValueError("orchestrator_entry_refused: --stream must be a canonical epic:<N> stream id")
-    if args.initiator != cto_safe_mode.CTO_SEAT or not cto_safe_mode.is_cto_caller(os.environ, args.initiator):
+    # A worker marker that is present at all, even empty, makes the caller a task, never the CTO seat.
+    if (args.initiator != cto_safe_mode.CTO_SEAT or any(marker in os.environ for marker in cto_safe_mode._WORKER_MARKERS)
+            or not cto_safe_mode.is_cto_caller(os.environ, args.initiator)):
         raise ValueError("orchestrator_entry_refused: only the CTO seat starts an orchestrator turn "
                          "(--initiator claude-cto, from outside any dispatched task)")
     if agent == "opencode" and args.provider == SAVANT_PROVIDER:
         raise ValueError("orchestrator_entry_refused: a Savant run cannot be an orchestrator turn")
-    given = [name for name in _ORCHESTRATOR_REFUSED if getattr(args, name, None) not in (None, False, [])]
+    # Every record scan skips a file named like a dispatcher sidecar, so such a turn would hold no stream.
+    if args.task_id is not None and task_record_store._is_dispatcher_sidecar(store.record_path(args.task_id)):
+        raise ValueError("orchestrator_entry_refused: --task-id ends like a dispatcher sidecar file name")
+    # Identity, not equality: --pr 0 is a given flag, though 0 == False.
+    given = [name for name in _ORCHESTRATOR_REFUSED
+             if (value := getattr(args, name, None)) is not None and value is not False and value != []]
     if given:
         flags = ", ".join("--" + name.replace("_", "-") for name in given)
         raise ValueError(f"orchestrator_entry_refused: an orchestrator turn takes no {flags}")
+    # A turn drives its stream: role policy (model_pause.dispatch_roles) must see that, not only authoring.
+    from lu_machinery.agent_runtime.model_pause import normalize_role
+
+    if args.research_role is not None and normalize_role(args.research_role) != "driving":
+        raise ValueError("orchestrator_entry_refused: an orchestrator turn's --research-role is driver")
+    args.research_role = args.research_role or "driver"
     return {"stream": stream}
 
 
@@ -445,7 +459,8 @@ def _parent_linkage(task_id: str) -> dict:
         raise ValueError("parent_task_unreadable: the dispatching task's record cannot be read, so whether it "
                          "is an orchestrator turn is unknown") from None
     if record is not None and stream is not None:
-        if record.get("status") not in store.ACTIVE or record.get("settling_at"):
+        status = record.get("status")
+        if not isinstance(status, str) or status not in store.ACTIVE or record.get("settling_at"):
             raise ValueError("orchestrator_parent_not_running: an orchestrator turn that has settled, or is "
                              "settling, dispatches nothing")
         fields.update(parent_run_nonce=record.get("run_nonce"), parent_stream=stream)
@@ -458,6 +473,12 @@ def _dispatch(args) -> int:
     orchestrator_requested = args.mode == "orchestrator"
     if orchestrator_requested:
         args.mode = "workspace-write"
+    orchestrator = None
+    if orchestrator_requested or getattr(args, "stream", None) is not None:
+        # First, so a flag the mode refuses gets the mode's own typed refusal.
+        entry_agent = ALIASES.get(args.agent, args.agent)
+        with admission.record_refusal(args, entry_agent, StartRefusal.ELIGIBILITY):
+            orchestrator = _orchestrator_entry(args, entry_agent, requested=orchestrator_requested)
     if binding := store.review_binding(vars(args)):
         # Bound attempts have their own accounting; PR selectors would also charge their records to a PR budget.
         if args.branch is not None or args.pr is not None:
@@ -506,10 +527,6 @@ def _dispatch(args) -> int:
             refusal := cto_safe_mode.refusal("write dispatch", os.environ, args.initiator)
         ):
             raise host_admission.Refused(f"❌ {refusal}", 2)
-    orchestrator = None
-    if orchestrator_requested or getattr(args, "stream", None) is not None:
-        with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
-            orchestrator = _orchestrator_entry(args, agent, requested=orchestrator_requested)
     if agent == "agy":
         # The requested Claude id is the catalog's AGY wire id, not the bare catalog id.
         from lu_machinery.dispatcher.providers.agy import transport_model

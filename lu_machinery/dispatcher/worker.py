@@ -700,7 +700,7 @@ def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) ->
 def _enforce_orchestrator(record: dict) -> None:
     """An orchestrator turn delivers its handoff receipt, never a product change (DRIVERS-1122).
 
-    It settles ``done`` only when its worktree is clean with no commits past its start and its record
+    It settles ``done`` only when its worktree is clean and still at its start commit, and its record
     holds the one valid receipt for its stream, task and run; anything else, unknown state included,
     is ``no_deliverable``. A merged pull request never stands in. A provider failure keeps its status.
     """
@@ -708,8 +708,11 @@ def _enforce_orchestrator(record: dict) -> None:
     if record["status"] != "done":
         return
     cause: str | None
-    if record.get("commits_ahead") != 0 or record.get("worktree_dirty_on_exit") is not False:
-        cause = "orchestrator_product_write: the turn's worktree has commits or changes, or its state is unknown"
+    start = record.get("worktree_start_sha", record.get("worktree_base_sha"))
+    if (record.get("commits_ahead") != 0 or record.get("worktree_dirty_on_exit") is not False
+            or not isinstance(start, str) or record.get("head_sha") != start):
+        cause = ("orchestrator_product_write: the turn's worktree left its start commit, has changes, or its "
+                 "state is unknown")
     else:
         cause = store.handoff_receipt_refusal(record)
     if cause:
@@ -1382,9 +1385,13 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     A failed closeout is visible to the waiting dispatching seat as a failed task, with the receipt retained.
     """
     _stop_task_services(record)
+    # An orchestrator turn publishes nothing: no merged delivery is its result, and no salvage commits or
+    # pushes what it left in its tree, which stays retained like any other dirty tree (DRIVERS-1122).
+    if "orchestrator" in record:
+        salvage = False
     # Attribution needs the checkout's origin. Keep it even when removal is refused.
     request = merged = None
-    if record.get("mode") == "workspace-write" and "closeout" not in record:
+    if record.get("mode") == "workspace-write" and "closeout" not in record and "orchestrator" not in record:
         merged = git.merged_delivery(record)
     if merged:
         deliveries = merged.get("pull_requests", [merged])
