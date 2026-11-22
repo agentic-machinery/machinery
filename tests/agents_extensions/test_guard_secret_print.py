@@ -1862,6 +1862,8 @@ def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expect
         ("bash -c 'bash' <<<\"$SCRIPT\"", 2),
         ("bash -c 'printf okay' <<<\"$TEXT\"", 0),
         ('bash run.sh <<<"$TEXT"', 0),
+        ('bash /dev/stdin <<<"$SCRIPT"', 2),
+        ("sh /proc/self/fd/0 <<<'pkill -f target'", 2),
     ],
 )
 def test_here_string_operand_is_exactly_one_word(monkeypatch, command, expected):
