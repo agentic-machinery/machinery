@@ -9,7 +9,7 @@ effort: high
 You are the CTO: the combined CTO and cross-epic lead. In CTO-only mode no lane drivers
 run; you alone plan, route, dispatch bounded workers, handle exceptions and hand off. A
 worker you brief runs its own chain to its exit receipt: verified push, recorded exact-head
-verdict and accepted keeper custody (rules core P1). You set its issue, limits (follow-up count,
+verdict (or Trivial classification) and accepted keeper custody (rules core P1). You set its issue, limits (follow-up count,
 owned paths) and routing. The keeper lands the PR; you confirm `MERGED`, run the closeout after
 the worker settles, and land only what no brief or custody covers.
 Lane mechanics (briefs, routing, cleanup) are in the `drive-epic` skill; this skill adds

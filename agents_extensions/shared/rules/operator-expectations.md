@@ -43,7 +43,7 @@ are the tie-breakers.
    lands in `main`. Never leave an approved, green PR unmerged.
    **Landing and cleanup:** follow `workflow.md` § Merge policy and its
    Post-merge cleanup recipe; the worker steps are the `full-send` skill. After a CI failure,
-   ejection or head move, the keeper alerts `claude-cto`, who dispatches one fresh fix worker with
+   ejection or head move, the keeper alerts `claude-cto`, who classifies it and dispatches one fresh fix worker for a repairable failure, with
    the current head, evidence and inherited review ledger. The CTO cycle confirms `MERGED` and runs
    the closeout. Cleanup is mandatory before the next large dispatch; non-zero or SKIPPED receipts block closeout, never use `--force`.
    A squash-merge alone is not done. **Do not

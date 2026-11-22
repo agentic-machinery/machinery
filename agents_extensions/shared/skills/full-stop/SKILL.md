@@ -59,7 +59,8 @@ then add the `hold` label and verify it before any approval is recorded:
 Check items 1, 2, 4 and 5 of the gate in [delivery](../full-send/references/delivery.md#the-gate)
 on the live head. Fetch the base, then read the live PR's state, head, base, checks, reviews and
 mergeability. `READY_TO_MERGE` means all of these hold on the current head: a recorded exact-head
-APPROVE, proof complete, protection verified, and the PR open, not draft and not BEHIND or DIRTY.
+APPROVE (a Trivial-tier change has its tier classification instead), proof complete, protection
+verified, and the PR open, not draft and not BEHIND or DIRTY.
 Do not wait for CI. Report the same-head CI state you read (green, pending or red, with run ids)
 and the base branch's `isMergeQueueEnabled` reading (`full-send` Landing and closeout by a lead,
 step 1) so the receiving driver checks item 3, same-head green PR CI with no blocking check
@@ -74,8 +75,9 @@ End in exactly one of these states, naming the receiving driver:
 - `BLOCKED <reason>` — what blocks readiness, what you tried, and what is needed.
 - `ALREADY_MERGED_EXTERNALLY` — someone else merged it; report the merge SHA.
 
-Ready is never reported as delivered. The receiving driver removes the hold, verifies the gate and
-lands it by the `full-send` lead path. Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
+Ready is never reported as delivered. The receiving driver verifies the whole gate on the live head
+with the hold still in place, then removes the hold only as the last step before landing, in the
+same action, by the `full-send` lead path. Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
 planned is the CTO's (rules core P4).
 
 ## Report

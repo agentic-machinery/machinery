@@ -121,9 +121,9 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 6. **Hand the PR to keeper custody, then exit.** This is the worker's last step: the merge-queue
    keeper watches CI and lands the PR, and the CTO cycle handles every later alert. Do not wait
    for CI, a runner or the queue; never rerun, enqueue, merge or run `merge_closeout`.
-   Check the live head equals the head of the recorded APPROVE (a moved head returns to step 4),
-   save the recorder's JSON receipt from step 5 under `batch_state/tasks/<task-id>.artifacts/`,
-   then transfer custody:
+   Check the live head equals the head of the recorded APPROVE, or of the Trivial classification
+   (a moved head returns to step 4). Save the recorder's JSON receipt from step 5 under
+   `batch_state/tasks/<task-id>.artifacts/`, then transfer custody:
 
    ```bash
    "$PY" -m lu_machinery.orchestration.pr_ownership keeper-transfer --pr "$PR" --repo "$REPO" \
@@ -136,16 +136,20 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    `BLOCKED`, never a fallback to watching CI. Exit 0 prints the keeper's acknowledgement,
    binding the repository, PR, base, head, your task and nonce, and the verdict. That receipt is
    the worker's proof of custody. Any other exit is a refusal: read its reason, fix what it names
-   (a moved head, a missing or stale verdict) or stop with `BLOCKED <refusal>`.
+   (a moved head, a missing or stale verdict) or stop with `BLOCKED <refusal>`. The keeper may
+   land the PR before you transfer: if the refusal shows the PR already queued or `MERGED`, read
+   `gh pr view "$PR" --json state,mergeCommit`, report that state with the verdict receipt, and
+   end; the CTO cycle owns the rest.
 
    Then check `git status --porcelain` is empty, report `CUSTODY_ACCEPTED` with the receipt
    ([Report](#report)) and end your run. The linked issue stays open: the CTO cycle closes it with
    the merged-outcome evidence after closeout.
 
    After this step the PR is not yours. If CI fails, the queue ejects the PR or its head moves,
-   the keeper holds it and alerts `claude-cto`, who dispatches one fresh fix worker with the
-   current head, the evidence and the inherited review ledger. That worker starts at
-   [pr-watch](references/pr-watch.md#failing-ci) and accepts the PR with `pr_ownership accept`.
+   the keeper holds it and alerts `claude-cto`, who classifies the alert and, for a repairable
+   failure, dispatches one fresh fix worker with the current head, the evidence and the inherited
+   review ledger. That worker starts at [pr-watch](references/pr-watch.md#failing-ci) and accepts
+   the PR with `pr_ownership accept`.
 
 ## Landing and closeout by a lead
 
@@ -161,7 +165,8 @@ CTO cycle after the keeper lands one. A worker never runs this section.
    "$PY" -m lu_machinery.publish read queue-status --repo "$REPO" --number "$PR" --branch "$BASE"
    ```
 
-   `true` means a merge queue and `false` none; keep it as `$QUEUE`. Any other reading (a failed
+   Run `verify_run` for every area the diff touches on this head (`verify` skill); a non-zero exit
+   blocks the landing. `true` means a merge queue and `false` none; keep it as `$QUEUE`. Any other reading (a failed
    read, a missing or non-boolean field) means stop; never guess. `headRefOid` must equal the
    head of the recorded APPROVE and of green PR CI, which is the same in both kinds: no
    blocking check on that head pending, red or cancelled, the `CI Gate` among them where the
@@ -340,7 +345,7 @@ head and completed work so a successor can resume.
 ## Report
 
 Lead with the outcome. A worker reports `CUSTODY_ACCEPTED` with the PR, the exact head, the proof
-(commands and run ids), the recorded verdict receipt, the `keeper-transfer` acknowledgement,
+(commands and run ids), the recorded verdict receipt (or the Trivial classification), the `keeper-transfer` acknowledgement,
 review rounds used of the budget with reviewer model, family and harness, the decisions you made,
 follow-ups with owners, the CI state last seen on that head (never waited for), and the
 residual owner or "none". A lead who landed a PR also reports the merge SHA, how each linked

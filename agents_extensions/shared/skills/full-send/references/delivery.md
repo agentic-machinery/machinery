@@ -119,10 +119,13 @@ Proof is evidence observed in this session: command output, a reproduction, a ru
 Every item must hold on the **current** head. A moved head voids the verdict and the CI. The
 keeper (or a lead landing a PR that no brief or custody covers) checks the whole gate at landing.
 A worker's exit needs items 1, 2, 4 and 5 and the accepted custody receipt, and never waits for
-item 3.
+item 3. Where this gate says APPROVE, a Trivial-tier change has the tier classification instead.
 
-1. Proof covers every change in the diff.
-2. A recorded exact-head APPROVE from the reviewer of record (`review-loop`), with no open
+1. Proof covers every change in the diff, including a passing `verify_run` for each area the diff
+   touches (`verify` skill): the worker runs it on this head before custody, and a lead runs it
+   again before landing.
+2. A recorded exact-head APPROVE from the reviewer of record (`review-loop`), or for a Trivial-tier
+   change (review policy section 2) the tier classification at that head in its place, with no open
    blocker applicable to that head. For an inherited blocker assigned elsewhere, approval
    requires exact-head evidence and the reviewer's confirmation under the
    [review policy](../../review-loop/references/policy.md#4-convergence). A missing or unverified

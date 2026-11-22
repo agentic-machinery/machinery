@@ -103,16 +103,23 @@ from the receipt (delivery.md, hand-off record); it never restarts them.
 
 ## Merge-queue kicks
 
-After enqueue, a CI Gate comment on the PR with a run URL means the queue ejected it. The keeper
-holds the PR and alerts `claude-cto`, who dispatches one fresh fix worker. That worker reads the
-failed jobs, fixes or rebases, re-runs the exact-head review if the head moved, and hands the PR
-back with `keeper-transfer` (`full-send` step 6). An ejection on a failing test node is fixed
-first. The keeper never re-queues an ejected head, except the one same-head re-enqueue after an
-infrastructure ejection, under the shared allowance.
+After enqueue, a CI Gate comment on the PR with a run URL means the queue ejected it. Which recipe
+applies depends on who holds the PR:
 
-## Queue custody (briefs started before detached delivery)
+- **Keeper custody (detached delivery).** The keeper holds the PR and alerts `claude-cto`, who
+  dispatches one fresh fix worker for a repairable failure. That worker reads the failed jobs,
+  fixes or rebases, re-runs the exact-head review if the head moved, and hands the PR back with
+  `keeper-transfer` (`full-send` step 6). An ejection on a failing test node is fixed first. The
+  keeper never re-queues an ejected head, except the one same-head re-enqueue after an
+  infrastructure ejection, under the shared allowance.
+- **Legacy queue custody** (see [Queue custody](#queue-custody)). The custodian or the original
+  owner reads the failed jobs, fixes or rebases, re-runs the exact-head review if the head moved,
+  and re-queues in the same hour with `pr-merge` (`full-send` Landing and closeout by a lead,
+  step 2; drive-epic §7). The one re-queue after an infrastructure ejection is that owner's.
 
-A worker started before detached delivery may still own a queued PR. When the PR's only
+## Queue custody
+
+This path is for briefs started before detached delivery. A worker started then may still own a queued PR. When the PR's only
 remaining step is waiting in the merge queue, that owner may hand the rest to the integration
 owner (or a successor) instead of waiting until the dispatcher's hard timeout ends it. New
 briefs never use this path: they exit at `keeper-transfer`. The custodian, from its own live dispatch task, accepts custody of ejection,
