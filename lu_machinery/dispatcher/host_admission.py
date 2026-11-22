@@ -6,8 +6,13 @@ The retained admission scanner and ownership ledger read the same hold format.
 
 import contextlib
 import http.client
+import ipaddress
+import os
+import socket
 import subprocess
 import sys
+import threading
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -70,24 +75,129 @@ def _head(root):
         return None
 
 
+def _monitor_json(read):
+    try:
+        return read()
+    except (OSError, ValueError, RecursionError, http.client.HTTPException):
+        return None
+
+
+# One deadline for the whole planning read. The view can wait up to 2 s
+# (state_helpers.DORMANT_READ_WAIT_S) to wake an idle active-task view.
+PLANNING_READ_TIMEOUT_S = 5.0
+PLANNING_BODY_LIMIT = 1 << 20
+PLANNING_PATH = "/api/fleet/model-stats/planning"
+
+
+def _planning_origin():
+    """Host, port and path prefix of the Monitor ``read_budget`` reads, or ``ValueError``.
+
+    Only plain HTTP to ``localhost`` or an IP literal, with no user information, query or fragment.
+    """
+    raw = os.environ.get("DELEGATE_MONITOR_API", "http://127.0.0.1:8765").rstrip("/")
+    base = urllib.parse.urlsplit(raw)
+    host = base.hostname
+    if base.scheme != "http" or host is None or any(mark in raw for mark in "@?#"):
+        raise ValueError("the planning view needs a plain http Monitor URL")
+    if host != "localhost":
+        ipaddress.ip_address(host)  # ValueError for a host name
+    return host, 80 if base.port is None else base.port, base.path
+
+
+def _planning_length(response):
+    """The one valid ``Content-Length`` of a 200 reply. Chunked or close-delimited replies are refused.
+
+    The parser keeps a header line that is not an HTTP field as a defect, as payload or as a mail envelope,
+    and fields after it would go unchecked, so any of the three refuses the reply.
+    """
+    if response.status != 200:
+        raise ValueError(f"the planning view answered HTTP {response.status}")
+    headers = response.headers
+    if headers.defects or headers.get_payload() or headers.get_unixfrom() is not None:
+        raise ValueError("the planning view header block is malformed")
+    lengths = response.headers.get_all("Content-Length") or []
+    if response.headers.get_all("Transfer-Encoding") or len(lengths) != 1:
+        raise ValueError("the planning view needs exactly one Content-Length and no Transfer-Encoding")
+    raw = lengths[0]
+    if not (raw.isascii() and raw.isdigit()) or int(raw) > PLANNING_BODY_LIMIT:
+        raise ValueError("the planning view Content-Length is invalid or above its read limit")
+    return int(raw)
+
+
+def _planning_body(connection, path, sockets, cancelled):
+    try:
+        connection.connect()
+        # The reply keeps reading this socket after getresponse() drops connection.sock for a closing reply.
+        sockets.append(connection.sock)
+        if cancelled.is_set():
+            raise TimeoutError("the planning view read passed its deadline")
+        connection.request("GET", path, headers={"Accept": "application/json"})
+        response = connection.getresponse()  # http.client follows no redirect
+        try:
+            length = _planning_length(response)
+            body = response.read(length)
+            if len(body) != length or response.length:
+                raise http.client.IncompleteRead(body, length - len(body))
+            return body
+        finally:
+            response.close()
+    finally:
+        connection.close()
+
+
+def read_planning():
+    """Monitor's planning view (``model-planning.v1``) within one end-to-end deadline.
+
+    A reader thread does the request. Past :data:`PLANNING_READ_TIMEOUT_S` the read is cancelled and its
+    socket shut down, which ends a blocked receive. Redirects, other statuses, chunked or close-delimited
+    replies, a missing, repeated or invalid ``Content-Length``, a body above :data:`PLANNING_BODY_LIMIT`
+    or short of its length fail too. The caller turns every failure into the fixed meter cap.
+    """
+    from lu_machinery.common import json_depth
+
+    host, port, prefix = _planning_origin()
+    connection = http.client.HTTPConnection(host, port, timeout=PLANNING_READ_TIMEOUT_S)
+    outcome, sockets, cancelled = [], [], threading.Event()
+
+    def fetch():
+        try:
+            outcome.append(_planning_body(connection, prefix + PLANNING_PATH, sockets, cancelled))
+        except Exception as exc:  # handed to the caller below
+            outcome.append(exc)
+
+    reader = threading.Thread(target=fetch, name="planning-view-read", daemon=True)
+    try:
+        reader.start()
+    except RuntimeError as exc:
+        raise OSError("the planning view reader could not start") from exc
+    reader.join(PLANNING_READ_TIMEOUT_S)
+    if reader.is_alive():
+        cancelled.set()  # before reading the handles: a reader that has not connected yet stops itself
+        for sock in list(sockets):
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+        raise TimeoutError("the planning view read passed its deadline")
+    if len(outcome) != 1 or isinstance(outcome[0], BaseException):
+        cause = outcome[0] if outcome else None
+        raise ValueError(f"the planning view read failed: {type(cause).__name__}") from cause
+    return json_depth.loads(outcome[0], max_depth=64)
+
+
 def _meter_budget(spec):
-    """Read the existing cache outside the admission lock, for a metered write."""
+    """Read the existing caches outside the admission lock, for a metered write: budget and forecast."""
     if spec is None or spec.mode not in legacy.WRITE_CAPABLE_MODES:
-        return None, None
+        return None, None, None
     meter = legacy.subscription_meter(
         spec.agent, model=spec.model, claude_account=spec.claude_account, codex_account=spec.codex_account,
     )
     if meter is None:
-        return None, None
+        return None, None, None
     from lu_machinery.dispatcher.pool_selector import read_budget
 
-    try:
-        return meter, read_budget()
-    except (OSError, ValueError, RecursionError, http.client.HTTPException):
-        return meter, None
+    return meter, _monitor_json(read_budget), _monitor_json(read_planning)
 
 
-def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None):
+def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None, forecast=None):
     """Copy-adapted from delegate._evaluate_dispatch_admission, including v2 liveness.
 
     Disk admission measures, alerts and refuses; it never removes anything. Each task's creator
@@ -97,7 +207,7 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budge
         mode, tasks_dir(), pid_alive=legacy.process_alive,
         record_liveness=lambda record: worker_liveness(record, pid_alive=legacy.process_alive),
         on_dead=heal_dead if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
-        meter=meter, meter_budget=budget,
+        meter=meter, meter_budget=budget, meter_forecast=forecast,
     )
 
 
@@ -136,8 +246,9 @@ def precheck(mode, *, force_reason=None):
 
 def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None):
     try:
-        meter, budget = _meter_budget(spec)
-        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard, meter=meter, budget=budget)
+        meter, budget, forecast = _meter_budget(spec)
+        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard, meter=meter, budget=budget,
+                            forecast=forecast)
     except ValueError as exc:
         raise Refused(f"❌ invalid dispatch admission threshold: {exc}", 2) from exc
     report(decision, force_reason=force_reason)
@@ -165,13 +276,13 @@ def check_credit(agent, model, codex_account=None):
 def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, spec=None):
     """Publish a creation hold for either mode; release unused setup only when its tree is absent."""
     hold = None
-    meter, budget = _meter_budget(spec)
+    meter, budget, forecast = _meter_budget(spec)
     try:
         refusal = None
         try:
             with legacy.admission_lock(tasks_dir()):
                 current = evaluate(mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard(),
-                                   meter=meter, budget=budget)
+                                   meter=meter, budget=budget, forecast=forecast)
                 if allows(current, force_reason):
                     nonce = uuid.uuid4().hex
                     owner = legacy.new_admission_hold(nonce)

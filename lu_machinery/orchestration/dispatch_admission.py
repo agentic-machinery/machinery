@@ -22,10 +22,16 @@ every check passes. Read-only dispatches are exempt.
   clock cannot pin one. A dead pid, or a pid-less record whose dispatcher is
   provably gone, never holds a slot; the caller may sweep it to ``crashed``
   through ``on_dead``.
-* **Subscription meter pacing (#1129).** A metered write dispatch also needs
-  a free slot on its meter and enough time since that meter's last launch
-  reservation. The ceiling is fixed and independent of quota telemetry.
-  Recent rate limiting and known near-cap or exhausted meters defer new writes.
+* **Subscription meter pacing (#1129, #1133).** A metered write dispatch also
+  needs a free slot on its meter and enough time since that meter's last
+  launch reservation. The meter's cap is
+  ``ceil(remaining_pct / (hours_to_reset x points_per_worker_hour))``, clamped
+  to ``[1, DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER]``, from the meter's row of
+  Monitor's planning forecast; the rate is measured over a trailing week of
+  write tasks, so a worker finishing does not move it. A missing or invalid
+  forecast, a passed reset or an unmeasured rate keeps the fixed ceiling and
+  the admission line says why (:func:`meter_cap`). Recent rate limiting and
+  known near-cap or exhausted meters defer new writes.
 * **``MemAvailable``** from ``/proc/meminfo`` at or above the floor.
 * **CPU:** the 1-minute load average divided by ``os.cpu_count()`` at or below
   the limit.
@@ -114,8 +120,9 @@ import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -140,6 +147,14 @@ PIDLESS_CLOCK_SKEW_S = 30.0
 LOCK_FILE_NAME = "dispatch-admission.lock"
 DEFAULT_LOCK_TIMEOUT_S = 60.0
 PROC_ROOT = Path("/proc")
+
+# Monitor's planning view (``lu_machinery.api.planning.SCHEMA_VERSION``), read by the dispatcher outside the
+# admission lock. Its capacity rows name the Grok+Cursor meter ``grok``.
+PLANNING_SCHEMA_VERSION = "model-planning.v1"
+_PLANNING_POOLS = {"grok+cursor": "grok"}
+# A rate from fewer worker tasks is a low sample on the model statistics page (``model_stats_router.LOW_SAMPLE``).
+_MIN_RATE_SAMPLES = 10
+_MICROS_PER_HOUR = 3_600_000_000
 
 ENV_MAX_LIVE_WRITE_WORKERS = "DISPATCH_MAX_LIVE_WRITE_WORKERS"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER"
@@ -238,11 +253,12 @@ class MeterCheck:
     interval_s: float
     defer: MeterDefer | None
     retry_in_s: float = 0.0
+    basis: str = "fixed cap"
 
     def clause(self) -> str:
         clause = (
             f"meter {self.meter}: live write workers {self.live}/{self.cap} "
-            f"(fixed cap), launch interval {self.interval_s:g}s"
+            f"({self.basis}), launch interval {self.interval_s:g}s"
         )
         if self.defer is not None:
             clause += f", subscription_meter_defer={self.defer}"
@@ -1193,6 +1209,62 @@ def _meter_defer(meter: str, budget: Mapping[str, Any], now: datetime) -> MeterD
     return None
 
 
+def _forecast_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)  # a JSON integer beyond the float range raises OverflowError
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tuple[int, str]:
+    """The meter's live-worker cap and the basis the admission line shows (#1133).
+
+    ``forecast`` is the Monitor planning view (``model-planning.v1``). With a valid row for the meter, a
+    future reset and a positive rate measured over at least ten worker tasks, the cap is the number of workers that spend the remaining
+    allowance by the reset at the measured rate, ``ceil(remaining_pct / (hours_to_reset x rate))``,
+    clamped to ``[1, ceiling]``, computed exactly from the given values and the reset interval in
+    microseconds. It reads no live-worker count. Anything else keeps the fixed ceiling.
+    """
+    view = _mapping(forecast)
+    rows = view.get("capacity")
+    if view.get("schema_version") != PLANNING_SCHEMA_VERSION or not isinstance(rows, list):
+        return ceiling, "fixed cap: planning forecast unavailable"
+    pool = _PLANNING_POOLS.get(meter, meter)
+    matches = [row for row in rows if isinstance(row, Mapping) and row.get("pool") == pool]
+    if len(matches) != 1:
+        return ceiling, "fixed cap: no single forecast row for this meter"
+    row = matches[0]
+    remaining = _forecast_number(row.get("remaining_pct"))
+    if remaining is None or not 0 <= remaining <= 100:
+        return ceiling, "fixed cap: remaining allowance unknown"
+    raw_reset = row.get("reset_at")
+    try:
+        reset = datetime.fromisoformat(raw_reset) if isinstance(raw_reset, str) and len(raw_reset) <= 40 else None
+    except ValueError:
+        reset = None
+    if reset is None or reset.tzinfo is None:
+        return ceiling, "fixed cap: reset time unknown"
+    micros = (reset - now) // timedelta(microseconds=1)
+    if micros <= 0:
+        return ceiling, "fixed cap: reset time passed"
+    rate = _forecast_number(row.get("points_per_worker_hour"))
+    if rate is None or not rate > 0:
+        return ceiling, "fixed cap: no measured points per worker-hour"
+    samples = row.get("worker_samples")
+    if type(samples) is not int or samples < _MIN_RATE_SAMPLES:
+        return ceiling, f"fixed cap: rate measured over fewer than {_MIN_RATE_SAMPLES} worker tasks"
+    # Exact rational arithmetic: no float error can cross a whole-worker boundary and nothing underflows.
+    workers = Fraction(remaining) * _MICROS_PER_HOUR / (micros * Fraction(rate))
+    cap = min(ceiling, max(1, math.ceil(workers)))
+    return cap, (
+        f"paced cap: {remaining:g}% left, {micros / _MICROS_PER_HOUR:.1f}h to reset, {rate:g} points per worker-hour "
+        f"over {samples} tasks, ceiling {ceiling}"
+    )
+
+
 def new_admission_hold(run_nonce: str) -> dict[str, Any]:
     """This dispatcher's claim on an admitted slot: run, pid and ``/proc`` start time."""
     from lu_machinery.orchestration.dead_worker_state import capture_worker_identity
@@ -1519,6 +1591,7 @@ def evaluate(
     record_shadow: bool = True,
     meter: str | None = None,
     meter_budget: Mapping[str, Any] | None = None,
+    meter_forecast: object = None,
     now: datetime | None = None,
 ) -> AdmissionDecision:
     """Decide whether a ``mode`` dispatch may start a worker on this host now.
@@ -1533,7 +1606,9 @@ def evaluate(
     the alert. Invalid threshold environment variables raise
     ``ValueError``. A missing or incompatible product policy raises
     ``ProductPolicyError`` (a ``ValueError``) for every mode, read-only
-    included, before anything is read or swept (#12680).
+    included, before anything is read or swept (#12680). ``meter_forecast`` is
+    the Monitor planning view the caller read for a metered write; it sets
+    only that meter's cap (:func:`meter_cap`).
     """
     load_product_policy()
     if mode not in WRITE_CAPABLE_MODES:
@@ -1557,7 +1632,7 @@ def evaluate(
         )
     meter_check = None
     if meter is not None:
-        cap = limits.max_live_write_workers_per_meter
+        cap, basis = meter_cap(meter, limits.max_live_write_workers_per_meter, meter_forecast, clock)
         defer = (
             MeterDefer.RATE_LIMITED if scan.meter_recently_rate_limited
             else _meter_defer(meter, meter_budget or {}, clock)
@@ -1569,7 +1644,7 @@ def evaluate(
         if defer is None and scan.last_meter_launch_age_s is not None:
             defer = MeterDefer.CADENCE
             retry_in = interval - scan.last_meter_launch_age_s
-        meter_check = MeterCheck(meter, scan.live_on_meter, cap, interval, defer, retry_in)
+        meter_check = MeterCheck(meter, scan.live_on_meter, cap, interval, defer, retry_in, basis)
         if defer is not None:
             failures.append(meter_check.clause())
     failures.extend(host_failures(probe, limits))
