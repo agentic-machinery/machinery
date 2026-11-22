@@ -324,7 +324,7 @@ def refuse(name, frame):
 
 
 def candidate_spec(name, path, target):
-    cand = [tree] if path is None else [p for p in path if p == tree or p.startswith(prefix)]
+    cand = [tree] if path is None else [p for p in path if isinstance(p, str) and (p == tree or p.startswith(prefix))]
     spec = path_finder.find_spec(name, cand, target) if cand else None
     if spec is not None and spec.loader is None and spec.submodule_search_locations is not None:
         # Keep _NamespacePath (required by importlib.resources.NamespaceReader), but bind its
