@@ -246,17 +246,28 @@ function waitingSeats(payload) {
   return count;
 }
 
+const failedNotice = new Set();
+
+function rememberStatus(panelId, sentence) {
+  if (typeof queueMicrotask !== "function") return;
+  queueMicrotask(() => {
+    const region = typeof document === "object" && document && typeof document.getElementById === "function"
+      ? document.getElementById(`${panelId}-status`) : null;
+    if (region) region.textContent = sentence;
+  });
+}
+
 function notice(sentence, panelId, label) {
-  // The runner announces a successful response as loaded. Say the visible failure after that.
-  if (typeof queueMicrotask === "function") {
-    queueMicrotask(() => {
-      const region = typeof document === "object" && document && typeof document.getElementById === "function"
-        ? document.getElementById(`${panelId}-status`) : null;
-      if (region) region.textContent = sentence;
-    });
-  }
+  // The runner announces a successful response as loaded, and it will not say loaded again.
+  failedNotice.add(panelId);
+  rememberStatus(panelId, sentence);
   return `<p class="error">${escapeHtml(sentence)}</p>`
     + `<p><button type="button" class="retry" data-retry-panel="${escapeHtml(panelId)}" aria-label="Retry ${escapeHtml(label)}">Retry</button></p>`;
+}
+
+function recoverNotice(panelId, label) {
+  if (!failedNotice.delete(panelId)) return;
+  rememberStatus(panelId, `${label} loaded.`);
 }
 
 function selectable(id) {
@@ -358,6 +369,7 @@ function renderSeats(payload) {
   if (!rosterReady(payload) || !payload.seats.every(row => row && typeof row.seat === "string" && row.seat)) {
     return notice("Seat list unavailable", "seats", "Seats");
   }
+  recoverNotice("seats", "Seats");
   return table(SEAT_HEADERS, payload.seats.map(row => [
     text(row.seat),
     tokenCell(row.kind),
@@ -402,7 +414,9 @@ function revealMessages() {
   if (typeof location !== "object" || !location || location.hash !== "#messages") return;
   if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return;
   const target = document.getElementById("messages");
+  const seats = document.getElementById("seats-content");
   if (!target || typeof target.getBoundingClientRect !== "function") return;
+  if (!seats || typeof seats.querySelector !== "function" || seats.querySelector("p.error")) return;
   const header = typeof document.querySelector === "function" ? document.querySelector("header") : null;
   const headerHeight = header && typeof header.getBoundingClientRect === "function"
     ? header.getBoundingClientRect().height : 0;
@@ -428,6 +442,7 @@ function renderMessages(payload) {
   if (payload.total === 0) {
     if (rows.length !== 0) return notice("Message log unavailable", "messages", "Messages");
     const since = payload.filters && typeof payload.filters.since === "string" ? payload.filters.since : "7d";
+    recoverNotice("messages", "Messages");
     return emptyDeliveries(since);
   }
   const built = [];
@@ -468,6 +483,7 @@ function renderMessages(payload) {
   const next = Number.isInteger(payload.next_offset) && payload.next_offset > offset ? pageHref(payload.next_offset) : "";
   const links = [prev ? `<a href="${escapeHtml(prev)}">Previous</a>` : "", next ? `<a href="${escapeHtml(next)}">Next</a>` : ""].filter(Boolean).join(" ");
   const pager = `<p class="pager"><span>${start}–${end} of ${payload.total}</span>${links ? ` ${links}` : ""}</p>`;
+  recoverNotice("messages", "Messages");
   if (!built.length) return `<p class="muted">No rows on this page.</p>${pager}`;
   return table(["When", "From to To", "Kind", "Message id", "State", "Attempts", "Waited"], built, true) + pager;
 }
