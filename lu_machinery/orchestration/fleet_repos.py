@@ -404,6 +404,28 @@ def canonical_repository(value: str) -> str:
     raise FleetRepoError("PR repository must be owner/name")
 
 
+_EXACT_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def repository_slugs(spelling: object) -> tuple[str, ...]:
+    """Every baked slug of the repository an exact owner/name *spelling* names.
+
+    A spelling of either baked slug of a registry row (case-insensitive, as
+    GitHub slugs are) returns that row's baked slugs, so a payload written
+    before or after a transfer binds to the same repository. An unregistered
+    owner/name returns only itself. Anything else (a registry key, a URL,
+    surrounding whitespace, a non-string) names no repository and returns
+    ``()``. An unreadable catalog raises ``FleetRepoError``.
+    """
+    if not isinstance(spelling, str) or not _EXACT_SLUG.fullmatch(spelling):
+        return ()
+    folded = spelling.casefold()
+    for repo in _repository_catalog(_CONFIG_PATH.resolve()).values():
+        if any(folded == slug.casefold() for slug in repo.slugs):
+            return repo.slugs
+    return (spelling,)
+
+
 def pull_request_repository(payload: Any, *, scoped_repository: str | None = None) -> str | None:
     """Read the PR's base repository, never its possibly forked head repository.
 
@@ -494,6 +516,7 @@ __all__ = [
     "load_fleet_repos",
     "main",
     "pull_request_repository",
+    "repository_slugs",
     "resolve_active_fleet_repo",
     "resolve_fleet_repo",
     "resolve_fleet_repo_by_slug",

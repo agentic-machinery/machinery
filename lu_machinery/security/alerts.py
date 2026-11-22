@@ -36,6 +36,7 @@ from lu_machinery.orchestration.fleet_repos import (
     FleetRepoError,
     canonical_repo_key,
     load_fleet_repos,
+    repository_slugs,
 )
 from lu_machinery.review.model_catalog import ModelCatalogError, load_model_catalog, validate_catalog
 from lu_machinery.review.role_resolution import RoleCandidate, resolve_role
@@ -969,6 +970,14 @@ def _workflow_run_path_matches(path: Any, filename: str) -> bool:
     return _REF_RE.fullmatch(path[len(prefix) :]) is not None
 
 
+def _repository_slugs(owner: str, name: str) -> tuple[str, ...]:
+    """Both baked slugs of the scanned repository, so a payload already naming its transfer slug binds."""
+    try:
+        return repository_slugs(f"{owner}/{name}")
+    except FleetRepoError:
+        return ()
+
+
 def _run_record(
     owner: str, name: str, filename: str, run: Mapping[str, Any], branch: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -984,18 +993,19 @@ def _run_record(
     full_name = head_repository.get("full_name") if isinstance(head_repository, Mapping) else None
     if not isinstance(event, str) or not isinstance(full_name, str):
         return None, "github_invalid_payload"
-    if event not in _ALLOWED_RUN_EVENTS or full_name != f"{owner}/{name}":
+    slugs = _repository_slugs(owner, name)
+    if event not in _ALLOWED_RUN_EVENTS or full_name not in slugs:
         return None, "run_not_on_default_branch"
     head_sha = run.get("head_sha")
     safe_sha = head_sha if isinstance(head_sha, str) and _FULL_SHA_RE.fullmatch(head_sha) else None
     html_url = run.get("html_url")
-    expected_url = f"https://github.com/{owner}/{name}/actions/runs/{run_id}"
+    expected_urls = tuple(f"https://github.com/{slug}/actions/runs/{run_id}" for slug in slugs)
     return {
         "path": f".github/workflows/{filename}",
         "run_id": run_id,
         "head_sha": safe_sha,
         "conclusion": _sanitize_text(run.get("conclusion")) or None,
-        "html_url": html_url if html_url == expected_url else None,
+        "html_url": html_url if html_url in expected_urls else None,
     }, None
 
 
@@ -1003,7 +1013,7 @@ def _annotation_endpoint(owner: str, name: str, check_run_url: Any) -> str | Non
     if not isinstance(check_run_url, str):
         return None
     matched = _CHECK_RUN_URL_RE.fullmatch(check_run_url)
-    if not matched or matched.group(1) != owner or matched.group(2) != name:
+    if not matched or f"{matched.group(1)}/{matched.group(2)}" not in _repository_slugs(owner, name):
         return None
     return _repo_api(owner, name, f"check-runs/{matched.group(3)}/annotations?per_page=100")
 

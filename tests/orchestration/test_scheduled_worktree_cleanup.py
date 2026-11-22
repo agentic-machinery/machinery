@@ -2063,3 +2063,36 @@ def test_atomic_write_keeps_replace_error_when_unlink_fails(tmp_path, monkeypatc
         cleanup.atomic_write(tmp_path / "out.json", b"{}")
     assert any("injected unlink failure" in note for note in raised.value.__notes__)
     assert "atomic write cleanup failed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("module_name", "push"),
+    [
+        ("lu_machinery.orchestration.scheduled_worktree_cleanup",
+         ("push", "--force-with-lease=refs/heads/x:" + "a" * 40, "origin", ":refs/heads/x")),
+        ("lu_machinery.hygiene.branch_sweep",
+         ("push", "--porcelain", "--force-with-lease=refs/heads/x:" + "a" * 40, "origin", ":refs/heads/x")),
+    ],
+)
+def test_selector_failure_during_host_deletion_push_is_a_typed_refusal(tmp_path, monkeypatch, module_name, push):
+    """Defect class: a selector failure during push escapes as an uncaught exception instead of a typed refusal."""
+    import importlib
+
+    from lu_machinery.common.git_credentials import SELECTOR_ENV
+    from lu_machinery.dispatcher import write_boundary
+
+    module = importlib.import_module(module_name)
+    run = getattr(module, "_run_git", None) or module._git
+
+    def boundary_git(cwd, *args, network=False, **kwargs):
+        if args[:2] == ("remote", "get-url"):
+            return "https://github.com/learn-ukrainian/machinery.git\n"
+        raise AssertionError(f"pushed without a trusted selector: {args}")
+
+    monkeypatch.setattr(write_boundary, "_git", boundary_git)
+    monkeypatch.delenv(SELECTOR_ENV, raising=False)
+
+    result = run(tmp_path, *push)
+
+    assert result.returncode == 1
+    assert result.stderr.startswith("host deletion refused: fleet repository selector")

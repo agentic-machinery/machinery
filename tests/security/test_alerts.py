@@ -1172,3 +1172,30 @@ def test_single_caller_run_keeps_its_state(finding: bool) -> None:
     assert evidence["reason"] is None
     assert [item["caller"] for item in evidence["findings"]] == (["Fleet security"] if finding else [])
     assert [run["gate_conclusion"] for run in evidence["runs"]] == ["failure" if finding else "success"]
+
+
+@pytest.mark.parametrize(("payload_slug", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
+def test_run_links_bind_either_baked_slug_of_the_scanned_repository(monkeypatch, payload_slug, accepted):
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (scanned as org/repo)."""
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch)
+    run_url = f"https://github.com/{payload_slug}/actions/runs/9"
+    run = {
+        "id": 9, "path": ".github/workflows/fleet-security.yml", "head_branch": "main", "status": "completed",
+        "event": "schedule", "head_repository": {"full_name": payload_slug}, "head_sha": "a" * 40,
+        "conclusion": "success", "html_url": run_url,
+    }
+
+    record, error = alerts_module._run_record("org", "repo", "fleet-security.yml", run, "main")
+    endpoint = alerts_module._annotation_endpoint(
+        "org", "repo", f"https://api.github.com/repos/{payload_slug}/check-runs/5",
+    )
+
+    if accepted:
+        assert error is None and record["html_url"] == run_url
+        assert endpoint == "repos/org/repo/check-runs/5/annotations?per_page=100"
+    else:
+        assert (record, error) == (None, "run_not_on_default_branch")
+        assert endpoint is None

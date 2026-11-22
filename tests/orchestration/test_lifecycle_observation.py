@@ -6,10 +6,15 @@ import shutil
 
 import pytest
 
+from lu_machinery.orchestration import lifecycle_observation as lo
 from lu_machinery.orchestration import merge_closeout as mc
 from lu_machinery.orchestration import task_lifecycle as tl
+from tests.orchestration import closeout_fixtures
 from tests.orchestration.test_merge_closeout import add_worktree, git, init_repo
 from tests.orchestration.test_task_lifecycle import NOW, _body, _ledger, _observation
+from tests.test_fleet_repos import transferred_catalog
+
+bound_case = closeout_fixtures.bound_case
 
 
 @pytest.fixture
@@ -592,3 +597,27 @@ def test_task_commit_range_refuses_ambiguous_absorbed_merge(observation_case):
     with pytest.raises(lo.ObservationRefusal, match="LIFECYCLE_LOCAL_OBSERVATION_INCOMPLETE"):
         lo.before_reap(repo, worktree)
     assert ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize(("payload_slug", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
+def test_merged_run_evidence_binds_either_baked_slug_of_the_ledger_repository(
+    bound_case, monkeypatch, payload_slug, accepted
+):
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (ledger and evidence recorded as org/repo)."""
+    transferred_catalog(monkeypatch)
+    _, observation, pull, run, jobs = bound_case
+    run_url = f"https://github.com/{payload_slug}/actions/runs/123"
+    pull["html_url"] = f"https://github.com/{payload_slug}/pull/77"
+    pull["base"]["repo"]["full_name"] = payload_slug
+    run.update(html_url=run_url, repository={"full_name": payload_slug})
+    jobs[0]["html_url"] = f"{run_url}/job/456"
+    observation["github"]["pr"]["url"] = pull["html_url"]
+
+    if not accepted:
+        with pytest.raises(lo.ObservationRefusal, match="CLOSEOUT_MERGED_PR_MISMATCH"):
+            closeout_fixtures.derive(bound_case)
+        return
+    _, report = closeout_fixtures.derive(bound_case)
+    assert report["run_url"] == run_url
+    assert [item["executed"][0]["url"] for item in report["criteria"]] == [f"{run_url}/job/456"]

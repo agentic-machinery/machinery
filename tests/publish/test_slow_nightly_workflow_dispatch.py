@@ -474,6 +474,32 @@ def test_dismissal_fixes_endpoint_state_and_replays_scanned_comment(dismissal_tr
     assert pub.ENUMS["reason"] == {"completed", "not planned"}
 
 
+@pytest.mark.parametrize(("payload_slug", "accepted"), [("unit/public", True), ("neworg/public", True), ("evil/public", False)])
+def test_dismissal_binds_either_baked_slug_of_the_repository(dismissal_transport, monkeypatch, payload_slug, accepted):
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (dismissed through unit/public)."""
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch, github="unit/public", alternate="neworg/public")
+    documents, writes, _, options, sender, comment = dismissal_transport
+    comment = comment.replace("/unit/public/", f"/{payload_slug}/")
+    options["readback"] = {"dismissed_comment": comment}
+    documents["pulls/2"]["html_url"] = f"https://github.com/{payload_slug}/pull/2"
+    for number in (3, 4):
+        documents[f"pulls/{number}"]["url"] = f"https://github.com/{payload_slug}/pull/{number}"
+
+    if not accepted:
+        with pytest.raises(gate.PublishBlocked):
+            pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+                        comment=comment, runner=sender, capture_output=True, text=True)
+        assert writes == []
+        return
+    answer = pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
+                         comment=comment, runner=sender, capture_output=True, text=True)
+    assert answer.returncode == 0
+    assert len(writes) == 1
+
+
 @pytest.mark.parametrize("change", [
     {"number": 0}, {"number": True}, {"number": "1"}, {"reason": "completed"}, {"reason": "mitigated"},
     {"comment": "Alert #1 - https://github.com/unit/public/pull/2"},

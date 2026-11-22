@@ -318,14 +318,26 @@ def record_changelog(
     """Add the release's section under Unreleased and its compare link; idempotent per version.
 
     ``previous`` is the last tag, which the Unreleased link names. ``since`` (default ``previous``) is
-    the release the notes start from, which the version's compare link starts from.
+    the release the notes start from, which the version's compare link starts from. The existing
+    Unreleased link may name either baked slug of a transferred repository; the new links name ``repo``.
     """
     if f"\n## [{version}]" in text:
         return text
     unreleased = _UNRELEASED
-    link = f"[Unreleased]: https://github.com/{repo}/compare/v{previous}...HEAD\n"
-    if text.count(unreleased) != 1 or text.count(link) != 1:
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, repository_slugs
+
+    try:
+        slugs = repository_slugs(repo)
+    except FleetRepoError as exc:
+        raise CutError(f"the fleet repository registry is unreadable: {exc}") from exc
+    found = [
+        link
+        for link in dict.fromkeys(f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD\n" for slug in slugs)
+        if link in text
+    ]
+    if text.count(unreleased) != 1 or len(found) != 1 or text.count(found[0]) != 1:
         raise CutError("CHANGELOG.md lacks one Unreleased heading and its compare link to the previous tag")
+    link = found[0]
     unreleased_must_be_empty(text)
     heading = f'<a id="v{version}"></a>\n## [{version}] - {date}' + (" [YANKED]" if yanked else "")
     section = f"{heading}\n\n{notes.rstrip()}\n\n"

@@ -190,18 +190,36 @@ def stream_epic_url(repository: str, number: int) -> str:
     return f"https://github.com/{repository}/issues/{number}"
 
 
+def _epic_repository_slugs(epic_repository: str) -> tuple[str, ...]:
+    """Both baked slugs of the epic's repository; an unreadable fleet catalog matches nothing."""
+    try:
+        return fleet_repos.repository_slugs(epic_repository)
+    except fleet_repos.FleetRepoError:
+        return ()
+
+
 def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -> bool:
     url = identity["stream_epic_url"]
+    slugs = _epic_repository_slugs(epic_repository)
     if url is None:
         repository = identity["repository"]
-        return repository_identity_valid(repository) and repository.casefold() == epic_repository.casefold()
-    return isinstance(url, str) and url.casefold() == stream_epic_url(epic_repository, identity["stream_epic"]).casefold()
+        return repository_identity_valid(repository) and any(
+            repository.casefold() == slug.casefold() for slug in slugs
+        )
+    return isinstance(url, str) and any(
+        url.casefold() == stream_epic_url(slug, identity["stream_epic"]).casefold() for slug in slugs
+    )
 
 
 def stream_registry_repository(repository: str) -> str:
-    """Bind the numeric stream registry to its owner in the fleet catalog."""
+    """Bind the numeric stream registry to its owner in the fleet catalog.
+
+    Either baked slug of a transferred row is that row, so tasks recorded before the move stay bound.
+    """
     repos = fleet_repos.load_fleet_repos().values()
-    if not any(repo.github.casefold() == repository.casefold() for repo in repos):
+    if not isinstance(repository, str) or not any(
+        repository.casefold() == slug.casefold() for repo in repos for slug in repo.slugs
+    ):
         raise LifecycleError("task repository is not configured in the fleet")
     owners = [repo.github for repo in repos if repo.role == "public-monorepo"]
     if len(owners) != 1 or not repository_identity_valid(owners[0]):

@@ -324,11 +324,13 @@ def bound_rollup_judgment(
                 continue
             details = row.get("detailsUrl")
             # The GitHub adapter projects html_url as detailsUrl. Accept that
-            # representation only when its canonical URL binds the REST ID.
+            # representation only when its canonical URL, under either baked
+            # slug of the repository, binds the REST ID.
             matches = [run for run in runs if run.get("name") == row.get("name") and details and (
                 run.get("details_url") == details or (
                     type(run.get("id")) is int and run["id"] > 0
-                    and details == run.get("html_url") == f"https://github.com/{repo}/runs/{run['id']}"
+                    and details == run.get("html_url")
+                    and details in _repository_urls(repo, f"runs/{run['id']}")
                 )
             )]
             if len(matches) != 1:
@@ -337,6 +339,18 @@ def bound_rollup_judgment(
         if external_advisory_names(rows) != names:
             advisory = prove_external_advisory(repo, head, external_advisory_names(rows), get_json)
     return None if advisory is None else _judge_status_rollup_rows(rows, advisory=advisory)
+
+
+def _repository_urls(repo, path):
+    """``https://github.com/<slug>/<path>`` for each baked slug of *repo*; nothing when unknown."""
+    # Imported here: the fleet catalog stays out of this module's import closure.
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, repository_slugs
+
+    try:
+        slugs = repository_slugs(repo)
+    except FleetRepoError:
+        return ()
+    return tuple(f"https://github.com/{slug}/{path}" for slug in slugs)
 
 
 def _duplicate_check_names(rows):

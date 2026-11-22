@@ -150,8 +150,16 @@ def entire_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_docume
     return runner
 
 
-def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
-    """Distinct vendor details and canonical check URLs must preserve App proof."""
+@pytest.mark.parametrize(("run_slug", "accepted"), [("unit/public", True), ("neworg/public", True), ("evil/public", False)])
+def test_oo48_publisher_proves_entire_gates_at_the_metadata_head(monkeypatch, run_slug, accepted):
+    """Distinct vendor details and canonical check URLs must preserve App proof.
+
+    Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (canonical check URL under run_slug).
+    """
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch, github="unit/public", alternate="neworg/public")
     calls = []
     app = {"id": 2626939, "slug": "entire"}
     old = {"name": "Body guard", "head_sha": HEAD, "status": "completed", "conclusion": "cancelled",
@@ -164,7 +172,7 @@ def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
             {"name": "CI Gate", "head_sha": HEAD, "status": "completed", "conclusion": "success",
              "details_url": "https://github.com/unit/public/runs/23"},
             {"name": "Entire Gates", "head_sha": HEAD, "status": "in_progress", "app": app,
-             "id": 24, "html_url": "https://github.com/unit/public/runs/24",
+             "id": 24, "html_url": f"https://github.com/{run_slug}/runs/24",
              "details_url": "https://entire.com/gh/unit/public/trails/7"}]
     rollup = [{"__typename": "CheckRun", "name": row["name"], "status": row["status"].upper(),
                "conclusion": str(row.get("conclusion") or "").upper(),
@@ -180,6 +188,10 @@ def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
                                                        "workflow_id": 7, "name": "Body guard"}}
     runner = entire_runner(app, calls, bound={"headRefOid": HEAD, "statusCheckRollup": rollup},
                            extra_documents=documents)
+    if not accepted:
+        with pytest.raises(PublishBlocked):
+            ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD)
+        return
     assert ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD) == HEAD
     assert [call[1:6] for call in calls] == [
         ["pr", "view", "1", "--json", "number,isDraft,headRefOid,mergeStateStatus"],
