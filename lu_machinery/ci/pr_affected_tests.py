@@ -281,11 +281,14 @@ IMPORT_PROBE_TIMEOUT = 60
 # allowed distribution's own dependencies load, and it is imported first, so a name it brings
 # adds no requirement. A lookup alone (`importlib.util.find_spec`) is not an import: it finds
 # what the path holds. A dotted lookup imports the parent package first; that load is an import.
-# Python answers a request for a loaded module from sys.modules without asking a finder, so
-# `__import__` and `importlib.import_module` check such a request too: an allowed distribution's
-# own dependencies are loaded, but first-party code may not import them by name.
+# Python answers a request for a loaded module from sys.modules without asking a finder, so the
+# two entry points every Python-level request passes through check it too, by its absolute name:
+# `builtins.__import__` (import statements, `__import__` and the C API's `PyImport_Import`) and
+# `importlib._bootstrap._gcd_import` (`importlib.import_module`, `importlib.__import__`). An
+# allowed distribution's own dependencies are loaded, but first-party code may not import them.
 _CONTRACT_PROBE = r"""
 import builtins, importlib, json, sys
+from importlib import _bootstrap
 tree, package, report, allowed, roots, *sites = sys.argv[1:]
 allowed, roots = frozenset(filter(None, allowed.split(","))), roots.split(",")
 sys.path[:0] = [tree]
@@ -322,16 +325,26 @@ def cached(name, frame):
         refuse(top, caller(frame)[0])
 
 
+def absolute(name, package, level):
+    # An invalid relative request fails in the import itself.
+    try:
+        return _bootstrap._resolve_name(name, package, level) if level else name
+    except Exception:
+        return ""
+
+
 def checked_import(name, globals=None, locals=None, fromlist=(), level=0, _import=builtins.__import__):
-    if level == 0:
-        cached(name, sys._getframe(1))
+    try:
+        package = _bootstrap._calc___package__(globals) if level else None
+    except Exception:
+        package = None
+    cached(absolute(name, package, level), sys._getframe(1))
     return _import(name, globals, locals, fromlist, level)
 
 
-def checked_import_module(name, package=None, _import_module=importlib.import_module):
-    if not name.startswith("."):
-        cached(name, sys._getframe(1))
-    return _import_module(name, package)
+def checked_gcd_import(name, package=None, level=0, _gcd_import=_bootstrap._gcd_import):
+    cached(absolute(name, package, level), sys._getframe(1))
+    return _gcd_import(name, package, level)
 
 
 class Contract:
@@ -347,9 +360,9 @@ class Contract:
         return None
 
 
-wrappers = (checked_import.__code__, checked_import_module.__code__)
+wrappers = (checked_import.__code__, checked_gcd_import.__code__)
 sys.meta_path.insert(0, Contract)
-builtins.__import__, importlib.import_module = checked_import, checked_import_module
+builtins.__import__, _bootstrap._gcd_import = checked_import, checked_gcd_import
 for name in [*sorted(allowed), *roots]:
     try:
         importlib.import_module(name)
