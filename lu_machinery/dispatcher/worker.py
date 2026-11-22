@@ -2296,8 +2296,8 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
     Write workers run outside the write boundary (#619), whose broker no longer hands an author its review's reply,
     and their launch context forbids reading another task's records. So ``wait --reply`` returns the reply (its
     digest checked by the recorder) to that author only: the caller is the review's running parent, the wait names
-    the review's run nonce, the review is of the parent's PR branch (its publish branch on a takeover, else its
-    worktree branch) and the parent's worktree is still at the reviewed head. Anyone else gets a typed reason, no
+    the review's run nonce, the review is of the parent's publish branch or worktree branch, and the parent's
+    worktree is still at the reviewed head. Anyone else gets a typed reason, no
     reply. Opt-in, so plain ``wait`` output stays an exact copy of the record (task_record_store.is_identical_copy).
     """
     if record.get("status") != "done" or not record.get("review_branch"):
@@ -2315,8 +2315,11 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
         return {"result_unavailable": "parent_record_unavailable"}
     if parent["status"] not in store.ACTIVE:
         return {"result_unavailable": "parent_not_running"}
-    branch = parent.get("publish_branch") or parent.get("worktree_branch")
-    if parent.get("repository_id") != record.get("repository_id") or record["review_branch"] != branch:
+    branches = {
+        branch for branch in (parent.get("publish_branch"), parent.get("worktree_branch"))
+        if isinstance(branch, str) and branch
+    }
+    if parent.get("repository_id") != record.get("repository_id") or _text(record["review_branch"]) not in branches:
         return {"result_unavailable": "review_not_of_parent_branch"}
     # Git walks up from a directory that lost its own repository, so the top level it names must be the tree.
     tree = parent.get("worktree_path")
