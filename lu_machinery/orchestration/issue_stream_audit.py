@@ -161,9 +161,22 @@ def _default_refresh_state() -> dict:
     }
 
 
+def _epoch_or_none(val: object) -> float | None:
+    """Return a finite float >= 0 for a real (non-bool) numeric epoch, else None."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    try:
+        numeric = float(val)
+    except OverflowError:
+        return None
+    if not math.isfinite(numeric) or numeric < 0:
+        return None
+    return numeric
+
+
 def _is_finite_epoch(val: object) -> bool:
     """True for a real (non-bool) int/float >= 0 suitable as a UTC epoch."""
-    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0
+    return _epoch_or_none(val) is not None
 
 
 def _validate_refresh_state(raw: object) -> dict | None:
@@ -643,7 +656,10 @@ _UniqueSafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG
 
 
 def _load_registry_doc(path: Path) -> dict:
-    doc = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueSafeLoader)
+    try:
+        doc = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueSafeLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"issue_streams.yaml is invalid YAML: {exc}") from None
     if not isinstance(doc, dict):
         raise ValueError("issue_streams.yaml must be a mapping")
     return doc
@@ -659,9 +675,9 @@ _REPO_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
 def _parse_repos(doc: dict) -> dict[str, dict]:
-    raw_repos = doc.get("repos")
-    if raw_repos is None:
+    if "repos" not in doc:
         return {}
+    raw_repos = doc["repos"]
     if not isinstance(raw_repos, dict):
         raise ValueError("issue_streams.yaml repos must be a mapping")
     parsed: dict[str, dict] = {}
@@ -671,8 +687,9 @@ def _parse_repos(doc: dict) -> dict[str, dict]:
         if not isinstance(entry, dict) or set(entry) - {"streams"} or "streams" not in entry:
             raise ValueError(f"issue_streams.yaml repository section {repo_key!r} must declare only 'streams'")
         streams = entry.get("streams")
-        if streams is not None and not isinstance(streams, dict):
-            raise ValueError(f"issue_streams.yaml repository section {repo_key!r} streams must be a mapping")
+        if not isinstance(streams, dict) or not streams:
+            raise ValueError(f"issue_streams.yaml repository section {repo_key!r} streams must be a non-empty mapping")
+        _parse_streams(streams, allow_empty_epics=True, audit_only=False)
         parsed[repo_key] = entry
     return parsed
 
@@ -722,6 +739,25 @@ def _parse_streams(streams_raw: object, *, allow_empty_epics: bool, audit_only: 
     return registry
 
 
+def _validate_registry_default_ownership(
+    doc: dict,
+    repos: dict[str, dict],
+    *,
+    default_key: str | None = None,
+    require_default: bool = False,
+) -> str | None:
+    if "streams" in doc and not isinstance(doc["streams"], dict):
+        raise ValueError("issue_streams.yaml streams must be a mapping")
+    if not repos and not require_default:
+        return None
+    resolved_default = _default_repo_key(default_key)
+    if resolved_default in repos and "streams" in doc:
+        raise ValueError(
+            f"issue_streams.yaml declares default repository {resolved_default!r} in both streams and repos"
+        )
+    return resolved_default
+
+
 def _resolve_repo_section(
     doc: dict,
     repo: str | None,
@@ -730,15 +766,12 @@ def _resolve_repo_section(
 ) -> tuple[object, bool]:
     repos = _parse_repos(doc)
     if repo is None:
+        _validate_registry_default_ownership(doc, repos, default_key=default_key, require_default=False)
         return doc.get("streams"), False
     if not isinstance(repo, str) or not repo.strip() or repo != repo.strip() or "/" in repo:
         raise ValueError(f"invalid repository key {repo!r}")
-    resolved_default = _default_repo_key(default_key)
+    resolved_default = _validate_registry_default_ownership(doc, repos, default_key=default_key, require_default=True)
     if repo in repos:
-        if repo == resolved_default and doc.get("streams") is not None:
-            raise ValueError(
-                f"issue_streams.yaml declares default repository {repo!r} in both streams and repos"
-            )
         return repos[repo].get("streams"), True
     if repo == resolved_default:
         return doc.get("streams"), False
@@ -756,16 +789,11 @@ def repo_has_registry(
         raise ValueError(f"invalid repository key {repo_key!r}")
     doc = _load_registry_doc(path)
     repos = _parse_repos(doc)
-    resolved_default = _default_repo_key(default_key)
+    resolved_default = _validate_registry_default_ownership(doc, repos, default_key=default_key, require_default=True)
     if repo_key in repos:
-        if repo_key == resolved_default and doc.get("streams") is not None:
-            raise ValueError(
-                f"issue_streams.yaml declares default repository {repo_key!r} in both streams and repos"
-            )
-        _parse_streams(repos[repo_key].get("streams"), allow_empty_epics=True, audit_only=False)
         return True
     if repo_key == resolved_default:
-        if doc.get("streams") is None:
+        if "streams" not in doc:
             return False
         _parse_streams(doc.get("streams"), allow_empty_epics=False, audit_only=False)
         return True
@@ -783,15 +811,11 @@ def repo_has_roots(
         raise ValueError(f"invalid repository key {repo_key!r}")
     doc = _load_registry_doc(path)
     repos = _parse_repos(doc)
-    resolved_default = _default_repo_key(default_key)
+    resolved_default = _validate_registry_default_ownership(doc, repos, default_key=default_key, require_default=True)
     if repo_key in repos:
-        if repo_key == resolved_default and doc.get("streams") is not None:
-            raise ValueError(
-                f"issue_streams.yaml declares default repository {repo_key!r} in both streams and repos"
-            )
         return bool(_parse_streams(repos[repo_key].get("streams"), allow_empty_epics=True, audit_only=False))
     if repo_key == resolved_default:
-        if doc.get("streams") is None:
+        if "streams" not in doc:
             return False
         return bool(_parse_streams(doc.get("streams"), allow_empty_epics=False, audit_only=False))
     return False
@@ -1153,63 +1177,70 @@ def _is_nonneg_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _is_valid_subissue_page(page: object, *, allow_zero_number: bool = False) -> bool:
+def _is_valid_repo_slug(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    owner, sep, name = stripped.partition("/")
+    return bool(sep and owner and name and "/" not in name and stripped == value)
+
+
+def _is_valid_subissue_page(
+    page: object,
+    *,
+    allow_zero_number: bool = False,
+    require_node_repo: bool = False,
+) -> bool:
     """Validate every field consumed from a GraphQL/REST sub-issue page.
 
-    Accepts ``body`` (``str | None``), ``subIssues`` (``dict | None``; key must be
-    present), ``nodes`` (``list | None``), ``pageInfo`` (``dict | None``), and
-    per-node ``number``, ``repository.nameWithOwner``, and
-    ``subIssuesSummary.total`` (non-negative ``int``, excluding ``bool``).
+    Requires a complete ``subIssues`` connection (``dict`` with ``nodes`` list
+    and ``pageInfo`` dict carrying a boolean ``hasNextPage`` and ``str | None``
+    ``endCursor``), ``body`` (``str | None``), and typed child node fields
+    (``number``, optional/required ``repository.nameWithOwner``, and
+    ``subIssuesSummary.total`` as a non-negative ``int`` excluding ``bool``).
     """
     if not isinstance(page, dict):
         return False
     body = page.get("body")
     if body is not None and not isinstance(body, str):
         return False
-    if "subIssues" not in page:
-        return False
-    sub_issues = page["subIssues"]
-    if sub_issues is None:
-        return True
+    sub_issues = page.get("subIssues")
     if not isinstance(sub_issues, dict):
         return False
-    if "nodes" not in sub_issues or "pageInfo" not in sub_issues:
+    nodes = sub_issues.get("nodes")
+    if not isinstance(nodes, list):
         return False
-    nodes = sub_issues["nodes"]
-    if nodes is not None:
-        if not isinstance(nodes, list):
+    for node in nodes:
+        if not isinstance(node, dict):
             return False
-        for node in nodes:
-            if not isinstance(node, dict):
+        num = node.get("number")
+        if not (_is_nonneg_int(num) if allow_zero_number else _is_positive_int(num)):
+            return False
+        repo_obj = node.get("repository")
+        if require_node_repo:
+            if not isinstance(repo_obj, dict) or not _is_valid_repo_slug(repo_obj.get("nameWithOwner")):
                 return False
-            num = node.get("number")
-            if not (_is_nonneg_int(num) if allow_zero_number else _is_positive_int(num)):
+        elif repo_obj is not None:
+            if not isinstance(repo_obj, dict):
                 return False
-            repo_obj = node.get("repository")
-            if repo_obj is not None:
-                if not isinstance(repo_obj, dict):
-                    return False
-                nwo = repo_obj.get("nameWithOwner")
-                if nwo is not None and not isinstance(nwo, str):
-                    return False
-            summary = node.get("subIssuesSummary")
-            if summary is not None:
-                if not isinstance(summary, dict):
-                    return False
-                total = summary.get("total")
-                if total is not None and not _is_nonneg_int(total):
-                    return False
-    page_info = sub_issues["pageInfo"]
-    if page_info is not None:
-        if not isinstance(page_info, dict):
-            return False
-        has_next = page_info.get("hasNextPage")
-        if has_next is not None and not isinstance(has_next, bool):
-            return False
-        end_cursor = page_info.get("endCursor")
-        if end_cursor is not None and not isinstance(end_cursor, str):
-            return False
-    return True
+            nwo = repo_obj.get("nameWithOwner")
+            if nwo is not None and not _is_valid_repo_slug(nwo):
+                return False
+        summary = node.get("subIssuesSummary")
+        if summary is not None:
+            if not isinstance(summary, dict):
+                return False
+            total = summary.get("total")
+            if total is not None and not _is_nonneg_int(total):
+                return False
+    page_info = sub_issues.get("pageInfo")
+    if not isinstance(page_info, dict):
+        return False
+    has_next = page_info.get("hasNextPage")
+    if not isinstance(has_next, bool):
+        return False
+    end_cursor = page_info.get("endCursor")
+    return end_cursor is None or isinstance(end_cursor, str)
 
 
 def _fetch_subissues_page(
@@ -1218,8 +1249,14 @@ def _fetch_subissues_page(
     repo_root: Path | None = None,
     *,
     repo_slug: str | None = None,
-) -> dict:
-    """One GraphQL page of ``issue.subIssues`` (+ ``body`` on the first page)."""
+) -> dict | None:
+    """One GraphQL page of ``issue.subIssues`` (+ ``body`` on the first page).
+
+    Returns ``None`` only when GitHub answered that the issue is absent
+    (explicit ``null`` or exact ``NOT_FOUND`` on ``["repository", "issue"]``).
+    Raises ``ValueError`` for missing envelope fields, untrusted errors, or
+    malformed pages.
+    """
     target = repo_slug if repo_slug is not None else "/".join(_repo_owner_name(repo_root))
     data = _gh_json(
         Request(
@@ -1255,41 +1292,48 @@ def _fetch_subissues_page(
     if not_found:
         if "issue" in repo_obj and repo_obj["issue"] is not None:
             raise ValueError("sub-issues payload unavailable")
-        return {"body": None, "subIssues": None}
+        return None
     if "issue" not in repo_obj:
         raise ValueError("sub-issues payload unavailable")
     issue_obj = repo_obj["issue"]
     if issue_obj is None:
-        return {"body": None, "subIssues": None}
-    if not isinstance(issue_obj, dict) or not _is_valid_subissue_page(issue_obj):
+        return None
+    if not isinstance(issue_obj, dict) or not _is_valid_subissue_page(issue_obj, require_node_repo=True):
         raise ValueError("sub-issues payload unavailable")
     return issue_obj
 
 
-def _paginate_subissues(epic: int, fetch_page: Callable[[int, str | None], dict]) -> tuple[set[int], str]:
+def _paginate_subissues(epic: int, fetch_page: Callable[[int, str | None], dict | None]) -> tuple[set[int], str]:
     """Drive cursor pagination over ``fetch_page`` and return (native, body).
 
     ``fetch_page`` is injected so this is testable without any network or
     ``gh`` subprocess — see ``tests/test_issue_stream_audit.py``. Bounded by
-    ``_MAX_SUBISSUE_PAGES``: a page with no ``endCursor`` (or ``hasNextPage``
-    false) stops the loop, and the hard page ceiling is a belt-and-suspenders
-    guard against a runaway/adversarial response.
+    ``_MAX_SUBISSUE_PAGES``: a page with ``hasNextPage`` false stops the loop,
+    ``hasNextPage: true`` without a usable cursor fails closed with
+    ``ValueError``, and the hard page ceiling is a belt-and-suspenders guard
+    against a runaway/adversarial response.
     """
     native: set[int] = set()
     body = ""
     cursor: str | None = None
     for page in range(_MAX_SUBISSUE_PAGES):
         issue = fetch_page(epic, cursor)
+        if issue is None:
+            if page == 0:
+                return set(), ""
+            raise ValueError("sub-issues payload unavailable")
         if not _is_valid_subissue_page(issue, allow_zero_number=True):
             raise ValueError("sub-issues payload unavailable")
         if page == 0:
             body = issue.get("body") or ""
-        sub_issues = issue.get("subIssues") or {}
-        native.update(n["number"] for n in (sub_issues.get("nodes") or []))
-        page_info = sub_issues.get("pageInfo") or {}
+        sub_issues = issue["subIssues"]
+        native.update(n["number"] for n in sub_issues["nodes"])
+        page_info = sub_issues["pageInfo"]
         next_cursor = page_info.get("endCursor")
-        if not page_info.get("hasNextPage") or not next_cursor:
+        if not page_info["hasNextPage"]:
             break
+        if not isinstance(next_cursor, str) or not next_cursor:
+            raise ValueError("sub-issues payload unavailable")
         cursor = next_cursor
     return native, body
 
@@ -1429,7 +1473,7 @@ def _fetch_subissue_batch(
             node_val = repository[alias]
             if node_val is None:
                 pages[number] = None
-            elif _is_valid_subissue_page(node_val):
+            elif _is_valid_subissue_page(node_val, require_node_repo=True):
                 pages[number] = node_val
             else:
                 pages[number] = INCOMPLETE_NODE
@@ -1486,7 +1530,9 @@ def _tree_membership(
                             warnings.append({"code": "unresolved_subissue", "issue": number})
                         children.setdefault(number, set())
                         continue
-                    if not isinstance(issue, dict) or not _is_valid_subissue_page(issue):
+                    if not isinstance(issue, dict) or not _is_valid_subissue_page(
+                        issue, require_node_repo=bool(repo_slug)
+                    ):
                         if warnings is not None and not any(
                             w.get("code") == "traversal_incomplete" and w.get("issue") == number for w in warnings
                         ):
@@ -1916,21 +1962,55 @@ def run_audit(
     return report
 
 
+def _is_valid_cached_report(report: object) -> bool:
+    if not isinstance(report, dict):
+        return False
+    if type(report.get("ok")) is not bool:
+        return False
+    if not _is_nonneg_int(report.get("open_total")):
+        return False
+    streams = report.get("streams")
+    if not isinstance(streams, dict):
+        return False
+    for stream_key, epics in streams.items():
+        if not isinstance(stream_key, str) or not isinstance(epics, list) or not all(_is_positive_int(e) for e in epics):
+            return False
+    orphans = report.get("orphans")
+    if not isinstance(orphans, list) or any(
+        not isinstance(o, dict) or not _is_positive_int(o.get("number")) or not isinstance(o.get("title"), str)
+        for o in orphans
+    ):
+        return False
+    multi_homed = report.get("multi_homed")
+    if not isinstance(multi_homed, list) or any(
+        not isinstance(m, dict)
+        or not _is_positive_int(m.get("number"))
+        or not isinstance(m.get("streams"), list)
+        or any(not isinstance(s, str) for s in m["streams"])
+        for m in multi_homed
+    ):
+        return False
+    if not isinstance(report.get("pending_native_link"), list):
+        return False
+    if not isinstance(report.get("closed_or_missing_epics"), list):
+        return False
+    warnings = report.get("warnings")
+    return warnings is None or (
+        isinstance(warnings, list)
+        and all(isinstance(w, dict) and isinstance(w.get("code"), str) for w in warnings)
+    )
+
+
 def read_cache(max_age_s: int) -> dict | None:
     path = state_root() / "batch_state/issue_stream_audit.json"
     try:
         report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
     except (OSError, ValueError):
         return None
-    if not isinstance(report, dict):
+    if not isinstance(report, dict) or not _is_valid_cached_report(report):
         return None
-    generated_at = report.get("generated_at")
-    if (
-        isinstance(generated_at, bool)
-        or not isinstance(generated_at, (int, float))
-        or not math.isfinite(generated_at)
-        or generated_at < 0
-    ):
+    generated_at = _epoch_or_none(report.get("generated_at"))
+    if generated_at is None:
         return None
     if time.time() - generated_at > max_age_s:
         return None
@@ -2056,7 +2136,8 @@ def membership_report_is_complete(report: object) -> bool:
         return False
     if report.get("membership_complete") is not True:
         return False
-    if not isinstance(report.get("incomplete_nodes"), list):
+    incomplete_nodes = report.get("incomplete_nodes")
+    if not isinstance(incomplete_nodes, list) or incomplete_nodes:
         return False
     warnings = report.get("warnings")
     if warnings is not None and not isinstance(warnings, list):
@@ -2084,10 +2165,8 @@ def validate_membership_report(report: object, max_age_s: int) -> dict | None:
     if not isinstance(report, dict):
         return None
 
-    generated_at = report.get("generated_at")
-    if isinstance(generated_at, bool) or not isinstance(generated_at, (int, float)):
-        return None
-    if not math.isfinite(generated_at):
+    generated_at = _epoch_or_none(report.get("generated_at"))
+    if generated_at is None:
         return None
     age = time.time() - generated_at
     if age > max_age_s or age < -CACHE_FUTURE_SKEW_S:

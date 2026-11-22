@@ -242,11 +242,16 @@ def read_parent(repository: str, number: int) -> dict | None:
     if proc.returncode:
         raise RuntimeError("parent read failed")
     doc = json_depth.loads(proc.stdout, max_depth=512)
-    repo = (doc.get("data") or {}).get("repository")
+    if not isinstance(doc, dict):
+        raise ValueError("parent repository unread")
+    data = doc.get("data")
+    repo = data.get("repository") if isinstance(data, dict) else None
+    nwo = repo.get("nameWithOwner") if isinstance(repo, dict) else None
     if (
         doc.get("errors")
         or not isinstance(repo, dict)
-        or str(repo.get("nameWithOwner", "")).casefold() != repository.casefold()
+        or not isinstance(nwo, str)
+        or nwo.casefold() != repository.casefold()
     ):
         raise ValueError("parent repository unread")
     issue = repo.get("issue")
@@ -262,8 +267,16 @@ def read_parent(repository: str, number: int) -> dict | None:
         return None
     if not isinstance(parent, dict):
         raise ValueError("parent malformed")
-    slug = (parent.get("repository") or {}).get("nameWithOwner")
-    if not lifecycle.repository_identity_valid(slug) or type(parent.get("number")) is not int or parent["number"] < 1:
+    parent_repo = parent.get("repository")
+    if not isinstance(parent_repo, dict):
+        raise ValueError("parent identity malformed")
+    slug = parent_repo.get("nameWithOwner")
+    if (
+        not isinstance(slug, str)
+        or not lifecycle.repository_identity_valid(slug)
+        or type(parent.get("number")) is not int
+        or parent["number"] < 1
+    ):
         raise ValueError("parent identity malformed")
     return {"number": parent["number"], "repository": slug}
 
@@ -762,6 +775,9 @@ def fetch_issue(repo: str, number: int) -> dict:
     data = json_depth.loads(raw, max_depth=512)
     if not isinstance(data, dict) or not isinstance(data.get("body", ""), (str, type(None))):
         raise ValueError("issue unread")
+    labels = data.get("labels")
+    if labels is not None and (not isinstance(labels, list) or any(not isinstance(item, dict) for item in labels)):
+        raise ValueError("issue unread")
     return data
 
 
@@ -806,11 +822,16 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.issue is not None:
-            target_repo = args.repo
-            if "/" not in target_repo:
-                target_repo = fleet_repos.resolve_active_fleet_repo(
-                    target_repo, repos=fleet_repos.load_fleet_repos()
-                ).active_github
+            raw_repo = args.repo.strip() if isinstance(args.repo, str) else ""
+            if not raw_repo:
+                raise ValueError("repository must be non-empty")
+            catalog = fleet_repos.load_fleet_repos()
+            active = fleet_repos.resolve_active_fleet_repo(raw_repo, repos=catalog)
+            if "/" in raw_repo and active.active_github.casefold() != raw_repo.casefold():
+                raise ValueError(
+                    f"repository {raw_repo!r} is not the active fleet slug ({active.active_github!r})"
+                )
+            target_repo = active.active_github
             with time_budget():
                 issue = fetch_issue(target_repo, args.issue)
             if args.trivial:

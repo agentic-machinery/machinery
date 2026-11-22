@@ -2521,6 +2521,7 @@ def test_a02_dor_and_closeout_resolve_moved_repo_both_selector_states_and_same_i
         # #42 in public is root_exempt, while #42 in machinery is NOT root_exempt.
         assert check_issue_task_quality.observe_membership({}, public_slug, 42)["status"] == "root_exempt"
 
+        real_read_parent = check_issue_task_quality.read_parent
         monkeypatch.setattr(
             check_issue_task_quality,
             "read_parent",
@@ -2530,14 +2531,15 @@ def test_a02_dor_and_closeout_resolve_moved_repo_both_selector_states_and_same_i
 
         # Same root number #10 in public or under the inactive slug is refused for machinery #42.
         for bad_parent_repo in (public_slug, inactive_slug):
-            monkeypatch.setattr(
-                check_issue_task_quality,
-                "read_parent",
-                lambda repo, number, target=bad_parent_repo: {"number": 10, "repository": target},
-            )
-            verdict = check_issue_task_quality.observe_membership({}, active_slug, 42)
-            assert verdict["status"] == "WARN"
-            assert verdict["errors"][0]["code"] == "membership_conflicting_ancestry"
+            with monkeypatch.context() as ctx:
+                ctx.setattr(
+                    check_issue_task_quality,
+                    "read_parent",
+                    lambda repo, number, target=bad_parent_repo: {"number": 10, "repository": target},
+                )
+                verdict = check_issue_task_quality.observe_membership({}, active_slug, 42)
+                assert verdict["status"] == "WARN"
+                assert verdict["errors"][0]["code"] == "membership_conflicting_ancestry"
 
         # Inactive slug target fails closed with membership_registry_absent.
         inactive_verdict = check_issue_task_quality.observe_membership({}, inactive_slug, 42)
@@ -2546,6 +2548,40 @@ def test_a02_dor_and_closeout_resolve_moved_repo_both_selector_states_and_same_i
 
         # Non-default repo never overwrites the shared public membership cache.
         assert check_issue_task_quality.write_membership_cache(_body_audit(), active_slug, {"epics": [10]}) is False
+
+        # DoR CLI rejects unregistered or inactive slash-form repo BEFORE calling fetch_issue (F1).
+        for bad_target in ("outside/unregistered", inactive_slug):
+            with monkeypatch.context() as ctx:
+                ctx.setattr(
+                    check_issue_task_quality,
+                    "fetch_issue",
+                    lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("fetch_issue must not run for invalid repo")),
+                )
+                assert check_issue_task_quality.main(["--issue", "42", "--repo", bad_target, "--strict", "--json"]) == 1
+
+        # DoR read_parent fails closed with ValueError (not AttributeError) on non-dict or bool repository (F4).
+        for bad_parent_stdout in (
+            "[]",
+            '{"data": true}',
+            json.dumps(
+                {
+                    "data": {
+                        "repository": {
+                            "nameWithOwner": active_slug,
+                            "issue": {"number": 42, "parent": {"number": 10, "repository": True}},
+                        }
+                    }
+                }
+            ),
+        ):
+            with monkeypatch.context() as ctx:
+                ctx.setattr(
+                    check_issue_task_quality,
+                    "read",
+                    lambda *_a, out=bad_parent_stdout, **_k: subprocess.CompletedProcess([], 0, out, ""),
+                )
+                with pytest.raises(ValueError):
+                    real_read_parent(active_slug, 42)
 
         # GhGitHubAdapter.registered_stream_epics resolves once and returns machinery's own roots,
         # never silently falling back to public's [10, 42] on a transient selector error (F1).

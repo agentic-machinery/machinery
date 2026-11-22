@@ -518,14 +518,18 @@ def test_validate_membership_report_rejects_non_dict():
 # No network/gh subprocess: ``_paginate_subissues`` takes an injected page
 # fetcher, exactly as production wires it to ``_fetch_subissues_page``.
 # --------------------------------------------------------------------------- #
-def _page(nodes, has_next, end_cursor=None, body="", child_totals=None):
+def _page(nodes, has_next, end_cursor=None, body="", child_totals=None, repo_slug="acme/repo"):
     return {
         "body": body,
         "subIssues": {
             "nodes": [
-                {"number": n, "subIssuesSummary": {"total": child_totals[n]}}
+                {
+                    "number": n,
+                    "repository": {"nameWithOwner": repo_slug},
+                    "subIssuesSummary": {"total": child_totals[n]},
+                }
                 if child_totals and n in child_totals
-                else {"number": n}
+                else {"number": n, "repository": {"nameWithOwner": repo_slug}}
                 for n in nodes
             ],
             "pageInfo": {"hasNextPage": has_next, "endCursor": end_cursor},
@@ -564,14 +568,14 @@ def test_paginate_subissues_walks_multiple_pages_past_100():
 
 
 def test_paginate_subissues_stops_without_end_cursor():
-    """``hasNextPage: true`` with no ``endCursor`` must stop, not loop forever
-    or crash trying to use a null cursor."""
+    """``hasNextPage: true`` with no usable ``endCursor`` must fail closed
+    rather than loop forever or silently return partial membership (PR1207-F5)."""
 
     def fetch_page(epic, cursor):
         return _page([1], has_next=True, end_cursor=None)
 
-    native, _body = _paginate_subissues(100, fetch_page)
-    assert native == {1}  # only the one page fetched
+    with pytest.raises(ValueError, match="sub-issues payload unavailable"):
+        _paginate_subissues(100, fetch_page)
 
 
 def test_paginate_subissues_bounded_against_runaway_pagination():
@@ -2118,13 +2122,17 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
             assert issue_stream_audit.main(["--repo", "machinery", "--check", "--json"]) == 2
             assert "open issues payload unavailable" in capsys.readouterr().err
 
-        # Malformed or omitted GraphQL sub-issue batch payloads degrade to INCOMPLETE_NODE (F5).
+        # Malformed or omitted GraphQL sub-issue batch payloads degrade to INCOMPLETE_NODE (PR1207-F5).
         for bad_batch in (
             [],
             {"data": None},
             {"data": {"repository": {}}},  # omitted alias != explicit null
             {"data": {"repository": {"i10": "not-a-dict"}}},
             {"data": {"repository": {"i10": {}}}},  # missing subIssues
+            {"data": {"repository": {"i10": {"body": "", "subIssues": None}}}},  # null connection
+            {"data": {"repository": {"i10": {"body": "", "subIssues": {"nodes": None, "pageInfo": {"hasNextPage": False}}}}}},
+            {"data": {"repository": {"i10": {"body": "", "subIssues": {"nodes": [], "pageInfo": None}}}}},
+            {"data": {"repository": {"i10": {"body": "", "subIssues": {"nodes": [], "pageInfo": {}}}}}},  # missing hasNextPage
             {"data": {"repository": {"i10": {"body": True, "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}},
             {"data": {"repository": {"i10": {"body": "", "subIssues": "bad"}}}},
             {"data": {"repository": {"i10": {"body": "", "subIssues": {"nodes": "bad", "pageInfo": {"hasNextPage": False}}}}}},
@@ -2135,7 +2143,26 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
                         "i10": {
                             "body": "",
                             "subIssues": {
-                                "nodes": [{"number": 42, "subIssuesSummary": {"total": False}}],
+                                "nodes": [{"number": 42}],  # missing child repository identity
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            },
+                        }
+                    }
+                }
+            },
+            {
+                "data": {
+                    "repository": {
+                        "i10": {
+                            "body": "",
+                            "subIssues": {
+                                "nodes": [
+                                    {
+                                        "number": 42,
+                                        "repository": {"nameWithOwner": active_slug},
+                                        "subIssuesSummary": {"total": False},
+                                    }
+                                ],
                                 "pageInfo": {"hasNextPage": False, "endCursor": None},
                             },
                         }
@@ -2158,27 +2185,46 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
             monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=absent_batch, **k: payload)
             assert issue_stream_audit._fetch_subissue_batch({10: None}, audit_root, repo_slug=active_slug) == {10: None}
 
-        # Single-page sub-issue reader fails closed with ValueError on missing envelope or malformed page (F5).
+        # Single-page sub-issue reader fails closed with ValueError on missing envelope or malformed page (PR1207-F5).
         for bad_single in (
             {},
             {"data": None},
             {"data": {}},
             {"data": {"repository": {}}},
             {"data": {"repository": {"issue": {}}}},
-            {"data": {"repository": {"issue": {"body": True, "subIssues": None}}}},
+            {"data": {"repository": {"issue": {"body": "", "subIssues": None}}}},
+            {"data": {"repository": {"issue": {"body": "", "subIssues": {"nodes": [], "pageInfo": {}}}}}},
+            {"data": {"repository": {"issue": {"body": True, "subIssues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}},
             {"data": {"repository": {"issue": {"subIssues": "bad"}}}},
-            {"data": {"repository": {"issue": {"subIssues": {"nodes": [{"number": 42, "subIssuesSummary": {"total": False}}], "pageInfo": {"hasNextPage": False}}}}}},
+            {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "subIssues": {
+                                "nodes": [{"number": 42, "repository": {"nameWithOwner": active_slug}, "subIssuesSummary": {"total": False}}],
+                                "pageInfo": {"hasNextPage": False},
+                            }
+                        }
+                    }
+                }
+            },
             {"data": {"repository": {"issue": None}}, "errors": [{"type": "FORBIDDEN", "path": ["repository", "issue"]}]},
         ):
             monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=bad_single, **k: payload)
             with pytest.raises(ValueError, match="sub-issues payload unavailable"):
                 issue_stream_audit._fetch_subissues_page(10, None, audit_root, repo_slug=active_slug)
+        # Explicit absent issue on single-page read returns None -> empty membership.
+        monkeypatch.setattr(
+            issue_stream_audit, "_gh_json", lambda *a, **k: {"data": {"repository": {"issue": None}}}
+        )
+        assert issue_stream_audit._fetch_subissues_page(10, None, audit_root, repo_slug=active_slug) is None
         with pytest.raises(ValueError, match="sub-issues payload unavailable"):
             _paginate_subissues(10, lambda _e, _c: {"subIssues": "bad"})
 
-        # End-to-end CLI check: bool total=False or omitted alias fails closed with exit 1 & membership_complete=False (F5).
+        # End-to-end CLI check: bool total=False, omitted alias, or pageInfo={} fails closed (exit 1 & incomplete) (PR1207-F5).
         for bad_graph in (
             {"data": {"repository": {}}},
+            {"data": {"repository": {"i10": {"body": "", "subIssues": {"nodes": [], "pageInfo": {}}}}}},
             {
                 "data": {
                     "repository": {
@@ -2215,6 +2261,83 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
             assert bad_report["membership_complete"] is False
             assert bad_report["ok"] is False
             assert 10 in bad_report["incomplete_nodes"]
+
+        # REST adapter rejects boolean sub_issues_summary and non-string repository_url as typed github_invalid_read (PR1207-F5).
+        from lu_machinery.common import github_client as _gh_client
+
+        for bad_rest_sub in (
+            [{"number": 42, "repository_url": f"https://api.github.com/repos/{active_slug}", "sub_issues_summary": True}],
+            [{"number": 42, "repository_url": 123, "sub_issues_summary": {"total": 0}}],
+        ):
+            def _fake_rest_runner(args, *, sub_rows=bad_rest_sub, **_kw):
+                endpoint = args[4]
+                if endpoint.endswith("/issues/10"):
+                    return subprocess.CompletedProcess(
+                        args,
+                        0,
+                        json.dumps({"number": 10, "body": "", "repository_url": f"https://api.github.com/repos/{active_slug}"}),
+                        "",
+                    )
+                if "/sub_issues" in endpoint:
+                    return subprocess.CompletedProcess(args, 0, json.dumps(sub_rows), "")
+                raise AssertionError(f"unexpected REST endpoint: {endpoint}")
+
+            proc_batch = _gh_client.rest_read(
+                "subissue-batch", active_slug, {"cursors": {10: None}, "body_roots": {10}}, runner=_fake_rest_runner
+            )
+            assert proc_batch.returncode != 0
+            assert proc_batch.github_result.error == "github_invalid_read"
+            proc_single = _gh_client.rest_read(
+                "subissues", active_slug, {"number": 10}, runner=_fake_rest_runner
+            )
+            assert proc_single.returncode != 0
+            assert proc_single.github_result.error == "github_invalid_read"
+
+        # Registry validation catches dual default even for repo=None, repos: null, streams: null, and duplicate YAML keys (F2).
+        for bad_yaml_name, bad_yaml_text in (
+            ("dual_default.yaml", "schema_version: 1\nrepos:\n  public:\n    streams:\n      epics:\n        epics: [10]\nstreams:\n  epics:\n    epics: [10]\n"),
+            ("repos_null.yaml", "schema_version: 1\nrepos: null\nstreams:\n  epics:\n    epics: [10]\n"),
+            ("streams_null.yaml", "schema_version: 1\nrepos:\n  machinery:\n    streams: null\nstreams:\n  epics:\n    epics: [10]\n"),
+            ("dup_key.yaml", "schema_version: 1\nstreams:\n  epics:\n    epics: [10]\n  epics:\n    epics: [20]\n"),
+        ):
+            bad_reg = tmp_path / bad_yaml_name
+            bad_reg.write_text(bad_yaml_text, encoding="utf-8")
+            with pytest.raises(ValueError):
+                load_registry(bad_reg)
+            with pytest.raises(ValueError):
+                issue_stream_audit.repo_has_registry("machinery", bad_reg)
+
+        # Cache reader rejects string ok, missing ok, huge int timestamp, and non-empty malformed incomplete_nodes (F3).
+        cache_file = audit_root / "batch_state" / "issue_stream_audit.json"
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        now_ts = int(time.time())
+        for bad_cache in (
+            {"generated_at": now_ts, "ok": "false", "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": [], "closed_or_missing_epics": []},
+            {"generated_at": now_ts, "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": [], "closed_or_missing_epics": []},
+            {"generated_at": 10**400, "ok": True, "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": [], "closed_or_missing_epics": []},
+        ):
+            cache_file.write_text(json.dumps(bad_cache), encoding="utf-8")
+            assert issue_stream_audit.read_cache(3600) is None
+        cache_file.unlink()
+        assert issue_stream_audit.membership_report_is_complete(
+            {
+                "generated_at": now_ts,
+                "membership_complete": True,
+                "incomplete_nodes": [False],
+                "effective_membership": {},
+                "open_issue_numbers": [],
+            }
+        ) is False
+        assert validate_membership_report(
+            {
+                "generated_at": 10**400,
+                "membership_complete": True,
+                "incomplete_nodes": [],
+                "effective_membership": {},
+                "open_issue_numbers": [],
+            },
+            3600,
+        ) is None
 
         # Missing/broken fleet catalog default fails closed instead of substituting 'public' (F1 sibling).
         monkeypatch.setattr(

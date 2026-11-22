@@ -693,7 +693,8 @@ def test_issue_create_epic_admits_only_an_explicit_cto_root(monkeypatch, capsys)
         ("unit/public", "[EPIC][x] \nTitle", ["--epic"], "EPIC_REFUSED"),
         ("unit/public", title, ["--epic", "--parent", "14"], "EPIC_REFUSED"),
         ("unit/private", title, ["--epic"], "EPIC_REFUSED"),
-        ("other.example/unit/public", title, ["--epic"], "EPIC_REFUSED"),
+        ("other.example/unit/public", title, ["--epic"], "REPO_REFUSED"),
+        ("other.example/unit/private", title, [], "REPO_REFUSED"),
         ("outside/unknown", title, ["--epic"], "REPO_REFUSED"),
     ):
         args = ["issue-create", "--repo", repo, "--title", issue_title, "--body", body, *flags]
@@ -868,15 +869,45 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
                 read_endpoints.append(endpoint)
                 if endpoint == f"repos/{active_slug}/issues/10":
                     return subprocess.CompletedProcess(
-                        argv, 0, json.dumps({"state": "open", "node_id": "M_ROOT_10"}), ""
+                        argv,
+                        0,
+                        json.dumps(
+                            {
+                                "number": 10,
+                                "state": "open",
+                                "node_id": "M_ROOT_10",
+                                "repository_url": f"https://api.github.com/repos/{active_slug}",
+                            }
+                        ),
+                        "",
                     )
                 if endpoint == f"repos/{active_slug}/issues/500":
                     return subprocess.CompletedProcess(
-                        argv, 0, json.dumps({"state": "open", "node_id": "M_CHILD_500"}), ""
+                        argv,
+                        0,
+                        json.dumps(
+                            {
+                                "number": 500,
+                                "state": "open",
+                                "node_id": "M_CHILD_500",
+                                "repository_url": f"https://api.github.com/repos/{active_slug}",
+                            }
+                        ),
+                        "",
                     )
                 if endpoint == f"repos/{public_slug}/issues/10":
                     return subprocess.CompletedProcess(
-                        argv, 0, json.dumps({"state": "open", "node_id": "P_ROOT_10"}), ""
+                        argv,
+                        0,
+                        json.dumps(
+                            {
+                                "number": 10,
+                                "state": "open",
+                                "node_id": "P_ROOT_10",
+                                "repository_url": f"https://api.github.com/repos/{public_slug}",
+                            }
+                        ),
+                        "",
                     )
                 return subprocess.CompletedProcess(argv, 1, "", "not found")
             if argv[1:3] == ["issue", "create"]:
@@ -956,9 +987,65 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
                 with pytest.raises(gate.PublishBlocked, match="allowlist malformed"):
                     pub._fleet_catalog_row("learn-ukrainian/machinery", env={})
 
-        # Foreign-host repository with matching slug is never treated as a registered GitHub fleet repo.
+        # Foreign-host repository with matching slug is never treated as a registered GitHub fleet repo (F1).
         assert pub._fleet_catalog_row(f"https://gitlab.com/{active_slug}", env={}) is None
         assert pub._fleet_catalog_row(f"https://github.com.evil.com/{active_slug}", env={}) is None
+        host_writes = []
+        with pytest.raises(gate.PublishBlocked, match="REPO_REFUSED"):
+            pub.publish(
+                "issue-create",
+                repo=f"other.example/{active_slug}",
+                title="Task",
+                body="Body",
+                runner=lambda argv, **_kw: host_writes.append(argv),
+            )
+        assert host_writes == []
+
+        # Missing/unreadable registry refuses default-repo --epic creation (F2).
+        missing_reg = tmp_path / "does_not_exist.yaml"
+        with monkeypatch.context() as ctx:
+            ctx.setattr(issue_stream_audit, "REGISTRY_PATH", missing_reg)
+            assert (
+                pub.main(
+                    [
+                        "issue-create",
+                        "--repo",
+                        public_slug,
+                        "--title",
+                        "[EPIC][epics] Default root",
+                        "--body",
+                        "Root",
+                        "--epic",
+                    ],
+                    runner=lambda argv, **_kw: host_writes.append(argv),
+                )
+                == 2
+            )
+            assert "REGISTRY_REFUSED" in capsys.readouterr().err
+        assert host_writes == []
+
+        # Malformed or mismatched parent issue lookup responses fail closed with PARENT_REFUSED (F4).
+        for bad_issue_json in (
+            json.dumps([]),
+            json.dumps({"number": 10, "state": "open", "node_id": "   ", "repository_url": f"https://api.github.com/repos/{active_slug}"}),
+            json.dumps({"number": 99, "state": "open", "node_id": "WRONG_NUM", "repository_url": f"https://api.github.com/repos/{active_slug}"}),
+            json.dumps({"number": 10, "state": "open", "node_id": "WRONG_REPO", "repository_url": f"https://api.github.com/repos/{public_slug}"}),
+        ):
+            def _bad_parent_runner(argv, *, payload=bad_issue_json, **_kw):
+                if argv[1:4] == ["api", "--method", "GET"]:
+                    return subprocess.CompletedProcess(argv, 0, payload, "")
+                raise AssertionError(f"unexpected write call: {argv}")
+
+            with monkeypatch.context() as ctx:
+                ctx.setenv(fleet_repos.SELECTOR_ENV, str(sel_file))
+                assert (
+                    pub.main(
+                        ["issue-create", "--repo", active_slug, "--parent", "10", "--title", "Task", "--body", "Body"],
+                        runner=_bad_parent_runner,
+                    )
+                    == 2
+                )
+                assert "PARENT_REFUSED" in capsys.readouterr().err
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)

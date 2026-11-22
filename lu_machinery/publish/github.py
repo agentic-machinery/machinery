@@ -894,17 +894,61 @@ def _refuse_unreadable_criteria(body):
 
 
 def _issue_node(read_runner, gh_repo, number, cwd, environment):
-    """Return the node id of an open issue, or None when it is missing, closed or a PR."""
+    """Return the node id of an open issue matching *gh_repo* and *number*, or None."""
+    from urllib.parse import urlsplit
+
+    expected_slug = _github_slug_or_none(gh_repo)
+    if expected_slug is None or type(number) is not int or number < 1:
+        return None
     result = read(
-        "issue", repo=gh_repo, number=number, runner=read_runner, cwd=cwd, env=environment,
+        "issue", repo=expected_slug, number=number, runner=read_runner, cwd=cwd, env=environment,
         capture_output=True, text=True, check=False, timeout=15,
     )
     if result.returncode:
         return None
-    document = json_depth.loads(result.stdout, max_depth=512)
-    if document.get("state") != "open" or "pull_request" in document or not isinstance(document.get("node_id"), str):
+    try:
+        document = json_depth.loads(result.stdout, max_depth=512)
+    except ValueError:
         return None
-    return document["node_id"]
+    if not isinstance(document, dict):
+        return None
+    if document.get("state") != "open" or "pull_request" in document:
+        return None
+    doc_number = document.get("number")
+    if type(doc_number) is not int or doc_number != number:
+        return None
+    node_id = document.get("node_id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        return None
+    observed_slugs = []
+    repo_url = document.get("repository_url")
+    if repo_url is not None:
+        if not isinstance(repo_url, str):
+            return None
+        parsed = urlsplit(repo_url.strip())
+        if parsed.scheme != "https" or parsed.netloc.lower() != "api.github.com" or not parsed.path.startswith("/repos/"):
+            return None
+        repo_slug = _github_slug_or_none(parsed.path.removeprefix("/repos/"))
+        if repo_slug is None:
+            return None
+        observed_slugs.append(repo_slug)
+    html_url = document.get("html_url")
+    if html_url is not None:
+        if not isinstance(html_url, str):
+            return None
+        parsed_html = urlsplit(html_url.strip())
+        if parsed_html.scheme != "https" or parsed_html.netloc.lower() != "github.com":
+            return None
+        parts = [p for p in parsed_html.path.split("/") if p]
+        if len(parts) != 4 or parts[2] != "issues" or not parts[3].isdigit() or int(parts[3]) != number:
+            return None
+        html_slug = _github_slug_or_none(f"{parts[0]}/{parts[1]}")
+        if html_slug is None:
+            return None
+        observed_slugs.append(html_slug)
+    if not observed_slugs or any(slug.casefold() != expected_slug.casefold() for slug in observed_slugs):
+        return None
+    return node_id
 
 
 def _github_slug_or_none(value):
@@ -999,20 +1043,21 @@ def _fleet_catalog_row(gh_repo, *, env=None):
 
 
 def _owns_stream_registry(active, *, default_key=None):
-    """True for the default repository or any repository with a declared section in issue_streams.yaml.
+    """True for any repository with a readable, valid section in issue_streams.yaml.
 
-    Accepts a declared per-repo section before its bootstrap root exists so CTO
-    ``--epic`` root creation succeeds before the root number is registered.
+    Validates the registry for the default repository as well as non-default
+    repositories so a missing or malformed ``issue_streams.yaml`` fails closed
+    with ``REGISTRY_REFUSED``. Accepts a declared per-repo section with
+    ``epics: []`` before its bootstrap root exists.
     """
     from lu_machinery.orchestration import issue_stream_audit
 
-    if active.repo.default:
-        return True
+    effective_default = active.repo.key if active.repo.default else default_key
     try:
         return issue_stream_audit.repo_has_registry(
             active.repo.key,
             issue_stream_audit.REGISTRY_PATH,
-            default_key=default_key,
+            default_key=effective_default,
         )
     except (OSError, ValueError) as exc:
         raise gate.PublishBlocked(f"REGISTRY_REFUSED: issue_streams.yaml is unreadable ({exc}); nothing was created.") from None
@@ -2530,7 +2575,7 @@ def publish(
         readiness_runner = merge_readiness_runner(runner)
         parent_node = None
         if verb == "issue-create":
-            policy = _issue_create_parent_policy(gh_repo, env=environment)
+            policy = _issue_create_parent_policy(dest, env=environment)
             if policy == "unregistered":
                 raise gate.PublishBlocked(
                     "REPO_REFUSED: issue-create only targets a repository registered in "
@@ -2555,7 +2600,7 @@ def publish(
                         "PARENT_REQUIRED: issue-create requires parent, the number of a registered open stream epic; "
                         "nothing was created."
                     )
-                parent_node = _parent_epic_node(readiness_runner, gh_repo, fields["parent"], cwd, environment)
+                parent_node = _parent_epic_node(readiness_runner, dest, fields["parent"], cwd, environment)
             elif "parent" in fields:
                 raise gate.PublishBlocked(
                     "PARENT_REFUSED: this repository has no stream registry, so issue-create accepts no --parent; "
