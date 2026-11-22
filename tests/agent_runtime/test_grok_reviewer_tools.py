@@ -274,26 +274,131 @@ def _is_assignment(token: str) -> bool:
     return bool(sep) and name.isascii() and name.isidentifier()
 
 
+_REDIRECT_OPERATORS = frozenset({">", ">>", "<", "<>", ">&", "<&", ">|", "&>"})
+_COMMENT_BOUNDARIES = frozenset(" \t\n;&|()<>`")
+
+
+def _strip_shell_comments(script: str) -> str:
+    """Drop unquoted comments, keeping the newline that ends each one.
+
+    ``shlex`` drops newlines, so a ``#`` token cannot tell ``note;\\n pwd``
+    (the next line runs) from ``note \\n; pwd``. A quoted ``#note`` and an
+    escaped ``\\#`` stay in the text. An apostrophe inside the comment goes
+    with it, so it cannot look like an unclosed quote.
+    """
+    out: list[str] = []
+    index = 0
+    limit = len(script)
+    state = "normal"
+    while index < limit:
+        char = script[index]
+        if state == "single":
+            out.append(char)
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+        if state == "double":
+            if char == "\\" and index + 1 < limit:
+                out.append(char)
+                out.append(script[index + 1])
+                index += 2
+                continue
+            if char == '"':
+                state = "normal"
+            out.append(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < limit:
+            out.append(char)
+            out.append(script[index + 1])
+            index += 2
+            continue
+        if char == "'":
+            state = "single"
+            out.append(char)
+            index += 1
+            continue
+        if char == '"':
+            state = "double"
+            out.append(char)
+            index += 1
+            continue
+        at_word_start = not out or out[-1] in _COMMENT_BOUNDARIES
+        if char == "#" and at_word_start:
+            index += 1
+            while index < limit and script[index] != "\n":
+                index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _active_command_substitution(script: str) -> bool:
+    """True when ``$(...)`` or a backtick is outside single quotes.
+
+    Inside double quotes ``shlex`` keeps the substitution in one word, so the
+    command it runs is never a segment. Single quotes leave it literal.
+    """
+    index = 0
+    limit = len(script)
+    state = "normal"
+    while index < limit:
+        char = script[index]
+        if state == "single":
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+        if state == "double":
+            if char == "\\" and index + 1 < limit:
+                index += 2
+                continue
+            if char == '"':
+                state = "normal"
+                index += 1
+                continue
+        elif char == "\\" and index + 1 < limit:
+            index += 2
+            continue
+        elif char == "'":
+            state = "single"
+            index += 1
+            continue
+        elif char == '"':
+            state = "double"
+            index += 1
+            continue
+        if char == "`" or (char == "$" and index + 1 < limit and script[index + 1] == "("):
+            return True
+        index += 1
+    return False
+
+
 def _shell_script_segments(script: str) -> list[list[str]]:
     """Split a shell script with ``shlex`` in POSIX mode.
 
-    ``punctuation_chars`` is the standard set plus newline and backtick.
-    ``whitespace_split`` keeps ``ok#tag`` one word. A ``#`` token starts a
-    comment through the next newline. Quotes stay one word, so ``'not;pwd'``
-    is not a command separator.
+    Continuations are folded before the bash ``$'...'`` check, because the
+    quote exists only after the join. Comments are removed before ``shlex``
+    so a quoted hash stays a word. ``punctuation_chars`` is the standard set
+    plus newline and backtick. ``whitespace_split`` keeps ``ok#tag`` one word.
     """
-    if _unquoted_special_quote(script):
-        raise _UnparsedHookShell(script)
     folded = _fold_continuations(script)
-    masked_script, quoted_operators = _mask_quoted_operators(folded)
+    if _unquoted_special_quote(folded):
+        raise _UnparsedHookShell(script)
+    stripped = _strip_shell_comments(folded)
+    if _active_command_substitution(stripped):
+        raise _UnparsedHookShell(script)
+    masked_script, quoted_operators = _mask_quoted_operators(stripped)
     lexer = shlex.shlex(masked_script, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
     lexer.whitespace_split = True
     lexer.commenters = ""
     segments: list[list[str]] = []
     current: list[str] = []
     needs_command = False
+    expect_redirect_target = False
     groups: list[bool] = []
-    comment = False
 
     def flush() -> None:
         nonlocal current, needs_command
@@ -306,13 +411,6 @@ def _shell_script_segments(script: str) -> list[list[str]]:
             groups[-1] = True
 
     for raw in lexer:
-        if comment:
-            if raw == "\n":
-                comment = False
-            continue
-        if raw == "#" or raw.startswith("#"):
-            comment = True
-            continue
         if _QUOTED_OPERATOR in raw:
             token = _restore_quoted_operators(raw, quoted_operators)
             parts = None
@@ -322,11 +420,21 @@ def _shell_script_segments(script: str) -> list[list[str]]:
         if parts is None:
             if not current and token in _UNPARSED_SHELL_WORDS:
                 raise _UnparsedHookShell(token)
+            if expect_redirect_target:
+                expect_redirect_target = False
+                continue
+            if token in _REDIRECT_OPERATORS:
+                expect_redirect_target = True
+                continue
+            if token == "<<":
+                raise _UnparsedHookShell(token)
             current.append(token)
             needs_command = False
             if groups:
                 groups[-1] = True
             continue
+        if expect_redirect_target:
+            raise _UnparsedHookShell(raw)
         for op in parts:
             if op == "(":
                 flush()
@@ -338,7 +446,7 @@ def _shell_script_segments(script: str) -> list[list[str]]:
                     raise _UnparsedHookShell(op)
                 continue
             if op in _PIPELINE_OPERATORS:
-                if needs_command:
+                if needs_command or not current:
                     raise _UnparsedHookShell(op)
                 flush()
                 needs_command = True
@@ -352,7 +460,7 @@ def _shell_script_segments(script: str) -> list[list[str]]:
                 raise _UnparsedHookShell(op)
             flush()
     flush()
-    if needs_command or groups or quoted_operators:
+    if needs_command or expect_redirect_target or groups or quoted_operators:
         raise _UnparsedHookShell(script)
     return segments
 
@@ -462,9 +570,10 @@ def _hook_script_hides_read_command(script: str, commands: tuple[str, ...], *, d
 
 def _hook_command_hides_read_command(hook_command: str, commands: tuple[str, ...]) -> bool:
     try:
-        if _unquoted_special_quote(hook_command):
+        folded = _fold_continuations(hook_command)
+        if _unquoted_special_quote(folded):
             return True
-        tokens = shlex.split(_fold_continuations(hook_command))
+        tokens = shlex.split(folded)
     except (ValueError, _UnparsedHookShell):
         return True
     return _hook_tokens_hide_read_command(tokens, commands)
@@ -683,6 +792,19 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
         "sh -c 'printf ok ||'",
         "sh -c 'printf ok; then'",
         "sh -c '()'",
+        # A quoted hash is an argument, an escaped hash is a word, and a comment
+        # ends at the newline even when the next line starts with punctuation.
+        'sh -c \'printf "%s" "#note"; pwd\'',
+        "sh -c 'printf ok; \\#\npwd'",
+        "sh -c 'printf ok # note;\npwd'",
+        # A continued line can form a bash $'...' quote only after the join.
+        "bash -c " + shlex.quote("printf ok; $" + chr(92) + chr(10) + "'true'"),
+        # A pipeline with nothing on the left, a redirect with no target, a
+        # heredoc body, and a substitution inside double quotes are unclassified.
+        "sh -c 'printf ok; | echo done'",
+        "sh -c 'printf ok >'",
+        "sh -c 'printf ok <<EOF'",
+        'sh -c \'printf "$(pwd)"\'',
     ]
     nested = "echo done"
     for _ in range(_MAX_SHELL_SCRIPT_DEPTH + 1):
@@ -722,6 +844,11 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
         "sh -c 'pwd#not'",
         "sh -c '# pwd'",
         "sh -c '   '",
+        # An apostrophe inside a comment is not an unclosed quote. A single-quoted
+        # substitution is literal. A redirect with a target is not a command.
+        "sh -c \"printf ok # it's a note\necho done\"",
+        "sh -c \"printf '$(pwd)'\"",
+        "sh -c 'printf ok > /dev/null'",
     ]
     eight = ""
     for _ in range(_MAX_SHELL_SCRIPT_DEPTH):
