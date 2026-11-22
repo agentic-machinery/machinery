@@ -1732,6 +1732,12 @@
     },
     {
       "guard": "secret_print",
+      "command_index": 780,
+      "before": false,
+      "after": true
+    },
+    {
+      "guard": "secret_print",
       "command_index": 1291,
       "before": false,
       "after": true
