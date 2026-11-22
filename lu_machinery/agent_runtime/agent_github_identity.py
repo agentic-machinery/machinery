@@ -557,6 +557,19 @@ def resolve_agent_github_identity(
     reason to silently fall through to a broader credential.
     """
     env = os.environ if environment is None else environment
+    require_verified_identity = expected_repository_id is not None or expected_visibility is not None
+    if expected_repository_id is not None and (type(expected_repository_id) is not int or expected_repository_id <= 0):
+        raise (
+            RescueIdentityError("expected-repository-id:invalid")
+            if rescue
+            else GitHubIdentityError("invalid expected repository id for the GitHub App token")
+        )
+    if expected_visibility is not None and expected_visibility not in {"public", "private"}:
+        raise (
+            RescueIdentityError("expected-visibility:invalid")
+            if rescue
+            else GitHubIdentityError("invalid expected visibility for the GitHub App token")
+        )
     if rescue:
         try:
             fields = _rescue_app_fields(env)
@@ -584,6 +597,8 @@ def resolve_agent_github_identity(
                 except Exception:
                     raise RescueIdentityError("app-token:mint_failed") from None
                 return GitHubIdentity(token=token, source="app")
+            if require_verified_identity:
+                raise RescueIdentityError("app-directory:missing")
             token = env.get("LU_AGENT_GITHUB_TOKEN")
             if token:
                 return GitHubIdentity(token=token, source="token")
@@ -672,6 +687,9 @@ def resolve_agent_github_identity(
             ),
             source="app",
         )
+
+    if require_verified_identity:
+        raise GitHubIdentityError("expected repository id or visibility requires a GitHub App installation token")
 
     token = env.get("LU_AGENT_GITHUB_TOKEN")
     if token:

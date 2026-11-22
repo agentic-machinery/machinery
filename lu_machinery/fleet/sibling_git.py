@@ -474,7 +474,7 @@ def resolve_repository(key: str, primary: Path, git: Git) -> Repository:
     spec = catalog.get(key)
     if spec is None or spec.default or key == "public":
         raise Refusal("select a registered non-default sibling repository")
-    if spec.is_dual_slug:
+    if spec.has_alternate_slug:
         try:
             active = resolve_active_fleet_repo(key, repos=catalog, registry_path=_REGISTRY_PATH.resolve())
         except FleetRepoError:

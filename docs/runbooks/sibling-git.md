@@ -73,14 +73,43 @@ active_slugs:
 
 - **Fail-closed validation:** a missing, empty, relative, symlinked, unreadable,
   malformed, duplicate-key, unknown-slug, missing-row, inside-worktree, or
-  worker-writable selector (file or parent directory writable by the current uid,
-  group, or others) is refused before any credential mint or network call.
+  worker-writable selector is refused before any credential mint or network call.
   Resolution never defaults to the old slug.
+- **Host ownership vs read-only mount:** because an owner can `chmod u+w` a file
+  on a read-write filesystem, a non-root process accepts a selector only when
+  either:
+  1. The file, parent directory, and entire ancestor chain up to `/` are owned
+     by `root` (distinct from the worker uid) and not writable by the worker,
+     group, or others; or
+  2. When owned by the same uid as the checking process, both the file and
+     parent directory reside on a kernel-enforced read-only mount (`ST_RDONLY`,
+     such as a sandbox `--ro-bind`) with no write mode bits (`0400`/`0500`).
+  Same-uid selectors on a read-write filesystem are refused.
+- **Rollout precondition and non-network preflight:** `canonical_origins` and
+  `verification_credentials` fail closed on dual-slug rows (`machinery` and
+  `infra-private`) when `LU_FLEET_REPO_SELECTOR_FILE` is absent or invalid.
+  Before installing or running a release containing dual-slug rows on a host,
+  provision the host selector file, export `LU_FLEET_REPO_SELECTOR_FILE` to
+  every dispatcher, keeper, API, launcher, and service unit, and verify the
+  non-network preflight exits `0`:
+
+  ```bash
+  .venv/bin/python -m lu_machinery.orchestration.fleet_repos selector-check
+  ```
+
+  Unmodified consumers that read `canonical_origins` or
+  `verification_credentials` (`dispatcher/cli.py`, `dispatcher/git.py`,
+  `dispatcher/store.py`, `orchestration/dispatch_settle.py`,
+  `dispatcher/write_boundary.py`, `hygiene/branch_sweep.py`) depend on this
+  precondition; A01b owns consumer adoption (including `SelectorError` refusal
+  handling in `branch_sweep.py` and recording selector receipts).
 - **Active-slug-only credentials and identity verification:** only the selected
   active slug receives credentials (`lu_machinery.common.git_credentials`
   exact-path helper and `sibling_git` origin/fetch resolution). Authenticated
   GitHub App responses must match the expected `repository_id`, active
-  `full_name`, and `visibility`; HTTP redirects stay refused.
+  `full_name`, and `visibility`; fallback to dedicated or legacy tokens is
+  refused when expected identity constraints are passed; HTTP redirects stay
+  refused.
 - **Receipts:** `lu_machinery.orchestration.fleet_repos.selector_receipt()` and
   `ActiveFleetRepo.selector_receipt()` expose `selector_value` and
   `selector_sha256` without host filesystem paths.

@@ -18,6 +18,7 @@ processes after flipping a selector or updating ``fleet_repos.yaml``.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -112,11 +113,22 @@ def _is_valid_visibility(value: Any) -> bool:
     return isinstance(value, str) and value in _VALID_VISIBILITIES
 
 
+def _current_euid() -> int:
+    return os.geteuid()
+
+
+def _is_readonly_mount(fd: int) -> bool:
+    st_rdonly = getattr(os, "ST_RDONLY", 0)
+    if not st_rdonly:
+        return False
+    return bool(os.fstatvfs(fd).f_flag & st_rdonly)
+
+
 def _is_writable_by_current_user(info: os.stat_result, path: Path) -> bool:
     mode = stat.S_IMODE(info.st_mode)
     if mode & (stat.S_IWGRP | stat.S_IWOTH):
         return True
-    euid = os.geteuid()
+    euid = _current_euid()
     if info.st_uid == euid and (mode & stat.S_IWUSR):
         return True
     if euid == 0:
@@ -124,6 +136,24 @@ def _is_writable_by_current_user(info: os.stat_result, path: Path) -> bool:
     if os.access in os.supports_effective_ids:
         return bool(os.access(path, os.W_OK, effective_ids=True))
     return bool(os.access(path, os.W_OK))
+
+
+def _assert_ancestors_not_worker_controlled(parent: Path, *, euid: int) -> None:
+    """Ensure no ancestor above a distinct-owner selector can be swapped by the worker."""
+    for ancestor in (parent, *parent.parents):
+        try:
+            anc_st = os.lstat(ancestor)
+        except OSError:
+            raise SelectorError("fleet repository selector ancestor directory is unreadable") from None
+        if stat.S_ISLNK(anc_st.st_mode) or not stat.S_ISDIR(anc_st.st_mode):
+            raise SelectorError("fleet repository selector ancestor must be a real directory")
+        mode = stat.S_IMODE(anc_st.st_mode)
+        if mode & (stat.S_IWGRP | stat.S_IWOTH):
+            raise SelectorError("fleet repository selector ancestor directory is group- or world-writable")
+        if euid != 0 and anc_st.st_uid == euid:
+            raise SelectorError("fleet repository selector ancestor directory is owned by the worker uid")
+        if euid != 0 and _is_writable_by_current_user(anc_st, ancestor):
+            raise SelectorError("fleet repository selector ancestor directory is writable")
 
 
 def _validate_selector_path_shape(raw_path: Any) -> Path:
@@ -150,24 +180,32 @@ def _validate_selector_path_shape(raw_path: Any) -> Path:
 
 
 def _assert_outside_worktrees(selector_path: Path, env: Mapping[str, str]) -> None:
-    resolved = selector_path.resolve(strict=False)
+    try:
+        resolved = selector_path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        raise SelectorError("fleet repository selector path cannot be resolved") from None
     for ancestor in resolved.parents:
         if ancestor.name == ".worktrees" or os.path.lexists(ancestor / ".git"):
             raise SelectorError("fleet repository selector must live outside any git checkout or worktree")
     for var in _WORKTREE_ROOT_ENVS:
         raw_root = env.get(var)
-        if not raw_root or not os.path.isabs(raw_root):
+        if not raw_root:
             continue
+        if not isinstance(raw_root, str) or not os.path.isabs(raw_root) or "\x00" in raw_root:
+            raise SelectorError("configured repository root is invalid for selector containment check")
         try:
             root_path = Path(raw_root).resolve(strict=False)
-        except OSError:
-            continue
+            with contextlib.suppress(FileNotFoundError):
+                os.stat(root_path)
+        except (OSError, RuntimeError):
+            raise SelectorError("configured repository root cannot be resolved for selector containment check") from None
         if resolved == root_path or resolved.is_relative_to(root_path):
             raise SelectorError("fleet repository selector must live outside configured repository roots")
 
 
 def _read_host_selector_bytes(selector_path: Path) -> bytes:
     parent = selector_path.parent
+    euid = _current_euid()
     try:
         parent_lstat = os.lstat(parent)
     except FileNotFoundError:
@@ -191,7 +229,7 @@ def _read_host_selector_bytes(selector_path: Path) -> bytes:
             raise SelectorError("fleet repository selector directory changed during validation")
         if not stat.S_ISDIR(dir_st.st_mode):
             raise SelectorError("fleet repository selector parent must be a real directory")
-        if dir_st.st_uid not in (0, os.geteuid()):
+        if dir_st.st_uid not in (0, euid):
             raise SelectorError("fleet repository selector directory has untrusted owner")
         if _is_writable_by_current_user(dir_st, parent):
             raise SelectorError("fleet repository selector directory is writable")
@@ -224,10 +262,17 @@ def _read_host_selector_bytes(selector_path: Path) -> bytes:
                 raise SelectorError("fleet repository selector changed during validation")
             if not stat.S_ISREG(file_st.st_mode):
                 raise SelectorError("fleet repository selector must be a regular file")
-            if file_st.st_uid not in (0, os.geteuid()):
+            if file_st.st_uid not in (0, euid):
                 raise SelectorError("fleet repository selector has untrusted owner")
             if _is_writable_by_current_user(file_st, selector_path):
                 raise SelectorError("fleet repository selector is writable")
+            if euid != 0 and (file_st.st_uid == euid or dir_st.st_uid == euid):
+                if not (_is_readonly_mount(file_fd) and _is_readonly_mount(dir_fd)):
+                    raise SelectorError(
+                        "fleet repository selector is owned by the worker uid on a writable filesystem"
+                    )
+            else:
+                _assert_ancestors_not_worker_controlled(parent, euid=euid)
             if file_st.st_size > _MAX_SELECTOR_BYTES:
                 raise SelectorError("fleet repository selector exceeds size limit")
             os.set_blocking(file_fd, True)

@@ -526,6 +526,9 @@ def test_registry_opts_in_exactly_the_private_sibling(https_world, tmp_path, mon
     )
     sel_file.chmod(0o400)
     sel_dir.chmod(0o500)
+    from lu_machinery.common import git_credentials
+
+    monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
     monkeypatch.setenv("LU_FLEET_REPO_SELECTOR_FILE", str(sel_file))
     try:
         git(https_world[1], "remote", "set-url", "origin", INTENDED_PRIVATE_URL)
@@ -782,13 +785,30 @@ def test_credentials_and_sibling_fetch_refuse_inactive_slug_and_wrong_authentica
         with pytest.raises(sg.Refusal, match="selector unavailable"):
             sg.resolve_repository("infra-private", https_world[0], runner(tmp_path, "https://unused.invalid", None))
 
-        # With a valid selector, ONLY the active slug gets credentials and canonical origins.
+        # With a valid selector on a read-only mount, ONLY the active slug gets credentials and canonical origins.
+        monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
         monkeypatch.setenv("LU_FLEET_REPO_SELECTOR_FILE", str(sel_file))
         active_settings = git_credentials.verification_credentials(selected_url)
         assert active_settings
         assert "http.followRedirects=false" in active_settings
         assert f"http.{selected_url}.followRedirects=false" in active_settings
         assert git_credentials.verification_credentials(inactive_url) == []
+
+        # Expected repository_id / visibility refuses non-App token fallbacks (normal and rescue).
+        with pytest.raises(identity.GitHubIdentityError, match="GitHub App installation token"):
+            identity.resolve_agent_github_identity(
+                environment={"LU_AGENT_GITHUB_TOKEN": TOKEN},
+                repository=selected_slug,
+                expected_repository_id=1282510453,
+                expected_visibility="private",
+            )
+        with pytest.raises(identity.RescueIdentityError, match="app-directory:missing"):
+            identity.resolve_agent_github_identity(
+                environment={"HOME": str(tmp_path / "no-app"), "LU_AGENT_GITHUB_TOKEN": TOKEN},
+                repository=selected_slug,
+                rescue=True,
+                expected_repository_id=1282510453,
+            )
 
         # Inactive slug origin is refused by sibling_git before any credential mint or network call.
         mint_calls = []

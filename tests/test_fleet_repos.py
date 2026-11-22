@@ -21,6 +21,9 @@ from lu_machinery.orchestration.fleet_repos import (
     selector_receipt,
     verify_repository_identity,
 )
+from lu_machinery.orchestration.fleet_repos import (
+    main as fleet_repos_main,
+)
 
 
 def test_resolve_public_uses_primary_root(tmp_path: Path):
@@ -240,6 +243,7 @@ def test_dual_slug_alias_rejects_mismatched_repository_id_or_visibility(tmp_path
         },
     )
     try:
+        monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
         monkeypatch.setenv(SELECTOR_ENV, str(sel_file))
         active = resolve_active_fleet_repo("learn-ukrainian/machinery", expected_repository_id=1445647449, expected_visibility="public")
         assert active.repo == machinery
@@ -257,6 +261,7 @@ def test_dual_slug_alias_rejects_mismatched_repository_id_or_visibility(tmp_path
             "selector_sha256": expected_digest,
         }
         assert str(sel_file) not in str(full_receipt)
+        assert fleet_repos_main(["selector-check"]) == 0
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)
@@ -271,6 +276,7 @@ def test_dual_slug_alias_rejects_mismatched_repository_id_or_visibility(tmp_path
         "whitespace",
         "control-char",
         "missing-file",
+        "same-uid-rw-file",
         "writable-file",
         "writable-dir",
         "group-writable-file",
@@ -278,6 +284,7 @@ def test_dual_slug_alias_rejects_mismatched_repository_id_or_visibility(tmp_path
         "inside-git-checkout",
         "inside-worktrees-dir",
         "inside-configured-root",
+        "configured-root-symlink-loop",
         "unknown-slug",
         "missing-row",
         "extra-row",
@@ -298,6 +305,8 @@ def test_selector_missing_unreadable_unknown_or_worker_writable_fails_closed(
     }
     cleanup_dirs: list[Path] = []
     cleanup_files: list[Path] = []
+    if case in {"unknown-slug", "missing-row", "extra-row", "duplicate-key", "bad-version"}:
+        monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
     try:
         if case == "unset":
             monkeypatch.delenv(SELECTOR_ENV, raising=False)
@@ -315,6 +324,11 @@ def test_selector_missing_unreadable_unknown_or_worker_writable_fails_closed(
             sel_dir.chmod(0o500)
             cleanup_dirs.append(sel_dir)
             monkeypatch.setenv(SELECTOR_ENV, str(sel_dir / "absent.yaml"))
+        elif case == "same-uid-rw-file":
+            sel_dir, sel_file, _ = _write_readonly_selector(tmp_path / case, valid_doc, dir_mode=0o500, file_mode=0o400)
+            cleanup_dirs.append(sel_dir)
+            cleanup_files.append(sel_file)
+            monkeypatch.setenv(SELECTOR_ENV, str(sel_file))
         elif case == "writable-file":
             sel_dir, sel_file, _ = _write_readonly_selector(tmp_path / case, valid_doc, dir_mode=0o500, file_mode=0o600)
             cleanup_dirs.append(sel_dir)
@@ -362,6 +376,17 @@ def test_selector_missing_unreadable_unknown_or_worker_writable_fails_closed(
             cleanup_dirs.append(sel_dir)
             cleanup_files.append(sel_file)
             monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+            monkeypatch.setenv(SELECTOR_ENV, str(sel_file))
+        elif case == "configured-root-symlink-loop":
+            loop_a = tmp_path / "loop-a"
+            loop_b = tmp_path / "loop-b"
+            loop_a.symlink_to(loop_b)
+            loop_b.symlink_to(loop_a)
+            sel_dir, sel_file, _ = _write_readonly_selector(tmp_path / case, valid_doc)
+            cleanup_dirs.append(sel_dir)
+            cleanup_files.append(sel_file)
+            monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
+            monkeypatch.setenv("LU_PRODUCT_ROOT", str(loop_a))
             monkeypatch.setenv(SELECTOR_ENV, str(sel_file))
         elif case == "unknown-slug":
             bad = {
@@ -416,6 +441,7 @@ def test_selector_missing_unreadable_unknown_or_worker_writable_fails_closed(
         with pytest.raises(FleetRepoError) as exc_info:
             resolve_active_fleet_repo("machinery")
         assert str(tmp_path) not in str(exc_info.value)
+        assert fleet_repos_main(["selector-check"]) == 2
 
         with pytest.raises(git_credentials.SelectorError):
             git_credentials.verification_credentials("https://github.com/learn-ukrainian/machinery.git")

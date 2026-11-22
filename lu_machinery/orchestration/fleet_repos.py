@@ -17,7 +17,10 @@ restart long-running processes after a registry or selector flip.
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
@@ -66,7 +69,7 @@ class FleetRepo:
         return (self.github,)
 
     @property
-    def is_dual_slug(self) -> bool:
+    def has_alternate_slug(self) -> bool:
         return self.alternate_github is not None
 
 
@@ -281,7 +284,7 @@ def resolve_active_fleet_repo(
         expected_repository_id=expected_repository_id,
         expected_visibility=expected_visibility,
     )
-    if not repo.is_dual_slug:
+    if not repo.has_alternate_slug:
         return ActiveFleetRepo(repo=repo, active_github=repo.github)
     entry: dict[str, Any] = {
         "key": repo.key,
@@ -442,6 +445,39 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
     return next(iter(canonical)) if canonical else scoped_repository
 
 
+def main(argv: list[str] | None = None) -> int:
+    """Non-network preflight CLI for fleet repository selector verification."""
+    parser = argparse.ArgumentParser(
+        prog="python -m lu_machinery.orchestration.fleet_repos",
+        description="Inspect or verify the host-owned dual-slug fleet repository selector without network calls.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    check = sub.add_parser(
+        "selector-check",
+        help="Verify LU_FLEET_REPO_SELECTOR_FILE fails closed and print its receipt JSON.",
+    )
+    check.add_argument(
+        "--registry",
+        type=Path,
+        default=None,
+        help="Optional fleet_repos.yaml path (default: bundled catalog).",
+    )
+    args = parser.parse_args(argv)
+    if args.command == "selector-check":
+        try:
+            receipt = selector_receipt(registry_path=args.registry)
+        except FleetRepoError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+            return 2
+        print(json.dumps({"ok": True, **receipt}))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = [
     "SELECTOR_ENV",
     "ActiveFleetRepo",
@@ -456,6 +492,7 @@ __all__ = [
     "default_repo_key",
     "load_fleet_repo_selector",
     "load_fleet_repos",
+    "main",
     "pull_request_repository",
     "resolve_active_fleet_repo",
     "resolve_fleet_repo",

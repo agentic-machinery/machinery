@@ -38,9 +38,19 @@
 # - Active slug selection for dual-slug rows is controlled by the host-owned
 #   read-only selector file named by `LU_FLEET_REPO_SELECTOR_FILE` (outside any
 #   git checkout or writable worktree, `version: 1`, `active_slugs: {<key>: <slug>}`).
-#   Resolution fails closed on a missing, unreadable, unknown, or worker-writable
-#   selector and never defaults to the old slug. Only the active slug receives
-#   credentials.
+#   The file, parent, and ancestor chain must be host-owned (root / distinct from
+#   the worker uid and non-writable), or mounted read-only (`ST_RDONLY`, e.g.
+#   sandbox `--ro-bind`). Resolution fails closed on a missing, unreadable,
+#   unknown, or worker-writable selector and never defaults to the old slug.
+#   Only the active slug receives credentials.
+# - Rollout precondition: provision the host selector file, export
+#   `LU_FLEET_REPO_SELECTOR_FILE` to every dispatcher, keeper, API, and service
+#   unit, and verify `python -m lu_machinery.orchestration.fleet_repos selector-check`
+#   exits 0 BEFORE installing a release containing dual-slug rows; unmodified
+#   consumers of `canonical_origins` and `verification_credentials` (`dispatcher/cli.py`,
+#   `dispatcher/git.py`, `dispatcher/store.py`, `orchestration/dispatch_settle.py`,
+#   `dispatcher/write_boundary.py`, `hygiene/branch_sweep.py`) fail closed without
+#   it (A01b owns consumer adoption and `branch_sweep` refusal handling).
 # - Cache/restart requirement: `lu_machinery.common.git_credentials.repository_registry`
 #   and `lu_machinery.orchestration.fleet_repos._repository_catalog` are `@cache`d
 #   in-process; restart long-running services and workers after flipping a selector
