@@ -234,7 +234,7 @@ def selecting(sources: dict[str, bytes]) -> set[str]:
 # that changes or deletes one of those files, or one of the listed files, runs the contract's
 # tests, which exercise every stage, variable and lazy path.
 _HOOK_FILES = (".githooks/", f"{_PACKAGE_DIR.name}/lib/project_interpreter.sh", f"{_PACKAGE_DIR.name}/install_git_hooks.sh")
-IMPORT_TIME_CONTRACTS: tuple[tuple[str, tuple[str, ...], frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
+IMPORT_TIME_CONTRACTS: tuple[tuple[str, tuple[str, ...], frozenset[str] | None, tuple[str, ...], tuple[str, ...]], ...] = (
     # The installed commit and push hooks' owned-path checker, with its task-record and grant
     # lookups, from a wheel installed without its dependencies. The tests copy this checkout's
     # hooks, install their delegators with the package's installer, and the hooks find their
@@ -263,12 +263,12 @@ IMPORT_TIME_CONTRACTS: tuple[tuple[str, tuple[str, ...], frozenset[str], tuple[s
      frozenset({"yaml"}), (), ("tests/test_installed_root_contract.py",)),
     # The sealed scenarios settle a qualifying receipt, which reaches the formal reviewer catalog
     # and resolver (`_formal_candidates`), the provider transport models (`_route_models`) and the
-    # recorder's attestation (`_attested_model`) through lazy imports. These modules are not
-    # dependency-free: the allowance is what main reaches, a ratchet.
+    # recorder's attestation (`_attested_model`) through lazy imports. Their test runs with every
+    # dependency installed, so no import can fail it: no growth check (allowance None), closure only.
     ("contract canary sealed receipt",
      ("review.contract_canary", "review.model_catalog", "review.reviewer_resolver", "dispatcher.providers.agy",
       "dispatcher.providers.codex", "review.record_cf_verdict"),
-     frozenset({"jsonschema", "psutil", "yaml"}), (), ("tests/test_installed_root_contract.py",)),
+     None, (), ("tests/test_installed_root_contract.py",)),
 )
 IMPORT_PROBE_TIMEOUT = 60
 # Imports one contract's roots in a fresh interpreter (-I -S: no site hooks, no preloaded
@@ -281,16 +281,15 @@ IMPORT_PROBE_TIMEOUT = 60
 # allowed distribution's own dependencies load, and it is imported first, so a name it brings
 # adds no requirement. A lookup alone (`importlib.util.find_spec`) is not an import: it finds
 # what the path holds. A dotted lookup imports the parent package first; that load is an import.
-# Python answers a request for a loaded module from sys.modules without asking a finder, so the
-# two entry points every Python-level request passes through check it too, by its absolute name:
-# `builtins.__import__` (import statements, `__import__` and the C API's `PyImport_Import`) and
-# `importlib._bootstrap._gcd_import` (`importlib.import_module`, `importlib.__import__`). An
-# allowed distribution's own dependencies are loaded, but first-party code may not import them.
+# Python answers a request for a loaded module from sys.modules without asking a finder, so a
+# name an allowed distribution has already loaded is not refused again (known limit: with the
+# yaml and psutil allowances that is only Cython's runtime modules). A contract whose allowance is
+# None has no growth check: its closure only.
 _CONTRACT_PROBE = r"""
-import builtins, importlib, json, sys
-from importlib import _bootstrap
+import importlib, json, sys
 tree, package, report, allowed, roots, *sites = sys.argv[1:]
-allowed, roots = frozenset(filter(None, allowed.split(","))), roots.split(",")
+check, roots = allowed != "*", roots.split(",")
+allowed = frozenset(filter(None, allowed.split(","))) if check else frozenset()
 sys.path[:0] = [tree]
 sys.path.extend(sites)
 inside = tuple(site.rstrip("/") + "/" for site in sites)
@@ -300,9 +299,9 @@ refused, failed, tried = [], [], set()
 
 def caller(frame):
     # The requesting code: the nearest frame outside the standard library (the import system and
-    # helpers such as importlib.resources and functools act for their caller) and these wrappers.
+    # helpers such as importlib.resources and functools act for their caller).
     loading, lookup = False, False
-    while frame is not None and (frame.f_code in wrappers or str(frame.f_globals.get("__name__")).startswith(
+    while frame is not None and (str(frame.f_globals.get("__name__")).startswith(
             "_frozen_importlib") or str(frame.f_globals.get("__name__")).partition(".")[0] in sys.stdlib_module_names):
         loading = loading or frame.f_code.co_name == "_find_and_load"
         lookup = lookup or (not loading and frame.f_globals.get("__name__") == "importlib.util"
@@ -319,40 +318,12 @@ def refuse(name, frame):
     raise ModuleNotFoundError(f"{name} is outside the import-time contract", name=name)
 
 
-def cached(name, frame):
-    top = name.partition(".")[0]
-    if top not in known and top in sys.modules:
-        refuse(top, caller(frame)[0])
-
-
-def absolute(name, package, level):
-    # An invalid relative request fails in the import itself.
-    try:
-        return _bootstrap._resolve_name(name, package, level) if level else name
-    except Exception:
-        return ""
-
-
-def checked_import(name, globals=None, locals=None, fromlist=(), level=0, _import=builtins.__import__):
-    try:
-        package = _bootstrap._calc___package__(globals) if level else None
-    except Exception:
-        package = None
-    cached(absolute(name, package, level), sys._getframe(1))
-    return _import(name, globals, locals, fromlist, level)
-
-
-def checked_gcd_import(name, package=None, level=0, _gcd_import=_bootstrap._gcd_import):
-    cached(absolute(name, package, level), sys._getframe(1))
-    return _gcd_import(name, package, level)
-
-
 class Contract:
     @staticmethod
     def find_spec(name, path=None, target=None):
         if name == package or name.startswith(package + "."):
             tried.add(name)
-        if path is not None or name.partition(".")[0] in known:
+        if not check or path is not None or name.partition(".")[0] in known:
             return None
         frame, lookup = caller(sys._getframe(1))
         if not lookup:
@@ -360,9 +331,7 @@ class Contract:
         return None
 
 
-wrappers = (checked_import.__code__, checked_gcd_import.__code__)
 sys.meta_path.insert(0, Contract)
-builtins.__import__, _bootstrap._gcd_import = checked_import, checked_gcd_import
 for name in [*sorted(allowed), *roots]:
     try:
         importlib.import_module(name)
@@ -435,8 +404,8 @@ def import_time_contracts(candidate: str) -> tuple[list[str], dict[str, frozense
             report.unlink(missing_ok=True)
             # A fixed interpreter and probe; the arguments are module names and paths, never a shell.
             command = [sys.executable, "-I", "-S", "-B", "-c", _CONTRACT_PROBE, str(tree), package, str(report),
-                       ",".join(sorted(allowed)), ",".join(f"{package}.{root}" for root in roots),
-                       *(sites if allowed else ())]
+                       "*" if allowed is None else ",".join(sorted(allowed)), ",".join(f"{package}.{root}" for root in roots),
+                       *(sites if allowed is None or allowed else ())]
             env = {"PATH": os.defpath, "HOME": scratch, "TMPDIR": scratch, "LC_ALL": "C.UTF-8"}
             try:
                 result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
