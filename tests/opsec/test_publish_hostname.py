@@ -693,7 +693,8 @@ def test_issue_create_epic_admits_only_an_explicit_cto_root(monkeypatch, capsys)
         ("unit/public", "[EPIC][x] \nTitle", ["--epic"], "EPIC_REFUSED"),
         ("unit/public", title, ["--epic", "--parent", "14"], "EPIC_REFUSED"),
         ("unit/private", title, ["--epic"], "EPIC_REFUSED"),
-        ("other.example/unit/public", title, ["--epic"], "EPIC_REFUSED"),
+        ("other.example/unit/public", title, ["--epic"], "REPO_REFUSED"),
+        ("other.example/unit/private", title, [], "REPO_REFUSED"),
         ("outside/unknown", title, ["--epic"], "REPO_REFUSED"),
     ):
         args = ["issue-create", "--repo", repo, "--title", issue_title, "--body", body, *flags]
@@ -709,6 +710,406 @@ def test_issue_create_epic_admits_only_an_explicit_cto_root(monkeypatch, capsys)
     assert sent == []
     assert pub.main(args, runner=send) == 0
     assert sent == [(["gh", "issue", "create", "--repo", "unit/public"], body, f"--title={title}")]
+
+
+@pytest.mark.usefixtures("configured_roots", "synthetic_opsec")
+@pytest.mark.parametrize(
+    ("active_slug", "inactive_slug"),
+    [
+        ("learn-ukrainian/machinery", "agentic-machinery/machinery"),
+        ("agentic-machinery/machinery", "learn-ukrainian/machinery"),
+    ],
+    ids=["pre-flip", "post-flip"],
+)
+def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_number(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    active_slug: str,
+    inactive_slug: str,
+) -> None:
+    """Defect class: an issue in a moved repo resolves to the other repo registry;
+    the same number in two repos is treated as one issue."""
+    import yaml
+
+    from lu_machinery.common import git_credentials
+    from lu_machinery.orchestration import fleet_repos, issue_stream_audit
+
+    for name in ("GH_HOST", "GH_REPO", "SESSION_EPIC", "LEARN_UKRAINIAN_DISPATCH_TASK_ID", pub.BROKER_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SESSION_SEAT", "cto")
+
+    public_slug = "learn-ukrainian/learn-ukrainian.github.io"
+    sel_dir = tmp_path / "selector"
+    sel_dir.mkdir(mode=0o700)
+    sel_file = sel_dir / "selector.yaml"
+    sel_file.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "active_slugs": {
+                    "machinery": active_slug,
+                    "infra-private": "learn-ukrainian/learn-ukrainian-infra-private",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sel_file.chmod(0o400)
+    sel_dir.chmod(0o500)
+    try:
+        monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
+        monkeypatch.setenv(fleet_repos.SELECTOR_ENV, str(sel_file))
+
+        # Pre-bootstrap (MUST-FIX 4): machinery declared with empty epics allows CTO --epic
+        # and refuses ordinary issues without a registered local root.
+        empty_streams = tmp_path / "issue_streams_empty.yaml"
+        empty_streams.write_text(
+            "schema_version: 1\n"
+            "repos:\n"
+            "  machinery:\n"
+            "    streams:\n"
+            "      epics:\n"
+            "        title: Machinery\n"
+            "        epics: []\n"
+            "streams:\n"
+            "  epics:\n"
+            "    title: Public\n"
+            "    epics: [10, 99]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", empty_streams)
+
+        assert pub._issue_create_parent_policy(active_slug) == "stream"
+        assert pub._issue_create_parent_policy("learn-ukrainian/hramatka") == "none"
+        with pytest.raises(gate.PublishBlocked, match="REPO_REFUSED"):
+            pub._issue_create_parent_policy(inactive_slug)
+
+        writes = []
+
+        def send_bootstrap(argv, **_kwargs):
+            writes.append(argv)
+            return subprocess.CompletedProcess(argv, 0, f"https://github.com/{active_slug}/issues/1216\n", "")
+
+        assert (
+            pub.main(
+                [
+                    "issue-create",
+                    "--repo",
+                    active_slug,
+                    "--title",
+                    "[EPIC][epics] Machinery root",
+                    "--body",
+                    "Root",
+                    "--epic",
+                ],
+                runner=send_bootstrap,
+            )
+            == 0
+        )
+        assert writes == [
+            [
+                "gh",
+                "issue",
+                "create",
+                "--repo",
+                active_slug,
+                "--title=[EPIC][epics] Machinery root",
+                "--body-file",
+                writes[0][writes[0].index("--body-file") + 1],
+            ]
+        ]
+
+        # Inactive slug and missing selector are refused before any write.
+        writes.clear()
+        assert (
+            pub.main(
+                [
+                    "issue-create",
+                    "--repo",
+                    inactive_slug,
+                    "--title",
+                    "[EPIC][epics] Machinery root",
+                    "--body",
+                    "Root",
+                    "--epic",
+                ],
+                runner=send_bootstrap,
+            )
+            == 2
+        )
+        assert "REPO_REFUSED" in capsys.readouterr().err
+        assert writes == []
+
+        # Post-PR-2: #10 exists in BOTH repos, #99 only in public, #20 only in machinery.
+        populated_streams = tmp_path / "issue_streams_populated.yaml"
+        populated_streams.write_text(
+            "schema_version: 1\n"
+            "repos:\n"
+            "  machinery:\n"
+            "    streams:\n"
+            "      epics:\n"
+            "        title: Machinery\n"
+            "        epics: [10, 20]\n"
+            "streams:\n"
+            "  epics:\n"
+            "    title: Public\n"
+            "    epics: [10, 99]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", populated_streams)
+
+        read_endpoints = []
+        link_payloads = []
+        created_repos = []
+
+        def transport(argv, **_kwargs):
+            if argv[1:4] == ["api", "--method", "GET"]:
+                endpoint = argv[4].split("?", 1)[0]
+                read_endpoints.append(endpoint)
+                if endpoint == f"repos/{active_slug}/issues/10":
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        json.dumps(
+                            {
+                                "number": 10,
+                                "state": "open",
+                                "node_id": "M_ROOT_10",
+                                "repository_url": f"https://api.github.com/repos/{active_slug}",
+                            }
+                        ),
+                        "",
+                    )
+                if endpoint == f"repos/{active_slug}/issues/500":
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        json.dumps(
+                            {
+                                "number": 500,
+                                "state": "open",
+                                "node_id": "M_CHILD_500",
+                                "repository_url": f"https://api.github.com/repos/{active_slug}",
+                            }
+                        ),
+                        "",
+                    )
+                if endpoint == f"repos/{public_slug}/issues/10":
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        json.dumps(
+                            {
+                                "number": 10,
+                                "state": "open",
+                                "node_id": "P_ROOT_10",
+                                "repository_url": f"https://api.github.com/repos/{public_slug}",
+                            }
+                        ),
+                        "",
+                    )
+                return subprocess.CompletedProcess(argv, 1, "", "not found")
+            if argv[1:3] == ["issue", "create"]:
+                created_repos.append(argv[argv.index("--repo") + 1])
+                return subprocess.CompletedProcess(argv, 0, f"https://github.com/{active_slug}/issues/500\n", "")
+            if argv[1:5] == ["api", "--method", "POST", "graphql"]:
+                payload = json.loads(Path(argv[argv.index("--input") + 1]).read_text())
+                link_payloads.append(payload)
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
+            raise AssertionError(f"unexpected transport call: {argv}")
+
+        # Public-only root #99 is refused in machinery; machinery-only root #20 is refused in public.
+        assert (
+            pub.main(
+                ["issue-create", "--repo", active_slug, "--parent", "99", "--title", "Task", "--body", "Body"],
+                runner=transport,
+            )
+            == 2
+        )
+        assert "PARENT_REFUSED" in capsys.readouterr().err
+
+        # During a transfer window, a parent payload naming the row's other baked slug still binds,
+        # while a payload naming a different fleet repository row is refused.
+        def transfer_window_read(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    {
+                        "number": 10,
+                        "state": "open",
+                        "node_id": "M_ROOT_10_ALT",
+                        "repository_url": f"https://api.github.com/repos/{inactive_slug}",
+                        "html_url": f"https://github.com/{inactive_slug}/issues/10",
+                    }
+                ),
+                "",
+            )
+
+        assert pub._parent_epic_node(transfer_window_read, active_slug, 10, tmp_path, None) == "M_ROOT_10_ALT"
+
+        def foreign_repo_read(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    {
+                        "number": 10,
+                        "state": "open",
+                        "node_id": "P_ROOT_10",
+                        "repository_url": f"https://api.github.com/repos/{public_slug}",
+                        "html_url": f"https://github.com/{public_slug}/issues/10",
+                    }
+                ),
+                "",
+            )
+
+        with pytest.raises(gate.PublishBlocked, match="PARENT_REFUSED"):
+            pub._parent_epic_node(foreign_repo_read, active_slug, 10, tmp_path, None)
+        assert (
+            pub.main(
+                ["issue-create", "--repo", public_slug, "--parent", "20", "--title", "Task", "--body", "Body"],
+                runner=transport,
+            )
+            == 2
+        )
+        assert "PARENT_REFUSED" in capsys.readouterr().err
+        assert created_repos == []
+
+        # Same root number #10 in machinery resolves machinery's own node ID (M_ROOT_10), never public's.
+        assert (
+            pub.main(
+                ["issue-create", "--repo", active_slug, "--parent", "10", "--title", "Task", "--body", "Body"],
+                runner=transport,
+            )
+            == 0
+        )
+        assert created_repos == [active_slug]
+        assert f"repos/{active_slug}/issues/10" in read_endpoints
+        assert f"repos/{public_slug}/issues/10" not in read_endpoints
+        assert link_payloads[-1]["variables"] == {"p": "M_ROOT_10", "c": "M_CHILD_500"}
+
+        # Missing selector fails closed on issue-create with REPO_REFUSED.
+        monkeypatch.delenv(fleet_repos.SELECTOR_ENV, raising=False)
+        assert (
+            pub.main(
+                ["issue-create", "--repo", active_slug, "--parent", "10", "--title", "Task", "--body", "Body"],
+                runner=transport,
+            )
+            == 2
+        )
+        assert "REPO_REFUSED" in capsys.readouterr().err
+
+        # Malformed alternate_github (and non-github.com hosts) fail closed (F2 + CodeQL host partition).
+        for bad_alt in (
+            123,
+            "agentic-machinery/machïnery",
+            ["agentic-machinery/machinery"],
+            "",
+            "https://github.com.evil.com/agentic-machinery/machinery",
+            "https://gitlab.com/agentic-machinery/machinery",
+        ):
+            bad_catalog = {
+                "public": {"github": public_slug, "default": True, "local_name": "p", "role": "public-monorepo"},
+                "machinery": {
+                    "github": "learn-ukrainian/machinery",
+                    "alternate_github": bad_alt,
+                    "repository_id": 1445647449,
+                    "visibility": "public",
+                    "local_name": "m",
+                    "role": "public-machinery",
+                },
+            }
+            with monkeypatch.context() as ctx:
+                ctx.setattr(gate, "catalog", lambda rows=bad_catalog: rows)
+                with pytest.raises(gate.PublishBlocked, match="allowlist malformed"):
+                    pub._fleet_catalog_row("learn-ukrainian/machinery", env={})
+
+        # Foreign-host repository with matching slug is never treated as a registered GitHub fleet repo (F1).
+        assert pub._fleet_catalog_row(f"https://gitlab.com/{active_slug}", env={}) is None
+        assert pub._fleet_catalog_row(f"https://github.com.evil.com/{active_slug}", env={}) is None
+        host_writes = []
+        with pytest.raises(gate.PublishBlocked, match="REPO_REFUSED"):
+            pub.publish(
+                "issue-create",
+                repo=f"other.example/{active_slug}",
+                title="Task",
+                body="Body",
+                runner=lambda argv, **_kw: host_writes.append(argv),
+            )
+        assert host_writes == []
+
+        # Missing, repos-only, empty, or streams:{} registry refuses default-repo issue-create (with or without --epic) (F2).
+        missing_reg = tmp_path / "does_not_exist.yaml"
+        repos_only_reg = tmp_path / "repos_only.yaml"
+        repos_only_reg.write_text(
+            "schema_version: 1\nrepos:\n  machinery:\n    streams:\n      epics:\n        epics: []\n",
+            encoding="utf-8",
+        )
+        empty_reg = tmp_path / "empty_doc.yaml"
+        empty_reg.write_text("schema_version: 1\n", encoding="utf-8")
+        empty_streams_reg = tmp_path / "empty_streams_doc.yaml"
+        empty_streams_reg.write_text("schema_version: 1\nstreams: {}\n", encoding="utf-8")
+        for bad_reg_path in (missing_reg, repos_only_reg, empty_reg, empty_streams_reg):
+            with monkeypatch.context() as ctx:
+                ctx.setattr(issue_stream_audit, "REGISTRY_PATH", bad_reg_path)
+                for cli_args in (
+                    [
+                        "issue-create",
+                        "--repo",
+                        public_slug,
+                        "--title",
+                        "[EPIC][epics] Default root",
+                        "--body",
+                        "Root",
+                        "--epic",
+                    ],
+                    [
+                        "issue-create",
+                        "--repo",
+                        public_slug,
+                        "--title",
+                        "Task without parent",
+                        "--body",
+                        "Body",
+                    ],
+                ):
+                    assert (
+                        pub.main(
+                            cli_args,
+                            runner=lambda argv, **_kw: host_writes.append(argv),
+                        )
+                        == 2
+                    )
+                    assert "REGISTRY_REFUSED" in capsys.readouterr().err
+        assert host_writes == []
+
+        # Malformed or mismatched parent issue lookup responses fail closed with PARENT_REFUSED (F4).
+        for bad_issue_json in (
+            json.dumps([]),
+            json.dumps({"number": 10, "state": "open", "node_id": "   ", "repository_url": f"https://api.github.com/repos/{active_slug}"}),
+            json.dumps({"number": 99, "state": "open", "node_id": "WRONG_NUM", "repository_url": f"https://api.github.com/repos/{active_slug}"}),
+            json.dumps({"number": 10, "state": "open", "node_id": "WRONG_REPO", "repository_url": f"https://api.github.com/repos/{public_slug}"}),
+        ):
+            def _bad_parent_runner(argv, *, payload=bad_issue_json, **_kw):
+                if argv[1:4] == ["api", "--method", "GET"]:
+                    return subprocess.CompletedProcess(argv, 0, payload, "")
+                raise AssertionError(f"unexpected write call: {argv}")
+
+            with monkeypatch.context() as ctx:
+                ctx.setenv(fleet_repos.SELECTOR_ENV, str(sel_file))
+                assert (
+                    pub.main(
+                        ["issue-create", "--repo", active_slug, "--parent", "10", "--title", "Task", "--body", "Body"],
+                        runner=_bad_parent_runner,
+                    )
+                    == 2
+                )
+                assert "PARENT_REFUSED" in capsys.readouterr().err
+    finally:
+        sel_dir.chmod(0o700)
+        sel_file.chmod(0o600)
 
 
 @pytest.mark.usefixtures('configured_roots', 'catalog')

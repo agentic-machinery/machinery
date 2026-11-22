@@ -225,20 +225,56 @@ def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -
     )
 
 
-def stream_registry_repository(repository: str) -> str:
-    """Bind the numeric stream registry to its owner in the fleet catalog.
+def stream_registry_target(repository: str, *, require_active_slug: bool = False) -> tuple[str, str | None]:
+    """Bind a fleet repository to ``(active_slug, non_default_repo_key)`` in one A01 resolution.
 
-    Either baked slug of a transferred row is that row, so tasks recorded before the move stay bound.
+    Either baked slug of a transferred row binds by default so ledgers recorded before a selector
+    flip stay valid. Callers validating operator-supplied targets pass ``require_active_slug=True``.
     """
-    repos = fleet_repos.load_fleet_repos().values()
-    if not isinstance(repository, str) or not repository.isascii() or not any(
-        repository.casefold() == slug.casefold() for repo in repos for slug in repo.slugs
-    ):
+    if not repository_identity_valid(repository):
         raise LifecycleError("task repository is not configured in the fleet")
-    owners = [repo.github for repo in repos if repo.role == "public-monorepo"]
-    if len(owners) != 1 or not repository_identity_valid(owners[0]):
+    try:
+        catalog = fleet_repos.load_fleet_repos()
+        active = fleet_repos.resolve_active_fleet_repo(repository, repos=catalog)
+        default_key = fleet_repos.default_repo_key(catalog)
+    except fleet_repos.FleetRepoError as exc:
+        raise LifecycleError(f"task repository is not configured in the fleet: {exc}") from None
+    if require_active_slug and active.active_github.casefold() != repository.casefold():
+        raise LifecycleError(
+            f"task repository {repository!r} is not the active fleet slug ({active.active_github!r})"
+        )
+    if not repository_identity_valid(active.active_github):
         raise LifecycleError("issue-stream registry must have one configured repository")
-    return owners[0]
+    if active.repo.role == "public-monorepo" or active.repo.default:
+        return active.active_github, None
+    try:
+        has_own_roots = issue_stream_audit.repo_has_roots(
+            active.repo.key,
+            issue_stream_audit.REGISTRY_PATH,
+            default_key=default_key,
+        )
+    except (OSError, ValueError) as exc:
+        raise LifecycleError(f"cannot load the issue-stream registry: {exc}") from None
+    if has_own_roots:
+        return active.active_github, active.repo.key
+    owners = [repo for repo in catalog.values() if repo.role == "public-monorepo"]
+    if len(owners) != 1:
+        raise LifecycleError("issue-stream registry must have one configured repository")
+    try:
+        owner_active = fleet_repos.resolve_active_fleet_repo(owners[0].key, repos=catalog)
+    except fleet_repos.FleetRepoError as exc:
+        raise LifecycleError(f"issue-stream registry repository could not be resolved: {exc}") from None
+    if not repository_identity_valid(owner_active.active_github):
+        raise LifecycleError("issue-stream registry must have one configured repository")
+    return owner_active.active_github, None
+
+
+def stream_registry_repository(repository: str, *, require_active_slug: bool = False) -> str:
+    """Bind a fleet repository to the active slug that owns its stream roots."""
+    return stream_registry_target(repository, require_active_slug=require_active_slug)[0]
+
+
+_DEFAULT_STREAM_REGISTRY_REPOSITORY = stream_registry_repository
 
 
 def membership_needs_audit(

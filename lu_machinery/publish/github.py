@@ -893,48 +893,196 @@ def _refuse_unreadable_criteria(body):
             raise gate.PublishBlocked(f"ACCEPTANCE_CRITERIA_REFUSED: {exc}") from None
 
 
-def _issue_node(read_runner, gh_repo, number, cwd, environment):
-    """Return the node id of an open issue, or None when it is missing, closed or a PR."""
+def _issue_node(read_runner, gh_repo, number, cwd, environment, *, allowed_slugs=None):
+    """Return the node id of an open issue matching *gh_repo* and *number*, or None."""
+    from urllib.parse import urlsplit
+
+    expected_slug = _github_slug_or_none(gh_repo)
+    if expected_slug is None or type(number) is not int or number < 1:
+        return None
     result = read(
-        "issue", repo=gh_repo, number=number, runner=read_runner, cwd=cwd, env=environment,
+        "issue", repo=expected_slug, number=number, runner=read_runner, cwd=cwd, env=environment,
         capture_output=True, text=True, check=False, timeout=15,
     )
     if result.returncode:
         return None
-    document = json_depth.loads(result.stdout, max_depth=512)
-    if document.get("state") != "open" or "pull_request" in document or not isinstance(document.get("node_id"), str):
+    try:
+        document = json_depth.loads(result.stdout, max_depth=512)
+    except ValueError:
         return None
-    return document["node_id"]
+    if not isinstance(document, dict):
+        return None
+    if document.get("state") != "open" or "pull_request" in document:
+        return None
+    doc_number = document.get("number")
+    if type(doc_number) is not int or doc_number != number:
+        return None
+    node_id = document.get("node_id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        return None
+    observed_slugs = []
+    repo_url = document.get("repository_url")
+    if repo_url is not None:
+        if not isinstance(repo_url, str):
+            return None
+        parsed = urlsplit(repo_url.strip())
+        if parsed.scheme != "https" or parsed.netloc.lower() != "api.github.com" or not parsed.path.startswith("/repos/"):
+            return None
+        repo_slug = _github_slug_or_none(parsed.path.removeprefix("/repos/"))
+        if repo_slug is None:
+            return None
+        observed_slugs.append(repo_slug)
+    html_url = document.get("html_url")
+    if html_url is not None:
+        if not isinstance(html_url, str):
+            return None
+        parsed_html = urlsplit(html_url.strip())
+        if parsed_html.scheme != "https" or parsed_html.netloc.lower() != "github.com":
+            return None
+        parts = [p for p in parsed_html.path.split("/") if p]
+        if len(parts) != 4 or parts[2] != "issues" or not parts[3].isdigit() or int(parts[3]) != number:
+            return None
+        html_slug = _github_slug_or_none(f"{parts[0]}/{parts[1]}")
+        if html_slug is None:
+            return None
+        observed_slugs.append(html_slug)
+    if not observed_slugs:
+        return None
+    if allowed_slugs is not None:
+        accepted = {s.casefold() for s in allowed_slugs if isinstance(s, str) and s.isascii()}
+        if not all(slug.isascii() and slug.casefold() in accepted for slug in observed_slugs):
+            return None
+    elif not all(_same_repository(slug, expected_slug) for slug in observed_slugs):
+        return None
+    return node_id
 
 
-def _fleet_catalog_row(gh_repo):
-    """The fleet_repos row for this owner/name, or None when the repository is not registered."""
-    slug = gh_repo.casefold()
-    for row in gate.catalog().values():
-        github = row.get("github") if isinstance(row, dict) else None
-        if not isinstance(github, str):
-            continue
-        normalized = gate.normalize_repository(github)
-        if normalized != "unknown" and normalized.split("/", 1)[1] == slug:
-            return row
-    return None
+def _github_slug_or_none(value):
+    """Return lowercase ``owner/name`` when *value* normalizes to host ``github.com``, else None."""
+    normalized = gate.normalize_repository(value)
+    host, sep, slug = normalized.partition("/")
+    if host != "github.com" or not sep or not slug:
+        return None
+    return slug
 
 
-def _owns_stream_registry(row):
-    """True for the repository whose issues the stream-registry numbers are.
+def _catalog_fleet_repos():
+    """Convert ``gate.catalog()`` rows into validated ``FleetRepo`` objects for the A01 resolver.
 
-    ``issue_streams.yaml`` has no per-repository key. Its epic numbers are issues in the
-    one default fleet repository. Every other registered repository has no stream registry.
+    Fails closed on any malformed key, row, ``github``, or ``alternate_github`` entry so
+    broken dual-slug configuration can never downgrade into selector-free acceptance.
     """
-    return bool(row.get("default"))
+    from lu_machinery.orchestration import fleet_repos
+
+    raw_catalog = gate.catalog()
+    if not isinstance(raw_catalog, dict) or not raw_catalog:
+        raise gate.PublishBlocked("OPSEC: repository allowlist unavailable; write refused.")
+    repos = {}
+    defaults = 0
+    for key, row in raw_catalog.items():
+        if not isinstance(key, str) or not key.strip() or not isinstance(row, dict):
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        github = row.get("github")
+        if not isinstance(github, str):
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        slug = _github_slug_or_none(github)
+        if slug is None:
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        default_raw = row.get("default", False)
+        if type(default_raw) is not bool:
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        if default_raw:
+            defaults += 1
+        repo_id = row.get("repository_id")
+        if repo_id is not None and (type(repo_id) is not int or repo_id <= 0):
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        visibility = row.get("visibility")
+        if visibility is not None and (not isinstance(visibility, str) or visibility not in {"public", "private"}):
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        alt_raw = row.get("alternate_github")
+        alt_slug = None
+        if alt_raw is not None:
+            if not isinstance(alt_raw, str):
+                raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+            alt_slug = _github_slug_or_none(alt_raw)
+            if alt_slug is None:
+                raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+            if alt_slug.casefold() == slug.casefold() or repo_id is None or visibility is None:
+                raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        repos[key] = fleet_repos.FleetRepo(
+            key=key,
+            github=slug,
+            local_name=str(row.get("local_name") or key),
+            role=str(row.get("role") or ""),
+            default=default_raw,
+            repository_id=repo_id,
+            visibility=visibility,
+            alternate_github=alt_slug,
+        )
+    if defaults != 1:
+        raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+    return repos
 
 
-def _issue_create_parent_policy(gh_repo):
+def _fleet_catalog_row(gh_repo, *, env=None):
+    """Resolve *gh_repo* through the A01 active-slug resolver, or None when unregistered."""
+    from lu_machinery.orchestration import fleet_repos
+
+    slug = _github_slug_or_none(gh_repo)
+    if slug is None:
+        return None
+    repos = _catalog_fleet_repos()
+    try:
+        fleet_repos.resolve_fleet_repo_by_slug(slug, repos=repos)
+    except fleet_repos.FleetRepoError:
+        return None
+    try:
+        active = fleet_repos.resolve_active_fleet_repo(slug, repos=repos, env=env)
+    except fleet_repos.FleetRepoError as exc:
+        raise gate.PublishBlocked(f"REPO_REFUSED: {exc}; nothing was created.") from None
+    if active.active_github.casefold() != slug.casefold():
+        raise gate.PublishBlocked(
+            f"REPO_REFUSED: {slug} is not the active slug for {active.repo.key} "
+            f"(active: {active.active_github}); nothing was created."
+        )
+    return active
+
+
+def _owns_stream_registry(active, *, default_key=None):
+    """True for any repository with a readable, valid section in issue_streams.yaml.
+
+    Validates the registry for the default repository as well as non-default
+    repositories so a missing or malformed ``issue_streams.yaml`` fails closed
+    with ``REGISTRY_REFUSED``. Accepts a declared per-repo section with
+    ``epics: []`` before its bootstrap root exists.
+    """
+    from lu_machinery.orchestration import issue_stream_audit
+
+    effective_default = active.repo.key if active.repo.default else default_key
+    try:
+        has_registry = issue_stream_audit.repo_has_registry(
+            active.repo.key,
+            issue_stream_audit.REGISTRY_PATH,
+            default_key=effective_default,
+        )
+    except (OSError, ValueError) as exc:
+        raise gate.PublishBlocked(f"REGISTRY_REFUSED: issue_streams.yaml is unreadable ({exc}); nothing was created.") from None
+    if active.repo.default and not has_registry:
+        raise gate.PublishBlocked(
+            "REGISTRY_REFUSED: issue_streams.yaml defines no default-repository streams; nothing was created."
+        )
+    return has_registry
+
+
+def _issue_create_parent_policy(gh_repo, *, env=None):
     """``stream`` (own open epic), ``none`` (no --parent), or ``unregistered``."""
-    row = _fleet_catalog_row(gh_repo)
-    if row is None:
+    active = _fleet_catalog_row(gh_repo, env=env)
+    if active is None:
         return "unregistered"
-    return "stream" if _owns_stream_registry(row) else "none"
+    repos = _catalog_fleet_repos()
+    default_keys = [key for key, item in repos.items() if item.default]
+    default_key = default_keys[0] if len(default_keys) == 1 else None
+    return "stream" if _owns_stream_registry(active, default_key=default_key) else "none"
 
 
 def _cli_keeps_stream_parent_refusal(explicit):
@@ -942,33 +1090,64 @@ def _cli_keeps_stream_parent_refusal(explicit):
 
     An unresolved destination keeps that sentence, so a checkout of the default repository
     that omits ``--repo`` still prints it. A resolved repository with no stream registry, and
-    a resolved unregistered repository, fall through to ``publish``.
+    a resolved unregistered or inactive repository, fall through to ``publish``.
     """
-    slug = None
+    destination = None
     if isinstance(explicit, str) and explicit.strip():
         normalized = gate.normalize_repository(explicit)
         if normalized != "unknown":
-            slug = normalized.split("/", 1)[1]
-    if slug is None:
+            destination = normalized
+    environment = None
+    if destination is None:
         try:
-            dest = repository(Path.cwd(), _validated_environment(None), explicit)
+            environment = _validated_environment(None)
+            dest = repository(Path.cwd(), environment, explicit)
         except gate.PublishBlocked:
             return True
         if dest == "unknown":
             return True
-        slug = dest.split("/", 1)[1]
+        destination = dest
+    else:
+        try:
+            environment = _validated_environment(None)
+        except gate.PublishBlocked:
+            return False
     try:
-        return _issue_create_parent_policy(slug) == "stream"
+        return _issue_create_parent_policy(destination, env=environment) == "stream"
     except gate.PublishBlocked:
-        return True
+        return False
 
 
 def _parent_epic_node(read_runner, gh_repo, parent, cwd, environment):
-    """Resolve --parent to a registered open stream epic's node id before anything is created."""
+    """Resolve --parent to a local registered open stream epic's node id before anything is created."""
     from lu_machinery.orchestration import issue_stream_audit
 
-    epics = {number for numbers in issue_stream_audit.load_registry(audit_only=True).values() for number in numbers}
-    node = _issue_node(read_runner, gh_repo, parent, cwd, environment) if parent in epics else None
+    active = _fleet_catalog_row(gh_repo, env=environment)
+    if active is None:
+        raise gate.PublishBlocked(
+            f"REPO_REFUSED: issue-create only targets a repository registered in {_FLEET_REPOS}; nothing was created."
+        )
+    try:
+        registry = issue_stream_audit.load_registry(
+            issue_stream_audit.REGISTRY_PATH,
+            audit_only=True,
+            repo=None if active.repo.default else active.repo.key,
+        )
+    except (OSError, ValueError) as exc:
+        raise gate.PublishBlocked(f"REGISTRY_REFUSED: issue_streams.yaml is unreadable ({exc}); nothing was created.") from None
+    epics = {number for numbers in registry.values() for number in numbers}
+    node = (
+        _issue_node(
+            read_runner,
+            active.active_github,
+            parent,
+            cwd,
+            environment,
+            allowed_slugs=active.repo.slugs,
+        )
+        if parent in epics
+        else None
+    )
     if node is None:
         raise gate.PublishBlocked(
             "PARENT_REFUSED: --parent must be the number of a registered, open stream epic; nothing was created."
@@ -2479,7 +2658,7 @@ def publish(
         readiness_runner = merge_readiness_runner(runner)
         parent_node = None
         if verb == "issue-create":
-            policy = _issue_create_parent_policy(gh_repo)
+            policy = _issue_create_parent_policy(dest, env=environment)
             if policy == "unregistered":
                 raise gate.PublishBlocked(
                     "REPO_REFUSED: issue-create only targets a repository registered in "
@@ -2504,7 +2683,7 @@ def publish(
                         "PARENT_REQUIRED: issue-create requires parent, the number of a registered open stream epic; "
                         "nothing was created."
                     )
-                parent_node = _parent_epic_node(readiness_runner, gh_repo, fields["parent"], cwd, environment)
+                parent_node = _parent_epic_node(readiness_runner, dest, fields["parent"], cwd, environment)
             elif "parent" in fields:
                 raise gate.PublishBlocked(
                     "PARENT_REFUSED: this repository has no stream registry, so issue-create accepts no --parent; "

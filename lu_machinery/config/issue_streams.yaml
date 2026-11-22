@@ -7,14 +7,25 @@
 # - Every OPEN issue must be a member of EXACTLY ONE stream (native descendant of a
 #   stream epic, or a #N reference in the epic body while migration is pending).
 # - New issues link their stream epic at creation time.
-# - Epic numbers identify issues in the default fleet repository. Lifecycle membership
-#   for a sibling repository uses a direct native link to a registered epic with the same owner.
+# - Epic numbers under top-level `streams:` identify issues in the default fleet
+#   repository. Non-default repositories with their own roots declare a section
+#   under `repos:` keyed by fleet_repos.yaml key (placed before `streams:` so the
+#   narrow awk parser in lib/handoff_identity.sh keeps reading only the default
+#   numeric view). A declared repo section may start with `epics: []` before its
+#   bootstrap root exists. Lifecycle membership for sibling repositories without
+#   their own roots uses a direct native link to a registered default-repo epic.
 # - Active root epics themselves are exempt from membership. Closed epics may
 #   stay registered for launcher/session consumers but are not audit roots.
 # - An optional `retired: true` marker (boolean; rejected otherwise) likewise
 #   keeps a stream registered for launcher/session consumers without making it
 #   an audit root. Retired lanes are normally removed outright instead.
 schema_version: 1
+repos:
+  machinery:
+    streams:
+      epics:
+        title: "Machinery epic coordination"
+        epics: []
 streams:
   epics:
     title: "Epic coordination"

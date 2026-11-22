@@ -219,12 +219,17 @@ class GhGitHubAdapter:
         try:
             from lu_machinery.orchestration import issue_stream_audit
 
-            epic_repository = task_lifecycle.stream_registry_repository(repository)
+            if task_lifecycle.stream_registry_repository is task_lifecycle._DEFAULT_STREAM_REGISTRY_REPOSITORY:
+                epic_repository, repo_key = task_lifecycle.stream_registry_target(repository)
+            else:
+                epic_repository = task_lifecycle.stream_registry_repository(repository)
+                repo_key = None
             # Closed epics stay in the file for launcher and Work API consumers.
             # Membership roots are the audit registry only (#12176).
             registry = issue_stream_audit.load_registry(
                 machinery_path("config/issue_streams.yaml"),
                 audit_only=True,
+                **({"repo": repo_key} if repo_key is not None else {}),
             )
         except (OSError, ValueError) as exc:
             raise task_lifecycle.LifecycleError(
@@ -1097,7 +1102,7 @@ def _issue_snapshot(
             "issue membership does not resolve to the identity's exact registered "
             f"stream epic: {membership['reason']}"
         )
-    if identity["repository"].casefold() != epic_repository.casefold():
+    if task_lifecycle._repository_key(identity["repository"]) != task_lifecycle._repository_key(epic_repository):
         identity["stream_epic_url"] = epic_url
     snapshot = task_lifecycle.build_ac_snapshot(
         issue["body"], _load_policy(Path(args.ac_policy)), finalized_at=now

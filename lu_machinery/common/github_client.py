@@ -3939,9 +3939,37 @@ def _rest_read(operation, repo, fields, *, runner=None, env=None, cwd=None, **kw
             states = {}
             for number in fields["numbers"]:
                 issue = get(root + f"/issues/{number}", optional=True)
-                states[f"i{number}"] = {"number": number, "state": str(issue["state"]).upper()} if issue else None
+                if issue is not None:
+                    if not isinstance(issue, dict) or not isinstance(issue.get("state"), str):
+                        raise ValueError("malformed GitHub issue state")
+                    states[f"i{number}"] = {"number": number, "state": issue["state"].upper()}
+                else:
+                    states[f"i{number}"] = None
             value = {"data": {"repository": states}}
         elif operation in {"issue-parent", "issue-scope", "subissues", "subissues-next", "subissue-batch"}:
+
+            def _repo_slug(row):
+                if not isinstance(row, dict):
+                    raise ValueError("malformed GitHub issue row")
+                repo_url = row.get("repository_url")
+                if not isinstance(repo_url, str) or "/repos/" not in repo_url:
+                    raise ValueError("malformed GitHub repository_url")
+                slug = repo_url.split("/repos/", 1)[1].strip()
+                owner, sep, name = slug.partition("/")
+                if not sep or not owner or not name or "/" in name:
+                    raise ValueError("malformed GitHub repository_url")
+                return slug
+
+            def _summary_total(row):
+                summary = row.get("sub_issues_summary")
+                if summary is None:
+                    return None
+                if not isinstance(summary, dict):
+                    raise ValueError("malformed GitHub sub_issues_summary")
+                total = summary.get("total")
+                if total is not None and (type(total) is not int or total < 0):
+                    raise ValueError("malformed GitHub sub_issues_summary.total")
+                return total
 
             def connection(number, cursor=None):
                 if cursor is not None:
@@ -3949,14 +3977,19 @@ def _rest_read(operation, repo, fields, *, runner=None, env=None, cwd=None, **kw
                     # GraphQL cursor cannot safely be reinterpreted as a page.
                     raise ValueError("obsolete GitHub pagination cursor")
                 rows = get(root + f"/issues/{number}/sub_issues?per_page=100", paginate=True)
-                nodes = [
-                    {
-                        "number": r["number"],
-                        "repository": {"nameWithOwner": r["repository_url"].split("/repos/", 1)[1]},
-                        "subIssuesSummary": {"total": (r.get("sub_issues_summary") or {}).get("total")},
-                    }
-                    for r in rows
-                ]
+                if not isinstance(rows, list):
+                    raise ValueError("malformed GitHub sub_issues list")
+                nodes = []
+                for r in rows:
+                    if not isinstance(r, dict) or type(r.get("number")) is not int or r["number"] < 1:
+                        raise ValueError("malformed GitHub sub_issue row")
+                    nodes.append(
+                        {
+                            "number": r["number"],
+                            "repository": {"nameWithOwner": _repo_slug(r)},
+                            "subIssuesSummary": {"total": _summary_total(r)},
+                        }
+                    )
                 return {"nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}
 
             if operation == "subissue-batch":
@@ -3966,38 +3999,66 @@ def _rest_read(operation, repo, fields, *, runner=None, env=None, cwd=None, **kw
                     if parent is None:
                         issues[f"i{number}"] = None
                         continue
+                    if not isinstance(parent, dict):
+                        raise ValueError("malformed GitHub issue row")
                     issue = {"subIssues": connection(number, cursor)}
                     if number in fields["body_roots"] and cursor is None:
-                        issue["body"] = parent["body"]
+                        body = parent.get("body")
+                        if body is not None and not isinstance(body, str):
+                            raise ValueError("malformed GitHub issue body")
+                        issue["body"] = body
                     issues[f"i{number}"] = issue
                 value = {"data": {"repository": issues}}
             else:
                 number = fields["number"]
                 issue = get(root + f"/issues/{number}")
+                if not isinstance(issue, dict):
+                    raise ValueError("malformed GitHub issue row")
                 if operation in {"issue-parent", "issue-scope"}:
                     parent = get(root + f"/issues/{number}/parent", optional=True)
-                    parent = (
-                        {
+                    if parent is not None:
+                        if (
+                            not isinstance(parent, dict)
+                            or type(parent.get("number")) is not int
+                            or parent["number"] < 1
+                            or not isinstance(parent.get("html_url"), str)
+                        ):
+                            raise ValueError("malformed GitHub parent row")
+                        parent = {
                             "number": parent["number"],
                             "url": parent["html_url"],
-                            "repository": {"nameWithOwner": parent["repository_url"].split("/repos/", 1)[1]},
+                            "repository": {"nameWithOwner": _repo_slug(parent)},
                         }
-                        if parent
-                        else None
-                    )
+                    if (
+                        "number" not in issue
+                        or not isinstance(issue.get("state"), str)
+                        or not isinstance(issue.get("html_url"), str)
+                    ):
+                        raise ValueError("malformed GitHub issue row")
                     row = {
                         "number": issue["number"],
-                        "state": str(issue["state"]).upper(),
+                        "state": issue["state"].upper(),
                         "url": issue["html_url"],
                         "parent": parent,
                     }
                     if operation == "issue-scope":
-                        row.update(body=issue["body"], labels={"nodes": [{"name": r["name"]} for r in issue["labels"]]})
+                        body = issue.get("body")
+                        labels = issue.get("labels")
+                        if (
+                            (body is not None and not isinstance(body, str))
+                            or not isinstance(labels, list)
+                            or any(not isinstance(r, dict) or not isinstance(r.get("name"), str) for r in labels)
+                        ):
+                            raise ValueError("malformed GitHub issue scope")
+                        row.update(body=body, labels={"nodes": [{"name": r["name"]} for r in labels]})
                 else:
-                    row = {"body": issue["body"], "subIssues": connection(number, fields.get("cursor"))}
+                    body = issue.get("body")
+                    if body is not None and not isinstance(body, str):
+                        raise ValueError("malformed GitHub issue body")
+                    row = {"body": body, "subIssues": connection(number, fields.get("cursor"))}
                 value = {
                     "data": {
-                        "repository": {"nameWithOwner": issue["repository_url"].split("/repos/", 1)[1], "issue": row}
+                        "repository": {"nameWithOwner": _repo_slug(issue), "issue": row}
                     }
                 }
         elif operation == "merge-facts":

@@ -20,7 +20,7 @@ from pathlib import Path
 
 from lu_machinery.ci._location import module_name
 from lu_machinery.common import github_client, json_depth
-from lu_machinery.common.repo_root import machinery_path, product_root, state_root
+from lu_machinery.common.repo_root import product_root, state_root
 from lu_machinery.orchestration import fleet_repos, postmerge_criteria
 from lu_machinery.orchestration import issue_stream_audit as audit
 from lu_machinery.orchestration import task_lifecycle as lifecycle
@@ -137,29 +137,65 @@ def time_budget(seconds: float = 60):
         signal.signal(signal.SIGALRM, old_handler)
 
 
+def _resolve_active_repository(repository: str) -> fleet_repos.ActiveFleetRepo | None:
+    """Resolve an exact active owner/name slug through the A01 resolver, or None."""
+    if not lifecycle.repository_identity_valid(repository):
+        return None
+    try:
+        catalog = fleet_repos.load_fleet_repos()
+        active = fleet_repos.resolve_active_fleet_repo(repository, repos=catalog)
+    except fleet_repos.FleetRepoError:
+        return None
+    if active.active_github.casefold() != repository.casefold():
+        return None
+    return active
+
+
+def _is_default_repository(repository: str) -> bool:
+    active = _resolve_active_repository(repository)
+    return active is not None and (active.repo.default or active.repo.role == "public-monorepo")
+
+
 def registry_for(repository: str) -> dict[str, list[int]] | None:
-    """Only the public monorepo owns this registry; numbers are repository scoped."""
-    for repo in fleet_repos.load_fleet_repos().values():
-        if repo.github.casefold() == repository.casefold() and repo.role == "public-monorepo":
-            try:
-                return audit.load_registry(machinery_path("config/issue_streams.yaml"), audit_only=True)
-            except FileNotFoundError:
-                return {}
-    return None
+    """Load active audit roots for *repository* through the A01 active-slug resolver."""
+    if not lifecycle.repository_identity_valid(repository):
+        return None
+    try:
+        catalog = fleet_repos.load_fleet_repos()
+        active = fleet_repos.resolve_active_fleet_repo(repository, repos=catalog)
+        default_key = fleet_repos.default_repo_key(catalog)
+    except fleet_repos.FleetRepoError:
+        return None
+    if active.active_github.casefold() != repository.casefold():
+        return None
+    path = audit.REGISTRY_PATH
+    if active.repo.role == "public-monorepo" or active.repo.default:
+        try:
+            return audit.load_registry(path, audit_only=True)
+        except FileNotFoundError:
+            return {}
+    try:
+        if not audit.repo_has_roots(active.repo.key, path, default_key=default_key):
+            return None
+        return audit.load_registry(path, audit_only=True, repo=active.repo.key)
+    except FileNotFoundError:
+        return {}
 
 
 def live_audit(
     repository: str, registry: dict, *, root: Path | None = None, progress: MembershipProgress | None = None
 ) -> dict:
     """Compose the existing live auditor in memory. Never write its shared cache."""
-    root = product_root(root)
+    is_default = _is_default_repository(repository)
+    explicit_repo = None if is_default else repository
+    audit_root = product_root(root) if (is_default or root is not None) else Path.cwd()
     progress = progress or MembershipProgress()
     progress.stage = "live_audit_repository"
-    observed_repository = "/".join(audit._repo_owner_name(root))
-    if observed_repository.casefold() != repository.casefold():
+    observed_repository = "/".join(audit._repo_owner_name(audit_root, repo_slug=explicit_repo))
+    if lifecycle.repository_evidence_refusal(repository, observed_repository, source="live audit") is not None:
         raise ValueError("audit repository does not match target")
     progress.stage = "live_audit_open_issues"
-    issues = audit.fetch_open_issues(root)
+    issues = audit.fetch_open_issues(audit_root, repo_slug=explicit_repo)
     warnings: list[dict] = []
     roots = {n for ns in registry.values() for n in ns}
     root_positions = {n: i for i, n in enumerate(sorted(roots), 1)}
@@ -171,7 +207,13 @@ def live_audit(
         for number, cursor in cursors.items():
             position = branch_positions[number]
             progress.stage = f"live_audit_root_{position}_of_{len(roots)}_issue_{number}"
-            page = audit._fetch_subissue_batch({number: cursor}, root, roots, retry_budget)
+            page = audit._fetch_subissue_batch(
+                {number: cursor},
+                audit_root,
+                roots,
+                retry_budget,
+                repo_slug=explicit_repo,
+            )
             pages.update(page)
             node = page.get(number)
             if isinstance(node, dict):
@@ -179,7 +221,10 @@ def live_audit(
                     if not isinstance(child, dict) or type(child.get("number")) is not int:
                         continue
                     child_repo = (child.get("repository") or {}).get("nameWithOwner")
-                    if isinstance(child_repo, str) and child_repo.casefold() != repository.casefold():
+                    if (
+                        isinstance(child_repo, str)
+                        and lifecycle._repository_key(child_repo) != lifecycle._repository_key(repository)
+                    ):
                         continue
                     branch_positions.setdefault(child["number"], position)
         return pages
@@ -200,11 +245,15 @@ def read_parent(repository: str, number: int) -> dict | None:
     if proc.returncode:
         raise RuntimeError("parent read failed")
     doc = json_depth.loads(proc.stdout, max_depth=512)
-    repo = (doc.get("data") or {}).get("repository")
+    if not isinstance(doc, dict):
+        raise ValueError("parent repository unread")
+    data = doc.get("data")
+    repo = data.get("repository") if isinstance(data, dict) else None
+    nwo = repo.get("nameWithOwner") if isinstance(repo, dict) else None
     if (
         doc.get("errors")
         or not isinstance(repo, dict)
-        or str(repo.get("nameWithOwner", "")).casefold() != repository.casefold()
+        or lifecycle.repository_evidence_refusal(repository, nwo, source="parent repository") is not None
     ):
         raise ValueError("parent repository unread")
     issue = repo.get("issue")
@@ -220,8 +269,16 @@ def read_parent(repository: str, number: int) -> dict | None:
         return None
     if not isinstance(parent, dict):
         raise ValueError("parent malformed")
-    slug = (parent.get("repository") or {}).get("nameWithOwner")
-    if not lifecycle.repository_identity_valid(slug) or type(parent.get("number")) is not int or parent["number"] < 1:
+    parent_repo = parent.get("repository")
+    if not isinstance(parent_repo, dict):
+        raise ValueError("parent identity malformed")
+    slug = parent_repo.get("nameWithOwner")
+    if (
+        not isinstance(slug, str)
+        or not lifecycle.repository_identity_valid(slug)
+        or type(parent.get("number")) is not int
+        or parent["number"] < 1
+    ):
         raise ValueError("parent identity malformed")
     return {"number": parent["number"], "repository": slug}
 
@@ -240,7 +297,11 @@ def _claim(issue: dict, repository: str, roots: list[int], index: dict, parents:
             if entry.get("unique_stream") is True and len(entry.get("epics", [])) == 1:
                 return entry["epics"][0]
             parent = parents.get(number)
-            if number in visited or not parent or parent["repository"].casefold() != repository.casefold():
+            if (
+                number in visited
+                or not parent
+                or lifecycle._repository_key(parent["repository"]) != lifecycle._repository_key(repository)
+            ):
                 break
             visited.add(number)
             number = parent.get("number")
@@ -259,7 +320,7 @@ def _audit_refusal(report: dict, repository: str, registry: dict, *, cached: boo
     if audit.validate_membership_report(report, MAX_AGE_S) is None:
         return membership_error("membership_audit_stale")
     observed_repository = report.get("repository")
-    if not isinstance(observed_repository, str) or observed_repository.casefold() != repository.casefold():
+    if lifecycle.repository_evidence_refusal(repository, observed_repository, source="membership audit") is not None:
         return membership_error("membership_audit_repository_mismatch")
     if report.get("streams") != {k: sorted(v) for k, v in registry.items()}:
         return membership_error("membership_audit_registry_mismatch")
@@ -279,7 +340,10 @@ def write_membership_cache(report: dict, repository: str, registry: dict, *, roo
     ``report`` is a membership audit from ``live_audit``. The Monitor serves this
     shared file as its hygiene report, so the writer appends the same closed-epic
     and milestone warnings ``run_audit`` adds; a failed lookup writes nothing.
+    Non-default repositories never write into the shared default-repo cache.
     """
+    if not _is_default_repository(repository):
+        return False
     if _audit_refusal(report, repository, registry) or audit.membership_root_results(report, registry) is None:
         return False
     checkout = product_root(root)
@@ -308,7 +372,7 @@ def evaluate_membership(
     produced by an in-memory live audit; see ``_audit_refusal``.
     """
     epic_repository = repository if epic_repository is None else epic_repository
-    local_registry = repository.casefold() == epic_repository.casefold()
+    local_registry = lifecycle._repository_key(repository) == lifecycle._repository_key(epic_repository)
     roots = [n for ns in registry.values() for n in ns]
     if report is not None:
         refusal = _audit_refusal(report, repository, registry, cached=cached)
@@ -327,7 +391,10 @@ def evaluate_membership(
         (
             p["number"]
             for p in parents.values()
-            if p and p.get("repository", "").casefold() == epic_repository.casefold() and p.get("number") in roots
+            if p
+            and isinstance(p.get("repository"), str)
+            and lifecycle._repository_key(p["repository"]) == lifecycle._repository_key(epic_repository)
+            and p.get("number") in roots
         ),
         None,
     )
@@ -390,13 +457,13 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
     cache_rejection = None
     try:
         try:
-            epic_repository = lifecycle.stream_registry_repository(repository)
+            epic_repository = lifecycle.stream_registry_repository(repository, require_active_slug=True)
         except lifecycle.LifecycleError as exc:
             return membership_error("membership_registry_absent", str(exc))
         registry = registry_for(epic_repository)
         if not registry:
             return membership_error("membership_registry_absent")
-        local_registry = repository.casefold() == epic_repository.casefold()
+        local_registry = lifecycle._repository_key(repository) == lifecycle._repository_key(epic_repository)
         roots = {n for ns in registry.values() for n in ns}
         if local_registry and number in roots:
             return section("root_exempt")
@@ -407,7 +474,10 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
             progress.stage = f"parent_{current}"
             parent = read_parent(repository, current)
             parents[current] = parent
-            crosses_repository = parent is not None and parent["repository"].casefold() != repository.casefold()
+            crosses_repository = (
+                parent is not None
+                and lifecycle._repository_key(parent["repository"]) != lifecycle._repository_key(repository)
+            )
             if (
                 parent is None
                 or crosses_repository
@@ -421,16 +491,18 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
         if not local_registry and not crosses_repository:
             return section("membership_not_applicable")
         report = None
+        use_shared_cache = _is_default_repository(repository)
         if audit_orphans and local_registry and parents.get(number) is None:
-            progress.stage = "cached_audit_validation"
-            cached = cached_membership(issue, repository, number, registry, parents, epic_repository=epic_repository)
-            if cached["status"] == "PASS" or cached["errors"][0]["code"] == "membership_unregistered_parentless":
-                return cached
-            cache_rejection = cached["errors"][0]["code"]
+            if use_shared_cache:
+                progress.stage = "cached_audit_validation"
+                cached = cached_membership(issue, repository, number, registry, parents, epic_repository=epic_repository)
+                if cached["status"] == "PASS" or cached["errors"][0]["code"] == "membership_unregistered_parentless":
+                    return cached
+                cache_rejection = cached["errors"][0]["code"]
             progress.stage = "live_audit"
             report = live_audit(repository, registry, progress=progress)
         result = evaluate_membership(issue, repository, number, registry, parents, report, epic_repository=epic_repository)
-        if report is not None and (
+        if use_shared_cache and report is not None and (
             result["status"] == "PASS" or result["errors"][0]["code"] == "membership_unregistered_parentless"
         ):
             progress.stage = "live_audit_cache_write"
@@ -715,6 +787,9 @@ def fetch_issue(repo: str, number: int) -> dict:
     data = json_depth.loads(raw, max_depth=512)
     if not isinstance(data, dict) or not isinstance(data.get("body", ""), (str, type(None))):
         raise ValueError("issue unread")
+    labels = data.get("labels")
+    if labels is not None and (not isinstance(labels, list) or any(not isinstance(item, dict) for item in labels)):
+        raise ValueError("issue unread")
     return data
 
 
@@ -759,13 +834,23 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.issue is not None:
+            raw_repo = args.repo.strip() if isinstance(args.repo, str) else ""
+            if not raw_repo:
+                raise ValueError("repository must be non-empty")
+            catalog = fleet_repos.load_fleet_repos()
+            active = fleet_repos.resolve_active_fleet_repo(raw_repo, repos=catalog)
+            if "/" in raw_repo and active.active_github.casefold() != raw_repo.casefold():
+                raise ValueError(
+                    f"repository {raw_repo!r} is not the active fleet slug ({active.active_github!r})"
+                )
+            target_repo = active.active_github
             with time_budget():
-                issue = fetch_issue(args.repo, args.issue)
+                issue = fetch_issue(target_repo, args.issue)
             if args.trivial:
                 issue = {**issue, "labels": [{"name": "trivial"}]}
             try:
                 with time_budget():
-                    membership = observe_membership(issue, args.repo, args.issue)
+                    membership = observe_membership(issue, target_repo, args.issue)
             except (TimeoutError, subprocess.TimeoutExpired):
                 membership = membership_error("membership_timeout")
             result = evaluate_issue(issue, membership)

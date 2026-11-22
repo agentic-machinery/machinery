@@ -6365,47 +6365,12 @@
     {
       "path": "lu_machinery/orchestration/issue_stream_audit.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"_gh_json\" has incompatible type \"Request\"; expected \"list[str]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_gh_json\" has incompatible type \"Request\"; expected \"list[str]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_gh_json\" has incompatible type \"Request\"; expected \"list[str]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_gh_json\" has incompatible type \"Request\"; expected \"list[str]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"sorted\" has incompatible type \"None | set[int]\"; expected \"Iterable[int]\""
     },
     {
       "path": "lu_machinery/orchestration/issue_stream_audit.py",
       "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | dict[Any, Any]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "no-any-return",
       "message": "Returning Any from function declared to return \"None | object\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"list[dict[Any, Any]]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"str\""
     },
     {
       "path": "lu_machinery/orchestration/issue_stream_audit.py",
@@ -6426,16 +6391,6 @@
       "path": "lu_machinery/orchestration/issue_stream_audit.py",
       "code": "operator",
       "message": "Unsupported operand types for >= (\"float\" and \"None\")"
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "union-attr",
-      "message": "Item \"_IncompleteNode\" of \"_IncompleteNode | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "union-attr",
-      "message": "Item \"_IncompleteNode\" of \"_IncompleteNode | dict[Any, Any]\" has no attribute \"get\""
     },
     {
       "path": "lu_machinery/orchestration/issue_stream_audit.py",
