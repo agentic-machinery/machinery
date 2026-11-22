@@ -509,37 +509,53 @@ overlap planned outputs.
 #### Agent source contract
 
 Each fleet prompt, rule, skill, contract and hook has one tracked source: its
-file under `agents_extensions/shared/`. Every other representation is derived
-from it and is never edited by hand:
+file under `agents_extensions/shared/`. The packaged copy in the wheel and every
+deployed output are copies of it and are never edited by hand:
 
-- The `include` lines in `MANIFEST.in` and the `files` keys of
-  `lu_machinery/agent_deploy/release.v1.json` list exactly the tracked files,
-  and the wheel ships them byte for byte.
-  `tests/packaging/test_release_resources.py::test_wheel_omission_or_product_leakage`
-  fails on any difference, so a PR that adds, renames or deletes a source
-  updates all three.
-- The deployer reads fleet sources only from the installed package
-  (`release_inputs`), never from a checkout. It writes generated outputs into the
-  consumer's provider roots (`.claude`, `.codex`, `.agent`, `.agents`, `.cursor`)
-  and records ownership in `.deploy-state/agent-deploy.v1.json`. Consumers ignore
-  those roots and never track them. `--check` reports byte, mode, ownership and
-  retirement drift.
-- AGY core parts and `.agent/rules.json` derive from `rules/core.md`. The
-  bootstrap commands under `required_hooks` derive from
-  `agy_hook_config.native_hook_command`, and
-  `test_release_requires_each_claude_python_guard_as_its_native_command` pins
-  them.
+- Three declarations name the same set of files: the `include` lines in
+  `MANIFEST.in`, the `files` keys of `lu_machinery/agent_deploy/release.v1.json`
+  and the tracked tree. A PR that adds, renames or deletes a source updates all
+  three. `tests/packaging/test_release_resources.py::test_wheel_omission_or_product_leakage`
+  fails when the tracked files, the inventory keys and the wheel's
+  `agents_extensions/shared/` entries differ, or when a shipped file's bytes
+  differ from its tracked source. It does not catch a stale `include` line for a
+  file that no longer exists, which the sdist build only warns about, so review
+  `MANIFEST.in` by hand.
+- The deployer reads fleet sources only from the package it runs from
+  (`release_inputs`, resolved with `importlib.resources` beside `lu_machinery`),
+  never from the consumer checkout. It writes outputs into the enabled provider
+  roots (`.claude`, `.codex`, `.agent`, `.agents`, `.cursor`) and records ownership
+  in `.deploy-state/agent-deploy.v1.json`. `--check` compares the files on disk
+  with the recomposed plan: bytes, modes, ownership and retirement. It does not
+  read the Git index, so a tracked output still passes. Consumers must ignore
+  these roots and keep the outputs out of Git themselves.
+- Some outputs are generated rather than copied. The AGY core parts
+  `.agent/rules/core-part-NN.md` are split from `rules/core.md`. The
+  `.agent/rules.json` exclusion list is fixed in
+  `lu_machinery/agent_deploy/plan.py`, so it changes there.
+- The `required_hooks` commands in `release.v1.json` are literal commands that
+  each consumer's settings must contain unchanged. The `/bin/bash` bootstrap
+  commands among them, for the Claude Python guards and the dirt audit, must
+  equal `agy_hook_config.native_hook_command`.
+  `tests/agent_deploy/test_release_deployer.py::test_release_requires_each_claude_python_guard_as_its_native_command`
+  pins that equality. The other commands are maintained by hand in the
+  inventory.
 - Product sources live under the consumer descriptor's `sources`. The deployer
   refuses a product path that duplicates a fleet path.
-- Machinery is not a deployment consumer. Its `.gitignore` ignores the same
-  output roots, the ownership state and the retired `.gemini` root, so a runtime
-  copy created in a checkout or worktree is never committed.
+- Machinery is not a deployment consumer. Its `.gitignore` also ignores these
+  output roots, the ownership state and the retired `.gemini` root, so ordinary
+  staging leaves an untracked runtime copy in a checkout or worktree out of a
+  commit.
 
-Intentional exceptions: resources the package reads in place and never deploys
-keep their single tracked copy under `lu_machinery/`. They are the ACPX Grok
-profiles `lu_machinery/agent_runtime/profiles/*.md`, the AGY hook scripts
-`lu_machinery/agy_hooks/*.sh`, `lu_machinery/agent_runtime/codex_hook_entry.sh`
-and `lu_machinery/agent_runtime/claude_acp_exec.sh`.
+Intentional exceptions: these agent files are read from the package at run time
+and never deployed, so each keeps its single tracked copy under `lu_machinery/`:
+- the ACPX Grok profiles `lu_machinery/agent_runtime/profiles/*.md`, read by
+  `agent_runtime/adapters/acpx.py`;
+- the AGY hook scripts `lu_machinery/agy_hooks/*.sh` and
+  `lu_machinery/agent_runtime/codex_hook_entry.sh`, run from the package through
+  the hook bootstrap in `agent_runtime/agy_hook_config.py`;
+- `lu_machinery/agent_runtime/claude_acp_exec.sh`, which the ACP launcher
+  executes from a private copy it makes for each launch.
 
 The product workflow `rules-deployment-check.yml` and its tracked-mirror test in
 `tests/test_deploy_script_idempotency.py` must switch from the old option to
