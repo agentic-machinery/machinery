@@ -30,6 +30,7 @@ from urllib.parse import urlsplit
 import jwt
 
 from lu_machinery.common import json_depth
+from lu_machinery.common.git_credentials import verify_authenticated_repository
 from lu_machinery.common.github_client import http_open
 from lu_machinery.common.repo_root import ProductRootError, product_root
 
@@ -422,6 +423,8 @@ def mint_installation_token(
     permissions: Mapping[str, str] | None = None,
     api_base_url: str = _GITHUB_API_URL,
     ssl_context=None,
+    expected_repository_id: int | None = None,
+    expected_visibility: str | None = None,
 ) -> str:
     """Mint a repository-scoped GitHub App installation token.
 
@@ -429,6 +432,9 @@ def mint_installation_token(
     no workflow, admin, or organization-secret permissions.  When
     ``installation_id`` is omitted, the installation covering the target
     ``owner/repository`` is resolved via the App JWT and cached per owner.
+    When ``expected_repository_id`` or ``expected_visibility`` is provided,
+    the authenticated token response's ``repositories[0]`` entry must match
+    that exact id, full_name, and visibility.
     """
     issued_at = int(time.time()) if now is None else now
     if (
@@ -438,9 +444,14 @@ def mint_installation_token(
         or any(ord(c) <= 32 or ord(c) == 127 for c in app_id)
     ):
         raise GitHubIdentityError("invalid GitHub App id")
+    if expected_repository_id is not None and (type(expected_repository_id) is not int or expected_repository_id <= 0):
+        raise GitHubIdentityError("invalid expected repository id for the GitHub App token")
+    if expected_visibility is not None and expected_visibility not in {"public", "private"}:
+        raise GitHubIdentityError("invalid expected visibility for the GitHub App token")
     selected = _repository_slug() if repository is None else repository
     owner, repo_name = _split_repository(selected)
-    if permissions is not None and owner is None:
+    enforce_identity = expected_repository_id is not None or expected_visibility is not None
+    if (permissions is not None or enforce_identity) and owner is None:
         raise GitHubIdentityError("GitHub App installation token scope or expiry refused")
     assertion = _build_app_jwt(app_id=app_id, private_key=private_key, issued_at=issued_at)
     base_url = api_base_url.rstrip("/")
@@ -478,7 +489,7 @@ def mint_installation_token(
     try:
         open_request = (
             _restricted_opener(ssl_context).open
-            if permissions is not None or ssl_context is not None or installation_id is None
+            if permissions is not None or enforce_identity or ssl_context is not None or installation_id is None
             else urllib.request.urlopen
         )
         with http_open(request, opener=open_request, timeout=15) as response:
@@ -491,30 +502,37 @@ def mint_installation_token(
     token = payload.get("token")
     if not isinstance(token, str) or not token:
         raise GitHubIdentityError("GitHub App installation token response did not contain a token")
-    if permissions is not None:
+    if permissions is not None or enforce_identity:
         try:
             repositories = payload["repositories"]
             if not isinstance(repositories, list) or len(repositories) != 1:
                 raise ValueError("invalid repository scope")
-            if "/" not in selected or repositories[0]["full_name"] != selected:
+            if "/" not in selected:
                 raise ValueError("invalid repository identity")
-            granted = payload["permissions"]
-            levels = {"read": 1, "write": 2, "admin": 3}
-            ceilings = {"metadata": "read", **permissions}
-            if (
-                not isinstance(granted, dict)
-                or any(
-                    value not in levels or levels[value] > levels.get(ceilings.get(key), 0)
-                    for key, value in granted.items()
-                )
-                or any(granted.get(key) != value for key, value in permissions.items())
-            ):
-                raise ValueError("invalid permissions")
-            expires = datetime.fromisoformat(payload["expires_at"].replace("Z", "+00:00"))
-            if expires.tzinfo is None or expires <= datetime.fromtimestamp(
-                time.time() if now is None else issued_at, UTC
-            ):
-                raise ValueError("invalid expiry")
+            verify_authenticated_repository(
+                repositories[0],
+                expected_slug=selected,
+                expected_repository_id=expected_repository_id,
+                expected_visibility=expected_visibility,
+            )
+            if permissions is not None:
+                granted = payload["permissions"]
+                levels = {"read": 1, "write": 2, "admin": 3}
+                ceilings = {"metadata": "read", **permissions}
+                if (
+                    not isinstance(granted, dict)
+                    or any(
+                        value not in levels or levels[value] > levels.get(ceilings.get(key), 0)
+                        for key, value in granted.items()
+                    )
+                    or any(granted.get(key) != value for key, value in permissions.items())
+                ):
+                    raise ValueError("invalid permissions")
+                expires = datetime.fromisoformat(payload["expires_at"].replace("Z", "+00:00"))
+                if expires.tzinfo is None or expires <= datetime.fromtimestamp(
+                    time.time() if now is None else issued_at, UTC
+                ):
+                    raise ValueError("invalid expiry")
         except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as exc:
             raise GitHubIdentityError("GitHub App installation token scope or expiry refused") from exc
     return token
@@ -530,6 +548,8 @@ def resolve_agent_github_identity(
     api_base_url: str = _GITHUB_API_URL,
     ssl_context=None,
     rescue: bool = False,
+    expected_repository_id: int | None = None,
+    expected_visibility: str | None = None,
 ) -> GitHubIdentity:
     """Resolve App, dedicated-token, then temporary legacy identity.
 
@@ -537,6 +557,19 @@ def resolve_agent_github_identity(
     reason to silently fall through to a broader credential.
     """
     env = os.environ if environment is None else environment
+    require_verified_identity = expected_repository_id is not None or expected_visibility is not None
+    if expected_repository_id is not None and (type(expected_repository_id) is not int or expected_repository_id <= 0):
+        raise (
+            RescueIdentityError("expected-repository-id:invalid")
+            if rescue
+            else GitHubIdentityError("invalid expected repository id for the GitHub App token")
+        )
+    if expected_visibility is not None and expected_visibility not in {"public", "private"}:
+        raise (
+            RescueIdentityError("expected-visibility:invalid")
+            if rescue
+            else GitHubIdentityError("invalid expected visibility for the GitHub App token")
+        )
     if rescue:
         try:
             fields = _rescue_app_fields(env)
@@ -558,10 +591,14 @@ def resolve_agent_github_identity(
                         permissions={"contents": "write"},
                         api_base_url=api_base_url,
                         ssl_context=ssl_context,
+                        expected_repository_id=expected_repository_id,
+                        expected_visibility=expected_visibility,
                     )
                 except Exception:
                     raise RescueIdentityError("app-token:mint_failed") from None
                 return GitHubIdentity(token=token, source="app")
+            if require_verified_identity:
+                raise RescueIdentityError("app-directory:missing")
             token = env.get("LU_AGENT_GITHUB_TOKEN")
             if token:
                 return GitHubIdentity(token=token, source="token")
@@ -636,6 +673,10 @@ def resolve_agent_github_identity(
                 mint_kwargs["api_base_url"] = api_base_url
             if ssl_context is not None:
                 mint_kwargs["ssl_context"] = ssl_context
+        if expected_repository_id is not None:
+            mint_kwargs["expected_repository_id"] = expected_repository_id
+        if expected_visibility is not None:
+            mint_kwargs["expected_visibility"] = expected_visibility
         return GitHubIdentity(
             token=mint_installation_token(
                 app_id=app_id,
@@ -646,6 +687,9 @@ def resolve_agent_github_identity(
             ),
             source="app",
         )
+
+    if require_verified_identity:
+        raise GitHubIdentityError("expected repository id or visibility requires a GitHub App installation token")
 
     token = env.get("LU_AGENT_GITHUB_TOKEN")
     if token:
