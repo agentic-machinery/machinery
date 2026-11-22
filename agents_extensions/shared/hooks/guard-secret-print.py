@@ -1781,14 +1781,25 @@ def _program_reason(cmd: str, program: str, words: tuple[str, ...] = ()) -> str 
     return None
 
 
-def _glued_option_readings(value: str) -> str:
-    """The value, or for an option word every split of its leading letters from a glued rest."""
+# An option word's leading run of option characters (`-w0e`, `-0777e`). Interpreters take
+# flags repeated without limit, so a run longer than the limit is refused, not read.
+_OPTION_RUN = re.compile(r"-([A-Za-z0-9]+)")
+_OPTION_RUN_LIMIT = 32
+
+
+def _glued_option_readings(value: str) -> str | None:
+    """The value, or for an option word every split of its leading option characters from a glued rest.
+
+    None when the run is too long to split; the caller refuses the command.
+    """
     if value.startswith("--") and "=" in value:
         return value.replace("=", " ", 1)
-    letters = re.match(r"-([A-Za-z]{1,8})", value)
-    if not letters or len(value) <= 2:
+    run = _OPTION_RUN.match(value)
+    if not run or len(value) <= 2:
         return value
-    return " ".join(value[: 1 + count] + " " + value[1 + count :] for count in range(1, len(letters[1]) + 1))
+    if len(run[1]) > _OPTION_RUN_LIMIT:
+        return None
+    return " ".join(value[: 1 + count] + " " + value[1 + count :] for count in range(1, len(run[1]) + 1))
 
 
 def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | None:
@@ -1802,11 +1813,14 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     if reason:
         return reason
     # Read the shell values of all arguments, and again with every short option
-    # that may hold a glued program (`-e'ENV'`, `-esystem(...)`) split after each of
-    # its letters, and long options split at `=`. Do not infer which flags select program text.
+    # that may hold a glued program (`-e'ENV'`, `-0777e'...'`) split after each of
+    # its option characters, and long options split at `=`. Do not infer which flags select program text.
     values = [_strip_quotes(arg) for arg in args]
     programs = [" ".join(values)]
-    split = " ".join(_glued_option_readings(value) for value in values)
+    readings = [_glued_option_readings(value) for value in values]
+    if None in readings:
+        return "interpreter option word too long to read"
+    split = " ".join(reading for reading in readings if reading is not None)
     if split != programs[0]:
         programs.append(split)
     for program in programs:

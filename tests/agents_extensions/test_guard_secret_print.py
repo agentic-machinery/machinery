@@ -2002,6 +2002,8 @@ def test_unparseable_text_is_refused(monkeypatch, command, override):
         "echo \"${x:-$$'a\\'}\" ; env ; echo \"'}\"",
         "X=\"'$GH_TOKEN'\"; echo \"$X\"",
         "python3 -uc'import os; os.system(\"e\" # c\n \"nv\")'",
+        "ruby -0e'ENV.each{|k,v|puts k,v}'",
+        "perl -wwwwwwwwe'system \"env\"'",
     ],
     ids=[
         "parameter-boundary",
@@ -2014,6 +2016,8 @@ def test_unparseable_text_is_refused(monkeypatch, command, override):
         "double-dollar-in-parameter",
         "assignment-value-quotes",
         "python-flag-cluster",
+        "digit-option-cluster",
+        "long-option-cluster",
     ],
 )
 def test_round_one_reader_classes_are_refused(monkeypatch, command):
@@ -2024,6 +2028,8 @@ def test_round_one_reader_classes_are_refused(monkeypatch, command):
     `$'...'` inside `${...}` keeps its escapes, a script word with a `NAME=`
     prefix reads as its value, and `env -a` takes a value. `$$` is one token
     before a quote, an assignment's secret check reads its spelling, not its
-    value, and Python's `-c` may follow other options in one word.
+    value, and Python's `-c` may follow other options in one word. A glued
+    option cluster was split only on leading runs of up to 8 letters, so a
+    digit flag (`-0e`) or a ninth repeated flag hid the program after it.
     """
     assert _run(monkeypatch, command) == 2
