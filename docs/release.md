@@ -127,31 +127,34 @@ environment. The opt-in permission test gets MCP from the `test`
 dependency group. The release build tools use hash-pinned installs. The
 product consumer check uses the job's checksum-verified `UV_VERSION`.
 
-uv gives third-party distributions a three-day cooldown. For an urgent CVE
-fix inside that window, add a dated entry for the affected package to
-`[tool.uv].exclude-newer-package`. Choose a UTC cutoff just after the upload
-of the last distribution needed for the fix. Record the CVE and removal date
-in a comment, and regenerate the lock with `uv lock --upgrade-package NAME`.
-Remove the entry and regenerate the lock once the last required distribution
-is three days old. The first-party `lu-machinery = false` entry lets the
-release cut adopt a newly published machinery wheel in the product.
+uv gives third-party distributions a seven-day cooldown. A temporary third-party
+override inside that window is allowed only through a dated entry for the
+affected package in `[tool.uv].exclude-newer-package`; open-ended third-party
+exceptions are not allowed. Choose a UTC cutoff just after the upload of the
+last distribution needed for the fix, record the advisory or reason and a
+removal date in a comment, and regenerate the lock with
+`uv lock --upgrade-package NAME`. Remove the entry and regenerate the lock once
+the last required distribution is seven days old. The first-party
+`lu-machinery = false` entry lets the release cut adopt a newly published
+machinery wheel in the product.
 See [uv's package cutoff settings](https://docs.astral.sh/uv/reference/settings/#exclude-newer-package).
 
-`.github/dependabot.yml` schedules weekly grouped updates for npm and GitHub Actions.
-Dependabot's default three-day cooldown applies to version updates. Security updates
-are eligible immediately. The config leaves out uv until Dependabot bundles uv 0.13.9
-or newer. Update actions coupled to `.github/workflows/pins.txt` together with their pin
-records. Adopt the latest eligible releases and fix compatibility in machinery.
-Lockfiles record the exact resolved versions. Every dependency PR requires exact-head
-review and a green `CI Gate`.
+`.github/dependabot.yml` schedules weekly grouped updates for npm and GitHub Actions
+with a seven-day cooldown (`cooldown.default-days: 7`) on version updates. Security
+updates are eligible immediately. The config leaves out uv until Dependabot bundles
+uv 0.13.9 or newer. Update actions coupled to `.github/workflows/pins.txt` together
+with their pin records. Adopt the latest eligible releases and fix compatibility in
+machinery. Lockfiles record the exact resolved versions. Every dependency PR requires
+exact-head review and a green `CI Gate`.
 
 Open a manual PR for an urgent uv fix inside the cooldown or for a coordinated pin update.
 
-- Inside the three-day uv cooldown window, add the dated `[tool.uv].exclude-newer-package`
-  override above.
+- Inside the seven-day uv cooldown window, add the dated `[tool.uv].exclude-newer-package`
+  override above (naming the advisory or reason and a removal date; no open-ended
+  third-party exceptions).
 - For a `pins.txt`-coupled tool or action, bump `.github/workflows/pins.txt` and its matching
   workflow, gate, and baseline pins together.
-- When a `pins.txt`-coupled uv tool needs an urgent fix inside the three-day window, apply
+- When a `pins.txt`-coupled uv tool needs an urgent fix inside the seven-day window, apply
   both the dated `[tool.uv].exclude-newer-package` override and the coordinated pin bump.
 
 The release wheelhouse includes core and the `api`, `postgres`, and
