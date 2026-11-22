@@ -869,3 +869,235 @@ def test_retry_after_a_channel_context_change_reconciles_instead_of_stalling(tmp
         service.close()
         assert own.deliver(broken, service) and broken  # a real failure stays queued
     assert len(inbox(tmp_path)) == 1
+
+
+# --- pre-enqueue keeper custody (DETACH-CI-1122 PR 1) ------------------------------
+
+
+def _verdict_receipt(pr_number: int = 42, head: str = HEAD, **extra):
+    base = {
+        "pr": pr_number,
+        "head": head,
+        "task": "review-42-r1",
+        "verdict": "APPROVED",
+        "comment": "posted",
+        "status": "posted",
+    }
+    base.update(extra)
+    return base
+
+
+def _worker_task(task_id: str = "worker-1", branch: str = "codex/x", *, status: str = "running", nonce: str = "nonce-1", initiator: str | None = "claude-cto"):
+    rec = {**task(task_id, branch, status=status), "run_nonce": nonce}
+    if initiator is not None:
+        rec["initiator"] = initiator
+    return rec
+
+
+def test_keeper_transfer_binds_exact_pr_and_allows_worker_exit_while_ci_pending(tmp_path, monkeypatch, capsys):
+    """Defect class: worker cannot exit with durable keeper custody while CI is pending before enqueue."""
+    from lu_machinery.dispatcher import store
+    from lu_machinery.orchestration import fleet_repos
+
+    path = tmp_path / "pr_ownership" / "state.json"
+    pr_open = {
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefOid": HEAD,
+        "headRefName": "codex/x",
+        "baseRefName": "main",
+        "isCrossRepository": False,
+    }
+    worker = _worker_task("worker-1", nonce="nonce-abc")
+    ack = own.acknowledge_keeper_transfer(
+        path,
+        repo=REPO,
+        number=42,
+        pr=pr_open,
+        worker_task="worker-1",
+        worker_nonce="nonce-abc",
+        records=[worker],
+        now=at(0),
+        rerun="unspent",
+        repos=FLEET,
+        verdict_receipt=_verdict_receipt(),
+        live=is_live,
+    )
+    assert ack["accepted"] is True and ack["acknowledged"] is True
+    assert ack["custody_mode"] == "keeper" and ack["keeper_state"] == "active"
+    assert ack["repository"] == REPO and ack["pr"] == 42 and ack["base"] == "main" and ack["head"] == HEAD
+    assert ack["worker_task"] == "worker-1" and ack["worker_nonce"] == "nonce-abc"
+    assert ack["review_classification"] == "verdict" and ack["verdict_receipt"]["verdict"] == "APPROVED"
+
+    # Exact retry is idempotent.
+    ack2 = own.acknowledge_keeper_transfer(
+        path,
+        repo=REPO,
+        number=42,
+        pr=pr_open,
+        worker_task="worker-1",
+        worker_nonce="nonce-abc",
+        records=[worker],
+        now=at(1),
+        rerun="unspent",
+        repos=FLEET,
+        verdict_receipt=_verdict_receipt(),
+        live=is_live,
+    )
+    assert ack2["custody_sha256"] == ack["custody_sha256"]
+
+    # After worker exits cleanly while CI is still pending, PR is NOT alerted ownerless.
+    tick_args = dict(path=path, observe=lambda h: ({KEY}, {KEY: ownerless()}), service_factory=fleet(tmp_path))
+    assert own.keeper_tick(now=at(5), **tick_args)[1] is False
+    assert own.keeper_tick(now=at(25), **tick_args)[1] is False
+    assert inbox(tmp_path) == []
+    view = own.custody_view(own.load(path))
+    assert view["keeper_custody"] == [{
+        "pr": KEY,
+        "keeper_state": "active",
+        "base": "main",
+        "head": HEAD,
+        "worker_task": "worker-1",
+        "worker_nonce": "nonce-abc",
+        "review_classification": "verdict",
+    }]
+    assert view["alert_outstanding"] == [] and view["waiting_for_grace"] == []
+
+    # CLI keeper-transfer also supports --trivial and --verdict-receipt-file.
+    cli_path = tmp_path / "cli_state.json"
+    monkeypatch.setattr(own, "state_path", lambda: cli_path)
+    monkeypatch.setattr(store, "list_tasks", lambda *a, **k: [worker])
+    monkeypatch.setattr(own, "liveness", is_live)
+    monkeypatch.setattr(own, "_gh_pr", lambda repo, n: pr_open)
+    monkeypatch.setattr(own, "_rerun_allowance", lambda *a: "unspent")
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: FLEET)
+    monkeypatch.setenv(own.TASK_ENV, "worker-1")
+    assert own.main(["keeper-transfer", "--pr", "42", "--repo", REPO, "--nonce", "nonce-abc", "--trivial"]) == 0
+    cli_ack = json.loads(capsys.readouterr().out)
+    assert cli_ack["acknowledged"] is True and cli_ack["review_classification"] == "trivial"
+    assert cli_ack["verdict_receipt"] is None
+
+    # Verdict receipt file on a second PR.
+    receipt_file = tmp_path / "receipt.json"
+    receipt_file.write_text(json.dumps(_verdict_receipt(pr_number=43)))
+    worker_43 = _worker_task("worker-43", branch="codex/y", nonce="nonce-43")
+    monkeypatch.setattr(store, "list_tasks", lambda *a, **k: [worker_43])
+    monkeypatch.setattr(own, "_gh_pr", lambda repo, n: {**pr_open, "headRefName": "codex/y"})
+    monkeypatch.setenv(own.TASK_ENV, "worker-43")
+    assert own.main([
+        "keeper-transfer", "--pr", "43", "--repo", REPO, "--nonce", "nonce-43",
+        "--verdict-receipt-file", str(receipt_file),
+    ]) == 0
+    file_ack = json.loads(capsys.readouterr().out)
+    assert file_ack["acknowledged"] is True and file_ack["review_classification"] == "verdict"
+
+
+def test_keeper_transfer_refuses_invalid_bindings_draft_and_non_owner():
+    """Defect class: forged receipt, wrong nonce, draft PR, or non-owner obtains keeper custody."""
+    pr_open = {
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefOid": HEAD,
+        "headRefName": "codex/x",
+        "baseRefName": "main",
+        "isCrossRepository": False,
+    }
+    worker = _worker_task("worker-1", nonce="nonce-1")
+    stranger = _worker_task("stranger", branch="codex/other", nonce="nonce-s")
+    dead = _worker_task("worker-1", status="done", nonce="nonce-1")
+
+    def call(**overrides):
+        kwargs = dict(
+            repo=REPO, number=42, pr=pr_open, worker_task="worker-1", worker_nonce="nonce-1",
+            records=[worker], now=at(0), rerun="unspent", repos=FLEET,
+            verdict_receipt=_verdict_receipt(), trivial=False, live=is_live,
+        )
+        kwargs.update(overrides)
+        return own.transfer_to_keeper(own._empty(), **kwargs)
+
+    # Draft or closed PR refused.
+    with pytest.raises(own.OwnershipError, match="draft"):
+        call(pr={**pr_open, "isDraft": True})
+    with pytest.raises(own.OwnershipError, match="not open"):
+        call(pr={**pr_open, "state": "CLOSED"})
+    # Mismatched nonce or dead worker or non-owner refused.
+    with pytest.raises(own.OwnershipError, match="worker_nonce"):
+        call(worker_nonce="wrong-nonce")
+    with pytest.raises(own.OwnershipError, match="not live"):
+        call(records=[dead])
+    with pytest.raises(own.OwnershipError, match="does not currently own"):
+        call(worker_task="stranger", worker_nonce="nonce-s", records=[worker, stranger])
+    # Both or neither of verdict_receipt and trivial refused.
+    with pytest.raises(own.OwnershipError, match="not both"):
+        call(verdict_receipt=_verdict_receipt(), trivial=True)
+    with pytest.raises(own.OwnershipError, match="requires a verdict_receipt or trivial"):
+        call(verdict_receipt=None, trivial=False)
+    # Forged / mismatched verdict receipts refused.
+    for bad in (
+        _verdict_receipt(verdict="CHANGES_REQUESTED"),
+        _verdict_receipt(head="b" * 40),
+        _verdict_receipt(pr_number=99),
+        _verdict_receipt(status="failed"),
+        _verdict_receipt(repository="other/repo"),
+    ):
+        with pytest.raises(own.OwnershipError):
+            call(verdict_receipt=bad)
+    # Different binding overwrite refused.
+    data = own._empty()
+    own.transfer_to_keeper(
+        data, repo=REPO, number=42, pr=pr_open, worker_task="worker-1", worker_nonce="nonce-1",
+        records=[worker], now=at(0), rerun="unspent", repos=FLEET, verdict_receipt=_verdict_receipt(), live=is_live,
+    )
+    with pytest.raises(own.OwnershipError, match="different binding"):
+        own.transfer_to_keeper(
+            data, repo=REPO, number=42, pr=pr_open, worker_task="worker-1", worker_nonce="nonce-1",
+            records=[worker], now=at(1), rerun="unspent", repos=FLEET, trivial=True, live=is_live,
+        )
+
+
+def test_keeper_repair_custody_released_only_when_cto_successor_accepts():
+    """Defect class: repair custody cleared without a live claude-cto successor accepting ownership."""
+    pr_open = {
+        "state": "OPEN",
+        "isDraft": False,
+        "headRefOid": HEAD,
+        "headRefName": "codex/x",
+        "baseRefName": "main",
+        "isCrossRepository": False,
+    }
+    data = own._empty()
+    worker_live = _worker_task("worker-1", nonce="nonce-1", status="running")
+    own.transfer_to_keeper(
+        data, repo=REPO, number=42, pr=pr_open, worker_task="worker-1", worker_nonce="nonce-1",
+        records=[worker_live], now=at(0), rerun="unspent", repos=FLEET, verdict_receipt=_verdict_receipt(), live=is_live,
+    )
+    worker_done = _worker_task("worker-1", nonce="nonce-1", status="done")
+    cto_succ = _worker_task("repair-1", branch="claude/repair", status="running", nonce="nonce-r1", initiator="claude-cto")
+    rogue_succ = _worker_task("rogue-1", branch="claude/rogue", status="running", nonce="nonce-g1", initiator="other-lane")
+
+    # Active keeper custody refuses accept, decision custody, and release_decision_custody.
+    with pytest.raises(own.OwnershipError, match="active keeper custody"):
+        do_accept(data, [worker_done, cto_succ], successor="repair-1", pr=pr_open)
+    with pytest.raises(own.OwnershipError, match="keeper custody"):
+        own.record_decision_custody(
+            data, repo=REPO, number=42, pr=pr_open, reason="hold", decision_owner="claude-cto",
+            records=[worker_done], now=at(5), rerun="unspent", repos=FLEET, live=is_live,
+        )
+    with pytest.raises(own.OwnershipError, match="keeper custody"):
+        own.release_decision_custody(data, repo=REPO, number=42, pr=pr_open, now=at(5))
+
+    # Transition to repair custody.
+    updated = own.mark_keeper_repair(data, repo=REPO, number=42, reason="CI-red-CI Gate", now=at(10), head="b" * 40, run_ids=[555])
+    assert updated is not None and updated["keeper_state"] == "repair" and updated["observed_head"] == "b" * 40
+
+    # Non-CTO successor and release_decision_custody are still refused.
+    with pytest.raises(own.OwnershipError, match="claude-cto successor"):
+        do_accept(data, [worker_done, rogue_succ], successor="rogue-1", pr=pr_open)
+    with pytest.raises(own.OwnershipError, match="keeper custody"):
+        own.release_decision_custody(data, repo=REPO, number=42, pr=pr_open, now=at(11))
+
+    # Only the CTO's live successor releases repair custody.
+    receipt = do_accept(data, [worker_done, cto_succ], successor="repair-1", pr=pr_open)
+    assert receipt["successor"] == "repair-1"
+    assert not own.keeper_custody(data["handoffs"][KEY])
+    assert any(item["event"] == "repair_custody_released" and item["successor"] == "repair-1" for item in data["history"])

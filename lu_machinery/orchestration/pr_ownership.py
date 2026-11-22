@@ -69,10 +69,13 @@ TICK_INTERVAL = timedelta(minutes=5)
 # ``queue-exit`` needs a successful ownership check this recent: the alert is in place.
 TICK_FRESH = timedelta(minutes=20)
 CUSTODY_COVERS = ("ejection", "stale-approval", "merge-confirmation", "closeout")
+KEEPER_CUSTODY_COVERS = ("ci-watch", "landing", "ejection", "stale-approval", "merge-confirmation", "closeout")
+KEEPER_STATES = frozenset({"active", "repair"})
 CTO_INBOX = "claude-cto"
 CTO_CHANNEL = "cto"
 SENDER = "merge-queue-keeper"
 TASK_ENV = "LEARN_UKRAINIAN_DISPATCH_TASK_ID"
+NONCE_ENV = "LEARN_UKRAINIAN_RUN_NONCE"
 HISTORY_LIMIT = 200
 # Help and a mixed accept print these lines. Queue custody and recorded custody do not combine.
 QUEUE_CUSTODY_USAGE = (
@@ -91,9 +94,22 @@ RELEASE_CUSTODY_USAGE = (
     "ownership only, never a merge gate): "
     f"python -m {_MODULE} accept --pr N --repo OWNER/NAME --release"
 )
+KEEPER_CUSTODY_USAGE = (
+    "keeper custody (pre-enqueue transfer from a live worker to the merge-queue keeper, "
+    "bound to repository, PR, base, head, worker task/nonce and verdict receipt or Trivial tier; "
+    "acknowledged before worker exit; repair custody is released only when a claude-cto successor accepts): "
+    f"python -m {_MODULE} keeper-transfer --pr N --repo OWNER/NAME --nonce NONCE "
+    "(--verdict-receipt JSON | --verdict-receipt-file PATH | --trivial)"
+)
 _OWNERSHIP_FIELDS = frozenset({
     "successor", "predecessor", "accepted_at", "head", "custody",
     "rerun_allowance", "reason", "decision_owner", "pr_state",
+})
+_KEEPER_ONLY_FIELDS = frozenset({
+    "custody_mode", "keeper_state", "repository", "pr", "base",
+    "worker_task", "worker_nonce", "review_classification", "verdict_receipt",
+    "acknowledged_at", "custody_sha256", "repair_reason", "repair_at",
+    "observed_head", "repair_run_ids",
 })
 # Compiled at the call. A module-level ``re.compile`` plus a later method call is one
 # Semgrep match spanning every byte in between, so an edit in that span is a new finding.
@@ -140,8 +156,13 @@ def _git_head(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and len(value) == 40 and all(character in "0123456789abcdef" for character in value)
 
 
-def _single_line(value: object) -> bool:
-    return isinstance(value, str) and bool(value) and value == value.strip() and "\n" not in value and "\r" not in value
+def _single_line(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and all(ord(ch) >= 32 and ord(ch) != 127 for ch in value)
+    )
 
 
 def _require_publish_branch(record: Mapping[str, Any] | None, pr: Mapping[str, Any]) -> None:
@@ -169,7 +190,7 @@ def _refused(exc: OwnershipError) -> str:
 
 def decision_custody(handoff: Mapping[str, Any] | None) -> bool:
     """Coordinator custody of an open PR: a reason and a decision owner, not a task acceptance."""
-    if not isinstance(handoff, dict):
+    if not isinstance(handoff, dict) or handoff.get("custody_mode") == "keeper":
         return False
     owner = handoff.get("decision_owner")
     return (
@@ -177,6 +198,130 @@ def decision_custody(handoff: Mapping[str, Any] | None) -> bool:
         and _single_line(owner)
         and handoff.get("pr_state") == "OPEN"
         and handoff.get("successor") == owner
+    )
+
+
+def _valid_repo_slug(value: object) -> TypeGuard[str]:
+    return (
+        isinstance(value, str)
+        and bool(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value))
+        and not value.endswith(".git")
+    )
+
+
+def _validate_verdict_receipt(receipt: object, *, pr: int, head: str, repo: str | None = None) -> dict[str, Any]:
+    """Validate an exact-head recorded APPROVE verdict receipt from record_cf_verdict."""
+    if not isinstance(receipt, Mapping):
+        raise OwnershipError("verdict_receipt must be a JSON object")
+    if repo is not None and "repository" in receipt:
+        rec_repo = receipt.get("repository")
+        if not isinstance(rec_repo, str) or rec_repo.casefold() != repo.casefold():
+            raise OwnershipError("verdict_receipt repository does not match target repository")
+    if type(receipt.get("pr")) is not int or receipt["pr"] != pr:
+        raise OwnershipError("verdict_receipt pr does not match target PR")
+    if receipt.get("head") != head or not _git_head(head):
+        raise OwnershipError("verdict_receipt head does not match exact PR head")
+    if not _single_line(receipt.get("task")):
+        raise OwnershipError("verdict_receipt must name the review task")
+    if receipt.get("verdict") != "APPROVED":
+        raise OwnershipError("verdict_receipt must record verdict=APPROVED")
+    if receipt.get("status") != "posted":
+        raise OwnershipError("verdict_receipt must record status=posted")
+    if "comment" in receipt and receipt["comment"] not in {"posted", "existing"}:
+        raise OwnershipError("verdict_receipt comment status is invalid")
+    try:
+        serialized = json.dumps(dict(receipt), sort_keys=True)
+        normalized = json_depth.loads(serialized, max_depth=64)
+    except (TypeError, ValueError) as exc:
+        raise OwnershipError("verdict_receipt is not valid JSON") from exc
+    if not isinstance(normalized, dict):
+        raise OwnershipError("verdict_receipt must be a JSON object")
+    return normalized
+
+
+def _keeper_custody_digest(
+    *,
+    repository: str,
+    pr: int,
+    base: str,
+    head: str,
+    worker_task: str,
+    worker_nonce: str,
+    review_classification: str,
+    verdict_receipt: Mapping[str, Any] | None,
+) -> str:
+    binding = {
+        "repository": repository.casefold(),
+        "pr": pr,
+        "base": base,
+        "head": head,
+        "worker_task": worker_task,
+        "worker_nonce": worker_nonce,
+        "review_classification": review_classification,
+        "verdict_receipt": dict(verdict_receipt) if verdict_receipt is not None else None,
+    }
+    return hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def keeper_custody(handoff: Mapping[str, Any] | None) -> bool:
+    """Pre-enqueue keeper custody of an open PR, bound to exact repo/PR/base/head/task/nonce/review."""
+    if not isinstance(handoff, dict) or handoff.get("custody_mode") != "keeper":
+        return False
+    if any(name in handoff for name in ("reason", "decision_owner", "pr_state")):
+        return False
+    repo = handoff.get("repository")
+    number = handoff.get("pr")
+    base = handoff.get("base")
+    head = handoff.get("head")
+    worker_task = handoff.get("worker_task")
+    worker_nonce = handoff.get("worker_nonce")
+    classification = handoff.get("review_classification")
+    verdict_receipt = handoff.get("verdict_receipt")
+    if (
+        handoff.get("successor") != SENDER
+        or handoff.get("keeper_state") not in KEEPER_STATES
+        or not _valid_repo_slug(repo)
+        or type(number) is not int
+        or number <= 0
+        or not _single_line(base)
+        or not _git_head(head)
+        or not _single_line(worker_task)
+        or handoff.get("predecessor") != worker_task
+        or not _single_line(worker_nonce)
+        or not _single_line(handoff.get("acknowledged_at"))
+        or tuple(handoff.get("custody") or ()) != KEEPER_CUSTODY_COVERS
+    ):
+        return False
+    if classification == "trivial":
+        if verdict_receipt is not None:
+            return False
+    elif classification == "verdict":
+        try:
+            _validate_verdict_receipt(verdict_receipt, pr=number, head=head, repo=repo)
+        except OwnershipError:
+            return False
+    else:
+        return False
+    expected_digest = _keeper_custody_digest(
+        repository=repo,
+        pr=number,
+        base=base,
+        head=head,
+        worker_task=worker_task,
+        worker_nonce=worker_nonce,
+        review_classification=classification,
+        verdict_receipt=verdict_receipt,
+    )
+    if handoff.get("custody_sha256") != expected_digest:
+        return False
+    if handoff.get("keeper_state") == "repair" and not _single_line(handoff.get("repair_reason")):
+        return False
+    observed_head = handoff.get("observed_head")
+    if observed_head is not None and not _git_head(observed_head):
+        return False
+    run_ids = handoff.get("repair_run_ids")
+    return run_ids is None or (
+        isinstance(run_ids, list) and all(type(item) is int and item > 0 for item in run_ids)
     )
 
 
@@ -206,6 +351,12 @@ def load(path: Path) -> dict[str, Any]:
                 raise TypeError(key)
             if any(name in handoff for name in ("reason", "decision_owner", "pr_state")) and not decision_custody(handoff):
                 raise TypeError(key)
+            if any(name in handoff for name in _KEEPER_ONLY_FIELDS):
+                if not keeper_custody(handoff):
+                    raise TypeError(key)
+                _at(handoff["acknowledged_at"])
+                if handoff.get("repair_at") is not None:
+                    _at(handoff["repair_at"])
         last = data.get("last_tick")
         if last is not None:
             _at(last["at"])
@@ -256,14 +407,38 @@ def locked(path: Path) -> Iterator[dict[str, Any]]:
 
 
 def _handoff_map(data: Mapping[str, Any]) -> dict[tuple[str, int], str]:
-    """Successor task ids. Decision custody names a person, not a task, so it stays out."""
+    """Successor task ids. Decision custody and keeper custody are not dispatch tasks."""
     result = {}
     for key, handoff in data["handoffs"].items():
-        if decision_custody(handoff):
+        if decision_custody(handoff) or keeper_custody(handoff):
             continue
         repo, _, number = key.rpartition("#")
         result[(repo, int(number))] = handoff["successor"]
     return result
+
+
+def keeper_custody_for(path: Path | None, repo: str, number: int) -> dict[str, Any] | None:
+    """Return the persisted keeper custody record for ``repo#number``, or None when absent."""
+    target = path or state_path()
+    if not target.exists():
+        return None
+    data = load(target)
+    handoff = data["handoffs"].get(pr_key(repo, number))
+    return copy.deepcopy(handoff) if keeper_custody(handoff) else None
+
+
+def keeper_custodies_for_repo(path: Path | None, repo: str) -> dict[int, dict[str, Any]]:
+    """Return ``{pr_number: handoff}`` for every PR in ``repo`` currently under keeper custody."""
+    target = path or state_path()
+    if not target.exists():
+        return {}
+    data = load(target)
+    prefix = f"{repo.casefold()}#"
+    found: dict[int, dict[str, Any]] = {}
+    for key, handoff in data["handoffs"].items():
+        if key.startswith(prefix) and keeper_custody(handoff):
+            found[int(handoff["pr"])] = copy.deepcopy(handoff)
+    return found
 
 
 def _end_ownerless_episode(
@@ -324,10 +499,15 @@ def step(
         handoff = handoffs.pop(key)
         if decision_custody(handoff):
             data["history"].append({"pr": key, "event": "custody_released", "at": stamp, "how": "PR state changed"})
+        elif keeper_custody(handoff):
+            data["history"].append({
+                "pr": key, "event": "keeper_custody_released", "at": stamp,
+                "how": "PR state changed", "worker_task": handoff["worker_task"],
+            })
     for key in sorted(open_keys):
         finding = findings.get(key)
-        if decision_custody(handoffs.get(key)):
-            finding = None  # held for a decision: not ownerless while the PR stays open
+        if decision_custody(handoffs.get(key)) or keeper_custody(handoffs.get(key)):
+            finding = None  # held for a decision or owned by the keeper: not ownerless while open
         episode = episodes.get(key)
         if finding is not None and finding.unknown:
             if episode is not None and not episode["alerted_at"]:
@@ -732,6 +912,7 @@ def _tick(now, path, observe, service_factory) -> tuple[list[str], bool]:
         findings = {
             key: finding for key, finding in findings.items()
             if not decision_custody(data["handoffs"].get(key))
+            and not keeper_custody(data["handoffs"].get(key))
         }
         notices = step(data, keys, findings, now)
         seated = _heal_ownerless(data, findings, notices, now)
@@ -761,7 +942,7 @@ def _tick(now, path, observe, service_factory) -> tuple[list[str], bool]:
 def _gh_pr(repo: str, number: int) -> dict[str, Any]:
     proc = github_client.run(
         ["gh", "pr", "view", str(number), "--repo", repo, "--json",
-         "state,headRefOid,headRefName,baseRefName,isCrossRepository,commits"],
+         "state,isDraft,headRefOid,headRefName,baseRefName,isCrossRepository,commits"],
         capture_output=True, text=True, check=False, timeout=60,
     )
     try:
@@ -840,10 +1021,20 @@ def accept(
         raise OwnershipError(f"successor {successor} is {'unknown' if state is None else 'not live'}")
     key = pr_key(repo, number)
     previous = data["handoffs"].get(key)
-    # A decision owner is a person. The same string on a live task is not ownership.
+    releasing_repair = False
+    if keeper_custody(previous):
+        if previous.get("keeper_state") != "repair":
+            raise OwnershipError("PR is under active keeper custody; cannot accept unless held for repair")
+        if custody or predecessor:
+            raise OwnershipError("repair custody release cannot combine with queue custody")
+        successor_record = by_id.get(successor)
+        if not isinstance(successor_record, Mapping) or successor_record.get("initiator") != CTO_INBOX:
+            raise OwnershipError(f"repair custody can only be released when a {CTO_INBOX} successor accepts it")
+        releasing_repair = True
+    # A decision owner is a person, and keeper custody is not a task acceptance.
     seated = (
         {(repo.casefold(), number): previous["successor"]}
-        if previous and not decision_custody(previous) else {}
+        if previous and not decision_custody(previous) and not keeper_custody(previous) else {}
     )
 
     def ownership(record: Mapping[str, Any]) -> bool | None:
@@ -873,8 +1064,270 @@ def accept(
         "rerun_allowance": rerun,
     }
     data["handoffs"][key] = handoff
+    if releasing_repair and isinstance(previous, Mapping):
+        data["history"].append({
+            "pr": key,
+            "event": "repair_custody_released",
+            "at": handoff["accepted_at"],
+            "successor": successor,
+            "previous_head": previous.get("head"),
+            "previous_worker_task": previous.get("worker_task"),
+        })
     data["history"].append({"pr": key, "event": "accepted", "at": handoff["accepted_at"], **handoff})
     return handoff
+
+
+def transfer_to_keeper(
+    data: dict[str, Any],
+    *,
+    repo: str,
+    number: int,
+    pr: Mapping[str, Any],
+    worker_task: str,
+    worker_nonce: str,
+    records: list[dict[str, Any]],
+    now: datetime,
+    rerun: str,
+    repos: Mapping[str, Any],
+    verdict_receipt: Mapping[str, Any] | None = None,
+    trivial: bool = False,
+    live: Callable[[Mapping[str, Any] | None], bool | None] | None = None,
+) -> dict[str, Any]:
+    """Transfer an open, non-draft PR from its live owning worker to keeper custody before enqueue.
+
+    Bound to repository, PR, base, head, worker task/nonce, and either a recorded exact-head
+    APPROVE verdict receipt or Trivial classification. Does not require queue membership or
+    completed CI: pending CI allows worker exit once this transfer is durably acknowledged.
+    """
+    live = live or liveness
+    if not _valid_repo_slug(repo):
+        raise OwnershipError("repository must be owner/name")
+    if type(number) is not int or number <= 0:
+        raise OwnershipError("PR number must be a positive integer")
+    if pr.get("state") != "OPEN":
+        raise OwnershipError(f"PR is {pr.get('state')}, not open")
+    if pr.get("isDraft") is not False:
+        raise OwnershipError("draft or unknown-draft PR cannot transfer to keeper custody")
+    head = pr.get("headRefOid")
+    if not _git_head(head):
+        raise OwnershipError("PR head must be a 40-character lowercase git SHA")
+    base = pr.get("baseRefName")
+    if not _single_line(base):
+        raise OwnershipError("PR base branch is unreadable")
+    if not _single_line(worker_task) or not _single_line(worker_nonce):
+        raise OwnershipError("keeper transfer requires single-line worker task and nonce")
+    if trivial and verdict_receipt is not None:
+        raise OwnershipError("provide either verdict_receipt or trivial=True, not both")
+    if not trivial and verdict_receipt is None:
+        raise OwnershipError("keeper transfer requires a verdict_receipt or trivial=True")
+    normalized_receipt = (
+        _validate_verdict_receipt(verdict_receipt, pr=number, head=head, repo=repo)
+        if verdict_receipt is not None
+        else None
+    )
+    classification = "trivial" if trivial else "verdict"
+    by_id = {record.get("task_id"): record for record in records}
+    worker_record = by_id.get(worker_task)
+    worker_state = live(worker_record)
+    if worker_state is not True:
+        raise OwnershipError(f"worker {worker_task} is {'unknown' if worker_state is None else 'not live'}")
+    if not isinstance(worker_record, Mapping) or worker_record.get("run_nonce") != worker_nonce:
+        raise OwnershipError("worker_nonce does not match the live worker task record")
+    key = pr_key(repo, number)
+    previous = data["handoffs"].get(key)
+    digest = _keeper_custody_digest(
+        repository=repo,
+        pr=number,
+        base=base,
+        head=head,
+        worker_task=worker_task,
+        worker_nonce=worker_nonce,
+        review_classification=classification,
+        verdict_receipt=normalized_receipt,
+    )
+    if keeper_custody(previous):
+        if isinstance(previous, dict) and previous.get("keeper_state") == "active" and previous.get("custody_sha256") == digest:
+            return dict(previous)
+        raise OwnershipError("PR is already under keeper custody with a different binding or state")
+    if decision_custody(previous):
+        raise OwnershipError("PR is already under recorded decision custody")
+    seated = {(repo.casefold(), number): previous["successor"]} if previous else {}
+
+    def ownership(record: Mapping[str, Any]) -> bool | None:
+        target = {repo: [{**pr, "number": number}]}
+        rows = findings(target, [dict(record)], repos, seated, live=lambda _record: True)
+        if not rows:
+            return True
+        return None if rows[0].unknown else False
+
+    if ownership(worker_record) is not True:
+        raise OwnershipError(f"worker {worker_task} does not currently own {repo}#{number}")
+    blocking = sorted(
+        record["task_id"] for record in records
+        if record.get("task_id") != worker_task
+        and live(record) is not False and ownership(record) is not False
+    )
+    if blocking:
+        raise OwnershipError(f"one owner at a time: {', '.join(blocking)} may still own this PR")
+    stamp = now.isoformat()
+    handoff: dict[str, Any] = {
+        "successor": SENDER,
+        "predecessor": worker_task,
+        "accepted_at": stamp,
+        "acknowledged_at": stamp,
+        "custody": list(KEEPER_CUSTODY_COVERS),
+        "custody_mode": "keeper",
+        "keeper_state": "active",
+        "repository": repo,
+        "pr": number,
+        "base": base,
+        "head": head,
+        "worker_task": worker_task,
+        "worker_nonce": worker_nonce,
+        "review_classification": classification,
+        "verdict_receipt": normalized_receipt,
+        "custody_sha256": digest,
+        "rerun_allowance": rerun,
+    }
+    data["handoffs"][key] = handoff
+    data["history"].append({
+        "pr": key,
+        "event": "keeper_transfer_acknowledged",
+        "at": stamp,
+        "worker_task": worker_task,
+        "worker_nonce": worker_nonce,
+        "base": base,
+        "head": head,
+        "review_classification": classification,
+        "custody_sha256": digest,
+    })
+    _end_ownerless_episode(
+        data, key, how=f"keeper custody acknowledged from {worker_task}", successor=SENDER, now=now,
+    )
+    return handoff
+
+
+def acknowledge_keeper_transfer(
+    path: Path,
+    *,
+    repo: str,
+    number: int,
+    pr: Mapping[str, Any],
+    worker_task: str,
+    worker_nonce: str,
+    records: list[dict[str, Any]],
+    now: datetime,
+    rerun: str,
+    repos: Mapping[str, Any],
+    verdict_receipt: Mapping[str, Any] | None = None,
+    trivial: bool = False,
+    live: Callable[[Mapping[str, Any] | None], bool | None] | None = None,
+) -> dict[str, Any]:
+    """Durably persist and verify keeper custody transfer before worker exit."""
+    with locked(path) as data:
+        receipt = transfer_to_keeper(
+            data,
+            repo=repo,
+            number=number,
+            pr=pr,
+            worker_task=worker_task,
+            worker_nonce=worker_nonce,
+            records=records,
+            now=now,
+            rerun=rerun,
+            repos=repos,
+            verdict_receipt=verdict_receipt,
+            trivial=trivial,
+            live=live,
+        )
+    persisted = keeper_custody_for(path, repo, number)
+    if persisted is None or persisted.get("custody_sha256") != receipt["custody_sha256"]:
+        raise OwnershipError("keeper transfer persistence could not be verified on read-back")
+    return {"accepted": True, "acknowledged": True, "pr": pr_key(repo, number), **persisted}
+
+
+def mark_keeper_repair(
+    data: dict[str, Any],
+    *,
+    repo: str,
+    number: int,
+    reason: str,
+    now: datetime,
+    head: str | None = None,
+    run_ids: list[int] | tuple[int, ...] = (),
+) -> dict[str, Any] | None:
+    """Hold an active keeper custody record for CTO repair until a CTO successor accepts it."""
+    clean_reason = reason.strip()
+    if not _single_line(clean_reason):
+        raise OwnershipError("repair custody requires a single-line reason")
+    key = pr_key(repo, number)
+    handoff = data["handoffs"].get(key)
+    if not keeper_custody(handoff):
+        return None
+    assert isinstance(handoff, dict)
+    handoff["keeper_state"] = "repair"
+    handoff["repair_reason"] = clean_reason
+    handoff["repair_at"] = now.isoformat()
+    if head is not None and _git_head(head) and head != handoff["head"]:
+        handoff["observed_head"] = head
+    valid_runs = [item for item in run_ids if type(item) is int and item > 0]
+    if valid_runs:
+        handoff["repair_run_ids"] = sorted(set(valid_runs))
+    data["history"].append({
+        "pr": key,
+        "event": "keeper_repair_held",
+        "at": handoff["repair_at"],
+        "reason": clean_reason,
+        "head": handoff["head"],
+        **({"observed_head": handoff["observed_head"]} if "observed_head" in handoff else {}),
+        **({"run_ids": handoff["repair_run_ids"]} if "repair_run_ids" in handoff else {}),
+    })
+    return handoff
+
+
+def record_keeper_repair(
+    path: Path,
+    *,
+    repo: str,
+    number: int,
+    reason: str,
+    now: datetime | None = None,
+    head: str | None = None,
+    run_ids: list[int] | tuple[int, ...] = (),
+) -> dict[str, Any] | None:
+    """Persist keeper repair custody under the ownership lock."""
+    with locked(path) as data:
+        return mark_keeper_repair(
+            data, repo=repo, number=number, reason=reason, now=now or datetime.now(UTC),
+            head=head, run_ids=run_ids,
+        )
+
+
+def release_closed_keeper_custody(
+    path: Path,
+    *,
+    repo: str,
+    number: int,
+    how: str,
+    now: datetime | None = None,
+) -> bool:
+    """Drop keeper custody after the PR has been confirmed MERGED or CLOSED."""
+    if not path.exists():
+        return False
+    key = pr_key(repo, number)
+    with locked(path) as data:
+        handoff = data["handoffs"].get(key)
+        if not keeper_custody(handoff):
+            return False
+        data["handoffs"].pop(key)
+        data["history"].append({
+            "pr": key,
+            "event": "keeper_custody_released",
+            "at": (now or datetime.now(UTC)).isoformat(),
+            "how": how,
+            "worker_task": handoff["worker_task"],
+        })
+        return True
 
 
 def queue_exit(
@@ -1073,6 +1526,10 @@ def record_decision_custody(
     head = pr.get("headRefOid")
     if not isinstance(head, str) or not head:
         raise OwnershipError("PR head is unreadable")
+    if keeper_custody(data["handoffs"].get(pr_key(repo, number))):
+        raise OwnershipError(
+            f"PR is under keeper custody; only a {CTO_INBOX} successor acceptance releases repair custody"
+        )
     rows = findings(
         {repo: [{**dict(pr), "number": number}]}, records, repos, _handoff_map(data), live or liveness,
     )
@@ -1099,6 +1556,11 @@ def release_decision_custody(
     key = pr_key(repo, number)
     handoff = data["handoffs"].get(key)
     if not decision_custody(handoff):
+        if keeper_custody(handoff):
+            raise OwnershipError(
+                f"this handoff is keeper custody, not recorded custody; "
+                f"only a {CTO_INBOX} successor acceptance releases repair custody"
+            )
         if handoff:
             raise OwnershipError("this handoff is a task acceptance, not recorded custody")
         return {"released": False, "pr": key, "reason": "no recorded custody"}
@@ -1146,6 +1608,7 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
     episodes: dict[Any, Any] = episodes_raw if isinstance(episodes_raw, dict) else {}
     attempts: dict[Any, Any] = attempts_raw if isinstance(attempts_raw, dict) else {}
     recorded: dict[str, dict[str, Any]] = {}
+    keeper_rows: dict[str, dict[str, Any]] = {}
     unknown: dict[str, dict[str, Any]] = {}
     waiting: dict[str, dict[str, Any]] = {}
     alerts: dict[str, dict[str, Any]] = {}
@@ -1193,6 +1656,17 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
 
     for key in sorted(name for name in handoffs if isinstance(name, str)):
         handoff = handoffs[key]
+        if isinstance(handoff, dict) and keeper_custody(handoff):
+            keeper_rows[key] = {
+                "pr": key,
+                "keeper_state": handoff["keeper_state"],
+                "base": handoff["base"],
+                "head": handoff["head"],
+                "worker_task": handoff["worker_task"],
+                "worker_nonce": handoff["worker_nonce"],
+                "review_classification": handoff["review_classification"],
+            }
+            continue
         if not isinstance(handoff, dict) or not decision_custody(handoff):
             continue
         if not set(handoff) <= _OWNERSHIP_FIELDS:
@@ -1227,7 +1701,7 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
             "alerted": bool(isinstance(episode_row, dict) and episode_row.get("alerted_at")),
         }
 
-    claimed = set(recorded) | set(unknown)
+    claimed = set(recorded) | set(keeper_rows) | set(unknown)
     keys = {name for name in episodes if isinstance(name, str) and name not in claimed}
 
     for key in sorted(keys):
@@ -1271,6 +1745,7 @@ def custody_view(data: Mapping[str, Any]) -> dict[str, Any]:
         "evidence": "known" if known else "unknown",
         "waiting_for_grace": [waiting[key] for key in sorted(waiting)],
         "recorded_custody": [recorded[key] for key in sorted(recorded)],
+        "keeper_custody": [keeper_rows[key] for key in sorted(keeper_rows)],
         "unknown_evidence": [unknown[key] for key in sorted(unknown)],
         "alert_outstanding": [alerts[key] for key in sorted(alerts)],
     }
@@ -1316,6 +1791,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"  {QUEUE_CUSTODY_USAGE}\n"
             f"  {RECORDED_CUSTODY_USAGE}\n"
             f"  {RELEASE_CUSTODY_USAGE}\n"
+            f"  {KEEPER_CUSTODY_USAGE}\n"
             f"  python -m {_MODULE} queue-exit --pr 42 --repo OWNER/NAME\n\n"
             "status custody.evidence is known or unknown. "
             "waiting_for_grace: the keeper has not acted. "
@@ -1352,10 +1828,39 @@ def build_parser() -> argparse.ArgumentParser:
     queue_exit = subs.add_parser(
         "queue-exit", help="Exit 0 when this waiting owner may end under queue custody",
     )
-    for sub in (accept, queue_exit):
+    keeper_transfer = subs.add_parser(
+        "keeper-transfer",
+        help="Transfer an open PR from a live worker to pre-enqueue keeper custody",
+        description="Bind repository, PR, base, head, worker task/nonce, and verdict receipt or Trivial classification.",
+        epilog=KEEPER_CUSTODY_USAGE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    for sub in (accept, queue_exit, keeper_transfer):
         sub.add_argument("--pr", type=int, required=True, help="PR number, e.g. 42")
         sub.add_argument("--repo", required=True, type=_repo_slug,
                          help="owner/name of the PR's repository; never inferred from the checkout")
+    keeper_transfer.add_argument(
+        "--nonce",
+        default=None,
+        help=f"Run nonce of the live worker task (default: ${NONCE_ENV}).",
+    )
+    review_group = keeper_transfer.add_mutually_exclusive_group(required=True)
+    review_group.add_argument(
+        "--verdict-receipt",
+        default=None,
+        help="JSON object receipt returned by record_cf_verdict for the exact PR head.",
+    )
+    review_group.add_argument(
+        "--verdict-receipt-file",
+        type=Path,
+        default=None,
+        help="Path to a JSON file containing the exact-head verdict receipt.",
+    )
+    review_group.add_argument(
+        "--trivial",
+        action="store_true",
+        help="Declare Trivial-tier classification (no review verdict receipt required).",
+    )
     accept.add_argument(
         "--custody", action="store_true",
         help="Queue custody only, with --from: take the live predecessor's remaining queue steps. "
@@ -1434,7 +1939,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check":
             data = load(path)
             keys, rows = _observe(_handoff_map(data))
-            rows = {key: row for key, row in rows.items() if not decision_custody(data["handoffs"].get(key))}
+            rows = {
+                key: row for key, row in rows.items()
+                if not decision_custody(data["handoffs"].get(key))
+                and not keeper_custody(data["handoffs"].get(key))
+            }
             for row in rows.values():
                 print(json.dumps(asdict(row), sort_keys=True))
             print(f"{len(keys) - len(rows)}/{len(keys)} open PRs have a live owner", file=sys.stderr)
@@ -1455,6 +1964,45 @@ def main(argv: list[str] | None = None) -> int:
         records = store.list_tasks(strict=True)
         pr = _gh_pr(repo, args.pr)
         now = datetime.now(UTC)
+        if args.command == "keeper-transfer":
+            nonce = args.nonce if args.nonce is not None else os.environ.get(NONCE_ENV, "")
+            verdict_receipt: Mapping[str, Any] | None = None
+            if args.verdict_receipt is not None or args.verdict_receipt_file is not None:
+                raw_receipt = (
+                    args.verdict_receipt_file.read_text(encoding="utf-8")
+                    if args.verdict_receipt_file is not None
+                    else args.verdict_receipt
+                )
+                try:
+                    loaded_receipt = json_depth.loads(raw_receipt, max_depth=64)
+                except ValueError as exc:
+                    print(_refused(OwnershipError(f"verdict_receipt JSON invalid: {exc}")))
+                    return 1
+                if not isinstance(loaded_receipt, Mapping):
+                    print(_refused(OwnershipError("verdict_receipt must be a JSON object")))
+                    return 1
+                verdict_receipt = loaded_receipt
+            rerun = _rerun_allowance(repo, args.pr, pr["headRefOid"])
+            try:
+                ack = acknowledge_keeper_transfer(
+                    path,
+                    repo=repo,
+                    number=args.pr,
+                    pr=pr,
+                    worker_task=me,
+                    worker_nonce=nonce,
+                    records=records,
+                    now=now,
+                    rerun=rerun,
+                    repos=load_fleet_repos(),
+                    verdict_receipt=verdict_receipt,
+                    trivial=bool(args.trivial),
+                )
+            except OwnershipError as exc:
+                print(_refused(exc))
+                return 1
+            print(json.dumps(ack, sort_keys=True))
+            return 0
         if args.command == "accept":
             rerun = _rerun_allowance(repo, args.pr, pr["headRefOid"])
             with locked(path) as data:

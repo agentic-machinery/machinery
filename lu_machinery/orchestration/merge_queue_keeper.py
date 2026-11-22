@@ -13,6 +13,7 @@ import sys
 import unicodedata
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ from lu_machinery.orchestration.integration_sweep import (
     pr_file_paths,
     verdict_detail,
 )
+from lu_machinery.publish import recovery
 from lu_machinery.publish.github import Request, request_run
 from lu_machinery.review.tiers import ReviewTier, classify_pr_files, review_satisfied
 
@@ -171,6 +173,40 @@ def marker_value(raw: str) -> str:
 
 class KeeperError(RuntimeError):
     """A GitHub response or mutation was incomplete or failed."""
+
+
+@dataclass(frozen=True)
+class DirectLandingConfig:
+    """Opt-in configuration for keeper direct landing and/or infrastructure re-enqueue.
+
+    Dormant by default (``direct_config=None``). Every field fails closed when malformed.
+    """
+
+    repository: str
+    bases: frozenset[str]
+    required_checks: tuple[str, ...] = ("CI Gate",)
+    verdict_recorder_login: str | None = None
+    require_custody: bool = False
+    allow_infra_reenqueue: bool = False
+
+    def __post_init__(self) -> None:
+        if normalize_repository(self.repository) == "unknown":
+            raise KeeperError(f"invalid direct-landing repository: {self.repository!r}")
+        if not self.bases or any(
+            not isinstance(base, str) or not base or base != base.strip() or any(ord(c) <= 32 for c in base)
+            for base in self.bases
+        ):
+            raise KeeperError("direct-landing configuration requires at least one valid base branch")
+        if not self.required_checks or any(
+            not isinstance(name, str) or not name.strip() or "\n" in name or "\r" in name
+            for name in self.required_checks
+        ):
+            raise KeeperError("direct-landing configuration requires non-empty single-line required_checks")
+        if self.verdict_recorder_login is not None and (
+            not isinstance(self.verdict_recorder_login, str)
+            or not re.fullmatch(r"\S+", self.verdict_recorder_login)
+        ):
+            raise KeeperError("invalid verdict_recorder_login")
 
 
 def _auto_merge_armed(row: Mapping[str, Any]) -> bool:
@@ -360,11 +396,51 @@ class GitHub:
     def enqueue(self, number: int, head: str) -> bool:
         """Enqueue through pr-merge; True when the publisher put the PR at the front of the queue.
 
-        ``expect_queue`` pins the landing kind: the keeper only ever enqueues, so a base
+        ``expect_queue`` pins the landing kind: the keeper only ever enqueues here, so a base
         branch whose merge queue was turned off is refused instead of squash-merged directly.
         """
         self.call(Request("pr-merge", repo=self.repository, number=number, match_head=head, expect_queue="true"))
         return self.queue_jump
+
+    def direct_merge(self, number: int, head: str) -> None:
+        """Direct squash-merge through pr-merge pinned to ``expect_queue="false"`` and exact head."""
+        self.call(Request("pr-merge", repo=self.repository, number=number, match_head=head, expect_queue="false"))
+
+    def re_enqueue(self, number: int, head: str, recovery_run_id: int) -> bool:
+        """Same-head infrastructure recovery re-enqueue through the publisher's atomic reservation."""
+        self.call(
+            Request(
+                "pr-merge",
+                repo=self.repository,
+                number=number,
+                match_head=head,
+                expect_queue="true",
+                recovery_run_id=recovery_run_id,
+            )
+        )
+        return self.queue_jump
+
+    def branch_head(self, branch: str) -> str:
+        """Return the current 40-hex head SHA of ``branch``; fail closed on unreadable output."""
+        data = self.json(Request("read-branch", repo=self.repository, branch=branch))
+        commit = data.get("commit") if isinstance(data, dict) else None
+        sha = commit.get("sha") if isinstance(commit, dict) else None
+        if not isinstance(sha, str) or not SHA.fullmatch(sha):
+            raise KeeperError(f"base branch head unknown for {branch}")
+        return sha
+
+    def head_runs(self, sha: str) -> list[dict[str, Any]]:
+        """Return the complete Actions workflow runs page for commit ``sha``."""
+        data = self.json(Request("read-head-runs", repo=self.repository, sha=sha))
+        if (
+            not isinstance(data, dict)
+            or type(data.get("total_count")) is not int
+            or not isinstance(data.get("workflow_runs"), list)
+            or data["total_count"] != len(data["workflow_runs"])
+            or not all(isinstance(item, dict) for item in data["workflow_runs"])
+        ):
+            raise KeeperError("base branch workflow runs incomplete")
+        return list(data["workflow_runs"])
 
     def dequeue(self, node_id: str) -> None:
         data = self.json(Request("pr-dequeue", repo=self.repository, node_id=node_id))
@@ -495,6 +571,187 @@ def _check_state(checks: list[dict[str, Any]], head: str) -> str:
     return pending or "ok"
 
 
+def _direct_check_state(
+    checks: list[dict[str, Any]], head: str, required_checks: Sequence[str] = ("CI Gate",)
+) -> str:
+    """Exact-head check state for opt-in direct landing.
+
+    Every configured required check must exist, be COMPLETED and SUCCESS, and every
+    other check run on ``head`` must be COMPLETED with SUCCESS, SKIPPED or NEUTRAL.
+    Zero checks, missing required checks, cancelled checks or malformed rows fail closed.
+    """
+    for row in checks:
+        if not isinstance(row, dict) or row.get("head_sha") != head or not isinstance(row.get("name"), str):
+            return "CI-unknown"
+    if not checks:
+        return "CI-missing"
+    names, _ = group_collapsed_by_name(project_check_runs(checks))
+    pending: str | None = None
+    for name in required_checks:
+        rows = names.get(name, [])
+        if not rows:
+            pending = pending or f"CI-pending-{name}"
+            continue
+        for row in rows:
+            if row.get("status") != "COMPLETED":
+                pending = pending or f"CI-pending-{name}"
+                continue
+            conclusion = row.get("conclusion")
+            if conclusion == "CANCELLED":
+                return f"CI-cancelled-{name}"
+            if conclusion != "SUCCESS":
+                return f"CI-red-{name}"
+    required_set = set(required_checks)
+    for name, rows in sorted(names.items()):
+        if name in required_set:
+            continue
+        for row in rows:
+            if row.get("status") != "COMPLETED":
+                pending = pending or f"CI-pending-{name}"
+                continue
+            conclusion = row.get("conclusion")
+            if conclusion == "CANCELLED":
+                return f"CI-cancelled-{name}"
+            if conclusion not in {"SUCCESS", "SKIPPED", "NEUTRAL"}:
+                return f"CI-red-{name}"
+    return pending or "ok"
+
+
+def _failed_check_run_ids(check_rows: Sequence[Mapping[str, Any]], head: str) -> list[int]:
+    """Extract positive Actions run or check-run IDs for failing/cancelled checks on ``head``."""
+    found: set[int] = set()
+    for row in check_rows:
+        if not isinstance(row, Mapping) or row.get("head_sha") != head:
+            continue
+        conclusion = str(row.get("conclusion") or "").lower()
+        if conclusion not in {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}:
+            continue
+        wf_id = row.get("workflow_run_id")
+        if type(wf_id) is int and wf_id > 0:
+            found.add(wf_id)
+            continue
+        for field in ("details_url", "html_url"):
+            url = row.get(field)
+            if isinstance(url, str):
+                match = re.search(r"/actions/runs/([1-9][0-9]*)", url)
+                if match:
+                    found.add(int(match[1]))
+                    break
+        else:
+            row_id = row.get("id")
+            if type(row_id) is int and row_id > 0:
+                found.add(row_id)
+    return sorted(found)
+
+
+def _base_ci_state(gh: GitHub, base: str) -> tuple[str, str | None, list[int]]:
+    """Return ``(status, base_sha, run_ids)`` for the latest completed CI run(s) on ``base`` head.
+
+    ``status`` is one of ``"green"``, ``"red"``, ``"pending"``, ``"none"`` or ``"unknown"``.
+    A red latest completed run for any workflow on ``base_sha`` blocks all direct merges on
+    ``base`` and returns those failing run IDs so the keeper alerts ``claude-cto`` once.
+    """
+    try:
+        base_sha = gh.branch_head(base)
+        runs = gh.head_runs(base_sha)
+    except KeeperError:
+        return "unknown", None, []
+    relevant: list[dict[str, Any]] = []
+    for item in runs:
+        if item.get("head_sha") != base_sha:
+            continue
+        event = item.get("event")
+        if event in {"pull_request", "pull_request_target"}:
+            continue
+        if event == "push" and item.get("head_branch") not in {None, base}:
+            continue
+        relevant.append(item)
+    if not relevant:
+        return "none", base_sha, []
+    completed_by_workflow: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+    pending_ids: set[int] = set()
+    for item in relevant:
+        status = item.get("status")
+        run_id = item.get("id")
+        if status == "completed":
+            wf_key = item.get("workflow_id") if type(item.get("workflow_id")) is int else (
+                item.get("name") if isinstance(item.get("name"), str) and item.get("name") else run_id
+            )
+            completed_by_workflow[wf_key].append(item)
+        elif status in {"queued", "in_progress", "waiting", "pending", "requested"}:
+            if type(run_id) is int and run_id > 0:
+                pending_ids.add(run_id)
+        else:
+            return "unknown", base_sha, []
+    if completed_by_workflow:
+        red_ids: set[int] = set()
+        for group in completed_by_workflow.values():
+            latest = max(
+                group,
+                key=lambda r: (
+                    str(r.get("updated_at") or r.get("created_at") or ""),
+                    r["id"] if type(r.get("id")) is int else 0,
+                ),
+            )
+            conclusion = latest.get("conclusion")
+            if not isinstance(conclusion, str) or not conclusion:
+                return "unknown", base_sha, []
+            if conclusion not in {"success", "neutral", "skipped"}:
+                if type(latest.get("id")) is int and latest["id"] > 0:
+                    red_ids.add(latest["id"])
+                else:
+                    return "red", base_sha, sorted(red_ids)
+        if red_ids:
+            return "red", base_sha, sorted(red_ids)
+        return "green", base_sha, []
+    return "pending", base_sha, sorted(pending_ids)
+
+
+def _direct_reason(
+    row: Mapping[str, Any],
+    verdict: Verdict,
+    check_state: str,
+    *,
+    tier: ReviewTier,
+    repo_matches: bool,
+    base_matches: bool,
+    base_ci_status: str,
+    custody_error: str | None = None,
+) -> str:
+    """Why a head may not direct-land, or ``ready``."""
+    if not repo_matches:
+        return "direct-land-repo-mismatch"
+    if not base_matches:
+        return "direct-land-base-not-configured"
+    if not isinstance(row.get("headRefOid"), str) or not SHA.fullmatch(row["headRefOid"]):
+        return "head-unknown"
+    if row.get("isDraft") is not False:
+        return "draft" if row.get("isDraft") is True else "draft-unknown"
+    hold = _hold(row)
+    if hold is not False:
+        return "hold" if hold else "hold-unknown"
+    if custody_error:
+        return custody_error
+    if not review_satisfied(tier, verdict.state):
+        return "needs-CF" if verdict.state in MISSING_CF_STATES else f"CF-{verdict.state.lower()}"
+    if check_state != "ok":
+        return check_state
+    merge_state = row.get("mergeStateStatus")
+    if not isinstance(merge_state, str) or not merge_state:
+        return "merge-state-unknown"
+    if merge_state == "DIRTY":
+        return "merge-conflict"
+    if merge_state not in {"CLEAN", "HAS_HOOKS"}:
+        return f"merge-state-{merge_state.lower()}"
+    if base_ci_status == "red":
+        return "base-ci-red"
+    if base_ci_status == "pending":
+        return "base-ci-pending"
+    if base_ci_status == "unknown":
+        return "base-ci-unknown"
+    return "ready"
+
+
 def _reason(
     row: Mapping[str, Any],
     verdict: Verdict,
@@ -585,6 +842,10 @@ def _load(path: Path) -> dict[str, Any]:
         or not isinstance(data.get("squash_revoked", {}), dict)
         or not isinstance(data.get("pending_comments", {}), dict)
         or not isinstance(data.get("defect_reports", {}), dict)
+        or not isinstance(data.get("tracked", {}), dict)
+        or not isinstance(data.get("pending_closeout", {}), dict)
+        or not isinstance(data.get("hold_alerts", {}), dict)
+        or not isinstance(data.get("base_ci_alerts", {}), dict)
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
         or not isinstance(data.get("cto_outbox", []), list)
     ):
@@ -756,6 +1017,202 @@ def _queue_cto_report(previous: dict[str, Any], kind: str, key: str, body: str) 
         outbox.append({"kind": kind, "key": key, "body": body})
 
 
+def _canonical_slug(repository: str) -> str:
+    normalized = normalize_repository(repository)
+    return normalized.split("/", 1)[1] if normalized != "unknown" else repository.strip().casefold()
+
+
+def _queue_hold_alert(
+    previous: dict[str, Any],
+    *,
+    repo: str,
+    number: int,
+    kind: str,
+    old_head: str,
+    current_head: str,
+    reason: str,
+    run_ids: Sequence[int],
+    observed: str,
+) -> bool:
+    """Freeze one deduplicated CTO inbox alert for a held PR with old/current SHA and run IDs."""
+    alert_key = f"merge-queue-keeper:{kind}:{repo}:{number}:{old_head}:{current_head}:{marker_value(reason)}"
+    sent = previous.setdefault("hold_alerts", {})
+    if alert_key in sent:
+        return False
+    body = (
+        f"Merge queue keeper: {repo}#{number} held ({display_text(reason, DISPLAY_REASON_LIMIT)}). "
+        f"old_sha={old_head} current_sha={current_head} run_ids={_run_ids(run_ids)}. "
+        "Keeper repair custody stays held until a claude-cto successor accepts ownership."
+    )
+    _queue_cto_report(previous, kind, alert_key, body)
+    sent[alert_key] = observed
+    return True
+
+
+def _queue_base_ci_red_alert(
+    previous: dict[str, Any],
+    *,
+    repo: str,
+    base: str,
+    base_sha: str,
+    run_ids: Sequence[int],
+    observed: str,
+) -> bool:
+    """Freeze one deduplicated CTO alert when the latest completed CI run on ``base`` head is red."""
+    alert_key = f"merge-queue-keeper:base-ci-red:{repo}:{base}:{base_sha}"
+    sent = previous.setdefault("base_ci_alerts", {})
+    if alert_key in sent:
+        return False
+    body = (
+        f"Merge queue keeper: direct landing paused for {repo} base={base} head={base_sha}: "
+        f"latest completed base CI run is red (run_ids={_run_ids(run_ids)}). "
+        "No PR will direct-land until base CI recovers."
+    )
+    _queue_cto_report(previous, "base-ci-red", alert_key, body)
+    sent[alert_key] = observed
+    return True
+
+
+def _default_closeout(number: int, repo: str, root: Path) -> tuple[str, str]:
+    """Run ``merge_closeout`` only after confirming MERGED and worktree settlement."""
+    from lu_machinery.orchestration import merge_closeout
+
+    try:
+        dry = merge_closeout.run_merge_closeout(root, number, repo=repo, apply=False)
+    except merge_closeout.MergeCloseoutError as exc:
+        return "not_merged", str(exc)
+    if dry.pr.state != "MERGED":
+        return "not_merged", f"state={dry.pr.state}"
+    if dry.matched_worktrees:
+        return "awaiting_worktree", f"worktrees={len(dry.matched_worktrees)}"
+    try:
+        applied = merge_closeout.run_merge_closeout(root, number, repo=repo, apply=True)
+    except merge_closeout.MergeCloseoutError as exc:
+        return "failed", str(exc)
+    if applied.ok:
+        return "closed_out", ""
+    return "failed", "; ".join(applied.errors) or "closeout residual"
+
+
+def _reconcile_closed_tracked(
+    gh: GitHub,
+    previous: dict[str, Any],
+    open_numbers: set[str],
+    *,
+    canonical_repo: str,
+    observed: str,
+    ownership_path: Path | None,
+    closeout_runner: Callable[[int, str, Path], tuple[str, str]],
+) -> tuple[list[str], bool]:
+    """Reconcile tracked PRs that left the open list so fast merges and restarts still reach closeout."""
+    raw_tracked = previous.get("tracked")
+    tracked: dict[str, Any] = raw_tracked if isinstance(raw_tracked, dict) else {}
+    raw_pending = previous.get("pending_closeout")
+    pending: dict[str, Any] = raw_pending if isinstance(raw_pending, dict) else {}
+    custody_map = (
+        pr_ownership.keeper_custodies_for_repo(ownership_path, canonical_repo)
+        if ownership_path is not None
+        else {}
+    )
+    candidates: dict[str, dict[str, Any]] = {}
+    for key, entry in tracked.items():
+        if key not in open_numbers or (isinstance(entry, dict) and entry.get("status") == "merge-sent"):
+            candidates[key] = dict(entry) if isinstance(entry, dict) else {"number": int(key)}
+    for key, entry in pending.items():
+        if key not in open_numbers:
+            candidates.setdefault(key, dict(entry) if isinstance(entry, dict) else {"number": int(key)})
+    for number, handoff in custody_map.items():
+        key = str(number)
+        if key not in open_numbers:
+            candidates.setdefault(key, {"number": number, "head": handoff.get("head"), "base": handoff.get("base")})
+    if not candidates:
+        return [], False
+    lines: list[str] = []
+    failed = False
+    for key in sorted(candidates, key=lambda item: int(item) if item.isdigit() else 0):
+        if not key.isdigit():
+            continue
+        number = int(key)
+        entry = candidates[key]
+        raw_head = entry.get("head")
+        head: str = raw_head if isinstance(raw_head, str) else "unknown"
+        try:
+            current = gh.current(number)
+        except KeeperError as exc:
+            failed = True
+            previous.setdefault("pending_closeout", {})[key] = {**entry, "status": "lookup_failed", "updated_at": observed}
+            lines.append(f"#{number} reconciled: lookup failed ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
+            continue
+        state = current.get("state")
+        if state == "OPEN":
+            if key in pending:
+                previous["pending_closeout"].pop(key, None)
+            continue
+        if state == "CLOSED":
+            if isinstance(previous.get("tracked"), dict):
+                previous["tracked"].pop(key, None)
+            if isinstance(previous.get("pending_closeout"), dict):
+                previous["pending_closeout"].pop(key, None)
+            if ownership_path is not None:
+                pr_ownership.release_closed_keeper_custody(
+                    ownership_path, repo=canonical_repo, number=number, how="closed without merge",
+                )
+            _queue_hold_alert(
+                previous,
+                repo=canonical_repo,
+                number=number,
+                kind="closed-unmerged",
+                old_head=head,
+                current_head=str(current.get("headRefOid") or head),
+                reason="closed-without-merge",
+                run_ids=(),
+                observed=observed,
+            )
+            lines.append(f"#{number} reconciled: closed without merge")
+            continue
+        if state != "MERGED":
+            failed = True
+            previous.setdefault("pending_closeout", {})[key] = {**entry, "status": "state_unknown", "updated_at": observed}
+            lines.append(f"#{number} reconciled: state unknown ({display_text(str(state), DISPLAY_REASON_LIMIT)})")
+            continue
+        status, detail = closeout_runner(number, canonical_repo, gh.root)
+        if status == "closed_out":
+            if isinstance(previous.get("tracked"), dict):
+                previous["tracked"].pop(key, None)
+            if isinstance(previous.get("pending_closeout"), dict):
+                previous["pending_closeout"].pop(key, None)
+            if ownership_path is not None:
+                pr_ownership.release_closed_keeper_custody(
+                    ownership_path, repo=canonical_repo, number=number, how="merged and closed out",
+                )
+            lines.append(f"#{number} reconciled: merged and closed out")
+        elif status == "awaiting_worktree":
+            previous.setdefault("pending_closeout", {})[key] = {
+                **entry, "status": "awaiting_worktree", "updated_at": observed,
+            }
+            if isinstance(previous.get("tracked"), dict):
+                previous["tracked"].pop(key, None)
+            lines.append(f"#{number} reconciled: merged, awaiting worktree settlement")
+        else:
+            failed = True
+            previous.setdefault("pending_closeout", {})[key] = {
+                **entry, "status": "closeout_failed", "detail": detail, "updated_at": observed,
+            }
+            _queue_hold_alert(
+                previous,
+                repo=canonical_repo,
+                number=number,
+                kind="closeout-failed",
+                old_head=head,
+                current_head=str(current.get("headRefOid") or head),
+                reason=f"closeout-{status}:{detail}" if detail else f"closeout-{status}",
+                run_ids=(),
+                observed=observed,
+            )
+            lines.append(f"#{number} reconciled: closeout failed ({display_text(detail or status, DISPLAY_REASON_LIMIT)})")
+    return lines, failed
+
+
 def _ever_queued(gh: GitHub, number: int) -> bool:
     """Whether the PR's timeline shows any queue stay, by anyone, at any head.
 
@@ -894,7 +1351,13 @@ def _repeat_kind(line: str) -> str:
         return "once"
     if rest.startswith("FAILED:") or rest == "squash text unverified":
         return "error"
-    if rest == "remains queued" or rest.startswith("held: ") or rest == "armed: requirement unmet":
+    if (
+        rest == "remains queued"
+        or rest.startswith("held: ")
+        or rest == "armed: requirement unmet"
+        or rest == "deferred: direct-land-tick-limit"
+        or rest == "reconciled: merged, awaiting worktree settlement"
+    ):
         return "steady"
     if rest.startswith("head=") and " state=" in rest and " queued=" in rest and " armed=" in rest:
         return "steady"
@@ -990,7 +1453,15 @@ def quiet_for_journal(
     return quiet
 
 
-def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str], bool]:
+def run(
+    gh: GitHub,
+    state_path: Path,
+    *,
+    apply: bool = False,
+    direct_config: DirectLandingConfig | None = None,
+    ownership_path: Path | None = None,
+    closeout_runner: Callable[[int, str, Path], tuple[str, str]] | None = None,
+) -> tuple[list[str], bool]:
     branches = gh.branch_names()
     snap = gh.snapshot(branches)
     lines: list[str] = []
@@ -1004,18 +1475,67 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
     previous = _load(state_path)
     approved_now: dict[str, str] = {}
     login = gh.identity()
+    verdict_login = direct_config.verdict_recorder_login or login if direct_config is not None else login
+    canonical_repo = _canonical_slug(gh.repository)
+    repo_matches_direct = (
+        direct_config is not None
+        and normalize_repository(gh.repository) == normalize_repository(direct_config.repository)
+    )
+    direct_merged_this_tick = 0
+    base_ci_cache: dict[str, tuple[str, str | None, list[int]]] = {}
     observed = datetime.now(UTC).isoformat()
     open_numbers = {str(pr.get("number")) for pr in snap["prs"]}
     # Unknown membership or an incomplete row cannot erase a previously observed queue stay.
     queued_now: dict[str, str] = {
         number: head for number, head in previous["queued"].items() if number in open_numbers
     }
+
+    def cached_base_ci(base_name: str) -> tuple[str, str | None, list[int]]:
+        if base_name not in base_ci_cache:
+            base_ci_cache[base_name] = _base_ci_state(gh, base_name)
+        return base_ci_cache[base_name]
+
+    def custody_for(number: int) -> dict[str, Any] | None:
+        if ownership_path is None:
+            return None
+        return pr_ownership.keeper_custody_for(ownership_path, canonical_repo, number)
+
+    def decision_custody_for(number: int) -> bool:
+        if ownership_path is None or not ownership_path.exists():
+            return False
+        return pr_ownership.decision_custody(
+            pr_ownership.load(ownership_path)["handoffs"].get(pr_ownership.pr_key(canonical_repo, number))
+        )
+
+    def hold_in_repair(number: int, *, reason: str, old_head: str, current_head: str, run_ids: Sequence[int]) -> None:
+        if ownership_path is not None and ownership_path.exists():
+            pr_ownership.record_keeper_repair(
+                ownership_path,
+                repo=canonical_repo,
+                number=number,
+                reason=reason,
+                head=current_head,
+                run_ids=list(run_ids),
+            )
+        _queue_hold_alert(
+            previous,
+            repo=canonical_repo,
+            number=number,
+            kind="repair-hold",
+            old_head=old_head,
+            current_head=current_head,
+            reason=reason,
+            run_ids=run_ids,
+            observed=observed,
+        )
+
     for pr in snap["prs"]:
         number, head, node_id = pr.get("number"), pr.get("headRefOid"), pr.get("id")
         if not isinstance(number, int) or not isinstance(head, str) or not isinstance(node_id, str):
             lines.append("invalid PR identity: unknown, no mutation")
             continue
         key = str(number)
+        base_name = pr.get("baseRefName")
         approved_before = previous.get("approved", {}).get(key) == head
         queued = pr.get("isInMergeQueue")
         armed = _auto_merge_armed(pr)
@@ -1026,7 +1546,8 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 previous.get("ejection_alerts", {}).pop(f"{number}:{head}", None)
         elif queued is False:
             queued_now.pop(key, None)
-        queue_enabled = snap["queues"].get(pr.get("baseRefName"))
+        queue_enabled = snap["queues"].get(base_name)
+        direct_candidate = direct_config is not None and queue_enabled is False
         comment_safe = True
         # Whether the PR changes learner content, which takes the Ukrainian seats; None when unread.
         learner_content: bool | None = None
@@ -1041,18 +1562,233 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             low_tier = tier in {"trivial", "low"}
             learner_content = changes_learner_content(files)
             verdict = lookup_verdict(
-                comments, head, login, learner_content=learner_content, low_tier=low_tier,
+                comments, head, verdict_login, learner_content=learner_content, low_tier=low_tier,
             )
             check_rows = gh.checks(head)
-            checks = _check_state(check_rows, head)
+            checks = (
+                _direct_check_state(check_rows, head, direct_config.required_checks)
+                if direct_candidate and direct_config is not None
+                else _check_state(check_rows, head)
+            )
         except KeeperError:
             comments, checks, check_rows = [], "CI-unknown", []
             verdict = Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
             comment_safe = False
-        if comment_safe and _recorded_approval_for_head(comments, head, login, low_tier=low_tier):
+        if comment_safe and _recorded_approval_for_head(comments, head, verdict_login, low_tier=low_tier):
             approved_before = True
         if approved_before:
             approved_now[key] = head
+        if direct_candidate and direct_config is not None:
+            base_matches = isinstance(base_name, str) and base_name in direct_config.bases
+            try:
+                custody = custody_for(number)
+                has_decision_custody = decision_custody_for(number)
+            except pr_ownership.OwnershipError:
+                custody = None
+                has_decision_custody = False
+                custody_error: str | None = "custody-unknown"
+            else:
+                custody_error = None
+            tracked_entry = previous.get("tracked", {}).get(key)
+            tracked_head = tracked_entry.get("head") if isinstance(tracked_entry, dict) else None
+            old_head = head
+            if has_decision_custody:
+                custody_error = "decision-custody"
+            elif custody is not None:
+                old_head = str(custody["head"])
+                if custody["keeper_state"] == "repair":
+                    custody_error = "repair-custody"
+                elif custody["repository"].casefold() != canonical_repo.casefold() or custody["base"] != base_name:
+                    custody_error = "custody-mismatch"
+                elif custody["head"] != head:
+                    custody_error = "head-moved"
+                elif custody["review_classification"] == "trivial" and tier != "trivial":
+                    custody_error = "custody-tier-mismatch"
+                elif (
+                    custody["review_classification"] == "verdict"
+                    and isinstance(custody.get("verdict_receipt"), dict)
+                    and custody["verdict_receipt"].get("head") != head
+                ):
+                    custody_error = "head-moved"
+            elif isinstance(tracked_head, str) and SHA.fullmatch(tracked_head) and tracked_head != head:
+                old_head = tracked_head
+                custody_error = "head-moved"
+            elif direct_config.require_custody:
+                custody_error = "no-keeper-custody"
+            base_ci_status, base_sha, base_run_ids = (
+                cached_base_ci(base_name) if repo_matches_direct and base_matches and isinstance(base_name, str) else ("green", None, [])
+            )
+            reason = _direct_reason(
+                pr,
+                verdict,
+                checks,
+                tier=tier,
+                repo_matches=repo_matches_direct,
+                base_matches=base_matches,
+                base_ci_status=base_ci_status,
+                custody_error=custody_error,
+            )
+            rollup = project_check_runs(check_rows)
+            report = classify_pr(
+                {**pr, "statusCheckRollup": rollup},
+                verdict,
+                queued=False,
+                observed_at=observed,
+                tier=tier,
+            )
+            state = "ready" if reason == "ready" else report.state
+            lines.append(
+                f"#{number} head={head[:12]} state={state} reason={reason} queued=False armed={armed}"
+                + verdict_detail(verdict.reason, verdict.comment_id, verdict.superseded_markers)
+            )
+            if not apply or not budget:
+                continue
+            try:
+                if (
+                    base_ci_status == "red"
+                    and base_sha
+                    and isinstance(base_name, str)
+                    and _queue_base_ci_red_alert(
+                        previous, repo=canonical_repo, base=base_name, base_sha=base_sha,
+                        run_ids=base_run_ids, observed=observed,
+                    )
+                ):
+                    lines.append(f"#{number} base CI red alerted to the CTO: base={base_name} runs={_run_ids(base_run_ids)}")
+                if custody_error in {"head-moved", "custody-mismatch", "custody-tier-mismatch"}:
+                    hold_in_repair(
+                        number,
+                        reason=custody_error,
+                        old_head=old_head,
+                        current_head=head,
+                        run_ids=_failed_check_run_ids(check_rows, head),
+                    )
+                    lines.append(f"#{number} held: {custody_error}")
+                    continue
+                if checks.startswith(("CI-red-", "CI-cancelled-")) and (custody is not None or tracked_entry is not None):
+                    hold_in_repair(
+                        number,
+                        reason=checks,
+                        old_head=old_head,
+                        current_head=head,
+                        run_ids=_failed_check_run_ids(check_rows, head),
+                    )
+                    lines.append(f"#{number} held: {checks}")
+                    continue
+                if verdict.state in {"CHANGES_REQUESTED", "BLOCKED"} and (custody is not None or tracked_entry is not None):
+                    hold_in_repair(
+                        number,
+                        reason=f"CF-{verdict.state.lower()}",
+                        old_head=old_head,
+                        current_head=head,
+                        run_ids=(),
+                    )
+                    lines.append(f"#{number} held: CF-{verdict.state.lower()}")
+                    continue
+                if reason != "ready":
+                    lines.append(f"#{number} held: {reason}" + _cf_unknown_detail(reason, verdict))
+                    continue
+                if direct_merged_this_tick >= 1:
+                    lines.append(f"#{number} deferred: direct-land-tick-limit")
+                    continue
+                # Fresh verification right before direct landing write.
+                current = gh.current(number)
+                current_head = current.get("headRefOid")
+                if (
+                    current_head != head
+                    or current.get("state") != "OPEN"
+                    or current.get("baseRefName") != base_name
+                ):
+                    fresh_reason = (
+                        "head-moved"
+                        if current_head != head
+                        else "base-changed"
+                        if current.get("baseRefName") != base_name
+                        else "state-changed"
+                    )
+                    if fresh_reason == "head-moved" and isinstance(current_head, str):
+                        hold_in_repair(
+                            number,
+                            reason="head-moved",
+                            old_head=head,
+                            current_head=current_head,
+                            run_ids=(),
+                        )
+                    lines.append(f"#{number} held: {fresh_reason}")
+                    continue
+                fresh_comments = gh.comments(number)
+                fresh_file_rows = gh.pr_file_rows(number)
+                fresh_files = pr_file_paths(fresh_file_rows)
+                fresh_tier = classify_pr_files(fresh_file_rows)
+                fresh_low = fresh_tier in {"trivial", "low"}
+                fresh_learner = changes_learner_content(fresh_files)
+                fresh_verdict = lookup_verdict(
+                    fresh_comments, head, verdict_login, learner_content=fresh_learner, low_tier=fresh_low,
+                )
+                fresh_check_rows = gh.checks(head)
+                fresh_checks = _direct_check_state(fresh_check_rows, head, direct_config.required_checks)
+                fresh_custody_error = custody_error
+                if custody is not None and custody["review_classification"] == "trivial" and fresh_tier != "trivial":
+                    fresh_custody_error = "custody-tier-mismatch"
+                fresh_reason = _direct_reason(
+                    current,
+                    fresh_verdict,
+                    fresh_checks,
+                    tier=fresh_tier,
+                    repo_matches=repo_matches_direct,
+                    base_matches=base_matches,
+                    base_ci_status=base_ci_status,
+                    custody_error=fresh_custody_error,
+                )
+                if fresh_reason != "ready":
+                    if fresh_checks.startswith(("CI-red-", "CI-cancelled-")) and (custody is not None or tracked_entry is not None):
+                        hold_in_repair(
+                            number,
+                            reason=fresh_checks,
+                            old_head=old_head,
+                            current_head=head,
+                            run_ids=_failed_check_run_ids(fresh_check_rows, head),
+                        )
+                    elif fresh_verdict.state in {"CHANGES_REQUESTED", "BLOCKED"} and (custody is not None or tracked_entry is not None):
+                        hold_in_repair(
+                            number,
+                            reason=f"CF-{fresh_verdict.state.lower()}",
+                            old_head=old_head,
+                            current_head=head,
+                            run_ids=(),
+                        )
+                    lines.append(f"#{number} held: {fresh_reason}" + _cf_unknown_detail(fresh_reason, fresh_verdict))
+                    continue
+                # Persist custody/tracking BEFORE sending the direct-merge write so a lost response still reconciles.
+                previous.setdefault("tracked", {})[key] = {
+                    "number": number,
+                    "repo": canonical_repo,
+                    "base": base_name,
+                    "head": head,
+                    "mode": "direct",
+                    "status": "merging",
+                    "updated_at": observed,
+                }
+                _save(state_path, previous)
+                direct_merged_this_tick += 1
+                gh.direct_merge(number, head)
+                previous["tracked"][key]["status"] = "merge-sent"
+                _save(state_path, previous)
+                lines.append(f"#{number} direct-merged head={head[:12]}")
+                estimated_remaining -= 30
+            except KeeperError as exc:
+                failed = True
+                err_text = str(exc)
+                if "QUEUE_MODE_CHANGED" in err_text or "reviewed head changed" in err_text:
+                    hold_in_repair(
+                        number,
+                        reason="queue-mode-changed" if "QUEUE_MODE_CHANGED" in err_text else "head-moved",
+                        old_head=old_head,
+                        current_head=head,
+                        run_ids=(),
+                    )
+                lines.append(f"#{number} FAILED: {exc}")
+            budget = estimated_remaining - 30 >= FLOOR
+            continue
         drop_key = f"{number}:{head}"
         dropped = key in previous["queued"] and queued is False
         detail = ""
@@ -1175,7 +1911,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     tier = classify_pr_files(file_rows)
                     low_tier = tier in {"trivial", "low"}
                     current_verdict = lookup_verdict(
-                        current_comments, head, login, learner_content=learner_content, low_tier=low_tier,
+                        current_comments, head, verdict_login, learner_content=learner_content, low_tier=low_tier,
                     )
                 except KeeperError:
                     current_comments, current_verdict = [], Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
@@ -1187,7 +1923,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     comment_safe = True
                     can_comment = True
                     verdict = current_verdict
-                    if _recorded_approval_for_head(current_comments, head, login, low_tier=low_tier):
+                    if _recorded_approval_for_head(current_comments, head, verdict_login, low_tier=low_tier):
                         approved_before = True
                         approved_now[key] = head
                 try:
@@ -1270,7 +2006,76 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     lines.append(f"#{number} held: {reason}" + _cf_unknown_detail(reason, current_verdict))
                 else:
                     lines.append(f"#{number} armed: requirement unmet")
+            elif (
+                direct_config is not None
+                and direct_config.allow_infra_reenqueue
+                and reason == "ejected"
+                and exited
+                and queued is False
+                and verdict_lookup_ok
+                and current_verdict.state == "APPROVED"
+                and current_checks == "ok"
+                and not failed_tests
+                and not any(TEST_JOB_MARKER in job for job in failed_jobs)
+            ):
+                runs = previous.get("ejections", {}).get(drop_key, [])
+                recovery_run_id = failed_run if type(failed_run) is int else (runs[-1] if runs else None)
+                if type(recovery_run_id) is int:
+                    try:
+                        recovery.evidence_from_comments(
+                            comments,
+                            number,
+                            head,
+                            authenticated_login=verdict_login,
+                            run_id=recovery_run_id,
+                            require_infra_diagnosis=True,
+                        )
+                        if ownership_path is not None:
+                            previous.setdefault("tracked", {})[key] = {
+                                "number": number, "repo": canonical_repo, "base": base_name,
+                                "head": head, "mode": "queue", "status": "re-enqueuing", "updated_at": observed,
+                            }
+                            _save(state_path, previous)
+                        jumped = gh.re_enqueue(number, head, recovery_run_id)
+                        if not gh.membership(number):
+                            raise KeeperError("re-enqueue returned success without queue membership")
+                        queued_now[key] = head
+                        lines.append(
+                            f"#{number} re-enqueued (infra recovery run={recovery_run_id})"
+                            + (" at the front (priority)" if jumped else "")
+                        )
+                        estimated_remaining -= 30
+                    except (PublishBlocked, KeeperError) as exc:
+                        hold_in_repair(
+                            number,
+                            reason=f"infra-recovery-refused:{exc}",
+                            old_head=head,
+                            current_head=head,
+                            run_ids=runs,
+                        )
+                        lines.append(f"#{number} held: infra-recovery-refused ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
             elif reason == "ready":
+                if ownership_path is not None:
+                    custody = custody_for(number)
+                    if custody is not None:
+                        if custody["keeper_state"] == "repair":
+                            lines.append(f"#{number} held: repair-custody")
+                            continue
+                        if custody["head"] != head:
+                            hold_in_repair(
+                                number,
+                                reason="head-moved",
+                                old_head=str(custody["head"]),
+                                current_head=head,
+                                run_ids=(),
+                            )
+                            lines.append(f"#{number} held: head-moved")
+                            continue
+                        previous.setdefault("tracked", {})[key] = {
+                            "number": number, "repo": canonical_repo, "base": base_name,
+                            "head": head, "mode": "queue", "status": "enqueuing", "updated_at": observed,
+                        }
+                        _save(state_path, previous)
                 jumped = gh.enqueue(number, head)
                 if not gh.membership(number):
                     after_enqueue = gh.current(number)
@@ -1280,6 +2085,8 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                         raise KeeperError("enqueue returned success without queue membership or armed auto-merge")
                 else:
                     queued_now[key] = head
+                    if key in previous.get("tracked", {}):
+                        previous["tracked"][key]["status"] = "queued"
                     lines.append(f"#{number} enqueued" + (" at the front (priority)" if jumped else ""))
                 estimated_remaining -= 30
             _flush_pending_comments(gh, number, comments, login, previous, comment_safe=can_comment)
@@ -1289,6 +2096,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             if (
                 exited
                 and queued is False
+                and key not in queued_now
                 and comment_safe
                 and drop_key not in previous.get("ejection_alerts", {})
             ):
@@ -1298,6 +2106,15 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     " missing)." + EJECTED_NOTE
                 ))
                 _queue_cto_alert(previous, number, head, runs)
+                if ownership_path is not None and ownership_path.exists():
+                    pr_ownership.record_keeper_repair(
+                        ownership_path,
+                        repo=canonical_repo,
+                        number=number,
+                        reason="ejected",
+                        head=head,
+                        run_ids=list(runs),
+                    )
                 previous.setdefault("ejection_alerts", {})[drop_key] = observed
                 lines.append(f"#{number} ejection alerted to the CTO: runs={_run_ids(runs)}")
             if (
@@ -1305,7 +2122,7 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                     "ready", "ejected", "needs-CF", "CF-unknown", "fresh-evidence-unknown", "fresh-read-unknown",
                 }
                 and comment_safe
-                and (_ever_approved(comments, login) or dropped)
+                and (_ever_approved(comments, verdict_login) or dropped)
             ):
                 _comment_once(
                     gh, number, head, reason, comments, login, detail + (EJECTED_NOTE if reason == "queued-before" else "")
@@ -1327,6 +2144,17 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
             lines.append(f"#{number} FAILED: {exc}")
         budget = estimated_remaining - 30 >= FLOOR
     if apply:
+        reconcile_lines, reconcile_failed = _reconcile_closed_tracked(
+            gh,
+            previous,
+            open_numbers,
+            canonical_repo=canonical_repo,
+            observed=observed,
+            ownership_path=ownership_path,
+            closeout_runner=closeout_runner or _default_closeout,
+        )
+        lines.extend(reconcile_lines)
+        failed = failed or reconcile_failed
         previous["queued"] = queued_now
         previous["approved"] = approved_now
         previous["observed"] = observed
@@ -1335,6 +2163,13 @@ def run(gh: GitHub, state_path: Path, *, apply: bool = False) -> tuple[list[str]
                 previous[name] = {
                     item: value for item, value in previous[name].items() if item.split(":", 1)[0] in open_numbers
                 }
+        if "hold_alerts" in previous:
+            keep_numbers = open_numbers | set(previous.get("pending_closeout", {}))
+            previous["hold_alerts"] = {
+                alert_key: value
+                for alert_key, value in previous["hold_alerts"].items()
+                if len(alert_key.split(":")) >= 4 and alert_key.split(":")[3] in keep_numbers
+            }
     cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
     failures = [
         item for item in previous.get("failures", [])
@@ -1393,20 +2228,107 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repo-root", type=Path, default=Path.cwd(), help="Checkout root (default: current directory)."
     )
+    parser.add_argument(
+        "--state-file",
+        type=Path,
+        default=None,
+        help="Keeper state JSON path (default: <repo-root>/batch_state/merge_queue_keeper.json).",
+    )
+    parser.add_argument(
+        "--lock-file",
+        type=Path,
+        default=None,
+        help="Keeper lock file path (default: <repo-root>/batch_state/locks/merge_queue_keeper.lock).",
+    )
+    parser.add_argument(
+        "--ownership-state-file",
+        type=Path,
+        default=None,
+        help="Optional pr_ownership state.json path for keeper custody tracking (dormant by default).",
+    )
+    parser.add_argument(
+        "--direct-land-repo",
+        default=None,
+        help="Opt-in owner/name allowed for direct landing on bases without a merge queue (dormant by default).",
+    )
+    parser.add_argument(
+        "--direct-land-base",
+        action="append",
+        default=[],
+        help="Opt-in protected base branch for direct landing (repeatable; requires --direct-land-repo).",
+    )
+    parser.add_argument(
+        "--required-check",
+        action="append",
+        default=[],
+        help="Required check name for direct landing (repeatable; default: CI Gate).",
+    )
+    parser.add_argument(
+        "--verdict-recorder-login",
+        default=None,
+        help="Trusted GitHub login that posts cf-verdict comments when distinct from the merger login.",
+    )
+    parser.add_argument(
+        "--direct-land-require-custody",
+        action="store_true",
+        help="Require active pr_ownership keeper custody before direct landing (default off).",
+    )
+    parser.add_argument(
+        "--allow-infra-reenqueue",
+        action="store_true",
+        help="Opt-in keeper-owned same-head infrastructure re-enqueue in merge-queue mode (default off).",
+    )
     return parser
+
+
+def _direct_config_from_args(args: argparse.Namespace) -> DirectLandingConfig | None:
+    """Build opt-in ``DirectLandingConfig`` from parsed CLI args, or None when dormant."""
+    has_direct_flags = bool(
+        args.direct_land_repo
+        or args.direct_land_base
+        or args.required_check
+        or args.verdict_recorder_login
+        or args.direct_land_require_custody
+        or args.allow_infra_reenqueue
+    )
+    if not has_direct_flags:
+        return None
+    if not args.direct_land_repo or not args.direct_land_base:
+        raise KeeperError("direct landing requires both --direct-land-repo and at least one --direct-land-base")
+    if normalize_repository(args.direct_land_repo) != normalize_repository(args.repo):
+        raise KeeperError(
+            f"--direct-land-repo ({args.direct_land_repo}) must match --repo ({args.repo})"
+        )
+    return DirectLandingConfig(
+        repository=args.direct_land_repo,
+        bases=frozenset(args.direct_land_base),
+        required_checks=tuple(args.required_check) if args.required_check else ("CI Gate",),
+        verdict_recorder_login=args.verdict_recorder_login,
+        require_custody=bool(args.direct_land_require_custody),
+        allow_infra_reenqueue=bool(args.allow_infra_reenqueue),
+    )
 
 
 @publication_cli(KeeperError)
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = args.repo_root.resolve()
-    lock_path = root / "batch_state/locks/merge_queue_keeper.lock"
+    direct_config = _direct_config_from_args(args)
+    state_path = args.state_file.resolve() if args.state_file is not None else root / "batch_state/merge_queue_keeper.json"
+    lock_path = args.lock_file.resolve() if args.lock_file is not None else root / "batch_state/locks/merge_queue_keeper.lock"
+    ownership_path = args.ownership_state_file.resolve() if args.ownership_state_file is not None else None
+    run_kwargs: dict[str, Any] = {}
+    if direct_config is not None:
+        run_kwargs["direct_config"] = direct_config
+    if ownership_path is not None:
+        run_kwargs["ownership_path"] = ownership_path
     if not args.apply:
         try:
             lines, failed = run(
                 GitHub(root, args.repo),
-                root / "batch_state/merge_queue_keeper.json",
+                state_path,
                 apply=False,
+                **run_kwargs,
             )
         except GitHubRateLimited as exc:
             print(f"merge queue keeper: skipped reset_at={exc.reset_at}")
@@ -1424,7 +2346,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         except BlockingIOError:
             print("merge queue keeper: overlap, skipped")
             return 0
-        state_path = root / "batch_state/merge_queue_keeper.json"
         interval = _min_interval(os.environ)
         if _throttled(state_path, interval):
             shown = quiet_for_journal(
@@ -1436,7 +2357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(line)
             return 0
         try:
-            lines, failed = run(GitHub(root, args.repo), state_path, apply=args.apply)
+            lines, failed = run(GitHub(root, args.repo), state_path, apply=args.apply, **run_kwargs)
         except GitHubRateLimited as exc:
             lines, failed = [f"merge queue keeper: skipped reset_at={exc.reset_at}"], False
             full_pass = False
@@ -1455,7 +2376,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # never hides the queue pass's result. It records decision custody when it can
         # prove the PR ownerless, and alerts only when it cannot.
         try:
-            ownership_lines, ownership_failed = pr_ownership.keeper_tick()
+            ownership_lines, ownership_failed = (
+                pr_ownership.keeper_tick(path=ownership_path)
+                if ownership_path is not None
+                else pr_ownership.keeper_tick()
+            )
         except Exception as exc:
             ownership_lines, ownership_failed = [f"pr ownership: FAILED ({type(exc).__name__})"], True
         for line in [*quiet_for_journal(state_path, lines, full_pass=full_pass), *ownership_lines]:
