@@ -2503,7 +2503,9 @@ def _script_reads_stdin(script: str) -> bool:
             # A computed command word may name a shell.
             if found[0] in SHELL_COMMANDS or found[0] == _UNDECIDABLE or "$" in found[0]:
                 return True
-            if any(_names_stdin(_strip_quotes(word)) for word in segment):
+            # Any word may be a file operand here, so only a path-shaped one counts:
+            # a bare `0` or `stdin` is more often an exit status or text than a file.
+            if any("/" in (value := _strip_quotes(word)) and _names_stdin(value) for word in segment):
                 return True
     return False
 
