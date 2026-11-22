@@ -843,7 +843,15 @@ def _load(path: Path) -> dict[str, Any]:
         or not isinstance(data.get("pending_comments", {}), dict)
         or not isinstance(data.get("defect_reports", {}), dict)
         or not isinstance(data.get("tracked", {}), dict)
+        or not all(
+            isinstance(k, str) and k.isdigit() and isinstance(v, dict)
+            for k, v in data.get("tracked", {}).items()
+        )
         or not isinstance(data.get("pending_closeout", {}), dict)
+        or not all(
+            isinstance(k, str) and k.isdigit() and isinstance(v, dict)
+            for k, v in data.get("pending_closeout", {}).items()
+        )
         or not isinstance(data.get("hold_alerts", {}), dict)
         or not isinstance(data.get("base_ci_alerts", {}), dict)
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
@@ -1094,6 +1102,13 @@ def _default_closeout(number: int, repo: str, root: Path) -> tuple[str, str]:
     return "failed", "; ".join(applied.errors) or "closeout residual"
 
 
+def _repair_reason(raw: str) -> str:
+    """Single printable line safe for ``pr_ownership.record_keeper_repair``."""
+    cleaned = display_text(raw, DISPLAY_REASON_LIMIT)
+    cleaned = "".join(" " if ord(ch) < 32 or ord(ch) == 127 else ch for ch in cleaned)
+    return " ".join(cleaned.split()) or "unknown"
+
+
 def _reconcile_closed_tracked(
     gh: GitHub,
     previous: dict[str, Any],
@@ -1105,20 +1120,30 @@ def _reconcile_closed_tracked(
     closeout_runner: Callable[[int, str, Path], tuple[str, str]],
 ) -> tuple[list[str], bool]:
     """Reconcile tracked PRs that left the open list so fast merges and restarts still reach closeout."""
+    lines: list[str] = []
+    failed = False
     raw_tracked = previous.get("tracked")
     tracked: dict[str, Any] = raw_tracked if isinstance(raw_tracked, dict) else {}
     raw_pending = previous.get("pending_closeout")
     pending: dict[str, Any] = raw_pending if isinstance(raw_pending, dict) else {}
-    custody_map = (
-        pr_ownership.keeper_custodies_for_repo(ownership_path, canonical_repo)
-        if ownership_path is not None
-        else {}
-    )
+    custody_map: dict[int, dict[str, Any]] = {}
+    if ownership_path is not None:
+        try:
+            custody_map = pr_ownership.keeper_custodies_for_repo(ownership_path, canonical_repo)
+        except (pr_ownership.OwnershipError, OSError) as exc:
+            failed = True
+            lines.append(
+                f"pr ownership reconciliation FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})"
+            )
     candidates: dict[str, dict[str, Any]] = {}
     for key, entry in tracked.items():
+        if not isinstance(key, str) or not key.isdigit():
+            continue
         if key not in open_numbers or (isinstance(entry, dict) and entry.get("status") == "merge-sent"):
             candidates[key] = dict(entry) if isinstance(entry, dict) else {"number": int(key)}
     for key, entry in pending.items():
+        if not isinstance(key, str) or not key.isdigit():
+            continue
         if key not in open_numbers:
             candidates.setdefault(key, dict(entry) if isinstance(entry, dict) else {"number": int(key)})
     for number, handoff in custody_map.items():
@@ -1126,12 +1151,8 @@ def _reconcile_closed_tracked(
         if key not in open_numbers:
             candidates.setdefault(key, {"number": number, "head": handoff.get("head"), "base": handoff.get("base")})
     if not candidates:
-        return [], False
-    lines: list[str] = []
-    failed = False
-    for key in sorted(candidates, key=lambda item: int(item) if item.isdigit() else 0):
-        if not key.isdigit():
-            continue
+        return lines, failed
+    for key in sorted(candidates, key=int):
         number = int(key)
         entry = candidates[key]
         raw_head = entry.get("head")
@@ -1154,9 +1175,13 @@ def _reconcile_closed_tracked(
             if isinstance(previous.get("pending_closeout"), dict):
                 previous["pending_closeout"].pop(key, None)
             if ownership_path is not None:
-                pr_ownership.release_closed_keeper_custody(
-                    ownership_path, repo=canonical_repo, number=number, how="closed without merge",
-                )
+                try:
+                    pr_ownership.release_closed_keeper_custody(
+                        ownership_path, repo=canonical_repo, number=number, how="closed without merge",
+                    )
+                except (pr_ownership.OwnershipError, OSError) as exc:
+                    failed = True
+                    lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
             _queue_hold_alert(
                 previous,
                 repo=canonical_repo,
@@ -1182,9 +1207,13 @@ def _reconcile_closed_tracked(
             if isinstance(previous.get("pending_closeout"), dict):
                 previous["pending_closeout"].pop(key, None)
             if ownership_path is not None:
-                pr_ownership.release_closed_keeper_custody(
-                    ownership_path, repo=canonical_repo, number=number, how="merged and closed out",
-                )
+                try:
+                    pr_ownership.release_closed_keeper_custody(
+                        ownership_path, repo=canonical_repo, number=number, how="merged and closed out",
+                    )
+                except (pr_ownership.OwnershipError, OSError) as exc:
+                    failed = True
+                    lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
             lines.append(f"#{number} reconciled: merged and closed out")
         elif status == "awaiting_worktree":
             previous.setdefault("pending_closeout", {})[key] = {
@@ -1508,15 +1537,21 @@ def run(
         )
 
     def hold_in_repair(number: int, *, reason: str, old_head: str, current_head: str, run_ids: Sequence[int]) -> None:
+        nonlocal failed
+        safe_reason = _repair_reason(reason)
         if ownership_path is not None and ownership_path.exists():
-            pr_ownership.record_keeper_repair(
-                ownership_path,
-                repo=canonical_repo,
-                number=number,
-                reason=reason,
-                head=current_head,
-                run_ids=list(run_ids),
-            )
+            try:
+                pr_ownership.record_keeper_repair(
+                    ownership_path,
+                    repo=canonical_repo,
+                    number=number,
+                    reason=safe_reason,
+                    head=current_head,
+                    run_ids=list(run_ids),
+                )
+            except (pr_ownership.OwnershipError, OSError) as exc:
+                failed = True
+                lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
         _queue_hold_alert(
             previous,
             repo=canonical_repo,
@@ -1524,7 +1559,7 @@ def run(
             kind="repair-hold",
             old_head=old_head,
             current_head=current_head,
-            reason=reason,
+            reason=safe_reason,
             run_ids=run_ids,
             observed=observed,
         )
@@ -1583,16 +1618,20 @@ def run(
             try:
                 custody = custody_for(number)
                 has_decision_custody = decision_custody_for(number)
-            except pr_ownership.OwnershipError:
+            except (pr_ownership.OwnershipError, OSError) as exc:
                 custody = None
                 has_decision_custody = False
                 custody_error: str | None = "custody-unknown"
+                failed = True
+                lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
             else:
                 custody_error = None
             tracked_entry = previous.get("tracked", {}).get(key)
             tracked_head = tracked_entry.get("head") if isinstance(tracked_entry, dict) else None
             old_head = head
-            if has_decision_custody:
+            if custody_error is not None:
+                pass
+            elif has_decision_custody:
                 custody_error = "decision-custody"
             elif custody is not None:
                 old_head = str(custody["head"])
@@ -1611,8 +1650,12 @@ def run(
                 ):
                     custody_error = "head-moved"
             elif isinstance(tracked_head, str) and SHA.fullmatch(tracked_head) and tracked_head != head:
-                old_head = tracked_head
-                custody_error = "head-moved"
+                # Without active keeper custody, an OPEN PR at a newer head means the older
+                # tracked head did not merge; clear the stale record so the new head is judged
+                # purely on its own fresh exact-head review and CI.
+                if apply and isinstance(previous.get("tracked"), dict):
+                    previous["tracked"].pop(key, None)
+                tracked_entry = None
             elif direct_config.require_custody:
                 custody_error = "no-keeper-custody"
             base_ci_status, base_sha, base_run_ids = (
@@ -1777,6 +1820,8 @@ def run(
                 estimated_remaining -= 30
             except KeeperError as exc:
                 failed = True
+                if key in previous.get("tracked", {}) and previous["tracked"][key].get("status") == "merging":
+                    previous["tracked"][key]["status"] = "merge-failed"
                 err_text = str(exc)
                 if "QUEUE_MODE_CHANGED" in err_text or "reviewed head changed" in err_text:
                     hold_in_repair(
@@ -2026,7 +2071,7 @@ def run(
                             comments,
                             number,
                             head,
-                            authenticated_login=verdict_login,
+                            authenticated_login=login,
                             run_id=recovery_run_id,
                             require_infra_diagnosis=True,
                         )
@@ -2056,7 +2101,12 @@ def run(
                         lines.append(f"#{number} held: infra-recovery-refused ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
             elif reason == "ready":
                 if ownership_path is not None:
-                    custody = custody_for(number)
+                    try:
+                        custody = custody_for(number)
+                    except (pr_ownership.OwnershipError, OSError) as exc:
+                        failed = True
+                        lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
+                        continue
                     if custody is not None:
                         if custody["keeper_state"] == "repair":
                             lines.append(f"#{number} held: repair-custody")
@@ -2107,14 +2157,18 @@ def run(
                 ))
                 _queue_cto_alert(previous, number, head, runs)
                 if ownership_path is not None and ownership_path.exists():
-                    pr_ownership.record_keeper_repair(
-                        ownership_path,
-                        repo=canonical_repo,
-                        number=number,
-                        reason="ejected",
-                        head=head,
-                        run_ids=list(runs),
-                    )
+                    try:
+                        pr_ownership.record_keeper_repair(
+                            ownership_path,
+                            repo=canonical_repo,
+                            number=number,
+                            reason="ejected",
+                            head=head,
+                            run_ids=list(runs),
+                        )
+                    except (pr_ownership.OwnershipError, OSError) as exc:
+                        failed = True
+                        lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
                 previous.setdefault("ejection_alerts", {})[drop_key] = observed
                 lines.append(f"#{number} ejection alerted to the CTO: runs={_run_ids(runs)}")
             if (
@@ -2241,12 +2295,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keeper lock file path (default: <repo-root>/batch_state/locks/merge_queue_keeper.lock).",
     )
     parser.add_argument(
-        "--ownership-state-file",
-        type=Path,
-        default=None,
-        help="Optional pr_ownership state.json path for keeper custody tracking (dormant by default).",
-    )
-    parser.add_argument(
         "--direct-land-repo",
         default=None,
         help="Opt-in owner/name allowed for direct landing on bases without a merge queue (dormant by default).",
@@ -2316,12 +2364,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     direct_config = _direct_config_from_args(args)
     state_path = args.state_file.resolve() if args.state_file is not None else root / "batch_state/merge_queue_keeper.json"
     lock_path = args.lock_file.resolve() if args.lock_file is not None else root / "batch_state/locks/merge_queue_keeper.lock"
-    ownership_path = args.ownership_state_file.resolve() if args.ownership_state_file is not None else None
     run_kwargs: dict[str, Any] = {}
     if direct_config is not None:
         run_kwargs["direct_config"] = direct_config
-    if ownership_path is not None:
-        run_kwargs["ownership_path"] = ownership_path
+        run_kwargs["ownership_path"] = pr_ownership.state_path()
     if not args.apply:
         try:
             lines, failed = run(
@@ -2376,11 +2422,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         # never hides the queue pass's result. It records decision custody when it can
         # prove the PR ownerless, and alerts only when it cannot.
         try:
-            ownership_lines, ownership_failed = (
-                pr_ownership.keeper_tick(path=ownership_path)
-                if ownership_path is not None
-                else pr_ownership.keeper_tick()
-            )
+            ownership_lines, ownership_failed = pr_ownership.keeper_tick()
         except Exception as exc:
             ownership_lines, ownership_failed = [f"pr ownership: FAILED ({type(exc).__name__})"], True
         for line in [*quiet_for_journal(state_path, lines, full_pass=full_pass), *ownership_lines]:

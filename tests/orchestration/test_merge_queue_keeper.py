@@ -886,6 +886,44 @@ def test_direct_landing_head_move_ci_failure_and_queue_mode_race_hold_and_dedupl
     ci_outbox = json.loads(ci_state.read_text())["cto_outbox"]
     assert len(ci_outbox) == 1 and "8888" in ci_outbox[0]["body"]
 
+    # F1 regression: tab/control chars in failing check name and corrupt ownership state never crash the tick.
+    tab_own = tmp_path / "tab_own.json"
+    own.acknowledge_keeper_transfer(
+        tab_own, repo=PRIVATE_REPO, number=42,
+        pr={"state": "OPEN", "isDraft": False, "headRefOid": HEAD_A, "headRefName": "codex/x", "baseRefName": "main", "isCrossRepository": False},
+        worker_task="w1", worker_nonce="n1", records=[worker], now=datetime(2026, 9, 23, 12, 0, tzinfo=UTC),
+        rerun="unspent", repos=fleet, verdict_receipt={"pr": 42, "head": HEAD_A, "task": "rev1", "verdict": "APPROVED", "status": "posted"},
+        live=lambda r: r is not None and r.get("status") == "running",
+    )
+    tab_fail = DirectFakeGitHub([pr(number=42)])
+    tab_fail.checks_by_head[HEAD_A] = [
+        {"id": 701, "name": "CI Gate", "head_sha": HEAD_A, "status": "completed", "conclusion": "success", "started_at": "2026-09-23T00:00:00Z"},
+        {"id": 702, "workflow_run_id": 8889, "name": "lint\tjob", "head_sha": HEAD_A, "status": "completed", "conclusion": "failure", "started_at": "2026-09-23T00:00:00Z"},
+    ]
+    tab_lines, tab_failed = keeper.run(tab_fail, tmp_path / "tab.json", apply=True, direct_config=_direct_cfg(), ownership_path=tab_own)
+    assert not tab_failed and any("held: CI-red-lint\tjob" in line for line in tab_lines)
+    corrupt_own = tmp_path / "corrupt_own.json"
+    corrupt_own.write_text("{not json")
+    corrupt_lines, corrupt_failed = keeper.run(DirectFakeGitHub([pr(number=42)]), tmp_path / "corrupt.json", apply=True, direct_config=_direct_cfg(), ownership_path=corrupt_own)
+    assert corrupt_failed and any("custody-unknown" in line for line in corrupt_lines)
+
+    # F2 regression: failed direct-merge write at HEAD_A must not permanently block a newly approved HEAD_B.
+    retry_state = tmp_path / "retry.json"
+    retry_fake = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_A)])
+    retry_fake.direct_merge_error = keeper.KeeperError("OPSEC: squash text refused")
+    _rl1, rf1 = keeper.run(retry_fake, retry_state, apply=True, direct_config=_direct_cfg())
+    assert rf1 and json.loads(retry_state.read_text())["tracked"]["42"]["status"] == "merge-failed"
+    retry_fake.direct_merge_error = None
+    retry_fake.rows = [pr(number=42, headRefOid=HEAD_B)]
+    retry_fake.fresh_by_pr[42] = {**retry_fake.rows[0], "state": "OPEN", "labels": []}
+    retry_fake.comments_by_pr[42] = [recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", HEAD_B)]
+    retry_fake.checks_by_head[HEAD_B] = checks(HEAD_B)
+    rl2, rf2 = keeper.run(
+        retry_fake, retry_state, apply=True, direct_config=_direct_cfg(),
+        closeout_runner=lambda num, repo, root: ("closed_out", ""),
+    )
+    assert not rf2 and ("direct-merge", (42, HEAD_B)) in retry_fake.actions and "#42 direct-merged" in "\n".join(rl2)
+
 
 def test_restart_after_lost_response_reconciles_closeout_only_after_merged_and_worktree_settled(tmp_path: Path) -> None:
     """Defect class: lost direct-merge response drops closeout, or closeout runs before MERGED/worktree settlement."""
@@ -943,6 +981,18 @@ def test_restart_after_lost_response_reconciles_closeout_only_after_merged_and_w
     assert not failed_c and closed_calls == []
     assert "#99 reconciled: closed without merge" in lines_c
     assert len(json.loads(closed_state.read_text())["cto_outbox"]) == 1
+
+    # F5 regression: malformed non-digit tracked key fails closed in _load and is skipped in reconciliation.
+    bad_state = tmp_path / "bad_tracked.json"
+    bad_state.write_text(json.dumps({"queued": {}, "tracked": {"not-a-number": "corrupt"}}))
+    with pytest.raises(keeper.KeeperError, match="keeper state malformed"):
+        keeper._load(bad_state)
+    rec_lines, rec_failed = keeper._reconcile_closed_tracked(
+        closed_fake, {"tracked": {"bad": "corrupt"}}, set(),
+        canonical_repo=PRIVATE_REPO, observed="2026-09-23T12:00:00+00:00",
+        ownership_path=None, closeout_runner=lambda num, repo, root: ("closed_out", ""),
+    )
+    assert rec_lines == [] and rec_failed is False
 
 
 def test_recovery_concurrent_rerun_vs_reenqueue_and_keeper_sole_ownership(

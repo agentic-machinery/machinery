@@ -919,7 +919,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         comments,
         number,
         head,
-        authenticated_login=verdict_login,
+        authenticated_login=login,
         run_id=run_id,
         require_infra_diagnosis=require_infra_diagnosis,
     )
