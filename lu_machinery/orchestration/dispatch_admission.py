@@ -32,6 +32,17 @@ every check passes. Read-only dispatches are exempt.
   forecast, a passed reset or an unmeasured rate keeps the fixed ceiling and
   the admission line says why (:func:`meter_cap`). Recent rate limiting and
   known near-cap or exhausted meters defer new writes.
+* **Operator drain deadlines (C-6214).** ``DISPATCH_DRAIN_DEADLINES_FILE``
+  names a JSON file such as
+  ``{"Codex a": {"after": iso, "deadline": iso, "order": text}}`` for the
+  meters ``codex:a`` (``"Codex a"``) and ``codex:b`` (``"Codex b"``); other
+  names are ignored. While ``after <= now < deadline`` a reset credit will
+  discard the meter's remaining allowance at ``deadline``, so the paced cap
+  uses ``min(reset_at, deadline)`` as the reset and the admission line says
+  "to drain deadline". It can only raise a paced cap, never above the
+  ceiling. Unset, missing, unreadable or malformed means today's pacing; the
+  reason is logged once (:func:`active_drain_deadline`). Like the thresholds
+  it is read from the process environment, else the deployment env file.
 * **``MemAvailable``** from ``/proc/meminfo`` at or above the floor.
 * **CPU:** the 1-minute load average divided by ``os.cpu_count()`` at or below
   the limit.
@@ -114,6 +125,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -156,6 +168,16 @@ _PLANNING_POOLS = {"grok+cursor": "grok"}
 _MIN_RATE_SAMPLES = 10
 _MICROS_PER_HOUR = 3_600_000_000
 
+# Operator drain plan (C-6214): a JSON file whose entries name a window in which a reset credit discards a
+# meter's remaining allowance at ``deadline`` (:func:`active_drain_deadline`). Read like the thresholds: the
+# process environment, else the deployment env file.
+ENV_DRAIN_DEADLINES_FILE = "DISPATCH_DRAIN_DEADLINES_FILE"
+_DRAIN_ENTRY_NAMES = {"codex:a": "Codex a", "codex:b": "Codex b"}
+_DRAIN_FILE_MAX_BYTES = 64 * 1024
+_DRAIN_TIME_MAX_CHARS = 40
+# Each distinct reason is logged once per process, so a bad file does not repeat on every admission check.
+_drain_warned: set[str] = set()
+
 ENV_MAX_LIVE_WRITE_WORKERS = "DISPATCH_MAX_LIVE_WRITE_WORKERS"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER"
 ENV_MIN_METER_LAUNCH_INTERVAL_S = "DISPATCH_MIN_METER_LAUNCH_INTERVAL_S"
@@ -186,7 +208,7 @@ DISK_ALERT_PUBLISH_TIMEOUT_S = 30.0
 # existing worktree adds no checkout and skips it.
 DISK_GUARD_REUSE_SKIP = "dispatch reuses an existing worktree"
 
-# Deployment env file with the same variables (``NAME=value`` or
+# Deployment env file with the same variables and ``DISPATCH_DRAIN_DEADLINES_FILE`` (``NAME=value`` or
 # ``export NAME=value`` lines). Read only for the live environment, after the
 # process environment, so a long-running session started before the host set
 # its overrides still sees them. ``DISPATCH_ADMISSION_ENV_FILE`` names another
@@ -581,8 +603,9 @@ def admission_env_file(environ: Mapping[str, str], *, live: bool) -> Path | None
     return Path(base) / "learn-ukrainian" / ADMISSION_ENV_FILE_NAME
 
 
-def read_admission_env_file(path: Path | None) -> dict[str, str]:
-    """Threshold variables from a deployment env file; missing or unreadable reads as empty."""
+def read_admission_env_file(path: Path | None, names: Iterable[str] = _THRESHOLD_ENV_NAMES) -> dict[str, str]:
+    """``names`` (default: the threshold variables) from a deployment env file; missing or unreadable reads as empty."""
+    wanted = frozenset(names)
     if path is None:
         return {}
     try:
@@ -598,7 +621,7 @@ def read_admission_env_file(path: Path | None) -> dict[str, str]:
             line = line[len("export ") :].lstrip()
         name, sep, value = line.partition("=")
         name, value = name.strip(), value.strip()
-        if not sep or name not in _THRESHOLD_ENV_NAMES:
+        if not sep or name not in wanted:
             continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
@@ -1219,7 +1242,103 @@ def _forecast_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tuple[int, str]:
+def _drain_warn(reason: str) -> None:
+    if reason not in _drain_warned:
+        _drain_warned.add(reason)
+        # WARNING: callers such as dispatch.py configure no logging, so only WARNING and above reach stderr.
+        _logger.warning("dispatch admission: %s %s; pacing uses the meter reset", ENV_DRAIN_DEADLINES_FILE, reason)
+
+
+def _drain_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) > _DRAIN_TIME_MAX_CHARS:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        raise ValueError("duplicate member")
+    return members
+
+
+def active_drain_deadline(meter: str, now: datetime, environ: Mapping[str, str] | None = None) -> datetime | None:
+    """The operator drain deadline active for ``meter`` now, or ``None`` (C-6214).
+
+    ``DISPATCH_DRAIN_DEADLINES_FILE`` (the process environment, else the deployment env file, as for the
+    thresholds) names a JSON object such as ``{"Codex a": {"after": iso, "deadline": iso, "order": text}}``.
+    ``"Codex a"`` and ``"Codex b"`` are the meters ``codex:a`` and ``codex:b``; other names are ignored. An
+    entry is active when ``after <= now < deadline``; both times need a UTC offset. An unset variable or a
+    meter without an entry means no deadline. A missing, unreadable, non-regular, oversized or malformed file
+    or entry also means no deadline: the reason is logged once per process and nothing raises.
+    """
+    name = _DRAIN_ENTRY_NAMES.get(meter)
+    if name is None:
+        return None
+    live = environ is None
+    process_env = os.environ if environ is None else environ
+    raw = process_env.get(ENV_DRAIN_DEADLINES_FILE, "").strip()
+    if not raw:
+        file_env = read_admission_env_file(admission_env_file(process_env, live=live), (ENV_DRAIN_DEADLINES_FILE,))
+        raw = file_env.get(ENV_DRAIN_DEADLINES_FILE, "").strip()
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser()
+    except RuntimeError:  # ``~name`` for an unknown user
+        path = Path(raw)
+    if not path.is_absolute():  # relative to whichever directory the dispatcher runs in
+        _drain_warn("is not an absolute path")
+        return None
+    try:
+        # O_NONBLOCK: a FIFO at the path cannot make admission wait; only a regular file is read.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except (OSError, ValueError) as exc:  # ValueError: an embedded NUL
+        _drain_warn("file missing" if isinstance(exc, FileNotFoundError) else "file unreadable")
+        return None
+    try:
+        regular: bool | None = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        regular = None
+    if not regular:
+        os.close(fd)
+        _drain_warn("file unreadable" if regular is None else "is not a regular file")
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:  # owns and closes fd
+            data = handle.read(_DRAIN_FILE_MAX_BYTES + 1)
+    except OSError:
+        _drain_warn("file unreadable")
+        return None
+    if len(data) > _DRAIN_FILE_MAX_BYTES:
+        _drain_warn(f"file is larger than {_DRAIN_FILE_MAX_BYTES} bytes")
+        return None
+    try:
+        document = json_depth.loads(data.decode("utf-8"), max_depth=8, object_pairs_hook=_unique_members)
+    except (ValueError, RecursionError):  # UnicodeDecodeError and JSONDecodeError are ValueErrors
+        _drain_warn("is not valid JSON")
+        return None
+    if not isinstance(document, dict):
+        _drain_warn("is not a JSON object")
+        return None
+    if name not in document:
+        return None
+    entry = document[name]
+    after = _drain_time(entry.get("after")) if isinstance(entry, dict) else None
+    deadline = _drain_time(entry.get("deadline")) if isinstance(entry, dict) else None
+    if after is None or deadline is None:
+        _drain_warn(f"entry {name!r} needs 'after' and 'deadline' times with a UTC offset")
+        return None
+    return deadline if after <= now < deadline else None
+
+
+def meter_cap(
+    meter: str, ceiling: int, forecast: object, now: datetime, drain_deadline: datetime | None = None,
+) -> tuple[int, str]:
     """The meter's live-worker cap and the basis the admission line shows (#1133).
 
     ``forecast`` is the Monitor planning view (``model-planning.v1``). With a valid row for the meter, a
@@ -1227,6 +1346,11 @@ def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tupl
     allowance by the reset at the measured rate, ``ceil(remaining_pct / (hours_to_reset x rate))``,
     clamped to ``[1, ceiling]``, computed exactly from the given values and the reset interval in
     microseconds. It reads no live-worker count. Anything else keeps the fixed ceiling.
+
+    ``drain_deadline`` is the meter's active operator drain deadline (:func:`active_drain_deadline`): when
+    it comes before the row's reset, the allowance is gone at the deadline, so the cap paces to it instead
+    and the basis says "to drain deadline". It only shortens the interval, so it can only raise the cap,
+    never above ``ceiling``, and never paces a meter the forecast does not.
     """
     view = _mapping(forecast)
     rows = view.get("capacity")
@@ -1247,6 +1371,9 @@ def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tupl
         reset = None
     if reset is None or reset.tzinfo is None:
         return ceiling, "fixed cap: reset time unknown"
+    until = "reset"
+    if drain_deadline is not None and drain_deadline < reset:
+        reset, until = drain_deadline, "drain deadline"
     micros = (reset - now) // timedelta(microseconds=1)
     if micros <= 0:
         return ceiling, "fixed cap: reset time passed"
@@ -1260,7 +1387,7 @@ def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tupl
     workers = Fraction(remaining) * _MICROS_PER_HOUR / (micros * Fraction(rate))
     cap = min(ceiling, max(1, math.ceil(workers)))
     return cap, (
-        f"paced cap: {remaining:g}% left, {micros / _MICROS_PER_HOUR:.1f}h to reset, {rate:g} points per worker-hour "
+        f"paced cap: {remaining:g}% left, {micros / _MICROS_PER_HOUR:.1f}h to {until}, {rate:g} points per worker-hour "
         f"over {samples} tasks, ceiling {ceiling}"
     )
 
@@ -1632,7 +1759,9 @@ def evaluate(
         )
     meter_check = None
     if meter is not None:
-        cap, basis = meter_cap(meter, limits.max_live_write_workers_per_meter, meter_forecast, clock)
+        cap, basis = meter_cap(
+            meter, limits.max_live_write_workers_per_meter, meter_forecast, clock, active_drain_deadline(meter, clock),
+        )
         defer = (
             MeterDefer.RATE_LIMITED if scan.meter_recently_rate_limited
             else _meter_defer(meter, meter_budget or {}, clock)
