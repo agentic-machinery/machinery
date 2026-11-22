@@ -1373,3 +1373,34 @@ def test_main_help_resolves_no_checkout(
     assert caught.value.code == 0
     assert "fleet catalog" in help_text
     assert "current directory" not in help_text
+
+
+@pytest.mark.parametrize(("payload_slug", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
+def test_fetch_pr_info_binds_either_baked_slug_of_the_requested_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload_slug: str, accepted: bool
+) -> None:
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (--repo spells the old slug)."""
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch)
+    rest = {
+        "number": 42, "state": "closed", "merged_at": "2026-01-02T03:04:05Z", "head": {"ref": "b", "sha": "a" * 40},
+        "base": {"repo": {"full_name": payload_slug}}, "html_url": f"https://github.com/{payload_slug}/pull/42",
+    }
+    graphql = {"number": 42, "state": "MERGED", "headRefName": "b", "headRefOid": "a" * 40,
+               "url": f"https://github.com/{payload_slug}/pull/42"}
+
+    def fake_run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert args[0] == "gh", args
+        return subprocess.CompletedProcess(args, 0, json.dumps(rest if args[1] == "api" else graphql), "")
+
+    monkeypatch.setattr(mc.github_client, "run", fake_run)
+
+    if not accepted:
+        with pytest.raises(mc.MergeCloseoutError, match="does not match requested"):
+            mc.fetch_pr_info(tmp_path, 42, repo="org/repo")
+        return
+    assert mc.fetch_pr_info(tmp_path, 42, repo="org/repo") == mc.PullRequestInfo(
+        42, "MERGED", "b", "a" * 40, repository="org/repo"
+    )

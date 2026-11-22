@@ -163,9 +163,27 @@ def advisory_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_docu
     return runner
 
 
-def test_external_advisory_publisher_proves_check_at_the_metadata_head(monkeypatch):
-    """Distinct vendor details and canonical check URLs must preserve App proof."""
+@pytest.mark.parametrize(
+    ("run_slug", "rollup_slug", "accepted"),
+    [
+        ("unit/public", "unit/public", True),
+        ("neworg/public", "neworg/public", True),
+        ("unit/public", "neworg/public", True),
+        ("evil/public", "evil/public", False),
+        ("unit/public", "evil/public", False),
+    ],
+)
+def test_external_advisory_publisher_proves_check_at_the_metadata_head(monkeypatch, run_slug, rollup_slug, accepted):
+    """Distinct vendor details and canonical check URLs must preserve App proof.
+
+    Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (canonical check URL under run_slug
+    in the REST read and rollup_slug in the separate rollup read).
+    """
+    from tests.test_fleet_repos import transferred_catalog
+
     _enable_synthetic_advisory(monkeypatch)
+    transferred_catalog(monkeypatch, github="unit/public", alternate="neworg/public")
     calls = []
     app = ADVISORY_APP
     old = {"name": "Body guard", "head_sha": HEAD, "status": "completed", "conclusion": "cancelled",
@@ -178,11 +196,11 @@ def test_external_advisory_publisher_proves_check_at_the_metadata_head(monkeypat
             {"name": "CI Gate", "head_sha": HEAD, "status": "completed", "conclusion": "success",
              "details_url": "https://github.com/unit/public/runs/23"},
             {"name": ADVISORY_NAME, "head_sha": HEAD, "status": "in_progress", "app": app,
-             "id": 24, "html_url": "https://github.com/unit/public/runs/24",
+             "id": 24, "html_url": f"https://github.com/{run_slug}/runs/24",
              "details_url": "https://example.invalid/gh/unit/public/trails/7"}]
     rollup = [{"__typename": "CheckRun", "name": row["name"], "status": row["status"].upper(),
                "conclusion": str(row.get("conclusion") or "").upper(),
-               "detailsUrl": row.get("html_url", row["details_url"])}
+               "detailsUrl": row.get("html_url", row["details_url"]).replace(f"/{run_slug}/", f"/{rollup_slug}/")}
               for row in rest]
     rollup.append({"__typename": "StatusContext", "context": "external-status", "state": "SUCCESS"})
     endpoint = f"repos/unit/public/commits/{HEAD}/check-runs?filter=all&per_page=100"
@@ -194,6 +212,10 @@ def test_external_advisory_publisher_proves_check_at_the_metadata_head(monkeypat
                                                        "workflow_id": 7, "name": "Body guard"}}
     runner = advisory_runner(app, calls, bound={"headRefOid": HEAD, "statusCheckRollup": rollup},
                              extra_documents=documents)
+    if not accepted:
+        with pytest.raises(PublishBlocked):
+            ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD)
+        return
     assert ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD) == HEAD
     assert [call[1:6] for call in calls] == [
         ["pr", "view", "1", "--json", "number,isDraft,headRefOid,mergeStateStatus"],

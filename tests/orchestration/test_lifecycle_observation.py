@@ -6,10 +6,15 @@ import shutil
 
 import pytest
 
+from lu_machinery.orchestration import lifecycle_observation as lo
 from lu_machinery.orchestration import merge_closeout as mc
 from lu_machinery.orchestration import task_lifecycle as tl
+from tests.orchestration import closeout_fixtures
 from tests.orchestration.test_merge_closeout import add_worktree, git, init_repo
 from tests.orchestration.test_task_lifecycle import NOW, _body, _ledger, _observation
+from tests.test_fleet_repos import transferred_catalog
+
+bound_case = closeout_fixtures.bound_case
 
 
 @pytest.fixture
@@ -592,3 +597,119 @@ def test_task_commit_range_refuses_ambiguous_absorbed_merge(observation_case):
     with pytest.raises(lo.ObservationRefusal, match="LIFECYCLE_LOCAL_OBSERVATION_INCOMPLETE"):
         lo.before_reap(repo, worktree)
     assert ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("payload_slug", "job_slug", "refusal"),
+    [
+        ("org/repo", "org/repo", None),
+        ("ORG/Repo", "NewOrg/Repo", None),
+        ("neworg/repo", "neworg/repo", None),
+        ("org/repo", "neworg/repo", None),
+        ("evil/repo", "evil/repo", "CLOSEOUT_MERGED_PR_MISMATCH"),
+        ("org/repo", "evil/repo", "CLOSEOUT_JOB_RUN_MISMATCH"),
+    ],
+)
+def test_merged_run_evidence_binds_either_baked_slug_of_the_ledger_repository(
+    bound_case, observation_case, monkeypatch, payload_slug, job_slug, refusal
+):
+    """Defect class: a payload naming the other baked slug (or an ASCII case variant) of the same
+    repository is refused, or a slug with the same repository name under another owner is accepted
+    (ledger and evidence recorded as org/repo or ORG/Repo; separate reads may mix the two baked
+    slugs and ASCII case variants, including child recovery and replay)."""
+    from copy import deepcopy
+
+    from lu_machinery.orchestration import task_identity
+
+    transferred_catalog(monkeypatch)
+    _, observation, pull, run, jobs = bound_case
+    run_url = f"https://github.com/{payload_slug}/actions/runs/123"
+    pull["html_url"] = f"https://github.com/{payload_slug}/pull/77"
+    pull["base"]["repo"]["full_name"] = payload_slug
+    run.update(html_url=run_url, repository={"full_name": payload_slug})
+    jobs[0]["html_url"] = f"https://github.com/{job_slug}/actions/runs/123/job/456"
+    observation["github"]["pr"]["url"] = pull["html_url"]
+
+    if refusal:
+        with pytest.raises(lo.ObservationRefusal, match=refusal):
+            closeout_fixtures.derive(bound_case)
+    else:
+        _, report = closeout_fixtures.derive(bound_case)
+        assert report["run_url"] == run_url
+        assert [item["executed"][0]["url"] for item in report["criteria"]] == [jobs[0]["html_url"]]
+
+    # Child recovery and replay must bind either baked slug (including ASCII case variants) for carrier
+    # and PR URLs, and refuse foreign or non-ASCII look-alike slugs.
+    repo, worktree, child_file, task_file, manifest, push_file, head = observation_case
+    child = tl.load_lifecycle(child_file)
+    if payload_slug == "ORG/Repo":
+        # Exercise a schema-valid mixed-case child ledger paired with mixed-case and canonical PR URLs.
+        cased_identity = deepcopy(child["identity"])
+        cased_identity.update(
+            repository="ORG/Repo",
+            github_issue_url="https://github.com/ORG/Repo/issues/42",
+            stream_epic_url="https://github.com/ORG/Repo/issues/10",
+        )
+        child = tl.build_lifecycle(
+            cased_identity, author_family="codex", ac_snapshot=child["ac_snapshot"],
+            required_checks=["CI Gate"], now=NOW, pr_number=77,
+        )
+        child_file = tl.lifecycle_path(repo, cased_identity)
+        tl.write_lifecycle(child_file, child)
+    carrier_slug = "NewOrg/Repo" if payload_slug in {"neworg/repo", "ORG/Repo"} else "org/repo"
+    earlier_identity = deepcopy(child["identity"])
+    earlier_identity.update(
+        repository=carrier_slug,
+        github_issue_number=41,
+        github_issue_url=f"https://github.com/{carrier_slug}/issues/41",
+        stream_epic_url=f"https://github.com/{carrier_slug}/issues/10",
+        visible_title=task_identity.visible_title(
+            semantic_title=earlier_identity["semantic_title"],
+            github_issue_number=41,
+            task_family=earlier_identity["task_family"],
+        ),
+    )
+    earlier_identity["carriers"] = dict.fromkeys(earlier_identity["carriers"], earlier_identity["visible_title"])
+    earlier = tl.build_lifecycle(
+        earlier_identity, author_family="codex", ac_snapshot=child["ac_snapshot"],
+        required_checks=["CI Gate"], now=NOW, pr_number=76,
+    )
+    earlier_file = tl.lifecycle_path(repo, earlier_identity)
+    tl.write_lifecycle(earlier_file, earlier)
+    task = json.loads(task_file.read_text())
+    task["task_lifecycle"] = tl.carrier_projection(earlier, state_file=str(earlier_file))
+    task_file.write_text(json.dumps(task))
+    git(repo, "worktree", "remove", str(worktree))
+    recover_kwargs = dict(
+        state_file=child_file, task_file=task_file, manifest_file=manifest, push_file=push_file, now=NOW,
+    )
+    first_pr = {
+        "number": 77, "url": f"https://github.com/{payload_slug}/pull/77",
+        "state": "MERGED", "head_sha": head, "head_branch": task["worktree_branch"],
+    }
+    replay_pr = {**first_pr, "url": f"https://github.com/{job_slug}/pull/77"}
+    if payload_slug == "evil/repo":
+        with pytest.raises(lo.ObservationRefusal, match="RECOVERY_CHILD_PR_MISMATCH"):
+            lo.recover(repo, **recover_kwargs, child_pr=first_pr)
+        return
+    receipt, replayed = lo.recover(repo, **recover_kwargs, child_pr=first_pr)
+    assert replayed is False
+    if job_slug == "evil/repo":
+        with pytest.raises(lo.ObservationRefusal, match="RECOVERY_CHILD_PR_MISMATCH"):
+            lo.recover(repo, **recover_kwargs, child_pr=replay_pr)
+        return
+    again, replayed = lo.recover(repo, **recover_kwargs, child_pr=replay_pr)
+    assert replayed is True and again == receipt
+    if payload_slug == "ORG/Repo":
+        # Case-only replay and exact-host/suffix guards hold on mixed-case ledgers too.
+        lower_again, lower_replayed = lo.recover(
+            repo, **recover_kwargs, child_pr={**first_pr, "url": "https://github.com/org/repo/pull/77"},
+        )
+        assert lower_replayed is True and lower_again == receipt
+        for bad_url in (
+            "HTTPS://GITHUB.COM/org/repo/pull/77",
+            "https://github.com/org/repo/PULL/77",
+            "https://github.com/org/repo\u212a/pull/77",
+        ):
+            with pytest.raises(lo.ObservationRefusal, match="RECOVERY_CHILD_PR_MISMATCH"):
+                lo.recover(repo, **recover_kwargs, child_pr={**first_pr, "url": bad_url})

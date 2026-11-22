@@ -167,7 +167,7 @@ def _git(
     text: bool = True,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     if args[:1] == ("push",):
-        from lu_machinery.common.git_credentials import verification_credentials
+        from lu_machinery.common.git_credentials import SelectorError, verification_credentials
         from lu_machinery.dispatcher import write_boundary
 
         try:
@@ -182,6 +182,10 @@ def _git(
             result = subprocess.CompletedProcess(args, 0, output, "")  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         except write_boundary.Refused as exc:
             result = subprocess.CompletedProcess(args, 1, "", str(exc))  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        except SelectorError as exc:
+            # A transferred origin without a trusted host selector gets no credential and no push:
+            # a typed refusal (its text names no path), never an exception that ends the sweep.
+            result = subprocess.CompletedProcess(args, 1, "", f"host deletion refused: {exc}")  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         return result if text else subprocess.CompletedProcess(args, result.returncode, result.stdout.encode(),  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
                                                                result.stderr.encode())
     return subprocess.run(
