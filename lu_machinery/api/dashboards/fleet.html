@@ -13,7 +13,7 @@
   <div class="header-top">
     <div class="title">
       <h1>Fleet</h1>
-      <p class="purpose">Live agent workers, recently finished dispatches, and Fleet Comms backlog.</p>
+      <p class="purpose">Which seats have queued mail, how long it has waited, and the live workers and Fleet Comms backlog.</p>
     </div>
     <div class="header-utils">
       <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
@@ -30,6 +30,42 @@
   </div>
 </header>
 <main id="main" tabindex="-1">
+  <section class="wide stacked" id="seats">
+    <h2>Seats <span class="age" id="seats-age">Loading…</span></h2>
+    <p id="seats-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="seats-content">Loading…</div>
+  </section>
+  <section class="wide stacked" id="messages">
+    <h2>Messages <span class="age" id="messages-age">Loading…</span></h2>
+    <form id="message-filters" class="filters" method="get" action="/fleet">
+      <label>Seat
+        <select id="filter-seat" name="seat" autocomplete="off">
+          <option value="">All seats</option>
+        </select>
+      </label>
+      <label>State
+        <select id="filter-state" name="state" autocomplete="off">
+          <option value="">Any state</option>
+          <option value="queued">queued</option>
+          <option value="running">running</option>
+          <option value="acknowledged">acknowledged</option>
+          <option value="failed">failed</option>
+          <option value="expired">expired</option>
+          <option value="dead_lettered">dead_lettered</option>
+        </select>
+      </label>
+      <label>Since
+        <select id="filter-since" name="since" autocomplete="off">
+          <option value="7d" selected>Last 7 d</option>
+          <option value="24h">Last 24 h</option>
+          <option value="all">All</option>
+        </select>
+      </label>
+      <button type="button" class="retry" data-clear-filters>Clear filters</button>
+    </form>
+    <p id="messages-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="messages-content">Loading…</div>
+  </section>
   <section class="wide" id="fleet">
     <h2>Agent fleet <span class="age" id="workers-age">Loading…</span></h2>
     <p id="workers-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
@@ -164,9 +200,254 @@ function renderComms(metrics) {
   return table(["Measure", "Current", "24 h", "7 d", "Lifetime"], rows);
 }
 
+// Filters and paging live in the page URL. Only these keys are sent to the deliveries route.
+function pageQuery() {
+  try {
+    const search = typeof location === "object" && location && typeof location.search === "string" ? location.search : "";
+    return new URLSearchParams(search);
+  } catch {
+    return new URLSearchParams();
+  }
+}
+
+const SEATS_URL = "/api/fleet/seats";
+const DELIVERIES_URL = "/api/fleet/deliveries";
+const LOG_DOWN = new Set(["db_unavailable", "db_missing", "plane_root_unavailable", "authority_unsupported_component"]);
+
+function deliveryUrl() {
+  const query = new URLSearchParams();
+  for (const key of ["seat", "state", "since", "limit", "offset"]) {
+    const value = pageQuery().get(key);
+    if (value) query.set(key, value);
+  }
+  const text = query.toString();
+  return text ? `${DELIVERIES_URL}?${text}` : DELIVERIES_URL;
+}
+
+function rosterReady(payload) {
+  return Boolean(payload)
+    && payload.driver_roster === "available"
+    && payload.external_roster === "available"
+    && Array.isArray(payload.seats);
+}
+
+function waitingSeats(payload) {
+  if (!rosterReady(payload) || payload.availability !== "available") return null;
+  let count = 0;
+  for (const row of payload.seats) {
+    if (!row || typeof row.queued !== "number" || !Number.isInteger(row.queued) || row.queued < 0) return null;
+    if (row.queued > 0) count += 1;
+  }
+  return count;
+}
+
+function notice(sentence, panelId, label) {
+  return `<p class="error">${escapeHtml(sentence)}</p>`
+    + `<p><button type="button" class="retry" data-retry-panel="${escapeHtml(panelId)}" aria-label="Retry ${escapeHtml(label)}">Retry</button></p>`;
+}
+
+function selectable(id) {
+  const select = typeof document === "object" && document && document.getElementById ? document.getElementById(id) : null;
+  return select && typeof select.add === "function" ? select : null;
+}
+
+let applyingFilters = false;
+
+function setChoice(id, value) {
+  const select = selectable(id);
+  if (!select) return;
+  const next = typeof value === "string" ? value : "";
+  if (next && ![...select.options].some(option => option.value === next)) {
+    const option = document.createElement("option");
+    option.value = next;
+    option.textContent = next;
+    select.append(option);
+  }
+  applyingFilters = true;
+  try { select.value = next; }
+  finally { applyingFilters = false; }
+}
+
+function fillSeatOptions() {
+  const select = selectable("filter-seat");
+  if (!select) return;
+  const current = pageQuery().get("seat") || "";
+  const ids = [];
+  const payload = runner.latest.seats;
+  if (rosterReady(payload)) {
+    for (const row of payload.seats) {
+      if (row && typeof row.seat === "string" && row.seat && !ids.includes(row.seat)) ids.push(row.seat);
+    }
+  }
+  if (current && !ids.includes(current)) ids.push(current);
+  select.replaceChildren();
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = "All seats";
+  select.append(all);
+  for (const id of ids) {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = id;
+    select.append(option);
+  }
+  applyingFilters = true;
+  try { select.value = current; }
+  finally { applyingFilters = false; }
+}
+
+function syncAppliedFilters(payload) {
+  const filters = payload && payload.filters;
+  if (!filters || typeof filters !== "object") return;
+  setChoice("filter-state", typeof filters.state === "string" ? filters.state : "");
+  setChoice("filter-since", typeof filters.since === "string" && filters.since ? filters.since : "7d");
+  setChoice("filter-seat", typeof filters.seat === "string" ? filters.seat : "");
+}
+
+// Zero queued has no status tone. A missing count stays "?" and is never shown as 0.
+function queuedCell(row) {
+  const queued = row.queued;
+  if (typeof queued !== "number" || !Number.isInteger(queued) || queued < 0) return text("?", "num warn");
+  const href = `?seat=${encodeURIComponent(row.seat)}&state=queued#messages`;
+  const tone = queued > 0 ? ' class="warn"' : "";
+  return td(`<a${tone} href="${escapeHtml(href)}">${queued}</a>`, "num");
+}
+
+function tokenCell(value) {
+  return typeof value === "string" && value ? text(value) : text("?", "warn");
+}
+
+function activityCell(row) {
+  if (row.last_activity_at != null && typeof row.last_activity_at !== "string") return text("?", "warn");
+  if (row.last_activity_source != null && typeof row.last_activity_source !== "string") return text("?", "warn");
+  const when = typeof row.last_activity_at === "string" ? relative(row.last_activity_at) : "";
+  const source = typeof row.last_activity_source === "string" ? row.last_activity_source : "";
+  return text([when, source].filter(Boolean).join(" · ") || null);
+}
+
+function oldestCell(row) {
+  if (row.oldest_queued_at != null && typeof row.oldest_queued_at !== "string") return text("?", "warn");
+  const when = typeof row.oldest_queued_at === "string" ? relative(row.oldest_queued_at) : "";
+  return text(when || null);
+}
+
+function stateCell(row) {
+  if (typeof row.lease_state !== "string" || !row.lease_state) return text("?", "warn");
+  if (row.lease_reason != null && typeof row.lease_reason !== "string") return text("?", "warn");
+  const reason = typeof row.lease_reason === "string" && row.lease_reason ? row.lease_reason : "";
+  const tone = row.lease_state === "unknown" ? "warn" : row.lease_state === "live" ? "ok" : "";
+  return text(reason ? `${row.lease_state} · ${reason}` : row.lease_state, tone);
+}
+
+const SEAT_HEADERS = ["Seat", "Kind", "State", "Queued", "Oldest queued", "Last activity"];
+
+function renderSeats(payload) {
+  if (!rosterReady(payload) || !payload.seats.every(row => row && typeof row.seat === "string" && row.seat)) {
+    return notice("Seat list unavailable", "seats", "Seats");
+  }
+  return table(SEAT_HEADERS, payload.seats.map(row => [
+    text(row.seat),
+    tokenCell(row.kind),
+    stateCell(row),
+    queuedCell(row),
+    oldestCell(row),
+    activityCell(row),
+  ]), true);
+}
+
+function emptyDeliveries(since) {
+  const sentence = since === "24h"
+    ? "No deliveries for this filter in the last 24 h"
+    : since === "all"
+      ? "No deliveries for this filter"
+      : "No deliveries for this filter in the last 7 d";
+  return `<p>${escapeHtml(sentence)} <button type="button" class="retry" data-clear-filters>Clear filters</button></p>`;
+}
+
+function asText(value) {
+  if (value === null || value === undefined) return null;
+  return typeof value === "string" ? value : undefined;
+}
+
+function asNumber(value) {
+  if (value === null || value === undefined) return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function pageHref(offset) {
+  const params = pageQuery();
+  if (offset) params.set("offset", String(offset));
+  else params.delete("offset");
+  const text = params.toString();
+  return `${text ? `?${text}` : "?"}#messages`;
+}
+
+function renderMessages(payload) {
+  syncAppliedFilters(payload);
+  if (!payload || typeof payload !== "object" || LOG_DOWN.has(payload.availability)) {
+    return notice("Message log unavailable", "messages", "Messages");
+  }
+  if (payload.driver_roster !== "available" || payload.external_roster !== "available") {
+    return notice("Seat list unavailable", "messages", "Messages");
+  }
+  if (payload.availability !== "available") return notice("Message log unavailable", "messages", "Messages");
+  const rows = payload.deliveries;
+  if (!Array.isArray(rows) || typeof payload.total !== "number" || !Number.isInteger(payload.total) || payload.total < 0) {
+    return notice("Message log unavailable", "messages", "Messages");
+  }
+  if (payload.total === 0) {
+    if (rows.length !== 0) return notice("Message log unavailable", "messages", "Messages");
+    const since = payload.filters && typeof payload.filters.since === "string" ? payload.filters.since : "7d";
+    return emptyDeliveries(since);
+  }
+  const built = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") return notice("Message log unavailable", "messages", "Messages");
+    const from = asText(row.sender);
+    const to = asText(row.recipient);
+    const kind = asText(row.kind);
+    const state = asText(row.state);
+    const attempts = asNumber(row.attempt_count);
+    const waited = asNumber(row.waited_s);
+    const created = asText(row.created_at);
+    let messageId = null;
+    if (row.message_id !== null && row.message_id !== undefined) {
+      if (typeof row.message_id !== "string") return notice("Message log unavailable", "messages", "Messages");
+      messageId = row.message_id;
+    }
+    if ([from, to, kind, state, attempts, waited, created].includes(undefined)) {
+      return notice("Message log unavailable", "messages", "Messages");
+    }
+    const when = created ? relative(created) : "";
+    built.push([
+      text(when || null),
+      text(from === null && to === null ? null : `${from ?? "—"} → ${to ?? "—"}`),
+      text(kind),
+      messageId === null ? text(null) : td(escapeHtml(messageId)),
+      text(state),
+      text(attempts === null ? null : String(attempts), attempts !== null && attempts < 0 ? "num warn" : "num"),
+      waited === null ? text(null, "num") : waited < 0 ? text("?", "num warn") : text(span(waited), "num"),
+    ]);
+  }
+  const offset = Number.isInteger(payload.offset) && payload.offset >= 0 ? payload.offset : 0;
+  const start = built.length ? offset + 1 : 0;
+  const end = offset + built.length;
+  const prev = offset > 0 && Number.isInteger(payload.limit) && payload.limit > 0
+    ? pageHref(Math.max(0, offset - payload.limit)) : "";
+  const next = Number.isInteger(payload.next_offset) && payload.next_offset > offset ? pageHref(payload.next_offset) : "";
+  const links = [prev ? `<a href="${escapeHtml(prev)}">Previous</a>` : "", next ? `<a href="${escapeHtml(next)}">Next</a>` : ""].filter(Boolean).join(" ");
+  const pager = `<p class="pager"><span>${start}–${end} of ${payload.total}</span>${links ? ` ${links}` : ""}</p>`;
+  if (!built.length) return `<p class="muted">No rows on this page.</p>${pager}`;
+  return table(["When", "From to To", "Kind", "Message id", "State", "Attempts", "Waited"], built, true) + pager;
+}
+
 function renderChips(latest) {
   const out = [];
   if (latest.workers) out.push(chip("#fleet", (latest.workers.tasks || []).length, "live workers"));
+  if (latest.seats) {
+    const waiting = waitingSeats(latest.seats);
+    out.push(chip("#seats", waiting === null ? "?" : waiting, "seats waiting", waiting === null || waiting > 0 ? "warn" : ""));
+  }
   if (latest.comms) {
     const dead = latest.comms.failure_windows?.["24h"]?.dead_letters?.total;
     out.push(chip("#comms", dead ?? "?", "dead letters / 24 h", dead ? "warn" : ""));
@@ -209,9 +490,67 @@ const PANELS = [
   {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs(), onTick: expireWorkerPrsIfStale, onError: () => { latestPrsReading = null; }},
   {id: "recent", label: "Recently finished", urls: ["/api/delegate/recent"], render: renderRecent},
   {id: "comms", label: "Fleet Comms", urls: ["/api/comms/v1/metrics"], render: renderComms},
+  {id: "seats", label: "Seats", urls: [SEATS_URL], render: renderSeats, onData: () => fillSeatOptions()},
+  {id: "messages", label: "Messages", urls: [deliveryUrl()], render: renderMessages},
 ];
 
 const runner = createPanelRunner({panels: PANELS, renderChips});
+
+function currentPath() {
+  return typeof location === "object" && location && typeof location.pathname === "string" && location.pathname
+    ? location.pathname : "/fleet";
+}
+
+function assignPage(search) {
+  if (typeof location !== "object" || !location || typeof location.assign !== "function") return;
+  location.assign(`${currentPath()}${search}#messages`);
+}
+
+function filtersFromForm() {
+  const form = document.getElementById("message-filters");
+  const params = new URLSearchParams();
+  if (!form || typeof FormData !== "function") return params;
+  const data = new FormData(form);
+  for (const key of ["seat", "state", "since"]) {
+    const value = String(data.get(key) || "");
+    if (value) params.set(key, value);
+  }
+  const limit = pageQuery().get("limit");
+  if (limit) params.set("limit", limit);
+  return params;
+}
+
+function bindMessageFilters() {
+  if (typeof document !== "object" || !document || typeof document.addEventListener !== "function") return;
+  if (document._fleetFiltersBound) return;
+  document._fleetFiltersBound = true;
+  document.addEventListener("click", event => {
+    const target = event.target && typeof event.target.closest === "function"
+      ? event.target.closest("[data-clear-filters]") : null;
+    if (!target) return;
+    event.preventDefault();
+    assignPage("");
+  });
+  const form = document.getElementById("message-filters");
+  if (!form || !form.dataset || typeof form.addEventListener !== "function" || form.dataset.bound) return;
+  form.dataset.bound = "1";
+  fillSeatOptions();
+  const params = pageQuery();
+  setChoice("filter-state", params.get("state") || "");
+  setChoice("filter-since", params.get("since") || "7d");
+  const apply = () => {
+    if (applyingFilters) return;
+    const text = filtersFromForm().toString();
+    assignPage(text ? `?${text}` : "");
+  };
+  form.addEventListener("change", apply);
+  form.addEventListener("submit", event => {
+    event.preventDefault();
+    apply();
+  });
+}
+
+bindMessageFilters();
 runner.start();
 </script>
 </body>
