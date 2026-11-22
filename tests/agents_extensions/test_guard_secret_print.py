@@ -1863,6 +1863,7 @@ def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expect
         ('bash <<<"$SCRIPT"', 2),
         ("bash -c 'bash' <<<\"$SCRIPT\"", 2),
         ("bash -c 'printf okay' <<<\"$TEXT\"", 0),
+        ('bash -c "exit 0" <<<"$TEXT"', 0),
         ('bash run.sh <<<"$TEXT"', 0),
         ('bash /dev/stdin <<<"$SCRIPT"', 2),
         ('bash /dev//stdin <<<"$SCRIPT"', 2),
