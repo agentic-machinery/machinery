@@ -9,6 +9,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -47,6 +48,7 @@ from lu_machinery.api.project_state_store import (
     workers_status_from_document,
 )
 from lu_machinery.common.task_store_paths import TASK_RECORD_CACHE_MAX_ENTRIES
+from lu_machinery.control_plane import storage
 from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.orchestration.dispatch_admission import _ACTIVE_STATUS_MARKERS
 from lu_machinery.orchestration.dispatch_admission import (
@@ -345,36 +347,40 @@ def _read_driver_leases(
     *,
     db_path: Path | None = None,
     now: datetime | None = None,
-) -> list[dict[str, Any]]:
-    path = session_streams_db_path() if db_path is None else db_path
+) -> tuple[list[dict[str, Any]], str]:
     clock = now or datetime.now(UTC)
-    if not path.is_file():
-        return []
     try:
-        conn = open_readonly(str(path))
-        conn.row_factory = sqlite3.Row
-        raw_rows = conn.execute(
-            """
-            SELECT l.stream_id, l.holder_agent, l.holder_harness, l.holder_instance_id,
-                   l.holder_task_id, l.holder_host_id, l.heartbeat_at, l.expires_at, l.state
-            FROM stream_leases AS l
-            JOIN sessions AS s ON s.stream_id = l.stream_id AND s.session_id = l.session_id
-            WHERE l.state = 'active' AND s.state IN ('open', 'rolling')
-            """
-        ).fetchall()
-        conn.close()
-    except Exception:
-        return []
+        storage.assert_component_supported(storage.StoreId.SESSION_STREAMS, "session_streams")
+        path = session_streams_db_path() if db_path is None else db_path
+        if not path.is_file():
+            return [], "db_missing"
+        with closing(open_readonly(path, timeout=0.25)) as conn:
+            conn.row_factory = sqlite3.Row
+            raw_rows = conn.execute(
+                """
+                SELECT l.stream_id, l.holder_agent, l.holder_harness, l.holder_instance_id,
+                       l.holder_task_id, l.holder_host_id, l.heartbeat_at, l.expires_at, l.state
+                FROM stream_leases AS l
+                JOIN sessions AS s ON s.stream_id = l.stream_id AND s.session_id = l.session_id
+                WHERE l.state = 'active' AND s.state IN ('open', 'rolling')
+                """
+            ).fetchall()
+    except storage.ControlPlaneUnsupportedComponentError:
+        return [], "authority_unsupported_component"
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return [], "db_unavailable"
     leases: list[dict[str, Any]] = []
+    availability = "available"
     for row in raw_rows:
         try:
-            expires_at = parse_timestamp(str(row["expires_at"]))
-        except (KeyError, TypeError, ValueError):
+            expires_at = parse_timestamp(row["expires_at"])
+        except ValueError:
+            availability = "db_unavailable"
             continue
         if expires_at <= clock:
             continue
         leases.append(dict(row))
-    return leases
+    return leases, availability
 
 
 def collect_driver_workers(
@@ -386,7 +392,8 @@ def collect_driver_workers(
     clock = now or datetime.now(UTC)
     attributed: list[CollectedWorker] = []
     unattributed: list[CollectedWorker] = []
-    for lease in _read_driver_leases(db_path=db_path, now=clock):
+    leases, _availability = _read_driver_leases(db_path=db_path, now=clock)
+    for lease in leases:
         instance_id = _worker_id_token(lease.get("holder_instance_id"), tally=tally)
         agent = _agent_token(lease.get("holder_agent"))
         if instance_id is None or agent is None:
