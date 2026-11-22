@@ -29,7 +29,14 @@ unset _fleet_comms_lib_dir
 export LU_AGENT_COMM_TRANSPORT="${LU_AGENT_COMM_TRANSPORT:-acp}"
 
 fleet_comms_rule_relpath() {
-  printf '%s' "agents_extensions/shared/rules/fleet-comms-coordination.md"
+  local root="${LC_ROOT:-${PROJECT_DIR:-.}}" target rule
+  for target in .codex .agent .cursor; do
+    rule="$target/rules/fleet-comms-coordination.md"
+    if [ -f "$root/$rule" ] && [ -r "$root/$rule" ]; then
+      printf '%s' "$rule"
+      return
+    fi
+  done
 }
 
 # Resolve the one project interpreter (R66): never a worktree .venv.
@@ -71,10 +78,10 @@ fleet_comms_cold_clause() {
   if [ -z "$plane_mode" ]; then
     plane_mode="$(fleet_comms_resolve_plane_mode)"
   fi
-  local rule
-  rule="$(fleet_comms_rule_relpath)"
+  local offline_rule
+  offline_rule="$(fleet_comms_rule_relpath)"
   printf '%s' \
-    "Fleet-comms (#6159) authority cutover — obey ${rule} (also in /api/rules?scope=task:fleet-comms or scope=full). " \
+    "Fleet-comms (#6159) authority cutover — read /api/rules?scope=task:fleet-comms.${offline_rule:+ Offline, read ${offline_rule} from the workspace root.} " \
     "Method playbook: load skill ${skill} (provider drivers inject the binding after lease + canary). " \
     "Use fleet-comms as communication authority when current mode=${plane_mode}; " \
     "legacy bridge/channel stores are read-only migration projections in authority mode. " \
@@ -91,21 +98,24 @@ fleet_comms_cold_clause() {
 # One-line operator banner (stdout).
 fleet_comms_print_banner_line() {
   local plane_mode="${FLEET_COMMS_PLANE_MODE:-}"
+  local rule
+  rule="$(fleet_comms_rule_relpath)"
+  rule="${rule:-/api/rules?scope=task:fleet-comms}"
   if [ -z "$plane_mode" ]; then
     plane_mode="$(fleet_comms_resolve_plane_mode)"
   fi
   case "$plane_mode" in
     off)
-      echo "  fleet-comms: plane=off · diary authoritative · CF via direct ask · rule=$(fleet_comms_rule_relpath) · skill=drive-epic"
+      echo "  fleet-comms: plane=off · diary authoritative · CF via direct ask · rule=$rule · skill=drive-epic"
       ;;
     shadow|dual_write)
-      echo "  fleet-comms: plane=${plane_mode} (compatibility soak) · rule=$(fleet_comms_rule_relpath) · skill=drive-epic"
+      echo "  fleet-comms: plane=${plane_mode} (compatibility soak) · rule=$rule · skill=drive-epic"
       ;;
     authority)
-      echo "  fleet-comms: plane=authority · ACP transport · legacy read-only · rule=$(fleet_comms_rule_relpath) · skill=drive-epic"
+      echo "  fleet-comms: plane=authority · ACP transport · legacy read-only · rule=$rule · skill=drive-epic"
       ;;
     *)
-      echo "  fleet-comms: plane=${plane_mode} (unknown→treat off) · rule=$(fleet_comms_rule_relpath)"
+      echo "  fleet-comms: plane=${plane_mode} (unknown→treat off) · rule=$rule"
       ;;
   esac
 }
