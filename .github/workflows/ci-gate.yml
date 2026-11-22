@@ -451,7 +451,10 @@ jobs:
             exit 1
           fi
           basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
-          echo "::add-mask::${basic}"
+          if [ -z "$basic" ]; then
+            echo "::error::Failed to encode GH_TOKEN for git fetch"
+            exit 1
+          fi
           # No --depth: on a push to main the checkout is the main tip, and a
           # depth-1 fetch of it would move the shallow boundary to HEAD and
           # drop HEAD^. Without it, Git fetches only commits it does not have.
@@ -556,7 +559,10 @@ jobs:
             exit 1
           fi
           basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
-          echo "::add-mask::${basic}"
+          if [ -z "$basic" ]; then
+            echo "::error::Failed to encode GH_TOKEN for git fetch"
+            exit 1
+          fi
           # No --depth: on a push to main the checkout is the main tip, and a
           # depth-1 fetch of it would move the shallow boundary to HEAD and
           # drop HEAD^. The introducing PR has no baseline on origin/main yet;
@@ -720,7 +726,10 @@ jobs:
             exit 1
           fi
           basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
-          echo "::add-mask::${basic}"
+          if [ -z "$basic" ]; then
+            echo "::error::Failed to encode GH_TOKEN for git fetch"
+            exit 1
+          fi
           rules="$RUNNER_TEMP/semgrep-rules"
           rm -rf "$rules"
           git init --quiet "$rules"
