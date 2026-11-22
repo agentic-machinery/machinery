@@ -1918,10 +1918,11 @@ def test_interpreter_strings_are_read_decoded_joined_and_past_comments(monkeypat
         ("echo a={$,x}GH_TOKEN", 2),
         ("X={a,.env} cat notes.txt", 0),
         ("perl -e'system(\"env\");'{,}", 2),
+        ("eval \\$'x; echo \\\"; env; echo \\\"'{}", 2),
     ],
 )
 def test_brace_expansion_words_are_read_as_bash_expands_them(monkeypatch, command, expected):
-    """Defect class: an unquoted brace word read as written instead of the words Bash expands it to."""
+    """Defect class: a brace word read as written instead of the words Bash expands it to, or its quoted text read as an expansion."""
     assert _run(monkeypatch, command) == expected
 
 
@@ -1943,6 +1944,7 @@ LEXER_CASES = [
     ("{007..009}", ["007", "008", "009"]),
     ("echo x={a,b}", ["echo", "x=a", "x=b"]),
     ("$'caf\u00e9 \\x41'", ["caf\u00e9 A"]),
+    ("\\$'a\\b'{}", ["$a\\b{}"]),
 ]
 
 
