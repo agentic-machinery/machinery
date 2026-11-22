@@ -9,7 +9,8 @@ seat's own process scope as the private operations doc describes: the launcher s
 whole scope when its agent exits, so a child of the session dies with it. The restart counts
 only when its log shows the successor live.
 
-1. Run a last [cycle](cycle.md) so every number is current.
+1. Run a last [cycle](cycle.md) so every number is current. Check that every pool has queued work
+   that will outlast the expected gap to the next session. Apply the cycle's queue step to any shortfall.
 2. Timestamp with `date -u +%Y-%m-%dT%H:%MZ`; never type a time.
 3. Update the mistakes ledger ([learning](learning.md)): new entries, status changes and
    recurrence counts.

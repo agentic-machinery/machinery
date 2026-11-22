@@ -16,23 +16,16 @@ never fine.
    recipient: claim it with your session identity as `--worker-id`, and a worker escalation
    waits there at most one cycle. Any backlog still queued at a `claude-cto-<id>` name is a
    leftover to drain once, then report it as a producer defect.
-   Search the operator's mail for replies to the CTO's notification threads (Gmail connector
-   `search_threads` with `from:me newer_than:2d subject:Re:`) only while a notification the CTO sent is
-   still unanswered, skip it otherwise, and record any answer as an operator order in driver state
-   before deciding anything on that item.
+   Owner replies come through the Jean channel and Fleet Comms.
 2. **Every pool's usage**, from the scorecard metrics when present, including unused ones:
    each Claude pool, Codex, Grok and Cursor, AGY and any other catalog pool. A pool with no
    metric gets a hand-read meter, and the gap is logged as a monitoring task. Grok and Cursor
    share one meter, never two pools of headroom. Keep readings in a scratch log for trends.
    Read each pool's CodexBar pace line: used minus expected and whether it will last to reset.
-   Restrict routing for scarcity only when projected exhaustion precedes reset
-   ([OO-99 pacing](decisions.md#tactical-layer-per-cycle)). Unknown pace is not scarcity.
-   A pool that will have allowance left at its reset (the pace line shows reserve and
-   projected unused allowance) gets ready work dispatched on it in that cycle, per the standing
-   order to pace every pool to its reset; reserve is unused capacity, not safety margin.
+   When the [pace rule](decisions.md#tactical-layer-per-cycle) shows a deficit, shift ready work
+   to an eligible pool with reserve. Unknown pace is not scarcity.
    Read Opus task-hours per lane over the last 12 hours from task records. Flag a lane
-   when the Claude pool's pace line shows it running out before reset, or for unauthorized
-   use. Apply the same scarcity rule before changing routing.
+   when the Claude pool's pace line shows it running out before reset, or for unauthorized use.
    Before recording an account or credential blocker from a refusal code, check whether
    the account's access token has merely expired while its refresh token remains. Then the
    blocker is a token refresh, done through the supported refresh path in the private
@@ -112,8 +105,12 @@ never fine.
    attention item; before calling a dispatch dead check open PRs and its worktree for
    unpushed work; check the worktree disposition after terminal status ([recipes](recipes.md#worktree-disposition-before-re-dispatch)).
    List every task result or lane message awaiting a CTO grant or approval, with its age.
-   Before any reply, compare running workers per pool with current authorized targets;
-   fill a deficit with ready reserve-pool work, or name the blocker. Sent orders are not starts.
+   Never hold work back to save allowance. Each cycle, rank pools by required burn,
+   the percent left divided by hours until the reset or an earlier drain deadline.
+   Fill the most urgent pool first with eligible, ready work. Before going quiet, queue long-running
+   work under the same conditions on every pool. Name any blocker.
+   Report any dispatcher cap that leaves a pool idle to the owning lane as a defect to fix.
+   Sent orders are not starts.
 6. **Residuals.** Quote open-issue and residual counts from `gh`. A free slot with a ready
    item gets a dispatch; a residual above zero gets a next dispatch this session.
 7. **Record tracker changes.** Use `lu-driver-state add --lane cto` for new orders,

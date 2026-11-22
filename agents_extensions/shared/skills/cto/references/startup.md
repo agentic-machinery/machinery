@@ -30,10 +30,7 @@ ones, [learning](learning.md)). The database is the seat's handoff; the markdown
 only a pointer ([handoff](handoff.md)).
 Before restarting a lane or ordering an item, read its last state and linked PR or issue.
 Honor shutdown orders; send stale-open items whose PRs merged to the tracker owner.
-Search the operator's mail for replies to the CTO's notification threads (Gmail connector
-`search_threads` with `from:me newer_than:2d subject:Re:`) only while a notification the CTO sent is
-still unanswered, skip it otherwise, and record any answer as an operator order in driver state
-before deciding anything on that item.
+Owner replies come through the Jean channel and Fleet Comms.
 
 ## 3. Resume exactly the named rollover
 
