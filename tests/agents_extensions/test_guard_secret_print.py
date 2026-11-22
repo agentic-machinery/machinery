@@ -1837,11 +1837,10 @@ def test_escaped_apostrophe_publisher_body_with_command_substitution_text_is_all
         ("printf ok </dev/nul{l..l}", 0),
         ("env >/proc/thread-self/fd/1", 2),
         ("cat </dev/fd/../environ", 2),
-        ("[[ -f .env ]] && echo ENV_FILE=.env", 0),
     ],
 )
 def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expected):
-    """Defect class: a split-quoted redirect operand read as several words, a stream or /proc file in another spelling, or a data word read as a file.
+    """Defect class: a split-quoted redirect operand read as several words, or a stream or /proc file in another spelling.
 
     The shell joins `'a'b` into one file name, so a stderr redirect leaves the
     dump on stdout; reading `b` as the command after `env` hid the dump.
@@ -1879,8 +1878,7 @@ def test_here_string_operand_is_exactly_one_word(monkeypatch, command, expected)
 
     The shell feeds exactly the next word to the shell's stdin; gluing the
     following words changed the script, and `0<<<` was not read as stdin. A
-    bare `0` or `stdin` names stdin wherever a word may name a file; as an
-    operand of a data-word command such as `exit` it is data.
+    bare `0` or `stdin` names stdin where a program loader may open it.
     """
     assert _run(monkeypatch, command) == expected
 
