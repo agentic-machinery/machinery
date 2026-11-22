@@ -2393,7 +2393,7 @@ def publish(
         environment["GH_HOST"] = dest.split("/", 1)[0]
     gh_repo = dest.split("/", 1)[1] if dest != "unknown" else ""
     if verb == "repo-fork" and (
-        not dest.startswith("github.com/") or any(part in {".", ".."} for part in gh_repo.split("/"))
+        environment["GH_HOST"] != "github.com" or any(part in {".", ".."} for part in gh_repo.split("/"))
     ):
         raise gate.PublishBlocked("OPSEC: repo-fork requires a github.com repository owner/name.")
     texts, names = [], []
