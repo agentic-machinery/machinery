@@ -73,6 +73,25 @@ def _punctuation_words(text: str) -> list[str]:
     return list(lexer)
 
 
+def _expand_dollar_quote(tokens: list[str]) -> list[str]:
+    """Drop the ``$`` that ``shlex`` leaves on an ANSI-C quote such as ``$'pwd'``."""
+    expanded: list[str] = []
+    for token in tokens:
+        if token in _SHELL_SEPARATORS:
+            expanded.append(token)
+            continue
+        inner: str | None = None
+        if token.startswith("$'") and token.endswith("'") and len(token) > 3:
+            inner = token[2:-1]
+        elif token.startswith("$") and not token.startswith("${") and len(token) > 1:
+            inner = token[1:]
+        if inner is None:
+            expanded.append(token)
+            continue
+        expanded.extend(_punctuation_words(inner) or [inner])
+    return expanded
+
+
 def _simple_commands(tokens: list[str]) -> list[list[str]]:
     groups: list[list[str]] = []
     current: list[str] = []
@@ -117,12 +136,13 @@ def _hook_hides_read_command(
     Words are split on shell punctuation, so ``echo;pwd`` cannot hide ``pwd``. A quoted
     argument stays one word: ``--review-root .../pytest.pwds69p6`` does not match, and
     neither does a quoted path that merely contains ``;``. A script given to ``sh -c``
-    or ``eval`` is split again. An unreadable or over-nested script fails closed.
+    or ``eval`` is split again. The ``$`` left on an ANSI-C quote is removed.
+    An unreadable or over-nested script fails closed.
     """
     if _depth > _MAX_SHELL_NESTING:
         return "<shell nesting limit>"
     try:
-        tokens = _punctuation_words(hook_command)
+        tokens = _expand_dollar_quote(_punctuation_words(hook_command))
     except ValueError:
         return "<unreadable shell command>"
     for command in read_commands:
