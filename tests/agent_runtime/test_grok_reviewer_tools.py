@@ -39,13 +39,38 @@ def _plan(tmp_path: Path, config: dict | None):
         )
 
 
+def _split_agent_definition(definition: str) -> tuple[dict[str, object], str]:
+    import yaml
+
+    assert definition.startswith("---\n")
+    frontmatter_raw, sep, body = definition[4:].partition("\n---\n")
+    assert sep == "\n---\n"
+    frontmatter = yaml.safe_load(frontmatter_raw)
+    assert isinstance(frontmatter, dict)
+    return frontmatter, body
+
+
+def _contains_command_tokens(tokens: list[str], command_tokens: list[str]) -> bool:
+    width = len(command_tokens)
+    if width == 0 or len(tokens) < width:
+        return False
+    if any(tokens[i : i + width] == command_tokens for i in range(len(tokens) - width + 1)):
+        return True
+    return [Path(tokens[0]).name, *tokens[1:width]] == command_tokens
+
+
 def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path) -> None:
+    # Seed a path containing "pwd" (as in CI tmp root pytest.pwds69p6) so a raw
+    # substring assertion over the definition cannot silently pass on lucky tmp dirs.
+    review_root = tmp_path / "pytest.pwds69p6"
+    review_root.mkdir()
     adapter = GrokBuildAdapter()
-    baseline = _plan(tmp_path, None)
-    reviewer = _plan(tmp_path, {"reviewer_tools": True})
+    baseline = _plan(review_root, None)
+    reviewer = _plan(review_root, {"reviewer_tools": True})
     try:
         agent_path = Path(reviewer.cmd[reviewer.cmd.index("--agent") + 1])
         definition = agent_path.read_text(encoding="utf-8")
+        frontmatter, body = _split_agent_definition(definition)
         assert definition.count("type: command") == 11
         for name in (
             "enforce-venv.sh",
@@ -68,15 +93,59 @@ def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path
         assert tools == ["read_file", "list_dir", "grep"]
         assert allows == ["Read", "Grep"]
         assert "grok_reviewer_permissions.py" in definition
-        assert "Approval-requiring tools are denied without prompting" in definition
-        assert "using tracked-file reads only" in definition
-        assert "Report any execution evidence you could not obtain" in definition
-        assert "literal read commands" not in definition
+        assert "Approval-requiring tools are denied without prompting" in body
+        assert "using tracked-file reads only" in body
+        assert "Report any execution evidence you could not obtain" in body
+        assert "literal read commands" not in body
         from lu_machinery.agent_runtime.grok_reviewer_permissions import (
             GROK_REVIEWER_READ_COMMANDS,
         )
 
-        assert all(command not in definition for command in GROK_REVIEWER_READ_COMMANDS)
+        # Check the prompt body, non-command frontmatter fields, and each hook's
+        # parsed command tokens so a read command cannot leak anywhere while
+        # arbitrary --review-root paths (like pytest.pwds69p6) do not false-positive.
+        assert all(command not in body for command in GROK_REVIEWER_READ_COMMANDS)
+        non_hook_text = json.dumps(
+            {key: value for key, value in frontmatter.items() if key != "hooks"},
+            sort_keys=True,
+            default=str,
+        )
+        assert all(command not in non_hook_text for command in GROK_REVIEWER_READ_COMMANDS)
+        hooks_by_event = frontmatter.get("hooks")
+        assert isinstance(hooks_by_event, dict) and hooks_by_event
+        parsed_hook_commands: list[list[str]] = []
+        for groups in hooks_by_event.values():
+            assert isinstance(groups, list)
+            for group in groups:
+                assert isinstance(group, dict)
+                group_meta = json.dumps(
+                    {key: value for key, value in group.items() if key != "hooks"},
+                    sort_keys=True,
+                    default=str,
+                )
+                assert all(command not in group_meta for command in GROK_REVIEWER_READ_COMMANDS)
+                group_hooks = group.get("hooks")
+                assert isinstance(group_hooks, list)
+                for hook in group_hooks:
+                    assert isinstance(hook, dict)
+                    hook_meta = json.dumps(
+                        {key: value for key, value in hook.items() if key != "command"},
+                        sort_keys=True,
+                        default=str,
+                    )
+                    assert all(command not in hook_meta for command in GROK_REVIEWER_READ_COMMANDS)
+                    hook_command = hook.get("command")
+                    assert isinstance(hook_command, str)
+                    hook_tokens = shlex.split(hook_command)
+                    parsed_hook_commands.append(hook_tokens)
+                    for command in GROK_REVIEWER_READ_COMMANDS:
+                        assert command not in hook_tokens
+                        assert not _contains_command_tokens(hook_tokens, shlex.split(command))
+        assert len(parsed_hook_commands) == 11
+        assert any(
+            len(tokens) >= 2 and tokens[-2:] == ["--review-root", str(review_root)]
+            for tokens in parsed_hook_commands
+        )
         assert "--no-subagents" in reviewer.cmd and "--disable-web-search" in reviewer.cmd
         denies = [reviewer.cmd[i + 1] for i, arg in enumerate(reviewer.cmd) if arg == "--deny"]
         assert set(denies) == {"Write", "Edit", "Bash", "MCPTool", "WebFetch", "WebSearch"}
