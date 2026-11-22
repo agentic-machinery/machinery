@@ -9,6 +9,48 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.49"></a>
+## [0.1.49] - 2026-11-22
+
+### Added
+
+- Rank subscription meters by projected surplus per hour to reset ([#1123](https://github.com/learn-ukrainian/machinery/pull/1123))
+- Pace writes by subscription meter ([#1130](https://github.com/learn-ukrainian/machinery/pull/1130))
+
+### Changed
+
+- Extract pinned fleet security workflow from machinery CI (#1080) ([#1098](https://github.com/learn-ukrainian/machinery/pull/1098))
+- Audit and trim the lane-driver skill for current machinery (#1066), supersedes #1096 ([#1100](https://github.com/learn-ukrainian/machinery/pull/1100))
+- Route fresh-build lesson writing to Neon ([#1102](https://github.com/learn-ukrainian/machinery/pull/1102))
+- Release when a change is ready instead of on a fixed train ([#1105](https://github.com/learn-ukrainian/machinery/pull/1105))
+- Accept exact Trivy FS licence dispositions ([#1104](https://github.com/learn-ukrainian/machinery/pull/1104))
+- Name the Neon fresh-build lesson writer in core (supersedes #1106) ([#1108](https://github.com/learn-ukrainian/machinery/pull/1108))
+- Use trusted scanner policy and allow runner selection ([#1107](https://github.com/learn-ukrainian/machinery/pull/1107))
+- Schedule machinery fleet scans ([#1115](https://github.com/learn-ukrainian/machinery/pull/1115))
+- Retry transient API verification timeouts ([#1128](https://github.com/learn-ukrainian/machinery/pull/1128))
+
+### Fixed
+
+- Honor caller-supplied lifespans ([#1097](https://github.com/learn-ukrainian/machinery/pull/1097))
+- Skip trusted base directories in ShellCheck policy export ([#1110](https://github.com/learn-ukrainian/machinery/pull/1110))
+- Prevent overlapping cuts ([#1112](https://github.com/learn-ukrainian/machinery/pull/1112))
+- Scan caller-named pip lock files with Trivy ([#1114](https://github.com/learn-ukrainian/machinery/pull/1114))
+- Let the CTO create stream root epics ([#1113](https://github.com/learn-ukrainian/machinery/pull/1113))
+- Allow manual fleet security workflow dispatch ([#1117](https://github.com/learn-ukrainian/machinery/pull/1117))
+- Reject unreadable fleet scan evidence ([#1116](https://github.com/learn-ukrainian/machinery/pull/1116))
+- Keep read-only Codex policy refusals typed ([#1118](https://github.com/learn-ukrainian/machinery/pull/1118))
+- Refuse reviewer routing for unknown authors ([#1122](https://github.com/learn-ukrainian/machinery/pull/1122))
+- Read each fleet-security caller in a run on its own ([#1121](https://github.com/learn-ukrainian/machinery/pull/1121))
+- Reject unsupported OpenCode effort at admission ([#1127](https://github.com/learn-ukrainian/machinery/pull/1127))
+- Return a review's sealed reply to its own parent run ([#1126](https://github.com/learn-ukrainian/machinery/pull/1126))
+- Extend the mixed-family pair to the critical tier ([#1125](https://github.com/learn-ukrainian/machinery/pull/1125))
+- Verify the parent HEAD before checking review replies ([#1131](https://github.com/learn-ukrainian/machinery/pull/1131))
+- Build Codex review launches without product modules ([#1137](https://github.com/learn-ukrainian/machinery/pull/1137))
+
+### Removed
+
+- Remove stale skill and routing references ([#1119](https://github.com/learn-ukrainian/machinery/pull/1119))
+
 <a id="v0.1.48"></a>
 ## [0.1.48] - 2026-11-21 [YANKED]
 
@@ -1252,7 +1294,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.48...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.49...HEAD
+[0.1.49]: https://github.com/learn-ukrainian/machinery/compare/v0.1.47...v0.1.49
 [0.1.48]: https://github.com/learn-ukrainian/machinery/compare/v0.1.47...v0.1.48
 [0.1.47]: https://github.com/learn-ukrainian/machinery/compare/v0.1.46...v0.1.47
 [0.1.46]: https://github.com/learn-ukrainian/machinery/compare/v0.1.45...v0.1.46
