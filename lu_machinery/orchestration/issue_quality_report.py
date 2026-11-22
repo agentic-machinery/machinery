@@ -9,12 +9,13 @@ import os
 import subprocess
 import sys
 import uuid
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 from lu_machinery.ci import check_issue_task_quality as checker
 from lu_machinery.common import github_client, json_depth
-from lu_machinery.common.repo_root import machinery_path, product_root, state_root
+from lu_machinery.common.repo_root import product_root, state_root
 from lu_machinery.orchestration import fleet_repos
 from lu_machinery.orchestration import issue_stream_audit as audit
 from lu_machinery.publish.github import read
@@ -30,6 +31,7 @@ COUNTERS = ("open", "missing_dor", "missing_dod", "malformed_dod", "missing_epic
 CODES = frozenset(
     {
         "forge_unavailable",
+        "repository_resolution_failed",
         "rate_limited",
         "listing_truncated",
         "listing_count_mismatch",
@@ -46,7 +48,9 @@ def lane(*, unavailable: bool = False) -> dict:
     return dict.fromkeys(COUNTERS, None if unavailable else 0)
 
 
-def collect_repository(repo) -> tuple[list[dict] | None, int | None, dict | None, list[str]]:
+def collect_repository(
+    repo: fleet_repos.FleetRepo, registry: dict[str, list[int]],
+) -> tuple[list[dict] | None, int | None, dict | None, list[str]]:
     """Keep exceptions and private issue data inside this read boundary."""
     issues, count, report, codes = None, None, None, []
     try:
@@ -92,21 +96,19 @@ def collect_repository(repo) -> tuple[list[dict] | None, int | None, dict | None
     except Exception:
         count = None
         codes.append("forge_unavailable")
-    if repo.role == "public-monorepo":
+    if registry:
         try:
-            # Exactly one audit per repository, no per-issue ancestry walks.
-            registry = checker.registry_for(repo.github)
-            if not registry:
-                raise ValueError("membership registry absent")
-            # Avoid run_audit's unvalidated, checkout-local cache write.
-            # Publish only after the independent census reconciles.
-            report = checker.live_audit(repo.github, registry, root=product_root())
+            if repo.default:
+                # Publish the shared cache only after the independent census reconciles.
+                report = checker.live_audit(repo.github, registry, root=product_root())
+            else:
+                report = audit.run_audit(repo=repo.github)
         except github_client.GitHubRateLimited:
             codes.append("rate_limited")
         except Exception:
             codes.append("membership_audit_incomplete")
         if (
-            report is not None and issues is not None and count == len(issues) and len(issues) < LIMIT
+            repo.default and report is not None and issues is not None and count == len(issues) and len(issues) < LIMIT
             and sorted(i["number"] for i in issues) == report.get("open_issue_numbers")
         ):
             try:
@@ -117,12 +119,15 @@ def collect_repository(repo) -> tuple[list[dict] | None, int | None, dict | None
 
 
 def summarize_repository(
-    repo, issues: list[dict] | None, count: int | None, report: dict | None, codes: list[str], registry: dict
+    repo: fleet_repos.FleetRepo,
+    issues: list[dict] | None,
+    count: int | None,
+    report: dict | None,
+    codes: list[str],
+    registry: dict[str, list[int]],
 ) -> dict:
     """Pure counts projection. Never copy issue fields or exception diagnostics."""
     codes = list(codes)
-    public = repo.role == "public-monorepo"
-    registry = registry if public else {}
     lanes = {
         key: lane(unavailable=issues is None) for key in [*registry, "unassigned", "ambiguous", "membership_unknown"]
     }
@@ -134,6 +139,7 @@ def summarize_repository(
         not isinstance(report, dict)
         or report.get("repository", "").casefold() != repo.github.casefold()
         or not audit.membership_report_is_complete(report)
+        or report.get("streams") != {key: sorted(numbers) for key, numbers in registry.items()}
     ):
         codes.append("membership_audit_incomplete")
     elif audit.validate_membership_report(report, checker.MAX_AGE_S) is None:
@@ -145,7 +151,10 @@ def summarize_repository(
             codes.append("listing_truncated")
         if count is not None and (len({i["number"] for i in issues}) != count or len(issues) != count):
             codes.append("listing_count_mismatch")
-        if report is not None and report.get("open_total") != len(issues):
+        if report is not None and (
+            report.get("open_total") != len(issues)
+            or report.get("open_issue_numbers") != sorted(i["number"] for i in issues)
+        ):
             codes.append("membership_audit_incomplete")
             membership_ok = False
     evaluated = root_exempt = 0
@@ -190,7 +199,7 @@ def summarize_repository(
     codes = sorted(set(codes) & CODES)
     return {
         "key": repo.key,
-        "visibility": "public" if public else "private",
+        "visibility": "public" if repo.role == "public-monorepo" else "private",
         "coverage": "incomplete" if codes else "complete",
         "incomplete_codes": codes,
         "open_total": count,
@@ -202,20 +211,27 @@ def summarize_repository(
 
 def build_report() -> dict:
     repos = fleet_repos.load_fleet_repos()
-    try:
-        registry = audit.load_registry(machinery_path("config/issue_streams.yaml"), audit_only=True)
-    except (OSError, ValueError):
-        registry = {}
     source = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=product_root(), capture_output=True, text=True, check=True, timeout=10
     ).stdout.strip()
+    repositories = {}
+    for key, repo in repos.items():
+        try:
+            active = fleet_repos.resolve_active_fleet_repo(key, repos=repos)
+        except fleet_repos.FleetRepoError:
+            repositories[key] = summarize_repository(repo, None, None, None, ["repository_resolution_failed"], {})
+            continue
+        repo = replace(repo, github=active.active_github)
+        try:
+            registry = checker.registry_for(repo.github) or {}
+        except (OSError, ValueError):
+            registry = {}
+        repositories[key] = summarize_repository(repo, *collect_repository(repo, registry), registry)
     return {
         "schema": "issue-quality-report.v1",
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "source_sha": source,
-        "repositories": {
-            key: summarize_repository(repo, *collect_repository(repo), registry) for key, repo in repos.items()
-        },
+        "repositories": repositories,
     }
 
 

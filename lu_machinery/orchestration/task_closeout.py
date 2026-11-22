@@ -237,7 +237,7 @@ class GhGitHubAdapter:
             ) from exc
         return epic_repository, sorted({epic for epics in registry.values() for epic in epics})
 
-    def membership_audit_report(self) -> dict[str, Any]:
+    def membership_audit_report(self, repository: str) -> dict[str, Any]:
         """One fresh, live issue-stream membership audit snapshot.
 
         Feeds :func:`task_lifecycle.resolve_membership` for the canonical
@@ -246,13 +246,13 @@ class GhGitHubAdapter:
         transferred-scope follow-up issue) must call this ONCE and carry the
         same snapshot through both resolutions rather than re-auditing.
 
-        Audit ``self.repo_root`` using the packaged registry. The auditor
-        publishes shared-state cache data only for the configured GitHub repository.
+        Audit the resolved epic repository using the packaged registry.
+        The auditor publishes shared cache data only for the default repository.
         """
         from lu_machinery.orchestration import issue_stream_audit
 
         try:
-            return issue_stream_audit.run_audit(self.repo_root)
+            return issue_stream_audit.run_audit(self.repo_root, repo=repository)
         except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired) as exc:
             raise task_lifecycle.LifecycleError(
                 f"cannot run the issue-stream membership audit: {exc}"
@@ -451,7 +451,7 @@ class GhGitHubAdapter:
             )
             for target in (issue, follow_up) if target is not None
         )
-        membership_audit = self.membership_audit_report() if needs_membership_audit else None
+        membership_audit = self.membership_audit_report(epic_repository) if needs_membership_audit else None
         pr_number = ledger["pr"]["number"]
         pr: dict[str, Any] = {
             "number": None,
@@ -1080,7 +1080,7 @@ def _issue_snapshot(
     # parentage is absent (body path) or the native parent is an unregistered
     # sub-epic (native-chain path, #9783).
     membership_report = (
-        adapter.membership_audit_report()
+        adapter.membership_audit_report(epic_repository)
         if task_lifecycle.membership_needs_audit(
             issue["parent_epic"], registered_epics, repository=identity["repository"],
             epic_repository=epic_repository, native_parent_repository=issue.get("parent_repository"),
@@ -1112,6 +1112,8 @@ def _issue_snapshot(
 
 def cmd_init(args: argparse.Namespace) -> int:
     identity = _identity_from_args(args)
+    if args.fresh_task_id is not None:
+        task_lifecycle.stream_registry_repository(identity["repository"], require_active_slug=True)
     now = args.now or utc_now()
     adapter, snapshot, epic_repository, registered_epics, membership_report = _issue_snapshot(args, identity, now)
     ledger = task_lifecycle.build_lifecycle(

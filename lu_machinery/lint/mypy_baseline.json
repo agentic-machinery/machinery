@@ -6349,11 +6349,6 @@
     },
     {
       "path": "lu_machinery/orchestration/issue_quality_report.py",
-      "code": "arg-type",
-      "message": "Argument 3 to \"write_membership_cache\" has incompatible type \"None | dict[str, list[int]]\"; expected \"dict[Any, Any]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_quality_report.py",
       "code": "index",
       "message": "Value of type \"object\" is not indexable"
     },
