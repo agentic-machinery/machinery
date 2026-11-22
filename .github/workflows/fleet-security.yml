@@ -2573,7 +2573,7 @@ jobs:
 
   security-gate:
     name: Fleet security gate
-    if: always()
+    if: ${{ !cancelled() || github.event_name != 'pull_request' }}
     needs: [actionlint, shellcheck, zizmor, secret-scan, trivy-fs, trivy-iac, trivy-image]
     runs-on: ${{ fromJSON(inputs.runs-on) }}
     timeout-minutes: 5
