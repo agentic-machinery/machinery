@@ -1480,6 +1480,10 @@ def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
             reason = "provider_processes_alive" if alive else "provider_liveness_unknown"
             record.update(worktree_disposition="retained", worktree_disposition_reason=reason)
             return
+        if "orchestrator" in record:
+            # The stream reservation releases a turn only on this proof, taken after its own scope or
+            # fallback stop has run, never on the provider group's absence alone (DRIVERS-1122).
+            record["provider_exit_proven_at"] = store.now()
 
         def borrowed() -> bool:
             return (salvage and _provider_alive(record) is not False) or _borrowed(record)

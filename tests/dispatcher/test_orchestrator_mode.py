@@ -28,7 +28,8 @@ TASK_ENV = ownership.TASK_ID_ENV
 
 _MISSING = object()
 _DEAD_PID = 2**22 + 1  # above the default pid_max, so never a live process
-_LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="popen-fallback", provider_pgid=None)
+_LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="popen-fallback", provider_pgid=None,
+                 provider_exit_proven_at="2026-11-22T20:00:00+00:00")
 
 
 def _lease(state="active", session_state="open", expires_in=600):
@@ -207,9 +208,15 @@ def test_concurrent_turns_on_one_stream_get_one_reservation(task_store):
         (dict(status="crashed", **{**_LAUNCHED, "launch_mode": ["scope"]}), True),
         (dict(status="crashed", **{**_LAUNCHED, "launch_mode": None}), True),
         (dict(status="crashed"), True),  # provider liveness unknown
-        # A run that never launched: no pid, no launch mode, and a reason it never started.
+        # Terminal before settlement's process-tree proof (a fallback descendant may outlive the group).
+        (dict(status="done", **{key: value for key, value in _LAUNCHED.items() if key != "provider_exit_proven_at"}),
+         True),
+        (dict(status="done", **{**_LAUNCHED, "provider_exit_proven_at": "soon"}), True),
+        # A run that never launched: no pid, no launch mode, no provider group, and a reason it never started.
         (dict(status="failed", never_started_reason="placement"), False),
         (dict(status="crashed", returncode_reason="dispatch_died_after_admission"), False),
+        (dict(status="failed", never_started_reason="placement", provider_pgid=os.getpgid(0)), True),  # contradicts
+        (dict(status="failed", provider_pgid=None), True),  # no never-started reason
         (dict(status="mystery"), True),
         (dict(status="spawning"), True),
         (dict(status=["running"]), True),  # a status of the wrong type is unknown, never an error
