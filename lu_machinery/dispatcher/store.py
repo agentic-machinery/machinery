@@ -590,16 +590,19 @@ _HANDOFF_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:#/-]{0,255}")
 _HANDOFF_RECEIPT_FIELDS = frozenset({"schema", "receipt_id", "stream", "task_id", "run_nonce", "handoff_ref", "recorded_at"})
 
 
-def _utc_timestamp(value: object) -> bool:
-    """Whether ``value`` is an ISO-8601 timestamp at UTC, as ``now()`` writes it."""
-    if not isinstance(value, str):
-        return False
+# An ISO-8601 UTC date-time as now() (+00:00) or Monitor (Z) writes it: ASCII digits, a T separator, at most
+# microseconds. datetime.fromisoformat alone also accepts other separators and forms.
+_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
+
+
+def parse_utc_timestamp(value: object) -> datetime | None:
+    """``value`` as an aware UTC datetime when it is exactly such a timestamp, else None."""
+    if not isinstance(value, str) or not _UTC_TIMESTAMP.fullmatch(value):
+        return None
     try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return False
-    offset = parsed.utcoffset()
-    return offset is not None and offset.total_seconds() == 0
+        return datetime.fromisoformat(value)
+    except ValueError:  # a field out of range, such as month 13
+        return None
 
 
 def handoff_receipt_id(stream: str, task_id: str, run_nonce: str, handoff_ref: str) -> str:
@@ -621,7 +624,7 @@ def handoff_receipt_refusal(record: dict) -> str | None:
     expected = dict(schema=HANDOFF_RECEIPT_SCHEMA, stream=stream, task_id=record.get("task_id"),
                     run_nonce=record.get("run_nonce"))
     if (not isinstance(receipt, dict) or stream is None or set(receipt) != _HANDOFF_RECEIPT_FIELDS
-            or not _utc_timestamp(receipt.get("recorded_at"))
+            or parse_utc_timestamp(receipt.get("recorded_at")) is None
             or any(receipt.get(key) != value for key, value in expected.items())
             or not isinstance(receipt.get("handoff_ref"), str) or not _HANDOFF_REF.fullmatch(receipt["handoff_ref"])
             or receipt.get("receipt_id") != handoff_receipt_id(stream, record["task_id"], record["run_nonce"],
