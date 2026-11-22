@@ -10,7 +10,6 @@ import os
 import subprocess
 import sys
 import threading
-import time
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -21,6 +20,7 @@ from lu_machinery.orchestration import dispatch_admission
 from lu_machinery.session_supervisor import remote
 from tests.dispatcher.conftest import await_file, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.wait_helpers import wait_until
 
 STREAM = "epic:7"
 TASK_ENV = ownership.TASK_ID_ENV
@@ -152,10 +152,9 @@ def test_concurrent_turns_on_one_stream_get_one_reservation(task_store):
     for thread in threads:
         thread.start()
     start.wait()
-    deadline = time.monotonic() + 30
-    while len(holds) + len(refusals) + len(errors) < contenders and time.monotonic() < deadline:
-        time.sleep(0.01)
     try:
+        wait_until(lambda: len(holds) + len(refusals) + len(errors) == contenders, timeout=30,
+                   message="every contender reserved or was refused")
         assert not errors
         assert sorted(hold[dispatch_admission.ORCHESTRATOR_KEY]["stream"] for hold in holds) == ["epic:7", "epic:8"]
         assert len(refusals) == contenders - 2
