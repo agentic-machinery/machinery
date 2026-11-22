@@ -411,12 +411,13 @@ def _one_line(text: str) -> str:
     return " ".join(text.split())
 
 
+def _json_list(value: object) -> list[Any]:
+    return list(value) if isinstance(value, list) else []
+
+
 def _row_digest(report: Mapping[str, Any]) -> str:
     rows = []
-    raw = report.get("rows") or []
-    if type(raw) is not list:
-        raw = []
-    for row in raw:
+    for row in _json_list(report.get("rows")):
         if isinstance(row, dict):
             rows.append({key: value for key, value in row.items() if key != "age_hours"})
         else:
@@ -433,19 +434,21 @@ def journal_lines(
     A cadence skip and an unchanged clean report print nothing. Exit status stays with the report.
     """
     state = {
-        "errors": list(journal.get("errors") or []),
+        "errors": _json_list(journal.get("errors")),
         "errors_at": journal.get("errors_at"),
         "rows": journal.get("rows"),
     }
     if report.get("skipped") == "cadence":
         return [], state
-    raw = report.get("errors") or []
-    if type(raw) is not list:
-        current = ["stalled scan failed (ValueError)"]
-    else:
+    raw = report.get("errors")
+    if isinstance(raw, list):
         current = sorted(
             _one_line(item if type(item) is str else f"stalled scan failed ({type(item).__name__})") for item in raw
         )
+    elif raw:
+        current = ["stalled scan failed (ValueError)"]
+    else:
+        current = []
     if current:
         lines: list[str] = []
         if current != state["errors"]:
@@ -466,7 +469,7 @@ def journal_lines(
     state["errors"] = []
     state["errors_at"] = None
     digest = _row_digest(report)
-    count = len(report.get("rows") or []) if type(report.get("rows") or []) is list else 0
+    count = len(_json_list(report.get("rows")))
     if digest != state["rows"] and (state["rows"] is not None or count):
         lines.append(f"stalled-work: rows={count}")
     state["rows"] = digest
