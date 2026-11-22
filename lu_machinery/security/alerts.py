@@ -488,13 +488,11 @@ def _split_github_slug(repo: FleetRepo) -> tuple[str, str] | None:
 
 
 def _fleet_security_workflow(repos: Mapping[str, FleetRepo] | None) -> str | None:
-    machinery = repos.get("machinery") if repos is not None else None
-    if machinery is None:
-        # A scan-specific catalog can omit the workflow's host from its targets.
-        try:
-            machinery = load_fleet_repos().get("machinery")
-        except FleetRepoError:
-            return None
+    try:
+        catalog = load_fleet_repos() if repos is None else repos
+    except FleetRepoError:
+        return None
+    machinery = catalog.get("machinery")
     if machinery is None or _split_github_slug(machinery) is None:
         return None
     return f"{machinery.github}/{_FLEET_SECURITY_WORKFLOW_PATH}"

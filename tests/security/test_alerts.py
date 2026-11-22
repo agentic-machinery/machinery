@@ -508,11 +508,12 @@ def test_workflow_loader_exceptions_make_evidence_unreadable(scalar: str) -> Non
     assert evidence["state"] == "inaccessible_evidence"
     assert evidence["reason"] == "workflow_file_unreadable"
     invalid = FleetRepo("machinery", "new-owner/../machinery", "machinery", "public-machinery")
-    client = _FakeGitHubClient(respond)
-    unavailable = read_fleet_security(client, repo, timeout=1.0, repos={"machinery": invalid})
-    assert unavailable["state"] == "inaccessible_evidence"
-    assert unavailable["reason"] == "machinery_repository_unavailable"
-    assert client.calls == []
+    for catalog in ({"fixture": repo}, {"fixture": repo, "machinery": invalid}):
+        client = _FakeGitHubClient(respond)
+        unavailable = read_fleet_security(client, repo, timeout=1.0, repos=catalog)
+        assert unavailable["state"] == "inaccessible_evidence"
+        assert unavailable["reason"] == "machinery_repository_unavailable"
+        assert client.calls == []
 
 
 @pytest.mark.parametrize(
