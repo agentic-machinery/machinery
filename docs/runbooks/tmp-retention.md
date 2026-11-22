@@ -217,9 +217,11 @@ nonce (a re-dispatch that reuses the nonce gets a fresh unit token) that still
 holds a process keeps it too. A fallback (non-scope) launch's tree is never
 proven gone, so settlement never releases its scratch: it is kept for good
 (`kept`) and left to `tmp_sweep`'s settled-task rule. The hourly unit also runs
-`tmp_sweep --temp-root /var/tmp` with the settled-task rule. The
-unattributed-scratch pass uses the default temp area. The general sweep
-protects the managed `lu` scratch directory and its existing exclusions.
+`tmp_sweep --temp-root /var/tmp --settled-task-only`. This pass quarantines
+and purges only settled-task scratch. It leaves existing unattributed
+quarantine in place and skips pytest retention. The common sweep protects
+the managed `lu` scratch directory. The unattributed-scratch and pytest
+passes run with the default temp area.
 A recorded disposition is never taken as proof. Once
 the provider is proven gone, when no task process is left to register another
 service, settlement stops and checks every service the record and the
