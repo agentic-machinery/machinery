@@ -380,6 +380,19 @@ def test_publisher_transport_refuses_a_repeated_check_run_across_pages(tmp_path,
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=tmp_path, environment=environment)
 
 
+def test_refusal_names_a_failed_check_run_read_for_a_plain_runner():
+    base = bound_runner([], bound={"headRefOid": HEAD, "statusCheckRollup": DUPLICATE_ROLLUP})
+
+    def runner(args, **kwargs):
+        if args[1] == "api" and args[4] == CHECK_RUNS:
+            return subprocess.CompletedProcess(args, 1, "", "")
+        return base(args, **kwargs)
+
+    with pytest.raises(PublishBlocked) as refused:
+        ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
+    assert str(refused.value) == "OPSEC: merge refused: cannot establish check state (check runs: exit 1)."
+
+
 def test_refusal_names_a_failed_actions_run_read_with_gh_http_status():
     rest = [{"name": "Body guard", "head_sha": HEAD, "status": "completed", "conclusion": "success",
              "check_suite": {"id": 2}, "app": ACTIONS, "details_url": DUPLICATE_DETAILS}]
@@ -437,3 +450,16 @@ def test_refusal_names_an_invalid_shape_or_says_no_read_failed(bound, named):
     with pytest.raises(PublishBlocked) as refused:
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
     assert str(refused.value) == f"OPSEC: merge refused: cannot establish check state ({named})."
+
+
+def test_refusal_names_a_check_run_read_of_the_wrong_shape():
+    base = bound_runner([], bound={"headRefOid": HEAD, "statusCheckRollup": DUPLICATE_ROLLUP})
+
+    def runner(args, **kwargs):
+        if args[1] == "api" and args[4] == CHECK_RUNS:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"check_runs": []}), "")
+        return base(args, **kwargs)
+
+    with pytest.raises(PublishBlocked) as refused:
+        ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
+    assert str(refused.value) == "OPSEC: merge refused: cannot establish check state (check runs: invalid shape)."
