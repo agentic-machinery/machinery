@@ -467,13 +467,32 @@ jobs:
 
       - name: Fetch semgrep-rules at the pinned commit
         if: steps.scanner-tests.outputs.required == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is empty; refusing unauthenticated fetch"
+            exit 1
+          fi
+          basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
+          if [ -z "$basic" ]; then
+            echo "::error::Failed to encode GH_TOKEN for git fetch"
+            exit 1
+          fi
           rules="$RUNNER_TEMP/semgrep-rules"
           rm -rf "$rules"
           git init --quiet "$rules"
-          git -C "$rules" fetch --quiet --depth 1 --no-tags \
-            https://github.com/semgrep/semgrep-rules.git "$SEMGREP_RULES_COMMIT"
+          echo "Fetching semgrep-rules@${SEMGREP_RULES_COMMIT} authenticated via host-scoped http.extraheader."
+          GIT_TERMINAL_PROMPT=0 \
+          GIT_CONFIG_COUNT=2 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0='' \
+          GIT_CONFIG_KEY_1=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_1="AUTHORIZATION: basic ${basic}" \
+            git -C "$rules" fetch --quiet --depth 1 --no-tags \
+              https://github.com/semgrep/semgrep-rules.git "$SEMGREP_RULES_COMMIT"
+          unset basic GH_TOKEN
           git -C "$rules" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
           checked_out="$(git -C "$rules" rev-parse HEAD)"
           if [ "$checked_out" != "$SEMGREP_RULES_COMMIT" ]; then
