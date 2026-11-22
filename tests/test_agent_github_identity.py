@@ -37,8 +37,10 @@ def rescue_app(tmp_path, monkeypatch):
     token = "ghs_throwaway_rescue_token_for_tests_only"
 
     class Response:
-        status = 201
-        headers: ClassVar[dict[str, str]] = {}
+        def __init__(self, status: int, body: dict[str, object]):
+            self.status = status
+            self._body = body
+            self.headers: dict[str, str] = {}
 
         def __enter__(self):
             return self
@@ -47,20 +49,29 @@ def rescue_app(tmp_path, monkeypatch):
             pass
 
         def read(self):
-            return json.dumps(
+            return json.dumps(self._body).encode()
+
+    class Opener:
+        def open(self, request, **_kwargs):
+            if request.get_method() == "GET":
+                assert request.full_url.endswith("/repos/learn-ukrainian/learn-ukrainian.github.io/installation")
+                return Response(
+                    200,
+                    {"id": 456, "app_id": 123, "account": {"login": "learn-ukrainian"}, "suspended_at": None},
+                )
+            assert request.full_url.endswith("/app/installations/456/access_tokens")
+            requests.append(json.loads(request.data))
+            return Response(
+                201,
                 {
                     "token": token,
                     "repositories": [{"full_name": "learn-ukrainian/learn-ukrainian.github.io"}],
                     "permissions": {"contents": "write", "metadata": "read"},
                     "expires_at": (datetime.now(UTC) + timedelta(minutes=30)).isoformat(),
-                }
-            ).encode()
+                },
+            )
 
-    class Opener:
-        def open(self, request, **_kwargs):
-            requests.append(json.loads(request.data))
-            return Response()
-
+    module.clear_installation_cache()
     monkeypatch.setattr(module, "_restricted_opener", lambda *_args: Opener())
     monkeypatch.setattr(module, "_read_legacy_token", lambda *_args: pytest.fail("rescue read legacy credentials"))
     return directory, environment, material, token, requests
@@ -198,7 +209,7 @@ def test_partial_environment_app_refuses_directory_and_token_fallback(rescue_app
             },
             rescue=True,
         )
-    assert error.value.missing == ("installation-id:missing", "private-key.pem:missing")
+    assert error.value.missing == ("private-key.pem:missing",)
     assert requests == []
 
 

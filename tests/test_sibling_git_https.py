@@ -543,39 +543,54 @@ def test_generated_app_credential_end_to_end(https_world, tmp_path, monkeypatch,
         assertion = handler.headers["Authorization"].removeprefix("Bearer ")
         claims = identity.jwt.decode(assertion, signing_key.public_key(), algorithms=["RS256"])
         assert claims["iss"] == "fixture"
+        if handler.command == "GET":
+            assert handler.path == "/repos/org/repo/installation"
+            handler.send_response(200)
+            handler.end_headers()
+            handler.wfile.write(
+                json.dumps(
+                    {"id": 4242, "app_id": 123, "client_id": "fixture", "account": {"login": "org"}, "suspended_at": None}
+                ).encode()
+            )
+            return
+        assert handler.path == "/app/installations/4242/access_tokens"
         handler.send_response(201)
         handler.end_headers()
         handler.wfile.write(json.dumps(payload).encode())
 
+    identity.clear_installation_cache()
     sha = advance(https_world, tmp_path)
     git(https_world[2], "update-server-info")
-    with tls_server(tmp_path, mint_response) as (api_url, api_ca, api_requests):
-        with tls_server(tmp_path, static_response(https_world[2])) as (url, ca, fetch_requests):
-            scratch = tmp_path / "scratch"
-            scratch.mkdir()
-            client = sg.Git(
-                scratch,
-                https_base_url=url,
-                ca_file=ca,
-                api_base_url=api_url,
-                ssl_context=ssl.create_default_context(cafile=str(api_ca)),
-            )
-            repo = resolved(https_world, client)
-            if credential_state == "valid":
-                assert sg.sync_main(repo, https_world[0], client)["head"] == sha
-                assert git(https_world[1], "rev-parse", "HEAD") == sha
-                assert fetch_requests and all(header == HEADER for _, header in fetch_requests)
-            else:
-                before = snapshot(https_world[1])
-                with pytest.raises(sg.Refusal, match="restricted installation credential unavailable") as error:
-                    sg.sync_main(repo, https_world[0], client)
-                assert fetch_requests == []
-                assert snapshot(https_world[1]) == before
-                assert TOKEN not in str(error.value)
-            assert len(api_requests) == (2 if credential_state == "valid" else 1)
-            if credential_state == "valid":
-                assert api_requests[1] == ("/installation/token", f"Bearer {TOKEN}")
-            assert api_requests[0][0] == {"repositories": ["repo"], "permissions": {"contents": "read"}}
+    with (
+        tls_server(tmp_path, mint_response) as (api_url, api_ca, api_requests),
+        tls_server(tmp_path, static_response(https_world[2])) as (url, ca, fetch_requests),
+    ):
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        client = sg.Git(
+            scratch,
+            https_base_url=url,
+            ca_file=ca,
+            api_base_url=api_url,
+            ssl_context=ssl.create_default_context(cafile=str(api_ca)),
+        )
+        repo = resolved(https_world, client)
+        if credential_state == "valid":
+            assert sg.sync_main(repo, https_world[0], client)["head"] == sha
+            assert git(https_world[1], "rev-parse", "HEAD") == sha
+            assert fetch_requests and all(header == HEADER for _, header in fetch_requests)
+        else:
+            before = snapshot(https_world[1])
+            with pytest.raises(sg.Refusal, match="restricted installation credential unavailable") as error:
+                sg.sync_main(repo, https_world[0], client)
+            assert fetch_requests == []
+            assert snapshot(https_world[1]) == before
+            assert TOKEN not in str(error.value)
+        assert len(api_requests) == (3 if credential_state == "valid" else 2)
+        assert api_requests[0][0] == "/repos/org/repo/installation"
+        if credential_state == "valid":
+            assert api_requests[2] == ("/installation/token", f"Bearer {TOKEN}")
+        assert api_requests[1][0] == {"repositories": ["repo"], "permissions": {"contents": "read"}}
 
 
 def test_untrusted_tls_certificate_fails_closed(https_world, tmp_path):

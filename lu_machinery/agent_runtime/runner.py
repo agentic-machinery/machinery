@@ -1985,7 +1985,12 @@ def _execute_invocation_once(
         # Merge guard shims are host paths outside the sandbox allowlist and
         # are not needed for evidence-only review (no gh merge). Skip them.
     else:
-        env = build_agent_env(provider=agent_name, model=model, overrides=plan.env_overrides)
+        env = build_agent_env(
+            provider=agent_name,
+            model=model,
+            overrides=plan.env_overrides,
+            cwd=review_cwd if mode in _WRITE_CAPABLE_MODES else None,
+        )
         for key in plan.env_unsets:
             env.pop(key, None)
         env["AGENT_NO_TELEMETRY_FOOTER"] = "1"
