@@ -263,10 +263,7 @@ class GhGitHubAdapter:
         if not isinstance(repository_doc, dict):
             raise task_lifecycle.LifecycleError("GitHub parent repository is unread")
         observed_repository = repository_doc.get("nameWithOwner")
-        if (
-            not task_lifecycle.repository_identity_valid(observed_repository)
-            or observed_repository.casefold() != repository.casefold()
-        ):
+        if task_lifecycle.repository_evidence_refusal(repository, observed_repository, source="GitHub parent read"):
             raise task_lifecycle.LifecycleError("GitHub parent read repository does not match")
         issue = repository_doc.get("issue")
         if (

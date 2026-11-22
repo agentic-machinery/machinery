@@ -3313,6 +3313,10 @@ def test_stream_epic_binding_accepts_either_baked_slug_of_the_registry_row(monke
                 "stream_epic_url": f"https://github.com/{repository}/issues/10"}
 
     assert task_lifecycle.stream_epic_url_matches(identity, "org/repo") is accepted
+    # A live read may name the other baked slug of the ledger's repository (separate reads).
+    for ledger_repository in ("org/repo", "neworg/repo"):
+        refusal = task_lifecycle.repository_evidence_refusal(ledger_repository, repository, source="issue-stream registry")
+        assert (refusal is None) is accepted
     assert task_lifecycle.stream_epic_url_matches({**identity, "stream_epic_url": None}, "org/repo") is accepted
     if accepted:
         assert task_lifecycle.stream_registry_repository(repository) == "org/repo"

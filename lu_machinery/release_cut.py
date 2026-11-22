@@ -331,10 +331,11 @@ def record_changelog(
     except FleetRepoError as exc:
         raise CutError(f"the fleet repository registry is unreadable: {exc}") from exc
     # Anything Markdown could read as an Unreleased reference definition (any case, padding or
-    # container, any destination, fenced or not) counts: exactly one may exist, it must be a whole
+    # container, any destination, fenced or not; a label may continue across block-quote lines, so
+    # `>` counts as padding inside the brackets) counts: exactly one may exist, it must be a whole
     # line, and that line must be the previous-tag compare link under a baked slug of the repository.
     # Only that line is rewritten.
-    labels = list(re.finditer(r"\[\s*unreleased\s*\]\s*:", text, flags=re.IGNORECASE))
+    labels = list(re.finditer(r"\[[\s>]*unreleased[\s>]*\]\s*:", text, flags=re.IGNORECASE))
     accepted = {f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD" for slug in slugs}
     start = labels[0].start() if len(labels) == 1 else -1
     end = text.find("\n", start)

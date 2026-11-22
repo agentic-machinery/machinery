@@ -198,6 +198,19 @@ def _epic_repository_slugs(epic_repository: str) -> tuple[str, ...]:
         return ()
 
 
+def _repository_key(repository: str) -> str:
+    """One comparison key per repository: either baked slug of a fleet row keys as that row.
+
+    Live reads after a transfer name the destination slug while ledgers keep the one they were
+    recorded with. A non-ASCII spelling keeps its raw form, so casefold never maps a look-alike
+    such as U+212A onto an ASCII slug.
+    """
+    if not repository.isascii():
+        return repository
+    slugs = _epic_repository_slugs(repository)
+    return (slugs[0] if slugs else repository).casefold()
+
+
 def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -> bool:
     url = identity["stream_epic_url"]
     slugs = _epic_repository_slugs(epic_repository)
@@ -237,11 +250,11 @@ def membership_needs_audit(
     native_parent_repository: str | None,
 ) -> bool:
     """Consult the repository-local audit only for body or native-chain evidence."""
-    return repository.casefold() == epic_repository.casefold() and (
+    return _repository_key(repository) == _repository_key(epic_repository) and (
         native_parent_epic is None
         or (
             repository_identity_valid(native_parent_repository)
-            and native_parent_repository.casefold() == epic_repository.casefold()
+            and _repository_key(native_parent_repository) == _repository_key(epic_repository)
             and native_parent_epic not in registered_epics
         )
     )
@@ -353,7 +366,9 @@ def repository_evidence_refusal(repository: str, evidence_repository: object, *,
         return "task repository identity is malformed"
     if not repository_identity_valid(evidence_repository):
         return f"{source} repository is missing or malformed"
-    if evidence_repository.casefold() != repository.casefold():
+    # Both spellings passed the ASCII slug check above; either baked slug of the task's row is that row
+    # (a ledger recorded before a transfer meets a live read naming the destination slug).
+    if _repository_key(evidence_repository) != _repository_key(repository):
         return f"{source} repository does not match the task identity"
     return None
 
@@ -384,8 +399,8 @@ def resolve_live_ancestry(
         return _membership_refusal("issue-stream registry repository identity is malformed")
     if not isinstance(registered_epics, list) or stream_epic not in registered_epics:
         return _membership_refusal("identity stream epic is absent from the registered issue-stream epics")
-    local_repo = repository.casefold()
-    epic_repo = epic_repository.casefold()
+    local_repo = _repository_key(repository)
+    epic_repo = _repository_key(epic_repository)
     current = issue_number
     visited = {current}
     for _ in range(issue_stream_audit._MAX_SUBISSUE_DEPTH):
@@ -431,7 +446,7 @@ def resolve_live_ancestry(
             }
         if not isinstance(parent, Mapping) or not repository_identity_valid(parent.get("repository")):
             return _membership_refusal("live ancestry parent repository identity is malformed")
-        parent_repo = parent["repository"].casefold()
+        parent_repo = _repository_key(parent["repository"])
         number = parent.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number < 1:
             return _membership_refusal("live ancestry parent number is malformed")
@@ -516,14 +531,14 @@ def resolve_membership(
         return _membership_refusal("identity stream epic is absent from the registered issue-stream epics")
     if not repository_identity_valid(repository):
         return _membership_refusal("task repository identity is malformed")
-    local_repo = repository.casefold()
-    epic_repo = epic_repository.casefold()
+    local_repo = _repository_key(repository)
+    epic_repo = _repository_key(epic_repository)
     if native_parent_epic is not None:
         if not repository_identity_valid(native_parent_repository):
             return _membership_refusal("native parent repository identity is missing or malformed")
         if type(native_parent_epic) is not int or native_parent_epic < 1:
             return _membership_refusal("native parent number is malformed")
-        parent_repo = native_parent_repository.casefold()
+        parent_repo = _repository_key(native_parent_repository)
         if parent_repo == epic_repo and native_parent_epic == stream_epic:
             return {
                 "valid": True,
