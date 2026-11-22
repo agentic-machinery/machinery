@@ -115,7 +115,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
     cfg_path = path or _CONFIG_PATH
     try:
         repos_raw = repository_registry(cfg_path.resolve())
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on Python 3.12
         raise FleetRepoError(f"fleet_repos catalog unreadable: {cfg_path} ({type(exc).__name__}: {exc})") from exc
     out: dict[str, FleetRepo] = {}
     defaults = 0
@@ -235,13 +235,22 @@ def resolve_fleet_repo_by_slug(
     return repo
 
 
+def _resolved_registry_path(registry_path: Path | None) -> Path:
+    """Resolve *registry_path* (default: the bundled catalog) inside the ``FleetRepoError`` boundary."""
+    path = registry_path or _CONFIG_PATH
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on Python 3.12
+        raise FleetRepoError(f"fleet_repos catalog unreadable: {path} ({type(exc).__name__}: {exc})") from exc
+
+
 def load_fleet_repo_selector(
     *,
     registry_path: Path | None = None,
     env: Mapping[str, str] | None = None,
 ) -> SelectorState:
     """Load the validated host-owned selector state, normalizing failures to ``FleetRepoError``."""
-    cfg_path = (registry_path or _CONFIG_PATH).resolve()
+    cfg_path = _resolved_registry_path(registry_path)
     try:
         return load_selector(registry_path=cfg_path, env=env)
     except (SelectorError, ValueError, OSError) as exc:
@@ -276,7 +285,7 @@ def resolve_active_fleet_repo(
     Dual-slug rows fail closed when the host-owned selector (``LU_FLEET_REPO_SELECTOR_FILE``)
     is missing, unreadable, unknown, or worker-writable, and never default to the old slug.
     """
-    cfg_path = (registry_path or _CONFIG_PATH).resolve()
+    cfg_path = _resolved_registry_path(registry_path)
     catalog = repos if repos is not None else load_fleet_repos(cfg_path)
     repo = resolve_fleet_repo_by_slug(
         identifier,
@@ -386,6 +395,11 @@ def _repository_catalog(path: Path) -> dict[str, FleetRepo]:
     return load_fleet_repos(path)
 
 
+def _bundled_catalog() -> dict[str, FleetRepo]:
+    """The cached bundled catalog; any failure to locate or read it is a ``FleetRepoError``."""
+    return _repository_catalog(_resolved_registry_path(None))
+
+
 def clear_repository_cache() -> None:
     """Reload registry edits on the next canonical repository lookup."""
     repository_registry.cache_clear()
@@ -394,14 +408,39 @@ def clear_repository_cache() -> None:
 
 def canonical_repository(value: str) -> str:
     """Canonical owner/name, accepting registry keys and both baked slug spellings."""
+    if not isinstance(value, str) or not value.isascii():
+        # Slugs and keys are ASCII; casefold would map look-alikes such as U+212A onto them.
+        raise FleetRepoError("PR repository must be owner/name")
     spelling = value.strip().casefold()
-    for repo in _repository_catalog(_CONFIG_PATH.resolve()).values():
+    for repo in _bundled_catalog().values():
         known = {repo.key.casefold(), *(slug.casefold() for slug in repo.slugs)}
         if spelling in known:
             return repo.github.casefold()
     if re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", spelling):
         return spelling
     raise FleetRepoError("PR repository must be owner/name")
+
+
+_EXACT_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def repository_slugs(spelling: object) -> tuple[str, ...]:
+    """Every baked slug of the repository an exact owner/name *spelling* names.
+
+    A spelling of either baked slug of a registry row (case-insensitive, as
+    GitHub slugs are) returns that row's baked slugs, so a payload written
+    before or after a transfer binds to the same repository. An unregistered
+    owner/name returns only itself. Anything else (a registry key, a URL,
+    surrounding whitespace, a non-string) names no repository and returns
+    ``()``. An unreadable catalog raises ``FleetRepoError``.
+    """
+    if not isinstance(spelling, str) or not _EXACT_SLUG.fullmatch(spelling):
+        return ()
+    folded = spelling.casefold()
+    for repo in _bundled_catalog().values():
+        if any(folded == slug.casefold() for slug in repo.slugs):
+            return repo.slugs
+    return (spelling,)
 
 
 def pull_request_repository(payload: Any, *, scoped_repository: str | None = None) -> str | None:
@@ -494,6 +533,7 @@ __all__ = [
     "load_fleet_repos",
     "main",
     "pull_request_repository",
+    "repository_slugs",
     "resolve_active_fleet_repo",
     "resolve_fleet_repo",
     "resolve_fleet_repo_by_slug",

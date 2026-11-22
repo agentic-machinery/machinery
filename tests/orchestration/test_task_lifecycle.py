@@ -3442,3 +3442,64 @@ def test_a02_stream_registry_repository_both_selector_states_and_same_issue_numb
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)
+
+
+@pytest.mark.parametrize(("repository", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
+def test_stream_epic_binding_accepts_either_baked_slug_of_the_registry_row(tmp_path, monkeypatch, repository, accepted):
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (registry spells the row org/repo)."""
+    import yaml
+
+    from lu_machinery.common import git_credentials
+    from lu_machinery.orchestration import fleet_repos
+    from tests.test_fleet_repos import transferred_catalog
+
+    row = transferred_catalog(monkeypatch, role="public-monorepo")
+    identity = {"repository": repository, "stream_epic": 10,
+                "stream_epic_url": f"https://github.com/{repository}/issues/10"}
+
+    assert task_lifecycle.stream_epic_url_matches(identity, "org/repo") is accepted
+    # A live read may name the other baked slug of the ledger's repository (separate reads).
+    for ledger_repository in ("org/repo", "neworg/repo"):
+        refusal = task_lifecycle.repository_evidence_refusal(ledger_repository, repository, source="issue-stream registry")
+        assert (refusal is None) is accepted
+    assert task_lifecycle.stream_epic_url_matches({**identity, "stream_epic_url": None}, "org/repo") is accepted
+
+    # stream_registry_repository resolves strictly to the active slug selected for the dual-slug row.
+    sel_dir = tmp_path / "selector"
+    sel_dir.mkdir(mode=0o700)
+    sel_file = sel_dir / "selector.yaml"
+    sel_file.write_text(
+        yaml.safe_dump({"version": 1, "active_slugs": {"case": "org/repo"}}),
+        encoding="utf-8",
+    )
+    sel_file.chmod(0o400)
+    sel_dir.chmod(0o500)
+    try:
+        monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
+        monkeypatch.setenv(fleet_repos.SELECTOR_ENV, str(sel_file))
+        monkeypatch.setattr(
+            git_credentials,
+            "repository_registry",
+            lambda _path: {
+                "case": {
+                    "github": row.github,
+                    "alternate_github": row.alternate_github,
+                    "local_name": row.local_name,
+                    "default": row.default,
+                    "repository_id": row.repository_id,
+                    "visibility": row.visibility,
+                }
+            },
+        )
+        if repository == "org/repo":
+            assert task_lifecycle.stream_registry_repository(repository) == "org/repo"
+        elif repository == "neworg/repo":
+            with pytest.raises(task_lifecycle.LifecycleError, match="not the active fleet slug"):
+                task_lifecycle.stream_registry_repository(repository)
+        else:
+            with pytest.raises(task_lifecycle.LifecycleError, match="not configured in the fleet"):
+                task_lifecycle.stream_registry_repository(repository)
+    finally:
+        sel_dir.chmod(0o700)
+        sel_file.chmod(0o600)

@@ -2529,17 +2529,25 @@ def test_a02_dor_and_closeout_resolve_moved_repo_both_selector_states_and_same_i
         )
         assert check_issue_task_quality.observe_membership({}, active_slug, 42)["status"] == "PASS"
 
-        # Same root number #10 in public or under the inactive slug is refused for machinery #42.
-        for bad_parent_repo in (public_slug, inactive_slug):
-            with monkeypatch.context() as ctx:
-                ctx.setattr(
-                    check_issue_task_quality,
-                    "read_parent",
-                    lambda repo, number, target=bad_parent_repo: {"number": 10, "repository": target},
-                )
-                verdict = check_issue_task_quality.observe_membership({}, active_slug, 42)
-                assert verdict["status"] == "WARN"
-                assert verdict["errors"][0]["code"] == "membership_conflicting_ancestry"
+        # Same root number #10 in a different repository row (public) is refused for machinery #42.
+        with monkeypatch.context() as ctx:
+            ctx.setattr(
+                check_issue_task_quality,
+                "read_parent",
+                lambda repo, number: {"number": 10, "repository": public_slug},
+            )
+            verdict = check_issue_task_quality.observe_membership({}, active_slug, 42)
+            assert verdict["status"] == "WARN"
+            assert verdict["errors"][0]["code"] == "membership_conflicting_ancestry"
+
+        # A live parent read naming the other baked slug of the SAME repository row binds via _repository_key (PR #1213).
+        with monkeypatch.context() as ctx:
+            ctx.setattr(
+                check_issue_task_quality,
+                "read_parent",
+                lambda repo, number: {"number": 10, "repository": inactive_slug},
+            )
+            assert check_issue_task_quality.observe_membership({}, active_slug, 42)["status"] == "PASS"
 
         # Inactive slug target fails closed with membership_registry_absent.
         inactive_verdict = check_issue_task_quality.observe_membership({}, inactive_slug, 42)

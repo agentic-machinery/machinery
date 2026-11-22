@@ -85,6 +85,12 @@ active_slugs:
      parent directory reside on a kernel-enforced read-only mount (`ST_RDONLY`,
      such as a sandbox `--ro-bind`) with no write mode bits (`0400`/`0500`).
   Same-uid selectors on a read-write filesystem are refused.
+- **Host namespace only:** this ownership model holds only for processes in the
+  host user namespace. A sandbox started with `--unshare-user` maps host `root`
+  to the overflow uid (65534), so a root-owned selector reads as owned by an
+  unknown user there and the ownership proof means nothing. Read selectors that
+  gate credentials host-side, before entering such a sandbox, or bind them into
+  it read-only (rule 2), and never mint credentials from a selector read inside it.
 - **Rollout precondition and non-network preflight:** `canonical_origins` and
   `verification_credentials` fail closed on dual-slug rows (`machinery` and
   `infra-private`) when `LU_FLEET_REPO_SELECTOR_FILE` is absent or invalid.
@@ -97,12 +103,22 @@ active_slugs:
   .venv/bin/python -m lu_machinery.orchestration.fleet_repos selector-check
   ```
 
-  Unmodified consumers that read `canonical_origins` or
-  `verification_credentials` (`dispatcher/cli.py`, `dispatcher/git.py`,
-  `dispatcher/store.py`, `orchestration/dispatch_settle.py`,
-  `dispatcher/write_boundary.py`, `hygiene/branch_sweep.py`) depend on this
-  precondition; A01b owns consumer adoption (including `SelectorError` refusal
-  handling in `branch_sweep.py` and recording selector receipts).
+  Consumers that read `canonical_origins` or `verification_credentials`
+  (`dispatcher/cli.py`, `dispatcher/git.py`, `dispatcher/store.py`,
+  `orchestration/dispatch_settle.py`, `dispatcher/write_boundary.py`,
+  `hygiene/branch_sweep.py`, `orchestration/execution_safe_git.py`,
+  `orchestration/scheduled_worktree_cleanup.py`) depend on this precondition.
+  The two host deletion pushes (`branch_sweep.py`, `scheduled_worktree_cleanup.py`)
+  turn a selector failure into a typed refusal of that push; `execution_safe_git.py`
+  runs its transfer with no credential.
+- **Payload consumers accept both baked slugs:** checks that bind a forge
+  payload (PR, run, commit, issue or check URL, `full_name`) or a recorded
+  origin to a repository compare against every baked slug of its row
+  (`fleet_repos.repository_slugs`), so ledgers, receipts and CHANGELOG links
+  written before the transfer stay valid and payloads naming the destination
+  slug bind. A slug outside the row, such as the same repository name under
+  another owner, is refused. Destinations that carry a credential still use the
+  active slug only (for example `orchestration/safe_git_context.py`).
 - **Active-slug-only credentials and identity verification:** only the selected
   active slug receives credentials (`lu_machinery.common.git_credentials`
   exact-path helper and `sibling_git` origin/fetch resolution). Authenticated

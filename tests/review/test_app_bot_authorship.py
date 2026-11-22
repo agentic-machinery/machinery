@@ -50,6 +50,18 @@ def test_complete_dependabot_commit_is_proven():
     assert verified_app_bot_login(dependabot(), SHA, REPOSITORY) == "dependabot[bot]"
 
 
+@pytest.mark.parametrize(("payload_slug", "accepted"), [("owner/repo", True), ("neworg/repo", True), ("evil/repo", False)])
+def test_commit_urls_bind_either_baked_slug_of_the_repository(monkeypatch, payload_slug, accepted):
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (requested as owner/repo)."""
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch, github=REPOSITORY, alternate="neworg/repo")
+    commit = json.loads(json.dumps(dependabot()).replace(f"/{REPOSITORY}/", f"/{payload_slug}/"))
+
+    assert verified_app_bot_login(commit, SHA, REPOSITORY) == ("dependabot[bot]" if accepted else None)
+
+
 def _set(data: dict, path: tuple[str, ...], value: object) -> dict:
     changed = copy.deepcopy(data)
     target = changed

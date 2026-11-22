@@ -3,7 +3,9 @@
 import json
 import subprocess
 from pathlib import Path
+
 import pytest
+
 from lu_machinery.opsec.prepublish import PublishBlocked
 from lu_machinery.publish.merge_guard import ensure_merge_ready
 
@@ -112,21 +114,26 @@ def test_failing_continue_on_error_job_blocks_merge(monkeypatch, tmp_path, ident
         merge_with_checks(json.dumps(checks), returncode=1)
 
 
-# --- OO-48 external advisory provenance (#11184) ------------------------------------------
+# --- Head-bound check judgment ------------------------------------------------------------
 
 HEAD = "a" * 40
-ENTIRE_ROWS = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": "Entire Gates", "bucket": "pending"}]
-RUNS = f"repos/unit/public/commits/{HEAD}/check-runs?check_name=Entire%20Gates&filter=all&per_page=100"
-STATUS = f"repos/unit/public/commits/{HEAD}/status?per_page=100"
+VENDOR_APP = {"id": 987654, "slug": "example-vendor-app"}
+VENDOR_NAME = "Vendor check"
+ROWS = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": VENDOR_NAME, "bucket": "pending"}]
 
 
 BOUND_ROLLUP = [
     {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI"},
-    {"__typename": "CheckRun", "name": "Entire Gates", "status": "IN_PROGRESS", "conclusion": "", "workflowName": ""},
+    {"__typename": "CheckRun", "name": VENDOR_NAME, "status": "IN_PROGRESS", "conclusion": "", "workflowName": ""},
 ]
+# A repeated name without workflow identity: judging it needs the exact-head REST check runs.
+DUPLICATE_DETAILS = "https://github.com/unit/public/actions/runs/12/job/22"
+DUPLICATE_ROLLUP = [{"__typename": "CheckRun", "name": "Body guard", "status": "COMPLETED", "conclusion": "SUCCESS",
+                     "detailsUrl": DUPLICATE_DETAILS}] * 2
+CHECK_RUNS = f"repos/unit/public/commits/{HEAD}/check-runs?filter=all&per_page=100"
 
 
-def entire_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_documents=None):
+def bound_runner(calls, *, head=HEAD, error=None, bound=None, documents=None):
     def runner(args, **kwargs):
         calls.append(args)
         if args[2:5] == ["view", "1", "--json"] and args[5] == "headRefOid,statusCheckRollup":
@@ -135,25 +142,37 @@ def entire_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_docume
         if args[2] == "view":
             return subprocess.CompletedProcess(args, 0, json.dumps({"number": 1, "isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": head}), "")
         if args[2] == "checks":
-            return subprocess.CompletedProcess(args, 8, json.dumps(ENTIRE_ROWS), "")
+            return subprocess.CompletedProcess(args, 8, json.dumps(ROWS), "")
         if error is not None:
             raise error
-        documents = {
-            STATUS: {"total_count": 0, "statuses": []},
-            RUNS: {"total_count": 1, "check_runs": [{"name": "Entire Gates", "head_sha": HEAD, "app": app}]},
-            **(extra_documents or {}),
-        }
-        if args[:4] == ["gh", "api", "--method", "GET"] and args[4] in documents:
+        if args[:4] == ["gh", "api", "--method", "GET"] and args[4] in (documents or {}):
             return subprocess.CompletedProcess(args, 0, json.dumps(documents[args[4]]), "")
         return subprocess.CompletedProcess(args, 1, "", "HTTP 404")
 
     return runner
 
 
-def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
-    """Distinct vendor details and canonical check URLs must preserve App proof."""
+@pytest.mark.parametrize(
+    ("run_slug", "rollup_slug", "accepted"),
+    [
+        ("unit/public", "unit/public", True),
+        ("neworg/public", "neworg/public", True),
+        ("unit/public", "neworg/public", True),
+        ("evil/public", "evil/public", False),
+        ("unit/public", "evil/public", False),
+    ],
+)
+def test_publisher_binds_canonical_check_urls_distinct_from_vendor_details(monkeypatch, run_slug, rollup_slug, accepted):
+    """A rollup detailsUrl that is the run's canonical html_url binds it, not only its vendor details_url.
+
+    Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (canonical check URL under run_slug
+    in the REST read and rollup_slug in the separate rollup read).
+    """
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch, github="unit/public", alternate="neworg/public")
     calls = []
-    app = {"id": 2626939, "slug": "entire"}
     old = {"name": "Body guard", "head_sha": HEAD, "status": "completed", "conclusion": "cancelled",
            "started_at": "2026-10-23T20:00:00Z", "check_suite": {"id": 1},
            "app": {"id": 15368, "slug": "github-actions"},
@@ -163,30 +182,30 @@ def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
     rest = [current, old,
             {"name": "CI Gate", "head_sha": HEAD, "status": "completed", "conclusion": "success",
              "details_url": "https://github.com/unit/public/runs/23"},
-            {"name": "Entire Gates", "head_sha": HEAD, "status": "in_progress", "app": app,
-             "id": 24, "html_url": "https://github.com/unit/public/runs/24",
-             "details_url": "https://entire.com/gh/unit/public/trails/7"}]
+            {"name": VENDOR_NAME, "head_sha": HEAD, "status": "completed", "conclusion": "success", "app": VENDOR_APP,
+             "id": 24, "html_url": f"https://github.com/{run_slug}/runs/24",
+             "details_url": "https://example.invalid/gh/unit/public/trails/7"}]
     rollup = [{"__typename": "CheckRun", "name": row["name"], "status": row["status"].upper(),
                "conclusion": str(row.get("conclusion") or "").upper(),
-               "detailsUrl": row.get("html_url", row["details_url"])}
+               "detailsUrl": row.get("html_url", row["details_url"]).replace(f"/{run_slug}/", f"/{rollup_slug}/")}
               for row in rest]
     rollup.append({"__typename": "StatusContext", "context": "external-status", "state": "SUCCESS"})
-    endpoint = f"repos/unit/public/commits/{HEAD}/check-runs?filter=all&per_page=100"
-    documents = {STATUS: {"total_count": 1, "statuses": [{"context": "external-status", "state": "success"}]},
-                 endpoint: {"total_count": len(rest), "check_runs": rest},
+    documents = {CHECK_RUNS: {"total_count": len(rest), "check_runs": rest},
                  "repos/unit/public/actions/runs/11": {"id": 11, "head_sha": HEAD, "check_suite_id": 1,
                                                        "workflow_id": 7, "name": "Body guard"},
                  "repos/unit/public/actions/runs/12": {"id": 12, "head_sha": HEAD, "check_suite_id": 2,
                                                        "workflow_id": 7, "name": "Body guard"}}
-    runner = entire_runner(app, calls, bound={"headRefOid": HEAD, "statusCheckRollup": rollup},
-                           extra_documents=documents)
+    runner = bound_runner(calls, bound={"headRefOid": HEAD, "statusCheckRollup": rollup}, documents=documents)
+    if not accepted:
+        with pytest.raises(PublishBlocked):
+            ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD)
+        return
     assert ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD) == HEAD
     assert [call[1:6] for call in calls] == [
         ["pr", "view", "1", "--json", "number,isDraft,headRefOid,mergeStateStatus"],
         ["pr", "checks", "1", "--json", "name,bucket,state,workflow"],
         ["pr", "view", "1", "--json", "headRefOid,statusCheckRollup"],
-        ["api", "--method", "GET", STATUS], ["api", "--method", "GET", RUNS],
-        ["api", "--method", "GET", endpoint],
+        ["api", "--method", "GET", CHECK_RUNS],
         ["api", "--method", "GET", "repos/unit/public/actions/runs/12"],
         ["api", "--method", "GET", "repos/unit/public/actions/runs/11"]]
 
@@ -198,17 +217,17 @@ def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
     {"headRefOid": HEAD},
     [],
 ])
-def test_oo48_publisher_refuses_rows_not_bound_to_the_metadata_head(bound):
+def test_publisher_refuses_rows_not_bound_to_the_metadata_head(bound):
     calls = []
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, calls, bound=bound)
+    runner = bound_runner(calls, bound=bound)
     with pytest.raises(PublishBlocked, match="cannot establish check state"):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD)
     assert all(call[1] != "api" for call in calls)
 
 
-def test_oo48_publisher_judges_the_bound_rollup_not_the_headless_rows():
+def test_publisher_judges_the_bound_rollup_not_the_headless_rows():
     red = [{**BOUND_ROLLUP[0], "conclusion": "FAILURE"}, BOUND_ROLLUP[1]]
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, [], bound={"headRefOid": HEAD, "statusCheckRollup": red})
+    runner = bound_runner([], bound={"headRefOid": HEAD, "statusCheckRollup": red})
     with pytest.raises(PublishBlocked, match=r"merge refused: FAILING checks\."):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
 
@@ -236,32 +255,28 @@ def test_publisher_old_client_rollup_must_be_a_list(rollup, refusal):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
 
 
-@pytest.mark.parametrize("app", [{"id": 15368, "slug": "github-actions"}, None, {"id": "2626939", "slug": "entire"}])
-def test_oo48_publisher_refuses_unproven_entire_gates(app):
-    with pytest.raises(PublishBlocked, match="cannot establish check state"):
-        ensure_merge_ready("unit/public", 1, runner=entire_runner(app, []), cwd=".", environment={})
-
-
-def test_oo48_exemption_never_waives_the_reviewed_head():
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, [])
+def test_changed_reviewed_head_refuses_whatever_the_checks_say():
+    runner = bound_runner([])
     with pytest.raises(PublishBlocked, match="reviewed head changed"):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head="b" * 40)
 
 
-def test_oo48_rate_limit_during_provenance_is_not_masked():
+def test_rate_limit_during_a_check_run_read_is_not_masked():
     from lu_machinery.common.github_client import GitHubRateLimited
 
     limited = GitHubRateLimited(None, "fixture")
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, [], error=limited)
+    runner = bound_runner([], error=limited, bound={"headRefOid": HEAD, "statusCheckRollup": DUPLICATE_ROLLUP})
     with pytest.raises(GitHubRateLimited):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
 
 
-def test_oo48_garbage_provenance_reply_is_refused():
+def test_garbage_check_run_reply_is_refused():
+    base = bound_runner([], bound={"headRefOid": HEAD, "statusCheckRollup": DUPLICATE_ROLLUP})
+
     def runner(args, **kwargs):
         if args[1] == "api":
             return subprocess.CompletedProcess(args, 0, "not JSON", "")
-        return entire_runner({"id": 2626939, "slug": "entire"}, [])(args, **kwargs)
+        return base(args, **kwargs)
 
     with pytest.raises(PublishBlocked, match="cannot establish check state"):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
@@ -387,29 +402,24 @@ def test_publisher_transport_refuses_a_repeated_check_run_across_pages(tmp_path,
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=tmp_path, environment=environment)
 
 
-def test_refusal_names_a_failed_status_read_for_a_plain_runner():
-    base = entire_runner({"id": 2626939, "slug": "entire"}, [])
+def test_refusal_names_a_failed_check_run_read_for_a_plain_runner():
+    base = bound_runner([], bound={"headRefOid": HEAD, "statusCheckRollup": DUPLICATE_ROLLUP})
 
     def runner(args, **kwargs):
-        if args[1] == "api" and args[4] == STATUS:
+        if args[1] == "api" and args[4] == CHECK_RUNS:
             return subprocess.CompletedProcess(args, 1, "", "")
         return base(args, **kwargs)
 
     with pytest.raises(PublishBlocked) as refused:
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
-    assert str(refused.value) == "OPSEC: merge refused: cannot establish check state (commit statuses: exit 1)."
+    assert str(refused.value) == "OPSEC: merge refused: cannot establish check state (check runs: exit 1)."
 
 
 def test_refusal_names_a_failed_actions_run_read_with_gh_http_status():
-    details = "https://github.com/unit/public/actions/runs/12/job/22"
     rest = [{"name": "Body guard", "head_sha": HEAD, "status": "completed", "conclusion": "success",
-             "check_suite": {"id": 2}, "app": ACTIONS, "details_url": details}]
-    rollup = [{"__typename": "CheckRun", "name": "Body guard", "status": "COMPLETED", "conclusion": "SUCCESS",
-               "detailsUrl": details}] * 2
-    documents = {f"repos/unit/public/commits/{HEAD}/check-runs?filter=all&per_page=100":
-                 {"total_count": 1, "check_runs": rest}}
-    base = entire_runner({"id": 2626939, "slug": "entire"}, [], extra_documents=documents,
-                         bound={"headRefOid": HEAD, "statusCheckRollup": rollup})
+             "check_suite": {"id": 2}, "app": ACTIONS, "details_url": DUPLICATE_DETAILS}]
+    documents = {CHECK_RUNS: {"total_count": 1, "check_runs": rest}}
+    base = bound_runner([], documents=documents, bound={"headRefOid": HEAD, "statusCheckRollup": DUPLICATE_ROLLUP})
 
     def runner(args, **kwargs):
         if args[1] == "api" and args[4] == "repos/unit/public/actions/runs/12":
@@ -423,7 +433,7 @@ def test_refusal_names_a_failed_actions_run_read_with_gh_http_status():
 
 
 def test_refusal_names_a_read_that_raised():
-    base = entire_runner({"id": 2626939, "slug": "entire"}, [])
+    base = bound_runner([])
 
     def runner(args, **kwargs):
         if "headRefOid,statusCheckRollup" in args:
@@ -458,20 +468,20 @@ def test_refusal_names_how_the_checks_read_failed(returncode, stdout, stderr, na
 ])
 def test_refusal_names_an_invalid_shape_or_says_no_read_failed(bound, named):
     rollup = {"headRefOid": "b" * 40, "statusCheckRollup": BOUND_ROLLUP} if bound is None else bound
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, [], bound=rollup)
+    runner = bound_runner([], bound=rollup)
     with pytest.raises(PublishBlocked) as refused:
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
     assert str(refused.value) == f"OPSEC: merge refused: cannot establish check state ({named})."
 
 
-def test_refusal_names_a_status_read_of_the_wrong_shape():
-    base = entire_runner({"id": 2626939, "slug": "entire"}, [])
+def test_refusal_names_a_check_run_read_of_the_wrong_shape():
+    base = bound_runner([], bound={"headRefOid": HEAD, "statusCheckRollup": DUPLICATE_ROLLUP})
 
     def runner(args, **kwargs):
-        if args[1] == "api" and args[4] == STATUS:
-            return subprocess.CompletedProcess(args, 0, json.dumps({"statuses": []}), "")
+        if args[1] == "api" and args[4] == CHECK_RUNS:
+            return subprocess.CompletedProcess(args, 0, json.dumps({"check_runs": []}), "")
         return base(args, **kwargs)
 
     with pytest.raises(PublishBlocked) as refused:
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
-    assert str(refused.value) == "OPSEC: merge refused: cannot establish check state (commit statuses: invalid shape)."
+    assert str(refused.value) == "OPSEC: merge refused: cannot establish check state (check runs: invalid shape)."

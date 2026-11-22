@@ -14,9 +14,8 @@ FAIL-CLOSED: if the PR, its draft flag or its check states can't be determined
 (gh error/timeout, no PR number), block the command.
 
 A red check blocks regardless of whether GitHub calls it required: "required" is a
-config accident, red is red. So EVERY check counts unless it is a ci.yml advisory job, or an
-operator-switched-off external check proven by GitHub App identity at the PR head
-(scripts/ci/advisory_checks.py); a display name alone never exempts anything.
+config accident, red is red. So EVERY check counts: no ci.yml job and no external check
+is advisory (lu_machinery/ci/advisory_checks.py), and no display name exempts anything.
 
 SCOPE, stated honestly: this is a discipline gate, not a sandbox. It matches the shapes a
 careless merge actually takes — direct, wrapper-prefixed, `bash -c` wrapped, and xargs-fed
@@ -1450,7 +1449,7 @@ def _repo_name(value: str) -> str | None:
 def _judged_repo(pr: str, repo: str | None, data: object) -> str | None:
     """``owner/repo`` of PR metadata that is the PR this command names, else None.
 
-    An exemption trusts the metadata's head, so its own number and URL, and the command's
+    The check judgment trusts the metadata's head, so its own number and URL, and the command's
     number, URL and ``--repo`` selectors, must all name the same PR first. A branch
     selector names no number; the metadata must still agree with itself and ``--repo``.
     """
@@ -1607,7 +1606,7 @@ def _judge(args: list[str], cwd: str | None = None) -> str | None:
     if reason == "check states unverifiable":
         return _block_msg(
             f"could not verify PR {pr} check states (gh error, timeout, an unrecognized check state, "
-            "or an external check whose GitHub App provenance at the PR head is unproven)",
+            "or check rows not bound to the PR head)",
             "An unverifiable merge is refused, not assumed safe. Re-read the checks with\n"
             "`gh pr checks` and retry once gh answers.",
         )

@@ -42,6 +42,102 @@ assert read_only_snapshot_digest(None, {})['pre']['entries'] == 0
     assert result.returncode == 0, result.stderr
 
 
+def test_task_log_expiry_requires_every_run_old_settled_and_unheld(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from lu_machinery.maintenance import task_log_retention
+    from lu_machinery.orchestration.task_record_store import task_state_lock
+
+    tasks = tmp_path / "tasks"
+    archive = tasks / "archive"
+    logs = tasks / "logs"
+    archive.mkdir(parents=True)
+    logs.mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    hold_list = tmp_path / "holds.json"
+    hold_list.write_text('{"schema":"batch-state-retention.v1","holds":[]}')
+    monkeypatch.setattr(task_log_retention, "RETENTION_LIST", hold_list)
+    monkeypatch.setattr(task_log_retention, "worker_liveness", lambda record: record["task_id"] == "still-live")
+    provider_alive = task_log_retention.worker._provider_alive
+    monkeypatch.setattr(task_log_retention.worker, "_provider_alive", lambda record: (
+        record["task_id"] == "live-provider" if record.get("launch_mode") == "scope" else provider_alive(record)
+    ))
+    now = datetime.now(UTC)
+    old = now - timedelta(days=8)
+
+    def write_record(where: Path, task_id: str, *, name: str | None = None, **changes: object) -> None:
+        record: dict[str, object] = dict(schema_version=2, task_id=task_id, status="done", finished_at=old.isoformat(),
+                                        pid=None, provider_pgid=None)
+        record.update(changes)
+        (where / (name or f"{task_id}.json")).write_text(json.dumps(record))
+
+    write_record(tasks, "settled.v2", pid=101, launch_mode="scope")
+    write_record(archive, "settled.v2")
+    write_record(archive, "archived-only")
+    write_record(tasks, "reused", status="running")
+    write_record(archive, "reused")
+    write_record(tasks, "held", worktree_retention_hold=True)
+    write_record(tasks, "archived-hold")
+    write_record(archive, "archived-hold", name="archived-hold.20260925T120000Z.7.archived.json",
+                 worktree_retention_hold=True)
+    write_record(tasks, "malformed-hold", worktree_retention_hold="false")
+    write_record(tasks, "recent")
+    write_record(archive, "recent", finished_at=now.isoformat())
+    write_record(tasks, "unknown-finish", finished_at="2026-09-25T12:00:00")
+    write_record(tasks, "still-live", pid=102, launch_mode="scope")
+    write_record(tasks, "live-provider", pid=103, launch_mode="scope")
+    write_record(tasks, "unknown-fallback", launch_mode="popen-fallback")
+    write_record(tasks, "busy")
+    write_record(tasks, "bad-archive")
+    (archive / "bad-archive.json").write_text("{")
+    write_record(tasks, "symlink")
+    write_record(tasks, "recent-write")
+    old_logs = {
+        "settled.v2.stdout.log", "settled.v2.stderr.log", "archived-only.stderr.log", "reused.stdout.log",
+        "held.stderr.log", "archived-hold.stdout.log", "malformed-hold.stdout.log", "recent.stdout.log",
+        "still-live.stderr.log", "busy.stderr.log", "bad-archive.stderr.log", "missing.stdout.log",
+        "live-provider.stdout.log", "unknown-finish.stderr.log", "unknown-fallback.stderr.log", "unrecognized.log",
+    }
+    for name in old_logs:
+        (logs / name).write_text("dispatch output")
+        os.utime(logs / name, (old.timestamp(), old.timestamp()))
+    (logs / "recent-write.stdout.log").write_text("new dispatch output")
+    (logs / "symlink.stdout.log").symlink_to(logs / "held.stderr.log")
+    (logs / "directory.stderr.log").mkdir()
+
+    eligible = ["archived-only.stderr.log", "settled.v2.stderr.log", "settled.v2.stdout.log"]
+    before = {entry.name for entry in logs.iterdir()}
+    with task_state_lock(tasks / "busy.json"):
+        assert task_log_retention.main([]) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report == {
+            "mode": "dry-run", "selected": 3, "logs": eligible,
+            "retained": {
+                "log_not_regular": 2, "log_too_recent": 1, "retention_hold": 2, "retention_hold_invalid": 1,
+                "task_finish_unknown": 1, "task_liveness_unproven": 3, "task_lock_busy": 1,
+                "task_not_settled": 1, "task_record_missing": 1, "task_record_unknown": 1,
+                "task_too_recent": 1, "unrecognized_name": 1,
+            },
+        }
+        assert {entry.name for entry in logs.iterdir()} == before
+        assert set(tasks.glob("*.lock")) == {tasks / "busy.json.lock"}
+
+        assert task_log_retention.main(["--apply"]) == 0
+        applied = json.loads(capsys.readouterr().out)
+        assert applied == {**report, "mode": "apply"}
+        assert {entry.name for entry in logs.iterdir()} == before.difference(eligible)
+
+        hold_list.write_text(json.dumps({
+            "schema": "batch-state-retention.v1",
+            "holds": [{"path": "batch_state/tasks/held.json", "reason": "fixture evidence"}],
+        }))
+        assert task_log_retention.main(["--apply", "--summary"]) == 0
+        held = json.loads(capsys.readouterr().out)
+        assert held["selected"] == 0
+        assert held["retained"]["batch_state_hold"] == len(old_logs) - len(eligible) - 1
+        assert {entry.name for entry in logs.iterdir()} == before.difference(eligible)
+
+
 def test_snapshot_digest_preserves_canonical_bytes() -> None:
     assert retention.read_only_snapshot_digest(None, {}) == {
         "pre": {"sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a", "entries": 0},

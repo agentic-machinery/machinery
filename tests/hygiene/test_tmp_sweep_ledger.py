@@ -324,6 +324,10 @@ def test_purge_happens_only_after_the_window(box):
     inside = box.run(apply=True)
     assert inside["purged_entries"] == 0 and inside["quarantine_held_entries"] == 1 and held.location.is_dir()
     box.at(7.1)
+    restricted = box.run(scratch=None, settled_task_only=True, apply=True)
+    assert restricted["purged_entries"] == 0 and held.location.is_dir()
+    assert "pytest_retention" not in restricted
+    assert held.intent["reason"] == "unattributed_scratch"
     dry = box.run()
     assert (dry["purgeable_entries"], dry["bytes_purgeable"]) == (1, held.intent["allocated_bytes"])
     assert dry["projected_free_bytes"] == dry["free_bytes"] + dry["bytes_purgeable"] and held.location.is_dir()

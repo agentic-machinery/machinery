@@ -92,7 +92,7 @@ def utc_now() -> str:
 
 def _run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     if args[:1] == ("push",):
-        from lu_machinery.common.git_credentials import verification_credentials
+        from lu_machinery.common.git_credentials import SelectorError, verification_credentials
         from lu_machinery.dispatcher import write_boundary
 
         try:
@@ -107,6 +107,10 @@ def _run_git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(args, 0, output, "")  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         except write_boundary.Refused as exc:
             return subprocess.CompletedProcess(args, 1, "", str(exc))  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+        except SelectorError as exc:
+            # A transferred origin without a trusted host selector gets no credential and no push:
+            # a typed refusal (its text names no path), never an exception that ends the sweep.
+            return subprocess.CompletedProcess(args, 1, "", f"host deletion refused: {exc}")  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
     return subprocess.run(
         ["git", "-c", "core.hooksPath=/dev/null", *args],
         cwd=repo_root,
@@ -192,7 +196,7 @@ def _worktree_prune(repo_root: Path, *, apply: bool) -> dict[str, Any]:
 
 _PROTECTED_BRANCHES = frozenset({"main", "master"})
 # salvage/* holds work settlement pushed instead of discarding it; only the operator deletes it.
-_PROTECTED_LOCAL_PREFIXES = ("entire/", "salvage/")
+_PROTECTED_LOCAL_PREFIXES = ("salvage/",)
 _REVIEW_CHECKOUT_RE = re.compile(r"^(?:pr|review)-(\d+)(?:-review|-tmp)?$")
 
 

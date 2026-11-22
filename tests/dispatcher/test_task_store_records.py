@@ -5,15 +5,17 @@ import json
 import re
 import signal
 from pathlib import Path
+
 import pytest
+
 from lu_machinery.dispatcher import ownership, store, worker
 from lu_machinery.dispatcher.types import ReviewAttempt, TaskSpec
 from lu_machinery.orchestration.task_record_store import read_task_record
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review import review_lineage
 from tests.dispatcher.conftest import run_git
-from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers import current_sol
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 CURRENT_SOL = current_sol()
 
@@ -318,7 +320,7 @@ def test_failed_record_recovery_types_os_errors_and_keeps_a_removed_tree(tmp_pat
 REPLY = '{"verdict": "REQUEST_CHANGES", "findings": [{"id": "F1"}]}\n'
 
 
-def _review_of_takeover(tmp_path, monkeypatch):
+def _review_of_takeover(tmp_path, monkeypatch, *, review_branch="codex/inherited"):
     """A running takeover author (publish branch unlike its worktree branch) and its done review at its head."""
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
     monkeypatch.delenv(worker.write_boundary.BROKER_ENV, raising=False)
@@ -335,7 +337,7 @@ def _review_of_takeover(tmp_path, monkeypatch):
         "stranger": dict(status="running", run_nonce="s1", worktree_branch="codex/inherited",
                          worktree_path=str(tree)),
         "author-review": dict(status="done", run_nonce="r1", parent_task_id="author", mode="read-only",
-                              review_branch="codex/inherited", pinned_head=head,
+                              review_branch=review_branch, pinned_head=head,
                               result_file=str(tmp_path / "tasks/author-review.result"),
                               result_sha256=hashlib.sha256(REPLY.encode()).hexdigest()),
     }.items():
@@ -344,14 +346,23 @@ def _review_of_takeover(tmp_path, monkeypatch):
     return tree
 
 
-def test_takeover_author_reads_its_own_exact_head_review_reply(tmp_path, monkeypatch):
-    """Defect (#1075): a takeover worker's wait returned its review's metadata without the sealed reply."""
-    _review_of_takeover(tmp_path, monkeypatch)
+@pytest.mark.parametrize("review_branch", ["codex/inherited", "codex/author"])
+def test_takeover_author_reads_its_own_exact_head_review_reply(tmp_path, monkeypatch, review_branch):
+    """Defect: a takeover worker is refused its sealed reply when the review is on its new branch."""
+    _review_of_takeover(tmp_path, monkeypatch, review_branch=review_branch)
     monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
     record, code = worker.wait("author-review", "r1", reply=True)
-    assert (code, record["result"], record.get("result_unavailable")) == (0, REPLY, None)
+    assert (code, record.get("result"), record.get("result_unavailable")) == (0, REPLY, None)
     # Without --reply the output stays an exact copy of the record (saved wait output, task_record_store).
     assert worker.wait("author-review", "r1")[0] == json.loads((tmp_path / "tasks/author-review.json").read_text())
+
+
+def test_takeover_author_gets_no_review_reply_for_another_branch(tmp_path, monkeypatch):
+    """A matching head cannot authorize a reply on a branch outside the parent's recorded branches."""
+    _review_of_takeover(tmp_path, monkeypatch, review_branch="codex/other")
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
+    record, _code = worker.wait("author-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, "review_not_of_parent_branch")
 
 
 def test_unrelated_worker_gets_no_review_reply(tmp_path, monkeypatch):

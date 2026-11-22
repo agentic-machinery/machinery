@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from lu_machinery.common import git_credentials
+from lu_machinery.orchestration.fleet_repos import SELECTOR_ENV, load_fleet_repos
 from lu_machinery.orchestration.safe_git_context import GIT, SafeGitContext, SnapshotRefusal
 
 
@@ -31,6 +33,20 @@ def source(tmp_path):
     git(repo, "add", "-A")
     git(repo, "commit", "-m", "base")
     return repo, remote, git(repo, "rev-parse", "HEAD")
+
+
+def select_slugs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **active: str) -> None:
+    """Install a trusted read-only host selector choosing each transferred row's slug (default: its github)."""
+    rows = {key: row for key, row in load_fleet_repos().items() if row.has_alternate_slug}
+    directory = tmp_path / "host-selector"
+    directory.mkdir()
+    selector = directory / "selector.yaml"
+    slugs = "".join(f"  {key}: {active.get(key, row.github)}\n" for key, row in rows.items())
+    selector.write_text(f"version: 1\nactive_slugs:\n{slugs}", encoding="utf-8")
+    selector.chmod(0o400)
+    directory.chmod(0o500)
+    monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
+    monkeypatch.setenv(SELECTOR_ENV, str(selector))
 
 
 def context(source, tmp_path, **kwargs):
@@ -250,12 +266,11 @@ def test_sparse_capture_preserves_absent_skip_worktree_entries(source, tmp_path)
 @pytest.mark.parametrize(
     "url", ["ssh://github.com/repo", "ext::program", "https://example.com/other", "kimi-push-disabled://blocked"]
 )
-def test_noncanonical_destination_refused(source, tmp_path, url):
+def test_noncanonical_destination_refused(source, tmp_path, monkeypatch, url):
     from dataclasses import replace
 
-    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
-
     repo, _remote, _head = source
+    select_slugs(tmp_path, monkeypatch)
     private = load_fleet_repos()["infra-private"]
     with pytest.raises(SnapshotRefusal, match="rescue_push_url_unavailable"):
         SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, repository=private, origin=url)
@@ -270,10 +285,9 @@ def test_noncanonical_destination_refused(source, tmp_path, url):
         SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path)
 
 
-def test_destination_is_derived_from_the_explicit_registered_repository(source, tmp_path):
-    from lu_machinery.orchestration.fleet_repos import load_fleet_repos
-
+def test_destination_is_derived_from_the_explicit_registered_repository(source, tmp_path, monkeypatch):
     repo, _remote, _head = source
+    select_slugs(tmp_path, monkeypatch)
     repos = load_fleet_repos()
     machinery = repos["machinery"]
     machinery_origin = f"https://github.com/{machinery.github}.git"
@@ -294,6 +308,29 @@ def test_destination_is_derived_from_the_explicit_registered_repository(source, 
         assert safe.repository == private.github
         assert safe.checked("config", f"http.{origin}.extraHeader").startswith("Authorization: Basic ")
         assert safe.run("config", f"http.{machinery_origin}.extraHeader").returncode == 1
+
+
+@pytest.mark.parametrize("origin_slug", ["learn-ukrainian/machinery", "agentic-machinery/machinery", "evil-org/machinery"])
+def test_rescue_origin_binds_either_baked_slug_and_pushes_to_the_active_one(source, tmp_path, monkeypatch, origin_slug):
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted; the credential goes to the active slug only."""
+    repo, _remote, _head = source
+    machinery = load_fleet_repos()["machinery"]
+    select_slugs(tmp_path, monkeypatch, machinery="agentic-machinery/machinery")
+    origin = f"https://github.com/{origin_slug}.git"
+
+    if origin_slug not in machinery.slugs:
+        with pytest.raises(SnapshotRefusal, match="rescue_push_url_unavailable"):
+            SafeGitContext(objects=repo / ".git/objects", temp_root=tmp_path, repository=machinery, origin=origin)
+        return
+    with SafeGitContext(
+        objects=repo / ".git/objects", temp_root=tmp_path, repository=machinery, origin=origin, token="synthetic",
+    ) as safe:
+        active = "https://github.com/agentic-machinery/machinery.git"
+        assert safe.checked("config", "remote.origin.url") == active
+        assert safe.checked("config", f"http.{active}.extraHeader").startswith("Authorization: Basic ")
+        # The other baked slug redirects to the active one; the header must never follow a redirect.
+        assert safe.checked("config", "http.followRedirects") == "false"
 
 
 def test_source_repository_exclusions_are_preserved_as_data(source, tmp_path):

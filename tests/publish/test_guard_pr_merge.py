@@ -2096,15 +2096,13 @@ def test_issue_9480_consecutive_cd_matches_bash(monkeypatch, tmp_path, suffix):
     assert _judged_cwds(monkeypatch, command) == [("5", oracle.stdout.strip())]
 
 
-# --- OO-48 external advisory provenance (#11184) ------------------------------------------
+# --- Head-bound check judgment ------------------------------------------------------------
 
-_ENTIRE_ROWS = json.dumps(
-    [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": "Entire Gates", "bucket": "pending"}]
-)
-_ENTIRE_RUN = {"name": "Entire Gates", "head_sha": _HEAD, "app": {"id": 2626939, "slug": "entire"}}
+_VENDOR_APP = {"id": 987654, "slug": "example-vendor-app"}
+_VENDOR_NAME = "Vendor check"
+_GREEN_ROWS = json.dumps([{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}])
 _BOUND_ROLLUP = [
     {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI"},
-    {"__typename": "CheckRun", "name": "Entire Gates", "status": "IN_PROGRESS", "conclusion": "", "workflowName": ""},
 ]
 _BOUND = ("pr", "view", "5", "--json", "headRefOid,statusCheckRollup")
 _META = {"number": 5, "headRefOid": _HEAD, "url": _URL}
@@ -2127,18 +2125,14 @@ def _scripted_gh(monkeypatch, replies: dict):
     return calls
 
 
-def _provenance_replies(head=_HEAD, runs=(_ENTIRE_RUN,), bound_head=_HEAD):
+def _bound_replies(bound_head=_HEAD, rollup=_BOUND_ROLLUP):
     return {
-        ("pr", "checks"): (8, _ENTIRE_ROWS),
-        _BOUND: (0, json.dumps({"headRefOid": bound_head, "statusCheckRollup": _BOUND_ROLLUP})),
-        ("api", "--method", "GET", f"repos/owner/repo/commits/{head}/status?per_page=100"): (
-            0, json.dumps({"total_count": 0, "statuses": []})),
-        ("api", "--method", "GET", f"repos/owner/repo/commits/{head}/check-runs?check_name=Entire%20Gates"
-         "&filter=all&per_page=100"): (0, json.dumps({"total_count": len(runs), "check_runs": list(runs)})),
+        ("pr", "checks"): (0, _GREEN_ROWS),
+        _BOUND: (0, json.dumps({"headRefOid": bound_head, "statusCheckRollup": rollup})),
     }
 
 
-def test_oo48_check_states_prove_at_the_judged_metadata_head(monkeypatch):
+def test_check_states_bind_canonical_check_urls_distinct_from_vendor_details(monkeypatch):
     """The legacy hook must bind canonical check URLs distinct from vendor details."""
     old = {"name": "Body guard", "head_sha": _HEAD, "status": "completed", "conclusion": "cancelled",
            "started_at": "2026-10-23T20:00:00Z", "check_suite": {"id": 1},
@@ -2146,19 +2140,16 @@ def test_oo48_check_states_prove_at_the_judged_metadata_head(monkeypatch):
            "details_url": "https://github.com/owner/repo/actions/runs/11/job/21"}
     current = {**old, "conclusion": "success", "started_at": "2026-10-23T21:00:00Z",
                "check_suite": {"id": 2}, "details_url": "https://github.com/owner/repo/actions/runs/12/job/22"}
-    rest = [current, old, {**_ENTIRE_RUN, "status": "in_progress", "conclusion": "", "id": 24,
-                           "html_url": "https://github.com/owner/repo/runs/24",
-                           "details_url": "https://entire.com/gh/owner/repo/trails/7"}]
+    rest = [current, old, {"name": _VENDOR_NAME, "head_sha": _HEAD, "app": _VENDOR_APP, "status": "completed",
+                           "conclusion": "success", "id": 24, "html_url": "https://github.com/owner/repo/runs/24",
+                           "details_url": "https://example.invalid/gh/owner/repo/trails/7"}]
     rollup = [{"__typename": "CheckRun", "name": row["name"], "status": row["status"].upper(),
                "conclusion": str(row.get("conclusion") or "").upper(),
                "detailsUrl": row.get("html_url", row["details_url"])}
               for row in rest]
     rollup.append({"__typename": "StatusContext", "context": "external-status", "state": "SUCCESS"})
-    replies = _provenance_replies()
+    replies = _bound_replies(rollup=rollup)
     replies[("pr", "checks")] = (1, "", _GH_246_CHECKS_JSON_GAP)
-    replies[_BOUND] = (0, json.dumps({"headRefOid": _HEAD, "statusCheckRollup": rollup}))
-    replies[("api", "--method", "GET", f"repos/owner/repo/commits/{_HEAD}/status?per_page=100")] = (
-        0, json.dumps({"total_count": 1, "statuses": [{"context": "external-status", "state": "success"}]}))
     replies[("api", "--method", "GET", f"repos/owner/repo/commits/{_HEAD}/check-runs?filter=all&per_page=100")] = (
         0, json.dumps({"total_count": len(rest), "check_runs": rest}))
     replies[("api", "--method", "GET", "repos/owner/repo/actions/runs/12")] = (
@@ -2166,20 +2157,20 @@ def test_oo48_check_states_prove_at_the_judged_metadata_head(monkeypatch):
     replies[("api", "--method", "GET", "repos/owner/repo/actions/runs/11")] = (
         0, json.dumps({"id": 11, "head_sha": _HEAD, "check_suite_id": 1, "workflow_id": 7, "name": "Body guard"}))
     calls = _scripted_gh(monkeypatch, replies)
-    assert guard._check_states("5", None, None, lambda: _META) == ([], [], 2)
-    assert [call[:2] for call in calls] == [["pr", "checks"], ["pr", "view"], *[["api", "--method"]] * 5]
+    assert guard._check_states("5", None, None, lambda: _META) == ([], [], 3)
+    assert [call[:2] for call in calls] == [["pr", "checks"], ["pr", "view"], *[["api", "--method"]] * 3]
     assert tuple(calls[1]) == _BOUND
 
 
-def test_oo48_moved_head_is_not_proven_by_older_runs(monkeypatch):
+def test_check_states_at_a_moved_metadata_head_are_unverifiable(monkeypatch):
     moved = "b" * 40
-    _scripted_gh(monkeypatch, _provenance_replies(head=moved))
+    _scripted_gh(monkeypatch, _bound_replies())
     assert guard._check_states("5", None, None, lambda: {**_META, "headRefOid": moved}) is None
 
 
-def test_oo48_checks_read_after_a_head_move_are_never_proven(monkeypatch):
+def test_checks_read_after_a_head_move_are_never_proven(monkeypatch):
     # The metadata saw A; by the bound read the PR is at B. Nothing is proven for B with A.
-    calls = _scripted_gh(monkeypatch, _provenance_replies(bound_head="b" * 40))
+    calls = _scripted_gh(monkeypatch, _bound_replies(bound_head="b" * 40))
     assert guard._check_states("5", None, None, lambda: _META) is None
     assert all(call[0] != "api" for call in calls)
 
@@ -2189,14 +2180,14 @@ def test_oo48_checks_read_after_a_head_move_are_never_proven(monkeypatch):
     {**_META, "url": "https://github.com/owner/repo"}, {**_META, "headRefOid": None}, {"headRefOid": _HEAD, "url": _URL},
     {**_META, "number": 77}, {**_META, "url": "https://github.com/owner/repo/pull/77"},
 ])
-def test_oo48_unverifiable_metadata_blocks_the_exemption(monkeypatch, meta):
-    calls = _scripted_gh(monkeypatch, _provenance_replies())
+def test_unverifiable_metadata_makes_check_states_unverifiable(monkeypatch, meta):
+    calls = _scripted_gh(monkeypatch, _bound_replies())
     assert guard._check_states("5", None, None, lambda: meta) is None
     assert all(call[0] != "api" for call in calls)
 
 
-def test_oo48_without_snapshot_metadata_reads_the_pr_itself(monkeypatch):
-    replies = _provenance_replies()
+def test_check_states_without_snapshot_metadata_read_the_pr_itself(monkeypatch):
+    replies = _bound_replies()
     replies[("pr", "view")] = (0, json.dumps({"isDraft": False, "body": "", "number": 5, "headRefOid": _HEAD,
                                               "url": _URL}))
     calls = _scripted_gh(monkeypatch, replies)
@@ -2204,7 +2195,7 @@ def test_oo48_without_snapshot_metadata_reads_the_pr_itself(monkeypatch):
     assert ["pr", "view", "5", "--json", "isDraft,baseRefName,body,headRefOid,number,url"] in calls
 
 
-def test_oo48_snapshot_hands_its_metadata_to_the_check_reader(monkeypatch):
+def test_snapshot_hands_its_metadata_to_the_check_reader(monkeypatch):
     meta = {"isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": _HEAD, "url": _URL}
     seen = []
     monkeypatch.setattr(guard, "_pr_meta", lambda *_args: meta)
@@ -2238,22 +2229,15 @@ def test_pinned_merge_of_a_zero_check_head_is_refused_like_the_publisher(monkeyp
     assert f"PR 5: {reason}." in capsys.readouterr().err
 
 
-def test_oo48_api_failure_or_garbage_is_unproven(monkeypatch):
-    replies = _provenance_replies()
-    replies = {key: ((0, "not json") if key[0] == "api" else value) for key, value in replies.items()}
-    _scripted_gh(monkeypatch, replies)
+def test_garbage_check_run_reply_is_unverifiable(monkeypatch):
+    # A repeated name without workflow identity needs the REST check runs; a garbage reply proves nothing.
+    details = "https://github.com/owner/repo/actions/runs/12/job/22"
+    duplicate = [{"__typename": "CheckRun", "name": "Body guard", "status": "COMPLETED", "conclusion": "SUCCESS",
+                  "detailsUrl": details}] * 2
+    replies = {**_bound_replies(rollup=duplicate), ("api",): (0, "not json")}
+    calls = _scripted_gh(monkeypatch, replies)
     assert guard._check_states("5", None, None, lambda: _META) is None
-
-
-def test_oo48_unproven_pending_entire_gates_blocks_main(monkeypatch, capsys):
-    _scripted_gh(monkeypatch, {
-        **_provenance_replies(runs=({**_ENTIRE_RUN, "app": {"id": 15368, "slug": "github-actions"}},)),
-        ("pr", "view"): (0, json.dumps({"isDraft": False, "body": "", "number": 5, "headRefOid": _HEAD,
-                                         "url": _URL, "baseRefName": "main"})),
-    })
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": _pinned_merge()}})))
-    assert guard.main() == 2
-    assert "GitHub App provenance at the PR head is unproven" in capsys.readouterr().err
+    assert any(call[0] == "api" for call in calls)
 
 
 @pytest.mark.parametrize("rollup", [(1, ""), (0, "not json"), (0, '{"statusCheckRollup": {}}'), (0, "[]")])
@@ -2385,15 +2369,14 @@ def _branch_replies(selector, rollup):
             0, json.dumps({"headRefOid": _HEAD, "statusCheckRollup": rollup})),
         ("pr", "view", selector): (0, json.dumps(meta)),
     }
-    return {**replies, **{key: value for key, value in _provenance_replies().items() if key[0] == "api"}}
+    return replies
 
 
 @pytest.mark.parametrize("selector", [
     "9223372036854775808", "+9223372036854775808", "#9223372036854775808", "#+9223372036854775808",
 ])
-@pytest.mark.parametrize("rollup", [_BOUND_ROLLUP, _BOUND_ROLLUP[:1]], ids=["entire-proven", "green-only"])
-def test_overflow_branch_selector_is_judged_as_the_branch_gh_merges(monkeypatch, selector, rollup):
-    calls = _scripted_gh(monkeypatch, _branch_replies(selector, rollup))
+def test_overflow_branch_selector_is_judged_as_the_branch_gh_merges(monkeypatch, selector):
+    calls = _scripted_gh(monkeypatch, _branch_replies(selector, _BOUND_ROLLUP))
     command = _pinned_merge(selector)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": command}})))
     assert guard.main() == 0
@@ -2411,12 +2394,12 @@ def test_in_range_non_canonical_selector_still_blocks_before_any_gh_read(monkeyp
 
 
 def test_in_range_number_is_still_bound_to_the_metadata_number(monkeypatch, capsys):
-    # gh reads 9223372036854775807 as a PR number; PR 5's metadata does not prove its exemption.
+    # gh reads 9223372036854775807 as a PR number; PR 5's metadata does not prove its green checks.
     selector = "9223372036854775807"
     _scripted_gh(monkeypatch, _branch_replies(selector, _BOUND_ROLLUP))
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": _pinned_merge(selector)}})))
     assert guard.main() == 2
-    assert "GitHub App provenance at the PR head is unproven" in capsys.readouterr().err
+    assert f"could not verify PR {selector} check states" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("selector", ["+9", "#+9", "+0009", "#+0009", "#9", "0009"])

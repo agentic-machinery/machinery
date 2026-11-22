@@ -1371,18 +1371,38 @@ def _transfer_resolution(endpoint, number, reader, cwd, environment):
     ):
         raise ValueError("malformed issue")
     resolved["repository"] = match[1]
-    if not resolved["pull_request"] and resolved["url"].casefold() != (
-        f"https://github.com/{match[1]}/issues/{resolved['number']}".casefold()
+    if not resolved["pull_request"] and not _same_repository_url(
+        resolved["url"], match[1], f"issues/{resolved['number']}"
     ):
         raise ValueError("issue URL does not match its repository")
     return resolved
 
 
-def _transfer_label_connection(query, variables, select, reader, cwd, environment, temp):
+def _same_transfer_identity(current, identity, repository):
+    """Whether two GraphQL label pages belong to the same object.
+
+    Node id and metadata must stay equal across pages; a repository's
+    ``nameWithOwner`` may switch between the requested row's two baked slugs.
+    """
+    if not isinstance(current, dict) or not isinstance(identity, dict) or set(current) != set(identity):
+        return False
+    for key, value in current.items():
+        if key == "nameWithOwner" and repository is not None:
+            if value == identity[key]:
+                continue
+            if not (_same_repository(value, repository) and _same_repository(identity[key], repository)):
+                return False
+        elif value != identity[key]:
+            return False
+    return True
+
+
+def _transfer_label_connection(query, variables, select, reader, cwd, environment, temp, *, repository=None):
     """Every label of one GraphQL label connection: paginated, count-checked and distinct.
 
     ``select`` maps the repository object to (identity fields, label page); the identity must
-    stay the same on every page.
+    stay the same on every page (allowing ``nameWithOwner`` to vary across the requested row's
+    two baked slugs when *repository* is given).
     """
     labels, cursor, identity, total = [], None, None, None
     for _ in range(TRANSFER_LABEL_PAGES):
@@ -1398,7 +1418,11 @@ def _transfer_label_connection(query, variables, select, reader, cwd, environmen
         current, page = select(document["data"]["repository"])
         if identity is None:
             identity, total = current, page["totalCount"]
-        if current != identity or page["totalCount"] != total or type(total) is not int:
+        if (
+            not _same_transfer_identity(current, identity, repository)
+            or page["totalCount"] != total
+            or type(total) is not int
+        ):
             raise ValueError("labels changed while reading")
         names = [node["name"] for node in page["nodes"]]
         if not all(isinstance(label, str) and label for label in names):
@@ -1425,6 +1449,7 @@ def _transfer_repository(endpoint, reader, cwd, environment, temp):
     identity, labels = _transfer_label_connection(
         TRANSFER_REPOSITORY_QUERY, {"owner": owner, "name": name},
         lambda repo: ({key: repo[key] for key in fields}, repo["labels"]), reader, cwd, environment, temp,
+        repository=endpoint["repository"],
     )
     if not isinstance(identity["id"], str) or not identity["id"]:
         raise ValueError("repository id unreadable")
@@ -1448,8 +1473,36 @@ def _missing_labels(labels, present):
     return [name for name in labels if name.casefold() not in kept]
 
 
+def _repository_slugs(repository):
+    """Both baked slugs of a transferred fleet row, else the spelling itself; an unreadable catalog names none."""
+    # Imported here: the fleet catalog stays out of the publisher's import closure.
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, repository_slugs
+
+    try:
+        return repository_slugs(repository)
+    except FleetRepoError:
+        return ()
+
+
 def _same_repository(left, right):
-    return isinstance(left, str) and isinstance(right, str) and left.casefold() == right.casefold()
+    """Whether two owner/name spellings name one repository, ignoring case; either baked slug of a row counts."""
+    # Slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
+    if not isinstance(left, str) or not isinstance(right, str) or not left.isascii() or not right.isascii():
+        return False
+    return left.casefold() == right.casefold() or any(
+        left.casefold() == slug.casefold() for slug in _repository_slugs(right)
+    )
+
+
+def _repository_urls(repository, path):
+    """``https://github.com/<slug>/<path>`` for each baked slug of *repository*."""
+    return tuple(f"https://github.com/{slug}/{path}" for slug in _repository_slugs(repository))
+
+
+def _same_repository_url(url, repository, path):
+    return isinstance(url, str) and url.isascii() and any(
+        url.casefold() == known.casefold() for known in _repository_urls(repository, path)
+    )
 
 
 def _transfer_verify(source, destination, number, moved, receipt, reader, cwd, environment, temp):
@@ -1502,6 +1555,10 @@ def _issue_transfer(fields, *, runner, cwd, environment, capture_output, text):
         raise _transfer_refused("the destination is the source repository")
     if source["privacy"] == "private" and destination["privacy"] != "private":
         raise _transfer_refused("an issue in a private-role repository never moves to a public-role repository")
+    # The result checks bind both endpoints through the fleet registry; prove it binds them
+    # now, before the mutation, so an unreadable registry cannot strand a sent transfer.
+    if not _repository_slugs(source["repository"]) or not _repository_slugs(destination["repository"]):
+        raise _transfer_refused("the fleet registry cannot bind the source or destination repository")
     number = fields["number"]
     environment["GH_HOST"] = "github.com"
     receipt = {
@@ -1664,7 +1721,7 @@ def _transfer_checked(fields, source, destination, receipt, sink, temp, *, runne
             type(moved_number) is not int or moved_number <= 0
             or not isinstance(moved["id"], str) or not re.fullmatch(PATTERNS["node"], moved["id"])
             or not _same_repository(moved["repository"]["nameWithOwner"], destination["repository"])
-            or not _same_repository(moved["url"], f"https://github.com/{destination['repository']}/issues/{moved_number}")
+            or not _same_repository_url(moved["url"], destination["repository"], f"issues/{moved_number}")
         ):
             raise ValueError("the mutation returned another issue or repository")
         # Only a validated URL is recorded, so only a validated URL is probed.
@@ -2003,7 +2060,11 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     if not re.search(identifier, comment):
         raise ValueError("comment must identify its alert")
     links = re.findall(r"https://[^\s<>()]+", comment)
-    pattern = rf"https://github\.com/{re.escape(gh_repo)}/pull/([1-9][0-9]*)(?:#[A-Za-z0-9_-]+)?"
+    known = _repository_slugs(gh_repo)
+    if not known:
+        raise ValueError("the repository is not an exact owner/name or the fleet registry is unreadable")
+    slugs = "|".join(re.escape(slug) for slug in known)
+    pattern = rf"https://github\.com/(?:{slugs})/pull/([1-9][0-9]*)(?:#[A-Za-z0-9_-]+)?"
     prs = {int(match[1]) for link in links if (match := re.fullmatch(pattern, link))}
     explanation = re.sub(identifier, "", re.sub(r"https://[^\s<>()]+", "", comment)).strip(" .,:;\n")
     if dest.partition("/")[0] != "github.com" or len(prs) != 1 or not any(char.isalpha() for char in explanation):
@@ -2022,7 +2083,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
         _parse_utc_timestamp(pr["merged_at"]) - _DISMISS_ANALYSIS_CLOCK_SKEW
         if "merged_at" in pr else None
     )
-    if pr["html_url"] != f"https://github.com/{gh_repo}/pull/{pr_number}":
+    if pr["html_url"] not in _repository_urls(gh_repo, f"pull/{pr_number}"):
         raise ValueError("PR identity changed")
     files = get(f"pulls/{pr_number}/files?per_page=100", pages=True)
     triage_files = [item for item in files if item.get("filename") == _DISMISS_TRIAGE_PATH and item.get("status") in {"added", "modified"}]
@@ -2204,7 +2265,7 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
                     merged = pull["merged"]
                     if (
                         type(pull["number"]) is not int or pull["number"] != n
-                        or pull["url"] != f"https://github.com/{gh_repo}/pull/{n}"
+                        or pull["url"] not in _repository_urls(gh_repo, f"pull/{n}")
                         or not isinstance(state, str) or state not in {"OPEN", "CLOSED", "MERGED"}
                         or type(merged) is not bool
                         or (state == "MERGED") != merged

@@ -9,12 +9,15 @@ import pytest
 import yaml
 
 from lu_machinery.common import git_credentials
+from lu_machinery.orchestration import fleet_repos
 from lu_machinery.orchestration.fleet_repos import (
     SELECTOR_ENV,
+    FleetRepo,
     FleetRepoError,
     canonical_repository,
     clear_repository_cache,
     load_fleet_repos,
+    repository_slugs,
     resolve_active_fleet_repo,
     resolve_fleet_repo,
     resolve_fleet_repo_by_slug,
@@ -24,6 +27,50 @@ from lu_machinery.orchestration.fleet_repos import (
 from lu_machinery.orchestration.fleet_repos import (
     main as fleet_repos_main,
 )
+
+
+def transferred_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    github: str = "org/repo",
+    alternate: str = "neworg/repo",
+    role: str = "public-labs",
+) -> FleetRepo:
+    """Make the cached fleet catalog one transferred row whose two baked slugs are *github* and *alternate*."""
+    row = FleetRepo(
+        key="case", github=github, local_name="repo", role=role, default=True,
+        repository_id=4242, visibility="public", alternate_github=alternate,
+    )
+    monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: {"case": row})
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: {"case": row})
+    return row
+
+
+BOTH = ("org/repo", "neworg/repo")
+
+
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [
+        ("org/repo", BOTH),
+        ("neworg/repo", BOTH),
+        ("NewOrg/Repo", BOTH),
+        ("evil/repo", ("evil/repo",)),
+        ("case", ()),
+        (" org/repo", ()),
+        ("org/repo\n", ()),
+        ("org/repo/extra", ()),
+        ("https://github.com/org/repo", ()),
+        (None, ()),
+        (["org/repo"], ()),
+    ],
+)
+def test_repository_slugs_binds_both_baked_slugs_and_nothing_else(monkeypatch, spelling, expected):
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner (or a key, URL or padded spelling) is accepted."""
+    transferred_catalog(monkeypatch)
+
+    assert repository_slugs(spelling) == expected
 
 
 def test_resolve_public_uses_primary_root(tmp_path: Path):

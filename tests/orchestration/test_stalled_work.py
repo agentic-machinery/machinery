@@ -480,7 +480,9 @@ def test_tick_cadence_and_retry(host):
 
     host.monkeypatch.setattr(mod, "run", run)
     assert mod.tick(args, now=NOW)["errors"] == []
+    assert args.journal_lines == []
     assert mod.tick(args, now=NOW + timedelta(minutes=5))["skipped"] == "cadence"
+    assert args.journal_lines == []
     args.route = True
     assert mod.tick(args, now=NOW + timedelta(minutes=5))["errors"] == []
     assert mod.tick(args, now=NOW + timedelta(minutes=30))["errors"] == []
@@ -488,7 +490,16 @@ def test_tick_cadence_and_retry(host):
     args.state_file.unlink()
     host.monkeypatch.setattr(mod, "run", lambda *a, **k: {"errors": ["unknown"]})
     assert mod.tick(args, now=NOW)["errors"] == ["unknown"]
-    assert not args.state_file.exists()
+    assert args.journal_lines == ["stalled-work: error: unknown"]
+    saved = json.loads(args.state_file.read_text())
+    assert "report" not in saved and "route" not in saved
+    assert mod.tick(args, now=NOW + timedelta(minutes=1))["errors"] == ["unknown"]
+    assert args.journal_lines == []
+    assert mod.tick(args, now=NOW + timedelta(hours=1))["errors"] == ["unknown"]
+    assert args.journal_lines == ["stalled-work: summary: 1 error(s): unknown"]
+    host.monkeypatch.setattr(mod, "run", lambda *a, **k: {"errors": ["other"]})
+    assert mod.tick(args, now=NOW + timedelta(hours=1, minutes=1))["errors"] == ["other"]
+    assert args.journal_lines == ["stalled-work: error: other", "stalled-work: cleared: unknown"]
 
 
 def test_untrusted_copy_cannot_delay_a_trusted_rejection(host):
