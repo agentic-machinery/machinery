@@ -1788,3 +1788,28 @@ def test_escaped_apostrophe_quoting_keeps_secret_print_refusals(monkeypatch, wor
     command = " ".join(f'"{word}"' if word.startswith("$") else _shell_single_quote(word) for word in words)
     assert "'\\''" in command
     assert _run(monkeypatch, command) == 2
+
+
+def test_escaped_apostrophe_fold_keeps_refusal_for_expandable_python_selector(monkeypatch):
+    """Defect class: an expandable word before python's program selector is folded and allowed.
+
+    `"$DOC_PATH"` can expand to an option such as -c that turns the next word into
+    program text, so the folded reread must keep main's refusal.
+    """
+    body = _shell_single_quote("it's done; see #12 | next")
+    command = f'python3 "$DOC_PATH" {body}'
+    assert "'\\''" in command
+    assert _run(monkeypatch, command) == 2
+
+
+def test_escaped_apostrophe_publisher_body_with_command_substitution_text_is_allowed(monkeypatch):
+    """Defect class: a publisher body with `$(` after an escaped apostrophe is refused.
+
+    The process-kill scan read the unfolded words, hit its parse limit and refused
+    a single-quoted body that runs nothing (ML-30CB-APOSTROPHE).
+    """
+    words = ["/venv/bin/python", "-m", "lu_machinery.publish", "pr-comment", "--number", "12", "--body"]
+    words.append("it's literal text: $(not run)")
+    command = " ".join(_shell_single_quote(word) for word in words)
+    assert "'\\''" in command
+    assert _run(monkeypatch, command) == 0
