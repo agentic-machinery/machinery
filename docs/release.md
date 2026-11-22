@@ -506,6 +506,41 @@ checkout with no ownership manifest cannot pass check before apply. Runtime
 subtrees belong in the descriptor's explicit `preserve` list, which cannot
 overlap planned outputs.
 
+#### Agent source contract
+
+Each fleet prompt, rule, skill, contract and hook has one tracked source: its
+file under `agents_extensions/shared/`. Every other representation is derived
+from it and is never edited by hand:
+
+- The `include` lines in `MANIFEST.in` and the `files` keys of
+  `lu_machinery/agent_deploy/release.v1.json` list exactly the tracked files,
+  and the wheel ships them byte for byte.
+  `tests/packaging/test_release_resources.py::test_wheel_omission_or_product_leakage`
+  fails on any difference, so a PR that adds, renames or deletes a source
+  updates all three.
+- The deployer reads fleet sources only from the installed package
+  (`release_inputs`), never from a checkout. It writes generated outputs into the
+  consumer's provider roots (`.claude`, `.codex`, `.agent`, `.agents`, `.cursor`)
+  and records ownership in `.deploy-state/agent-deploy.v1.json`. Consumers ignore
+  those roots and never track them. `--check` reports byte, mode, ownership and
+  retirement drift.
+- AGY core parts and `.agent/rules.json` derive from `rules/core.md`. The
+  bootstrap commands under `required_hooks` derive from
+  `agy_hook_config.native_hook_command`, and
+  `test_release_requires_each_claude_python_guard_as_its_native_command` pins
+  them.
+- Product sources live under the consumer descriptor's `sources`. The deployer
+  refuses a product path that duplicates a fleet path.
+- Machinery is not a deployment consumer. Its `.gitignore` ignores the same
+  output roots, the ownership state and the retired `.gemini` root, so a runtime
+  copy created in a checkout or worktree is never committed.
+
+Intentional exceptions: resources the package reads in place and never deploys
+keep their single tracked copy under `lu_machinery/`. They are the ACPX Grok
+profiles `lu_machinery/agent_runtime/profiles/*.md`, the AGY hook scripts
+`lu_machinery/agy_hooks/*.sh`, `lu_machinery/agent_runtime/codex_hook_entry.sh`
+and `lu_machinery/agent_runtime/claude_acp_exec.sh`.
+
 The product workflow `rules-deployment-check.yml` and its tracked-mirror test in
 `tests/test_deploy_script_idempotency.py` must switch from the old option to
 apply followed by `--check` on an enrolled scratch consumer. The legacy deploy
