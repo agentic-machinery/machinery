@@ -773,7 +773,7 @@ def _host(monkeypatch, tmp_path, interpreter):
     _init_repo(primary)
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
     monkeypatch.setattr(git_module, "resolve_repo", lambda name=None: (primary, {"github": f"learn-ukrainian/{name or 'learn-ukrainian'}"}))
-    monkeypatch.setattr(repo_root, "primary_root", lambda: primary)
+    monkeypatch.setattr(repo_root, "primary_root", lambda *args, **kwargs: primary)
     monkeypatch.setattr(repo_root, "project_interpreter", lambda: interpreter)
     return primary
 

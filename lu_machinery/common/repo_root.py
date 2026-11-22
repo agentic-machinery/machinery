@@ -12,7 +12,8 @@ directory or ``site-packages`` lookup takes part, so a decoy file cannot change 
   modes; never configured, and resource paths stay in the package or its shipped shared resource tree.
 - :func:`product_root`: an explicit argument, else ``LU_PRODUCT_ROOT``; with neither,
   lu_machinery refuses, and only the in-tree copy derives the checkout holding it.
-- :func:`state_root` and :func:`primary_root`: ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``;
+- :func:`state_root` and :func:`primary_root`: ``LU_PRIMARY_REPO_ROOT`` (alias
+  ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``);
   without it, lu_machinery refuses, and only the in-tree copy derives the primary of its
   own checkout (unchanged).
 
@@ -29,19 +30,31 @@ in-tree source copy an unset or empty variable keeps today's value, so the defau
 are the behaviour before the configuration existed.
 
 ========================  ====================================  =================================================
-Root                      Variable                              Default (today's behaviour)
+Root                      Variable (compatibility alias)        Default (today's behaviour)
 ========================  ====================================  =================================================
 runtime (machinery code)  none: the checkout this file is in    ``Path(__file__).parents[2]``
-primary checkout          ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``  ``main_checkout_root`` of the runtime checkout
-GitHub slug               ``LEARN_UKRAINIAN_GITHUB_SLUG``        ``learn-ukrainian/learn-ukrainian.github.io``
-state root                ``LEARN_UKRAINIAN_STATE_ROOT``         the primary checkout (holds ``batch_state/``)
+primary checkout          ``LU_PRIMARY_REPO_ROOT``              ``main_checkout_root`` of the runtime checkout
+                          (``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``)
+GitHub slug               the plane owner's consumer profile,   ``learn-ukrainian/learn-ukrainian.github.io``
+                          ``LU_GITHUB_SLUG``                    when the plane owner has no profile
+                          (``LEARN_UKRAINIAN_GITHUB_SLUG``)
+state root                ``LU_STATE_ROOT``                     the primary checkout (holds ``batch_state/``)
+                          (``LEARN_UKRAINIAN_STATE_ROOT``)
 rules directory (policy)  none: installed release                ``agents_extensions/shared/rules`` beside the package
-interpreter               ``LEARN_UKRAINIAN_PYTHON``             :func:`project_interpreter`'s resolution order
+interpreter               ``LU_PYTHON``                         :func:`project_interpreter`'s resolution order
+                          (``LEARN_UKRAINIAN_PYTHON``)
 ========================  ====================================  =================================================
 
-``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT`` and ``LEARN_UKRAINIAN_PYTHON`` are the names the
-project-state reporter wrapper already reads; the configuration reuses them so one
-setting means one thing everywhere.
+Each ``LU_*`` name is the primary name; its ``LEARN_UKRAINIAN_*`` alias is still read, so a
+host configured before the rename keeps working unchanged. Both set to different values
+refuses (:class:`MachineryConfigError`, naming both), so the two can never select different
+roots. Messages name the variable that was actually read. The project-state reporter wrapper,
+child-process environments and the shell libraries still read and export the alias only.
+
+The GitHub slug has one authority. The plane owner's consumer profile
+(``<state root>/.lu-machinery/profile.v1.json``, read by :mod:`.profile`) and the slug
+variable may both name it only when they agree; a conflict refuses. The default slug is the
+compatibility path for a plane owner without a profile (learn-ukrainian until it commits one).
 
 Path values must be absolute; a relative value raises :class:`MachineryConfigError`
 (a ``ValueError``) rather than resolving against the working directory. The state root
@@ -78,7 +91,7 @@ product files names the product checkout with ``LU_PRODUCT_ROOT`` (a systemd
 API selects it at startup (``scripts.api.config.PRODUCT_ROOT``): served from a release
 snapshot, that is the snapshot itself, never the live checkout.
 
-Shared runtime state is anchored on ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT``, never on the
+Shared runtime state is anchored on ``LU_PRIMARY_REPO_ROOT`` (or its alias), never on the
 selected product: kube-dojo's worktrees and the shared dispatch state live in different
 places. The installed package refuses state-dependent use without that anchor.
 """
@@ -121,17 +134,35 @@ def _install_redacted_environ() -> None:
 
 _install_redacted_environ()
 
+# The configuration names. ``LU_*`` are the primary names; each ``LEARN_UKRAINIAN_*`` name is its
+# compatibility alias and is still read. The constants below keep naming the alias because their
+# importers export it to child processes and shell readers, which read only that name until the
+# propagation step of the consumer profile work (A08.2).
+LU_PRIMARY_ROOT_ENV = "LU_PRIMARY_REPO_ROOT"
+LU_GITHUB_SLUG_ENV = "LU_GITHUB_SLUG"
+LU_STATE_ROOT_ENV = "LU_STATE_ROOT"
+LU_INTERPRETER_ENV = "LU_PYTHON"
 PRIMARY_ROOT_ENV = "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
 GITHUB_SLUG_ENV = "LEARN_UKRAINIAN_GITHUB_SLUG"
 STATE_ROOT_ENV = "LEARN_UKRAINIAN_STATE_ROOT"
 INTERPRETER_ENV = "LEARN_UKRAINIAN_PYTHON"
+# Primary name -> compatibility alias. Both set to different values refuses.
+ENV_ALIASES = {
+    LU_PRIMARY_ROOT_ENV: PRIMARY_ROOT_ENV,
+    LU_GITHUB_SLUG_ENV: GITHUB_SLUG_ENV,
+    LU_STATE_ROOT_ENV: STATE_ROOT_ENV,
+    LU_INTERPRETER_ENV: INTERPRETER_ENV,
+}
 MACHINERY_ENV_VARS = (
     PRIMARY_ROOT_ENV,
     GITHUB_SLUG_ENV,
     STATE_ROOT_ENV,
     INTERPRETER_ENV,
+    *ENV_ALIASES,
 )
 DEFAULT_GITHUB_SLUG = "learn-ukrainian/learn-ukrainian.github.io"
+# The plane owner's consumer profile directory (``common/profile.py`` reads the profile inside it).
+CONSUMER_PROFILE_DIR = ".lu-machinery"
 RULES_DIR_REL = "agents_extensions/shared/rules"
 RUNTIME_ROOT = Path(__file__).resolve().parents[2]
 _MACHINERY_ROOT = Path(__file__).resolve().parents[1]
@@ -186,14 +217,36 @@ def _env(env: Mapping[str, str] | None) -> Mapping[str, str]:
     return os.environ if env is None else env
 
 
-def _configured_path(name: str, env: Mapping[str, str] | None) -> Path | None:
-    """Absolute path named by ``name``, ``None`` when unset or empty; refuse a relative path."""
-    value = _env(env).get(name, "")
-    if not value:
+def _setting(primary: str, env: Mapping[str, str] | None) -> tuple[str, str] | None:
+    """``(name, value)`` of the setting ``primary`` or its alias, ``None`` when both are unset or empty.
+
+    An empty value counts as unset, as before the alias existed. Both set to different values
+    refuses, naming both, so the two names can never select different roots.
+    """
+    alias = ENV_ALIASES[primary]
+    values = _env(env)
+    new, old = values.get(primary, ""), values.get(alias, "")
+    if new and old and new != old:
+        raise MachineryConfigError(
+            f"{primary} and its compatibility alias {alias} are both set to different values; "
+            f"set one, or set both to the same value"
+        )
+    if new:
+        return primary, new
+    if old:
+        return alias, old
+    return None
+
+
+def _configured_path(primary: str, env: Mapping[str, str] | None) -> tuple[str, Path] | None:
+    """``(name, path)`` of the absolute path setting ``primary`` or its alias; refuse a relative path."""
+    setting = _setting(primary, env)
+    if setting is None:
         return None
-    if not os.path.isabs(value):
+    name, value = setting
+    if "\x00" in value or not os.path.isabs(value):
         raise MachineryConfigError(f"{name} must be an absolute path, got {value!r}")
-    return Path(value)
+    return name, Path(value)
 
 
 def configured_primary_root(env: Mapping[str, str] | None = None) -> Path | None:
@@ -206,10 +259,13 @@ def configured_primary_root(env: Mapping[str, str] | None = None) -> Path | None
     stray ``.git`` directory, or no ``.git``) is refused, since anchoring state there
     would split task records from the locks closeout reads (#5171 class).
     """
-    configured = _configured_path(PRIMARY_ROOT_ENV, env)
-    if configured is not None and not _is_primary_git_layout(configured, env):
+    setting = _configured_path(LU_PRIMARY_ROOT_ENV, env)
+    if setting is None:
+        return None
+    name, configured = setting
+    if not _is_primary_git_layout(configured, env):
         raise MachineryConfigError(
-            f"{PRIMARY_ROOT_ENV} must name a primary checkout, not a linked worktree or a stray .git: "
+            f"{name} must name a primary checkout, not a linked worktree or a stray .git: "
             f"{configured}/.git is not a real Git directory of its own"
         )
     return configured
@@ -220,8 +276,11 @@ def _is_primary_git_layout(checkout: Path, env: Mapping[str, str] | None = None)
 
     A Git directory passes Git's own test (``is_git_directory`` in Git's ``setup.c``): a
     valid ``HEAD`` (:func:`_valid_git_head`), an object directory (``objects``, or
-    ``GIT_OBJECT_DIRECTORY`` when the environment names one) and ``refs``. An empty or
-    stray ``.git`` is not one.
+    ``GIT_OBJECT_DIRECTORY`` when the environment names an absolute one) and ``refs``. An
+    empty or stray ``.git`` is not one. A relative ``GIT_OBJECT_DIRECTORY`` names a directory
+    below whatever the caller's working directory is, not a property of this checkout, so it
+    is ignored and the checkout's own ``objects`` decides: the answer never depends on the
+    working directory.
     """
     git_dir = checkout / ".git"
     try:
@@ -231,7 +290,8 @@ def _is_primary_git_layout(checkout: Path, env: Mapping[str, str] | None = None)
         return False
     if os.path.lexists(git_dir / "commondir"):
         return False
-    objects = _env(env).get(_GIT_OBJECT_DIRECTORY_ENV) or git_dir / "objects"
+    override = _env(env).get(_GIT_OBJECT_DIRECTORY_ENV, "")
+    objects = override if os.path.isabs(override) else git_dir / "objects"
     return _valid_git_head(git_dir / "HEAD") and os.path.isdir(objects) and os.path.isdir(git_dir / "refs")
 
 
@@ -268,7 +328,7 @@ def primary_root(start: Path | None = None, env: Mapping[str, str] | None = None
     """The configured primary checkout, else the primary that owns ``start`` (default: the runtime).
 
     The fallback exists only in the in-tree source copy. The installed package requires
-    ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT`` and raises :class:`StateRootError` without it,
+    ``LU_PRIMARY_REPO_ROOT`` (or its alias) and raises :class:`StateRootError` without it,
     whatever ``start`` is: callers pass their own install location there, and a
     ``site-packages`` directory is never a state anchor.
     """
@@ -278,23 +338,86 @@ def primary_root(start: Path | None = None, env: Mapping[str, str] | None = None
     _require_in_tree_default(
         StateRootError,
         "shared-state anchor",
-        f"set {PRIMARY_ROOT_ENV} to the primary checkout that holds batch_state/",
+        f"set {LU_PRIMARY_ROOT_ENV} (or its alias {PRIMARY_ROOT_ENV}) to the primary checkout that holds batch_state/",
     )
     return main_checkout_root(RUNTIME_ROOT if start is None else start)
 
 
-def configured_github_slug(env: Mapping[str, str] | None = None) -> str | None:
-    """The configured ``owner/name`` GitHub slug, or ``None`` when unset or empty."""
-    value = _env(env).get(GITHUB_SLUG_ENV, "")
-    if not value:
+def valid_github_slug(value: object) -> bool:
+    """``value`` is an ``owner/name`` GitHub slug: owner alphanumerics with inner hyphens, a plain name."""
+    return (
+        isinstance(value, str)
+        and _GITHUB_SLUG_RE.fullmatch(value) is not None
+        and value.split("/")[1] not in (".", "..")
+    )
+
+
+def env_github_slug(env: Mapping[str, str] | None = None) -> str | None:
+    """The ``owner/name`` slug set by ``LU_GITHUB_SLUG`` or its alias, ``None`` when unset or empty."""
+    setting = _setting(LU_GITHUB_SLUG_ENV, env)
+    if setting is None:
         return None
-    if not _GITHUB_SLUG_RE.fullmatch(value) or value.split("/")[1] in (".", ".."):
-        raise MachineryConfigError(f"{GITHUB_SLUG_ENV} must be an owner/name GitHub slug, got {value!r}")
+    name, value = setting
+    if not valid_github_slug(value):
+        raise MachineryConfigError(f"{name} must be an owner/name GitHub slug, got {value!r}")
     return value
 
 
+def _profile_reader():
+    """The consumer profile module beside this resolver, imported only when a plane owner may hold a profile.
+
+    It is a sibling in the same package, whatever the package is called. A by-file copy of this
+    resolver outside a package has no profile reader and refuses, rather than ignoring a profile.
+    """
+    try:
+        if not __package__:
+            raise ImportError("loaded outside its package")
+        return importlib.import_module(".profile", __package__)
+    except ImportError as exc:
+        raise MachineryConfigError(f"the consumer profile reader beside this resolver is unavailable: {exc}") from None
+
+
+def _may_hold_profile(env: Mapping[str, str] | None) -> bool:
+    """False only when the plane owner provably has no profile: no owner is configured, or it has no ``.lu-machinery``.
+
+    Anything else, an unreadable owner included, goes to the profile reader, which decides or refuses.
+    """
+    try:
+        owner = state_root(env=env)
+    except StateRootError:
+        return False
+    try:
+        os.lstat(owner / CONSUMER_PROFILE_DIR)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def configured_github_slug(env: Mapping[str, str] | None = None) -> str | None:
+    """The one authoritative ``owner/name`` slug: the plane owner's profile, else the environment.
+
+    The profile (:mod:`.profile`) and ``LU_GITHUB_SLUG`` (or its alias) may both name the slug only
+    when they agree; a conflict refuses before any caller acts on either. ``None`` when neither
+    names one. A plane owner without a ``.lu-machinery`` entry has no profile, so the profile
+    reader is not needed for it.
+    """
+    if _may_hold_profile(env):
+        selected = _profile_reader().load_profile(env=env)
+        if selected is not None:
+            slug: str = selected.github_slug
+            return slug
+    return env_github_slug(env)
+
+
 def github_slug(env: Mapping[str, str] | None = None) -> str:
-    """The configured ``owner/name`` GitHub slug, else this repository's."""
+    """The configured ``owner/name`` GitHub slug, else this repository's.
+
+    ``DEFAULT_GITHUB_SLUG`` is the compatibility path for a plane owner with no consumer profile
+    and no configured slug (learn-ukrainian before its profile lands); a consumer with a profile
+    never reaches it.
+    """
     return configured_github_slug(env) or DEFAULT_GITHUB_SLUG
 
 
@@ -304,16 +427,19 @@ def state_root(start: Path | None = None, env: Mapping[str, str] | None = None) 
     A configured state root must be that same directory (compared after ``realpath``);
     any other value would point state at a new store, which only the operator's state
     cutover may do, so it is refused. The installed package anchors only on a configured
-    ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT`` (see :func:`primary_root`): a configured state
+    ``LU_PRIMARY_REPO_ROOT`` or its alias (see :func:`primary_root`): a configured state
     root alone does not stand in for it.
     """
+    # The state setting is validated first (alias conflict, relative path), so a missing primary
+    # anchor can never hide an invalid one.
+    setting = _configured_path(LU_STATE_ROOT_ENV, env)
     primary = primary_root(start, env)
-    configured = _configured_path(STATE_ROOT_ENV, env)
-    if configured is None:
+    if setting is None:
         return primary
+    name, configured = setting
     if _realpath(configured) != _realpath(primary):
         raise MachineryConfigError(
-            f"{STATE_ROOT_ENV} ({configured}) must be the primary checkout ({primary}); "
+            f"{name} ({configured}) must be the primary checkout ({primary}); "
             "moving dispatch state to another store is the operator's state cutover"
         )
     return configured
@@ -326,7 +452,8 @@ def rules_dir() -> Path:
 
 def configured_interpreter(env: Mapping[str, str] | None = None) -> Path | None:
     """The interpreter named by the configuration, or ``None`` for :func:`project_interpreter`'s order."""
-    return _configured_path(INTERPRETER_ENV, env)
+    setting = _configured_path(LU_INTERPRETER_ENV, env)
+    return None if setting is None else setting[1]
 
 
 @dataclass(frozen=True)
@@ -597,7 +724,7 @@ def project_interpreter(root: Path | None = None, *, env: Mapping[str, str] | No
     imported. Import therefore succeeds when no project interpreter can be
     found; this function raises ``FileNotFoundError`` at the call.
 
-    A configured ``LEARN_UKRAINIAN_PYTHON`` wins for every checkout. It must be an
+    A configured ``LU_PYTHON`` (or its alias ``LEARN_UKRAINIAN_PYTHON``) wins for every checkout. It must be an
     absolute path to an executable file. A relative path raises
     ``MachineryConfigError``. A missing or non-executable file raises
     ``FileNotFoundError``. There is no fallback. The operator who sets it
@@ -612,11 +739,12 @@ def project_interpreter(root: Path | None = None, *, env: Mapping[str, str] | No
     ``sys.executable`` are not used. Anything else raises
     ``FileNotFoundError``.
     """
-    configured = configured_interpreter(env)
-    if configured is not None:
+    setting = _configured_path(LU_INTERPRETER_ENV, env)
+    if setting is not None:
+        name, configured = setting
         if not _executable_file(configured):
             raise FileNotFoundError(
-                f"project interpreter not found: {INTERPRETER_ENV}={configured} is not an executable file"
+                f"project interpreter not found: {name}={configured} is not an executable file"
             )
         return configured
     repo = primary_root(env=env) if root is None else Path(root)
@@ -672,6 +800,15 @@ def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
 
     library = machinery_path("lib/project_interpreter.sh")
     env = {name: os.environ[name] for name in _HOOK_ROOTS_ENV if name in os.environ}
+    # The shell rule reads the compatibility names only: hand it the value of whichever name is set
+    # (a conflict between the two refuses here, before the rule runs).
+    try:
+        for name in (LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV):
+            setting = _setting(name, None)
+            if setting is not None:
+                env[ENV_ALIASES[name]] = setting[1]
+    except MachineryConfigError as exc:
+        raise ProductRootError(f"no hook context resolves from {invocation_dir}: {exc}") from None
     try:
         # Fixed /bin/bash argv; the library path and directory are arguments, never shell text.
         result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
@@ -705,14 +842,14 @@ def configure_native_hook_roots(invocation_dir: Path) -> None:
     ``invocation_dir``, the caller's explicit invocation directory, never a payload's
     working directory), so configured roots get the same Git-metadata checks as the
     generated hook command; a refusal raises :class:`ProductRootError`. Configured
-    ``LU_PRODUCT_ROOT`` and ``LEARN_UKRAINIAN_PRIMARY_REPO_ROOT`` values are kept; only
-    missing ones are set. The in-process validators then run as well. Call it only from
+    ``LU_PRODUCT_ROOT`` and primary-checkout values (``LU_PRIMARY_REPO_ROOT`` or its alias)
+    are kept; only missing ones are set, the primary under its alias name. The in-process validators then run as well. Call it only from
     a hook or launch boundary, never at import.
     """
     product, primary = native_hook_roots(invocation_dir)
     if not os.environ.get(PRODUCT_ROOT_ENV):
         os.environ[PRODUCT_ROOT_ENV] = os.fspath(product)
-    if not os.environ.get(PRIMARY_ROOT_ENV):
+    if _setting(LU_PRIMARY_ROOT_ENV, None) is None:
         os.environ[PRIMARY_ROOT_ENV] = os.fspath(primary)
     product_root()
     state_root()
