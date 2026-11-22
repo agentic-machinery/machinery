@@ -182,7 +182,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Bound review access; full needs --full-checkout (default: isolated for bound attempts)")
     dispatch.add_argument(
         "--force-admission", metavar="REASON",
-        help="Override host admission with a recorded non-empty reason, except disk and subscription pacing (default: off)",
+        help="Override host admission with a recorded non-empty reason, except disk and subscription pacing; "
+        "DISPATCH_DRAIN_DEADLINES_FILE names the operator drain-deadline JSON file that meter pacing reads (default: off)",
     )
     dispatch.add_argument(
         "--task-card", metavar="CARD",
