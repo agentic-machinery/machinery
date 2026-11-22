@@ -6,9 +6,12 @@ probe, never from allocating memory or generating load.
 
 from __future__ import annotations
 
+import http.server
 import json
 import math
 import os
+import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -169,8 +172,9 @@ def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, pro
 
 def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe, monkeypatch):
     """Defect classes: a paced cap above the fixed ceiling or below 1, a cap that ignores measured burn,
-    a cap that moves when a worker finishes without a meter change, and an invalid, missing or expired
-    forecast or unmeasured rate that changes the fixed ceiling."""
+    a cap that moves when a worker finishes without a meter change, and an invalid, missing, expired or
+    unreadable forecast (redirected, failed, short, oversized or slow Monitor reply, or a Monitor URL that is
+    not plain HTTP to an IP literal) or an unmeasured rate that changes the fixed ceiling."""
     now = datetime.now(UTC)
 
     def view(*, pool="claude:b", remaining=27.0, hours=40.0, rate=0.3, samples=120, **row):
@@ -183,8 +187,10 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
     assert adm.meter_cap("claude:b", 8, view(), now) == (
         3, "paced cap: 27% left, 40.0h to reset, 0.3 points per worker-hour over 120 tasks, ceiling 8")
     for forecast, cap in (
-        (view(remaining=24, hours=24, rate=0.5), 2),  # exactly two workers, never lifted to three by float noise
+        (view(remaining=24, hours=24, rate=0.5), 2),
+        (view(remaining=10, hours=30, rate=1 / 3), 1),
         (view(remaining=0.0), 1),
+        (view(remaining=0, hours=1e-9, rate=5e-324), 1),  # nothing left, even when the denominator underflows
         (view(remaining=1, hours=100, rate=1, samples=10), 1),
         (view(remaining=100, rate=0.0001), 8),
         (view(remaining=100, hours=1e-9, rate=5e-324), 8),  # the denominator underflows to zero
@@ -203,13 +209,13 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
         (view(pool="claude:a"), "no single forecast row for this meter"),
         ({**view(), "capacity": view()["capacity"] * 2}, "no single forecast row for this meter"),
         *((view(remaining=value), "remaining allowance unknown")
-          for value in (None, True, "27", math.nan, math.inf, -1, 100.5)),
+          for value in (None, True, "27", math.nan, math.inf, -1, 100.5, 10**309)),
         *((view(reset_at=value), "reset time unknown")
           for value in (None, 7, "", "not a time", "2026-11-23T22:00:00", "2026-11-23T22:00:00+00:00" + " " * 20)),
         (view(hours=0), "reset time passed"),
         (view(hours=-3), "reset time passed"),
         *((view(rate=value), "no measured points per worker-hour")
-          for value in (None, 0, -0.2, False, "0.3", math.nan, math.inf)),
+          for value in (None, 0, -0.2, False, "0.3", math.nan, math.inf, 10**309)),
         *((view(samples=value), "rate measured over fewer than 10 worker tasks")
           for value in (None, 9, 0, -1, True, 10.0, "120")),
     ):
@@ -234,15 +240,66 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
     assert finished.admitted and finished.meter is not None
     assert (finished.meter.live, finished.meter.cap) == (2, 3)
 
-    monkeypatch.setattr(pool_selector, "read_budget", lambda: {})
-    monkeypatch.setattr(host_admission, "read_planning", lambda: view(remaining=4, hours=50, rate=0.1))
-    monkeypatch.setattr(host_admission, "tasks_dir", lambda: tmp_path / "host-tasks")
-    monkeypatch.setattr(adm, "load_thresholds", lambda: limits)
-    spec = SimpleNamespace(mode="workspace-write", agent="claude", model="claude-opus-5-5",
-                           claude_account="b", codex_account=None)
-    result = host_admission.check(spec.mode, dry_run=True, disk_guard=False, spec=spec)
-    assert result.admitted
-    assert "meter claude:b: live write workers 0/1 (paced cap: 4% left, 50.0h to reset" in result.summary()
+    # The dispatcher reads the view from a Monitor; every transport failure is a missing forecast.
+    mode = {"name": "ok"}
+    good = json.dumps(view(remaining=4, hours=50, rate=0.1)).encode()
+    release = threading.Event()  # a stalled reply waits on it until the test ends
+
+    class Monitor(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            name = mode["name"]
+            if name in ("stalled_headers", "stalled_body"):
+                self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                if name == "stalled_body":
+                    self.wfile.write(f"Content-Length: {len(good)}\r\n\r\n".encode() + good[:10])
+                self.wfile.flush()
+                release.wait(10)
+                return
+            body = {"oversize": json.dumps({**view(), "pad": "x" * host_admission.PLANNING_BODY_LIMIT}).encode(),
+                    "not_json": b"{"}.get(name, good)
+            status = {"redirect": 302, "error": 503}.get(name, 200)
+            self.send_response(status)
+            if name == "redirect":
+                self.send_header("Location", self.path)
+            self.send_header("Content-Length", str(len(body) + (10 if name == "short" else 0)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Monitor)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setenv("DELEGATE_MONITOR_API", f"http://127.0.0.1:{server.server_port}/")
+        monkeypatch.setattr(host_admission, "PLANNING_READ_TIMEOUT_S", 0.5)
+        assert host_admission.read_planning() == json.loads(good)
+        for name in ("redirect", "error", "short", "oversize", "not_json", "stalled_headers", "stalled_body"):
+            mode["name"] = name
+            started = time.monotonic()
+            assert host_admission._monitor_json(host_admission.read_planning) is None, name
+            assert time.monotonic() - started < 2, name
+        for base in ("", "https://127.0.0.1:1", "file:///dev/zero", "http://user@127.0.0.1:1",
+                     "http://127.0.0.1:1/?q", "http://127.0.0.1:1/#f", "http://monitor.invalid:1", "http://127.0.0.1:x"):
+            monkeypatch.setenv("DELEGATE_MONITOR_API", base)
+            with pytest.raises(ValueError):
+                host_admission._planning_origin()
+        mode["name"] = "ok"
+        monkeypatch.setenv("DELEGATE_MONITOR_API", f"http://127.0.0.1:{server.server_port}")
+        monkeypatch.setattr(pool_selector, "read_budget", lambda: {})
+        monkeypatch.setattr(host_admission, "tasks_dir", lambda: tmp_path / "host-tasks")
+        monkeypatch.setattr(adm, "load_thresholds", lambda: limits)
+        spec = SimpleNamespace(mode="workspace-write", agent="claude", model="claude-opus-5-5",
+                               claude_account="b", codex_account=None)
+        result = host_admission.check(spec.mode, dry_run=True, disk_guard=False, spec=spec)
+        assert result.admitted
+        assert "meter claude:b: live write workers 0/1 (paced cap: 4% left, 50.0h to reset" in result.summary()
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
 
 
 def test_grok_and_cursor_share_one_meter(tmp_path, probe):

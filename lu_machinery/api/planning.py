@@ -544,7 +544,7 @@ def forecast(snap: MeterSnapshot, rates: Mapping[str, Any], *, now: datetime) ->
             "workers_needed": workers, "worker_samples": samples,
             # Pool points per worker-hour over the trailing week of write tasks: dispatch admission paces
             # each meter with it, and one worker finishing does not move it the way burn per live worker does.
-            "points_per_worker_hour": round(rate, 4) if rate is not None and rate >= 0 else None,
+            "points_per_worker_hour": rate if rate is not None and rate >= 0 else None,
         })
     return rows
 

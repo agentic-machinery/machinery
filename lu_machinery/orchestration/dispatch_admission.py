@@ -1208,9 +1208,13 @@ def _meter_defer(meter: str, budget: Mapping[str, Any], now: datetime) -> MeterD
 
 
 def _forecast_number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)  # a JSON integer beyond the float range raises OverflowError
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tuple[int, str]:
@@ -1250,9 +1254,9 @@ def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tupl
     if type(samples) is not int or samples < _MIN_RATE_SAMPLES:
         return ceiling, f"fixed cap: rate measured over fewer than {_MIN_RATE_SAMPLES} worker tasks"
     denominator = hours * rate
-    workers = remaining / denominator if denominator > 0 else math.inf
-    # Rounding first keeps float noise from lifting an exact whole number to the next worker.
-    cap = ceiling if not workers < ceiling else min(ceiling, max(1, math.ceil(round(workers, 9))))
+    # Nothing left needs no worker, even when the denominator underflows to zero.
+    workers = 0.0 if remaining == 0 else remaining / denominator if denominator > 0 else math.inf
+    cap = ceiling if not workers < ceiling else min(ceiling, max(1, math.ceil(workers)))
     return cap, (
         f"paced cap: {remaining:g}% left, {hours:.1f}h to reset, {rate:g} points per worker-hour "
         f"over {samples} tasks, ceiling {ceiling}"
