@@ -10,13 +10,12 @@ remote ref names, the names and messages of the annotated tags on the way from
 each sent id (nested tags included) and the whole raw messages of every commit
 reachable from the sent ids, with the tag names and messages embedded in their
 mergetag headers, are scanned through check_texts, except commits reachable
-from the head of the default branch of the registered public repository the
-push goes to (already public), and only when every commit object reachable
-from it hashes to its id. That repository is the catalogue row the push
-destination names; an unregistered or ambiguous destination excludes nothing. That head comes from one GitHub API read per push;
-nothing is cached between pushes, and nothing the destination reports is
-evidence of what it already has. Enumeration ignores replacement objects,
-grafts and commit-graph files, a grafted repository is refused, a shallow one
+from the default branch of the registered public destination or of the
+registered public parent of a fork owned by the authenticated publisher.
+The scanner excludes that history only when every commit object reachable
+from the GitHub-reported head hashes to its id. Nothing cached between pushes
+or advertised by the Git transport establishes what is public. Enumeration
+ignores replacement objects, grafts and commit-graph files. A grafted repository is refused, a shallow one
 is refused when a boundary commit is inside the scan set, an alternate shallow
 file is refused, and the scan's own git calls run without tracing or prompts.
 File contents are not scanned. A deletion publishes no text.
@@ -57,7 +56,7 @@ DELETE = b"(delete)"
 # The canonical public repository's default branch and the id form GitHub reports for its head.
 PUBLIC_DEFAULT_BRANCH = "main"
 PUBLIC_HEAD = re.compile(r"[0-9a-f]{40}")
-# Bound on the one public repository read of a push.
+# Timeout for the typed public repository reads.
 API_TIMEOUT = 10
 # Seconds the whole scan may take before the push is refused; LU_OPSEC_PUSH_SCAN_TIMEOUT overrides it.
 SCAN_TIMEOUT = 300
@@ -322,13 +321,7 @@ class Repository:
 
 
 class CanonicalPublicRepository:
-    """The default-branch head of a registered public repository, read through the typed publisher reads.
-
-    The repository comes from the catalogue, never from the push URL or local
-    git configuration alone (from_catalog), and the answer comes from the GitHub API. Only a
-    well-formed reply bound to the question counts; a failure, timeout, rate
-    limit, 404 or malformed or inconsistent body is no answer.
-    """
+    """Resolve public history through the catalogue and the typed publisher."""
 
     def __init__(self, repo: str, environment: dict[str, str], *, runner=None, timeout: int = API_TIMEOUT):
         self.repo = repo
@@ -336,49 +329,88 @@ class CanonicalPublicRepository:
         self.runner = runner
         self.timeout = timeout
         self.calls = 0
+        self._fork_parent_head: str | None = None
 
-    @classmethod
-    def from_catalog(cls, environment: dict[str, str], destination: str) -> CanonicalPublicRepository | None:
-        """The registered public repository the push goes to, or None, which excludes nothing.
-
-        destination (the push URL's canonical host/owner/name) only selects
-        among catalogue rows: it must equal the repository of exactly one row
-        whose role is public ("public-..."), and the repository asked about
-        is that row's. Whatever a row selects, only commits its verified
-        public default-branch history holds are ever excluded, so a forged
-        or rewritten URL can at most pick another public history. An unknown,
-        unregistered, private or ambiguous destination selects nothing.
-        """
+    def from_catalog(self) -> CanonicalPublicRepository | None:
+        """Select the public destination or its verified public parent."""
+        destination = self.repo
         if destination == "unknown":
             return None
         rows = [
-            repo
+            (gate.normalize_repository(str(row.get("github", ""))), str(row.get("role", "")).startswith("public-"))
             for row in gate.catalog().values()
-            if str(row.get("role", "")).startswith("public-")
-            and (repo := gate.normalize_repository(str(row.get("github", "")))) == destination
         ]
-        return cls(rows[0], environment) if len(rows) == 1 else None
+        matches = [public for repo, public in rows if repo == destination]
+        if matches:
+            # Keep the registered-destination rule: exactly one public row.
+            return self if matches.count(True) == 1 else None
+        if gate.normalize_repository(destination) != destination:
+            return None
+        host, owner, name = destination.split("/")
+        if host != "github.com" or owner in {".", ".."} or name in {".", ".."}:
+            return None
+
+        try:
+            from lu_machinery.common.github_client import parse_graphql_envelope
+
+            result = self._read("fork-public-head")
+            observation = getattr(result, "github_result", None)
+            if result.returncode != 0 or (observation is not None and observation.stale):
+                return None
+            data = parse_graphql_envelope(result.stdout)["data"]
+            repository = data["repository"]
+            viewer = data["viewer"]["login"]
+            slug = repository["nameWithOwner"]
+            if (
+                repository["isFork"] is not True
+                or not viewer.isascii()
+                or viewer.lower() != owner
+                or not slug.isascii()
+                or slug.lower() != f"{owner}/{name}"
+            ):
+                return None
+            parent = repository["parent"]
+            parent_slug = parent["nameWithOwner"]
+            if not parent_slug.isascii() or parent["visibility"] != "PUBLIC":
+                return None
+            parent_repo = f"github.com/{parent_slug.lower()}"
+            if [public for repo, public in rows if repo == parent_repo] != [True]:
+                return None
+            oid = parent["defaultBranchRef"]["target"]["oid"]
+            if not isinstance(oid, str) or PUBLIC_HEAD.fullmatch(oid) is None:
+                return None
+        except Exception:
+            return None
+        self.repo = parent_repo
+        self._fork_parent_head = oid
+        return self
+
+    def _read(self, operation: str) -> subprocess.CompletedProcess[str]:
+        from lu_machinery.publish.github import read
+
+        self.calls += 1
+        result: subprocess.CompletedProcess[str] = read(
+            operation,
+            repo=self.repo,
+            runner=self.runner,
+            env=dict(self.environment),
+            capture_output=True,
+            text=True,
+            timeout=self.timeout,
+        )
+        return result
 
     def default_head(self) -> str | None:
-        """The commit the public default branch names now, or None without a bound answer.
+        """Return the verified fork-parent head or read the registered destination's head.
 
-        The reply must name this repository (nameWithOwner), the default branch
+        For a registered destination the reply must name the repository, the default branch
         by its expected name, and a 40-character lowercase hex commit id, with
         no GraphQL errors.
         """
-        self.calls += 1
+        if self._fork_parent_head is not None:
+            return self._fork_parent_head
         try:
-            from lu_machinery.publish.github import read
-
-            result = read(
-                "default-head",
-                repo=self.repo,
-                runner=self.runner,
-                env=dict(self.environment),
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
+            result = self._read("default-head")
             body = json_depth.loads(result.stdout, max_depth=512)
             repository = body["data"]["repository"]
             branch = repository["defaultBranchRef"]
@@ -686,9 +718,8 @@ def scan_push(
 
     arguments are the hook's (remote name, URL) and data its whole input.
     public_repository reports the canonical public default-branch head; by
-    default it is the catalogue's public repository the destination names
-    (from_catalog), built only when the push sends commits. transport, for a
-    caller that scans before its own push, is the Git every scan query runs
+    default it is selected by from_catalog only when the push sends commits.
+    transport, for a caller that scans before its own push, is the Git every scan query runs
     with; by default that is the hook's own environment.
     """
     if len(arguments) != 2:
@@ -717,8 +748,10 @@ def scan_push(
         grafted, boundaries = repository.layout(object_format)
         if grafted:
             raise gate.PublishBlocked("OPSEC: grafted history present; push refused.")
-        if public_repository is None:
-            public_repository = CanonicalPublicRepository.from_catalog(dict(os.environ), dest)
+        public_lookup = public_repository
+        if public_lookup is None:
+            public_lookup = CanonicalPublicRepository(dest, dict(os.environ))
+            public_repository = public_lookup.from_catalog()
         head, state = public_history(repository, public_repository, object_format)
         exclusion = f"^{head}\n" if state == "present" else ""
         stdin = "".join(f"{sha}\n" for sha in tips) + exclusion
@@ -746,7 +779,7 @@ def scan_push(
                 owners.append(sha)
         print(
             f"OPSEC: push scan: {len(pending)} commit(s) scanned; public default-branch head {state} "
-            f"({getattr(public_repository, 'calls', 0)} public repository call(s)).",
+            f"({getattr(public_lookup, 'calls', 0)} public repository call(s)).",
             file=sys.stderr,
         )
     first = len(texts) - len(owners)
