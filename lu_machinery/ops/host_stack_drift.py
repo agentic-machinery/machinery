@@ -61,7 +61,6 @@ _PROBES: dict[str, tuple[tuple[str, ...], str]] = {
     "grok": (("grok", "--version"), "grok"),
     "cursor-agent": (("cursor-agent", "--version"), "cursor-agent"),
     "agy": (("agy", "--version"), "agy"),
-    "entire": (("entire", "--version"), "entire"),
     "gh": (("gh", "--version"), "gh"),
     "uv": (("uv", "--version"), "uv"),
     "node": (("node", "--version"), "node"),
@@ -290,10 +289,6 @@ def _default_run(argv: tuple[str, ...], deadline: float) -> str:
             case ("agy", "--version"):
                 completed = subprocess.run(
                     ["agy", "--version"], capture_output=True, text=True, timeout=timeout, check=False
-                )
-            case ("entire", "--version"):
-                completed = subprocess.run(
-                    ["entire", "--version"], capture_output=True, text=True, timeout=timeout, check=False
                 )
             case ("gh", "--version"):
                 completed = github_run(

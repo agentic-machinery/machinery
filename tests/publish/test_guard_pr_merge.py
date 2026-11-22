@@ -2096,18 +2096,29 @@ def test_issue_9480_consecutive_cd_matches_bash(monkeypatch, tmp_path, suffix):
     assert _judged_cwds(monkeypatch, command) == [("5", oracle.stdout.strip())]
 
 
-# --- OO-48 external advisory provenance (#11184) ------------------------------------------
+# --- External advisory provenance ---------------------------------------------------------
 
-_ENTIRE_ROWS = json.dumps(
-    [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": "Entire Gates", "bucket": "pending"}]
+_ADVISORY_APP = {"id": 987654, "slug": "example-advisory-app"}
+_ADVISORY_NAME = "External Advisory"
+_ADVISORY_ROWS = json.dumps(
+    [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": _ADVISORY_NAME, "bucket": "pending"}]
 )
-_ENTIRE_RUN = {"name": "Entire Gates", "head_sha": _HEAD, "app": {"id": 2626939, "slug": "entire"}}
+_ADVISORY_RUN = {"name": _ADVISORY_NAME, "head_sha": _HEAD, "app": _ADVISORY_APP}
 _BOUND_ROLLUP = [
     {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI"},
-    {"__typename": "CheckRun", "name": "Entire Gates", "status": "IN_PROGRESS", "conclusion": "", "workflowName": ""},
+    {"__typename": "CheckRun", "name": _ADVISORY_NAME, "status": "IN_PROGRESS", "conclusion": "", "workflowName": ""},
 ]
 _BOUND = ("pr", "view", "5", "--json", "headRefOid,statusCheckRollup")
 _META = {"number": 5, "headRefOid": _HEAD, "url": _URL}
+
+
+def _enable_synthetic_advisory(monkeypatch):
+    from lu_machinery.ci import advisory_checks
+
+    entry = advisory_checks.ExternalAdvisoryCheck(
+        name=_ADVISORY_NAME, app_id=_ADVISORY_APP["id"], app_slug=_ADVISORY_APP["slug"], decision="TEST-1"
+    )
+    monkeypatch.setattr(advisory_checks, "EXTERNAL_ADVISORY_CHECKS", (entry,))
 
 
 def _scripted_gh(monkeypatch, replies: dict):
@@ -2127,28 +2138,29 @@ def _scripted_gh(monkeypatch, replies: dict):
     return calls
 
 
-def _provenance_replies(head=_HEAD, runs=(_ENTIRE_RUN,), bound_head=_HEAD):
+def _provenance_replies(head=_HEAD, runs=(_ADVISORY_RUN,), bound_head=_HEAD):
     return {
-        ("pr", "checks"): (8, _ENTIRE_ROWS),
+        ("pr", "checks"): (8, _ADVISORY_ROWS),
         _BOUND: (0, json.dumps({"headRefOid": bound_head, "statusCheckRollup": _BOUND_ROLLUP})),
         ("api", "--method", "GET", f"repos/owner/repo/commits/{head}/status?per_page=100"): (
             0, json.dumps({"total_count": 0, "statuses": []})),
-        ("api", "--method", "GET", f"repos/owner/repo/commits/{head}/check-runs?check_name=Entire%20Gates"
+        ("api", "--method", "GET", f"repos/owner/repo/commits/{head}/check-runs?check_name=External%20Advisory"
          "&filter=all&per_page=100"): (0, json.dumps({"total_count": len(runs), "check_runs": list(runs)})),
     }
 
 
-def test_oo48_check_states_prove_at_the_judged_metadata_head(monkeypatch):
+def test_external_advisory_check_states_prove_at_the_judged_metadata_head(monkeypatch):
     """The legacy hook must bind canonical check URLs distinct from vendor details."""
+    _enable_synthetic_advisory(monkeypatch)
     old = {"name": "Body guard", "head_sha": _HEAD, "status": "completed", "conclusion": "cancelled",
            "started_at": "2026-10-23T20:00:00Z", "check_suite": {"id": 1},
            "app": {"id": 15368, "slug": "github-actions"},
            "details_url": "https://github.com/owner/repo/actions/runs/11/job/21"}
     current = {**old, "conclusion": "success", "started_at": "2026-10-23T21:00:00Z",
                "check_suite": {"id": 2}, "details_url": "https://github.com/owner/repo/actions/runs/12/job/22"}
-    rest = [current, old, {**_ENTIRE_RUN, "status": "in_progress", "conclusion": "", "id": 24,
+    rest = [current, old, {**_ADVISORY_RUN, "status": "in_progress", "conclusion": "", "id": 24,
                            "html_url": "https://github.com/owner/repo/runs/24",
-                           "details_url": "https://entire.com/gh/owner/repo/trails/7"}]
+                           "details_url": "https://example.invalid/gh/owner/repo/trails/7"}]
     rollup = [{"__typename": "CheckRun", "name": row["name"], "status": row["status"].upper(),
                "conclusion": str(row.get("conclusion") or "").upper(),
                "detailsUrl": row.get("html_url", row["details_url"])}
@@ -2171,13 +2183,15 @@ def test_oo48_check_states_prove_at_the_judged_metadata_head(monkeypatch):
     assert tuple(calls[1]) == _BOUND
 
 
-def test_oo48_moved_head_is_not_proven_by_older_runs(monkeypatch):
+def test_external_advisory_moved_head_is_not_proven_by_older_runs(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
     moved = "b" * 40
     _scripted_gh(monkeypatch, _provenance_replies(head=moved))
     assert guard._check_states("5", None, None, lambda: {**_META, "headRefOid": moved}) is None
 
 
-def test_oo48_checks_read_after_a_head_move_are_never_proven(monkeypatch):
+def test_external_advisory_checks_read_after_a_head_move_are_never_proven(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
     # The metadata saw A; by the bound read the PR is at B. Nothing is proven for B with A.
     calls = _scripted_gh(monkeypatch, _provenance_replies(bound_head="b" * 40))
     assert guard._check_states("5", None, None, lambda: _META) is None
@@ -2189,13 +2203,15 @@ def test_oo48_checks_read_after_a_head_move_are_never_proven(monkeypatch):
     {**_META, "url": "https://github.com/owner/repo"}, {**_META, "headRefOid": None}, {"headRefOid": _HEAD, "url": _URL},
     {**_META, "number": 77}, {**_META, "url": "https://github.com/owner/repo/pull/77"},
 ])
-def test_oo48_unverifiable_metadata_blocks_the_exemption(monkeypatch, meta):
+def test_external_advisory_unverifiable_metadata_blocks_the_exemption(monkeypatch, meta):
+    _enable_synthetic_advisory(monkeypatch)
     calls = _scripted_gh(monkeypatch, _provenance_replies())
     assert guard._check_states("5", None, None, lambda: meta) is None
     assert all(call[0] != "api" for call in calls)
 
 
-def test_oo48_without_snapshot_metadata_reads_the_pr_itself(monkeypatch):
+def test_external_advisory_without_snapshot_metadata_reads_the_pr_itself(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
     replies = _provenance_replies()
     replies[("pr", "view")] = (0, json.dumps({"isDraft": False, "body": "", "number": 5, "headRefOid": _HEAD,
                                               "url": _URL}))
@@ -2204,7 +2220,7 @@ def test_oo48_without_snapshot_metadata_reads_the_pr_itself(monkeypatch):
     assert ["pr", "view", "5", "--json", "isDraft,baseRefName,body,headRefOid,number,url"] in calls
 
 
-def test_oo48_snapshot_hands_its_metadata_to_the_check_reader(monkeypatch):
+def test_external_advisory_snapshot_hands_its_metadata_to_the_check_reader(monkeypatch):
     meta = {"isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": _HEAD, "url": _URL}
     seen = []
     monkeypatch.setattr(guard, "_pr_meta", lambda *_args: meta)
@@ -2238,16 +2254,18 @@ def test_pinned_merge_of_a_zero_check_head_is_refused_like_the_publisher(monkeyp
     assert f"PR 5: {reason}." in capsys.readouterr().err
 
 
-def test_oo48_api_failure_or_garbage_is_unproven(monkeypatch):
+def test_external_advisory_api_failure_or_garbage_is_unproven(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
     replies = _provenance_replies()
     replies = {key: ((0, "not json") if key[0] == "api" else value) for key, value in replies.items()}
     _scripted_gh(monkeypatch, replies)
     assert guard._check_states("5", None, None, lambda: _META) is None
 
 
-def test_oo48_unproven_pending_entire_gates_blocks_main(monkeypatch, capsys):
+def test_external_advisory_unproven_pending_check_blocks_main(monkeypatch, capsys):
+    _enable_synthetic_advisory(monkeypatch)
     _scripted_gh(monkeypatch, {
-        **_provenance_replies(runs=({**_ENTIRE_RUN, "app": {"id": 15368, "slug": "github-actions"}},)),
+        **_provenance_replies(runs=({**_ADVISORY_RUN, "app": {"id": 15368, "slug": "github-actions"}},)),
         ("pr", "view"): (0, json.dumps({"isDraft": False, "body": "", "number": 5, "headRefOid": _HEAD,
                                          "url": _URL, "baseRefName": "main"})),
     })
@@ -2391,8 +2409,9 @@ def _branch_replies(selector, rollup):
 @pytest.mark.parametrize("selector", [
     "9223372036854775808", "+9223372036854775808", "#9223372036854775808", "#+9223372036854775808",
 ])
-@pytest.mark.parametrize("rollup", [_BOUND_ROLLUP, _BOUND_ROLLUP[:1]], ids=["entire-proven", "green-only"])
+@pytest.mark.parametrize("rollup", [_BOUND_ROLLUP, _BOUND_ROLLUP[:1]], ids=["advisory-proven", "green-only"])
 def test_overflow_branch_selector_is_judged_as_the_branch_gh_merges(monkeypatch, selector, rollup):
+    _enable_synthetic_advisory(monkeypatch)
     calls = _scripted_gh(monkeypatch, _branch_replies(selector, rollup))
     command = _pinned_merge(selector)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": command}})))
@@ -2412,6 +2431,7 @@ def test_in_range_non_canonical_selector_still_blocks_before_any_gh_read(monkeyp
 
 def test_in_range_number_is_still_bound_to_the_metadata_number(monkeypatch, capsys):
     # gh reads 9223372036854775807 as a PR number; PR 5's metadata does not prove its exemption.
+    _enable_synthetic_advisory(monkeypatch)
     selector = "9223372036854775807"
     _scripted_gh(monkeypatch, _branch_replies(selector, _BOUND_ROLLUP))
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": _pinned_merge(selector)}})))
