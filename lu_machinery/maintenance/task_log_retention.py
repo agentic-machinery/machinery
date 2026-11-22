@@ -245,7 +245,11 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as error:
         print(json.dumps({"error": "task_log_inventory_unavailable", "kind": type(error).__name__}))
         return 1
-    report = {"mode": "apply" if args.apply else "dry-run", "selected": len(eligible), "retained": dict(retained)}
+    report: dict[str, object] = {
+        "mode": "apply" if args.apply else "dry-run",
+        "selected": len(eligible),
+        "retained": dict(retained),
+    }
     if not args.summary:
         report["logs"] = eligible
     print(json.dumps(report, sort_keys=True))
