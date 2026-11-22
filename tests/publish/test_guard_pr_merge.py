@@ -1379,10 +1379,12 @@ def test_repo_is_propagated_to_every_gh_lookup(monkeypatch):
 )
 def test_private_repo_merge_requires_both_pins(monkeypatch, capsys, command, reason):
     monkeypatch.setattr(guard, "_pr_snapshot", lambda *a, **kw: pytest.fail("unpinned merge reached PR lookup"))
-    assert _run(monkeypatch, command, pr="689") == 2
-    stderr = capsys.readouterr().err
-    assert reason in stderr
-    assert "--match-head <approved SHA> --expect-queue <verified true|false>" in stderr
+    variants = [command, command.replace(" pr-merge ", " -- pr-merge ", 1)] if " pr-merge " in command else [command]
+    for variant in variants:
+        assert _run(monkeypatch, variant, pr="689") == 2
+        stderr = capsys.readouterr().err
+        assert reason in stderr
+        assert "--match-head <approved SHA> --expect-queue <verified true|false>" in stderr
 
 
 # --- codex re-review round 4 (PR #5324): pflag shorthands + shell escaping ---
@@ -2487,7 +2489,7 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
             0,
         ),
         (
-            ".venv/bin/python -B -m scripts.publish.__main__ pr-comment --number 7 --body-file=- <<'EOF'\n"
+            ".venv/bin/python -B -m scripts.publish.__main__ -- pr-comment --number 7 --body-file=- <<'EOF'\n"
             "Use `gh pr merge` after review.\nEOF",
             ["CI Gate"],
             0,

@@ -981,7 +981,7 @@ def test_hook_recognises_typed_merge(monkeypatch):
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
     for prefix in (
-        [sys.executable, "--check-hash-based-pycs", "always", "-Im", "lu_machinery.publish"],
+        [sys.executable, "--check-hash-based-pycs", "always", "-Im", "lu_machinery.publish", "--"],
         ["/fixture/bin with space/python3.14", "-Wignore", "-X", "dev", "-mlu_machinery.publish.__main__"],
     ):
         merge = guard._merge_args([
