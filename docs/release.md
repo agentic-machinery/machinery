@@ -177,6 +177,46 @@ Python interpreter to uv and disables interpreter downloads. The
 post-release version bump refreshes `uv.lock` against the registry from that
 same environment.
 
+## Install and action inventory
+
+The inventory for [#1144](https://github.com/learn-ukrainian/machinery/issues/1144)
+covers production workflows, composite actions, release and test tooling, and
+current setup instructions. Historical examples and test fixtures are outside
+the inventory.
+
+| Install path | Dependency and execution controls |
+| --- | --- |
+| [CI Gate](../.github/workflows/ci-gate.yml) and [pytest](../.github/workflows/tests.yml) Python jobs | Locked, wheel-only syncs into runner scratch for lint, mypy, Semgrep, dependency audit, attribution and test dependencies. Build tools use explicit wheel hashes. Built machinery wheels install offline with a hash of the artifact built in the job. |
+| CI Gate product consumer | The pinned product checkout supplies `uv.lock`. A wheel-only sync installs the locked build tools first. The second sync builds the Git-pinned `ipa-uk` and the checkout's `learn-ukrainian-v4-runtime` using those tools in the product scratch venv. The candidate machinery wheel installs offline in a separate venv. |
+| [Release cut](../lu_machinery/release_cut.py) and [contract canary](../lu_machinery/review/contract_canary.py) | Build-tool hashes and the locked runtime wheel export cover the wheelhouse. The cut installs the candidate offline in a scratch venv. The canary installs the exact built wheel with dependencies disabled and a verified hash. |
+| ACPX release prefix and CI pytest provisioning | `npm ci --ignore-scripts` reads the packaged `package-lock.json` in a separate prefix. Sealing verifies cached archives against the lock. The documented offline restore uses the retained cache and the same lock. |
+| [Dispatched site dependencies](../lu_machinery/dispatcher/site_deps.py) | `npm ci` reads the target checkout's site lock into a staging directory with a fresh home. The lock determines reuse of the resulting tree. |
+| [Clean-machine drill](../drill/clean-machine/README.md), [filesystem parity probe](../lu_machinery/ci/linux_fs_parity.sh), [attribution](runbooks/agent-attribution.md) and [venv repair](../lu_machinery/hygiene/check_venv_integrity.py) | The drill checks the published wheel against `SHA256SUMS` and installs from the hashed consumer lock. The parity probe verifies its uv archive and installs from a hashed lock export in a container. Attribution and venv repair use hashed pip requirements. |
+| [CI scanner and uv downloads](../.github/workflows/pins.txt) | CI checks scanner and uv archive SHA-256 values before use, including scanner cache hits. The fleet security jobs run scanners with a cleared environment and a temporary home. |
+
+The five workflows and two composite actions contain 44 external `uses`
+references. Each pins a full commit SHA. The five workflows start with
+`permissions: {}`. CodeQL's SARIF upload has the sole write grant
+(`security-events: write` on its analysis job). The install jobs use
+read-scoped tokens and disable persisted checkout credentials.
+
+`uv lock --check` and `uv sync --locked` reject stale locks. The current
+`uv.lock` records a seven-day cutoff, with the first-party release wheel
+exception described above. `npm ci` rejects manifest and lock mismatches.
+Dependabot applies the seven-day cooldown to grouped npm and Actions version
+updates. Under the pinned npm 10 release, runtime installs use the committed
+lock, and the cooldown applies at update time through Dependabot.
+
+The following native inputs still need a scope or exception decision on
+[#1144](https://github.com/learn-ukrainian/machinery/issues/1144). The
+[pytest bootstrap](../lu_machinery/ci/setup_bubblewrap.sh) verifies the
+bubblewrap package hash, but missing PostgreSQL and libpq packages and
+transitive native dependencies can resolve from signed Ubuntu repositories.
+The filesystem parity probe defaults to a mutable container tag. The pytest
+Node setup selects a Node 22 patch through `.nvmrc`. CI's managed Python and
+Node downloads use the upstream toolchain distribution paths. These paths
+need a native toolchain disposition before claiming full coverage.
+
 ## Cut a release
 
 Run one command on the host, outside a dispatched worker. It needs `gh` and
@@ -335,11 +375,13 @@ order:
      head, against the product commit in `.github/workflows/product-consumer.pin`.
      Using the job's single checksum-verified `UV_VERSION`, it installs the
      product pin's `.python-version` CPython via `uv python install --no-bin`
-     and runs `uv sync --locked` from that commit's `uv.lock` with the
+     and syncs from that commit's `uv.lock` with the
      product CI exclusions (skipping `torch`, `torchvision`, `open-clip-torch`,
-     `stanza`, and `lu-machinery`), then builds v4 runtime assets and creates
-     the candidate wheel venv on that product Python so the overlay matches the
-     release cut's ABI and runtime. `LEARN_UKRAINIAN_PYTHON` names the candidate
+     `stanza`, and `lu-machinery`). The wheel-only pass installs the locked
+     build tools. The second locked pass uses them to build the source
+     dependencies. The job then builds v4 runtime assets and creates the
+     candidate wheel venv on the same Python so the overlay matches the release
+     cut's ABI and runtime. `LEARN_UKRAINIAN_PYTHON` names the candidate
      interpreter. The job then runs the pin's key consumer tests and reports
      the pin and the wheel's SHA-256. The pin never follows product `main`.
      Bump it in its own PR to a product commit whose CI Gate passed, and update
