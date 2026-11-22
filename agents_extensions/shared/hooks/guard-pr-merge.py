@@ -43,6 +43,10 @@ from typing import NamedTuple
 
 # Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
 _PAYLOAD_MAX_DEPTH = 512
+# The installed publisher and its legacy CLI alias both run the same command.
+_PUBLISHER = "lu_machinery.publish"
+_PUBLISHER_PACKAGES = (_PUBLISHER, "scripts.publish")
+_PUBLISHER_MODULES = {name for package in _PUBLISHER_PACKAGES for name in (package, f"{package}.__main__")}
 
 
 def _read_payload() -> dict | None:
@@ -68,7 +72,9 @@ def _command(payload: dict) -> str:
 def _merge_candidate(command: str) -> bool:
     """Conservative bootstrap/failure probe, never a merge decision."""
     probe = command.replace("\\\n", "").replace("\\", "").replace("'", "").replace('"', "")
-    return ("gh" in probe or "lu_machinery.publish" in probe) and "pr" in probe and "merge" in probe
+    return "pr" in probe and "merge" in probe and (
+        "gh" in probe or any(package in probe for package in _PUBLISHER_PACKAGES)
+    )
 
 
 def _plain_pr_read(command: str) -> bool:
@@ -100,11 +106,6 @@ if __name__ == "__main__":
     ):
         sys.exit(0)
 
-
-# The merge rules' module, by import name; under a checkout its package is the directory of the
-# same dotted path (this hook is outside the machinery package). The publisher is that package.
-_MERGE_GUARD_MODULE = "lu_machinery.publish.merge_guard"
-_PUBLISHER = _MERGE_GUARD_MODULE.rpartition(".")[0]
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -638,6 +639,31 @@ def _quote_after_line(line: str, quote: str) -> str:
     return quote
 
 
+def _publisher_args(argv: list[str], *, literal_stdin: bool = False) -> list[str] | None:
+    """Read the publisher verb and arguments at CPython's module boundary."""
+    if not argv or re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(argv[0]).name) is None:
+        return None
+    args = iter(argv[1:])
+    for arg in args:
+        if arg == "--check-hash-based-pycs":
+            if next(args, None) not in {"default", "always", "never"}:
+                return None
+            continue
+        # -W, -X and -m can take an attached operand, including after a short option cluster.
+        # Help, version, -c and scripts cannot start a publisher module invocation.
+        option = re.fullmatch(r"-([bBdEiIOPqRsStuvx]*)(?:([WXm])(.*))?", arg, re.DOTALL)
+        if not option or arg == "-":
+            return None
+        flags, takes_value, attached = option.groups()
+        if literal_stdin and "i" in flags:
+            return None
+        if takes_value:
+            value = attached or next(args, None)
+            if takes_value == "m":
+                return list(args) if value in _PUBLISHER_MODULES else None
+    return None
+
+
 def _literal_heredoc_data_reader(line: str) -> bool:
     """Prove wrapper-free commands consume stdin as literal data."""
     if any(char in line for char in ";&()$`"):
@@ -670,39 +696,29 @@ def _literal_heredoc_data_reader(line: str) -> bool:
     if argv[0] in {"cat", "tee", "wc", "head"} or argv == ["sort"]:
         return True
 
-    def stdin_option(options: set[str]) -> bool:
+    def stdin_option(args: list[str], options: set[str]) -> bool:
         return any(
-            (arg in options and argv[index + 1 : index + 2] == ["-"])
+            (arg in options and args[index + 1 : index + 2] == ["-"])
             or any(arg == option + "=-" for option in options if option.startswith("--"))
             or ("-F" in options and arg == "-F-")
-            for index, arg in enumerate(argv)
+            for index, arg in enumerate(args)
         )
 
     if argv[:2] == ["git", "commit"]:
-        return stdin_option({"-F", "--file"})
+        return stdin_option(argv[2:], {"-F", "--file"})
     if argv[:2] in (["gh", "pr"], ["gh", "issue"]) and argv[2:3] in (
         ["create"],
         ["comment"],
         ["edit"],
         ["merge"],
     ):
-        return stdin_option({"--body-file", "-F"})
-    return (
-        re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(argv[0]).name) is not None
-        and argv[1:3] == ["-m", _PUBLISHER]
-        and argv[3:4]
-        in (
-            ["pr-create"],
-            ["pr-edit"],
-            ["pr-comment"],
-            ["pr-merge"],
-            ["issue-create"],
-            ["issue-edit"],
-            ["issue-comment"],
-            ["comment-edit"],
-        )
-        and stdin_option({"--body-file"})
-    )
+        return stdin_option(argv[3:], {"--body-file", "-F"})
+    publisher = _publisher_args(argv, literal_stdin=True)
+    if not publisher:
+        return False
+    return publisher[0] in {
+        "pr-create", "pr-edit", "pr-comment", "pr-merge", "issue-create", "issue-edit", "issue-comment", "comment-edit",
+    } and stdin_option(publisher[1:], {"--body-file"})
 
 
 def _without_quoted_heredoc_data(command: str, *, executable: bool = False) -> str:
@@ -1129,14 +1145,10 @@ def _merge_args(seg: list[str]) -> _MergeArgs | None:
         # The prefix scan stopped on a wrapper option it cannot place, so nothing shows
         # where the command begins. A merge mentioned anywhere after it is refused.
         return _MergeArgs([_UNREADABLE_MARKER]) if _merge_candidate(shlex.join(seg[i:])) else None
-    if (
-        i + 3 < len(seg)
-        and re.fullmatch(r"python(?:3(?:\.\d+)?)?", Path(seg[i]).name)
-        and seg[i + 1 : i + 4] == ["-m", _PUBLISHER, "pr-merge"]
-    ):
-        args = []
-        pins = {}
-        rest = seg[i + 4 :]
+    publisher = _publisher_args(seg[i:])
+    if publisher and publisher[0] == "pr-merge":
+        fields = {}
+        rest = publisher[1:]
         j = 0
         while j < len(rest):
             if rest[j] in {"--help", "-h"} and not via_xargs:
@@ -1149,15 +1161,16 @@ def _merge_args(seg: list[str]) -> _MergeArgs | None:
                 if j >= len(rest):
                     return _MergeArgs([_UNREADABLE_MARKER])
                 value = rest[j]
-            if key == "--number":
-                args.append(value)
-            elif key in {"--match-head", "--expect-queue"}:
-                pins[key] = value
-            else:
-                args.append(key + "=" + value)
+            fields[key] = value
             j += 1
+        # The publisher's scalar options use argparse's last-value precedence.
+        args = [fields["--number"]] if "--number" in fields else []
+        args.extend(
+            key + "=" + value for key, value in fields.items()
+            if key in {"--repo", "--subject", "--body", "--body-file"}
+        )
         # The publisher validates the resolved values and checks both pins on the live PR.
-        if not pins.get("--match-head") or not pins.get("--expect-queue"):
+        if not fields.get("--match-head") or not fields.get("--expect-queue"):
             return _MergeArgs(args, "MERGE_PINS_REQUIRED")
         if via_xargs and _pr_selector(args) is None:
             return _MergeArgs([_UNREADABLE_MARKER])

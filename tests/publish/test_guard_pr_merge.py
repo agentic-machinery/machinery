@@ -1366,8 +1366,15 @@ def test_repo_is_propagated_to_every_gh_lookup(monkeypatch):
     "command,reason",
     [
         ("gh pr merge 689 -R owner/private-infra --squash", "RAW_MERGE_REQUIRES_PUBLISHER"),
-        (f"{_PUBLISHER_MERGE} --repo owner/private-infra --number 689 --expect-queue=true", "MERGE_PINS_REQUIRED"),
-        (f"{_PUBLISHER_MERGE} --repo owner/private-infra --number 689 --match-head={_HEAD}", "MERGE_PINS_REQUIRED"),
+        (
+            "python -I -m lu_machinery.publish pr-merge --repo owner/private-infra --number 689 --expect-queue=true",
+            "MERGE_PINS_REQUIRED",
+        ),
+        (
+            f'"/fixture/bin with space/python3.14" -IBm scripts.publish pr-merge '
+            f"--repo owner/private-infra --number 689 --match-head={_HEAD}",
+            "MERGE_PINS_REQUIRED",
+        ),
     ],
 )
 def test_private_repo_merge_requires_both_pins(monkeypatch, capsys, command, reason):
@@ -2480,7 +2487,8 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
             0,
         ),
         (
-            ".venv/bin/python -m lu_machinery.publish pr-comment --number 7 --body-file=- <<'EOF'\nUse `gh pr merge` after review.\nEOF",
+            ".venv/bin/python -B -m scripts.publish.__main__ pr-comment --number 7 --body-file=- <<'EOF'\n"
+            "Use `gh pr merge` after review.\nEOF",
             ["CI Gate"],
             0,
         ),

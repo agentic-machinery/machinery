@@ -980,10 +980,13 @@ def test_hook_recognises_typed_merge(monkeypatch):
     spec = importlib.util.spec_from_file_location("r5_guard", ROOT / "agents_extensions/shared/hooks/guard-pr-merge.py")
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    for prefix in (sys.executable, "/fixture/bin/python"):
+    for prefix in (
+        [sys.executable, "--check-hash-based-pycs", "always", "-Im", "lu_machinery.publish"],
+        ["/fixture/bin with space/python3.14", "-Wignore", "-X", "dev", "-mlu_machinery.publish.__main__"],
+    ):
         merge = guard._merge_args([
-            prefix, "-m", "lu_machinery.publish", "pr-merge",
-            "--repo", "unit/private", "--number", "1",
+            *prefix, "pr-merge",
+            "--repo", "unit/public", "--number=2", "--repo", "unit/private", "--number", "1",
             "--match-head=" + "a" * 40, "--expect-queue=false",
         ])
         assert merge.refusal is None
@@ -998,7 +1001,7 @@ def test_hook_judges_publisher_readiness(repo, state, monkeypatch, capsys):
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
     command = (
-        f".venv/bin/python -m lu_machinery.publish pr-merge --repo {repo} --number 1 "
+        f".venv/bin/python -I -m lu_machinery.publish.__main__ pr-merge --repo {repo} --number=2 --number 1 "
         f"--match-head {'a' * 40} --expect-queue true"
     )
     monkeypatch.setattr(guard, "_read_payload", lambda: {"tool_input": {"command": command}})
