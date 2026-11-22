@@ -46,6 +46,7 @@ from lu_machinery.fleet import credit_lane
 from lu_machinery.fleet.claude_account_lane import ClaudeAccount, bind_snapshot, require_account
 from lu_machinery.review.app_bot_authorship import VERIFIED_APP_BOT
 from lu_machinery.review.capacity import ReviewCapacity, review_capacity, review_capacity_action
+from lu_machinery.review.mixed_review_sets import MIXED_REVIEW_SETS
 from lu_machinery.review.model_catalog import (
     VALID_REVIEW_PROFILES,
     VALID_RISKS,
@@ -554,10 +555,6 @@ def complete_author_families(inputs: ResolverInputs, single_family: str) -> froz
     return frozenset(members)
 
 
-# Author family sets that take the mixed-family pair: Anthropic/OpenAI, and all three critical-tier
-# families (NEON-SOLTIER-1120), which leave no critical seat outside the authors. Every other set
-# keeps its single outside-family reviewer. integration_sweep's marker reader admits the same sets.
-MIXED_REVIEW_SETS = frozenset({frozenset({"anthropic", "openai"}), frozenset({"anthropic", "google", "openai"})})
 _FAMILY_NAMES = {"anthropic": "Anthropic", "google": "Google", "openai": "OpenAI"}
 
 
