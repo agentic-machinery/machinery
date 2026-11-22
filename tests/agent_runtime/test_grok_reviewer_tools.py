@@ -88,7 +88,9 @@ def _expand_dollar_quote(tokens: list[str]) -> list[str]:
         if inner is None:
             expanded.append(token)
             continue
-        expanded.extend(_punctuation_words(inner) or [inner])
+        # An ANSI-C quote is one shell word. Re-splitting it would treat a
+        # literal semicolon or backtick in that word as outer shell syntax.
+        expanded.append(inner)
     return expanded
 
 
@@ -105,6 +107,85 @@ def _simple_commands(tokens: list[str]) -> list[list[str]]:
     if current:
         groups.append(current)
     return groups or [[]]
+
+
+def _closing_backtick(text: str, start: int) -> int | None:
+    index = start
+    limit = len(text)
+    while index < limit:
+        if text[index] == "\\" and index + 1 < limit:
+            index += 2
+            continue
+        if text[index] == "`":
+            return index
+        index += 1
+    return None
+
+
+def _backtick_scripts(text: str) -> list[str]:
+    """Interiors of backticks a shell would execute.
+
+    Single quotes and ANSI-C quotes keep a backtick literal, so a review-root
+    path wrapped by ``shlex.quote`` is one argument. Double quotes do not.
+    An unclosed executing backtick fails closed.
+    """
+    scripts: list[str] = []
+    index = 0
+    limit = len(text)
+    state = "out"
+    while index < limit:
+        char = text[index]
+        if state == "single":
+            if char == "'":
+                state = "out"
+            index += 1
+            continue
+        if state == "ansi":
+            if char == "\\" and index + 1 < limit:
+                index += 2
+                continue
+            if char == "'":
+                state = "out"
+            index += 1
+            continue
+        if char == "\\" and index + 1 < limit:
+            index += 2
+            continue
+        if state == "double":
+            if char == '"':
+                state = "out"
+                index += 1
+                continue
+            if char == "`":
+                end = _closing_backtick(text, index + 1)
+                if end is None:
+                    raise ValueError("unclosed backtick")
+                scripts.append(text[index + 1 : end])
+                index = end + 1
+                continue
+            index += 1
+            continue
+        if char == "'":
+            state = "single"
+            index += 1
+            continue
+        if char == '"':
+            state = "double"
+            index += 1
+            continue
+        if char == "$" and index + 1 < limit and text[index + 1] == "'":
+            state = "ansi"
+            index += 2
+            continue
+        if char == "`":
+            end = _closing_backtick(text, index + 1)
+            if end is None:
+                raise ValueError("unclosed backtick")
+            scripts.append(text[index + 1 : end])
+            index = end + 1
+            continue
+        index += 1
+    return scripts
 
 
 def _script_operands(tokens: list[str]) -> list[str]:
@@ -135,14 +216,16 @@ def _hook_hides_read_command(
 
     Words are split on shell punctuation, so ``echo;pwd`` cannot hide ``pwd``. A quoted
     argument stays one word: ``--review-root .../pytest.pwds69p6`` does not match, and
-    neither does a quoted path that merely contains ``;``. A script given to ``sh -c``
-    or ``eval`` is split again. The ``$`` left on an ANSI-C quote is removed.
-    An unreadable or over-nested script fails closed.
+    neither does a quoted path that merely contains ``;`` or a literal backtick.
+    A script given to ``sh -c`` or ``eval`` is split again. Backticks are split again
+    only where a shell would execute them, including inside double quotes. The ``$``
+    left on an ANSI-C quote is removed. An unreadable or over-nested script fails closed.
     """
     if _depth > _MAX_SHELL_NESTING:
         return "<shell nesting limit>"
     try:
         tokens = _expand_dollar_quote(_punctuation_words(hook_command))
+        substitutions = _backtick_scripts(hook_command)
     except ValueError:
         return "<unreadable shell command>"
     for command in read_commands:
@@ -154,10 +237,7 @@ def _hook_hides_read_command(
             return command
         if any(_contains_command_tokens(simple, pieces) for simple in _simple_commands(tokens)):
             return command
-    fragments = _script_operands(tokens)
-    for token in tokens:
-        if "`" in token:
-            fragments.append(token.replace("`", " "))
+    fragments = [*_script_operands(tokens), *substitutions]
     for fragment in fragments:
         hidden = _hook_hides_read_command(fragment, read_commands, _depth=_depth + 1)
         if hidden is not None:
