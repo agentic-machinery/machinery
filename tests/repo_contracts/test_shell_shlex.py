@@ -133,7 +133,7 @@ def test_issue_9115_arithmetic_prefix_does_not_reset_backtick_cap():
 )
 def test_ansi_c_quoting_preserves_live_code_matching_bash(command: str, expected_live: str):
     """Defect class: ANSI-C escape quote-flip deleting live commands during preprocessing."""
-    bash_out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=False).stdout
+    bash_out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=False, timeout=5).stdout
     assert "LIVE" in bash_out
     collapsed = collapse_line_continuations(command)
     stripped = strip_shell_comments(collapsed)
@@ -159,9 +159,9 @@ def test_ansi_c_quoting_preserves_live_code_matching_bash(command: str, expected
 )
 def test_ansi_c_comment_stripping_preserves_bash_word_values(command: str, expected_args: list[str]):
     """Defect class: preprocessing alters Bash word values when stripping comments or continuations."""
-    raw_run = subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=True)
+    raw_run = subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=True, timeout=5)
     processed = preprocess_shell_command(command)
-    processed_run = subprocess.run(["bash", "-c", processed], capture_output=True, text=True, check=True)
+    processed_run = subprocess.run(["bash", "-c", processed], capture_output=True, text=True, check=True, timeout=5)
     assert raw_run.stdout == "".join(expected_args)
     assert processed_run.stdout == raw_run.stdout
     assert "# comment" not in processed
@@ -293,7 +293,10 @@ def test_ansi_c_bash_oracle_fuzz_never_hides_live_code():
             parts.append(f" ; ec\\\nho {marker}")
 
         command = "".join(parts)
-        bash_ran = marker in subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=False).stdout
+        bash_ran = (
+            marker
+            in subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=False, timeout=5).stdout
+        )
         try:
             visible = preprocess_shell_command(command)
         except ShellPreprocessLimit:
