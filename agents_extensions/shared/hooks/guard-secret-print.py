@@ -76,10 +76,12 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 from __future__ import annotations
 
 import codecs
+import contextvars
 import os
 import re
 import shlex
 import sys
+from collections.abc import Callable
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -106,6 +108,8 @@ except Exception as exc:
     print(f"guard dependency unavailable: json_depth ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
 # Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
+# Set only while _folded_simple_command_check rereads a command main could not parse.
+_FOLD_APOSTROPHES: contextvars.ContextVar[bool] = contextvars.ContextVar("fold_apostrophes", default=False)
 _PAYLOAD_MAX_DEPTH = 512
 
 SEPARATORS = {"&&", "||", ";", "&", "\n"}
@@ -461,17 +465,41 @@ def _tokenize(command: str, *, shell_words: bool = False) -> list[str]:
 
 
 def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
-    """Keep complete Bash ${...} words intact while shlex splits operators."""
+    """Keep complete Bash ${...} words intact while shlex splits operators.
+
+    While _FOLD_APOSTROPHES is set, `'\\''` inside single quotes (close, escaped
+    apostrophe, reopen) is kept too. The non-POSIX lexer honours a quote only at
+    the start of a word, so it would read the reopening quote as a plain character
+    and every later quote inverted; as a marker the word stays one fragment.
+    """
     substitutions = {start: end for start, end, _ in _substitution_spans(command)}
     parameters: dict[str, str] = {}
+    markers: dict[str, str] = {}
+    fold = _FOLD_APOSTROPHES.get()
     out: list[str] = []
     quote = ""
     i = 0
+
+    def protect(text: str) -> None:
+        # One marker per distinct text keeps restoring linear in the apostrophe count.
+        marker = markers.get(text)
+        if marker is None:
+            marker = f"\ue000{len(parameters)}\ue001"
+            while marker in command:
+                marker += "\ue002"
+            parameters[marker] = text
+            markers[text] = marker
+        out.append(marker)
+
     while i < len(command):
         char = command[i]
         if char == "\\" and quote != "'" and i + 1 < len(command):
             out.append(command[i : i + 2])
             i += 2
+            continue
+        if fold and quote == "'" and command.startswith("'\\''", i):
+            protect("'\\''")
+            i += 4
             continue
         if char == "'" and quote != '"':
             quote = "" if quote else "'"
@@ -501,11 +529,7 @@ def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
                     depth -= 1
                 end += 1
             if not depth:
-                marker = f"\ue000{len(parameters)}\ue001"
-                while marker in command:
-                    marker += "\ue002"
-                parameters[marker] = command[i:end]
-                out.append(marker)
+                protect(command[i:end])
                 i = end
                 continue
         out.append(char)
@@ -520,7 +544,10 @@ def _restore_parameters(token: str, parameters: dict[str, str]) -> str:
 
 
 def _strip_quotes(token: str) -> str:
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+    if len(token) >= 2 and token[0] == token[-1] == "'":
+        # A lexer single-quoted token holds '\\'' only where _protect_parameters folded it.
+        return token[1:-1].replace("'\\''", "'")
+    if len(token) >= 2 and token[0] == token[-1] == '"':
         return token[1:-1]
     return token
 
@@ -2024,6 +2051,95 @@ def _scan_command(
     return None
 
 
+# Main's parse refusals, the only results the folded rescan may replace.
+_UNPARSEABLE = frozenset({"shell command could not be parsed safely", "interpreter arguments could not be parsed safely"})
+# A word whose shell value _strip_quotes gives exactly: plain characters that are neither
+# syntax nor expanded, or one single-quoted word whose only inner quotes are folded '\''.
+_STATIC_WORD_RE = re.compile(r"[A-Za-z0-9_./:=,+@%-]+|'[^']*(?:'\\''[^']*)*'")
+# Bash builtins and keywords (bash 5.3 `compgen -b -k`): the shell itself reads their
+# words, as code (trap, coproc) or as arithmetic subscripts (let, declare, printf -v).
+_SHELL_BUILTINS = frozenset(
+    {
+        ":", "!", ".", "[", "[[", "]]", "{", "}", "alias", "bg", "bind", "break", "builtin", "caller", "case", "cd",
+        "command", "compgen", "complete", "compopt", "continue", "coproc", "declare", "dirs", "disown", "do", "done",
+        "echo", "elif", "else", "enable", "esac", "eval", "exec", "exit", "export", "false", "fc", "fg", "fi", "for",
+        "function", "getopts", "hash", "help", "history", "if", "in", "jobs", "kill", "let", "local", "logout",
+        "mapfile", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly", "return", "select", "set",
+        "shift", "shopt", "source", "suspend", "test", "then", "time", "times", "trap", "true", "type", "typeset",
+        "ulimit", "umask", "unalias", "unset", "until", "wait", "while",
+    }
+)
+# Python options that take no value and select no program text.
+_PYTHON_PLAIN_OPTIONS = frozenset({"-B", "-E", "-I", "-O", "-OO", "-P", "-q", "-s", "-S", "-u", "-b", "-bb"})
+
+
+def _runs_no_inline_program(cmd: str, args: list[str]) -> bool:
+    """Whether an interpreter runs a module or script file rather than program text from its words."""
+    if not _is_python_command(cmd):
+        return False
+    for index, arg in enumerate(_strip_quotes(arg) for arg in args):
+        if arg == "-m":
+            return index + 1 < len(args)
+        if not arg.startswith("-"):
+            return True
+        if arg not in _PYTHON_PLAIN_OPTIONS:
+            return False
+    return False  # no module or script: the program comes from stdin
+
+
+def _is_folded_simple_command(command: str) -> bool:
+    """Whether command, read with `'\\''` folded, is one simple command that reads no word as code.
+
+    Every token must be a static word (no operator, grouping or expansion, so the
+    shell cannot pick another command or option), its quote fragments must be its
+    exact shell words, with no wrapper, assignment, redirect, substitution or
+    here-document, and no word the shell or the guard reads as code (no shell,
+    builtin or keyword, no xargs or unresolved wrapper, no interpreter program
+    text). Process kills keep main's reading. Call with the fold on.
+    """
+    try:
+        executable, substitutions = _hide_substitutions(preprocess_shell_command(command))
+    except ShellPreprocessLimit:
+        return False
+    if substitutions or _heredoc_inputs(command):
+        return False
+    if not all(_STATIC_WORD_RE.fullmatch(token) for token in _tokenize(executable, shell_words=True)):
+        return False
+    words = _pipelines(executable, shell_words=True)
+    if _pipelines(executable) != words or len(words) != 1 or len(words[0]) != 1:
+        return False
+    segment = words[0][0]
+    found = _command_at(segment)
+    if found is None or found[2] != 0 or _raw_without_redirects(segment) != segment:
+        return False
+    cmd, args, _ = found
+    # Bash runs a builtin only for a bare name; a path names a file.
+    if _strip_quotes(segment[0]) in _SHELL_BUILTINS:
+        return False
+    # Shells and xargs run a command from their words; process tools keep main's process reading.
+    if cmd in SHELL_COMMANDS or cmd in {"pkill", "pgrep", "kill", "xargs"}:
+        return False
+    # A wrapper left as the command has a child the guard could not resolve (env -S, env 3).
+    if cmd == "env" or cmd in _WRAPPER_OPTIONS:
+        return False
+    return not (_is_interpreter_command(cmd) and not _runs_no_inline_program(cmd, args))
+
+
+def _folded_simple_command_check[T](command: str, check: Callable[[str], T]) -> tuple[bool, T | None]:
+    """Run check on command with `'\\''` folded, when it is a folded simple command.
+
+    Main's readers are not exact once any other command with `'\\''` parses, so
+    every other command keeps main's result; (False, None) says so.
+    """
+    token = _FOLD_APOSTROPHES.set(True)
+    try:
+        if not _is_folded_simple_command(command):
+            return False, None
+        return True, check(command)
+    finally:
+        _FOLD_APOSTROPHES.reset(token)
+
+
 def _block_msg(reason: str) -> str:
     return (
         f"BLOCKED by guard-secret-print (#M-5): {reason}.\n\n"
@@ -2073,6 +2189,10 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
 
     process_facts = _process_facts(command)
+    if "limit" in process_facts:
+        folded, folded_facts = _folded_simple_command_check(command, _process_facts)
+        if folded and folded_facts is not None:
+            process_facts = folded_facts
     if "pkill" in process_facts or {"pgrep", "kill"} <= process_facts:
         sys.stderr.write(_process_block_msg("full-command-line process kills can match the invoking shell"))
         return 2
@@ -2085,6 +2205,10 @@ def _main(argv: list[str] | None = None) -> int:
 
     try:
         reason = _scan_command(command, set())
+        if reason in _UNPARSEABLE:
+            folded, folded_reason = _folded_simple_command_check(command, lambda text: _scan_command(text, set()))
+            if folded:
+                reason = folded_reason
     except ShellPreprocessLimit:
         reason = "nested shell command could not be parsed safely"
     if reason:

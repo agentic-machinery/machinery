@@ -1751,3 +1751,65 @@ def test_round_six_shell_fragment_boundaries(command, code):
     result = _subprocess_guard(command)
     assert SENTINEL not in result.stdout + result.stderr
     assert result.returncode == code
+
+
+def _shell_single_quote(value: str) -> str:
+    """Quote one argument the way the REPL shell helper does: close, escaped quote, reopen."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+@pytest.mark.parametrize(
+    "verb,flag", [("issue-close", "--comment"), ("pr-comment", "--body")], ids=["issue-close", "pr-comment"]
+)
+def test_escaped_apostrophe_in_single_quoted_value_is_allowed(monkeypatch, verb: str, flag: str):
+    """Defect class: an unquoted `\\'` between single-quoted fragments inverts the lexer's quote state.
+
+    The value's later operators then read as unbalanced shell syntax, and a publisher
+    call that prints no secret is refused as unparseable (ML-30CB-APOSTROPHE).
+    """
+    words = ["/venv/bin/python", "-m", "lu_machinery.publish", verb, "--number", "12", flag]
+    words.append("the PR's content (see #12); it's done | next")
+    command = " ".join(_shell_single_quote(word) for word in words)
+    assert "'\\''" in command
+    assert _run(monkeypatch, command) == 0
+
+
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["echo", "the PR's token:", "$GH_TOKEN"],
+        ["cat", ".env", "it's"],
+        ["printenv", "GH_TOKEN", "it's"],
+    ],
+    ids=["echo-secret-var", "cat-dotenv", "printenv-secret"],
+)
+def test_escaped_apostrophe_quoting_keeps_secret_print_refusals(monkeypatch, words: list[str]):
+    """Defect class: shielding escaped quotes must not hide a real secret print in the same command."""
+    command = " ".join(f'"{word}"' if word.startswith("$") else _shell_single_quote(word) for word in words)
+    assert "'\\''" in command
+    assert _run(monkeypatch, command) == 2
+
+
+def test_escaped_apostrophe_fold_keeps_refusal_for_expandable_python_selector(monkeypatch):
+    """Defect class: an expandable word before python's program selector is folded and allowed.
+
+    `"$DOC_PATH"` can expand to an option such as -c that turns the next word into
+    program text, so the folded reread must keep main's refusal.
+    """
+    body = _shell_single_quote("it's done; see #12 | next")
+    command = f'python3 "$DOC_PATH" {body}'
+    assert "'\\''" in command
+    assert _run(monkeypatch, command) == 2
+
+
+def test_escaped_apostrophe_publisher_body_with_command_substitution_text_is_allowed(monkeypatch):
+    """Defect class: a publisher body with `$(` after an escaped apostrophe is refused.
+
+    The process-kill scan read the unfolded words, hit its parse limit and refused
+    a single-quoted body that runs nothing (ML-30CB-APOSTROPHE).
+    """
+    words = ["/venv/bin/python", "-m", "lu_machinery.publish", "pr-comment", "--number", "12", "--body"]
+    words.append("it's literal text: $(not run)")
+    command = " ".join(_shell_single_quote(word) for word in words)
+    assert "'\\''" in command
+    assert _run(monkeypatch, command) == 0
