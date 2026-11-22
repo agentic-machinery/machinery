@@ -218,7 +218,8 @@ def test_an_empty_unreleased_section_records_the_release_below_it():
         ("evil/repo", "", False),
         ("org/repo", "[Unreleased]: https://github.com/neworg/repo/compare/v0.1.20...HEAD\n", False),
         ("org/repo", "   [ unreleased ]: https://github.com/org/repo/compare/v0.1.20...HEAD\n", False),
-        ("org/repo", "Example: [Unreleased]: https://github.com/org/repo/compare/v0.1.21...HEAD\n\n", False),
+        ("org/repo", "Example: [Unreleased]: https://github.com/org/repo/compare/v0.1.21...HEAD\n\n", True),
+        ("org/repo", "[>Unreleased]: https://example.org/older\n\n- Fix: document [>Unreleased]: labels\n\n", True),
         ("org/repo", "[Unreleased]: data:text/plain,stale\n\n", False),
         ("org/repo", "> > [unreleased]: https://github.com/org/repo/compare/v0.1.20...HEAD\n\n", False),
         ("org/repo", "> [\n> Unreleased]: https://github.com/neworg/repo/compare/v0.1.20...HEAD\n\n", False),
@@ -227,7 +228,8 @@ def test_an_empty_unreleased_section_records_the_release_below_it():
 def test_unreleased_link_may_name_either_baked_slug_of_the_repository(monkeypatch, link_slug, stale, accepted):
     """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
     with the same repository name under another owner is accepted (CHANGELOG written before the transfer),
-    or a second, stale Unreleased definition survives the cut."""
+    or a second, stale Unreleased definition survives the cut, or text that defines no Unreleased link
+    (mid-line, or another label) blocks the cut."""
     from tests.test_fleet_repos import transferred_catalog
 
     transferred_catalog(monkeypatch)
