@@ -907,7 +907,9 @@ def test_direct_landing_head_move_ci_failure_and_queue_mode_race_hold_and_dedupl
     corrupt_lines, corrupt_failed = keeper.run(DirectFakeGitHub([pr(number=42)]), tmp_path / "corrupt.json", apply=True, direct_config=_direct_cfg(), ownership_path=corrupt_own)
     assert corrupt_failed and any("custody-unknown" in line for line in corrupt_lines)
 
-    # F2 regression: failed direct-merge write at HEAD_A must not permanently block a newly approved HEAD_B.
+    # F2/F6 regression: failed direct-merge write at HEAD_A must not permanently block a newly
+    # approved HEAD_B when require_custody=False, yet must STILL hold with no-keeper-custody when
+    # require_custody=True and no valid keeper custody exists.
     retry_state = tmp_path / "retry.json"
     retry_fake = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_A)])
     retry_fake.direct_merge_error = keeper.KeeperError("OPSEC: squash text refused")
@@ -918,6 +920,21 @@ def test_direct_landing_head_move_ci_failure_and_queue_mode_race_hold_and_dedupl
     retry_fake.fresh_by_pr[42] = {**retry_fake.rows[0], "state": "OPEN", "labels": []}
     retry_fake.comments_by_pr[42] = [recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", HEAD_B)]
     retry_fake.checks_by_head[HEAD_B] = checks(HEAD_B)
+    # F6 variant: require_custody=True with stale HEAD_A tracked entry and no keeper custody MUST hold.
+    req_state = tmp_path / "retry_req.json"
+    req_state.write_text(retry_state.read_text())
+    req_fake = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_B)])
+    req_fake.comments_by_pr[42] = [recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", HEAD_B)]
+    req_fake.checks_by_head[HEAD_B] = checks(HEAD_B)
+    req_lines, req_failed = keeper.run(
+        req_fake, req_state, apply=True, direct_config=_direct_cfg(require_custody=True),
+        ownership_path=tmp_path / "empty_own.json",
+    )
+    assert not req_failed
+    assert any("#42 held: no-keeper-custody" in line for line in req_lines)
+    assert ("direct-merge", (42, HEAD_B)) not in req_fake.actions
+    assert "42" not in json.loads(req_state.read_text()).get("tracked", {})
+    # F2 variant: require_custody=False clears stale HEAD_A tracking and lands approved HEAD_B.
     rl2, rf2 = keeper.run(
         retry_fake, retry_state, apply=True, direct_config=_direct_cfg(),
         closeout_runner=lambda num, repo, root: ("closed_out", ""),

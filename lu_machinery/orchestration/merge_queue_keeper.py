@@ -1629,6 +1629,19 @@ def run(
             tracked_entry = previous.get("tracked", {}).get(key)
             tracked_head = tracked_entry.get("head") if isinstance(tracked_entry, dict) else None
             old_head = head
+            if (
+                custody_error is None
+                and custody is None
+                and isinstance(tracked_head, str)
+                and SHA.fullmatch(tracked_head)
+                and tracked_head != head
+            ):
+                # Without active keeper custody, an OPEN PR at a newer head means the older
+                # tracked head did not merge; clear stale bookkeeping before custody checks so
+                # the new head is judged purely on its own review, CI, and custody policy.
+                if apply and isinstance(previous.get("tracked"), dict):
+                    previous["tracked"].pop(key, None)
+                tracked_entry = None
             if custody_error is not None:
                 pass
             elif has_decision_custody:
@@ -1649,13 +1662,6 @@ def run(
                     and custody["verdict_receipt"].get("head") != head
                 ):
                     custody_error = "head-moved"
-            elif isinstance(tracked_head, str) and SHA.fullmatch(tracked_head) and tracked_head != head:
-                # Without active keeper custody, an OPEN PR at a newer head means the older
-                # tracked head did not merge; clear the stale record so the new head is judged
-                # purely on its own fresh exact-head review and CI.
-                if apply and isinstance(previous.get("tracked"), dict):
-                    previous["tracked"].pop(key, None)
-                tracked_entry = None
             elif direct_config.require_custody:
                 custody_error = "no-keeper-custody"
             base_ci_status, base_sha, base_run_ids = (
@@ -1707,7 +1713,7 @@ def run(
                     )
                     lines.append(f"#{number} held: {custody_error}")
                     continue
-                if checks.startswith(("CI-red-", "CI-cancelled-")) and (custody is not None or tracked_entry is not None):
+                if custody_error is None and checks.startswith(("CI-red-", "CI-cancelled-")) and (custody is not None or tracked_entry is not None):
                     hold_in_repair(
                         number,
                         reason=checks,
@@ -1717,7 +1723,7 @@ def run(
                     )
                     lines.append(f"#{number} held: {checks}")
                     continue
-                if verdict.state in {"CHANGES_REQUESTED", "BLOCKED"} and (custody is not None or tracked_entry is not None):
+                if custody_error is None and verdict.state in {"CHANGES_REQUESTED", "BLOCKED"} and (custody is not None or tracked_entry is not None):
                     hold_in_repair(
                         number,
                         reason=f"CF-{verdict.state.lower()}",
