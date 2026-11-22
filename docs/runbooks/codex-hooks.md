@@ -336,8 +336,32 @@ exits 2 and tells the agent to create/`cd` into
   stays out of the way (fail open). It is a safety net; physical isolation is the
   real guarantee.
 
-Tests: `tests/test_guard_primary_checkout_write.py` (pure payload extraction plus
-end-to-end block/allow against a real repo with a dispatch worktree).
+### Run the guard regression
+
+Use a Machinery Git checkout or linked worktree with the test dependencies installed.
+From its root, collect and run the module in both dispatch-marker states. In a
+linked worktree, set `PY` to the absolute path of the project interpreter.
+
+```bash
+PY=${PY:-.venv/bin/python}
+(
+    set -e
+    marker=${LEARN_UKRAINIAN_DISPATCH_TASK_ID:-guard-regression}
+    test_file=tests/test_guard_primary_checkout_write.py
+
+    unset LEARN_UKRAINIAN_DISPATCH_TASK_ID
+    "$PY" -m pytest --collect-only -qq "$test_file"
+    "$PY" -m lu_machinery.common.test_slots run --slots 1 -- "$PY" -m pytest -q "$test_file"
+
+    export LEARN_UKRAINIAN_DISPATCH_TASK_ID="$marker"
+    "$PY" -m pytest --collect-only -qq "$test_file"
+    "$PY" -m lu_machinery.common.test_slots run --slots 1 -- "$PY" -m pytest -q "$test_file"
+)
+```
+
+The module checks payload extraction and hook decisions against temporary Git
+repositories with registered dispatch worktrees. Machinery CI runs the module
+through `tests/machinery_tests.txt`.
 
 ## Runtime write-cwd guard (#4446)
 

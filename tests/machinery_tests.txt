@@ -686,6 +686,7 @@ tests/test_agent_runtime_env_sanitize.py
 tests/test_ci_recovery.py
 tests/test_claude_account_bound_snapshot.py
 tests/test_guard_bash_process_kill.py
+tests/test_guard_primary_checkout_write.py
 tests/test_private_review_target.py
 tests/test_review_isolation.py
 tests/test_secret_print_hook.py
