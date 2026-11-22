@@ -458,6 +458,12 @@ def test_selection_refuses_a_third_party_import_in_the_receipt_gate_closure(
     (root / "lu_machinery/ci/pytest-file-durations.json").write_text(json.dumps({FILES[0]: 1}), encoding="utf-8")
     (root / "tests").mkdir()
     (root / FILES[0]).write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    # The package's contract tests must be tracked test files; stubs stand in for them.
+    from lu_machinery.ci.pr_affected_tests import IMPORT_TIME_CONTRACTS
+
+    for name in {test for *_, tests in IMPORT_TIME_CONTRACTS for test in tests}:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("def test_ok():\n    assert True\n", encoding="utf-8")
     _git(root, "init", "-b", "main")
     _git(root, "config", "user.name", "CI fixture")
     _git(root, "config", "user.email", "ci@example.com")
@@ -470,12 +476,20 @@ def test_selection_refuses_a_third_party_import_in_the_receipt_gate_closure(
     _git(root, "commit", "-qam", "unrelated change")
     benign = _git(root, "rev-parse", "HEAD")
     sweep = root / "lu_machinery/orchestration/integration_sweep.py"
-    sweep.write_text(sweep.read_text(encoding="utf-8") + "\nimport jsonschema  # noqa: E402\n", encoding="utf-8")
+    source = sweep.read_text(encoding="utf-8")
+    sweep.write_text(source + "\n# A change inside the receipt gate's closure.\n", encoding="utf-8")
+    _git(root, "commit", "-qam", "comment in the receipt gate closure")
+    inside = _git(root, "rev-parse", "HEAD")
+    sweep.write_text(source + "\nimport jsonschema  # noqa: E402\n", encoding="utf-8")
     _git(root, "commit", "-qam", "module-level third-party import")
     candidate = _git(root, "rev-parse", "HEAD")
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
     # The fixture itself selects cleanly: only the import breaks the contract.
     assert plan(base, benign, importers=False)["run_files"] == [FILES[0]]
+    # A change in a contract's closure runs that contract's real test, which the import scan cannot see.
+    selected = plan(base, inside, importers=False)
+    assert selected["contract_test_files"] == ["tests/test_installed_root_contract.py"]
+    assert "tests/test_installed_root_contract.py" in selected["run_files"]
     with pytest.raises(ValueError, match=(
         r"contract canary receipt gate: lu_machinery/orchestration/integration_sweep\.py:\d+ imports jsonschema at import time"
     )):
