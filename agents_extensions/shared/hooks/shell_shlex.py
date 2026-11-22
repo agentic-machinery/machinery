@@ -13,6 +13,8 @@ from collections.abc import Callable
 
 _HEREDOC_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _MAX_BACKTICK_DEPTH = 16
+_BACKTICK_UNESCAPE = re.compile(r"\\([\\`$])")
+_DQ_BACKTICK_UNESCAPE = re.compile(r'\\([\\`$"])')
 _SHELL_OPERATORS = (
     "&>>",
     "<<<",
@@ -41,7 +43,90 @@ _OPERATOR_CHARS = frozenset("();<>|&\n")
 
 
 class ShellPreprocessLimit(RuntimeError):
-    """A nested command could not be exposed within the parser's depth cap."""
+    """A shell construct could not be parsed safely within the preprocessor's limits."""
+
+
+def _match_continued(command: str, index: int, opener: str) -> int | None:
+    """Return index after a 2-char shell opener, skipping `\\<nl>` between its chars."""
+    if command[index : index + 1] != opener[0]:
+        return None
+    pos = index + 1
+    while command.startswith("\\\n", pos):
+        pos += 2
+    if pos < len(command) and command[pos] == opener[1]:
+        return pos + 1
+    return None
+
+
+def match_double_dollar(command: str, index: int) -> int | None:
+    """Return index after a Bash `$$` PID token (skipping `\\<nl>` between the `$`s), or None.
+
+    Bash lexes `$$` as one two-character token before checking for `$'`, `$(`, or `${`.
+    """
+    return _match_continued(command, index, "$$")
+
+
+def scan_ansi_c_body(command: str, body_start: int) -> int | None:
+    """Return index after the closing unescaped `'` of an ANSI-C string, or None if unclosed.
+
+    In Bash, every backslash inside `$'...'` quotes the single following character
+    (including `'` and newline; line continuations are not deleted inside `$'...'`).
+    """
+    pos = body_start
+    length = len(command)
+    while pos < length:
+        char = command[pos]
+        if char == "\\":
+            if pos + 1 >= length:
+                return None
+            pos += 2
+            continue
+        if char == "'":
+            return pos + 1
+        pos += 1
+    return None
+
+
+def _strip_continuations_raw(text: str) -> str:
+    """Delete `\\<nl>` pairs linearly, including pairs formed by an earlier deletion."""
+    joined: list[str] = []
+    for char in text:
+        if char == "\n" and joined and joined[-1] == "\\":
+            joined.pop()
+        else:
+            joined.append(char)
+    return "".join(joined)
+
+
+def _find_backtick_close(command: str, start: int) -> int | None:
+    """Find the matching unescaped closing backtick using Bash's phase-1 scan."""
+    pos = start + 1
+    length = len(command)
+    while pos < length:
+        if command[pos] == "\\":
+            pos += 2
+            continue
+        if command[pos] == "`":
+            return pos
+        pos += 1
+    return None
+
+
+def _backtick_has_ansi_c(raw_body: str, *, double_quoted: bool) -> bool:
+    """Whether a backtick body contains or can unescape to ANSI-C `$'`."""
+    unescape = _DQ_BACKTICK_UNESCAPE if double_quoted else _BACKTICK_UNESCAPE
+    layer = raw_body
+    for _ in range(_MAX_BACKTICK_DEPTH + 1):
+        joined = _strip_continuations_raw(layer)
+        if "$'" in layer or "$'" in joined:
+            return True
+        next_layer = unescape.sub(r"\1", joined)
+        if "$'" in next_layer or "$'" in _strip_continuations_raw(next_layer):
+            return True
+        if "`" not in next_layer or next_layer == layer:
+            return False
+        layer = next_layer
+    raise ShellPreprocessLimit("nested backtick depth exceeded")
 
 
 def normalize_io_descriptors(command: str, replace: Callable[[str, str], str] | None = None) -> str:
@@ -59,6 +144,18 @@ def normalize_io_descriptors(command: str, replace: Callable[[str, str], str] | 
         if char == "\\" and quote != "'" and index + 1 < len(command):
             out.extend(command[index : index + 2])
             index += 2
+            continue
+        if quote != "'" and (dd_end := match_double_dollar(command, index)) is not None:
+            out.append(command[index:dd_end])
+            index = dd_end
+            continue
+        if not quote and command.startswith("$'", index):
+            end = scan_ansi_c_body(command, index + 2)
+            if end is None:
+                out.append(command[index:])
+                break
+            out.append(command[index:end])
+            index = end
             continue
         if quote:
             if char == quote:
@@ -99,97 +196,62 @@ def split_operator_run(token: str) -> list[str]:
     return parts
 
 
-def collapse_line_continuations(command: str) -> str:
-    """Join Bash continuations while respecting physical-line comments."""
+def _transform_shell(
+    command: str,
+    *,
+    collapse_continuations: bool = False,
+    strip_comments: bool = False,
+    expose_backticks: bool = False,
+    backtick_depth: int = 0,
+) -> str:
+    """Walk Bash quoting, ANSI-C strings, expansions and comments in one shared pass."""
+    if expose_backticks and backtick_depth >= _MAX_BACKTICK_DEPTH and "`" in command:
+        raise ShellPreprocessLimit("nested backtick depth exceeded")
+
     out: list[str] = []
     quote = ""
-    outer_quote = ""
-    backtick_outer_quote = ""
-    substitution_depth = 0
+    # Stack of active expansions: (kind, outer_quote, paren_depth).
+    # kind is "cmdsubst" for $(...), "param" for unquoted ${...}, or "dq_param" for "${...}".
+    contexts: list[tuple[str, str, int]] = []
     backticks = False
-    comment = False
+    backtick_outer_quote = ""
     word_start = True
     i = 0
-    while i < len(command):
+    length = len(command)
+
+    while i < length:
         char = command[i]
-        if comment:
-            # A backtick closes its body before Bash parses that body's
-            # comment. Only an unescaped closer can resume the outer command.
-            if backticks and char == "`":
-                slash = i - 1
-                while slash >= 0 and command[slash] == "\\":
-                    slash -= 1
-                if (i - 1 - slash) % 2 == 0:
-                    comment = False
-            if comment:
-                out.append(char)
-                if char == "\n":
-                    comment = False
-                    word_start = True
-                i += 1
-                continue
-        if char == "\\" and quote != "'" and i + 1 < len(command):
+        if char == "\\" and quote != "'" and i + 1 < length:
             following = command[i + 1]
-            if following != "\n":
-                out.extend((char, following))
+            if following == "\n":
+                if not collapse_continuations:
+                    out.append(command[i : i + 2])
+            else:
+                out.append(command[i : i + 2])
                 word_start = False
             i += 2
             continue
-        if char == "'" and quote != '"':
-            quote = "" if quote == "'" else "'"
+        if quote != "'" and not backticks and (dd_end := match_double_dollar(command, i)) is not None:
+            out.append("$$" if collapse_continuations else command[i:dd_end])
             word_start = False
-        elif char == '"' and quote != "'":
-            quote = "" if quote == '"' else '"'
-            word_start = False
-        elif char == "`" and quote != "'":
-            if not backticks:
-                backtick_outer_quote = quote
-                quote = ""
-            else:
-                quote = backtick_outer_quote
-            backticks = not backticks
-            word_start = backticks
-        elif quote != "'" and not backticks and command.startswith("$(", i):
-            if not substitution_depth:
-                outer_quote = quote
-                quote = ""
-            substitution_depth += 1
-            out.append("$(")
-            word_start = True
-            i += 2
+            i = dd_end
             continue
-        elif substitution_depth and not quote and not backticks and char == "(":
-            substitution_depth += 1
-        elif substitution_depth and not quote and not backticks and char == ")":
-            substitution_depth -= 1
-            if not substitution_depth:
-                quote = outer_quote
+        if not quote and not backticks and (ansi_body := _match_continued(command, i, "$'")) is not None:
+            if contexts and contexts[-1][0] == "dq_param":
+                raise ShellPreprocessLimit(
+                    "ANSI-C quoting inside double-quoted parameter expansion cannot be parsed safely"
+                )
+            ansi_end = scan_ansi_c_body(command, ansi_body)
+            if ansi_end is None:
+                if contexts:
+                    raise ShellPreprocessLimit("unterminated ANSI-C quote inside shell expansion")
+                out.append("$'" if collapse_continuations else command[i:ansi_body])
+                out.append(command[ansi_body:])
+                break
+            out.append("$'" if collapse_continuations else command[i:ansi_body])
+            out.append(command[ansi_body:ansi_end])
             word_start = False
-        elif not quote:
-            if char == "#" and word_start:
-                comment = True
-            word_start = char in " \t\n;&|()"
-        out.append(char)
-        i += 1
-    return "".join(out)
-
-
-def strip_shell_comments(command: str) -> str:
-    """Remove Bash comments at word boundaries without changing quoted text."""
-    out: list[str] = []
-    quote = ""
-    backticks = False
-    substitution_depth = 0
-    outer_quote = ""
-    backtick_outer_quote = ""
-    word_start = True
-    i = 0
-    while i < len(command):
-        char = command[i]
-        if char == "\\" and quote != "'" and i + 1 < len(command):
-            out.append(command[i : i + 2])
-            word_start = False
-            i += 2
+            i = ansi_end
             continue
         if char == "'" and quote != '"':
             quote = "" if quote == "'" else "'"
@@ -199,39 +261,79 @@ def strip_shell_comments(command: str) -> str:
             word_start = False
         elif char == "`" and quote != "'":
             if not backticks:
+                close = _find_backtick_close(command, i)
+                raw_body = command[i + 1 : close] if close is not None else command[i + 1 :]
+                if _backtick_has_ansi_c(raw_body, double_quoted=(quote == '"')):
+                    raise ShellPreprocessLimit(
+                        "ANSI-C quoting inside backtick substitution cannot be parsed safely"
+                    )
+                if expose_backticks and close is not None:
+                    if quote == '"':
+                        out.append('"')
+                    body = re.sub(r"\\([\\`])", r"\1", raw_body)
+                    if "`" in body:
+                        body = _expose_backtick_bodies(body, depth=backtick_depth + 1)
+                    out.extend(("$(", body, ")"))
+                    if quote == '"':
+                        out.append('"')
+                    word_start = False
+                    i = close + 1
+                    continue
                 backtick_outer_quote = quote
                 quote = ""
+                backticks = True
+                word_start = True
             else:
                 quote = backtick_outer_quote
-            backticks = not backticks
-            word_start = backticks
-        elif quote != "'" and not backticks and command.startswith("$(", i):
-            if not substitution_depth:
-                outer_quote = quote
-                quote = ""
-            substitution_depth += 1
-            out.append("$(")
+                backticks = False
+                word_start = False
+        elif quote != "'" and not backticks and (sub_body := _match_continued(command, i, "$(")) is not None:
+            contexts.append(("cmdsubst", quote, 1))
+            quote = ""
+            out.append("$(" if collapse_continuations else command[i:sub_body])
             word_start = True
-            i += 2
+            i = sub_body
             continue
-        elif substitution_depth and not quote and not backticks and char == "(":
-            substitution_depth += 1
-        elif substitution_depth and not quote and not backticks and char == ")":
-            substitution_depth -= 1
-            if not substitution_depth:
-                quote = outer_quote
+        elif quote != "'" and not backticks and (param_body := _match_continued(command, i, "${")) is not None:
+            in_dq_param = quote == '"' or (bool(contexts) and contexts[-1][0] == "dq_param")
+            contexts.append(("dq_param" if in_dq_param else "param", quote, 0))
+            quote = ""
+            out.append("${" if collapse_continuations else command[i:param_body])
             word_start = False
-        elif not quote:
+            i = param_body
+            continue
+        elif contexts and not quote and not backticks and contexts[-1][0] == "cmdsubst" and char == "(":
+            kind, outer_quote, paren_depth = contexts[-1]
+            contexts[-1] = (kind, outer_quote, paren_depth + 1)
+            word_start = True
+        elif contexts and not quote and not backticks and contexts[-1][0] == "cmdsubst" and char == ")":
+            kind, outer_quote, paren_depth = contexts[-1]
+            if paren_depth == 1:
+                contexts.pop()
+                quote = outer_quote
+            else:
+                contexts[-1] = (kind, outer_quote, paren_depth - 1)
+            word_start = False
+        elif contexts and not quote and not backticks and contexts[-1][0] in {"param", "dq_param"} and char == "}":
+            _, outer_quote, _ = contexts.pop()
+            quote = outer_quote
+            word_start = False
+        elif not quote and not (contexts and contexts[-1][0] in {"param", "dq_param"}):
             if char == "#" and word_start:
                 end = i + 1
-                while end < len(command):
-                    if command[end] == "\n" or (backticks and command[end] == "`"):
+                while end < length:
+                    if command[end] == "\n":
                         break
-                    if backticks and command[end] == "\\" and end + 1 < len(command) and command[end + 1] != "\n":
-                        end += 2
-                    else:
-                        end += 1
-                if end == len(command):
+                    if backticks and command[end] == "`":
+                        slash = end - 1
+                        while slash >= i and command[slash] == "\\":
+                            slash -= 1
+                        if (end - 1 - slash) % 2 == 0:
+                            break
+                    end += 1
+                if not strip_comments:
+                    out.append(command[i:end])
+                if end == length:
                     break
                 i = end
                 continue
@@ -241,58 +343,19 @@ def strip_shell_comments(command: str) -> str:
     return "".join(out)
 
 
+def collapse_line_continuations(command: str) -> str:
+    """Join Bash continuations while respecting physical-line comments and ANSI-C quotes."""
+    return _transform_shell(command, collapse_continuations=True)
+
+
+def strip_shell_comments(command: str) -> str:
+    """Remove Bash comments at word boundaries without changing quoted or ANSI-C text."""
+    return _transform_shell(command, strip_comments=True)
+
+
 def _expose_backtick_bodies(command: str, *, depth: int = 0) -> str:
     """Expose executable backticks as inline command substitutions for guards."""
-    if depth >= _MAX_BACKTICK_DEPTH and "`" in command:
-        raise ShellPreprocessLimit("nested backtick depth exceeded")
-    out: list[str] = []
-    quote = ""
-    substitutions: list[tuple[str, int]] = []
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if char == "\\" and quote != "'":
-            out.append(command[index : index + 2])
-            index += 2
-            continue
-        if char == "'" and quote != '"':
-            quote = "" if quote == "'" else "'"
-        elif char == '"' and quote != "'":
-            quote = "" if quote == '"' else '"'
-        elif quote != "'" and command.startswith("$(", index):
-            substitutions.append((quote, 1))
-            quote = ""
-            out.append("$(")
-            index += 2
-            continue
-        elif quote != "'" and char == "`":
-            end = index + 1
-            while end < len(command) and command[end] != "`":
-                end += 2 if command[end] == "\\" else 1
-            if end < len(command):
-                if quote == '"':
-                    out.append('"')
-                body = re.sub(r"\\([\\`])", r"\1", command[index + 1 : end])
-                if "`" in body:
-                    body = _expose_backtick_bodies(body, depth=depth + 1)
-                out.extend(("$(", body, ")"))
-                if quote == '"':
-                    out.append('"')
-                index = end + 1
-                continue
-        elif char == "(" and not quote and substitutions:
-            outer_quote, paren_depth = substitutions[-1]
-            substitutions[-1] = (outer_quote, paren_depth + 1)
-        elif char == ")" and not quote and substitutions:
-            outer_quote, paren_depth = substitutions[-1]
-            if paren_depth == 1:
-                substitutions.pop()
-                quote = outer_quote
-            else:
-                substitutions[-1] = (outer_quote, paren_depth - 1)
-        out.append(char)
-        index += 1
-    return "".join(out)
+    return _transform_shell(command, expose_backticks=True, backtick_depth=depth)
 
 
 def _body_substitutions(body: str) -> list[str] | None:
@@ -305,6 +368,9 @@ def _body_substitutions(body: str) -> list[str] | None:
     while i < len(body):
         if body[i] == "\\":
             i += 2
+            continue
+        if (dd_end := match_double_dollar(body, i)) is not None:
+            i = dd_end
             continue
         if body.startswith("$((", i):
             i += 3
@@ -327,6 +393,17 @@ def _body_substitutions(body: str) -> list[str] | None:
                     continue
                 if char == "\\" and quote != "'":
                     i += 2
+                    word_start = False
+                    continue
+                if quote != "'" and not backticks and (dd_end := match_double_dollar(body, i)) is not None:
+                    i = dd_end
+                    word_start = False
+                    continue
+                if not quote and not backticks and (ansi_body := _match_continued(body, i, "$'")) is not None:
+                    ansi_end = scan_ansi_c_body(body, ansi_body)
+                    if ansi_end is None:
+                        return None
+                    i = ansi_end
                     word_start = False
                     continue
                 if char == "'" and quote != '"' and not backticks:
@@ -392,6 +469,13 @@ def skippable_heredoc_delimiters(line: str, *, initial_quote: str = "") -> list[
     contexts: list[str] = []
     arithmetic_shift = False
     while index < len(line):
+        if quote == "$'":
+            end = scan_ansi_c_body(line, index)
+            if end is None:
+                break
+            quote = ""
+            index = end
+            continue
         char = line[index]
         if quote:
             if char == "\\" and quote == '"' and index + 1 < len(line):
@@ -403,6 +487,16 @@ def skippable_heredoc_delimiters(line: str, *, initial_quote: str = "") -> list[
             continue
         if char == "\\":
             index += 2
+            continue
+        if (dd_end := match_double_dollar(line, index)) is not None:
+            index = dd_end
+            continue
+        if line.startswith("$'", index):
+            end = scan_ansi_c_body(line, index + 2)
+            if end is None:
+                quote = "$'"
+                break
+            index = end
             continue
         if char in "\"'":
             quote = char
@@ -476,6 +570,16 @@ def skippable_heredoc_delimiters(line: str, *, initial_quote: str = "") -> list[
             if char == "\\" and word_quote != "'" and index + 1 < len(line):
                 index += 2
                 continue
+            if word_quote != "'" and (dd_end := match_double_dollar(line, index)) is not None:
+                index = dd_end
+                continue
+            if not word_quote and line.startswith("$'", index):
+                end = scan_ansi_c_body(line, index + 2)
+                if end is None:
+                    index = len(line)
+                    break
+                index = end
+                continue
             if char in "\"'" and (not word_quote or word_quote == char):
                 word_quote = "" if word_quote else char
             elif not word_quote and char in " \t\r\n;|&()<>":
@@ -503,14 +607,46 @@ def _quote_after(line: str, initial_quote: str) -> str:
     quote = initial_quote
     i = 0
     while i < len(line):
+        if quote == "$'":
+            end = scan_ansi_c_body(line, i)
+            if end is None:
+                return "$'"
+            quote = ""
+            i = end
+            continue
         char = line[i]
         if char == "\\" and quote != "'":
             i += 2
+            continue
+        if quote != "'" and (dd_end := match_double_dollar(line, i)) is not None:
+            i = dd_end
+            continue
+        if not quote and line.startswith("$'", i):
+            end = scan_ansi_c_body(line, i + 2)
+            if end is None:
+                return "$'"
+            i = end
             continue
         if char in "\"'" and (not quote or quote == char):
             quote = "" if quote else char
         i += 1
     return quote
+
+
+def _quote_close_index(line: str, quote: str) -> int | None:
+    """Return index after ``quote`` closes on ``line``, or None if it stays open."""
+    if quote == "$'":
+        return scan_ansi_c_body(line, 0)
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if char == "\\" and quote == '"' and i + 1 < len(line):
+            i += 2
+            continue
+        if char == quote:
+            return i + 1
+        i += 1
+    return None
 
 
 def strip_skippable_heredoc_bodies(
@@ -535,7 +671,13 @@ def strip_skippable_heredoc_bodies(
         line = lines[index]
         kept.append(line)
         index += 1
-        opener = opener_transform(line) if opener_transform else line
+        if opener_transform is None:
+            opener = line
+        elif not quote:
+            opener = opener_transform(line)
+        else:
+            close = _quote_close_index(line, quote)
+            opener = line if close is None else line[:close] + opener_transform(line[close:])
         pending = skippable_heredoc_delimiters(opener, initial_quote=quote)
         quote = _quote_after(opener, quote)
         if pending is None:
@@ -583,12 +725,28 @@ def split_quote_preserving(command: str, *, punctuation_chars: str | bool, white
     index = 0
     while index < len(command):
         char = command[index]
+        if char == "\\" and not quote and index + 1 < len(command):
+            protected.append(command[index : index + 2])
+            index += 2
+            continue
         if char == "\\" and quote == '"' and index + 1 < len(command):
             following = command[index + 1]
             if following in {'"', "\\", "$", "`"}:
                 protected.append(marker if following == '"' else command[index : index + 2])
                 index += 2
                 continue
+        if quote != "'" and (dd_end := match_double_dollar(command, index)) is not None:
+            protected.append(command[index:dd_end])
+            index = dd_end
+            continue
+        if not quote and command.startswith("$'", index):
+            end = scan_ansi_c_body(command, index + 2)
+            if end is None:
+                protected.append(command[index:])
+                break
+            protected.append(command[index:end])
+            index = end
+            continue
         if char == "'" and quote != '"':
             quote = "" if quote else "'"
         elif char == '"' and quote != "'":
