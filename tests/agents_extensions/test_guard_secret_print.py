@@ -1832,6 +1832,9 @@ def test_escaped_apostrophe_publisher_body_with_command_substitution_text_is_all
         ("env >$(echo /dev/stdout)", 2),
         ("env >`echo /dev/stdout`", 2),
         ("env > >(cut -d= -f1)", 0),
+        ("env >/dev/stdou{t..t}", 2),
+        ("printf ok >/tmp/x{a,b}", 2),
+        ("printf ok </dev/nul{l..l}", 0),
     ],
 )
 def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expected):
@@ -1856,6 +1859,9 @@ def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expect
         ("bash 0<<<'pkill -f target'", 2),
         ("bash <<'EOF'\npkill -f target\nEOF", 2),
         ('bash <<<"$SCRIPT"', 2),
+        ("bash -c 'bash' <<<\"$SCRIPT\"", 2),
+        ("bash -c 'printf okay' <<<\"$TEXT\"", 0),
+        ('bash run.sh <<<"$TEXT"', 0),
     ],
 )
 def test_here_string_operand_is_exactly_one_word(monkeypatch, command, expected):
