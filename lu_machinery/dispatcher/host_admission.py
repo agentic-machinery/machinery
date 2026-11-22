@@ -199,24 +199,33 @@ _LAUNCH_MODES = frozenset({"scope", "popen-fallback"})
 
 
 def _provider_gone(provider_alive, record):
-    """True only when a terminal turn's provider is proven gone, from well-formed launch evidence.
+    """True only when a terminal turn's provider is proven gone, from affirmative evidence.
 
-    A launched run (one with a supervisor pid) names a known launch mode, and its liveness probe
-    answers False. A run that never launched has no pid, no launch mode and a recorded reason it
-    never started, or the probe proves it from its return reason. Anything else, a damaged field
-    or a probe error included, is not proof.
+    A launched run (a known launch mode) needs settlement's own proof that its whole process tree
+    exited (``provider_exit_proven_at``, written after the scope or fallback stop and the liveness
+    probe) and a probe that still answers False: the provider group's absence alone misses a
+    descendant that left it. A run that never launched has no pid, no process start, no launch
+    mode, no recorded provider group, and an explicit never-started or never-ran reason. Anything
+    else, a damaged field or a probe error included, is not proof.
     """
     if "launch_mode" in record:
         if not (isinstance(record["launch_mode"], str) and record["launch_mode"] in _LAUNCH_MODES):
             return False
-    elif record.get("pid") is not None or record.get("process_start") is not None:
+        if store.parse_utc_timestamp(record.get("provider_exit_proven_at")) is None:
+            return False
+        try:
+            return provider_alive(record) is False
+        except Exception:  # a malformed liveness field never ends the scan or frees the stream
+            return False
+    if (record.get("pid") is not None or record.get("process_start") is not None
+            or record.get("provider_pgid") is not None):
         return False
-    elif isinstance(record.get("never_started_reason"), str) and record["never_started_reason"]:
-        return True
-    try:
-        return provider_alive(record) is False
-    except Exception:  # a malformed liveness field never ends the scan or frees the stream
-        return False
+    started = record.get("never_started_reason")
+    return (isinstance(started, str) and bool(started)) or record.get("returncode_reason") in _NEVER_RAN
+
+
+# A launch the dispatcher itself recorded as never having produced a provider (worker._provider_alive).
+_NEVER_RAN = frozenset({"spawn_process_missing", "dispatch_died_after_admission", "spawn_setup_failed"})
 
 
 # The states Monitor's /api/epics/v1 projection names (epics_router._lease_payload; SessionState).
