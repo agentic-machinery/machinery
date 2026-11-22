@@ -542,9 +542,6 @@ def forecast(snap: MeterSnapshot, rates: Mapping[str, Any], *, now: datetime) ->
             "reported_burn_pct_per_hour": reported_burn,
             "sustainable_pct_per_hour": sustainable, "unused_pct": round(unused, 2) if unused is not None else None,
             "workers_needed": workers, "worker_samples": samples,
-            # Pool points per worker-hour over the trailing week of write tasks: dispatch admission paces
-            # each meter with it, and one worker finishing does not move it the way burn per live worker does.
-            "points_per_worker_hour": rate if rate is not None and rate >= 0 else None,
         })
     return rows
 

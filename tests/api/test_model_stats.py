@@ -292,13 +292,8 @@ def test_planning_forecast_matches_two_meter_readings(tmp_path, monkeypatch):
     assert claude["reported_burn_pct_per_hour"] == 0.9
     assert claude["workers_needed"] == 2
     assert claude["worker_samples"] == 12
-    assert claude["points_per_worker_hour"] == 0.2
     assert pools["codex:b"]["remaining_pct"] == 60
     assert pools["codex:b"]["unused_pct"] is None
-    # Admission paces a meter whose burn has no second reading from its measured rate alone.
-    assert pools["codex:b"]["points_per_worker_hour"] == 0.35
-    assert pools["agy:gemini"]["points_per_worker_hour"] == 0.05
-    assert pools["grok"]["points_per_worker_hour"] is None
 
     meter_key = ctx_scoped_ttl_key(context, "planning", "meters", context.roots)
     for row in samples:

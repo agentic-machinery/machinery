@@ -11,7 +11,7 @@ and live in ``scripts/curriculum/pedagogy_config.py`` (#12680).
 # danger) when any check fails; read-only dispatches are exempt. An environment
 # variable with the same name overrides each default; `--force-admission
 # "<reason>"` can override host checks for one dispatch and records its reason.
-# Disk and subscription pacing refusals are mandatory.
+# Disk and subscription meter refusals are mandatory.
 # The defaults below are generic and deliberately conservative; they are not
 # any deployment's values. Each host sets its real values through the
 # environment overrides or the deployment env file read by
@@ -19,7 +19,7 @@ and live in ``scripts/curriculum/pedagogy_config.py`` (#12680).
 # admission snapshots carry memory, load, and CPU steal counters for measurement.
 # Live write workers (spawning/running, pid alive) at which a new one is refused.
 DISPATCH_MAX_LIVE_WRITE_WORKERS = 2
-# Subscription pacing (#1129). The interval is measured between reservations
+# Subscription meter limits (#1129). The interval is measured between reservations
 # on the same subscription meter.
 DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER = 8
 DISPATCH_MIN_METER_LAUNCH_INTERVAL_S = 30.0
