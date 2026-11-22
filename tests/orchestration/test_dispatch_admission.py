@@ -7,6 +7,7 @@ probe, never from allocating memory or generating load.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -156,13 +157,92 @@ def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, pro
         return json_depth.loads("[" * 600 + "]" * 600, max_depth=512)
 
     monkeypatch.setattr(pool_selector, "read_budget", overdeep_budget)
+    monkeypatch.setattr(host_admission, "read_planning", overdeep_budget)
     monkeypatch.setattr(host_admission, "tasks_dir", lambda: tmp_path / "overdeep-tasks")
     monkeypatch.setattr(adm, "load_thresholds", lambda: limits)
     spec = SimpleNamespace(mode="workspace-write", agent="codex", model="gpt-6.2-sol",
                            claude_account=None, codex_account="b-sub")
     result = host_admission.check(spec.mode, dry_run=True, disk_guard=False, spec=spec)
     assert result.admitted
-    assert "meter codex:b: live write workers 0/8 (fixed cap)" in result.summary()
+    assert "meter codex:b: live write workers 0/8 (fixed cap: planning forecast unavailable)" in result.summary()
+
+
+def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe, monkeypatch):
+    """Defect classes: a paced cap above the fixed ceiling or below 1, a cap that ignores measured burn,
+    a cap that moves when a worker finishes without a meter change, and an invalid, missing or expired
+    forecast or unmeasured rate that changes the fixed ceiling."""
+    now = datetime.now(UTC)
+
+    def view(*, pool="claude:b", remaining=27.0, hours=40.0, rate=0.3, samples=120, **row):
+        reset = (now + timedelta(hours=hours)).isoformat() if hours is not None else None
+        fields = {"pool": pool, "remaining_pct": remaining, "reset_at": reset, "points_per_worker_hour": rate,
+                  "worker_samples": samples}
+        return {"schema_version": "model-planning.v1", "capacity": [{**fields, **row}]}
+
+    # 27 points left, 40 hours, 0.3 points per worker-hour: 2.25 workers spend it by the reset.
+    assert adm.meter_cap("claude:b", 8, view(), now) == (
+        3, "paced cap: 27% left, 40.0h to reset, 0.3 points per worker-hour over 120 tasks, ceiling 8")
+    for forecast, cap in (
+        (view(remaining=24, hours=24, rate=0.5), 2),  # exactly two workers, never lifted to three by float noise
+        (view(remaining=0.0), 1),
+        (view(remaining=1, hours=100, rate=1, samples=10), 1),
+        (view(remaining=100, rate=0.0001), 8),
+        (view(remaining=100, hours=1e-9, rate=5e-324), 8),  # the denominator underflows to zero
+        (view(pool="grok"), 3),
+    ):
+        meter = "grok+cursor" if forecast["capacity"][0]["pool"] == "grok" else "claude:b"
+        assert adm.meter_cap(meter, 8, forecast, now)[0] == cap
+    assert adm.meter_cap("claude:b", 2, view(), now)[0] == 2
+    assert adm.meter_cap("claude:b", 0, view(), now)[0] == 0
+
+    for forecast, reason in (
+        (None, "planning forecast unavailable"),
+        ([], "planning forecast unavailable"),
+        ({**view(), "schema_version": "model-planning.v2"}, "planning forecast unavailable"),
+        ({"schema_version": "model-planning.v1", "capacity": {}}, "planning forecast unavailable"),
+        (view(pool="claude:a"), "no single forecast row for this meter"),
+        ({**view(), "capacity": view()["capacity"] * 2}, "no single forecast row for this meter"),
+        *((view(remaining=value), "remaining allowance unknown")
+          for value in (None, True, "27", math.nan, math.inf, -1, 100.5)),
+        *((view(reset_at=value), "reset time unknown")
+          for value in (None, 7, "", "not a time", "2026-11-23T22:00:00", "2026-11-23T22:00:00+00:00" + " " * 20)),
+        (view(hours=0), "reset time passed"),
+        (view(hours=-3), "reset time passed"),
+        *((view(rate=value), "no measured points per worker-hour")
+          for value in (None, 0, -0.2, False, "0.3", math.nan, math.inf)),
+        *((view(samples=value), "rate measured over fewer than 10 worker tasks")
+          for value in (None, 9, 0, -1, True, 10.0, "120")),
+    ):
+        assert adm.meter_cap("claude:b", 8, forecast, now) == (8, f"fixed cap: {reason}")
+
+    tasks = tmp_path / "tasks"
+    limits = replace(_LIMITS, max_live_write_workers=10, min_meter_launch_interval_s=0)
+    started = (now - timedelta(minutes=10)).isoformat()
+    for index in range(3):
+        _record(tasks, f"claude-b-{index}", agent="claude", claude_account="b", started_at=started)
+
+    def decide():
+        return adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                            meter="claude:b", meter_forecast=view(), now=now)
+
+    full = decide()
+    assert not full.admitted and full.meter is not None
+    assert (full.meter.live, full.meter.cap, full.meter.defer) == (3, 3, adm.MeterDefer.CAP)
+    assert "meter claude:b: live write workers 3/3 (paced cap: 27% left" in full.refusal_line()
+    _record(tasks, "claude-b-0", status="done", agent="claude", claude_account="b", started_at=started)
+    finished = decide()
+    assert finished.admitted and finished.meter is not None
+    assert (finished.meter.live, finished.meter.cap) == (2, 3)
+
+    monkeypatch.setattr(pool_selector, "read_budget", lambda: {})
+    monkeypatch.setattr(host_admission, "read_planning", lambda: view(remaining=4, hours=50, rate=0.1))
+    monkeypatch.setattr(host_admission, "tasks_dir", lambda: tmp_path / "host-tasks")
+    monkeypatch.setattr(adm, "load_thresholds", lambda: limits)
+    spec = SimpleNamespace(mode="workspace-write", agent="claude", model="claude-opus-5-5",
+                           claude_account="b", codex_account=None)
+    result = host_admission.check(spec.mode, dry_run=True, disk_guard=False, spec=spec)
+    assert result.admitted
+    assert "meter claude:b: live write workers 0/1 (paced cap: 4% left, 50.0h to reset" in result.summary()
 
 
 def test_grok_and_cursor_share_one_meter(tmp_path, probe):
