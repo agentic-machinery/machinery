@@ -2492,34 +2492,11 @@ def _script_reads_stdin(script: str) -> bool:
             # A computed command word may name a shell.
             if found[0] in SHELL_COMMANDS or found[0] == _UNDECIDABLE or "$" in found[0]:
                 return True
-            # A path-shaped word counts in every position: printed text can still reach a loader
-            # through a pipe. A bare `stdin` or `0` is a file only in the working directory, and a
-            # program only to a loader, so it counts only where a loader may open it.
-            loader = _loader_file_indexes(segment, found[2]) if _is_interpreter_command(found[0]) else set()
-            for index, word in enumerate(segment):
-                value = _strip_quotes(word)
-                if _names_stdin(value) and ("/" in value or index in loader):
-                    return True
+            # Any word may be a file operand here, so only a path-shaped one counts:
+            # a bare `0` or `stdin` is more often an exit status or text than a file.
+            if any("/" in (value := _strip_quotes(word)) and _names_stdin(value) for word in segment):
+                return True
     return False
-
-
-def _loader_file_indexes(segment: list[str], start: int) -> set[int]:
-    """The positions of a loader's words that may name its program file.
-
-    They are the words after the command word at `start`, and a redirect operand
-    before it. A descriptor after `<&` or `>&` and a here-string or here-document
-    word are data.
-    """
-    indexes = set()
-    for index, word in enumerate(segment):
-        operator = re.sub(r"^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})", "", segment[index - 1]) if index else ""
-        if operator in _LITERAL_OPERAND_OPERATORS or (
-            operator in {"<&", ">&"} and re.fullmatch(r"[0-9]+-?|-", _strip_quotes(word))
-        ):
-            continue
-        if index > start or (index and _redirection_skip_count(segment[index - 1]) == 2):
-            indexes.add(index)
-    return indexes
 
 
 def _segment_process_facts(segment: list[str], depth: int, documents: dict[str, list[tuple[str, bool]]]) -> set[str]:
