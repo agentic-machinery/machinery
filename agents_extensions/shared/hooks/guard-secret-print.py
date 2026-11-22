@@ -23,8 +23,10 @@ shell: `pkill -f`, and a `pgrep -f` anywhere in the same invocation as a `kill`
 whose operands are not literal numeric PIDs. The secret override does not
 apply to them, nor to a command too deep or malformed to read whole.
 
-Quote-aware tokenization keeps dangerous-looking strings inside a quoted commit
-message from becoming false positives. This is defense-in-depth, not a sandbox.
+Every rule reads the command as the shell will: POSIX words with quotes and
+escapes resolved, so a quoted commit message stays one word and a split-quoted
+word (`'e'nv`) is the word it spells. Text the shell could not parse, such as an
+unterminated quote, is refused. This is defense-in-depth, not a sandbox.
 """
 
 # Known limits
@@ -35,8 +37,10 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 # `. .env` and printed through other variable names remain a data-flow limit.
 # Captured dumps are tracked within one invocation, not across separate events.
 # Variable-name tracking covers configured names and suffixes, and their copies.
-# Nested script inputs retain literal expansion syntax rather than evaluating
-# Bash expansions, and script-word joining is conservative about adjacency.
+# Expansions are not evaluated: a word holding one keeps its `$` spelling and
+# is opaque, so a shell script it could supply is refused.
+# Interpreter string literals are read as written, decoded and joined with
+# adjacent literals; strings built at run time remain a limit.
 # Explicit override and value-free transform policies remain trusted boundaries.
 # Interpreter identifier mentions are default-denied, including os.environ[k].
 # Import aliases (import os as o), getattr(os, "environ") and
@@ -71,17 +75,14 @@ message from becoming false positives. This is defense-in-depth, not a sandbox.
 # scripts fed to a shell on stdin and abbreviated long options are not
 # modeled. Only the launchers in _WRAPPER_OPTIONS plus `env` and `xargs` are
 # resolved; others such as setsid, doas or find -exec are not.
-# Quote-spliced command words (`'k'ill`) are a shared tokenizer limit.
 
 from __future__ import annotations
 
-import codecs
-import contextvars
+import itertools
 import os
 import re
-import shlex
 import sys
-from collections.abc import Callable
+import unicodedata
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -89,11 +90,8 @@ try:
     from agents_extensions.shared.hooks.shell_redirects import _redirect_target_dynamic
     from agents_extensions.shared.hooks.shell_shlex import (
         ShellPreprocessLimit,
-        normalize_io_descriptors,
         preprocess_shell_command,
         skippable_heredoc_delimiters,
-        split_operator_run,
-        split_quote_preserving,
         strip_skippable_heredoc_bodies,
     )
     from agents_extensions.shared.hooks.shell_shlex import (
@@ -108,8 +106,6 @@ except Exception as exc:
     print(f"guard dependency unavailable: json_depth ({exc})", file=sys.stderr)
     raise SystemExit(2) from exc
 # Hook payloads carry free-form tool input; deeper JSON is refused, not parsed (json_depth).
-# Set only while _folded_simple_command_check rereads a command main could not parse.
-_FOLD_APOSTROPHES: contextvars.ContextVar[bool] = contextvars.ContextVar("fold_apostrophes", default=False)
 _PAYLOAD_MAX_DEPTH = 512
 
 SEPARATORS = {"&&", "||", ";", "&", "\n"}
@@ -266,9 +262,9 @@ WORKER_ENV_MODULE = "lu_machinery.session_supervisor"
 WORKER_ENV_MODULES = frozenset({WORKER_ENV_MODULE, "scripts.session_supervisor"})
 WORKER_ENV_COMMAND = "worker-env"
 
-_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*\Z")
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*\Z", re.DOTALL)
 _VAR_REF_RE = re.compile(
-    r"(?<!\\)\$(?:\{!(?P<indirect>[A-Za-z_][A-Za-z0-9_]*)\}|"
+    r"\$(?:\{!(?P<indirect>[A-Za-z_][A-Za-z0-9_]*)\}|"
     r"\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)(?::[-=?+][^}]*)?\}|"
     r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
 )
@@ -369,186 +365,481 @@ def _collapse_shell_line_continuations(command: str) -> str:
     return "".join(out)
 
 
-def _separate_program_flag_quotes(command: str, *, keep_plain: bool = False) -> str:
-    """Give shlex's non-POSIX lexer a word boundary before attached scripts.
+# Bash operators, longest first; a word never equals one, since quoting keeps it a word.
+_OPERATORS = (
+    "&>>", "<<<", "<<-", "&>", ">>", ">|", "&&", "||", ";;", "|&", "<<", "<>", ">&", "<&",
+    ">", "<", "|", "&", ";", "(", ")", "\n",
+)  # fmt: skip
+_OPERATOR_START = frozenset("&<>|;()\n")
+# A word value that needs no quoting to keep its meaning in any reader.
+_PLAIN_VALUE = re.compile(r"[A-Za-z0-9_./:=,+@%-]+")
+_DESCRIPTOR = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\}")
+_NAME_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_PARAMETER_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
+# Operators after which the next word is a redirection target, not a command word.
+_REDIRECT_OPERATORS = frozenset({"<", ">", ">>", "<>", ">|", "&>", "&>>", "<<", "<<-", "<<<", ">&", "<&"})
+# Of those, the ones whose word Bash never brace-expands (here-strings and here-document delimiters).
+_LITERAL_OPERAND_OPERATORS = frozenset({"<<", "<<-", "<<<"})
+# Reserved words after which the next word is still in command position.
+_COMMAND_OPENERS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"})
 
-    With `keep_plain`, a flag whose attached quote holds no blank, operator or
-    escape stays one word, as the shell reads it (`-e'c'` is `-ec`).
+
+_UNDECIDABLE = "__UNDECIDABLE_SECRET_COMMAND__"
+
+
+class _Word(str):
+    """A shell word in canonical spelling, with the exact `value` the command receives.
+
+    The spelling keeps an unquoted `NAME=` prefix visible and expansions inside
+    double quotes; `value` resolves every quote and escape and leaves each
+    expansion spelled; `dynamic` says whether the word holds an expansion.
     """
-    out = []
+
+    value = ""
+    dynamic = False
+
+
+def _expansion_end(text: str, start: int) -> int:
+    """End of the `${...}`, `$(...)`, `$((...))` or backtick expansion at `start`."""
+    if text[start] == "`":
+        end = start + 1
+        while end < len(text):
+            if text[end] == "\\":
+                end += 2
+            elif text[end] == "`":
+                return end + 1
+            else:
+                end += 1
+        raise ValueError("unterminated backtick")
+    closer = "}" if text[start + 1] == "{" else ")"
+    depth = 1
     quote = ""
-    index = 0
-    while index < len(command):
-        char = command[index]
+    end = start + 2
+    while end < len(text):
+        char = text[end]
         if char == "\\" and quote != "'":
-            out.append(command[index : index + 2])
-            index += 2
+            end += 2
             continue
-        if not quote and (index == 0 or command[index - 1] in " \t\n;|&("):
-            # Options are opaque here; quote handling must not depend on the
-            # interpreter's option letters or their position in a cluster.
-            flag = re.match(r"(-{1,2}[A-Za-z][A-Za-z0-9_-]*=?)(?=[\"'])", command[index:])
-            if (
-                flag
-                and keep_plain
-                and re.match(r"""'[^'\s();&|<>]*'|"[^"\\\s();&|<>]*\"""", command[index + flag.end() :])
-            ):
-                flag = None
-            if flag:
-                out.append(flag[0].rstrip("=") + " ")
-                index += flag.end()
+        if quote:
+            if char == quote:
+                quote = ""
+            elif quote == '"' and (char == "`" or text.startswith(("${", "$("), end)):
+                end = _expansion_end(text, end)
                 continue
-        if quote == char and index + 1 < len(command) and command[index + 1] == char:
-            # Adjacent fragments of the same shell quote are one word. Preserve
-            # their join before the non-POSIX lexer can invent an argv boundary.
+        elif text.startswith("$'", end):
+            end = _ansi_c_end(text, end)
+            continue
+        elif char in "'\"":
+            quote = char
+        elif char == "`" or text.startswith(("${", "$("), end):
+            end = _expansion_end(text, end)
+            continue
+        elif closer == ")" and char == "(":
+            depth += 1
+        elif char == closer:
+            depth -= 1
+            if not depth:
+                return end + 1
+        end += 1
+    raise ValueError("unterminated expansion")
+
+
+def _parameter_end(text: str, start: int) -> int | None:
+    """End of the expansion starting at `start`, or None for a literal `$`."""
+    if text[start] == "`" or text.startswith(("${", "$("), start):
+        return _expansion_end(text, start)
+    name = _PARAMETER_NAME.match(text, start + 1)
+    return name.end() if name else None
+
+
+def _ansi_c_value(text: str, start: int) -> tuple[str, int]:
+    """Decode the `$'...'` word at `start`; refuse escapes whose Bash meaning is not modelled."""
+    end = start + 2
+    while end < len(text) and text[end] != "'":
+        end += 2 if text[end] == "\\" else 1
+    if end >= len(text):
+        raise ValueError("unterminated ANSI-C quote")
+    body = text[start + 2 : end]
+    if not _ansi_c_modelled(body):
+        raise ValueError("ANSI-C escape whose Bash meaning is not modelled")
+    return _ANSI_C_MODELLED_ESCAPE.sub(_ansi_c_escape, body), end + 1
+
+
+def _ansi_c_escape(match: re.Match[str]) -> str:
+    """The character one modelled ANSI-C escape stands for; literal text stays as written."""
+    if match[1] or match[2]:
+        return chr(int(match[1], 16) if match[1] else int(match[2], 8))
+    return {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}.get(match[0][1], match[0][1])
+
+
+def _double_quoted_parts(text: str, start: int) -> tuple[list[tuple[str, str]], int]:
+    """Parts of the double-quoted string opening at `start`, and the index after it."""
+    parts: list[tuple[str, str]] = []
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            return parts, index + 1
+        if char == "\\" and index + 1 < len(text) and text[index + 1] in '$`"\\\n':
+            if text[index + 1] != "\n":
+                parts.append(("lit", text[index + 1]))
             index += 2
             continue
-        if char in {"'", '"'} and (not quote or quote == char):
-            quote = "" if quote else char
-        out.append(char)
+        if char in "$`":
+            end = _parameter_end(text, index)
+            if end is not None:
+                parts.append(("exp", text[index:end]))
+                index = end
+                continue
+        parts.append(("lit", char))
         index += 1
-    return "".join(out)
+    raise ValueError("unterminated double quote")
 
 
-def _join_shell_words(text: str, tokens: list[str]) -> list[str]:
-    """Rejoin the quote fragments of one shell word (`'pk'"ill"`) that the lexer split.
+def _spell(parts: list[tuple[str, str]]) -> str:
+    """Canonical spelling: source for unquoted literals, else a quoting `_strip_quotes` undoes exactly."""
+    if all(kind == "src" for kind, _ in parts):
+        return "".join(text for _, text in parts)
+    if all(kind != "exp" for kind, _ in parts):
+        value = "".join(text for _, text in parts)
+        return value if _PLAIN_VALUE.fullmatch(value) else "'" + value.replace("'", "'\\''") + "'"
+    # A plain `$NAME` is braced, so literal text after it can never extend the name.
+    return (
+        '"'
+        + "".join(
+            re.sub(r"\A\$([A-Za-z_][A-Za-z0-9_]*)\Z", r"${\1}", text)
+            if kind == "exp"
+            else re.sub(r'([\\"$`])', r"\\\1", text)
+            for kind, text in parts
+        )
+        + '"'
+    )
 
-    The lexer ends a token after its closing quote, so tokens that touch in
-    `text` belong to one word unless either is an operator.
+
+def _canonical_word(parts: list[tuple[str, str]]) -> _Word:
+    """Spell one word; an unquoted `NAME=` prefix stays visible as an assignment."""
+    prefix = ""
+    if parts and parts[0][0] == "src" and (assignment := _NAME_ASSIGNMENT.match(parts[0][1])):
+        prefix = assignment.group()
+        parts = [("src", parts[0][1][len(prefix) :]), *parts[1:]]
+    spelled = _spell(parts)
+    word = _Word(prefix + spelled)
+    word.value = prefix + _strip_quotes(spelled)
+    word.dynamic = any(kind == "exp" for kind, _ in parts)
+    return word
+
+
+# Brace expansion stops here rather than build more words; past it the command is refused.
+_BRACE_LIMIT = 1024
+_BRACE_OPENERS = 256
+_BRACE_WORK = 1_000_000
+_BRACED_PARAMETER = re.compile(r"(\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]))")
+_BRACE_SEQUENCE = re.compile(r"(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])(?:\.\.(-?[0-9]+))?")
+# Same-kind endpoints and a second `..`: past an invalid step Bash leaves the brace as written.
+_SEQUENCE_ENDPOINTS = re.compile(r"(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])\.\.")
+# A `+` sign or a number past 64 bits, which Bash reads its own way; the command is refused.
+_SEQUENCE_UNMODELLED = re.compile(r"(?:\A|\.\.)\+|[0-9]{19}")
+# A unit is one unquoted character, one quoted or escaped character, or one expansion.
+_Unit = tuple[str, str]
+
+
+def _brace_sequence(text: str) -> list[str] | None:
+    """The words of a `{x..y[..step]}` body, as Bash generates them, or None."""
+    match = _BRACE_SEQUENCE.fullmatch(text)
+    if not match:
+        return None
+    start, end, step_text = match.groups()
+    step = abs(int(step_text or "1")) or 1
+    numeric = start.lstrip("-").isdigit()
+    if numeric != end.lstrip("-").isdigit():
+        return None
+    low, high = (int(start), int(end)) if numeric else (ord(start), ord(end))
+    if abs(high - low) // step >= _BRACE_LIMIT:
+        raise ValueError("brace expansion too large")
+    values = range(low, high + (1 if high >= low else -1), step if high >= low else -step)
+    if not numeric:
+        if ord("\\") in values:
+            # Bash quote-removes the backslash it generates, leaving an empty word.
+            raise ValueError("letter sequence across the backslash")
+        return [chr(value) for value in values]
+    # Bash pads every number to the widest endpoint when either endpoint has a leading zero.
+    padded = any(re.match(r"-?0[0-9]", endpoint) for endpoint in (start, end))
+    width = max(len(start), len(end)) if padded else 0
+    return [f"{value:0{width}d}" for value in values]
+
+
+def _brace_expand(
+    units: list[_Unit], first: int = 0, budget: list[int] | None = None, starts: frozenset[int] = frozenset({0})
+) -> list[list[_Unit]]:
+    """Expand the unquoted braces of one word, left to right, as Bash does.
+
+    Braces before `first` are already literal. `starts` holds the indices that
+    begin the word, a brace alternative or the text after a brace, which Bash
+    expands as texts of their own: a brace closes inside its text, and a `{}`
+    that begins one is literal. `budget` caps the units built across the
+    whole expansion; past it, or past the word and opener limits, the word is
+    refused.
     """
-    words: list[str] = []
-    end = 0
-    joinable = False
-    for token in tokens:
-        start = text.find(token, end)
-        if start < 0:
-            raise ValueError("token not found in its source text")
-        word = not set(token) <= set("();&|<>\n")
-        if joinable and word and start == end:
-            words[-1] += token
+    budget = [_BRACE_WORK] if budget is None else budget
+    if sum(unit == ("src", "{") for unit in units) > _BRACE_OPENERS:
+        raise ValueError("too many braces to expand")
+    for start in range(first, len(units)):
+        if units[start] != ("src", "{"):
+            continue
+        if units[start + 1 : start + 2] == [("src", "}")]:
+            # Bash never opens a brace at a `{}` that begins a text (find's placeholder),
+            if start in starts:
+                continue
+            # nor at one after a backslash-escaped blank, which units cannot tell from a quoted one.
+            if start and units[start - 1] in {("lit", " "), ("lit", "\t")}:
+                raise ValueError("brace after a blank whose quoting is not modelled")
+        depth = 0
+        commas: list[int] = []
+        dots = False
+        # Bash expands each text alone, so a brace closes inside the text it opens in.
+        limit = min((index for index in starts if index > start), default=len(units))
+        for end in range(start, limit):
+            kind, char = units[end]
+            if kind != "src":
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                # Bash reads a top-level `}` before any comma or `..` as a
+                # literal and keeps looking (`{a},b}` is `a}` `b`).
+                if depth == 1 and not commas and not dots:
+                    continue
+                depth -= 1
+                if not depth:
+                    break
+            elif char == "," and depth == 1:
+                commas.append(end)
+            elif (
+                char == "."
+                and depth == 1
+                and units[end + 1 : end + 2] == [("src", ".")]
+                and units[end + 2 : end + 3] != [("src", "}")]
+            ):
+                dots = True
         else:
-            words.append(token)
-        end = start + len(token)
-        joinable = word
+            continue
+        if commas:
+            bounds = [start, *commas, end]
+            alternatives = [units[left + 1 : right] for left, right in itertools.pairwise(bounds)]
+        else:
+            # Quoted characters and expansions never form a sequence field.
+            spelled = "".join(char if kind == "src" else "\0" for kind, char in units[start + 1 : end])
+            if _SEQUENCE_UNMODELLED.search(spelled):
+                raise ValueError("brace sequence field that Bash reads its own way")
+            sequence = _brace_sequence(spelled)
+            if sequence is None:
+                ends = _SEQUENCE_ENDPOINTS.match(spelled)
+                if ends and ends[1].lstrip("-").isdigit() == ends[2].lstrip("-").isdigit():
+                    # Bash 5.2 expands a brace nested in such a sequence and 5.3 keeps it literal.
+                    if ("src", "{") in units[start + 1 : end]:
+                        raise ValueError("brace inside an invalid-step sequence, which Bash versions read differently")
+                    # Valid endpoints, invalid step: Bash keeps the whole brace and expands the text after it alone.
+                    return _brace_expand(units, end + 1, budget, starts | {end + 1})
+                # Otherwise Bash leaves only this opening brace as written and reads on.
+                continue
+            alternatives = [[("src", char) for char in value] for value in sequence]
+        words: list[list[_Unit]] = []
+        for alternative in alternatives:
+            word = [*units[:start], *alternative, *units[end + 1 :]]
+            budget[0] -= len(word)
+            if budget[0] < 0:
+                raise ValueError("brace expansion too large")
+            shift = len(alternative) - (end + 1 - start)
+            inner = frozenset(
+                {
+                    *(index for index in starts if index < start),
+                    start,
+                    start + len(alternative),
+                    *(index + shift for index in starts if index > end),
+                }
+            )
+            # The braces before `start` stayed literal, so the rest of the word is read from there.
+            words.extend(_brace_expand(word, start, budget, inner))
+            if len(words) > _BRACE_LIMIT:
+                raise ValueError("brace expansion too large")
+        return words
+    return [units]
+
+
+def _brace_words(parts: list[tuple[str, str]]) -> list[_Word]:
+    """The canonical words Bash makes from one word by brace expansion."""
+    units = [
+        unit
+        for kind, text in parts
+        for unit in ([(kind, text)] if kind == "exp" or not text else [(kind, char) for char in text])
+    ]
+    words: list[_Word] = []
+    for word in _brace_expand(units):
+        # Bash drops an unquoted word that expands to nothing.
+        if not word or all(kind == "src" and not text for kind, text in word):
+            continue
+        # Join each run of literal units once; expansions stay separate parts.
+        merged: list[tuple[str, str]] = []
+        run_kind, run = "", []
+        for kind, text in word:
+            if kind != run_kind or kind == "exp":
+                if run:
+                    merged.append((run_kind, "".join(run)))
+                run_kind, run = kind, []
+            run.append(text)
+        if run:
+            merged.append((run_kind, "".join(run)))
+        # Parameters expand after braces, so an unquoted `$` that braces put
+        # before a name (`{$,}NAME`) is an expansion; quoted text stays literal.
+        if any(kind == "src" and ("${" in text or "$[" in text) for kind, text in merged):
+            raise ValueError("expansion assembled by brace expansion")
+        expanded = [
+            ("exp" if kind == "src" and _BRACED_PARAMETER.fullmatch(piece) else kind, piece)
+            for kind, text in merged
+            for piece in (_BRACED_PARAMETER.split(text) if kind == "src" else [text])
+            if piece or kind != "src"
+        ]
+        words.append(_canonical_word(expanded or [("src", "")]))
     return words
 
 
-def _tokenize(command: str, *, shell_words: bool = False) -> list[str]:
-    """Split a command into tokens; with `shell_words`, into the words the shell reads."""
-    try:
-        executable = _decode_ansi_c_quotes(preprocess_shell_command(command))
-        protected, parameters = _protect_parameters(_separate_program_flag_quotes(executable, keep_plain=shell_words))
+def _lex(command: str) -> list[str]:
+    """Split shell text into operators and POSIX words, quotes and escapes resolved.
 
-        def descriptor_word(descriptor: str, operator: str) -> str:
-            marker = f"\ue000{len(parameters)}\ue001"
-            while marker in protected:
-                marker += "\ue002"
-            parameters[marker] = descriptor + operator
-            return marker + " "
-
-        protected = normalize_io_descriptors(protected, descriptor_word)
-        tokens = split_quote_preserving(protected, punctuation_chars="();&|<>\n", whitespace=" \t")
-        if shell_words:
-            tokens = _join_shell_words(protected, tokens)
-        restored = [_restore_parameters(token, parameters) for token in tokens]
-        # shlex can combine an arithmetic close and newline as one punctuation
-        # run (`))\n`). The newline still starts a new executable command.
-        return [
-            part
-            for token in restored
-            for part in (
-                re.findall(r"[^\n]+|\n", token) if "\n" in token and set(token) <= set("();&|<>\n") else [token]
-            )
-        ]
-    except ValueError:
-        return ["__UNDECIDABLE_SECRET_COMMAND__"]
-
-
-def _protect_parameters(command: str) -> tuple[str, dict[str, str]]:
-    """Keep complete Bash ${...} words intact while shlex splits operators.
-
-    While _FOLD_APOSTROPHES is set, `'\\''` inside single quotes (close, escaped
-    apostrophe, reopen) is kept too. The non-POSIX lexer honours a quote only at
-    the start of a word, so it would read the reopening quote as a plain character
-    and every later quote inverted; as a marker the word stays one fragment.
+    Each word comes back in a canonical spelling whose `value` is exact, and a
+    quoted operator character can never read as syntax. Expansions stay spelled
+    inside double quotes. Brace expansion follows Bash: never on a redirection
+    or here-string operand, nor on an assignment before the command name.
+    Raises ValueError for text the shell would not parse (an unterminated quote
+    or expansion).
     """
-    substitutions = {start: end for start, end, _ in _substitution_spans(command)}
-    parameters: dict[str, str] = {}
-    markers: dict[str, str] = {}
-    fold = _FOLD_APOSTROPHES.get()
-    out: list[str] = []
-    quote = ""
-    i = 0
+    if "\0" in command:
+        # An argument string ends at NUL, so the shell would run a different command.
+        raise ValueError("NUL in shell text")
+    tokens: list[str] = []
+    parts: list[tuple[str, str]] = []
+    unquoted: list[str] = []
+    started = False
+    command_start = True
+    # The operator whose operand the next word is, or "" for an ordinary word.
+    redirect_target = ""
 
-    def protect(text: str) -> None:
-        # One marker per distinct text keeps restoring linear in the apostrophe count.
-        marker = markers.get(text)
-        if marker is None:
-            marker = f"\ue000{len(parameters)}\ue001"
-            while marker in command:
-                marker += "\ue002"
-            parameters[marker] = text
-            markers[text] = marker
-        out.append(marker)
+    def settle() -> None:
+        if unquoted:
+            parts.append(("src", "".join(unquoted)))
+            unquoted.clear()
 
-    while i < len(command):
-        char = command[i]
-        if char == "\\" and quote != "'" and i + 1 < len(command):
-            out.append(command[i : i + 2])
-            i += 2
-            continue
-        if fold and quote == "'" and command.startswith("'\\''", i):
-            protect("'\\''")
-            i += 4
-            continue
-        if char == "'" and quote != '"':
-            quote = "" if quote else "'"
-        elif char == '"' and quote != "'":
-            quote = "" if quote else '"'
-        if quote != "'" and command.startswith("${", i):
-            depth = 1
-            inner_quote = ""
-            end = i + 2
-            while end < len(command) and depth:
-                current = command[end]
-                if current == "\\" and inner_quote != "'":
-                    end += 2
-                    continue
-                if current == "'" and inner_quote != '"':
-                    inner_quote = "" if inner_quote else "'"
-                elif current == '"' and inner_quote != "'":
-                    inner_quote = "" if inner_quote else '"'
-                elif inner_quote != "'" and end in substitutions:
-                    end = substitutions[end]
-                    continue
-                elif not inner_quote and command.startswith("${", end):
-                    depth += 1
-                    end += 2
-                    continue
-                elif not inner_quote and current == "}":
-                    depth -= 1
-                end += 1
-            if not depth:
-                protect(command[i:end])
-                i = end
+    def add(kind: str, text: str) -> None:
+        nonlocal started
+        if kind == "src":
+            unquoted.append(text)
+        else:
+            settle()
+            parts.append((kind, text))
+        started = True
+
+    def flush() -> None:
+        nonlocal started, command_start, redirect_target
+        settle()
+        if started:
+            target = redirect_target
+            assignment = (
+                command_start and not target and parts[0][0] == "src" and bool(_NAME_ASSIGNMENT.match(parts[0][1]))
+            )
+            braces = (
+                target not in _LITERAL_OPERAND_OPERATORS
+                and not assignment
+                and any(kind == "src" and "{" in text for kind, text in parts)
+            )
+            words = _brace_words(parts) if braces else [_canonical_word(parts)]
+            if target and len(words) != 1:
+                # Bash refuses a redirection whose operand expands to other than one word.
+                raise ValueError("ambiguous redirect")
+            tokens.extend(words)
+            redirect_target = ""
+            if not target and not assignment and not (words and words[0] in _COMMAND_OPENERS):
+                command_start = False
+        parts.clear()
+        started = False
+
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char in " \t":
+            flush()
+            index += 1
+        elif char in _OPERATOR_START:
+            operator = next(op for op in _OPERATORS if command.startswith(op, index))
+            index += len(operator)
+            settle()
+            descriptor = "".join(text for _, text in parts)
+            if (
+                char in "<>"
+                and parts
+                and all(kind == "src" for kind, _ in parts)
+                and _DESCRIPTOR.fullmatch(descriptor)
+                and not (descriptor.isdigit() and int(descriptor) > 2147483647)
+            ):
+                parts.clear()
+                started = False
+                # Descriptor 0 is the default input; spell it as Bash reads it.
+                default = descriptor.isdigit() and not int(descriptor) and char == "<"
+                tokens.append(operator if default else descriptor + operator)
+            else:
+                flush()
+                tokens.append(operator)
+            redirect_target = operator if operator in _REDIRECT_OPERATORS else ""
+            if not redirect_target:
+                command_start = True
+        elif char == "\\":
+            if command.startswith("\\\n", index):
+                index += 2
                 continue
-        out.append(char)
-        i += 1
-    return "".join(out), parameters
+            if index + 1 == len(command):
+                # Bash keeps or drops a backslash that ends its input by how the last line began.
+                raise ValueError("backslash at the end of shell text")
+            add("lit", command[index + 1])
+            index += 2
+        elif char == "'":
+            end = command.find("'", index + 1)
+            if end < 0:
+                raise ValueError("unterminated single quote")
+            add("lit", command[index + 1 : end])
+            index = end + 1
+        elif command.startswith("$'", index):
+            value, index = _ansi_c_value(command, index)
+            add("lit", value)
+        elif char == '"' or command.startswith('$"', index):
+            quoted_parts, index = _double_quoted_parts(command, index + (char == "$"))
+            settle()
+            parts.extend(quoted_parts or [("lit", "")])
+            started = True
+        elif char in "$`" and (end := _parameter_end(command, index)) is not None:
+            add("exp", command[index:end])
+            index = end
+        else:
+            add("src", char)
+            index += 1
+    flush()
+    return tokens
 
 
-def _restore_parameters(token: str, parameters: dict[str, str]) -> str:
-    for marker, value in parameters.items():
-        token = token.replace(marker, value)
-    return token
+def _tokenize(command: str) -> list[str]:
+    """Split a command into the operators and canonical words the shell reads."""
+    try:
+        return _lex(preprocess_shell_command(command))
+    except ValueError:
+        return [_UNDECIDABLE]
 
 
 def _strip_quotes(token: str) -> str:
+    """The value of a word: exact for a lexer word, else single quotes hold `'\\''` and double quotes escapes."""
+    if isinstance(token, _Word):
+        return token.value
     if len(token) >= 2 and token[0] == token[-1] == "'":
-        # A lexer single-quoted token holds '\\'' only where _protect_parameters folded it.
         return token[1:-1].replace("'\\''", "'")
     if len(token) >= 2 and token[0] == token[-1] == '"':
-        return token[1:-1]
+        return re.sub(r"\\(.)", r"\1", token[1:-1], flags=re.DOTALL)
     return token
 
 
@@ -570,42 +861,6 @@ def _ansi_c_modelled(body: str) -> bool:
                 return False
         index = body.find("\\", match.end())
     return True
-
-
-def _decode_ansi_c_quotes(command: str) -> str:
-    """Turn Bash ANSI-C words into shell-quoted decoded words before parsing."""
-    out: list[str] = []
-    quote = ""
-    i = 0
-    while i < len(command):
-        char = command[i]
-        if char == "\\" and quote != "'" and i + 1 < len(command):
-            out.append(command[i : i + 2])
-            i += 2
-            continue
-        if not quote and command.startswith("$'", i):
-            end = i + 2
-            while end < len(command):
-                if command[end] == "\\":
-                    end += 2
-                elif command[end] == "'":
-                    break
-                else:
-                    end += 1
-            if end < len(command):
-                body = command[i + 2 : end]
-                if not _ansi_c_modelled(body):
-                    raise ValueError("ANSI-C escape whose Bash meaning is not modelled")
-                value = codecs.decode(body, "unicode_escape")
-                quoted = shlex.quote(value)
-                out.append(quoted if quoted.startswith("'") else "'" + quoted + "'")
-                i = end + 1
-                continue
-        if char in {"'", '"'}:
-            quote = "" if quote == char else quote if quote else char
-        out.append(char)
-        i += 1
-    return "".join(out)
 
 
 def _is_single_quoted(token: str) -> bool:
@@ -656,11 +911,9 @@ def _is_command_brace(token: str, segment: list[str]) -> bool:
     )
 
 
-def _pipelines(command: str, *, shell_words: bool = False) -> list[list[list[str]]]:
-    """Return command pipelines, split quote-aware on pipes and separators."""
-    # shlex groups adjacent punctuation into runs such as `);`. Split those
-    # before segmenting, or a command after a substitution can be hidden.
-    tokens = [part for token in _tokenize(command, shell_words=shell_words) for part in split_operator_run(token)]
+def _pipelines(command: str) -> list[list[list[str]]]:
+    """Return command pipelines of shell words, split on pipes and separators."""
+    tokens = _tokenize(command)
     pipelines: list[list[list[str]]] = []
     pipeline: list[list[str]] = []
     segment: list[str] = []
@@ -838,11 +1091,11 @@ def _command_at(seg: list[str]) -> tuple[str, list[str], int] | None:
                 if _is_assignment(seg[j]):
                     j += 1
                 elif token.startswith("--"):
-                    value_pending = token in {"--unset", "--chdir", "--split-string"}
+                    value_pending = token in {"--unset", "--chdir", "--split-string", "--argv0"}
                     j += 1
                 elif token.startswith("-"):
                     for index, letter in enumerate(token[1:], 1):
-                        if letter in "uCS":
+                        if letter in "uCSa":
                             value_pending = index == len(token) - 1
                             break
                     j += 1
@@ -890,12 +1143,16 @@ def _is_secret_var_name(name: str) -> bool:
 def _expanded_secret_var(arg: str, copied: set[str] | None = None, named: dict[str, str] | None = None) -> str | None:
     if _is_single_quoted(arg):
         return None
-    # Check each dollar position: an outer default such as ${x:-${GH_TOKEN}}
-    # otherwise consumes the inner reference before finditer can see it.
-    for index, char in enumerate(arg):
-        if char != "$":
+    # Check each unescaped dollar position: an outer default such as
+    # ${x:-${GH_TOKEN}} otherwise consumes the inner reference before finditer
+    # can see it. A backslash escapes the next character, itself included.
+    index = -1
+    while index + 1 < len(arg):
+        index += 1
+        if arg[index] == "\\":
+            index += 1
             continue
-        match = _VAR_REF_RE.match(arg, index)
+        match = _VAR_REF_RE.match(arg, index) if arg[index] == "$" else None
         if match is None:
             continue
         indirect = match.group("indirect")
@@ -915,17 +1172,6 @@ def _path_name(path: str) -> str:
     if not clean:
         return ""
     return clean.rsplit("/", 1)[-1].lower()
-
-
-def _is_dotenv_secret_file(path: str) -> bool:
-    clean = _strip_quotes(path).lower()
-    name = _path_name(clean)
-    return (
-        clean in {"~/.bash_secrets"}
-        or name in {".env", ".envrc", ".bash_secrets"}
-        or name.endswith(".env")
-        or (name.startswith(".env.") and not name.endswith(SAFE_DOTENV_SUFFIXES))
-    )
 
 
 def _is_secrets_directory(path: str) -> bool:
@@ -1076,11 +1322,14 @@ def _raw_without_redirects(args: list[str]) -> list[str]:
     return result
 
 
-def _stdout_target(args: list[str]) -> str | None:
+def _stdout_target(args: list[str], substitutions: dict[str, tuple[str, str]] | None = None) -> str | None:
     destinations: dict[str, str | None] = {"1": None, "2": "/dev/stderr"}
+    # A command substitution can print any path, `/dev/stdout` included.
+    computed = [marker for marker, (prefix, _) in (substitutions or {}).items() if prefix in {"$(", "`"}]
     for index, token in enumerate(args[:-1]):
         raw = args[index + 1]
-        target = "/dev/stderr" if _redirect_target_dynamic(raw) else _strip_quotes(raw)
+        dynamic = _redirect_target_dynamic(raw) or any(marker in raw for marker in computed)
+        target = "/dev/stderr" if dynamic else _strip_quotes(raw)
         if token in {"&>", "&>>"}:
             destinations["1"] = destinations["2"] = target
             continue
@@ -1153,7 +1402,7 @@ def _env_dump_reason(
         if not reason or _has_override(segment):
             continue
         found = _command_at(segment)
-        target = _stdout_target(found[1]) if found else None
+        target = written = _stdout_target(found[1], substitutions) if found else None
         if target is not None:
             target = _normalized_path(target)
         # Process substitutions are output consumers, not capture filenames.
@@ -1167,9 +1416,8 @@ def _env_dump_reason(
             if _has_safe_downstream(pipeline, index):
                 continue
             return reason
-        visible = target in {"/dev/stdout", "/dev/stderr", "/dev/tty"} or bool(
-            target and re.fullmatch(r"/(?:dev/fd|proc/(?:self|\$\$|[0-9]+)/fd)/[0-9]+", target)
-        )
+        # The written spelling: a lexically folded `..` loses the symlinks it crossed.
+        visible = any(_names_stream(written or target, name) for name in ("stdout", "stderr", "tty"))
         if target and not visible:
             if target != "/dev/null":
                 dumped_files.add(target)
@@ -1271,7 +1519,196 @@ def _is_interpreter_command(cmd: str) -> bool:
     }
 
 
-def _program_reason(cmd: str, program: str) -> str | None:
+# Between two literals the runtime joins into one string: blanks, `+` or `.` concatenation.
+_LITERAL_JOIN = re.compile(r"[\s+.]*")
+# Characters of folded Python strings one program may build before the reader refuses it.
+_PYTHON_STRING_BUDGET = 2_000_000
+_SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v", "0": "\0", "e": "\x1b"}
+_ESCAPE = re.compile(
+    r"\\(?:N\{(?:U\+(?P<nhex>[0-9A-Fa-f]{1,6})|(?P<name>[^}]+))\}"
+    r"|x\{(?P<xbrace>[0-9A-Fa-f]{1,6})\}|u\{(?P<ubrace>[0-9A-Fa-f]{1,6})\}|x(?P<hex>[0-9A-Fa-f]{2})"
+    r"|u(?P<u4>[0-9A-Fa-f]{4})|U(?P<u8>[0-9A-Fa-f]{8})|(?P<octal>[0-7]{1,3})|(?P<other>.))",
+    re.DOTALL,
+)
+# Runtime comment openers outside strings; a quote inside a comment opens no string.
+_LINE_COMMENTS = {"node": ("//",), "deno": ("//",), "bun": ("//",), "php": ("#", "//"), "lua": ("--",)}
+
+
+def _decoded(value: str, *, keep_unknown: bool) -> str:
+    """Decode string escapes; an unknown escape keeps its backslash or drops it, as runtimes differ."""
+
+    def replace(match: re.Match[str]) -> str:
+        if match["name"]:
+            try:
+                return unicodedata.lookup(match["name"])
+            except KeyError:
+                return match[0]
+        number = next((match[name] for name in ("nhex", "xbrace", "ubrace", "hex", "u4", "u8") if match[name]), None)
+        if number is not None or match["octal"]:
+            code = int(number, 16) if number is not None else int(match["octal"], 8)
+            return chr(code) if code <= 0x10FFFF else match[0]
+        other = match["other"]
+        if other in _SIMPLE_ESCAPES:
+            return _SIMPLE_ESCAPES[other]
+        if other == "\n":
+            # An escaped newline continues the string.
+            return ""
+        return match[0] if keep_unknown and other not in "\\'\"`\n$" else other
+
+    return _ESCAPE.sub(replace, value)
+
+
+def _literal_values(value: str) -> list[str]:
+    """A literal's text as written and as the runtimes may decode its escapes."""
+    values = [value]
+    if "\\" in value:
+        values += [_decoded(value, keep_unknown=True), _decoded(value, keep_unknown=False)]
+    # A C string ends at NUL, so a runtime that passes it on runs the text before it.
+    return list(dict.fromkeys(text.split("\0", 1)[0] for text in values))
+
+
+def _joined_runs(literals: list[tuple[int, int, str]], program: str) -> list[str]:
+    """Each literal and each run of literals the runtime joins into one string."""
+    texts: list[str] = []
+    run: list[str] = []
+    previous_end = -1
+    for start, end, value in literals:
+        if run and not _LITERAL_JOIN.fullmatch(program, previous_end, start):
+            if len(run) > 1:
+                texts.append("".join(run))
+            run = []
+        run.append(value)
+        texts.append(value)
+        previous_end = end
+    if len(run) > 1:
+        texts.append("".join(run))
+    return texts
+
+
+def _scanned_literals(program: str, runtime: str) -> list[tuple[int, int, str]]:
+    """String literals found by skipping comments, with their spans; quotes in a comment open nothing."""
+    comments = _LINE_COMMENTS.get(runtime, ("#",))
+    literals: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(program):
+        char = program[index]
+        if char in "\"'`":
+            quote = char * 3 if runtime == "python" and program.startswith(char * 3, index) else char
+            end = index + len(quote)
+            while end < len(program) and not program.startswith(quote, end):
+                end += 2 if program[end] == "\\" else 1
+            value = program[index + len(quote) : end]
+            if runtime == "python" and re.search(
+                r"(?<![\w])[rRbBuU]?[fFtT][rRbB]?\Z", program[max(index - 3, 0) : index]
+            ):
+                # Replacement fields of an f-string are code, not string text.
+                while (unfielded := re.sub(r"\{[^{}]*\}", " ", value)) != value:
+                    value = unfielded
+            literals.append((index, min(end + len(quote), len(program)), value))
+            index = end + len(quote)
+        elif program.startswith(comments, index) or (
+            runtime in {"node", "deno", "bun", "php"} and program.startswith("/*", index)
+        ):
+            closer = "*/" if program.startswith("/*", index) else "\n"
+            found = program.find(closer, index)
+            index = len(program) if found < 0 else found + len(closer)
+        else:
+            index += 1
+    return literals
+
+
+def _program_texts(program: str, runtime: str, words: tuple[str, ...] = ()) -> list[str]:
+    """Texts a program may pass to a shell: its string literals, joined runs and decodings.
+
+    Literals are read three ways and every reading counts: paired left to right
+    (main's reading), and with comments skipped by a string-aware scan, so a quote
+    inside a comment cannot shift the pairing.
+    """
+    paired = [(match.start(), match.end(), match["value"]) for match in _PROGRAM_STRINGS.finditer(program)]
+    texts = _joined_runs(paired, program) + _joined_runs(_scanned_literals(program, runtime), program)
+    values = [value for text in texts for value in _literal_values(text)]
+    if runtime == "python":
+        # The program may be the whole text (a here-document) or one of the words.
+        values += [text.split("\0", 1)[0] for source in (program, *words) for text in _python_strings(source)]
+    return list(dict.fromkeys(values))
+
+
+def _python_strings(program: str) -> list[str]:
+    """Every string Python's own parser builds from the program's literals, without running it.
+
+    Constants come decoded, implicitly joined literals as one string, `+` joins of
+    literals folded, and f-strings with their fields read as empty. Each node is
+    folded once and only the outermost folded strings are returned; past the
+    work budget this raises ValueError. A program Python cannot parse never
+    runs, so it yields nothing here.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(program)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return []
+    budget = _PYTHON_STRING_BUDGET
+    folded: dict[int, str] = {}
+    inner: set[int] = set()
+    order: list[ast.AST] = []
+    stack: list[ast.AST] = [tree]
+    while stack:
+        node = stack.pop()
+        order.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    # Children come after their parents in `order`, so reversing it folds them first.
+    for node in reversed(order):
+        value: str | None = None
+        children: list[ast.AST] = []
+        if isinstance(node, ast.Constant) and isinstance(node.value, str | bytes):
+            value = node.value.decode("latin-1") if isinstance(node.value, bytes) else node.value
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            children = [node.left, node.right]
+            if id(node.left) in folded and id(node.right) in folded:
+                value = folded[id(node.left)] + folded[id(node.right)]
+        elif isinstance(node, ast.JoinedStr):
+            children = list(node.values)
+            value = "".join(folded.get(id(child), "") for child in children)
+        elif isinstance(node, ast.FormattedValue):
+            children = [node.value]
+            value = folded.get(id(node.value))
+        if value is None:
+            continue
+        budget -= len(value)
+        if budget < 0:
+            raise ValueError("Python string literals exceed the reader's budget")
+        folded[id(node)] = value
+        inner.update(id(child) for child in children)
+    return [folded[id(node)] for node in order if id(node) in folded and id(node) not in inner]
+
+
+def _shell_pipelines(text: str) -> list[list[list[str]]]:
+    """Pipelines a shell runs from text: all of it, or each complete chunk of lines before one it cannot parse.
+
+    A shell executes every complete command before a syntax error, so text that
+    does not parse as a whole is read chunk by chunk; past the attempt budget,
+    every remaining line is read alone.
+    """
+    pipelines = _pipelines(text)
+    if pipelines != [[[_UNDECIDABLE]]]:
+        return pipelines
+    found: list[list[list[str]]] = []
+    lines = text.split("\n")
+    chunk: list[str] = []
+    for number, line in enumerate(lines):
+        chunk.append(line)
+        if number >= 256:
+            found.extend(pipeline for single in lines[number:] for pipeline in _pipelines(single))
+            break
+        read = _pipelines("\n".join(chunk))
+        if read != [[[_UNDECIDABLE]]]:
+            found.extend(read)
+            chunk = []
+    return found
+
+
+def _program_reason(cmd: str, program: str, words: tuple[str, ...] = ()) -> str | None:
     if not _is_interpreter_command(cmd):
         return None
     text, literals, boundaries, templates = _normalize_program(program)
@@ -1288,12 +1725,16 @@ def _program_reason(cmd: str, program: str) -> str | None:
         or (cmd in {"ruby", "perl"} and re.search(r"\b(?:system|exec|spawn|open|readpipe)\s+", program))
         or (cmd == "bun" and re.search(r"\$\s*`", program))
     )
-    for literal in _PROGRAM_STRINGS.finditer(program):
-        executes = child_call or (literal["quote"] == "`" and cmd in {"ruby", "perl", "php"})
-        if executes and any(
-            _env_source_reason(segment) for pipeline in _pipelines(literal["value"]) for segment in pipeline
-        ):
-            return "inline program contains a literal environment dumper"
+    # A backtick literal runs its text in Ruby, Perl and PHP even without a call.
+    backticks = cmd in {"ruby", "perl", "php"} and "`" in program
+    if child_call or backticks:
+        try:
+            texts = _program_texts(program, runtime, words)
+        except ValueError:
+            return "inline program strings exceed the reader's budget"
+        for value in texts:
+            if any(_env_source_reason(segment) for pipeline in _shell_pipelines(value) for segment in pipeline):
+                return "inline program contains a literal environment dumper"
     for language, pattern in _CHILD_COMMAND_LITERALS:
         if cmd != language or (language == "lua" and not child_call):
             continue
@@ -1330,6 +1771,16 @@ def _program_reason(cmd: str, program: str) -> str | None:
     return None
 
 
+def _glued_option_readings(value: str) -> str:
+    """The value, or for an option word every split of its leading letters from a glued rest."""
+    if value.startswith("--") and "=" in value:
+        return value.replace("=", " ", 1)
+    letters = re.match(r"-([A-Za-z]{1,8})", value)
+    if not letters or len(value) <= 2:
+        return value
+    return " ".join(value[: 1 + count] + " " + value[1 + count :] for count in range(1, len(letters[1]) + 1))
+
+
 def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | None:
     found = _command_at(segment)
     if not found:
@@ -1340,19 +1791,24 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     reason = _worker_env_reason(segment)
     if reason:
         return reason
-    try:
-        # Decode shell quoting across all arguments, including glued values.
-        # Do not infer which interpreter flags select program text.
-        program = " ".join(shlex.split(" ".join(args), posix=True))
-    except ValueError:
-        return "interpreter arguments could not be parsed safely"
-    reason = _program_reason(cmd, program)
-    if reason:
-        return reason
-    if _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
-        paths = re.findall(r"[\"']([^\"']+)[\"']", program)
-        if any(_normalized_path(path) in dumped_files for path in paths):
-            return "inline program would display a redirected environment dump"
+    # Read the shell values of all arguments, and again with every short option
+    # that may hold a glued program (`-e'ENV'`, `-esystem(...)`) split after each of
+    # its letters, and long options split at `=`. Do not infer which flags select program text.
+    values = [_strip_quotes(arg) for arg in args]
+    programs = [" ".join(values)]
+    split = " ".join(_glued_option_readings(value) for value in values)
+    if split != programs[0]:
+        programs.append(split)
+    for program in programs:
+        # Python's program may also be glued to its `-c` option.
+        glued = tuple(value[2:] for value in values if value.startswith("-c") and len(value) > 2)
+        reason = _program_reason(cmd, program, (*values, *glued))
+        if reason:
+            return reason
+        if _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
+            paths = re.findall(r"[\"']([^\"']+)[\"']", program)
+            if any(_normalized_path(path) in dumped_files for path in paths):
+                return "inline program would display a redirected environment dump"
     return None
 
 
@@ -1395,7 +1851,7 @@ def _heredoc_reason(
     cmd, args, _ = found
     for index, token in enumerate(args[:-1]):
         if token == "<<<":
-            inputs = [(body, True) for body in _script_words(args, index + 1)]
+            inputs = [(_strip_quotes(args[index + 1]), True)]
         elif token in {"<<", "<<-"}:
             pending = documents.get(_strip_quotes(args[index + 1]), [])
             inputs = [pending.pop(0)] if pending else []
@@ -1442,7 +1898,7 @@ def _file_args(cmd: str, args: list[str]) -> list[str]:
     i = 0
     while i < len(args):
         token = _strip_quotes(args[i])
-        redirection_skip = _redirection_skip_count(token)
+        redirection_skip = _redirection_skip_count(args[i])
         if redirection_skip:
             i += redirection_skip
             continue
@@ -1651,7 +2107,12 @@ def _normalized_path(path: str) -> str:
 
 def _sensitive_path(path: str) -> bool:
     clean = _normalized_path(path)
-    return _is_known_secret_file(clean) or bool(re.fullmatch(r"/proc/[^/]+/environ", clean))
+    # Any process's environment under /proc, or an `environ` whose directory is not known; the
+    # written spelling is read, since a lexically folded `..` loses the symlinks it crossed.
+    written = _strip_quotes(path)
+    parts = _path_parts(written)
+    environ = parts[-1:] == ["environ"] and (parts[:1] == ["proc"] or ".." in parts or not written.startswith("/"))
+    return _is_known_secret_file(clean) or environ
 
 
 def _non_printing_command(cmd: str, args: list[str]) -> bool:
@@ -1708,62 +2169,82 @@ def _sensitive_file_reason(pipeline: list[list[str]], index: int, dumped_files: 
     return "command could expose contents of a sensitive file"
 
 
+def _ansi_c_end(text: str, start: int) -> int:
+    """Index after the `$'...'` string at `start`; backslashes escape inside it."""
+    end = start + 2
+    while end < len(text) and text[end] != "'":
+        end += 2 if text[end] == "\\" else 1
+    if end >= len(text):
+        raise ValueError("unterminated ANSI-C quote")
+    return end + 1
+
+
 def _substitution_spans(command: str, *, heredoc: bool = False) -> list[tuple[int, int, str]]:
-    """Executable command and process substitutions with their source spans."""
+    """Executable command and process substitutions with their source spans.
+
+    Quoting contexts nest as Bash reads them: single quotes and `$'...'` hide
+    substitutions, except inside a `${...}` opened within double quotes, where
+    single quotes only pair for finding `}` and `$(...)` still runs. In a
+    here-document body (`heredoc`), quotes are literal.
+    """
     spans: list[tuple[int, int, str]] = []
-    quote = ""
+    # Contexts: '"' double quotes, "}" a `${` opened unquoted, "}q" one opened in
+    # double quotes, "'q" single quotes inside a "}q".
+    stack: list[str] = []
     index = 0
     while index < len(command):
         char = command[index]
-        if char == "\\" and (quote != "'" or heredoc):
+        top = stack[-1] if stack else ""
+        if char == "\\":
             index += 2
             continue
-        if not heredoc and char == "'" and quote != '"':
-            quote = "" if quote else "'"
-        elif not heredoc and char == '"' and quote != "'":
-            quote = "" if quote else '"'
-        elif quote != "'" and char == "`":
-            end = index + 1
-            while end < len(command) and command[end] != "`":
-                end += 2 if command[end] == "\\" else 1
-            if end < len(command):
-                spans.append((index, end + 1, command[index + 1 : end]))
-                index = end
-        elif quote != "'" and (
-            command.startswith("$(", index) or (not heredoc and command[index : index + 2] in {"<(", ">("})
-        ):
-            if command.startswith("$((", index):
+        if top == "'q":
+            if char == "'":
+                stack.pop()
                 index += 1
                 continue
-            start = index + 2
-            depth = 1
-            quotes = [""]
-            end = start
-            while end < len(command) and depth:
-                current = command[end]
-                if current == "\\" and quotes[-1] != "'":
-                    end += 2
-                    continue
-                if command.startswith("$(", end) and not command.startswith("$((", end) and quotes[-1] != "'":
-                    depth += 1
-                    quotes.append("")
-                    end += 2
-                    continue
-                if current == "'" and quotes[-1] != '"':
-                    quotes[-1] = "" if quotes[-1] else "'"
-                elif current == '"' and quotes[-1] != "'":
-                    quotes[-1] = "" if quotes[-1] else '"'
-                elif not quotes[-1]:
-                    if current == "(":
-                        depth += 1
-                        quotes.append("")
-                    elif current == ")":
-                        depth -= 1
-                        quotes.pop()
-                end += 1
-            if not depth:
-                spans.append((index, end, command[start : end - 1]))
-                index = end - 1
+        elif not heredoc and char == "'" and top == "}q":
+            stack.append("'q")
+            index += 1
+            continue
+        elif not heredoc and top in {"", "}"} and (char == "'" or command.startswith("$'", index)):
+            try:
+                end = command.index("'", index + 1) + 1 if char == "'" else _ansi_c_end(command, index)
+            except ValueError:
+                break
+            index = end
+            continue
+        elif not heredoc and char == '"':
+            if top == '"':
+                stack.pop()
+            else:
+                stack.append('"')
+            index += 1
+            continue
+        if command.startswith("${", index):
+            stack.append("}q" if top in {'"', "}q", "'q"} else "}")
+            index += 2
+            continue
+        if char == "}" and top in {"}", "}q"}:
+            stack.pop()
+            index += 1
+            continue
+        if command.startswith("$((", index):
+            index += 1
+            continue
+        if (
+            char == "`"
+            or command.startswith("$(", index)
+            or (not heredoc and top in {"", "}"} and command[index : index + 2] in {"<(", ">("})
+        ):
+            try:
+                end = _expansion_end(command, index)
+            except ValueError:
+                break
+            body = command[index + 1 : end - 1] if char == "`" else command[index + 2 : end - 1]
+            spans.append((index, end, body))
+            index = end
+            continue
         index += 1
     return spans
 
@@ -1780,61 +2261,61 @@ def _eval_secret_source(args: list[str], copied: set[str], named: dict[str, str]
     return False
 
 
-def _script_words(args: list[str], index: int) -> list[str]:
-    """Decode adjacent quote fragments for shell and interpreter script words."""
-    if index >= len(args):
-        return []
-    try:
-        words = shlex.split("".join(args[index:]), posix=True)
-    except ValueError:
-        return [_strip_quotes(args[index])]
-    return [words[0]] if words else []
-
-
 # Shell long options that take the next word, spelled with one or two dashes.
 _SHELL_VALUE_OPTIONS = {"rcfile", "init-file", "emulate"}
-# A literal first character that is not an option sign. Quotes, escapes,
-# expansions, tildes, globs, braces and substitutions could make it one.
-_SCRIPT_START = re.compile(r"""[^-+$`\\~{*?['"_]|'[^-+']|"[^-+"$`\\_]""")
+_SUBSTITUTION_MARKER = "__GUARD_SUBSTITUTION_"
+
+
+def _script_can_start(word: str) -> bool:
+    """Whether a canonical word starts with a character no expansion can make an option sign.
+
+    Expansions are spelled in double quotes and substitutions as markers; only
+    an unquoted word keeps tilde, glob or brace characters bare.
+    """
+    if _SUBSTITUTION_MARKER in word:
+        return False
+    if word.startswith('"'):
+        return bool(re.match(r'"[^-+"$`\\_]', word))
+    if word.startswith("'"):
+        value = _strip_quotes(word)
+        return bool(value) and value[0] not in "-+"
+    return bool(word) and word[0] not in "-+~*?[{"
 
 
 def _shell_script(args: list[str]) -> list[str]:
     """Extract the script operand of a shell -c invocation.
 
-    Every word before the script must be a plain literal word of letters,
-    digits and dashes, so no expansion can add or hide an option. The first
-    other word ends that region; it must start with a literal character that
-    is not an option sign, or the script is unreadable. When an option holds
-    `c`, that word and every plain non-option word before it are read as the
-    script, since a plain word may be an option's operand or the script itself.
+    Every word before the script must be a static word of letters, digits and
+    dashes, so no expansion can add or hide an option. The first other word
+    ends that region; it must start with a character no expansion can make an
+    option sign, or the script is unreadable. When an option holds `c`, that word and every plain
+    non-option word before it are read as the script, since a plain word may be
+    an option's operand or the script itself.
     """
     # Redirections may precede or sit among the options (`sh 2>/dev/null -c ...`).
     args = _raw_without_redirects(args)
     command = False
     operands = 0
     scripts: list[str] = []
-    for index, word in enumerate(args):
-        if not re.fullmatch(r"[A-Za-z0-9-]+", word):
-            if operands or not _SCRIPT_START.match(word):
-                return ["__UNDECIDABLE_SECRET_COMMAND__"]
-            # The tokenizer cannot tell quote fragments of one word (`'pk'"ill -f w"`)
-            # from separate words (`'env' _`), so the script is read both ways.
-            for script in _script_words(args, index) + _script_words(args[index : index + 1], 0):
-                if script not in scripts:
-                    scripts.append(script)
+    for word in args:
+        value = _strip_quotes(word)
+        if word[:1] in "\"'" or not re.fullmatch(r"[A-Za-z0-9-]+", word):
+            if operands or not _script_can_start(word):
+                return [_UNDECIDABLE]
+            scripts.append(value)
             break
         pending = max(operands - 1, 0)
-        if word.startswith("-"):
+        if value.startswith("-"):
             # Every single-dash word counts, operands and long options (`-posix`)
             # included, so the reader can only over-report options and operands.
-            command = command or (not word.startswith("--") and "c" in word)
-            name = word.lstrip("-")
+            command = command or (not value.startswith("--") and "c" in value)
+            name = value.lstrip("-")
             if name in _SHELL_VALUE_OPTIONS:
                 operands = max(pending, 1)
             else:
-                operands = max(pending, 0 if word.startswith("--") else sum(letter in "oO" for letter in name))
+                operands = max(pending, 0 if value.startswith("--") else sum(letter in "oO" for letter in name))
         else:
-            scripts.append(word)
+            scripts.append(value)
             operands = pending
     return scripts if command else []
 
@@ -1941,7 +2422,93 @@ def _xargs_target(args: list[str]) -> list[str]:
     return []
 
 
-def _segment_process_facts(segment: list[str], depth: int) -> set[str]:
+def _path_parts(path: str) -> list[str]:
+    """The components of a path, with repeated slashes and `.` folded away."""
+    return [part for part in path.split("/") if part not in {"", "."}]
+
+
+def _names_stream(path: str, name: str, descriptor: str = "[0-9]+") -> bool:
+    """Whether a path may name `/dev/<name>` or a descriptor (`descriptor`) of the shell.
+
+    Every spelling of `/dev/<name>`, `/dev/fd/<n>` and `/proc/<id>[/task/<id>]/fd/<n>`
+    ends in `<name>` or in `fd/<n>`. Only the file system resolves a `..`
+    through symlinks, and a relative path's directory is not known, so for
+    those a final `<n>` alone counts.
+    """
+    parts = _path_parts(path)
+    if not parts:
+        return False
+    if parts[-1] == name:
+        return True
+    return bool(re.fullmatch(descriptor, parts[-1])) and (
+        parts[-2:-1] == ["fd"] or ".." in parts or not path.startswith("/")
+    )
+
+
+def _names_stdin(path: str) -> bool:
+    """Whether a path may name standard input (`/dev/stdin` or descriptor 0)."""
+    return _names_stream(path, "stdin", "0")
+
+
+def _shell_reads_stdin(args: list[str]) -> bool:
+    """Whether a shell invocation takes its program from standard input.
+
+    True without `-c` and without a script operand, with `-s`, with a script
+    operand that names standard input, and whenever an expanding word in its
+    options hides which.
+    """
+    pending = 0
+    for word in _raw_without_redirects(args):
+        value = _strip_quotes(word)
+        if getattr(word, "dynamic", False) or _SUBSTITUTION_MARKER in word:
+            return True
+        if pending:
+            pending -= 1
+            continue
+        if value in {"-", "--"}:
+            # Both end the options; a lone `-` also names standard input.
+            continue
+        if value.startswith("--"):
+            pending = int(value[2:] in _SHELL_VALUE_OPTIONS)
+            continue
+        if value[:1] in "-+" and len(value) > 1:
+            letters = value[1:]
+            if "s" in letters:
+                return True
+            if "c" in letters:
+                return False
+            pending = sum(letter in "oO" for letter in letters)
+            continue
+        return _names_stdin(value)
+    return True
+
+
+def _script_reads_stdin(script: str) -> bool:
+    """Whether a shell script may run its standard input as a program (a shell, `source` or `/dev/stdin`)."""
+    if script == _UNDECIDABLE:
+        return True
+    for pipeline in _pipelines(script):
+        for segment in pipeline:
+            found = _command_at(segment)
+            if found is None:
+                continue
+            # A computed command word may name a shell.
+            if found[0] in SHELL_COMMANDS or found[0] == _UNDECIDABLE or "$" in found[0]:
+                return True
+            # Any word may be a file operand here, so only a path-shaped one counts:
+            # a bare `0` or `stdin` is more often an exit status or text than a file.
+            if any("/" in (value := _strip_quotes(word)) and _names_stdin(value) for word in segment):
+                return True
+    return False
+
+
+def _segment_process_facts(segment: list[str], depth: int, documents: dict[str, list[tuple[str, bool]]]) -> set[str]:
+    # Here-documents belong to their statement in order, whatever command reads them.
+    bodies = [
+        documents[delimiter].pop(0)[0]
+        for index, token in enumerate(segment[:-1])
+        if token in {"<<", "<<-"} and documents.get(delimiter := _strip_quotes(segment[index + 1]))
+    ]
     found = _command_at(segment)
     fed = False
     while found is not None and found[0] == "xargs":
@@ -1958,10 +2525,29 @@ def _segment_process_facts(segment: list[str], depth: int) -> set[str]:
     if cmd == "kill":
         # xargs appends its input to the operands, so a fed kill is never literal.
         return {"kill"} if fed or not _literal_pid_kill(args) else set()
-    if cmd in _PROCESS_SHELLS:
+    if cmd in SHELL_COMMANDS:
         facts: set[str] = set()
-        for script in _shell_script(args):
-            facts |= _process_facts(script, depth=depth + 1)
+        scripts = _shell_script(args) if cmd in _PROCESS_SHELLS else []
+        if cmd == "eval":
+            scripts.append(" ".join(_strip_quotes(arg) for arg in _raw_without_redirects(args)))
+        # Standard input is the program when no -c script or script file is given,
+        # or when the given script may itself run a shell or read /dev/stdin.
+        stdin_program = cmd in _PROCESS_SHELLS and (
+            _shell_reads_stdin(args) or any(_script_reads_stdin(script) for script in scripts)
+        )
+        inputs: list[str] = list(bodies)
+        for index, token in enumerate(args[:-1]):
+            if token == "<<<":
+                operand = args[index + 1]
+                computed = getattr(operand, "dynamic", False) or _SUBSTITUTION_MARKER in operand
+                inputs.append(_UNDECIDABLE if computed else _strip_quotes(operand))
+        if cmd in {"source", "."} or stdin_program:
+            scripts += inputs
+        else:
+            # Data for a script given another way; a readable copy still counts.
+            scripts += [text for text in inputs if text != _UNDECIDABLE]
+        for script in scripts:
+            facts |= {"limit"} if script == _UNDECIDABLE else _process_facts(script, depth=depth + 1)
         return facts
     return set()
 
@@ -1983,16 +2569,10 @@ def _process_facts(command: str, *, depth: int = 0) -> set[str]:
     facts: set[str] = set()
     for _, body in substitutions.values():
         facts |= _process_facts(body, depth=depth + 1)
-    # Facts from both tokenizations count. Shell words show a quote in a shell's
-    # options and a script spliced from quote fragments (`'pkill -'f`); the
-    # fragments show a word the readers only know unquoted (`'-f'""`).
-    seen: set[tuple[str, ...]] = set()
-    for shell_words in (False, True):
-        for pipeline in _pipelines(executable, shell_words=shell_words):
-            for segment in pipeline:
-                if tuple(segment) not in seen:
-                    seen.add(tuple(segment))
-                    facts |= _segment_process_facts(segment, depth)
+    documents = _heredoc_inputs(command)
+    for pipeline in _pipelines(executable):
+        for segment in pipeline:
+            facts |= _segment_process_facts(segment, depth, documents)
     return facts
 
 
@@ -2051,95 +2631,6 @@ def _scan_command(
     return None
 
 
-# Main's parse refusals, the only results the folded rescan may replace.
-_UNPARSEABLE = frozenset({"shell command could not be parsed safely", "interpreter arguments could not be parsed safely"})
-# A word whose shell value _strip_quotes gives exactly: plain characters that are neither
-# syntax nor expanded, or one single-quoted word whose only inner quotes are folded '\''.
-_STATIC_WORD_RE = re.compile(r"[A-Za-z0-9_./:=,+@%-]+|'[^']*(?:'\\''[^']*)*'")
-# Bash builtins and keywords (bash 5.3 `compgen -b -k`): the shell itself reads their
-# words, as code (trap, coproc) or as arithmetic subscripts (let, declare, printf -v).
-_SHELL_BUILTINS = frozenset(
-    {
-        ":", "!", ".", "[", "[[", "]]", "{", "}", "alias", "bg", "bind", "break", "builtin", "caller", "case", "cd",
-        "command", "compgen", "complete", "compopt", "continue", "coproc", "declare", "dirs", "disown", "do", "done",
-        "echo", "elif", "else", "enable", "esac", "eval", "exec", "exit", "export", "false", "fc", "fg", "fi", "for",
-        "function", "getopts", "hash", "help", "history", "if", "in", "jobs", "kill", "let", "local", "logout",
-        "mapfile", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly", "return", "select", "set",
-        "shift", "shopt", "source", "suspend", "test", "then", "time", "times", "trap", "true", "type", "typeset",
-        "ulimit", "umask", "unalias", "unset", "until", "wait", "while",
-    }
-)
-# Python options that take no value and select no program text.
-_PYTHON_PLAIN_OPTIONS = frozenset({"-B", "-E", "-I", "-O", "-OO", "-P", "-q", "-s", "-S", "-u", "-b", "-bb"})
-
-
-def _runs_no_inline_program(cmd: str, args: list[str]) -> bool:
-    """Whether an interpreter runs a module or script file rather than program text from its words."""
-    if not _is_python_command(cmd):
-        return False
-    for index, arg in enumerate(_strip_quotes(arg) for arg in args):
-        if arg == "-m":
-            return index + 1 < len(args)
-        if not arg.startswith("-"):
-            return True
-        if arg not in _PYTHON_PLAIN_OPTIONS:
-            return False
-    return False  # no module or script: the program comes from stdin
-
-
-def _is_folded_simple_command(command: str) -> bool:
-    """Whether command, read with `'\\''` folded, is one simple command that reads no word as code.
-
-    Every token must be a static word (no operator, grouping or expansion, so the
-    shell cannot pick another command or option), its quote fragments must be its
-    exact shell words, with no wrapper, assignment, redirect, substitution or
-    here-document, and no word the shell or the guard reads as code (no shell,
-    builtin or keyword, no xargs or unresolved wrapper, no interpreter program
-    text). Process kills keep main's reading. Call with the fold on.
-    """
-    try:
-        executable, substitutions = _hide_substitutions(preprocess_shell_command(command))
-    except ShellPreprocessLimit:
-        return False
-    if substitutions or _heredoc_inputs(command):
-        return False
-    if not all(_STATIC_WORD_RE.fullmatch(token) for token in _tokenize(executable, shell_words=True)):
-        return False
-    words = _pipelines(executable, shell_words=True)
-    if _pipelines(executable) != words or len(words) != 1 or len(words[0]) != 1:
-        return False
-    segment = words[0][0]
-    found = _command_at(segment)
-    if found is None or found[2] != 0 or _raw_without_redirects(segment) != segment:
-        return False
-    cmd, args, _ = found
-    # Bash runs a builtin only for a bare name; a path names a file.
-    if _strip_quotes(segment[0]) in _SHELL_BUILTINS:
-        return False
-    # Shells and xargs run a command from their words; process tools keep main's process reading.
-    if cmd in SHELL_COMMANDS or cmd in {"pkill", "pgrep", "kill", "xargs"}:
-        return False
-    # A wrapper left as the command has a child the guard could not resolve (env -S, env 3).
-    if cmd == "env" or cmd in _WRAPPER_OPTIONS:
-        return False
-    return not (_is_interpreter_command(cmd) and not _runs_no_inline_program(cmd, args))
-
-
-def _folded_simple_command_check[T](command: str, check: Callable[[str], T]) -> tuple[bool, T | None]:
-    """Run check on command with `'\\''` folded, when it is a folded simple command.
-
-    Main's readers are not exact once any other command with `'\\''` parses, so
-    every other command keeps main's result; (False, None) says so.
-    """
-    token = _FOLD_APOSTROPHES.set(True)
-    try:
-        if not _is_folded_simple_command(command):
-            return False, None
-        return True, check(command)
-    finally:
-        _FOLD_APOSTROPHES.reset(token)
-
-
 def _block_msg(reason: str) -> str:
     return (
         f"BLOCKED by guard-secret-print (#M-5): {reason}.\n\n"
@@ -2187,12 +2678,12 @@ def _main(argv: list[str] | None = None) -> int:
     command = _command(payload)
     if not command:
         return 0
+    if "\0" in command:
+        # The shell cannot receive NUL; what runs is not the text inspected. The override never covers it.
+        sys.stderr.write(_block_msg("command text holds a NUL character"))
+        return 2
 
     process_facts = _process_facts(command)
-    if "limit" in process_facts:
-        folded, folded_facts = _folded_simple_command_check(command, _process_facts)
-        if folded and folded_facts is not None:
-            process_facts = folded_facts
     if "pkill" in process_facts or {"pgrep", "kill"} <= process_facts:
         sys.stderr.write(_process_block_msg("full-command-line process kills can match the invoking shell"))
         return 2
@@ -2205,10 +2696,6 @@ def _main(argv: list[str] | None = None) -> int:
 
     try:
         reason = _scan_command(command, set())
-        if reason in _UNPARSEABLE:
-            folded, folded_reason = _folded_simple_command_check(command, lambda text: _scan_command(text, set()))
-            if folded:
-                reason = folded_reason
     except ShellPreprocessLimit:
         reason = "nested shell command could not be parsed safely"
     if reason:
