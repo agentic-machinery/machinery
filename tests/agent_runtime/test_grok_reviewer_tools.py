@@ -108,31 +108,77 @@ _SHELL_PUNCTUATION = "();<>|&\n`"
 _QUOTED_OPERATOR = "\ue000"
 
 
-def _fold_continuations(script: str) -> str:
-    """Drop a backslash-newline outside single quotes.
+def _prepare_shell_script(script: str) -> str:
+    """Join real continuations and drop comments in one quote-aware pass.
 
-    ``shlex`` keeps that pair inside the word. Single quotes keep both characters.
+    A backslash-newline is joined only in code, and only when the backslash
+    is not itself escaped. A comment ends at the newline even when the comment
+    ends in a backslash, so that backslash cannot swallow the next command.
+    ``#`` after a joined line is a comment only when it starts a word.
     """
     out: list[str] = []
     index = 0
     limit = len(script)
-    single = False
+    state = "normal"
     while index < limit:
         char = script[index]
-        if single:
-            out.append(char)
-            if char == "'":
-                single = False
+        if state == "comment":
+            if char == "\n":
+                out.append(";")
+                state = "normal"
             index += 1
             continue
-        if char == "\\" and index + 1 < limit and script[index + 1] == "\n":
+        if state == "single":
+            out.append(char)
+            if char == "'":
+                state = "normal"
+            index += 1
+            continue
+        if char == "\\" and index + 1 < limit:
+            end = index
+            while end < limit and script[end] == "\\":
+                end += 1
+            count = end - index
+            if end < limit and script[end] == "\n":
+                # A leftover literal backslash is doubled so the later shlex
+                # pass does not treat it as escaping this newline.
+                out.append("\\" * ((count // 2) * 2))
+                if count % 2 == 0:
+                    out.append(";")
+                index = end + 1
+                continue
+            out.append("\\")
+            out.append(script[index + 1])
             index += 2
             continue
+        if state == "double":
+            if char == '"':
+                state = "normal"
+            out.append(char)
+            index += 1
+            continue
         if char == "'":
-            single = True
+            state = "single"
+            out.append(char)
+            index += 1
+            continue
+        if char == '"':
+            state = "double"
+            out.append(char)
+            index += 1
+            continue
+        if char == "#" and (not out or out[-1] in _COMMENT_BOUNDARIES):
+            state = "comment"
+            index += 1
+            continue
+        if char == "\n":
+            out.append(";")
+            index += 1
+            continue
         out.append(char)
         index += 1
     return "".join(out)
+
 
 
 def _unquoted_special_quote(script: str) -> bool:
@@ -228,6 +274,11 @@ def _mask_quoted_operators(script: str) -> tuple[str, list[str]]:
                 out.append(char)
             index += 1
             continue
+        if char == "\\" and index + 1 < limit:
+            out.append(char)
+            out.append(script[index + 1])
+            index += 2
+            continue
         if char == "'":
             state = "single"
         elif char == '"':
@@ -277,62 +328,6 @@ def _is_assignment(token: str) -> bool:
 _REDIRECT_OPERATORS = frozenset({">", ">>", "<", "<>", ">&", "<&", ">|", "&>"})
 _COMMENT_BOUNDARIES = frozenset(" \t\n;&|()<>`")
 
-
-def _strip_shell_comments(script: str) -> str:
-    """Drop unquoted comments, keeping the newline that ends each one.
-
-    ``shlex`` drops newlines, so a ``#`` token cannot tell ``note;\\n pwd``
-    (the next line runs) from ``note \\n; pwd``. A quoted ``#note`` and an
-    escaped ``\\#`` stay in the text. An apostrophe inside the comment goes
-    with it, so it cannot look like an unclosed quote.
-    """
-    out: list[str] = []
-    index = 0
-    limit = len(script)
-    state = "normal"
-    while index < limit:
-        char = script[index]
-        if state == "single":
-            out.append(char)
-            if char == "'":
-                state = "normal"
-            index += 1
-            continue
-        if state == "double":
-            if char == "\\" and index + 1 < limit:
-                out.append(char)
-                out.append(script[index + 1])
-                index += 2
-                continue
-            if char == '"':
-                state = "normal"
-            out.append(char)
-            index += 1
-            continue
-        if char == "\\" and index + 1 < limit:
-            out.append(char)
-            out.append(script[index + 1])
-            index += 2
-            continue
-        if char == "'":
-            state = "single"
-            out.append(char)
-            index += 1
-            continue
-        if char == '"':
-            state = "double"
-            out.append(char)
-            index += 1
-            continue
-        at_word_start = not out or out[-1] in _COMMENT_BOUNDARIES
-        if char == "#" and at_word_start:
-            index += 1
-            while index < limit and script[index] != "\n":
-                index += 1
-            continue
-        out.append(char)
-        index += 1
-    return "".join(out)
 
 
 def _active_command_substitution(script: str) -> bool:
@@ -384,13 +379,12 @@ def _shell_script_segments(script: str) -> list[list[str]]:
     so a quoted hash stays a word. ``punctuation_chars`` is the standard set
     plus newline and backtick. ``whitespace_split`` keeps ``ok#tag`` one word.
     """
-    folded = _fold_continuations(script)
-    if _unquoted_special_quote(folded):
+    prepared = _prepare_shell_script(script)
+    if _unquoted_special_quote(prepared):
         raise _UnparsedHookShell(script)
-    stripped = _strip_shell_comments(folded)
-    if _active_command_substitution(stripped):
+    if _active_command_substitution(prepared):
         raise _UnparsedHookShell(script)
-    masked_script, quoted_operators = _mask_quoted_operators(stripped)
+    masked_script, quoted_operators = _mask_quoted_operators(prepared)
     lexer = shlex.shlex(masked_script, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -468,19 +462,22 @@ def _shell_script_segments(script: str) -> list[list[str]]:
 def _shell_c_script(tokens: list[str], shell_index: int) -> str | None:
     """Return the script run by a ``sh -c`` / ``bash -c`` word, or None when it is not one.
 
-    The script is the next word after ``-c`` or a short cluster that contains ``c``
-    (``-lc``, ``-cl``). An attached ``-cSCRIPT`` word, an unknown option, or a
-    missing script raises, so the caller refuses the hook instead of skipping it.
+    ``-c`` marks the invocation. The script is the first word that is not an
+    option, so ``-c -e``, ``-c --`` and ``+e -c`` still name it. An attached
+    ``-cSCRIPT`` word, an unknown option, or a missing script raises, so the
+    caller refuses the hook instead of skipping it.
     """
     index = shell_index + 1
+    wants_script = False
     while index < len(tokens):
         token = tokens[index]
         if token == "--":
-            return None
-        if token == "-c":
-            if index + 1 >= len(tokens):
-                raise _UnparsedHookShell(token)
-            return tokens[index + 1]
+            index += 1
+            break
+        plus = token.startswith("+") and len(token) > 1
+        minus = token.startswith("-") and len(token) > 1
+        if not plus and not minus:
+            break
         if token.startswith("--"):
             if token in _SHELL_NO_ARG_LONG:
                 index += 1
@@ -491,26 +488,30 @@ def _shell_c_script(tokens: list[str], shell_index: int) -> str | None:
                 index += 2
                 continue
             raise _UnparsedHookShell(token)
-        if token.startswith("-") and len(token) > 1:
-            body = token[1:]
-            if "c" in body:
-                head, rest = body.split("c", 1)
-                head_known = set(head) <= _SHELL_NO_ARG_SHORT
-                rest_known = not rest or set(rest) <= _SHELL_NO_ARG_SHORT
-                if not head_known or not rest_known or index + 1 >= len(tokens):
-                    raise _UnparsedHookShell(token)
-                return tokens[index + 1]
-            if body in {"o", "O"}:
-                if index + 1 >= len(tokens):
-                    raise _UnparsedHookShell(token)
-                index += 2
-                continue
-            if set(body) <= _SHELL_NO_ARG_SHORT:
-                index += 1
-                continue
-            raise _UnparsedHookShell(token)
+        body = token[1:]
+        if not plus and "c" in body:
+            head, rest = body.split("c", 1)
+            head_known = set(head) <= _SHELL_NO_ARG_SHORT
+            rest_known = not rest or set(rest) <= _SHELL_NO_ARG_SHORT
+            if not head_known or not rest_known:
+                raise _UnparsedHookShell(token)
+            wants_script = True
+            index += 1
+            continue
+        if body in {"o", "O"}:
+            if index + 1 >= len(tokens):
+                raise _UnparsedHookShell(token)
+            index += 2
+            continue
+        if set(body) <= _SHELL_NO_ARG_SHORT:
+            index += 1
+            continue
+        raise _UnparsedHookShell(token)
+    if not wants_script:
         return None
-    return None
+    if index >= len(tokens):
+        raise _UnparsedHookShell(tokens[shell_index])
+    return tokens[index]
 
 
 def _hook_tokens_hide_read_command(
@@ -569,14 +570,15 @@ def _hook_script_hides_read_command(script: str, commands: tuple[str, ...], *, d
 
 
 def _hook_command_hides_read_command(hook_command: str, commands: tuple[str, ...]) -> bool:
+    """True when the hook command itself, not only a nested ``-c`` script, runs a read command.
+
+    The hook is a shell command. ``printf ok && sh -c 'pwd'`` is two commands.
+    """
     try:
-        folded = _fold_continuations(hook_command)
-        if _unquoted_special_quote(folded):
-            return True
-        tokens = shlex.split(folded)
+        segments = _shell_script_segments(hook_command)
     except (ValueError, _UnparsedHookShell):
         return True
-    return _hook_tokens_hide_read_command(tokens, commands)
+    return any(_hook_tokens_hide_read_command(segment, commands) for segment in segments)
 
 
 def _assert_hook_command_excludes_read_commands(hook_command: str, commands: tuple[str, ...]) -> None:
@@ -805,6 +807,19 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
         "sh -c 'printf ok >'",
         "sh -c 'printf ok <<EOF'",
         'sh -c \'printf "$(pwd)"\'',
+        # A comment does not swallow the next line, an even backslash leaves the
+        # newline, and a quote inside double quotes does not block a continuation.
+        "sh -c " + shlex.quote("# comment\\\npwd"),
+        "echo \\\\\nsh -c " + shlex.quote("printf ok; pwd"),
+        "sh -c " + shlex.quote("echo \"'\"; p\\\nwd"),
+        # Options around -c, and a compound hook that is not itself a single argv list.
+        "sh +e -c 'printf ok; pwd'",
+        "bash +e -c 'printf ok; pwd'",
+        "bash -c -- 'printf ok; pwd'",
+        "bash -c -e 'printf ok; pwd'",
+        "printf ok && sh -c 'printf ok; pwd'",
+        # Double quotes do not make the single quotes inside them literal to the outer shell.
+        "sh -c \"printf '$(pwd)'\"",
     ]
     nested = "echo done"
     for _ in range(_MAX_SHELL_SCRIPT_DEPTH + 1):
@@ -844,11 +859,14 @@ def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() 
         "sh -c 'pwd#not'",
         "sh -c '# pwd'",
         "sh -c '   '",
-        # An apostrophe inside a comment is not an unclosed quote. A single-quoted
-        # substitution is literal. A redirect with a target is not a command.
+        # An apostrophe inside a comment is not an unclosed quote. An escaped
+        # dollar is not a substitution. A redirect with a target is not a command.
         "sh -c \"printf ok # it's a note\necho done\"",
-        "sh -c \"printf '$(pwd)'\"",
+        "sh -c \"printf '\\$(pwd)'\"",
         "sh -c 'printf ok > /dev/null'",
+        "bash +e -c 'echo done'",
+        "bash -c -- 'echo done'",
+        "printf ok && echo done",
     ]
     eight = ""
     for _ in range(_MAX_SHELL_SCRIPT_DEPTH):
