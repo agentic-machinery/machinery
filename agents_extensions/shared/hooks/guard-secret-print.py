@@ -681,7 +681,7 @@ def _brace_words(parts: list[tuple[str, str]]) -> list[_Word]:
         if any(kind == "src" and ("${" in text or "$[" in text) for kind, text in merged):
             raise ValueError("expansion assembled by brace expansion")
         expanded = [
-            ("exp" if kind == "src" and piece.startswith("$") and len(piece) > 1 else kind, piece)
+            ("exp" if kind == "src" and _BRACED_PARAMETER.fullmatch(piece) else kind, piece)
             for kind, text in merged
             for piece in (_BRACED_PARAMETER.split(text) if kind == "src" else [text])
             if piece or kind != "src"
