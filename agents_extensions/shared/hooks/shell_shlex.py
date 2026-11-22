@@ -58,6 +58,14 @@ def _match_continued(command: str, index: int, opener: str) -> int | None:
     return None
 
 
+def match_double_dollar(command: str, index: int) -> int | None:
+    """Return index after a Bash `$$` PID token (skipping `\\<nl>` between the `$`s), or None.
+
+    Bash lexes `$$` as one two-character token before checking for `$'`, `$(`, or `${`.
+    """
+    return _match_continued(command, index, "$$")
+
+
 def scan_ansi_c_body(command: str, body_start: int) -> int | None:
     """Return index after the closing unescaped `'` of an ANSI-C string, or None if unclosed.
 
@@ -136,6 +144,10 @@ def normalize_io_descriptors(command: str, replace: Callable[[str, str], str] | 
         if char == "\\" and quote != "'" and index + 1 < len(command):
             out.extend(command[index : index + 2])
             index += 2
+            continue
+        if quote != "'" and (dd_end := match_double_dollar(command, index)) is not None:
+            out.append(command[index:dd_end])
+            index = dd_end
             continue
         if not quote and command.startswith("$'", index):
             end = scan_ansi_c_body(command, index + 2)
@@ -218,6 +230,11 @@ def _transform_shell(
                 out.append(command[i : i + 2])
                 word_start = False
             i += 2
+            continue
+        if quote != "'" and not backticks and (dd_end := match_double_dollar(command, i)) is not None:
+            out.append("$$" if collapse_continuations else command[i:dd_end])
+            word_start = False
+            i = dd_end
             continue
         if not quote and not backticks and (ansi_body := _match_continued(command, i, "$'")) is not None:
             if contexts and contexts[-1][0] == "dq_param":
@@ -352,6 +369,9 @@ def _body_substitutions(body: str) -> list[str] | None:
         if body[i] == "\\":
             i += 2
             continue
+        if (dd_end := match_double_dollar(body, i)) is not None:
+            i = dd_end
+            continue
         if body.startswith("$((", i):
             i += 3
             continue
@@ -373,6 +393,10 @@ def _body_substitutions(body: str) -> list[str] | None:
                     continue
                 if char == "\\" and quote != "'":
                     i += 2
+                    word_start = False
+                    continue
+                if quote != "'" and not backticks and (dd_end := match_double_dollar(body, i)) is not None:
+                    i = dd_end
                     word_start = False
                     continue
                 if not quote and not backticks and (ansi_body := _match_continued(body, i, "$'")) is not None:
@@ -464,6 +488,9 @@ def skippable_heredoc_delimiters(line: str, *, initial_quote: str = "") -> list[
         if char == "\\":
             index += 2
             continue
+        if (dd_end := match_double_dollar(line, index)) is not None:
+            index = dd_end
+            continue
         if line.startswith("$'", index):
             end = scan_ansi_c_body(line, index + 2)
             if end is None:
@@ -543,6 +570,9 @@ def skippable_heredoc_delimiters(line: str, *, initial_quote: str = "") -> list[
             if char == "\\" and word_quote != "'" and index + 1 < len(line):
                 index += 2
                 continue
+            if word_quote != "'" and (dd_end := match_double_dollar(line, index)) is not None:
+                index = dd_end
+                continue
             if not word_quote and line.startswith("$'", index):
                 end = scan_ansi_c_body(line, index + 2)
                 if end is None:
@@ -587,6 +617,9 @@ def _quote_after(line: str, initial_quote: str) -> str:
         char = line[i]
         if char == "\\" and quote != "'":
             i += 2
+            continue
+        if quote != "'" and (dd_end := match_double_dollar(line, i)) is not None:
+            i = dd_end
             continue
         if not quote and line.startswith("$'", i):
             end = scan_ansi_c_body(line, i + 2)
@@ -698,6 +731,10 @@ def split_quote_preserving(command: str, *, punctuation_chars: str | bool, white
                 protected.append(marker if following == '"' else command[index : index + 2])
                 index += 2
                 continue
+        if quote != "'" and (dd_end := match_double_dollar(command, index)) is not None:
+            protected.append(command[index:dd_end])
+            index = dd_end
+            continue
         if not quote and command.startswith("$'", index):
             end = scan_ansi_c_body(command, index + 2)
             if end is None:

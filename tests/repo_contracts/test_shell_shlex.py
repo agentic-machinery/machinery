@@ -18,6 +18,7 @@ from agents_extensions.shared.hooks.shell_shlex import (
     strip_shell_comments,
     strip_skippable_heredoc_bodies,
 )
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 
 @pytest.mark.parametrize(
@@ -129,6 +130,17 @@ def test_issue_9115_arithmetic_prefix_does_not_reset_backtick_cap():
         # Backticks and double quotes inside $'...' are literal data.
         ("echo $'`printf NO`' ' #' ; printf LIVE", "printf LIVE"),
         ('echo $\'"\' " #" ; printf LIVE', "printf LIVE"),
+        # Even runs of `$` lex as `$$` PID token(s) first, so the following `'` is a plain single quote.
+        ("echo $$'\\'' #' ; printf LIVE", "printf LIVE"),
+        ("echo $$$$'\\'' #' ; printf LIVE", "printf LIVE"),
+        ("echo $\\\n$'\\'' #' ; printf LIVE", "printf LIVE"),
+        ("echo $$\\\n'\\'' #' ; printf LIVE", "printf LIVE"),
+        ('echo "$(echo $$\'\\\'\' #\' ; printf LIVE)"', "printf LIVE"),
+        # Odd runs (`$$$'`) lex `$$` then ANSI-C `$'`.
+        ("echo $$$'\\'' ' #' ; printf LIVE\n'", "printf LIVE"),
+        # `$$(` and `$${` inside double quotes lex as PID `$$`, not substitutions.
+        ('echo "$$(printf no)" " #" ; printf LIVE', "printf LIVE"),
+        ('echo "$${x:-a}" " #" ; printf LIVE', "printf LIVE"),
     ],
 )
 def test_ansi_c_quoting_preserves_live_code_matching_bash(command: str, expected_live: str):
@@ -256,18 +268,25 @@ def test_ansi_c_bash_oracle_fuzz_never_hides_live_code():
         "\\#",
         "\\\n",
         "foo#bar",
+        "$$",
+        "$",
+        "$$$'\\''",
+        "$$'\\'' #'",
     )
 
     live_checked = 0
     refused = 0
-    for _ in range(120):
+    for _ in range(160):
         parts = ["printf %s"]
         for _ in range(rng.randint(1, 4)):
-            kind = rng.choice(("ansi", "quote", "cmdsubst", "param", "dq_param", "bt"))
+            kind = rng.choice(("ansi", "quote", "cmdsubst", "param", "dq_param", "bt", "dollar_prefixed"))
             if kind == "ansi":
                 parts.append(" " + rng.choice(ansi_pieces))
             elif kind == "quote":
                 parts.append(" " + rng.choice(quote_pieces))
+            elif kind == "dollar_prefixed":
+                prefix = rng.choice(("$", "$$", "$$$", "$\\\n$"))
+                parts.append(" " + prefix + rng.choice(("'\\'' #'", "$'\\'' ' #'", "'a'")))
             elif kind == "cmdsubst":
                 inner = rng.choice(ansi_pieces) + " " + rng.choice(quote_pieces)
                 if rng.random() < 0.35:
@@ -312,7 +331,7 @@ def test_ansi_c_bash_oracle_fuzz_never_hides_live_code():
     assert refused >= 10
 
 
-def test_ansi_c_reported_class_refused_by_secret_pr_and_write_guards():
+def test_ansi_c_reported_class_refused_by_secret_pr_and_write_guards(configured_roots):
     """Defect class: shared preprocessor ANSI-C escape bypass across secret, PR merge, and write guards."""
     import importlib.util
     from pathlib import Path
@@ -333,6 +352,9 @@ def test_ansi_c_reported_class_refused_by_secret_pr_and_write_guards():
     for cmd in (
         "echo $'\\'' ' #' ; env\n'",
         "echo $\\\n'\\'' ' #' ; env\n'",
+        "echo $$'\\'' #' ; env",
+        "echo $$$$'\\'' #' ; env",
+        "echo $\\\n$'\\'' #' ; env",
         "echo $'\\'' '<<EOF'\nenv\nEOF",
         "cat <<EOF\n$(echo $'\\')' ; env)\nEOF",
     ):

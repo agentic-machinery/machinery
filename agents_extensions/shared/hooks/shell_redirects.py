@@ -14,6 +14,7 @@ from collections.abc import Callable
 
 from agents_extensions.shared.hooks.shell_shlex import (
     ShellPreprocessLimit,
+    match_double_dollar,
     preprocess_shell_command,
     scan_ansi_c_body,
 )
@@ -41,6 +42,10 @@ def _protect_ansi_c_quotes(line: str) -> tuple[str, dict[str, str]]:
         if ch == "\\" and quote != "'" and i + 1 < len(line):
             out.append(line[i : i + 2])
             i += 2
+            continue
+        if quote != "'" and (dd_end := match_double_dollar(line, i)) is not None:
+            out.append(line[i:dd_end])
+            i = dd_end
             continue
         if not quote and line.startswith("$'", i):
             end = scan_ansi_c_body(line, i + 2)
@@ -123,6 +128,10 @@ def _split_scopes(line: str) -> list[tuple[str, str]]:
             buf.append(ch)
             if ch == quote:
                 quote = None
+        elif (dd_end := match_double_dollar(line, i)) is not None:
+            buf.append(line[i:dd_end])
+            i = dd_end
+            continue
         elif line.startswith("$'", i):
             end = scan_ansi_c_body(line, i + 2)
             if end is None:
@@ -251,6 +260,11 @@ def unmodeled_shell_offset(line: str) -> int | None:
             literal = False
             i += 2
             continue
+        if quote != "'" and (dd_end := match_double_dollar(line, i)) is not None:
+            word += line[i:dd_end]
+            literal = False
+            i = dd_end
+            continue
         if quote != "'" and line.startswith("${", i):
             # Opaque parameter text: quotes and nested expansions cannot hide
             # parens. Quoted braces do not terminate an expansion.
@@ -265,6 +279,9 @@ def unmodeled_shell_offset(line: str) -> int | None:
                     if j + 1 < len(line) and line[j + 1] in "()":
                         return word_start
                     j += 2
+                    continue
+                if inner_quote != "'" and (dd_end := match_double_dollar(line, j)) is not None:
+                    j = dd_end
                     continue
                 if not inner_quote and line.startswith("$'", j):
                     ansi_end = scan_ansi_c_body(line, j + 2)
@@ -374,6 +391,11 @@ def preprocess_branch_command(command: str) -> str:
                 if pending:
                     raise ShellPreprocessLimit("heredoc closed before its body")
                 return "".join(out), index + len(closer)
+            if quote != "'" and (dd_end := match_double_dollar(command, index)) is not None:
+                out.append(command[index:dd_end])
+                index = dd_end
+                word_start = False
+                continue
             if quote != "'":
                 opening = next((op for op in ("$((", "$(", "${", "$[", "`") if command.startswith(op, index)), "")
                 if not data and not quote and not opening:
@@ -462,6 +484,10 @@ def preprocess_branch_command(command: str) -> str:
                         delimiter.append(command[index + 1])
                         index += 2
                         continue
+                    if delimiter_quote != "'" and (dd_end := match_double_dollar(command, index)) is not None:
+                        delimiter.append(command[index:dd_end])
+                        index = dd_end
+                        continue
                     if not delimiter_quote and command.startswith("$'", index):
                         raise ShellPreprocessLimit("ambiguous heredoc delimiter")
                     if char in "\"'" and (not delimiter_quote or delimiter_quote == char):
@@ -534,6 +560,9 @@ def preprocess_branch_command(command: str) -> str:
             while index < len(body):
                 if body[index] == "\\" and body[index + 1 : index + 2] in {"\\", "$", "`", "\n"}:
                     index += 2
+                    continue
+                if (dd_end := match_double_dollar(body, index)) is not None:
+                    index = dd_end
                     continue
                 opening = next((op for op in ("$((", "$(", "${", "`") if body.startswith(op, index)), "")
                 if opening:
@@ -628,6 +657,10 @@ def unknown_repository_segments(command: str) -> list[list[str]]:
             word += command[i : i + 2]
             i += 2
             continue
+        if quote != "'" and (dd_end := match_double_dollar(command, i)) is not None:
+            word += command[i:dd_end]
+            i = dd_end
+            continue
         if quote != "'" and command.startswith("${", i):
             # Parameter punctuation is opaque argument data, never a scope close.
             end = i + 2
@@ -638,6 +671,9 @@ def unknown_repository_segments(command: str) -> list[list[str]]:
                 char = command[end]
                 if char == "\\":
                     end += 2
+                    continue
+                if parameter_quote != "'" and (dd_end := match_double_dollar(command, end)) is not None:
+                    end = dd_end
                     continue
                 if not parameter_quote and command.startswith("$'", end):
                     ansi_end = scan_ansi_c_body(command, end + 2)

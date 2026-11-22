@@ -11,6 +11,7 @@ from agents_extensions.shared.hooks.shell_redirects import (
     unmodeled_shell_offset,
 )
 from agents_extensions.shared.hooks.shell_shlex import ShellPreprocessLimit, preprocess_shell_command
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 
 @pytest.mark.parametrize(
@@ -285,6 +286,9 @@ def test_branch_preprocessing_preserves_conservative_exotic_delimiter_refusal(op
         ("echo $'\\'' ' #' ; git checkout -b x\n'", ["git", "checkout", "-b", "x"]),
         ("echo $'\\'' ; git checkout -b x ; echo $'\\''", ["git", "checkout", "-b", "x"]),
         ("echo $\\\n'\\'' ' #' ; gh pr merge 5 --admin\n'", ["gh", "pr", "merge", "5", "--admin"]),
+        ("echo $$'\\'' #' ; gh pr merge 5 --admin", ["gh", "pr", "merge", "5", "--admin"]),
+        ("echo $$$$'\\'' #' ; gh pr merge 5 --admin", ["gh", "pr", "merge", "5", "--admin"]),
+        ("echo $\\\n$'\\'' #' ; git checkout -b x", ["git", "checkout", "-b", "x"]),
     ],
 )
 def test_ansi_c_escaped_quote_does_not_hide_commands_in_scope_events(command, expected_segment):
@@ -317,7 +321,7 @@ def test_ansi_c_in_branch_detector_and_unknown_repo_segments():
         preprocess_branch_command("cat <<$'EO\\'F'\ngit checkout -b x\nEO'F")
 
 
-def test_ansi_c_two_line_class_refused_by_redirect_guards():
+def test_ansi_c_two_line_class_refused_by_redirect_guards(configured_roots, monkeypatch):
     """Defect class: guard-admin-merge, guard-branch-switch-in-main, and guard-public-github-text allowing ANSI-C bypasses."""
     import importlib.util
     from pathlib import Path
@@ -333,13 +337,17 @@ def test_ansi_c_two_line_class_refused_by_redirect_guards():
 
     admin = load_hook("guard-admin-merge.py", "test_ansic_admin_merge")
     branch = load_hook("guard-branch-switch-in-main.py", "test_ansic_branch_switch")
+    monkeypatch.setattr(branch, "PROTECTED_ROOTS", [configured_roots.primary])
     public_gh = load_hook("guard-public-github-text.py", "test_ansic_public_gh")
 
-    # guard-admin-merge sees the live admin-merge segment on both two-line and paired ANSI-C forms.
+    # guard-admin-merge sees the live admin-merge segment on two-line, paired, and $$' forms.
     for cmd in (
         "echo $'\\'' ' #' ; gh pr merge 5 --admin\n'",
         "echo $'\\'' ; gh pr merge 5 --admin ; echo $'\\''",
         "echo $\\\n'\\'' ' #' ; gh pr merge 5 --admin\n'",
+        "echo $$'\\'' #' ; gh pr merge 5 --admin",
+        "echo $$$$'\\'' #' ; gh pr merge 5 --admin",
+        "echo $\\\n$'\\'' #' ; gh pr merge 5 --admin",
     ):
         assert any(admin._admin_merge_args(seg) is not None for seg in admin._segments(cmd)), cmd
 
@@ -349,11 +357,13 @@ def test_ansi_c_two_line_class_refused_by_redirect_guards():
         "echo $\\\n'\\'' ' #' ; git checkout -b x\n'",
     ):
         assert branch._command_danger_reason(cmd) is not None, cmd
-    # Paired ANSI-C keeps the branch segment visible for primary-root checking.
-    assert any(
-        branch._segment_is_dangerous(seg) is not None
-        for seg in branch._segments("echo $'\\'' ; git checkout -b x ; echo $'\\''")
-    )
+    # Paired ANSI-C and $$' forms keep the branch segment visible and blocked from the primary checkout.
+    for cmd in (
+        "echo $'\\'' ; git checkout -b x ; echo $'\\''",
+        "echo $$'\\'' #' ; git checkout -b x",
+        "echo $\\\n$'\\'' #' ; git checkout -b x",
+    ):
+        assert branch._command_danger_reason(cmd, session_cwd=configured_roots.primary) is not None, cmd
 
     # guard-public-github-text detects gh and routes through the publishing shim on all variants.
     for cmd in (
@@ -361,5 +371,6 @@ def test_ansi_c_two_line_class_refused_by_redirect_guards():
         "echo $'\\'' $'\\'' ' #' ; gh pr comment 5 --body ok\n'",
         "echo $'\\'' $'\\'' ' #' ; gh pr comment 5 --body ok",
         "echo $'\\'' ; gh pr comment 5 --body ok ; echo $'\\''",
+        "echo $$'\\'' #' ; gh pr comment 5 --body ok",
     ):
         assert public_gh.invokes_gh(cmd), cmd
