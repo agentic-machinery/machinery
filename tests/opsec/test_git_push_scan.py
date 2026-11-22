@@ -2654,6 +2654,14 @@ def test_url_scoped_verification_for_another_host_keeps_the_route(push_sandbox, 
         # Git and curl end the authority at "#" or "?" and connect to elsewhere.invalid, not github.com.
         ("https://elsewhere.invalid:9#@github.com/unit/private", "unknown"),
         ("https://elsewhere.invalid:9?@github.com/unit/private", "unknown"),
+        # Git ends the scp-like host at the first colon, so ssh is run for elsewhere.invalid.
+        ("elsewhere.invalid:x@github.com:unit/private", "unknown"),
+        # Git percent-decodes an ssh URL before it finds the host, so ssh is run for elsewhere.invalid.
+        ("ssh://elsewhere.invalid%2f@github.com/unit/private", "unknown"),
+        # An explicit host is never the github.com owner of an owner/name shorthand.
+        ("https://unit/private.git", "unknown"),
+        # Git runs a git-remote-HTTPS helper from PATH for a scheme that is not lower case.
+        ("HTTPS://github.com/unit/private", "unknown"),
         ("", "unknown"),
     ],
 )
