@@ -13,6 +13,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import store
 from lu_machinery.orchestration import dispatch_admission as legacy
@@ -156,51 +157,67 @@ def stream_holders(stream, task_id):
 
     A turn holds its stream until its record is terminal and its provider is proven gone
     (``_provider_gone``): an admission hold, a live run, a settled run whose provider lingers,
-    a crashed run and any fallback launch all hold it. Every record is parsed, hot and archived
-    alike, so neither archival nor a damaged byte pattern hides a turn. An unknown status and an
-    unreadable, damaged or malformed record each hold every stream, and so does a store whose
-    listing changed during the scan (a record moved between the hot store and the archive): the
-    reservation fails closed.
+    a crashed run and any fallback launch all hold it. The scan holds the task store's archive
+    lock, so no record is mid-way between the hot store and the archive, and it reads every
+    ``*.json`` file in both. An unknown status, an unlistable store, and a record that is
+    unreadable, vanished, damaged, malformed or a foreign-looking object that still names a turn
+    each hold every stream: the reservation fails closed.
     """
     from lu_machinery.dispatcher.worker import _provider_alive
-    from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME, iter_task_records, parse_task_record
+    from lu_machinery.orchestration.task_record_store import parse_task_record, task_archive_lock
 
-    root = tasks_dir()
     holders = []
-    for directory in (root, root / ARCHIVE_DIR_NAME):
-        # The record listing skips a directory it cannot read; here only an absent archive lists nothing.
+    root = tasks_dir()
+    with task_archive_lock(root):  # shared: archive and restore move records only under its exclusive side
         try:
-            os.listdir(directory)
-        except FileNotFoundError:
-            if directory == root:
-                holders.append("(the task store is missing)")
-        except OSError:
-            holders.append(f"({directory.name} unreadable)")
-    listed = list(iter_task_records(root, include_archive=True))
-    for path in listed:
-        try:
-            raw = path.read_bytes()
-        except FileNotFoundError:
-            continue  # moved or removed since it was listed: the listing check below holds
-        except OSError:
-            holders.append(f"{path.stem} (record unreadable)")
-            continue
-        try:
-            record = parse_task_record(path, raw)
-            other = legacy.orchestrator_stream(record) if isinstance(record, dict) else None
-        except ValueError:
-            holders.append(f"{path.stem} (record damaged or malformed)")
-            continue
-        if other is None or record.get("task_id") == task_id or other != stream:
-            continue
-        status = record.get("status")
-        if not (isinstance(status, str) and status in store.TERMINAL):
-            holders.append(str(record.get("task_id")))
-        elif not _provider_gone(_provider_alive, record):
-            holders.append(f"{record.get('task_id')} ({status}; provider not proven gone)")
-    if list(iter_task_records(root, include_archive=True)) != listed:
-        holders.append("(the task store changed during the scan)")
+            listed = _store_files(root)
+        except OSError as exc:
+            return [f"(the task store cannot be listed: {type(exc).__name__})"]
+        for path in listed:
+            try:
+                raw = path.read_bytes()
+                record = parse_task_record(path, raw)
+                other = legacy.orchestrator_stream(record) if isinstance(record, dict) else None
+            except (OSError, ValueError) as exc:
+                holders.append(f"{path.stem} (record unreadable or damaged: {type(exc).__name__})")
+                continue
+            if record is None and _names_a_turn(raw):
+                holders.append(f"{path.stem} (a turn record without its task identity)")
+                continue
+            if other is None or record.get("task_id") == task_id or other != stream:
+                continue
+            status = record.get("status")
+            if not (isinstance(status, str) and status in store.TERMINAL):
+                holders.append(str(record.get("task_id")))
+            elif not _provider_gone(_provider_alive, record):
+                holders.append(f"{record.get('task_id')} ({status}; provider not proven gone)")
     return holders
+
+
+def _store_files(root):
+    """The record candidates in the hot store, then its archive: ``iter_task_records``'s selection, raising instead.
+
+    That iterator skips a directory it cannot read; here only an absent archive lists nothing. Dispatcher
+    sidecars (boundary and sandbox receipts, saved tool results) are not candidates.
+    """
+    from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME, _is_dispatcher_sidecar
+
+    archive = root / ARCHIVE_DIR_NAME
+    try:
+        archived = sorted(os.listdir(archive))
+    except FileNotFoundError:
+        archived = []
+    paths = [root / name for name in sorted(os.listdir(root))] + [archive / name for name in archived]
+    return [path for path in paths if path.name.endswith(".json") and not _is_dispatcher_sidecar(path)]
+
+
+def _names_a_turn(raw):
+    """Whether bytes the record parser called foreign still decode to an object that names a turn."""
+    try:
+        value = json_depth.loads(raw.decode("utf-8"), max_depth=store._JSON_MAX_DEPTH)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(value, dict) and legacy.ORCHESTRATOR_KEY in value
 
 
 def _provider_gone(provider_alive, record):

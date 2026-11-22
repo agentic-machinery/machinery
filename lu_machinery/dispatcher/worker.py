@@ -719,6 +719,29 @@ def _enforce_orchestrator(record: dict) -> None:
         record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
 
 
+def _turn_tree_unproven(record: dict) -> bool:
+    """End a finished turn's services and leftover processes; True unless they are proven gone (DRIVERS-1122).
+
+    A turn is judged on its final tree, so nothing it started may still write it when the snapshot is taken.
+    Only a scope launch can prove that: its cgroup holds every descendant, while a fallback launch records one
+    process group, which a descendant can leave. A service is its own unit, so its stop must be verified too,
+    and another task still working in the turn's tree (dispatched there with --cwd) may write it as well.
+    """
+    if record.get("launch_mode") != "scope":
+        return True
+    try:
+        if _borrowed(record):
+            return True
+        _stop_task_services(record)
+        stops = record.get("task_service_stops")
+        if stops is not None and (not isinstance(stops, list) or any(
+                not isinstance(row, dict) or row.get("postcondition") != "true" for row in stops)):
+            return True
+        return _liveness_kept(record, _end_own_scope(record), time.monotonic() + SETTLE_PATIENCE) is not None
+    except Exception:  # an unreadable boundary is not proof, and never ends this settlement
+        return True
+
+
 def _enforce_delivery(record: dict) -> None:
     if record["mode"] == "read-only":
         return
@@ -1400,11 +1423,6 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
         record["delivery_prs"] = [f"{pr['repo']}#{pr['number']}" for pr in deliveries]
     _reap_worktree(record, patience=patience, salvage=salvage,
                    verified_merged_head=record.get("head_sha") if merged else None)
-    if "orchestrator" in record and record.get("status") == "done" and record.get("worktree_disposition") != "removed":
-        # Delivery checked the tree before this cleanup ended the turn's leftover processes, which could still
-        # write. Only a tree settlement then removed, clean and published, still proves the turn wrote nothing.
-        cause = "orchestrator_product_write: the turn's worktree was not proven clean once its processes ended"
-        record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
     if record.get("worktree_disposition") == "removed":
         if merged:
             try:
@@ -1457,6 +1475,24 @@ def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
     scratch.settle(record, provider_gone, hold=services_running)
 
 
+def _liveness_kept(record: dict, stopped, deadline: float) -> str | None:
+    """Why the provider's process tree may still run after ``_end_own_scope`` returned ``stopped``; None once gone.
+
+    Waits until ``deadline`` for the tree to empty. A failed fallback stop names each survivor it saw.
+    """
+    if record.get("launch_mode") == "popen-fallback" and stopped is not None and not stopped.ok:
+        # Only the process group's id is recorded for a fallback launch, so a descendant that left it is
+        # invisible to the liveness check below. Name each survivor so a later retry still sees it.
+        survivors = {str(proc.pid): identity for proc in stopped.survivors if (identity := _identity(proc.pid))}
+        record["fallback_survivors"] = survivors
+        return "provider_processes_alive" if survivors else "provider_liveness_unknown"
+    while (alive := _provider_alive(record)) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if alive is not False:
+        return "provider_processes_alive" if alive else "provider_liveness_unknown"
+    return None
+
+
 def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
                    verified_merged_head: str | None = None) -> None:
     """Record the task worktree's disposition and remove the task's caches.
@@ -1471,18 +1507,7 @@ def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
     record.pop("worktree_disposition_detail", None)  # a retry replaces an earlier attempt's detail
     stopped = _end_own_scope(record)
     try:
-        if record.get("launch_mode") == "popen-fallback" and stopped is not None and not stopped.ok:
-            # Only the process group's id is recorded for a fallback launch, so a descendant that left it is
-            # invisible to the liveness check below. Name each survivor so a later retry still sees it.
-            survivors = {str(proc.pid): identity for proc in stopped.survivors if (identity := _identity(proc.pid))}
-            record["fallback_survivors"] = survivors
-            record.update(worktree_disposition="retained",
-                          worktree_disposition_reason="provider_processes_alive" if survivors else "provider_liveness_unknown")
-            return
-        while (alive := _provider_alive(record)) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if alive is not False:
-            reason = "provider_processes_alive" if alive else "provider_liveness_unknown"
+        if (reason := _liveness_kept(record, stopped, deadline)) is not None:
             record.update(worktree_disposition="retained", worktree_disposition_reason=reason)
             return
 
@@ -2268,11 +2293,16 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 record["sources_mcp_call_count"] = sources_calls
             if record.get("require_review_verdict") is True:
                 record["dispatcher_code"] = _dispatcher_code()
+            tree_unproven = "orchestrator" in record and _turn_tree_unproven(record)
             record.update(git.snapshot_delivery(spec, record))
             if error and error.startswith("TASK_RECORD_"):
                 record.update(worktree_disposition="retained", worktree_disposition_reason="task_record_damaged")
             else:
                 _enforce_delivery(record)
+                if tree_unproven and record["status"] == "done":
+                    cause = ("orchestrator_tree_unproven: the turn's processes were not proven gone before its tree "
+                             "was checked")
+                    record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
             if children := _running_children(record):
                 # A run that ends while a task it dispatched still runs left that result unconsumed (#12156).
                 record["orphaned_child_tasks"] = children
