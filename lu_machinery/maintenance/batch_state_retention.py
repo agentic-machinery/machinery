@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Shrink clean read-only snapshot sidecars under batch_state, and report the rest.
+"""Shrink clean snapshot sidecars and settled task artifact directories.
 
 Use this to turn old terminal ``tasks/*.snapshots/`` directories that recorded an
-explicit clean checkout into a ``digest.json``. Do not use it to delete manifests,
-atlas output, open-model data, or any other batch_state subtree: those are
-reported and left untouched. Dry-run is the default; pass ``--apply`` to write.
+explicit clean checkout into a ``digest.json``, and to pack a settled
+``tasks/<id>.artifacts`` directory into ``tasks/<id>.artifacts.tar.xz``. Do not
+use it to delete manifests, atlas output, open-model data, an existing artifact
+archive, or any other batch_state subtree: those are reported and left
+untouched. Dry-run is the default; pass ``--apply`` to write.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import re
 import secrets
 import stat
 import sys
+import tarfile
 from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,8 +38,14 @@ for _path in (_PACKAGE_DIR.parent, _PACKAGE_DIR):
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.orchestration import worktree_claims
+from lu_machinery.orchestration.dead_worker_state import worker_liveness
 from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME
-from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES, WorktreeLockError
+from lu_machinery.orchestration.worktree_claims import (
+    RELEASED_TASK_STATUSES,
+    WorktreeLockError,
+    WorktreeLockReentry,
+    WorktreeLockTimeout,
+)
 
 
 def _mp(relative: str) -> str:
@@ -55,6 +64,12 @@ _SNAPSHOT_SUFFIX = _READ_ONLY_CHECKOUT_SNAPSHOT_SUFFIX
 # Only these directory globs may be rewritten. Everything else under batch_state
 # is measured and left alone.
 _ALLOWLISTED_SNAPSHOT_PARENTS = ("", ARCHIVE_DIR_NAME)
+# Settled task outputs. The archive is the sibling ``<id>.artifacts.tar.xz``;
+# this sweep never deletes that sibling, and it never rewrites ``tasks/archive``.
+_ARTIFACTS_SUFFIX = ".artifacts"
+_ARTIFACTS_ARCHIVE_TAIL = ".artifacts.tar.xz"
+_ARTIFACTS_RETENTION_ARCHIVED = "archived"
+_ARTIFACTS_SHA_FIELD = "artifacts_archive_sha256"
 _PHASES = ("pre", "post")
 # ``path_safety`` does not open by directory fd. Every name below the
 # batch_state fd is a single path component; ``..`` and symlinks never become
@@ -652,6 +667,679 @@ def _measure_candidate(
     return row, reclaimed
 
 
+def _artifact_stem(directory_name: str) -> str | None:
+    """Task id for ``<id>.artifacts``, or None when the name is not one component."""
+    if not directory_name.endswith(_ARTIFACTS_SUFFIX):
+        return None
+    stem = directory_name[: -len(_ARTIFACTS_SUFFIX)]
+    if not stem or not _component(stem) or any(ord(char) < 32 or ord(char) == 127 for char in stem):
+        return None
+    return stem
+
+
+def _recorded_pid(record: Mapping[str, Any]) -> bool:
+    raw = record.get("pid")
+    if isinstance(raw, bool) or raw is None:
+        return False
+    if isinstance(raw, int):
+        return raw > 0
+    if isinstance(raw, str):
+        try:
+            return int(raw) > 0
+        except ValueError:
+            return False
+    return False
+
+
+def _liveness_skip(record: Mapping[str, Any]) -> str | None:
+    """Skip a live process, and a recorded pid whose liveness cannot be shown.
+
+    A record with no pid has no process to skip. Unknown liveness with a pid
+    is not permission to remove the directory.
+    """
+    try:
+        live = worker_liveness(dict(record))
+    except (OSError, ValueError, TypeError):
+        return "process liveness unknown"
+    if live is True:
+        return "live process"
+    if live is None and _recorded_pid(record):
+        return "process liveness unknown"
+    return None
+
+
+def _artifact_eligible(
+    record: dict[str, Any] | None,
+    info: os.stat_result | None,
+    *,
+    min_age_days: float,
+    now: datetime,
+) -> bool:
+    """True when the record exists, is terminal, and is old enough.
+
+    Artifact directories do not need the snapshot clean-checkout verdict.
+    ``finished_at`` sets the age; a missing or unparseable value uses the
+    record file's mtime.
+    """
+    if record is None or info is None or not stat.S_ISREG(info.st_mode):
+        return False
+    try:
+        released = record.get("status") in RELEASED_TASK_STATUSES
+    except TypeError:
+        return False
+    if not released:
+        return False
+    return _record_age_days(record, info.st_mtime_ns, now) >= min_age_days
+
+
+def _inventory_artifacts(dir_fd: int, *, root_dev: int, prefix: str = "") -> dict[str, int] | None:
+    """Map regular-file paths to sizes. None when the tree is not safe to pack.
+
+    Symlinks, special files, another filesystem, and names that are not one
+    path component make the whole directory ineligible. Nothing is followed.
+    """
+    found: dict[str, int] = {}
+    for name in _names(dir_fd):
+        if not _component(name) or any(ord(char) < 32 or ord(char) == 127 for char in name):
+            return None
+        info = _lstat_at(dir_fd, name)
+        if info is None or info.st_dev != root_dev:
+            return None
+        relative = f"{prefix}/{name}" if prefix else name
+        if stat.S_ISREG(info.st_mode):
+            found[relative] = info.st_size
+        elif stat.S_ISDIR(info.st_mode):
+            child = _open_dir(dir_fd, name)
+            if child is None:
+                return None
+            try:
+                nested = _inventory_artifacts(child, root_dev=root_dev, prefix=relative)
+            finally:
+                os.close(child)
+            if nested is None:
+                return None
+            found.update(nested)
+        else:
+            return None
+    return found
+
+
+def _open_relative(root_fd: int, relative: str, flags: int) -> int | None:
+    """Open ``relative`` under ``root_fd`` without following a symlink."""
+    parts = relative.split("/")
+    if not parts or any(not _component(part) for part in parts):
+        return None
+    current = root_fd
+    opened: list[int] = []
+    try:
+        for index, part in enumerate(parts):
+            step = flags if index == len(parts) - 1 else _DIR_FLAGS
+            current = os.open(part, step, dir_fd=current)
+            opened.append(current)
+        return opened.pop()
+    except OSError:
+        return None
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+
+
+def _members_match(expected: Mapping[str, int], archive: tarfile.TarFile) -> bool:
+    """True when the archive's regular files are exactly ``expected`` paths and sizes."""
+    found: dict[str, int] = {}
+    for member in archive.getmembers():
+        if member.isdir():
+            continue
+        name = member.name
+        parts = name.split("/")
+        if (
+            not member.isreg()
+            or member.issym()
+            or member.islnk()
+            or member.isdev()
+            or not parts
+            or any(not _component(part) for part in parts)
+            or name in found
+            or member.size < 0
+        ):
+            return False
+        found[name] = member.size
+    return found == dict(expected)
+
+
+def _verify_archive_at(dir_fd: int, name: str, expected: Mapping[str, int]) -> bool:
+    """True when ``name`` is a regular xz archive of exactly ``expected``."""
+    try:
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return False
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as raw:
+            try:
+                with tarfile.open(fileobj=raw, mode="r:xz") as archive:
+                    return _members_match(expected, archive)
+            except (tarfile.TarError, OSError, EOFError):
+                return False
+    finally:
+        os.close(descriptor)
+
+
+def _sha256_at(dir_fd: int, name: str) -> str | None:
+    try:
+        descriptor = os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _add_archived_file(archive: tarfile.TarFile, root_fd: int, relative: str, size: int) -> None:
+    descriptor = _open_relative(root_fd, relative, _READ_FLAGS)
+    if descriptor is None:
+        raise OSError(errno.EINVAL, "refusing to archive an entry that is not a regular file")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            raise OSError(errno.EINVAL, "artifact entry changed while packing")
+        member = tarfile.TarInfo(name=relative)
+        member.size = info.st_size
+        member.mode = 0o600
+        member.mtime = int(info.st_mtime)
+        member.uid = 0
+        member.gid = 0
+        member.uname = ""
+        member.gname = ""
+        member.type = tarfile.REGTYPE
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+            archive.addfile(member, handle)
+    finally:
+        os.close(descriptor)
+
+
+def _write_xz_archive(parent_fd: int, tmp_name: str, root_fd: int, files: Mapping[str, int]) -> None:
+    """Create ``tmp_name`` mode 0600. On failure the temp name is removed; a finished archive is not."""
+    descriptor = os.open(
+        tmp_name,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "r+b", closefd=False) as raw:
+            with tarfile.open(fileobj=raw, mode="w:xz", format=tarfile.PAX_FORMAT) as archive:
+                for relative in sorted(files):
+                    _add_archived_file(archive, root_fd, relative, files[relative])
+            raw.flush()
+            os.fsync(raw.fileno())
+    except (OSError, tarfile.TarError):
+        os.close(descriptor)
+        _unlink_regular_at(parent_fd, tmp_name)
+        raise
+    os.close(descriptor)
+
+
+def _unlink_relative_file(root_fd: int, relative: str, size: int) -> bool:
+    parts = relative.split("/")
+    if not parts or any(not _component(part) for part in parts):
+        return False
+    parent_relative = "/".join(parts[:-1])
+    name = parts[-1]
+    parent = root_fd
+    opened: list[int] = []
+    try:
+        if parent_relative:
+            parent_fd = _open_relative(root_fd, parent_relative, _DIR_FLAGS)
+            if parent_fd is None:
+                return False
+            opened.append(parent_fd)
+            parent = parent_fd
+        info = _lstat_at(parent, name)
+        if info is None or not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            return False
+        os.unlink(name, dir_fd=parent)
+        return True
+    except OSError:
+        return False
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+
+
+def _rmdir_relative(root_fd: int, relative: str) -> bool:
+    parts = relative.split("/")
+    if not parts or any(not _component(part) for part in parts):
+        return False
+    parent_relative = "/".join(parts[:-1])
+    name = parts[-1]
+    parent = root_fd
+    opened: list[int] = []
+    child: int | None = None
+    try:
+        if parent_relative:
+            parent_fd = _open_relative(root_fd, parent_relative, _DIR_FLAGS)
+            if parent_fd is None:
+                return False
+            opened.append(parent_fd)
+            parent = parent_fd
+        child = _open_dir(parent, name)
+        if child is None or _names(child):
+            return False
+        os.rmdir(name, dir_fd=parent)
+        return True
+    except OSError:
+        return False
+    finally:
+        if child is not None:
+            os.close(child)
+        for descriptor in opened:
+            os.close(descriptor)
+
+
+def _remove_archived_directory(parent_fd: int, name: str, expected: Mapping[str, int]) -> bool:
+    """Remove ``name`` only while a fresh inventory still equals ``expected``.
+
+    Unlink inventoried regular files, then their empty parents. A new name, a
+    symlink, or a size change leaves the directory in place. This never unlinks
+    the sibling archive.
+    """
+    dir_fd = _open_dir(parent_fd, name)
+    if dir_fd is None:
+        return False
+    try:
+        info = os.fstat(dir_fd)
+        current = _inventory_artifacts(dir_fd, root_dev=info.st_dev)
+        if current != dict(expected):
+            return False
+        for relative, size in sorted(expected.items(), key=lambda item: (item[0].count("/"), item[0]), reverse=True):
+            if not _unlink_relative_file(dir_fd, relative, size):
+                return False
+        prefixes: set[str] = set()
+        for relative in expected:
+            parts = relative.split("/")
+            for index in range(1, len(parts)):
+                prefixes.add("/".join(parts[:index]))
+        for prefix in sorted(prefixes, key=lambda item: (item.count("/"), item), reverse=True):
+            if not _rmdir_relative(dir_fd, prefix):
+                return False
+        if _names(dir_fd):
+            return False
+    finally:
+        os.close(dir_fd)
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        return False
+    return True
+
+
+def _dry_run_lock_skip(
+    parent_fd: int,
+    record_name: str,
+    record: Mapping[str, Any],
+    logical_record: Path,
+) -> str | None:
+    """Report a held lock without creating one. None means no held lock was observed."""
+    try:
+        target = _record_lock_target(record, logical_record)
+    except WorktreeLockError:
+        return "worktree path state unknown"
+    try:
+        refusal = worktree_claims.existing_worktree_lock_refusal(
+            Path(target),
+            lock_dir=worktree_claims.repository_lock_dir(state_root()),
+        )
+    except WorktreeLockError:
+        return "worktree path state unknown"
+    if refusal is not None:
+        return "lock held"
+    try:
+        descriptor = os.open(record_name + ".lock", os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "lock held"
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            return "lock held"
+    finally:
+        os.close(descriptor)
+    return None
+
+
+@contextlib.contextmanager
+def _artifact_mutation_locks(parent_fd: int, record_name: str, held_target: str) -> Iterator[str | None]:
+    """Yield None while both locks are held, otherwise a skip reason.
+
+    The record lock is non-blocking. Creating it is an apply-time side effect,
+    the same permanent ``<record>.json.lock`` the snapshot rewrite uses.
+    """
+    try:
+        locker = worktree_lock(held_target, timeout_s=0)
+        locker.__enter__()
+    except (WorktreeLockTimeout, WorktreeLockReentry):
+        yield "lock held"
+        return
+    except WorktreeLockError:
+        yield "worktree path state unknown"
+        return
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(
+                record_name + ".lock",
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield "lock held"
+            return
+        except OSError as exc:
+            yield errno.errorcode.get(exc.errno or 0, "OSError")
+            return
+        yield None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        locker.__exit__(None, None, None)
+
+
+def _artifact_row(
+    rel_dir: str,
+    directory_name: str,
+    record: Mapping[str, Any],
+    record_name: str,
+    *,
+    action: str,
+    reclaimable: int,
+    **extra: Any,
+) -> dict[str, Any]:
+    task_id = record.get("task_id")
+    row = {
+        "artifacts_dir": f"{rel_dir}/{directory_name}",
+        "task_id": task_id if isinstance(task_id, str) and task_id else record_name[: -len(".json")],
+        "status": record.get("status"),
+        "reclaimable_bytes": reclaimable,
+        "action": action,
+    }
+    row.update(extra)
+    return row
+
+
+def _record_archive(parent_fd: int, record_name: str, record: dict[str, Any], digest: str) -> None:
+    """Set the retention field and archive sha, preserving the record's mode."""
+    if record.get("artifacts_retention") == _ARTIFACTS_RETENTION_ARCHIVED and record.get(_ARTIFACTS_SHA_FIELD) == digest:
+        return
+    record["artifacts_retention"] = _ARTIFACTS_RETENTION_ARCHIVED
+    record[_ARTIFACTS_SHA_FIELD] = digest
+    _write_bytes_at(parent_fd, record_name, json.dumps(record, indent=2, default=str).encode("utf-8"))
+
+
+def _commit_verified_archive(
+    parent_fd: int,
+    directory_name: str,
+    record_name: str,
+    record: dict[str, Any],
+    files: Mapping[str, int],
+    *,
+    archive_name: str,
+) -> dict[str, Any]:
+    """Record a verified archive, then remove the loose directory. Never unlinks the archive."""
+    digest = _sha256_at(parent_fd, archive_name)
+    if digest is None or not _verify_archive_at(parent_fd, archive_name, files):
+        return {"action": "error", "error": "archive verification failed"}
+    dir_fd = _open_dir(parent_fd, directory_name)
+    if dir_fd is None:
+        return {"action": "error", "error": "archive verification failed"}
+    try:
+        info = os.fstat(dir_fd)
+        current = _inventory_artifacts(dir_fd, root_dev=info.st_dev)
+    finally:
+        os.close(dir_fd)
+    if current != dict(files):
+        return {"action": "error", "error": "archive verification failed"}
+    _record_archive(parent_fd, record_name, record, digest)
+    if not _remove_archived_directory(parent_fd, directory_name, files):
+        return {"action": "error", "error": "directory changed", "reclaimable_bytes": 0}
+    return {"action": "archived", "reclaimable_bytes": sum(files.values())}
+
+
+def _publish_new_archive(
+    parent_fd: int,
+    root_fd: int,
+    files: Mapping[str, int],
+    *,
+    archive_name: str,
+) -> str | None:
+    """Link a verified temp archive to ``archive_name``. Return an error, or None on success.
+
+    Only the temp name is removed. ``archive_name`` is never unlinked, including
+    when it already exists or the new archive fails verification.
+    """
+    tmp_name = _temp_name(archive_name)
+    try:
+        _write_xz_archive(parent_fd, tmp_name, root_fd, files)
+        dir_info = os.fstat(root_fd)
+        current = _inventory_artifacts(root_fd, root_dev=dir_info.st_dev)
+        if current != dict(files) or not _verify_archive_at(parent_fd, tmp_name, files):
+            return "archive verification failed"
+        try:
+            os.link(tmp_name, archive_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+        except FileExistsError:
+            return "archive verification failed"
+        os.fsync(parent_fd)
+    except (OSError, tarfile.TarError) as exc:
+        return errno.errorcode.get(getattr(exc, "errno", None) or 0, "OSError")
+    finally:
+        if _is_regular(parent_fd, tmp_name):
+            _unlink_regular_at(parent_fd, tmp_name)
+    return None
+
+
+def _apply_one_artifact(
+    parent_fd: int,
+    directory_name: str,
+    record_name: str,
+    logical_record: Path,
+    observed: dict[str, Any],
+    *,
+    observed_status: Any,
+    observed_nonce: Any,
+    min_age_days: float,
+    now: datetime,
+    identity: tuple[int, int],
+) -> dict[str, Any] | None:
+    """Pack one artifact directory. None means it disappeared or was redispatched."""
+    try:
+        held_target = _record_lock_target(observed, logical_record)
+    except WorktreeLockError:
+        return {"action": "skipped", "skip_reason": "worktree path state unknown"}
+    try:
+        with _artifact_mutation_locks(parent_fd, record_name, held_target) as skip:
+            if skip is not None:
+                reason = skip if skip in {"lock held", "worktree path state unknown"} else None
+                if reason is None:
+                    return {"action": "error", "error": skip}
+                return {"action": "skipped", "skip_reason": reason}
+            if not _is_regular(parent_fd, record_name):
+                return None
+            dir_fd = _open_dir(parent_fd, directory_name)
+            if dir_fd is None:
+                return None
+            try:
+                current_info = _lstat_at(parent_fd, directory_name)
+                if current_info is None or (current_info.st_dev, current_info.st_ino) != identity:
+                    return None
+                if os.fstat(dir_fd).st_ino != identity[1] or os.fstat(dir_fd).st_dev != identity[0]:
+                    return None
+                current = _read_record_at(parent_fd, record_name)
+                record_info = _lstat_at(parent_fd, record_name)
+                if current is None or not _artifact_eligible(current, record_info, min_age_days=min_age_days, now=now):
+                    return None
+                try:
+                    current_target = _record_lock_target(current, logical_record)
+                except WorktreeLockError:
+                    return {"action": "skipped", "skip_reason": "worktree path state unknown"}
+                if current_target != held_target:
+                    return {"action": "skipped", "skip_reason": "worktree path state unknown"}
+                if current.get("status") != observed_status or current.get("run_nonce") != observed_nonce:
+                    return None
+                liveness = _liveness_skip(current)
+                if liveness is not None:
+                    return {"action": "skipped", "skip_reason": liveness}
+                root_info = os.fstat(dir_fd)
+                files = _inventory_artifacts(dir_fd, root_dev=root_info.st_dev)
+                if files is None:
+                    return {"action": "skipped", "skip_reason": "unsupported entry"}
+                archive_name = f"{directory_name}.tar.xz"
+                existing = _lstat_at(parent_fd, archive_name)
+                if existing is not None and not stat.S_ISREG(existing.st_mode):
+                    return {"action": "error", "error": "archive exists"}
+                if existing is not None:
+                    if not _verify_archive_at(parent_fd, archive_name, files):
+                        return {"action": "error", "error": "archive verification failed"}
+                else:
+                    problem = _publish_new_archive(parent_fd, dir_fd, files, archive_name=archive_name)
+                    if problem is not None:
+                        return {"action": "error", "error": problem}
+                return _commit_verified_archive(
+                    parent_fd,
+                    directory_name,
+                    record_name,
+                    current,
+                    files,
+                    archive_name=archive_name,
+                )
+            finally:
+                os.close(dir_fd)
+    except WorktreeLockError:
+        return {"action": "skipped", "skip_reason": "lock held"}
+    except OSError as exc:
+        return {"action": "error", "error": errno.errorcode.get(exc.errno or 0, "OSError")}
+
+
+def _measure_artifact_dirs(
+    parent_fd: int,
+    rel_dir: str,
+    *,
+    root: Path,
+    min_age_days: float,
+    now: datetime,
+    apply: bool,
+) -> tuple[list[dict[str, Any]], int]:
+    """Plan or pack ``tasks/*.artifacts``. Returns rows and reclaimable loose bytes."""
+    rows: list[dict[str, Any]] = []
+    reclaimable = 0
+    for directory_name in _names(parent_fd):
+        stem = _artifact_stem(directory_name)
+        info = _lstat_at(parent_fd, directory_name)
+        if stem is None or info is None or not stat.S_ISDIR(info.st_mode):
+            continue
+        record_name = f"{stem}.json"
+        record = _read_record_at(parent_fd, record_name)
+        record_info = _lstat_at(parent_fd, record_name)
+        if not _artifact_eligible(record, record_info, min_age_days=min_age_days, now=now) or record is None:
+            continue
+        logical = Path(os.path.abspath(os.path.join(os.fspath(root), rel_dir, record_name)))
+        liveness = _liveness_skip(record)
+        if liveness is not None:
+            rows.append(
+                _artifact_row(
+                    rel_dir, directory_name, record, record_name,
+                    action="skipped", reclaimable=0, skip_reason=liveness,
+                )
+            )
+            continue
+        if not apply:
+            lock_skip = _dry_run_lock_skip(parent_fd, record_name, record, logical)
+            if lock_skip is not None:
+                rows.append(
+                    _artifact_row(
+                        rel_dir, directory_name, record, record_name,
+                        action="skipped", reclaimable=0, skip_reason=lock_skip,
+                    )
+                )
+                continue
+            dir_fd = _open_dir(parent_fd, directory_name)
+            if dir_fd is None:
+                continue
+            try:
+                files = _inventory_artifacts(dir_fd, root_dev=os.fstat(dir_fd).st_dev)
+            finally:
+                os.close(dir_fd)
+            if files is None:
+                rows.append(
+                    _artifact_row(
+                        rel_dir, directory_name, record, record_name,
+                        action="skipped", reclaimable=0, skip_reason="unsupported entry",
+                    )
+                )
+                continue
+            archive_name = f"{directory_name}.tar.xz"
+            existing = _lstat_at(parent_fd, archive_name)
+            if existing is not None and (
+                not stat.S_ISREG(existing.st_mode) or not _verify_archive_at(parent_fd, archive_name, files)
+            ):
+                rows.append(
+                    _artifact_row(
+                        rel_dir, directory_name, record, record_name,
+                        action="error", reclaimable=0, error="archive verification failed",
+                    )
+                )
+                continue
+            nbytes = sum(files.values())
+            rows.append(
+                _artifact_row(
+                    rel_dir, directory_name, record, record_name, action="would_archive", reclaimable=nbytes,
+                )
+            )
+            reclaimable += nbytes
+            continue
+        outcome = _apply_one_artifact(
+            parent_fd,
+            directory_name,
+            record_name,
+            logical,
+            record,
+            observed_status=record.get("status"),
+            observed_nonce=record.get("run_nonce"),
+            min_age_days=min_age_days,
+            now=now,
+            identity=(info.st_dev, info.st_ino),
+        )
+        if outcome is None:
+            continue
+        nbytes = int(outcome.get("reclaimable_bytes") or 0)
+        row = _artifact_row(
+            rel_dir, directory_name, record, record_name, action=str(outcome["action"]), reclaimable=nbytes,
+        )
+        if outcome.get("skip_reason"):
+            row["skip_reason"] = outcome["skip_reason"]
+        if outcome.get("error"):
+            row["error"] = outcome["error"]
+        rows.append(row)
+        if outcome["action"] == "archived":
+            reclaimable += nbytes
+    return rows, reclaimable
+
+
 def plan_retention(
     batch_state: Path,
     *,
@@ -662,12 +1350,14 @@ def plan_retention(
     on_after_digest: Callable[[], None] | None = None,
     crash_after: str | None = None,
 ) -> dict[str, Any]:
-    """Measure every batch_state subtree. Rewrite only eligible snapshot sidecars.
+    """Measure every batch_state subtree. Rewrite only eligible snapshot and artifact dirs.
 
     ``batch_state`` must be a directory named ``batch_state``. A symlink at any
     level is ignored: every open, stat, write, and unlink below that directory
     uses a descriptor opened with ``O_NOFOLLOW``. Non-terminal tasks and
     snapshot dirs without an explicit clean verdict are left as they are.
+    Artifact directories are packed only for a terminal record old enough to
+    qualify, with no live process and no held lock.
     """
     root_fd = _open_root(batch_state)
     try:
@@ -700,6 +1390,7 @@ def _plan_open(
     selected: list[dict[str, Any]] = []
     temps_removed: list[dict[str, str]] = []
     temps_would_remove: list[dict[str, str]] = []
+    artifacts_reclaimable = 0
     tasks_fd = _open_dir(root_fd, "tasks")
     if tasks_fd is not None:
         try:
@@ -748,6 +1439,17 @@ def _plan_open(
                         row, reclaimed = measured
                         selected.append(row)
                         reclaimable_by_top["tasks"] = reclaimable_by_top.get("tasks", 0) + reclaimed
+                    if rel_dir == "tasks":
+                        artifact_rows, artifact_bytes = _measure_artifact_dirs(
+                            parent_fd,
+                            rel_dir,
+                            root=batch_state,
+                            min_age_days=min_age_days,
+                            now=now,
+                            apply=apply,
+                        )
+                        selected.extend(artifact_rows)
+                        artifacts_reclaimable += artifact_bytes
             finally:
                 if archive_fd is not None:
                     os.close(archive_fd)
@@ -785,6 +1487,7 @@ def _plan_open(
         "allowlist": [
             "tasks/*.snapshots",
             "tasks/archive/*.snapshots",
+            "tasks/*.artifacts",
         ],
         "subtrees": subtrees,
         "one_off_artifacts": _one_off_files_at(root_fd, now=now),
@@ -793,6 +1496,7 @@ def _plan_open(
             "bytes": sum(row["bytes"] for row in subtrees),
             "reclaimable_bytes": sum(row["reclaimable_bytes"] for row in subtrees),
         },
+        "artifacts_reclaimable_bytes": artifacts_reclaimable,
         "selected": selected,
         "temps_removed": temps_removed,
         "temps_would_remove": temps_would_remove,
@@ -803,22 +1507,35 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Report batch_state size and replace explicitly clean terminal snapshot sidecars with a digest.\n"
-            "Use it from the scheduled hygiene run; do not use it to delete any other batch_state subtree."
+            "Use it from the scheduled hygiene run; do not use it to delete any other batch_state subtree. "
+            "It also packs eligible tasks/*.artifacts directories into one xz archive."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             f"  .venv/bin/python {_mp('maintenance/batch_state_retention.py')}\n"
+            "      # dry-run. artifacts_reclaimable_bytes sums eligible tasks/*.artifacts files.\n"
             f"  .venv/bin/python {_mp('maintenance/batch_state_retention.py')} \\\n"
-            "      --min-age-days 0 --apply\n"
+            "      --min-age-days 1 --apply\n"
+            "      # pack each eligible tasks/<id>.artifacts directory and remove the loose copy.\n"
             "\n"
             "Outputs:\n"
             "  JSON on stdout: per-subtree bytes, reclaimable bytes, and selected snapshot dirs.\n"
+            "  artifacts_reclaimable_bytes is its own field: the sum of regular-file sizes in\n"
+            "  eligible tasks/*.artifacts directories. It is not included in totals.reclaimable_bytes,\n"
+            "  which counts only snapshot digests. The xz archive is kept, so bytes freed on apply\n"
+            "  are this loose size minus the archive size. Dry-run changes nothing.\n"
             "  one_off_artifacts lists regular files >=100 MiB with relative path, bytes and age_days;\n"
             "  these owner-disposition candidates are report-only and never deleted by that report.\n"
             "  With --apply, eligible tasks/*.snapshots and tasks/archive/*.snapshots dirs lose\n"
             "  read_only_checkout_{pre,post}.json and gain digest.json. The task record's\n"
             '  read_only_snapshot_retention field becomes "digest".\n'
+            "  With --apply, an eligible tasks/<id>.artifacts directory is packed to\n"
+            "  tasks/<id>.artifacts.tar.xz (mode 0600) only after the archive lists every file\n"
+            "  with the same size. The task record gains artifacts_retention \"archived\" and\n"
+            "  artifacts_archive_sha256. The loose directory is then removed. An existing archive\n"
+            "  is never deleted or replaced. A live process, a held lock, a non-terminal status,\n"
+            "  a young record, or a failed check leaves the directory in place.\n"
             "\n"
             "Exit codes:\n"
             "  0  report written (dry-run or apply)\n"
@@ -843,8 +1560,8 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MIN_AGE_DAYS,
         help=(
-            "Only digest snapshot dirs whose task record is at least this many days old "
-            f"(finished_at, else file mtime). Default: {DEFAULT_MIN_AGE_DAYS:g}. "
+            "Only digest snapshot dirs and pack artifact dirs whose task record is at least this many days old "
+            f"(finished_at, else the record file mtime). Default: {DEFAULT_MIN_AGE_DAYS:g}. "
             "A clean verdict is already on the task record, so the full JSON has no "
             "forensic value after a day; 7 reclaimed nothing because these dirs are "
             "younger than a week. Example: 0"
@@ -853,7 +1570,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Rewrite eligible sidecars. Default is dry-run: report reclaimable bytes and change nothing.",
+        help=(
+            "Rewrite eligible snapshot sidecars and pack eligible artifact directories. "
+            "Default is dry-run: report reclaimable bytes and change nothing. Example: --apply"
+        ),
     )
     return parser
 

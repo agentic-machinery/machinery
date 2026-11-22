@@ -595,6 +595,38 @@ Unclassified state is retained. Explicitly declared disposable scratch can
 expire through the existing sweep as described below. Quarantine directories
 are excluded from this staleness report; the sweep ledger owns them.
 
+### Settled task artifact archives
+
+`lu_machinery.maintenance.batch_state_retention` packs settled
+`tasks/<id>.artifacts` directories. The staleness report above does not, and
+neither does `tmp_sweep`. Dry-run is the default. It prints
+`artifacts_reclaimable_bytes`, the sum of regular-file sizes in eligible
+directories, and changes nothing. That field is separate from snapshot
+`reclaimable_bytes`. The archive is kept, so the bytes freed on apply are the
+loose size minus the archive size.
+
+```bash
+.venv/bin/python -m lu_machinery.maintenance.batch_state_retention
+.venv/bin/python -m lu_machinery.maintenance.batch_state_retention --min-age-days 1 --apply
+```
+
+`--apply` writes `tasks/<id>.artifacts.tar.xz` with mode 0600. It removes the
+loose directory only after the archive lists every file at the same size, then
+sets the task record's `artifacts_retention` to `archived` and
+`artifacts_archive_sha256` to the archive's sha256. One directory is packed at
+a time, so free space must hold that archive until the loose copy is removed.
+A failed check leaves the directory where it is.
+
+A directory is eligible when its task record exists, its status is one of
+`done`, `failed`, `timeout`, `rate_limited`, `cancelled`, `crashed`,
+`no_deliverable` or `dry_run`, and `finished_at` (or the record file's mtime
+when `finished_at` is missing) is at least `--min-age-days` (default 1). It is
+skipped when a recorded process is live or its liveness cannot be shown, when
+the task or checkout lock is held, or when the tree contains a symlink, a
+special file, or another filesystem. An existing archive is never deleted or
+replaced. Nothing outside `tasks/*.artifacts` and those two record fields is
+rewritten. `tasks/archive/` is left untouched.
+
 ### Explicit batch_state scratch expiry (#11365)
 
 The scheduled tmp-sweep service runs a final
