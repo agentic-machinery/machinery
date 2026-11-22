@@ -297,6 +297,8 @@ def test_codex_driver_preserves_transport_probe_and_lease_guard() -> None:
     assert prompt.startswith(
         "First run lu-driver-state render --lane devops, then lu-driver-state check --lane devops."
     )
+    assert "Load .agents/skills/drive-epic/SKILL.md from the workspace root" in prompt
+    assert "agents_extensions/shared/skills/" not in prompt
     assert "newest full-content DB handoff_note as authority" in prompt
     assert "exactly one full-content DB handoff_note" in prompt
     assert "rollover/lineage IDs, full live task IDs/run nonces, open order message IDs, PR heads" in prompt
@@ -313,6 +315,8 @@ def test_codex_driver_preserves_transport_probe_and_lease_guard() -> None:
     assert f"--model {CURRENT_SOL}" in governor.stdout
     assert "governor SESSION_EPIC=<unset>" in governor.stdout
     assert "would claim lease" not in governor.stdout
+    governor_prompt = shlex.split(governor.stdout.split("would exec ", 1)[1])[-1]
+    assert governor_prompt.startswith("Follow .codex/prompts/dynamic-area-epic-fleet-governor.md ")
 
 
 @pytest.mark.parametrize(
@@ -1229,7 +1233,10 @@ def test_cto_wrapper_start_builds_cto_prompt_not_lane_driver_prompt(tmp_path: Pa
     assert "launcher: would bind cto after lease" in cto.stdout
     prompt = argv_file.read_bytes().decode().removesuffix("\0").split("\0")[-1]
     assert prompt.startswith("First run lu-driver-state render --lane cto, then lu-driver-state check --lane cto.")
-    assert "agents_extensions/shared/skills/cto/SKILL.md" in prompt
+    assert "Load .claude/skills/cto/SKILL.md from the workspace root" in prompt
+    assert "agents_extensions/shared/skills/" not in prompt
+    assert "/api/rules?scope=task:fleet-comms" in prompt
+    assert "fleet-comms-coordination.md" not in prompt
     assert "The launcher already claimed the epics lease" in prompt
     assert "first repeat lu-driver-state render --lane cto and lu-driver-state check --lane cto" in prompt
     assert "drive-epic" not in prompt
@@ -1244,18 +1251,21 @@ def test_cto_wrapper_start_builds_cto_prompt_not_lane_driver_prompt(tmp_path: Pa
     assert lane_prompt.startswith(
         "First run lu-driver-state render --lane epics, then lu-driver-state check --lane epics."
     )
-    assert "agents_extensions/shared/skills/drive-epic/SKILL.md" in lane_prompt
+    assert "Load .claude/skills/drive-epic/SKILL.md from the workspace root" in lane_prompt
 
 
-def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic() -> None:
+def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic(tmp_path: Path) -> None:
     """#12496: only the CTO seat names another skill; the lane-driver clause is unchanged."""
     script = (
         'source "$1"; printf "%s\\0%s\\0%s" '
         '"$(fleet_comms_cold_clause)" "$(fleet_comms_cold_clause drive-epic)" "$(fleet_comms_cold_clause cto)"'
     )
+    offline_rule = tmp_path / ".agent/rules/fleet-comms-coordination.md"
+    offline_rule.parent.mkdir(parents=True)
+    shutil.copyfile(machinery_path("agents_extensions/shared/rules/fleet-comms-coordination.md"), offline_rule)
     result = subprocess.run(
         ["bash", "-c", script, "bash", str(machinery_path('lib/fleet_comms_cold_start.sh'))],
-        env={**launcher_environment(), "FLEET_COMMS_PLANE_MODE": "authority", "PROJECT_DIR": str(REPO), "LC_ROOT": str(REPO)},
+        env={**launcher_environment(), "FLEET_COMMS_PLANE_MODE": "authority", "LC_ROOT": str(tmp_path)},
         capture_output=True,
         text=True,
         check=False,
@@ -1264,6 +1274,9 @@ def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic() -> None:
     assert result.returncode == 0, result.stderr
     default, lane, cto = result.stdout.split("\0")
     assert default == lane
+    assert "read /api/rules?scope=task:fleet-comms." in lane
+    assert "Offline, read .agent/rules/fleet-comms-coordination.md from the workspace root." in lane
+    assert "agents_extensions/shared/rules/" not in lane
     assert "Method playbook: load skill drive-epic (provider drivers inject the binding after lease + canary). " in lane
     assert cto == lane.replace("load skill drive-epic", "load skill cto")
     # #12671: the closeout sentence names the proof that still exists.
@@ -1480,3 +1493,5 @@ def test_gemini_effort_does_not_conflict_or_bypass_driver_certification(name, ar
         # The unquoted model/effort prefix is sufficient to pin AGY selection.
         assert command.startswith(f"agy --model {model} ")
         assert not command.startswith(f"agy --model {model} --effort ")
+        if name == "start-gemini-driver.sh":
+            assert "Load .agents/skills/drive-epic/SKILL.md from the workspace root" in command
