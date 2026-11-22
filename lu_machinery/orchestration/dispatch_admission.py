@@ -142,15 +142,18 @@ ORCHESTRATOR_KEY = "orchestrator"
 def orchestrator_stream(record: Mapping[str, Any]) -> str | None:
     """The stream an orchestrator turn's record reserves, or None for any other task.
 
-    A record that carries the key with any other shape raises ``ValueError``: it is an
+    A record that carries the key with any other shape, or names anything but a canonical
+    ``epic:<N>`` stream (the only spelling dispatch admits), raises ``ValueError``: it is an
     orchestrator turn whose stream is unknown, never an ordinary task.
     """
+    from lu_machinery.session_streams.model import STREAM_ID_RE
+
     if ORCHESTRATOR_KEY not in record:
         return None
     value = record[ORCHESTRATOR_KEY]
     stream = value.get("stream") if isinstance(value, dict) else None
-    if not isinstance(stream, str) or not stream:
-        raise ValueError("orchestrator record names no stream")
+    if not isinstance(stream, str) or not STREAM_ID_RE.fullmatch(stream) or not stream.startswith("epic:"):
+        raise ValueError("orchestrator record names no canonical stream")
     return stream
 
 
@@ -1358,10 +1361,12 @@ def scan_task_records(
     for path, state in iter_active_records(tasks_dir, recent_since=recent_since):
         task_id = str(state.get("task_id") or path.stem)
         mode = state.get("mode")
-        write_capable = _holds_write_slot(state, isinstance(mode, str) and mode in WRITE_CAPABLE_MODES)
+        launches_writer = isinstance(mode, str) and mode in WRITE_CAPABLE_MODES
+        write_capable = _holds_write_slot(state, launches_writer)
         matches_meter = meter is not None and _meter_record(state) == meter
         on_meter = matches_meter and write_capable
-        if on_meter and not state.get("never_started_reason"):
+        # Cadence paces provider launches, so an orchestrator turn's launch counts here though it holds no slot.
+        if matches_meter and launches_writer and not state.get("never_started_reason"):
             launch_age = _age_s(state.get("started_at"), clock)
             if launch_age is not None and -PIDLESS_CLOCK_SKEW_S <= launch_age < min_interval_s:
                 launch_age = max(0.0, launch_age)

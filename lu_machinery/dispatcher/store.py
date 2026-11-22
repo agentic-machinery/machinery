@@ -587,6 +587,19 @@ def begin_settlement(record: dict) -> None:
 HANDOFF_RECEIPT_KEY = "orchestrator_handoff_receipt"
 HANDOFF_RECEIPT_SCHEMA = "lu.dispatch.orchestrator-handoff-receipt.v1"
 _HANDOFF_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:#/-]{0,255}")
+_HANDOFF_RECEIPT_FIELDS = frozenset({"schema", "receipt_id", "stream", "task_id", "run_nonce", "handoff_ref", "recorded_at"})
+
+
+def _utc_timestamp(value: object) -> bool:
+    """Whether ``value`` is an ISO-8601 timestamp at UTC, as ``now()`` writes it."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    offset = parsed.utcoffset()
+    return offset is not None and offset.total_seconds() == 0
 
 
 def handoff_receipt_id(stream: str, task_id: str, run_nonce: str, handoff_ref: str) -> str:
@@ -607,7 +620,8 @@ def handoff_receipt_refusal(record: dict) -> str | None:
         stream = None
     expected = dict(schema=HANDOFF_RECEIPT_SCHEMA, stream=stream, task_id=record.get("task_id"),
                     run_nonce=record.get("run_nonce"))
-    if (not isinstance(receipt, dict) or stream is None
+    if (not isinstance(receipt, dict) or stream is None or set(receipt) != _HANDOFF_RECEIPT_FIELDS
+            or not _utc_timestamp(receipt.get("recorded_at"))
             or any(receipt.get(key) != value for key, value in expected.items())
             or not isinstance(receipt.get("handoff_ref"), str) or not _HANDOFF_REF.fullmatch(receipt["handoff_ref"])
             or receipt.get("receipt_id") != handoff_receipt_id(stream, record["task_id"], record["run_nonce"],
@@ -643,11 +657,15 @@ def record_handoff_receipt(task_id: str, run_nonce: str, stream: str, handoff_re
             raise ValueError("handoff_receipt_refused: the task is not an orchestrator turn on this stream")
         receipt = dict(schema=HANDOFF_RECEIPT_SCHEMA, receipt_id=handoff_receipt_id(stream, task_id, run_nonce, handoff_ref),
                        stream=stream, task_id=task_id, run_nonce=run_nonce, handoff_ref=handoff_ref)
-        if (existing := record.get(HANDOFF_RECEIPT_KEY)) is not None:
-            if isinstance(existing, dict) and all(existing.get(key) == value for key, value in receipt.items()):
+        if HANDOFF_RECEIPT_KEY in record:
+            existing = record[HANDOFF_RECEIPT_KEY]
+            if (handoff_receipt_refusal(record) is None and isinstance(existing, dict)
+                    and all(existing.get(key) == value for key, value in receipt.items())):
                 return existing
-            raise ValueError("handoff_receipt_conflict: this run already recorded a different handoff receipt")
-        if record.get("schema_version") != 2 or record.get("status") not in ACTIVE or record.get("settling_at"):
+            raise ValueError("handoff_receipt_conflict: this run already holds a different or invalid handoff receipt")
+        status = record.get("status")
+        if (record.get("schema_version") != 2 or not isinstance(status, str) or status not in ACTIVE
+                or record.get("settling_at")):
             raise ValueError("handoff_receipt_refused: the turn is not running, or its settlement has started")
         receipt["recorded_at"] = now()
         record[HANDOFF_RECEIPT_KEY] = receipt

@@ -26,6 +26,9 @@ STREAM = "epic:7"
 TASK_ENV = ownership.TASK_ID_ENV
 
 
+_MISSING = object()
+
+
 def _lease(state="active", session_state="open", expires_in=600):
     expires = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
     return {"state": state, "session_state": session_state, "expires_at": expires, "holder": {"agent": "claude"}}
@@ -74,6 +77,13 @@ def _write(record):
          "takes no --owned-path"),
         (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--branch", "codex/x"],
          "takes no --branch"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--pr", "0"], "takes no --pr"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--require-review-verdict"],
+         "takes no --require-review-verdict"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn.sandbox"],
+         "ends like a dispatcher sidecar"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--research-role", "advisory"],
+         "--research-role is driver"),
     ],
 )
 def test_entry_refuses_anything_but_the_cto_seat_on_a_canonical_stream(task_store, cto_seat, monkeypatch, capsys,
@@ -83,18 +93,22 @@ def test_entry_refuses_anything_but_the_cto_seat_on_a_canonical_stream(task_stor
 
     for target, name in ((git, "create_worktree"), (worker, "start"), (host_admission, "reserve")):
         monkeypatch.setattr(target, name, lambda *_a, _name=name, **_k: pytest.fail(f"{_name} ran before refusal"))
-    code = cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", "--task-id", "turn",
+    task_id = [] if "--task-id" in flags else ["--task-id", "turn"]
+    code = cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", *task_id,
                      "--prompt", "drive", *flags])
     assert code == 2
     assert reason in capsys.readouterr().err
     assert not store.read("turn", missing_ok=True)
 
 
-def test_entry_refuses_a_caller_inside_a_dispatched_task(task_store, cto_seat, monkeypatch, capsys):
+@pytest.mark.parametrize(("marker", "value"), [(TASK_ENV, "some-worker"), (TASK_ENV, ""),
+                                               ("LU_WRITE_BOUNDARY_BROKER", "/broker.sock"),
+                                               ("LU_WRITE_BOUNDARY_BROKER", "")])
+def test_entry_refuses_a_caller_inside_a_dispatched_task(task_store, cto_seat, monkeypatch, capsys, marker, value):
     """Defect class: a running task (a turn or a worker copying --initiator claude-cto) starts a turn."""
     from lu_machinery.dispatcher import cli
 
-    monkeypatch.setenv(TASK_ENV, "some-worker")
+    monkeypatch.setenv(marker, value)
     monkeypatch.setattr(worker, "start", lambda *_a, **_k: pytest.fail("spawned"))
     assert cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", "--task-id", "turn",
                      "--prompt", "drive", "--mode", "orchestrator", "--stream", STREAM,
@@ -126,6 +140,12 @@ def test_a_turn_takes_no_write_slot_but_keeps_the_host_checks(task_store, monkey
     _write(_orchestrator_record("turn-bad", pid=os.getpid(), process_start=worker._identity(os.getpid()),
                                 orchestrator={"stream": None}))
     assert host_admission.evaluate("workspace-write", sweep=False).live_task_ids == ("turn-bad",)
+    # A turn's provider launch still paces its meter: cadence counts it, the slot counters do not.
+    _write(_orchestrator_record("turn-cursor", agent="cursor", pid=os.getpid(),
+                                process_start=worker._identity(os.getpid())))
+    scan = dispatch_admission.scan_task_records(task_store, record_liveness=lambda _r: True, meter="grok+cursor",
+                                                min_interval_s=60)
+    assert (scan.live_on_meter, scan.last_meter_launch_age_s is not None) == (0, True)
 
 
 def test_concurrent_turns_on_one_stream_get_one_reservation(task_store):
@@ -181,13 +201,19 @@ def test_concurrent_turns_on_one_stream_get_one_reservation(task_store):
         (dict(status="crashed"), True),  # provider liveness unknown
         (dict(status="mystery"), True),
         (dict(status="spawning"), True),
-        (dict(orchestrator={"stream": STREAM.upper()}), False),
-        (dict(orchestrator="epic:7"), True),  # malformed: holds every stream
+        (dict(status=["running"]), True),  # a status of the wrong type is unknown, never an error
+        (dict(orchestrator={"stream": "epic:8"}), False),
+        # Malformed or non-canonical (dispatch admits only epic:<N>): holds every stream.
+        (dict(orchestrator={"stream": STREAM.upper()}), True),
+        (dict(orchestrator={"stream": "shared:practice"}), True),
+        (dict(orchestrator={"stream": "epic:07"}), True),
+        (dict(orchestrator="epic:7"), True),
     ],
 )
 def test_a_stream_stays_reserved_until_its_turn_is_proven_finished(task_store, fields, held):
     """Defect class: a stream is released while a crashed turn's provider may still dispatch."""
-    _write(_orchestrator_record("prior", **fields))
+    # Written raw: a damaged record on disk is one the store's own writer would refuse to produce.
+    store.record_path("prior").write_text(json.dumps(_orchestrator_record("prior", **fields)))
     holders = host_admission.stream_holders(STREAM, "turn")
     assert bool(holders) is held, holders
 
@@ -204,14 +230,19 @@ def test_a_stream_stays_reserved_until_its_turn_is_proven_finished(task_store, f
         (_lease(expires_in=-5), None),
         (_lease(state="released"), None),
         (_lease(session_state="closed"), None),
+        (_lease(state="expired"), None),
         ({**_lease(), "expires_at": "soon"}, "orchestrator_lease_unknown"),
         ("lease", "orchestrator_lease_unknown"),
+        (_MISSING, "orchestrator_lease_unknown"),  # no lease field is not the projection's explicit null
+        ({key: value for key, value in _lease().items() if key != "session_state"}, "orchestrator_lease_unknown"),
+        (_lease(state="held"), "orchestrator_lease_unknown"),
+        (_lease(session_state=["open"]), "orchestrator_lease_unknown"),
     ],
 )
 def test_a_live_legacy_lease_refuses_the_turn(monkeypatch, lease, refused):
     """Defect class: a turn starts beside a live tmux driver lease, or an unreadable lease reads as none."""
     monkeypatch.setattr(remote.RemoteEpicClient, "stream", lambda self, stream_id, digest_limit=20: {
-        "stream_id": stream_id, "lease": lease})
+        "stream_id": stream_id, **({} if lease is _MISSING else {"lease": lease})})
     reason = host_admission.legacy_lease_refusal(STREAM)
     if refused is None:
         assert reason is None
@@ -259,14 +290,30 @@ def test_the_receipt_is_written_once_by_the_turn_and_survives_stale_writers(task
     monkeypatch.setenv(TASK_ENV, "late")
     with pytest.raises(ValueError, match="settlement has started"):
         store.record_handoff_receipt("late", late["run_nonce"], STREAM, "note-1")
+    # A stored receipt that fails validation is never returned as an identical retry.
+    partial = _orchestrator_record("partial")
+    partial[store.HANDOFF_RECEIPT_KEY] = {key: value for key, value in receipt.items() if key != "recorded_at"}
+    partial[store.HANDOFF_RECEIPT_KEY].update(task_id="partial", run_nonce=partial["run_nonce"], receipt_id=
+                                              store.handoff_receipt_id(STREAM, "partial", partial["run_nonce"], "note-1"))
+    _write(partial)
+    monkeypatch.setenv(TASK_ENV, "partial")
+    with pytest.raises(ValueError, match="handoff_receipt_conflict"):
+        store.record_handoff_receipt("partial", partial["run_nonce"], STREAM, "note-1")
 
 
 def _settled(**fields):
-    record = _orchestrator_record("turn", status="done", error=None, commits_ahead=0, worktree_dirty_on_exit=False)
+    record = _orchestrator_record("turn", status="done", error=None, commits_ahead=0, worktree_dirty_on_exit=False,
+                                  head_sha="5" * 40, worktree_start_sha="5" * 40)
     record[store.HANDOFF_RECEIPT_KEY] = dict(
         schema=store.HANDOFF_RECEIPT_SCHEMA, receipt_id=store.handoff_receipt_id(STREAM, "turn", record["run_nonce"], "n1"),
         stream=STREAM, task_id="turn", run_nonce=record["run_nonce"], handoff_ref="n1", recorded_at=store.now())
-    record.update(fields)
+    for key, value in fields.items():
+        if key.startswith("receipt."):  # one receipt field changed, or dropped with _MISSING
+            record[store.HANDOFF_RECEIPT_KEY][key.removeprefix("receipt.")] = value
+            if value is _MISSING:
+                record[store.HANDOFF_RECEIPT_KEY].pop(key.removeprefix("receipt."))
+        else:
+            record[key] = value
     return record
 
 
@@ -281,6 +328,12 @@ def _settled(**fields):
         ({"worktree_dirty_on_exit": None}, "no_deliverable", "orchestrator_product_write"),
         ({"commits_ahead": 1}, "no_deliverable", "orchestrator_product_write"),
         ({"commits_ahead": None}, "no_deliverable", "orchestrator_product_write"),
+        ({"head_sha": "a" * 40}, "no_deliverable", "orchestrator_product_write"),  # checked out another commit
+        ({"head_sha": None}, "no_deliverable", "orchestrator_product_write"),
+        ({"receipt.recorded_at": _MISSING}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
+        ({"receipt.recorded_at": "soon"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
+        ({"receipt.recorded_at": "2026-11-22T20:00:00+02:00"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
+        ({"receipt.extra": "field"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
         ({"status": "failed", "error": "provider exited unsuccessfully"}, "failed", None),
     ],
 )
@@ -321,6 +374,23 @@ def test_the_commit_and_push_hooks_refuse_every_write_by_a_turn(task_store, tmp_
     assert ownership.main(["--worktree", str(tree), stage]) == 0  # unchanged: empty owned paths stay unrestricted
 
 
+def test_cleanup_never_salvages_or_publishes_a_rejected_turn(monkeypatch):
+    """Defect class: scheduled cleanup commits and pushes the edits settlement refused (salvage, merged delivery)."""
+    seen = {}
+    monkeypatch.setattr(worker, "_stop_task_services", lambda _record: None)
+    monkeypatch.setattr(worker.scratch, "settleable", lambda _record: False)
+    monkeypatch.setattr(worker, "_reap_worktree", lambda _record, patience=0, salvage=False, **kwargs: seen.update(
+        salvage=salvage, **kwargs))
+    monkeypatch.setattr(git, "merged_delivery", lambda _record: pytest.fail("merged delivery consulted"))
+    worker._reap_settled(_settled(status="no_deliverable", worktree_dirty_on_exit=True), salvage=True)
+    assert seen == {"salvage": False, "verified_merged_head": None}
+    monkeypatch.setattr(git, "merged_delivery", lambda _record: None)
+    plain = _settled(status="no_deliverable")
+    plain.pop("orchestrator")
+    worker._reap_settled(plain, salvage=True)
+    assert seen["salvage"] is True  # unchanged for every other task
+
+
 def test_a_turn_gets_no_path_grant(task_store, tmp_path, monkeypatch):
     """Defect class: a coordinator grant gives an orchestrator turn product scope."""
     _write(_orchestrator_record("turn", worktree_path=str(tmp_path)))
@@ -356,6 +426,8 @@ def turn_box(sandbox):
     sandbox.env["LU_MONITOR_LOOPBACK"] = f"http://127.0.0.1:{server.server_address[1]}"
     # A turn takes no write slot: no write worker could start at this cap.
     sandbox.env["DISPATCH_MAX_LIVE_WRITE_WORKERS"] = "0"
+    # A turn's launch paces its meter, which would defer the duplicate turn before its stream is checked.
+    sandbox.env["DISPATCH_MIN_METER_LAUNCH_INTERVAL_S"] = "0"
 
     def run(*args, task_env=None, expected=0):
         env = {**sandbox.env, **({TASK_ENV: task_env} if task_env else {})}
@@ -387,6 +459,7 @@ def test_a_turn_end_to_end_reserves_links_children_and_settles_on_its_receipt(tu
     task_id, nonce = box.turn("turn-1").stdout.splitlines()
     record = store.read("turn-1", tasks_root=box.tasks)
     assert record["orchestrator"] == {"stream": STREAM} and record["mode"] == "workspace-write"
+    assert record["research_role"] == "driver"  # role policy sees a driving turn, not only authoring
     assert "orchestrator_stream_busy: epic:7" in box.turn("turn-2", expected=3).stderr
     await_file(box.tasks / "turn-1.started")  # the turn's provider runs, as when it dispatches
     child = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "child-1",
