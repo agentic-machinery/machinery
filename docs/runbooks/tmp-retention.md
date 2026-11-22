@@ -216,9 +216,11 @@ unknown and keeps the scratch. Another scope named for the same task and run
 nonce (a re-dispatch that reuses the nonce gets a fresh unit token) that still
 holds a process keeps it too. A fallback (non-scope) launch's tree is never
 proven gone, so settlement never releases its scratch: it is kept for good
-(`kept`) and left to `tmp_sweep`'s settled-task rule. The hourly unit
-inventories `/tmp` only, so that rule reaches `/var/tmp` only in a run with
-`--temp-root /var/tmp`. A recorded disposition is never taken as proof. Once
+(`kept`) and left to `tmp_sweep`'s settled-task rule. The hourly unit also runs
+`tmp_sweep --temp-root /var/tmp` with the settled-task rule. The
+unattributed-scratch pass uses the default temp area. The general sweep
+protects the managed `lu` scratch directory and its existing exclusions.
+A recorded disposition is never taken as proof. Once
 the provider is proven gone, when no task process is left to register another
 service, settlement stops and checks every service the record and the
 scratch's `task-services.txt` name, and a service not proven stopped keeps the
@@ -658,6 +660,30 @@ A hold anywhere below a top-level directory makes the report show that whole
 directory as `held`, not `stale`. When the condition in `until` is met,
 remove the entry. A malformed list makes the report exit with code 2, so a
 hold is never ignored without notice.
+
+### Dispatch stdout and stderr log expiry (#1206)
+
+The hourly service runs `lu_machinery.maintenance.task_log_retention --apply
+--summary`. Preview eligible files under `batch_state/tasks/logs` with:
+
+```bash
+.venv/bin/python -m lu_machinery.maintenance.task_log_retention
+```
+
+The command counts every entry in `logs`. It can unlink only regular files
+named `<task-id>.stdout.log` or `<task-id>.stderr.log`. The file's last write
+and every run's recorded finish must be at least seven days old. Use
+`--min-age-days` to change the threshold for a manual run.
+
+Task IDs can share one pair of log names across runs. The sweep checks current
+and archived records, including stamped copies, under the dispatcher locks.
+Every matching run must be settled, free of retention holds, and proven to have
+no live supervisor or provider. A batch-state evidence hold under `tasks/`
+also keeps the logs. Missing or unreadable records, uncertain liveness, and
+held tasks are counted by reason. Launched tasks without a scope lack proof
+that their detached descendants exited. The command defaults to a dry run and
+shows only eligible basenames. `--summary` shows counts alone. `--apply`
+unlinks eligible files directly.
 
 ## uv cache size and growth (#10827)
 

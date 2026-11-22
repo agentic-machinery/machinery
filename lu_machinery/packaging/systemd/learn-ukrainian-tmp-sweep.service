@@ -1,5 +1,5 @@
 [Unit]
-Description=Learn Ukrainian temp and explicit batch_state scratch expiry
+Description=Learn Ukrainian temp, dispatch log and explicit batch_state scratch expiry
 
 [Service]
 Type=oneshot
@@ -11,6 +11,8 @@ Environment="LU_TMP_SWEEP_HOLDER_PROBE=sudo -n /usr/local/libexec/lu-tmp-holders
 # Read-only report first; then reap quiet, unreferenced scratch (#9737).
 ExecStart=@PYTHON@ -m lu_machinery.hygiene.batch_state_retention
 ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --unattributed-scratch --apply --summary
+ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --temp-root /var/tmp --apply --summary
+ExecStart=@PYTHON@ -m lu_machinery.maintenance.task_log_retention --apply --summary
 ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary
 TimeoutStartSec=3600
 TimeoutStopSec=300
