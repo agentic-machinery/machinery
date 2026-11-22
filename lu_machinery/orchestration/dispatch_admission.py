@@ -22,28 +22,10 @@ every check passes. Read-only dispatches are exempt.
   clock cannot pin one. A dead pid, or a pid-less record whose dispatcher is
   provably gone, never holds a slot; the caller may sweep it to ``crashed``
   through ``on_dead``.
-* **Subscription meter pacing (#1129, #1133).** A metered write dispatch also
-  needs a free slot on its meter and enough time since that meter's last
-  launch reservation. The meter's cap is
-  ``ceil(remaining_pct / (hours_to_reset x points_per_worker_hour))``, clamped
-  to ``[1, DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER]``, from the meter's row of
-  Monitor's planning forecast; the rate is measured over a trailing week of
-  write tasks, so a worker finishing does not move it. A missing or invalid
-  forecast, a passed reset or an unmeasured rate keeps the fixed ceiling and
-  the admission line says why (:func:`meter_cap`). Recent rate limiting and
-  known near-cap or exhausted meters defer new writes.
-* **Operator drain deadlines (C-6214).** ``DISPATCH_DRAIN_DEADLINES_FILE``
-  names a JSON file such as
-  ``{"Codex a": {"after": iso, "deadline": iso, "order": text}}`` for the
-  meters ``codex:a`` (``"Codex a"``) and ``codex:b`` (``"Codex b"``); other
-  names are ignored. While ``after <= now < deadline`` a reset credit will
-  discard the meter's remaining allowance at ``deadline``, so the paced cap
-  uses ``min(reset_at, deadline)`` as the reset and the admission line says
-  "to drain deadline". It can only raise a paced cap, never above the
-  ceiling. Unset, blank, missing, unreadable or malformed (an entry without
-  offset times or ``order`` text included) means today's pacing; the reason
-  is logged once (:func:`active_drain_deadline`). A process value, even a
-  blank one, wins; otherwise it is read from the deployment env file.
+* **Subscription meter limits (#1129).** A metered write dispatch needs a free
+  slot under ``DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER`` and enough time
+  since its meter's last launch reservation. Recent rate limiting and known
+  near-cap or exhausted meters defer new writes.
 * **``MemAvailable``** from ``/proc/meminfo`` at or above the floor.
 * **CPU:** the 1-minute load average divided by ``os.cpu_count()`` at or below
   the limit.
@@ -126,16 +108,14 @@ import math
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import StrEnum
-from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -160,24 +140,6 @@ PIDLESS_CLOCK_SKEW_S = 30.0
 LOCK_FILE_NAME = "dispatch-admission.lock"
 DEFAULT_LOCK_TIMEOUT_S = 60.0
 PROC_ROOT = Path("/proc")
-
-# Monitor's planning view (``lu_machinery.api.planning.SCHEMA_VERSION``), read by the dispatcher outside the
-# admission lock. Its capacity rows name the Grok+Cursor meter ``grok``.
-PLANNING_SCHEMA_VERSION = "model-planning.v1"
-_PLANNING_POOLS = {"grok+cursor": "grok"}
-# A rate from fewer worker tasks is a low sample on the model statistics page (``model_stats_router.LOW_SAMPLE``).
-_MIN_RATE_SAMPLES = 10
-_MICROS_PER_HOUR = 3_600_000_000
-
-# Operator drain plan (C-6214): a JSON file whose entries name a window in which a reset credit discards a
-# meter's remaining allowance at ``deadline`` (:func:`active_drain_deadline`). A process value, even blank, wins;
-# otherwise the deployment env file names it. Both files are read with the same bound.
-ENV_DRAIN_DEADLINES_FILE = "DISPATCH_DRAIN_DEADLINES_FILE"
-_DRAIN_ENTRY_NAMES = {"codex:a": "Codex a", "codex:b": "Codex b"}
-_DRAIN_FILE_MAX_BYTES = 64 * 1024
-_DRAIN_TIME_MAX_CHARS = 40
-# Each distinct reason is logged once per process, so a bad file does not repeat on every admission check.
-_drain_warned: set[str] = set()
 
 ENV_MAX_LIVE_WRITE_WORKERS = "DISPATCH_MAX_LIVE_WRITE_WORKERS"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER"
@@ -209,7 +171,7 @@ DISK_ALERT_PUBLISH_TIMEOUT_S = 30.0
 # existing worktree adds no checkout and skips it.
 DISK_GUARD_REUSE_SKIP = "dispatch reuses an existing worktree"
 
-# Deployment env file with the same variables and ``DISPATCH_DRAIN_DEADLINES_FILE`` (``NAME=value`` or
+# Deployment env file with the same variables (``NAME=value`` or
 # ``export NAME=value`` lines). Read only for the live environment, after the
 # process environment, so a long-running session started before the host set
 # its overrides still sees them. ``DISPATCH_ADMISSION_ENV_FILE`` names another
@@ -276,12 +238,11 @@ class MeterCheck:
     interval_s: float
     defer: MeterDefer | None
     retry_in_s: float = 0.0
-    basis: str = "fixed cap"
 
     def clause(self) -> str:
         clause = (
             f"meter {self.meter}: live write workers {self.live}/{self.cap} "
-            f"({self.basis}), launch interval {self.interval_s:g}s"
+            f"(fixed ceiling), launch interval {self.interval_s:g}s"
         )
         if self.defer is not None:
             clause += f", subscription_meter_defer={self.defer}"
@@ -459,7 +420,7 @@ class AdmissionDecision:
         if self.meter_refused:
             return (
                 f"dispatch admission deferred for a {self.mode} worker: {'; '.join(self.failures)}. "
-                "Retry when the subscription meter has room. --force-admission cannot override meter pacing."
+                "Retry when the subscription meter has room. --force-admission cannot override meter limits."
             )
         return (
             f"dispatch admission refused for a {self.mode} worker: {'; '.join(self.failures)}. "
@@ -1238,203 +1199,6 @@ def _meter_defer(meter: str, budget: Mapping[str, Any], now: datetime) -> MeterD
     return None
 
 
-def _forecast_number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        number = float(value)  # a JSON integer beyond the float range raises OverflowError
-    except OverflowError:
-        return None
-    return number if math.isfinite(number) else None
-
-
-def _drain_log(reason: str, level: int = logging.WARNING) -> None:
-    if reason not in _drain_warned:
-        _drain_warned.add(reason)
-        # WARNING: callers such as dispatch.py configure no logging, so only WARNING and above reach stderr.
-        _logger.log(level, "dispatch admission: %s %s; pacing uses the meter reset", ENV_DRAIN_DEADLINES_FILE, reason)
-
-
-def _drain_time(value: object) -> datetime | None:
-    if not isinstance(value, str) or len(value) > _DRAIN_TIME_MAX_CHARS:
-        return None
-    try:
-        moment = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return moment if moment.tzinfo is not None else None
-
-
-def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    members = dict(pairs)
-    if len(members) != len(pairs):
-        raise ValueError("duplicate member")
-    return members
-
-
-def _no_constant(token: str) -> Any:
-    raise ValueError(f"{token} is not JSON")
-
-
-def _read_operator_text(raw: str) -> tuple[str | None, str]:
-    """``(text, "")`` for the UTF-8 regular file at the absolute path ``raw``, else ``(None, reason)``.
-
-    It never blocks (``O_NONBLOCK``, and only a regular file is read) and never raises. A path with a NUL,
-    one that cannot be expanded or is relative, and a missing, non-regular, unreadable, oversized or
-    non-UTF-8 file each give a fixed reason that names no path.
-    """
-    if "\0" in raw:
-        return None, "holds a NUL byte"
-    try:
-        path = Path(raw).expanduser()
-    except (RuntimeError, ValueError):  # ``~name`` for an unknown user
-        return None, "cannot be expanded"
-    if not path.is_absolute():  # relative to whichever directory the dispatcher runs in
-        return None, "is not an absolute path"
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-    except (OSError, ValueError) as exc:  # ValueError: a name the filesystem encoding cannot hold
-        return None, "is missing" if isinstance(exc, FileNotFoundError) else "is unreadable"
-    data = b""
-    try:
-        try:
-            regular = stat.S_ISREG(os.fstat(fd).st_mode)
-            while regular and len(data) <= _DRAIN_FILE_MAX_BYTES:
-                chunk = os.read(fd, _DRAIN_FILE_MAX_BYTES + 1 - len(data))
-                if not chunk:
-                    break
-                data += chunk
-        finally:
-            os.close(fd)  # exactly once; an error closing is an unreadable file, like an error reading
-    except OSError:
-        return None, "is unreadable"
-    if not regular:
-        return None, "is not a regular file"
-    if len(data) > _DRAIN_FILE_MAX_BYTES:
-        return None, f"is larger than {_DRAIN_FILE_MAX_BYTES} bytes"
-    try:
-        return data.decode("utf-8"), ""
-    except UnicodeDecodeError:
-        return None, "is not UTF-8 text"
-
-
-def _drain_setting(process_env: Mapping[str, str], *, live: bool) -> str:
-    """The drain file setting: a present process value, even blank, wins over the deployment env file."""
-    if ENV_DRAIN_DEADLINES_FILE in process_env:
-        return process_env[ENV_DRAIN_DEADLINES_FILE].strip()
-    try:
-        env_path = admission_env_file(process_env, live=live)
-    except (RuntimeError, ValueError):
-        _drain_log(f"lookup: {ENV_ADMISSION_FILE} cannot be expanded")
-        return ""
-    if env_path is None:
-        return ""
-    text, reason = _read_operator_text(str(env_path))
-    if text is None:
-        if reason != "is missing":  # no deployment env file is the ordinary case
-            _drain_log(f"lookup: the deployment env file {reason}")
-        return ""
-    return parse_admission_env(text, (ENV_DRAIN_DEADLINES_FILE,)).get(ENV_DRAIN_DEADLINES_FILE, "").strip()
-
-
-def active_drain_deadline(meter: str, now: datetime, environ: Mapping[str, str] | None = None) -> datetime | None:
-    """The operator drain deadline active for ``meter`` now, or ``None`` (C-6214).
-
-    ``DISPATCH_DRAIN_DEADLINES_FILE`` names a JSON object such as
-    ``{"Codex a": {"after": iso, "deadline": iso, "order": text}}``. A process value, even a blank one, wins;
-    otherwise the deployment env file is read, as for the thresholds. ``"Codex a"`` and ``"Codex b"`` are the
-    meters ``codex:a`` and ``codex:b``; other names are ignored. An entry is active when
-    ``after <= now < deadline``; both times need a UTC offset and ``order`` must be text. A meter without an
-    entry means no deadline. A blank or unset setting, a bad path, a missing, unreadable, non-regular,
-    oversized or malformed file (``NaN`` and ``Infinity`` included) or entry also means no deadline: the
-    reason is logged once per process (an unset setting at DEBUG) and nothing raises or blocks.
-    """
-    name = _DRAIN_ENTRY_NAMES.get(meter)
-    if name is None:
-        return None
-    raw = _drain_setting(os.environ if environ is None else environ, live=environ is None)
-    if not raw:
-        _drain_log("is not set", logging.DEBUG)
-        return None
-    text, reason = _read_operator_text(raw)
-    if text is None:
-        _drain_log(reason)
-        return None
-    try:
-        document = json_depth.loads(text, max_depth=8, object_pairs_hook=_unique_members, parse_constant=_no_constant)
-    except (ValueError, RecursionError):  # JSONDecodeError is a ValueError
-        _drain_log("is not valid JSON")
-        return None
-    if not isinstance(document, dict):
-        _drain_log("is not a JSON object")
-        return None
-    if name not in document:
-        return None
-    entry = document[name]
-    fields = entry if isinstance(entry, dict) else {}
-    after, deadline = _drain_time(fields.get("after")), _drain_time(fields.get("deadline"))
-    if after is None or deadline is None or not isinstance(fields.get("order"), str):
-        _drain_log(f"entry {name!r} needs 'after' and 'deadline' times with a UTC offset and an 'order' text")
-        return None
-    return deadline if after <= now < deadline else None
-
-
-def meter_cap(
-    meter: str, ceiling: int, forecast: object, now: datetime, drain_deadline: datetime | None = None,
-) -> tuple[int, str]:
-    """The meter's live-worker cap and the basis the admission line shows (#1133).
-
-    ``forecast`` is the Monitor planning view (``model-planning.v1``). With a valid row for the meter, a
-    future reset and a positive rate measured over at least ten worker tasks, the cap is the number of workers that spend the remaining
-    allowance by the reset at the measured rate, ``ceil(remaining_pct / (hours_to_reset x rate))``,
-    clamped to ``[1, ceiling]``, computed exactly from the given values and the reset interval in
-    microseconds. It reads no live-worker count. Anything else keeps the fixed ceiling.
-
-    ``drain_deadline`` is the meter's active operator drain deadline (:func:`active_drain_deadline`): when
-    it comes before the row's reset, the allowance is gone at the deadline, so the cap paces to it instead
-    and the basis says "to drain deadline". It only shortens the interval, so it can only raise the cap,
-    never above ``ceiling``, and never paces a meter the forecast does not.
-    """
-    view = _mapping(forecast)
-    rows = view.get("capacity")
-    if view.get("schema_version") != PLANNING_SCHEMA_VERSION or not isinstance(rows, list):
-        return ceiling, "fixed cap: planning forecast unavailable"
-    pool = _PLANNING_POOLS.get(meter, meter)
-    matches = [row for row in rows if isinstance(row, Mapping) and row.get("pool") == pool]
-    if len(matches) != 1:
-        return ceiling, "fixed cap: no single forecast row for this meter"
-    row = matches[0]
-    remaining = _forecast_number(row.get("remaining_pct"))
-    if remaining is None or not 0 <= remaining <= 100:
-        return ceiling, "fixed cap: remaining allowance unknown"
-    raw_reset = row.get("reset_at")
-    try:
-        reset = datetime.fromisoformat(raw_reset) if isinstance(raw_reset, str) and len(raw_reset) <= 40 else None
-    except ValueError:
-        reset = None
-    if reset is None or reset.tzinfo is None:
-        return ceiling, "fixed cap: reset time unknown"
-    until = "reset"
-    if drain_deadline is not None and drain_deadline < reset:
-        reset, until = drain_deadline, "drain deadline"
-    micros = (reset - now) // timedelta(microseconds=1)
-    if micros <= 0:
-        return ceiling, "fixed cap: reset time passed"
-    rate = _forecast_number(row.get("points_per_worker_hour"))
-    if rate is None or not rate > 0:
-        return ceiling, "fixed cap: no measured points per worker-hour"
-    samples = row.get("worker_samples")
-    if type(samples) is not int or samples < _MIN_RATE_SAMPLES:
-        return ceiling, f"fixed cap: rate measured over fewer than {_MIN_RATE_SAMPLES} worker tasks"
-    # Exact rational arithmetic: no float error can cross a whole-worker boundary and nothing underflows.
-    workers = Fraction(remaining) * _MICROS_PER_HOUR / (micros * Fraction(rate))
-    cap = min(ceiling, max(1, math.ceil(workers)))
-    return cap, (
-        f"paced cap: {remaining:g}% left, {micros / _MICROS_PER_HOUR:.1f}h to {until}, {rate:g} points per worker-hour "
-        f"over {samples} tasks, ceiling {ceiling}"
-    )
-
-
 def new_admission_hold(run_nonce: str) -> dict[str, Any]:
     """This dispatcher's claim on an admitted slot: run, pid and ``/proc`` start time."""
     from lu_machinery.orchestration.dead_worker_state import capture_worker_identity
@@ -1761,7 +1525,6 @@ def evaluate(
     record_shadow: bool = True,
     meter: str | None = None,
     meter_budget: Mapping[str, Any] | None = None,
-    meter_forecast: object = None,
     now: datetime | None = None,
 ) -> AdmissionDecision:
     """Decide whether a ``mode`` dispatch may start a worker on this host now.
@@ -1776,9 +1539,7 @@ def evaluate(
     the alert. Invalid threshold environment variables raise
     ``ValueError``. A missing or incompatible product policy raises
     ``ProductPolicyError`` (a ``ValueError``) for every mode, read-only
-    included, before anything is read or swept (#12680). ``meter_forecast`` is
-    the Monitor planning view the caller read for a metered write; it sets
-    only that meter's cap (:func:`meter_cap`).
+    included, before anything is read or swept (#12680).
     """
     load_product_policy()
     if mode not in WRITE_CAPABLE_MODES:
@@ -1802,9 +1563,7 @@ def evaluate(
         )
     meter_check = None
     if meter is not None:
-        cap, basis = meter_cap(
-            meter, limits.max_live_write_workers_per_meter, meter_forecast, clock, active_drain_deadline(meter, clock),
-        )
+        cap = limits.max_live_write_workers_per_meter
         defer = (
             MeterDefer.RATE_LIMITED if scan.meter_recently_rate_limited
             else _meter_defer(meter, meter_budget or {}, clock)
@@ -1816,7 +1575,7 @@ def evaluate(
         if defer is None and scan.last_meter_launch_age_s is not None:
             defer = MeterDefer.CADENCE
             retry_in = interval - scan.last_meter_launch_age_s
-        meter_check = MeterCheck(meter, scan.live_on_meter, cap, interval, defer, retry_in, basis)
+        meter_check = MeterCheck(meter, scan.live_on_meter, cap, interval, defer, retry_in)
         if defer is not None:
             failures.append(meter_check.clause())
     failures.extend(host_failures(probe, limits))

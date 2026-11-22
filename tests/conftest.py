@@ -1646,7 +1646,6 @@ def _hermetic_dispatch_admission_host(monkeypatch):
         "DISPATCH_DISK_REAP_USED_PERCENT",
         "DISPATCH_DISK_REFUSE_USED_PERCENT",
         "DISPATCH_DISK_ALERT_USED_PERCENT",
-        "DISPATCH_DRAIN_DEADLINES_FILE",
         "LU_SLICE_CGROUP",
     ):
         monkeypatch.delenv(name, raising=False)
