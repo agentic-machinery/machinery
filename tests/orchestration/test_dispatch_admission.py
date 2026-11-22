@@ -285,6 +285,10 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
                                  + b"no colon here\r\n" + hidden + b"\r\n\r\n" + body)
                 self.close_connection = True
                 return
+            if name == "hidden_envelope":  # a non-field line the parser keeps as a mail envelope, not a defect
+                self.wfile.write(f"HTTP/1.1 200 OK\r\nFrom x\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
+                self.close_connection = True
+                return
             self.send_response({"redirect": 302, "error": 503}.get(name, 200))
             if name == "redirect":
                 self.send_header("Location", self.path)
@@ -306,7 +310,7 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
         assert host_admission.read_planning() == json.loads(good)
         for name in ("redirect", "error", "short", "oversize", "not_json", "chunked", "close_delimited", "letters",
                      "negative", "superscript", "repeated", "conflicting", "hidden_length", "hidden_chunked",
-                     *stalls):
+                     "hidden_envelope", *stalls):
             mode["name"] = name
             started = time.monotonic()
             assert host_admission._monitor_json(host_admission.read_planning) is None, name
