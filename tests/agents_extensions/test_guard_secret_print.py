@@ -429,9 +429,9 @@ def test_issue_8896_literal_and_command_braces_allow(monkeypatch, command):
 def test_issue_8896_parameter_expansion_stays_one_word():
     assert guard._tokenize('echo ${x:-$(printf %s "${GH_TOKEN:-x}")}') == [
         "echo",
-        '${x:-$(printf %s "${GH_TOKEN:-x}")}',
+        '"${x:-$(printf %s "${GH_TOKEN:-x}")}"',
     ]
-    assert guard._tokenize("echo ${x#y}; cat .env") == ["echo", "${x#y}", ";", "cat", ".env"]
+    assert guard._tokenize("echo ${x#y}; cat .env") == ["echo", '"${x#y}"', ";", "cat", ".env"]
 
 
 @pytest.mark.parametrize(
@@ -448,10 +448,10 @@ def test_issue_9088_escaped_double_quote_commands_allow(monkeypatch, command):
 
 
 def test_issue_9088_double_quote_escapes_keep_quote_preserving_tokens():
-    assert guard._tokenize(r'echo "a \" b"') == ["echo", r'"a \" b"']
-    assert guard._tokenize(r'printf "%s\n" "x\"y"') == ["printf", r'"%s\n"', r'"x\"y"']
-    assert guard._tokenize(r'echo "a \\ \$ \` b"') == ["echo", r'"a \\ \$ \` b"']
-    assert guard._tokenize(r'echo "a \\"') == ["echo", r'"a \\"']
+    assert guard._tokenize(r'echo "a \" b"') == ["echo", """'a " b'"""]
+    assert guard._tokenize(r'printf "%s\n" "x\"y"') == ["printf", r"'%s\n'", """'x"y'"""]
+    assert guard._tokenize(r'echo "a \\ \$ \` b"') == ["echo", r"'a \ $ ` b'"]
+    assert guard._tokenize(r'echo "a \\"') == ["echo", r"'a \'"]
 
 
 def test_issue_9088_heredoc_opener_after_escaped_quote_is_found():
@@ -1790,16 +1790,20 @@ def test_escaped_apostrophe_quoting_keeps_secret_print_refusals(monkeypatch, wor
     assert _run(monkeypatch, command) == 2
 
 
-def test_escaped_apostrophe_fold_keeps_refusal_for_expandable_python_selector(monkeypatch):
-    """Defect class: an expandable word before python's program selector is folded and allowed.
+def test_escaped_apostrophe_after_expandable_python_selector_reads_its_value(monkeypatch):
+    """Defect class: an expandable word before python's program selector hides program text.
 
     `"$DOC_PATH"` can expand to an option such as -c that turns the next word into
-    program text, so the folded reread must keep main's refusal.
+    program text. The guard scans every interpreter word as program text, so the
+    apostrophe form decides as its value reads: this body holds no secret access,
+    and the same body with an environment read is refused.
     """
     body = _shell_single_quote("it's done; see #12 | next")
     command = f'python3 "$DOC_PATH" {body}'
     assert "'\\''" in command
-    assert _run(monkeypatch, command) == 2
+    assert _run(monkeypatch, command) == 0
+    secret = _shell_single_quote("it's done; import os; print(os.environ)")
+    assert _run(monkeypatch, f'python3 "$DOC_PATH" {secret}') == 2
 
 
 def test_escaped_apostrophe_publisher_body_with_command_substitution_text_is_allowed(monkeypatch):
@@ -1813,3 +1817,136 @@ def test_escaped_apostrophe_publisher_body_with_command_substitution_text_is_all
     command = " ".join(_shell_single_quote(word) for word in words)
     assert "'\\''" in command
     assert _run(monkeypatch, command) == 0
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("env 2>'a'b", 2),
+        ('env 2>a"b"', 2),
+        ("env 2> 'e'\"rr\"", 2),
+        ("env 2>'x'y | cat", 2),
+        ("env 2>'a'b >/dev/null", 0),
+        ("env >'a'b", 0),
+        ("env >'a'b; cat ab", 2),
+    ],
+)
+def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expected):
+    """Defect class: a split-quoted redirect operand read as several words.
+
+    The shell joins `'a'b` into one file name, so a stderr redirect leaves the
+    dump on stdout; reading `b` as the command after `env` hid the dump.
+    """
+    assert _run(monkeypatch, command) == expected
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("bash <<<'true;env' 1>&2", 2),
+        ("bash <<<env x", 2),
+        ("bash 0<<<env", 2),
+        ("bash <<< 'echo \"its\"'\" ; env\" -s", 2),
+        ("bash <<< 'echo hi' x", 0),
+    ],
+)
+def test_here_string_operand_is_exactly_one_word(monkeypatch, command, expected):
+    """Defect class: a here-string script glued to the words after it, or missed behind descriptor 0.
+
+    The shell feeds exactly the next word to the shell's stdin; gluing the
+    following words changed the script, and `0<<<` was not read as stdin.
+    """
+    assert _run(monkeypatch, command) == expected
+
+
+@pytest.mark.parametrize(
+    "program,expected",
+    [
+        ('import os;os.system("e\\x6ev")', 2),
+        ('import os;os.system("true\\nenv")', 2),
+        ('import os;os.system("e" "nv")', 2),
+        ('import os;os.system("e" + "nv")', 2),
+        ('x = "its"; import os # "\nos.system("env")', 2),
+        ("import os;os.system(\"env\\necho it's\")", 2),
+        ('x = "its"; import os # "\\nos.system("env")', 0),
+    ],
+)
+def test_interpreter_strings_are_read_decoded_joined_and_past_comments(monkeypatch, program, expected):
+    """Defect class: a program string read as written, not as the runtime builds it.
+
+    Escapes are decoded, adjacent literals joined, a quote inside a comment no
+    longer shifts the pairing, and a shell runs the complete lines before one it
+    cannot parse. The last row is a comment to the end of the line, so nothing runs.
+    """
+    assert _run(monkeypatch, "python3 -c " + _shell_single_quote(program)) == expected
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        ("cat {.env,x}", 2),
+        ("cat .e{n,}v", 2),
+        ("cat ~/.secret{s,}/x", 2),
+        ("{env,}", 2),
+        ("env{,}", 2),
+        ("echo {$,x}GH_TOKEN", 2),
+        ("grep -h key ~/cfg/*.{yaml,env}", 2),
+        ("echo {a,b}", 0),
+        ("cat {notes,todo}.txt", 0),
+        ("echo '{.env,x}'", 0),
+    ],
+)
+def test_brace_expansion_words_are_read_as_bash_expands_them(monkeypatch, command, expected):
+    """Defect class: an unquoted brace word read as written instead of the words Bash expands it to."""
+    assert _run(monkeypatch, command) == expected
+
+
+LEXER_CASES = [
+    ("a'b'c \"d\" e\\ f", ["abc", "d", "e f"]),
+    ("'it'\\''s'", ["it's"]),
+    ("$'a\\tb'", ["a\tb"]),
+    ('"a \\" b"', ['a " b']),
+    ('"a \\\\ \\$ \\` b"', ["a \\ $ ` b"]),
+    ("x\\\ny", ["xy"]),
+    ("x{,}", ["x", "x"]),
+    ("{a},b}", ["a}", "b"]),
+    ("{a{b,c}", ["{ab", "{ac"]),
+    ("a{b}c", ["a{b}c"]),
+    ("{1..10..4}", ["1", "5", "9"]),
+    ('"{a,b}" \\{a,b}', ["{a,b}", "{a,b}"]),
+    ("{a,b,} \"\"{,}", ["a", "b", "", ""]),
+    ("\\;'|'", [";|"]),
+]
+
+
+@pytest.mark.parametrize("text,values", LEXER_CASES)
+def test_lexer_word_values_match_bash(text, values):
+    """Defect class: guard words that differ from the words Bash passes to the command.
+
+    The table is checked against Bash itself when it is installed.
+    """
+    assert [guard._strip_quotes(word) for word in guard._tokenize(text)] == values
+    bash = shutil.which("bash")
+    if bash:
+        result = subprocess.run(
+            [bash, "--norc", "--noprofile", "-f", "-c", 'printf "%s\\0" ' + text],
+            capture_output=True,
+            check=True,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        printed = result.stdout.decode().split("\0")[:-1]
+        assert printed == (values or [""])
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", 'bash -c "$CMD"'],
+)
+@pytest.mark.parametrize("override", [False, True])
+def test_unparseable_text_is_refused(monkeypatch, command, override):
+    """Defect class: text the guard cannot read as words passes as harmless.
+
+    The secret override does not cover a command the process scan cannot read whole.
+    """
+    assert _run(monkeypatch, command, env_override=override) == 2
