@@ -442,13 +442,31 @@ jobs:
           uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Fetch origin/main for the shrink check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is empty; refusing unauthenticated fetch"
+            exit 1
+          fi
+          basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
+          echo "::add-mask::${basic}"
           # No --depth: on a push to main the checkout is the main tip, and a
           # depth-1 fetch of it would move the shallow boundary to HEAD and
           # drop HEAD^. Without it, Git fetches only commits it does not have.
-          git fetch --no-tags --no-recurse-submodules origin \
-            +refs/heads/main:refs/remotes/origin/main
+          # Scope the token to this one fetch via GIT_CONFIG_* (never persisted
+          # to disk or passed in argv).
+          echo "Fetching origin/main authenticated via host-scoped http.extraheader."
+          GIT_TERMINAL_PROMPT=0 \
+          GIT_CONFIG_COUNT=2 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0='' \
+          GIT_CONFIG_KEY_1=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_1="AUTHORIZATION: basic ${basic}" \
+            git fetch --no-tags --no-recurse-submodules origin \
+              +refs/heads/main:refs/remotes/origin/main
+          unset basic GH_TOKEN
           # A ref the ratchet cannot read is skipped, not failed, so require all three.
           for ref in HEAD HEAD^ origin/main; do
             if ! git rev-parse --verify --quiet "${ref}^{commit}" > /dev/null; then
@@ -529,14 +547,32 @@ jobs:
           uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Fetch origin/main for the shrink check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is empty; refusing unauthenticated fetch"
+            exit 1
+          fi
+          basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
+          echo "::add-mask::${basic}"
           # No --depth: on a push to main the checkout is the main tip, and a
           # depth-1 fetch of it would move the shallow boundary to HEAD and
           # drop HEAD^. The introducing PR has no baseline on origin/main yet;
           # the lint skips the shrink check until that blob exists.
-          git fetch --no-tags --no-recurse-submodules origin \
-            +refs/heads/main:refs/remotes/origin/main
+          # Scope the token to this one fetch via GIT_CONFIG_* (never persisted
+          # to disk or passed in argv).
+          echo "Fetching origin/main authenticated via host-scoped http.extraheader."
+          GIT_TERMINAL_PROMPT=0 \
+          GIT_CONFIG_COUNT=2 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0='' \
+          GIT_CONFIG_KEY_1=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_1="AUTHORIZATION: basic ${basic}" \
+            git fetch --no-tags --no-recurse-submodules origin \
+              +refs/heads/main:refs/remotes/origin/main
+          unset basic GH_TOKEN
           for ref in HEAD HEAD^ origin/main; do
             if ! git rev-parse --verify --quiet "${ref}^{commit}" > /dev/null; then
               echo "::error::${ref} is not available; the baseline shrink check would be skipped"
@@ -675,13 +711,29 @@ jobs:
           fi
 
       - name: Fetch semgrep-rules at the pinned commit
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GH_TOKEN is empty; refusing unauthenticated fetch"
+            exit 1
+          fi
+          basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w 0)"
+          echo "::add-mask::${basic}"
           rules="$RUNNER_TEMP/semgrep-rules"
           rm -rf "$rules"
           git init --quiet "$rules"
-          git -C "$rules" fetch --quiet --depth 1 --no-tags \
-            https://github.com/semgrep/semgrep-rules.git "$SEMGREP_RULES_COMMIT"
+          echo "Fetching semgrep-rules@${SEMGREP_RULES_COMMIT} authenticated via host-scoped http.extraheader."
+          GIT_TERMINAL_PROMPT=0 \
+          GIT_CONFIG_COUNT=2 \
+          GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_0='' \
+          GIT_CONFIG_KEY_1=http.https://github.com/.extraheader \
+          GIT_CONFIG_VALUE_1="AUTHORIZATION: basic ${basic}" \
+            git -C "$rules" fetch --quiet --depth 1 --no-tags \
+              https://github.com/semgrep/semgrep-rules.git "$SEMGREP_RULES_COMMIT"
+          unset basic GH_TOKEN
           git -C "$rules" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
           checked_out="$(git -C "$rules" rev-parse HEAD)"
           if [ "$checked_out" != "$SEMGREP_RULES_COMMIT" ]; then

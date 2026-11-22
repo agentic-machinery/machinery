@@ -50,14 +50,16 @@ runs:
           exit 1
         fi
         echo "version=${want}" >> "$GITHUB_OUTPUT"
-    # Downloads uv from GitHub Releases and checks the archive against the
-    # pinned SHA-256 before use. No Actions cache: every job starts from the pins.
-    # The venv lives in the job temp directory, never in the checkout.
+    # Downloads uv from the Astral mirror (falling back to GitHub Releases with
+    # github-token) and checks the archive against the pinned SHA-256 before
+    # use. No Actions cache: every job starts from the pins. The venv lives in
+    # the job temp directory, never in the checkout.
     - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         version: ${{ inputs.uv-version }}
         checksum: ${{ inputs.uv-sha256 }}
-        download-from-astral-mirror: 'false'
+        github-token: ${{ github.token }}
+        download-from-astral-mirror: 'true'
         enable-cache: 'false'
         python-version: ${{ steps.want.outputs.version }}
         activate-environment: 'true'
