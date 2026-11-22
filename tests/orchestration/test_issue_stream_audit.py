@@ -2078,6 +2078,14 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
         )
         assert not (audit_root / "batch_state" / "issue_stream_audit.json").exists()
 
+        # The lifecycle adapter must use the same repository even from the product checkout.
+        from lu_machinery.orchestration.task_closeout import GhGitHubAdapter
+
+        adapter_report = GhGitHubAdapter(audit_root).membership_audit_report(active_slug)
+        assert adapter_report["repository"] == active_slug
+        assert adapter_report["effective_membership"]["42"]["epics"] == [10]
+        assert not (audit_root / "batch_state" / "issue_stream_audit.json").exists()
+
         # CLI --repo --check --json succeeds on active slug; --from-cache on non-default repo refuses.
         assert issue_stream_audit.main(["--repo", active_slug, "--check", "--json"]) == 0
         cli_report = json.loads(capsys.readouterr().out)

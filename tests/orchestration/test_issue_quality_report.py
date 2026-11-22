@@ -66,9 +66,9 @@ REPO = "learn-ukrainian/learn-ukrainian.github.io"
 
 REGISTRY = {"devops": [5703], "harness": [6943]}
 
-def audit_report(*, native=(), body=()):
+def audit_report(*, number=123, native=(), body=()):
     result = audit.classify(
-        [{"number": 123, "title": "target"}], REGISTRY, {5703: (set(native), set(body)), 6943: (set(), set())}
+        [{"number": number, "title": "target"}], REGISTRY, {5703: (set(native), set(body)), 6943: (set(), set())}
     )
     result.update(repository=REPO, warnings=[])
     return result
@@ -92,7 +92,7 @@ PRIVATE = FleetRepo("infra-private", "unit/private", "private", "private-infra")
 
 
 def summarize(issues, count, membership=None, codes=(), repo=PUBLIC):
-    return report.summarize_repository(repo, issues, count, membership, list(codes), REGISTRY)
+    return report.summarize_repository(repo, issues, count, membership, list(codes), REGISTRY if repo == PUBLIC else {})
 
 
 def test_advisory_comment_reconciliation_ignores_null_user() -> None:
@@ -181,6 +181,8 @@ def test_visibility_fails_closed_for_unknown_role():
         (lambda r: r.update(membership_complete=False), "membership_audit_incomplete"),
         (lambda r: r.update(generated_at=0), "membership_audit_stale"),
         (lambda r: r.update(open_total=2), "membership_audit_incomplete"),
+        (lambda r: r.update(open_issue_numbers=[124]), "membership_audit_incomplete"),
+        (lambda r: r.update(streams={"other": [5703]}), "membership_audit_incomplete"),
     ],
 )
 def test_audit_incompleteness_never_reports_zero_membership(mutate, code):
@@ -213,7 +215,7 @@ def stub_collection(monkeypatch, tmp_path, *, count=1, membership=None):
     monkeypatch.setattr(report, "read", lambda *a, **k: subprocess.CompletedProcess(
         [], 0, json.dumps({"data": {"repository": {"issues": {"totalCount": count}}}}), ""
     ))
-    monkeypatch.setattr(report.checker, "registry_for", lambda *a: REGISTRY)
+    monkeypatch.setattr(report.checker, "registry_for", lambda repository: REGISTRY if repository == REPO else None)
     snapshot = membership if membership is not None else audit_report(body=[123])
     live = Mock(return_value=snapshot)
     monkeypatch.setattr(report.checker, "live_audit", live)
@@ -224,7 +226,7 @@ def stub_collection(monkeypatch, tmp_path, *, count=1, membership=None):
 def test_daily_report_writes_cache_consumed_by_parentless_checker(monkeypatch, tmp_path):
     """The daily report must publish a cache that the parentless-issue checker can consume."""
     live = stub_collection(monkeypatch, tmp_path)
-    issues, count, membership, codes = report.collect_repository(PUBLIC)
+    issues, count, membership, codes = report.collect_repository(PUBLIC, REGISTRY)
     assert issues == [{"number": 123}] and count == 1 and codes == []
     live.assert_called_once_with(REPO, REGISTRY, root=tmp_path)
     report.audit.hygiene_warnings.assert_called_once_with(tmp_path, {123})
@@ -243,6 +245,52 @@ def test_daily_report_writes_cache_consumed_by_parentless_checker(monkeypatch, t
     live.assert_not_called()
 
 
+def test_daily_report_uses_active_sibling_repository_and_its_roots(monkeypatch, tmp_path):
+    """The daily census must not use the default registry or pre-transfer slug for a sibling."""
+    sibling = FleetRepo(
+        "machinery", "old/machinery", "machinery", "public-machinery",
+        alternate_github="new/machinery", visibility="public", repository_id=456,
+    )
+    slug = sibling.alternate_github
+    registry = {"machinery": [5703]}
+    snapshot = audit.classify(
+        [{"number": 123, "title": "target"}], registry, {5703: ({123}, set())},
+    )
+    snapshot.update(repository=slug, warnings=[])
+    catalog = {sibling.key: sibling}
+    monkeypatch.setattr(report.fleet_repos, "load_fleet_repos", lambda: catalog)
+    monkeypatch.setattr(report.fleet_repos, "_bundled_catalog", lambda: catalog)
+    resolve = Mock(return_value=report.fleet_repos.ActiveFleetRepo(sibling, slug))
+    monkeypatch.setattr(report.fleet_repos, "resolve_active_fleet_repo", resolve)
+    registry_for = Mock(return_value=registry)
+    monkeypatch.setattr(report.checker, "registry_for", registry_for)
+    runner = Mock(return_value=subprocess.CompletedProcess([], 0, "a" * 40, ""))
+    monkeypatch.setattr(report.subprocess, "run", runner)
+    listing = Mock(return_value='[{"number":123}]')
+    monkeypatch.setattr(report.github_client, "check_output", listing)
+    count = Mock(return_value=subprocess.CompletedProcess(
+        [], 0, '{"data":{"repository":{"issues":{"totalCount":1}}}}', "",
+    ))
+    monkeypatch.setattr(report, "read", count)
+    live = Mock(return_value=snapshot)
+    monkeypatch.setattr(audit, "run_audit", live)
+    cache = Mock(side_effect=AssertionError("sibling report may not publish the default cache"))
+    monkeypatch.setattr(report.checker, "write_membership_cache", cache)
+
+    repository = report.build_report()["repositories"][sibling.key]
+
+    resolve.assert_called_once_with(sibling.key, repos=catalog)
+    registry_for.assert_called_once_with(slug)
+    assert listing.call_args.args[0][4] == slug
+    assert count.call_args.kwargs["repo"] == slug
+    live.assert_called_once_with(repo=slug)
+    cache.assert_not_called()
+    assert repository["coverage"] == "complete"
+    assert repository["lanes"]["machinery"]["open"] == 1
+    assert repository["lanes"]["machinery"]["missing_epic"] == 0
+    assert "devops" not in repository["lanes"]
+
+
 @pytest.mark.parametrize("count,change", [
     (2, {}), (None, {}), (1, {"open_issue_numbers": [124]}),
     (1, {"membership_complete": False}), (1, {"generated_at": 0}),
@@ -250,7 +298,7 @@ def test_daily_report_writes_cache_consumed_by_parentless_checker(monkeypatch, t
 def test_daily_report_never_publishes_unverified_cache(monkeypatch, tmp_path, count, change):
     """A daily report must not publish a cache whose verification has failed."""
     stub_collection(monkeypatch, tmp_path, count=count, membership={**audit_report(body=[123]), **change})
-    report.collect_repository(PUBLIC)
+    report.collect_repository(PUBLIC, REGISTRY)
     assert not (tmp_path / "batch_state/issue_stream_audit.json").exists()
 
 
@@ -262,7 +310,7 @@ def test_daily_report_cache_failure_is_typed_and_redacted(monkeypatch, tmp_path)
         raise OSError("PRIVATE_CANARY")
 
     monkeypatch.setattr(report.checker, "write_membership_cache", fail)
-    issues, count, membership, codes = report.collect_repository(PUBLIC)
+    issues, count, membership, codes = report.collect_repository(PUBLIC, REGISTRY)
     assert codes == ["membership_audit_cache_write_failed"]
     result = summarize(issues, count, membership, codes)
     assert result["coverage"] == "incomplete"
@@ -274,7 +322,7 @@ def test_daily_report_hygiene_lookup_failure_publishes_nothing(monkeypatch, tmp_
     """A failed hygiene lookup must stop publication instead of emitting an incomplete report."""
     stub_collection(monkeypatch, tmp_path)
     report.audit.hygiene_warnings.side_effect = ValueError("PRIVATE_CANARY")
-    issues, count, membership, codes = report.collect_repository(PUBLIC)
+    issues, count, membership, codes = report.collect_repository(PUBLIC, REGISTRY)
     assert codes == ["membership_audit_cache_write_failed"]
     assert not (tmp_path / "batch_state/issue_stream_audit.json").exists()
     assert "CANARY" not in json.dumps(summarize(issues, count, membership, codes))
@@ -287,7 +335,7 @@ def test_collection_redacts_exception_data(monkeypatch):
 
     monkeypatch.setattr(report.github_client, "check_output", fail)
     monkeypatch.setattr(report, "read", fail)
-    issues, count, membership, codes = report.collect_repository(PRIVATE)
+    issues, count, membership, codes = report.collect_repository(PRIVATE, {})
     result = summarize(issues, count, membership, codes, PRIVATE)
     assert "CANARY" not in json.dumps(result)
     assert result["incomplete_codes"] == ["forge_unavailable", "membership_registry_absent"]
@@ -368,7 +416,7 @@ def test_collection_rate_limit_never_zeros(monkeypatch):
 
     monkeypatch.setattr(report.github_client, "check_output", limited)
     monkeypatch.setattr(report, "read", limited)
-    issues, count, membership, codes = report.collect_repository(PRIVATE)
+    issues, count, membership, codes = report.collect_repository(PRIVATE, {})
     assert issues is count is membership is None
     assert set(codes) == {"rate_limited"}
 
@@ -376,7 +424,7 @@ def test_collection_rate_limit_never_zeros(monkeypatch):
 @pytest.mark.parametrize("body,missing,malformed", [("", 1, 0), (COMPLETE + "\n- [ ] AC-01: duplicate", 0, 1)])
 def test_registered_roots_still_count_dor_and_dod(body, missing, malformed):
     """Registered stream roots must still contribute to readiness and completion counts."""
-    membership = audit_report()
+    membership = audit_report(number=5703)
     result = summarize([{"number": 5703, "body": body}], 1, membership)
     assert result["evaluated_total"] == 1
     assert result["root_exempt_total"] == 1
