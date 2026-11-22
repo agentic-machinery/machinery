@@ -6,8 +6,10 @@ The retained admission scanner and ownership ledger read the same hold format.
 
 import contextlib
 import http.client
+import os
 import subprocess
 import sys
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -70,24 +72,49 @@ def _head(root):
         return None
 
 
+def _monitor_json(read):
+    try:
+        return read()
+    except (OSError, ValueError, RecursionError, http.client.HTTPException):
+        return None
+
+
+# The planning view waits up to 2 s (state_helpers.DORMANT_READ_WAIT_S) to wake an idle active-task snapshot.
+PLANNING_READ_TIMEOUT_S = 5.0
+PLANNING_BODY_LIMIT = 1 << 20
+
+
+def read_planning():
+    """Monitor's planning view (``model-planning.v1``) from the Monitor ``read_budget`` reads.
+
+    An unreadable view keeps the fixed meter cap.
+    """
+    from lu_machinery.common import json_depth
+
+    base = os.environ.get("DELEGATE_MONITOR_API", "http://127.0.0.1:8765").rstrip("/")
+    url = base + "/api/fleet/model-stats/planning"
+    with urllib.request.urlopen(url, timeout=PLANNING_READ_TIMEOUT_S) as response:
+        body = response.read(PLANNING_BODY_LIMIT + 1)
+    if len(body) > PLANNING_BODY_LIMIT:
+        raise ValueError("planning view larger than its read limit")
+    return json_depth.loads(body, max_depth=64)
+
+
 def _meter_budget(spec):
-    """Read the existing cache outside the admission lock, for a metered write."""
+    """Read the existing caches outside the admission lock, for a metered write: budget and forecast."""
     if spec is None or spec.mode not in legacy.WRITE_CAPABLE_MODES:
-        return None, None
+        return None, None, None
     meter = legacy.subscription_meter(
         spec.agent, model=spec.model, claude_account=spec.claude_account, codex_account=spec.codex_account,
     )
     if meter is None:
-        return None, None
+        return None, None, None
     from lu_machinery.dispatcher.pool_selector import read_budget
 
-    try:
-        return meter, read_budget()
-    except (OSError, ValueError, RecursionError, http.client.HTTPException):
-        return meter, None
+    return meter, _monitor_json(read_budget), _monitor_json(read_planning)
 
 
-def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None):
+def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None, forecast=None):
     """Copy-adapted from delegate._evaluate_dispatch_admission, including v2 liveness.
 
     Disk admission measures, alerts and refuses; it never removes anything. Each task's creator
@@ -97,7 +124,7 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budge
         mode, tasks_dir(), pid_alive=legacy.process_alive,
         record_liveness=lambda record: worker_liveness(record, pid_alive=legacy.process_alive),
         on_dead=heal_dead if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
-        meter=meter, meter_budget=budget,
+        meter=meter, meter_budget=budget, meter_forecast=forecast,
     )
 
 
@@ -136,8 +163,9 @@ def precheck(mode, *, force_reason=None):
 
 def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None):
     try:
-        meter, budget = _meter_budget(spec)
-        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard, meter=meter, budget=budget)
+        meter, budget, forecast = _meter_budget(spec)
+        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard, meter=meter, budget=budget,
+                            forecast=forecast)
     except ValueError as exc:
         raise Refused(f"❌ invalid dispatch admission threshold: {exc}", 2) from exc
     report(decision, force_reason=force_reason)
@@ -165,13 +193,13 @@ def check_credit(agent, model, codex_account=None):
 def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, spec=None):
     """Publish a creation hold for either mode; release unused setup only when its tree is absent."""
     hold = None
-    meter, budget = _meter_budget(spec)
+    meter, budget, forecast = _meter_budget(spec)
     try:
         refusal = None
         try:
             with legacy.admission_lock(tasks_dir()):
                 current = evaluate(mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard(),
-                                   meter=meter, budget=budget)
+                                   meter=meter, budget=budget, forecast=forecast)
                 if allows(current, force_reason):
                     nonce = uuid.uuid4().hex
                     owner = legacy.new_admission_hold(nonce)
