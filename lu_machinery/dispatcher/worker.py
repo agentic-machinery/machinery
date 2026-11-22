@@ -1480,9 +1480,12 @@ def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
             reason = "provider_processes_alive" if alive else "provider_liveness_unknown"
             record.update(worktree_disposition="retained", worktree_disposition_reason=reason)
             return
-        if "orchestrator" in record:
-            # The stream reservation releases a turn only on this proof, taken after its own scope or
-            # fallback stop has run, never on the provider group's absence alone (DRIVERS-1122).
+        whole_tree = record.get("launch_mode") == "scope" or (
+            record.get("launch_mode") == "popen-fallback" and stopped is not None and stopped.ok)
+        if "orchestrator" in record and whole_tree:
+            # The stream reservation releases a turn only on this proof (DRIVERS-1122). A scope's probe sees
+            # every descendant; a fallback launch's probe sees only its process group, so only the supervisor's
+            # own successful tree stop proves it. A later sweep from another process never writes it.
             record["provider_exit_proven_at"] = store.now()
 
         def borrowed() -> bool:

@@ -202,11 +202,12 @@ def _provider_gone(provider_alive, record):
     """True only when a terminal turn's provider is proven gone, from affirmative evidence.
 
     A launched run (a known launch mode) needs settlement's own proof that its whole process tree
-    exited (``provider_exit_proven_at``, written after the scope or fallback stop and the liveness
-    probe) and a probe that still answers False: the provider group's absence alone misses a
-    descendant that left it. A run that never launched has no pid, no process start, no launch
-    mode, no recorded provider group, and an explicit never-started or never-ran reason. Anything
-    else, a damaged field or a probe error included, is not proof.
+    exited (``provider_exit_proven_at``, which ``worker._reap_worktree`` writes only from a scope's
+    probe or after the supervisor's own successful fallback tree stop) and a probe that still answers
+    False: the provider group's absence alone misses a descendant that left it. A run that never
+    launched has no pid, no process start, no launch mode, no recorded provider group, and an
+    explicit never-started or never-ran reason. Anything else, a damaged field or a probe error
+    included, is not proof.
     """
     if "launch_mode" in record:
         if not (isinstance(record["launch_mode"], str) and record["launch_mode"] in _LAUNCH_MODES):
@@ -217,13 +218,14 @@ def _provider_gone(provider_alive, record):
             return provider_alive(record) is False
         except Exception:  # a malformed liveness field never ends the scan or frees the stream
             return False
-    if (record.get("pid") is not None or record.get("process_start") is not None
-            or record.get("provider_pgid") is not None):
+    if any(record.get(key) is not None for key in _LAUNCH_EVIDENCE):
         return False
-    started = record.get("never_started_reason")
-    return (isinstance(started, str) and bool(started)) or record.get("returncode_reason") in _NEVER_RAN
+    started, ran = record.get("never_started_reason"), record.get("returncode_reason")
+    return (isinstance(started, str) and bool(started)) or (isinstance(ran, str) and ran in _NEVER_RAN)
 
 
+# Fields only a launch writes: any of them contradicts a claim that the run never started.
+_LAUNCH_EVIDENCE = ("pid", "process_start", "provider_pgid", "launch_unit", "launch_cgroup", "fallback_survivors")
 # A launch the dispatcher itself recorded as never having produced a provider (worker._provider_alive).
 _NEVER_RAN = frozenset({"spawn_process_missing", "dispatch_died_after_admission", "spawn_setup_failed"})
 
