@@ -104,18 +104,36 @@ def _planning_origin():
     return host, 80 if base.port is None else base.port, base.path
 
 
-def _planning_body(connection, path):
+def _planning_length(response):
+    """The one valid ``Content-Length`` of a 200 reply. Chunked or close-delimited replies are refused."""
+    if response.status != 200:
+        raise ValueError(f"the planning view answered HTTP {response.status}")
+    lengths = response.headers.get_all("Content-Length") or []
+    if response.headers.get_all("Transfer-Encoding") or len(lengths) != 1:
+        raise ValueError("the planning view needs exactly one Content-Length and no Transfer-Encoding")
+    raw = lengths[0]
+    if not (raw.isascii() and raw.isdigit()) or int(raw) > PLANNING_BODY_LIMIT:
+        raise ValueError("the planning view Content-Length is invalid or above its read limit")
+    return int(raw)
+
+
+def _planning_body(connection, path, sockets, cancelled):
     try:
+        connection.connect()
+        # The reply keeps reading this socket after getresponse() drops connection.sock for a closing reply.
+        sockets.append(connection.sock)
+        if cancelled.is_set():
+            raise TimeoutError("the planning view read passed its deadline")
         connection.request("GET", path, headers={"Accept": "application/json"})
         response = connection.getresponse()  # http.client follows no redirect
-        if response.status != 200:
-            raise ValueError(f"the planning view answered HTTP {response.status}")
-        body = response.read(PLANNING_BODY_LIMIT + 1)
-        if len(body) > PLANNING_BODY_LIMIT:
-            raise ValueError("the planning view is larger than its read limit")
-        if response.length:  # bytes its Content-Length still owes
-            raise http.client.IncompleteRead(body, response.length)
-        return body
+        try:
+            length = _planning_length(response)
+            body = response.read(length)
+            if len(body) != length or response.length:
+                raise http.client.IncompleteRead(body, length - len(body))
+            return body
+        finally:
+            response.close()
     finally:
         connection.close()
 
@@ -123,35 +141,39 @@ def _planning_body(connection, path):
 def read_planning():
     """Monitor's planning view (``model-planning.v1``) within one end-to-end deadline.
 
-    A reader thread does the request; past :data:`PLANNING_READ_TIMEOUT_S` its socket is shut down and
-    the read fails. Redirects, other statuses, a body above :data:`PLANNING_BODY_LIMIT` or short of its
-    ``Content-Length`` fail too. The caller turns every failure into the fixed meter cap.
+    A reader thread does the request. Past :data:`PLANNING_READ_TIMEOUT_S` the read is cancelled and its
+    socket shut down, which ends a blocked receive. Redirects, other statuses, chunked or close-delimited
+    replies, a missing, repeated or invalid ``Content-Length``, a body above :data:`PLANNING_BODY_LIMIT`
+    or short of its length fail too. The caller turns every failure into the fixed meter cap.
     """
     from lu_machinery.common import json_depth
 
     host, port, prefix = _planning_origin()
     connection = http.client.HTTPConnection(host, port, timeout=PLANNING_READ_TIMEOUT_S)
-    outcome = []
+    outcome, sockets, cancelled = [], [], threading.Event()
 
     def fetch():
         try:
-            outcome.append(_planning_body(connection, prefix + PLANNING_PATH))
+            outcome.append(_planning_body(connection, prefix + PLANNING_PATH, sockets, cancelled))
         except Exception as exc:  # handed to the caller below
             outcome.append(exc)
 
     reader = threading.Thread(target=fetch, name="planning-view-read", daemon=True)
-    reader.start()
+    try:
+        reader.start()
+    except RuntimeError as exc:
+        raise OSError("the planning view reader could not start") from exc
     reader.join(PLANNING_READ_TIMEOUT_S)
     if reader.is_alive():
-        sock = connection.sock
-        if sock is not None:
+        cancelled.set()  # before reading the handles: a reader that has not connected yet stops itself
+        for sock in list(sockets):
             with contextlib.suppress(OSError):
-                sock.shutdown(socket.SHUT_RDWR)  # wakes a blocked receive so the thread ends
+                sock.shutdown(socket.SHUT_RDWR)
         raise TimeoutError("the planning view read passed its deadline")
-    [result] = outcome
-    if isinstance(result, Exception):
-        raise ValueError(f"the planning view read failed: {type(result).__name__}") from result
-    return json_depth.loads(result, max_depth=64)
+    if len(outcome) != 1 or isinstance(outcome[0], BaseException):
+        cause = outcome[0] if outcome else None
+        raise ValueError(f"the planning view read failed: {type(cause).__name__}") from cause
+    return json_depth.loads(outcome[0], max_depth=64)
 
 
 def _meter_budget(spec):
