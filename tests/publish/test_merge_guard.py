@@ -3,7 +3,9 @@
 import json
 import subprocess
 from pathlib import Path
+
 import pytest
+
 from lu_machinery.opsec.prepublish import PublishBlocked
 from lu_machinery.publish.merge_guard import ensure_merge_ready
 
@@ -112,21 +114,32 @@ def test_failing_continue_on_error_job_blocks_merge(monkeypatch, tmp_path, ident
         merge_with_checks(json.dumps(checks), returncode=1)
 
 
-# --- OO-48 external advisory provenance (#11184) ------------------------------------------
+# --- External advisory provenance ---------------------------------------------------------
 
 HEAD = "a" * 40
-ENTIRE_ROWS = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": "Entire Gates", "bucket": "pending"}]
-RUNS = f"repos/unit/public/commits/{HEAD}/check-runs?check_name=Entire%20Gates&filter=all&per_page=100"
+ADVISORY_APP = {"id": 987654, "slug": "example-advisory-app"}
+ADVISORY_NAME = "External Advisory"
+ADVISORY_ROWS = [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": ADVISORY_NAME, "bucket": "pending"}]
+RUNS = f"repos/unit/public/commits/{HEAD}/check-runs?check_name=External%20Advisory&filter=all&per_page=100"
 STATUS = f"repos/unit/public/commits/{HEAD}/status?per_page=100"
 
 
 BOUND_ROLLUP = [
     {"__typename": "CheckRun", "name": "CI Gate", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI"},
-    {"__typename": "CheckRun", "name": "Entire Gates", "status": "IN_PROGRESS", "conclusion": "", "workflowName": ""},
+    {"__typename": "CheckRun", "name": ADVISORY_NAME, "status": "IN_PROGRESS", "conclusion": "", "workflowName": ""},
 ]
 
 
-def entire_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_documents=None):
+def _enable_synthetic_advisory(monkeypatch):
+    from lu_machinery.ci import advisory_checks
+
+    entry = advisory_checks.ExternalAdvisoryCheck(
+        name=ADVISORY_NAME, app_id=ADVISORY_APP["id"], app_slug=ADVISORY_APP["slug"], decision="TEST-1"
+    )
+    monkeypatch.setattr(advisory_checks, "EXTERNAL_ADVISORY_CHECKS", (entry,))
+
+
+def advisory_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_documents=None):
     def runner(args, **kwargs):
         calls.append(args)
         if args[2:5] == ["view", "1", "--json"] and args[5] == "headRefOid,statusCheckRollup":
@@ -135,12 +148,12 @@ def entire_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_docume
         if args[2] == "view":
             return subprocess.CompletedProcess(args, 0, json.dumps({"number": 1, "isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": head}), "")
         if args[2] == "checks":
-            return subprocess.CompletedProcess(args, 8, json.dumps(ENTIRE_ROWS), "")
+            return subprocess.CompletedProcess(args, 8, json.dumps(ADVISORY_ROWS), "")
         if error is not None:
             raise error
         documents = {
             STATUS: {"total_count": 0, "statuses": []},
-            RUNS: {"total_count": 1, "check_runs": [{"name": "Entire Gates", "head_sha": HEAD, "app": app}]},
+            RUNS: {"total_count": 1, "check_runs": [{"name": ADVISORY_NAME, "head_sha": HEAD, "app": app}]},
             **(extra_documents or {}),
         }
         if args[:4] == ["gh", "api", "--method", "GET"] and args[4] in documents:
@@ -150,10 +163,11 @@ def entire_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_docume
     return runner
 
 
-def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
+def test_external_advisory_publisher_proves_check_at_the_metadata_head(monkeypatch):
     """Distinct vendor details and canonical check URLs must preserve App proof."""
+    _enable_synthetic_advisory(monkeypatch)
     calls = []
-    app = {"id": 2626939, "slug": "entire"}
+    app = ADVISORY_APP
     old = {"name": "Body guard", "head_sha": HEAD, "status": "completed", "conclusion": "cancelled",
            "started_at": "2026-10-23T20:00:00Z", "check_suite": {"id": 1},
            "app": {"id": 15368, "slug": "github-actions"},
@@ -163,9 +177,9 @@ def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
     rest = [current, old,
             {"name": "CI Gate", "head_sha": HEAD, "status": "completed", "conclusion": "success",
              "details_url": "https://github.com/unit/public/runs/23"},
-            {"name": "Entire Gates", "head_sha": HEAD, "status": "in_progress", "app": app,
+            {"name": ADVISORY_NAME, "head_sha": HEAD, "status": "in_progress", "app": app,
              "id": 24, "html_url": "https://github.com/unit/public/runs/24",
-             "details_url": "https://entire.com/gh/unit/public/trails/7"}]
+             "details_url": "https://example.invalid/gh/unit/public/trails/7"}]
     rollup = [{"__typename": "CheckRun", "name": row["name"], "status": row["status"].upper(),
                "conclusion": str(row.get("conclusion") or "").upper(),
                "detailsUrl": row.get("html_url", row["details_url"])}
@@ -178,8 +192,8 @@ def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
                                                        "workflow_id": 7, "name": "Body guard"},
                  "repos/unit/public/actions/runs/12": {"id": 12, "head_sha": HEAD, "check_suite_id": 2,
                                                        "workflow_id": 7, "name": "Body guard"}}
-    runner = entire_runner(app, calls, bound={"headRefOid": HEAD, "statusCheckRollup": rollup},
-                           extra_documents=documents)
+    runner = advisory_runner(app, calls, bound={"headRefOid": HEAD, "statusCheckRollup": rollup},
+                             extra_documents=documents)
     assert ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD) == HEAD
     assert [call[1:6] for call in calls] == [
         ["pr", "view", "1", "--json", "number,isDraft,headRefOid,mergeStateStatus"],
@@ -198,17 +212,19 @@ def test_oo48_publisher_proves_entire_gates_at_the_metadata_head():
     {"headRefOid": HEAD},
     [],
 ])
-def test_oo48_publisher_refuses_rows_not_bound_to_the_metadata_head(bound):
+def test_external_advisory_publisher_refuses_rows_not_bound_to_the_metadata_head(monkeypatch, bound):
+    _enable_synthetic_advisory(monkeypatch)
     calls = []
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, calls, bound=bound)
+    runner = advisory_runner(ADVISORY_APP, calls, bound=bound)
     with pytest.raises(PublishBlocked, match="cannot establish check state"):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD)
     assert all(call[1] != "api" for call in calls)
 
 
-def test_oo48_publisher_judges_the_bound_rollup_not_the_headless_rows():
+def test_external_advisory_publisher_judges_the_bound_rollup_not_the_headless_rows(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
     red = [{**BOUND_ROLLUP[0], "conclusion": "FAILURE"}, BOUND_ROLLUP[1]]
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, [], bound={"headRefOid": HEAD, "statusCheckRollup": red})
+    runner = advisory_runner(ADVISORY_APP, [], bound={"headRefOid": HEAD, "statusCheckRollup": red})
     with pytest.raises(PublishBlocked, match=r"merge refused: FAILING checks\."):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
 
@@ -236,32 +252,37 @@ def test_publisher_old_client_rollup_must_be_a_list(rollup, refusal):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
 
 
-@pytest.mark.parametrize("app", [{"id": 15368, "slug": "github-actions"}, None, {"id": "2626939", "slug": "entire"}])
-def test_oo48_publisher_refuses_unproven_entire_gates(app):
+@pytest.mark.parametrize("app", [{"id": 15368, "slug": "github-actions"}, None, {"id": "987654", "slug": "example-advisory-app"}])
+def test_external_advisory_publisher_refuses_unproven_check(monkeypatch, app):
+    _enable_synthetic_advisory(monkeypatch)
     with pytest.raises(PublishBlocked, match="cannot establish check state"):
-        ensure_merge_ready("unit/public", 1, runner=entire_runner(app, []), cwd=".", environment={})
+        ensure_merge_ready("unit/public", 1, runner=advisory_runner(app, []), cwd=".", environment={})
 
 
-def test_oo48_exemption_never_waives_the_reviewed_head():
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, [])
+def test_external_advisory_exemption_never_waives_the_reviewed_head(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
+    runner = advisory_runner(ADVISORY_APP, [])
     with pytest.raises(PublishBlocked, match="reviewed head changed"):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head="b" * 40)
 
 
-def test_oo48_rate_limit_during_provenance_is_not_masked():
+def test_external_advisory_rate_limit_during_provenance_is_not_masked(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
     from lu_machinery.common.github_client import GitHubRateLimited
 
     limited = GitHubRateLimited(None, "fixture")
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, [], error=limited)
+    runner = advisory_runner(ADVISORY_APP, [], error=limited)
     with pytest.raises(GitHubRateLimited):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
 
 
-def test_oo48_garbage_provenance_reply_is_refused():
+def test_external_advisory_garbage_provenance_reply_is_refused(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
+
     def runner(args, **kwargs):
         if args[1] == "api":
             return subprocess.CompletedProcess(args, 0, "not JSON", "")
-        return entire_runner({"id": 2626939, "slug": "entire"}, [])(args, **kwargs)
+        return advisory_runner(ADVISORY_APP, [])(args, **kwargs)
 
     with pytest.raises(PublishBlocked, match="cannot establish check state"):
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
@@ -387,8 +408,9 @@ def test_publisher_transport_refuses_a_repeated_check_run_across_pages(tmp_path,
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=tmp_path, environment=environment)
 
 
-def test_refusal_names_a_failed_status_read_for_a_plain_runner():
-    base = entire_runner({"id": 2626939, "slug": "entire"}, [])
+def test_refusal_names_a_failed_status_read_for_a_plain_runner(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
+    base = advisory_runner(ADVISORY_APP, [])
 
     def runner(args, **kwargs):
         if args[1] == "api" and args[4] == STATUS:
@@ -400,7 +422,8 @@ def test_refusal_names_a_failed_status_read_for_a_plain_runner():
     assert str(refused.value) == "OPSEC: merge refused: cannot establish check state (commit statuses: exit 1)."
 
 
-def test_refusal_names_a_failed_actions_run_read_with_gh_http_status():
+def test_refusal_names_a_failed_actions_run_read_with_gh_http_status(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
     details = "https://github.com/unit/public/actions/runs/12/job/22"
     rest = [{"name": "Body guard", "head_sha": HEAD, "status": "completed", "conclusion": "success",
              "check_suite": {"id": 2}, "app": ACTIONS, "details_url": details}]
@@ -408,8 +431,8 @@ def test_refusal_names_a_failed_actions_run_read_with_gh_http_status():
                "detailsUrl": details}] * 2
     documents = {f"repos/unit/public/commits/{HEAD}/check-runs?filter=all&per_page=100":
                  {"total_count": 1, "check_runs": rest}}
-    base = entire_runner({"id": 2626939, "slug": "entire"}, [], extra_documents=documents,
-                         bound={"headRefOid": HEAD, "statusCheckRollup": rollup})
+    base = advisory_runner(ADVISORY_APP, [], extra_documents=documents,
+                           bound={"headRefOid": HEAD, "statusCheckRollup": rollup})
 
     def runner(args, **kwargs):
         if args[1] == "api" and args[4] == "repos/unit/public/actions/runs/12":
@@ -422,8 +445,9 @@ def test_refusal_names_a_failed_actions_run_read_with_gh_http_status():
         "OPSEC: merge refused: cannot establish check state (actions run: exit 1 HTTP 404).")
 
 
-def test_refusal_names_a_read_that_raised():
-    base = entire_runner({"id": 2626939, "slug": "entire"}, [])
+def test_refusal_names_a_read_that_raised(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
+    base = advisory_runner(ADVISORY_APP, [])
 
     def runner(args, **kwargs):
         if "headRefOid,statusCheckRollup" in args:
@@ -456,16 +480,18 @@ def test_refusal_names_how_the_checks_read_failed(returncode, stdout, stderr, na
     ({"headRefOid": HEAD, "statusCheckRollup": None}, "pr view rollup: invalid shape"),
     (None, "no read failed; check rows unverifiable"),
 ])
-def test_refusal_names_an_invalid_shape_or_says_no_read_failed(bound, named):
+def test_refusal_names_an_invalid_shape_or_says_no_read_failed(monkeypatch, bound, named):
+    _enable_synthetic_advisory(monkeypatch)
     rollup = {"headRefOid": "b" * 40, "statusCheckRollup": BOUND_ROLLUP} if bound is None else bound
-    runner = entire_runner({"id": 2626939, "slug": "entire"}, [], bound=rollup)
+    runner = advisory_runner(ADVISORY_APP, [], bound=rollup)
     with pytest.raises(PublishBlocked) as refused:
         ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={})
     assert str(refused.value) == f"OPSEC: merge refused: cannot establish check state ({named})."
 
 
-def test_refusal_names_a_status_read_of_the_wrong_shape():
-    base = entire_runner({"id": 2626939, "slug": "entire"}, [])
+def test_refusal_names_a_status_read_of_the_wrong_shape(monkeypatch):
+    _enable_synthetic_advisory(monkeypatch)
+    base = advisory_runner(ADVISORY_APP, [])
 
     def runner(args, **kwargs):
         if args[1] == "api" and args[4] == STATUS:

@@ -1,8 +1,8 @@
 """DeepSeekAdapter — wraps opencode CLI for first-party DeepSeek (deepseek).
 
 Operator 2026-08-13: DeepSeek dispatch routes through OpenCode to first-party
-``api.deepseek.com`` with ``--variant high`` by default so runs get native
-Entire capture. ``deepseek-v4.1-flash`` is the default. Superseded Pro and
+``api.deepseek.com`` with ``--variant high`` by default.
+``deepseek-v4.1-flash`` is the default. Superseded Pro and
 Flash pins are retired and refused before invocation; historical records
 retain their original identities. The first-party OpenCode alias is
 ``deepseek/deepseek-flash``.

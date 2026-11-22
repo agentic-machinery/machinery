@@ -15,10 +15,10 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.helpers.product_tree import configured_roots as configured_roots
 from lu_machinery.common import task_scratch
 from lu_machinery.maintenance.claude_session_scratch import ProcessEvidence, sweep_sessions
 from lu_machinery.orchestration import scheduled_worktree_cleanup as cleanup
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -1535,39 +1535,6 @@ def test_review_checkout_exact_merged_head_is_deleted(tmp_path: Path, monkeypatc
     assert result[0]["action"] == "deleted"
     assert "exact head of MERGED PR #7020" in result[0]["reason"]
     assert _git(repo, "branch", "--list", branch) == ""
-
-
-def test_origin_entire_checkpoint_is_not_deleted(tmp_path: Path, monkeypatch) -> None:
-    repo = _repo(tmp_path)
-    branch = "entire/checkpoints/v1"
-    _git(repo, "branch", branch, "main")
-    _git(repo, "push", "origin", branch)
-    monkeypatch.setattr(
-        cleanup.worktree_git,
-        "_query_pr_states",
-        lambda _repo, _branch: ([], None),
-    )
-
-    result = cleanup.cleanup_stale_origin_branches(repo, apply=True)
-
-    assert all(item.get("branch") != branch for item in result)
-    remote_heads = _git(tmp_path / "origin.git", "for-each-ref", "--format=%(refname:short)")
-    assert branch in remote_heads.splitlines()
-
-
-def test_entire_checkpoint_branch_is_not_deleted(tmp_path: Path, monkeypatch) -> None:
-    repo = _repo(tmp_path)
-    _git(repo, "branch", "entire/checkpoints/v1", "main")
-    monkeypatch.setattr(
-        cleanup.worktree_git,
-        "_query_pr_states",
-        lambda _repo, _branch: ([], None),
-    )
-
-    result = cleanup.cleanup_untracked_local_branches(repo, apply=True)
-
-    assert result == []
-    assert _git(repo, "branch", "--list", "entire/checkpoints/v1") != ""
 
 
 def test_dry_run_zero_repo_mutation(tmp_path: Path, monkeypatch) -> None:

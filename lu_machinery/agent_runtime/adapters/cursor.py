@@ -278,7 +278,7 @@ class CursorAdapter:
                 cmd.append("--approve-mcps")
             cmd.extend(["--force", "--sandbox", "disabled"])
 
-        env_overrides: dict[str, str] = {"LU_ENTIRE_CAPTURE_OWNER": "fleet"}
+        env_overrides: dict[str, str] = {}
         if not os.environ.get("CURSOR_API_KEY", "").strip():
             file_key = _load_cursor_api_key_from_env_file()
             if file_key:
