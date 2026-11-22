@@ -264,10 +264,20 @@ def _read_reservation(dir_fd: int, name: str) -> dict | None:
     if not (isinstance(value, dict) and set(value) == _RESERVATION_FIELDS and value["schema"] == RESERVATION_SCHEMA
             and value["stream"] == stream and _valid_task_id(value["task_id"])
             and isinstance(value["run_nonce"], str) and _NONCE.fullmatch(value["run_nonce"])
-            and isinstance(value["worktree_path"], str) and os.path.isabs(value["worktree_path"])
-            and store.parse_utc_timestamp(value["reserved_at"]) is not None):
+            and _usable_path(value["worktree_path"]) and store.parse_utc_timestamp(value["reserved_at"]) is not None):
         raise ReservationUnsafe(f"orchestrator_reservation_malformed: {stream:.80}")
     return value
+
+
+def _usable_path(value) -> bool:
+    """An absolute path string the filesystem calls accept: no NUL, and encodable as a file name."""
+    if not (isinstance(value, str) and os.path.isabs(value) and "\x00" not in value):
+        return False
+    try:
+        os.fsencode(value)
+    except UnicodeError:
+        return False
+    return True
 
 
 def _valid_task_id(value) -> bool:
@@ -302,8 +312,8 @@ def stream_refusal(stream: str) -> str | None:
 def _publish_reservation(dir_fd: int, stream: str, task_id: str, run_nonce: str, worktree_path: str) -> None:
     """Create ``stream``'s reservation exclusively and make it durable; a crash part way leaves it held (malformed)."""
     name = stream + RESERVATION_SUFFIX
-    if not (isinstance(worktree_path, str) and os.path.isabs(worktree_path)):
-        raise ReservationUnsafe("orchestrator_reservation_refused: the turn's tree path must be absolute")
+    if not _usable_path(worktree_path):
+        raise ReservationUnsafe("orchestrator_reservation_refused: the turn's tree path must be an absolute file name")
     body = json.dumps(dict(schema=RESERVATION_SCHEMA, stream=stream, task_id=task_id, run_nonce=run_nonce,
                            worktree_path=worktree_path, reserved_at=store.now()), sort_keys=True).encode() + b"\n"
     if len(body) > _RESERVATION_MAX_BYTES:
@@ -390,7 +400,7 @@ def turn_writer_refusal(*, task_ids=(), tree=None) -> str | None:
             os.close(fd)
     except ReservationUnsafe as exc:
         return exc.reason
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return f"orchestrator_reservation_unknown: {type(exc).__name__}"
     return None
 
@@ -475,15 +485,15 @@ def _claim_stream(stream, task_id, run_nonce, tree):
 
 @contextlib.contextmanager
 def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, spec=None, orchestrator=None,
-            linkage=None, tree=None):
+            linkage=None, tree=None, launch=None):
     """Publish a creation hold for either mode; release unused setup only when its tree is absent.
 
     An orchestrator turn (``orchestrator`` is its ``{"stream": ...}`` record field, ``tree`` its planned
     worktree path) first publishes its stream's reservation file in the same admission-locked step, so a
     crash after it leaves the stream held; a stream with any reservation file refuses, and no
-    ``--force-admission`` reason or reused task id overrides it. When this dispatch ends before any
-    supervisor could start (no published record names a prompt file or a pid), the reservation is released;
-    otherwise only the turn's settlement releases it. ``linkage`` (the parent fields of a task dispatched
+    ``--force-admission`` reason or reused task id overrides it. ``launch`` is the caller's own launch
+    progress: it sets ``launch["started"] = True`` before it starts a supervisor. Only a dispatch that ends
+    before that releases the reservation here; otherwise only the turn's settlement releases it. ``linkage`` (the parent fields of a task dispatched
     from inside another run) is in the hold before anything spawns.
     """
     hold = reservation = None
@@ -527,16 +537,14 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
             raise refusal
         yield hold
     finally:
-        # Unknown until the record shows otherwise: a supervisor may have started.
-        launched = hold is not None
+        # Read before anything else here can fail: missing progress means a supervisor may have started.
+        launch_started = launch is None or launch.get("started") is not False
         if hold is not None:
             path = store.record_path(task_id)
             with contextlib.suppress(OSError), task_state_lock(path):
                 current = store.read(task_id, missing_ok=True)
-                mine = current is not None and current.get("run_nonce") == hold["run_nonce"]
-                # A supervisor starts only from a published record that names its prompt file (store.create).
-                launched = mine and ("prompt_file" in current or current.get("pid") is not None)
-                if (mine and current.get("status") in store.ACTIVE and legacy.is_admission_hold_record(current)
+                if (current is not None and current.get("run_nonce") == hold["run_nonce"]
+                        and current.get("status") in store.ACTIVE and legacy.is_admission_hold_record(current)
                         and "prompt_file" not in current):  # store.create handed this record to the supervisor
                     tree_absent = not current.get("worktree_path")
                     if not tree_absent:
@@ -546,8 +554,8 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
                             tree_absent = True
                     if tree_absent:
                         path.unlink(missing_ok=True)
-        # A known pre-launch abort: nothing of this run can write, so its stream is free again.
-        if reservation is not None and not launched and (reason := release_stream(*reservation)):
+        # A known pre-launch abort: this dispatch never started a supervisor, so nothing of the run can write.
+        if reservation is not None and not launch_started and (reason := release_stream(*reservation)):
             print(f"dispatcher: {reservation[0]} stays reserved: {reason}", file=sys.stderr)
 
 

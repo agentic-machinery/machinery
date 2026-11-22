@@ -741,14 +741,17 @@ def _turn_tree_unproven(record: dict) -> bool:
         return True
 
 
-def _release_stream(record: dict) -> None:
+def _release_stream(record: dict, *, evidence_lost: bool) -> None:
     """Free a settled orchestrator turn's stream once nothing of its run can write (DRIVERS-1122).
 
     Only on proof: the published record is terminal and still this run's turn, its launch was a scope whose
     probe (``_provider_alive``) answers False, so every descendant has exited, and it lists no task service.
-    A fallback launch, a probe error, a damaged or replaced record and anything unknown keep the reservation;
-    so does a supervisor that dies first. The reservation file is released only for this task id and nonce.
+    ``evidence_lost`` (the record was found damaged, replaced or missing and had to be rebuilt) keeps the
+    reservation, as do a fallback launch, a probe error and anything unknown; so does a supervisor that dies
+    first. The reservation file is released only for this task id and nonce.
     """
+    if evidence_lost:
+        return
     from lu_machinery.dispatcher import host_admission
     from lu_machinery.orchestration import dispatch_isolation
     from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
@@ -2327,6 +2330,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             if record.get("require_review_verdict") is True:
                 record["dispatcher_code"] = _dispatcher_code()
             tree_unproven = "orchestrator" in record and _turn_tree_unproven(record)
+            record_lost = False
             record.update(git.snapshot_delivery(spec, record))
             if error and error.startswith("TASK_RECORD_"):
                 record.update(worktree_disposition="retained", worktree_disposition_reason="task_record_damaged")
@@ -2366,6 +2370,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                         store.replace(record, path, require_existing=True)
                     except store.TaskRecordError:
                         store.publish_failed_record(record, path)
+                        record_lost = True
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 if record.get("worktree_disposition_reason") != "task_record_damaged":
@@ -2374,9 +2379,11 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     store.replace(record, path, require_existing=True)
                 except store.TaskRecordError:
                     store.publish_failed_record(record, path)
+                    record_lost = True
             if "orchestrator" in record:
                 # Last, outside the task-state lock (admission's lock order): nothing may follow the release.
-                _release_stream(record)
+                _release_stream(record, evidence_lost=record_lost
+                                or record.get("worktree_disposition_reason") == "task_record_damaged")
         finally:
             if draft_fd is not None:
                 os.close(draft_fd)

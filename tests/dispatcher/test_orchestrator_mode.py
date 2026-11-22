@@ -162,7 +162,7 @@ print("ready", flush=True)
 sys.stdin.readline()
 try:
     with host_admission.reserve(task_id, "workspace-write", decision, agent="claude", disk_guard=lambda: False,
-                                orchestrator={"stream": stream}, tree="/trees/" + task_id):
+                                orchestrator={"stream": stream}, tree="/trees/" + task_id, launch={"started": False}):
         print("held", flush=True)
         sys.stdin.readline()
 except host_admission.Refused as exc:
@@ -174,12 +174,12 @@ def _reservation(stream=STREAM):
     return host_admission.reservations_dir() / f"{stream}{host_admission.RESERVATION_SUFFIX}"
 
 
-def _reserve(task_id, stream=STREAM, *, force_reason=None):
-    """Reserve ``stream`` for ``task_id`` as dispatch does; the hold's record is then handed on, as to a supervisor."""
+def _reserve(task_id, stream=STREAM, *, force_reason=None, launch=None):
+    """Reserve ``stream`` for ``task_id`` as dispatch does, then hand the record on as to a supervisor."""
     decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
     with host_admission.reserve(task_id, "workspace-write", decision, agent="claude", disk_guard=lambda: False,
                                 force_reason=force_reason, orchestrator={"stream": stream},
-                                tree=f"/trees/{task_id}") as hold:
+                                tree=f"/trees/{task_id}", launch=launch) as hold:
         store.replace({**hold, "prompt_file": "/prompts/turn.md"}, store.record_path(task_id))
     return hold
 
@@ -248,6 +248,29 @@ def test_release_needs_the_reserving_task_and_run(task_store):
     assert host_admission.release_stream(STREAM, "turn", hold["run_nonce"]) == "orchestrator_reservation_missing"
 
 
+@pytest.mark.parametrize(("progress", "record", "released"), [
+    ({"started": False}, "kept", True),  # this dispatch never started a supervisor
+    ({"started": False}, "deleted", True),
+    ({"started": True}, "kept", False),  # a supervisor may run, whatever the record says
+    ({"started": True}, "deleted", False),
+    ({"started": True}, "replaced", False),
+    ({"started": None}, "kept", False),  # damaged progress is not proof
+    (None, "kept", False),  # no progress given
+])
+def test_a_pre_launch_abort_follows_the_dispatchers_own_launch_progress(task_store, progress, record, released):
+    """Defect class: a lost, replaced or stale hold record reads as 'never launched' and frees the stream while a
+    supervisor this dispatch started may still run."""
+    decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+    with host_admission.reserve("turn", "workspace-write", decision, agent="claude", disk_guard=lambda: False,
+                                orchestrator={"stream": STREAM}, tree="/trees/turn", launch=progress) as hold:
+        path = store.record_path("turn")
+        if record == "deleted":
+            path.unlink()
+        elif record == "replaced":
+            path.write_text(json.dumps({**hold, "run_nonce": "f" * 32}))
+    assert _reservation().exists() is not released
+
+
 @pytest.mark.parametrize("damage", ["deleted", "archived", "truncated", "key-lost", "foreign", "fifo"])
 def test_occupancy_is_the_reservation_alone_whatever_the_task_records_say(task_store, damage):
     """Defect class: a deleted, archived, damaged or identity-less turn record (or a non-regular file in the store)
@@ -304,6 +327,8 @@ def _plant(kind, entry):
             "bad-nonce": json.dumps({**hold, "run_nonce": "nonce"}),
             "bad-task-id": json.dumps({**hold, "task_id": "../turn"}),
             "relative-tree": json.dumps({**hold, "worktree_path": "trees/turn"}),
+            "nul-tree": json.dumps({**hold, "worktree_path": "/trees/turn\x00x"}),
+            "surrogate-tree": json.dumps({**hold, "worktree_path": "/trees/\ud800"}),
             "bad-time": json.dumps({**hold, "reserved_at": "soon"}),
             "other-schema": json.dumps({**hold, "schema": "v0"}),
         }[kind]
@@ -312,7 +337,8 @@ def _plant(kind, entry):
 
 @pytest.mark.parametrize("kind", ["symlink", "fifo", "directory", "oversized", "empty", "not-json", "not-utf8",
                                   "a-list", "duplicate-key", "extra-field", "missing-field", "other-stream",
-                                  "bad-nonce", "bad-task-id", "relative-tree", "bad-time", "other-schema"])
+                                  "bad-nonce", "bad-task-id", "relative-tree", "nul-tree", "surrogate-tree",
+                                  "bad-time", "other-schema"])
 def test_an_unsafe_or_malformed_reservation_holds_its_stream(task_store, kind):
     """Defect class: a symlinked, non-regular (a FIFO must not block), oversized or malformed reservation file reads
     as a free stream, or its damage frees or blocks another stream."""
@@ -395,7 +421,9 @@ def test_settlement_releases_the_stream_only_on_proof_the_run_is_gone(task_store
         return change.get("probe", False)
 
     monkeypatch.setattr(worker, "_provider_alive", probe)
-    worker._release_stream(record)
+    worker._release_stream(record, evidence_lost=True)  # the record had to be rebuilt at publication
+    assert _reservation().exists()
+    worker._release_stream(record, evidence_lost=False)
     assert _reservation().exists() is not released
 
 

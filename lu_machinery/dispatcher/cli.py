@@ -859,12 +859,13 @@ def _dispatch(args) -> int:
             with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
                 stack.enter_context(git.worktree_lock(repo))
                 checks.check_review_budget(args, info, sha)
+        launch = {"started": False}  # set before worker.start: from then on a supervisor may run
         with admission.record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
             hold = stack.enter_context(host_admission.reserve(
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,
                 spec=spec,
                 disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
-                orchestrator=orchestrator, linkage=linkage, tree=str(worktree),
+                orchestrator=orchestrator, linkage=linkage, tree=str(worktree), launch=launch,
             ))
         with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
             if binding:
@@ -914,6 +915,7 @@ def _dispatch(args) -> int:
                         # tree this dispatch creates gets, and keeps, the deployment its start commit composes.
                         raise ValueError("agent_deploy_attach_refused: a write task cannot borrow (--cwd) a tree "
                                          "enrolled in the agent deployment; dispatch it without --cwd")
+                launch["started"] = True
                 worker.start(spec, record, prompt, args.hard_timeout)
         except admission.LaunchRefused as exc:
             # The record is terminal: preserve the account/placement port's no-relaunch refusal.
