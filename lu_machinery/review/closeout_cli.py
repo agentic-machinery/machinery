@@ -439,6 +439,11 @@ def _checkout_repository(repo_root: Path) -> str:
 
 
 def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
+    automation = args.author_family == "automation"
+    if automation and args.author_model is not None:
+        raise CloseoutStateError("--author-family automation cannot be combined with --author-model")
+    if not automation and args.author_model is None:
+        raise CloseoutStateError("pass --author-model or --author-family automation")
     if args.domain.strip().casefold() not in VALID_REVIEW_PROFILES:
         print(
             json.dumps(
@@ -470,6 +475,8 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
     }
     state = _load_state(args.state_file)
     target = _target_from_dict(state["target"]) if state.get("target") is not None else None
+    if automation and (target is None or target.mode == "local"):
+        raise CloseoutStateError("AUTHOR_UNRESOLVED: automation requires a committed target with a verified app-bot author")
     if args.review_profile.strip().casefold() in {"code", "infra"} and target is None and not args.owned_path:
         raise CloseoutStateError("review_target_required: resolve the target first or supply --owned-path")
     changed_paths = target.changed_paths if target else ()
@@ -533,7 +540,10 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
                 print(json.dumps(failed, indent=2))
                 return 1
             unknown_authors = list(facts.unresolved_authors)
-            if resolve_author_family(args.author_model, args.author_family) == UNKNOWN_AUTHOR_FAMILY:
+            if automation:
+                if not facts.app_bot_commits:
+                    unknown_authors.append("--author-family automation without a verified app-bot commit")
+            elif resolve_author_family(args.author_model, args.author_family) == UNKNOWN_AUTHOR_FAMILY:
                 unknown_authors.append(f"--author-model {args.author_model!r}")
             if unknown_authors:
                 failed = {
@@ -562,14 +572,14 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
     if isinstance(routing_snapshot, dict):
         routing_snapshot, evidence = claude_account_lane.select_account(routing_snapshot, account=account)
     common: dict[str, Any] = {
-        "author_model": args.author_model,
+        "author_model": args.author_model or "",
         "domain": args.domain,
         "language_lane": args.language_lane,
         "required_capabilities": frozenset(args.required_capability or []),
         "data_egress_policy": args.data_egress_policy,
         "isolation_required": args.isolation_required,
         "routing_snapshot": routing_snapshot,
-        "author_family": args.author_family,
+        "author_family": None if automation else args.author_family,
         "claude_account": account,
     }
     if facts is not None:
@@ -1780,13 +1790,15 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Resolve the formal reviewer or the two-seat mixed-family review plan.\n"
             "Resolve the target first in the same state file, or supply --owned-path. "
-            "For a committed target (commit, branch, pr), every author named by the "
-            "target's X-Agent trailers and task records contributes to independence checks; "
-            "--author-model adds to them. Unresolved authorship returns AUTHOR_UNRESOLVED. "
+            "For a committed target (commit, branch, pr), independence checks use authors "
+            "from X-Agent trailers, task records, and verified app-bot commits. "
+            "--author-model adds a model to those checks. With a verified app-bot commit, "
+            "use --author-family automation and omit --author-model. The bot excludes no "
+            "reviewer family. Unresolved authorship returns AUTHOR_UNRESOLVED. "
             "Anthropic/OpenAI branches return two quorum seats, "
             "each scoped to the other family's commits with the whole diff as context. "
             "Both must approve the same exact head. Single-family routing is unchanged. "
-            "Use it after the author model is known. Pass --subject-seat, "
+            "Pass --subject-seat, "
             "--subject-family, or --owned-path when the change governs a seat's "
             "adapter or reviewer hooks. Do not use it to hand-pick a lane, and do "
             "not use it for learner-content semantic review."
@@ -1799,7 +1811,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "    resolve-reviewer --author-model codex:gpt-6.2-sol --domain infra --risk high \\\n"
             f"    --owned-path {_EXAMPLE_OWNED_PATH}\n"
             f"  .venv/bin/python {_ENTRY} --state-file .agent/review.json \\\n"
-            "    resolve-reviewer --author-model claude --subject-seat grok --subject-family xai\n"
+            "    resolve-reviewer --author-family automation --risk high\n"
             "\n"
             "Outputs:\n"
             "  stdout JSON (selected, quorum, advisory, trace, fail_closed_reason) and the\n"
@@ -1825,17 +1837,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_reviewer.add_argument(
         "--author-model",
-        required=True,
         help=(
             "Concrete seat/model id, or '<ambiguous-harness>:<concrete-model>' "
-            "(e.g. 'cursor:claude-opus-5-5') to disambiguate a multi-model harness session."
+            "(e.g. 'cursor:claude-opus-5-5') to disambiguate a multi-model harness session. "
+            "Required unless --author-family automation is supplied."
         ),
     )
     p_reviewer.add_argument(
         "--author-family",
         default=None,
         help=(
-            "Explicit, caller-asserted author model family (e.g. from session logs). "
+            "Explicit author model family (e.g. from session logs). Use automation without "
+            "--author-model for a committed target with a GitHub-verified app-bot commit. "
             "Default: unset. Required to disambiguate a bare ambiguous-harness "
             "--author-model; optional corroboration otherwise — a mismatch is a "
             "fail-closed conflict. Example: anthropic"
