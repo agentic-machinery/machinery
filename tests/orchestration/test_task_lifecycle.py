@@ -3300,3 +3300,145 @@ def test_runtime_release_metadata_accepts_infra_proof_without_exempting_learner_
     renamed_blockers = " ".join(renamed["hard_blockers"])
     assert "learner-content change requires a ukrainian behavior-proof receipt" in renamed_blockers
     assert "behavior_proof" not in renamed["valid_evidence"].get("AC-IMPL", set())
+
+
+@pytest.mark.parametrize(
+    ("active_slug", "inactive_slug"),
+    [
+        ("learn-ukrainian/machinery", "agentic-machinery/machinery"),
+        ("agentic-machinery/machinery", "learn-ukrainian/machinery"),
+    ],
+    ids=["pre-flip", "post-flip"],
+)
+def test_a02_stream_registry_repository_both_selector_states_and_same_issue_number(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_slug: str,
+    inactive_slug: str,
+) -> None:
+    """Defect class: an issue in a moved repo resolves to the other repo registry;
+    the same number in two repos is treated as one issue."""
+    import yaml
+
+    from lu_machinery.common import git_credentials
+    from lu_machinery.orchestration import fleet_repos, issue_stream_audit
+
+    public_slug = "learn-ukrainian/learn-ukrainian.github.io"
+    sel_dir = tmp_path / "selector"
+    sel_dir.mkdir(mode=0o700)
+    sel_file = sel_dir / "selector.yaml"
+    sel_file.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "active_slugs": {
+                    "machinery": active_slug,
+                    "infra-private": "learn-ukrainian/learn-ukrainian-infra-private",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sel_file.chmod(0o400)
+    sel_dir.chmod(0o500)
+    try:
+        monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
+        monkeypatch.setenv(fleet_repos.SELECTOR_ENV, str(sel_file))
+
+        # Pre-bootstrap (MUST-FIX 4): declared machinery section with empty epics keeps
+        # stream_registry_repository pointing at public so existing cross-repo issues stay valid.
+        empty_registry = tmp_path / "issue_streams_empty.yaml"
+        empty_registry.write_text(
+            "schema_version: 1\n"
+            "repos:\n"
+            "  machinery:\n"
+            "    streams:\n"
+            "      epics:\n"
+            "        title: Machinery\n"
+            "        epics: []\n"
+            "streams:\n"
+            "  epics:\n"
+            "    title: Public\n"
+            "    epics: [10]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", empty_registry)
+        assert task_lifecycle.stream_registry_repository(active_slug) == public_slug
+        assert task_lifecycle.stream_registry_repository(public_slug) == public_slug
+        with pytest.raises(task_lifecycle.LifecycleError, match="not the active fleet slug"):
+            task_lifecycle.stream_registry_repository(inactive_slug)
+
+        # Post-PR-2: both repos register the same root number #10 independently.
+        populated_registry = tmp_path / "issue_streams_populated.yaml"
+        populated_registry.write_text(
+            "schema_version: 1\n"
+            "repos:\n"
+            "  machinery:\n"
+            "    streams:\n"
+            "      epics:\n"
+            "        title: Machinery\n"
+            "        epics: [10]\n"
+            "streams:\n"
+            "  epics:\n"
+            "    title: Public\n"
+            "    epics: [10]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", populated_registry)
+        assert task_lifecycle.stream_registry_repository(active_slug) == active_slug
+        assert task_lifecycle.stream_registry_repository(public_slug) == public_slug
+        with pytest.raises(task_lifecycle.LifecycleError, match="not the active fleet slug"):
+            task_lifecycle.stream_registry_repository(inactive_slug)
+
+        # Same issue number #42 and root #10 in both repos are distinct identities and memberships.
+        machinery_id = task_lifecycle.lifecycle_id(
+            {**_identity(), "repository": active_slug, "stream_epic": 10}
+        )
+        public_id = task_lifecycle.lifecycle_id(
+            {**_identity(), "repository": public_slug, "stream_epic": 10}
+        )
+        assert machinery_id != public_id
+
+        ok = task_lifecycle.resolve_membership(
+            issue_number=42,
+            stream_epic=10,
+            native_parent_epic=10,
+            repository=active_slug,
+            native_parent_repository=active_slug,
+            registered_epics=[10],
+            epic_repository=active_slug,
+            membership_report=None,
+        )
+        assert ok["valid"] is True and ok["method"] == "native"
+
+        foreign_same_number = task_lifecycle.resolve_membership(
+            issue_number=42,
+            stream_epic=10,
+            native_parent_epic=10,
+            repository=active_slug,
+            native_parent_repository=public_slug,
+            registered_epics=[10],
+            epic_repository=active_slug,
+            membership_report=None,
+        )
+        assert foreign_same_number["valid"] is False
+        assert "repository boundary" in foreign_same_number["reason"]
+
+        live_foreign = task_lifecycle.resolve_live_ancestry(
+            repository=active_slug,
+            issue_number=42,
+            stream_epic=10,
+            registered_epics=[10],
+            epic_repository=active_slug,
+            read_parent=lambda _repo, _n: {"number": 10, "repository": public_slug},
+        )
+        assert live_foreign["valid"] is False
+        assert "repository boundary" in live_foreign["reason"]
+
+        # Missing selector fails closed instead of falling back to the old slug.
+        monkeypatch.delenv(fleet_repos.SELECTOR_ENV, raising=False)
+        with pytest.raises(task_lifecycle.LifecycleError, match="not configured in the fleet"):
+            task_lifecycle.stream_registry_repository(active_slug)
+    finally:
+        sel_dir.chmod(0o700)
+        sel_file.chmod(0o600)

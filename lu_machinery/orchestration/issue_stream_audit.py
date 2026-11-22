@@ -50,6 +50,7 @@ import yaml
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import github_slug, machinery_path, product_root, state_root
 from lu_machinery.opsec.prepublish import publication_cli
+from lu_machinery.orchestration import fleet_repos
 from lu_machinery.publish.github import Request, request_run
 
 # This package's import name, from the unresolved file location: never from __package__, which a
@@ -620,25 +621,100 @@ def _run_refresh_worker(run_id: str) -> int:
         _release_lock(fd)
 
 
-def load_registry(path: Path = REGISTRY_PATH, *, audit_only: bool = False) -> dict[str, list[int]]:
-    """Return registered epics, optionally excluding retired/closed audit roots.
+class _UniqueSafeLoader(yaml.SafeLoader):
+    """Reject duplicate YAML keys instead of silently keeping the last value."""
 
-    The default preserves the full registry for launcher and session consumers.
-    A stream may carry ``retired: true`` to stay registered for those consumers
-    without remaining an audit root; any non-boolean ``retired`` marker is
-    rejected so a typo cannot silently change audit scope.
-    """
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    streams = doc.get("streams") or {}
+
+def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False) -> dict:
+    seen: set = set()
+    for key_node, _ in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in seen
+            seen.add(key)
+        except TypeError:
+            raise yaml.constructor.ConstructorError(None, None, "unhashable key", node.start_mark) from None
+        if duplicate:
+            raise yaml.constructor.ConstructorError(None, None, "duplicate key", node.start_mark)
+    return dict(loader.construct_mapping(node, deep=deep))
+
+
+_UniqueSafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
+def _load_registry_doc(path: Path) -> dict:
+    doc = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueSafeLoader)
+    if not isinstance(doc, dict):
+        raise ValueError("issue_streams.yaml must be a mapping")
+    return doc
+
+
+def _default_repo_key(default_key: str | None = None) -> str:
+    if default_key is not None:
+        return default_key
+    try:
+        return fleet_repos.default_repo_key()
+    except fleet_repos.FleetRepoError:
+        return "public"
+
+
+_REPO_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _parse_repos(doc: dict) -> dict[str, dict]:
+    raw_repos = doc.get("repos")
+    if raw_repos is None:
+        return {}
+    if not isinstance(raw_repos, dict):
+        raise ValueError("issue_streams.yaml repos must be a mapping")
+    parsed: dict[str, dict] = {}
+    for repo_key, entry in raw_repos.items():
+        if not isinstance(repo_key, str) or not _REPO_KEY_RE.fullmatch(repo_key):
+            raise ValueError(f"issue_streams.yaml has invalid repository key {repo_key!r}")
+        if not isinstance(entry, dict) or set(entry) - {"streams"} or "streams" not in entry:
+            raise ValueError(f"issue_streams.yaml repository section {repo_key!r} must declare only 'streams'")
+        streams = entry.get("streams")
+        if streams is not None and not isinstance(streams, dict):
+            raise ValueError(f"issue_streams.yaml repository section {repo_key!r} streams must be a mapping")
+        parsed[repo_key] = entry
+    return parsed
+
+
+def _parse_streams(streams_raw: object, *, allow_empty_epics: bool, audit_only: bool) -> dict[str, list[int]]:
+    if streams_raw is None:
+        if allow_empty_epics:
+            return {}
+        raise ValueError("issue_streams.yaml defines no streams")
+    if not isinstance(streams_raw, dict):
+        raise ValueError("issue_streams.yaml streams must be a mapping")
     registry: dict[str, list[int]] = {}
-    for key, spec in streams.items():
-        epics = [int(n) for n in (spec.get("epics") or [])]
-        if not epics:
+    seen_epics: set[int] = set()
+    for key, spec in streams_raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"invalid stream key {key!r}")
+        if not isinstance(spec, dict):
+            raise ValueError(f"stream {key!r} must be a mapping")
+        raw_epics = spec.get("epics")
+        if raw_epics is None:
+            raw_epics = []
+        if not isinstance(raw_epics, list) or not all(_is_positive_int(n) for n in raw_epics):
+            raise ValueError(f"stream {key!r} epics must be positive integers")
+        epics = list(raw_epics)
+        if not epics and not allow_empty_epics:
             raise ValueError(f"stream {key!r} has no epics")
+        for n in epics:
+            if n in seen_epics:
+                raise ValueError(f"duplicate epic #{n} in stream {key!r}")
+            seen_epics.add(n)
         retired = spec.get("retired", False)
         if not isinstance(retired, bool):
             raise ValueError(f"stream {key!r} has invalid retired marker")
-        closed = [int(n) for n in (spec.get("closed_epics") or [])]
+        raw_closed = spec.get("closed_epics")
+        if raw_closed is None:
+            raw_closed = []
+        if not isinstance(raw_closed, list) or not all(_is_positive_int(n) for n in raw_closed):
+            raise ValueError(f"stream {key!r} closed_epics must be positive integers")
+        closed = list(raw_closed)
         if not set(closed) <= set(epics):
             raise ValueError(f"stream {key!r} has closed epics outside its epic list")
         if retired and audit_only:
@@ -646,24 +722,121 @@ def load_registry(path: Path = REGISTRY_PATH, *, audit_only: bool = False) -> di
         active_epics = [n for n in epics if n not in closed] if audit_only else epics
         if active_epics:
             registry[key] = active_epics
-    if not registry:
+    return registry
+
+
+def _resolve_repo_section(
+    doc: dict,
+    repo: str | None,
+    *,
+    default_key: str | None = None,
+) -> tuple[object, bool]:
+    repos = _parse_repos(doc)
+    if repo is None:
+        return doc.get("streams"), False
+    if not isinstance(repo, str) or not repo.strip() or repo != repo.strip() or "/" in repo:
+        raise ValueError(f"invalid repository key {repo!r}")
+    resolved_default = _default_repo_key(default_key)
+    if repo in repos:
+        if repo == resolved_default and doc.get("streams") is not None:
+            raise ValueError(
+                f"issue_streams.yaml declares default repository {repo!r} in both streams and repos"
+            )
+        return repos[repo].get("streams"), True
+    if repo == resolved_default:
+        return doc.get("streams"), False
+    raise ValueError(f"issue_streams.yaml defines no repository section for {repo!r}")
+
+
+def repo_has_registry(
+    repo_key: str,
+    path: Path = REGISTRY_PATH,
+    *,
+    default_key: str | None = None,
+) -> bool:
+    """True when *repo_key* has a declared section in ``issue_streams.yaml`` (even before its first root)."""
+    if not isinstance(repo_key, str) or not repo_key.strip() or repo_key != repo_key.strip() or "/" in repo_key:
+        raise ValueError(f"invalid repository key {repo_key!r}")
+    doc = _load_registry_doc(path)
+    repos = _parse_repos(doc)
+    resolved_default = _default_repo_key(default_key)
+    if repo_key in repos:
+        if repo_key == resolved_default and doc.get("streams") is not None:
+            raise ValueError(
+                f"issue_streams.yaml declares default repository {repo_key!r} in both streams and repos"
+            )
+        _parse_streams(repos[repo_key].get("streams"), allow_empty_epics=True, audit_only=False)
+        return True
+    if repo_key == resolved_default:
+        if doc.get("streams") is None:
+            return False
+        _parse_streams(doc.get("streams"), allow_empty_epics=False, audit_only=False)
+        return True
+    return False
+
+
+def repo_has_roots(
+    repo_key: str,
+    path: Path = REGISTRY_PATH,
+    *,
+    default_key: str | None = None,
+) -> bool:
+    """True when *repo_key* has a declared section in ``issue_streams.yaml`` with at least one registered epic."""
+    if not isinstance(repo_key, str) or not repo_key.strip() or repo_key != repo_key.strip() or "/" in repo_key:
+        raise ValueError(f"invalid repository key {repo_key!r}")
+    doc = _load_registry_doc(path)
+    repos = _parse_repos(doc)
+    resolved_default = _default_repo_key(default_key)
+    if repo_key in repos:
+        if repo_key == resolved_default and doc.get("streams") is not None:
+            raise ValueError(
+                f"issue_streams.yaml declares default repository {repo_key!r} in both streams and repos"
+            )
+        return bool(_parse_streams(repos[repo_key].get("streams"), allow_empty_epics=True, audit_only=False))
+    if repo_key == resolved_default:
+        if doc.get("streams") is None:
+            return False
+        return bool(_parse_streams(doc.get("streams"), allow_empty_epics=False, audit_only=False))
+    return False
+
+
+def load_registry(
+    path: Path = REGISTRY_PATH,
+    *,
+    audit_only: bool = False,
+    repo: str | None = None,
+) -> dict[str, list[int]]:
+    """Return registered epics, optionally excluding retired/closed audit roots.
+
+    The default (``repo=None``) preserves the full default-repository numeric
+    registry for launcher, handoff, and Work callers. Passing ``repo=<key>``
+    selects that repository's section under ``repos:`` (accepting a declared
+    section with empty epics before its bootstrap root exists).
+    """
+    doc = _load_registry_doc(path)
+    streams_raw, allow_empty = _resolve_repo_section(doc, repo)
+    registry = _parse_streams(streams_raw, allow_empty_epics=allow_empty, audit_only=audit_only)
+    if not allow_empty and not registry:
         raise ValueError("issue_streams.yaml defines no streams")
     return registry
 
 
-def load_closed_epics(path: Path = REGISTRY_PATH) -> dict[str, list[int]]:
+def load_closed_epics(path: Path = REGISTRY_PATH, *, repo: str | None = None) -> dict[str, list[int]]:
     """Return {stream_key: [closed_epic_numbers]} declared via ``closed_epics``.
 
     The list is hand-maintained, so the auditor re-checks each entry against
     live issue state and warns when a supposedly closed epic is actually open
     (see ``run_audit``).
     """
-    doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-    streams = doc.get("streams") or {}
+    doc = _load_registry_doc(path)
+    streams_raw, allow_empty = _resolve_repo_section(doc, repo)
+    if not isinstance(streams_raw, dict):
+        return {}
+    _parse_streams(streams_raw, allow_empty_epics=allow_empty, audit_only=False)
     return {
         key: [int(n) for n in (spec.get("closed_epics") or [])]
-        for key, spec in streams.items()
-        if spec.get("closed_epics")
+        for key, spec in streams_raw.items()
+        if isinstance(spec, dict) and spec.get("closed_epics")
     }
 
 
@@ -805,7 +978,21 @@ def milestone_warnings(
     return warnings
 
 
-def _gh_json(args: list[str], timeout_s: float = 30.0, *, cwd: Path | None = None):
+def resolve_audit_repo(repo: str) -> fleet_repos.ActiveFleetRepo:
+    """Resolve ``--repo`` (fleet key or active owner/name) through the A01 resolver."""
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError("audit repository must be non-empty")
+    raw = repo.strip()
+    catalog = fleet_repos.load_fleet_repos()
+    active = fleet_repos.resolve_active_fleet_repo(raw, repos=catalog)
+    if "/" in raw and active.active_github.casefold() != raw.casefold():
+        raise ValueError(
+            f"audit repository {raw!r} is not the active fleet slug ({active.active_github!r})"
+        )
+    return active
+
+
+def _gh_json(args: list[str] | Request, timeout_s: float = 30.0, *, cwd: Path | None = None):
     proc = request_run(
         args if isinstance(args, Request) else ["gh", *args], capture_output=True, text=True, timeout=timeout_s, cwd=product_root(cwd)
     )
@@ -826,11 +1013,12 @@ def _gh_json(args: list[str], timeout_s: float = 30.0, *, cwd: Path | None = Non
     return json_depth.loads(proc.stdout, max_depth=512)
 
 
-def fetch_open_issues(repo_root: Path | None = None) -> list[dict]:
-    return _gh_json(
-        ["issue", "list", "--state", "open", "--limit", "500", "--json", "number,title"],
-        cwd=repo_root,
-    )
+def fetch_open_issues(repo_root: Path | None = None, *, repo_slug: str | None = None) -> list[dict]:
+    args = ["issue", "list"]
+    if repo_slug is not None:
+        args += ["-R", repo_slug]
+    args += ["--state", "open", "--limit", "500", "--json", "number,title"]
+    return _gh_json(args, cwd=repo_root)
 
 
 def fetch_issue_states(
@@ -838,6 +1026,7 @@ def fetch_issue_states(
     repo_root: Path | None = None,
     *,
     known_open_issue_numbers: set[int] | None = None,
+    repo_slug: str | None = None,
 ) -> tuple[dict[int, str], set[int]]:
     """Resolve milestone states without letting advisory lookup abort an audit.
 
@@ -853,7 +1042,11 @@ def fetch_issue_states(
             states[number] = "OPEN"
             continue
         try:
-            issue = _gh_json(["issue", "view", str(number), "--json", "number,state"], cwd=repo_root)
+            view_args = ["issue", "view", str(number)]
+            if repo_slug is not None:
+                view_args += ["-R", repo_slug]
+            view_args += ["--json", "number,state"]
+            issue = _gh_json(view_args, cwd=repo_root)
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
             unavailable.add(number)
             continue
@@ -866,16 +1059,19 @@ def fetch_issue_states(
     return states, unavailable
 
 
-# Keyed by resolved repo root so a closeout invocation configured for one
+# Keyed by resolved repo root (or explicit slug) so a closeout invocation configured for one
 # checkout never reuses another checkout's owner/name (a caller auditing two
 # different worktrees in the same process must not cross-contaminate).
 _REPO_CACHE: dict[str, tuple[str, str]] = {}
 
 
-def _repo_owner_name(repo_root: Path | None = None) -> tuple[str, str]:
+def _repo_owner_name(repo_root: Path | None = None, *, repo_slug: str | None = None) -> tuple[str, str]:
     """Resolve the actual owner/name once per repo root — GraphQL -f fields do
     NOT expand the gh {owner}/{repo} placeholders (REST paths do). Caught by
     live probe."""
+    if repo_slug is not None:
+        data = _gh_json(["repo", "view", repo_slug, "--json", "owner,name"], cwd=repo_root)
+        return (data["owner"]["login"], data["name"])
     repo_root = product_root(repo_root)
     key = str(repo_root)
     if key not in _REPO_CACHE:
@@ -928,13 +1124,19 @@ class _RetryBudget:
         self.remaining = limit
 
 
-def _fetch_subissues_page(epic: int, cursor: str | None, repo_root: Path | None = None) -> dict:
+def _fetch_subissues_page(
+    epic: int,
+    cursor: str | None,
+    repo_root: Path | None = None,
+    *,
+    repo_slug: str | None = None,
+) -> dict:
     """One GraphQL page of ``issue.subIssues`` (+ ``body`` on the first page)."""
-    owner, name = _repo_owner_name(repo_root)
+    target = repo_slug if repo_slug is not None else "/".join(_repo_owner_name(repo_root))
     data = _gh_json(
         Request(
             "read-subissues" if cursor is None else "read-subissues-next",
-            repo=f"{owner}/{name}",
+            repo=target,
             number=epic,
             **({"cursor": cursor} if cursor is not None else {}),
         ),
@@ -973,13 +1175,21 @@ def _paginate_subissues(epic: int, fetch_page: Callable[[int, str | None], dict]
     return native, body
 
 
-def fetch_epic_membership(epic: int, repo_root: Path | None = None) -> tuple[set[int], set[int]]:
+def fetch_epic_membership(
+    epic: int,
+    repo_root: Path | None = None,
+    *,
+    repo_slug: str | None = None,
+) -> tuple[set[int], set[int]]:
     """Return (native_sub_issue_numbers, body_reference_numbers) for one epic.
 
     Native sub-issues are paginated (see ``_paginate_subissues``) so an epic
     with more than 100 children is not silently truncated to its first page.
     """
-    native, body = _paginate_subissues(epic, lambda e, c: _fetch_subissues_page(e, c, repo_root))
+    native, body = _paginate_subissues(
+        epic,
+        lambda e, c: _fetch_subissues_page(e, c, repo_root, repo_slug=repo_slug),
+    )
     refs = {int(m) for m in ISSUE_REF_RE.findall(body)}
     return native, refs
 
@@ -989,6 +1199,8 @@ def _fetch_subissue_batch(
     repo_root: Path | None = None,
     body_roots: set[int] | None = None,
     retry_budget: _RetryBudget | None = None,
+    *,
+    repo_slug: str | None = None,
 ) -> dict[int, dict | _IncompleteNode | None]:
     """Fetch one page for each parent in a bounded GraphQL alias batch.
 
@@ -1009,10 +1221,10 @@ def _fetch_subissue_batch(
     """
     if retry_budget is None:
         retry_budget = _RetryBudget()
-    owner, name = _repo_owner_name(repo_root)
+    target = repo_slug if repo_slug is not None else "/".join(_repo_owner_name(repo_root))
     try:
         data = _gh_json(
-            Request("read-subissue-batch", repo=f"{owner}/{name}", cursors=cursors, body_roots=body_roots or set()),
+            Request("read-subissue-batch", repo=target, cursors=cursors, body_roots=body_roots or set()),
             cwd=repo_root,
         )
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
@@ -1027,7 +1239,15 @@ def _fetch_subissue_batch(
                 pages[number] = INCOMPLETE_NODE
                 continue
             retry_budget.remaining -= 1
-            pages.update(_fetch_subissue_batch({number: cursor}, repo_root, body_roots, retry_budget))
+            pages.update(
+                _fetch_subissue_batch(
+                    {number: cursor},
+                    repo_root,
+                    body_roots,
+                    retry_budget,
+                    repo_slug=repo_slug,
+                )
+            )
         return pages
 
     errors = data.get("errors") or []
@@ -1057,7 +1277,15 @@ def _fetch_subissue_batch(
                 pages[number] = INCOMPLETE_NODE
                 continue
             retry_budget.remaining -= 1
-            pages.update(_fetch_subissue_batch({number: cursor}, repo_root, body_roots, retry_budget))
+            pages.update(
+                _fetch_subissue_batch(
+                    {number: cursor},
+                    repo_root,
+                    body_roots,
+                    retry_budget,
+                    repo_slug=repo_slug,
+                )
+            )
         return pages
 
     repository = (data.get("data") or {}).get("repository") or {}
@@ -1200,15 +1428,25 @@ def _tree_membership(
 
 
 def fetch_tree_membership(
-    roots: set[int], repo_root: Path | None = None, warnings: list[dict] | None = None
+    roots: set[int],
+    repo_root: Path | None = None,
+    warnings: list[dict] | None = None,
+    *,
+    repo_slug: str | None = None,
 ) -> dict[int, tuple[set[int], set[int]]]:
-    owner, name = _repo_owner_name(repo_root)
+    target = repo_slug if repo_slug is not None else "/".join(_repo_owner_name(repo_root))
     retry_budget = _RetryBudget()
     return _tree_membership(
         roots,
-        lambda batch: _fetch_subissue_batch(batch, repo_root, roots, retry_budget),
+        lambda batch: _fetch_subissue_batch(
+            batch,
+            repo_root,
+            roots,
+            retry_budget,
+            repo_slug=repo_slug,
+        ),
         warnings,
-        repo_slug=f"{owner}/{name}",
+        repo_slug=target,
     )
 
 
@@ -1333,10 +1571,13 @@ def _effective_membership(
 
 
 def hygiene_warnings(
-    root: Path,
+    root: Path | None,
     open_issue_numbers: set[int],
     *,
     max_confirmed_age_days: int = DEFAULT_MAX_CONFIRMED_AGE_DAYS,
+    repo_key: str | None = None,
+    repo_slug: str | None = None,
+    include_milestones: bool = True,
 ) -> list[dict]:
     """Closed-epic and stream-milestone warnings every published report carries.
 
@@ -1345,15 +1586,24 @@ def hygiene_warnings(
     no publication of the shared cache serves a reduced hygiene report (#10793).
     """
     registry_path = REGISTRY_PATH
-    closed_epics = load_closed_epics(registry_path)
-    milestone_rows = load_milestone_rows(root / "docs" / "WORKSTREAMS.md")
+    closed_epics = load_closed_epics(registry_path, repo=repo_key)
+    milestone_rows = (
+        load_milestone_rows(root / "docs" / "WORKSTREAMS.md")
+        if include_milestones and root is not None
+        else []
+    )
     milestone_numbers = {number for row in milestone_rows for number in row["issue_numbers"]}
     closed_epic_numbers = {n for numbers in closed_epics.values() for n in numbers}
-    issue_states, unavailable_numbers = fetch_issue_states(
-        milestone_numbers | closed_epic_numbers,
-        root,
-        known_open_issue_numbers=open_issue_numbers,
-    )
+    numbers_to_check = milestone_numbers | closed_epic_numbers
+    if numbers_to_check:
+        issue_states, unavailable_numbers = fetch_issue_states(
+            numbers_to_check,
+            root,
+            known_open_issue_numbers=open_issue_numbers,
+            repo_slug=repo_slug,
+        )
+    else:
+        issue_states, unavailable_numbers = {}, set()
     # closed_epics is hand-maintained: a listed epic that is actually OPEN on
     # GitHub must surface as a warning instead of silently dropping out of the
     # audit (it is excluded from audit roots either way).
@@ -1363,6 +1613,8 @@ def hygiene_warnings(
         for number in numbers
         if issue_states.get(number) == "OPEN"
     ]
+    if not milestone_rows:
+        return reopened_warnings
     return reopened_warnings + milestone_warnings(
         milestone_rows,
         issue_states,
@@ -1444,34 +1696,82 @@ def run_audit(
     repo_root: Path | None = None,
     *,
     max_confirmed_age_days: int = DEFAULT_MAX_CONFIRMED_AGE_DAYS,
+    repo: str | None = None,
 ) -> dict:
-    """Audit the selected product using the packaged registry and shared state cache."""
-    root = product_root(repo_root)
-    cache_path = state_root() / "batch_state/issue_stream_audit.json"
-    repository = "/".join(_repo_owner_name(root))
-    if repository.casefold() != github_slug().casefold():
-        raise ValueError("audit repository does not match the shared stream registry")
-    registry = load_registry(REGISTRY_PATH, audit_only=True)
-    open_issues = fetch_open_issues(root)
-    traversal_warnings: list[dict] = []
+    """Audit the selected repository using the packaged registry.
+
+    With ``repo=None`` (default), audits the configured product checkout and
+    publishes the shared state cache. With ``repo=<fleet key or active slug>``,
+    resolves the repository through the A01 active-slug resolver and audits its
+    own roots without overwriting the shared default-repo cache for non-default
+    repositories.
+    """
+    if repo is None:
+        root = product_root(repo_root)
+        cache_path = state_root() / "batch_state/issue_stream_audit.json"
+        repository = "/".join(_repo_owner_name(root))
+        if repository.casefold() != github_slug().casefold():
+            raise ValueError("audit repository does not match the shared stream registry")
+        registry = load_registry(REGISTRY_PATH, audit_only=True)
+        open_issues = fetch_open_issues(root)
+        traversal_warnings: list[dict] = []
+        membership = fetch_tree_membership(
+            {epic for epics in registry.values() for epic in epics}, root, traversal_warnings
+        )
+        incomplete_nodes = sorted(_unread_warning_nodes(traversal_warnings))
+        report = classify(open_issues, registry, membership, incomplete_nodes=incomplete_nodes)
+        report["repository"] = repository
+        if incomplete_nodes:
+            # Fail closed (#8661): an unread subtree can hide a duplicate
+            # membership, so an incomplete traversal must not be green even when
+            # every node we DID read classifies clean.
+            report["ok"] = False
+            report["membership_complete"] = False
+            report["incomplete_nodes"] = incomplete_nodes
+        open_issue_numbers = {issue["number"] for issue in open_issues if isinstance(issue.get("number"), int)}
+        report["warnings"] = traversal_warnings + hygiene_warnings(
+            root, open_issue_numbers, max_confirmed_age_days=max_confirmed_age_days
+        )
+        publish_cache(report, registry, cache_path)
+        return report
+
+    active = resolve_audit_repo(repo)
+    target_slug = active.active_github
+    is_default = active.repo.default
+    audit_cwd = product_root(repo_root) if is_default else (repo_root if repo_root is not None else Path.cwd())
+    observed = "/".join(_repo_owner_name(audit_cwd, repo_slug=target_slug))
+    if observed.casefold() != target_slug.casefold():
+        raise ValueError(f"audit repository {observed!r} does not match expected active slug {target_slug!r}")
+    repo_key = None if is_default else active.repo.key
+    registry = load_registry(REGISTRY_PATH, audit_only=True, repo=repo_key)
+    if not registry:
+        raise ValueError(f"issue_streams.yaml defines no active audit roots for repository {active.repo.key!r}")
+    open_issues = fetch_open_issues(audit_cwd, repo_slug=target_slug)
+    traversal_warnings = []
     membership = fetch_tree_membership(
-        {epic for epics in registry.values() for epic in epics}, root, traversal_warnings
+        {epic for epics in registry.values() for epic in epics},
+        audit_cwd,
+        traversal_warnings,
+        repo_slug=target_slug,
     )
     incomplete_nodes = sorted(_unread_warning_nodes(traversal_warnings))
     report = classify(open_issues, registry, membership, incomplete_nodes=incomplete_nodes)
-    report["repository"] = repository
+    report["repository"] = observed
     if incomplete_nodes:
-        # Fail closed (#8661): an unread subtree can hide a duplicate
-        # membership, so an incomplete traversal must not be green even when
-        # every node we DID read classifies clean.
         report["ok"] = False
         report["membership_complete"] = False
         report["incomplete_nodes"] = incomplete_nodes
     open_issue_numbers = {issue["number"] for issue in open_issues if isinstance(issue.get("number"), int)}
     report["warnings"] = traversal_warnings + hygiene_warnings(
-        root, open_issue_numbers, max_confirmed_age_days=max_confirmed_age_days
+        audit_cwd if is_default else None,
+        open_issue_numbers,
+        max_confirmed_age_days=max_confirmed_age_days,
+        repo_key=repo_key,
+        repo_slug=target_slug,
+        include_milestones=is_default,
     )
-    publish_cache(report, registry, cache_path)
+    if is_default:
+        publish_cache(report, registry, state_root() / "batch_state/issue_stream_audit.json")
     return report
 
 
@@ -1746,19 +2046,29 @@ def make_issue_resolver(report: dict) -> Callable[[str], bool]:
     return _resolve
 
 
-def _node_id(number: int) -> str:
-    data = _gh_json(Request("read-issue", repo="/".join(_repo_owner_name()), number=number))
+def _node_id(number: int, *, repo_slug: str | None = None, cwd: Path | None = None) -> str:
+    target = repo_slug if repo_slug is not None else "/".join(_repo_owner_name())
+    data = _gh_json(Request("read-issue", repo=target, number=number), cwd=cwd)
     return data["node_id"]
 
 
-def migrate(report: dict) -> int:
+def migrate(report: dict, *, repo: str | None = None) -> int:
     """Create native sub-issue links for pending body-only references.
 
     Ambiguous cases — body-referenced from MORE THAN ONE stream — are skipped
     (codex F2): GitHub's single-parent constraint would otherwise make the
     winner order-dependent instead of deliberate. Resolve them manually.
     """
-    registry = load_registry(audit_only=True)
+    repo_key: str | None = None
+    repo_slug: str | None = None
+    migrate_cwd: Path | None = None
+    if repo is not None:
+        active = resolve_audit_repo(repo)
+        repo_slug = active.active_github
+        if not active.repo.default:
+            repo_key = active.repo.key
+            migrate_cwd = Path.cwd()
+    registry = load_registry(REGISTRY_PATH, audit_only=True, repo=repo_key)
     ambiguous = {m["number"] for m in report.get("multi_homed", [])}
     if ambiguous:
         print(
@@ -1768,20 +2078,20 @@ def migrate(report: dict) -> int:
     created = 0
     for stream_key, epics in registry.items():
         for epic in epics:
-            native, refs = fetch_epic_membership(epic)
+            native, refs = fetch_epic_membership(epic, migrate_cwd, repo_slug=repo_slug)
             pending = sorted(refs - native - ambiguous - {e for es in registry.values() for e in es})
             if not pending:
                 continue
-            epic_node = _node_id(epic)
+            epic_node = _node_id(epic, repo_slug=repo_slug, cwd=migrate_cwd)
             for n in pending:
                 if n not in {x if isinstance(x, int) else x["number"] for x in report.get("pending_native_link", [])}:
                     continue
                 try:
-                    child_node = _node_id(n)
+                    child_node = _node_id(n, repo_slug=repo_slug, cwd=migrate_cwd)
+                    target = repo_slug if repo_slug is not None else "/".join(_repo_owner_name())
                     _gh_json(
-                        Request(
-                            "issue-link", repo="/".join(_repo_owner_name()), parent_id=epic_node, child_id=child_node
-                        )
+                        Request("issue-link", repo=target, parent_id=epic_node, child_id=child_node),
+                        cwd=migrate_cwd,
                     )
                     created += 1
                     print(f"linked #{n} → epic #{epic} ({stream_key})")
@@ -1844,12 +2154,17 @@ def human_summary(report: dict) -> str:
     return "\n".join(lines)
 
 
-@publication_cli()
+@publication_cli(ValueError)
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Audit GitHub issue membership in registered streams.\nUse read-only reporting before any authorized repair.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"Examples:\n  .venv/bin/python {_PACKAGE_DIR}/issue_stream_audit.py --help\nOutputs and exit codes: Membership report and authorized repair receipts. 0: successful command; >=1: audit or runtime error.\nRelated: #9297",
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help="Fleet repository key or active owner/name to audit (default: configured product repo)",
     )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
@@ -1875,6 +2190,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_refresh_worker(args.refresh_worker)
     if args.max_confirmed_age_days < 1:
         parser.error("--max-confirmed-age-days must be positive")
+    if args.repo is not None and args.from_cache:
+        active = resolve_audit_repo(args.repo)
+        if not active.repo.default:
+            parser.error("--from-cache is only available for the default repository")
 
     report = read_cache(args.max_age) if args.from_cache else None
     if report is None:
@@ -1882,12 +2201,12 @@ def main(argv: list[str] | None = None) -> int:
             # Hook path: never block a session start on the network.
             print("issue-stream audit: no fresh cache (run the auditor to refresh)")
             return 0
-        report = run_audit(max_confirmed_age_days=args.max_confirmed_age_days)
+        report = run_audit(max_confirmed_age_days=args.max_confirmed_age_days, repo=args.repo)
 
     if args.migrate:
-        created = migrate(report)
+        created = migrate(report, repo=args.repo)
         print(f"created {created} native sub-issue link(s)")
-        report = run_audit(max_confirmed_age_days=args.max_confirmed_age_days)
+        report = run_audit(max_confirmed_age_days=args.max_confirmed_age_days, repo=args.repo)
 
     print(json.dumps(report, ensure_ascii=False, indent=1) if args.json else human_summary(report))
     return 0 if (report["ok"] or not args.check) else 1

@@ -6365,26 +6365,6 @@
     {
       "path": "lu_machinery/orchestration/issue_stream_audit.py",
       "code": "arg-type",
-      "message": "Argument 1 to \"_gh_json\" has incompatible type \"Request\"; expected \"list[str]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_gh_json\" has incompatible type \"Request\"; expected \"list[str]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_gh_json\" has incompatible type \"Request\"; expected \"list[str]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"_gh_json\" has incompatible type \"Request\"; expected \"list[str]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "arg-type",
       "message": "Argument 1 to \"sorted\" has incompatible type \"None | set[int]\"; expected \"Iterable[int]\""
     },
     {

@@ -10,10 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers.product_tree import configured_roots as configured_roots
-
 from lu_machinery.ci import check_issue_task_quality
 from lu_machinery.orchestration import fleet_repos, issue_stream_audit, task_closeout, task_identity, task_lifecycle
+from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.orchestration import closeout_fixtures as run_evidence
 from tests.orchestration.test_merge_queue_keeper import product_policy as product_policy
 
@@ -2446,3 +2445,112 @@ def test_sync_still_refuses_authoritative_issue_mismatch(tmp_path):
     observation["github"]["issue"]["number"] = 43
     with pytest.raises(task_lifecycle.LifecycleError, match="AC sync blocked"):
         task_closeout._assert_mutation_ready("sync-acs", ledger, observation)
+
+
+@pytest.mark.parametrize(
+    ("active_slug", "inactive_slug"),
+    [
+        ("learn-ukrainian/machinery", "agentic-machinery/machinery"),
+        ("agentic-machinery/machinery", "learn-ukrainian/machinery"),
+    ],
+    ids=["pre-flip", "post-flip"],
+)
+def test_a02_dor_and_closeout_resolve_moved_repo_both_selector_states_and_same_issue_number(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_slug: str,
+    inactive_slug: str,
+) -> None:
+    """Defect class: an issue in a moved repo resolves to the other repo registry;
+    the same number in two repos is treated as one issue."""
+    import yaml
+
+    from lu_machinery.common import git_credentials
+
+    public_slug = "learn-ukrainian/learn-ukrainian.github.io"
+    sel_dir = tmp_path / "selector"
+    sel_dir.mkdir(mode=0o700)
+    sel_file = sel_dir / "selector.yaml"
+    sel_file.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "active_slugs": {
+                    "machinery": active_slug,
+                    "infra-private": "learn-ukrainian/learn-ukrainian-infra-private",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sel_file.chmod(0o400)
+    sel_dir.chmod(0o500)
+
+    registry_path = tmp_path / "issue_streams.yaml"
+    # #10 is a root in BOTH repos; #42 is a root in public ONLY and a child issue in machinery.
+    registry_path.write_text(
+        "schema_version: 1\n"
+        "repos:\n"
+        "  machinery:\n"
+        "    streams:\n"
+        "      epics:\n"
+        "        title: Machinery\n"
+        "        epics: [10]\n"
+        "streams:\n"
+        "  epics:\n"
+        "    title: Public\n"
+        "    epics: [10, 42]\n",
+        encoding="utf-8",
+    )
+    try:
+        monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
+        monkeypatch.setenv(fleet_repos.SELECTOR_ENV, str(sel_file))
+        monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", registry_path)
+        packaged_path = task_closeout.machinery_path
+        monkeypatch.setattr(
+            task_closeout,
+            "machinery_path",
+            lambda relative: registry_path if relative == "config/issue_streams.yaml" else packaged_path(relative),
+        )
+
+        # DoR registry resolution binds strictly to each repo's active registry.
+        assert check_issue_task_quality.registry_for(active_slug) == {"epics": [10]}
+        assert check_issue_task_quality.registry_for(public_slug) == {"epics": [10, 42]}
+        assert check_issue_task_quality.registry_for(inactive_slug) is None
+
+        # #42 in public is root_exempt, while #42 in machinery is NOT root_exempt.
+        assert check_issue_task_quality.observe_membership({}, public_slug, 42)["status"] == "root_exempt"
+
+        monkeypatch.setattr(
+            check_issue_task_quality,
+            "read_parent",
+            lambda repo, number: {"number": 10, "repository": active_slug},
+        )
+        assert check_issue_task_quality.observe_membership({}, active_slug, 42)["status"] == "PASS"
+
+        # Same root number #10 in public or under the inactive slug is refused for machinery #42.
+        for bad_parent_repo in (public_slug, inactive_slug):
+            monkeypatch.setattr(
+                check_issue_task_quality,
+                "read_parent",
+                lambda repo, number, target=bad_parent_repo: {"number": 10, "repository": target},
+            )
+            verdict = check_issue_task_quality.observe_membership({}, active_slug, 42)
+            assert verdict["status"] == "WARN"
+            assert verdict["errors"][0]["code"] == "membership_conflicting_ancestry"
+
+        # Inactive slug target fails closed with membership_registry_absent.
+        inactive_verdict = check_issue_task_quality.observe_membership({}, inactive_slug, 42)
+        assert inactive_verdict["status"] == "WARN"
+        assert inactive_verdict["errors"][0]["code"] == "membership_registry_absent"
+
+        # Non-default repo never overwrites the shared public membership cache.
+        assert check_issue_task_quality.write_membership_cache(_body_audit(), active_slug, {"epics": [10]}) is False
+
+        # GhGitHubAdapter.registered_stream_epics returns machinery's own roots, not public's [10, 42].
+        adapter = task_closeout.GhGitHubAdapter(tmp_path)
+        monkeypatch.setattr(adapter, "_json", lambda command: {"nameWithOwner": active_slug})
+        assert adapter.registered_stream_epics(active_slug) == (active_slug, [10])
+    finally:
+        sel_dir.chmod(0o700)
+        sel_file.chmod(0o600)

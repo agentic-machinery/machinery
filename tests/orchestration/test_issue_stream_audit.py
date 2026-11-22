@@ -9,8 +9,9 @@ import sys
 import textwrap
 import threading
 import time
+
 import pytest
-from tests.helpers.product_tree import configured_roots as configured_roots
+
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import issue_stream_audit
 from lu_machinery.orchestration.issue_stream_audit import (
@@ -25,9 +26,7 @@ from lu_machinery.orchestration.issue_stream_audit import (
     run_audit,
     validate_membership_report,
 )
-
-
-
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 pytestmark = [pytest.mark.usefixtures("github_command_boundary"), pytest.mark.usefixtures("configured_roots")]
 
@@ -1898,3 +1897,197 @@ def test_9794_malformed_warning_code_is_typed_membership_refusal(code):
     )
     assert result["valid"] is False
     assert "incomplete" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    ("active_slug", "inactive_slug"),
+    [
+        ("learn-ukrainian/machinery", "agentic-machinery/machinery"),
+        ("agentic-machinery/machinery", "learn-ukrainian/machinery"),
+    ],
+    ids=["pre-flip", "post-flip"],
+)
+def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    active_slug: str,
+    inactive_slug: str,
+) -> None:
+    """Defect class: an issue in a moved repo resolves to the other repo registry;
+    the same number in two repos is treated as one issue."""
+    import yaml
+
+    from lu_machinery.common import git_credentials
+    from lu_machinery.orchestration import fleet_repos
+
+    public_slug = "learn-ukrainian/learn-ukrainian.github.io"
+    sel_dir = tmp_path / "selector"
+    sel_dir.mkdir(mode=0o700)
+    sel_file = sel_dir / "selector.yaml"
+    sel_file.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "active_slugs": {
+                    "machinery": active_slug,
+                    "infra-private": "learn-ukrainian/learn-ukrainian-infra-private",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sel_file.chmod(0o400)
+    sel_dir.chmod(0o500)
+    try:
+        monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
+        monkeypatch.setenv(fleet_repos.SELECTOR_ENV, str(sel_file))
+        monkeypatch.setattr(issue_stream_audit, "_REPO_CACHE", {})
+
+        # Pre-bootstrap (MUST-FIX 4): declared empty machinery section accepted; default view unchanged.
+        empty_path = tmp_path / "empty_streams.yaml"
+        empty_path.write_text(
+            "schema_version: 1\n"
+            "repos:\n"
+            "  machinery:\n"
+            "    streams:\n"
+            "      epics:\n"
+            "        title: Machinery\n"
+            "        epics: []\n"
+            "streams:\n"
+            "  epics:\n"
+            "    title: Public\n"
+            "    epics: [10]\n",
+            encoding="utf-8",
+        )
+        assert load_registry(empty_path) == {"epics": [10]}
+        assert issue_stream_audit.repo_has_registry("machinery", empty_path) is True
+        assert issue_stream_audit.repo_has_roots("machinery", empty_path) is False
+        assert load_registry(empty_path, repo="machinery") == {}
+        assert load_registry(empty_path, repo="machinery", audit_only=True) == {}
+
+        # Malformed repos: duplicate epic within same repo and default repo duplication fail closed.
+        dup_path = tmp_path / "dup_streams.yaml"
+        dup_path.write_text(
+            "schema_version: 1\n"
+            "repos:\n"
+            "  machinery:\n"
+            "    streams:\n"
+            "      a:\n"
+            "        epics: [10]\n"
+            "      b:\n"
+            "        epics: [10]\n"
+            "streams:\n"
+            "  epics:\n"
+            "    epics: [10]\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="duplicate epic"):
+            load_registry(dup_path, repo="machinery")
+
+        # Same root #10 and child #42 exist in both public and machinery.
+        both_path = tmp_path / "both_streams.yaml"
+        both_path.write_text(
+            "schema_version: 1\n"
+            "repos:\n"
+            "  machinery:\n"
+            "    streams:\n"
+            "      epics:\n"
+            "        title: Machinery\n"
+            "        epics: [10]\n"
+            "streams:\n"
+            "  epics:\n"
+            "    title: Public\n"
+            "    epics: [10, 99]\n",
+            encoding="utf-8",
+        )
+        audit_root = tmp_path / "product"
+        audit_root.mkdir()
+        _configure_audit(audit_root, monkeypatch, repository=public_slug)
+        monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", both_path)
+        assert load_registry(both_path) == {"epics": [10, 99]}
+        assert load_registry(both_path, repo="machinery", audit_only=True) == {"epics": [10]}
+
+        owner, name = active_slug.split("/", 1)
+        calls = []
+
+        def fake_run(args, capture_output, text, timeout, cwd, **_kwargs):
+            calls.append(args)
+            if args[1:3] == ["repo", "view"]:
+                assert args[3] == active_slug
+                return _FakeCompletedProcess(json.dumps({"owner": {"login": owner}, "name": name}))
+            if args[1:3] == ["issue", "list"]:
+                assert "-R" in args and args[args.index("-R") + 1] == active_slug
+                return _FakeCompletedProcess(
+                    json.dumps([{"number": 10, "title": "Root"}, {"number": 42, "title": "Child"}])
+                )
+            if args[1:3] == ["read", "subissue-batch"]:
+                assert args[3]["repo"] == active_slug
+                assert args[3]["cursors"] == {10: None}
+                return _FakeCompletedProcess(
+                    json.dumps(
+                        {
+                            "data": {
+                                "repository": {
+                                    "i10": {
+                                        "body": "",
+                                        "subIssues": {
+                                            "nodes": [
+                                                {
+                                                    "number": 42,
+                                                    "repository": {"nameWithOwner": active_slug},
+                                                    "subIssuesSummary": {"total": 0},
+                                                },
+                                                {
+                                                    "number": 42,
+                                                    "repository": {"nameWithOwner": public_slug},
+                                                    "subIssuesSummary": {"total": 0},
+                                                },
+                                            ],
+                                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    )
+                )
+            raise AssertionError(f"unexpected gh invocation: {args}")
+
+        monkeypatch.setattr(issue_stream_audit.subprocess, "run", fake_run)
+
+        # Inactive slug fails closed before any gh call.
+        with pytest.raises(ValueError, match="not the active fleet slug"):
+            run_audit(repo=inactive_slug)
+        assert calls == []
+
+        # Key and active slug both audit machinery without touching public's shared cache.
+        report = run_audit(repo="machinery")
+        assert report["repository"] == active_slug
+        assert report["streams"] == {"epics": [10]}
+        assert report["ok"] is True
+        assert report["orphans"] == []
+        assert report["effective_membership"]["42"]["epics"] == [10]
+        assert any(
+            w["code"] == "cross_repo_subissue" and w["repository"] == public_slug and w["issue"] == 42
+            for w in report["warnings"]
+        )
+        assert not (audit_root / "batch_state" / "issue_stream_audit.json").exists()
+
+        # CLI --repo --check --json succeeds on active slug; --from-cache on non-default repo refuses.
+        assert issue_stream_audit.main(["--repo", active_slug, "--check", "--json"]) == 0
+        cli_report = json.loads(capsys.readouterr().out)
+        assert cli_report["repository"] == active_slug
+        assert cli_report["ok"] is True
+
+        with pytest.raises(SystemExit) as exc_info:
+            issue_stream_audit.main(["--repo", active_slug, "--from-cache"])
+        assert exc_info.value.code == 2
+
+        # Inactive slug via CLI returns exit 2 without invoking gh.
+        calls.clear()
+        assert issue_stream_audit.main(["--repo", inactive_slug, "--check", "--json"]) == 2
+        assert calls == []
+    finally:
+        sel_dir.chmod(0o700)
+        sel_file.chmod(0o600)

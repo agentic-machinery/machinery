@@ -20,7 +20,7 @@ from pathlib import Path
 
 from lu_machinery.ci._location import module_name
 from lu_machinery.common import github_client, json_depth
-from lu_machinery.common.repo_root import machinery_path, product_root, state_root
+from lu_machinery.common.repo_root import product_root, state_root
 from lu_machinery.orchestration import fleet_repos, postmerge_criteria
 from lu_machinery.orchestration import issue_stream_audit as audit
 from lu_machinery.orchestration import task_lifecycle as lifecycle
@@ -137,29 +137,68 @@ def time_budget(seconds: float = 60):
         signal.signal(signal.SIGALRM, old_handler)
 
 
+def _resolve_active_repository(repository: str) -> fleet_repos.ActiveFleetRepo | None:
+    """Resolve an exact active owner/name slug through the A01 resolver, or None."""
+    if not lifecycle.repository_identity_valid(repository):
+        return None
+    try:
+        catalog = fleet_repos.load_fleet_repos()
+        active = fleet_repos.resolve_active_fleet_repo(repository, repos=catalog)
+    except fleet_repos.FleetRepoError:
+        return None
+    if active.active_github.casefold() != repository.casefold():
+        return None
+    return active
+
+
+def _is_default_repository(repository: str) -> bool:
+    active = _resolve_active_repository(repository)
+    return active is not None and (active.repo.default or active.repo.role == "public-monorepo")
+
+
 def registry_for(repository: str) -> dict[str, list[int]] | None:
-    """Only the public monorepo owns this registry; numbers are repository scoped."""
-    for repo in fleet_repos.load_fleet_repos().values():
-        if repo.github.casefold() == repository.casefold() and repo.role == "public-monorepo":
-            try:
-                return audit.load_registry(machinery_path("config/issue_streams.yaml"), audit_only=True)
-            except FileNotFoundError:
-                return {}
-    return None
+    """Load active audit roots for *repository* through the A01 active-slug resolver."""
+    if not lifecycle.repository_identity_valid(repository):
+        return None
+    try:
+        catalog = fleet_repos.load_fleet_repos()
+        active = fleet_repos.resolve_active_fleet_repo(repository, repos=catalog)
+    except fleet_repos.FleetRepoError:
+        return None
+    if active.active_github.casefold() != repository.casefold():
+        return None
+    try:
+        default_key = fleet_repos.default_repo_key(catalog)
+    except fleet_repos.FleetRepoError:
+        default_key = None
+    path = audit.REGISTRY_PATH
+    if active.repo.role == "public-monorepo" or active.repo.default:
+        try:
+            return audit.load_registry(path, audit_only=True)
+        except FileNotFoundError:
+            return {}
+    try:
+        if not audit.repo_has_roots(active.repo.key, path, default_key=default_key):
+            return None
+        return audit.load_registry(path, audit_only=True, repo=active.repo.key)
+    except FileNotFoundError:
+        return {}
 
 
 def live_audit(
     repository: str, registry: dict, *, root: Path | None = None, progress: MembershipProgress | None = None
 ) -> dict:
     """Compose the existing live auditor in memory. Never write its shared cache."""
-    root = product_root(root)
+    is_default = _is_default_repository(repository)
+    explicit_repo = None if is_default else repository
+    audit_root = product_root(root) if (is_default or root is not None) else Path.cwd()
     progress = progress or MembershipProgress()
     progress.stage = "live_audit_repository"
-    observed_repository = "/".join(audit._repo_owner_name(root))
+    observed_repository = "/".join(audit._repo_owner_name(audit_root, repo_slug=explicit_repo))
     if observed_repository.casefold() != repository.casefold():
         raise ValueError("audit repository does not match target")
     progress.stage = "live_audit_open_issues"
-    issues = audit.fetch_open_issues(root)
+    issues = audit.fetch_open_issues(audit_root, repo_slug=explicit_repo)
     warnings: list[dict] = []
     roots = {n for ns in registry.values() for n in ns}
     root_positions = {n: i for i, n in enumerate(sorted(roots), 1)}
@@ -171,7 +210,13 @@ def live_audit(
         for number, cursor in cursors.items():
             position = branch_positions[number]
             progress.stage = f"live_audit_root_{position}_of_{len(roots)}_issue_{number}"
-            page = audit._fetch_subissue_batch({number: cursor}, root, roots, retry_budget)
+            page = audit._fetch_subissue_batch(
+                {number: cursor},
+                audit_root,
+                roots,
+                retry_budget,
+                repo_slug=explicit_repo,
+            )
             pages.update(page)
             node = page.get(number)
             if isinstance(node, dict):
@@ -279,7 +324,10 @@ def write_membership_cache(report: dict, repository: str, registry: dict, *, roo
     ``report`` is a membership audit from ``live_audit``. The Monitor serves this
     shared file as its hygiene report, so the writer appends the same closed-epic
     and milestone warnings ``run_audit`` adds; a failed lookup writes nothing.
+    Non-default repositories never write into the shared default-repo cache.
     """
+    if not _is_default_repository(repository):
+        return False
     if _audit_refusal(report, repository, registry) or audit.membership_root_results(report, registry) is None:
         return False
     checkout = product_root(root)
@@ -421,16 +469,18 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
         if not local_registry and not crosses_repository:
             return section("membership_not_applicable")
         report = None
+        use_shared_cache = _is_default_repository(repository)
         if audit_orphans and local_registry and parents.get(number) is None:
-            progress.stage = "cached_audit_validation"
-            cached = cached_membership(issue, repository, number, registry, parents, epic_repository=epic_repository)
-            if cached["status"] == "PASS" or cached["errors"][0]["code"] == "membership_unregistered_parentless":
-                return cached
-            cache_rejection = cached["errors"][0]["code"]
+            if use_shared_cache:
+                progress.stage = "cached_audit_validation"
+                cached = cached_membership(issue, repository, number, registry, parents, epic_repository=epic_repository)
+                if cached["status"] == "PASS" or cached["errors"][0]["code"] == "membership_unregistered_parentless":
+                    return cached
+                cache_rejection = cached["errors"][0]["code"]
             progress.stage = "live_audit"
             report = live_audit(repository, registry, progress=progress)
         result = evaluate_membership(issue, repository, number, registry, parents, report, epic_repository=epic_repository)
-        if report is not None and (
+        if use_shared_cache and report is not None and (
             result["status"] == "PASS" or result["errors"][0]["code"] == "membership_unregistered_parentless"
         ):
             progress.stage = "live_audit_cache_write"
@@ -759,13 +809,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.issue is not None:
+            target_repo = args.repo
+            if "/" not in target_repo:
+                target_repo = fleet_repos.resolve_active_fleet_repo(
+                    target_repo, repos=fleet_repos.load_fleet_repos()
+                ).active_github
             with time_budget():
-                issue = fetch_issue(args.repo, args.issue)
+                issue = fetch_issue(target_repo, args.issue)
             if args.trivial:
                 issue = {**issue, "labels": [{"name": "trivial"}]}
             try:
                 with time_budget():
-                    membership = observe_membership(issue, args.repo, args.issue)
+                    membership = observe_membership(issue, target_repo, args.issue)
             except (TimeoutError, subprocess.TimeoutExpired):
                 membership = membership_error("membership_timeout")
             result = evaluate_issue(issue, membership)
