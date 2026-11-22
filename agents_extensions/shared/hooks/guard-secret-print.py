@@ -378,6 +378,8 @@ _NAME_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _PARAMETER_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
 # Operators after which the next word is a redirection target, not a command word.
 _REDIRECT_OPERATORS = frozenset({"<", ">", ">>", "<>", ">|", "&>", "&>>", "<<", "<<-", "<<<", ">&", "<&"})
+# Of those, the ones whose word Bash never brace-expands (here-strings and here-document delimiters).
+_LITERAL_OPERAND_OPERATORS = frozenset({"<<", "<<-", "<<<"})
 # Reserved words after which the next word is still in command position.
 _COMMAND_OPENERS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"})
 
@@ -633,12 +635,17 @@ def _brace_words(parts: list[tuple[str, str]]) -> list[_Word]:
         # Bash drops an unquoted word that expands to nothing.
         if not word or all(kind == "src" and not text for kind, text in word):
             continue
+        # Join each run of literal units once; expansions stay separate parts.
         merged: list[tuple[str, str]] = []
+        run_kind, run = "", []
         for kind, text in word:
-            if merged and kind != "exp" and merged[-1][0] == kind:
-                merged[-1] = (kind, merged[-1][1] + text)
-            else:
-                merged.append((kind, text))
+            if kind != run_kind or kind == "exp":
+                if run:
+                    merged.append((run_kind, "".join(run)))
+                run_kind, run = kind, []
+            run.append(text)
+        if run:
+            merged.append((run_kind, "".join(run)))
         # Parameters expand after braces, so a `$` that braces put before a
         # name (`{$,}NAME`) is an expansion.
         expanded = [
@@ -669,7 +676,8 @@ def _lex(command: str) -> list[str]:
     unquoted: list[str] = []
     started = False
     command_start = True
-    redirect_target = False
+    # The operator whose operand the next word is, or "" for an ordinary word.
+    redirect_target = ""
 
     def settle() -> None:
         if unquoted:
@@ -693,10 +701,17 @@ def _lex(command: str) -> list[str]:
             assignment = (
                 command_start and not target and parts[0][0] == "src" and bool(_NAME_ASSIGNMENT.match(parts[0][1]))
             )
-            braces = not target and not assignment and any(kind == "src" and "{" in text for kind, text in parts)
+            braces = (
+                target not in _LITERAL_OPERAND_OPERATORS
+                and not assignment
+                and any(kind == "src" and "{" in text for kind, text in parts)
+            )
             words = _brace_words(parts) if braces else [_canonical_word(parts)]
+            if target and len(words) != 1:
+                # Bash refuses a redirection whose operand expands to other than one word.
+                raise ValueError("ambiguous redirect")
             tokens.extend(words)
-            redirect_target = False
+            redirect_target = ""
             if not target and not assignment and not (words and words[0] in _COMMAND_OPENERS):
                 command_start = False
         parts.clear()
@@ -728,7 +743,7 @@ def _lex(command: str) -> list[str]:
             else:
                 flush()
                 tokens.append(operator)
-            redirect_target = operator in _REDIRECT_OPERATORS
+            redirect_target = operator if operator in _REDIRECT_OPERATORS else ""
             if not redirect_target:
                 command_start = True
         elif char == "\\":
@@ -1470,6 +1485,8 @@ def _is_interpreter_command(cmd: str) -> bool:
 
 # Between two literals the runtime joins into one string: blanks, `+` or `.` concatenation.
 _LITERAL_JOIN = re.compile(r"[\s+.]*")
+# Characters of folded Python strings one program may build before the reader refuses it.
+_PYTHON_STRING_BUDGET = 2_000_000
 _SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v", "0": "\0", "e": "\x1b"}
 _ESCAPE = re.compile(
     r"\\(?:N\{(?:U\+(?P<nhex>[0-9A-Fa-f]{1,6})|(?P<name>[^}]+))\}"
@@ -1584,8 +1601,10 @@ def _python_strings(program: str) -> list[str]:
     """Every string Python's own parser builds from the program's literals, without running it.
 
     Constants come decoded, implicitly joined literals as one string, `+` joins of
-    literals folded, and f-strings with their fields read as empty. A program
-    Python cannot parse never runs, so it yields nothing here.
+    literals folded, and f-strings with their fields read as empty. Each node is
+    folded once and only the outermost folded strings are returned; past the
+    work budget this raises ValueError. A program Python cannot parse never
+    runs, so it yields nothing here.
     """
     import ast
 
@@ -1593,23 +1612,39 @@ def _python_strings(program: str) -> list[str]:
         tree = ast.parse(program)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return []
-
-    def fold(node: ast.AST) -> str | None:
+    budget = _PYTHON_STRING_BUDGET
+    folded: dict[int, str] = {}
+    inner: set[int] = set()
+    order: list[ast.AST] = []
+    stack: list[ast.AST] = [tree]
+    while stack:
+        node = stack.pop()
+        order.append(node)
+        stack.extend(ast.iter_child_nodes(node))
+    # Children come after their parents in `order`, so reversing it folds them first.
+    for node in reversed(order):
+        value: str | None = None
+        children: list[ast.AST] = []
         if isinstance(node, ast.Constant) and isinstance(node.value, str | bytes):
-            return node.value.decode("latin-1") if isinstance(node.value, bytes) else node.value
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            left, right = fold(node.left), fold(node.right)
-            return None if left is None or right is None else left + right
-        if isinstance(node, ast.JoinedStr):
-            return "".join(fold(value) or "" for value in node.values)
-        if isinstance(node, ast.FormattedValue):
-            return fold(node.value)
-        return None
-
-    try:
-        return [text for node in ast.walk(tree) if (text := fold(node)) is not None]
-    except RecursionError:
-        return []
+            value = node.value.decode("latin-1") if isinstance(node.value, bytes) else node.value
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            children = [node.left, node.right]
+            if id(node.left) in folded and id(node.right) in folded:
+                value = folded[id(node.left)] + folded[id(node.right)]
+        elif isinstance(node, ast.JoinedStr):
+            children = list(node.values)
+            value = "".join(folded.get(id(child), "") for child in children)
+        elif isinstance(node, ast.FormattedValue):
+            children = [node.value]
+            value = folded.get(id(node.value))
+        if value is None:
+            continue
+        budget -= len(value)
+        if budget < 0:
+            raise ValueError("Python string literals exceed the reader's budget")
+        folded[id(node)] = value
+        inner.update(id(child) for child in children)
+    return [folded[id(node)] for node in order if id(node) in folded and id(node) not in inner]
 
 
 def _shell_pipelines(text: str) -> list[list[list[str]]]:
@@ -1657,7 +1692,11 @@ def _program_reason(cmd: str, program: str, words: tuple[str, ...] = ()) -> str 
     # A backtick literal runs its text in Ruby, Perl and PHP even without a call.
     backticks = cmd in {"ruby", "perl", "php"} and "`" in program
     if child_call or backticks:
-        for value in _program_texts(program, runtime, words):
+        try:
+            texts = _program_texts(program, runtime, words)
+        except ValueError:
+            return "inline program strings exceed the reader's budget"
+        for value in texts:
             if any(_env_source_reason(segment) for pipeline in _shell_pipelines(value) for segment in pipeline):
                 return "inline program contains a literal environment dumper"
     for language, pattern in _CHILD_COMMAND_LITERALS:
@@ -2342,6 +2381,56 @@ def _xargs_target(args: list[str]) -> list[str]:
     return []
 
 
+def _shell_reads_stdin(args: list[str]) -> bool:
+    """Whether a shell invocation takes its program from standard input.
+
+    True without `-c` and without a script operand, or with `-s`, and whenever
+    an expanding word in its options hides which.
+    """
+    pending = 0
+    for word in _raw_without_redirects(args):
+        value = _strip_quotes(word)
+        if getattr(word, "dynamic", False) or _SUBSTITUTION_MARKER in word:
+            return True
+        if pending:
+            pending -= 1
+            continue
+        if value in {"-", "--"}:
+            # Both end the options; a lone `-` also names standard input.
+            continue
+        if value.startswith("--"):
+            pending = int(value[2:] in _SHELL_VALUE_OPTIONS)
+            continue
+        if value[:1] in "-+" and len(value) > 1:
+            letters = value[1:]
+            if "s" in letters:
+                return True
+            if "c" in letters:
+                return False
+            pending = sum(letter in "oO" for letter in letters)
+            continue
+        return False
+    return True
+
+
+def _script_reads_stdin(script: str) -> bool:
+    """Whether a shell script may run its standard input as a program (a shell, `source` or `/dev/stdin`)."""
+    if script == _UNDECIDABLE:
+        return True
+    stdin_paths = {"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
+    for pipeline in _pipelines(script):
+        for segment in pipeline:
+            found = _command_at(segment)
+            if found is None:
+                continue
+            # A computed command word may name a shell.
+            if found[0] in SHELL_COMMANDS or found[0] == _UNDECIDABLE or "$" in found[0]:
+                return True
+            if any(_strip_quotes(word) in stdin_paths for word in segment):
+                return True
+    return False
+
+
 def _segment_process_facts(segment: list[str], depth: int, documents: dict[str, list[tuple[str, bool]]]) -> set[str]:
     # Here-documents belong to their statement in order, whatever command reads them.
     bodies = [
@@ -2370,13 +2459,23 @@ def _segment_process_facts(segment: list[str], depth: int, documents: dict[str, 
         scripts = _shell_script(args) if cmd in _PROCESS_SHELLS else []
         if cmd == "eval":
             scripts.append(" ".join(_strip_quotes(arg) for arg in _raw_without_redirects(args)))
-        # A shell also runs its standard input: here-strings and here-documents.
+        # Standard input is the program when no -c script or script file is given,
+        # or when the given script may itself run a shell or read /dev/stdin.
+        stdin_program = cmd in _PROCESS_SHELLS and (
+            _shell_reads_stdin(args) or any(_script_reads_stdin(script) for script in scripts)
+        )
+        inputs: list[str] = list(bodies)
         for index, token in enumerate(args[:-1]):
             if token == "<<<":
                 operand = args[index + 1]
                 computed = getattr(operand, "dynamic", False) or _SUBSTITUTION_MARKER in operand
-                scripts.append(_UNDECIDABLE if computed else _strip_quotes(operand))
-        for script in [*scripts, *bodies]:
+                inputs.append(_UNDECIDABLE if computed else _strip_quotes(operand))
+        if cmd in {"source", "."} or stdin_program:
+            scripts += inputs
+        else:
+            # Data for a script given another way; a readable copy still counts.
+            scripts += [text for text in inputs if text != _UNDECIDABLE]
+        for script in scripts:
             facts |= {"limit"} if script == _UNDECIDABLE else _process_facts(script, depth=depth + 1)
         return facts
     return set()
