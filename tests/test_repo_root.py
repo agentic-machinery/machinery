@@ -7,6 +7,7 @@ import importlib.util
 import itertools
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from lu_machinery.common import profile
 from lu_machinery.common import repo_root as rr
 from lu_machinery.common.repo_root import main_checkout_root, project_interpreter
 from lu_machinery.orchestration import worktree_claims
@@ -392,6 +394,8 @@ def test_resolution_creates_nothing(unconfigured, tmp_path, monkeypatch):
     (in_tree_product / rr.PRODUCT_MARKER).parent.mkdir(parents=True)
     (in_tree_product / rr.PRODUCT_MARKER).write_text("", encoding="utf-8")
     in_tree = _load_copy(monkeypatch, in_tree_product / "scripts")
+    # The plane owner's consumer profile is read too, and reading it creates nothing either.
+    _write_profile(primary, _PROFILE)
     monkeypatch.chdir(decoy)
     watched = (tmp_path, REPO / rr.INSTALLED_PACKAGE_NAME / "common")
     before = [_tree(root) for root in watched]
@@ -410,6 +414,13 @@ def test_resolution_creates_nothing(unconfigured, tmp_path, monkeypatch):
             ):
                 with contextlib.suppress(ValueError, FileNotFoundError):
                     resolve(*args)
+        for resolve, args in (
+            (profile.load_profile, ()),
+            (profile.config_path, ("fleet_repos",)),
+            (rr.github_slug, ()),
+        ):
+            with contextlib.suppress(ValueError):
+                resolve(*args)
 
     every_resolution()
     monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
@@ -528,3 +539,279 @@ def test_the_native_hook_contract_bytes_match_the_product_contract():
     }
     # Product PR 13005 retains this audit extension until machinery owns it.
     assert "claude-audit-hook" in hooks.NATIVE_HOOK_MODES
+
+
+# --------------------------------------------------------------------------- A08.1 consumer profile and LU_* names
+#
+# One profile, bound to the control-plane owner (the validated state root), is the one
+# authority for a consumer's GitHub slug and config files. The LU_* names are the primary
+# configuration names and the LEARN_UKRAINIAN_* names stay readable aliases.
+
+_PROFILE = {
+    "schema": profile.PROFILE_SCHEMA,
+    "version": profile.PROFILE_VERSION,
+    "profile_id": "demo-consumer",
+    "github_slug": "demo-org/demo-consumer",
+    "config": {"fleet_repos": ".lu-machinery/fleet_repos.yaml"},
+}
+
+
+def _write_profile(owner: Path, document: dict | bytes) -> Path:
+    """Commit-shaped profile files below ``owner``: the profile and the config file it names."""
+    directory = owner / profile.PROFILE_DIR
+    directory.mkdir(exist_ok=True)
+    (directory / "fleet_repos.yaml").write_text("version: 1\n", encoding="utf-8")
+    blob = document if isinstance(document, bytes) else json.dumps(document).encode()
+    (directory / profile.PROFILE_NAME).write_bytes(blob)
+    return directory / profile.PROFILE_NAME
+
+
+def _executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_lu_and_legacy_root_names_resolve_alike_and_a_conflict_refuses(unconfigured, tmp_path, monkeypatch):
+    """Defect class: alias split, where LU_* and LEARN_UKRAINIAN_* silently select different roots.
+
+    New-only, legacy-only and agreeing settings resolve alike; differing ones refuse naming both;
+    messages name the variable read; state/primary equality and the primary .venv fallback hold.
+    """
+    primary = _primary_checkout(tmp_path / "primary")
+    other = _primary_checkout(tmp_path / "other")
+    venv_python = _executable(primary / ".venv" / "bin" / "python")
+    python, other_python = _executable(tmp_path / "bin" / "python"), _executable(tmp_path / "bin" / "python2")
+    anchored = {rr.LU_PRIMARY_ROOT_ENV: str(primary)}
+    cases = {
+        rr.LU_PRIMARY_ROOT_ENV: ({}, primary, other, lambda env: rr.primary_root(env=env)),
+        rr.LU_STATE_ROOT_ENV: (anchored, primary, other, lambda env: rr.state_root(env=env)),
+        rr.LU_INTERPRETER_ENV: (anchored, python, other_python, lambda env: project_interpreter(env=env)),
+        rr.LU_GITHUB_SLUG_ENV: (anchored, "demo-org/a", "demo-org/b", lambda env: rr.github_slug(env)),
+    }
+    before = _tree(tmp_path)
+    for new, (base, value, different, resolve) in cases.items():
+        legacy = rr.ENV_ALIASES[new]
+        expected = resolve({**base, legacy: str(value)})
+        assert expected == value
+        assert resolve({**base, new: str(value)}) == expected
+        assert resolve({**base, new: str(value), legacy: str(value)}) == expected
+        assert resolve({**base, new: "", legacy: str(value)}) == expected
+        for pair in ({new: str(value), legacy: str(different)}, {new: str(different), legacy: str(value)}):
+            with pytest.raises(rr.MachineryConfigError, match=f"{new} and its compatibility alias {legacy}"):
+                resolve({**base, **pair})
+        for name in (new, legacy):
+            with pytest.raises(rr.MachineryConfigError, match=f"^{name} must be"):
+                resolve({**base, name: "relative"})
+    for name in (rr.LU_STATE_ROOT_ENV, rr.STATE_ROOT_ENV):
+        with pytest.raises(rr.MachineryConfigError, match=f"^{name} .* must be the primary checkout"):
+            rr.state_root(env={**anchored, name: str(other)})
+    for name in (rr.LU_PRIMARY_ROOT_ENV, rr.PRIMARY_ROOT_ENV):
+        assert project_interpreter(env={name: str(primary)}) == venv_python
+    with pytest.raises(rr.StateRootError, match=rr.LU_PRIMARY_ROOT_ENV):
+        rr.state_root(env={})
+    # The native hook boundary refuses a conflict before it runs the shell rule.
+    monkeypatch.setenv(rr.LU_PRIMARY_ROOT_ENV, str(primary))
+    monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(other))
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: pytest.fail("the hook rule ran"))
+    with pytest.raises(rr.ProductRootError, match="compatibility alias"):
+        rr.native_hook_roots(tmp_path)
+    assert _tree(tmp_path) == before
+
+
+def test_an_absent_profile_keeps_the_compatibility_slug_and_refuses_consumer_config(unconfigured, tmp_path):
+    """Defect class: silent fallback to packaged consumer data, or a behaviour change without a profile.
+
+    A plane owner with no profile (learn-ukrainian today, configured with the legacy names) keeps
+    today's slug; every consumer config name refuses, naming the name and the profile path.
+    """
+    owner = _primary_checkout(tmp_path / "owner")
+    (owner / profile.PROFILE_DIR).mkdir()  # a profile directory without the profile is no profile
+    where = re.escape(str(owner / profile.PROFILE_REL))
+    before = _tree(tmp_path)
+    for env in ({rr.PRIMARY_ROOT_ENV: str(owner)}, {rr.LU_PRIMARY_ROOT_ENV: str(owner)}, {}):
+        assert profile.load_profile(env=env) is None
+        assert rr.configured_github_slug(env) is None
+        assert rr.github_slug(env) == rr.DEFAULT_GITHUB_SLUG
+        assert rr.github_slug({**env, rr.LU_GITHUB_SLUG_ENV: "demo-org/x"}) == "demo-org/x"
+        for name in sorted(profile.CONSUMER_CONFIG_NAMES):
+            expected = f"consumer config '{name}' needs a consumer profile, and " + (
+                f"the plane owner has none at {where}" if env else "no plane owner is configured"
+            )
+            with pytest.raises(profile.ProfileError, match=expected):
+                profile.config_path(name, env=env)
+        with pytest.raises(profile.ProfileError, match="'model_catalog' is not a consumer config name"):
+            profile.config_path("model_catalog", env=env)
+    assert _tree(tmp_path) == before
+
+
+def test_a_profile_binds_slug_and_config_paths_to_the_plane_owner(unconfigured, tmp_path, monkeypatch):
+    """Defect class: a profile read from or resolved against a non-owner root, or a conflicting slug accepted.
+
+    Profiles in the selected product and the working directory are never read; config paths
+    resolve below the plane owner; an environment slug may only agree with the profile.
+    """
+    owner = _primary_checkout(tmp_path / "owner")
+    nested = owner / "deploy" / "streams.yaml"
+    nested.parent.mkdir()
+    nested.write_text("streams: []\n", encoding="utf-8")
+    path = _write_profile(owner, {**_PROFILE, "config": {**_PROFILE["config"], "issue_streams": "deploy/streams.yaml"}})
+    for decoy, slug in ((tmp_path / "product", "decoy-org/product"), (tmp_path / "cwd", "decoy-org/cwd")):
+        decoy.mkdir()
+        _write_profile(decoy, {**_PROFILE, "github_slug": slug, "config": {"code_owners": ".lu-machinery/fleet_repos.yaml"}})
+    monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, str(tmp_path / "product"))
+    monkeypatch.chdir(tmp_path / "cwd")
+    before = _tree(tmp_path)
+    for env in (
+        {rr.LU_PRIMARY_ROOT_ENV: str(owner)},
+        {rr.PRIMARY_ROOT_ENV: str(owner)},
+        {rr.PRIMARY_ROOT_ENV: str(owner), rr.LU_STATE_ROOT_ENV: str(owner)},
+    ):
+        loaded = profile.load_profile(env=env)
+        assert loaded is not None
+        assert (loaded.path, loaded.owner_root, loaded.profile_id, loaded.github_slug, dict(loaded.config)) == (
+            path,
+            owner,
+            "demo-consumer",
+            "demo-org/demo-consumer",
+            {"fleet_repos": ".lu-machinery/fleet_repos.yaml", "issue_streams": "deploy/streams.yaml"},
+        )
+        assert rr.github_slug(env) == rr.configured_github_slug(env) == "demo-org/demo-consumer"
+        assert profile.config_path("fleet_repos", env=env) == owner / ".lu-machinery" / "fleet_repos.yaml"
+        assert profile.config_path("issue_streams", env=env) == nested
+        with pytest.raises(profile.ProfileError, match="names no 'code_owners' config"):
+            profile.config_path("code_owners", env=env)
+        for name in (rr.LU_GITHUB_SLUG_ENV, rr.GITHUB_SLUG_ENV):
+            assert rr.github_slug({**env, name: "demo-org/demo-consumer"}) == "demo-org/demo-consumer"
+            for call in (
+                rr.github_slug,
+                rr.configured_github_slug,
+                lambda e: profile.load_profile(env=e),
+                lambda e: profile.config_path("fleet_repos", env=e),
+            ):
+                with pytest.raises(profile.ProfileError, match="the profile is the one authority"):
+                    call({**env, name: "demo-org/other"})
+    assert _tree(tmp_path) == before
+
+
+def _profile_text(**changes: object) -> bytes:
+    return json.dumps({**_PROFILE, **changes}).encode()
+
+
+def _symlinked_profile(owner: Path) -> None:
+    target = owner.parent / "elsewhere.json"
+    target.write_bytes(json.dumps(_PROFILE).encode())
+    (owner / profile.PROFILE_REL).unlink()
+    (owner / profile.PROFILE_REL).symlink_to(target)
+
+
+def _symlinked_directory(owner: Path) -> None:
+    shutil.move(owner / profile.PROFILE_DIR, owner.parent / "elsewhere")
+    (owner / profile.PROFILE_DIR).symlink_to(owner.parent / "elsewhere", target_is_directory=True)
+
+
+def _replace(owner: Path, kind: str, relative: str = profile.PROFILE_REL) -> None:
+    entry = owner / relative
+    entry.unlink()
+    if kind == "fifo":
+        os.mkfifo(entry)
+    elif kind == "directory":
+        entry.mkdir()
+    else:
+        entry.symlink_to(owner / "deploy-target.yaml")
+        (owner / "deploy-target.yaml").write_text("version: 1\n", encoding="utf-8")
+
+
+def _profile_dir_is_a_file(owner: Path) -> None:
+    shutil.rmtree(owner / profile.PROFILE_DIR)
+    (owner / profile.PROFILE_DIR).write_text("{}", encoding="utf-8")
+
+
+def _symlinked_config_directory(owner: Path) -> None:
+    (owner / "real").mkdir()
+    (owner / "real" / "fleet_repos.yaml").write_text("version: 1\n", encoding="utf-8")
+    (owner / "linked").symlink_to(owner / "real", target_is_directory=True)
+    (owner / profile.PROFILE_REL).write_bytes(_profile_text(config={"fleet_repos": "linked/fleet_repos.yaml"}))
+
+
+_VALID = json.dumps(_PROFILE)
+_INVALID_PROFILES = {
+    "duplicate-member": _VALID.replace('"version": 1', '"version": 1, "version": 1').encode(),
+    "nested-duplicate-member": _VALID.replace('"config": {', '"config": {"fleet_repos": "x.yaml", ').encode(),
+    "unknown-field": _profile_text(hooks={}),
+    "missing-field": json.dumps({k: v for k, v in _PROFILE.items() if k != "github_slug"}).encode(),
+    "oversize": _VALID.encode() + b" " * profile.MAX_PROFILE_BYTES,
+    "nan": _VALID.replace('"version": 1', '"version": NaN').encode(),
+    "infinity": _VALID.replace('"version": 1', '"version": -Infinity').encode(),
+    "bool-version": _profile_text(version=True),
+    "float-version": _profile_text(version=1.0),
+    "wrong-schema": _profile_text(schema="lu-machinery.profile.v2"),
+    "non-utf8": _VALID.encode().replace(b"demo-consumer", b"demo-\xff"),
+    "utf8-bom": b"\xef\xbb\xbf" + _VALID.encode(),
+    "not-an-object": b"[]",
+    "empty-file": b"",
+    "trailing-data": _VALID.encode() + b"{}",
+    "too-deep": _profile_text(config={"fleet_repos": {"path": "x.yaml"}}),
+    "bad-slug-traversal": _profile_text(github_slug="demo-org/.."),
+    "bad-slug-shape": _profile_text(github_slug="-demo/x"),
+    "bad-profile-id": _profile_text(profile_id="Demo"),
+    "config-not-object": _profile_text(config=[]),
+    "unknown-config-name": _profile_text(config={"model_catalog": "x.yaml"}),
+    "absolute-config": _profile_text(config={"fleet_repos": "/etc/fleet_repos.yaml"}),
+    "traversal-config": _profile_text(config={"fleet_repos": "../fleet_repos.yaml"}),
+    "dot-config": _profile_text(config={"fleet_repos": "./fleet_repos.yaml"}),
+    "empty-component-config": _profile_text(config={"fleet_repos": ".lu-machinery//fleet_repos.yaml"}),
+    "trailing-slash-config": _profile_text(config={"fleet_repos": ".lu-machinery/"}),
+    "backslash-config": _profile_text(config={"fleet_repos": ".lu-machinery\\fleet_repos.yaml"}),
+    "control-config": _profile_text(config={"fleet_repos": "fleet\nrepos.yaml"}),
+    "bidi-config": _profile_text(config={"fleet_repos": "fleet‮repos.yaml"}),
+    "line-separator-config": _profile_text(config={"fleet_repos": "fleet repos.yaml"}),
+    "surrogate-config": _VALID.replace(".lu-machinery/fleet_repos.yaml", "fleet\\ud800.yaml").encode(),
+    "symlinked-profile": _symlinked_profile,
+    "symlinked-profile-directory": _symlinked_directory,
+    "fifo-profile": lambda owner: _replace(owner, "fifo"),
+    "directory-profile": lambda owner: _replace(owner, "directory"),
+    "profile-directory-is-a-file": _profile_dir_is_a_file,
+}
+_INVALID_CONFIG_TARGETS = {
+    "missing-target": lambda owner: (owner / ".lu-machinery" / "fleet_repos.yaml").unlink(),
+    "symlinked-target": lambda owner: _replace(owner, "symlink", ".lu-machinery/fleet_repos.yaml"),
+    "fifo-target": lambda owner: _replace(owner, "fifo", ".lu-machinery/fleet_repos.yaml"),
+    "directory-target": lambda owner: _replace(owner, "directory", ".lu-machinery/fleet_repos.yaml"),
+    "symlinked-target-directory": _symlinked_config_directory,
+}
+
+
+@pytest.mark.parametrize(
+    "case", [*(("profile", name) for name in _INVALID_PROFILES), *(("target", name) for name in _INVALID_CONFIG_TARGETS)],
+    ids=lambda case: f"{case[0]}-{case[1]}",
+)
+def test_an_invalid_profile_refuses_and_never_falls_back(unconfigured, tmp_path, case):
+    """Defect class: fail-open profile parsing, where a malformed, oversized, symlinked or special file,
+    or a config entry that escapes or does not reach a regular file, is accepted or treated as no profile.
+    """
+    kind, name = case
+    owner = _primary_checkout(tmp_path / "owner")
+    _write_profile(owner, _PROFILE)
+    change = (_INVALID_PROFILES if kind == "profile" else _INVALID_CONFIG_TARGETS)[name]
+    if isinstance(change, bytes):
+        (owner / profile.PROFILE_REL).write_bytes(change)
+    else:
+        change(owner)
+    before = _tree(tmp_path)
+    for env in ({rr.PRIMARY_ROOT_ENV: str(owner)}, {rr.LU_PRIMARY_ROOT_ENV: str(owner)}):
+        # An agreeing slug variable never stands in for an unusable profile.
+        agreeing = {**env, rr.LU_GITHUB_SLUG_ENV: _PROFILE["github_slug"]}
+        if kind == "profile":
+            for call in (profile.load_profile, rr.github_slug, rr.configured_github_slug):
+                for selected in (env, agreeing):
+                    with pytest.raises(profile.ProfileError, match="consumer profile"):
+                        call(env=selected) if call is profile.load_profile else call(selected)
+        else:
+            assert profile.load_profile(env=env) is not None
+            assert rr.github_slug(agreeing) == _PROFILE["github_slug"]
+        for selected in (env, agreeing):
+            with pytest.raises(profile.ProfileError):
+                profile.config_path("fleet_repos", env=selected)
+    assert _tree(tmp_path) == before
