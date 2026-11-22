@@ -3384,6 +3384,11 @@ REST_COMPAT_READS = {
     "subissue-batch": {"cursors", "body_roots"},
 }
 GQL_READS = {
+    "fork-public-head": (
+        "query($owner:String!,$name:String!){viewer{login}"
+        "repository(owner:$owner,name:$name,followRenames:false){nameWithOwner isFork"
+        " parent{nameWithOwner visibility defaultBranchRef{target{... on Commit{oid}}}}}}"
+    ),
     "queue-removal": "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid removals:timelineItems(first:100,after:$cursor,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){totalCount pageInfo{hasNextPage endCursor} nodes{... on RemovedFromMergeQueueEvent{beforeCommit{oid} createdAt reason}}} pushes:timelineItems(last:1,itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT]){nodes{... on HeadRefForcePushedEvent{afterCommit{oid} createdAt}}}}}}",
     "queue-status": "\nquery($owner: String!, $name: String!, $number: Int!, $branch: String!) {\n  repository(owner: $owner, name: $name) {\n    pullRequest(number: $number) {\n      number\n      title\n      state\n      merged\n      mergeable\n      mergeStateStatus\n      isInMergeQueue\n      isMergeQueueEnabled\n      headRefName\n      headRefOid\n      baseRefName\n      mergeQueueEntry {\n        id\n        position\n        state\n        enqueuedAt\n        estimatedTimeToMerge\n        jump\n        solo\n        headCommit {\n          oid\n          checkSuites(first: 20) {\n            nodes {\n              status\n              conclusion\n              createdAt\n              updatedAt\n              workflowRun {\n                id\n                url\n                event\n                createdAt\n                updatedAt\n                workflow {\n                  name\n                }\n              }\n            }\n          }\n        }\n      }\n    }\n    mergeQueue(branch: $branch) {\n      url\n      nextEntryEstimatedTimeToMerge\n      entries(first: 50) {\n        totalCount\n        nodes {\n          position\n          state\n          enqueuedAt\n          estimatedTimeToMerge\n          pullRequest {\n            number\n          }\n        }\n      }\n    }\n  }\n}\n",
     "membership-head": "query($owner:String!,$name:String!,$number:Int!,$branch:String!){repository(owner:$owner,name:$name){pullRequest(number:$number){headRefOid isInMergeQueue} mergeQueue(branch:$branch){url}}}",
@@ -3616,6 +3621,12 @@ def read(
                 if operation in {"queue-status", "membership-head"}
                 else {"number"}
             )
+            if operation == "fork-public-head":
+                expected = set()
+                if not dest.startswith("github.com/") or any(part in {".", ".."} for part in variables.values()):
+                    raise gate.PublishBlocked("OPSEC: fork history read requires a GitHub.com repository.")
+                if paginate or slurp:
+                    raise gate.PublishBlocked("OPSEC: fork history read does not support pagination.")
             if operation == "queue-removal" and "cursor" in fields:
                 expected.add("cursor")
             if (
@@ -3660,6 +3671,7 @@ def read(
                 timeout=timeout,
                 stdout=stdout,
                 stderr=stderr,
+                **({"fresh": True} if operation == "fork-public-head" and runner is None else {}),
             )
     argv += _hostname_flag(dest)
     if operation == "dependabot-alerts":

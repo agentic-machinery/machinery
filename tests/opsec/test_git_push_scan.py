@@ -19,9 +19,14 @@ import time
 import tracemalloc
 import zlib
 from pathlib import Path
+
 import pytest
+
+from lu_machinery.common.repo_root import machinery_root
 from lu_machinery.opsec import git_push
 from lu_machinery.opsec import prepublish as gate
+from lu_machinery.publish import github
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.opsec_fixtures import (
     CATALOG,
     MATCHER,
@@ -30,9 +35,6 @@ from tests.opsec_fixtures import (
     make_tooling,
     synthetic_rules,
 )
-from lu_machinery.common.repo_root import machinery_root
-from tests.helpers.product_tree import configured_roots  # noqa: F401
-
 
 REAL_GIT = shutil.which("git", path=os.defpath)
 pytestmark = pytest.mark.skipif(REAL_GIT is None, reason="git unavailable")
@@ -1119,12 +1121,11 @@ def test_real_client_excludes_on_a_bound_reply_from_the_catalogue_repository(pus
 def test_the_default_client_names_the_catalogue_public_repository(monkeypatch):
     """Never GH_REPO or local git configuration."""
     monkeypatch.setattr(gate, "catalog", lambda: CATALOG)
-    client = git_push.CanonicalPublicRepository.from_catalog(
-        {"GH_REPO": "unit/forged", "LU_OPSEC_OVERRIDE": "x"}, "github.com/unit/public"
+    client = git_push.CanonicalPublicRepository(
+        "github.com/unit/public", {"GH_REPO": "unit/forged", "LU_OPSEC_OVERRIDE": "x"}
     )
+    assert client.from_catalog() is client
     assert client.repo == "github.com/unit/public" and "LU_OPSEC_OVERRIDE" not in client.environment
-    monkeypatch.setattr(gate, "catalog", lambda: {"private": CATALOG["infra-private"]})
-    assert git_push.CanonicalPublicRepository.from_catalog({}, "github.com/unit/public") is None
 
 
 FLEET = {**CATALOG, "content": {"github": "Unit/Content", "local_name": "content", "role": "public-content"}}
@@ -1141,6 +1142,50 @@ def _asked(monkeypatch, head):
 
     monkeypatch.setattr(git_push.CanonicalPublicRepository, "default_head", default_head)
     return asked
+
+
+def _fork_reply(monkeypatch, head, *, parent="Unit/Public", visibility="PUBLIC", is_fork=True, status=0):
+    calls = []
+
+    def read_fork(argv, **kwargs):
+        assert argv[:6] == ["gh", "api", "--method", "POST", "graphql", "--input"]
+        assert kwargs["env"]["GH_HOST"] == "github.com" and kwargs["timeout"] == git_push.API_TIMEOUT
+        query = json.loads(Path(argv[6]).read_text())
+        calls.append(query["variables"])
+        parent_data = {
+            "nameWithOwner": parent,
+            "visibility": visibility,
+            "defaultBranchRef": {"target": {"oid": head}},
+        }
+        body = {
+            "data": {
+                "viewer": {"login": "Unit"},
+                "repository": {
+                    "nameWithOwner": "Unit/Fork-Copy",
+                    "isFork": is_fork,
+                    "parent": parent_data if is_fork else None,
+                },
+            }
+        }
+        return subprocess.CompletedProcess(argv, status, json.dumps(body), "")
+
+    monkeypatch.setattr(github, "_run_transport", read_fork)
+    return calls
+
+
+def test_fork_of_registered_public_parent_excludes_parent_history(push_sandbox, monkeypatch, capfd):
+    old = push_sandbox.commit("published subject " + TOKEN)
+    public_head = push_sandbox.commit("published clean")
+    new = push_sandbox.commit("new subject " + TOKEN)
+    calls = _fork_reply(monkeypatch, public_head)
+    status, chained = run_hook(
+        push_sandbox, monkeypatch, None, url="https://github.com/unit/fork-copy.git", GH_REPO="unit/forged"
+    )
+    err = capfd.readouterr().err
+    assert status == 1 and not chained, err
+    assert calls == [{"owner": "unit", "name": "fork-copy"}]
+    assert "1 commit(s) scanned; public default-branch head present (1 public repository call(s))" in err
+    assert old[:12] not in err and f"field=commit[{new[:12]}].message" in err
 
 
 @pytest.mark.parametrize(
@@ -1164,26 +1209,39 @@ def test_the_public_head_is_the_registered_repository_the_push_goes_to(push_sand
 
 
 @pytest.mark.parametrize(
-    ("url", "catalog"),
+    ("url", "catalog", "reply"),
     [
-        pytest.param("https://github.com/unit/unregistered.git", FLEET, id="unregistered"),
-        pytest.param(None, FLEET, id="local-path"),
+        pytest.param("https://github.com/unit/fork-copy.git", FLEET, {"is_fork": False}, id="unregistered-non-fork"),
+        pytest.param(
+            "https://github.com/unit/fork-copy.git", FLEET, {"parent": "Unit/Unknown"}, id="unregistered-parent"
+        ),
+        pytest.param(
+            "https://github.com/unit/fork-copy.git",
+            FLEET,
+            {"parent": CATALOG["infra-private"]["github"], "visibility": "PRIVATE"},
+            id="private-parent",
+        ),
+        pytest.param("https://github.com/unit/fork-copy.git", FLEET, {"status": 1}, id="read-failure"),
+        pytest.param(None, FLEET, None, id="local-path"),
         pytest.param(
             "https://github.com/unit/content.git",
             {**FLEET, "mirror": {**FLEET["content"], "local_name": "mirror"}},
+            None,
             id="ambiguous",
         ),
     ],
 )
-def test_an_unregistered_or_ambiguous_destination_scans_all_history(push_sandbox, monkeypatch, capfd, url, catalog):
+def test_an_unverified_destination_scans_all_history(push_sandbox, monkeypatch, capfd, url, catalog, reply):
     hit = push_sandbox.commit("published subject " + TOKEN)
     public_head = push_sandbox.commit("published clean")
     push_sandbox.commit("new clean work")
     asked = _asked(monkeypatch, public_head)
+    calls = _fork_reply(monkeypatch, public_head, **(reply or {}))
     status, chained = run_hook(push_sandbox, monkeypatch, None, url=url, catalog=catalog)
     err = capfd.readouterr().err
     assert status == 1 and not chained and asked == [], err
-    assert "public default-branch head unavailable (0 public repository call(s))" in err
+    assert len(calls) == (reply is not None)
+    assert f"public default-branch head unavailable ({len(calls)} public repository call(s))" in err
     assert f"field=commit[{hit[:12]}].message" in err
 
 
