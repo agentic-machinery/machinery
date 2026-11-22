@@ -1262,7 +1262,7 @@ def test_fleet_cold_clause_keeps_lane_drivers_on_drive_epic(tmp_path: Path) -> N
     )
     offline_rule = tmp_path / ".agent/rules/fleet-comms-coordination.md"
     offline_rule.parent.mkdir(parents=True)
-    offline_rule.write_text("Fleet Comms rules fixture\n", encoding="utf-8")
+    shutil.copyfile(machinery_path("agents_extensions/shared/rules/fleet-comms-coordination.md"), offline_rule)
     result = subprocess.run(
         ["bash", "-c", script, "bash", str(machinery_path('lib/fleet_comms_cold_start.sh'))],
         env={**launcher_environment(), "FLEET_COMMS_PLANE_MODE": "authority", "LC_ROOT": str(tmp_path)},

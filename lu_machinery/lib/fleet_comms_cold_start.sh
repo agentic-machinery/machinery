@@ -30,9 +30,12 @@ export LU_AGENT_COMM_TRANSPORT="${LU_AGENT_COMM_TRANSPORT:-acp}"
 
 fleet_comms_rule_relpath() {
   local root="${LC_ROOT:-${PROJECT_DIR:-.}}" target rule
+  local release_rule="$PROJECT_CODE_ROOT/agents_extensions/shared/rules/fleet-comms-coordination.md"
   for target in .codex .agent .cursor; do
     rule="$target/rules/fleet-comms-coordination.md"
-    if [ -f "$root/$rule" ] && [ -r "$root/$rule" ]; then
+    # A provider root outside the deployment can contain unmanaged files.
+    if [ ! -L "$root/$target" ] && [ ! -L "$root/$target/rules" ] && [ ! -L "$root/$rule" ] \
+        && [ -f "$root/$rule" ] && cmp -s -- "$release_rule" "$root/$rule"; then
       printf '%s' "$rule"
       return
     fi

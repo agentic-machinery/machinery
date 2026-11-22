@@ -835,9 +835,7 @@ launcher_validate_mode() {
     fi
     LC_MODEL="${LC_MODEL:-gpt-6.2-sol}"
     unset SESSION_EPIC
-    local prompt_dir=.codex/prompts
-    if [ "$LC_HARNESS" = claude-code ]; then prompt_dir=.claude/prompts; fi
-    LC_GOVERNOR_PROMPT="Follow ${prompt_dir}/dynamic-area-epic-fleet-governor.md from the workspace root for one bounded supervision cycle. TARGET=$LC_EPIC GOAL=AUTO"
+    LC_GOVERNOR_PROMPT="Follow .codex/prompts/dynamic-area-epic-fleet-governor.md from the workspace root for one bounded supervision cycle. TARGET=$LC_EPIC GOAL=AUTO"
     LC_FORWARD_ARGS=("$LC_GOVERNOR_PROMPT" "${LC_FORWARD_ARGS[@]}")
     return
   fi
@@ -1412,7 +1410,8 @@ launcher_validate_provider_option_arity() {
 
 launcher_bind_drive_epic() {
   local fleet_clause skill_dir=.agents/skills
-  if [ "${LC_HARNESS:-}" = claude-code ]; then skill_dir=.claude/skills; fi
+  # Deployment follows the launcher provider, including Codex on Claude Code.
+  if [ "${LC_PROVIDER:-}" = claude ]; then skill_dir=.claude/skills; fi
   # The CTO seat holds the epics lease, but its state lane is cto and its entry
   # point is the cto skill, not drive-epic (#12496).
   local state_lane="$LC_EPIC" entry_skill=drive-epic
