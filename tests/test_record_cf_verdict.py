@@ -753,13 +753,17 @@ def setup_record(monkeypatch, tmp_path, **kwargs):
 def test_round_cap_applies_to_preflight_dispatch_and_record(
     monkeypatch, tmp_path, capsys, risk, path, default_cap, override, exhausted,
 ):
-    """Defect class: one admission entry point permits a review beyond the PR's round cap."""
+    """Defect classes: round-cap bypass or historical Git I/O without an approval."""
     from dataclasses import replace
     from types import SimpleNamespace
 
     from lu_machinery.dispatcher import checks
     from tests.review.record_support import BRANCH, REPOSITORY, facts_for, recorded_verdict
 
+    def unexpected_git(_repo_root, args, **_kwargs):
+        pytest.fail(f"round-cap history unexpectedly ran git {args[0]}")
+
+    monkeypatch.setattr(recorder, "_facts_git", unexpected_git)
     tasks, comments, calls = setup_record(monkeypatch, tmp_path)
     facts = facts_for({"google"}, changed_paths=(path,))
     facts = replace(facts, commits=tuple(replace(commit, task_id="agy/author") for commit in facts.commits))

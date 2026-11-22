@@ -2435,8 +2435,12 @@ def budget_exempt_heads(
     """
     markers = _trusted_markers(comments, login)
     first: dict[str, int] = {}
+    first_approval: dict[str, int] = {}
     for index, marker in markers:
-        first.setdefault(marker["sha"], index)
+        head = marker["sha"]
+        first.setdefault(head, index)
+        if marker["verdict"] == "APPROVED":
+            first_approval.setdefault(head, index)
     order = sorted(first.items(), key=lambda item: item[1])
     order.extend((head, len(comments)) for head in dict.fromkeys([*sorted(unrecorded), sha]) if head not in first)
     exempt: dict[str, dict[str, Any]] = {}
@@ -2449,6 +2453,9 @@ def budget_exempt_heads(
                 latest[marker["sha"]] = index
         anchor = None
         for candidate, _ in sorted(latest.items(), key=lambda item: item[1], reverse=True):
+            # A clean base merge can only follow an approval visible in this prefix.
+            if first_approval.get(candidate, start) >= start:
+                continue
             try:
                 context = approval_context(candidate) if approval_context else {}
             except RecordError:
