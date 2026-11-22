@@ -646,10 +646,12 @@ def _brace_words(parts: list[tuple[str, str]]) -> list[_Word]:
             run.append(text)
         if run:
             merged.append((run_kind, "".join(run)))
-        # Parameters expand after braces, so a `$` that braces put before a
-        # name (`{$,}NAME`) is an expansion.
+        # Parameters expand after braces, so an unquoted `$` that braces put
+        # before a name (`{$,}NAME`) is an expansion; quoted text stays literal.
+        if any(kind == "src" and ("${" in text or "$[" in text) for kind, text in merged):
+            raise ValueError("expansion assembled by brace expansion")
         expanded = [
-            ("exp" if piece.startswith("$") and len(piece) > 1 else kind, piece)
+            ("exp" if kind == "src" and piece.startswith("$") and len(piece) > 1 else kind, piece)
             for kind, text in merged
             for piece in (_BRACED_PARAMETER.split(text) if kind == "src" else [text])
             if piece or kind != "src"
