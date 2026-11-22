@@ -37,6 +37,8 @@ _GITHUB_API_URL = "https://api.github.com"
 _GIT_TIMEOUT_SECONDS = 30
 _GITHUB_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,99}$")
 _INSTALLATION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
+_SCP_AUTHORITY_RE = re.compile(r"^(?:[A-Za-z0-9_.-]+@)?[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$")
 _INSTALLATION_CACHE_TTL_SECONDS = 300.0
 _INSTALLATION_CACHE_MAX_ENTRIES = 64
 _INSTALLATION_CACHE_LOCK = threading.Lock()
@@ -200,27 +202,52 @@ def _split_repository(repository: str) -> tuple[str | None, str]:
 
 
 def _parse_remote_slug(remote: str) -> str:
-    trimmed = remote.strip().rstrip("/")
-    if not trimmed:
+    if (
+        not isinstance(remote, str)
+        or not remote
+        or not remote.isascii()
+        or any(ord(c) <= 32 or ord(c) == 127 for c in remote)
+        or any(c in remote for c in ("?", "#", "\\", "%"))
+    ):
         raise GitHubIdentityError("cannot determine the repository for the GitHub App token")
-    if "://" in trimmed:
-        parsed = urlsplit(trimmed)
+    if "://" in remote:
+        try:
+            parsed = urlsplit(remote)
+            host = parsed.hostname
+            _ = parsed.port
+        except ValueError:
+            raise GitHubIdentityError("cannot determine the repository for the GitHub App token") from None
         if (
             parsed.scheme not in {"https", "ssh"}
-            or parsed.query
-            or parsed.fragment
-            or not parsed.netloc
+            or not host
+            or ".." in host
+            or not _HOST_RE.fullmatch(host)
             or parsed.password is not None
             or (parsed.scheme == "https" and parsed.username is not None)
+            or not parsed.path.startswith("/")
+            or parsed.path.startswith("//")
         ):
             raise GitHubIdentityError("cannot determine the repository for the GitHub App token")
-        path = parsed.path.strip("/")
-    elif ":" in trimmed and "/" not in trimmed.split(":", 1)[0]:
-        path = trimmed.split(":", 1)[1].strip("/")
+        raw_path = parsed.path[1:]
+    elif ":" in remote:
+        authority, raw_path = remote.split(":", 1)
+        if (
+            not authority
+            or "/" in authority
+            or ".." in authority
+            or not _SCP_AUTHORITY_RE.fullmatch(authority)
+            or raw_path.startswith("/")
+        ):
+            raise GitHubIdentityError("cannot determine the repository for the GitHub App token")
     else:
         raise GitHubIdentityError("cannot determine the repository for the GitHub App token")
-    path = path.removesuffix(".git")
-    parts = path.split("/")
+    if raw_path.endswith("/"):
+        raw_path = raw_path[:-1]
+    if not raw_path or raw_path.endswith("/") or "//" in raw_path:
+        raise GitHubIdentityError("cannot determine the repository for the GitHub App token")
+    if raw_path.endswith(".git"):
+        raw_path = raw_path[:-4]
+    parts = raw_path.split("/")
     if len(parts) != 2:
         raise GitHubIdentityError("cannot determine the repository for the GitHub App token")
     try:
@@ -241,7 +268,7 @@ def _repository_slug(repo_root: Path | None = None, *, env: Mapping[str, str] | 
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_SECONDS,
-        ).stdout.strip()
+        ).stdout.removesuffix("\n")
     except (OSError, ProductRootError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise GitHubIdentityError("cannot determine the repository for the GitHub App token") from exc
     return _parse_remote_slug(remote)
@@ -309,16 +336,24 @@ def _resolve_installation_id(
         raw_id = payload.get("id")
         if type(raw_id) is not int or raw_id <= 0:
             raise ValueError("invalid installation id")
-        if payload.get("suspended_at") is not None:
+        if "suspended_at" not in payload or payload["suspended_at"] is not None:
             raise ValueError("installation suspended")
         account = payload.get("account")
         login = account.get("login") if isinstance(account, dict) else None
         if not isinstance(login, str) or not login or login.lower() != owner_key:
             raise ValueError("installation owner mismatch")
-        if "app_id" in payload and payload["app_id"] is not None:
-            raw_app_id = payload["app_id"]
-            if isinstance(raw_app_id, bool) or str(raw_app_id) != app_id:
+        raw_app_id = payload.get("app_id")
+        if type(raw_app_id) is not int or raw_app_id <= 0:
+            raise ValueError("invalid installation app id")
+        if "client_id" in payload:
+            raw_client_id = payload["client_id"]
+            if not isinstance(raw_client_id, str) or not raw_client_id:
+                raise ValueError("invalid installation client id")
+        if app_id.isascii() and app_id.isdigit():
+            if str(raw_app_id) != app_id:
                 raise ValueError("installation app mismatch")
+        elif payload.get("client_id") != app_id:
+            raise ValueError("installation client mismatch")
     except Exception:
         raise GitHubIdentityError("GitHub App installation lookup failed for repository owner") from None
 
@@ -396,6 +431,13 @@ def mint_installation_token(
     ``owner/repository`` is resolved via the App JWT and cached per owner.
     """
     issued_at = int(time.time()) if now is None else now
+    if (
+        not isinstance(app_id, str)
+        or not app_id
+        or not app_id.isascii()
+        or any(ord(c) <= 32 or ord(c) == 127 for c in app_id)
+    ):
+        raise GitHubIdentityError("invalid GitHub App id")
     selected = _repository_slug() if repository is None else repository
     owner, repo_name = _split_repository(selected)
     if permissions is not None and owner is None:
@@ -483,6 +525,7 @@ def resolve_agent_github_identity(
     environment: Mapping[str, str] | None = None,
     bash_secrets_path: Path | None = None,
     repository: str | None = None,
+    repo_root: Path | None = None,
     permissions: Mapping[str, str] | None = None,
     api_base_url: str = _GITHUB_API_URL,
     ssl_context=None,
@@ -499,11 +542,14 @@ def resolve_agent_github_identity(
             fields = _rescue_app_fields(env)
             if fields is not None:
                 try:
-                    selected_repository = (
-                        _repository_slug(product_root(env=env))
-                        if repository is None and env.get("LU_PRODUCT_ROOT")
-                        else repository
-                    )
+                    if repository is not None:
+                        selected_repository: str | None = repository
+                    elif repo_root is not None:
+                        selected_repository = _repository_slug(repo_root)
+                    elif env.get("LU_PRODUCT_ROOT"):
+                        selected_repository = _repository_slug(product_root(env=env))
+                    else:
+                        selected_repository = None
                     token = mint_installation_token(
                         app_id=fields["app-id"],
                         private_key=fields["private-key.pem"],
@@ -555,13 +601,17 @@ def resolve_agent_github_identity(
     if any((raw_app_id, private_key, legacy_installation_id)) or key_file:
         if not (app_id and private_key):
             raise GitHubIdentityError("incomplete LU_AGENT_GITHUB_APP_* configuration")
-        if repository is None and env.get("LU_PRODUCT_ROOT"):
+        if repository is not None:
+            selected_repository = repository
+        elif repo_root is not None:
+            selected_repository = _repository_slug(repo_root)
+        elif env.get("LU_PRODUCT_ROOT"):
             try:
                 selected_repository = _repository_slug(product_root(env=env))
             except (GitHubIdentityError, ProductRootError):
                 raise GitHubIdentityError("cannot determine the repository for the GitHub App token") from None
         else:
-            selected_repository = repository
+            selected_repository = None
         # Resolve per-owner via App JWT whenever the target names an owner (or
         # will be read from origin). Only bare legacy repository names without an
         # owner use LU_AGENT_GITHUB_APP_INSTALLATION_ID.

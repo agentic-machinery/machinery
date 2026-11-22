@@ -591,7 +591,12 @@ def _isolated_git_env(
 
 
 def child_credential_env(
-    raw: Mapping[str, str], provider: str, *, harness: str | None = None, driver_launcher: bool = False
+    raw: Mapping[str, str],
+    provider: str,
+    *,
+    harness: str | None = None,
+    driver_launcher: bool = False,
+    cwd: Path | None = None,
 ) -> dict[str, str]:
     """Keep the seat's credentials; resolve GitHub identity only for workers.
 
@@ -639,7 +644,12 @@ def child_credential_env(
         ):
             env[name] = value
 
-    identity = None if driver_launcher or is_kimi_seat(provider) else resolve_agent_github_identity(environment=raw)
+    if driver_launcher or is_kimi_seat(provider):
+        identity = None
+    elif cwd is not None:
+        identity = resolve_agent_github_identity(environment=raw, repo_root=cwd)
+    else:
+        identity = resolve_agent_github_identity(environment=raw)
     if identity is not None and identity.token:
         env["GH_TOKEN"] = identity.token
         env["LU_AGENT_GITHUB_IDENTITY_SOURCE"] = identity.source or "legacy"
@@ -652,6 +662,7 @@ def build_agent_env(
     model: str | None = None,
     harness: str | None = None,
     overrides: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> dict[str, str]:
     """Return a scrubbed env for a spawned agent CLI.
 
@@ -678,7 +689,7 @@ def build_agent_env(
     # Driver state belongs to the launcher session, never child/consult agents.
     raw.pop("LU_DRIVER_STATE_FILE", None)
 
-    credentials = child_credential_env(raw, provider, harness=harness)
+    credentials = child_credential_env(raw, provider, harness=harness, cwd=cwd)
     env: dict[str, str] = {}
     for name, value in credentials.items():
         # Credential admission already happened in the shared child policy.
@@ -1084,8 +1095,14 @@ if __name__ == "__main__":
 
             if args.check_helper:
                 raise SystemExit(0)
+            exec_cwd = Path.cwd()
+            in_git_checkout = any((parent / ".git").exists() for parent in (exec_cwd, *exec_cwd.parents))
             child = child_credential_env(
-                os.environ, args.provider, harness=args.harness, driver_launcher=args.driver_launcher
+                os.environ,
+                args.provider,
+                harness=args.harness,
+                driver_launcher=args.driver_launcher,
+                cwd=exec_cwd if (not args.driver_launcher and in_git_checkout) else None,
             )
             # The launcher's module bootstrap sets no PYTHONPATH pin; drop any ambient value so the child never inherits one.
             child.pop("PYTHONPATH", None)

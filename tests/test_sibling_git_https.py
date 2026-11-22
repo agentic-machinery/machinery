@@ -548,7 +548,9 @@ def test_generated_app_credential_end_to_end(https_world, tmp_path, monkeypatch,
             handler.send_response(200)
             handler.end_headers()
             handler.wfile.write(
-                json.dumps({"id": 4242, "account": {"login": "org"}, "suspended_at": None}).encode()
+                json.dumps(
+                    {"id": 4242, "app_id": 123, "client_id": "fixture", "account": {"login": "org"}, "suspended_at": None}
+                ).encode()
             )
             return
         assert handler.path == "/app/installations/4242/access_tokens"
