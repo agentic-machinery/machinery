@@ -506,7 +506,9 @@ def test_routed_scripts_do_not_build_a_venv_interpreter_path() -> None:
 def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
     """Defect class: a tracked pre-push hook that skips machinery's scanner, or pushes when that scanner cannot start.
 
-    A public non-product fleet repository must also refuse an Entire checkpoint push.
+    A public non-product fleet repository must also refuse an Entire checkpoint push. Defect class (F1): an Entire
+    ref push to a URL whose real host differs from the classified private host ("#@" or "?@" before the private
+    host) is allowed; a canonical private URL is the control that passes the Entire check.
     A temporary repository, synthetic matcher fixtures, and a local bare remote. The planted value is the
     fixture token, never a credential.
     """
@@ -590,6 +592,25 @@ def _tracked_pre_push_scans_the_outgoing_range(tmp_path: Path) -> None:
         check=False,
     )
     assert entire.returncode == 1 and "(public_entire_ref)" in entire.stderr, entire.stderr
+
+    def entire_push(url: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(repo / ".githooks/pre_push_gate.py"), "--push-messages", "receiver", url],
+            cwd=repo,
+            env={**env, "AGENT_REAL_GH": "/bin/false", "LU_OPSEC_REAL_GIT": real_git},
+            input=f"HEAD {clean} refs/heads/entire/checkpoints/v1 {'0' * len(clean)}\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    control = entire_push("https://github.com/unit/private.git")
+    assert control.returncode == 0 and "entire_destination" not in control.stderr, control.stderr
+    for crafted in ("https://evil.example#@github.com/unit/private", "https://evil.example?@github.com/unit/private"):
+        refused_entire = entire_push(crafted)
+        assert refused_entire.returncode == 1, refused_entire.stderr
+        assert "(entire_destination_unverified)" in refused_entire.stderr, refused_entire.stderr
 
     (repo / "lu_machinery/opsec/git_push.py").unlink()
     (repo / "file.txt").write_text("clean\nagain\n", encoding="utf-8")

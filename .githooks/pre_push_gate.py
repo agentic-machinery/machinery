@@ -209,12 +209,15 @@ def parse_updates(text: str) -> list[Update]:
     return updates
 
 
-# The only URL spellings that may carry the private Entire exemption: https, ssh or scp-like GitHub URLs with an
-# optional plain user and an owner/name path. Git and curl end a URL authority at characters such as "?", "#" or
-# "\\" that the scanner's destination grammar reads as userinfo, so a URL outside this allowlist can name a private
-# slug while Git connects to another host; it is never exempt.
+# The only URL spellings that may carry the private Entire exemption: https (optional default port 443), ssh,
+# git+ssh or ssh+git (optional default port 22) or scp-like GitHub URLs with an optional plain user and an
+# owner/name path, which are the routes git_push.trusted_route trusts. Git and curl end a URL authority at
+# characters such as "?", "#" or "\\" that the scanner's destination grammar reads as userinfo, so a URL outside
+# this allowlist can name a private slug while Git connects to another host; it is never exempt.
 PRIVATE_ENTIRE_URL = re.compile(
-    r"(?:(?:https|ssh)://(?:[A-Za-z0-9._-]+@)?(?i:github\.com)/|(?:[A-Za-z0-9._-]+@)?(?i:github\.com):)"
+    r"(?:https://(?:[A-Za-z0-9._-]+@)?(?i:github\.com)(?::443)?/"
+    r"|(?:ssh|git\+ssh|ssh\+git)://(?:[A-Za-z0-9._-]+@)?(?i:github\.com)(?::22)?/"
+    r"|(?:[A-Za-z0-9._-]+@)?(?i:github\.com):)"
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?",
     re.ASCII,
 )
