@@ -477,7 +477,6 @@ def test_selection_refuses_a_third_party_import_in_the_receipt_gate_closure(
     # The fixture itself selects cleanly: only the import breaks the contract.
     assert plan(base, benign, importers=False)["run_files"] == [FILES[0]]
     with pytest.raises(ValueError, match=(
-        r"contract canary receipt gate: lu_machinery/orchestration/integration_sweep\.py:\d+ imports jsonschema "
-        r"at import time \(via lu_machinery\.orchestration\.integration_sweep <- lu_machinery\.review\.review_contract\)"
+        r"contract canary receipt gate: lu_machinery/orchestration/integration_sweep\.py:\d+ imports jsonschema at import time"
     )):
         plan(base, candidate, importers=False)
