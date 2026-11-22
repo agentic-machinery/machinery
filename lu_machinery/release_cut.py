@@ -295,42 +295,6 @@ def release_notes(titles: Sequence[str], repo: str) -> str:
     return "\n\n".join(blocks) + "\n"
 
 
-# One container marker at a line start: a block quote, or a list item marker followed by a blank.
-_CONTAINER_MARKER = re.compile(r"[ \t]*(?:>|[-+*](?=[ \t])|[0-9]{1,9}[.)](?=[ \t]))")
-_LABEL_PADDING = re.compile(r"[ \t\r\n]+")
-
-
-def _without_containers(line: str) -> str:
-    while match := _CONTAINER_MARKER.match(line):
-        line = line[match.end():]
-    return line.lstrip(" \t")
-
-
-def _unreleased_definition_lines(lines: list[str]) -> list[int]:
-    """Indexes of the lines that may begin a reference definition whose label is ``Unreleased``.
-
-    Counted as CommonMark reads a definition: after any block-quote or list markers, a ``[`` that
-    starts the line, a label that may continue across lines (each continuation line losing its own
-    markers) and normalizes, by case fold and whitespace collapse, to ``unreleased``, then ``]:``.
-    Text in the middle of a line is never a definition. Code blocks are not excluded, so an example
-    there counts too (a refusal, never a missed duplicate).
-    """
-    found = []
-    for index, line in enumerate(lines):
-        rest = _without_containers(line)
-        if not rest.startswith("["):
-            continue
-        label, following = rest[1:], index + 1
-        # A label holds at most 999 characters and no blank line.
-        while "]" not in label and following < len(lines) and len(label) < 1000 and lines[following].strip():
-            label += "\n" + _without_containers(lines[following])
-            following += 1
-        inner, closed, after = label.partition("]")
-        if closed and after.startswith(":") and _LABEL_PADDING.sub(" ", inner).strip().casefold() == "unreleased":
-            found.append(index)
-    return found
-
-
 def unreleased_must_be_empty(text: str) -> None:
     """Refuse a CHANGELOG.md whose Unreleased section holds anything.
 
@@ -354,26 +318,14 @@ def record_changelog(
     """Add the release's section under Unreleased and its compare link; idempotent per version.
 
     ``previous`` is the last tag, which the Unreleased link names. ``since`` (default ``previous``) is
-    the release the notes start from, which the version's compare link starts from. The existing
-    Unreleased link may name either baked slug of a transferred repository; the new links name ``repo``.
+    the release the notes start from, which the version's compare link starts from.
     """
     if f"\n## [{version}]" in text:
         return text
     unreleased = _UNRELEASED
-    from lu_machinery.orchestration.fleet_repos import FleetRepoError, repository_slugs
-
-    try:
-        slugs = repository_slugs(repo)
-    except FleetRepoError as exc:
-        raise CutError(f"the fleet repository registry is unreadable: {exc}") from exc
-    # Exactly one line may begin an Unreleased reference definition, and it must be the previous-tag
-    # compare link under a baked slug of the repository; only that line is rewritten.
-    lines = text.split("\n")
-    found = _unreleased_definition_lines(lines)
-    accepted = {f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD" for slug in slugs}
-    if text.count(unreleased) != 1 or len(found) != 1 or lines[found[0]] not in accepted:
+    link = f"[Unreleased]: https://github.com/{repo}/compare/v{previous}...HEAD\n"
+    if text.count(unreleased) != 1 or text.count(link) != 1:
         raise CutError("CHANGELOG.md lacks one Unreleased heading and its compare link to the previous tag")
-    index = found[0]
     unreleased_must_be_empty(text)
     heading = f'<a id="v{version}"></a>\n## [{version}] - {date}' + (" [YANKED]" if yanked else "")
     section = f"{heading}\n\n{notes.rstrip()}\n\n"
@@ -381,8 +333,7 @@ def record_changelog(
         f"[Unreleased]: https://github.com/{repo}/compare/v{version}...HEAD\n"
         f"[{version}]: https://github.com/{repo}/compare/v{since or previous}...v{version}\n"
     )
-    relinked = "\n".join([*lines[:index], links.rstrip("\n"), *lines[index + 1:]])
-    return relinked.replace(unreleased, unreleased + section, 1)
+    return text.replace(unreleased, unreleased + section, 1).replace(link, links, 1)
 
 
 def version_of(name: str, text: str) -> dict[str, str]:
