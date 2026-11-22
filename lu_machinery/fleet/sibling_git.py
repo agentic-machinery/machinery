@@ -257,11 +257,11 @@ class Git:
         _safe_config(self, repo.checkout, https=True)
         _https_url(repo.remote, repo.github)
         # Resolve in the parent; no credential material enters other Git verbs.
+        # HTTPS transport always resolves the installation per repository owner via App JWT.
         app_environment = {
             k: os.environ[k]
             for k in (
                 "LU_AGENT_GITHUB_APP_ID",
-                "LU_AGENT_GITHUB_APP_INSTALLATION_ID",
                 "LU_AGENT_GITHUB_APP_PRIVATE_KEY",
                 "LU_AGENT_GITHUB_APP_PRIVATE_KEY_FILE",
             )
