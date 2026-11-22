@@ -2,23 +2,25 @@
 
 
 
-import json
-import subprocess
-import pytest
-from lu_machinery.opsec import prepublish as gate
-from lu_machinery.opsec.gh_snapshot import repository
-from lu_machinery.publish import github as pub
-from tests.opsec_fixtures import CATALOG as CATALOG
-from tests.helpers.product_tree import configured_roots as configured_roots
 import importlib.util
 import io
+import json
 import os
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
-from lu_machinery.opsec.gh_snapshot import admit
+
+import pytest
+
+from lu_machinery.opsec import prepublish as gate
+from lu_machinery.opsec.gh_snapshot import admit, repository
+from lu_machinery.publish import github as pub
 from lu_machinery.review.record_cf_verdict import build_comment as _recovery_build_comment
-from tests.opsec_fixtures import ROOT as ROOT, recorded_approval as recorded_approval
+from tests.helpers.product_tree import configured_roots as configured_roots
+from tests.opsec_fixtures import CATALOG as CATALOG
+from tests.opsec_fixtures import ROOT as ROOT
+from tests.opsec_fixtures import recorded_approval as recorded_approval
 
 VALID_DESTINATIONS = [
     ("github.com/unit/public", []),
@@ -979,8 +981,13 @@ def test_hook_recognises_typed_merge(monkeypatch):
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
     for prefix in (sys.executable, "/fixture/bin/python"):
-        args = guard._merge_args([prefix, "-m", "lu_machinery.publish", "pr-merge", "--repo", "unit/private", "--number", "1"])
-        assert guard._pr_selector(args) == "1" and guard._repo_option(args) == "unit/private"
+        merge = guard._merge_args([
+            prefix, "-m", "lu_machinery.publish", "pr-merge",
+            "--repo", "unit/private", "--number", "1",
+            "--match-head=" + "a" * 40, "--expect-queue=false",
+        ])
+        assert merge.refusal is None
+        assert guard._pr_selector(merge.args) == "1" and guard._repo_option(merge.args) == "unit/private"
 
 
 @pytest.mark.usefixtures('configured_roots', 'catalog')
@@ -990,7 +997,11 @@ def test_hook_judges_publisher_readiness(repo, state, monkeypatch, capsys):
     spec = importlib.util.spec_from_file_location("r5_hook", ROOT / "agents_extensions/shared/hooks/guard-pr-merge.py")
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
-    monkeypatch.setattr(guard, "_read_payload", lambda: {"tool_input": {"command": f".venv/bin/python -m lu_machinery.publish pr-merge --repo {repo} --number 1"}})
+    command = (
+        f".venv/bin/python -m lu_machinery.publish pr-merge --repo {repo} --number 1 "
+        f"--match-head {'a' * 40} --expect-queue true"
+    )
+    monkeypatch.setattr(guard, "_read_payload", lambda: {"tool_input": {"command": command}})
     reads = []
     def snapshot(pr, target, cwd=None):
         reads.append((pr, target))

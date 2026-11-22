@@ -1,21 +1,4 @@
-"""Unit tests for the PR-merge guard hook (#189 class / free-plan protection gap).
-
-Exercises the pure decision logic in
-``agents_extensions/shared/hooks/guard-pr-merge.py``:
-
-  * `gh pr merge` detection (incl. wrappers, a positional PR number, and the
-    `--disable-auto` segment it deliberately leaves alone; `--admin` remains
-    visible to the same draft/check protections),
-  * the quote-aware tokenizer (a `gh pr merge` inside a quoted commit body is NOT a merge),
-  * failing/pending check classification (every named check blocks, C-6339),
-  * the fail-CLOSED `main()` decision (block on draft, red checks, pending-without-auto,
-    --auto on an unprotected base, and on anything undeterminable; allow on green).
-
-The hook filename has hyphens, so it is loaded by path via importlib. `main()` is guarded
-by `__name__ == "__main__"`, so import has no side effects. Network functions
-(`_pr_ref`, `_pr_meta`, `_check_states`, `_base_protected`) are monkeypatched — no
-`gh`/network in tests.
-"""
+"""Exercise merge admission, shell command recognition and PR readiness offline."""
 
 from __future__ import annotations
 
@@ -23,22 +6,22 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import threading
 from pathlib import Path
+
 import pytest
+
 from lu_machinery.common.repo_root import machinery_path
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 from tests.helpers.restore_import_state import restore_import_state
 
-
-
-
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HOOK_PATH = machinery_path("agents_extensions/shared/hooks/guard-pr-merge.py")
+_HEAD = "a" * 40
 _URL = "https://github.com/owner/repo/pull/5"
 _GH_246_CHECKS_JSON_GAP = (
     "unknown flag: --json\n\nUsage:  gh pr checks [<number> | <url> | <branch>] [flags]\n\n"
@@ -81,10 +64,17 @@ def test_hook_accepts_exactly_the_publisher_pr_merge_flags():
     assert "bool" not in schema.values()
 
 
+_PUBLISHER_MERGE = "python -m lu_machinery.publish pr-merge"
+
+
+def _pinned_merge(number: str | int = 5) -> str:
+    return f"{_PUBLISHER_MERGE} --number {shlex.quote(str(number))} --match-head {_HEAD} --expect-queue false"
+
+
 _ISSUE_9461_MERGES = [
     "gh pr merge 5",
-    "python -m lu_machinery.publish pr-merge --number 5 --match-head " + "a" * 40,
-    "python -m lu_machinery.publish pr-merge --number 5 --match-head " + "a" * 40 + " --expect-queue false",
+    f"{_PUBLISHER_MERGE} --number 5 --match-head {_HEAD}",
+    _pinned_merge(),
 ]
 _ISSUE_9461_SUFFIXES = [
     "",
@@ -135,7 +125,8 @@ runpy.run_path(sys.argv[1], run_name="__main__")
         # The readiness module is needed only where a merge is judged, so a merge the shell
         # reader refuses first keeps that reason; either way the merge is refused.
         assert "guard dependency unavailable" in result.stderr or (
-            dependency.endswith("merge_guard") and "cannot be read safely" in result.stderr
+            dependency.endswith("merge_guard")
+            and ("cannot be read" in result.stderr or "RAW_MERGE_REQUIRES_PUBLISHER" in result.stderr)
         )
 
 
@@ -357,12 +348,10 @@ def _run(
     pr: str | None = "5",
     meta: dict | None = None,
     checks: tuple[list[str], list[str], int] | None = ([], [], 1),
-    owner_repo: str | None = "owner/repo",
-    protected: bool | None = False,
 ) -> int:
     """Drive main() with a simulated stdin payload + monkeypatched network calls.
 
-    Defaults describe this repo today: a ready PR, all checks green, unprotected base.
+    Defaults describe this repo today: a ready PR with all checks green.
     """
     payload = json.dumps({"tool_input": {"command": command}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
@@ -384,8 +373,6 @@ def _run(
         ),
     )
     monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: checks)
-    monkeypatch.setattr(guard, "_owner_repo_from_url", lambda u: owner_repo)
-    monkeypatch.setattr(guard, "_base_protected", lambda o, b: protected)
     return guard.main()
 
 
@@ -409,9 +396,13 @@ def test_issue_9461_redirect_matrix_uses_pr_state(monkeypatch, capsys, command, 
     monkeypatch.setattr(guard, "_pr_meta", meta)
     monkeypatch.setattr(guard, "_pr_ref", original_ref)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"tool_input": {"command": command + suffix}})))
-    assert guard.main() == expected
-    assert seen == ["5"]
-    assert "cannot be read" not in capsys.readouterr().err
+    pinned = command == _pinned_merge()
+    assert guard.main() == (expected if pinned else 2)
+    assert seen == (["5"] if pinned else [])
+    stderr = capsys.readouterr().err
+    assert "cannot be read" not in stderr
+    if not pinned:
+        assert "--match-head <approved SHA> --expect-queue <verified true|false>" in stderr
 
 
 @pytest.mark.parametrize("command", _ISSUE_9461_MERGES)
@@ -425,7 +416,7 @@ def test_issue_9461_redirects_removed_from_argv(command, redirect):
 @pytest.mark.parametrize("target", ["'$FILE'", "'$(cmd)'", r"file\$name", '"file >name"', "'`cmd`'"])
 def test_issue_9461_literal_redirect_target_is_not_dynamic(monkeypatch, command, target):
     assert guard._segments(command + " > " + target) == guard._segments(command)
-    assert _run(monkeypatch, command + " > " + target) == 0
+    assert _run(monkeypatch, command + " > " + target) == (0 if command == _pinned_merge() else 2)
 
 
 @pytest.mark.parametrize("suffix", _ISSUE_9461_SUFFIXES)
@@ -535,22 +526,23 @@ def test_issue_9461_literal_here_string_still_judges_pr(monkeypatch, capsys, com
 @pytest.mark.parametrize("command", _ISSUE_9461_MERGES)
 @pytest.mark.parametrize("quote", ["'", '"'])
 def test_issue_9461_quoted_redirect_is_argument(monkeypatch, command, quote):
+    pinned = command == _pinned_merge()
     command += f" --subject {quote}>{quote} 2>&1"
     argv = guard._segments(command)[0]
     assert argv[-2:] == ["--subject", ">"]
-    assert _run(monkeypatch, command) == 0
+    assert _run(monkeypatch, command) == (0 if pinned else 2)
 
 
 @pytest.mark.parametrize("suffix", _ISSUE_9461_SUFFIXES)
 def test_issue_9461_cd_scope_unchanged(monkeypatch, suffix):
-    assert _judged_cwds(monkeypatch, "cd /repo 2>&1 && gh pr merge 5" + suffix) == [("5", "/repo")]
-    assert _run(monkeypatch, 'cd "$DIR" 2>&1 && gh pr merge 5' + suffix) == 2
-    assert _run(monkeypatch, "cd /repo > $(cmd) && gh pr merge 5" + suffix) == 2
+    assert _judged_cwds(monkeypatch, f"cd /repo 2>&1 && {_pinned_merge()}" + suffix) == [("5", "/repo")]
+    assert _run(monkeypatch, f'cd "$DIR" 2>&1 && {_pinned_merge()}' + suffix) == 2
+    assert _run(monkeypatch, f"cd /repo > $(cmd) && {_pinned_merge()}" + suffix) == 2
 
 
 def test_issue_9461_piped_into_merge_is_judged(monkeypatch):
-    assert _run(monkeypatch, "true | gh pr merge 5 2>&1", checks=(["CI Gate"], [], 1)) == 2
-    assert _judged_cwds(monkeypatch, "gh pr merge 5 2>&1 | gh pr merge 6") == [("5", None), ("6", None)]
+    assert _run(monkeypatch, f"true | {_pinned_merge()} 2>&1", checks=(["CI Gate"], [], 1)) == 2
+    assert _judged_cwds(monkeypatch, f"{_pinned_merge()} 2>&1 | {_pinned_merge(6)}") == [("5", None), ("6", None)]
 
 
 @pytest.mark.parametrize(
@@ -619,37 +611,43 @@ def test_unrelated_command_is_untouched(monkeypatch):
     assert _run(monkeypatch, "git push origin main") == 0
 
 
-def test_admin_merge_is_judged_by_pr_guard(monkeypatch):
-    judged: list[list[str]] = []
-    monkeypatch.setattr(guard, "_judge", lambda args, cwd=None: judged.append(args) or "blocked")
-    assert _run(monkeypatch, "gh pr merge 5 --admin", checks=(["Test (pytest)"], [], 1)) == 2
-    assert judged == [["5", "--admin"]]
+def test_admin_merge_is_refused_before_readiness(monkeypatch, capsys):
+    monkeypatch.setattr(guard, "_pr_snapshot", lambda *a, **kw: pytest.fail("raw admin merge reached PR lookup"))
+    assert _run(monkeypatch, "gh pr merge 5 --admin") == 2
+    assert "RAW_MERGE_REQUIRES_PUBLISHER" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
-    "command,checks,protected",
+    "command,expect_raw",
     [
-        ("gh pr merge 5 --auto --squash", ([], [], 1), False),
-        ("gh pr comment 5 --body note && gh pr merge --auto 5 --squash", ([], [], 1), False),
-        ("gh pr comment 5 --body note; gh pr merge 5 --squash", (["boundary-and-tests"], [], 1), False),
-        ("printf ready | gh pr merge 5 --squash", ([], ["Test (pytest)"], 1), False),
-        ("gh pr comment 5 --body note\ngh pr merge 5 --squash", ([], ["Test (pytest)"], 1), False),
-        (r"echo $'\'' ; gh pr merge 5 ; echo \'", ([], [], 1), False),
-        ('x="$(echo "\'")"; gh pr merge 5; x="$(echo "\'")"', ([], [], 1), False),
-        ('x="\n"; gh pr merge 5; echo "\n"', ([], [], 1), False),
-        ("# it's\necho 'a\nb' $'\\'' ; gh pr merge 5 ; echo \\'", ([], [], 1), False),
+        ("gh pr merge 5 --auto -R owner/public-monorepo", True),
+        ("gh pr comment 5 --body note && gh pr merge 5 --auto -R owner/private-infra", True),
+        ("gh pr comment 5 --body note; gh pr merge 5 -R owner/private-product", True),
+        ("printf ready | gh pr merge https://github.com/owner/public-content/pull/5", True),
+        ("gh pr comment 5 --body note\ngh pr merge 5 --repo=owner/public-labs", True),
+        ("env GH_REPO=owner/public-machinery gh pr merge 5 -Rowner/public-machinery", True),
+        (f"{_pinned_merge()} && gh pr merge 5 -R owner/private-labs", True),
+        ('x="\n"; gh pr merge 5; echo "\n"', False),
+        ("# it's\necho 'a\nb' $'\\'' ; gh pr merge 5 ; echo \\'", False),
+    ],
+    ids=[
+        "public-monorepo", "private-infra", "private-product", "public-content",
+        "public-labs", "public-machinery", "private-labs", "split-quote", "comment-and-split-quote",
     ],
 )
-def test_compound_merge_segments_are_judged(monkeypatch, command, checks, protected):
-    assert _run(monkeypatch, command, checks=checks, protected=protected) == 2
+def test_compound_merge_segments_are_refused_before_lookup(monkeypatch, capsys, command, expect_raw):
+    monkeypatch.setattr(guard, "_pr_snapshot", lambda *a, **kw: pytest.fail("raw merge reached PR lookup"))
+    assert _run(monkeypatch, command) == 2
+    stderr = capsys.readouterr().err
+    if expect_raw:
+        assert "RAW_MERGE_REQUIRES_PUBLISHER" in stderr
+    assert "publish pr-merge --match-head <approved SHA> --expect-queue <verified true|false>" in stderr
 
 
-def test_compound_admin_merge_is_judged(monkeypatch):
-    judged: list[list[str]] = []
-    monkeypatch.setattr(guard, "_judge", lambda args, cwd=None: judged.append(args) or "blocked")
-    command = "gh pr comment 5 --body note && gh pr merge 5 --admin"
-    assert _run(monkeypatch, command, checks=(["boundary-and-tests"], [], 1)) == 2
-    assert judged == [["5", "--admin"]]
+def test_compound_admin_merge_is_refused_before_readiness(monkeypatch, capsys):
+    monkeypatch.setattr(guard, "_pr_snapshot", lambda *a, **kw: pytest.fail("raw admin merge reached PR lookup"))
+    assert _run(monkeypatch, "gh pr comment 5 --body note && gh pr merge 5 --admin") == 2
+    assert "RAW_MERGE_REQUIRES_PUBLISHER" in capsys.readouterr().err
 
 
 def test_disable_auto_is_not_a_merge(monkeypatch):
@@ -661,11 +659,11 @@ def test_disable_auto_is_not_a_merge(monkeypatch):
 
 
 def test_draft_is_blocked(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --squash", meta={"isDraft": True, "baseRefName": "main", "url": _URL}) == 2
+    assert _run(monkeypatch, _pinned_merge(), meta={"isDraft": True, "baseRefName": "main", "url": _URL}) == 2
 
 
 def test_red_non_advisory_check_is_blocked(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --squash", checks=(["boundary-and-tests"], [], 1)) == 2
+    assert _run(monkeypatch, _pinned_merge(), checks=(["boundary-and-tests"], [], 1)) == 2
 
 
 @pytest.mark.parametrize(
@@ -693,7 +691,7 @@ def test_green_is_allowed(monkeypatch, tmp_path, capsys, seat, safe_mode, expect
             encoding="utf-8",
         )
 
-    assert _run(monkeypatch, "gh pr merge 5 --squash --delete-branch") == expected
+    assert _run(monkeypatch, _pinned_merge()) == expected
     stderr = capsys.readouterr().err
     if expected == 2:
         assert stderr.startswith("CTO_SAFE_MODE: pr-merge refused for the CTO seat")
@@ -701,43 +699,30 @@ def test_green_is_allowed(monkeypatch, tmp_path, capsys, seat, safe_mode, expect
         assert stderr == ""
 
 
-def test_pending_without_auto_is_blocked(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --squash", checks=([], ["Test (pytest)"], 1)) == 2
+def test_pending_publisher_merge_is_blocked(monkeypatch):
+    assert _run(monkeypatch, _pinned_merge(), checks=([], ["Test (pytest)"], 1)) == 2
 
 
-def test_auto_on_protected_base_is_allowed(monkeypatch):
-    # Protection with required status checks → --auto waits for them, as advertised.
-    assert _run(monkeypatch, "gh pr merge 5 --auto --squash", checks=([], ["Test (pytest)"], 1), protected=True) == 0
-
-
-def test_auto_on_unprotected_base_is_blocked(monkeypatch):
-    # 403/404 → the repo enforces nothing → auto-merge fires regardless of checks.
-    assert _run(monkeypatch, "gh pr merge 5 --auto --squash", protected=False) == 2
-
-
-def test_auto_with_undeterminable_protection_fails_closed(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --auto --squash", protected=None) == 2
-
-
-def test_auto_with_unknown_repo_fails_closed(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --auto --squash", owner_repo=None) == 2
+def test_raw_auto_merge_is_refused(monkeypatch, capsys):
+    assert _run(monkeypatch, "gh pr merge 5 --auto --squash") == 2
+    assert "publish pr-disarm" in capsys.readouterr().err
 
 
 def test_unknown_pr_fails_closed(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge --squash", pr=None) == 2
+    assert _run(monkeypatch, f"{_PUBLISHER_MERGE} --match-head {_HEAD} --expect-queue true", pr=None) == 2
 
 
 def test_undeterminable_pr_meta_fails_closed(monkeypatch):
     # _pr_meta returning None (gh error/timeout) → block, never "assume not a draft".
     monkeypatch.setattr(guard, "_pr_meta", lambda p, repo=None, cwd=None: None)
-    payload = json.dumps({"tool_input": {"command": "gh pr merge 5 --squash"}})
+    payload = json.dumps({"tool_input": {"command": _pinned_merge()}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     monkeypatch.setattr(guard, "_pr_ref", lambda args, repo=None, cwd=None: "5")
     assert guard.main() == 2
 
 
 def test_undeterminable_checks_fails_closed(monkeypatch):
-    assert _run(monkeypatch, "gh pr merge 5 --squash", checks=None) == 2
+    assert _run(monkeypatch, _pinned_merge(), checks=None) == 2
 
 
 # --- _pr_meta / _check_states: gh-output handling (fail-open regression) -----
@@ -837,66 +822,6 @@ def test_check_states_garbage_output_is_failclosed(monkeypatch):
     assert guard._check_states("5") is None
 
 
-def test_base_protected_true_only_with_required_checks(monkeypatch):
-    _fake_gh(monkeypatch, returncode=0, stdout='{"required_status_checks":{"contexts":["Test (pytest)"]}}')
-    assert guard._base_protected("owner/repo", "main") is True
-
-
-def test_base_protected_without_required_checks_is_false(monkeypatch):
-    # Protected, but nothing required → --auto still merges regardless of checks.
-    _fake_gh(monkeypatch, returncode=0, stdout='{"allow_force_pushes":{"enabled":false}}')
-    assert guard._base_protected("owner/repo", "main") is False
-
-
-def test_base_protected_with_empty_required_checks_is_false(monkeypatch):
-    # required_status_checks can exist while requiring NOTHING: a truthy dict whose
-    # contexts and checks are both empty. Auto-merge would then wait for nothing and
-    # merge red — the same hole as an unprotected branch, wearing protection's clothes.
-    _fake_gh(monkeypatch, returncode=0, stdout='{"required_status_checks":{"contexts":[],"checks":[],"strict":false}}')
-    assert guard._base_protected("owner/repo", "main") is False
-
-
-def test_base_protected_with_checks_but_no_contexts_is_true(monkeypatch):
-    # The modern shape: `checks` populated, legacy `contexts` empty. Still enforcing.
-    _fake_gh(
-        monkeypatch,
-        returncode=0,
-        stdout='{"required_status_checks":{"contexts":[],"checks":[{"context":"CI Gate","app_id":15368}]}}',
-    )
-    assert guard._base_protected("owner/repo", "main") is True
-
-
-def test_base_protected_with_non_dict_required_checks_is_false(monkeypatch):
-    _fake_gh(monkeypatch, returncode=0, stdout='{"required_status_checks":"weird"}')
-    assert guard._base_protected("owner/repo", "main") is False
-
-
-def test_auto_on_base_with_empty_required_checks_is_blocked(monkeypatch):
-    # End-to-end: the empty-required-checks branch must refuse --auto like any other
-    # base that enforces nothing.
-    monkeypatch.setattr(guard, "_base_protected", lambda o, b: False)
-    payload = json.dumps({"tool_input": {"command": "gh pr merge 5 --auto --squash"}})
-    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
-    monkeypatch.setattr(guard, "_pr_ref", lambda args, repo=None, cwd=None: "5")
-    monkeypatch.setattr(
-        guard, "_pr_meta", lambda p, repo=None, cwd=None: {"isDraft": False, "baseRefName": "main", "url": _URL}
-    )
-    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], [], 1))
-    monkeypatch.setattr(guard, "_owner_repo_from_url", lambda u: "owner/repo")
-    assert guard.main() == 2
-
-
-@pytest.mark.parametrize("err", ["HTTP 403: Upgrade to GitHub Pro", "HTTP 404: Branch not protected"])
-def test_base_protected_403_404_is_false(monkeypatch, err):
-    _fake_gh(monkeypatch, returncode=1, stdout="", stderr=err)
-    assert guard._base_protected("owner/repo", "main") is False
-
-
-def test_base_protected_other_error_is_undeterminable(monkeypatch):
-    _fake_gh(monkeypatch, returncode=1, stdout="", stderr="HTTP 500: Internal Server Error")
-    assert guard._base_protected("owner/repo", "main") is None
-
-
 # --- codex adversarial round (PR #5324): confirmed fail-open holes -----------
 #
 # Every case below was a REAL hole, reproduced against the code before the fix.
@@ -906,27 +831,18 @@ def test_base_protected_other_error_is_undeterminable(monkeypatch):
 
 
 def test_flag_enabled_spellings():
-    assert guard._flag_enabled(["--auto"], "auto")
-    assert guard._flag_enabled(["--auto=true"], "auto")
-    assert guard._flag_enabled(["--auto=1"], "auto")
-    assert guard._flag_enabled(["--auto=T"], "auto")
-    assert not guard._flag_enabled(["--auto=false"], "auto")
-    assert not guard._flag_enabled(["--auto=0"], "auto")
-    assert not guard._flag_enabled(["--squash"], "auto")
-    # Malformed → gh itself would exit non-zero; reading it as ON is fail-closed.
-    assert guard._flag_enabled(["--auto=maybe"], "auto")
+    for value in ("1", "t", "T", "true", "TRUE", "True"):
+        assert guard._flag_enabled([f"--disable-auto={value}"], "disable-auto")
+    for value in ("0", "false", "maybe", "$DISARM", ""):
+        assert not guard._flag_enabled([f"--disable-auto={value}"], "disable-auto")
 
 
-def test_auto_equals_true_on_unprotected_base_is_blocked(monkeypatch):
-    # F001: `--auto=true` skipped the protection check entirely and armed auto-merge
-    # on a base that enforces nothing — the exact incident this hook exists to stop.
-    assert _run(monkeypatch, "gh pr merge 5 --auto=true --squash", protected=False) == 2
+def test_auto_equals_true_is_refused(monkeypatch):
+    assert _run(monkeypatch, "gh pr merge 5 --auto=true --squash") == 2
 
 
-def test_auto_equals_false_is_a_normal_merge(monkeypatch):
-    # Not an auto-merge → judged as a manual merge: green passes, pending blocks.
-    assert _run(monkeypatch, "gh pr merge 5 --auto=false --squash", protected=False) == 0
-    assert _run(monkeypatch, "gh pr merge 5 --auto=false --squash", checks=([], ["Test (pytest)"], 1)) == 2
+def test_auto_equals_false_is_still_raw(monkeypatch):
+    assert _run(monkeypatch, "gh pr merge 5 --auto=false --squash") == 2
 
 
 def test_disable_auto_equals_true_is_not_a_merge(monkeypatch):
@@ -939,11 +855,9 @@ def test_disable_auto_equals_true_is_not_a_merge(monkeypatch):
     )
 
 
-def test_admin_equals_true_is_judged_by_pr_guard(monkeypatch):
-    judged: list[list[str]] = []
-    monkeypatch.setattr(guard, "_judge", lambda args, cwd=None: judged.append(args) or "blocked")
-    assert _run(monkeypatch, "gh pr merge 5 --admin=true", checks=(["Test (pytest)"], [], 1)) == 2
-    assert judged == [["5", "--admin=true"]]
+def test_admin_equals_true_is_refused(monkeypatch, capsys):
+    assert _run(monkeypatch, "gh pr merge 5 --admin=true") == 2
+    assert "RAW_MERGE_REQUIRES_PUBLISHER" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1260,19 +1174,15 @@ def test_non_bool_isdraft_fails_closed(monkeypatch, draft):
 
 
 def test_flag_enabled_last_occurrence_wins():
-    # pflag applies repeated flags in order, so `--auto=false --auto` IS auto-merge.
-    # Verified live: `gh pr list --draft=false --draft=true` returns draft PRs.
-    # Returning on the first match read this as "off" and waved the merge through.
-    assert guard._flag_enabled(["--auto=false", "--auto"], "auto")
-    assert guard._flag_enabled(["--auto", "--auto=true"], "auto")
-    assert not guard._flag_enabled(["--auto", "--auto=false"], "auto")
-    assert not guard._flag_enabled(["--auto=true", "--auto=false"], "auto")
+    assert guard._flag_enabled(["--disable-auto=false", "--disable-auto"], "disable-auto")
+    assert guard._flag_enabled(["--disable-auto", "--disable-auto=true"], "disable-auto")
+    assert not guard._flag_enabled(["--disable-auto", "--disable-auto=false"], "disable-auto")
+    assert not guard._flag_enabled(["--disable-auto=true", "--disable-auto=false"], "disable-auto")
 
 
-def test_repeated_auto_flags_on_unprotected_base_is_blocked(monkeypatch):
-    # The fail-open: green checks + `--auto=false --auto` → gh arms auto-merge on a base
-    # that requires nothing, and a later red check does not stop it.
-    assert _run(monkeypatch, "gh pr merge 5 --auto=false --auto --squash", protected=False) == 2
+def test_repeated_disarm_flags_require_the_final_value(monkeypatch):
+    assert _run(monkeypatch, "gh pr merge 5 --disable-auto=false --disable-auto") == 0
+    assert _run(monkeypatch, "gh pr merge 5 --disable-auto --disable-auto=false") == 2
 
 
 @pytest.mark.parametrize(
@@ -1320,49 +1230,6 @@ def test_shell_c_merge_blocks_end_to_end(monkeypatch):
 )
 def test_pr_selector(args, expected):
     assert guard._pr_selector(args) == expected
-
-
-@pytest.mark.parametrize(
-    "url,expected",
-    [
-        (
-            "https://github.com/learn-ukrainian/learn-ukrainian.github.io/pull/5324",
-            "learn-ukrainian/learn-ukrainian.github.io",
-        ),
-        ("https://github.com/other/repo/pull/9", "other/repo"),
-        ("https://ghe.example.com/o/r/pull/1", "o/r"),
-        ("not a url", None),
-        ("", None),
-    ],
-)
-def test_owner_repo_from_url(url, expected):
-    # Identity comes from the PR's own url — the BASE repo, fork-safe, and correct even
-    # when cwd is a different repo entirely (a URL selector).
-    assert guard._owner_repo_from_url(url) == expected
-
-
-def test_cross_repo_url_selector_uses_that_repo(monkeypatch):
-    # The PR url decides which repo's protection is read, not the cwd.
-    seen = {}
-    monkeypatch.setattr(guard, "_pr_ref", lambda args, repo=None, cwd=None: "https://github.com/other/repo/pull/9")
-    monkeypatch.setattr(
-        guard,
-        "_pr_meta",
-        lambda p, repo=None, cwd=None: {
-            "isDraft": False,
-            "baseRefName": "main",
-            "body": "",
-            "headRefOid": "a" * 40,
-            "number": 9,
-            "url": "https://github.com/other/repo/pull/9",
-        },
-    )
-    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], [], 1))
-    monkeypatch.setattr(guard, "_base_protected", lambda o, b: seen.setdefault("repo", o) and True)
-    payload = json.dumps({"tool_input": {"command": "gh pr merge https://github.com/other/repo/pull/9 --auto"}})
-    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
-    guard.main()
-    assert seen["repo"] == "other/repo"
 
 
 def test_pr_meta_requires_url_field(monkeypatch):
@@ -1414,17 +1281,11 @@ def test_valid_nested_shell_is_judged():
     assert _any_judged_merge("""bash -c 'bash -c "gh pr merge 5 --squash"'""")
 
 
-def test_recursion_cap_fails_closed(monkeypatch):
-    # At the cap the payload is NOT inspected, so it must be refused rather than passed
-    # through. Regression for an inert sentinel: the marker segment carries no PR
-    # selector, and _pr_ref falls back to the CURRENT BRANCH's PR — so without an
-    # explicit marker check, a green current branch would approve an unread payload.
-    monkeypatch.setattr(guard, "_pr_ref", lambda args, repo=None, cwd=None: "5")
-    monkeypatch.setattr(
-        guard, "_pr_meta", lambda p, repo=None, cwd=None: {"isDraft": False, "baseRefName": "main", "url": _URL}
-    )
-    monkeypatch.setattr(guard, "_check_states", lambda p, repo=None, cwd=None, meta=None: ([], [], 1))  # all green
-    assert guard._judge([guard._UNREADABLE_MARKER]) is not None
+def test_recursion_cap_fails_closed(monkeypatch, capsys):
+    monkeypatch.setattr(guard, "_MAX_SHELL_DEPTH", 0)
+    monkeypatch.setattr(guard, "_pr_snapshot", lambda *a, **kw: pytest.fail("unreadable merge reached PR lookup"))
+    assert _run(monkeypatch, f"bash -c '{_pinned_merge()}'") == 2
+    assert "target cannot be read" in capsys.readouterr().err
 
 
 def test_deep_nesting_emits_unparsed_marker():
@@ -1455,7 +1316,7 @@ def test_flag_looking_value_does_not_force_auto_path():
 
 def test_real_control_flags_still_recognized():
     assert guard._merge_args(["gh", "pr", "merge", "5", "--disable-auto"]) is None
-    assert guard._merge_args(["gh", "pr", "merge", "5", "--admin"]) == ["5", "--admin"]
+    assert guard._merge_args(["gh", "pr", "merge", "5", "--admin"]).args == ["5", "--admin"]
     assert guard._flag_enabled(guard._classify(["5", "--auto"])[0], "auto")
 
 
@@ -1502,48 +1363,19 @@ def test_repo_is_propagated_to_every_gh_lookup(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "meta,checks,expected",
+    "command,reason",
     [
-        (
-            {
-                "isDraft": False,
-                "baseRefName": "main",
-                "url": "https://github.com/learn-ukrainian/learn-ukrainian-infra-private/pull/689",
-            },
-            ([], [], 1),
-            0,
-        ),
-        (
-            {
-                "isDraft": True,
-                "baseRefName": "main",
-                "url": "https://github.com/learn-ukrainian/learn-ukrainian-infra-private/pull/689",
-            },
-            ([], [], 1),
-            2,
-        ),
-        (
-            {
-                "isDraft": False,
-                "baseRefName": "main",
-                "url": "https://github.com/learn-ukrainian/learn-ukrainian-infra-private/pull/689",
-            },
-            (["CI Gate"], [], 1),
-            2,
-        ),
+        ("gh pr merge 689 -R owner/private-infra --squash", "RAW_MERGE_REQUIRES_PUBLISHER"),
+        (f"{_PUBLISHER_MERGE} --repo owner/private-infra --number 689 --expect-queue=true", "MERGE_PINS_REQUIRED"),
+        (f"{_PUBLISHER_MERGE} --repo owner/private-infra --number 689 --match-head={_HEAD}", "MERGE_PINS_REQUIRED"),
     ],
 )
-def test_private_repo_selector_checks_its_own_pr(monkeypatch, meta, checks, expected):
-    assert (
-        _run(
-            monkeypatch,
-            "gh pr merge 689 -R learn-ukrainian/learn-ukrainian-infra-private --squash",
-            pr="689",
-            meta=meta,
-            checks=checks,
-        )
-        == expected
-    )
+def test_private_repo_merge_requires_both_pins(monkeypatch, capsys, command, reason):
+    monkeypatch.setattr(guard, "_pr_snapshot", lambda *a, **kw: pytest.fail("unpinned merge reached PR lookup"))
+    assert _run(monkeypatch, command, pr="689") == 2
+    stderr = capsys.readouterr().err
+    assert reason in stderr
+    assert "--match-head <approved SHA> --expect-queue <verified true|false>" in stderr
 
 
 # --- codex re-review round 4 (PR #5324): pflag shorthands + shell escaping ---
@@ -1654,9 +1486,8 @@ def test_xargs_fed_selector_fails_closed(monkeypatch):
     assert _run(monkeypatch, "printf '5' | xargs gh pr merge --squash", checks=([], [], 1)) == 2
 
 
-def test_xargs_with_explicit_selector_is_judged_normally(monkeypatch):
-    assert _run(monkeypatch, "printf '' | xargs gh pr merge 5 --squash", checks=(["boundary-and-tests"], [], 1)) == 2
-    assert _run(monkeypatch, "printf '' | xargs gh pr merge 5 --squash", checks=([], [], 1)) == 0
+def test_xargs_with_explicit_selector_is_refused(monkeypatch):
+    assert _run(monkeypatch, "printf '' | xargs gh pr merge 5 --squash") == 2
 
 
 def test_xargs_options_are_stepped_over(monkeypatch):
@@ -1833,34 +1664,6 @@ def test_colorized_pr_meta_honors_draft(monkeypatch):
     assert meta is not None and meta["isDraft"] is True
 
 
-def test_colorized_base_protection_still_classified(monkeypatch):
-    """_base_protected's parse was raw too. Colorized protection JSON must classify as
-    protected — reading it as undeterminable blocks legitimate --auto on a guarded base."""
-    colorized = (
-        "\x1b[1;37m{\x1b[m\n"
-        '  \x1b[1;34m"required_status_checks"\x1b[m: \x1b[1;37m{\x1b[m\n'
-        '    \x1b[1;34m"contexts"\x1b[m: [\x1b[32m"Test (pytest)"\x1b[m],\n'
-        '    \x1b[1;34m"strict"\x1b[m: \x1b[35mtrue\x1b[m\n'
-        "  \x1b[1;37m}\x1b[m\n"
-        "\x1b[1;37m}\x1b[m\n"
-    )
-    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=colorized, stderr="")
-    monkeypatch.setattr(guard.subprocess, "run", lambda *a, **k: completed)
-    assert guard._base_protected("owner/repo", "main") is True
-
-
-def test_colorized_empty_required_checks_still_unprotected(monkeypatch):
-    """Decolorizing must not flip the empty-required-checks verdict: protection that
-    requires NOTHING is still False (auto-merge would wait for nothing and merge red)."""
-    colorized = '\x1b[1;37m{\x1b[m\x1b[1;34m"required_status_checks"\x1b[m: \x1b[1;37m{\x1b[m\x1b[1;34m"contexts"\x1b[m: [], \x1b[1;34m"checks"\x1b[m: []\x1b[1;37m}\x1b[m\x1b[1;37m}\x1b[m'
-    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=colorized, stderr="")
-    monkeypatch.setattr(guard.subprocess, "run", lambda *a, **k: completed)
-    assert guard._base_protected("owner/repo", "main") is False
-
-
-# --- cd-target resolution: judge the PR in the repo the merge RUNS in ---------
-
-
 def test_cd_target_literal_and_home():
     assert guard._cd_target(["cd", "/tmp"]) == "/tmp"
     assert guard._cd_target(["cd", "~/x"]) == os.path.expanduser("~/x")
@@ -1883,7 +1686,7 @@ def test_cd_then_merge_threads_cwd(monkeypatch):
         seen["cwd"] = cwd
         return None
 
-    payload = json.dumps({"tool_input": {"command": "cd /tmp && gh pr merge 7 --squash"}})
+    payload = json.dumps({"tool_input": {"command": f"cd /tmp && {_pinned_merge(7)}"}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     monkeypatch.setattr(guard, "_judge", fake_judge)
     assert guard.main() == 0
@@ -1891,7 +1694,7 @@ def test_cd_then_merge_threads_cwd(monkeypatch):
 
 
 def test_unreadable_cd_before_merge_blocks(monkeypatch):
-    payload = json.dumps({"tool_input": {"command": 'cd "$WORKDIR" && gh pr merge 7 --squash'}})
+    payload = json.dumps({"tool_input": {"command": f'cd "$WORKDIR" && {_pinned_merge(7)}'}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     assert guard.main() == 2
 
@@ -1903,7 +1706,7 @@ def test_plain_merge_has_no_cwd(monkeypatch):
         seen["cwd"] = cwd
         return None
 
-    payload = json.dumps({"tool_input": {"command": "gh pr merge 7 --squash"}})
+    payload = json.dumps({"tool_input": {"command": _pinned_merge(7)}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     monkeypatch.setattr(guard, "_judge", fake_judge)
     assert guard.main() == 0
@@ -1955,12 +1758,12 @@ def test_shell_c_cd_does_not_leak_out(monkeypatch):
     `bash -c 'cd /inner && true'` ends with the outer shell still where it started, so
     PR 9 is resolved there — not in /inner, whose PR 9 is a different PR entirely.
     """
-    assert _judged_cwds(monkeypatch, "bash -c 'cd /inner && true' && gh pr merge 9") == [("9", None)]
+    assert _judged_cwds(monkeypatch, f"bash -c 'cd /inner && true' && {_pinned_merge(9)}") == [("9", None)]
 
 
 def test_subshell_cd_does_not_leak_out(monkeypatch):
     """LEAK, direction 1 via `( ... )` — the subshell's cd dies at its `)`."""
-    assert _judged_cwds(monkeypatch, "(cd /inner && true) && gh pr merge 9") == [("9", None)]
+    assert _judged_cwds(monkeypatch, f"(cd /inner && true) && {_pinned_merge(9)}") == [("9", None)]
 
 
 def test_shell_c_payload_inherits_cwd_but_does_not_export_it(monkeypatch):
@@ -1971,28 +1774,28 @@ def test_shell_c_payload_inherits_cwd_but_does_not_export_it(monkeypatch):
     """
     assert _judged_cwds(
         monkeypatch,
-        "cd /outer && bash -c 'cd /inner && gh pr merge 1' && gh pr merge 2",
+        f"cd /outer && bash -c 'cd /inner && {_pinned_merge(1)}' && {_pinned_merge(2)}",
     ) == [("1", "/inner"), ("2", "/outer")]
 
 
 @pytest.mark.parametrize(
     "command",
     [
-        "cd /safe; env -S echo cd /wrong; gh pr merge 5",
-        "cd /safe; env --split-string=echo cd /wrong; gh pr merge 5",
-        "cd /safe; env --sp echo cd /wrong; gh pr merge 5",
-        "cd /safe; env -S 'cd /wrong'; gh pr merge 5",
-        "cd /safe; env -S echo eval cd /wrong; gh pr merge 5",
+        f"cd /safe; env -S echo cd /wrong; {_pinned_merge()}",
+        f"cd /safe; env --split-string=echo cd /wrong; {_pinned_merge()}",
+        f"cd /safe; env --sp echo cd /wrong; {_pinned_merge()}",
+        f"cd /safe; env -S 'cd /wrong'; {_pinned_merge()}",
+        f"cd /safe; env -S echo eval cd /wrong; {_pinned_merge()}",
         # A child wrapper cannot run the cd builtin, whatever precedes the cd.
-        "cd /safe; env A-B=1 cd /wrong; gh pr merge 5",
-        "cd /safe; env =x cd /wrong; gh pr merge 5",
-        "cd /safe; env -- A-B=1 cd /wrong; gh pr merge 5",
-        "cd /safe; env -u FOO A-B=1 cd /wrong; gh pr merge 5",
-        "cd /safe; sudo A-B=1 cd /wrong; gh pr merge 5",
-        "cd /safe; env cd /wrong; gh pr merge 5",
-        "cd /safe; sudo -u bot cd /wrong; gh pr merge 5",
-        "cd /safe; nice -n 1 cd /wrong; gh pr merge 5",
-        "cd /safe; env cd \"$DIR\"; gh pr merge 5",
+        f"cd /safe; env A-B=1 cd /wrong; {_pinned_merge()}",
+        f"cd /safe; env =x cd /wrong; {_pinned_merge()}",
+        f"cd /safe; env -- A-B=1 cd /wrong; {_pinned_merge()}",
+        f"cd /safe; env -u FOO A-B=1 cd /wrong; {_pinned_merge()}",
+        f"cd /safe; sudo A-B=1 cd /wrong; {_pinned_merge()}",
+        f"cd /safe; env cd /wrong; {_pinned_merge()}",
+        f"cd /safe; sudo -u bot cd /wrong; {_pinned_merge()}",
+        f"cd /safe; nice -n 1 cd /wrong; {_pinned_merge()}",
+        f"cd /safe; env cd \"$DIR\"; {_pinned_merge()}",
     ],
 )
 def test_child_wrapper_cd_does_not_change_parent_cwd(monkeypatch, command):
@@ -2003,9 +1806,9 @@ def test_child_wrapper_cd_does_not_change_parent_cwd(monkeypatch, command):
 @pytest.mark.parametrize(
     "command,cwd",
     [
-        ("cd /safe; command cd /inner; gh pr merge 5", "/inner"),
-        ("cd /safe; time -p cd /inner; gh pr merge 5", "/inner"),
-        ("cd /safe; A=1 cd /inner; gh pr merge 5", "/inner"),
+        (f"cd /safe; command cd /inner; {_pinned_merge()}", "/inner"),
+        (f"cd /safe; time -p cd /inner; {_pinned_merge()}", "/inner"),
+        (f"cd /safe; A=1 cd /inner; {_pinned_merge()}", "/inner"),
     ],
 )
 def test_shell_level_prefix_cd_still_moves_cwd(monkeypatch, command, cwd):
@@ -2015,31 +1818,31 @@ def test_shell_level_prefix_cd_still_moves_cwd(monkeypatch, command, cwd):
 
 def test_unparsed_wrapper_option_names_the_refusal(monkeypatch, capsys):
     monkeypatch.setattr(guard, "_pr_snapshot", lambda *a, **kw: pytest.fail("unparsed wrapper reached PR lookup"))
-    assert _run(monkeypatch, "sudo --unknown bot gh pr merge 5 --squash") == 2
+    assert _run(monkeypatch, f"sudo --unknown bot {_pinned_merge()}") == 2
     assert "wrapper\noption this guard cannot parse" in capsys.readouterr().err
 
 
 def test_merge_inside_subshell_is_judged_in_the_subshell_cwd(monkeypatch):
     """Scoping must not overshoot: a merge INSIDE the cd's scope is judged there."""
-    assert _judged_cwds(monkeypatch, "(cd /inner && gh pr merge 5)") == [("5", "/inner")]
+    assert _judged_cwds(monkeypatch, f"(cd /inner && {_pinned_merge()})") == [("5", "/inner")]
 
 
 def test_merge_inside_shell_c_is_judged_in_the_payload_cwd(monkeypatch):
-    assert _judged_cwds(monkeypatch, 'bash -c "cd /inner && gh pr merge 5"') == [("5", "/inner")]
+    assert _judged_cwds(monkeypatch, f'bash -c "cd /inner && {_pinned_merge()}"') == [("5", "/inner")]
 
 
 def test_nested_subshells_restore_each_level(monkeypatch):
     """Each `)` restores exactly one level — /b, then /a, then the session's cwd."""
     assert _judged_cwds(
         monkeypatch,
-        "(cd /a && (cd /b && gh pr merge 1) && gh pr merge 2) && gh pr merge 3",
+        f"(cd /a && (cd /b && {_pinned_merge(1)}) && {_pinned_merge(2)}) && {_pinned_merge(3)}",
     ) == [("1", "/b"), ("2", "/a"), ("3", None)]
 
 
 def test_glued_subshell_operators_keep_scope(monkeypatch):
     """`&&(` and `)&&` tokenize as one glued punctuation run (#4876) — the parens in
     them still open and close scopes, in order."""
-    assert _judged_cwds(monkeypatch, "cd /a&&(cd /b&&gh pr merge 1)&&gh pr merge 2") == [
+    assert _judged_cwds(monkeypatch, f"cd /a&&(cd /b&&{_pinned_merge(1)})&&{_pinned_merge(2)}") == [
         ("1", "/b"),
         ("2", "/a"),
     ]
@@ -2047,41 +1850,41 @@ def test_glued_subshell_operators_keep_scope(monkeypatch):
 
 def test_command_substitution_cd_does_not_leak(monkeypatch):
     """`$(...)` runs in a subshell, so its cd dies at the `)` — as bash does."""
-    assert _judged_cwds(monkeypatch, "cd /a && echo $(cd /b; pwd) && gh pr merge 1") == [("1", "/a")]
+    assert _judged_cwds(monkeypatch, f"cd /a && echo $(cd /b; pwd) && {_pinned_merge(1)}") == [("1", "/a")]
 
 
 def test_unreadable_cd_inside_payload_does_not_escape(monkeypatch):
     """An unreadable cd is scoped too: it blocks the merge INSIDE the payload..."""
-    payload = json.dumps({"tool_input": {"command": "bash -c 'cd $D && gh pr merge 7'"}})
+    payload = json.dumps({"tool_input": {"command": f"bash -c 'cd $D && {_pinned_merge(7)}'"}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     assert guard.main() == 2
 
 
 def test_unreadable_cd_in_subshell_does_not_block_outer_merge(monkeypatch):
     """...but does NOT taint a merge outside it, which that cd never touched."""
-    assert _judged_cwds(monkeypatch, '(cd "$D" && true) && gh pr merge 7') == [("7", None)]
+    assert _judged_cwds(monkeypatch, f'(cd "$D" && true) && {_pinned_merge(7)}') == [("7", None)]
 
 
 def test_unattributable_scope_boundary_fails_closed(monkeypatch):
     """A `)` with no `(` desyncs the scope model — block rather than guess a cwd."""
-    payload = json.dumps({"tool_input": {"command": "(cd /a)) && gh pr merge 7"}})
+    payload = json.dumps({"tool_input": {"command": f"(cd /a)) && {_pinned_merge(7)}"}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     assert guard.main() == 2
 
 
 def test_cd_after_merge_does_not_apply_to_it(monkeypatch):
     """A `cd` the merge never reached cannot move it: the merge already ran."""
-    assert _judged_cwds(monkeypatch, "gh pr merge 7 && cd /elsewhere") == [("7", None)]
+    assert _judged_cwds(monkeypatch, f"{_pinned_merge(7)} && cd /elsewhere") == [("7", None)]
 
 
 def test_cd_threads_across_lines(monkeypatch):
     """cwd survives the line break, as it does in a real script — `cd` and merge on
     separate lines are still the same shell."""
-    assert _judged_cwds(monkeypatch, "cd /repo\ngh pr merge 7 --squash") == [("7", "/repo")]
+    assert _judged_cwds(monkeypatch, f"cd /repo\n{_pinned_merge(7)}") == [("7", "/repo")]
 
 
 def test_multiline_merges_track_their_own_cwd(monkeypatch):
-    assert _judged_cwds(monkeypatch, "cd /a\ngh pr merge 1\ncd /b\ngh pr merge 2") == [("1", "/a"), ("2", "/b")]
+    assert _judged_cwds(monkeypatch, f"cd /a\n{_pinned_merge(1)}\ncd /b\n{_pinned_merge(2)}") == [("1", "/a"), ("2", "/b")]
 
 
 # --- #5333 r2: the fail-closed path's own two bugs ----------------------------
@@ -2101,7 +1904,7 @@ def test_repo_option_is_honoured_when_cwd_is_unreadable(monkeypatch):
 
     The `case` arm's bare `)` is what makes the cwd unreadable here (see N1 below).
     """
-    assert _judged_cwds(monkeypatch, "case x in y) true;; esac; gh pr merge 9 --squash -R owner/repo") == [("9", None)]
+    assert _judged_cwds(monkeypatch, f"case x in y) true;; esac; {_pinned_merge(9)} --repo owner/repo") == [("9", None)]
 
 
 def test_repo_option_under_unreadable_cwd_is_judged_not_waved_through(monkeypatch):
@@ -2110,14 +1913,14 @@ def test_repo_option_under_unreadable_cwd_is_judged_not_waved_through(monkeypatc
     A draft PR named with `-R` is still a draft.
     """
     monkeypatch.setattr(guard, "_pr_meta", lambda pr, repo=None, cwd=None: {"isDraft": True})
-    payload = json.dumps({"tool_input": {"command": "case x in y) true;; esac; gh pr merge 9 -R owner/repo"}})
+    payload = json.dumps({"tool_input": {"command": f"case x in y) true;; esac; {_pinned_merge(9)} --repo owner/repo"}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     assert guard.main() == 2
 
 
 def test_unreadable_cwd_without_repo_option_still_fails_closed(monkeypatch):
     """B1's fix is scoped to `-R`: without it, an unreadable cwd still blocks."""
-    payload = json.dumps({"tool_input": {"command": 'cd "$D" && gh pr merge 9 --squash'}})
+    payload = json.dumps({"tool_input": {"command": f'cd "$D" && {_pinned_merge(9)}'}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     assert guard.main() == 2
 
@@ -2125,9 +1928,9 @@ def test_unreadable_cwd_without_repo_option_still_fails_closed(monkeypatch):
 @pytest.mark.parametrize(
     "command",
     [
-        "echo ')' && gh pr merge 9 --squash",
-        'echo ")" && gh pr merge 9 --squash',
-        "printf '%s' ')' ; gh pr merge 9 --squash",
+        f"echo ')' && {_pinned_merge(9)}",
+        f'echo ")" && {_pinned_merge(9)}',
+        f"printf '%s' ')' ; {_pinned_merge(9)}",
     ],
 )
 def test_quoted_paren_is_not_a_scope_boundary(monkeypatch, command):
@@ -2146,13 +1949,13 @@ def test_quoted_close_paren_does_not_pop_a_real_scope(monkeypatch):
     Bash runs this merge inside the subshell, in /a. Reading `')'` as a real `)` restores
     the session cwd early and judges PR 9 there instead — a different PR 9.
     """
-    assert _judged_cwds(monkeypatch, "(cd /a && echo ')' && gh pr merge 9)") == [("9", "/a")]
+    assert _judged_cwds(monkeypatch, f"(cd /a && echo ')' && {_pinned_merge(9)})") == [("9", "/a")]
 
 
 def test_quoted_open_paren_does_not_push_a_scope(monkeypatch):
     """B2, mirror: a fake `open` swallows the real `)`, so a real subshell's `cd` leaks
     out to the merge that follows it. Bash runs PR 9 in the session cwd."""
-    assert _judged_cwds(monkeypatch, "echo '(' && (cd /a && true) && gh pr merge 9") == [("9", None)]
+    assert _judged_cwds(monkeypatch, f"echo '(' && (cd /a && true) && {_pinned_merge(9)}") == [("9", None)]
 
 
 def test_quoted_paren_stays_in_argv():
@@ -2165,7 +1968,7 @@ def test_quoted_paren_stays_in_argv():
 
 def test_escaped_paren_is_not_a_scope_boundary(monkeypatch):
     r"""`\)` is escaped, not a boundary — bash passes it to echo as a literal."""
-    assert _judged_cwds(monkeypatch, "cd /a && echo \\) && gh pr merge 9") == [("9", "/a")]
+    assert _judged_cwds(monkeypatch, f"cd /a && echo \\) && {_pinned_merge(9)}") == [("9", "/a")]
 
 
 def test_bare_unmatched_paren_still_fails_closed(monkeypatch):
@@ -2173,13 +1976,13 @@ def test_bare_unmatched_paren_still_fails_closed(monkeypatch):
     unattributable boundary. The r2 fix narrows what counts as bare — it does not make
     the guard `case`-aware. Blocking a `case`-plus-merge one-liner is the accepted cost;
     a literal `cd` (or `-R`, above) recovers."""
-    payload = json.dumps({"tool_input": {"command": "case x in y) true;; esac; gh pr merge 9"}})
+    payload = json.dumps({"tool_input": {"command": f"case x in y) true;; esac; {_pinned_merge(9)}"}})
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     assert guard.main() == 2
 
 
 @pytest.mark.parametrize("command", ["cd /tmp &&>file gh pr merge 5 --admin", "{fd}>file gh pr merge 5 --admin"])
-@pytest.mark.parametrize("checks,expected", [(([], [], 1), 0), ((["CI Gate"], [], 1), 2)])
+@pytest.mark.parametrize("checks,expected", [(([], [], 1), 2), ((["CI Gate"], [], 1), 2)])
 def test_issue_9479_r2_redirect_merge_decision(monkeypatch, command, checks, expected):
     assert _run(monkeypatch, command, checks=checks) == expected
     assert ["gh", "pr", "merge", "5", "--admin"] in guard._segments(command)
@@ -2212,7 +2015,7 @@ def test_issue_9480_target_argv_matches_bash(monkeypatch, tmp_path, command, exp
     )
     assert oracle.stdout.decode().split("\0")[:-1] == ["pr", "merge", *expected]
     args = [guard._merge_args(seg.argv) for seg in guard._judged_segments(command + suffix)]
-    assert [arg for arg in args if arg is not None] == [expected]
+    assert [merge.args for merge in args if merge is not None] == [expected]
     judged = []
     monkeypatch.setattr(
         guard,
@@ -2221,8 +2024,7 @@ def test_issue_9480_target_argv_matches_bash(monkeypatch, tmp_path, command, exp
     )
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": command + suffix}})))
     assert guard.main() == 2
-    # A zero-padded number is refused before any lookup: gh would read it as a PR number.
-    assert judged == ([expected[0]] if guard._canonical_selector(expected[0]) else [])
+    assert judged == []
 
 
 @pytest.mark.parametrize("suffix", ["", " >out", " | cat"])
@@ -2259,9 +2061,9 @@ def test_issue_9480_negated_echo_does_not_invoke_merge():
 
 
 def test_issue_9480_relative_cd_cannot_clear_unknown_cwd(monkeypatch, capsys):
-    assert _run(monkeypatch, 'cd "$DIR"; cd b; gh pr merge 5') == 2
+    assert _run(monkeypatch, f'cd "$DIR"; cd b; {_pinned_merge()}') == 2
     assert "working directory cannot be read" in capsys.readouterr().err
-    assert _judged_cwds(monkeypatch, 'cd "$DIR"; cd /known; cd b; gh pr merge 5') == [("5", "/known/b")]
+    assert _judged_cwds(monkeypatch, f'cd "$DIR"; cd /known; cd b; {_pinned_merge()}') == [("5", "/known/b")]
 
 
 def test_issue_9480_eval_cd_cannot_launder_merge_cwd(monkeypatch, capsys):
@@ -2273,9 +2075,9 @@ def test_issue_9480_eval_cd_cannot_launder_merge_cwd(monkeypatch, capsys):
 def test_issue_9480_consecutive_cd_matches_bash(monkeypatch, tmp_path, suffix):
     (tmp_path / "a" / "b").mkdir(parents=True)
     monkeypatch.chdir(tmp_path)
-    command = "cd a; cd b; gh pr merge 5" + suffix
+    command = f"cd a; cd b; {_pinned_merge()}" + suffix
     oracle = subprocess.run(
-        ["bash", "-c", "exec 3>&1; gh() { pwd >&3; }; " + command],
+        ["bash", "-c", "exec 3>&1; python() { pwd >&3; }; " + command],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -2287,7 +2089,6 @@ def test_issue_9480_consecutive_cd_matches_bash(monkeypatch, tmp_path, suffix):
 
 # --- OO-48 external advisory provenance (#11184) ------------------------------------------
 
-_HEAD = "a" * 40
 _ENTIRE_ROWS = json.dumps(
     [{"name": "CI Gate", "bucket": "pass", "workflow": "CI"}, {"name": "Entire Gates", "bucket": "pending"}]
 )
@@ -2407,8 +2208,8 @@ def test_oo48_snapshot_hands_its_metadata_to_the_check_reader(monkeypatch):
     ((1, ""), []),
     ((0, "[]"), []),
 ])
-def test_raw_merge_of_a_zero_check_head_is_refused_like_the_publisher(monkeypatch, capsys, checks, rollup):
-    """Defect class: a raw `gh pr merge` lands a head with no blocking check that pr-merge refuses (NO_CHECKS)."""
+def test_pinned_merge_of_a_zero_check_head_is_refused_like_the_publisher(monkeypatch, capsys, checks, rollup):
+    """A pinned merge still needs at least one blocking check."""
     from lu_machinery.publish import merge_guard
 
     meta = {"isDraft": False, "baseRefName": "main", "body": "", "headRefOid": _HEAD, "number": 5, "url": _URL}
@@ -2423,7 +2224,7 @@ def test_raw_merge_of_a_zero_check_head_is_refused_like_the_publisher(monkeypatc
         merge_guard.ensure_merge_ready("owner/repo", 5, runner=guard.subprocess.run, cwd=None, environment={})
     reason = str(refused.value).removeprefix("OPSEC: merge refused: ").removesuffix(".")
     assert reason.startswith("NO_CHECKS")
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": "gh pr merge 5 --squash"}})))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": _pinned_merge()}})))
     assert guard.main() == 2
     assert f"PR 5: {reason}." in capsys.readouterr().err
 
@@ -2441,7 +2242,7 @@ def test_oo48_unproven_pending_entire_gates_blocks_main(monkeypatch, capsys):
         ("pr", "view"): (0, json.dumps({"isDraft": False, "body": "", "number": 5, "headRefOid": _HEAD,
                                          "url": _URL, "baseRefName": "main"})),
     })
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": "gh pr merge 5"}})))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": _pinned_merge()}})))
     assert guard.main() == 2
     assert "GitHub App provenance at the PR head is unproven" in capsys.readouterr().err
 
@@ -2584,7 +2385,7 @@ def _branch_replies(selector, rollup):
 @pytest.mark.parametrize("rollup", [_BOUND_ROLLUP, _BOUND_ROLLUP[:1]], ids=["entire-proven", "green-only"])
 def test_overflow_branch_selector_is_judged_as_the_branch_gh_merges(monkeypatch, selector, rollup):
     calls = _scripted_gh(monkeypatch, _branch_replies(selector, rollup))
-    command = f"gh pr merge '{selector}' --squash"
+    command = _pinned_merge(selector)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": command}})))
     assert guard.main() == 0
     assert all(call[2] == selector for call in calls if call[0] == "pr")
@@ -2593,7 +2394,7 @@ def test_overflow_branch_selector_is_judged_as_the_branch_gh_merges(monkeypatch,
 @pytest.mark.parametrize("selector", ["#9223372036854775807", "+9223372036854775807", "#+9223372036854775807"])
 def test_in_range_non_canonical_selector_still_blocks_before_any_gh_read(monkeypatch, capsys, selector):
     calls = _scripted_gh(monkeypatch, {})
-    command = f"gh pr merge '{selector}' --squash"
+    command = _pinned_merge(selector)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": command}})))
     assert guard.main() == 2
     assert "is not canonical" in capsys.readouterr().err
@@ -2604,7 +2405,7 @@ def test_in_range_number_is_still_bound_to_the_metadata_number(monkeypatch, caps
     # gh reads 9223372036854775807 as a PR number; PR 5's metadata does not prove its exemption.
     selector = "9223372036854775807"
     _scripted_gh(monkeypatch, _branch_replies(selector, _BOUND_ROLLUP))
-    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": f"gh pr merge {selector}"}})))
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": _pinned_merge(selector)}})))
     assert guard.main() == 2
     assert "GitHub App provenance at the PR head is unproven" in capsys.readouterr().err
 
@@ -2612,7 +2413,7 @@ def test_in_range_number_is_still_bound_to_the_metadata_number(monkeypatch, caps
 @pytest.mark.parametrize("selector", ["+9", "#+9", "+0009", "#+0009", "#9", "0009"])
 def test_non_canonical_selector_blocks_before_any_gh_read(monkeypatch, capsys, selector):
     calls = _scripted_gh(monkeypatch, {})
-    command = f"gh pr merge '{selector}' --squash"
+    command = _pinned_merge(selector)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"tool_input": {"command": command}})))
     assert guard.main() == 2
     assert "is not canonical" in capsys.readouterr().err
@@ -2687,12 +2488,12 @@ def test_status_rollup_returns_the_bound_response(monkeypatch):
         ("git commit -F - <<'EOF'\nfix(hooks): refuse gh pr merge via heredoc\nEOF", ["CI Gate"], 0),
         ("git commit --file=- <<'EOF'\nfix(hooks): high-risk merge path proven\nEOF", ["CI Gate"], 0),
         (
-            ".venv/bin/python -m lu_machinery.publish pr-merge --number 5 --body-file - <<'EOF'\nApproved through review; merge when green.\nEOF",
+            f"{_pinned_merge()} --body-file - <<'EOF'\nApproved through review; merge when green.\nEOF",
             [],
             0,
         ),
         (
-            ".venv/bin/python -m lu_machinery.publish pr-merge --number 5 --body-file - <<'EOF'\nApproved through review; merge when green.\nEOF",
+            f"{_pinned_merge()} --body-file - <<'EOF'\nApproved through review; merge when green.\nEOF",
             ["CI Gate"],
             2,
         ),
