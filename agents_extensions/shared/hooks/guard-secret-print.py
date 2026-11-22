@@ -782,7 +782,10 @@ def _lex(command: str) -> list[str]:
             if command.startswith("\\\n", index):
                 index += 2
                 continue
-            add("lit", command[index + 1 : index + 2] or "\\")
+            if index + 1 == len(command):
+                # Bash keeps or drops a backslash that ends its input by how the last line began.
+                raise ValueError("backslash at the end of shell text")
+            add("lit", command[index + 1])
             index += 2
         elif char == "'":
             end = command.find("'", index + 1)
@@ -1397,7 +1400,7 @@ def _env_dump_reason(
         if not reason or _has_override(segment):
             continue
         found = _command_at(segment)
-        target = _stdout_target(found[1], substitutions) if found else None
+        target = written = _stdout_target(found[1], substitutions) if found else None
         if target is not None:
             target = _normalized_path(target)
         # Process substitutions are output consumers, not capture filenames.
@@ -1411,9 +1414,8 @@ def _env_dump_reason(
             if _has_safe_downstream(pipeline, index):
                 continue
             return reason
-        visible = target in {"/dev/stdout", "/dev/stderr", "/dev/tty"} or bool(
-            target and re.fullmatch(r"/(?:dev/fd|proc/(?:self|\$\$|[0-9]+)/fd)/[0-9]+", target)
-        )
+        # The written spelling: a lexically folded `..` loses the symlinks it crossed.
+        visible = any(_names_stream(written or target, name) for name in ("stdout", "stderr", "tty"))
         if target and not visible:
             if target != "/dev/null":
                 dumped_files.add(target)
@@ -2103,7 +2105,12 @@ def _normalized_path(path: str) -> str:
 
 def _sensitive_path(path: str) -> bool:
     clean = _normalized_path(path)
-    return _is_known_secret_file(clean) or bool(re.fullmatch(r"/proc/[^/]+/environ", clean))
+    # Any process's environment under /proc, or an `environ` whose directory is not known; the
+    # written spelling is read, since a lexically folded `..` loses the symlinks it crossed.
+    written = _strip_quotes(path)
+    parts = _path_parts(written)
+    environ = parts[-1:] == ["environ"] and (parts[:1] == ["proc"] or ".." in parts or not written.startswith("/"))
+    return _is_known_secret_file(clean) or environ
 
 
 def _non_printing_command(cmd: str, args: list[str]) -> bool:
@@ -2413,18 +2420,32 @@ def _xargs_target(args: list[str]) -> list[str]:
     return []
 
 
-def _names_stdin(path: str) -> bool:
-    """Whether a path may name standard input (`/dev/stdin`, `/dev/fd/0`, `/proc/<id>/fd/0`).
+def _path_parts(path: str) -> list[str]:
+    """The components of a path, with repeated slashes and `.` folded away."""
+    return [part for part in path.split("/") if part not in {"", "."}]
 
-    Every spelling of those ends in `stdin` or in `fd/0`; slashes and `.` fold
-    away. A `..` is resolved through symlinks only by the file system, so a
-    final `0` after one counts, as does a relative path, whose directory is
-    not known.
+
+def _names_stream(path: str, name: str, descriptor: str = "[0-9]+") -> bool:
+    """Whether a path may name `/dev/<name>` or a descriptor (`descriptor`) of the shell.
+
+    Every spelling of `/dev/<name>`, `/dev/fd/<n>` and `/proc/<id>[/task/<id>]/fd/<n>`
+    ends in `<name>` or in `fd/<n>`. Only the file system resolves a `..`
+    through symlinks, and a relative path's directory is not known, so for
+    those a final `<n>` alone counts.
     """
-    parts = [part for part in path.split("/") if part not in {"", "."}]
+    parts = _path_parts(path)
     if not parts:
         return False
-    return parts[-1] == "stdin" or (parts[-1] == "0" and (parts[-2:-1] == ["fd"] or ".." in parts))
+    if parts[-1] == name:
+        return True
+    return bool(re.fullmatch(descriptor, parts[-1])) and (
+        parts[-2:-1] == ["fd"] or ".." in parts or not path.startswith("/")
+    )
+
+
+def _names_stdin(path: str) -> bool:
+    """Whether a path may name standard input (`/dev/stdin` or descriptor 0)."""
+    return _names_stream(path, "stdin", "0")
 
 
 def _shell_reads_stdin(args: list[str]) -> bool:
