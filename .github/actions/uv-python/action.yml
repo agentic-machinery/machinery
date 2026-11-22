@@ -54,6 +54,30 @@ runs:
     # github-token) and checks the archive against the pinned SHA-256 before
     # use. No Actions cache: every job starts from the pins. The venv lives in
     # the job temp directory, never in the checkout.
+    # On a tool-cache miss, an exact uv version still fetches the version
+    # manifest, and a failed fetch fails the job (setup-uv c18668ad
+    # src/download/download-version.ts getArtifact; src/download/manifest.ts
+    # fetchManifestResponse; src/setup-uv.ts run). manifest-file is a URL
+    # (docs/customization.md). The data URL is the committed copy, so that
+    # fetch does not call raw.githubusercontent.com.
+    - name: Read the pinned uv manifest
+      id: uv-manifest
+      shell: bash
+      run: |
+        set -euo pipefail
+        manifest="${GITHUB_ACTION_PATH}/uv-manifest.ndjson"
+        if [ ! -s "$manifest" ]; then
+          echo "::error::Pinned uv manifest is missing or empty"
+          exit 1
+        fi
+        payload="$(base64 -w0 "$manifest")"
+        case "$payload" in
+          ''|*[!A-Za-z0-9+/=]*)
+            echo "::error::Pinned uv manifest did not encode as one base64 line"
+            exit 1
+            ;;
+        esac
+        printf 'url=data:application/x-ndjson;base64,%s\n' "$payload" >> "$GITHUB_OUTPUT"
     - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       with:
         version: ${{ inputs.uv-version }}
@@ -61,6 +85,7 @@ runs:
         github-token: ${{ github.token }}
         download-from-astral-mirror: 'true'
         enable-cache: 'false'
+        manifest-file: ${{ steps.uv-manifest.outputs.url }}
         python-version: ${{ steps.want.outputs.version }}
         activate-environment: 'true'
         venv-path: ${{ runner.temp }}/python

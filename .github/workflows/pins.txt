@@ -88,8 +88,9 @@ ACTIONS_SETUP_UV=c18668ad3cf93ea998bef934396af7bb5c839dc7
 #   astral-sh/setup-uv tag v10.2.0, the commit the source repository's
 #   .github/actions/python-ci-env pins; checked 2026-11-17 with
 #   `gh api repos/astral-sh/setup-uv/git/ref/tags/v10.2.0` (a commit ref).
-#   Only .github/actions/uv-python uses it, with the uv pins below, the
-#   GitHub Releases download and no Actions cache.
+#   Only .github/actions/uv-python uses it, with the uv pins below. The Astral
+#   mirror is the primary download, GitHub Releases is the fallback, and the
+#   SHA-256 check is unchanged. No Actions cache.
 
 # Bootstrap CI Gate (ci-gate.yml). Its secret-scan and sast jobs run the
 # TruffleHog and Semgrep pins above, plus the checkout, setup, cache and
