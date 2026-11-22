@@ -153,8 +153,8 @@ merge-group CI is not yet proven at that point.
 
 ## Terminal states
 
-- `full-send` worker: `CUSTODY_ACCEPTED` (verified push, recorded exact-head verdict and the
-  `pr_ownership keeper-transfer` acknowledgement) or `BLOCKED <reason>`. The keeper owns the
+- `full-send` worker: `CUSTODY_ACCEPTED` (verified push, recorded exact-head verdict or Trivial
+  classification, and the `pr_ownership keeper-transfer` acknowledgement) or `BLOCKED <reason>`. The keeper owns the
   landing, and the CTO cycle owns `MERGED`, the closeout and the issue.
 - `full-send` lead landing without custody: `MERGED` with a clean closeout receipt, or
   `BLOCKED <reason>`.

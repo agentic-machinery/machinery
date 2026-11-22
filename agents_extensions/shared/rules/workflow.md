@@ -190,7 +190,7 @@ with `review-loop` for review rounds and the budget.
    Continue client expiry on the same task/nonce (§6), never repeat the launch.
    On `REQUEST_CHANGES`: fix on the branch → push → re-CF that SHA while CI runs on the new head.
    An open PR or its green CI is not approval.
-1. Independent exact-head review **APPROVE** on the tip you intend to land, at the tier the
+1. Independent exact-head review **APPROVE** on the tip you intend to land (none at the Trivial tier), at the tier the
    [review policy](../skills/review-loop/references/policy.md#2-risk-tier-is-set-by-the-change)
    sets: cross-family, except any qualified non-author reviewer at Low tier.
 2. Open the PR if it is not already open, then run `"$PY" -m lu_machinery.review.record_cf_verdict` to bind the completed
@@ -209,7 +209,7 @@ with `review-loop` for review rounds and the budget.
    queue, the real merge-group candidate must pass the required **CI Gate**, which runs the
    full supported pytest suite, before landing; nightly and opt-in `workflow_dispatch` runs run the full suite too.
 3. Only then enqueue (the merge-queue keeper, or a lead landing what no brief owns; a briefed
-   worker never waits on CI or enqueues): a recorded exact-head APPROVE and a green PR CI Gate, both bound to the
+   worker never waits on CI or enqueues): a recorded exact-head APPROVE (none at the Trivial tier) and a green PR CI Gate, both bound to the
    current PR head. Never arm auto-merge ahead of either gate —
 early-armed auto-merge is how #7447–#7449 landed with empty reviews, and a moved head
 voids both approval and CI; re-establish both on the new head. Automated merge pipelines cannot replace review gates; land

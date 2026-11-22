@@ -136,10 +136,12 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    `BLOCKED`, never a fallback to watching CI. Exit 0 prints the keeper's acknowledgement,
    binding the repository, PR, base, head, your task and nonce, and the verdict. That receipt is
    the worker's proof of custody. Any other exit is a refusal: read its reason, fix what it names
-   (a moved head, a missing or stale verdict) or stop with `BLOCKED <refusal>`. The keeper may
-   land the PR before you transfer: if the refusal shows the PR already queued or `MERGED`, read
-   `gh pr view "$PR" --json state,mergeCommit`, report that state with the verdict receipt, and
-   end; the CTO cycle owns the rest.
+   (a moved head, a missing or stale verdict) or stop with `BLOCKED <refusal>`. If the keeper
+   landed or queued the PR before you transferred (the refusal says the PR is not open, or
+   `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json`
+   shows it queued), end `BLOCKED early landing: <state>` with the verdict receipt and the
+   `gh pr view "$PR" --json state,mergeCommit` reading. That is an exception the CTO disposes of,
+   never a custody receipt.
 
    Then check `git status --porcelain` is empty, report `CUSTODY_ACCEPTED` with the receipt
    ([Report](#report)) and end your run. The linked issue stays open: the CTO cycle closes it with
@@ -168,7 +170,7 @@ CTO cycle after the keeper lands one. A worker never runs this section.
    Run `verify_run` for every area the diff touches on this head (`verify` skill); a non-zero exit
    blocks the landing. `true` means a merge queue and `false` none; keep it as `$QUEUE`. Any other reading (a failed
    read, a missing or non-boolean field) means stop; never guess. `headRefOid` must equal the
-   head of the recorded APPROVE and of green PR CI, which is the same in both kinds: no
+   head of the recorded APPROVE (or Trivial classification) and of green PR CI, which is the same in both kinds: no
    blocking check on that head pending, red or cancelled, the `CI Gate` among them where the
    repository runs one. `pr-merge`'s merge guard refuses otherwise before it enqueues or merges.
    If CI evidence that arrived after the verdict materially undermines it (for example a failure

@@ -64,7 +64,8 @@ never fine.
    Run `.venv/bin/python -m lu_machinery.orchestration.pr_ownership check` (exit 1 lists ownerless
    PRs, 2 is unknown). It is the replacement-owner check `lu_machinery.fleet.pr_owner_check` with
    accepted handoffs counted, and an owner whose supervisor cannot be observed is unknown, not
-   ownerless. Dispatch an owner for every ownerless PR, replacing any owner that ended failed,
+   ownerless. A PR in a pending-CI review continuation ([recipes](recipes.md#writes-and-merging))
+   gets that continuation's one successor, not a second owner. Dispatch an owner for every ownerless PR, replacing any owner that ended failed,
    timed out or was cancelled. Ownership is the live task on the PR branch, the running task
    named by the X-Agent trailer on the PR head, an accepted handoff, or recorded custody, never
    the author or branch prefix. The merge-queue keeper runs the same check every 5 minutes. It

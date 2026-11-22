@@ -76,8 +76,9 @@ End in exactly one of these states, naming the receiving driver:
 - `ALREADY_MERGED_EXTERNALLY` — someone else merged it; report the merge SHA.
 
 Ready is never reported as delivered. The receiving driver verifies the whole gate on the live head
-with the hold still in place, then removes the hold only as the last step before landing, in the
-same action, by the `full-send` lead path. Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
+with the hold still in place, then clears both hold markers (the `hold` label and the `[hold]`
+title marker) only as the last step before landing, in the same action, by the `full-send` lead
+path. Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
 planned is the CTO's (rules core P4).
 
 ## Report

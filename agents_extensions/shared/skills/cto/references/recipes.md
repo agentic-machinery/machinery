@@ -14,24 +14,34 @@ file only points there and adds what the CTO seat learned on top.
   exact-head verdict (or Trivial classification) and an accepted `pr_ownership keeper-transfer`
   receipt, never waits on CI, runners or the queue, and never reruns, enqueues, merges or runs
   `merge_closeout`. Dispatch detached briefs only after you verify, on the installed release,
-  that it carries `keeper-transfer`; that the keeper holds off landing a PR before custody is
-  recorded, or landing first is harmless; that a head moved to an unreviewed head alerts you; and
-  that it provides each recovery action below. Where any is missing, do not dispatch a detached
-  brief: the worker contract has no fallback, and the older contract belongs only to briefs
-  already started under it. In-flight briefs keep their owner until an explicit transfer.
+  every item of this rollout gate:
+  1. it carries `keeper-transfer`;
+  2. the keeper cannot enqueue or merge a detached PR before it has acknowledged custody (an
+     early landing is otherwise a reported exception you dispose of);
+  3. a move to an unreviewed head alerts you before that head's review or CI readiness is read;
+  4. the keeper's landing write requires a fresh passing `verify_run` for every area the diff
+     touches (`verify` skill); until it does, detach only diffs that touch no such area;
+  5. each recovery named below exists: the alert, the one same-head infrastructure recovery, and
+     the keeper's re-enqueue of an approved repaired head after an ejection.
+  Where any item is missing, do not dispatch a detached brief: the worker contract has no
+  fallback, and the older contract belongs only to briefs already started under it. In-flight
+  briefs keep their owner until an explicit transfer.
 - **Keeper alert on CI failure, ejection or head move after approval.** Classify it from the
   evidence before releasing custody. An infrastructure failure with no failing test node and an
   unspent allowance is the keeper's one same-head recovery: dispatch no worker, because accepting
   the PR replaces keeper custody. A code, own-check or head-move failure gets one fresh fix worker
   whose brief carries the current head, the run and job ids, the inherited review ledger and its
   remaining budget, and starts with `pr_ownership accept --pr <N> --repo <owner/name>`. A failing
-  test node is fixed, never rerun. An unknown diagnosis or a spent allowance means stop, report and
-  request direction (rules core P4).
+  test node is fixed, never rerun. A second own-check failure on this PR, an unknown diagnosis or a
+  spent allowance means stop, report and request direction (rules core P4;
+  [pr-watch](../../full-send/references/pr-watch.md#failing-ci)).
 - **Review continuation after a pending-CI `BLOCKED`.** When a worker ends `BLOCKED pending CI
   evidence`, wait for the named check, revalidate the head and `budget-check`, start the one
   same-head review with the finished CI evidence inlined, then seat one live successor for the
   original terminal (`full-send` custody, or `full-stop` with its hold intact). The successor
-  accepts the PR with `pr_ownership accept`, records the verdict and finishes that terminal.
+  accepts the PR with `pr_ownership accept`, records the verdict and finishes that terminal. Until
+  then this continuation is the PR's owner plan: an ownerless alert on that PR is answered by this
+  one successor, never a second.
 - **After the keeper lands a PR.** Confirm `MERGED` and the merge SHA with `gh`, wait for the
   worker to settle, then run the closeout (`full-send` § Landing and closeout by a lead, steps
   3 to 5) and close the issue with the merged-outcome evidence.

@@ -34,7 +34,7 @@ are the tie-breakers.
    `extensions.worktreeConfig=true`), never an intentional mode. PRs for everything — no
    direct commits to main. **Merge duty:** nobody arms auto-merge. The worker that
    receives a brief runs its chain to its exit receipt (rules core P1): verified push, a
-   recorded exact-head review verdict at the review-policy tier and an accepted keeper custody
+   recorded exact-head review verdict at the review-policy tier (none at Trivial) and an accepted keeper custody
    receipt (`pr_ownership keeper-transfer`, `full-send` step 6; it needs the lu-machinery
    release that carries that command). It never waits on CI, runners or the queue, and never
    reruns, enqueues or merges; a `full-stop` brief ends at ready-to-merge instead. The
