@@ -17,6 +17,7 @@ from lu_machinery.api.fleet_workers_collect import collect_local_workers_for_rep
 from lu_machinery.api.project_state_sanitize import sanitize_lane_usage_entry
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.release_layout import is_release_root
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
 
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _GIT_TIMEOUT_S = 4.0
@@ -79,7 +80,10 @@ def resolve_work_private_root(primary_root: Path) -> Path:
     configured = os.environ.get("LEARN_UKRAINIAN_INFRA_PRIVATE_ROOT", "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
-    return (primary_root.parent / "learn-ukrainian-infra-private").resolve()
+    repo = load_fleet_repos().get("infra-private")
+    if repo is None or not re.fullmatch(r"[A-Za-z0-9_-]+", repo.local_name):
+        raise FleetRepoError("fleet registry must give infra-private a sibling checkout name")
+    return (primary_root.parent / repo.local_name).resolve()
 
 
 def origin_main_age_s(repo_root: Path) -> float | None:
@@ -242,7 +246,10 @@ def _default_service_state(name: str, definition: ServiceDefinition) -> str:
     pid = _default_listener_pid(definition.port)
     if pid is None:
         if name == "work":
-            private = resolve_work_private_root(resolve_primary_repo_root(Path.cwd()))
+            try:
+                private = resolve_work_private_root(resolve_primary_repo_root(Path.cwd()))
+            except FleetRepoError:
+                return "unavailable"
             if not (private / ".git").exists() and not (private / ".git").is_file():
                 return "unavailable"
             # Intentional: the private work-service checkout, not this repo.

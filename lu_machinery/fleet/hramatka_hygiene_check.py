@@ -45,20 +45,20 @@ from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import main_checkout_root, product_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet import pr_identity
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
 from lu_machinery.orchestration.task_record_store import read_task_record
 
 POLICY_VERSION = "hramatka-hygiene-v1"
 
 PUBLIC_REPOSITORY = "learn-ukrainian/learn-ukrainian.github.io"
 PUBLIC_EPIC = 4542
-PRIVATE_REPOSITORY = "learn-ukrainian/learn-ukrainian-infra-private"
 PRIVATE_BOARD = 349
 
 DEFAULT_HIGH_WATER_PERCENT = 95
 GH_TIMEOUT_SECONDS = 15.0
 
 # Same terminal-status vocabulary as the drive-epic settle-loop contract,
-# duplicated (not imported) so this gate stays free of orchestration imports.
+# duplicated (not imported) so this gate does not depend on the driver loop.
 _TERMINAL_STATUSES = frozenset(
     {
         "done",
@@ -381,7 +381,7 @@ def hygiene_check(
     *,
     public_repo: str = PUBLIC_REPOSITORY,
     public_epic: int = PUBLIC_EPIC,
-    private_repo: str = PRIVATE_REPOSITORY,
+    private_repo: str | None = None,
     private_board: int = PRIVATE_BOARD,
     high_water_percent: int = DEFAULT_HIGH_WATER_PERCENT,
     disk_path: Path | None = None,
@@ -403,6 +403,21 @@ def hygiene_check(
     dispatch_worktrees_root = dispatch_worktrees_root or main_checkout_root(product_root()) / ".worktrees" / "dispatch"
     if reader is _gh_issue:
         reader = functools.partial(_gh_issue, cwd=repo_root)
+
+    if private_repo is None:
+        try:
+            private_repo = load_fleet_repos()["infra-private"].github
+        except (FleetRepoError, KeyError):
+            return _receipt(
+                status=Status.UNKNOWN,
+                epic_charter_ok=None,
+                queue_pointer_ok=None,
+                zombie_worktrees=[],
+                zombie_worktrees_detectable=False,
+                df=None,
+                reasons=["private board repository is unavailable in the fleet registry"],
+                high_water_percent=high_water_percent,
+            )
 
     try:
         epic_issue = reader(public_repo, public_epic)
@@ -472,7 +487,7 @@ def main(argv: list[str] | None = None, *, reader: IssueReader = _gh_issue) -> i
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--public-repo", default=PUBLIC_REPOSITORY, help="owner/name of the public repo")
     parser.add_argument("--public-epic", type=int, default=PUBLIC_EPIC, help="public Hramatka epic issue number")
-    parser.add_argument("--private-repo", default=PRIVATE_REPOSITORY, help="owner/name of the private repo")
+    parser.add_argument("--private-repo", help="owner/name of the private repo (default: the infra-private registry entry)")
     parser.add_argument("--private-board", type=int, default=PRIVATE_BOARD, help="private priority-board issue number")
     parser.add_argument(
         "--high-water-percent",

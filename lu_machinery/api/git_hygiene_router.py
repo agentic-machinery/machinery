@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ from pydantic import AfterValidator, BaseModel
 from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.task_store_paths import read_cached_task_record
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
 from lu_machinery.orchestration.task_record_store import (
     candidate_task_record_names,
     locate_task_record,
@@ -600,12 +602,13 @@ def compute_git_cleanup(project_root: Path | None = None) -> CleanupReport:
 
 
 # Open pull requests and merge-queue state for the repositories the fleet lands in.
-# (owner, repository, display name)
+# (registry key, display name). The display order also sets the query aliases.
 PULL_REQUEST_REPOSITORIES = (
-    ("learn-ukrainian", "machinery", "machinery"),
-    ("learn-ukrainian", "learn-ukrainian.github.io", "learn-ukrainian"),
-    ("learn-ukrainian", "learn-ukrainian-infra-private", "infra-private"),
+    ("machinery", "machinery"),
+    ("public", "learn-ukrainian"),
+    ("infra-private", "infra-private"),
 )
+_REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}")
 PULL_REQUESTS_TTL_S = 120.0
 PULL_REQUESTS_TIMEOUT_S = 20.0
 PULL_REQUESTS_PER_REPOSITORY = 50
@@ -618,12 +621,12 @@ _PR_FIELDS = (
 )
 
 
-def _pull_requests_query() -> str:
+def _pull_requests_query(repositories: list[tuple[str, str, str]]) -> str:
     pulls = (
         f"pullRequests(states: OPEN, first: {PULL_REQUESTS_PER_REPOSITORY}, orderBy: {{field: CREATED_AT, direction: DESC}})"
     )
     blocks = []
-    for index, (owner, name, _display) in enumerate(PULL_REQUEST_REPOSITORIES):
+    for index, (owner, name, _display) in enumerate(repositories):
         header = f'r{index}: repository(owner: "{owner}", name: "{name}")'
         blocks.append(f"{header} {{ isPrivate {pulls} {{ totalCount nodes {{ {_PR_FIELDS} }} }} }}")
     return "query { " + " ".join(blocks) + " }"
@@ -711,8 +714,16 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
     records = tasks_dir if tasks_dir is not None else project_root / "batch_state" / "tasks"
     observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     try:
+        catalog = load_fleet_repos()
+        targets = [(catalog[key], display) for key, display in PULL_REQUEST_REPOSITORIES]
+    except (FleetRepoError, KeyError):
+        return _unknown_pull_requests("registry_unavailable", observed_at)
+    if any(not _REPOSITORY_SLUG.fullmatch(repo.github) or repo.name in {".", ".."} for repo, _ in targets):
+        return _unknown_pull_requests("invalid_repository", observed_at)
+    repositories = [(repo.owner, repo.name, display) for repo, display in targets]
+    try:
         proc = github_client.run(
-            ["gh", "api", "graphql", "-f", f"query={_pull_requests_query()}"],
+            ["gh", "api", "graphql", "-f", f"query={_pull_requests_query(repositories)}"],
             cwd=project_root,
             capture_output=True,
             text=True,
@@ -731,12 +742,12 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         return _unknown_pull_requests("github_invalid_response", observed_at)
     if not isinstance(data, dict):
         return _unknown_pull_requests("github_invalid_response", observed_at)
-    repositories = []
-    for index, (owner, name, display) in enumerate(PULL_REQUEST_REPOSITORIES):
+    rows = []
+    for index, (owner, name, display) in enumerate(repositories):
         repo = data.get(f"r{index}")
         entry: dict[str, Any] = {"repository": f"{owner}/{name}", "name": display}
         if not isinstance(repo, dict) or not isinstance(repo.get("pullRequests"), dict):
-            repositories.append({**entry, "status": "unknown", "reason": "not_readable", "private": None,
+            rows.append({**entry, "status": "unknown", "reason": "not_readable", "private": None,
                                  "open_total": None, "pull_requests": []})
             continue
         # Fail closed: anything but an explicit public repository is treated as private.
@@ -745,10 +756,10 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         total = repo["pullRequests"].get("totalCount")
         # A missing or null PR node would silently read as fewer open PRs.
         if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes):
-            repositories.append({**entry, "status": "unknown", "reason": "github_invalid_response", "private": private,
+            rows.append({**entry, "status": "unknown", "reason": "github_invalid_response", "private": private,
                                  "open_total": None, "pull_requests": []})
             continue
-        repositories.append({
+        rows.append({
             **entry,
             "status": "ok",
             "reason": None,
@@ -759,7 +770,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
                 for node in nodes[:PULL_REQUESTS_PER_REPOSITORY]
             ],
         })
-    return {"status": "ok", "reason": None, "observed_at": observed_at, "repositories": repositories}
+    return {"status": "ok", "reason": None, "observed_at": observed_at, "repositories": rows}
 
 
 def _pull_requests_cache_key(ctx: MonitorContext) -> str:

@@ -30,6 +30,7 @@ from lu_machinery.security.alerts import (
 
 _PIN = "0123456789abcdef0123456789abcdef01234567"
 _HEAD = "a" * 40
+_MACHINERY = FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery", security_alerts=False)
 
 
 class _FakeGitHubClient:
@@ -62,7 +63,7 @@ def _enrolled_workflow(pin: str = _PIN) -> str:
         "on: [push]\n"
         "jobs:\n"
         "  fleet-security:\n"
-        f'    "uses": learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{pin}\n'
+        f'    "uses": {_MACHINERY.github}/.github/workflows/fleet-security.yml@{pin}\n'
     )
 
 
@@ -135,7 +136,11 @@ def _series(prom: str, metric: str, labels: dict[str, str], value: str) -> bool:
 
 def _write_registry(tmp_path: Path, repos: dict[str, dict[str, Any]]) -> Path:
     path = tmp_path / "fleet_repos.yaml"
-    path.write_text(yaml.safe_dump({"version": 1, "repos": repos}, sort_keys=False), encoding="utf-8")
+    machinery = {**_repo_row(_MACHINERY.github), "security_alerts": False}
+    path.write_text(
+        yaml.safe_dump({"version": 1, "repos": {"machinery": machinery, **repos}}, sort_keys=False),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -379,6 +384,7 @@ def test_brief_routes_through_catalog() -> None:
     mutated["seats"][first_seat_name]["model_id"] = synthetic_model
 
     repos = {
+        "machinery": _MACHINERY,
         "example-app": FleetRepo(
             key="example-app",
             github="example-org/example-app",
@@ -498,9 +504,15 @@ def test_workflow_loader_exceptions_make_evidence_unreadable(scalar: str) -> Non
         assert response is not None, endpoint
         return response
 
-    evidence = read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0)
+    evidence = read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0, repos={"machinery": _MACHINERY})
     assert evidence["state"] == "inaccessible_evidence"
     assert evidence["reason"] == "workflow_file_unreadable"
+    invalid = FleetRepo("machinery", "new-owner/../machinery", "machinery", "public-machinery")
+    client = _FakeGitHubClient(respond)
+    unavailable = read_fleet_security(client, repo, timeout=1.0, repos={"machinery": invalid})
+    assert unavailable["state"] == "inaccessible_evidence"
+    assert unavailable["reason"] == "machinery_repository_unavailable"
+    assert client.calls == []
 
 
 @pytest.mark.parametrize(
@@ -530,7 +542,7 @@ def test_malformed_annotations_do_not_leave_a_partial_finding_list(row: dict[str
         assert response is not None, endpoint
         return response
 
-    evidence = read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0)
+    evidence = read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0, repos={"machinery": _MACHINERY})
     assert evidence["state"] == "inaccessible_evidence"
     assert evidence["reason"] == "annotations_unreadable"
     assert evidence["findings"] == []
@@ -588,17 +600,19 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         "on: [push]\n"
         "jobs:\n"
         "  branch:\n"
-        "    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@main\n"
+        f"    uses: {_MACHINERY.github}/.github/workflows/fleet-security.yml@main\n"
         "  short:\n"
-        '    uses: "learn-ukrainian/machinery/.github/workflows/fleet-security.yml@abc1234"\n'
+        f'    uses: "{_MACHINERY.github}/.github/workflows/fleet-security.yml@abc1234"\n'
+        "  other-owner:\n"
+        f"    uses: wrong-owner/machinery/.github/workflows/fleet-security.yml@{_PIN}\n"
         "  upper:\n"
-        "    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@"
+        f"    uses: {_MACHINERY.github}/.github/workflows/fleet-security.yml@"
         "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n"
         "  script:\n"
         "    runs-on: ubuntu-latest\n"
         "    steps:\n"
         "      - run: |\n"
-        "          echo uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@"
+        f"          echo uses: {_MACHINERY.github}/.github/workflows/fleet-security.yml@"
         f"{_PIN}\n"
     )
 
@@ -802,10 +816,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
     assert _series(text, METRIC_FLEET_SECURITY_FINDINGS, {"repo": "dirty", "scanner": "trivy-image", "severity": "high"}, "1.0")
 
     catalog = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
-    repos = {
-        key: FleetRepo(key=key, github=f"org/{key}", local_name=key, role="public-app", default=key == "missing")
-        for key in ("missing", "hidden", "dirty")
-    }
+    repos = load_fleet_repos(registry)
     dirty_brief = build_fix_brief(
         "dirty",
         repos=repos,
@@ -846,6 +857,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         clock=lambda: 1700000000.0,
     )
     assert "State: `missing_enrollment`." in missing_brief.brief_markdown
+    assert "`new-owner/machinery/.github/workflows/fleet-security.yml`" in missing_brief.brief_markdown
     assert "zero_findings" not in missing_brief.brief_markdown
 
     def _limit_scan(files: list[dict[str, Any]], texts: dict[str, str]) -> dict[str, Any]:
@@ -930,7 +942,7 @@ def test_fleet_security_states_stay_distinct(tmp_path: Path) -> None:
         {
             "security.yml": (
                 "name: security\non: [push]\njobs:\n  fleet-security:\n"
-                f'    uses: "learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{_PIN} "\n'
+                f'    uses: "{_MACHINERY.github}/.github/workflows/fleet-security.yml@{_PIN} "\n'
             )
         },
     )
@@ -1043,10 +1055,10 @@ _TWO_CALLER_WORKFLOW = (
     "jobs:\n"
     "  fleet-security:\n"
     "    name: Fleet security\n"
-    f"    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{_PIN}\n"
+    f"    uses: {_MACHINERY.github}/.github/workflows/fleet-security.yml@{_PIN}\n"
     "  python-dependencies:\n"
     "    name: Python dependencies\n"
-    f"    uses: learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{_PIN}\n"
+    f"    uses: {_MACHINERY.github}/.github/workflows/fleet-security.yml@{_PIN}\n"
 )
 
 
@@ -1082,7 +1094,7 @@ def _caller_run_scan(
         assert response is not None, endpoint
         return response
 
-    return read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0)
+    return read_fleet_security(_FakeGitHubClient(respond), repo, timeout=1.0, repos={"machinery": _MACHINERY})
 
 
 def test_two_caller_run_with_clean_gates_reads_zero_findings() -> None:

@@ -7,14 +7,21 @@ import json
 import pytest
 
 from lu_machinery.fleet import hramatka_scope_gate as gate
+from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 PUBLIC = gate.PUBLIC_REPOSITORY
-PRIVATE = gate.PRIVATE_REPOSITORY
+PRIVATE = "new-owner/private-infra"
 REGISTRY = {
     "hramatka": [4542],
     "infra-harness": [4707],
     "devops": [5703],
 }
+
+
+@pytest.fixture(autouse=True)
+def _fleet_repos(monkeypatch: pytest.MonkeyPatch) -> None:
+    repos = {"infra-private": FleetRepo("infra-private", PRIVATE, "private-infra", "private-infra")}
+    monkeypatch.setattr(gate, "load_fleet_repos", lambda: repos)
 
 
 def _issue(repository: str, number: int) -> gate.IssueRef:
@@ -43,7 +50,9 @@ def _unavailable(_issue_ref: gate.IssueRef) -> gate.IssueObservation:
 
 
 def test_constants_pin_the_approved_hramatka_scope() -> None:
-    config = gate.HRAMATKA_SCOPE_GATE
+    config = gate._default_scope_gate()
+
+    assert config.private_repository == PRIVATE
 
     assert config.stream_name == "hramatka"
     assert config.public_epic == 4542

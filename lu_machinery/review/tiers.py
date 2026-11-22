@@ -250,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  .venv/bin/python -m lu_machinery.review.tiers --repository learn-ukrainian/machinery --pr 714\n"
+            "  .venv/bin/python -m lu_machinery.review.tiers --repository owner/name --pr 714\n"
             "  .venv/bin/python -m lu_machinery.review.tiers --rows-file pr-files.json\n"
             "Outputs: one JSON object on stdout: {\"tier\": ..., \"review\": ...}; no writes.\n"
             "Exit codes: 0 tier printed (an unreadable file list or table prints high); 2 invalid arguments.\n"
@@ -264,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         "--rows-file", type=Path,
         help="JSON list of GitHub PR-files rows (filename, status, patch) instead of reading GitHub",
     )
-    parser.add_argument("--repository", help="owner/name of the pull request's repository, e.g. learn-ukrainian/machinery")
+    parser.add_argument("--repository", help="owner/name of the pull request's repository")
     args = parser.parse_args(argv)
     if args.pr is not None and not args.repository:
         parser.error("--pr needs --repository")
