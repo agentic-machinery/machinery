@@ -51,8 +51,8 @@ Practices used:
 - After two failed review executions at the same head (the escalation in
   [review-loop policy](../../review-loop/references/policy.md#recording-the-verdict)), never authorize
   another same-head run. Dispose of it as a fresh-lineage replacement PR with designated approval,
-  a capability-failure record only when a missing capability truly caused the failures, or a
-  `BLOCKED` hand-off.
+  a `BLOCKED` hand-off, or the capability-failure record for a single run that qualifies under
+  the review-loop policy and skill.
 - Apply OO-99 through the binding [native usage pace/reserve rule](../../../rules/model-assignment.md).
   Read each pool's CodexBar pace line, used minus expected. A pool is short only when
   it will not last to reset; reset credits cover a deficit. Use capacity before reset,
