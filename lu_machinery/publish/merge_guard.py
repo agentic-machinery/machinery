@@ -244,17 +244,44 @@ def bound_rollup_judgment(
                 continue
             details = row.get("detailsUrl")
             # The GitHub adapter projects html_url as detailsUrl. Accept that
-            # representation only when its canonical URL binds the REST ID.
+            # representation only when its canonical URL binds the REST ID. The
+            # rollup and the REST read are separate reads, so during a transfer
+            # each may spell either baked slug of the repository.
             matches = [run for run in runs if run.get("name") == row.get("name") and details and (
-                run.get("details_url") == details or (
+                _same_repository_url(run.get("details_url"), details, repo) or (
                     type(run.get("id")) is int and run["id"] > 0
-                    and details == run.get("html_url") == f"https://github.com/{repo}/runs/{run['id']}"
+                    and details in (urls := _repository_urls(repo, f"runs/{run['id']}"))
+                    and run.get("html_url") in urls
                 )
             )]
             if len(matches) != 1:
                 return None
         rows = project_check_runs(runs) + [row for row in rows if row.get("__typename") != "CheckRun"]
     return _judge_status_rollup_rows(rows)
+
+
+def _repository_urls(repo, path):
+    """``https://github.com/<slug>/<path>`` for each baked slug of *repo*; nothing when unknown."""
+    # Imported here: the fleet catalog stays out of this module's import closure.
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, repository_slugs
+
+    try:
+        slugs = repository_slugs(repo)
+    except FleetRepoError:
+        return ()
+    return tuple(f"https://github.com/{slug}/{path}" for slug in slugs)
+
+
+def _same_repository_url(left, right, repo):
+    """Whether two URLs are equal, or one github.com path of *repo* under its two baked slugs."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    if left == right:
+        return True
+    for known in _repository_urls(repo, ""):
+        if left.startswith(known):
+            return right in _repository_urls(repo, left[len(known):])
+    return False
 
 
 def _duplicate_check_names(rows):

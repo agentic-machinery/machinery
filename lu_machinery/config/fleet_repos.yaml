@@ -46,11 +46,15 @@
 # - Rollout precondition: provision the host selector file, export
 #   `LU_FLEET_REPO_SELECTOR_FILE` to every dispatcher, keeper, API, and service
 #   unit, and verify `python -m lu_machinery.orchestration.fleet_repos selector-check`
-#   exits 0 BEFORE installing a release containing dual-slug rows; unmodified
-#   consumers of `canonical_origins` and `verification_credentials` (`dispatcher/cli.py`,
+#   exits 0 BEFORE installing a release containing dual-slug rows; consumers of
+#   `canonical_origins` and `verification_credentials` (`dispatcher/cli.py`,
 #   `dispatcher/git.py`, `dispatcher/store.py`, `orchestration/dispatch_settle.py`,
-#   `dispatcher/write_boundary.py`, `hygiene/branch_sweep.py`) fail closed without
-#   it (A01b owns consumer adoption and `branch_sweep` refusal handling).
+#   `dispatcher/write_boundary.py`, `hygiene/branch_sweep.py`,
+#   `orchestration/execution_safe_git.py`, `orchestration/scheduled_worktree_cleanup.py`)
+#   fail closed without it. The selector proof holds only in the host user namespace
+#   (an `--unshare-user` sandbox maps root to uid 65534): read it host-side.
+# - Payload consumers bind either baked slug of a row through
+#   `fleet_repos.repository_slugs` (docs/runbooks/sibling-git.md).
 # - Cache/restart requirement: `lu_machinery.common.git_credentials.repository_registry`
 #   and `lu_machinery.orchestration.fleet_repos._repository_catalog` are `@cache`d
 #   in-process; restart long-running services and workers after flipping a selector

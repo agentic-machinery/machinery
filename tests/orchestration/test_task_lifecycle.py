@@ -3300,3 +3300,26 @@ def test_runtime_release_metadata_accepts_infra_proof_without_exempting_learner_
     renamed_blockers = " ".join(renamed["hard_blockers"])
     assert "learner-content change requires a ukrainian behavior-proof receipt" in renamed_blockers
     assert "behavior_proof" not in renamed["valid_evidence"].get("AC-IMPL", set())
+
+
+@pytest.mark.parametrize(("repository", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
+def test_stream_epic_binding_accepts_either_baked_slug_of_the_registry_row(monkeypatch, repository, accepted):
+    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (registry spells the row org/repo)."""
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch, role="public-monorepo")
+    identity = {"repository": repository, "stream_epic": 10,
+                "stream_epic_url": f"https://github.com/{repository}/issues/10"}
+
+    assert task_lifecycle.stream_epic_url_matches(identity, "org/repo") is accepted
+    # A live read may name the other baked slug of the ledger's repository (separate reads).
+    for ledger_repository in ("org/repo", "neworg/repo"):
+        refusal = task_lifecycle.repository_evidence_refusal(ledger_repository, repository, source="issue-stream registry")
+        assert (refusal is None) is accepted
+    assert task_lifecycle.stream_epic_url_matches({**identity, "stream_epic_url": None}, "org/repo") is accepted
+    if accepted:
+        assert task_lifecycle.stream_registry_repository(repository) == "org/repo"
+    else:
+        with pytest.raises(task_lifecycle.LifecycleError, match="not configured in the fleet"):
+            task_lifecycle.stream_registry_repository(repository)

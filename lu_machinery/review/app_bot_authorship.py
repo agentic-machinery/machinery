@@ -48,6 +48,21 @@ GITHUB_COMMITTER_NAME = "GitHub"
 GITHUB_COMMITTER_EMAIL = "noreply@github.com"
 
 
+def _repository_slugs(repository: str) -> tuple[str, ...]:
+    """Both baked slugs of a transferred fleet row, else *repository* itself; an unreadable catalog proves none."""
+    # Imported here: CI scripts import this module, and the fleet catalog stays out of their import closure.
+    try:
+        from lu_machinery.orchestration.fleet_repos import FleetRepoError, repository_slugs
+    except ImportError:
+        # The commit-attribution CI job installs only its Markdown parser, so the registry (PyYAML)
+        # is absent there. It asks about its own live slug, which the exact spelling alone proves.
+        return (repository,)
+    try:
+        return repository_slugs(repository)
+    except FleetRepoError:
+        return ()
+
+
 def verified_app_bot_login(commit: object, sha: str, repository: str) -> str | None:
     """The allowlisted bot login that GitHub's REST commit object for ``sha`` proves, else None.
 
@@ -66,9 +81,10 @@ def verified_app_bot_login(commit: object, sha: str, repository: str) -> str | N
         return None
     if not isinstance(commit, Mapping) or commit.get("sha") != sha:
         return None
+    slugs = _repository_slugs(repository)
     if (
-        commit.get("url") != f"https://api.github.com/repos/{repository}/commits/{sha}"
-        or commit.get("html_url") != f"https://github.com/{repository}/commit/{sha}"
+        commit.get("url") not in tuple(f"https://api.github.com/repos/{slug}/commits/{sha}" for slug in slugs)
+        or commit.get("html_url") not in tuple(f"https://github.com/{slug}/commit/{sha}" for slug in slugs)
     ):
         return None
     author = commit.get("author")
@@ -86,7 +102,7 @@ def verified_app_bot_login(commit: object, sha: str, repository: str) -> str | N
     ):
         return None
     if (
-        git.get("url") != f"https://api.github.com/repos/{repository}/git/commits/{sha}"
+        git.get("url") not in tuple(f"https://api.github.com/repos/{slug}/git/commits/{sha}" for slug in slugs)
         or committer.get("login") != GITHUB_COMMITTER_LOGIN
         or committer.get("type") != "User"
         or type(committer.get("id")) is not int

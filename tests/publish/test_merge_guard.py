@@ -152,8 +152,26 @@ def bound_runner(calls, *, head=HEAD, error=None, bound=None, documents=None):
     return runner
 
 
-def test_publisher_binds_canonical_check_urls_distinct_from_vendor_details():
-    """A rollup detailsUrl that is the run's canonical html_url binds it, not only its vendor details_url."""
+@pytest.mark.parametrize(
+    ("run_slug", "rollup_slug", "accepted"),
+    [
+        ("unit/public", "unit/public", True),
+        ("neworg/public", "neworg/public", True),
+        ("unit/public", "neworg/public", True),
+        ("evil/public", "evil/public", False),
+        ("unit/public", "evil/public", False),
+    ],
+)
+def test_publisher_binds_canonical_check_urls_distinct_from_vendor_details(monkeypatch, run_slug, rollup_slug, accepted):
+    """A rollup detailsUrl that is the run's canonical html_url binds it, not only its vendor details_url.
+
+    Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
+    with the same repository name under another owner is accepted (canonical check URL under run_slug
+    in the REST read and rollup_slug in the separate rollup read).
+    """
+    from tests.test_fleet_repos import transferred_catalog
+
+    transferred_catalog(monkeypatch, github="unit/public", alternate="neworg/public")
     calls = []
     old = {"name": "Body guard", "head_sha": HEAD, "status": "completed", "conclusion": "cancelled",
            "started_at": "2026-10-23T20:00:00Z", "check_suite": {"id": 1},
@@ -165,11 +183,11 @@ def test_publisher_binds_canonical_check_urls_distinct_from_vendor_details():
             {"name": "CI Gate", "head_sha": HEAD, "status": "completed", "conclusion": "success",
              "details_url": "https://github.com/unit/public/runs/23"},
             {"name": VENDOR_NAME, "head_sha": HEAD, "status": "completed", "conclusion": "success", "app": VENDOR_APP,
-             "id": 24, "html_url": "https://github.com/unit/public/runs/24",
+             "id": 24, "html_url": f"https://github.com/{run_slug}/runs/24",
              "details_url": "https://example.invalid/gh/unit/public/trails/7"}]
     rollup = [{"__typename": "CheckRun", "name": row["name"], "status": row["status"].upper(),
                "conclusion": str(row.get("conclusion") or "").upper(),
-               "detailsUrl": row.get("html_url", row["details_url"])}
+               "detailsUrl": row.get("html_url", row["details_url"]).replace(f"/{run_slug}/", f"/{rollup_slug}/")}
               for row in rest]
     rollup.append({"__typename": "StatusContext", "context": "external-status", "state": "SUCCESS"})
     documents = {CHECK_RUNS: {"total_count": len(rest), "check_runs": rest},
@@ -178,6 +196,10 @@ def test_publisher_binds_canonical_check_urls_distinct_from_vendor_details():
                  "repos/unit/public/actions/runs/12": {"id": 12, "head_sha": HEAD, "check_suite_id": 2,
                                                        "workflow_id": 7, "name": "Body guard"}}
     runner = bound_runner(calls, bound={"headRefOid": HEAD, "statusCheckRollup": rollup}, documents=documents)
+    if not accepted:
+        with pytest.raises(PublishBlocked):
+            ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD)
+        return
     assert ensure_merge_ready("unit/public", 1, runner=runner, cwd=".", environment={}, match_head=HEAD) == HEAD
     assert [call[1:6] for call in calls] == [
         ["pr", "view", "1", "--json", "number,isDraft,headRefOid,mergeStateStatus"],

@@ -18,7 +18,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepo,
+    FleetRepoError,
+    load_fleet_repos,
+    resolve_active_fleet_repo,
+)
 
 GIT = shutil.which("git", path=os.defpath) or "/usr/bin/git"
 
@@ -49,23 +54,29 @@ class SafeGitContext:
         repository: FleetRepo | None = None,
     ) -> None:
         canonical = None
+        baked: tuple[str, ...] = ()
         if repository is not None:
             try:
                 registered = load_fleet_repos()
+                # A transferred row pushes only to the host-selected active slug (never a default),
+                # because the credential header below is bound to this one destination.
+                active = resolve_active_fleet_repo(repository.key, repos=registered).active_github
             except FleetRepoError as exc:
                 raise SnapshotRefusal("rescue_push_url_unavailable") from exc
-            if (
-                registered.get(repository.key) != repository
-                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository.github)
+            if registered.get(repository.key) != repository or not all(
+                re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug) for slug in repository.slugs
             ):
                 raise SnapshotRefusal("rescue_push_url_unavailable")
-            canonical = f"https://github.com/{repository.github}.git"
+            canonical = f"https://github.com/{active}.git"
+            baked = tuple(f"https://github.com/{slug}.git" for slug in repository.slugs)
         if local_remote:
             if origin is None or not Path(origin).is_absolute():
                 raise SnapshotRefusal("rescue_push_url_unavailable")
             self.origin = origin
         else:
-            if canonical is None or (origin is not None and origin != canonical):
+            # A caller's origin may name either baked slug of the same repository (one recorded
+            # before the transfer stays valid); the push still goes to the active slug.
+            if canonical is None or (origin is not None and origin not in baked):
                 raise SnapshotRefusal("rescue_push_url_unavailable")
             self.origin = canonical
         self.repository = repository.github if repository is not None else None
@@ -111,6 +122,9 @@ class SafeGitContext:
                 "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
                 "\tfilemode = true\n\tsymlinks = true\n\tcommitGraph = false\n\tuseReplaceRefs = false\n"
                 '[protocol]\n\tallow = never\n[protocol "https"]\n\tallow = always\n'
+                # A transferred repository's other slug redirects; the credential header above must
+                # never follow it to a URL the selector did not choose (git_credentials does the same).
+                + "[http]\n\tfollowRedirects = false\n"
                 + ('[protocol "file"]\n\tallow = always\n' if self.local_remote else "")
                 + f'[remote "origin"]\n\turl = "{self.origin}"\n'
                 # Discover objects the destination already has before packing.
