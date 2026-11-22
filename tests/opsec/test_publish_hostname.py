@@ -928,6 +928,45 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
             == 2
         )
         assert "PARENT_REFUSED" in capsys.readouterr().err
+
+        # During a transfer window, a parent payload naming the row's other baked slug still binds,
+        # while a payload naming a different fleet repository row is refused.
+        def transfer_window_read(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    {
+                        "number": 10,
+                        "state": "open",
+                        "node_id": "M_ROOT_10_ALT",
+                        "repository_url": f"https://api.github.com/repos/{inactive_slug}",
+                        "html_url": f"https://github.com/{inactive_slug}/issues/10",
+                    }
+                ),
+                "",
+            )
+
+        assert pub._parent_epic_node(transfer_window_read, active_slug, 10, tmp_path, None) == "M_ROOT_10_ALT"
+
+        def foreign_repo_read(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    {
+                        "number": 10,
+                        "state": "open",
+                        "node_id": "P_ROOT_10",
+                        "repository_url": f"https://api.github.com/repos/{public_slug}",
+                        "html_url": f"https://github.com/{public_slug}/issues/10",
+                    }
+                ),
+                "",
+            )
+
+        with pytest.raises(gate.PublishBlocked, match="PARENT_REFUSED"):
+            pub._parent_epic_node(foreign_repo_read, active_slug, 10, tmp_path, None)
         assert (
             pub.main(
                 ["issue-create", "--repo", public_slug, "--parent", "20", "--title", "Task", "--body", "Body"],

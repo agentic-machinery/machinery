@@ -3365,8 +3365,10 @@ def test_a02_stream_registry_repository_both_selector_states_and_same_issue_numb
         monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", empty_registry)
         assert task_lifecycle.stream_registry_repository(active_slug) == public_slug
         assert task_lifecycle.stream_registry_repository(public_slug) == public_slug
+        # Recorded ledger identities keep binding across either baked slug; operator targets refuse inactive slugs.
+        assert task_lifecycle.stream_registry_repository(inactive_slug) == public_slug
         with pytest.raises(task_lifecycle.LifecycleError, match="not the active fleet slug"):
-            task_lifecycle.stream_registry_repository(inactive_slug)
+            task_lifecycle.stream_registry_repository(inactive_slug, require_active_slug=True)
 
         # Post-PR-2: both repos register the same root number #10 independently.
         populated_registry = tmp_path / "issue_streams_populated.yaml"
@@ -3387,8 +3389,9 @@ def test_a02_stream_registry_repository_both_selector_states_and_same_issue_numb
         monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", populated_registry)
         assert task_lifecycle.stream_registry_repository(active_slug) == active_slug
         assert task_lifecycle.stream_registry_repository(public_slug) == public_slug
+        assert task_lifecycle.stream_registry_repository(inactive_slug) == active_slug
         with pytest.raises(task_lifecycle.LifecycleError, match="not the active fleet slug"):
-            task_lifecycle.stream_registry_repository(inactive_slug)
+            task_lifecycle.stream_registry_repository(inactive_slug, require_active_slug=True)
 
         # Same issue number #42 and root #10 in both repos are distinct identities and memberships.
         machinery_id = task_lifecycle.lifecycle_id(
@@ -3492,14 +3495,14 @@ def test_stream_epic_binding_accepts_either_baked_slug_of_the_registry_row(tmp_p
                 }
             },
         )
-        if repository == "org/repo":
+        if accepted:
             assert task_lifecycle.stream_registry_repository(repository) == "org/repo"
-        elif repository == "neworg/repo":
-            with pytest.raises(task_lifecycle.LifecycleError, match="not the active fleet slug"):
-                task_lifecycle.stream_registry_repository(repository)
         else:
             with pytest.raises(task_lifecycle.LifecycleError, match="not configured in the fleet"):
                 task_lifecycle.stream_registry_repository(repository)
+        if repository == "neworg/repo":
+            with pytest.raises(task_lifecycle.LifecycleError, match="not the active fleet slug"):
+                task_lifecycle.stream_registry_repository(repository, require_active_slug=True)
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)

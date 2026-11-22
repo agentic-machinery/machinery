@@ -893,7 +893,7 @@ def _refuse_unreadable_criteria(body):
             raise gate.PublishBlocked(f"ACCEPTANCE_CRITERIA_REFUSED: {exc}") from None
 
 
-def _issue_node(read_runner, gh_repo, number, cwd, environment):
+def _issue_node(read_runner, gh_repo, number, cwd, environment, *, allowed_slugs=None):
     """Return the node id of an open issue matching *gh_repo* and *number*, or None."""
     from urllib.parse import urlsplit
 
@@ -946,7 +946,13 @@ def _issue_node(read_runner, gh_repo, number, cwd, environment):
         if html_slug is None:
             return None
         observed_slugs.append(html_slug)
-    if not observed_slugs or any(slug.casefold() != expected_slug.casefold() for slug in observed_slugs):
+    if not observed_slugs:
+        return None
+    if allowed_slugs is not None:
+        accepted = {s.casefold() for s in allowed_slugs if isinstance(s, str) and s.isascii()}
+        if not all(slug.isascii() and slug.casefold() in accepted for slug in observed_slugs):
+            return None
+    elif not all(_same_repository(slug, expected_slug) for slug in observed_slugs):
         return None
     return node_id
 
@@ -1130,7 +1136,18 @@ def _parent_epic_node(read_runner, gh_repo, parent, cwd, environment):
     except (OSError, ValueError) as exc:
         raise gate.PublishBlocked(f"REGISTRY_REFUSED: issue_streams.yaml is unreadable ({exc}); nothing was created.") from None
     epics = {number for numbers in registry.values() for number in numbers}
-    node = _issue_node(read_runner, active.active_github, parent, cwd, environment) if parent in epics else None
+    node = (
+        _issue_node(
+            read_runner,
+            active.active_github,
+            parent,
+            cwd,
+            environment,
+            allowed_slugs=active.repo.slugs,
+        )
+        if parent in epics
+        else None
+    )
     if node is None:
         raise gate.PublishBlocked(
             "PARENT_REFUSED: --parent must be the number of a registered, open stream epic; nothing was created."

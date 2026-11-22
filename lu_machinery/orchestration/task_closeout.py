@@ -1102,7 +1102,7 @@ def _issue_snapshot(
             "issue membership does not resolve to the identity's exact registered "
             f"stream epic: {membership['reason']}"
         )
-    if identity["repository"].casefold() != epic_repository.casefold():
+    if task_lifecycle._repository_key(identity["repository"]) != task_lifecycle._repository_key(epic_repository):
         identity["stream_epic_url"] = epic_url
     snapshot = task_lifecycle.build_ac_snapshot(
         issue["body"], _load_policy(Path(args.ac_policy)), finalized_at=now

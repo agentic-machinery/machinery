@@ -225,8 +225,12 @@ def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -
     )
 
 
-def stream_registry_target(repository: str) -> tuple[str, str | None]:
-    """Bind a fleet repository to ``(active_slug, non_default_repo_key)`` in one A01 resolution."""
+def stream_registry_target(repository: str, *, require_active_slug: bool = False) -> tuple[str, str | None]:
+    """Bind a fleet repository to ``(active_slug, non_default_repo_key)`` in one A01 resolution.
+
+    Either baked slug of a transferred row binds by default so ledgers recorded before a selector
+    flip stay valid. Callers validating operator-supplied targets pass ``require_active_slug=True``.
+    """
     if not repository_identity_valid(repository):
         raise LifecycleError("task repository is not configured in the fleet")
     try:
@@ -235,7 +239,7 @@ def stream_registry_target(repository: str) -> tuple[str, str | None]:
         default_key = fleet_repos.default_repo_key(catalog)
     except fleet_repos.FleetRepoError as exc:
         raise LifecycleError(f"task repository is not configured in the fleet: {exc}") from None
-    if active.active_github.casefold() != repository.casefold():
+    if require_active_slug and active.active_github.casefold() != repository.casefold():
         raise LifecycleError(
             f"task repository {repository!r} is not the active fleet slug ({active.active_github!r})"
         )
@@ -265,9 +269,9 @@ def stream_registry_target(repository: str) -> tuple[str, str | None]:
     return owner_active.active_github, None
 
 
-def stream_registry_repository(repository: str) -> str:
+def stream_registry_repository(repository: str, *, require_active_slug: bool = False) -> str:
     """Bind a fleet repository to the active slug that owns its stream roots."""
-    return stream_registry_target(repository)[0]
+    return stream_registry_target(repository, require_active_slug=require_active_slug)[0]
 
 
 _DEFAULT_STREAM_REGISTRY_REPOSITORY = stream_registry_repository

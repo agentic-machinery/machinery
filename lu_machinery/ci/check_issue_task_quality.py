@@ -192,7 +192,7 @@ def live_audit(
     progress = progress or MembershipProgress()
     progress.stage = "live_audit_repository"
     observed_repository = "/".join(audit._repo_owner_name(audit_root, repo_slug=explicit_repo))
-    if observed_repository.casefold() != repository.casefold():
+    if lifecycle.repository_evidence_refusal(repository, observed_repository, source="live audit") is not None:
         raise ValueError("audit repository does not match target")
     progress.stage = "live_audit_open_issues"
     issues = audit.fetch_open_issues(audit_root, repo_slug=explicit_repo)
@@ -221,7 +221,10 @@ def live_audit(
                     if not isinstance(child, dict) or type(child.get("number")) is not int:
                         continue
                     child_repo = (child.get("repository") or {}).get("nameWithOwner")
-                    if isinstance(child_repo, str) and child_repo.casefold() != repository.casefold():
+                    if (
+                        isinstance(child_repo, str)
+                        and lifecycle._repository_key(child_repo) != lifecycle._repository_key(repository)
+                    ):
                         continue
                     branch_positions.setdefault(child["number"], position)
         return pages
@@ -250,8 +253,7 @@ def read_parent(repository: str, number: int) -> dict | None:
     if (
         doc.get("errors")
         or not isinstance(repo, dict)
-        or not isinstance(nwo, str)
-        or nwo.casefold() != repository.casefold()
+        or lifecycle.repository_evidence_refusal(repository, nwo, source="parent repository") is not None
     ):
         raise ValueError("parent repository unread")
     issue = repo.get("issue")
@@ -295,7 +297,11 @@ def _claim(issue: dict, repository: str, roots: list[int], index: dict, parents:
             if entry.get("unique_stream") is True and len(entry.get("epics", [])) == 1:
                 return entry["epics"][0]
             parent = parents.get(number)
-            if number in visited or not parent or parent["repository"].casefold() != repository.casefold():
+            if (
+                number in visited
+                or not parent
+                or lifecycle._repository_key(parent["repository"]) != lifecycle._repository_key(repository)
+            ):
                 break
             visited.add(number)
             number = parent.get("number")
@@ -314,7 +320,7 @@ def _audit_refusal(report: dict, repository: str, registry: dict, *, cached: boo
     if audit.validate_membership_report(report, MAX_AGE_S) is None:
         return membership_error("membership_audit_stale")
     observed_repository = report.get("repository")
-    if not isinstance(observed_repository, str) or observed_repository.casefold() != repository.casefold():
+    if lifecycle.repository_evidence_refusal(repository, observed_repository, source="membership audit") is not None:
         return membership_error("membership_audit_repository_mismatch")
     if report.get("streams") != {k: sorted(v) for k, v in registry.items()}:
         return membership_error("membership_audit_registry_mismatch")
@@ -366,7 +372,7 @@ def evaluate_membership(
     produced by an in-memory live audit; see ``_audit_refusal``.
     """
     epic_repository = repository if epic_repository is None else epic_repository
-    local_registry = repository.casefold() == epic_repository.casefold()
+    local_registry = lifecycle._repository_key(repository) == lifecycle._repository_key(epic_repository)
     roots = [n for ns in registry.values() for n in ns]
     if report is not None:
         refusal = _audit_refusal(report, repository, registry, cached=cached)
@@ -385,7 +391,10 @@ def evaluate_membership(
         (
             p["number"]
             for p in parents.values()
-            if p and p.get("repository", "").casefold() == epic_repository.casefold() and p.get("number") in roots
+            if p
+            and isinstance(p.get("repository"), str)
+            and lifecycle._repository_key(p["repository"]) == lifecycle._repository_key(epic_repository)
+            and p.get("number") in roots
         ),
         None,
     )
@@ -448,13 +457,13 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
     cache_rejection = None
     try:
         try:
-            epic_repository = lifecycle.stream_registry_repository(repository)
+            epic_repository = lifecycle.stream_registry_repository(repository, require_active_slug=True)
         except lifecycle.LifecycleError as exc:
             return membership_error("membership_registry_absent", str(exc))
         registry = registry_for(epic_repository)
         if not registry:
             return membership_error("membership_registry_absent")
-        local_registry = repository.casefold() == epic_repository.casefold()
+        local_registry = lifecycle._repository_key(repository) == lifecycle._repository_key(epic_repository)
         roots = {n for ns in registry.values() for n in ns}
         if local_registry and number in roots:
             return section("root_exempt")
@@ -465,7 +474,10 @@ def observe_membership(issue: dict, repository: str, number: int, *, audit_orpha
             progress.stage = f"parent_{current}"
             parent = read_parent(repository, current)
             parents[current] = parent
-            crosses_repository = parent is not None and parent["repository"].casefold() != repository.casefold()
+            crosses_repository = (
+                parent is not None
+                and lifecycle._repository_key(parent["repository"]) != lifecycle._repository_key(repository)
+            )
             if (
                 parent is None
                 or crosses_repository

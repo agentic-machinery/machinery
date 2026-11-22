@@ -2591,10 +2591,38 @@ def test_a02_dor_and_closeout_resolve_moved_repo_both_selector_states_and_same_i
                 with pytest.raises(ValueError):
                     real_read_parent(active_slug, 42)
 
-        # GhGitHubAdapter.registered_stream_epics resolves once and returns machinery's own roots,
-        # never silently falling back to public's [10, 42] on a transient selector error (F1).
+        # Live read_parent accepts the other baked slug of the same repository row in nameWithOwner.
+        with monkeypatch.context() as ctx:
+            ctx.setattr(
+                check_issue_task_quality,
+                "read",
+                lambda *_a, **_k: subprocess.CompletedProcess(
+                    [],
+                    0,
+                    json.dumps(
+                        {
+                            "data": {
+                                "repository": {
+                                    "nameWithOwner": inactive_slug,
+                                    "issue": {
+                                        "number": 42,
+                                        "parent": {"number": 10, "repository": {"nameWithOwner": inactive_slug}},
+                                    },
+                                }
+                            }
+                        }
+                    ),
+                    "",
+                ),
+            )
+            assert real_read_parent(active_slug, 42) == {"number": 10, "repository": inactive_slug}
+
+        # GhGitHubAdapter.registered_stream_epics binds pre-flip recorded ledgers (inactive_slug)
+        # to the active registry target, resolves once per call, and never silently falls back to
+        # public's [10, 42] on a transient selector error (F1).
         adapter = task_closeout.GhGitHubAdapter(tmp_path)
         monkeypatch.setattr(adapter, "_json", lambda command: {"nameWithOwner": active_slug})
+        assert adapter.registered_stream_epics(inactive_slug) == (active_slug, [10])
         resolve_calls = 0
         real_resolve = fleet_repos.resolve_active_fleet_repo
 
