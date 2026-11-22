@@ -1369,13 +1369,16 @@ jobs:
             exit 1
           fi
           uv python install --no-bin "$product_python"
-          # Match the pinned product's python-ci-env install. The release cut
-          # collection step overlays this environment behind the candidate wheel.
+          # Keep the pinned product's dependency selection and install its locked
+          # setuptools and wheel before building the two source packages.
           echo "uv sync --locked from product@$(git rev-parse HEAD)"
-          uv sync --locked --no-python-downloads --python "$product_python" \
-            --no-install-package torch --no-install-package torchvision \
-            --no-install-package open-clip-torch --no-install-package stanza \
-            --no-install-package lu-machinery
+          sync=(uv sync --locked --no-python-downloads --python "$product_python"
+            --no-install-package torch --no-install-package torchvision
+            --no-install-package open-clip-torch --no-install-package stanza
+            --no-install-package lu-machinery)
+          "${sync[@]}" --no-build \
+            --no-install-package ipa-uk --no-install-package learn-ukrainian-v4-runtime
+          "${sync[@]}" --no-build-isolation
           reported="$("$UV_PROJECT_ENVIRONMENT/bin/python" -I -c 'import platform; print(platform.python_version())')"
           if [ "$reported" != "$product_python" ]; then
             echo "::error::The product pin requires Python ${product_python}; environment uses ${reported}"
