@@ -28,6 +28,8 @@ def test_service_and_timer_contract() -> None:
     assert starts == [
         "ExecStart=@PYTHON@ -m lu_machinery.hygiene.batch_state_retention",
         "ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --unattributed-scratch --apply --summary",
+        "ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --temp-root /var/tmp --settled-task-only --apply --summary",
+        "ExecStart=@PYTHON@ -m lu_machinery.maintenance.task_log_retention --apply --summary",
         "ExecStart=@PYTHON@ -m lu_machinery.hygiene.tmp_sweep --batch-state --apply --summary",
     ]
     # The data-volume drop-in is product-retained (#127 R20).

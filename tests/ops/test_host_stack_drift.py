@@ -10,8 +10,8 @@ import time
 from pathlib import Path
 
 import pytest
-from lu_machinery.ops import host_stack_drift as drift
 
+from lu_machinery.ops import host_stack_drift as drift
 from tests._host_path_guard import FIXTURE_HOME, assert_no_host_facts, assert_no_host_paths
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -239,7 +239,6 @@ def test_state_dir_inside_any_git_checkout_is_refused(tmp_path: Path, kind: str)
         ("grok", ("grok", "--version"), "grok"),
         ("cursor-agent", ("cursor-agent", "--version"), "cursor-agent"),
         ("agy", ("agy", "--version"), "agy"),
-        ("entire", ("entire", "--version"), "entire"),
         ("gh", ("gh", "--version"), "gh"),
         ("uv", ("uv", "--version"), "uv"),
         ("node", ("node", "--version"), "node"),

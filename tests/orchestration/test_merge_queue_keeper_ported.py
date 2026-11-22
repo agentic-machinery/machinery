@@ -14,15 +14,15 @@ from typing import Any
 
 import pytest
 
-from tests.orchestration.test_merge_queue_keeper import product_policy as product_policy
-from tests.helpers.product_tree import configured_roots as configured_roots
 from lu_machinery.opsec import prepublish as gate
 from lu_machinery.orchestration import merge_queue_keeper as keeper
 from lu_machinery.orchestration.integration_sweep import Verdict
 from lu_machinery.publish import github as publisher
 from lu_machinery.publish import recovery
 from lu_machinery.review.record_cf_verdict import build_comment
+from tests.helpers.product_tree import configured_roots as configured_roots
 from tests.opsec_fixtures import CATALOG, TOKEN
+from tests.orchestration.test_merge_queue_keeper import product_policy as product_policy
 
 pytestmark = pytest.mark.usefixtures("configured_roots")
 
@@ -315,10 +315,6 @@ def _keeper_comment(fake: FakeGitHub) -> str:
 def test_queued_with_cf_at_head_is_kept(tmp_path: Path) -> None:
     fake = FakeGitHub(pr(isInMergeQueue=True))
     fake.check_rows.extend([
-        {"name": "Entire Gates", "head_sha": HEAD_A, "status": "completed", "conclusion": "failure",
-         "app": {"id": 2626939, "slug": "entire"}},
-        {"name": "Entire Gates", "head_sha": HEAD_A, "status": "in_progress", "conclusion": None,
-         "app": {"id": 2626939, "slug": "entire"}},
         {"name": "Reject negated closing references", "head_sha": HEAD_A,
          "status": "completed", "conclusion": "failure"},
     ])

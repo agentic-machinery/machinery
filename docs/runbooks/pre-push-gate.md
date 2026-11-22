@@ -17,7 +17,7 @@ The scanner reads remote ref names, annotated tag names and messages (nested tag
 
 ## What a push does not run
 
-The hook does not run `pre-commit`, `lint_opsec_leaks.py --commit-range` or `check-no-internal-ids`. This repository has no `.pre-commit-config.yaml`. The hook does not call `.githooks/pre_push_gate.py` `main()`. That entry still holds admission, the stage and run budgets, the concurrent scope, receipts, measurements and the Entire-ref refusal, and its product stage always raises `validation_incomplete` with the detail `this repository has no product push stage; the publication scanner is the push scan`. The same uncalled entry still reads `LU_PRE_PUSH_GATE_ADMISSION_WAIT_S`, `LU_PRE_PUSH_GATE_STAGE_BUDGET_S`, `LU_PRE_PUSH_GATE_RUN_BUDGET_S`, `LU_PRE_PUSH_GATE_MAX_CONCURRENT_RUNS` and `LU_PRE_PUSH_GATE_RUN_TOKEN`. None of them apply to a push.
+The hook does not run `pre-commit`, `lint_opsec_leaks.py --commit-range` or `check-no-internal-ids`. This repository has no `.pre-commit-config.yaml`. The hook does not call `.githooks/pre_push_gate.py` `main()`. That entry still holds admission, the stage and run budgets, the concurrent scope, receipts and measurements, and its product stage always raises `validation_incomplete` with the detail `this repository has no product push stage; the publication scanner is the push scan`. The same uncalled entry still reads `LU_PRE_PUSH_GATE_ADMISSION_WAIT_S`, `LU_PRE_PUSH_GATE_STAGE_BUDGET_S`, `LU_PRE_PUSH_GATE_RUN_BUDGET_S`, `LU_PRE_PUSH_GATE_MAX_CONCURRENT_RUNS` and `LU_PRE_PUSH_GATE_RUN_TOKEN`. None of them apply to a push.
 
 ## Untracked inputs and deployed agent outputs
 

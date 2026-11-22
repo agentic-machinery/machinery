@@ -812,7 +812,7 @@ Each run performs the following in both repository roots:
    still on disk and dirty or hold commits absent from `origin` (rescue
    candidates; report only, clean published trees are not listed);
 4. deletes origin heads that are not checked out, have no open PR, and are not
-   `entire/` refs, only when the tip is proven contained: the GitHub PR is
+   `salvage/` refs, only when the tip is proven contained: the GitHub PR is
    MERGED or CLOSED at the exact live origin SHA (`ls-remote` +
    `--force-with-lease`), the tip is contained in a MERGED PR and is not an
    ancestor of `origin/main`, or the tip is already an ancestor of
@@ -823,7 +823,7 @@ Each run performs the following in both repository roots:
    remote ref does not count. A git error during that check is not
    containment, and an unproven scratch ref is kept;
 5. deletes local branches whose upstream is gone, or that were never tracked,
-   on the same containment evidence (`entire/` refs are preserved);
+   on the same containment evidence (`salvage/` refs are preserved);
 6. preserves and reports unproven gone branches and orphaned worktree
    directories;
 7. records Git maintenance as `scheduled_separately`;

@@ -1341,6 +1341,7 @@ def sweep(
     quarantine_s: float = DEFAULT_QUARANTINE_S,
     digest_limit: int = DEFAULT_DIGEST_LIMIT,
     batch_state: bool = False,
+    settled_task_only: bool = False,
 ) -> dict[str, Any]:
     """Inventory top-level unmanaged entries; on ``apply``, purge expired quarantine, then quarantine proven ones.
 
@@ -1348,7 +1349,9 @@ def sweep(
     crashed steps, restore unledgered quarantine leftovers, purge expired
     entries, and quarantine newly proven candidates. Dry runs report the
     same passes without changing anything. Inactive pytest scratch follows
-    its own rule (:mod:`scripts.hygiene.pytest_retention`, #11297).
+    its own rule (:mod:`scripts.hygiene.pytest_retention`, #11297). A
+    settled-task-only pass skips that rule and purges only task-attributed
+    quarantine entries.
     """
     worktree_root = main_checkout_root(product_root() if repo_root is None else repo_root)
     repo_root = repo_root if repo_root is not None else state_root()
@@ -1365,6 +1368,8 @@ def sweep(
     root = temp_root.resolve()
     if batch_state and (root != repo_root.resolve() / "batch_state" or scratch is not None):
         raise ValueError("batch expiry requires the repository batch_state root and explicit metadata")
+    if settled_task_only and (batch_state or scratch is not None):
+        raise ValueError("settled-task-only cannot be combined with other expiry modes")
     if batch_state:
         load_holds(batch_state_retention.RETENTION_LIST)  # No batch mutation with unreadable holds.
     allowed_areas = {*SYSTEM_TEMP_AREAS, *protected_roots()}
@@ -1393,8 +1398,9 @@ def sweep(
             quarantine_s=quarantine_s,
             digest_limit=digest_limit,
             batch_state=batch_state,
+            settled_task_only=settled_task_only,
         )
-        if not batch_state:
+        if not batch_state and not settled_task_only:
             from lu_machinery.hygiene.pytest_retention import sweep_pytest_runs
 
             report["pytest_retention"] = sweep_pytest_runs(
@@ -1419,6 +1425,7 @@ def _sweep_locked(
     quarantine_s: float,
     digest_limit: int,
     batch_state: bool = False,
+    settled_task_only: bool = False,
 ) -> dict[str, Any]:
     root_fd = os.open(root, _DIR_FLAGS)
     quarantine: Quarantine | None = None
@@ -1434,8 +1441,12 @@ def _sweep_locked(
         recovered, restored, recover_errors = recover_quarantines(root, root_fd, apply=apply, known=known)
         rows += recovered
         errors += recover_errors
+        purge_entries = (
+            {key: entry for key, entry in local.items() if entry.intent.get("reason") == "dead_attributed_task"}
+            if settled_task_only else local
+        )
         purged, purge_errors = purge_quarantine(
-            local,
+            purge_entries,
             ledger,
             run_id,
             now=time.time(),
@@ -1866,6 +1877,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"  .venv/bin/python -m {_mod('hygiene', 'tmp_sweep')} --json\n"
             f"  .venv/bin/python -m {_mod('hygiene', 'tmp_sweep')} --unattributed-scratch --summary\n"
             f"  .venv/bin/python -m {_mod('hygiene', 'tmp_sweep')} --unattributed-scratch --apply --summary\n"
+            f"  .venv/bin/python -m {_mod('hygiene', 'tmp_sweep')} --temp-root /var/tmp --settled-task-only --summary\n"
             f"  .venv/bin/python -m {_mod('hygiene', 'tmp_sweep')} --batch-state --summary\n"
             f"  .venv/bin/python -m {_mod('hygiene', 'tmp_sweep')} restore <ledger-id>\n"
             "Outputs: stdout inventory (or --summary counts) with ledger location, quarantine and purge totals; "
@@ -1886,6 +1898,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="System temp area to inventory (default /tmp; example /private/tmp).",
+    )
+    parser.add_argument(
+        "--settled-task-only", action="store_true",
+        help="Limit quarantine and purge to settled-task entries and skip the separate pytest pass (default off).",
     )
     parser.add_argument(
         "--task-root",
@@ -1957,6 +1973,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.batch_state and (args.temp_root is not None or args.unattributed_scratch):
         parser.error("--batch-state cannot be combined with --temp-root or --unattributed-scratch")
+    if args.settled_task_only and (args.batch_state or args.unattributed_scratch):
+        parser.error("--settled-task-only cannot be combined with --batch-state or --unattributed-scratch")
     try:
         scratch = (
             ScratchPolicy(min_age_s=args.scratch_age_hours * 3600, quiet_s=args.scratch_quiet_hours * 3600)
@@ -1975,6 +1993,7 @@ def main(argv: list[str] | None = None) -> int:
             quarantine_s=args.quarantine_days * 86400,
             digest_limit=int(args.digest_limit_mib * (1 << 20)),
             batch_state=args.batch_state,
+            settled_task_only=args.settled_task_only,
         )
     except LedgerError as error:
         # The step in progress stays unconfirmed in the ledger, and the next run reconciles it.
