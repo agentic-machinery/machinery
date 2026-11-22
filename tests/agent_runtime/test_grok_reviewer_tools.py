@@ -59,6 +59,211 @@ def _contains_command_tokens(tokens: list[str], command_tokens: list[str]) -> bo
     return [Path(tokens[0]).name, *tokens[1:width]] == command_tokens
 
 
+# Basenames of shells whose ``-c`` argument is itself a script. ``busybox sh -c``
+# is caught because ``sh`` is one of these words, not because of the busybox prefix.
+_SHELL_BASENAMES = frozenset({"ash", "bash", "busybox", "dash", "ksh", "mksh", "rbash", "sh", "zsh"})
+_SHELL_NO_ARG_SHORT = frozenset("efilnprstuvx")
+_SHELL_NO_ARG_LONG = frozenset({"--login", "--noprofile", "--norc", "--posix"})
+_SHELL_ARG_LONG = frozenset({"--rcfile"})
+_SHELL_SEPARATORS = frozenset({";", "&", "|", "&&", "||", "\n", "(", ")", "`"})
+_MAX_SHELL_SCRIPT_DEPTH = 8
+
+
+class _UnparsedHookShell(Exception):
+    """A shell word whose ``-c`` script could not be classified."""
+
+
+def _tokens_include_read_command(tokens: list[str], commands: tuple[str, ...]) -> bool:
+    return any(
+        command in tokens or _contains_command_tokens(tokens, shlex.split(command)) for command in commands
+    )
+
+
+def _shell_script_segments(script: str) -> list[list[str]]:
+    """Split a shell script into simple-command word lists.
+
+    Operators and newlines are separators, including when they are glued to a
+    word (``ok;pwd``). Quotes stay quoted, so ``'not;pwd'`` is one word.
+    """
+    lexer = shlex.shlex(script, posix=True, punctuation_chars=";&|()<>\n`")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in lexer:
+        if token in _SHELL_SEPARATORS:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _shell_c_script(tokens: list[str], shell_index: int) -> str | None:
+    """Return the script run by a ``sh -c`` / ``bash -c`` word, or None when it is not one.
+
+    The script is the next word after ``-c`` or a short cluster that contains ``c``
+    (``-lc``, ``-cl``). An attached ``-cSCRIPT`` word, an unknown option, or a
+    missing script raises, so the caller refuses the hook instead of skipping it.
+    """
+    index = shell_index + 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return None
+        if token == "-c":
+            if index + 1 >= len(tokens):
+                raise _UnparsedHookShell(token)
+            return tokens[index + 1]
+        if token.startswith("--"):
+            if token in _SHELL_NO_ARG_LONG:
+                index += 1
+                continue
+            if token in _SHELL_ARG_LONG:
+                if index + 1 >= len(tokens):
+                    raise _UnparsedHookShell(token)
+                index += 2
+                continue
+            raise _UnparsedHookShell(token)
+        if token.startswith("-") and len(token) > 1:
+            body = token[1:]
+            if "c" in body:
+                head, rest = body.split("c", 1)
+                head_known = set(head) <= _SHELL_NO_ARG_SHORT
+                rest_known = not rest or set(rest) <= _SHELL_NO_ARG_SHORT
+                if not head_known or not rest_known or index + 1 >= len(tokens):
+                    raise _UnparsedHookShell(token)
+                return tokens[index + 1]
+            if body in {"o", "O"}:
+                if index + 1 >= len(tokens):
+                    raise _UnparsedHookShell(token)
+                index += 2
+                continue
+            if set(body) <= _SHELL_NO_ARG_SHORT:
+                index += 1
+                continue
+            raise _UnparsedHookShell(token)
+        return None
+    return None
+
+
+def _bash_special_quotes(text: str) -> bool:
+    """True for bash ``$'...'`` and ``$"..."`` quotes.
+
+    ``shlex`` turns ``$'pwd'`` into the word ``$pwd``, which is not the read
+    command, but bash runs ``pwd``. The quote marks are the part that can be
+    seen before that collapse. Dash does not run this form; bash does.
+    """
+    return "$'" in text or '$"' in text
+
+
+def _dollar_word_hides_read_command(token: str, commands: tuple[str, ...]) -> bool:
+    """True when a collapsed ``$'pwd'`` / ``$pwd`` word is exactly a one-word read command."""
+    if len(token) < 2 or not token.startswith("$") or token.startswith(("${", "$(")):
+        return False
+    return token[1:] in commands
+
+
+def _hook_tokens_hide_read_command(
+    tokens: list[str],
+    commands: tuple[str, ...],
+    *,
+    depth: int = 0,
+) -> bool:
+    """True when these words run a reviewer read command, including inside a shell ``-c`` script."""
+    if depth > _MAX_SHELL_SCRIPT_DEPTH:
+        return True
+    if _tokens_include_read_command(tokens, commands):
+        return True
+    if any(_dollar_word_hides_read_command(token, commands) for token in tokens):
+        return True
+    for index, token in enumerate(tokens):
+        if Path(token).name not in _SHELL_BASENAMES:
+            continue
+        try:
+            script = _shell_c_script(tokens, index)
+        except _UnparsedHookShell:
+            return True
+        if script is None:
+            continue
+        if _hook_script_hides_read_command(script, commands, depth=depth):
+            return True
+    for index, token in enumerate(tokens):
+        if Path(token).name != "eval" or index + 1 >= len(tokens):
+            continue
+        # eval joins its remaining words into one script, the same way a shell -c argument does.
+        if _hook_script_hides_read_command(" ".join(tokens[index + 1 :]), commands, depth=depth):
+            return True
+    return False
+
+
+def _hook_script_hides_read_command(script: str, commands: tuple[str, ...], *, depth: int) -> bool:
+    if _bash_special_quotes(script):
+        return True
+    try:
+        segments = _shell_script_segments(script)
+    except ValueError:
+        return True
+    return any(
+        _hook_tokens_hide_read_command(segment, commands, depth=depth + 1) for segment in segments
+    )
+
+
+def _hook_command_hides_read_command(hook_command: str, commands: tuple[str, ...]) -> bool:
+    if _bash_special_quotes(hook_command):
+        return True
+    try:
+        tokens = shlex.split(hook_command)
+    except ValueError:
+        return True
+    return _hook_tokens_hide_read_command(tokens, commands)
+
+
+def _assert_hook_command_excludes_read_commands(hook_command: str, commands: tuple[str, ...]) -> None:
+    assert not _hook_command_hides_read_command(hook_command, commands), hook_command
+
+
+def _seeded_reviewer_definition(hook_command: str) -> str:
+    """A reviewer-shaped definition whose only hook command is ``hook_command``."""
+    return (
+        "---\n"
+        "name: seeded-reviewer\n"
+        "description: seeded hook\n"
+        "hooks:\n"
+        "  PreToolUse:\n"
+        '    - matcher: ".*"\n'
+        "      hooks:\n"
+        "        - type: command\n"
+        f"          command: {json.dumps(hook_command)}\n"
+        "          timeout: 15\n"
+        "---\n"
+        "Review the requested work using tracked-file reads only.\n"
+    )
+
+
+def _definition_hook_commands(definition: str) -> list[str]:
+    frontmatter, _body = _split_agent_definition(definition)
+    hooks_by_event = frontmatter["hooks"]
+    assert isinstance(hooks_by_event, dict)
+    commands: list[str] = []
+    for groups in hooks_by_event.values():
+        assert isinstance(groups, list)
+        for group in groups:
+            assert isinstance(group, dict)
+            group_hooks = group["hooks"]
+            assert isinstance(group_hooks, list)
+            for hook in group_hooks:
+                assert isinstance(hook, dict)
+                command = hook["command"]
+                assert isinstance(command, str)
+                commands.append(command)
+    return commands
+
+
 def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path) -> None:
     # Seed a path containing "pwd" (as in CI tmp root pytest.pwds69p6) so a raw
     # substring assertion over the definition cannot silently pass on lucky tmp dirs.
@@ -102,8 +307,9 @@ def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path
         )
 
         # Check the prompt body, non-command frontmatter fields, and each hook's
-        # parsed command tokens so a read command cannot leak anywhere while
-        # arbitrary --review-root paths (like pytest.pwds69p6) do not false-positive.
+        # parsed command tokens, including the words of a sh -c / bash -c script,
+        # so a read command cannot leak anywhere while arbitrary --review-root
+        # paths (like pytest.pwds69p6) do not false-positive.
         assert all(command not in body for command in GROK_REVIEWER_READ_COMMANDS)
         non_hook_text = json.dumps(
             {key: value for key, value in frontmatter.items() if key != "hooks"},
@@ -138,9 +344,7 @@ def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path
                     assert isinstance(hook_command, str)
                     hook_tokens = shlex.split(hook_command)
                     parsed_hook_commands.append(hook_tokens)
-                    for command in GROK_REVIEWER_READ_COMMANDS:
-                        assert command not in hook_tokens
-                        assert not _contains_command_tokens(hook_tokens, shlex.split(command))
+                    assert not _hook_command_hides_read_command(hook_command, GROK_REVIEWER_READ_COMMANDS)
         assert len(parsed_hook_commands) == 11
         assert any(
             len(tokens) >= 2 and tokens[-2:] == ["--review-root", str(review_root)]
@@ -161,6 +365,88 @@ def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path
     finally:
         adapter.cleanup_invocation(reviewer)
     assert not agent_path.exists()
+
+
+def test_compound_quoted_shell_hook_hiding_a_read_command_fails_the_assertion() -> None:
+    """A read command hidden in a compound quoted shell script fails this assertion.
+
+    Defect class: hook checks that look only at outer argv tokens, contiguous
+    slices and the argv[0] basename miss a read command that is a word of a
+    ``sh -c`` / ``bash -c`` script. The seeded definition is refused. A compound
+    shell script that does not run a read command, and the generated definition
+    in ``test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads``, pass.
+    """
+    from lu_machinery.agent_runtime.grok_reviewer_permissions import (
+        GROK_REVIEWER_READ_COMMANDS,
+    )
+
+    git_status = next(command for command in GROK_REVIEWER_READ_COMMANDS if command.endswith(" status --short"))
+    hidden = [
+        # Compound separators, quoting, glued words, paths and flag clusters.
+        "sh -c 'printf ok; pwd'",
+        "sh -c 'pwd; printf ok'",
+        'bash -c "printf ok && pwd"',
+        "bash -cl 'printf ok & pwd'",
+        "/bin/dash -c 'printf ok;pwd'",
+        "ksh -c 'printf ok; pwd'",
+        "ash -c 'printf ok; pwd'",
+        "bash -lc 'printf ok; date -u'",
+        "bash -o errexit -c 'printf ok; /bin/pwd'",
+        "env sh -c 'printf ok || pwd'",
+        "sh -c 'printf ok\npwd'",
+        "sh -c 'printf ok | /usr/bin/date -u'",
+        "busybox sh -c 'printf ok; pwd'",
+        'zsh -c \'bash -c "printf ok; pwd"\'',
+        'sh -c \'eval "printf ok; pwd"\'',
+        "eval 'printf ok; pwd'",
+        "sh -c " + shlex.quote(f"printf ok; {git_status}"),
+        # Quote removal still yields the read-command word, as the outer token rule does.
+        "sh -c 'printf \"pwd\"'",
+        "sh -c 'printf `pwd`'",
+        "sh -c 'printf $(pwd)'",
+        # bash runs $'pwd' and $"pwd"; shlex collapses both to the word $pwd.
+        "bash -c $'pwd'",
+        'bash -c "printf ok; $\'pwd\'"',
+        "bash -c $'\\160wd'",
+        'bash -c $"pwd"',
+        # Unparsed shell forms fail closed: the script words were not classified.
+        "sh -c",
+        'sh -c "printf \'ok"',
+        "bash --not-a-real-flag -c 'printf ok'",
+        "bash -c'printf ok; pwd'",
+    ]
+    nested = "echo done"
+    for _ in range(_MAX_SHELL_SCRIPT_DEPTH + 1):
+        nested = "sh -c " + shlex.quote(nested)
+    hidden.append(nested)
+    clean = [
+        "sh -c 'printf ok; echo done'",
+        "eval 'echo done'",
+        "sh -c ''",
+        "sh -c 'echo done' /bin/pwd",
+        "sh ./guard.sh",
+        "/usr/bin/bash -c 'echo done'",
+        "bash -lc 'echo done'",
+        "bash --norc -c 'printf ok; echo done'",
+        "bash --rcfile /dev/null -c 'printf ok; echo done'",
+        "sh -c " + shlex.quote("bash -c " + shlex.quote("echo done")),
+        # A comment, a longer word and a path that merely contains "pwd" are not the command.
+        "sh -c 'printf ok # pwd'",
+        'sh -c \'printf "not a command: pwd"\'',
+        "sh -c 'echo pytest.pwds69p6'",
+        "sh -c 'echo $HOME'",
+    ]
+    for hook_command in hidden:
+        command = _definition_hook_commands(_seeded_reviewer_definition(hook_command))
+        assert command == [hook_command]
+        tokens = shlex.split(hook_command)
+        assert not _tokens_include_read_command(tokens, GROK_REVIEWER_READ_COMMANDS), hook_command
+        with pytest.raises(AssertionError):
+            _assert_hook_command_excludes_read_commands(hook_command, GROK_REVIEWER_READ_COMMANDS)
+    for hook_command in clean:
+        command = _definition_hook_commands(_seeded_reviewer_definition(hook_command))
+        assert command == [hook_command]
+        _assert_hook_command_excludes_read_commands(hook_command, GROK_REVIEWER_READ_COMMANDS)
 
 
 @pytest.mark.parametrize(
