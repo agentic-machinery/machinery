@@ -344,7 +344,10 @@ class CanonicalPublicRepository:
         if matches:
             # Keep the registered-destination rule: exactly one public row.
             return self if matches.count(True) == 1 else None
-        if not destination.startswith("github.com/") or gate.normalize_repository(destination) != destination:
+        if gate.normalize_repository(destination) != destination:
+            return None
+        host, owner, name = destination.split("/")
+        if host != "github.com" or owner in {".", ".."} or name in {".", ".."}:
             return None
 
         try:
@@ -356,7 +359,6 @@ class CanonicalPublicRepository:
                 return None
             data = parse_graphql_envelope(result.stdout)["data"]
             repository = data["repository"]
-            _, owner, name = destination.split("/")
             viewer = data["viewer"]["login"]
             slug = repository["nameWithOwner"]
             if (

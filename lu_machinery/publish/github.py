@@ -3623,7 +3623,7 @@ def read(
             )
             if operation == "fork-public-head":
                 expected = set()
-                if not dest.startswith("github.com/") or any(part in {".", ".."} for part in variables.values()):
+                if dest.split("/", 1)[0] != "github.com" or any(part in {".", ".."} for part in variables.values()):
                     raise gate.PublishBlocked("OPSEC: fork history read requires a GitHub.com repository.")
                 if paginate or slurp:
                     raise gate.PublishBlocked("OPSEC: fork history read does not support pagination.")
