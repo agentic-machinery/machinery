@@ -398,13 +398,36 @@ def test_active_drain_deadline_paces_to_the_earlier_reset_and_anything_else_keep
         assert cap(contents=inactive) == today
     target.write_text(json.dumps({"Codex a": entry()}))
     assert adm.meter_cap("claude:b", 8, view("claude:b"), now, adm.active_drain_deadline("claude:b", now))[0] == 1
-    assert not caplog.records
+    assert not [record for record in caplog.records if record.levelname != "DEBUG"]
+    monkeypatch.delenv(adm.ENV_DRAIN_DEADLINES_FILE)
+    monkeypatch.setattr(adm, "_drain_warned", set())
+    with caplog.at_level("DEBUG", logger=adm.__name__):
+        assert cap() == today
+        assert cap() == today
+    assert [(record.levelname, record.getMessage()) for record in caplog.records] == [(
+        "DEBUG", f"dispatch admission: {adm.ENV_DRAIN_DEADLINES_FILE} is not set; pacing uses the meter reset")]
+    caplog.clear()
+
+    def warned(reason, *, setting=None, env=None):
+        """One WARNING for ``reason`` over two checks, and today's cap."""
+        monkeypatch.setattr(adm, "_drain_warned", set())
+        environ = None if setting is None else {adm.ENV_DRAIN_DEADLINES_FILE: setting, **(env or {})}
+        with caplog.at_level("WARNING", logger=adm.__name__):
+            for _ in range(2):
+                assert adm.meter_cap("codex:a", 8, view(), now, adm.active_drain_deadline("codex:a", now, environ)) == today
+        assert [record.getMessage() for record in caplog.records] == [
+            f"dispatch admission: {adm.ENV_DRAIN_DEADLINES_FILE} {reason}; pacing uses the meter reset"]
+        caplog.clear()
+
+    warned("holds a NUL byte", setting="~\0/drain.json")
+    warned("holds a NUL byte", setting=f"{target}\0")
 
     fifo = tmp_path / "fifo"
     os.mkfifo(fifo)
     bad_files = (
         ("codex-drain-deadlines.json", "is not an absolute path"),
-        (str(tmp_path / "absent.json"), "file missing"),
+        (str(tmp_path / "absent.json"), "is missing"),
+        ("~no-such-user-lu-drain-test/drain.json", "cannot be expanded"),
         (str(tmp_path), "is not a regular file"),
         (str(fifo), "is not a regular file"),
     )
@@ -421,19 +444,23 @@ def test_active_drain_deadline_paces_to_the_earlier_reset_and_anything_else_keep
     monkeypatch.setenv(adm.ENV_DRAIN_DEADLINES_FILE, str(target))
     naive = {"Codex a": {**entry(), "after": "2026-11-20T13:00:00"}}
     for contents, reason in (
-        (b" " * (64 * 1024 + 1), "file is larger than 65536 bytes"),
-        (b'{"Codex a": "\xff"}', "is not valid JSON"),
+        (b" " * (64 * 1024 + 1), "is larger than 65536 bytes"),
+        (b'{"Codex a": "\xff"}', "is not UTF-8 text"),
+        *((json.dumps({"Codex a": entry()}).encode()[:-1] + b', "Codex c": ' + token + b"}", "is not valid JSON")
+          for token in (b"NaN", b"Infinity", b"-Infinity")),
         (b"\xef\xbb\xbf" + json.dumps({"Codex a": entry()}).encode(), "is not valid JSON"),
         (b'{"Codex a": ' + b"[" * 600 + b"]" * 600 + b"}", "is not valid JSON"),
         (b"{", "is not valid JSON"),
         (json.dumps({"Codex a": entry()}).encode()[:-1] + b', "Codex a": {}}', "is not valid JSON"),
         ([entry()], "is not a JSON object"),
         (None, "is not a JSON object"),
-        (naive, "entry 'Codex a' needs 'after' and 'deadline' times with a UTC offset"),
-        *(({"Codex a": value}, "entry 'Codex a' needs 'after' and 'deadline' times with a UTC offset") for value in (
-            None, "2026-11-23T14:00:00Z", [], {"after": entry()["after"]},
+        *(({"Codex a": value}, "entry 'Codex a' needs 'after' and 'deadline' times with a UTC offset and an "
+           "'order' text") for value in (
+            None, "2026-11-23T14:00:00Z", [], {"after": entry()["after"]}, naive["Codex a"],
             {**entry(), "deadline": 1795442400}, {**entry(), "deadline": "tomorrow"},
             {**entry(), "deadline": entry()["deadline"] + " " * 20},
+            {key: value for key, value in entry().items() if key != "order"}, {**entry(), "order": None},
+            {**entry(), "order": ["C-6214"]},
         )),
     ):
         target.write_bytes(contents if isinstance(contents, bytes) else json.dumps(contents).encode())
@@ -462,6 +489,39 @@ def test_active_drain_deadline_paces_to_the_earlier_reset_and_anything_else_keep
     paced = decide()
     assert paced.admitted and paced.meter is not None and (paced.meter.live, paced.meter.cap) == (2, 3)
     assert "28.5h to drain deadline" in paced.summary()
+    # A present process value, even a blank one, wins over the deployment env file.
+    for blank in ("", "  "):
+        monkeypatch.setenv(adm.ENV_DRAIN_DEADLINES_FILE, blank)
+        assert decide().meter.cap == 1  # type: ignore[union-attr]
+    monkeypatch.delenv(adm.ENV_DRAIN_DEADLINES_FILE)
+    # A bad deployment env file never blocks, raises or applies a deadline: the reason is logged once.
+    def env_warned(reason):
+        monkeypatch.setattr(adm, "_drain_warned", set())
+        with caplog.at_level("WARNING", logger=adm.__name__):
+            for _ in range(2):
+                assert decide().meter.cap == 1  # type: ignore[union-attr]
+        assert [record.getMessage() for record in caplog.records] == [
+            f"dispatch admission: {adm.ENV_DRAIN_DEADLINES_FILE} lookup: {reason}; pacing uses the meter reset"]
+        caplog.clear()
+
+    env_fifo = tmp_path / "env-fifo"
+    os.mkfifo(env_fifo)
+    for setting, reason in (
+        (str(env_fifo), "the deployment env file is not a regular file"),
+        ("dispatch-admission.env", "the deployment env file is not an absolute path"),
+        ("~no-such-user-lu-drain-test/a.env", f"{adm.ENV_ADMISSION_FILE} cannot be expanded"),
+    ):
+        monkeypatch.setenv(adm.ENV_ADMISSION_FILE, setting)
+        env_warned(reason)
+    monkeypatch.setenv(adm.ENV_ADMISSION_FILE, str(env_file))
+    for contents, reason in ((b"\xff=1\n", "is not UTF-8 text"), (b"#" * (64 * 1024 + 1), "is larger than 65536 bytes")):
+        env_file.write_bytes(contents)
+        env_warned(f"the deployment env file {reason}")
+    monkeypatch.setenv(adm.ENV_ADMISSION_FILE, str(tmp_path / "absent.env"))  # no deployment env file: silent
+    with caplog.at_level("WARNING", logger=adm.__name__):
+        assert decide().meter.cap == 1  # type: ignore[union-attr]
+    assert not caplog.records
+    monkeypatch.setenv(adm.ENV_ADMISSION_FILE, str(env_file))
     env_file.write_text("")
     refused = decide()
     assert not refused.admitted and refused.meter is not None and refused.meter.defer == adm.MeterDefer.CAP
