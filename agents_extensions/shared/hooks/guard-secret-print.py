@@ -1171,17 +1171,6 @@ def _path_name(path: str) -> str:
     return clean.rsplit("/", 1)[-1].lower()
 
 
-def _is_dotenv_secret_file(path: str) -> bool:
-    clean = _strip_quotes(path).lower()
-    name = _path_name(clean)
-    return (
-        clean in {"~/.bash_secrets"}
-        or name in {".env", ".envrc", ".bash_secrets"}
-        or name.endswith(".env")
-        or (name.startswith(".env.") and not name.endswith(SAFE_DOTENV_SUFFIXES))
-    )
-
-
 def _is_secrets_directory(path: str) -> bool:
     """True for the singular or plural secret directory and its contents."""
     clean = _strip_quotes(path).replace("\\", "/").lower()
@@ -2151,18 +2140,21 @@ def _sensitive_file_reason(pipeline: list[list[str]], index: int, dumped_files: 
     # Preserve the explicitly documented source-data-flow residual.
     if cmd in {"source", "."}:
         return None
-    # Echo/printf arguments are literal text, not file operands. Their input
-    # redirections still follow the sensitive-input policy below.
-    operands = (
-        [] if cmd in {"echo", "printf"} else _grep_file_args(args) if cmd in GREP_COMMANDS else _file_args(cmd, args)
-    )
+    # Echo/printf arguments are literal text, and `[[`, a reserved word no function can
+    # replace, only tests its operands: none is a file operand, `NAME=value` ones
+    # included. Their input redirections still follow the sensitive-input policy below.
+    data = cmd in {"echo", "printf", "[["}
+    operands = [] if data else _grep_file_args(args) if cmd in GREP_COMMANDS else _file_args(cmd, args)
     operands += [
         args[i + 1]
         for i, token in enumerate(args[:-1])
         if re.fullmatch(r"(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<|<>)", token)
     ]
     # Named file operands (e.g. dd's if=) and long options carry the same path.
-    operands += [_strip_quotes(arg).split("=", 1)[1] for arg in args if "=" in arg and not _redirection_skip_count(arg)]
+    if not data:
+        operands += [
+            _strip_quotes(arg).split("=", 1)[1] for arg in args if "=" in arg and not _redirection_skip_count(arg)
+        ]
     paths = [_strip_quotes(arg) for arg in operands]
     sensitive = [path for path in paths if _sensitive_path(path) or _normalized_path(path) in dumped_files]
     if not sensitive:
@@ -2347,6 +2339,9 @@ def _hide_substitutions(command: str) -> tuple[str, dict[str, tuple[str, str]]]:
 # procps pgrep/pkill short options whose value follows the letter or the next word.
 _PROCESS_VALUE_OPTIONS = set("dgGPstuUFOrq")
 _PROCESS_SHELLS = {"bash", "sh", "dash", "zsh", "ksh"}
+# Commands whose operands are data (an exit status, a count, printed text or a test
+# operand), never a file they read or a program they load.
+_DATA_WORD_COMMANDS = {"exit", "return", "echo", "printf", "sleep", "true", "false", ":", "test", "[", "[[", "shift"}
 _XARGS_VALUE_LONGS = {
     "--arg-file",
     "--delimiter",
@@ -2503,11 +2498,30 @@ def _script_reads_stdin(script: str) -> bool:
             # A computed command word may name a shell.
             if found[0] in SHELL_COMMANDS or found[0] == _UNDECIDABLE or "$" in found[0]:
                 return True
-            # Any word may be a file operand here, so only a path-shaped one counts:
-            # a bare `0` or `stdin` is more often an exit status or text than a file.
-            if any("/" in (value := _strip_quotes(word)) and _names_stdin(value) for word in segment):
-                return True
+            # A bare `stdin` or `0` counts wherever a word may name a file. A path-shaped word
+            # counts in every position: printed text can still reach a loader through a pipe.
+            data = _data_word_indexes(segment, found)
+            for index, word in enumerate(segment):
+                value = _strip_quotes(word)
+                if _names_stdin(value) and ("/" in value or index not in data):
+                    return True
     return False
+
+
+def _data_word_indexes(segment: list[str], found: tuple[str, list[str], int]) -> set[int]:
+    """The positions of a segment's words that cannot name a file.
+
+    They are a data-word command's operands, a descriptor after `<&` or `>&`,
+    and a here-string or here-document word.
+    """
+    cmd, _, start = found
+    data = set(range(start + 1, len(segment))) if cmd in _DATA_WORD_COMMANDS else set()
+    for index, word in enumerate(segment[:-1]):
+        operator = re.sub(r"^(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})", "", word)
+        descriptor = re.fullmatch(r"[0-9]+-?|-", _strip_quotes(segment[index + 1]))
+        if operator in _LITERAL_OPERAND_OPERATORS or (operator in {"<&", ">&"} and descriptor):
+            data.add(index + 1)
+    return data
 
 
 def _segment_process_facts(segment: list[str], depth: int, documents: dict[str, list[tuple[str, bool]]]) -> set[str]:
