@@ -106,8 +106,9 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    Before step 5, the author may optionally run the DeepSeek author pre-check
    ([below](#optional-deepseek-author-pre-check-ds-precheck-1101)) on the pinned pushed head.
 5. **Review with `review-loop`**, which you run yourself, at that pushed head, in parallel with
-   its PR CI; a Trivial-tier change has no review (review policy section 2), so go to step 6 with
-   `--trivial`. It resolves the reviewer live (never from a family that authored the branch,
+   its PR CI; a Trivial-tier change has no review (review policy section 2), so under `full-send`
+   go to step 6 with `--trivial` (under `full-stop` it keeps its held hand-off and never reaches
+   step 6). It resolves the reviewer live (never from a family that authored the branch,
    except any qualified non-author reviewer at the review policy's Low tier), dispatches it at
    the exact pushed head, keeps the budget and the ledger, and records the verdict. A fix that
    moves the head returns to step 4: push, then run the next round on the new head. The reviewer
@@ -161,8 +162,8 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 
 ## Landing and closeout by a lead
 
-For the integration owner or the CTO landing a PR that no brief or custody covers, and for the
-CTO cycle after the keeper lands one. A worker never runs this section.
+For the accountable stream driver (its own stream only, Step 0), the integration owner or the CTO
+landing a PR that no brief or custody covers, and for the CTO cycle after the keeper lands one. A worker never runs this section.
 
 1. **Check the gate on the live head** ([delivery](references/delivery.md#the-gate)). First
    read the base branch's landing kind from `data.repository.pullRequest.isMergeQueueEnabled`

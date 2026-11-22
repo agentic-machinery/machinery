@@ -14,9 +14,10 @@ file only points there and adds what the CTO seat learned on top.
   exact-head verdict (or Trivial classification) and an accepted `pr_ownership keeper-transfer`
   receipt, never waits on CI, runners or the queue, and never reruns, enqueues, merges or runs
   `merge_closeout`. No worker brief uses this detached contract until `claude-cto` records the
-  rollout acceptance criteria verified on merged keeper code; the criteria list lives with the
-  CTO (tracker disposition D-DETACH-RESIDUALS), not in this file. In-flight briefs keep their owner
-  until an explicit transfer.
+  rollout acceptance criteria verified on merged keeper code and names the installed lu-machinery
+  release built from it (the one workers run); the criteria list lives with the CTO (tracker
+  disposition D-DETACH-RESIDUALS), not in this file. Every lane or CTO brief that states the exit
+  receipt carries this gate. In-flight briefs keep their owner until an explicit transfer.
 - **Keeper alert on CI failure, ejection or head move after approval.** Classify it from the
   evidence before releasing custody. An infrastructure failure with no failing test node and an
   unspent allowance is the one same-head recovery (the keeper's re-enqueue, or a CTO `run-rerun` with the evidence on the PR): dispatch no worker, because accepting
@@ -25,8 +26,9 @@ file only points there and adds what the CTO seat learned on top.
   remaining budget, and starts with `pr_ownership accept --pr <N> --repo <owner/name>`. A failing
   test node is fixed, never rerun. If the installed `run-rerun` or re-enqueue refuses the head (for
   example `RECOVERY_APPROVAL_MISSING` on a Trivial head), the outcome is blocked: report it with
-  the refusal and request direction. A second own-check failure on this PR, an unknown diagnosis or a
-  spent allowance means stop, report and request direction (rules core P4;
+  the refusal and request direction. A second own-check failure on this PR, an unknown diagnosis, or a further infrastructure
+  failure after the infrastructure allowance is spent means stop, report and request direction;
+  that spent allowance never blocks the first own-check fix worker (rules core P4;
   [pr-watch](../../full-send/references/pr-watch.md#failing-ci)).
 - **Review continuation after a pending-CI `BLOCKED`.** When a worker ends `BLOCKED pending CI
   evidence`, wait for the named check, revalidate the head and `budget-check`, start the one
@@ -34,7 +36,9 @@ file only points there and adds what the CTO seat learned on top.
   original terminal (`full-send` custody, or `full-stop` with its hold intact). The successor
   accepts the PR with `pr_ownership accept`, records the verdict and finishes that terminal. Until
   then this continuation is the PR's owner plan: an ownerless alert on that PR is answered by this
-  one successor, never a second.
+  one successor, never a second. If the head has moved when you revalidate it, the continuation is
+  stale: retire it and seat one successor for the current head under the inherited terminal and
+  review budget; that one disposition answers the alert.
 - **After the keeper lands a PR.** Confirm `MERGED` and the merge SHA with `gh`, wait for the
   worker to settle, then run the closeout (`full-send` § Landing and closeout by a lead, steps
   3 to 5) and close the issue with the merged-outcome evidence.

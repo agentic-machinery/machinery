@@ -66,7 +66,8 @@ never fine.
    accepted handoffs counted, and an owner whose supervisor cannot be observed is unknown, not
    ownerless. A PR in an active pending-CI review continuation ([recipes](recipes.md#writes-and-merging))
    is excluded from every reseating step below: its alert attaches to that continuation, whose one
-   successor is seated when the review evidence is ready. Dispatch an owner for every other ownerless PR, replacing any owner that ended failed,
+   successor is seated when the review evidence is ready, or, once its head has moved, by the
+   recipe's single stale-continuation disposition. Dispatch an owner for every other ownerless PR, replacing any owner that ended failed,
    timed out or was cancelled. Ownership is the live task on the PR branch, the running task
    named by the X-Agent trailer on the PR head, an accepted handoff, or recorded custody, never
    the author or branch prefix. The merge-queue keeper runs the same check every 5 minutes. It
@@ -90,7 +91,8 @@ never fine.
    nothing. Neither form changes review, CI, enqueue or merge.
    Keeper custody comes from a worker's `keeper-transfer` and needs no action from this seat until
    the keeper alerts on a CI failure, ejection or head move; then classify the alert first and
-   dispatch a fresh fix worker only for a first repairable failure
+   act as that recipe's class-specific rules say (one infrastructure recovery, a fix worker for a
+   first own-check failure, otherwise stop)
    ([recipes](recipes.md#writes-and-merging)), and confirm `MERGED` and closeout after landing.
    Queue custody is only for a predecessor that is still live and waiting in the merge queue
    (a brief started before detached delivery). The

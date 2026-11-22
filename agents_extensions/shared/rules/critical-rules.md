@@ -151,10 +151,10 @@ everything" cannot survive this repo's merge rate and is corporate dual-control 
   missing a required capability; it still blocks) follow the `local-code-review` checklist, Steps 2-6.
 
 **8.5 — Merge queue protocol.** The sole ordered landing and cleanup recipe is
-[`workflow.md`](workflow.md) § Merge policy. Nobody arms auto-merge. The worker that
-owns the brief (rules core P1), or the accountable driver for work no brief owns, verifies
-independent exact-head CF and same-head CI, lands the non-draft PR, confirms MERGED and
-completes closeout.
+[`workflow.md`](workflow.md) § Merge policy. Nobody arms auto-merge. The merge-queue keeper
+lands a PR held in worker custody (rules core P1) and the CTO cycle confirms MERGED and
+completes closeout; the accountable driver does both for work no brief owns, after verifying
+independent exact-head CF and same-head CI on the non-draft PR.
 Missing evidence, stale heads, pending/cancelled checks and unresolved BLOCKING
 findings fail closed. Never bypass blocking CI with `--admin`, arm `--auto`, or
 delete a queued branch. The CI recovery allowance and diagnostics in the rules
