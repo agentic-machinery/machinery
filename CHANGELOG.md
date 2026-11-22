@@ -9,6 +9,36 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.54"></a>
+## [0.1.54] - 2026-11-22
+
+### Added
+
+- Collect PR size and first review wait ([#1195](https://github.com/learn-ukrainian/machinery/pull/1195))
+- Add the consumer profile resolver and LU_* root names (A08.1) ([#1193](https://github.com/learn-ukrainian/machinery/pull/1193))
+- A01a dual-slug bridge, host selector, and credential verification ([#1196](https://github.com/learn-ukrainian/machinery/pull/1196))
+- A01b consumers accept both baked slugs of one repository ([#1213](https://github.com/learn-ukrainian/machinery/pull/1213))
+
+### Changed
+
+- Route owner replies and prioritize expiring allowance ([#1191](https://github.com/learn-ukrainian/machinery/pull/1191))
+- Restore primary checkout write regression in machinery ([#1192](https://github.com/learn-ukrainian/machinery/pull/1192))
+
+### Fixed
+
+- Point startup prompts at deployed files ([#1189](https://github.com/learn-ukrainian/machinery/pull/1189))
+- Coordinate setup-node updates and lock ACPX onboarding ([#1198](https://github.com/learn-ukrainian/machinery/pull/1198))
+- Require both pins for agent PR landings ([#1194](https://github.com/learn-ukrainian/machinery/pull/1194))
+- Classify push destinations by the host Git connects to ([#1203](https://github.com/learn-ukrainian/machinery/pull/1203))
+- Log keeper ticks only when state or errors change ([#1208](https://github.com/learn-ukrainian/machinery/pull/1208))
+- Sweep persistent temp and expire settled task logs ([#1209](https://github.com/learn-ukrainian/machinery/pull/1209))
+- Accept review replies on a takeover worker's branch ([#1211](https://github.com/learn-ukrainian/machinery/pull/1211))
+
+### Removed
+
+- Remove retired Entire CLI, hooks, ref and advisory-check residue ([#1214](https://github.com/learn-ukrainian/machinery/pull/1214))
+- Delete the dead external advisory check mechanism ([#1215](https://github.com/learn-ukrainian/machinery/pull/1215))
+
 <a id="v0.1.53"></a>
 ## [0.1.53] - 2026-11-22
 
@@ -1360,7 +1390,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.53...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.54...HEAD
+[0.1.54]: https://github.com/learn-ukrainian/machinery/compare/v0.1.53...v0.1.54
 [0.1.53]: https://github.com/learn-ukrainian/machinery/compare/v0.1.52...v0.1.53
 [0.1.52]: https://github.com/learn-ukrainian/machinery/compare/v0.1.51...v0.1.52
 [0.1.51]: https://github.com/learn-ukrainian/machinery/compare/v0.1.50...v0.1.51
