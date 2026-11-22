@@ -226,27 +226,32 @@ def selecting(sources: dict[str, bytes]) -> set[str]:
 # Import-time contracts of this package, checked on every PR candidate (`import_time_contracts`):
 # a label, the modules its contract tests' subprocesses import (with the modules their code paths
 # import lazily, as traced from those tests), the third-party names their imports may reach, the
-# other tracked files those tests run (a path, or a directory ending in "/") and the contract
-# tests. Those tests run the code in a subprocess, which the import scan cannot see,
+# other tracked files those tests run or read (a path, or a directory ending in "/"; also traced)
+# and the contract tests. Those tests run the code in a subprocess, which the import scan cannot see,
 # so before this check a broken contract first failed in the merge group (PR 1130: yaml reached
 # the hook; PR 1134: jsonschema reached the receipt gate). The probe refuses a new third-party
-# name at import time and reports the package files the roots load; a candidate that changes one
-# of those files runs the contract's tests, which exercise every stage, variable and lazy path.
-_HOOK_SCRIPTS = (".githooks/", f"{_PACKAGE_DIR.name}/lib/project_interpreter.sh")
+# name at import time and reports the package files the roots load or try to load; a candidate
+# that changes or deletes one of those files, or one of the listed files, runs the contract's
+# tests, which exercise every stage, variable and lazy path.
+_HOOK_FILES = (".githooks/", f"{_PACKAGE_DIR.name}/lib/project_interpreter.sh", f"{_PACKAGE_DIR.name}/install_git_hooks.sh")
 IMPORT_TIME_CONTRACTS: tuple[tuple[str, tuple[str, ...], frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
     # The installed commit and push hooks' owned-path checker, with its task-record and grant
     # lookups, from a wheel installed without its dependencies. The tests copy this checkout's
-    # hooks, which find their interpreter through the package's shell helper.
+    # hooks, install their delegators with the package's installer, and the hooks find their
+    # interpreter through the package's shell helper.
     ("installed ownership hook",
      ("dispatcher.ownership", "dispatcher.store", "guardrails.delegate_ownership", "secret_redactor"),
-     frozenset(), _HOOK_SCRIPTS, ("tests/githooks/test_ownership_fail_closed.py", "tests/githooks/test_owned_paths_hook.py")),
-    # The installed commit-msg delegator's message gate and the product plan-version hook, from a
-    # wheel installed with its dependencies: the allowance is what main reaches, a ratchet.
+     frozenset(), _HOOK_FILES, ("tests/githooks/test_ownership_fail_closed.py", "tests/githooks/test_owned_paths_hook.py")),
+    # The installed commit-msg delegator's message gate, with its pattern and repository data, and
+    # the product plan-version hook, from a wheel installed with its dependencies: the allowance
+    # is what main reaches, a ratchet.
     ("installed commit-msg hooks", ("opsec.git_push", "opsec.prepublish", "pre_commit.check_plan_immutability"),
-     frozenset({"yaml"}), _HOOK_SCRIPTS, ("tests/githooks/test_owned_paths_hook.py",)),
+     frozenset({"yaml"}),
+     (*_HOOK_FILES, f"{_PACKAGE_DIR.name}/opsec/blocking.json", f"{_PACKAGE_DIR.name}/config/fleet_repos.yaml"),
+     ("tests/githooks/test_owned_paths_hook.py",)),
     # The loopback target, read from a wheel installed without its dependencies.
-    ("installed verify_run loopback probe", ("ops.verify_run", "common.repo_root"), frozenset(), (),
-     ("tests/ops/test_verify_run.py",)),
+    ("installed verify_run loopback probe", ("ops.verify_run", "common.repo_root"), frozenset(),
+     (f"{_PACKAGE_DIR.name}/packaging/systemd/learn-ukrainian-loopback.target",), ("tests/ops/test_verify_run.py",)),
     # top_module and head_move: a checkout-top jsonschema.py shadows the installed distribution
     # while the canary imports the dispatcher and attests its checkout (`worker._dispatcher_code`),
     # then settles a receipt, whose gate imports review_contract (`contract_canary._receipt_gated`)
@@ -268,43 +273,83 @@ IMPORT_TIME_CONTRACTS: tuple[tuple[str, tuple[str, ...], frozenset[str], tuple[s
 IMPORT_PROBE_TIMEOUT = 60
 # Imports one contract's roots in a fresh interpreter (-I -S: no site hooks, no preloaded
 # distributions), with the candidate's package first on the path, and reports the package files
-# loaded. A contract with an allowance gets the caller's site-packages after it (which -S would
+# loaded and the package modules looked for, so a deleted or failing module stays in the closure
+# of the code that tries it. A contract with an allowance gets the caller's site-packages after it (which -S would
 # not find in a virtual environment); one without gets none, as in a wheel installed without
 # its dependencies. A top-level name outside the standard library, the package and the
 # allowance is refused and recorded when first-party or standard-library code imports it; an
 # allowed distribution's own dependencies load, and it is imported first, so a name it brings
 # adds no requirement. A lookup alone (`importlib.util.find_spec`) is not an import: it finds
 # what the path holds. A dotted lookup imports the parent package first; that load is an import.
+# Python answers a request for a loaded module from sys.modules without asking a finder, so
+# `__import__` and `importlib.import_module` check such a request too: an allowed distribution's
+# own dependencies are loaded, but first-party code may not import them by name.
 _CONTRACT_PROBE = r"""
-import importlib, json, sys
+import builtins, importlib, json, sys
 tree, package, report, allowed, roots, *sites = sys.argv[1:]
 allowed, roots = frozenset(filter(None, allowed.split(","))), roots.split(",")
 sys.path[:0] = [tree]
 sys.path.extend(sites)
 inside = tuple(site.rstrip("/") + "/" for site in sites)
 known = sys.stdlib_module_names | {"__future__", package} | allowed
-refused, failed = [], []
+refused, failed, tried = [], [], set()
+
+
+def caller(frame):
+    # The requesting code: the nearest frame outside the standard library (the import system and
+    # helpers such as importlib.resources and functools act for their caller) and these wrappers.
+    loading, lookup = False, False
+    while frame is not None and (frame.f_code in wrappers or str(frame.f_globals.get("__name__")).startswith(
+            "_frozen_importlib") or str(frame.f_globals.get("__name__")).partition(".")[0] in sys.stdlib_module_names):
+        loading = loading or frame.f_code.co_name == "_find_and_load"
+        lookup = lookup or (not loading and frame.f_globals.get("__name__") == "importlib.util"
+                            and frame.f_code.co_name == "find_spec")
+        frame = frame.f_back
+    return frame, lookup
+
+
+def refuse(name, frame):
+    file, line = (frame.f_code.co_filename, frame.f_lineno) if frame is not None else ("<unknown>", 0)
+    if file.startswith(inside):
+        return
+    refused.append({"name": name, "file": file, "line": line})
+    raise ModuleNotFoundError(f"{name} is outside the import-time contract", name=name)
+
+
+def cached(name, frame):
+    top = name.partition(".")[0]
+    if top not in known and top in sys.modules:
+        refuse(top, caller(frame)[0])
+
+
+def checked_import(name, globals=None, locals=None, fromlist=(), level=0, _import=builtins.__import__):
+    if level == 0:
+        cached(name, sys._getframe(1))
+    return _import(name, globals, locals, fromlist, level)
+
+
+def checked_import_module(name, package=None, _import_module=importlib.import_module):
+    if not name.startswith("."):
+        cached(name, sys._getframe(1))
+    return _import_module(name, package)
 
 
 class Contract:
     @staticmethod
     def find_spec(name, path=None, target=None):
+        if name == package or name.startswith(package + "."):
+            tried.add(name)
         if path is not None or name.partition(".")[0] in known:
             return None
-        frame, loading, lookup = sys._getframe(1), False, False
-        while frame is not None and str(frame.f_globals.get("__name__")).startswith(("importlib", "_frozen_importlib")):
-            loading = loading or frame.f_code.co_name == "_find_and_load"
-            lookup = lookup or (not loading and frame.f_globals.get("__name__") == "importlib.util"
-                                and frame.f_code.co_name == "find_spec")
-            frame = frame.f_back
-        file, line = (frame.f_code.co_filename, frame.f_lineno) if frame is not None else ("<unknown>", 0)
-        if lookup or file.startswith(inside):
-            return None
-        refused.append({"name": name.partition(".")[0], "file": file, "line": line})
-        raise ModuleNotFoundError(f"{name} is outside the import-time contract", name=name)
+        frame, lookup = caller(sys._getframe(1))
+        if not lookup:
+            refuse(name.partition(".")[0], frame)
+        return None
 
 
+wrappers = (checked_import.__code__, checked_import_module.__code__)
 sys.meta_path.insert(0, Contract)
+builtins.__import__, importlib.import_module = checked_import, checked_import_module
 for name in [*sorted(allowed), *roots]:
     try:
         importlib.import_module(name)
@@ -312,7 +357,8 @@ for name in [*sorted(allowed), *roots]:
         failed.append({"module": name, "error": f"{type(exc).__name__}: {exc}"[:300]})
 prefix = tree.rstrip("/") + "/"
 closure = sorted({file[len(prefix):] for module in list(sys.modules.values())
-                  if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)})
+                  if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)}
+                 | {name.replace(".", "/") + suffix for name in tried for suffix in (".py", "/__init__.py")})
 with open(report, "w", encoding="utf-8") as stream:
     json.dump({"refused": refused, "failed": failed, "closure": closure}, stream)
 """
@@ -371,7 +417,7 @@ def import_time_contracts(candidate: str) -> tuple[list[str], dict[str, frozense
         work = Path(scratch)
         tree = work / "candidate"
         problems.extend(f"import-time contracts: {why}" for why in _materialize(candidate, package, tree))
-        for label, roots, allowed, _scripts, _tests in IMPORT_TIME_CONTRACTS:
+        for label, roots, allowed, _files, _tests in IMPORT_TIME_CONTRACTS:
             report = work / "report.json"
             report.unlink(missing_ok=True)
             # A fixed interpreter and probe; the arguments are module names and paths, never a shell.
@@ -397,8 +443,7 @@ def import_time_contracts(candidate: str) -> tuple[list[str], dict[str, frozense
                     where = f"{Path(entry['file']).relative_to(tree).as_posix()}:{int(entry['line'])}" if (
                         Path(entry["file"]).is_relative_to(tree)) else f"{entry['file']}:{int(entry['line'])}"
                     problems.append(f"{label}: {where} imports {entry['name']} at import time")
-                problems.extend(f"{label}: importing {entry['module']} failed ({entry['error']})" for entry in failed
-                                if "outside the import-time contract" not in entry["error"])
+                problems.extend(f"{label}: importing {entry['module']} failed ({entry['error']})" for entry in failed)
             except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
                 detail = (result.stderr.strip().splitlines() or ["no output"])[-1][:300]
                 problems.append(f"{label}: the import probe exited {result.returncode} without a readable report ({detail})")
@@ -551,10 +596,10 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     if not contract_files <= set(selectable):
         raise ValueError("import-time contract test is not a test file the pytest job runs")
     contracts = sorted({
-        name for label, _roots, _allowed, scripts, files in IMPORT_TIME_CONTRACTS
+        name for label, _roots, _allowed, files, tests in IMPORT_TIME_CONTRACTS
         if label in closures and any(path in closures[label] or any(
-            path == script or (script.endswith("/") and path.startswith(script)) for script in scripts) for path in changed)
-        for name in files
+            path == file or (file.endswith("/") and path.startswith(file)) for file in files) for path in changed)
+        for name in tests
     })
     mandatory = sorted(set(guards) | set(contracts))
     for name in {guard_file(g) for g in guards} | set(tests) | contract_files:
