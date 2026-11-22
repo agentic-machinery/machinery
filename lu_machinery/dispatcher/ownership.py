@@ -155,6 +155,8 @@ def _task_record(root: Path) -> dict | None:
     ).stdout.rstrip("\n")
     if not Path(bound_root).is_absolute() or Path(bound_root).resolve(strict=True) != bound:
         raise ValueError("worktree binding is not a Git worktree root")
+    if "orchestrator" in record:
+        return record  # an orchestrator turn commits and pushes in no worktree at all (DRIVERS-1122)
     # The task id is inherited by every process the worker starts; only its own worktree is bound.
     if bound != root.resolve(strict=True):
         return None
@@ -221,6 +223,13 @@ def main(argv: list[str] | None = None) -> int:
         record = _task_record(args.worktree)
         if record is None:
             return 0
+        if "orchestrator" in record:
+            from lu_machinery.guardrails.delegate_ownership import sanitize_for_display
+
+            print(f"owned-path check refused this {'commit' if args.stage == 'staged' else 'push'} for orchestrator "
+                  f"task {sanitize_for_display(record['task_id'])}: an orchestrator turn writes no product change. "
+                  "Dispatch a worker with owned paths for it.", file=sys.stderr)
+            return 1
         run = _local_git(args.worktree)
         paths = (_staged_paths(run) if args.stage == "staged" else
                  _pushed_paths(run, record, sys.stdin.read()))

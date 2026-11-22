@@ -697,8 +697,30 @@ def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) ->
     return None
 
 
+def _enforce_orchestrator(record: dict) -> None:
+    """An orchestrator turn delivers its handoff receipt, never a product change (DRIVERS-1122).
+
+    It settles ``done`` only when its worktree is clean with no commits past its start and its record
+    holds the one valid receipt for its stream, task and run; anything else, unknown state included,
+    is ``no_deliverable``. A merged pull request never stands in. A provider failure keeps its status.
+    """
+    record["owned_path_grants_used"] = []
+    if record["status"] != "done":
+        return
+    cause: str | None
+    if record.get("commits_ahead") != 0 or record.get("worktree_dirty_on_exit") is not False:
+        cause = "orchestrator_product_write: the turn's worktree has commits or changes, or its state is unknown"
+    else:
+        cause = store.handoff_receipt_refusal(record)
+    if cause:
+        record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
+
+
 def _enforce_delivery(record: dict) -> None:
     if record["mode"] == "read-only":
+        return
+    if "orchestrator" in record:
+        _enforce_orchestrator(record)
         return
     provider_failed = record["status"] == "failed" and record.get("provider_terminal_failure") is True
     if record["status"] != "done" and not provider_failed:
@@ -950,7 +972,8 @@ def _agy_follow_up(spec: TaskSpec, record: dict, parsed: ParsedResult, started: 
     if spec.agent != "agy" or spec.mode != "workspace-write":
         return None, parsed
     incomplete = parsed.error == "agy: incomplete run"
-    children = _running_children(record)
+    # An orchestrator turn dispatches its wave and exits; its children outlive it by design (DRIVERS-1122).
+    children = [] if "orchestrator" in record else _running_children(record)
     if not incomplete and not children:
         return None, parsed
     deadline = started + hard_timeout if hard_timeout > 0 else time.monotonic()
