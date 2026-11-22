@@ -549,12 +549,18 @@ review, and plane-status checks.
 
 ACPX is installed once at the shared primary checkout as a project-local
 dependency; a dispatch worktree resolves that primary install and must not
-create its own global ACPX installation. The manifest accepts versions from
-`0.13.0` onward, the lockfile preserves reproducibility, and the runtime probe
-rejects incompatible command-surface drift before prompt delivery. The same
-install owns the rolling Claude ACP adapter dependency; run `npm install` in
-the primary checkout after pulling a lockfile change so worktrees do not fall
-back to dynamic package execution. For an E2E/replay check, run the real
+create its own global ACPX installation. The runtime probe rejects incompatible
+command-surface drift before prompt delivery. After pulling a lockfile change,
+install ACPX and the Claude ACP adapter from the committed lockfile in the
+primary checkout. The install replaces `node_modules`, so wait for active ACPX
+sessions to finish first. Compare the adapter version reported by `npm ls` with
+its entry in `package-lock.json`.
+
+```bash
+npm ci --ignore-scripts && npm ls --depth=0 @agentclientprotocol/claude-agent-acp
+```
+
+For an E2E/replay check, run the real
 stdin-only `acp-discuss` command from a registered worktree with one bounded
 read-only task, then repeat the **identical** task, correlation, and idempotency
 values. The first terminal result is evidence; the second must be durable
@@ -693,7 +699,7 @@ counts and outcomes.
 | `AUTH_REQUIRED` with an existing ChatGPT Codex login | Verify `codex login status`, then set the non-secret per-process selector `ACPX_AUTH_CHAT_GPT=1`; `--auth-policy fail` deliberately refuses implicit method selection |
 | `AUTH_REQUIRED` on the Grok shadow seat | Establish the native Grok CLI's cached login outside this adapter; the Grok adapter automatically sets the non-secret per-process selector `ACPX_AUTH_CACHED_TOKEN=1` and scrubs ambient XAI API-key auth selectors so cached native login is the only accepted path |
 | Other auth failure | Fail closed; do not retry in-adapter; fix credentials outside the adapter and never store or log API keys in the repository |
-| `acp_adapter_missing` / `acp_adapter_incompatible` | Run `npm install` in the canonical primary checkout and verify the locked `@agentclientprotocol/claude-agent-acp` package; do not use a global install or permit dynamic package execution |
+| `acp_adapter_missing` / `acp_adapter_incompatible` | Run `npm ci --ignore-scripts` in the canonical primary checkout and compare the installed adapter version with the lockfile using the [shared ACPX install procedure](#shared-acpx-install-and-e2ereplay-verification) |
 | `acp_agent_startup` / `acp_agent_disconnected` | Inspect the provider and adapter installation outside the privacy-limited runtime record; the persisted code deliberately contains no stderr or transcript body |
 | `acp_session_create_timeout` | Treat as a terminal Claude adapter session-creation failure for that call; do not retry or bridge-fallback automatically |
 | `acp_turn_limit` | Ordinary no-tool calls remain capped at one turn. Prompt retries stay at zero; tree review uses the direct toolful route |
