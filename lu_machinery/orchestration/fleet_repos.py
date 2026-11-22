@@ -3,6 +3,16 @@
 The public primary that owns ``scripts/dispatch.py`` remains the control-plane
 root. ``--repo`` selects which sibling git checkout receives worktree creation
 and GitHub targeting.
+
+Dual-slug transfer bridge (PLAN NEW-ORG-1122 A01):
+Moved rows declare ``alternate_github``, ``repository_id``, and explicit
+``visibility``. Both baked slugs resolve to the same ``FleetRepo`` row. Active
+slug selection comes from the host-owned, read-only selector file named by
+``LU_FLEET_REPO_SELECTOR_FILE`` (failing closed on missing, unreadable, unknown,
+or worker-writable selectors and never defaulting to the old slug).
+
+``_repository_catalog`` and ``repository_registry`` are ``@cache``d in-process:
+restart long-running processes after a registry or selector flip.
 """
 
 from __future__ import annotations
@@ -15,9 +25,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from lu_machinery.common.git_credentials import repository_registry
+from lu_machinery.common.git_credentials import (
+    SELECTOR_ENV,
+    SelectorError,
+    SelectorState,
+    active_slug,
+    load_selector,
+    repository_registry,
+    verify_authenticated_repository,
+)
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
+_VALID_VISIBILITIES = frozenset({"public", "private"})
 
 
 @dataclass(frozen=True)
@@ -28,6 +47,9 @@ class FleetRepo:
     role: str
     default: bool = False
     security_alerts: bool = True
+    repository_id: int | None = None
+    visibility: str | None = None
+    alternate_github: str | None = None
 
     @property
     def owner(self) -> str:
@@ -37,9 +59,45 @@ class FleetRepo:
     def name(self) -> str:
         return self.github.split("/", 1)[1]
 
+    @property
+    def slugs(self) -> tuple[str, ...]:
+        if self.alternate_github is not None:
+            return (self.github, self.alternate_github)
+        return (self.github,)
+
+    @property
+    def is_dual_slug(self) -> bool:
+        return self.alternate_github is not None
+
+
+@dataclass(frozen=True)
+class ActiveFleetRepo:
+    """A resolved registry row bound to its one active slug and selector receipt."""
+
+    repo: FleetRepo
+    active_github: str
+    selector_value: str | None = None
+    selector_digest: str | None = None
+
+    @property
+    def owner(self) -> str:
+        return self.active_github.split("/", 1)[0]
+
+    @property
+    def name(self) -> str:
+        return self.active_github.split("/", 1)[1]
+
+    def selector_receipt(self) -> dict[str, str] | None:
+        if self.selector_value is None or self.selector_digest is None:
+            return None
+        return {
+            "selector_value": self.selector_value,
+            "selector_sha256": self.selector_digest,
+        }
+
 
 class FleetRepoError(ValueError):
-    """Unknown key, bad or unreadable catalog, or missing sibling checkout."""
+    """Unknown key, bad or unreadable catalog, invalid selector, or missing sibling checkout."""
 
 
 class MissingFleetCheckout(FleetRepoError):
@@ -64,12 +122,26 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
         role = body.get("role") or ""
         default = bool(body.get("default", False))
         security_alerts = body.get("security_alerts", True)
+        repository_id = body.get("repository_id")
+        visibility = body.get("visibility")
+        alternate_github = body.get("alternate_github")
         if not isinstance(github, str) or "/" not in github:
             raise FleetRepoError(f"fleet_repos[{key!r}].github must be owner/name")
         if not isinstance(local_name, str) or not local_name.strip():
             raise FleetRepoError(f"fleet_repos[{key!r}].local_name must be a non-empty string")
         if type(security_alerts) is not bool:
             raise FleetRepoError(f"fleet_repos[{key!r}].security_alerts must be a boolean")
+        if repository_id is not None and (type(repository_id) is not int or repository_id <= 0):
+            raise FleetRepoError(f"fleet_repos[{key!r}].repository_id must be a positive integer")
+        if visibility is not None and (not isinstance(visibility, str) or visibility not in _VALID_VISIBILITIES):
+            raise FleetRepoError(f"fleet_repos[{key!r}].visibility must be 'public' or 'private'")
+        if alternate_github is not None:
+            if not isinstance(alternate_github, str) or "/" not in alternate_github:
+                raise FleetRepoError(f"fleet_repos[{key!r}].alternate_github must be owner/name")
+            if repository_id is None or visibility is None:
+                raise FleetRepoError(
+                    f"fleet_repos[{key!r}] with alternate_github requires repository_id and visibility"
+                )
         if default:
             defaults += 1
         out[key] = FleetRepo(
@@ -79,6 +151,9 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
             role=str(role),
             default=default,
             security_alerts=security_alerts,
+            repository_id=repository_id,
+            visibility=visibility,
+            alternate_github=alternate_github,
         )
     if defaults != 1:
         raise FleetRepoError("fleet_repos must mark exactly one default repo")
@@ -112,6 +187,142 @@ def canonical_repo_key(key: str, repos: Mapping[str, FleetRepo] | None = None) -
     if len(matches) == 1:
         return matches[0]
     raise FleetRepoError(f"unknown --repo {stripped!r}; allowlisted: {known}")
+
+
+def resolve_fleet_repo_by_slug(
+    identifier: str,
+    *,
+    repos: Mapping[str, FleetRepo] | None = None,
+    expected_repository_id: int | None = None,
+    expected_visibility: str | None = None,
+) -> FleetRepo:
+    """Resolve a registry key or either baked slug of a row to its one ``FleetRepo``.
+
+    When *expected_repository_id* or *expected_visibility* is given, mismatches
+    fail closed before any network call.
+    """
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise FleetRepoError("unknown fleet repository identifier")
+    catalog = repos if repos is not None else load_fleet_repos()
+    spelling = identifier.strip().casefold()
+    matches = [
+        repo
+        for repo in catalog.values()
+        if spelling == repo.key.casefold() or any(spelling == slug.casefold() for slug in repo.slugs)
+    ]
+    if len(matches) != 1:
+        raise FleetRepoError(f"unknown fleet repository {identifier.strip()!r}")
+    repo = matches[0]
+    if expected_repository_id is not None:
+        if type(expected_repository_id) is not int or expected_repository_id <= 0:
+            raise FleetRepoError("expected_repository_id must be a positive integer")
+        if repo.repository_id is None or repo.repository_id != expected_repository_id:
+            raise FleetRepoError(
+                f"repository id mismatch for {repo.key!r}: expected {expected_repository_id}, "
+                f"registered {repo.repository_id}"
+            )
+    if expected_visibility is not None:
+        if expected_visibility not in _VALID_VISIBILITIES:
+            raise FleetRepoError("expected_visibility must be 'public' or 'private'")
+        if repo.visibility is None or repo.visibility != expected_visibility:
+            raise FleetRepoError(
+                f"repository visibility mismatch for {repo.key!r}: expected {expected_visibility!r}, "
+                f"registered {repo.visibility!r}"
+            )
+    return repo
+
+
+def load_fleet_repo_selector(
+    *,
+    registry_path: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> SelectorState:
+    """Load the validated host-owned selector state, normalizing failures to ``FleetRepoError``."""
+    cfg_path = (registry_path or _CONFIG_PATH).resolve()
+    try:
+        return load_selector(registry_path=cfg_path, env=env)
+    except (SelectorError, ValueError, OSError) as exc:
+        raise FleetRepoError(str(exc)) from exc
+
+
+def selector_receipt(
+    key: str | None = None,
+    *,
+    registry_path: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return selector value and sha256 digest for receipts (adopted by A01b consumers)."""
+    state = load_fleet_repo_selector(registry_path=registry_path, env=env)
+    try:
+        return state.receipt(key)
+    except SelectorError as exc:
+        raise FleetRepoError(str(exc)) from exc
+
+
+def resolve_active_fleet_repo(
+    identifier: str,
+    *,
+    repos: Mapping[str, FleetRepo] | None = None,
+    registry_path: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    expected_repository_id: int | None = None,
+    expected_visibility: str | None = None,
+) -> ActiveFleetRepo:
+    """Resolve *identifier* (key or either baked slug) and bind dual-slug rows to the active slug.
+
+    Dual-slug rows fail closed when the host-owned selector (``LU_FLEET_REPO_SELECTOR_FILE``)
+    is missing, unreadable, unknown, or worker-writable, and never default to the old slug.
+    """
+    cfg_path = (registry_path or _CONFIG_PATH).resolve()
+    catalog = repos if repos is not None else load_fleet_repos(cfg_path)
+    repo = resolve_fleet_repo_by_slug(
+        identifier,
+        repos=catalog,
+        expected_repository_id=expected_repository_id,
+        expected_visibility=expected_visibility,
+    )
+    if not repo.is_dual_slug:
+        return ActiveFleetRepo(repo=repo, active_github=repo.github)
+    entry: dict[str, Any] = {
+        "key": repo.key,
+        "github": repo.github,
+        "alternate_github": repo.alternate_github,
+        "repository_id": repo.repository_id,
+        "visibility": repo.visibility,
+    }
+    try:
+        chosen, state = active_slug(entry, key=repo.key, registry_path=cfg_path, env=env)
+    except (SelectorError, ValueError, OSError) as exc:
+        raise FleetRepoError(str(exc)) from exc
+    if state is None:
+        raise FleetRepoError(f"fleet repository selector required for dual-slug row {repo.key!r}")
+    return ActiveFleetRepo(
+        repo=repo,
+        active_github=chosen,
+        selector_value=chosen,
+        selector_digest=state.digest,
+    )
+
+
+def verify_repository_identity(
+    repo: FleetRepo,
+    payload: Mapping[str, Any],
+    *,
+    active_github: str | None = None,
+) -> None:
+    """Verify an authenticated GitHub repository payload against *repo*."""
+    expected_slug = repo.github if active_github is None else active_github
+    if expected_slug not in repo.slugs:
+        raise FleetRepoError(f"active slug {expected_slug!r} is not baked on row {repo.key!r}")
+    try:
+        verify_authenticated_repository(
+            payload,
+            expected_slug=expected_slug,
+            expected_repository_id=repo.repository_id,
+            expected_visibility=repo.visibility,
+        )
+    except ValueError as exc:
+        raise FleetRepoError(str(exc)) from exc
 
 
 def _missing_checkout_error(repo: FleetRepo, supplied_key: str | None, detail: str) -> MissingFleetCheckout:
@@ -168,6 +379,7 @@ def resolve_fleet_repo(
 
 @cache
 def _repository_catalog(path: Path) -> dict[str, FleetRepo]:
+    """Cached catalog loader; restart long-running processes after a registry/selector flip."""
     return load_fleet_repos(path)
 
 
@@ -178,10 +390,11 @@ def clear_repository_cache() -> None:
 
 
 def canonical_repository(value: str) -> str:
-    """Canonical owner/name, accepting the registry's keys and slug spellings."""
+    """Canonical owner/name, accepting registry keys and both baked slug spellings."""
     spelling = value.strip().casefold()
     for repo in _repository_catalog(_CONFIG_PATH.resolve()).values():
-        if spelling in {repo.key.casefold(), repo.github.casefold()}:
+        known = {repo.key.casefold(), *(slug.casefold() for slug in repo.slugs)}
+        if spelling in known:
             return repo.github.casefold()
     if re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", spelling):
         return spelling
@@ -212,8 +425,12 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
             parts = url.path.strip("/").split("/")
             if url.hostname == "github.com" and len(parts) == 4 and parts[2] == "pull":
                 names.append("/".join(parts[:2]))
-            elif (url.hostname == "api.github.com" and len(parts) == 5
-                  and parts[0] == "repos" and parts[3] == "pulls"):
+            elif (
+                url.hostname == "api.github.com"
+                and len(parts) == 5
+                and parts[0] == "repos"
+                and parts[3] == "pulls"
+            ):
                 names.append("/".join(parts[1:3]))
             else:
                 raise FleetRepoError("PR payload has unusable repository attribution")
@@ -223,3 +440,26 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
     if len(canonical) > 1:
         raise FleetRepoError("PR payload has conflicting repository attribution")
     return next(iter(canonical)) if canonical else scoped_repository
+
+
+__all__ = [
+    "SELECTOR_ENV",
+    "ActiveFleetRepo",
+    "FleetRepo",
+    "FleetRepoError",
+    "MissingFleetCheckout",
+    "SelectorError",
+    "SelectorState",
+    "canonical_repo_key",
+    "canonical_repository",
+    "clear_repository_cache",
+    "default_repo_key",
+    "load_fleet_repo_selector",
+    "load_fleet_repos",
+    "pull_request_repository",
+    "resolve_active_fleet_repo",
+    "resolve_fleet_repo",
+    "resolve_fleet_repo_by_slug",
+    "selector_receipt",
+    "verify_repository_identity",
+]

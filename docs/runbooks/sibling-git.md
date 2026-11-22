@@ -52,6 +52,43 @@ Each entry's `transport` is `ssh` (the default) or `https`. SSH accepts
 configuration. HTTPS requires exactly `https://github.com/<org>/<repo>.git`
 or the same URL without `.git`; userinfo and alternative URL forms are refused.
 
+### Dual-slug bridge and host-owned selector
+
+Moved registry rows in `lu_machinery/config/fleet_repos.yaml` declare an immutable
+`repository_id` (from an authenticated GitHub readback), explicit `visibility`
+(`public` or `private`), and one `alternate_github` slug. Both baked slugs
+resolve to the same registry row.
+
+Active slug selection for dual-slug rows is controlled by the host-owned,
+read-only YAML file named by the `LU_FLEET_REPO_SELECTOR_FILE` setting (an
+absolute path outside any git checkout or writable worktree, with no host path
+baked into code):
+
+```yaml
+version: 1
+active_slugs:
+  machinery: learn-ukrainian/machinery
+  infra-private: learn-ukrainian/learn-ukrainian-infra-private
+```
+
+- **Fail-closed validation:** a missing, empty, relative, symlinked, unreadable,
+  malformed, duplicate-key, unknown-slug, missing-row, inside-worktree, or
+  worker-writable selector (file or parent directory writable by the current uid,
+  group, or others) is refused before any credential mint or network call.
+  Resolution never defaults to the old slug.
+- **Active-slug-only credentials and identity verification:** only the selected
+  active slug receives credentials (`lu_machinery.common.git_credentials`
+  exact-path helper and `sibling_git` origin/fetch resolution). Authenticated
+  GitHub App responses must match the expected `repository_id`, active
+  `full_name`, and `visibility`; HTTP redirects stay refused.
+- **Receipts:** `lu_machinery.orchestration.fleet_repos.selector_receipt()` and
+  `ActiveFleetRepo.selector_receipt()` expose `selector_value` and
+  `selector_sha256` without host filesystem paths.
+- **Restart after flip:** `git_credentials.repository_registry` and
+  `fleet_repos._repository_catalog` are `@cache`d in-process. After flipping the
+  host selector file or updating `fleet_repos.yaml`, restart all long-running
+  services, APIs, keepers, and workers so cached registry views pick up the flip.
+
 HTTPS obtains an App installation credential in the parent process, requesting
 only `contents: read` for the registered repository. The mint response must
 identify exactly that repository, have no wider permissions (implicit metadata

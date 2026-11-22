@@ -30,7 +30,12 @@ from lu_machinery.common.repo_root import StateRootError, machinery_path, state_
 from lu_machinery.orchestration import worktree_claims
 from lu_machinery.orchestration.execution_safe_git import LOCAL_COMMANDS, SafeGitRunner
 from lu_machinery.orchestration.execution_safe_git import run_git as safe_git
-from lu_machinery.orchestration.fleet_repos import load_fleet_repos, resolve_fleet_repo
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepoError,
+    load_fleet_repos,
+    resolve_active_fleet_repo,
+    resolve_fleet_repo,
+)
 from lu_machinery.orchestration.task_record_store import parse_task_record
 
 _GIT = "/usr/bin/git"
@@ -99,6 +104,10 @@ class Repository:
     remote: str
     transport: str = "ssh"
     github: str = ""
+    repository_id: int | None = None
+    visibility: str | None = None
+    selector_value: str | None = None
+    selector_digest: str | None = None
 
 
 def _registry_transport(key: str) -> str:
@@ -276,6 +285,8 @@ class Git:
                 permissions={"contents": "read"},
                 api_base_url=self.api_base_url,
                 ssl_context=self.ssl_context,
+                expected_repository_id=repo.repository_id,
+                expected_visibility=repo.visibility,
             )
         except Exception:
             raise Refusal("restricted installation credential unavailable") from None
@@ -463,8 +474,20 @@ def resolve_repository(key: str, primary: Path, git: Git) -> Repository:
     spec = catalog.get(key)
     if spec is None or spec.default or key == "public":
         raise Refusal("select a registered non-default sibling repository")
+    if spec.is_dual_slug:
+        try:
+            active = resolve_active_fleet_repo(key, repos=catalog, registry_path=_REGISTRY_PATH.resolve())
+        except FleetRepoError:
+            raise Refusal("fleet repository selector unavailable or invalid") from None
+        active_github = active.active_github
+        selector_value = active.selector_value
+        selector_digest = active.selector_digest
+    else:
+        active_github = spec.github
+        selector_value = None
+        selector_digest = None
     if not re.fullmatch(r"[A-Za-z0-9_-]+", spec.local_name) or not re.fullmatch(
-        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", spec.github
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", active_github
     ):
         raise Refusal("invalid registry repository identity")
     lexical = _plain_path(primary.parent / spec.local_name)
@@ -490,16 +513,30 @@ def resolve_repository(key: str, primary: Path, git: Git) -> Repository:
     expected = [checkout, git_dir, common, git_dir / "index"]
     if len(actual) != 4 or [_plain_path(Path(p), exists=False) for p in actual] != expected:
         raise Refusal("Git paths do not match the independent registered checkout")
-    canonical = f"git@github.com:{spec.github}.git" if transport == "ssh" else f"https://github.com/{spec.github}.git"
+    canonical = (
+        f"git@github.com:{active_github}.git" if transport == "ssh" else f"https://github.com/{active_github}.git"
+    )
     urls = [v for _, k, v in git.config(checkout) if k == "remote.origin.url"]
     if transport == "https":
         if len(urls) != 1:
             raise Refusal("origin must have one registered canonical HTTPS remote")
-        _https_url(urls[0], spec.github)
+        _https_url(urls[0], active_github)
         canonical = urls[0]
-    elif urls not in ([canonical], [f"ssh://git@github.com/{spec.github}.git"]):
+    elif urls not in ([canonical], [f"ssh://git@github.com/{active_github}.git"]):
         raise Refusal("origin must be the registered canonical GitHub SSH remote")
-    return Repository(key, checkout, git_dir, common, canonical, transport, spec.github)
+    return Repository(
+        key,
+        checkout,
+        git_dir,
+        common,
+        canonical,
+        transport,
+        active_github,
+        spec.repository_id,
+        spec.visibility,
+        selector_value,
+        selector_digest,
+    )
 
 
 def _clean(git: Git, checkout: Path) -> None:

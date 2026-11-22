@@ -506,9 +506,37 @@ def test_registry_opts_in_exactly_the_private_sibling(https_world, tmp_path, mon
     )
     # The intended slug and URL are pinned as literals, independent of the registry value.
     assert shipped.github == INTENDED_PRIVATE_SLUG
-    git(https_world[1], "remote", "set-url", "origin", INTENDED_PRIVATE_URL)
-    repo = sg.resolve_repository("infra-private", https_world[0], runner(tmp_path, "https://unused.invalid", None))
-    assert (repo.transport, repo.remote, repo.github) == ("https", INTENDED_PRIVATE_URL, INTENDED_PRIVATE_SLUG)
+    assert shipped.alternate_github == "agentic-machinery/machinery-infra"
+    assert shipped.repository_id == 1282510453
+    assert shipped.visibility == "private"
+    sel_dir = tmp_path / "host-selector"
+    sel_dir.mkdir(mode=0o700)
+    sel_file = sel_dir / "selector.yaml"
+    sel_file.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "active_slugs": {
+                    "machinery": "learn-ukrainian/machinery",
+                    "infra-private": INTENDED_PRIVATE_SLUG,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sel_file.chmod(0o400)
+    sel_dir.chmod(0o500)
+    monkeypatch.setenv("LU_FLEET_REPO_SELECTOR_FILE", str(sel_file))
+    try:
+        git(https_world[1], "remote", "set-url", "origin", INTENDED_PRIVATE_URL)
+        repo = sg.resolve_repository("infra-private", https_world[0], runner(tmp_path, "https://unused.invalid", None))
+        assert (repo.transport, repo.remote, repo.github) == ("https", INTENDED_PRIVATE_URL, INTENDED_PRIVATE_SLUG)
+        assert (repo.repository_id, repo.visibility) == (1282510453, "private")
+        assert repo.selector_value == INTENDED_PRIVATE_SLUG
+        assert isinstance(repo.selector_digest, str) and len(repo.selector_digest) == 64
+    finally:
+        sel_dir.chmod(0o700)
+        sel_file.chmod(0o600)
 
 
 @pytest.mark.parametrize("credential_state", ["valid", "wrong-repository", "expired"])
@@ -698,3 +726,188 @@ def test_fetch_revokes_same_token_once_without_changing_outcome(
     assert output.out == ""
     assert output.err == ("Installation credential revocation failed\n" if revoke_fails else "")
     assert TOKEN not in output.out + output.err
+
+
+@pytest.mark.parametrize("active_choice", ["old", "new"])
+@pytest.mark.parametrize("auth_case", ["valid", "wrong-id", "wrong-visibility", "contradictory-private", "missing-id"])
+def test_credentials_and_sibling_fetch_refuse_inactive_slug_and_wrong_authenticated_identity(
+    https_world, tmp_path, monkeypatch, active_choice, auth_case
+):
+    """Defect class: credential minted or configured for the inactive slug, or authenticated App token response with wrong repository id or visibility accepted."""
+    from lu_machinery.common import git_credentials
+    from tests.test_agent_github_identity import restricted_payload
+
+    old_slug = "learn-ukrainian/learn-ukrainian-infra-private"
+    new_slug = "agentic-machinery/machinery-infra"
+    selected_slug = old_slug if active_choice == "old" else new_slug
+    inactive_slug = new_slug if active_choice == "old" else old_slug
+    selected_url = f"https://github.com/{selected_slug}.git"
+    inactive_url = f"https://github.com/{inactive_slug}.git"
+
+    sel_dir = tmp_path / f"selector-{active_choice}-{auth_case}"
+    sel_dir.mkdir(mode=0o700)
+    sel_file = sel_dir / "selector.yaml"
+    sel_file.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "active_slugs": {
+                    "machinery": "learn-ukrainian/machinery",
+                    "infra-private": selected_slug,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sel_file.chmod(0o400)
+    sel_dir.chmod(0o500)
+
+    shipped = load_fleet_repos()["infra-private"]
+    monkeypatch.setattr(sg, "_REGISTRY_PATH", _REAL_REGISTRY)
+    monkeypatch.setattr(
+        sg,
+        "load_fleet_repos",
+        lambda: {
+            "public": FleetRepo("public", "org/public", https_world[0].name, "public", True),
+            "infra-private": dataclasses.replace(shipped, local_name=https_world[1].name),
+        },
+    )
+    monkeypatch.setattr(git_credentials, "real_gh", lambda _env: "/usr/bin/false")
+
+    try:
+        # Missing selector refuses credentials and sibling resolution before any network call.
+        monkeypatch.delenv("LU_FLEET_REPO_SELECTOR_FILE", raising=False)
+        with pytest.raises(git_credentials.SelectorError):
+            git_credentials.verification_credentials(selected_url)
+        with pytest.raises(sg.Refusal, match="selector unavailable"):
+            sg.resolve_repository("infra-private", https_world[0], runner(tmp_path, "https://unused.invalid", None))
+
+        # With a valid selector, ONLY the active slug gets credentials and canonical origins.
+        monkeypatch.setenv("LU_FLEET_REPO_SELECTOR_FILE", str(sel_file))
+        active_settings = git_credentials.verification_credentials(selected_url)
+        assert active_settings
+        assert "http.followRedirects=false" in active_settings
+        assert f"http.{selected_url}.followRedirects=false" in active_settings
+        assert git_credentials.verification_credentials(inactive_url) == []
+
+        # Inactive slug origin is refused by sibling_git before any credential mint or network call.
+        mint_calls = []
+        monkeypatch.setattr(sg, "resolve_agent_github_identity", lambda **kw: mint_calls.append(kw))
+        git(https_world[1], "remote", "set-url", "origin", inactive_url)
+        with pytest.raises(sg.Refusal, match="canonical HTTPS"):
+            sg.resolve_repository("infra-private", https_world[0], runner(tmp_path, "https://unused.invalid", None))
+        assert mint_calls == []
+
+        # Active slug origin resolves and enforces authenticated id, full_name, and visibility on fetch.
+        git(https_world[1], "remote", "set-url", "origin", selected_url)
+        signing_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        key_file = tmp_path / f"key-{active_choice}-{auth_case}"
+        key_file.write_bytes(
+            signing_key.private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+            )
+        )
+        key_file.chmod(0o600)
+        monkeypatch.setenv("LU_AGENT_GITHUB_APP_PRIVATE_KEY_FILE", str(key_file))
+        monkeypatch.delenv("LU_AGENT_GITHUB_APP_PRIVATE_KEY", raising=False)
+        monkeypatch.setattr(sg, "resolve_agent_github_identity", identity.resolve_agent_github_identity)
+        monkeypatch.setattr(sg, "revoke_installation_token", identity.revoke_installation_token)
+
+        repo_obj: dict[str, object] = {
+            "id": 1282510453,
+            "full_name": selected_slug,
+            "visibility": "private",
+            "private": True,
+        }
+        if auth_case == "wrong-id":
+            repo_obj["id"] = 999999999
+        elif auth_case == "wrong-visibility":
+            repo_obj["visibility"] = "public"
+            repo_obj["private"] = False
+        elif auth_case == "contradictory-private":
+            repo_obj["private"] = False
+        elif auth_case == "missing-id":
+            repo_obj.pop("id")
+
+        payload = restricted_payload()
+        payload["repositories"] = [repo_obj]
+        expected_owner, expected_name = selected_slug.split("/", 1)
+
+        def mint_response(handler):
+            if handler.command == "DELETE":
+                handler.send_response(204)
+                handler.end_headers()
+                return
+            if handler.command == "GET":
+                assert handler.path == f"/repos/{selected_slug}/installation"
+                handler.send_response(200)
+                handler.end_headers()
+                handler.wfile.write(
+                    json.dumps(
+                        {
+                            "id": 4242,
+                            "app_id": 123,
+                            "client_id": "fixture",
+                            "account": {"login": expected_owner},
+                            "suspended_at": None,
+                        }
+                    ).encode()
+                )
+                return
+            assert handler.path == "/app/installations/4242/access_tokens"
+            handler.send_response(201)
+            handler.end_headers()
+            handler.wfile.write(json.dumps(payload).encode())
+
+        def slug_static_response(handler):
+            if handler.headers.get("Authorization") != HEADER:
+                handler.send_response(401)
+                handler.send_header("WWW-Authenticate", 'Basic realm="fixture"')
+                handler.end_headers()
+                return
+            rel = urlsplit(handler.path).path.removeprefix(f"/{selected_slug}.git/").removeprefix(f"/{selected_slug}/")
+            target = https_world[2] / rel
+            if not target.is_file():
+                handler.send_response(404)
+                handler.end_headers()
+                return
+            data = target.read_bytes()
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+
+        identity.clear_installation_cache()
+        sha = advance(https_world, tmp_path)
+        git(https_world[2], "update-server-info")
+        with (
+            tls_server(tmp_path, mint_response) as (api_url, api_ca, api_requests),
+            tls_server(tmp_path, slug_static_response) as (url, ca, fetch_requests),
+        ):
+            scratch = tmp_path / f"scratch-{active_choice}-{auth_case}"
+            scratch.mkdir()
+            client = sg.Git(
+                scratch,
+                https_base_url=url,
+                ca_file=ca,
+                api_base_url=api_url,
+                ssl_context=ssl.create_default_context(cafile=str(api_ca)),
+            )
+            repo = sg.resolve_repository("infra-private", https_world[0], client)
+            assert repo.github == selected_slug
+            assert repo.repository_id == 1282510453
+            assert repo.visibility == "private"
+            if auth_case == "valid":
+                assert sg.sync_main(repo, https_world[0], client)["head"] == sha
+                assert git(https_world[1], "rev-parse", "HEAD") == sha
+                assert fetch_requests and all(header == HEADER for _, header in fetch_requests)
+                assert api_requests[1][0] == {"repositories": [expected_name], "permissions": {"contents": "read"}}
+            else:
+                before = snapshot(https_world[1])
+                with pytest.raises(sg.Refusal, match="restricted installation credential unavailable"):
+                    sg.sync_main(repo, https_world[0], client)
+                assert fetch_requests == []
+                assert snapshot(https_world[1]) == before
+    finally:
+        sel_dir.chmod(0o700)
+        sel_file.chmod(0o600)
