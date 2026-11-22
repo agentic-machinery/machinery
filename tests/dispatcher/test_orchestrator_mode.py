@@ -190,6 +190,9 @@ def test_dispatch_processes_contending_for_one_stream_get_one_reservation(task_s
     contenders = [(f"turn-{n}", STREAM) for n in range(4)] + [("other", "epic:8")]
     procs = [subprocess.Popen([sys.executable, "-c", _CONTENDER, task_id, stream], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for task_id, stream in contenders]
+    # Bounds every pipe read: a contender that hangs is killed, which ends its output.
+    watchdog = threading.Timer(120, lambda: [proc.kill() for proc in procs])
+    watchdog.start()
     try:
         for proc in procs:
             assert proc.stdout.readline() == "ready\n", proc.stderr.read()
@@ -212,6 +215,7 @@ def test_dispatch_processes_contending_for_one_stream_get_one_reservation(task_s
                 proc.stdin.write("done\n")
                 proc.stdin.close()
             proc.wait(timeout=60)
+        watchdog.cancel()
     # Each hold ended before any supervisor could start, so both streams are free again.
     assert not _reservation().exists() and not _reservation("epic:8").exists()
     assert _reserve("turn-next")["orchestrator"] == {"stream": STREAM}
