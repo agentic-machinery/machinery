@@ -1128,6 +1128,7 @@ def _judged_segments(
 # it can be used, never refused as unreadable by surprise or passed through unjudged.
 _PUBLISHER_MERGE_FLAGS = frozenset({
     "--number", "--repo", "--subject", "--body", "--body-file", "--match-head", "--expect-queue",
+    "--recovery-run-id",
 })
 _PIN_GUIDANCE = (
     f"Use `python -m {_PUBLISHER} pr-merge "
