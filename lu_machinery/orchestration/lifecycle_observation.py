@@ -194,7 +194,7 @@ def _child_association(
         valid_source = False
     if (
         not valid_source
-        or source.get("repository") != target["repository"]
+        or not _same_repository_slug(source.get("repository"), target["repository"])
         or source.get("stream_epic") != target["stream_epic"]
         or source.get("github_issue_number") == target["github_issue_number"]
     ):
@@ -204,10 +204,12 @@ def _child_association(
     proof = task.get("worktree_reap_proof") or {}
     if proof.get("pr_state") != "MERGED" or proof.get("pr_number") != ledger["pr"]["number"]:
         raise ObservationRefusal("RECOVERY_MERGED_PR_UNPROVEN")
+    pr_urls = _repository_urls(target["repository"], f"pull/{ledger['pr']['number']}")
     # Exact preserved PR membership is required in addition to Git ancestry.
     if (
         child_pr.get("number") != ledger["pr"]["number"]
-        or child_pr.get("url") != ledger["pr"]["url"]
+        or ledger["pr"]["url"] not in pr_urls
+        or child_pr.get("url") not in pr_urls
         or child_pr.get("state") != "MERGED"
         or not child_pr.get("head_sha")
         or child_pr.get("head_sha") != proof.get("pr_head_sha")
@@ -220,7 +222,7 @@ def _child_association(
         "run_nonce": task["run_nonce"],
         "source": {"lifecycle_id": carrier["lifecycle_id"], "identity": source},
         "target": {"lifecycle_id": ledger["lifecycle_id"], "identity": target},
-        "child_pr": {key: child_pr[key] for key in ("number", "url", "state", "head_sha", "head_branch")},
+        "child_pr": {key: child_pr[key] for key in _CHILD_PR_KEYS},
     }
 
 
@@ -394,12 +396,31 @@ def _repository_slugs(repository: Any) -> tuple[str, ...]:
         return ()
 
 
+def _same_repository_slug(left: Any, right: Any) -> bool:
+    """Whether *left* is one of the baked slugs of *right*'s fleet row (exact owner/name, ASCII case-insensitive)."""
+    if not isinstance(left, str) or not left.isascii():
+        return False
+    return any(left.casefold() == slug.casefold() for slug in _repository_slugs(right))
+
+
 def _repository_urls(repository: Any, path: str) -> tuple[str, ...]:
     # A tuple, not a set: membership of an unhashable payload value must be False, not TypeError.
     return tuple(f"https://github.com/{slug}/{path}" for slug in _repository_slugs(repository))
 
 
 _MERGED_PR_KEYS = ("number", "url", "state", "head_sha", "head_branch", "merge_sha")
+_CHILD_PR_KEYS = ("number", "url", "state", "head_sha", "head_branch")
+
+
+def _same_pr_fields(left: Any, right: Any, repository: Any, keys: tuple[str, ...]) -> bool:
+    """Whether two PR records match on *keys*, allowing either baked slug in ``url``."""
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    urls = _repository_urls(repository, f"pull/{left.get('number')}")
+    return all(
+        (left.get(key) in urls and right.get(key) in urls) if key == "url" else left.get(key) == right.get(key)
+        for key in keys
+    )
 
 
 def _same_merged_pr(left: Any, right: Any, repository: Any) -> bool:
@@ -407,12 +428,22 @@ def _same_merged_pr(left: Any, right: Any, repository: Any) -> bool:
 
     A record saved before a transfer and a fresh read after it spell the URL with different slugs.
     """
-    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+    return _same_pr_fields(left, right, repository, _MERGED_PR_KEYS)
+
+
+def _same_child_association(left: Any, right: Any, repository: Any) -> bool:
+    """Whether two child-recovery associations match, allowing either baked slug in ``child_pr.url``."""
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping) or set(left) != set(right):
         return False
-    urls = _repository_urls(repository, f"pull/{left.get('number')}")
-    return all(
-        (left.get(key) in urls and right.get(key) in urls) if key == "url" else left.get(key) == right.get(key)
-        for key in _MERGED_PR_KEYS
+    if any(left[key] != right[key] for key in left if key != "child_pr"):
+        return False
+    left_pr, right_pr = left.get("child_pr"), right.get("child_pr")
+    return (
+        isinstance(left_pr, Mapping)
+        and isinstance(right_pr, Mapping)
+        and set(left_pr) == set(_CHILD_PR_KEYS)
+        and set(right_pr) == set(_CHILD_PR_KEYS)
+        and _same_pr_fields(left_pr, right_pr, repository, _CHILD_PR_KEYS)
     )
 
 
@@ -485,11 +516,8 @@ def _recovery_pr_head(
         }
         # merge_closeout records the canonical (folded) spelling of the row, which may be the
         # other baked slug of the ledger's repository.
-        or ("repository" in cleanup_pr and not (
-            isinstance(cleanup_pr["repository"], str)
-            and cleanup_pr["repository"].isascii()  # casefold would map look-alikes such as U+212A onto ASCII
-            and any(cleanup_pr["repository"].casefold() == slug.casefold()
-                    for slug in _repository_slugs(ledger["identity"]["repository"]))
+        or ("repository" in cleanup_pr and not _same_repository_slug(
+            cleanup_pr["repository"], ledger["identity"]["repository"]
         ))
         or branch.get("branch") != task["worktree_branch"]
         or branch.get("remote_gone") is not True
@@ -603,7 +631,11 @@ def recover(
                     raise ObservationRefusal("RECOVERY_MERGED_PR_UNPROVEN")
                 if (
                     "association" in recovery and child_pr is not None
-                    and _child_association(task, ledger, child_pr) != recovery["association"]
+                    and not _same_child_association(
+                        _child_association(task, ledger, child_pr),
+                        recovery["association"],
+                        ledger["identity"]["repository"],
+                    )
                 ):
                     raise ObservationRefusal("RECOVERY_ASSOCIATION_INVALID")
                 return receipt, True

@@ -1174,33 +1174,157 @@ def test_single_caller_run_keeps_its_state(finding: bool) -> None:
     assert [run["gate_conclusion"] for run in evidence["runs"]] == ["failure" if finding else "success"]
 
 
-@pytest.mark.parametrize(("payload_slug", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
-def test_run_links_bind_either_baked_slug_of_the_scanned_repository(monkeypatch, payload_slug, accepted):
-    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
-    with the same repository name under another owner is accepted (scanned as org/repo)."""
-    from tests.test_fleet_repos import transferred_catalog
-
-    transferred_catalog(monkeypatch)
+@pytest.mark.parametrize(
+    ("payload_slug", "accepted"),
+    [
+        ("learn-ukrainian/machinery", True),
+        ("next-owner/machinery", True),
+        ("agentic-machinery/machinery", False),
+        ("evil/machinery", False),
+    ],
+)
+def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Path, payload_slug: str, accepted: bool):
+    """Defect class: alert pagination, runs, and annotations use the bundled registry instead of the
+    selected FleetRepo row, rejecting the selected row's alternate slug or accepting an unrelated
+    bundled alternate slug."""
+    registry = _write_registry(
+        tmp_path,
+        {
+            "machinery": {
+                **_repo_row("learn-ukrainian/machinery", default=True),
+                "alternate_github": "next-owner/machinery",
+                "repository_id": 1445647449,
+                "visibility": "public",
+            }
+        },
+    )
     run_url = f"https://github.com/{payload_slug}/actions/runs/9"
-    run = {
-        "id": 9, "path": ".github/workflows/fleet-security.yml", "head_branch": "main", "status": "completed",
-        "event": "schedule", "head_repository": {"full_name": payload_slug}, "head_sha": "a" * 40,
-        "conclusion": "success", "html_url": run_url,
-    }
-
-    record, error = alerts_module._run_record("org", "repo", "fleet-security.yml", run, "main")
-    endpoint = alerts_module._annotation_endpoint(
-        "org", "repo", f"https://api.github.com/repos/{payload_slug}/check-runs/5",
-    )
-    following = alerts_module._accept_next_link(
-        "org", "repo", f"https://api.github.com/repos/{payload_slug}/code-scanning/alerts?per_page=100&page=2",
-        "repos/org/repo/code-scanning/alerts", None,
+    workflow_text = (
+        "name: security\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  fleet-security:\n"
+        f'    "uses": learn-ukrainian/machinery/.github/workflows/fleet-security.yml@{_PIN}\n'
     )
 
+    def _job_row(job_id: int, job_name: str, check_id: int) -> dict[str, Any]:
+        return {
+            "id": job_id,
+            "name": job_name,
+            "conclusion": "success",
+            "check_run_url": f"https://api.github.com/repos/{payload_slug}/check-runs/{check_id}",
+        }
+
+    def respond(endpoint: str) -> Result:
+        path, _, query = endpoint.partition("?")
+        if path == "repos/learn-ukrainian/machinery/code-scanning/alerts" and "page=2" not in query:
+            return Result(
+                status=200,
+                headers={"Link": f'<https://api.github.com/repos/{payload_slug}/code-scanning/alerts?state=open&per_page=100&page=2>; rel="next"'},
+                value=[{"number": 1, "rule": {"security_severity_level": "high"}}],
+            )
+        if path == f"repos/{payload_slug}/code-scanning/alerts" and "page=2" in query:
+            return Result(status=200, value=[{"number": 2, "rule": {"security_severity_level": "medium"}}])
+        if path == "repos/learn-ukrainian/machinery/dependabot/alerts":
+            return Result(status=200, value=[])
+        if path == "repos/learn-ukrainian/machinery/secret-scanning/alerts" and "page=2" not in query:
+            return Result(
+                status=200,
+                headers={"Link": f'<https://api.github.com/repos/{payload_slug}/secret-scanning/alerts?state=open&per_page=100&hide_secret=true&page=2>; rel="next"'},
+                value=[],
+            )
+        if path == f"repos/{payload_slug}/secret-scanning/alerts" and "page=2" in query:
+            return Result(status=200, value=[])
+        if path == "repos/learn-ukrainian/machinery":
+            return Result(status=200, value={"id": 1445647449, "default_branch": "main"})
+        if path == "repos/learn-ukrainian/machinery/contents/.github/workflows":
+            return Result(status=200, value=[{"name": "security.yml", "path": ".github/workflows/security.yml", "type": "file"}])
+        if path == "repos/learn-ukrainian/machinery/contents/.github/workflows/security.yml":
+            return Result(status=200, value=_workflow_file(workflow_text))
+        if path == "repos/learn-ukrainian/machinery/actions/workflows/security.yml/runs":
+            return Result(
+                status=200,
+                value={
+                    "total_count": 1,
+                    "workflow_runs": [
+                        {
+                            "id": 9, "path": ".github/workflows/security.yml", "head_branch": "main",
+                            "status": "completed", "event": "schedule",
+                            "head_repository": {"full_name": payload_slug}, "head_sha": "a" * 40,
+                            "conclusion": "success", "html_url": run_url,
+                        }
+                    ],
+                },
+            )
+        if path == "repos/learn-ukrainian/machinery/actions/runs/9/jobs" and "page=2" not in query:
+            return Result(
+                status=200,
+                headers={"Link": f'<https://api.github.com/repos/{payload_slug}/actions/runs/9/jobs?per_page=100&page=2>; rel="next"'},
+                value={"total_count": 2, "jobs": [_job_row(8, "fleet-security / ShellCheck", 5)]},
+            )
+        if path == f"repos/{payload_slug}/actions/runs/9/jobs" and "page=2" in query:
+            return Result(
+                status=200,
+                value={"total_count": 2, "jobs": [_job_row(9, "fleet-security / Fleet security gate", 6)]},
+            )
+        if path == "repos/learn-ukrainian/machinery/check-runs/5/annotations" and "page=2" not in query:
+            return Result(
+                status=200,
+                headers={"Link": f'<https://api.github.com/repos/{payload_slug}/check-runs/5/annotations?per_page=100&page=2>; rel="next"'},
+                value=[],
+            )
+        if path == f"repos/{payload_slug}/check-runs/5/annotations" and "page=2" in query:
+            return Result(status=200, value=[])
+        if path == "repos/learn-ukrainian/machinery/check-runs/6/annotations":
+            return Result(status=200, value=[])
+        raise AssertionError(endpoint)
+
+    report = scan_fleet_alerts(registry_path=registry, client=_FakeGitHubClient(respond), clock=lambda: 1700000000.0)
+    entry = report["repositories"]["machinery"]
+    selected_slugs = ("learn-ukrainian/machinery", "next-owner/machinery")
     if accepted:
-        assert error is None and record["html_url"] == run_url
-        assert endpoint == "repos/org/repo/check-runs/5/annotations?per_page=100"
-        assert following == f"repos/{payload_slug}/code-scanning/alerts?per_page=100&page=2"
+        assert entry["source_ok"] is True
+        assert entry["tools"]["code_scanning"]["total"] == 2
+        assert entry["tools"]["secret_scanning"]["status"] == "ok"
+        assert entry["fleet_security"]["state"] == "zero_findings"
+        assert entry["fleet_security"]["runs"][0]["html_url"] == run_url
+        # Secret-scanning pagination must still enforce hide_secret=true on alternate-slug links.
+        unredacted = _FakeGitHubClient(
+            lambda ep: Result(
+                status=200,
+                headers={"Link": f'<https://api.github.com/repos/{payload_slug}/secret-scanning/alerts?state=open&per_page=100&page=2>; rel="next"'},
+                value=[],
+            )
+        )
+        selected_repo = load_fleet_repos(registry)["machinery"]
+        assert alerts_module._fetch_tool_alerts(unredacted, selected_repo, "secret_scanning", timeout=1.0) == (
+            "error", None, "github_invalid_next_link"
+        )
+        catalog = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
+        brief = build_fix_brief(
+            "machinery",
+            registry_path=registry,
+            client=_FakeGitHubClient(respond),
+            catalog=catalog,
+            task_id="sec-machinery",
+            prompt_file="brief.md",
+            clock=lambda: 1700000000.0,
+        )
+        assert brief.alerts["code_scanning"]["total"] == 2
+        assert brief.fleet_security["state"] == "zero_findings"
     else:
-        assert (record, error) == (None, "run_not_on_default_branch")
-        assert endpoint is None and following is None
+        assert entry["source_ok"] is False
+        assert entry["tools"]["code_scanning"]["error"] == "github_invalid_next_link"
+        assert entry["tools"]["secret_scanning"]["error"] == "github_invalid_next_link"
+        assert entry["fleet_security"]["state"] == "inaccessible_evidence"
+        assert entry["fleet_security"]["reason"] == "run_not_on_default_branch"
+        assert alerts_module._annotation_endpoint(
+            "learn-ukrainian", "machinery", f"https://api.github.com/repos/{payload_slug}/check-runs/5",
+            allowed_slugs=selected_slugs,
+        ) is None
+        assert alerts_module._accept_next_link(
+            "learn-ukrainian", "machinery",
+            f"https://api.github.com/repos/{payload_slug}/actions/runs/9/jobs?per_page=100&page=2",
+            "repos/learn-ukrainian/machinery/actions/runs/9/jobs", None,
+            allowed_slugs=selected_slugs,
+        ) is None

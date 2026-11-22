@@ -36,7 +36,6 @@ from lu_machinery.orchestration.fleet_repos import (
     FleetRepoError,
     canonical_repo_key,
     load_fleet_repos,
-    repository_slugs,
 )
 from lu_machinery.review.model_catalog import ModelCatalogError, load_model_catalog, validate_catalog
 from lu_machinery.review.role_resolution import RoleCandidate, resolve_role
@@ -385,8 +384,12 @@ def _fetch_tool_alerts(
         initial_endpoint = _repo_endpoint(repo, tool)
     except SecurityAlertsError:
         return "error", None, "invalid_repository_slug"
+    slugs = _repo_slugs(repo)
+    if slugs is None:
+        return "error", None, "invalid_repository_slug"
     expected_path = initial_endpoint.split("?", 1)[0]
     expected_tool_suffix = _ENDPOINT_SUFFIXES[tool].split("?", 1)[0]
+    allowed_paths = _allowed_repo_paths(slugs, expected_tool_suffix)
     endpoint: str | None = initial_endpoint
     known_repo_id: str | None = None
     repo_id_loaded = False
@@ -422,7 +425,7 @@ def _fetch_tool_alerts(
         if split is None:
             return "error", None, "github_invalid_next_link"
         next_path, next_query = split
-        if next_path != expected_path:
+        if next_path != expected_path and next_path not in allowed_paths:
             numeric_match = _NUMERIC_REPO_PATH_RE.fullmatch(next_path)
             if not numeric_match or numeric_match.group(2) != expected_tool_suffix:
                 return "error", None, "github_invalid_next_link"
@@ -481,11 +484,34 @@ def _github_get(client: Any, endpoint: str, timeout: float) -> github_client.Res
     return result
 
 
-def _split_github_slug(repo: FleetRepo) -> tuple[str, str] | None:
-    parts = repo.github.split("/")
+def _split_slug(slug: Any) -> tuple[str, str] | None:
+    if not isinstance(slug, str):
+        return None
+    parts = slug.split("/")
     if len(parts) != 2 or not all(_SLUG_SEGMENT_RE.fullmatch(part) and part not in {".", ".."} for part in parts):
         return None
     return parts[0], parts[1]
+
+
+def _split_github_slug(repo: FleetRepo) -> tuple[str, str] | None:
+    return _split_slug(repo.github)
+
+
+def _repo_slugs(repo: FleetRepo) -> tuple[str, ...] | None:
+    """Validated baked slugs of the selected ``FleetRepo``, or None if any slug is invalid."""
+    slugs = repo.slugs
+    if not slugs or any(_split_slug(slug) is None for slug in slugs):
+        return None
+    return slugs
+
+
+def _allowed_repo_paths(slugs: Sequence[str], suffix: str) -> frozenset[str]:
+    paths: set[str] = set()
+    for slug in slugs:
+        parts = _split_slug(slug)
+        if parts is not None:
+            paths.add(_repo_api(parts[0], parts[1], suffix))
+    return frozenset(paths)
 
 
 def _fleet_security_workflow(repos: Mapping[str, FleetRepo] | None) -> str | None:
@@ -553,22 +579,25 @@ def _accept_next_link(
     next_url: str,
     expected_path: str,
     required_repo_id: str | None,
+    *,
+    allowed_slugs: Sequence[str] | None = None,
 ) -> str | None:
     """Return the next endpoint, or None when the link is not this repository's page."""
     split = _split_next_link(next_url)
     if split is None:
         return None
     path, query = split
-    suffix = expected_path.removeprefix(f"repos/{owner}/{name}/")
+    prefix = _repo_api(owner, name, "")
+    if not expected_path.startswith(prefix):
+        return None
+    suffix = expected_path.removeprefix(prefix)
+    slugs = tuple(allowed_slugs) if allowed_slugs is not None else (f"{owner}/{name}",)
     numeric = _NUMERIC_REPO_PATH_RE.fullmatch(path)
     if numeric:
         if numeric.group(2) != suffix or required_repo_id is None or numeric.group(1) != required_repo_id:
             return None
-    elif path != expected_path and path not in {
-        _repo_api(slug_owner, slug_name, suffix)
-        for slug_owner, _, slug_name in (slug.partition("/") for slug in _repository_slugs(owner, name))
-    }:
-        # The next page may name either baked slug of a transferred repository.
+    elif path not in _allowed_repo_paths(slugs, suffix):
+        # The next page may name either baked slug of the selected repository row.
         return None
     return f"{path}?{query}" if query else path
 
@@ -582,6 +611,7 @@ def _collect_pages(
     name: str,
     expected_path: str,
     required_repo_id: str | None,
+    allowed_slugs: Sequence[str] | None = None,
 ) -> tuple[list[github_client.Result], str | None]:
     pages: list[github_client.Result] = []
     seen: set[str] = set()
@@ -598,7 +628,14 @@ def _collect_pages(
         next_url = github_client.next_link(headers)
         if not next_url:
             return pages, None
-        current = _accept_next_link(owner, name, next_url, expected_path, required_repo_id)
+        current = _accept_next_link(
+            owner,
+            name,
+            next_url,
+            expected_path,
+            required_repo_id,
+            allowed_slugs=allowed_slugs,
+        )
         if current is None:
             return [], "github_invalid_next_link"
     return [], "github_pagination_limit"
@@ -974,16 +1011,14 @@ def _workflow_run_path_matches(path: Any, filename: str) -> bool:
     return _REF_RE.fullmatch(path[len(prefix) :]) is not None
 
 
-def _repository_slugs(owner: str, name: str) -> tuple[str, ...]:
-    """Both baked slugs of the scanned repository, so a payload already naming its transfer slug binds."""
-    try:
-        return repository_slugs(f"{owner}/{name}")
-    except FleetRepoError:
-        return ()
-
-
 def _run_record(
-    owner: str, name: str, filename: str, run: Mapping[str, Any], branch: str
+    owner: str,
+    name: str,
+    filename: str,
+    run: Mapping[str, Any],
+    branch: str,
+    *,
+    allowed_slugs: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     run_id = run.get("id")
     if type(run_id) is not int or run_id <= 0:
@@ -997,7 +1032,7 @@ def _run_record(
     full_name = head_repository.get("full_name") if isinstance(head_repository, Mapping) else None
     if not isinstance(event, str) or not isinstance(full_name, str):
         return None, "github_invalid_payload"
-    slugs = _repository_slugs(owner, name)
+    slugs = tuple(allowed_slugs) if allowed_slugs is not None else (f"{owner}/{name}",)
     if event not in _ALLOWED_RUN_EVENTS or full_name not in slugs:
         return None, "run_not_on_default_branch"
     head_sha = run.get("head_sha")
@@ -1013,11 +1048,18 @@ def _run_record(
     }, None
 
 
-def _annotation_endpoint(owner: str, name: str, check_run_url: Any) -> str | None:
+def _annotation_endpoint(
+    owner: str,
+    name: str,
+    check_run_url: Any,
+    *,
+    allowed_slugs: Sequence[str] | None = None,
+) -> str | None:
     if not isinstance(check_run_url, str):
         return None
+    slugs = tuple(allowed_slugs) if allowed_slugs is not None else (f"{owner}/{name}",)
     matched = _CHECK_RUN_URL_RE.fullmatch(check_run_url)
-    if not matched or f"{matched.group(1)}/{matched.group(2)}" not in _repository_slugs(owner, name):
+    if not matched or f"{matched.group(1)}/{matched.group(2)}" not in slugs:
         return None
     return _repo_api(owner, name, f"check-runs/{matched.group(3)}/annotations?per_page=100")
 
@@ -1030,6 +1072,8 @@ def _read_caller_evidence(
     caller: Mapping[str, str],
     timeout: float,
     required_repo_id: str | None,
+    *,
+    allowed_slugs: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], str | None]:
     filename = caller["path"].rsplit("/", 1)[-1]
     runs_endpoint = _repo_api(
@@ -1052,7 +1096,7 @@ def _read_caller_evidence(
         return None, [], "no_completed_run"
     if not workflow_runs or not isinstance(workflow_runs[0], Mapping):
         return None, [], "github_invalid_payload"
-    record, run_error = _run_record(owner, name, filename, workflow_runs[0], branch)
+    record, run_error = _run_record(owner, name, filename, workflow_runs[0], branch, allowed_slugs=allowed_slugs)
     if run_error or record is None:
         return None, [], run_error or "github_invalid_payload"
     run_id = record["run_id"]
@@ -1065,6 +1109,7 @@ def _read_caller_evidence(
         name=name,
         expected_path=jobs_path,
         required_repo_id=required_repo_id,
+        allowed_slugs=allowed_slugs,
     )
     if page_error:
         return None, [], page_error
@@ -1153,7 +1198,9 @@ def _read_caller_evidence(
                     return record, [], "scanner_incomplete"
                 if conclusion == "failure":
                     failed_scanners += 1
-            annotations_endpoint = _annotation_endpoint(owner, name, job.get("check_run_url"))
+            annotations_endpoint = _annotation_endpoint(
+                owner, name, job.get("check_run_url"), allowed_slugs=allowed_slugs
+            )
             if annotations_endpoint is None:
                 return None, [], "annotations_unreadable"
             expected_annotations = annotations_endpoint.split("?", 1)[0]
@@ -1165,6 +1212,7 @@ def _read_caller_evidence(
                 name=name,
                 expected_path=expected_annotations,
                 required_repo_id=required_repo_id,
+                allowed_slugs=allowed_slugs,
             )
             if annotation_error:
                 return None, [], annotation_error
@@ -1234,7 +1282,8 @@ def read_fleet_security(
     annotations the workflow already emits.
     """
     slug = _split_github_slug(repo)
-    if slug is None:
+    allowed_slugs = _repo_slugs(repo)
+    if slug is None or allowed_slugs is None:
         return _fleet_record("inaccessible_evidence", reason="invalid_repository")
     fleet_workflow = _fleet_security_workflow(repos)
     if fleet_workflow is None:
@@ -1262,7 +1311,7 @@ def read_fleet_security(
             continue
         seen_paths.add(caller["path"])
         record, caller_findings, evidence_error = _read_caller_evidence(
-            client, owner, name, branch, caller, timeout, repo_id
+            client, owner, name, branch, caller, timeout, repo_id, allowed_slugs=allowed_slugs
         )
         if evidence_error:
             return _fleet_record(

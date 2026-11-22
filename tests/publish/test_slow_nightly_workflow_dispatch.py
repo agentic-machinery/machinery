@@ -475,9 +475,10 @@ def test_dismissal_fixes_endpoint_state_and_replays_scanned_comment(dismissal_tr
 
 
 @pytest.mark.parametrize(("payload_slug", "accepted"), [("unit/public", True), ("neworg/public", True), ("evil/public", False)])
-def test_dismissal_binds_either_baked_slug_of_the_repository(dismissal_transport, monkeypatch, payload_slug, accepted):
+def test_dismissal_binds_either_baked_slug_of_the_repository(dismissal_transport, tmp_path, monkeypatch, payload_slug, accepted):
     """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
-    with the same repository name under another owner is accepted (dismissed through unit/public)."""
+    with the same repository name under another owner is accepted (dismissed through unit/public;
+    multi-page issue-transfer repository label reads bind both baked slugs while pinning node ID/metadata)."""
     from tests.test_fleet_repos import transferred_catalog
 
     transferred_catalog(monkeypatch, github="unit/public", alternate="neworg/public")
@@ -488,16 +489,61 @@ def test_dismissal_binds_either_baked_slug_of_the_repository(dismissal_transport
     for number in (3, 4):
         documents[f"pulls/{number}"]["url"] = f"https://github.com/{payload_slug}/pull/{number}"
 
+    def _paginated_repo_reader(page2_name, *, page2_id="R_1"):
+        pages = [
+            {
+                "data": {
+                    "repository": {
+                        "id": "R_1", "nameWithOwner": "unit/public", "visibility": "PUBLIC",
+                        "viewerPermission": "WRITE", "isArchived": False,
+                        "labels": {
+                            "totalCount": 2,
+                            "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+                            "nodes": [{"name": "bug"}],
+                        },
+                    }
+                }
+            },
+            {
+                "data": {
+                    "repository": {
+                        "id": page2_id, "nameWithOwner": page2_name, "visibility": "PUBLIC",
+                        "viewerPermission": "WRITE", "isArchived": False,
+                        "labels": {
+                            "totalCount": 2,
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [{"name": "triage"}],
+                        },
+                    }
+                }
+            },
+        ]
+        index = {"i": 0}
+
+        def reader(argv, **kw):
+            payload = pages[index["i"]]
+            index["i"] += 1
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+        return reader
+
+    endpoint = {"repository": "unit/public"}
     if not accepted:
         with pytest.raises(gate.PublishBlocked):
             pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
                         comment=comment, runner=sender, capture_output=True, text=True)
         assert writes == []
+        with pytest.raises(ValueError, match="labels changed while reading"):
+            pub._transfer_repository(endpoint, _paginated_repo_reader(payload_slug), tmp_path, {}, tmp_path)
         return
     answer = pub.publish("code-scanning-dismiss", repo="unit/public", number=1, reason="false positive",
                          comment=comment, runner=sender, capture_output=True, text=True)
     assert answer.returncode == 0
     assert len(writes) == 1
+    repo_state = pub._transfer_repository(endpoint, _paginated_repo_reader(payload_slug), tmp_path, {}, tmp_path)
+    assert repo_state["id"] == "R_1" and repo_state["labels"] == ["bug", "triage"]
+    with pytest.raises(ValueError, match="labels changed while reading"):
+        pub._transfer_repository(endpoint, _paginated_repo_reader(payload_slug, page2_id="R_2"), tmp_path, {}, tmp_path)
 
 
 @pytest.mark.parametrize("change", [

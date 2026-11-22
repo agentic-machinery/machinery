@@ -1216,11 +1216,31 @@ def _transfer_resolution(endpoint, number, reader, cwd, environment):
     return resolved
 
 
-def _transfer_label_connection(query, variables, select, reader, cwd, environment, temp):
+def _same_transfer_identity(current, identity, repository):
+    """Whether two GraphQL label pages belong to the same object.
+
+    Node id and metadata must stay equal across pages; a repository's
+    ``nameWithOwner`` may switch between the requested row's two baked slugs.
+    """
+    if not isinstance(current, dict) or not isinstance(identity, dict) or set(current) != set(identity):
+        return False
+    for key, value in current.items():
+        if key == "nameWithOwner" and repository is not None:
+            if value == identity[key]:
+                continue
+            if not (_same_repository(value, repository) and _same_repository(identity[key], repository)):
+                return False
+        elif value != identity[key]:
+            return False
+    return True
+
+
+def _transfer_label_connection(query, variables, select, reader, cwd, environment, temp, *, repository=None):
     """Every label of one GraphQL label connection: paginated, count-checked and distinct.
 
     ``select`` maps the repository object to (identity fields, label page); the identity must
-    stay the same on every page.
+    stay the same on every page (allowing ``nameWithOwner`` to vary across the requested row's
+    two baked slugs when *repository* is given).
     """
     labels, cursor, identity, total = [], None, None, None
     for _ in range(TRANSFER_LABEL_PAGES):
@@ -1236,7 +1256,11 @@ def _transfer_label_connection(query, variables, select, reader, cwd, environmen
         current, page = select(document["data"]["repository"])
         if identity is None:
             identity, total = current, page["totalCount"]
-        if current != identity or page["totalCount"] != total or type(total) is not int:
+        if (
+            not _same_transfer_identity(current, identity, repository)
+            or page["totalCount"] != total
+            or type(total) is not int
+        ):
             raise ValueError("labels changed while reading")
         names = [node["name"] for node in page["nodes"]]
         if not all(isinstance(label, str) and label for label in names):
@@ -1263,6 +1287,7 @@ def _transfer_repository(endpoint, reader, cwd, environment, temp):
     identity, labels = _transfer_label_connection(
         TRANSFER_REPOSITORY_QUERY, {"owner": owner, "name": name},
         lambda repo: ({key: repo[key] for key in fields}, repo["labels"]), reader, cwd, environment, temp,
+        repository=endpoint["repository"],
     )
     if not isinstance(identity["id"], str) or not identity["id"]:
         raise ValueError("repository id unreadable")

@@ -610,11 +610,15 @@ def test_task_commit_range_refuses_ambiguous_absorbed_merge(observation_case):
     ],
 )
 def test_merged_run_evidence_binds_either_baked_slug_of_the_ledger_repository(
-    bound_case, monkeypatch, payload_slug, job_slug, refusal
+    bound_case, observation_case, monkeypatch, payload_slug, job_slug, refusal
 ):
     """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
     with the same repository name under another owner is accepted (ledger and evidence recorded as org/repo;
-    separate reads may mix the two baked slugs)."""
+    separate reads may mix the two baked slugs, including child recovery and replay)."""
+    from copy import deepcopy
+
+    from lu_machinery.orchestration import task_identity
+
     transferred_catalog(monkeypatch)
     _, observation, pull, run, jobs = bound_case
     run_url = f"https://github.com/{payload_slug}/actions/runs/123"
@@ -627,7 +631,55 @@ def test_merged_run_evidence_binds_either_baked_slug_of_the_ledger_repository(
     if refusal:
         with pytest.raises(lo.ObservationRefusal, match=refusal):
             closeout_fixtures.derive(bound_case)
+    else:
+        _, report = closeout_fixtures.derive(bound_case)
+        assert report["run_url"] == run_url
+        assert [item["executed"][0]["url"] for item in report["criteria"]] == [jobs[0]["html_url"]]
+
+    # Child recovery and replay must bind either baked slug for carrier and PR URLs, and refuse foreign slugs.
+    repo, worktree, child_file, task_file, manifest, push_file, head = observation_case
+    child = tl.load_lifecycle(child_file)
+    carrier_slug = "neworg/repo" if payload_slug == "neworg/repo" else "org/repo"
+    earlier_identity = deepcopy(child["identity"])
+    earlier_identity.update(
+        repository=carrier_slug,
+        github_issue_number=41,
+        github_issue_url=f"https://github.com/{carrier_slug}/issues/41",
+        stream_epic_url=f"https://github.com/{carrier_slug}/issues/10",
+        visible_title=task_identity.visible_title(
+            semantic_title=earlier_identity["semantic_title"],
+            github_issue_number=41,
+            task_family=earlier_identity["task_family"],
+        ),
+    )
+    earlier_identity["carriers"] = dict.fromkeys(earlier_identity["carriers"], earlier_identity["visible_title"])
+    earlier = tl.build_lifecycle(
+        earlier_identity, author_family="codex", ac_snapshot=child["ac_snapshot"],
+        required_checks=["CI Gate"], now=NOW, pr_number=76,
+    )
+    earlier_file = tl.lifecycle_path(repo, earlier_identity)
+    tl.write_lifecycle(earlier_file, earlier)
+    task = json.loads(task_file.read_text())
+    task["task_lifecycle"] = tl.carrier_projection(earlier, state_file=str(earlier_file))
+    task_file.write_text(json.dumps(task))
+    git(repo, "worktree", "remove", str(worktree))
+    recover_kwargs = dict(
+        state_file=child_file, task_file=task_file, manifest_file=manifest, push_file=push_file, now=NOW,
+    )
+    first_pr = {
+        "number": 77, "url": f"https://github.com/{payload_slug}/pull/77",
+        "state": "MERGED", "head_sha": head, "head_branch": task["worktree_branch"],
+    }
+    replay_pr = {**first_pr, "url": f"https://github.com/{job_slug}/pull/77"}
+    if payload_slug == "evil/repo":
+        with pytest.raises(lo.ObservationRefusal, match="RECOVERY_CHILD_PR_MISMATCH"):
+            lo.recover(repo, **recover_kwargs, child_pr=first_pr)
         return
-    _, report = closeout_fixtures.derive(bound_case)
-    assert report["run_url"] == run_url
-    assert [item["executed"][0]["url"] for item in report["criteria"]] == [jobs[0]["html_url"]]
+    receipt, replayed = lo.recover(repo, **recover_kwargs, child_pr=first_pr)
+    assert replayed is False
+    if job_slug == "evil/repo":
+        with pytest.raises(lo.ObservationRefusal, match="RECOVERY_CHILD_PR_MISMATCH"):
+            lo.recover(repo, **recover_kwargs, child_pr=replay_pr)
+        return
+    again, replayed = lo.recover(repo, **recover_kwargs, child_pr=replay_pr)
+    assert replayed is True and again == receipt
