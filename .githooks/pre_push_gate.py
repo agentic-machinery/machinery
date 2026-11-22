@@ -209,13 +209,24 @@ def parse_updates(text: str) -> list[Update]:
     return updates
 
 
+# The only URL spellings that may carry the private Entire exemption: https, ssh or scp-like GitHub URLs with an
+# optional plain user and an owner/name path. Git and curl end a URL authority at characters such as "?", "#" or
+# "\\" that the scanner's destination grammar reads as userinfo, so a URL outside this allowlist can name a private
+# slug while Git connects to another host; it is never exempt.
+PRIVATE_ENTIRE_URL = re.compile(
+    r"(?:(?:https|ssh)://(?:[A-Za-z0-9._-]+@)?(?i:github\.com)/|(?:[A-Za-z0-9._-]+@)?(?i:github\.com):)"
+    r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/?",
+    re.ASCII,
+)
+
+
 def entire_destination(remote: list[str]) -> str:
     """Classify an Entire push destination with the publication scanner's own private exemption.
 
-    PRIVATE only when ``git_push.main`` would exempt the same push: ``prepublish.is_private`` names the
-    destination and ``git_push.trusted_route`` verifies the route, with the same Git. PUBLIC when a
-    ``public-`` fleet row names it by its current or alternate slug. Anything else is UNKNOWN or
-    UNVERIFIED, and every class except PRIVATE is refused.
+    PRIVATE only when ``git_push.main`` would exempt the same push (``prepublish.is_private`` names the
+    destination and ``git_push.trusted_route`` verifies the route, with the same Git) and the URL is also
+    one of the ``PRIVATE_ENTIRE_URL`` spellings. PUBLIC when a ``public-`` fleet row names it by its current
+    or alternate slug. Anything else is UNKNOWN or UNVERIFIED, and every class except PRIVATE is refused.
     """
     if len(remote) != 2:
         return "UNKNOWN"
@@ -235,6 +246,8 @@ def entire_destination(remote: list[str]) -> str:
                 return "PUBLIC"
         if not prepublish.is_private(identity):
             return "UNKNOWN"
+        if not PRIVATE_ENTIRE_URL.fullmatch(remote[1]):
+            return "UNVERIFIED"
         environment = dict(os.environ)
         repository = git_push.Repository(git_push.real_git(environment), environment)
         return "PRIVATE" if git_push.trusted_route(repository, *remote) else "UNVERIFIED"
@@ -261,7 +274,9 @@ def refuse_public_entire_refs(updates: list[Update], remote: list[str]) -> None:
     if destination == "PUBLIC":
         raise GateOutcome("public_entire_ref", detail + "Updates to public repositories are refused.")
     if destination == "UNVERIFIED":
-        raise GateOutcome("entire_destination_unverified", detail + "The private destination route could not be verified.")
+        raise GateOutcome(
+            "entire_destination_unverified", detail + "The private destination URL or route could not be verified."
+        )
     raise GateOutcome("entire_destination_unknown", detail + "Destination is unknown; Entire updates are refused.")
 
 
