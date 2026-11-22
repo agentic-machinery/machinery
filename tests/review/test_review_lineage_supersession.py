@@ -183,6 +183,128 @@ def test_verification_probe_does_not_block_the_post_approval_repair_round(tmp_pa
     )) == ["opus-r1", "opus-r2", "opus-r4"]
 
 
+PENDING_BLOCK = "VERDICT: BLOCKED\nThe CI Gate on this head is still pending; rerun with its result."
+
+
+@pytest.mark.usefixtures("configured_roots")
+def test_same_head_rerun_after_unpublished_blocks_admits_the_repair_round(tmp_path, monkeypatch, capsys):
+    """Defect class: a seat's unrecorded pending-check BLOCKED runs at the approved head refuse the repair round.
+
+    The PR 1175 shape: the seat ran twice at the approved head and was left unrecorded (review-loop step 7),
+    then its rerun at that head recorded APPROVE. The repair round is admitted and both runs stay listed.
+    """
+    from lu_machinery.review import repair_round
+    from tests.agent_runtime.test_authoring_review_feasibility import mini_repo
+    from tests.review.record_support import write_task
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    repository = "learn-ukrainian/machinery"
+    branch = "codex/topic"
+    number = 1175
+    tasks = tmp_path / "tasks"
+    path = "lu_machinery/dispatcher/admission.py"
+    first, second, approved, candidate = (
+        repo.commit(f"codex/{CURRENT_SOL}", path=path, text=f"{step}\n")
+        for step in ("first", "second", "approve", "repair")
+    )
+    common = {"schema_version": 2, "repository": repository, "review_branch": branch, "mode": "read-only",
+              "research_role": "review", "pr": number}
+    comments = []
+    for task_id, minute, sha, reply, publish in (
+        ("guardd-r1", 1, first, "VERDICT: REQUEST_CHANGES", True),
+        ("guardd-r2", 2, second, "VERDICT: REQUEST_CHANGES", True),
+        ("guardd-r3", 3, approved, PENDING_BLOCK, False),
+        ("guardd-r3b", 4, approved, PENDING_BLOCK, False),
+        ("guardd-r3c", 5, approved, "VERDICT: APPROVE", True),
+    ):
+        run, comment = review(task_id, sha, reply, minute=minute, family="anthropic", publish=publish)
+        fields = {key: value for key, value in run.record.items() if key not in {"task_id", "review_profile"}}
+        write_task(tasks, task_id=task_id, reply=reply, **common, **fields)
+        if comment:
+            comments.append(comment)
+
+    monkeypatch.setattr(recorder, "_repo_root", lambda: repo.root)
+    monkeypatch.setattr(recorder, "_review_repository_root", lambda *_: repo.root)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+
+    def github_json(request):
+        if isinstance(request, recorder.Request) and request.verb == "read-commits":
+            return [[{"sha": sha} for sha in (first, second, approved, candidate)]]
+        assert request[:3] == ["gh", "pr", "view"]
+        return {"headRefOid": candidate, "headRefName": branch, "state": "OPEN"}
+
+    monkeypatch.setattr(recorder, "_run_json", github_json)
+    monkeypatch.setattr(
+        recorder.GitHubAdapter, "pr_file_rows", lambda *_: [{"filename": path, "status": "added"}],
+    )
+    monkeypatch.setattr(recorder.GitHubAdapter, "identity", lambda *_: "fleet")
+    monkeypatch.setattr(recorder.GitHubAdapter, "comments", lambda *_: comments)
+    monkeypatch.setattr(repair_round, "github_reads", lambda *_: repair_round.GitHubReads(
+        failed_runs=lambda _: [{
+            "id": 1, "head_sha": approved, "event": "pull_request", "conclusion": "failure",
+            "path": ".github/workflows/ci-gate.yml",
+        }],
+        queue_runs=list, commit_tree=lambda _: None, closing_issues=list,
+    ))
+
+    status = recorder.budget_check_main(["--repository", repository, "--pr", str(number)])
+    result = json.loads(capsys.readouterr().out)
+
+    assert status == 0, result
+    assert result["admitted"] is True
+    assert result["repair_round"]["approved_head"] == approved
+    assert result["repair_round"]["candidate_head"] == candidate
+    assert result["repair_round"]["approved_seats"] == ["anthropic"]
+    assert [(item["task"], item["head"], item["verdict"], item["superseded_by"]["task"])
+            for item in result["repair_round"]["superseded_runs"]] == [
+        ("guardd-r3", approved, "BLOCKED", "guardd-r3c"),
+        ("guardd-r3b", approved, "BLOCKED", "guardd-r3c"),
+    ]
+
+
+def test_same_head_blocks_are_superseded_by_the_seats_later_verdict_at_that_head():
+    first = review("sol-r3", APPROVED, PENDING_BLOCK, minute=1, publish=False)
+    second = review("sol-r3b", APPROVED, PENDING_BLOCK, minute=2, publish=False)
+    witness = review("sol-r3c", APPROVED, "VERDICT: APPROVE", minute=3)
+    with pytest.raises(LineageRefused, match="review task sol-r3 finished but its verdict is unpublished"):
+        lineage(first, second)
+    seats, superseded = lineage(first, second, witness)
+    assert seats == ["openai"]
+    by = {"task": "sol-r3c", "started": started(3), "head": APPROVED, "verdict": "APPROVED", "model": CURRENT_SOL}
+    assert superseded == [
+        {"task": task, "started": started(minute), "head": APPROVED, "verdict": "BLOCKED",
+         "findings": recorder._review_verdict_and_count(PENDING_BLOCK)[1], "model": CURRENT_SOL,
+         "family": "openai", "profile": "code", "superseded_by": by}
+        for task, minute in (("sol-r3", 1), ("sol-r3b", 2))
+    ]
+
+
+@pytest.mark.parametrize(
+    "witness,exclude_head",
+    [
+        (lambda: review("sol-r3c", CANDIDATE, "VERDICT: APPROVE", minute=3), CANDIDATE),
+        (lambda: review("opus-r3c", APPROVED, "VERDICT: APPROVE", minute=3, family="anthropic"), None),
+        (lambda: review("sol-r3c", APPROVED, "VERDICT: APPROVE", minute=3, profile="ukrainian"), None),
+        (lambda: review("sol-r3c", APPROVED, "VERDICT: APPROVE", minute=0), None),
+    ],
+    ids=["later-verdict-only-at-the-excluded-candidate", "other-family", "other-profile", "earlier-verdict"],
+)
+def test_a_same_head_block_without_its_seats_later_verdict_at_that_head_still_refuses(witness, exclude_head):
+    orphan = review("sol-r3", APPROVED, PENDING_BLOCK, minute=1, publish=False)
+    approval = review("opus-r2", APPROVED, "VERDICT: APPROVE", minute=2, family="anthropic")
+    assert report(orphan, approval, witness(), exclude_head=exclude_head) == []
+    with pytest.raises(LineageRefused, match="review task sol-r3 finished but its verdict is unpublished"):
+        lineage(orphan, approval, witness(), exclude_head=exclude_head)
+
+
+def test_a_conflicting_same_head_witness_supersedes_no_block():
+    orphan = review("sol-r3", APPROVED, PENDING_BLOCK, minute=1, publish=False)
+    witness = review("sol-r3c", APPROVED, "VERDICT: APPROVE", minute=3, verdict="CHANGES_REQUESTED")
+    assert report(witness, orphan) == []
+    with pytest.raises(LineageRefused, match="published verdict of sol-r3c conflicts with its task record"):
+        lineage(witness, orphan)
+
+
 def test_a_later_same_seat_approve_supersedes_an_unpublished_rejection_and_keeps_it_listed():
     orphan = review("sol-r1", EARLY, ORPHAN_REJECTION, minute=1, publish=False)
     witness = review("sol-r2", APPROVED, "VERDICT: APPROVE", minute=2)
@@ -222,10 +344,15 @@ def test_another_seats_verdict_supersedes_nothing(seat):
         lineage(orphan, witness)
 
 
-@pytest.mark.parametrize("orphan_head,orphan_minute", [(APPROVED, 1), (EARLY, 3)], ids=["same-head", "older-witness"])
-def test_a_same_head_or_older_witness_supersedes_nothing(orphan_head, orphan_minute):
+@pytest.mark.parametrize(
+    "orphan_head,orphan_minute,orphan_reply",
+    [(APPROVED, 1, "VERDICT: APPROVE"), (APPROVED, 1, ORPHAN_REJECTION), (EARLY, 3, "VERDICT: APPROVE")],
+    ids=["same-head-approve", "same-head-changes-requested", "older-witness"],
+)
+def test_a_same_head_or_older_witness_supersedes_nothing(orphan_head, orphan_minute, orphan_reply):
+    """Only a BLOCKED run is rerun at its own head (review-loop step 7); any other same-head verdict stays."""
     witness = review("sol-r2", APPROVED, "VERDICT: APPROVE", minute=2)
-    orphan = review("sol-late", orphan_head, "VERDICT: APPROVE", minute=orphan_minute, publish=False)
+    orphan = review("sol-late", orphan_head, orphan_reply, minute=orphan_minute, publish=False)
     assert report(orphan, witness) == []
     with pytest.raises(LineageRefused, match="review task sol-late finished but its verdict is unpublished"):
         lineage(orphan, witness)

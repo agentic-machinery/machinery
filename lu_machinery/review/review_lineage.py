@@ -7,7 +7,8 @@ APPROVE is the latest verdict of every reviewer seat. Unknown, unpublished or
 in-flight evidence refuses. A finished run whose verdict was never published
 stops refusing only when its seat recorded a later verdict at another head
 (:func:`superseded_runs`; designated approval: CTO proposal, Sol 6.1 APPROVE
-WITH CHANGES, advisory task cto-e08a-advlineage-sol). A finished run whose
+WITH CHANGES, advisory task cto-e08a-advlineage-sol), or, for a BLOCKED, at
+its own head (the review-loop step 7 rerun after a pending check). A finished run whose
 only outcome is a published capability failure
 (``scripts/review/capability_failure.py``) has no verdict and fills no seat.
 A terminal run that is not ``done``, has no reply, and whose record proves
@@ -404,11 +405,13 @@ def _supersede(
             )
     superseded = []
     for orphan in sorted(orphans, key=lambda item: item["started"]):
+        # Only an unrecorded BLOCKED is rerun at its own head (review-loop step 7: a check was pending).
+        rerun = orphan["verdict"] == "BLOCKED"
         later = [
             witness
             for witness in witnesses
             if (witness["family"], witness["profile"]) == (orphan["family"], orphan["profile"])
-            and witness["head"] != orphan["head"]
+            and (witness["head"] != orphan["head"] or rerun)
             and witness["started"] > orphan["started"]
         ]
         if later:
@@ -432,6 +435,10 @@ def superseded_runs(
     latest recorded verdict is the one that counts (review-loop policy). The
     witness is a finished run whose intact published verdict matches its own
     record, from the same seat, at a different head, started strictly later.
+    An unpublished BLOCKED is also superseded by such a witness at its own
+    head: review-loop step 7 leaves a BLOCKED whose only reason is a pending
+    check unrecorded and reruns the seat once at that head. Any other
+    unpublished verdict at the witness's head stays a refusal.
     A run with a capability-failure event, a run whose reply, verdict or
     reviewer identity does not hold, and everything at ``exclude_head`` (the
     round being recorded) neither is superseded nor supersedes. Each entry
