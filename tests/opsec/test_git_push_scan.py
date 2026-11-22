@@ -19,6 +19,7 @@ import time
 import tracemalloc
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1255,15 +1256,16 @@ def test_the_public_head_is_the_registered_repository_the_push_goes_to(push_sand
 def test_an_unverified_destination_scans_all_history(
     push_sandbox, monkeypatch, capfd, url, catalog, reply, expected_destination
 ):
-    assert git_push.destination(url or str(push_sandbox.remote)) == expected_destination
     hit = push_sandbox.commit("published subject " + TOKEN)
     public_head = push_sandbox.commit("published clean")
     push_sandbox.commit("new clean work")
     asked = _asked(monkeypatch, public_head)
     calls = _fork_reply(monkeypatch, public_head, **(reply or {}))
-    status, chained = run_hook(push_sandbox, monkeypatch, None, url=url, catalog=catalog)
+    with patch.object(gate, "check_texts", wraps=gate.check_texts) as check_texts:
+        status, chained = run_hook(push_sandbox, monkeypatch, None, url=url, catalog=catalog)
     err = capfd.readouterr().err
     assert status == 1 and not chained and asked == [], err
+    assert [call.args[0] for call in check_texts.call_args_list] == [expected_destination]
     assert len(calls) == (reply is not None)
     assert f"public default-branch head unavailable ({len(calls)} public repository call(s))" in err
     assert f"field=commit[{hit[:12]}].message" in err
