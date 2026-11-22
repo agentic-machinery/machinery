@@ -1293,21 +1293,23 @@ def _read_operator_text(raw: str) -> tuple[str | None, str]:
         return None, "is not an absolute path"
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # ValueError: a name the filesystem encoding cannot hold
         return None, "is missing" if isinstance(exc, FileNotFoundError) else "is unreadable"
     data = b""
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None, "is not a regular file"
-        while len(data) <= _DRAIN_FILE_MAX_BYTES:
-            chunk = os.read(fd, _DRAIN_FILE_MAX_BYTES + 1 - len(data))
-            if not chunk:
-                break
-            data += chunk
+        try:
+            regular = stat.S_ISREG(os.fstat(fd).st_mode)
+            while regular and len(data) <= _DRAIN_FILE_MAX_BYTES:
+                chunk = os.read(fd, _DRAIN_FILE_MAX_BYTES + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            os.close(fd)  # exactly once; an error closing is an unreadable file, like an error reading
     except OSError:
         return None, "is unreadable"
-    finally:
-        os.close(fd)
+    if not regular:
+        return None, "is not a regular file"
     if len(data) > _DRAIN_FILE_MAX_BYTES:
         return None, f"is larger than {_DRAIN_FILE_MAX_BYTES} bytes"
     try:

@@ -7,6 +7,7 @@ probe, never from allocating memory or generating load.
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.server
 import json
 import math
@@ -421,6 +422,7 @@ def test_active_drain_deadline_paces_to_the_earlier_reset_and_anything_else_keep
 
     warned("holds a NUL byte", setting="~\0/drain.json")
     warned("holds a NUL byte", setting=f"{target}\0")
+    warned("is unreadable", setting="/\ud800")  # a name the filesystem encoding cannot hold
 
     fifo = tmp_path / "fifo"
     os.mkfifo(fifo)
@@ -526,6 +528,26 @@ def test_active_drain_deadline_paces_to_the_earlier_reset_and_anything_else_keep
     refused = decide()
     assert not refused.admitted and refused.meter is not None and refused.meter.defer == adm.MeterDefer.CAP
     assert "meter codex:a: live write workers 2/1 (paced cap: 41% left, 125.0h to reset" in refused.refusal_line()
+
+    # An error closing either file is an unreadable file: it never escapes, and the same files read cleanly apply.
+    real_close = os.close
+
+    def failing_close(fd):
+        real_close(fd)
+        raise OSError(errno.EIO, "close failed")
+
+    env_file.write_text(f"export {adm.ENV_DRAIN_DEADLINES_FILE}='{target}'\n")
+    sources = (({adm.ENV_ADMISSION_FILE: str(env_file)}, "lookup: the deployment env file is unreadable"),
+               ({adm.ENV_DRAIN_DEADLINES_FILE: str(target)}, "is unreadable"))
+    for environ, reason in sources:
+        monkeypatch.setattr(adm, "_drain_warned", set())
+        with monkeypatch.context() as patch, caplog.at_level("WARNING", logger=adm.__name__):
+            patch.setattr(os, "close", failing_close)
+            assert adm.active_drain_deadline("codex:a", now, environ) is None
+        assert [record.getMessage() for record in caplog.records] == [
+            f"dispatch admission: {adm.ENV_DRAIN_DEADLINES_FILE} {reason}; pacing uses the meter reset"]
+        caplog.clear()
+        assert adm.active_drain_deadline("codex:a", now, environ) == deadline
 
 
 def test_grok_and_cursor_share_one_meter(tmp_path, probe):
