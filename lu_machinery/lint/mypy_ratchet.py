@@ -534,13 +534,15 @@ def collect_errors(
 ) -> tuple[list[MypyError], list[str]]:
     """Run mypy. Fatal runner failures come back as violation strings."""
 
-    existing = [target for target in targets if (root / target).exists()]
-    if not existing:
-        return [], []
+    if not targets:
+        return [], ["no mypy targets specified"]
+    missing = [target for target in targets if not (root / target).exists()]
+    if missing:
+        return [], [f"{target}: target does not exist under {root}" for target in missing]
     if config_file is None:
         config_file = ratchet_config(root)
     command = mypy_command(
-        existing,
+        targets,
         config_file=config_file,
         cache_dir=root / ".mypy_cache",
         incremental=incremental,
@@ -627,8 +629,26 @@ def _payload_entries(payload: object, where: str) -> list[MypyError]:
     return _entries_from_rows(payload.get("entries"), where)
 
 
+def _installed_mypy_version() -> str | None:
+    try:
+        return importlib.metadata.version("mypy")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _load_baseline(path: Path) -> tuple[str | None, list[MypyError]]:
+    payload = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
+    entries = _payload_entries(payload, str(path))
+    if "mypy" in payload:
+        recorded = payload["mypy"]
+        if not isinstance(recorded, str) or not recorded.strip():
+            raise ValueError(f"{path}: mypy version must be a non-empty string")
+        return recorded, entries
+    return None, entries
+
+
 def load_entries(path: Path) -> list[MypyError]:
-    return _payload_entries(json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512), str(path))
+    return _load_baseline(path)[1]
 
 
 def write_baseline(path: Path, entries: Sequence[MypyError]) -> None:
@@ -721,17 +741,36 @@ def evaluate(
 ) -> list[str]:
     """Return violation strings. An empty list is a pass."""
 
+    recorded, entries = _load_baseline(baseline)
+    if recorded is not None:
+        installed = _installed_mypy_version()
+        if installed is None:
+            return [f"{baseline}: baseline records mypy {recorded}, but mypy is not installed"]
+        if recorded != installed:
+            return [f"{baseline}: baseline records mypy {recorded}, installed is {installed}: not a comparable analysis"]
     selected = _normalize_targets(root, targets)
+    missing = [
+        target
+        for target in selected
+        if not (root / target).exists() and not any(_covers(entry.path, target) for entry in entries)
+    ]
+    if missing:
+        return [f"{target}: target does not exist under {root}" for target in missing]
     py_targets = [target for target in selected if target.endswith(".py") or (root / target).is_dir()]
     # A baseline-only path (no Python) rechecks the whole scripts tree.
     default_target = product_tree_path(root=root).name
     scoped = py_targets or [default_target]
-    current, fatal = collect_errors(
-        root, scoped, config_file=config_file, incremental=incremental
-    )
-    if fatal:
-        return fatal
-    entries = load_entries(baseline)
+    if not py_targets and not (root / default_target).is_dir():
+        return [f"{default_target}: target directory does not exist under {root}"]
+    existing_scoped = [target for target in scoped if (root / target).exists()]
+    if existing_scoped:
+        current, fatal = collect_errors(
+            root, existing_scoped, config_file=config_file, incremental=incremental
+        )
+        if fatal:
+            return fatal
+    else:
+        current = []
     # A file list compares only those files. The full scripts/ census also
     # rejects a baseline entry that names something outside scripts/.
     relevant = [entry for entry in entries if _in_scope(entry.path, scoped)]
@@ -764,9 +803,10 @@ def prune_baseline(root: Path, baseline: Path) -> tuple[int, list[str]]:
         return 0, [str(exc)]
     if config is None:
         return 0, ["no pyproject.toml: the repository mypy config would not apply"]
-    payload = json_depth.loads(baseline.read_text(encoding="utf-8"), max_depth=512)
-    entries = _payload_entries(payload, str(baseline))
-    recorded, installed = payload.get("mypy"), importlib.metadata.version("mypy")
+    recorded, entries = _load_baseline(baseline)
+    installed = _installed_mypy_version()
+    if installed is None:
+        return 0, ["mypy is not installed: not a comparable analysis"]
     if recorded != installed:
         return 0, [f"baseline records mypy {recorded}, installed is {installed}: not a comparable analysis"]
     current, fatal = collect_errors(root, [tree.name], config_file=config, incremental=False)
@@ -784,12 +824,21 @@ def prune_baseline(root: Path, baseline: Path) -> tuple[int, list[str]]:
     return removed, []
 
 
-def _python_targets(paths: Sequence[str], root: Path) -> list[str]:
-    if not paths:
-        return [product_tree_path(root=root).name]
-    selected = _normalize_targets(root, paths)
-    python = [target for target in selected if target.endswith(".py") or (root / target).is_dir()]
-    return python or [product_tree_path(root=root).name]
+def _default_root() -> Path:
+    """Checkout to check when ``--root`` is omitted.
+
+    A checkout working directory (``pyproject.toml`` beside ``lu_machinery/`` or
+    ``scripts/``) wins over an inherited ``LU_PRODUCT_ROOT`` pointing at another
+    repository or primary checkout. Outside a checkout (for example an installed
+    wheel invoked from a neutral directory), fall back to :func:`product_root`.
+    """
+
+    cwd = Path.cwd().resolve()
+    if (cwd / "pyproject.toml").is_file() and (
+        (cwd / "lu_machinery").is_dir() or (cwd / "scripts").is_dir()
+    ):
+        return cwd
+    return product_root().resolve()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -813,7 +862,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=None,
         help=(
-            "Tree mypy runs in (default: selected product checkout)."
+            "Tree mypy runs in (default: current checkout when cwd has pyproject.toml "
+            "and lu_machinery/ or scripts/, otherwise selected product checkout)."
         ),
     )
     parser.add_argument(
@@ -833,7 +883,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.write_baseline and args.paths:
         parser.error("--write-baseline analyses the whole tree; a path list would prune on a partial census")
     try:
-        root = product_root(args.root.absolute() if args.root is not None else None).resolve()
+        root = product_root(args.root.absolute()).resolve() if args.root is not None else _default_root()
         baseline = product_tree_path(*BASELINE_PATH.parts, root=root) if args.baseline is None else (
             args.baseline if args.baseline.is_absolute() else root / args.baseline
         )
@@ -845,7 +895,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Removed {removed} stale mypy entries from {baseline.relative_to(root)}")
             return 0
         violations = evaluate(
-            root, baseline, _python_targets(args.paths, root), incremental=not args.no_incremental
+            root, baseline, args.paths, incremental=not args.no_incremental
         )
     except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
         print(f"mypy ratchet could not run: {exc}", file=sys.stderr)

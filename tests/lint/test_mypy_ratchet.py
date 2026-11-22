@@ -261,3 +261,61 @@ def test_whitespace_only_stderr_still_refuses_the_prune(tmp_path: Path, monkeypa
     assert removed == 0
     assert any("stderr" in item for item in refusals)
     assert baseline.read_bytes() == before
+
+
+def test_dispatch_worktree_reports_ci_rows_despite_product_root_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Defect class: local ratchet in a dispatch worktree reports OK when CI reports new rows.
+
+    Models a machinery worktree running with inherited LU_PRODUCT_ROOT pointing at a clean
+    product checkout, plus missing-target and mypy-version-mismatch fail-closed refusals.
+    """
+    product = tmp_path / "product"
+    (product / "scripts" / "lint").mkdir(parents=True)
+    (product / "pyproject.toml").write_text(_TREE_CONFIG, encoding="utf-8")
+    (product / "scripts" / "ok.py").write_text(_GOOD, encoding="utf-8")
+    write_baseline(product / "scripts" / "lint" / "mypy_baseline.json", [])
+
+    worktree = tmp_path / "worktree"
+    (worktree / "lu_machinery" / "lint").mkdir(parents=True)
+    (worktree / "pyproject.toml").write_text(_TREE_CONFIG, encoding="utf-8")
+    (worktree / "lu_machinery" / "__init__.py").write_text("", encoding="utf-8")
+    (worktree / "lu_machinery" / "mod.py").write_text(_BAD, encoding="utf-8")
+    worktree_baseline = worktree / "lu_machinery" / "lint" / "mypy_baseline.json"
+    write_baseline(worktree_baseline, [])
+
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(product))
+    monkeypatch.chdir(worktree)
+
+    # CI invocation (explicit --root on the worktree) establishes the expected new row.
+    assert ratchet.main(["--root", str(worktree), "--no-incremental"]) == 1
+    ci_err = capsys.readouterr().err
+    assert "lu_machinery/mod.py: new return-value:" in ci_err
+
+    # Local worker invocation (no --root, LU_PRODUCT_ROOT points to clean product) must match CI.
+    assert ratchet.main(["--no-incremental"]) == 1
+    assert capsys.readouterr().err == ci_err
+
+    # Local worker invocation with a worktree-relative file target must also report the new row.
+    assert ratchet.main(["--no-incremental", "lu_machinery/mod.py"]) == 1
+    assert capsys.readouterr().err == ci_err
+
+    # Missing explicit target under an explicit root must fail closed rather than printing OK.
+    assert ratchet.main(["--root", str(product), "--no-incremental", "lu_machinery/mod.py"]) == 1
+    assert "does not exist" in capsys.readouterr().err
+
+    # Outside a checkout, LU_PRODUCT_ROOT remains the default (installed-wheel caller contract).
+    monkeypatch.chdir(tmp_path)
+    assert ratchet.main(["--no-incremental"]) == 0
+    assert "OK:" in capsys.readouterr().out
+
+    # Check mode refuses a baseline recorded with a different mypy version instead of running it.
+    _other_mypy(worktree, worktree_baseline)
+    monkeypatch.chdir(worktree)
+    assert ratchet.main(["--no-incremental"]) == 1
+    version_err = capsys.readouterr().err
+    assert "baseline records mypy 0.0.1" in version_err
+    assert "not a comparable analysis" in version_err
