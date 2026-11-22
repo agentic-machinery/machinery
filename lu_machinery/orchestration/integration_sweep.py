@@ -90,6 +90,8 @@ _ITEM_LIST = rf"{_ITEM_ID}(?:,{_ITEM_ID})*"
 VOID_QUOTE_MISMATCH = "quote-mismatch"
 VOID_REVIEWER_BOOKKEEPING = "reviewer-bookkeeping"
 CHUNK_VOIDS = frozenset({VOID_QUOTE_MISMATCH, VOID_REVIEWER_BOOKKEEPING})
+# A pair token names a MIXED_REVIEW_SETS member's sorted families; the recorder writes the same spelling.
+_REVIEW_PAIRS = "|".join(sorted(re.escape("_".join(sorted(pair))) for pair in MIXED_REVIEW_SETS))
 # Applied with fullmatch to one trailer line: literal-keyed optional tokens, anchored at \Z, no nested quantifier.
 MARKER = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
     r"<!-- cf-verdict v1 sha=(?P<sha>[0-9a-f]{40}) task=(?P<task>[^\s]+) "
@@ -100,7 +102,7 @@ MARKER = re.compile(  # nosemgrep: python.lang.security.audit.regex_dos
     r"(?: review_profile=(?P<review_profile>ukrainian))?(?: sources_calls=(?P<sources_calls>[0-9]+))?"
     rf"(?: denominator=(?P<denominator>{_ITEM_LIST}))?(?: coverage=(?P<coverage>-|{_ITEM_LIST}))?"
     rf"(?: void=(?P<void>{VOID_QUOTE_MISMATCH}|{VOID_REVIEWER_BOOKKEEPING}))?"
-    r"(?: review_pair=(?P<review_pair>anthropic_google_openai|anthropic_openai)"
+    rf"(?: review_pair=(?P<review_pair>{_REVIEW_PAIRS})"
     r" scope_commits=(?P<scope_commits>[0-9a-f]{40}(?:,[0-9a-f]{40})*))?"
     r"(?: second_review=(?P<second_review>carbon))? -->\Z"
 )

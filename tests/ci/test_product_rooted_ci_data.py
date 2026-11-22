@@ -438,3 +438,46 @@ def test_changed_test_budget_overflow_keeps_unrelated_test_unselected(overflow_i
     assert "tests/test_delta.py" not in overflow_import_plan["run_files"]
     assert "tests/test_delta.py" not in overflow_import_plan["importing_test_files"]
     assert "tests/test_delta.py" not in overflow_import_plan["deferred_files"]
+
+
+def test_selection_refuses_a_third_party_import_in_the_receipt_gate_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class: a diff adding a module-level third-party import to integration_sweep passes
+    PR CI selection, although the receipt gate's contract test runs it in a subprocess the import
+    scan cannot see, so the broken contract first fails in the merge group (PR 1134)."""
+    from lu_machinery.ci.pr_affected_tests import plan
+
+    root = tmp_path / "machinery"
+    root.mkdir()
+    # This checkout's own package, from Git: the installed pytest job removes the worktree copy.
+    archive = subprocess.run(["git", "archive", "--format=tar", "HEAD", "lu_machinery"],
+                             cwd=REPO, check=True, capture_output=True, timeout=60).stdout
+    subprocess.run(["tar", "-x", "-C", str(root)], input=archive, check=True, timeout=60)
+    (root / "lu_machinery/ci/pr-affected-guards.txt").write_text(FILES[0] + "\n", encoding="utf-8")
+    (root / "lu_machinery/ci/pytest-file-durations.json").write_text(json.dumps({FILES[0]: 1}), encoding="utf-8")
+    (root / "tests").mkdir()
+    (root / FILES[0]).write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.name", "CI fixture")
+    _git(root, "config", "user.email", "ci@example.com")
+    _git(root, "config", "commit.gpgsign", "false")
+    _git(root, "config", "core.hooksPath", "/dev/null")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "machinery base")
+    base = _git(root, "rev-parse", "HEAD")
+    (root / FILES[0]).write_text("def test_changed():\n    assert True\n", encoding="utf-8")
+    _git(root, "commit", "-qam", "unrelated change")
+    benign = _git(root, "rev-parse", "HEAD")
+    sweep = root / "lu_machinery/orchestration/integration_sweep.py"
+    sweep.write_text(sweep.read_text(encoding="utf-8") + "\nimport jsonschema  # noqa: E402\n", encoding="utf-8")
+    _git(root, "commit", "-qam", "module-level third-party import")
+    candidate = _git(root, "rev-parse", "HEAD")
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+    # The fixture itself selects cleanly: only the import breaks the contract.
+    assert plan(base, benign, importers=False)["run_files"] == [FILES[0]]
+    with pytest.raises(ValueError, match=(
+        r"contract canary receipt gate: lu_machinery/orchestration/integration_sweep\.py:\d+ imports jsonschema "
+        r"at import time \(via lu_machinery\.orchestration\.integration_sweep <- lu_machinery\.review\.review_contract\)"
+    )):
+        plan(base, candidate, importers=False)

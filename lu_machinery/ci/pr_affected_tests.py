@@ -15,6 +15,7 @@ import sys
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
+from collections import deque
 from contextlib import chdir
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
@@ -91,6 +92,29 @@ TEST = re.compile(r"tests/(?:[^/]+/)*test_[^/]+\.py")
 # too slow to run whole under the PR cap. Names are plain identifiers, so a pinned id carries no
 # shell, glob or parametrize syntax and always runs every case of that test.
 NODE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)?")
+# Import-time contracts of this package, checked on every PR candidate (`import_time_violations`):
+# a label, the modules a contract test imports (a root with the modules its code path imports
+# lazily), and the third-party names their import-time closure may reach. The tests that pin them
+# run the code in a subprocess, which the import scan cannot see, so before this check a broken
+# contract first failed in the merge group (PR 1130: yaml reached the hook; PR 1134: jsonschema
+# reached the receipt gate).
+IMPORT_TIME_ROOTS: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
+    # tests/githooks/test_ownership_fail_closed.py and test_owned_paths_hook.py: the commit and
+    # push hooks run `python -m <package>.dispatcher.ownership` from a wheel installed without
+    # its dependencies; the check reads its task record and matches paths through lazy imports.
+    ("installed ownership hook",
+     ("dispatcher.ownership", "dispatcher.store", "guardrails.delegate_ownership", "secret_redactor"),
+     frozenset()),
+    # tests/ops/test_verify_run.py: the loopback target is read from a wheel installed without
+    # its dependencies.
+    ("installed verify_run loopback probe", ("ops.verify_run", "common.repo_root"), frozenset()),
+    # tests/test_installed_root_contract.py, top_module and head_move: the canary settles a receipt
+    # (`contract_canary._settled_receipt`, whose gate imports review_contract) while a checkout-top
+    # jsonschema.py shadows the installed distribution. review_contract reaches integration_sweep
+    # and mixed_review_sets at import time, so they are held to this contract too.
+    ("contract canary receipt gate", ("review.contract_canary", "review.review_contract"), frozenset({"yaml"})),
+)
+_IMPORT_CALLS = frozenset({"import_module", "__import__"})
 
 
 def guard_file(entry: str) -> str:
@@ -115,6 +139,136 @@ def validate_node(entry: str) -> None:
 
 def git(*args: str) -> bytes:
     return subprocess.run(["git", *args], check=True, capture_output=True, timeout=30).stdout
+
+
+def tree_entries(ref: str, *paths: str) -> dict[str, list[str]]:
+    """Each path ``ref`` tracks (under ``paths``) with its mode, object type and object id."""
+    tree = {}
+    for row in git("ls-tree", "-rz", ref, "--", *paths).split(b"\0"):
+        if row:
+            meta, name = row.decode("utf-8").split("\t", 1)
+            tree[name] = meta.split()
+    return tree
+
+
+def _type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def import_time_imports(tree: ast.Module) -> list[tuple[str | None, int, int, bool]]:
+    """``(module, level, line, required)`` of each import a module runs when it is imported.
+
+    A function or lambda body runs later and an ``if TYPE_CHECKING:`` body never, so their
+    imports are lazy; decorators and default values run at definition and count. A ``from``
+    import also yields each name as an optional ``module.name``, since a name can be a
+    submodule or an attribute. A guarded import (``try``/``except ImportError``) counts: it
+    still loads a shadowing module. An ``import_module`` or ``__import__`` call counts with a
+    literal name; without one its module is None, which the caller refuses.
+    """
+    found: list[tuple[str | None, int, int, bool]] = []
+    stack: list[ast.AST] = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Import):
+            found.extend((alias.name, 0, node.lineno, True) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            found.append((node.module, node.level, node.lineno, True))
+            found.extend((".".join(filter(None, (node.module, alias.name))), node.level, node.lineno, False)
+                         for alias in node.names if alias.name != "*")
+        elif isinstance(node, ast.Call) and _callee(node.func) in _IMPORT_CALLS:
+            first = node.args[0] if node.args else None
+            name = first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None
+            found.append((name, 0, node.lineno, True))
+        children: list[ast.AST]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            arguments = node.args
+            children = [*getattr(node, "decorator_list", ()), *arguments.defaults,
+                        *(value for value in arguments.kw_defaults if value is not None)]
+        elif isinstance(node, ast.If) and _type_checking(node.test):
+            children = list(node.orelse)
+        else:
+            children = list(ast.iter_child_nodes(node))
+        stack.extend(reversed(children))
+    return found
+
+
+def _callee(node: ast.AST) -> str:
+    return node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else ""
+
+
+def import_time_violations(candidate: str) -> list[str]:
+    """Each broken `IMPORT_TIME_ROOTS` contract in ``candidate``, with the import that breaks it.
+
+    It reads the candidate's committed blobs, never the worktree, and follows only imports a
+    module runs when imported (`import_time_imports`), through every parent package. A name
+    outside the standard library and this package that a root's allowance does not list breaks
+    the contract, as do a first-party import with no tracked module, a dynamic or relative import
+    it cannot name and a module that does not parse: each would fail or escape at import. A product
+    checkout keeps its own code under its own tree and is not checked.
+    """
+    from lu_machinery.ci import components
+
+    tree = product_tree_path()
+    package = tree.name
+    if package != _PACKAGE_DIR.name:
+        return []
+    prefix = tree.relative_to(product_root()).as_posix()
+    blobs = tuple(
+        (name, meta[2]) for name, meta in tree_entries(candidate, prefix).items()
+        if name.endswith(".py") and meta[0] in {"100644", "100755"} and meta[1] == "blob"
+    )
+    sources = components.indexed_python_sources(str(product_root()), blobs, ())
+    modules = {package + path[len(prefix):-3].replace("/", ".").removesuffix(".__init__"): path for path in sources}
+    # A directory without __init__.py imports as a namespace package.
+    namespaces = {name.rsplit(".", depth)[0] for name in modules for depth in range(1, name.count(".") + 1)}
+    problems = []
+    for label, roots, allowed in IMPORT_TIME_ROOTS:
+        importer: dict[str, str | None] = {}
+        queue: deque[tuple[str, str | None]] = deque((f"{package}.{root}", None) for root in roots)
+        broken: dict[str, str] = {}
+        while queue:
+            name, parent = queue.popleft()
+            if name in importer:
+                continue
+            importer[name] = parent
+            path = modules.get(name)
+            if path is None:
+                broken.setdefault(name, f"{label}: {name} is not a tracked module")
+                continue
+            try:
+                parsed = ast.parse(sources[path], filename=path)
+            except (SyntaxError, ValueError):
+                broken.setdefault(path, f"{label}: {path} does not parse")
+                continue
+            chain, step = [name], parent
+            while step is not None:
+                chain.append(step)
+                step = importer[step]
+            # A relative import counts from the importing module's package, never above the top.
+            package_parts = name.split(".")[: None if path.endswith("/__init__.py") else -1]
+            for target, level, line, required in import_time_imports(parsed):
+                where = f"{path}:{line}"
+                if level:
+                    anchor = package_parts[: len(package_parts) - level + 1] if level <= len(package_parts) else []
+                    target = ".".join([*anchor, *([target] if target else [])]) if anchor else None
+                if not target or target.startswith("."):
+                    broken.setdefault(where, f"{label}: {where} imports a module this check cannot name")
+                    continue
+                parts = target.split(".")
+                if parts[0] == package:
+                    for depth in range(1, len(parts) + 1):
+                        dotted = ".".join(parts[:depth])
+                        if dotted in modules:
+                            queue.append((dotted, name))
+                        elif required and dotted not in namespaces:
+                            broken.setdefault(where, f"{label}: {where} imports {target}, which is not a tracked module")
+                elif parts[0] not in sys.stdlib_module_names and parts[0] != "__future__" and parts[0] not in allowed:
+                    via = " <- ".join(chain)
+                    broken.setdefault(parts[0], f"{label}: {where} imports {parts[0]} at import time (via {via})")
+        problems.extend(broken.values())
+    return problems
 
 
 def safe_path(name: str, *, node: bool = False) -> str:
@@ -274,11 +428,7 @@ def importing_tests(
     scan = candidate_scan(tuple(sources.items()), tuple(components.tracked_paths()))
     edges, directories = scan["file_edges"], scan["directory_edges"]
     if deleted:
-        tree = {}
-        for row in git("ls-tree", "-rz", base).split(b"\0"):
-            if row:
-                meta, name = row.decode("utf-8").split("\t", 1)
-                tree[name] = meta.split()
+        tree = tree_entries(base)
         blobs = tuple((name, meta[2]) for name, meta in tree.items() if name.endswith(".py") and meta[1] == "blob")
         sources = components.indexed_python_sources(str(product_root()), blobs, ())
         scan = components.scan_imports(sources, set(tree), importers=selecting(sources))
@@ -354,12 +504,12 @@ def infrastructure_changed(changed: list[str]) -> bool:
 
 
 def _plan(base: str, candidate: str, *, importers: bool) -> dict:
-    entries = {}
-    for row in git("ls-tree", "-rz", candidate, "--", "tests").split(b"\0"):
-        if row:
-            meta, name = row.decode("utf-8").split("\t", 1)
-            entries[name] = meta.split()[0]
+    entries = {name: meta[0] for name, meta in tree_entries(candidate, "tests").items()}
     changed = changed_files(base, candidate)
+    # Contract tests run the code in subprocesses, out of the scan's sight: check the contracts here.
+    broken = import_time_violations(candidate)
+    if broken:
+        raise ValueError("import-time dependency contract broken: " + "; ".join(broken))
     guards = [safe_path(line, node=True) for line in product_tree_path(*GUARDS.parts).read_text(encoding="utf-8").splitlines()]
     if not guards or len(set(guards)) != len(guards):
         raise ValueError("empty or duplicate guard list")
