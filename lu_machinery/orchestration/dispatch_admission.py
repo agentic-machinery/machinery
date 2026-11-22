@@ -120,8 +120,9 @@ import time
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -153,6 +154,7 @@ PLANNING_SCHEMA_VERSION = "model-planning.v1"
 _PLANNING_POOLS = {"grok+cursor": "grok"}
 # A rate from fewer worker tasks is a low sample on the model statistics page (``model_stats_router.LOW_SAMPLE``).
 _MIN_RATE_SAMPLES = 10
+_MICROS_PER_HOUR = 3_600_000_000
 
 ENV_MAX_LIVE_WRITE_WORKERS = "DISPATCH_MAX_LIVE_WRITE_WORKERS"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER"
@@ -1223,7 +1225,8 @@ def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tupl
     ``forecast`` is the Monitor planning view (``model-planning.v1``). With a valid row for the meter, a
     future reset and a positive rate measured over at least ten worker tasks, the cap is the number of workers that spend the remaining
     allowance by the reset at the measured rate, ``ceil(remaining_pct / (hours_to_reset x rate))``,
-    clamped to ``[1, ceiling]``. It reads no live-worker count. Anything else keeps the fixed ceiling.
+    clamped to ``[1, ceiling]``, computed exactly from the given values and the reset interval in
+    microseconds. It reads no live-worker count. Anything else keeps the fixed ceiling.
     """
     view = _mapping(forecast)
     rows = view.get("capacity")
@@ -1244,8 +1247,8 @@ def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tupl
         reset = None
     if reset is None or reset.tzinfo is None:
         return ceiling, "fixed cap: reset time unknown"
-    hours = (reset - now).total_seconds() / 3600
-    if not hours > 0:
+    micros = (reset - now) // timedelta(microseconds=1)
+    if micros <= 0:
         return ceiling, "fixed cap: reset time passed"
     rate = _forecast_number(row.get("points_per_worker_hour"))
     if rate is None or not rate > 0:
@@ -1253,12 +1256,11 @@ def meter_cap(meter: str, ceiling: int, forecast: object, now: datetime) -> tupl
     samples = row.get("worker_samples")
     if type(samples) is not int or samples < _MIN_RATE_SAMPLES:
         return ceiling, f"fixed cap: rate measured over fewer than {_MIN_RATE_SAMPLES} worker tasks"
-    denominator = hours * rate
-    # Nothing left needs no worker, even when the denominator underflows to zero.
-    workers = 0.0 if remaining == 0 else remaining / denominator if denominator > 0 else math.inf
-    cap = ceiling if not workers < ceiling else min(ceiling, max(1, math.ceil(workers)))
+    # Exact rational arithmetic: no float error can cross a whole-worker boundary and nothing underflows.
+    workers = Fraction(remaining) * _MICROS_PER_HOUR / (micros * Fraction(rate))
+    cap = min(ceiling, max(1, math.ceil(workers)))
     return cap, (
-        f"paced cap: {remaining:g}% left, {hours:.1f}h to reset, {rate:g} points per worker-hour "
+        f"paced cap: {remaining:g}% left, {micros / _MICROS_PER_HOUR:.1f}h to reset, {rate:g} points per worker-hour "
         f"over {samples} tasks, ceiling {ceiling}"
     )
 

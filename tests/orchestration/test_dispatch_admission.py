@@ -6,6 +6,7 @@ probe, never from allocating memory or generating load.
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import math
@@ -188,9 +189,12 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
         3, "paced cap: 27% left, 40.0h to reset, 0.3 points per worker-hour over 120 tasks, ceiling 8")
     for forecast, cap in (
         (view(remaining=24, hours=24, rate=0.5), 2),
-        (view(remaining=10, hours=30, rate=1 / 3), 1),
+        (view(remaining=10, hours=40, rate=0.25), 1),
+        (view(remaining=10, hours=30, rate=1 / 3), 2),  # the float below a third: the exact quotient is above 1
         (view(remaining=0.0), 1),
         (view(remaining=0, hours=1e-9, rate=5e-324), 1),  # nothing left, even when the denominator underflows
+        (view(remaining=10, hours=1 / 6, rate=10, samples=10), 6),  # exactly six: no float error lifts it to seven
+        (view(remaining=5e-324, hours=0.5, rate=5e-324), 2),  # a subnormal product does not underflow to "unbounded"
         (view(remaining=1, hours=100, rate=1, samples=10), 1),
         (view(remaining=100, rate=0.0001), 8),
         (view(remaining=100, hours=1e-9, rate=5e-324), 8),  # the denominator underflows to zero
@@ -243,7 +247,8 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
     # The dispatcher reads the view from a Monitor; every transport failure is a missing forecast.
     mode = {"name": "ok"}
     good = json.dumps(view(remaining=4, hours=50, rate=0.1)).encode()
-    release = threading.Event()  # a stalled reply waits on it until the test ends
+    stalls = ("stalled_headers", "stalled_body", "stalled_closing_body")
+    hung_up = {name: threading.Event() for name in stalls}  # the reader shut its socket at the deadline
 
     class Monitor(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -251,20 +256,37 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
 
         def do_GET(self):
             name = mode["name"]
-            if name in ("stalled_headers", "stalled_body"):
+            if name in stalls:
                 self.wfile.write(b"HTTP/1.1 200 OK\r\n")
-                if name == "stalled_body":
-                    self.wfile.write(f"Content-Length: {len(good)}\r\n\r\n".encode() + good[:10])
+                if name != "stalled_headers":
+                    closing = b"Connection: close\r\n" if name == "stalled_closing_body" else b""
+                    self.wfile.write(closing + f"Content-Length: {len(good)}\r\n\r\n".encode() + good[:10])
                 self.wfile.flush()
-                release.wait(10)
+                self.connection.settimeout(10)
+                with contextlib.suppress(OSError):
+                    if self.rfile.read(1) == b"":
+                        hung_up[name].set()
+                self.close_connection = True
                 return
             body = {"oversize": json.dumps({**view(), "pad": "x" * host_admission.PLANNING_BODY_LIMIT}).encode(),
                     "not_json": b"{"}.get(name, good)
-            status = {"redirect": 302, "error": 503}.get(name, 200)
-            self.send_response(status)
+            if name == "chunked":
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                 + f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n")
+                self.close_connection = True
+                return
+            if name == "close_delimited":
+                self.wfile.write(b"HTTP/1.0 200 OK\r\n\r\n" + body)
+                self.close_connection = True
+                return
+            self.send_response({"redirect": 302, "error": 503}.get(name, 200))
             if name == "redirect":
                 self.send_header("Location", self.path)
-            self.send_header("Content-Length", str(len(body) + (10 if name == "short" else 0)))
+            lengths = {"short": [str(len(body) + 10)], "letters": ["12a"], "negative": ["-1"],
+                       "superscript": ["\u00b2"], "repeated": [str(len(body))] * 2,
+                       "conflicting": [str(len(body)), str(len(body) + 1)]}.get(name, [str(len(body))])
+            for length in lengths:
+                self.send_header("Content-Length", length)
             self.end_headers()
             self.wfile.write(body)
             self.close_connection = True
@@ -276,11 +298,21 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
         monkeypatch.setenv("DELEGATE_MONITOR_API", f"http://127.0.0.1:{server.server_port}/")
         monkeypatch.setattr(host_admission, "PLANNING_READ_TIMEOUT_S", 0.5)
         assert host_admission.read_planning() == json.loads(good)
-        for name in ("redirect", "error", "short", "oversize", "not_json", "stalled_headers", "stalled_body"):
+        for name in ("redirect", "error", "short", "oversize", "not_json", "chunked", "close_delimited", "letters",
+                     "negative", "superscript", "repeated", "conflicting", *stalls):
             mode["name"] = name
             started = time.monotonic()
             assert host_admission._monitor_json(host_admission.read_planning) is None, name
             assert time.monotonic() - started < 2, name
+            if name in stalls:
+                assert hung_up[name].wait(2), name
+        mode["name"] = "ok"
+        with monkeypatch.context() as patch:
+            def refuse_start(_thread):
+                raise RuntimeError("can't start new thread")
+
+            patch.setattr(host_admission.threading.Thread, "start", refuse_start)
+            assert host_admission._monitor_json(host_admission.read_planning) is None
         for base in ("", "https://127.0.0.1:1", "file:///dev/zero", "http://user@127.0.0.1:1",
                      "http://127.0.0.1:1/?q", "http://127.0.0.1:1/#f", "http://monitor.invalid:1", "http://127.0.0.1:x"):
             monkeypatch.setenv("DELEGATE_MONITOR_API", base)
@@ -297,7 +329,6 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
         assert result.admitted
         assert "meter claude:b: live write workers 0/1 (paced cap: 4% left, 50.0h to reset" in result.summary()
     finally:
-        release.set()
         server.shutdown()
         server.server_close()
 
