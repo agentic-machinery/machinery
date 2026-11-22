@@ -40,6 +40,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 # Executed by the hook as a file, so imports do not depend on the hook's cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -99,24 +100,46 @@ def _is_local(url: str) -> bool:
     return colon < 0 or 0 <= slash < colon
 
 
-HOSTED_URL = re.compile(r"(?:https?|ssh|git|git\+ssh|ssh\+git)://(?:[^@/]+@)?([^/:@]+)(?::\d*)?/(.+)", re.I)
-SCP_URL = re.compile(r"(?:[^@/]+@)?([^/:@]+):([^:].*)")
+# RFC 3986 characters outside a query or fragment, less the delimiters "?", "#", "[" and "]". Each excluded
+# character (those four, backslash, space, controls, non-ASCII) is one that curl, Git, ssh or urlsplit may read
+# as a boundary differently, or drop, so the host the push reaches would not be the one classified.
+URL_CHARACTERS = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@/%-]+")
+HOSTED_URL = re.compile(r"(?:https?|ssh|git|git\+ssh|ssh\+git)://(?:[^@/]+@)?([^/:@]+)(?::(\d*))?/(.+)", re.I)
+# Git ends the host of [user@]host:path at the first colon and ssh splits user@host at an @, so userinfo has neither.
+SCP_URL = re.compile(r"(?:[^@/:]+@)?([^/:@]+):([^:].*)")
 
 
 def destination(url: str) -> str:
     """Canonical host/owner/name for a push URL, or unknown (never private by default).
 
     Accepts the URL, ssh and scp-like ([user@]host:path) forms git uses, with or
-    without userinfo. Local paths, file URLs, remote helpers and anything else
-    without a hosted identity are unknown, which counts as public.
+    without userinfo, only when the host is the one Git, curl and ssh connect to:
+    the URL holds only URL_CHARACTERS (so no query, fragment, bracketed host or
+    whitespace) and has at most one @, and for the URL forms urlsplit reads the
+    same host, a valid port and the same path. Local paths, file URLs, remote
+    helpers and anything else without such a hosted identity are unknown, which
+    counts as public.
     """
-    value = url.strip()
-    if not value or _is_local(value):
+    if not URL_CHARACTERS.fullmatch(url) or _is_local(url):
         return "unknown"
-    match = HOSTED_URL.fullmatch(value) or (None if "://" in value else SCP_URL.fullmatch(value))
+    if "://" not in url:
+        match = SCP_URL.fullmatch(url)
+        if not match:
+            return "unknown"
+        host, path = match.groups()
+        return gate.normalize_repository(f"{host}/{path.strip('/')}")
+    match = HOSTED_URL.fullmatch(url)
     if not match:
         return "unknown"
-    host, path = match.groups()
+    host, port, path = match.groups()
+    parts = urlsplit(url)
+    try:
+        # .port raises ValueError for a port outside 0-65535, which curl and Git refuse too.
+        same = (parts.hostname, parts.port, parts.path) == (host.lower(), int(port) if port else None, f"/{path}")
+    except ValueError:
+        return "unknown"
+    if not same:
+        return "unknown"
     return gate.normalize_repository(f"{host}/{path.strip('/')}")
 
 

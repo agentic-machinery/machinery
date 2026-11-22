@@ -2651,6 +2651,9 @@ def test_url_scoped_verification_for_another_host_keeps_the_route(push_sandbox, 
         ("/srv/unit/remote.git", "unknown"),
         ("file:///srv/unit/private.git", "unknown"),
         ("helper::github.com/unit/private", "unknown"),
+        # Git and curl end the authority at "#" or "?" and connect to elsewhere.invalid, not github.com.
+        ("https://elsewhere.invalid:9#@github.com/unit/private", "unknown"),
+        ("https://elsewhere.invalid:9?@github.com/unit/private", "unknown"),
         ("", "unknown"),
     ],
 )
