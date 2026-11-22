@@ -91,8 +91,6 @@ _UNPARSED_SHELL_WORDS = frozenset(
         "while",
     }
 )
-_WORD_BREAKS = frozenset(" \t\r\n;&|()<>`")
-
 
 class _UnparsedHookShell(Exception):
     """A shell word whose ``-c`` script could not be classified."""
@@ -104,95 +102,93 @@ def _tokens_include_read_command(tokens: list[str], commands: tuple[str, ...]) -
     )
 
 
-def _prepare_shell_script(script: str) -> str:
-    """Join line continuations and blank comments. Refuse a real bash special quote.
+# shlex punctuation_chars=True is "();<>|&". Newline and backtick are included so a
+# comment ends at the next line and a backtick substitution yields its own words.
+_SHELL_PUNCTUATION = "();<>|&\n`"
+_QUOTED_OPERATOR = "\ue000"
 
-    ``#`` starts a comment only at the beginning of a word, so ``ok#tag`` stays
-    one word. A backslash-newline is removed before that decision, and the word
-    boundary stays where the joined word was, so ``ok\\<newline>#tag`` is still
-    one word. ``$'...'`` and ``$"..."`` count only outside quotes and comments:
-    bash runs them, and ``shlex`` collapses them to a different word.
+
+def _fold_continuations(script: str) -> str:
+    """Drop a backslash-newline outside single quotes.
+
+    ``shlex`` keeps that pair inside the word. Single quotes keep both characters.
     """
     out: list[str] = []
     index = 0
     limit = len(script)
+    single = False
+    while index < limit:
+        char = script[index]
+        if single:
+            out.append(char)
+            if char == "'":
+                single = False
+            index += 1
+            continue
+        if char == "\\" and index + 1 < limit and script[index + 1] == "\n":
+            index += 2
+            continue
+        if char == "'":
+            single = True
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _unquoted_special_quote(script: str) -> bool:
+    """True for a bash ``$'...'`` or ``$"..."`` quote outside quotes and comments.
+
+    ``shlex`` collapses ``$'pwd'`` to ``$pwd``. Bash runs ``pwd``.
+    """
+    index = 0
+    limit = len(script)
     state = "normal"
-    at_word_start = True
-
-    def emit(text: str) -> None:
-        nonlocal at_word_start
-        out.append(text)
-        at_word_start = text[-1] in _WORD_BREAKS
-
     while index < limit:
         char = script[index]
         if state == "single":
-            emit(char)
             if char == "'":
                 state = "normal"
             index += 1
             continue
         if state == "double":
             if char == "\\" and index + 1 < limit:
-                nxt = script[index + 1]
-                if nxt == "\n":
-                    index += 2
-                    continue
-                emit(char + nxt)
                 index += 2
                 continue
-            emit(char)
             if char == '"':
                 state = "normal"
             index += 1
             continue
         if state == "comment":
             if char == "\n":
-                emit("\n")
                 state = "normal"
-            else:
-                emit(" ")
             index += 1
             continue
-        if char == "\\" and index + 1 < limit and script[index + 1] == "\n":
-            index += 2
-            continue
         if char == "\\" and index + 1 < limit:
-            emit(char + script[index + 1])
             index += 2
             continue
         if char == "'":
             state = "single"
-            emit(char)
             index += 1
             continue
         if char == '"':
             state = "double"
-            emit(char)
+            index += 1
+            continue
+        if char == "#" and (index == 0 or script[index - 1] in " \t\n;&|()<>`"):
+            state = "comment"
             index += 1
             continue
         if char == "$" and index + 1 < limit and script[index + 1] in "'\"":
-            raise _UnparsedHookShell(script[index : index + 2])
-        if char == "#" and at_word_start:
-            state = "comment"
-            emit(" ")
-            index += 1
-            continue
-        emit(char)
+            return True
         index += 1
-    return "".join(out)
-
-
-_QUOTED_OPERATOR = "\ue000"
-_OPERATOR_CHARS = frozenset(";|&()<>\n`")
+    return False
 
 
 def _mask_quoted_operators(script: str) -> tuple[str, list[str]]:
-    """Hide operator characters that appear inside quotes.
+    """Hide operator characters inside quotes before ``shlex`` sees them.
 
-    ``shlex`` drops the quotes before a later check can see them, so a quoted
-    ``'|'`` would otherwise look like a pipeline. The hidden characters are
-    restored onto the word after operator splitting.
+    ``punctuation_chars`` splits a quoted ``'|'`` into a pipeline token. The
+    hidden characters are put back on the word after ``shlex`` returns it.
     """
     out: list[str] = []
     masked: list[str] = []
@@ -205,7 +201,7 @@ def _mask_quoted_operators(script: str) -> tuple[str, list[str]]:
             if char == "'":
                 state = "normal"
                 out.append(char)
-            elif char in _OPERATOR_CHARS:
+            elif char in _SHELL_PUNCTUATION:
                 masked.append(char)
                 out.append(_QUOTED_OPERATOR)
             else:
@@ -216,7 +212,7 @@ def _mask_quoted_operators(script: str) -> tuple[str, list[str]]:
             if char == "\\" and index + 1 < limit:
                 nxt = script[index + 1]
                 out.append(char)
-                if nxt in _OPERATOR_CHARS:
+                if nxt in _SHELL_PUNCTUATION:
                     masked.append(nxt)
                     out.append(_QUOTED_OPERATOR)
                 else:
@@ -225,8 +221,7 @@ def _mask_quoted_operators(script: str) -> tuple[str, list[str]]:
                 continue
             if char == '"':
                 state = "normal"
-                out.append(char)
-            elif char in _OPERATOR_CHARS:
+            if char in _SHELL_PUNCTUATION and state == "double":
                 masked.append(char)
                 out.append(_QUOTED_OPERATOR)
             else:
@@ -247,17 +242,17 @@ def _restore_quoted_operators(token: str, masked: list[str]) -> str:
         return token
     chars: list[str] = []
     for char in token:
-        if char == _QUOTED_OPERATOR:
-            if not masked:
-                raise _UnparsedHookShell(token)
-            chars.append(masked.pop(0))
+        if char != _QUOTED_OPERATOR:
+            chars.append(char)
             continue
-        chars.append(char)
+        if not masked:
+            raise _UnparsedHookShell(token)
+        chars.append(masked.pop(0))
     return "".join(chars)
 
 
 def _operator_parts(token: str) -> list[str] | None:
-    """Split a token that is only shell operators, such as ``;(`` into ``;`` and ``(``."""
+    """Split a ``shlex`` token that is only operators, such as ``;(`` or ``()``."""
     parts: list[str] = []
     index = 0
     while index < len(token):
@@ -280,22 +275,25 @@ def _is_assignment(token: str) -> bool:
 
 
 def _shell_script_segments(script: str) -> list[list[str]]:
-    """Split a shell script into simple-command word lists.
+    """Split a shell script with ``shlex`` in POSIX mode.
 
-    Operators and newlines are separators, including when they are glued to a
-    word (``ok;pwd``, ``ok;(/bin/pwd)``). Quotes stay quoted, so ``'not;pwd'``
-    is one word. A comment starts at ``#`` only when ``#`` starts a word.
+    ``punctuation_chars`` is the standard set plus newline and backtick.
+    ``whitespace_split`` keeps ``ok#tag`` one word. A ``#`` token starts a
+    comment through the next newline. Quotes stay one word, so ``'not;pwd'``
+    is not a command separator.
     """
-    prepared = _prepare_shell_script(script)
-    masked_script, quoted_operators = _mask_quoted_operators(prepared)
-    lexer = shlex.shlex(masked_script, posix=True, punctuation_chars=";&|()<>\n`")
-    lexer.whitespace = " \t\r"
+    if _unquoted_special_quote(script):
+        raise _UnparsedHookShell(script)
+    folded = _fold_continuations(script)
+    masked_script, quoted_operators = _mask_quoted_operators(folded)
+    lexer = shlex.shlex(masked_script, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
     lexer.whitespace_split = True
     lexer.commenters = ""
     segments: list[list[str]] = []
     current: list[str] = []
     needs_command = False
     groups: list[bool] = []
+    comment = False
 
     def flush() -> None:
         nonlocal current, needs_command
@@ -308,16 +306,20 @@ def _shell_script_segments(script: str) -> list[list[str]]:
             groups[-1] = True
 
     for raw in lexer:
+        if comment:
+            if raw == "\n":
+                comment = False
+            continue
+        if raw == "#" or raw.startswith("#"):
+            comment = True
+            continue
         if _QUOTED_OPERATOR in raw:
             token = _restore_quoted_operators(raw, quoted_operators)
             parts = None
         else:
             token = raw
             parts = _operator_parts(token)
-        if "\n" in token and token != "\n":
-            raise _UnparsedHookShell(token)
         if parts is None:
-            # Reserved words are syntax only in command position. ``echo done`` is one command.
             if not current and token in _UNPARSED_SHELL_WORDS:
                 raise _UnparsedHookShell(token)
             current.append(token)
@@ -340,6 +342,11 @@ def _shell_script_segments(script: str) -> list[list[str]]:
                     raise _UnparsedHookShell(op)
                 flush()
                 needs_command = True
+                continue
+            if op == "\n":
+                if needs_command:
+                    raise _UnparsedHookShell(op)
+                flush()
                 continue
             if needs_command:
                 raise _UnparsedHookShell(op)
@@ -455,7 +462,9 @@ def _hook_script_hides_read_command(script: str, commands: tuple[str, ...], *, d
 
 def _hook_command_hides_read_command(hook_command: str, commands: tuple[str, ...]) -> bool:
     try:
-        tokens = shlex.split(_prepare_shell_script(hook_command))
+        if _unquoted_special_quote(hook_command):
+            return True
+        tokens = shlex.split(_fold_continuations(hook_command))
     except (ValueError, _UnparsedHookShell):
         return True
     return _hook_tokens_hide_read_command(tokens, commands)
