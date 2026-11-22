@@ -6,9 +6,8 @@ import json
 import re
 import subprocess
 from collections.abc import Callable
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs
 
-from lu_machinery.ci.advisory_checks import external_advisory_check, is_external_advisory_run
 from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.github_check_rollup import (
@@ -108,19 +107,6 @@ def _latest_rollup_rows(rows: list[dict]) -> list[dict] | None:
     return latest
 
 
-def external_advisory_names(rows: object) -> frozenset[str]:
-    """Exact operator-entry names among check rows; each still needs exact-head app proof."""
-    if not isinstance(rows, list):
-        return frozenset()
-    return frozenset(
-        row[field]
-        for row in rows
-        if isinstance(row, dict)
-        for field in ("name", "context")
-        if external_advisory_check(row.get(field)) is not None
-    )
-
-
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 
@@ -163,79 +149,18 @@ def _read_all_pages(get_json: Callable[[str], object], endpoint: str, key: str) 
     return {"total_count": total, key: records}
 
 
-def prove_external_advisory(
-    repo: object, head: object, names: frozenset[str], get_json: Callable[[str], object]
-) -> frozenset[str] | None:
-    """``names`` when every same-named record at ``head`` is the entry's GitHub App, else None.
-
-    The check rows carry no app identity, so the exact-head REST check runs supply it.
-    A same-named run from another or no app, another head, a same-named commit status
-    or an incomplete page cannot be attributed: the whole check state is unverifiable.
-    ``get_json(endpoint)`` returns the decoded REST response, or None on failure.
-    """
-    if not names:
-        return frozenset()
-    if (
-        not isinstance(repo, str)
-        or not re.fullmatch(r"[\w.-]+/[\w.-]+", repo)
-        or not isinstance(head, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40}", head)
-    ):
-        return None
-    head = head.lower()
-    status = _read_all_pages(get_json, f"repos/{repo}/commits/{head}/status?per_page=100", "statuses")
-    if status is None or any(
-        not isinstance(row, dict) or not isinstance(row.get("context"), str) or row["context"] in names
-        for row in status["statuses"]
-    ):
-        return None
-    for name in sorted(names):
-        entry = external_advisory_check(name)
-        page = _read_all_pages(
-            get_json,
-            f"repos/{repo}/commits/{head}/check-runs?check_name={quote(name, safe='')}&filter=all&per_page=100",
-            "check_runs",
-        )
-        if (
-            entry is None
-            or page is None
-            or not page["check_runs"]
-            or not all(is_external_advisory_run(entry, run, head) for run in page["check_runs"])
-        ):
-            return None
-    return names
-
-
-def _exempt(row: dict, advisory: frozenset[str]) -> bool | None:
-    """Whether a rollup row is a proven external check run; None for a conflicting identity.
-
-    Only a ``CheckRun`` named exactly as a proven entry, with no commit-status identity,
-    is exempt. Any other record claiming a proven name in ``name`` or ``context`` (a
-    status, a hybrid or an untyped row) cannot be attributed to the proven GitHub App.
-    """
-    name, context = row.get("name"), row.get("context")
-    if not any(isinstance(value, str) and value in advisory for value in (name, context)):
-        return False
-    clean = row.get("__typename") == "CheckRun" and context is None and row.get("state") is None
-    return True if clean and isinstance(name, str) and name in advisory else None
-
-
-def _parse_status_rollup_rows(
-    rows: object, *, advisory: frozenset[str] = frozenset()
-) -> tuple[list[str], list[str]] | None:
-    """Parse old-client rollup rows; ``advisory`` holds only proven external names."""
-    judged = _judge_status_rollup_rows(rows, advisory=advisory)
+def _parse_status_rollup_rows(rows: object) -> tuple[list[str], list[str]] | None:
+    """Parse old-client rollup rows; older deployed hooks import this name."""
+    judged = _judge_status_rollup_rows(rows)
     return None if judged is None else (judged[0], judged[1])
 
 
-def _judge_status_rollup_rows(
-    rows: object, *, advisory: frozenset[str] = frozenset()
-) -> tuple[list[str], list[str], int] | None:
-    """``(failing, pending, judged)``: ``judged`` counts the checks proven blocking, whatever their result.
+def _judge_status_rollup_rows(rows: object) -> tuple[list[str], list[str], int] | None:
+    """``(failing, pending, judged)``: ``judged`` counts the blocking checks, whatever their result.
 
-    Proven external advisory runs and unexpanded matrix parents are not judged, so a
-    head carrying only those has ``judged == 0``. Every other row is blocking, including
-    a ``continue-on-error`` job's (C-6339).
+    Unexpanded matrix parents are not judged, so a head carrying only those has
+    ``judged == 0``. Every other row is blocking, including a ``continue-on-error``
+    job's (C-6339).
     """
     # Only a list is a check collection; null, {}, "" or false establish nothing.
     if not isinstance(rows, list):
@@ -247,12 +172,11 @@ def _judge_status_rollup_rows(
         if not isinstance(row, dict):
             return None
         name = _rollup_name(row)
-        exempt = _exempt(row, advisory)
-        if name is None or exempt is None:
+        if name is None:
             return None
         # Cancelled runs can retain an unexpanded matrix parent. It is not an
         # executed job and cannot be superseded by the differently named shards.
-        if "${{" not in name and not exempt:
+        if "${{" not in name:
             named.append(row)
     latest = _latest_rollup_rows(named)
     if latest is None:
@@ -285,9 +209,9 @@ def bound_rollup_judgment(
 ) -> tuple[list[str], list[str], int] | None:
     """Judge a ``headRefOid,statusCheckRollup`` read whose own head is the judged ``head``.
 
-    The rollup and its head arrive in one response, so the judged rows, the App
-    provenance and the judged PR head are one commit. A missing, malformed or different
-    head (the PR moved since its metadata was read) is unverifiable, never proof.
+    The rollup and its head arrive in one response, so the judged rows and the judged
+    PR head are one commit. A missing, malformed or different head (the PR moved
+    since its metadata was read) is unverifiable, never proof.
     """
     if (
         not isinstance(bound, dict)
@@ -297,10 +221,6 @@ def bound_rollup_judgment(
     ):
         return None
     rows = bound.get("statusCheckRollup")
-    names = external_advisory_names(rows)
-    advisory = prove_external_advisory(repo, head, names, get_json)
-    if advisory is None:
-        return None
     # gh's rollup omits workflow/app identity. Supersession of a duplicate
     # name needs check runs joined to exact-head Actions runs.
     if isinstance(rows, list) and any(
@@ -334,9 +254,7 @@ def bound_rollup_judgment(
             if len(matches) != 1:
                 return None
         rows = project_check_runs(runs) + [row for row in rows if row.get("__typename") != "CheckRun"]
-        if external_advisory_names(rows) != names:
-            advisory = prove_external_advisory(repo, head, external_advisory_names(rows), get_json)
-    return None if advisory is None else _judge_status_rollup_rows(rows, advisory=advisory)
+    return _judge_status_rollup_rows(rows)
 
 
 def _duplicate_check_names(rows):
@@ -345,18 +263,18 @@ def _duplicate_check_names(rows):
 
 
 def external_check_states(rows, parse, bound_states):
-    """``parse(rows)``, or ``bound_states()`` when a row names an operator entry.
+    """``parse(rows)``, or ``bound_states()`` when duplicate check names need run identity.
 
-    Ordinary check rows carry no head, so they never grant an exemption themselves: an
-    entry name switches the judgment to :func:`bound_rollup_states` at the judged head,
-    a newer read. The headless rows must still be a well-formed collection.
+    Older deployed hooks import this name. Headless rows cannot tell a superseded
+    duplicate from a current one, so they switch the judgment to :func:`bound_rollup_states`
+    at the judged head, a newer read. The headless rows must still be a well-formed collection.
     """
     duplicates_need_proof = isinstance(rows, list) and _duplicate_check_names(rows) and (
         parse is parse_checks or any(
             isinstance(row, dict) and row.get("name") and not row.get("workflowName") for row in rows
         )
     )
-    if not external_advisory_names(rows) and not duplicates_need_proof:
+    if not duplicates_need_proof:
         return parse(rows)
     return bound_states() if all(isinstance(row, dict) for row in rows) else None
 
@@ -406,10 +324,8 @@ def _read_label(endpoint: str) -> str:
     """The class of a guard REST read, without its repository or head."""
     path, _, query = endpoint.partition("?")
     params = parse_qs(query)
-    if path.endswith("/status"):
-        label = "commit statuses"
-    elif path.endswith("/check-runs"):
-        label = "named check runs" if "check_name" in params else "check runs"
+    if path.endswith("/check-runs"):
+        label = "check runs"
     elif re.search(r"/actions/runs/\d+$", path):
         label = "actions run"
     else:
@@ -431,13 +347,10 @@ def _read_failure(result) -> str:
 
 def _collection_shape(label: str) -> Callable[[object], bool]:
     """Whether a decoded guard REST read has its class's shape (the walk judges the content)."""
-    key = {"check runs": "check_runs", "named check runs": "check_runs", "commit statuses": "statuses"}.get(
-        label.split(" page ")[0]
-    )
-    if key is None:
+    if label.split(" page ")[0] != "check runs":
         return lambda value: isinstance(value, dict)
     return lambda value: (
-        isinstance(value, dict) and type(value.get("total_count")) is int and isinstance(value.get(key), list)
+        isinstance(value, dict) and type(value.get("total_count")) is int and isinstance(value.get("check_runs"), list)
     )
 
 
@@ -558,7 +471,7 @@ def ensure_merge_ready(repo, number, *, runner, cwd, environment, match_head=Non
         failing, pending, judged = states
         reason = readiness_reason(meta, (failing, pending))
         if not reason and not judged:
-            # Nothing ran (or only proven external advisory checks ran) on this head: no CI result to land on.
+            # Nothing that blocks ran on this head: no CI result to land on.
             reason = NO_CHECKS
         if match_head is not None and meta["headRefOid"].lower() != match_head.lower():
             reason = "reviewed head changed"
