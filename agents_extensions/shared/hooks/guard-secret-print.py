@@ -2381,11 +2381,16 @@ def _xargs_target(args: list[str]) -> list[str]:
     return []
 
 
+# Paths that name standard input when a shell is given them as a script.
+_STDIN_PATHS = frozenset({"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+
+
 def _shell_reads_stdin(args: list[str]) -> bool:
     """Whether a shell invocation takes its program from standard input.
 
-    True without `-c` and without a script operand, or with `-s`, and whenever
-    an expanding word in its options hides which.
+    True without `-c` and without a script operand, with `-s`, with a script
+    operand that names standard input, and whenever an expanding word in its
+    options hides which.
     """
     pending = 0
     for word in _raw_without_redirects(args):
@@ -2409,7 +2414,7 @@ def _shell_reads_stdin(args: list[str]) -> bool:
                 return False
             pending = sum(letter in "oO" for letter in letters)
             continue
-        return False
+        return value in _STDIN_PATHS
     return True
 
 
@@ -2417,7 +2422,6 @@ def _script_reads_stdin(script: str) -> bool:
     """Whether a shell script may run its standard input as a program (a shell, `source` or `/dev/stdin`)."""
     if script == _UNDECIDABLE:
         return True
-    stdin_paths = {"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
     for pipeline in _pipelines(script):
         for segment in pipeline:
             found = _command_at(segment)
@@ -2426,7 +2430,7 @@ def _script_reads_stdin(script: str) -> bool:
             # A computed command word may name a shell.
             if found[0] in SHELL_COMMANDS or found[0] == _UNDECIDABLE or "$" in found[0]:
                 return True
-            if any(_strip_quotes(word) in stdin_paths for word in segment):
+            if any(_strip_quotes(word) in _STDIN_PATHS for word in segment):
                 return True
     return False
 
