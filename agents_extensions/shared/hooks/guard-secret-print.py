@@ -2413,8 +2413,18 @@ def _xargs_target(args: list[str]) -> list[str]:
     return []
 
 
-# Paths that name standard input when a shell is given them as a script.
-_STDIN_PATHS = frozenset({"/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+def _names_stdin(path: str) -> bool:
+    """Whether a path may name standard input (`/dev/stdin`, `/dev/fd/0`, `/proc/<id>/fd/0`).
+
+    Every spelling of those ends in `stdin` or in `fd/0`; slashes and `.` fold
+    away. A `..` is resolved through symlinks only by the file system, so a
+    final `0` after one counts, as does a relative path, whose directory is
+    not known.
+    """
+    parts = [part for part in path.split("/") if part not in {"", "."}]
+    if not parts:
+        return False
+    return parts[-1] == "stdin" or (parts[-1] == "0" and (parts[-2:-1] == ["fd"] or ".." in parts))
 
 
 def _shell_reads_stdin(args: list[str]) -> bool:
@@ -2446,7 +2456,7 @@ def _shell_reads_stdin(args: list[str]) -> bool:
                 return False
             pending = sum(letter in "oO" for letter in letters)
             continue
-        return value in _STDIN_PATHS
+        return _names_stdin(value)
     return True
 
 
@@ -2462,7 +2472,7 @@ def _script_reads_stdin(script: str) -> bool:
             # A computed command word may name a shell.
             if found[0] in SHELL_COMMANDS or found[0] == _UNDECIDABLE or "$" in found[0]:
                 return True
-            if any(_strip_quotes(word) in _STDIN_PATHS for word in segment):
+            if any(_names_stdin(_strip_quotes(word)) for word in segment):
                 return True
     return False
 

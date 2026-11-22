@@ -1863,11 +1863,14 @@ def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expect
         ("bash -c 'printf okay' <<<\"$TEXT\"", 0),
         ('bash run.sh <<<"$TEXT"', 0),
         ('bash /dev/stdin <<<"$SCRIPT"', 2),
+        ('bash /dev//stdin <<<"$SCRIPT"', 2),
+        ('bash /dev/fd/./0 <<<"$SCRIPT"', 2),
+        ('bash /proc/thread-self/fd/0 <<<"$SCRIPT"', 2),
         ("sh /proc/self/fd/0 <<<'pkill -f target'", 2),
     ],
 )
 def test_here_string_operand_is_exactly_one_word(monkeypatch, command, expected):
-    """Defect class: a here-string script glued to the words after it, or missed behind descriptor 0.
+    """Defect class: a here-string script glued to the words after it, or missed behind descriptor 0 or a stdin path spelling.
 
     The shell feeds exactly the next word to the shell's stdin; gluing the
     following words changed the script, and `0<<<` was not read as stdin.
