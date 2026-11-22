@@ -223,6 +223,258 @@ def selecting(sources: dict[str, bytes]) -> set[str]:
     return {path for path in sources if TEST.fullmatch(path) or PurePosixPath(path).name == "conftest.py"}
 
 
+# Import-time contracts of this package, checked on every PR candidate (`import_time_contracts`):
+# a label, the modules its contract tests' subprocesses import (with the modules their code paths
+# import lazily, as traced from those tests), the third-party names their imports may reach, the
+# other tracked files those tests run or read (a path, or a directory ending in "/"; also traced)
+# and the contract tests. Those tests run the code in a subprocess, which the import scan cannot see,
+# so before this check a broken contract first failed in the merge group (PR 1130: yaml reached
+# the hook; PR 1134: jsonschema reached the receipt gate). The probe refuses a new third-party
+# name at import time and reports the package files the roots load or try to load; a candidate
+# that changes or deletes one of those files, or one of the listed files, runs the contract's
+# tests, which exercise every stage, variable and lazy path.
+_HOOK_FILES = (".githooks/", f"{_PACKAGE_DIR.name}/lib/project_interpreter.sh", f"{_PACKAGE_DIR.name}/install_git_hooks.sh")
+# Shared first-party namespace shipped beside `_PACKAGE_DIR` in the wheel (`pyproject.toml`).
+_SHARED_NAMESPACE = "agents_extensions.shared"
+IMPORT_TIME_CONTRACTS: tuple[tuple[str, tuple[str, ...], frozenset[str] | None, tuple[str, ...], tuple[str, ...]], ...] = (
+    # The installed commit and push hooks' owned-path checker, with its task-record and grant
+    # lookups, from a wheel installed without its dependencies. The tests copy this checkout's
+    # hooks, install their delegators with the package's installer, and the hooks find their
+    # interpreter through the package's shell helper.
+    ("installed ownership hook",
+     ("dispatcher.ownership", "dispatcher.store", "guardrails.delegate_ownership", "secret_redactor"),
+     frozenset(), _HOOK_FILES, ("tests/githooks/test_ownership_fail_closed.py", "tests/githooks/test_owned_paths_hook.py")),
+    # The installed commit-msg delegator's message gate, with its pattern and repository data, and
+    # the product plan-version hook, from a wheel installed with its dependencies: the allowance
+    # is what main reaches, a ratchet.
+    ("installed commit-msg hooks", ("opsec.git_push", "opsec.prepublish", "pre_commit.check_plan_immutability"),
+     frozenset({"yaml"}),
+     (*_HOOK_FILES, f"{_PACKAGE_DIR.name}/opsec/blocking.json", f"{_PACKAGE_DIR.name}/config/fleet_repos.yaml"),
+     ("tests/githooks/test_owned_paths_hook.py",)),
+    # The loopback target, read from a wheel installed without its dependencies.
+    ("installed verify_run loopback probe", ("ops.verify_run", "common.repo_root"), frozenset(),
+     (f"{_PACKAGE_DIR.name}/packaging/systemd/learn-ukrainian-loopback.target",), ("tests/ops/test_verify_run.py",)),
+    # top_module and head_move: a checkout-top jsonschema.py shadows the installed distribution
+    # while the canary imports the dispatcher and attests its checkout (`worker._dispatcher_code`),
+    # then settles a receipt, whose gate imports review_contract (`contract_canary._receipt_gated`)
+    # and its schema lookup's modules.
+    ("canary dispatcher attestation", ("dispatcher.worker", "common.git_context"),
+     frozenset({"psutil", "yaml"}), (), ("tests/test_installed_root_contract.py",)),
+    ("contract canary receipt gate",
+     ("review.contract_canary", "review.review_contract", "review.language_lane", "common.repo_root"),
+     frozenset({"yaml"}), (), ("tests/test_installed_root_contract.py",)),
+    # The sealed scenarios settle a qualifying receipt, which reaches the formal reviewer catalog
+    # and resolver (`_formal_candidates`), the provider transport models (`_route_models`) and the
+    # recorder's attestation (`_attested_model`) through lazy imports. Their test runs with every
+    # dependency installed, so no import can fail it: no growth check (allowance None), closure only.
+    ("contract canary sealed receipt",
+     ("review.contract_canary", "review.model_catalog", "review.reviewer_resolver", "dispatcher.providers.agy",
+      "dispatcher.providers.codex", "review.record_cf_verdict"),
+     None, (), ("tests/test_installed_root_contract.py",)),
+)
+IMPORT_PROBE_TIMEOUT = 60
+# Imports one contract's roots in a fresh interpreter (-I -S: no site hooks, no preloaded
+# distributions), with the candidate's package first on the path, and reports the package files
+# loaded and the package modules looked for, so a deleted or failing module stays in the closure
+# of the code that tries it. A contract with an allowance gets the caller's site-packages after it (which -S would
+# not find in a virtual environment); one without gets none, as in a wheel installed without
+# its dependencies. A top-level name outside the standard library, the package and the
+# allowance is refused and recorded when first-party or standard-library code imports it; an
+# allowed distribution's own dependencies load, and it is imported first, so a name it brings
+# adds no requirement. A lookup alone (`importlib.util.find_spec`) is not an import: it finds
+# what the path holds. A dotted lookup imports the parent package first; that load is an import.
+# Python answers a request for a loaded module from sys.modules without asking a finder, so a
+# name an allowed distribution has already loaded is not refused again (known limit: with the
+# yaml and psutil allowances that is only Cython's runtime modules). A contract whose allowance is
+# None has no growth check: its closure only.
+_CONTRACT_PROBE = r"""
+import importlib, importlib.machinery, json, sys
+tree, package, shared, report, allowed, roots, *sites = sys.argv[1:]
+check, roots = allowed != "*", roots.split(",")
+allowed = frozenset(filter(None, allowed.split(","))) if check else frozenset()
+shared_top = shared.partition(".")[0]
+prefix = tree.rstrip("/") + "/"
+sys.path[:0] = [tree]
+sys.path.extend(sites)
+inside = tuple(site.rstrip("/") + "/" for site in sites)
+known = sys.stdlib_module_names | {"__future__", package} | allowed
+refused, failed, tried = [], [], set()
+path_finder = importlib.machinery.PathFinder
+
+
+def caller(frame):
+    # The requesting code: the nearest frame outside the standard library (the import system and
+    # helpers such as importlib.resources and functools act for their caller).
+    loading, lookup = False, False
+    while frame is not None and (str(frame.f_globals.get("__name__")).startswith(
+            "_frozen_importlib") or str(frame.f_globals.get("__name__")).partition(".")[0] in sys.stdlib_module_names):
+        loading = loading or frame.f_code.co_name == "_find_and_load"
+        lookup = lookup or (not loading and frame.f_globals.get("__name__") == "importlib.util"
+                            and frame.f_code.co_name == "find_spec")
+        frame = frame.f_back
+    return frame, lookup
+
+
+def refuse(name, frame):
+    file, line = (frame.f_code.co_filename, frame.f_lineno) if frame is not None else ("<unknown>", 0)
+    if file.startswith(inside):
+        return
+    refused.append({"name": name, "file": file, "line": line})
+    raise ModuleNotFoundError(f"{name} is outside the import-time contract", name=name)
+
+
+def candidate_spec(name, path, target):
+    cand = [tree] if path is None else [p for p in path if isinstance(p, str) and (p == tree or p.startswith(prefix))]
+    spec = path_finder.find_spec(name, cand, target) if cand else None
+    if spec is not None and spec.loader is None and spec.submodule_search_locations is not None:
+        # Keep _NamespacePath (required by importlib.resources.NamespaceReader), but bind its
+        # recalculation finder to candidate_spec so invalidation or sys.path edits never re-scan sites.
+        locs = spec.submodule_search_locations
+        if hasattr(locs, "_path_finder"):
+            locs._path_finder = lambda mod, paths: candidate_spec(mod, paths, None)
+    return spec
+
+
+class Contract:
+    invalidate_caches = path_finder.invalidate_caches
+
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        if name == package or name.startswith(package + ".") or name == shared or name.startswith(shared + "."):
+            tried.add(name)
+            return candidate_spec(name, path, target)
+        if name == shared_top:
+            tried.add(shared)
+            return candidate_spec(name, None, target)
+        if name.startswith(shared_top + "."):
+            if check:
+                frame, lookup = caller(sys._getframe(1))
+                if not lookup:
+                    refuse(name, frame)
+            return None
+        if check and path is None and name.partition(".")[0] not in known:
+            frame, lookup = caller(sys._getframe(1))
+            if not lookup:
+                refuse(name.partition(".")[0], frame)
+        return path_finder.find_spec(name, path, target)
+
+
+sys.meta_path = [Contract if finder is path_finder else finder for finder in sys.meta_path]
+for name in [*sorted(allowed), *roots]:
+    try:
+        importlib.import_module(name)
+    except BaseException as exc:
+        failed.append({"module": name, "error": f"{type(exc).__name__}: {exc}"[:300]})
+loaded = {mod_name for mod_name, module in list(sys.modules.items())
+          if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)}
+closure = sorted(
+    {file[len(prefix):] for module in list(sys.modules.values())
+     if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)}
+    | {name.replace(".", "/") + suffix for name in tried for suffix in (".py", "/__init__.py")}
+    | {name.replace(".", "/") + "/" for name in tried
+       if name not in loaded and not any(mod.startswith(name + ".") for mod in loaded)}
+)
+with open(report, "w", encoding="utf-8") as stream:
+    json.dump({"refused": refused, "failed": failed, "closure": closure}, stream)
+"""
+
+
+def tree_entries(ref: str, *paths: str) -> dict[str, list[str]]:
+    """Each path ``ref`` tracks (under ``paths``) with its mode, object type and object id."""
+    tree = {}
+    for row in git("ls-tree", "-rz", ref, "--", *paths).split(b"\0"):
+        if row:
+            meta, name = row.decode("utf-8").split("\t", 1)
+            tree[name] = meta.split()
+    return tree
+
+
+def _materialize(candidate: str, package: str, into: Path) -> list[str]:
+    """Write the candidate's tracked package and shared-namespace files under ``into``; each entry it cannot write.
+
+    Blobs come from the object store, never from the worktree or ``git archive``, whose
+    attributes a candidate controls. Only regular files are written: a link or a submodule
+    could load code from outside the candidate's package.
+    """
+    from lu_machinery.ci import components
+
+    entries = tree_entries(candidate, package, _SHARED_NAMESPACE.replace(".", "/"))
+    unsupported = [f"{name} is not a regular file" for name, meta in entries.items() if meta[0] not in {"100644", "100755"}]
+    blobs = tuple((name, meta[2]) for name, meta in entries.items() if meta[0] in {"100644", "100755"})
+    for name, data in components.indexed_python_sources(str(product_root()), blobs, ()).items():
+        path = into / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return unsupported
+
+
+def import_time_contracts(candidate: str, base: str | None = None) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """Each broken `IMPORT_TIME_CONTRACTS` contract in ``candidate``, and each contract's closure.
+
+    Python itself decides what runs: each contract's roots are imported from the candidate's
+    committed package files in a fresh interpreter (`_CONTRACT_PROBE`), which runs only what an
+    import runs. A refused name, a root that fails to import, an unwritable entry and a probe
+    that times out, exits nonzero or leaves no readable report each break the contract. The
+    closure is the repository paths of the package files the roots loaded. A checkout where
+    neither ``base`` nor ``candidate`` tracks this package's ``__init__.py`` (a product, with
+    its own tree) is not checked and has no closures; removing it from a machinery checkout
+    fails closed.
+    """
+    import sysconfig
+    import tempfile
+
+    package = _PACKAGE_DIR.name
+    init = f"{package}/__init__.py"
+    in_candidate = init in tree_entries(candidate, init)
+    in_base = base is not None and init in tree_entries(base, init)
+    if not in_candidate and not in_base:
+        return [], {}
+    if not in_candidate:
+        return [f"import-time contracts: {init} was removed"], {}
+    problems: list[str] = []
+    closures: dict[str, frozenset[str]] = {}
+    sites = list(dict.fromkeys(sysconfig.get_path(key) for key in ("purelib", "platlib")))
+    with tempfile.TemporaryDirectory(prefix="import-contracts-") as scratch:
+        work = Path(scratch)
+        tree = work / "candidate"
+        problems.extend(f"import-time contracts: {why}" for why in _materialize(candidate, package, tree))
+        for label, roots, allowed, _files, _tests in IMPORT_TIME_CONTRACTS:
+            report = work / "report.json"
+            report.unlink(missing_ok=True)
+            # A fixed interpreter and probe; the arguments are module names and paths, never a shell.
+            command = [sys.executable, "-I", "-S", "-B", "-c", _CONTRACT_PROBE, str(tree), package, _SHARED_NAMESPACE,
+                       str(report), "*" if allowed is None else ",".join(sorted(allowed)),
+                       ",".join(f"{package}.{root}" for root in roots),
+                       *(sites if allowed is None or allowed else ())]
+            env = {"PATH": os.defpath, "HOME": scratch, "TMPDIR": scratch, "LC_ALL": "C.UTF-8"}
+            try:
+                result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                    command, cwd=work, env=env, capture_output=True, text=True,
+                    timeout=IMPORT_PROBE_TIMEOUT, check=False,
+                )
+            except subprocess.TimeoutExpired:
+                problems.append(f"{label}: the import probe did not finish in {IMPORT_PROBE_TIMEOUT} s")
+                continue
+            try:
+                found = json_depth.loads(report.read_text(encoding="utf-8"), max_depth=8)
+                refused, failed, closure = found["refused"], found["failed"], found["closure"]
+                if result.returncode or not all(isinstance(value, list) for value in (refused, failed, closure)):
+                    raise ValueError
+                closures[label] = frozenset(
+                    safe_path(path[:-1]) + "/" if isinstance(path, str) and path.endswith("/") else safe_path(path)
+                    for path in closure
+                )
+                for entry in refused:
+                    where = f"{Path(entry['file']).relative_to(tree).as_posix()}:{int(entry['line'])}" if (
+                        Path(entry["file"]).is_relative_to(tree)) else f"{entry['file']}:{int(entry['line'])}"
+                    problems.append(f"{label}: {where} imports {entry['name']} at import time")
+                problems.extend(f"{label}: importing {entry['module']} failed ({entry['error']})" for entry in failed)
+            except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError, OverflowError):
+                detail = (result.stderr.strip().splitlines() or ["no output"])[-1][:300]
+                problems.append(f"{label}: the import probe exited {result.returncode} without a readable report ({detail})")
+    return list(dict.fromkeys(problems)), closures
+
+
 @lru_cache(maxsize=2)
 def candidate_scan(sources: tuple[tuple[str, bytes], ...], known_paths: tuple[str, ...]) -> dict:
     """The import scan of the files that can select a test (`selecting`), shared, never mutated.
@@ -274,11 +526,7 @@ def importing_tests(
     scan = candidate_scan(tuple(sources.items()), tuple(components.tracked_paths()))
     edges, directories = scan["file_edges"], scan["directory_edges"]
     if deleted:
-        tree = {}
-        for row in git("ls-tree", "-rz", base).split(b"\0"):
-            if row:
-                meta, name = row.decode("utf-8").split("\t", 1)
-                tree[name] = meta.split()
+        tree = tree_entries(base)
         blobs = tuple((name, meta[2]) for name, meta in tree.items() if name.endswith(".py") and meta[1] == "blob")
         sources = components.indexed_python_sources(str(product_root()), blobs, ())
         scan = components.scan_imports(sources, set(tree), importers=selecting(sources))
@@ -354,12 +602,12 @@ def infrastructure_changed(changed: list[str]) -> bool:
 
 
 def _plan(base: str, candidate: str, *, importers: bool) -> dict:
-    entries = {}
-    for row in git("ls-tree", "-rz", candidate, "--", "tests").split(b"\0"):
-        if row:
-            meta, name = row.decode("utf-8").split("\t", 1)
-            entries[name] = meta.split()[0]
+    entries = {name: meta[0] for name, meta in tree_entries(candidate, "tests").items()}
     changed = changed_files(base, candidate)
+    # Contract tests run the code in subprocesses, out of the scan's sight: check the contracts here.
+    broken, closures = import_time_contracts(candidate, base)
+    if broken:
+        raise ValueError("import-time dependency contract broken: " + "; ".join(broken))
     guards = [safe_path(line, node=True) for line in product_tree_path(*GUARDS.parts).read_text(encoding="utf-8").splitlines()]
     if not guards or len(set(guards)) != len(guards):
         raise ValueError("empty or duplicate guard list")
@@ -367,7 +615,20 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     runnable = manifest_run_files(candidate, entries)
     selectable = entries if runnable is None else {name: mode for name, mode in entries.items() if name in runnable}
     tests = sorted(p for p in changed if TEST.fullmatch(p) and p in selectable)
-    for name in {guard_file(g) for g in guards} | set(tests):
+    # A contract whose closure the candidate changes runs its tests as the guards run: always.
+    # Every contract test must be one the job runs, so a rename or a manifest edit cannot drop it.
+    contract_files = {name for *_, files in IMPORT_TIME_CONTRACTS for name in files} if closures else set()
+    if not contract_files <= set(selectable):
+        raise ValueError("import-time contract test is not a test file the pytest job runs")
+    contracts = sorted({
+        name for label, _roots, _allowed, files, tests in IMPORT_TIME_CONTRACTS
+        if label in closures and any(
+            path == entry or (entry.endswith("/") and path.startswith(entry))
+            for entry in (*closures[label], *files) for path in changed)
+        for name in tests
+    })
+    mandatory = sorted(set(guards) | set(contracts))
+    for name in {guard_file(g) for g in guards} | set(tests) | contract_files:
         if not TEST.fullmatch(name) or entries.get(name) not in {"100644", "100755"}:
             raise ValueError("test is not a tracked regular file")
         path = Path(name)
@@ -380,7 +641,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     if not isinstance(durations, dict):
         raise ValueError("invalid duration record")
     # A pinned id always runs: its whole file may be deferred by cost even when it changed.
-    selected = sorted(set(guards) | set(tests))
+    selected = sorted(set(mandatory) | set(tests))
     unknown = [p for p in selected if p not in durations and "::" not in p]
     for p in selected:
         value = durations.get(p)
@@ -410,7 +671,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
 
     estimate = 60 + sum(cost(p) for p in selected)
     infrastructure = infrastructure_changed(changed)
-    guard_estimate = 60 + sum(cost(p, set(guards)) for p in guards)
+    guard_estimate = 60 + sum(cost(p, set(mandatory)) for p in mandatory)
     reason = (
         "pytest infrastructure changed"
         if infrastructure
@@ -420,12 +681,12 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         if estimate > SAFE_SECONDS
         else None
     )
-    run = set(guards) if reason else set(selected)
+    run = set(mandatory) if reason else set(selected)
     if reason and not infrastructure:
-        # Over the safe budget: changed tests fill what the guards leave, cheapest
-        # first, so the same rule bounds the mandatory selection and the importers.
+        # Over the safe budget: changed tests fill what the guards and contract tests
+        # leave, cheapest first, so the same rule bounds the mandatory selection and the importers.
         used = guard_estimate
-        for p in sorted(set(tests) - set(guards), key=lambda p: (cost(p), p)):
+        for p in sorted(set(tests) - set(mandatory), key=lambda p: (cost(p), p)):
             if used + cost(p) <= SAFE_SECONDS:
                 run.add(p)
                 used += cost(p)
@@ -481,6 +742,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         "base": base,
         "guards": guards,
         "changed_test_files": tests,
+        "contract_test_files": contracts,
         "importing_test_files": imported,
         "text_reading_test_files": readers,
         "run_files": run,

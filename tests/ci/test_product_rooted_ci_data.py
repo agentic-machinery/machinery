@@ -438,3 +438,81 @@ def test_changed_test_budget_overflow_keeps_unrelated_test_unselected(overflow_i
     assert "tests/test_delta.py" not in overflow_import_plan["run_files"]
     assert "tests/test_delta.py" not in overflow_import_plan["importing_test_files"]
     assert "tests/test_delta.py" not in overflow_import_plan["deferred_files"]
+
+
+def test_selection_refuses_a_third_party_import_in_the_receipt_gate_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class: a diff adding a module-level third-party import to integration_sweep passes
+    PR CI selection, although the receipt gate's contract test runs it in a subprocess the import
+    scan cannot see, so the broken contract first fails in the merge group (PR 1134)."""
+    from lu_machinery.ci.pr_affected_tests import plan
+
+    root = tmp_path / "machinery"
+    root.mkdir()
+    # This checkout's own package, from Git: the installed pytest job removes the worktree copy.
+    archive = subprocess.run(["git", "archive", "--format=tar", "HEAD", "lu_machinery"],
+                             cwd=REPO, check=True, capture_output=True, timeout=60).stdout
+    subprocess.run(["tar", "-x", "-C", str(root)], input=archive, check=True, timeout=60)
+    (root / "lu_machinery/ci/pr-affected-guards.txt").write_text(FILES[0] + "\n", encoding="utf-8")
+    (root / "lu_machinery/ci/pytest-file-durations.json").write_text(json.dumps({FILES[0]: 1}), encoding="utf-8")
+    (root / "tests").mkdir()
+    (root / FILES[0]).write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    # The package's contract tests must be tracked test files; stubs stand in for them.
+    from lu_machinery.ci.pr_affected_tests import IMPORT_TIME_CONTRACTS
+
+    for name in {test for *_, tests in IMPORT_TIME_CONTRACTS for test in tests}:
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    shared_hook = root / "agents_extensions/shared/hooks/tool_names.py"
+    shared_hook.parent.mkdir(parents=True, exist_ok=True)
+    shared_hook.write_text("TOOL = 'ok'\n", encoding="utf-8")
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.name", "CI fixture")
+    _git(root, "config", "user.email", "ci@example.com")
+    _git(root, "config", "commit.gpgsign", "false")
+    _git(root, "config", "core.hooksPath", "/dev/null")
+    _git(root, "add", ".")
+    _git(root, "commit", "-qm", "machinery base")
+    base = _git(root, "rev-parse", "HEAD")
+    (root / FILES[0]).write_text("def test_changed():\n    assert True\n", encoding="utf-8")
+    _git(root, "commit", "-qam", "unrelated change")
+    benign = _git(root, "rev-parse", "HEAD")
+    sweep = root / "lu_machinery/orchestration/integration_sweep.py"
+    source = sweep.read_text(encoding="utf-8")
+    sweep.write_text(source + "\n# A change inside the receipt gate's closure.\n", encoding="utf-8")
+    _git(root, "commit", "-qam", "comment in the receipt gate closure")
+    inside = _git(root, "rev-parse", "HEAD")
+    # Defect class (PR1160-F1): non-string sys.path entries (e.g. Path.cwd()) must be ignored during
+    # _NamespacePath recalculation after importlib.invalidate_caches(), matching CPython PathFinder.
+    canary = root / "lu_machinery/review/contract_canary.py"
+    canary_source = canary.read_text(encoding="utf-8")
+    canary.write_text(
+        canary_source
+        + "\nimport importlib as _imp, importlib.resources as _res, pathlib as _pl, sys as _sys\n"
+        + "assert _res.files('agents_extensions.shared').is_dir()\n"
+        + "_sys.path.extend([_pl.Path.cwd(), None, 123, b'/tmp'])\n"
+        + "_imp.invalidate_caches()\n"
+        + "assert _res.files('agents_extensions.shared.hooks').is_dir()\n",
+        encoding="utf-8",
+    )
+    _git(root, "commit", "-qam", "non-string sys.path entry before namespace resource recalculation")
+    ns_recalc = _git(root, "rev-parse", "HEAD")
+    canary.write_text(canary_source, encoding="utf-8")
+    sweep.write_text(source + "\nimport jsonschema  # noqa: E402\n", encoding="utf-8")
+    _git(root, "commit", "-qam", "module-level third-party import")
+    candidate = _git(root, "rev-parse", "HEAD")
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+    # The fixture itself selects cleanly: only the import breaks the contract.
+    assert plan(base, benign, importers=False)["run_files"] == [FILES[0]]
+    # A change in a contract's closure runs that contract's real test, which the import scan cannot see.
+    selected = plan(base, inside, importers=False)
+    assert selected["contract_test_files"] == ["tests/test_installed_root_contract.py"]
+    assert "tests/test_installed_root_contract.py" in selected["run_files"]
+    # Namespace resource recalculation ignores non-string sys.path entries and selects the contract test.
+    recalc_plan = plan(base, ns_recalc, importers=False)
+    assert recalc_plan["contract_test_files"] == ["tests/test_installed_root_contract.py"]
+    with pytest.raises(ValueError, match=(
+        r"contract canary receipt gate: lu_machinery/orchestration/integration_sweep\.py:\d+ imports jsonschema at import time"
+    )):
+        plan(base, candidate, importers=False)
