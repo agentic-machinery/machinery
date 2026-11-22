@@ -660,7 +660,11 @@ def _publisher_args(argv: list[str], *, literal_stdin: bool = False) -> list[str
         if takes_value:
             value = attached or next(args, None)
             if takes_value == "m":
-                return list(args) if value in _PUBLISHER_MODULES else None
+                if value not in _PUBLISHER_MODULES:
+                    return None
+                publisher_args = list(args)
+                # The publisher's top-level argparse parser accepts one option terminator before the verb.
+                return publisher_args[1:] if publisher_args[:1] == ["--"] else publisher_args
     return None
 
 
