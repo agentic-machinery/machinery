@@ -197,41 +197,49 @@ def worktree_records(*args: str, root: Path) -> list[str] | None:
 def parse_updates(text: str) -> list[Update]:
     if not text:
         return []
+    if not text.endswith("\n"):
+        raise GateOutcome("invalid_ref_updates", "Could not read a complete ref update from Git.")
     updates = []
     for line in text.removesuffix("\n").split("\n"):
         # Git separates fields with spaces. A local revision expression can itself contain spaces.
         fields = line.rsplit(" ", 3)
-        if len(fields) != 4:
+        if len(fields) != 4 or not all(fields):
             raise GateOutcome("invalid_ref_updates", "Could not read a valid ref update from Git.")
         updates.append(Update(*fields))
     return updates
 
 
 def entire_destination(remote: list[str]) -> str:
-    """Classify a GitHub destination by its unique, explicitly public or private fleet entry."""
+    """Classify an Entire push destination with the publication scanner's own private exemption.
+
+    PRIVATE only when ``git_push.main`` would exempt the same push: ``prepublish.is_private`` names the
+    destination and ``git_push.trusted_route`` verifies the route, with the same Git. PUBLIC when a
+    ``public-`` fleet row names it by its current or alternate slug. Anything else is UNKNOWN or
+    UNVERIFIED, and every class except PRIVATE is refused.
+    """
     if len(remote) != 2:
         return "UNKNOWN"
     try:
-        from lu_machinery.opsec.git_push import destination
-        from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+        from lu_machinery.opsec import git_push, prepublish
     except ImportError:
         return "UNKNOWN"
-    host, _, slug = destination(remote[1]).partition("/")
-    if host != "github.com":
-        return "UNKNOWN"
     try:
-        repos = load_fleet_repos()
-    except FleetRepoError:
+        identity = git_push.destination(remote[1])
+        if identity == "unknown":
+            return "UNKNOWN"
+        for row in prepublish.catalog().values():
+            slugs = {str(row.get(key)) for key in ("github", "alternate_github") if row.get(key)}
+            if str(row.get("role", "")).startswith("public-") and identity in {
+                prepublish.normalize_repository(slug) for slug in slugs
+            }:
+                return "PUBLIC"
+        if not prepublish.is_private(identity):
+            return "UNKNOWN"
+        environment = dict(os.environ)
+        repository = git_push.Repository(git_push.real_git(environment), environment)
+        return "PRIVATE" if git_push.trusted_route(repository, *remote) else "UNVERIFIED"
+    except Exception:  # A registry, transport or Git failure never grants the exemption: refused as unknown.
         return "UNKNOWN"
-    matches = [repo for repo in repos.values() if repo.github.isascii() and repo.github.lower() == slug]
-    if len(matches) != 1:
-        return "UNKNOWN"
-    repo = matches[0]
-    if repo.role.startswith("public-"):
-        return "PUBLIC"
-    if repo.role.startswith("private-") and not repo.default:
-        return "KNOWN_NONPUBLIC"
-    return "UNKNOWN"
 
 
 def refuse_public_entire_refs(updates: list[Update], remote: list[str]) -> None:
@@ -247,19 +255,12 @@ def refuse_public_entire_refs(updates: list[Update], remote: list[str]) -> None:
     if not classes:
         return
     destination = entire_destination(remote)
+    if destination == "PRIVATE":
+        return
     detail = f"Entire destination ref classes: {', '.join(classes)}. "
     if destination == "PUBLIC":
         raise GateOutcome("public_entire_ref", detail + "Updates to public repositories are refused.")
-    if destination == "KNOWN_NONPUBLIC":
-        from lu_machinery.opsec import git_push, prepublish
-
-        environment = dict(os.environ)
-        executable = shutil.which(git_push.real_git(environment))
-        try:
-            if executable and git_push.trusted_route(git_push.Repository(executable, environment), *remote):
-                return
-        except (OSError, subprocess.SubprocessError, prepublish.PublishBlocked):
-            pass
+    if destination == "UNVERIFIED":
         raise GateOutcome("entire_destination_unverified", detail + "The private destination route could not be verified.")
     raise GateOutcome("entire_destination_unknown", detail + "Destination is unknown; Entire updates are refused.")
 
