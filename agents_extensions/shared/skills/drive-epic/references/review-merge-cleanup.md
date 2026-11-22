@@ -171,7 +171,7 @@ ids for suite results. Add no test and repeat no run.
 ## §7. Landing
 
 The gates are `workflow.md` § Merge policy; the delivery steps are `full-send` and `full-stop`,
-and a briefed worker never lands: the merge-queue keeper lands a PR held in worker custody. Landing needs a green same-head CI Gate and, above the Trivial tier, the recorded exact-head APPROVE or APPROVEs its tier requires (a recorded `CHANGES_REQUESTED` blocks until a new head is approved); a Trivial PR needs no review, but a recorded rejection on its head still blocks it. `workflow.md` § Merge policy defines every exception. You land only a PR no brief owns, and flag another
+and a briefed worker never lands: the merge-queue keeper lands a PR held in worker custody. Landing needs a green same-head CI Gate and, above the Trivial tier, the recorded exact-head APPROVE or APPROVEs its tier requires (a recorded `CHANGES_REQUESTED` blocks until a new head is approved); a Trivial PR needs no review, but a recorded rejection on its head still blocks it. `workflow.md` § Merge policy defines every exception. You land only a PR that neither a brief nor keeper custody covers, and flag another
 lane's PR with `needs=merge` instead of merging it. Run the core inbox drain immediately before an
 enqueue and reconcile its messages with the approved head.
 

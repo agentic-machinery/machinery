@@ -22,8 +22,8 @@ file only points there and adds what the CTO seat learned on top.
   evidence before releasing custody. An infrastructure failure with no failing test node and an
   unspent allowance is the one same-head recovery (the keeper's re-enqueue, or a CTO `run-rerun` with the evidence on the PR): dispatch no worker, because accepting
   the PR replaces keeper custody. A code, own-check or head-move failure gets one fresh fix worker
-  whose brief carries the current head, the run and job ids, the inherited review ledger and its
-  remaining budget, and starts with `pr_ownership accept --pr <N> --repo <owner/name>`. A failing
+  whose brief carries the old and current head SHAs, the alert evidence (run and job ids where CI
+  ran), the inherited review ledger and its remaining budget, and starts with `pr_ownership accept --pr <N> --repo <owner/name>`. A failing
   test node is fixed, never rerun. If the installed `run-rerun` or re-enqueue refuses the head (for
   example `RECOVERY_APPROVAL_MISSING` on a Trivial head), the outcome is blocked: report it with
   the refusal and request direction. A second own-check failure on this PR, an unknown diagnosis, or a further infrastructure
@@ -31,14 +31,16 @@ file only points there and adds what the CTO seat learned on top.
   that spent allowance never blocks the first own-check fix worker (rules core P4;
   [pr-watch](../../full-send/references/pr-watch.md#failing-ci)).
 - **Review continuation after a pending-CI `BLOCKED`.** When a worker ends `BLOCKED pending CI
-  evidence`, wait for the named check, revalidate the head and `budget-check`, start the one
-  same-head review with the finished CI evidence inlined, then seat one live successor for the
+  evidence`, compare the live head with the continuation's head, then wait for the named check,
+  compare again and `budget-check`, start the one same-head review with the finished CI evidence
+  inlined, then seat one live successor for the
   original terminal (`full-send` custody, or `full-stop` with its hold intact). The successor
   accepts the PR with `pr_ownership accept`, records the verdict and finishes that terminal. Until
   then this continuation is the PR's owner plan: an ownerless alert on that PR is answered by this
-  one successor, never a second. If the head has moved when you revalidate it, the continuation is
-  stale: retire it and seat one successor for the current head under the inherited terminal and
-  review budget; that one disposition answers the alert.
+  one successor, never a second. As soon as either comparison (or the cycle) shows the head has
+  moved, the continuation is stale: stop waiting on its check, retire it and seat one successor for
+  the current head under the inherited terminal and review budget; that one disposition answers
+  the alert.
 - **After the keeper lands a PR.** Confirm `MERGED` and the merge SHA with `gh`, wait for the
   worker to settle, then run the closeout (`full-send` § Landing and closeout by a lead, steps
   3 to 5) and close the issue with the merged-outcome evidence.

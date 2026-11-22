@@ -153,8 +153,9 @@ everything" cannot survive this repo's merge rate and is corporate dual-control 
 **8.5 — Merge queue protocol.** The sole ordered landing and cleanup recipe is
 [`workflow.md`](workflow.md) § Merge policy. Nobody arms auto-merge. The merge-queue keeper
 lands a PR held in worker custody (rules core P1) and the CTO cycle confirms MERGED and
-completes closeout; the accountable driver does both for work no brief owns, after verifying
-independent exact-head CF and same-head CI on the non-draft PR.
+completes closeout; the accountable driver does both only for work neither a brief nor custody
+covers, at the gate its tier sets in `workflow.md` § Merge policy (same-head CI and a non-draft
+PR always).
 Missing evidence, stale heads, pending/cancelled checks and unresolved BLOCKING
 findings fail closed. Never bypass blocking CI with `--admin`, arm `--auto`, or
 delete a queued branch. The CI recovery allowance and diagnostics in the rules

@@ -90,9 +90,8 @@ never fine.
    Two accept forms, and they do not combine. A mixed call prints the usage of each form and writes
    nothing. Neither form changes review, CI, enqueue or merge.
    Keeper custody comes from a worker's `keeper-transfer` and needs no action from this seat until
-   the keeper alerts on a CI failure, ejection or head move; then classify the alert first and
-   act as that recipe's class-specific rules say (one infrastructure recovery, a fix worker for a
-   first own-check failure, otherwise stop)
+   the keeper alerts on a CI failure, ejection or head move; then classify the alert by the
+   keeper-alert recipe and take the one action it names
    ([recipes](recipes.md#writes-and-merging)), and confirm `MERGED` and closeout after landing.
    Queue custody is only for a predecessor that is still live and waiting in the merge queue
    (a brief started before detached delivery). The

@@ -208,7 +208,7 @@ with `review-loop` for review rounds and the budget.
    the `repo_wide` invariants), not the pytest shards. Where the base branch has a merge
    queue, the real merge-group candidate must pass the required **CI Gate**, which runs the
    full supported pytest suite, before landing; nightly and opt-in `workflow_dispatch` runs run the full suite too.
-3. Only then enqueue (the merge-queue keeper, or a lead landing what no brief owns; a briefed
+3. Only then enqueue (the merge-queue keeper, or a lead landing what no brief or custody covers; a briefed
    worker never waits on CI or enqueues): a recorded exact-head APPROVE (none at the Trivial tier) and a green PR CI Gate, both bound to the
    current PR head. Never arm auto-merge ahead of either gate —
 early-armed auto-merge is how #7447–#7449 landed with empty reviews, and a moved head
