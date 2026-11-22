@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import copy
+import json
+
 import pytest
+
 from lu_machinery.publish.github import Request
+from lu_machinery.review import closeout_cli
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.app_bot_authorship import (
     APP_BOT_ALLOWLIST,
@@ -13,11 +17,8 @@ from lu_machinery.review.app_bot_authorship import (
     verified_app_bot_login,
 )
 from lu_machinery.review.reviewer_resolver import ResolverInputs, complete_author_families, resolve_reviewer
+from tests.agent_runtime.test_authoring_review_feasibility import OPUS, mini_repo
 from tests.claude_route_accounts import HOST_ACCOUNT
-
-
-
-
 
 SHA = "a" * 40
 OTHER = "b" * 40
@@ -197,6 +198,65 @@ def test_resolver_treats_a_verified_bot_as_complete_authorship_excluding_no_fami
     assert {scope.reviewer_family: scope.commits for scope in plan.review_scopes} == {
         "anthropic": ("b" * 40,), "openai": ("a" * 40,),
     }
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "bot", "bot-with-model-coauthor", "bot-with-unknown-coauthor", "unknown-human", "unknown-model",
+        "model", "model-as-automation",
+    ],
+)
+def test_resolve_reviewer_automation_requires_verified_commit_authorship(
+    case, tmp_path, monkeypatch, capsys, reviewer_headroom_snapshot
+):
+    repo = mini_repo(tmp_path, monkeypatch)
+    repo.git("remote", "set-url", "origin", f"https://github.com/{REPOSITORY}.git")
+    bot = repo.commit(None, message="Dependency update") if case.startswith("bot") else None
+    if case in {"bot-with-model-coauthor", "model", "model-as-automation"}:
+        repo.commit(OPUS)
+    elif case in {"unknown-model", "bot-with-unknown-coauthor"}:
+        repo.commit("codex/missing-author-task")
+    elif case == "unknown-human":
+        repo.commit(None, message="Unattributed change")
+
+    def read_commit(request):
+        assert request.verb == "read-commit"
+        assert request.fields["repo"] == REPOSITORY
+        if bot is not None and bot == request.fields["sha"]:
+            return dependabot(bot)
+        return {"author": {"login": "dependabot[bot]"}}
+
+    monkeypatch.setattr(recorder, "_run_json", read_commit)
+    monkeypatch.setattr(closeout_cli.claude_account_lane, "resolve_route_account", lambda *_a, **_kw: HOST_ACCOUNT)
+    snapshot = tmp_path / "routing.json"
+    snapshot.write_text(json.dumps(reviewer_headroom_snapshot), encoding="utf-8")
+    state = ["--state-file", str(tmp_path / "review.json")]
+    assert closeout_cli.main([
+        *state, "target", "--mode", "branch", "--branch", "feature", "--base", "origin/main",
+        "--repo-root", str(repo.root),
+    ]) == 0
+    capsys.readouterr()
+
+    author = ["--author-model", OPUS.split("/", 1)[1]] if case == "model" else ["--author-family", "automation"]
+    code = closeout_cli.main([
+        *state, "resolve-reviewer", *author, "--domain", "infra", "--review-profile", "infra",
+        "--risk", "critical", "--routing-snapshot-file", str(snapshot), "--task-root", str(tmp_path / "tasks"),
+    ])
+    receipt = json.loads(capsys.readouterr().out)
+    if case in {"unknown-human", "unknown-model", "bot-with-unknown-coauthor", "model-as-automation"}:
+        assert code == 1 and receipt["selected"] is None
+        assert "author" in receipt["fail_closed_reason"]
+        return
+
+    assert code == 0 and receipt["selected"] is not None
+    assert receipt["resolved_risk"] == "critical"
+    families = [VERIFIED_APP_BOT] if case == "bot" else ["anthropic", VERIFIED_APP_BOT] if bot else ["anthropic"]
+    assert receipt["branch_facts"]["author_families"] == families
+    if bot:
+        assert receipt["branch_facts"]["app_bot_commits"] == [bot]
+    if "anthropic" in families:
+        assert receipt["selected"]["family"] != "anthropic"
 
 
 @pytest.mark.parametrize("repository", [None, "", "owner", "other/repo", "owner/repo/extra"])
