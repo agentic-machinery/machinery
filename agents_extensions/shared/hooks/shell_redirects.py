@@ -548,7 +548,7 @@ def preprocess_branch_command(command: str) -> str:
             raise ShellPreprocessLimit("unterminated shell or heredoc context")
         return "".join(out), index
 
-    def body_expansions(body: str, depth: int) -> list[str]:
+    def body_expansions(body: str, depth: int) -> list[str]:  # nosemgrep: python.lang.maintainability.useless-inner-function (called by scan above)
         # Heredoc text has no shell quote/comment rules. Reuse the scanner on
         # just the expansions; an apostrophe outside one cannot quote it away.
         nonlocal command

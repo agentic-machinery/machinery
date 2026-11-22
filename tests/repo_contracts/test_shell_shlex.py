@@ -193,9 +193,17 @@ def test_ansi_c_heredoc_io_and_split_helpers_track_escapes():
     assert "printf LIVE" in preprocess_shell_command(multiline_ansi)
     # IO descriptor normalization ignores redirects inside $'...' and sees those after $'\''.
     assert normalize_io_descriptors("echo $'\\'2>a' 2>b") == "echo $'\\'2>a' >b"
-    # Quote-preserving split keeps \" inside "..." protected after $'\''.
+    # Quote-preserving split keeps \" inside "..." protected after $'\'', \$$'\'', and unquoted \'.
     tokens = split_quote_preserving('echo $\'\\\'\' "a\\"b"', punctuation_chars="();&|<>\n", whitespace=" \t")
     assert '"a\\"b"' in tokens
+    escaped_dd = split_quote_preserving(
+        'echo \\$$\'\\\'\' "a\\" " ; env ; echo \\"', punctuation_chars="();&|<>\n", whitespace=" \t"
+    )
+    assert "env" in escaped_dd
+    escaped_sq = split_quote_preserving(
+        'echo \\\' "a\\" " ; env ; echo \\"', punctuation_chars="();&|<>\n", whitespace=" \t"
+    )
+    assert "env" in escaped_sq
 
 
 @pytest.mark.parametrize(
@@ -355,6 +363,8 @@ def test_ansi_c_reported_class_refused_by_secret_pr_and_write_guards(configured_
         "echo $$'\\'' #' ; env",
         "echo $$$$'\\'' #' ; env",
         "echo $\\\n$'\\'' #' ; env",
+        'echo \\$$\'\\\'\' "a\\" " ; env ; echo \\"',
+        'echo \\\' "a\\" " ; env ; echo \\"',
         "echo $'\\'' '<<EOF'\nenv\nEOF",
         "cat <<EOF\n$(echo $'\\')' ; env)\nEOF",
     ):

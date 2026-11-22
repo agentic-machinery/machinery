@@ -725,6 +725,10 @@ def split_quote_preserving(command: str, *, punctuation_chars: str | bool, white
     index = 0
     while index < len(command):
         char = command[index]
+        if char == "\\" and not quote and index + 1 < len(command):
+            protected.append(command[index : index + 2])
+            index += 2
+            continue
         if char == "\\" and quote == '"' and index + 1 < len(command):
             following = command[index + 1]
             if following in {'"', "\\", "$", "`"}:
