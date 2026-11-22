@@ -794,8 +794,9 @@ def repo_has_registry(
         return True
     if repo_key == resolved_default:
         if "streams" not in doc:
-            return False
-        _parse_streams(doc.get("streams"), allow_empty_epics=False, audit_only=False)
+            raise ValueError("issue_streams.yaml defines no default-repository streams")
+        if not _parse_streams(doc.get("streams"), allow_empty_epics=False, audit_only=False):
+            raise ValueError("issue_streams.yaml defines no streams")
         return True
     return False
 
@@ -816,8 +817,10 @@ def repo_has_roots(
         return bool(_parse_streams(repos[repo_key].get("streams"), allow_empty_epics=True, audit_only=False))
     if repo_key == resolved_default:
         if "streams" not in doc:
-            return False
-        return bool(_parse_streams(doc.get("streams"), allow_empty_epics=False, audit_only=False))
+            raise ValueError("issue_streams.yaml defines no default-repository streams")
+        if not _parse_streams(doc.get("streams"), allow_empty_epics=False, audit_only=False):
+            raise ValueError("issue_streams.yaml defines no streams")
+        return True
     return False
 
 
@@ -1990,9 +1993,11 @@ def _is_valid_cached_report(report: object) -> bool:
         for m in multi_homed
     ):
         return False
-    if not isinstance(report.get("pending_native_link"), list):
+    pending = report.get("pending_native_link")
+    if not isinstance(pending, list) or not all(_is_positive_int(n) for n in pending):
         return False
-    if not isinstance(report.get("closed_or_missing_epics"), list):
+    closed = report.get("closed_or_missing_epics")
+    if not isinstance(closed, list) or not all(_is_positive_int(n) for n in closed):
         return False
     warnings = report.get("warnings")
     return warnings is None or (

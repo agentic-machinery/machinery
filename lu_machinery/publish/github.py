@@ -1054,13 +1054,18 @@ def _owns_stream_registry(active, *, default_key=None):
 
     effective_default = active.repo.key if active.repo.default else default_key
     try:
-        return issue_stream_audit.repo_has_registry(
+        has_registry = issue_stream_audit.repo_has_registry(
             active.repo.key,
             issue_stream_audit.REGISTRY_PATH,
             default_key=effective_default,
         )
     except (OSError, ValueError) as exc:
         raise gate.PublishBlocked(f"REGISTRY_REFUSED: issue_streams.yaml is unreadable ({exc}); nothing was created.") from None
+    if active.repo.default and not has_registry:
+        raise gate.PublishBlocked(
+            "REGISTRY_REFUSED: issue_streams.yaml defines no default-repository streams; nothing was created."
+        )
+    return has_registry
 
 
 def _issue_create_parent_policy(gh_repo, *, env=None):

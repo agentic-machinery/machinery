@@ -1001,12 +1001,21 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
             )
         assert host_writes == []
 
-        # Missing/unreadable registry refuses default-repo --epic creation (F2).
+        # Missing, repos-only, empty, or streams:{} registry refuses default-repo issue-create (with or without --epic) (F2).
         missing_reg = tmp_path / "does_not_exist.yaml"
-        with monkeypatch.context() as ctx:
-            ctx.setattr(issue_stream_audit, "REGISTRY_PATH", missing_reg)
-            assert (
-                pub.main(
+        repos_only_reg = tmp_path / "repos_only.yaml"
+        repos_only_reg.write_text(
+            "schema_version: 1\nrepos:\n  machinery:\n    streams:\n      epics:\n        epics: []\n",
+            encoding="utf-8",
+        )
+        empty_reg = tmp_path / "empty_doc.yaml"
+        empty_reg.write_text("schema_version: 1\n", encoding="utf-8")
+        empty_streams_reg = tmp_path / "empty_streams_doc.yaml"
+        empty_streams_reg.write_text("schema_version: 1\nstreams: {}\n", encoding="utf-8")
+        for bad_reg_path in (missing_reg, repos_only_reg, empty_reg, empty_streams_reg):
+            with monkeypatch.context() as ctx:
+                ctx.setattr(issue_stream_audit, "REGISTRY_PATH", bad_reg_path)
+                for cli_args in (
                     [
                         "issue-create",
                         "--repo",
@@ -1017,11 +1026,24 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
                         "Root",
                         "--epic",
                     ],
-                    runner=lambda argv, **_kw: host_writes.append(argv),
-                )
-                == 2
-            )
-            assert "REGISTRY_REFUSED" in capsys.readouterr().err
+                    [
+                        "issue-create",
+                        "--repo",
+                        public_slug,
+                        "--title",
+                        "Task without parent",
+                        "--body",
+                        "Body",
+                    ],
+                ):
+                    assert (
+                        pub.main(
+                            cli_args,
+                            runner=lambda argv, **_kw: host_writes.append(argv),
+                        )
+                        == 2
+                    )
+                    assert "REGISTRY_REFUSED" in capsys.readouterr().err
         assert host_writes == []
 
         # Malformed or mismatched parent issue lookup responses fail closed with PARENT_REFUSED (F4).

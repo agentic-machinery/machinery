@@ -2307,7 +2307,7 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
             with pytest.raises(ValueError):
                 issue_stream_audit.repo_has_registry("machinery", bad_reg)
 
-        # Cache reader rejects string ok, missing ok, huge int timestamp, and non-empty malformed incomplete_nodes (F3).
+        # Cache reader rejects string ok, missing ok, huge int timestamp, malformed list elements (F5), and malformed incomplete_nodes (F3).
         cache_file = audit_root / "batch_state" / "issue_stream_audit.json"
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         now_ts = int(time.time())
@@ -2315,6 +2315,9 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
             {"generated_at": now_ts, "ok": "false", "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": [], "closed_or_missing_epics": []},
             {"generated_at": now_ts, "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": [], "closed_or_missing_epics": []},
             {"generated_at": 10**400, "ok": True, "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": [], "closed_or_missing_epics": []},
+            {"generated_at": now_ts, "ok": True, "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": ["5"], "closed_or_missing_epics": []},
+            {"generated_at": now_ts, "ok": True, "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": [None], "closed_or_missing_epics": []},
+            {"generated_at": now_ts, "ok": True, "open_total": 0, "streams": {}, "orphans": [], "multi_homed": [], "pending_native_link": [], "closed_or_missing_epics": [True]},
         ):
             cache_file.write_text(json.dumps(bad_cache), encoding="utf-8")
             assert issue_stream_audit.read_cache(3600) is None
