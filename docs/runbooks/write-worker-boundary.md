@@ -16,6 +16,32 @@ with that interpreter, for example `"$LEARN_UKRAINIAN_PYTHON" -m pytest -q <test
 Write worktrees leave `.venv` unlinked because a worktree-local install could modify the shared
 project environment.
 
+## Run the machinery mypy ratchet offline
+
+From the root of a machinery write worktree, run this command in Bash. It uses the same
+locked dependency groups and extras as the [mypy CI job](../../.github/workflows/ci-gate.yml).
+The command creates a fresh environment in the worktree and removes it on exit.
+
+```bash
+(
+	set -eu
+	mypy_venv="$(mktemp -d "$(pwd -P)/.mypy-ratchet-venv.XXXXXXXX")"
+	trap 'rm -r -- "$mypy_venv"' EXIT
+	UV_PROJECT_ENVIRONMENT="$mypy_venv" uv sync --directory . --project . \
+		--locked --offline --no-active --no-build --no-install-project \
+		--all-extras --no-extra test --group typecheck \
+		--python "$LEARN_UKRAINIAN_PYTHON" --no-python-downloads --link-mode copy
+	"$mypy_venv/bin/python" -I -m mypy --version
+	LEARN_UKRAINIAN_PYTHON="$mypy_venv/bin/python" \
+		env -u PYTHONHOME -u PYTHONPATH -u MYPYPATH \
+		"$mypy_venv/bin/python" -m lu_machinery.lint.mypy_ratchet
+)
+```
+
+The sync uses the local uv cache. If a locked wheel is missing, the command stops at the sync.
+On success, the command prints the mypy version and `OK: mypy ratchet matches the baseline`.
+Run one ratchet at a time in each worktree because runs share `.mypy_cache`.
+
 ## Routes
 
 `worker.supervise` launches every write route (`claude`, `codex`, `cursor`, `agy` and `opencode`,
