@@ -83,7 +83,9 @@ path:
 
 ```bash
 "$PY" -m lu_machinery.publish pr-edit --number "$PR" --remove-labels hold --title "$TITLE_WITHOUT_HOLD"
-``` Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
+```
+
+Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
 planned is the CTO's (rules core P4).
 
 ## Report

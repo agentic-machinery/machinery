@@ -194,7 +194,7 @@ with `review-loop` for review rounds and the budget.
    [review policy](../skills/review-loop/references/policy.md#2-risk-tier-is-set-by-the-change)
    sets: cross-family, except any qualified non-author reviewer at Low tier.
 2. Open the PR if it is not already open, then run `"$PY" -m lu_machinery.review.record_cf_verdict` to bind the completed
-   review, reviewed head, and author qualification in a **PR comment bound to the head SHA**,
+   review (a Trivial-tier change has none to record), reviewed head, and author qualification in a **PR comment bound to the head SHA**,
    with reviewer model/family/harness provenance. Resolve `PRIMARY_REPO` and `PY` with the
    [review-loop setup](../skills/review-loop/SKILL.md#review-loop) to use current recorder rules
    regardless of the caller's branch age. GitHub rejects API approval reviews
@@ -225,7 +225,7 @@ Queued is not MERGED: diagnose conflicts, changed bases, failed checks or queue
 ejection, and re-establish the gates before re-enqueueing.
 **No merge queue:** where `read queue-status` reports `isMergeQueueEnabled: false` for the
 base branch, no merge-group run exists. The same `pr-merge` squash-merges the PR directly,
-pinned to the approved head, after a recorded exact-head APPROVE with no blocking check on
+pinned to the approved head, after a recorded exact-head APPROVE (or the Trivial classification) with no blocking check on
 that head pending, failing or cancelled, never with `--admin`; an unreadable flag stops the
 landing. The PR-side CI rule is the same in both cases (the publisher's merge guard applies it
 before enqueue and before a direct merge). `pr-merge --expect-queue` carries the flag the

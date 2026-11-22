@@ -64,8 +64,9 @@ never fine.
    Run `.venv/bin/python -m lu_machinery.orchestration.pr_ownership check` (exit 1 lists ownerless
    PRs, 2 is unknown). It is the replacement-owner check `lu_machinery.fleet.pr_owner_check` with
    accepted handoffs counted, and an owner whose supervisor cannot be observed is unknown, not
-   ownerless. A PR in a pending-CI review continuation ([recipes](recipes.md#writes-and-merging))
-   gets that continuation's one successor, not a second owner. Dispatch an owner for every ownerless PR, replacing any owner that ended failed,
+   ownerless. A PR in an active pending-CI review continuation ([recipes](recipes.md#writes-and-merging))
+   is excluded from every reseating step below: its alert attaches to that continuation, whose one
+   successor is seated when the review evidence is ready. Dispatch an owner for every other ownerless PR, replacing any owner that ended failed,
    timed out or was cancelled. Ownership is the live task on the PR branch, the running task
    named by the X-Agent trailer on the PR head, an accepted handoff, or recorded custody, never
    the author or branch prefix. The merge-queue keeper runs the same check every 5 minutes. It
@@ -88,8 +89,9 @@ never fine.
    Two accept forms, and they do not combine. A mixed call prints the usage of each form and writes
    nothing. Neither form changes review, CI, enqueue or merge.
    Keeper custody comes from a worker's `keeper-transfer` and needs no action from this seat until
-   the keeper alerts on a CI failure, ejection or head move; then dispatch one fresh fix worker
-   ([recipes](recipes.md#writes-and-merging)) and confirm `MERGED` and closeout after landing.
+   the keeper alerts on a CI failure, ejection or head move; then classify the alert first and
+   dispatch a fresh fix worker only for a first repairable failure
+   ([recipes](recipes.md#writes-and-merging)), and confirm `MERGED` and closeout after landing.
    Queue custody is only for a predecessor that is still live and waiting in the merge queue
    (a brief started before detached delivery). The
    successor runs `accept --pr <N> --repo <owner/name> --custody --from <predecessor-task>`. That

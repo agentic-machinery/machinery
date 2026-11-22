@@ -145,8 +145,9 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    binding the repository, PR, base, head, your task and nonce, and the verdict. That receipt is
    the worker's proof of custody. Any other exit is a refusal: read its reason, fix what it names
    (a moved head, a missing or stale verdict) or stop with `BLOCKED <refusal>`. If the refusal says
-   the PR is no longer open, the keeper landed it first: end `BLOCKED early landing: MERGED` with the
-   verdict receipt and the `gh pr view "$PR" --json state,mergeCommit` reading.
+   the PR is no longer open, read `gh pr view "$PR" --json state,mergeCommit` and end with that
+   state: `BLOCKED early landing: MERGED` only when it reads `MERGED`, `BLOCKED closed` when it
+   reads `CLOSED`, `BLOCKED unreadable state` when the read fails; add the verdict receipt.
 
    Then check `git status --porcelain` is empty, report `CUSTODY_ACCEPTED` with the receipt
    ([Report](#report)) and end your run. The linked issue stays open: the CTO cycle closes it with

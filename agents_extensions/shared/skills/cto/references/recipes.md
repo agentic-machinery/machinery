@@ -20,7 +20,7 @@ file only points there and adds what the CTO seat learned on top.
      early landing is otherwise a reported exception you dispose of);
   3. a move to an unreviewed head alerts you before that head's review or CI readiness is read;
   4. the keeper's landing write requires a fresh passing `verify_run` for every area the diff
-     touches (`verify` skill); until it does, detach only diffs that touch no such area;
+     touches (`verify` skill);
   5. each recovery named below exists: the alert, the one same-head infrastructure recovery, and
      the keeper's re-enqueue of an approved repaired head after an ejection.
   Where any item is missing, do not dispatch a detached brief: the worker contract has no
@@ -32,7 +32,9 @@ file only points there and adds what the CTO seat learned on top.
   the PR replaces keeper custody. A code, own-check or head-move failure gets one fresh fix worker
   whose brief carries the current head, the run and job ids, the inherited review ledger and its
   remaining budget, and starts with `pr_ownership accept --pr <N> --repo <owner/name>`. A failing
-  test node is fixed, never rerun. A second own-check failure on this PR, an unknown diagnosis or a
+  test node is fixed, never rerun. If the installed `run-rerun` or re-enqueue refuses the head (for
+  example `RECOVERY_APPROVAL_MISSING` on a Trivial head), the outcome is blocked: report it with
+  the refusal and request direction. A second own-check failure on this PR, an unknown diagnosis or a
   spent allowance means stop, report and request direction (rules core P4;
   [pr-watch](../../full-send/references/pr-watch.md#failing-ci)).
 - **Review continuation after a pending-CI `BLOCKED`.** When a worker ends `BLOCKED pending CI
