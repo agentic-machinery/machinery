@@ -1179,7 +1179,9 @@ def test_single_caller_run_keeps_its_state(finding: bool) -> None:
     [
         ("learn-ukrainian/machinery", True),
         ("next-owner/machinery", True),
+        ("Next-Owner/Machinery", True),
         ("agentic-machinery/machinery", False),
+        ("Agentic-Machinery/Machinery", False),
         ("evil/machinery", False),
     ],
 )
@@ -1298,6 +1300,16 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(tmp_path: Pa
         )
         selected_repo = load_fleet_repos(registry)["machinery"]
         assert alerts_module._fetch_tool_alerts(unredacted, selected_repo, "secret_scanning", timeout=1.0) == (
+            "error", None, "github_invalid_next_link"
+        )
+        wrong_suffix = _FakeGitHubClient(
+            lambda ep: Result(
+                status=200,
+                headers={"Link": f'<https://api.github.com/repos/{payload_slug}/CODE-SCANNING/alerts?state=open&per_page=100&page=2>; rel="next"'},
+                value=[],
+            )
+        )
+        assert alerts_module._fetch_tool_alerts(wrong_suffix, selected_repo, "code_scanning", timeout=1.0) == (
             "error", None, "github_invalid_next_link"
         )
         catalog = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))

@@ -389,7 +389,6 @@ def _fetch_tool_alerts(
         return "error", None, "invalid_repository_slug"
     expected_path = initial_endpoint.split("?", 1)[0]
     expected_tool_suffix = _ENDPOINT_SUFFIXES[tool].split("?", 1)[0]
-    allowed_paths = _allowed_repo_paths(slugs, expected_tool_suffix)
     endpoint: str | None = initial_endpoint
     known_repo_id: str | None = None
     repo_id_loaded = False
@@ -425,7 +424,7 @@ def _fetch_tool_alerts(
         if split is None:
             return "error", None, "github_invalid_next_link"
         next_path, next_query = split
-        if next_path != expected_path and next_path not in allowed_paths:
+        if next_path != expected_path and not _repo_path_matches(next_path, slugs, expected_tool_suffix):
             numeric_match = _NUMERIC_REPO_PATH_RE.fullmatch(next_path)
             if not numeric_match or numeric_match.group(2) != expected_tool_suffix:
                 return "error", None, "github_invalid_next_link"
@@ -485,7 +484,7 @@ def _github_get(client: Any, endpoint: str, timeout: float) -> github_client.Res
 
 
 def _split_slug(slug: Any) -> tuple[str, str] | None:
-    if not isinstance(slug, str):
+    if not isinstance(slug, str) or not slug.isascii():
         return None
     parts = slug.split("/")
     if len(parts) != 2 or not all(_SLUG_SEGMENT_RE.fullmatch(part) and part not in {".", ".."} for part in parts):
@@ -505,13 +504,44 @@ def _repo_slugs(repo: FleetRepo) -> tuple[str, ...] | None:
     return slugs
 
 
-def _allowed_repo_paths(slugs: Sequence[str], suffix: str) -> frozenset[str]:
-    paths: set[str] = set()
-    for slug in slugs:
-        parts = _split_slug(slug)
-        if parts is not None:
-            paths.add(_repo_api(parts[0], parts[1], suffix))
-    return frozenset(paths)
+def _slug_matches(candidate: Any, allowed_slugs: Sequence[str]) -> bool:
+    """Whether *candidate* is a validated ASCII ``owner/name`` matching one of *allowed_slugs* case-insensitively."""
+    parts = _split_slug(candidate)
+    if parts is None:
+        return False
+    folded = f"{parts[0]}/{parts[1]}".casefold()
+    for slug in allowed_slugs:
+        allowed_parts = _split_slug(slug)
+        if allowed_parts is not None and f"{allowed_parts[0]}/{allowed_parts[1]}".casefold() == folded:
+            return True
+    return False
+
+
+def _repo_path_matches(path: str, allowed_slugs: Sequence[str], suffix: str) -> bool:
+    """Whether *path* is ``repos/<owner>/<name>/<suffix>`` for one of *allowed_slugs* (ASCII case-insensitive slug, exact suffix)."""
+    if not path.startswith("repos/"):
+        return False
+    rest = path.removeprefix("repos/")
+    expected_suffix = f"/{suffix}"
+    if len(rest) <= len(expected_suffix) or not rest.endswith(expected_suffix):
+        return False
+    slug = rest[: len(rest) - len(expected_suffix)]
+    return _slug_matches(slug, allowed_slugs)
+
+
+def _run_html_url_matches(html_url: Any, allowed_slugs: Sequence[str], run_id: int) -> bool:
+    """Whether *html_url* is ``https://github.com/<owner>/<name>/actions/runs/<run_id>`` for one of *allowed_slugs*."""
+    prefix = "https://github.com/"
+    suffix = f"/actions/runs/{run_id}"
+    if (
+        not isinstance(html_url, str)
+        or len(html_url) <= len(prefix) + len(suffix)
+        or not html_url.startswith(prefix)
+        or not html_url.endswith(suffix)
+    ):
+        return False
+    slug = html_url[len(prefix) : len(html_url) - len(suffix)]
+    return _slug_matches(slug, allowed_slugs)
 
 
 def _fleet_security_workflow(repos: Mapping[str, FleetRepo] | None) -> str | None:
@@ -596,7 +626,7 @@ def _accept_next_link(
     if numeric:
         if numeric.group(2) != suffix or required_repo_id is None or numeric.group(1) != required_repo_id:
             return None
-    elif path not in _allowed_repo_paths(slugs, suffix):
+    elif not _repo_path_matches(path, slugs, suffix):
         # The next page may name either baked slug of the selected repository row.
         return None
     return f"{path}?{query}" if query else path
@@ -1033,18 +1063,17 @@ def _run_record(
     if not isinstance(event, str) or not isinstance(full_name, str):
         return None, "github_invalid_payload"
     slugs = tuple(allowed_slugs) if allowed_slugs is not None else (f"{owner}/{name}",)
-    if event not in _ALLOWED_RUN_EVENTS or full_name not in slugs:
+    if event not in _ALLOWED_RUN_EVENTS or not _slug_matches(full_name, slugs):
         return None, "run_not_on_default_branch"
     head_sha = run.get("head_sha")
     safe_sha = head_sha if isinstance(head_sha, str) and _FULL_SHA_RE.fullmatch(head_sha) else None
     html_url = run.get("html_url")
-    expected_urls = tuple(f"https://github.com/{slug}/actions/runs/{run_id}" for slug in slugs)
     return {
         "path": f".github/workflows/{filename}",
         "run_id": run_id,
         "head_sha": safe_sha,
         "conclusion": _sanitize_text(run.get("conclusion")) or None,
-        "html_url": html_url if html_url in expected_urls else None,
+        "html_url": html_url if _run_html_url_matches(html_url, slugs, run_id) else None,
     }, None
 
 
@@ -1059,7 +1088,7 @@ def _annotation_endpoint(
         return None
     slugs = tuple(allowed_slugs) if allowed_slugs is not None else (f"{owner}/{name}",)
     matched = _CHECK_RUN_URL_RE.fullmatch(check_run_url)
-    if not matched or f"{matched.group(1)}/{matched.group(2)}" not in slugs:
+    if not matched or not _slug_matches(f"{matched.group(1)}/{matched.group(2)}", slugs):
         return None
     return _repo_api(owner, name, f"check-runs/{matched.group(3)}/annotations?per_page=100")
 

@@ -204,12 +204,12 @@ def _child_association(
     proof = task.get("worktree_reap_proof") or {}
     if proof.get("pr_state") != "MERGED" or proof.get("pr_number") != ledger["pr"]["number"]:
         raise ObservationRefusal("RECOVERY_MERGED_PR_UNPROVEN")
-    pr_urls = _repository_urls(target["repository"], f"pull/{ledger['pr']['number']}")
+    pr_path = f"pull/{ledger['pr']['number']}"
     # Exact preserved PR membership is required in addition to Git ancestry.
     if (
         child_pr.get("number") != ledger["pr"]["number"]
-        or ledger["pr"]["url"] not in pr_urls
-        or child_pr.get("url") not in pr_urls
+        or not _matches_repository_url(ledger["pr"]["url"], target["repository"], pr_path)
+        or not _matches_repository_url(child_pr.get("url"), target["repository"], pr_path)
         or child_pr.get("state") != "MERGED"
         or not child_pr.get("head_sha")
         or child_pr.get("head_sha") != proof.get("pr_head_sha")
@@ -403,9 +403,23 @@ def _same_repository_slug(left: Any, right: Any) -> bool:
     return any(left.casefold() == slug.casefold() for slug in _repository_slugs(right))
 
 
-def _repository_urls(repository: Any, path: str) -> tuple[str, ...]:
-    # A tuple, not a set: membership of an unhashable payload value must be False, not TypeError.
-    return tuple(f"https://github.com/{slug}/{path}" for slug in _repository_slugs(repository))
+def _matches_repository_url(url: Any, repository: Any, path: str) -> bool:
+    """Whether *url* is ``https://github.com/<slug>/<path>`` for a baked slug of *repository*.
+
+    The scheme, host and *path* suffix match verbatim; only the validated ASCII
+    ``owner/name`` slug segment is compared case-insensitively.
+    """
+    prefix = "https://github.com/"
+    suffix = f"/{path}"
+    if (
+        not isinstance(url, str)
+        or len(url) <= len(prefix) + len(suffix)
+        or not url.startswith(prefix)
+        or not url.endswith(suffix)
+    ):
+        return False
+    slug = url[len(prefix) : len(url) - len(suffix)]
+    return _same_repository_slug(slug, repository)
 
 
 _MERGED_PR_KEYS = ("number", "url", "state", "head_sha", "head_branch", "merge_sha")
@@ -413,12 +427,17 @@ _CHILD_PR_KEYS = ("number", "url", "state", "head_sha", "head_branch")
 
 
 def _same_pr_fields(left: Any, right: Any, repository: Any, keys: tuple[str, ...]) -> bool:
-    """Whether two PR records match on *keys*, allowing either baked slug in ``url``."""
+    """Whether two PR records match on *keys*, allowing either baked slug (ASCII case-insensitive) in ``url``."""
     if not isinstance(left, Mapping) or not isinstance(right, Mapping):
         return False
-    urls = _repository_urls(repository, f"pull/{left.get('number')}")
+    path = f"pull/{left.get('number')}"
     return all(
-        (left.get(key) in urls and right.get(key) in urls) if key == "url" else left.get(key) == right.get(key)
+        (
+            _matches_repository_url(left.get(key), repository, path)
+            and _matches_repository_url(right.get(key), repository, path)
+        )
+        if key == "url"
+        else left.get(key) == right.get(key)
         for key in keys
     )
 
@@ -488,11 +507,11 @@ def _recovery_pr_head(
             raise ObservationRefusal("RECOVERY_BRANCH_MISMATCH")
         return proof.get("pr_head_sha")
     pr = recovery.get("merged_pr") or {}
-    pr_urls = _repository_urls(ledger["identity"]["repository"], f"pull/{pr.get('number')}")
+    pr_path = f"pull/{pr.get('number')}"
     if (
         pr.get("number") != ledger["pr"]["number"]
-        or ledger["pr"]["url"] not in pr_urls
-        or pr.get("url") not in pr_urls
+        or not _matches_repository_url(ledger["pr"]["url"], ledger["identity"]["repository"], pr_path)
+        or not _matches_repository_url(pr.get("url"), ledger["identity"]["repository"], pr_path)
         or pr.get("state") != "MERGED"
         or pr.get("head_branch") != task["worktree_branch"]
         or not isinstance(pr.get("merge_sha"), str)
@@ -741,15 +760,16 @@ def merged_run_evidence(
     merge = pull.get("merge_commit_sha")
     merged_at = pull.get("merged_at")
     base_ref = pull.get("base", {}).get("ref")
-    pr_urls = _repository_urls(repository, f"pull/{pr_number}")
+    pr_path = f"pull/{pr_number}"
     observed_pr = observation.get("github", {}).get("pr", {})
     if (
-        pull.get("number") != pr_number or pull.get("html_url") not in pr_urls
-        or pull.get("base", {}).get("repo", {}).get("full_name") not in _repository_slugs(repository)
+        pull.get("number") != pr_number or not _matches_repository_url(pull.get("html_url"), repository, pr_path)
+        or not _same_repository_slug(pull.get("base", {}).get("repo", {}).get("full_name"), repository)
         or pull.get("state") != "closed" or pull.get("merged") is not True
         or not isinstance(merged_at, str) or not isinstance(base_ref, str) or not base_ref
         or not all(isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (head, merge))
-        or observed_pr.get("number") != pr_number or observed_pr.get("url") not in pr_urls
+        or observed_pr.get("number") != pr_number
+        or not _matches_repository_url(observed_pr.get("url"), repository, pr_path)
         or observed_pr.get("state") != "MERGED" or observed_pr.get("head_sha") != head
         or observed_pr.get("merge_sha") != merge
     ):
@@ -759,9 +779,9 @@ def merged_run_evidence(
     if (
         type(run_id) is not int or type(attempt) is not int or min(run_id, attempt) < 1
         or not isinstance(run.get("repository"), Mapping)
-        or run["repository"].get("full_name") not in _repository_slugs(repository)
+        or not _same_repository_slug(run["repository"].get("full_name"), repository)
         or run.get("event") != "merge_group" or run.get("head_sha") != merge
-        or run.get("html_url") not in _repository_urls(repository, f"actions/runs/{run_id}")
+        or not _matches_repository_url(run.get("html_url"), repository, f"actions/runs/{run_id}")
         or run.get("path") != workflow
         or not re.fullmatch(rf"gh-readonly-queue/{re.escape(base_ref)}/pr-{pr_number}-[0-9a-f]+", str(run.get("head_branch", "")))
         or run.get("status") != "completed" or run.get("conclusion") != "success"
@@ -783,7 +803,7 @@ def merged_run_evidence(
         if (
             type(job_id) is not int or job_id < 1 or job.get("run_id") != run_id
             or type(job.get("run_attempt")) is not int or job.get("run_attempt") != attempt or job.get("head_sha") != merge
-            or job.get("html_url") not in _repository_urls(repository, f"actions/runs/{run_id}/job/{job_id}")
+            or not _matches_repository_url(job.get("html_url"), repository, f"actions/runs/{run_id}/job/{job_id}")
         ):
             raise ObservationRefusal("CLOSEOUT_JOB_RUN_MISMATCH")
     for name in updated["required_checks"]:
@@ -830,7 +850,7 @@ def merged_run_evidence(
             # Evidence recorded before a transfer names the other baked slug of the same job URL.
             matching = [
                 job for job in jobs
-                if record["url"] in _repository_urls(repository, f"actions/runs/{run_id}/job/{job['id']}")
+                if _matches_repository_url(record["url"], repository, f"actions/runs/{run_id}/job/{job['id']}")
             ]
             if (not isinstance(names, list) or not names or not all(isinstance(name, str) and name for name in names)
                     or len(matching) != 1 or not _execution_succeeded(matching[0], merged_at=merged_at, not_before=run["run_started_at"])):

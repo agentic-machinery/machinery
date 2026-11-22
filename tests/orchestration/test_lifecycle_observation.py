@@ -603,6 +603,7 @@ def test_task_commit_range_refuses_ambiguous_absorbed_merge(observation_case):
     ("payload_slug", "job_slug", "refusal"),
     [
         ("org/repo", "org/repo", None),
+        ("ORG/Repo", "NewOrg/Repo", None),
         ("neworg/repo", "neworg/repo", None),
         ("org/repo", "neworg/repo", None),
         ("evil/repo", "evil/repo", "CLOSEOUT_MERGED_PR_MISMATCH"),
@@ -612,9 +613,10 @@ def test_task_commit_range_refuses_ambiguous_absorbed_merge(observation_case):
 def test_merged_run_evidence_binds_either_baked_slug_of_the_ledger_repository(
     bound_case, observation_case, monkeypatch, payload_slug, job_slug, refusal
 ):
-    """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
-    with the same repository name under another owner is accepted (ledger and evidence recorded as org/repo;
-    separate reads may mix the two baked slugs, including child recovery and replay)."""
+    """Defect class: a payload naming the other baked slug (or an ASCII case variant) of the same
+    repository is refused, or a slug with the same repository name under another owner is accepted
+    (ledger and evidence recorded as org/repo or ORG/Repo; separate reads may mix the two baked
+    slugs and ASCII case variants, including child recovery and replay)."""
     from copy import deepcopy
 
     from lu_machinery.orchestration import task_identity
@@ -636,10 +638,25 @@ def test_merged_run_evidence_binds_either_baked_slug_of_the_ledger_repository(
         assert report["run_url"] == run_url
         assert [item["executed"][0]["url"] for item in report["criteria"]] == [jobs[0]["html_url"]]
 
-    # Child recovery and replay must bind either baked slug for carrier and PR URLs, and refuse foreign slugs.
+    # Child recovery and replay must bind either baked slug (including ASCII case variants) for carrier
+    # and PR URLs, and refuse foreign or non-ASCII look-alike slugs.
     repo, worktree, child_file, task_file, manifest, push_file, head = observation_case
     child = tl.load_lifecycle(child_file)
-    carrier_slug = "neworg/repo" if payload_slug == "neworg/repo" else "org/repo"
+    if payload_slug == "ORG/Repo":
+        # Exercise a schema-valid mixed-case child ledger paired with mixed-case and canonical PR URLs.
+        cased_identity = deepcopy(child["identity"])
+        cased_identity.update(
+            repository="ORG/Repo",
+            github_issue_url="https://github.com/ORG/Repo/issues/42",
+            stream_epic_url="https://github.com/ORG/Repo/issues/10",
+        )
+        child = tl.build_lifecycle(
+            cased_identity, author_family="codex", ac_snapshot=child["ac_snapshot"],
+            required_checks=["CI Gate"], now=NOW, pr_number=77,
+        )
+        child_file = tl.lifecycle_path(repo, cased_identity)
+        tl.write_lifecycle(child_file, child)
+    carrier_slug = "NewOrg/Repo" if payload_slug in {"neworg/repo", "ORG/Repo"} else "org/repo"
     earlier_identity = deepcopy(child["identity"])
     earlier_identity.update(
         repository=carrier_slug,
@@ -683,3 +700,16 @@ def test_merged_run_evidence_binds_either_baked_slug_of_the_ledger_repository(
         return
     again, replayed = lo.recover(repo, **recover_kwargs, child_pr=replay_pr)
     assert replayed is True and again == receipt
+    if payload_slug == "ORG/Repo":
+        # Case-only replay and exact-host/suffix guards hold on mixed-case ledgers too.
+        lower_again, lower_replayed = lo.recover(
+            repo, **recover_kwargs, child_pr={**first_pr, "url": "https://github.com/org/repo/pull/77"},
+        )
+        assert lower_replayed is True and lower_again == receipt
+        for bad_url in (
+            "HTTPS://GITHUB.COM/org/repo/pull/77",
+            "https://github.com/org/repo/PULL/77",
+            "https://github.com/org/repo\u212a/pull/77",
+        ):
+            with pytest.raises(lo.ObservationRefusal, match="RECOVERY_CHILD_PR_MISMATCH"):
+                lo.recover(repo, **recover_kwargs, child_pr={**first_pr, "url": bad_url})
