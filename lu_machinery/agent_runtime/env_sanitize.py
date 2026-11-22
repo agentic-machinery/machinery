@@ -1096,7 +1096,9 @@ if __name__ == "__main__":
             if args.check_helper:
                 raise SystemExit(0)
             exec_cwd = Path.cwd()
-            in_git_checkout = any((parent / ".git").exists() for parent in (exec_cwd, *exec_cwd.parents))
+            in_git_checkout = any(
+                (parent / ".git").is_dir() or (parent / ".git").is_file() for parent in (exec_cwd, *exec_cwd.parents)
+            )
             child = child_credential_env(
                 os.environ,
                 args.provider,
