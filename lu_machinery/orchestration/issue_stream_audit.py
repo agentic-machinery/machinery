@@ -1010,15 +1010,23 @@ def _gh_json(args: list[str] | Request, timeout_s: float = 30.0, *, cwd: Path | 
     return json_depth.loads(proc.stdout, max_depth=512)
 
 
+def _validate_open_issue_rows(data: object) -> list[dict]:
+    if not isinstance(data, list):
+        raise ValueError("open issues payload unavailable")
+    rows: list[dict] = []
+    for row in data:
+        if not isinstance(row, dict) or not _is_positive_int(row.get("number")) or not isinstance(row.get("title"), str):
+            raise ValueError("open issues payload unavailable")
+        rows.append(row)
+    return rows
+
+
 def fetch_open_issues(repo_root: Path | None = None, *, repo_slug: str | None = None) -> list[dict]:
     args = ["issue", "list"]
     if repo_slug is not None:
         args += ["-R", repo_slug]
     args += ["--state", "open", "--limit", "500", "--json", "number,title"]
-    data = _gh_json(args, cwd=repo_root)
-    if not isinstance(data, list):
-        raise ValueError("open issues payload unavailable")
-    return data
+    return _validate_open_issue_rows(_gh_json(args, cwd=repo_root))
 
 
 def fetch_issue_states(
@@ -1050,9 +1058,9 @@ def fetch_issue_states(
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
             unavailable.add(number)
             continue
-        resolved_number = issue.get("number")
-        state = issue.get("state")
-        if isinstance(resolved_number, int) and isinstance(state, str):
+        resolved_number = issue.get("number") if isinstance(issue, dict) else None
+        state = issue.get("state") if isinstance(issue, dict) else None
+        if isinstance(resolved_number, int) and not isinstance(resolved_number, bool) and resolved_number > 0 and isinstance(state, str):
             states[resolved_number] = state
         else:
             unavailable.add(number)
@@ -1151,7 +1159,24 @@ def _fetch_subissues_page(
         ),
         cwd=repo_root,
     )
-    return (data.get("data") or {}).get("repository", {}).get("issue") or {}
+    if not isinstance(data, dict):
+        raise ValueError("sub-issues payload unavailable")
+    data_obj = data.get("data")
+    if data_obj is None:
+        return {}
+    if not isinstance(data_obj, dict):
+        raise ValueError("sub-issues payload unavailable")
+    repo_obj = data_obj.get("repository")
+    if repo_obj is None:
+        return {}
+    if not isinstance(repo_obj, dict):
+        raise ValueError("sub-issues payload unavailable")
+    issue_obj = repo_obj.get("issue")
+    if issue_obj is None:
+        return {}
+    if not isinstance(issue_obj, dict):
+        raise ValueError("sub-issues payload unavailable")
+    return issue_obj
 
 
 def _paginate_subissues(epic: int, fetch_page: Callable[[int, str | None], dict]) -> tuple[set[int], str]:
@@ -1174,7 +1199,7 @@ def _paginate_subissues(epic: int, fetch_page: Callable[[int, str | None], dict]
         native.update(
             n["number"]
             for n in (sub_issues.get("nodes") or [])
-            if isinstance(n, dict) and isinstance(n.get("number"), int)
+            if isinstance(n, dict) and isinstance(n.get("number"), int) and not isinstance(n.get("number"), bool)
         )
         page_info = sub_issues.get("pageInfo") or {}
         next_cursor = page_info.get("endCursor")
@@ -1239,6 +1264,9 @@ def _fetch_subissue_batch(
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
         data = None
 
+    if not isinstance(data, dict):
+        data = None
+
     if data is None:
         if len(cursors) <= 1:
             return {number: INCOMPLETE_NODE for number in cursors}
@@ -1259,10 +1287,14 @@ def _fetch_subissue_batch(
             )
         return pages
 
-    errors = data.get("errors") or []
+    raw_errors = data.get("errors")
+    errors = raw_errors if isinstance(raw_errors, list) else []
     not_found_numbers: set[int] = set()
-    has_untrusted_errors = False
+    has_untrusted_errors = raw_errors is not None and not isinstance(raw_errors, list)
     for err in errors:
+        if not isinstance(err, dict):
+            has_untrusted_errors = True
+            continue
         path = err.get("path")
         if (
             err.get("type") == "NOT_FOUND"
@@ -1297,13 +1329,17 @@ def _fetch_subissue_batch(
             )
         return pages
 
-    repository = (data.get("data") or {}).get("repository") or {}
+    data_obj = data.get("data")
+    repository = data_obj.get("repository") if isinstance(data_obj, dict) else None
+    if not isinstance(repository, dict):
+        return {number: INCOMPLETE_NODE for number in cursors}
     pages = {}
     for number in cursors:
         if number in not_found_numbers:
             pages[number] = None
         else:
-            pages[number] = repository.get(f"i{number}")
+            node_val = repository.get(f"i{number}")
+            pages[number] = node_val if (node_val is None or isinstance(node_val, dict)) else INCOMPLETE_NODE
     return pages
 
 
@@ -1488,8 +1524,9 @@ def classify(
         n: (native_epics.get(n) or body_epics.get(n) or set()) for n in set(native_epics) | set(body_epics)
     }
 
-    open_numbers = {i["number"] for i in open_issues}
-    titles = {i["number"]: i["title"] for i in open_issues}
+    validated_open_issues = _validate_open_issue_rows(open_issues)
+    open_numbers = {i["number"] for i in validated_open_issues}
+    titles = {i["number"]: i["title"] for i in validated_open_issues}
 
     orphans = sorted(n for n in open_numbers if n not in epic_numbers and not owning_epics.get(n))
     multi_homed = sorted(n for n in open_numbers if n not in epic_numbers and len(owning_epics.get(n, ())) > 1)

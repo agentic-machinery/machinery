@@ -2095,6 +2095,27 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
             with pytest.raises(ValueError, match="repository identity unavailable"):
                 issue_stream_audit._repo_owner_name(audit_root, repo_slug=active_slug)
 
+        # Malformed open-issue rows fail closed with ValueError / CLI exit 2 (F4).
+        for bad_rows in (
+            [None],
+            [{"number": 10.0, "title": "root"}],
+            [{"number": True, "title": "root"}],
+            [{"number": 0, "title": "root"}],
+            [{"number": 10, "title": None}],
+            [{"number": 10}],
+        ):
+            monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=bad_rows, **k: payload)
+            with pytest.raises(ValueError, match="open issues payload unavailable"):
+                issue_stream_audit.fetch_open_issues(audit_root, repo_slug=active_slug)
+            assert issue_stream_audit.main(["--repo", "machinery", "--check", "--json"]) == 2
+            capsys.readouterr()
+
+        # Malformed GraphQL sub-issue batch payloads degrade to INCOMPLETE_NODE instead of crashing.
+        for bad_batch in ([], {"data": None}, {"data": {"repository": {"i10": "not-a-dict"}}}):
+            monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=bad_batch, **k: payload)
+            batch_result = issue_stream_audit._fetch_subissue_batch({10: None}, audit_root, repo_slug=active_slug)
+            assert batch_result == {10: issue_stream_audit.INCOMPLETE_NODE}
+
         # Missing/broken fleet catalog default fails closed instead of substituting 'public' (F1 sibling).
         monkeypatch.setattr(
             fleet_repos, "default_repo_key", lambda *_a, **_k: (_ for _ in ()).throw(fleet_repos.FleetRepoError("no default"))
