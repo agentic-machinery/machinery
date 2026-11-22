@@ -6,6 +6,7 @@ The retained admission scanner and ownership ledger read the same hold format.
 
 import contextlib
 import http.client
+import os
 import subprocess
 import sys
 import uuid
@@ -150,39 +151,45 @@ def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None, orchestrat
     return decision
 
 
-def _orchestrator_marked(raw: bytes) -> bool:
-    return f'"{legacy.ORCHESTRATOR_KEY}"'.encode() in raw
-
-
 def stream_holders(stream, task_id):
     """The other orchestrator turns that may still run on ``stream`` (DRIVERS-1122).
 
     A turn holds its stream until its record is terminal and its provider is proven gone
-    from well-formed launch evidence (``_provider_gone``): an admission hold, a live run, a
-    settled run whose provider lingers and a crashed run all hold it. An unknown status, a
-    malformed orchestrator record and an unreadable record that names an orchestrator each
-    hold every stream: the reservation fails closed. Reads hot records only; a record that
-    names no orchestrator is never parsed.
+    (``_provider_gone``): an admission hold, a live run, a settled run whose provider lingers,
+    a crashed run and any fallback launch all hold it. Every record is parsed, hot and archived
+    alike, so neither archival nor a damaged byte pattern hides a turn. An unknown status and an
+    unreadable, damaged or malformed record each hold every stream, and so does a store whose
+    listing changed during the scan (a record moved between the hot store and the archive): the
+    reservation fails closed.
     """
     from lu_machinery.dispatcher.worker import _provider_alive
-    from lu_machinery.orchestration.task_record_store import iter_task_records, parse_task_record
+    from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME, iter_task_records, parse_task_record
 
+    root = tasks_dir()
     holders = []
-    for path in iter_task_records(tasks_dir(), include_archive=False):
+    for directory in (root, root / ARCHIVE_DIR_NAME):
+        # The record listing skips a directory it cannot read; here only an absent archive lists nothing.
+        try:
+            os.listdir(directory)
+        except FileNotFoundError:
+            if directory == root:
+                holders.append("(the task store is missing)")
+        except OSError:
+            holders.append(f"({directory.name} unreadable)")
+    listed = list(iter_task_records(root, include_archive=True))
+    for path in listed:
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
-            continue  # settled and archived since it was listed
+            continue  # moved or removed since it was listed: the listing check below holds
         except OSError:
             holders.append(f"{path.stem} (record unreadable)")
-            continue
-        if not _orchestrator_marked(raw):
             continue
         try:
             record = parse_task_record(path, raw)
             other = legacy.orchestrator_stream(record) if isinstance(record, dict) else None
         except ValueError:
-            holders.append(f"{path.stem} (orchestrator record malformed)")
+            holders.append(f"{path.stem} (record damaged or malformed)")
             continue
         if other is None or record.get("task_id") == task_id or other != stream:
             continue
@@ -191,41 +198,41 @@ def stream_holders(stream, task_id):
             holders.append(str(record.get("task_id")))
         elif not _provider_gone(_provider_alive, record):
             holders.append(f"{record.get('task_id')} ({status}; provider not proven gone)")
+    if list(iter_task_records(root, include_archive=True)) != listed:
+        holders.append("(the task store changed during the scan)")
     return holders
-
-
-# The launch modes a supervisor records (admission.spawn_supervisor).
-_LAUNCH_MODES = frozenset({"scope", "popen-fallback"})
 
 
 def _provider_gone(provider_alive, record):
     """True only when a terminal turn's provider is proven gone, from affirmative evidence.
 
-    A launched run (a known launch mode) needs settlement's own proof that its whole process tree
-    exited (``provider_exit_proven_at``, which ``worker._reap_worktree`` writes only from a scope's
-    probe or after the supervisor's own successful fallback tree stop) and a probe that still answers
-    False: the provider group's absence alone misses a descendant that left it. A run that never
-    launched has no pid, no process start, no launch mode, no recorded provider group, and an
-    explicit never-started or never-ran reason. Anything else, a damaged field or a probe error
-    included, is not proof.
+    Only a scope launch can prove it: its cgroup holds every descendant, and the kernel never
+    removes a cgroup that still holds a process, so its probe (``worker._provider_alive``)
+    answering False is the proof. A popen-fallback launch records one process group, which a
+    descendant can leave, so nothing proves it gone; it holds its stream. A run that never
+    launched has no pid, process start, provider group, fallback survivors or ``launch_*``
+    field, and names a non-blank never-started reason or a never-ran return reason. Anything
+    else, a damaged field or a probe error included, is not proof.
     """
     if "launch_mode" in record:
-        if not (isinstance(record["launch_mode"], str) and record["launch_mode"] in _LAUNCH_MODES):
-            return False
-        if store.parse_utc_timestamp(record.get("provider_exit_proven_at")) is None:
+        if record["launch_mode"] != _SCOPE_LAUNCH:
             return False
         try:
             return provider_alive(record) is False
         except Exception:  # a malformed liveness field never ends the scan or frees the stream
             return False
-    if any(record.get(key) is not None for key in _LAUNCH_EVIDENCE):
+    if any(record.get(key) is not None for key in _LAUNCH_EVIDENCE) or any(
+            key.startswith("launch_") and value is not None for key, value in record.items()):
         return False
     started, ran = record.get("never_started_reason"), record.get("returncode_reason")
-    return (isinstance(started, str) and bool(started)) or (isinstance(ran, str) and ran in _NEVER_RAN)
+    return (isinstance(started, str) and bool(started.strip())) or (isinstance(ran, str) and ran in _NEVER_RAN)
 
 
-# Fields only a launch writes: any of them contradicts a claim that the run never started.
-_LAUNCH_EVIDENCE = ("pid", "process_start", "provider_pgid", "launch_unit", "launch_cgroup", "fallback_survivors")
+# The one launch whose probe sees every descendant (dispatch_isolation.LAUNCH_SCOPE).
+_SCOPE_LAUNCH = "scope"
+# Fields a supervisor writes once it runs (besides every ``launch_*`` field): any of them contradicts a
+# claim that the run never started.
+_LAUNCH_EVIDENCE = ("pid", "process_start", "provider_pgid", "fallback_survivors")
 # A launch the dispatcher itself recorded as never having produced a provider (worker._provider_alive).
 _NEVER_RAN = frozenset({"spawn_process_missing", "dispatch_died_after_admission", "spawn_setup_failed"})
 

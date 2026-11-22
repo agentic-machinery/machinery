@@ -1400,6 +1400,11 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
         record["delivery_prs"] = [f"{pr['repo']}#{pr['number']}" for pr in deliveries]
     _reap_worktree(record, patience=patience, salvage=salvage,
                    verified_merged_head=record.get("head_sha") if merged else None)
+    if "orchestrator" in record and record.get("status") == "done" and record.get("worktree_disposition") != "removed":
+        # Delivery checked the tree before this cleanup ended the turn's leftover processes, which could still
+        # write. Only a tree settlement then removed, clean and published, still proves the turn wrote nothing.
+        cause = "orchestrator_product_write: the turn's worktree was not proven clean once its processes ended"
+        record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
     if record.get("worktree_disposition") == "removed":
         if merged:
             try:
@@ -1480,13 +1485,6 @@ def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
             reason = "provider_processes_alive" if alive else "provider_liveness_unknown"
             record.update(worktree_disposition="retained", worktree_disposition_reason=reason)
             return
-        whole_tree = record.get("launch_mode") == "scope" or (
-            record.get("launch_mode") == "popen-fallback" and stopped is not None and stopped.ok)
-        if "orchestrator" in record and whole_tree:
-            # The stream reservation releases a turn only on this proof (DRIVERS-1122). A scope's probe sees
-            # every descendant; a fallback launch's probe sees only its process group, so only the supervisor's
-            # own successful tree stop proves it. A later sweep from another process never writes it.
-            record["provider_exit_proven_at"] = store.now()
 
         def borrowed() -> bool:
             return (salvage and _provider_alive(record) is not False) or _borrowed(record)

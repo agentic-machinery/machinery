@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from lu_machinery.dispatcher import git, host_admission, ownership, store, worker
-from lu_machinery.orchestration import dispatch_admission
+from lu_machinery.orchestration import dispatch_admission, task_record_store
 from lu_machinery.session_supervisor import remote
 from tests.dispatcher.conftest import await_file, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -28,8 +28,8 @@ TASK_ENV = ownership.TASK_ID_ENV
 
 _MISSING = object()
 _DEAD_PID = 2**22 + 1  # above the default pid_max, so never a live process
-_LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="popen-fallback", provider_pgid=None,
-                 provider_exit_proven_at="2026-11-22T20:00:00+00:00")
+_LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="scope", launch_unit="lu-worker-prior",
+                 provider_pgid=None)
 
 
 def _lease(state="active", session_state="open", expires_in=600):
@@ -197,25 +197,29 @@ def test_concurrent_turns_on_one_stream_get_one_reservation(task_store):
 @pytest.mark.parametrize(
     ("fields", "held"),
     [
-        # A launched run releases its stream once terminal with its provider proven gone (no provider group).
+        # A terminal scope launch releases its stream once its cgroup probe answers False: the scope holds every
+        # descendant.
         (dict(status="done", **_LAUNCHED), False),
         (dict(status="timeout", **_LAUNCHED), False),
         (dict(status="crashed", **_LAUNCHED), False),
-        (dict(status="done", **{**_LAUNCHED, "provider_pgid": os.getpgid(0)}), True),  # settled, provider lingers
-        (dict(status="crashed", **{**_LAUNCHED, "provider_pgid": os.getpgid(0)}), True),  # its provider still runs
+        (dict(status="done", **_LAUNCHED, probe=True), True),  # settled, provider lingers
+        (dict(status="crashed", **_LAUNCHED, probe=None), True),  # liveness unknown
+        (dict(status="crashed", **_LAUNCHED, probe="raise"), True),  # a probe error is not proof
+        # A fallback launch records one process group, which a descendant can leave: nothing proves it gone.
+        (dict(status="done", **{**_LAUNCHED, "launch_mode": "popen-fallback"}), True),
         (dict(status="crashed", pid=_DEAD_PID), True),  # launched, but no launch mode: not proof
         (dict(status="crashed", **{**_LAUNCHED, "launch_mode": "weird"}), True),
         (dict(status="crashed", **{**_LAUNCHED, "launch_mode": ["scope"]}), True),
         (dict(status="crashed", **{**_LAUNCHED, "launch_mode": None}), True),
-        (dict(status="crashed"), True),  # provider liveness unknown
-        # Terminal before settlement's process-tree proof (a fallback descendant may outlive the group).
-        (dict(status="done", **{key: value for key, value in _LAUNCHED.items() if key != "provider_exit_proven_at"}),
-         True),
-        (dict(status="done", **{**_LAUNCHED, "provider_exit_proven_at": "soon"}), True),
-        # A run that never launched: no pid, no launch mode, no provider group, and a reason it never started.
+        (dict(status="crashed"), True),  # no launch evidence, and no reason it never started
+        # A run that never launched: no launch evidence at all, and a reason it never started.
         (dict(status="failed", never_started_reason="placement"), False),
         (dict(status="crashed", returncode_reason="dispatch_died_after_admission"), False),
         (dict(status="failed", never_started_reason="placement", provider_pgid=os.getpgid(0)), True),  # contradicts
+        (dict(status="failed", never_started_reason="placement", launch_fallback_reason="no_bus"), True),
+        (dict(status="failed", never_started_reason="placement", launch_user_bus={"source": "caller"}), True),
+        (dict(status="failed", never_started_reason="   "), True),  # a blank reason names none
+        (dict(status="crashed", returncode_reason=["spawn_setup_failed"]), True),  # wrong type, never an error
         (dict(status="failed", provider_pgid=None), True),  # no never-started reason
         (dict(status="mystery"), True),
         (dict(status="spawning"), True),
@@ -228,12 +232,35 @@ def test_concurrent_turns_on_one_stream_get_one_reservation(task_store):
         (dict(orchestrator="epic:7"), True),
     ],
 )
-def test_a_stream_stays_reserved_until_its_turn_is_proven_finished(task_store, fields, held):
+def test_a_stream_stays_reserved_until_its_turn_is_proven_finished(task_store, monkeypatch, fields, held):
     """Defect class: a stream is released while a crashed turn's provider may still dispatch."""
+
+    def probe(record):  # the scope cgroup probe's answer, scripted per record
+        if record.get("probe", False) == "raise":
+            raise ValueError("a damaged liveness field")
+        return record.get("probe", False)
+
+    monkeypatch.setattr(worker, "_provider_alive", probe)
     # Written raw: a damaged record on disk is one the store's own writer would refuse to produce.
     store.record_path("prior").write_text(json.dumps(_orchestrator_record("prior", **fields)))
     holders = host_admission.stream_holders(STREAM, "turn")
     assert bool(holders) is held, holders
+
+
+@pytest.mark.parametrize("where", ["truncated", "escaped", "archived"])
+def test_no_record_state_hides_a_turn_from_the_stream_scan(task_store, where):
+    """Defect class: a truncated, escaped or archived turn record is skipped, so its stream is freed while it may run."""
+    text = json.dumps(_orchestrator_record("prior", status="crashed"))
+    path = store.record_path("prior")
+    if where == "truncated":
+        text = text[: text.index('"orchestrator"')]
+    elif where == "escaped":
+        text = text.replace('"orchestrator"', '"orchestr\\u0061tor"')
+    else:
+        path = task_store / task_record_store.ARCHIVE_DIR_NAME / "prior.json"
+        path.parent.mkdir()
+    path.write_text(text)
+    assert host_admission.stream_holders(STREAM, "turn")
 
 
 # --- legacy lease --------------------------------------------------------------------------------------------------
@@ -425,6 +452,18 @@ def test_cleanup_never_salvages_or_publishes_a_rejected_turn(monkeypatch):
     assert seen["salvage"] is True  # unchanged for every other task
 
 
+def test_a_turn_whose_tree_settlement_did_not_remove_is_not_done(monkeypatch):
+    """Defect class: a leftover process dirties the tree after delivery's snapshot, and the turn still settles done."""
+    monkeypatch.setattr(worker, "_stop_task_services", lambda _record: None)
+    monkeypatch.setattr(worker.scratch, "settleable", lambda _record: False)
+    monkeypatch.setattr(worker, "_reap_worktree", lambda record, **_kwargs: record.update(
+        worktree_disposition="retained", worktree_disposition_reason="dirty"))
+    record = _settled()
+    worker._reap_settled(record)
+    assert record["status"] == "no_deliverable"
+    assert record["no_deliverable_reason"].startswith("orchestrator_product_write")
+
+
 def test_a_turn_gets_no_path_grant(task_store, tmp_path, monkeypatch):
     """Defect class: a coordinator grant gives an orchestrator turn product scope."""
     _write(_orchestrator_record("turn", worktree_path=str(tmp_path)))
@@ -470,8 +509,8 @@ def turn_box(sandbox):
         assert result.returncode == expected, (result.stdout, result.stderr)
         return result
 
-    def turn(task_id, expected=0):
-        return run("dispatch", "--agent", "sol", "--model", "blocked", "--mode", "orchestrator", "--stream", STREAM,
+    def turn(task_id, expected=0, stream=STREAM):
+        return run("dispatch", "--agent", "sol", "--model", "blocked", "--mode", "orchestrator", "--stream", stream,
                    "--initiator", "claude-cto", "--task-id", task_id, "--prompt", "drive one wave",
                    expected=expected)
 
@@ -510,9 +549,11 @@ def test_a_turn_end_to_end_reserves_links_children_and_settles_on_its_receipt(tu
     late = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "child-late", "--prompt", "late",
                    task_env="turn-1", expected=2)
     assert "orchestrator_parent_not_running" in late.stderr
-    # The settled turn released its stream; a turn without a receipt settles no_deliverable.
-    second = box.turn("turn-3").stdout.splitlines()
-    _release(box, "turn-3")
+    # The sandbox forces a fallback launch, which never proves its process tree gone: the settled turn keeps its stream.
+    assert "provider not proven gone" in box.turn("turn-3", expected=3).stderr
+    # A turn without a receipt settles no_deliverable.
+    second = box.turn("turn-4", stream="epic:8").stdout.splitlines()
+    _release(box, "turn-4")
     missed = box.settle(second, expected=1)
     assert (missed["status"], missed["no_deliverable_reason"]) == ("no_deliverable", "orchestrator_handoff_receipt_missing")
 
