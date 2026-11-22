@@ -795,7 +795,7 @@ def _artifact_members(archive: Path) -> dict[str, int]:
         return {member.name: member.size for member in packed.getmembers() if member.isreg()}
 
 
-def test_settled_artifact_dir_is_archived_and_recorded(tmp_path: Path) -> None:
+def test_settled_artifact_dir_is_archived_and_recorded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = _batch(tmp_path)
     tasks = root / "tasks"
     _write_record(tasks, "old-done", status="done", age_days=10, run_nonce="same")
@@ -937,6 +937,69 @@ def test_settled_artifact_dir_is_archived_and_recorded(tmp_path: Path) -> None:
     assert not aged_dir.exists()
     assert stat.S_IMODE((tasks / "aged-mtime.artifacts.tar.xz").stat().st_mode) == 0o600
 
+    negative_path = tasks / "negative-mtime.json"
+    negative_path.write_text(
+        json.dumps(
+            {
+                "task_id": "negative-mtime",
+                "status": "done",
+                "read_only_mutation_paths": [],
+                "read_only_checkout_snapshot_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(negative_path, (-10, -10))
+    _write_full_sidecars(tasks, "negative-mtime", entries=1)
+    negative_dir = _write_artifact_tree(tasks, "negative-mtime")
+    pax_payload = io.BytesIO()
+    with tarfile.open(fileobj=pax_payload, mode="w:xz", format=tarfile.PAX_FORMAT) as packed:
+        member = tarfile.TarInfo("note.txt")
+        member.size = 5
+        member.pax_headers = {"size": "5"}
+        packed.addfile(member, io.BytesIO(b"hello"))
+    _write_record(tasks, "pax-size", status="done", age_days=4)
+    pax_dir = tasks / "pax-size.artifacts"
+    pax_dir.mkdir()
+    (pax_dir / "note.txt").write_bytes(b"hello")
+    pax_archive = tasks / "pax-size.artifacts.tar.xz"
+    pax_archive.write_bytes(pax_payload.getvalue())
+    pax_archive.chmod(0o600)
+    pax_before = pax_archive.read_bytes()
+    extended = plan_retention(root, min_age_days=1, apply=True, now=NOW)
+    extended_rows = {row["artifacts_dir"]: row for row in extended["selected"] if row.get("artifacts_dir")}
+    assert extended_rows["tasks/negative-mtime.artifacts"]["action"] == "archived"
+    assert not negative_dir.exists()
+    assert extended_rows["tasks/pax-size.artifacts"]["action"] == "archived"
+    assert not pax_dir.exists()
+    assert pax_archive.read_bytes() == pax_before
+
+    compressible = tasks / "compressible.artifacts"
+    _write_record(tasks, "compressible", status="done", age_days=4)
+    compressible.mkdir()
+    (compressible / "zeros.bin").write_bytes(b"\x00" * (3 * 1024 * 1024))
+    produced: list[int] = []
+    real_decompressor = lzma.LZMADecompressor
+
+    class CountingDecompressor:
+        def __init__(self, *args, **kwargs) -> None:
+            self._inner = real_decompressor(*args, **kwargs)
+
+        def __getattr__(self, name: str):
+            return getattr(self._inner, name)
+
+        def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+            out = self._inner.decompress(data, max_length)
+            produced.append(len(out))
+            return out
+
+    monkeypatch.setattr(retention.lzma, "LZMADecompressor", CountingDecompressor)
+    packed_zeros = plan_retention(root, min_age_days=0, apply=True, now=NOW)
+    assert produced and max(produced) <= 1024 * 1024
+    zeros_row = next(row for row in packed_zeros["selected"] if row.get("artifacts_dir") == "tasks/compressible.artifacts")
+    assert zeros_row["action"] == "archived"
+    assert not compressible.exists()
+
 
 def test_live_or_nonterminal_artifact_dir_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = _batch(tmp_path)
@@ -1009,7 +1072,7 @@ def test_live_or_nonterminal_artifact_dir_is_skipped(tmp_path: Path, monkeypatch
         assert "artifacts_retention" not in record
 
 
-def test_young_artifact_dir_is_skipped(tmp_path: Path) -> None:
+def test_young_artifact_dir_is_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = _batch(tmp_path)
     tasks = root / "tasks"
     _write_record(tasks, "young-done", status="done", age_days=0.5)
@@ -1049,6 +1112,35 @@ def test_young_artifact_dir_is_skipped(tmp_path: Path) -> None:
     assert (refreshed_dir / "note.txt").read_bytes() == b"hello"
     assert not (tasks / "refreshed.artifacts.tar.xz").exists()
     assert "artifacts_retention" not in json.loads(refreshed.read_text(encoding="utf-8"))
+
+    touched_path = tasks / "touched-after.json"
+    touched_path.write_text(
+        json.dumps(
+            {
+                "task_id": "touched-after",
+                "status": "done",
+                "read_only_mutation_paths": [],
+                "read_only_checkout_snapshot_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(touched_path, ((NOW - timedelta(days=9)).timestamp(),) * 2)
+    _write_full_sidecars(tasks, "touched-after", entries=1)
+    touched_dir = _write_artifact_tree(tasks, "touched-after")
+    real_measure = retention._measure_artifact_dirs
+
+    def touch_published(*args, **kwargs):
+        os.utime(touched_path, (NOW.timestamp(), NOW.timestamp()))
+        return real_measure(*args, **kwargs)
+
+    monkeypatch.setattr(retention, "_measure_artifact_dirs", touch_published)
+    after_touch = plan_retention(root, min_age_days=1, apply=True, now=NOW)
+    monkeypatch.undo()
+    assert [row for row in after_touch["selected"] if row.get("artifacts_dir") == "tasks/touched-after.artifacts"] == []
+    assert touched_dir.is_dir()
+    assert (touched_dir / "note.txt").read_bytes() == b"hello"
+    assert not (tasks / "touched-after.artifacts.tar.xz").exists()
 
 
 def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1150,6 +1242,28 @@ def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monke
     trailing_archive.write_bytes(valid_xz + b"trailing")
     trailing_archive.chmod(0o600)
     trailing_before = trailing_archive.read_bytes()
+    _write_record(tasks, "bad-mode", status="done", age_days=10)
+    bad_mode_dir = tasks / "bad-mode.artifacts"
+    bad_mode_dir.mkdir()
+    (bad_mode_dir / "note.txt").write_bytes(b"hello")
+    mode_tar = lzma.decompress(valid_xz)
+    mode_zero = b"\x00" * 512
+    mode_end = next(
+        offset
+        for offset in range(0, len(mode_tar) - 1023, 512)
+        if mode_tar[offset : offset + 1024] == mode_zero * 2
+    )
+    mode_block = bytearray(512)
+    mode_block[0:8] = b"evil.txt"
+    mode_block[100:108] = b"badmode\x00"
+    mode_block[124:136] = b"00000000000\x00"
+    mode_block[156:157] = b"0"
+    mode_sum = 256 + sum(mode_block[:148]) + sum(mode_block[156:])
+    mode_block[148:156] = f"{mode_sum:06o}\x00 ".encode()
+    bad_mode_archive = tasks / "bad-mode.artifacts.tar.xz"
+    bad_mode_archive.write_bytes(lzma.compress(mode_tar[:mode_end] + bytes(mode_block) + mode_tar[mode_end:]))
+    bad_mode_archive.chmod(0o600)
+    bad_mode_before = bad_mode_archive.read_bytes()
 
     refused = plan_retention(root, min_age_days=0, apply=True, now=NOW)
 
@@ -1157,7 +1271,7 @@ def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monke
     assert by_dir["tasks/mismatch.artifacts"]["action"] == "error"
     assert by_dir["tasks/mismatch.artifacts"]["error"] == "archive verification failed"
     assert by_dir["tasks/alias.artifacts"]["error"] == "archive exists"
-    for name in ("same-size", "truncated", "extra-dir", "wide", "bad-header", "trailing"):
+    for name in ("same-size", "truncated", "extra-dir", "wide", "bad-header", "trailing", "bad-mode"):
         assert by_dir[f"tasks/{name}.artifacts"]["error"] == "archive verification failed"
         assert (tasks / f"{name}.artifacts" / "note.txt").read_bytes() == b"hello"
         assert "artifacts_retention" not in json.loads((tasks / f"{name}.json").read_text(encoding="utf-8"))
@@ -1167,6 +1281,7 @@ def test_archive_verification_failure_leaves_the_directory(tmp_path: Path, monke
     assert wide_archive.read_bytes() == wide_before
     assert bad_archive.read_bytes() == bad_before
     assert trailing_archive.read_bytes() == trailing_before
+    assert bad_mode_archive.read_bytes() == bad_mode_before
     assert stat.S_IMODE(wide_archive.stat().st_mode) == 0o644
     assert (mismatch / "note.txt").read_bytes() == b"hello"
     assert (alias_dir / "note.txt").read_bytes() == b"hello"

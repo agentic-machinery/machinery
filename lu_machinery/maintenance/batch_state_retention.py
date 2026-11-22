@@ -601,15 +601,18 @@ def _apply_one(
                 current["read_only_snapshot_retention"] = _READ_ONLY_SNAPSHOT_RETENTION_DIGEST
                 written = json.dumps(current, indent=2, default=str).encode("utf-8")
                 _write_bytes_at(parent_fd, record_name, written)
+                published = _lstat_at(parent_fd, record_name)
                 if crash_after == "record":
                     raise RuntimeError("crash after record")
                 for phase in _PHASES:
                     _unlink_regular_at(snap_fd, f"read_only_checkout_{phase}.json")
-                return {
-                    "action": "digested",
-                    "preserved_mtime_ns": str(info.st_mtime_ns),
-                    "written_sha256": hashlib.sha256(written).hexdigest(),
-                }
+                digested = {"action": "digested"}
+                if published is not None and stat.S_ISREG(published.st_mode):
+                    digested["preserved_mtime_ns"] = str(info.st_mtime_ns)
+                    digested["published_dev"] = str(published.st_dev)
+                    digested["published_ino"] = str(published.st_ino)
+                    digested["published_mtime_ns"] = str(published.st_mtime_ns)
+                return digested
             finally:
                 os.close(snap_fd)
     except WorktreeLockError:
@@ -696,9 +699,9 @@ def _measure_candidate(
         if outcome["action"] == "error":
             row["error"] = outcome["error"]
             return row, 0
-        if outcome.get("preserved_mtime_ns") and outcome.get("written_sha256"):
-            row["preserved_mtime_ns"] = outcome["preserved_mtime_ns"]
-            row["written_sha256"] = outcome["written_sha256"]
+        for key in ("preserved_mtime_ns", "published_dev", "published_ino", "published_mtime_ns"):
+            if outcome.get(key):
+                row[key] = outcome[key]
     return row, reclaimed
 
 
@@ -899,117 +902,67 @@ def _member_matches_file(loose_fd: int, relative: str, stream: _BinaryChunk, siz
         os.close(descriptor)
 
 
-def _octal_field(field: bytes) -> int | None:
-    """Tar octal field, or None for a binary size or a non-numeric field."""
-    if field[:1] in (b"\x80", b"\xff"):
-        return None
-    text = field.replace(b"\x00", b" ").strip()
-    if not text:
-        return 0
-    try:
-        return int(text, 8)
-    except ValueError:
-        return None
+_XZ_DRAIN = 1024 * 1024
 
 
-def _tar_checksum_ok(block: bytes) -> bool:
-    """True when ``block`` carries a signed or unsigned tar header checksum."""
-    recorded = _octal_field(block[148:156])
-    if recorded is None:
+def _tar_ended(archive: tarfile.TarFile) -> bool:
+    """True when the tar parser stopped on the two zero end blocks.
+
+    A later header can have a valid checksum and still be unreadable. The
+    parser then stops as if the archive had ended. The stop offset has to be
+    those two blocks, and only zero padding may follow. Member sizes, including
+    a pax override or a binary size, stay the parser's.
+    """
+    fileobj = archive.fileobj
+    if fileobj is None:
         return False
-    unsigned = 256 + sum(block[:148]) + sum(block[156:])
-    signed = 256 + sum(byte - 256 if byte > 127 else byte for byte in block[:148])
-    signed += sum(byte - 256 if byte > 127 else byte for byte in block[156:])
-    return recorded in {unsigned, signed}
-
-
-class _TarFraming:
-    """Streaming check that a tar ends at two zero blocks and every header sums."""
-
-    def __init__(self) -> None:
-        self._buf = bytearray()
-        self._data_left = 0
-        self._phase = "header"
-        self._ok = True
-
-    def feed(self, data: bytes) -> bool:
-        if not self._ok:
+    try:
+        fileobj.seek(archive.offset)
+        if fileobj.read(1024) != b"\x00" * 1024:
             return False
-        self._buf.extend(data)
-        while self._ok and self._phase != "done":
-            if self._phase == "pad":
-                if self._buf.strip(b"\x00"):
-                    self._ok = False
-                else:
-                    self._buf.clear()
-                break
-            if self._phase == "data":
-                take = min(self._data_left, len(self._buf))
-                del self._buf[:take]
-                self._data_left -= take
-                if self._data_left:
-                    break
-                self._phase = "header"
-                continue
-            if len(self._buf) < 512:
-                break
-            block = bytes(self._buf[:512])
-            if block == b"\x00" * 512:
-                if len(self._buf) < 1024:
-                    break
-                if self._buf[512:1024] != b"\x00" * 512:
-                    self._ok = False
-                    break
-                del self._buf[:1024]
-                self._phase = "pad"
-                continue
-            if not _tar_checksum_ok(block):
-                self._ok = False
-                break
-            size = _octal_field(block[124:136])
-            if size is None or size < 0:
-                self._ok = False
-                break
-            del self._buf[:512]
-            self._data_left = (size + 511) // 512 * 512
-            self._phase = "data"
-        return self._ok
-
-    def finish(self) -> bool:
-        return self._ok and self._phase == "pad" and not self._buf.strip(b"\x00")
+        while True:
+            padding = fileobj.read(_XZ_DRAIN)
+            if not padding:
+                return True
+            if padding.strip(b"\x00"):
+                return False
+    except (OSError, AttributeError):
+        return False
 
 
-def _compressed_framing_intact(descriptor: int) -> bool:
-    """True when ``descriptor`` is one xz stream of a tar that ends cleanly.
+def _xz_consumes_file(descriptor: int) -> bool:
+    """True when ``descriptor`` is one xz stream and nothing follows it.
 
-    The tar reader stops at a bad header as if the archive had ended, and the
-    xz reader stops at the stream footer. Both leave a matching prefix looking
-    complete. This walk requires every header checksum, the two zero end
-    blocks, and no bytes after the xz stream.
+    Each decompress call is capped so a small compressed chunk cannot expand
+    into one unbounded buffer. The expanded bytes are discarded here; member
+    bytes are checked through the tar parser.
     """
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
     except OSError:
         return False
     decompressor = lzma.LZMADecompressor()
-    framing = _TarFraming()
     first = True
+    pending = b""
     try:
         while not decompressor.eof:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                return False
-            if first:
-                if not chunk.startswith(b"\xfd7zXZ\x00"):
+            if decompressor.needs_input:
+                if pending:
                     return False
-                first = False
-            if not framing.feed(decompressor.decompress(chunk)):
+                pending = os.read(descriptor, _XZ_DRAIN)
+                if not pending:
+                    return False
+                if first:
+                    if not pending.startswith(b"\xfd7zXZ\x00"):
+                        return False
+                    first = False
+            produced = decompressor.decompress(pending, max_length=_XZ_DRAIN)
+            pending = b""
+            if not produced and not decompressor.eof and not decompressor.needs_input:
                 return False
     except (lzma.LZMAError, EOFError, OSError):
         return False
-    if decompressor.unused_data or os.read(descriptor, 1):
-        return False
-    return framing.finish()
+    return not decompressor.unused_data and not os.read(descriptor, 1)
 
 
 def _verify_archive_at(
@@ -1023,9 +976,9 @@ def _verify_archive_at(
 ) -> bool:
     """True when ``name`` is a mode-0600 xz archive of the loose tree.
 
-    Every member is read and compared with the loose bytes. The xz stream must
-    be the whole file, and the tar inside it must end at two zero blocks with
-    a valid checksum on every header. ``subset`` is the resume case: the
+    Every member is read and compared with the loose bytes. The tar parser must
+    stop on the two zero end blocks, and the xz stream must be the whole file.
+    ``subset`` is the resume case: the
     recorded archive may still hold files already removed, and every file and
     directory still on disk must match it.
     """
@@ -1078,9 +1031,11 @@ def _verify_archive_at(
                         else:
                             return False
                         archived_files[relative] = member.size
+                    if not _tar_ended(archive):
+                        return False
         except (tarfile.TarError, OSError, EOFError, lzma.LZMAError):
             return False
-        if not _compressed_framing_intact(descriptor):
+        if not _xz_consumes_file(descriptor):
             return False
         if subset:
             return set(files) <= set(archived_files) and set(directories) <= archived_dirs
@@ -1501,7 +1456,7 @@ def _apply_one_artifact(
     min_age_days: float,
     now: datetime,
     identity: tuple[int, int],
-    rewritten: Mapping[str, tuple[int, str]] | None = None,
+    rewritten: Mapping[str, tuple[int, int, int, int]] | None = None,
 ) -> dict[str, Any] | None:
     """Pack one artifact directory. None means it disappeared or was redispatched."""
     try:
@@ -1532,7 +1487,7 @@ def _apply_one_artifact(
                     if record_info is not None and stat.S_ISREG(record_info.st_mode):
                         return {"action": "error", "error": "record unreadable"}
                     return None
-                age_mtime_ns = _rewritten_mtime(parent_fd, record_name, {} if rewritten is None else rewritten)
+                age_mtime_ns = _rewritten_mtime(record_name, {} if rewritten is None else rewritten, record_info)
                 if not _artifact_eligible(
                     current, record_info, min_age_days=min_age_days, now=now, age_mtime_ns=age_mtime_ns
                 ):
@@ -1599,31 +1554,34 @@ def _artifact_failure(rel_dir: str, directory_name: str, stem: str, reason: str)
 
 
 def _rewritten_mtime(
-    parent_fd: int, record_name: str, rewritten: Mapping[str, tuple[int, str]]
+    record_name: str,
+    rewritten: Mapping[str, tuple[int, int, int, int]],
+    info: os.stat_result | None,
 ) -> int | None:
-    """Pre-rewrite mtime, only while the file is still the bytes this sweep wrote."""
+    """Pre-rewrite mtime, only while the file is still the inode this sweep published."""
     saved = rewritten.get(record_name)
-    if saved is None:
+    if saved is None or info is None:
         return None
-    mtime_ns, digest = saved
-    if _sha256_at(parent_fd, record_name) != digest:
+    pre_mtime, dev, ino, post_mtime = saved
+    if (info.st_dev, info.st_ino, info.st_mtime_ns) != (dev, ino, post_mtime):
         return None
-    return mtime_ns
+    return pre_mtime
 
 
-def _take_rewrite(row: dict[str, Any]) -> tuple[str, int, str] | None:
+def _take_rewrite(row: dict[str, Any]) -> tuple[str, int, int, int, int] | None:
     """Remove rewrite bookkeeping from a public snapshot row."""
-    stamp = row.pop("preserved_mtime_ns", None)
-    digest = row.pop("written_sha256", None)
+    raw = [row.pop(key, None) for key in ("preserved_mtime_ns", "published_dev", "published_ino", "published_mtime_ns")]
     snapshot_dir = row.get("snapshot_dir")
-    if not isinstance(stamp, str) or not stamp.isdecimal() or not isinstance(digest, str) or not digest:
-        return None
     if not isinstance(snapshot_dir, str) or snapshot_dir.count("/") != 1 or not snapshot_dir.startswith("tasks/"):
         return None
     base = snapshot_dir.split("/", 1)[1]
     if not base.endswith(".snapshots"):
         return None
-    return base[: -len(".snapshots")] + ".json", int(stamp), digest
+    try:
+        pre_mtime, dev, ino, post_mtime = (int(value) for value in raw)
+    except (TypeError, ValueError):
+        return None
+    return base[: -len(".snapshots")] + ".json", pre_mtime, dev, ino, post_mtime
 
 
 def _measure_artifact_dirs(
@@ -1634,7 +1592,7 @@ def _measure_artifact_dirs(
     min_age_days: float,
     now: datetime,
     apply: bool,
-    rewritten: Mapping[str, tuple[int, str]] | None = None,
+    rewritten: Mapping[str, tuple[int, int, int, int]] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Plan or pack ``tasks/*.artifacts``. Returns rows and reclaimable loose bytes.
 
@@ -1673,7 +1631,7 @@ def _measure_artifact_dirs(
             record_info,
             min_age_days=min_age_days,
             now=now,
-            age_mtime_ns=_rewritten_mtime(parent_fd, record_name, saved_rewrite),
+            age_mtime_ns=_rewritten_mtime(record_name, saved_rewrite, record_info),
         ):
             continue
         logical = Path(os.path.abspath(os.path.join(os.fspath(root), rel_dir, record_name)))
@@ -1842,7 +1800,7 @@ def _plan_open(
             archive_fd = _open_dir(tasks_fd, ARCHIVE_DIR_NAME)
             if archive_fd is not None:
                 parents.append((f"tasks/{ARCHIVE_DIR_NAME}", archive_fd))
-            rewritten: dict[str, tuple[int, str]] = {}
+            rewritten: dict[str, tuple[int, int, int, int]] = {}
             try:
                 for rel_dir, parent_fd in parents:
                     _collect_own_temps(temps_removed, temps_would_remove, parent_fd, rel_dir, now=now, apply=apply)
@@ -1884,7 +1842,7 @@ def _plan_open(
                         row, reclaimed = measured
                         kept = _take_rewrite(row)
                         if kept is not None and rel_dir == "tasks":
-                            rewritten[kept[0]] = (kept[1], kept[2])
+                            rewritten[kept[0]] = (kept[1], kept[2], kept[3], kept[4])
                         selected.append(row)
                         reclaimable_by_top["tasks"] = reclaimable_by_top.get("tasks", 0) + reclaimed
                     if rel_dir == "tasks":
@@ -1981,8 +1939,8 @@ def _parser() -> argparse.ArgumentParser:
             '  read_only_snapshot_retention field becomes "digest".\n'
             "  With --apply, an eligible tasks/<id>.artifacts directory is packed to\n"
             "  tasks/<id>.artifacts.tar.xz (mode 0600) only after every archive member and the\n"
-            "  whole xz stream have been read, every tar header checksum holds, the tar ends\n"
-            "  at two zero blocks, and each file matches the loose bytes. Bytes after the xz\n"
+            "  whole xz stream have been read, the tar parser stops on the two zero end\n"
+            "  blocks, and each file matches the loose bytes. Bytes after the xz\n"
             "  stream are a failed check. The task record\n"
             "  gains artifacts_retention \"archived\" and artifacts_archive_sha256. The loose\n"
             "  directory is then removed. An existing archive is never deleted or replaced.\n"
