@@ -288,16 +288,18 @@ IMPORT_PROBE_TIMEOUT = 60
 # yaml and psutil allowances that is only Cython's runtime modules). A contract whose allowance is
 # None has no growth check: its closure only.
 _CONTRACT_PROBE = r"""
-import importlib, json, sys
+import importlib, importlib.machinery, json, sys
 tree, package, shared, report, allowed, roots, *sites = sys.argv[1:]
 check, roots = allowed != "*", roots.split(",")
 allowed = frozenset(filter(None, allowed.split(","))) if check else frozenset()
 shared_top = shared.partition(".")[0]
+prefix = tree.rstrip("/") + "/"
 sys.path[:0] = [tree]
 sys.path.extend(sites)
 inside = tuple(site.rstrip("/") + "/" for site in sites)
 known = sys.stdlib_module_names | {"__future__", package} | allowed
 refused, failed, tried = [], [], set()
+path_finder = importlib.machinery.PathFinder
 
 
 def caller(frame):
@@ -321,42 +323,57 @@ def refuse(name, frame):
     raise ModuleNotFoundError(f"{name} is outside the import-time contract", name=name)
 
 
+def candidate_spec(name, path, target):
+    cand = [tree] if path is None else [p for p in path if p == tree or p.startswith(prefix)]
+    spec = path_finder.find_spec(name, cand, target) if cand else None
+    if spec is not None and spec.loader is None and spec.submodule_search_locations is not None:
+        # Pin namespace search locations to a plain candidate-only list so _NamespacePath cannot re-scan sites.
+        locs = [p for p in spec.submodule_search_locations if p == tree or p.startswith(prefix)]
+        if not locs:
+            return None
+        spec.submodule_search_locations = locs
+    return spec
+
+
 class Contract:
+    invalidate_caches = path_finder.invalidate_caches
+
     @staticmethod
     def find_spec(name, path=None, target=None):
         if name == package or name.startswith(package + ".") or name == shared or name.startswith(shared + "."):
             tried.add(name)
-            return None
+            return candidate_spec(name, path, target)
         if name == shared_top:
-            return None
+            tried.add(shared)
+            return candidate_spec(name, None, target)
         if name.startswith(shared_top + "."):
             if check:
                 frame, lookup = caller(sys._getframe(1))
                 if not lookup:
                     refuse(name, frame)
             return None
-        if not check or path is not None or name.partition(".")[0] in known:
-            return None
-        frame, lookup = caller(sys._getframe(1))
-        if not lookup:
-            refuse(name.partition(".")[0], frame)
-        return None
+        if check and path is None and name.partition(".")[0] not in known:
+            frame, lookup = caller(sys._getframe(1))
+            if not lookup:
+                refuse(name.partition(".")[0], frame)
+        return path_finder.find_spec(name, path, target)
 
 
-sys.meta_path.insert(0, Contract)
+sys.meta_path = [Contract if finder is path_finder else finder for finder in sys.meta_path]
 for name in [*sorted(allowed), *roots]:
     try:
         importlib.import_module(name)
     except BaseException as exc:
         failed.append({"module": name, "error": f"{type(exc).__name__}: {exc}"[:300]})
-prefix = tree.rstrip("/") + "/"
-for mod_name, module in list(sys.modules.items()):
-    if (mod_name == shared_top or mod_name.startswith(shared_top + ".")) and isinstance(
-            file := getattr(module, "__file__", None), str) and file.startswith(inside):
-        failed.append({"module": mod_name, "error": "ModuleNotFoundError: absent from candidate tree"})
-closure = sorted({file[len(prefix):] for module in list(sys.modules.values())
-                  if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)}
-                 | {name.replace(".", "/") + suffix for name in tried for suffix in (".py", "/__init__.py")})
+loaded = {mod_name for mod_name, module in list(sys.modules.items())
+          if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)}
+closure = sorted(
+    {file[len(prefix):] for module in list(sys.modules.values())
+     if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)}
+    | {name.replace(".", "/") + suffix for name in tried for suffix in (".py", "/__init__.py")}
+    | {name.replace(".", "/") + "/" for name in tried
+       if name not in loaded and not any(mod.startswith(name + ".") for mod in loaded)}
+)
 with open(report, "w", encoding="utf-8") as stream:
     json.dump({"refused": refused, "failed": failed, "closure": closure}, stream)
 """
@@ -443,7 +460,10 @@ def import_time_contracts(candidate: str, base: str | None = None) -> tuple[list
                 refused, failed, closure = found["refused"], found["failed"], found["closure"]
                 if result.returncode or not all(isinstance(value, list) for value in (refused, failed, closure)):
                     raise ValueError
-                closures[label] = frozenset(safe_path(path) for path in closure)
+                closures[label] = frozenset(
+                    safe_path(path[:-1]) + "/" if path.endswith("/") else safe_path(path)
+                    for path in closure
+                )
                 for entry in refused:
                     where = f"{Path(entry['file']).relative_to(tree).as_posix()}:{int(entry['line'])}" if (
                         Path(entry["file"]).is_relative_to(tree)) else f"{entry['file']}:{int(entry['line'])}"
@@ -602,8 +622,9 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
         raise ValueError("import-time contract test is not a test file the pytest job runs")
     contracts = sorted({
         name for label, _roots, _allowed, files, tests in IMPORT_TIME_CONTRACTS
-        if label in closures and any(path in closures[label] or any(
-            path == file or (file.endswith("/") and path.startswith(file)) for file in files) for path in changed)
+        if label in closures and any(
+            path == entry or (entry.endswith("/") and path.startswith(entry))
+            for entry in (*closures[label], *files) for path in changed)
         for name in tests
     })
     mandatory = sorted(set(guards) | set(contracts))
