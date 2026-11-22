@@ -1835,10 +1835,12 @@ def test_escaped_apostrophe_publisher_body_with_command_substitution_text_is_all
         ("env >/dev/stdou{t..t}", 2),
         ("printf ok >/tmp/x{a,b}", 2),
         ("printf ok </dev/nul{l..l}", 0),
+        ("env >/proc/thread-self/fd/1", 2),
+        ("cat </dev/fd/../environ", 2),
     ],
 )
 def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expected):
-    """Defect class: a split-quoted redirect operand read as several words.
+    """Defect class: a split-quoted redirect operand read as several words, or a stream or /proc file in another spelling.
 
     The shell joins `'a'b` into one file name, so a stderr redirect leaves the
     dump on stdout; reading `b` as the command after `env` hid the dump.
@@ -1974,7 +1976,7 @@ def test_lexer_word_values_match_bash(text, values):
 
 @pytest.mark.parametrize(
     "command",
-    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", "echo inert #\x00", 'bash -c "$CMD"'],
+    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", "echo inert #\x00", 'bash -c "$CMD"', "echo x\\"],
 )
 @pytest.mark.parametrize("override", [False, True])
 def test_unparseable_text_is_refused(monkeypatch, command, override):
