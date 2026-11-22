@@ -458,6 +458,7 @@
   "tests/ops/test_lane_relaunch.py": 0.417,
   "tests/ops/test_lu_slice_apply.py": 0.64,
   "tests/ops/test_product_entry_confinement.py": 3.266,
+  "tests/ops/test_verify_run.py": 4.102,
   "tests/opsec/test_gh_snapshot.py": 19.768,
   "tests/opsec/test_git_push_scan.py": 337.658,
   "tests/opsec/test_override_command_scope.py": 14.699,
