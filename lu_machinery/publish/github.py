@@ -1299,7 +1299,8 @@ def _repository_slugs(repository):
 
 def _same_repository(left, right):
     """Whether two owner/name spellings name one repository, ignoring case; either baked slug of a row counts."""
-    if not isinstance(left, str) or not isinstance(right, str):
+    # Slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
+    if not isinstance(left, str) or not isinstance(right, str) or not left.isascii() or not right.isascii():
         return False
     return left.casefold() == right.casefold() or any(
         left.casefold() == slug.casefold() for slug in _repository_slugs(right)
@@ -1312,7 +1313,9 @@ def _repository_urls(repository, path):
 
 
 def _same_repository_url(url, repository, path):
-    return isinstance(url, str) and any(url.casefold() == known.casefold() for known in _repository_urls(repository, path))
+    return isinstance(url, str) and url.isascii() and any(
+        url.casefold() == known.casefold() for known in _repository_urls(repository, path)
+    )
 
 
 def _transfer_verify(source, destination, number, moved, receipt, reader, cwd, environment, temp):

@@ -206,7 +206,8 @@ def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -
         return repository_identity_valid(repository) and any(
             repository.casefold() == slug.casefold() for slug in slugs
         )
-    return isinstance(url, str) and any(
+    # Slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
+    return isinstance(url, str) and url.isascii() and any(
         url.casefold() == stream_epic_url(slug, identity["stream_epic"]).casefold() for slug in slugs
     )
 
@@ -217,7 +218,7 @@ def stream_registry_repository(repository: str) -> str:
     Either baked slug of a transferred row is that row, so tasks recorded before the move stay bound.
     """
     repos = fleet_repos.load_fleet_repos().values()
-    if not isinstance(repository, str) or not any(
+    if not isinstance(repository, str) or not repository.isascii() or not any(
         repository.casefold() == slug.casefold() for repo in repos for slug in repo.slugs
     ):
         raise LifecycleError("task repository is not configured in the fleet")

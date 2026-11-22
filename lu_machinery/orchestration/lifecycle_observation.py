@@ -487,6 +487,7 @@ def _recovery_pr_head(
         # other baked slug of the ledger's repository.
         or ("repository" in cleanup_pr and not (
             isinstance(cleanup_pr["repository"], str)
+            and cleanup_pr["repository"].isascii()  # casefold would map look-alikes such as U+212A onto ASCII
             and any(cleanup_pr["repository"].casefold() == slug.casefold()
                     for slug in _repository_slugs(ledger["identity"]["repository"]))
         ))

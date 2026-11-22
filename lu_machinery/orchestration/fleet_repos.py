@@ -408,6 +408,9 @@ def clear_repository_cache() -> None:
 
 def canonical_repository(value: str) -> str:
     """Canonical owner/name, accepting registry keys and both baked slug spellings."""
+    if not isinstance(value, str) or not value.isascii():
+        # Slugs and keys are ASCII; casefold would map look-alikes such as U+212A onto them.
+        raise FleetRepoError("PR repository must be owner/name")
     spelling = value.strip().casefold()
     for repo in _bundled_catalog().values():
         known = {repo.key.casefold(), *(slug.casefold() for slug in repo.slugs)}

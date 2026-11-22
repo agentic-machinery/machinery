@@ -330,23 +330,19 @@ def record_changelog(
         slugs = repository_slugs(repo)
     except FleetRepoError as exc:
         raise CutError(f"the fleet repository registry is unreadable: {exc}") from exc
-    # The CommonMark parser decides what defines the Unreleased link (labels ignore case and
-    # surrounding whitespace; fenced or inline examples define nothing). Exactly one definition may
-    # exist, its source must be the previous-tag compare link under a baked slug of the repository,
-    # and only that definition's own lines are rewritten.
-    from markdown_it import MarkdownIt
-
-    if "\r" in text:
-        # The parser counts lines after turning CR into LF; a span mapped back onto CR text would drift.
-        raise CutError("CHANGELOG.md must use LF line endings")
-    env: dict = {}
-    MarkdownIt("commonmark").parse(text, env)
-    definition = env.get("references", {}).get("UNRELEASED")
-    duplicates = [ref for ref in env.get("duplicate_refs", []) if ref.get("label") == "UNRELEASED"]
-    lines = text.split("\n")  # the parser's own line numbering
-    start, end = definition["map"] if definition else (0, 0)
+    # Anything Markdown could read as an Unreleased reference definition (any case, padding or
+    # container, any destination, fenced or not) counts: exactly one may exist, it must be a whole
+    # line, and that line must be the previous-tag compare link under a baked slug of the repository.
+    # Only that line is rewritten.
+    labels = list(re.finditer(r"\[\s*unreleased\s*\]\s*:", text, flags=re.IGNORECASE))
     accepted = {f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD" for slug in slugs}
-    if text.count(unreleased) != 1 or definition is None or duplicates or "\n".join(lines[start:end]) not in accepted:
+    start = labels[0].start() if len(labels) == 1 else -1
+    end = text.find("\n", start)
+    end = len(text) if end == -1 else end
+    if (
+        text.count(unreleased) != 1 or start < 0 or (start and text[start - 1] != "\n")
+        or text[start:end] not in accepted
+    ):
         raise CutError("CHANGELOG.md lacks one Unreleased heading and its compare link to the previous tag")
     unreleased_must_be_empty(text)
     heading = f'<a id="v{version}"></a>\n## [{version}] - {date}' + (" [YANKED]" if yanked else "")
@@ -355,7 +351,7 @@ def record_changelog(
         f"[Unreleased]: https://github.com/{repo}/compare/v{version}...HEAD\n"
         f"[{version}]: https://github.com/{repo}/compare/v{since or previous}...v{version}\n"
     )
-    relinked = "".join(line + "\n" for line in lines[:start]) + links + "\n".join(lines[end:])
+    relinked = text[:start] + links + text[end + 1:]
     return relinked.replace(unreleased, unreleased + section, 1)
 
 

@@ -218,7 +218,9 @@ def test_an_empty_unreleased_section_records_the_release_below_it():
         ("evil/repo", "", False),
         ("org/repo", "[Unreleased]: https://github.com/neworg/repo/compare/v0.1.20...HEAD\n", False),
         ("org/repo", "   [ unreleased ]: https://github.com/org/repo/compare/v0.1.20...HEAD\n", False),
-        ("org/repo", "Example: [Unreleased]: https://github.com/org/repo/compare/v0.1.21...HEAD\n\n", True),
+        ("org/repo", "Example: [Unreleased]: https://github.com/org/repo/compare/v0.1.21...HEAD\n\n", False),
+        ("org/repo", "[Unreleased]: data:text/plain,stale\n\n", False),
+        ("org/repo", "> > [unreleased]: https://github.com/org/repo/compare/v0.1.20...HEAD\n\n", False),
     ],
 )
 def test_unreleased_link_may_name_either_baked_slug_of_the_repository(monkeypatch, link_slug, stale, accepted):
