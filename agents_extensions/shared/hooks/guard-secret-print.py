@@ -2094,8 +2094,8 @@ def _is_folded_simple_command(command: str) -> bool:
     shell cannot pick another command or option), its quote fragments must be its
     exact shell words, with no wrapper, assignment, redirect, substitution or
     here-document, and no word the shell or the guard reads as code (no shell,
-    builtin or keyword, no interpreter program text). Process kills keep main's
-    reading. Call with the fold on.
+    builtin or keyword, no xargs, no interpreter program text). Process kills keep
+    main's reading. Call with the fold on.
     """
     try:
         executable, substitutions = _hide_substitutions(preprocess_shell_command(command))
@@ -2113,7 +2113,11 @@ def _is_folded_simple_command(command: str) -> bool:
     if found is None or found[2] != 0 or _raw_without_redirects(segment) != segment:
         return False
     cmd, args, _ = found
-    if cmd in SHELL_COMMANDS or cmd in _SHELL_BUILTINS or cmd in {"pkill", "pgrep"}:
+    # Bash runs a builtin only for a bare name; a path names a file.
+    if _strip_quotes(segment[0]) in _SHELL_BUILTINS:
+        return False
+    # Shells and xargs run a command from their words; process tools keep main's process reading.
+    if cmd in SHELL_COMMANDS or cmd in {"pkill", "pgrep", "kill", "xargs"}:
         return False
     return not (_is_interpreter_command(cmd) and not _runs_no_inline_program(cmd, args))
 
