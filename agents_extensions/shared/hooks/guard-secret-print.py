@@ -535,6 +535,10 @@ _BRACE_OPENERS = 256
 _BRACE_WORK = 1_000_000
 _BRACED_PARAMETER = re.compile(r"(\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]))")
 _BRACE_SEQUENCE = re.compile(r"(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])(?:\.\.(-?[0-9]+))?")
+# Same-kind endpoints and a second `..`: past an invalid step Bash leaves the brace as written.
+_SEQUENCE_ENDPOINTS = re.compile(r"(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])\.\.")
+# A `+` sign or a number past 64 bits, which Bash reads its own way; the command is refused.
+_SEQUENCE_UNMODELLED = re.compile(r"(?:\A|\.\.)\+|[0-9]{19}")
 # A unit is one unquoted character, one quoted or escaped character, or one expansion.
 _Unit = tuple[str, str]
 
@@ -554,16 +558,14 @@ def _brace_sequence(text: str) -> list[str] | None:
         raise ValueError("brace expansion too large")
     values = range(low, high + (1 if high >= low else -1), step if high >= low else -step)
     if not numeric:
+        if ord("\\") in values:
+            # Bash quote-removes the backslash it generates, leaving an empty word.
+            raise ValueError("letter sequence across the backslash")
         return [chr(value) for value in values]
     # Bash pads every number to the widest endpoint when either endpoint has a leading zero.
     padded = any(re.match(r"-?0[0-9]", endpoint) for endpoint in (start, end))
     width = max(len(start), len(end)) if padded else 0
     return [f"{value:0{width}d}" for value in values]
-
-
-def _unit_text(units: list[_Unit]) -> str:
-    """The text of units that are all unquoted characters, else "" (never a sequence)."""
-    return "".join(char for _, char in units) if all(kind == "src" for kind, _ in units) else ""
 
 
 def _brace_expand(
@@ -625,9 +627,17 @@ def _brace_expand(
             bounds = [start, *commas, end]
             alternatives = [units[left + 1 : right] for left, right in itertools.pairwise(bounds)]
         else:
-            sequence = _brace_sequence(_unit_text(units[start + 1 : end]))
+            # Quoted characters and expansions never form a sequence field.
+            spelled = "".join(char if kind == "src" else "\0" for kind, char in units[start + 1 : end])
+            if _SEQUENCE_UNMODELLED.search(spelled):
+                raise ValueError("brace sequence field that Bash reads its own way")
+            sequence = _brace_sequence(spelled)
             if sequence is None:
-                # Neither a comma nor a valid sequence: Bash leaves this brace as written.
+                ends = _SEQUENCE_ENDPOINTS.match(spelled)
+                if ends and ends[1].lstrip("-").isdigit() == ends[2].lstrip("-").isdigit():
+                    # Valid endpoints, invalid step: Bash keeps the whole brace and expands the text after it alone.
+                    return _brace_expand(units, end + 1, budget, starts | {end + 1})
+                # Otherwise Bash leaves only this opening brace as written and reads on.
                 continue
             alternatives = [[("src", char) for char in value] for value in sequence]
         words: list[list[_Unit]] = []
