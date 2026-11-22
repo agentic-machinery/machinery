@@ -8,9 +8,10 @@
 # or lists no [run] file.
 #
 # On pull_request the same job runs one shard. That shard replaces the manifest
-# with the file list from lu_machinery.ci.pr_affected_tests (changed tests,
-# tests that import or name a changed file, and the guard list) and then runs
-# the repo_wide invariants. It refuses to fall through to one shard of the full
+# with the file list from the base commit's lu_machinery.ci.pr_affected_tests
+# (changed tests, tests that import or name a changed file, and the guard list).
+# It also runs the selector tests when the selector or its tests change, then
+# runs the repo_wide invariants. It refuses to fall through to one shard of the full
 # manifest. The matrix is one shard on pull_request and six shards otherwise.
 # CI Gate requires the narrower run on pull_request and the six-shard suite
 # on merge_group.
@@ -314,54 +315,99 @@ jobs:
           OUT: ${{ runner.temp }}/pytest/pr-selection
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/test-venv/bin/python" -I -B - <<'PY'
+          work="$RUNNER_TEMP/pytest"
+          env -i PATH=/usr/bin:/bin HOME="$work/home" TMPDIR="$work/tmp" LC_ALL=C.UTF-8 \
+            GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
+            EVENT_NAME="$EVENT_NAME" GITHUB_EVENT_PATH="$GITHUB_EVENT_PATH" \
+            GITHUB_SHA="$GITHUB_SHA" GITHUB_REF="$GITHUB_REF" LU_PRODUCT_ROOT="$LU_PRODUCT_ROOT" \
+            GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY:-}" OUT="$OUT" \
+            "$RUNNER_TEMP/test-venv/bin/python" -I -S -B - <<'PY'
+          import io
           import json
           import os
+          import re
           import subprocess
           import sys
+          import sysconfig
+          import tarfile
+          import tempfile
           from pathlib import Path
 
-          from lu_machinery.ci.gate import event_tier
-          from lu_machinery.ci.pr_affected_tests import plan
 
           def fail(message):
               print(f"::error::{message}", file=sys.stderr)
               sys.exit(1)
 
           try:
-              actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=30).strip()
               payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
-              tier = event_tier(
-                  os.environ["EVENT_NAME"], payload,
-                  os.environ["GITHUB_SHA"], os.environ["GITHUB_REF"], actual,
-              )
-          except (KeyError, OSError, UnicodeError, json.JSONDecodeError, subprocess.SubprocessError, ValueError) as exc:
-              detail = f": {exc}" if type(exc) is ValueError else ""
-              fail(f"PR identity check failed: {type(exc).__name__}{detail}")
-          if tier != "admission":
-              fail(f"pull_request must be the admission tier, got {tier}")
-          try:
-              pr = payload["pull_request"]
-              parents = subprocess.check_output(
-                  ["git", "show", "-s", "--format=%P", actual], text=True, timeout=30,
-              ).split()
-              if len(parents) != 2 or parents[1] != pr["head"]["sha"]:
-                  fail("PR merge candidate must have two parents and match the event head")
-              subprocess.run(["git", "diff", "--quiet", actual, "--"], check=True, timeout=30)
-              record = plan(parents[0], actual)
-          except (KeyError, OSError, UnicodeError, subprocess.SubprocessError, ValueError) as exc:
-              detail = f": {exc}" if type(exc) is ValueError else ""
-              fail(f"affected-test plan failed: {type(exc).__name__}{detail}")
+              base_sha = payload["pull_request"]["base"]["sha"]
+              if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+                  fail("missing or invalid PR base SHA for the selector")
+          except (KeyError, OSError, TypeError, ValueError) as exc:
+              fail(f"could not read PR base SHA for the selector: {type(exc).__name__}")
+
+          selector_source = "lu_machinery/ci/pr_affected_tests.py"
+          selector_tests = "tests/ci/test_product_rooted_ci_data.py"
+          with tempfile.TemporaryDirectory(prefix="base-selector-") as base_tree:
+              try:
+                  snapshot = subprocess.check_output(
+                      ["git", "archive", "--format=tar", base_sha, "--", "lu_machinery"], timeout=30,
+                  )
+                  with tarfile.open(fileobj=io.BytesIO(snapshot)) as archive:
+                      archive.extractall(base_tree, filter="data")
+                  if not (Path(base_tree) / "lu_machinery" / "__init__.py").is_file():
+                      fail("base snapshot is missing the regular lu_machinery package")
+                  # The regular base package owns all its module paths. Add the venv's
+                  # locked dependencies directly, without running site startup hooks.
+                  sys.path.insert(0, base_tree)
+                  sys.path.extend(dict.fromkeys(sysconfig.get_path(key) for key in ("purelib", "platlib")))
+                  from lu_machinery.ci.gate import event_tier
+                  from lu_machinery.ci.pr_affected_tests import changed_files, plan
+              except (ImportError, OSError, subprocess.SubprocessError, tarfile.TarError) as exc:
+                  fail(f"could not load PR selector from base {base_sha}: {type(exc).__name__}")
+
+              try:
+                  actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, timeout=30).strip()
+                  tier = event_tier(
+                      os.environ["EVENT_NAME"], payload,
+                      os.environ["GITHUB_SHA"], os.environ["GITHUB_REF"], actual,
+                  )
+                  if tier != "admission":
+                      fail(f"pull_request must be the admission tier, got {tier}")
+                  parents = subprocess.check_output(
+                      ["git", "show", "-s", "--format=%P", actual], text=True, timeout=30,
+                  ).split()
+                  if len(parents) != 2 or parents[1] != payload["pull_request"]["head"]["sha"]:
+                      fail("PR merge candidate must have two parents and match the event head")
+                  subprocess.run(["git", "diff", "--quiet", actual, "--"], check=True, timeout=30)
+                  # The event pins the program; the tested merge's first parent pins the diff.
+                  changed = changed_files(parents[0], actual)
+                  require_selector_tests = selector_source in changed or selector_tests in changed
+                  if require_selector_tests:
+                      run_manifest = Path(os.environ["OUT"]).with_name("all-run-files")
+                      if selector_tests not in run_manifest.read_text(encoding="utf-8").splitlines():
+                          fail(f"selector test must be a [run] file: {selector_tests}")
+                  record = plan(parents[0], actual)
+              except (ImportError, KeyError, OSError, TypeError, subprocess.SubprocessError, ValueError) as exc:
+                  detail = f": {exc}" if type(exc) is ValueError else ""
+                  fail(f"affected-test plan failed: {type(exc).__name__}{detail}")
           if record["guards_exceed_safe_budget"]:
               fail("guards exceed the safe budget; the full suite still runs on merge_group")
           paths = record["run_files"]
           if not paths:
               fail("selector returned no tests")
+          if require_selector_tests:
+              # A whole test file also covers any pinned test IDs it contains.
+              paths = sorted(
+                  {selector_tests} | {path for path in paths if path.split("::", 1)[0] != selector_tests}
+              )
+              print(f"Selector change requires {selector_tests}")
+          deferred = set(record["deferred_files"]) - set(paths)
           Path(os.environ["OUT"]).write_text("".join(f"{path}\n" for path in paths), encoding="utf-8")
           summary = (
               f"PR affected selection: {len(paths)} path(s); "
-              f"deferred {len(record['deferred_files'])}; "
-              f"estimate {record['estimate_seconds']:.0f}s; "
+              f"deferred {len(deferred)}; "
+              f"base selector {base_sha} estimated {record['estimate_seconds']:.0f}s; "
               f"reason {record['reason'] or 'none'}. "
               "The full six-shard suite runs on merge_group.\n"
           )
