@@ -91,74 +91,6 @@ TEST = re.compile(r"tests/(?:[^/]+/)*test_[^/]+\.py")
 # too slow to run whole under the PR cap. Names are plain identifiers, so a pinned id carries no
 # shell, glob or parametrize syntax and always runs every case of that test.
 NODE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)?")
-# Import-time contracts of this package, checked on every PR candidate (`import_time_violations`):
-# a label, the modules a contract test imports (a root with the modules its code path imports
-# lazily) and the third-party names their imports may reach. The tests that pin them run the
-# code in a subprocess, which the import scan cannot see, so before this check a broken
-# contract first failed in the merge group (PR 1130: yaml reached the hook; PR 1134: jsonschema
-# reached the receipt gate).
-IMPORT_TIME_ROOTS: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
-    # tests/githooks/test_ownership_fail_closed.py and test_owned_paths_hook.py: the commit and
-    # push hooks run `python -m <package>.dispatcher.ownership` from a wheel installed without
-    # its dependencies; the check reads its task record and matches paths through lazy imports.
-    ("installed ownership hook",
-     ("dispatcher.ownership", "dispatcher.store", "guardrails.delegate_ownership", "secret_redactor"),
-     frozenset()),
-    # tests/ops/test_verify_run.py: the loopback target is read from a wheel installed without
-    # its dependencies.
-    ("installed verify_run loopback probe", ("ops.verify_run", "common.repo_root"), frozenset()),
-    # tests/test_installed_root_contract.py, top_module and head_move: a checkout-top jsonschema.py
-    # shadows the installed distribution while the canary imports the dispatcher and attests its
-    # checkout (`worker._dispatcher_code`), then settles a receipt, whose gate imports
-    # review_contract (`contract_canary._receipt_gated`) and its schema lookup's modules.
-    ("canary dispatcher attestation", ("dispatcher.worker", "common.git_context"),
-     frozenset({"jwt", "psutil", "yaml"})),
-    ("contract canary receipt gate",
-     ("review.contract_canary", "review.review_contract", "review.language_lane", "common.repo_root"),
-     frozenset({"yaml"})),
-)
-IMPORT_PROBE_TIMEOUT = 60
-# Imports one contract's roots in a fresh interpreter (-I -S: no site hooks, no preloaded
-# distributions), with the candidate's package first on the path and the caller's site-packages
-# (which -S would not find in a virtual environment) after it.
-# A top-level name outside the standard library, the package and the allowance is refused and
-# recorded when first-party or standard-library code asks for it; an allowed distribution's own
-# dependencies load, and it is imported first, so a name it brings adds no requirement.
-_CONTRACT_PROBE = r"""
-import importlib, json, sys
-tree, package, report = sys.argv[1], sys.argv[2], sys.argv[3]
-allowed, roots, sites = frozenset(json.loads(sys.argv[4])), json.loads(sys.argv[5]), json.loads(sys.argv[6])
-sys.path[:0] = [tree]
-sys.path.extend(sites)
-inside = tuple(site.rstrip("/") + "/" for site in sites)
-known = sys.stdlib_module_names | {"__future__", package} | allowed
-refused, failed = [], []
-
-
-class Contract:
-    @staticmethod
-    def find_spec(name, path=None, target=None):
-        if path is not None or name.partition(".")[0] in known:
-            return None
-        frame = sys._getframe(1)
-        while frame is not None and str(frame.f_globals.get("__name__")).startswith(("importlib", "_frozen_importlib")):
-            frame = frame.f_back
-        file, line = (frame.f_code.co_filename, frame.f_lineno) if frame is not None else ("<unknown>", 0)
-        if file.startswith(inside):
-            return None
-        refused.append({"name": name.partition(".")[0], "file": file, "line": line})
-        raise ModuleNotFoundError(f"{name} is outside the import-time contract", name=name)
-
-
-sys.meta_path.insert(0, Contract)
-for name in [*sorted(allowed), *roots]:
-    try:
-        importlib.import_module(name)
-    except BaseException as exc:
-        failed.append({"module": name, "error": f"{type(exc).__name__}: {exc}"[:300]})
-with open(report, "w", encoding="utf-8") as stream:
-    json.dump({"refused": refused, "failed": failed}, stream)
-"""
 
 
 def guard_file(entry: str) -> str:
@@ -183,86 +115,6 @@ def validate_node(entry: str) -> None:
 
 def git(*args: str) -> bytes:
     return subprocess.run(["git", *args], check=True, capture_output=True, timeout=30).stdout
-
-
-def tree_entries(ref: str, *paths: str) -> dict[str, list[str]]:
-    """Each path ``ref`` tracks (under ``paths``) with its mode, object type and object id."""
-    tree = {}
-    for row in git("ls-tree", "-rz", ref, "--", *paths).split(b"\0"):
-        if row:
-            meta, name = row.decode("utf-8").split("\t", 1)
-            tree[name] = meta.split()
-    return tree
-
-
-def _materialize(candidate: str, package: str, into: Path) -> list[str]:
-    """Write the candidate's tracked package files under ``into``; each entry it cannot write.
-
-    Blobs come from the object store, never from the worktree or ``git archive``, whose
-    attributes a candidate controls. Only regular files are written: a link or a submodule
-    could load code from outside the candidate's package.
-    """
-    from lu_machinery.ci import components
-
-    entries = tree_entries(candidate, package)
-    unsupported = [f"{name} is not a regular file" for name, meta in entries.items() if meta[0] not in {"100644", "100755"}]
-    blobs = tuple((name, meta[2]) for name, meta in entries.items() if meta[0] in {"100644", "100755"})
-    for name, data in components.indexed_python_sources(str(product_root()), blobs, ()).items():
-        path = into / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-    return unsupported
-
-
-def import_time_violations(candidate: str) -> list[str]:
-    """Each broken `IMPORT_TIME_ROOTS` contract in ``candidate``, with the import that breaks it.
-
-    Python itself decides what runs: each contract's roots are imported from the candidate's
-    committed package files in a fresh interpreter (`_CONTRACT_PROBE`), which runs only what an
-    import runs. A refused name, a root that fails to import, an unwritable entry and a probe
-    that times out, exits nonzero or leaves no readable report each break the contract. A
-    checkout whose candidate does not track this package's ``__init__.py`` (a product, with its
-    own tree) is not checked.
-    """
-    import sysconfig
-    import tempfile
-
-    package = _PACKAGE_DIR.name
-    if f"{package}/__init__.py" not in tree_entries(candidate, f"{package}/__init__.py"):
-        return []
-    problems: list[str] = []
-    sites = json.dumps(list(dict.fromkeys(sysconfig.get_path(key) for key in ("purelib", "platlib"))))
-    with tempfile.TemporaryDirectory(prefix="import-contracts-") as scratch:
-        work = Path(scratch)
-        tree = work / "candidate"
-        problems.extend(f"import-time contracts: {why}" for why in _materialize(candidate, package, tree))
-        for label, roots, allowed in IMPORT_TIME_ROOTS:
-            report = work / "report.json"
-            report.unlink(missing_ok=True)
-            command = [sys.executable, "-I", "-S", "-B", "-c", _CONTRACT_PROBE, str(tree), package, str(report),
-                       json.dumps(sorted(allowed)), json.dumps([f"{package}.{root}" for root in roots]), sites]
-            env = {"PATH": os.defpath, "HOME": scratch, "TMPDIR": scratch, "LC_ALL": "C.UTF-8"}
-            try:
-                result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True,
-                                        timeout=IMPORT_PROBE_TIMEOUT, check=False)
-            except subprocess.TimeoutExpired:
-                problems.append(f"{label}: the import probe did not finish in {IMPORT_PROBE_TIMEOUT} s")
-                continue
-            try:
-                found = json_depth.loads(report.read_text(encoding="utf-8"), max_depth=8)
-                refused, failed = found["refused"], found["failed"]
-                if result.returncode or not isinstance(refused, list) or not isinstance(failed, list):
-                    raise ValueError
-                for entry in refused:
-                    where = f"{Path(entry['file']).relative_to(tree).as_posix()}:{int(entry['line'])}" if (
-                        Path(entry["file"]).is_relative_to(tree)) else f"{entry['file']}:{int(entry['line'])}"
-                    problems.append(f"{label}: {where} imports {entry['name']} at import time")
-                problems.extend(f"{label}: importing {entry['module']} failed ({entry['error']})" for entry in failed
-                                if "outside the import-time contract" not in entry["error"])
-            except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError):
-                detail = (result.stderr.strip().splitlines() or ["no output"])[-1][:300]
-                problems.append(f"{label}: the import probe exited {result.returncode} without a readable report ({detail})")
-    return list(dict.fromkeys(problems))
 
 
 def safe_path(name: str, *, node: bool = False) -> str:
@@ -369,6 +221,159 @@ def selecting(sources: dict[str, bytes]) -> set[str]:
     so the scan parses only these; the other sources stay import targets.
     """
     return {path for path in sources if TEST.fullmatch(path) or PurePosixPath(path).name == "conftest.py"}
+
+
+# Import-time contracts of this package, checked on every PR candidate (`import_time_violations`):
+# a label, the modules a contract test imports (a root with the modules its code path imports
+# lazily) and the third-party names their imports may reach. The tests that pin them run the
+# code in a subprocess, which the import scan cannot see, so before this check a broken
+# contract first failed in the merge group (PR 1130: yaml reached the hook; PR 1134: jsonschema
+# reached the receipt gate).
+IMPORT_TIME_ROOTS: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
+    # tests/githooks/test_ownership_fail_closed.py and test_owned_paths_hook.py: the commit and
+    # push hooks run `python -m <package>.dispatcher.ownership` from a wheel installed without
+    # its dependencies; the check reads its task record and matches paths through lazy imports.
+    ("installed ownership hook",
+     ("dispatcher.ownership", "dispatcher.store", "guardrails.delegate_ownership", "secret_redactor"),
+     frozenset()),
+    # tests/ops/test_verify_run.py: the loopback target is read from a wheel installed without
+    # its dependencies.
+    ("installed verify_run loopback probe", ("ops.verify_run", "common.repo_root"), frozenset()),
+    # tests/test_installed_root_contract.py, top_module and head_move: a checkout-top jsonschema.py
+    # shadows the installed distribution while the canary imports the dispatcher and attests its
+    # checkout (`worker._dispatcher_code`), then settles a receipt, whose gate imports
+    # review_contract (`contract_canary._receipt_gated`) and its schema lookup's modules.
+    ("canary dispatcher attestation", ("dispatcher.worker", "common.git_context"),
+     frozenset({"jwt", "psutil", "yaml"})),
+    ("contract canary receipt gate",
+     ("review.contract_canary", "review.review_contract", "review.language_lane", "common.repo_root"),
+     frozenset({"yaml"})),
+)
+IMPORT_PROBE_TIMEOUT = 60
+# Imports one contract's roots in a fresh interpreter (-I -S: no site hooks, no preloaded
+# distributions), with the candidate's package first on the path and the caller's site-packages
+# (which -S would not find in a virtual environment) after it.
+# A top-level name outside the standard library, the package and the allowance is refused and
+# recorded when first-party or standard-library code asks for it; an allowed distribution's own
+# dependencies load, and it is imported first, so a name it brings adds no requirement.
+_CONTRACT_PROBE = r"""
+import importlib, json, sys
+tree, package, report, allowed, roots, *sites = sys.argv[1:]
+allowed, roots = frozenset(filter(None, allowed.split(","))), roots.split(",")
+sys.path[:0] = [tree]
+sys.path.extend(sites)
+inside = tuple(site.rstrip("/") + "/" for site in sites)
+known = sys.stdlib_module_names | {"__future__", package} | allowed
+refused, failed = [], []
+
+
+class Contract:
+    @staticmethod
+    def find_spec(name, path=None, target=None):
+        if path is not None or name.partition(".")[0] in known:
+            return None
+        frame = sys._getframe(1)
+        while frame is not None and str(frame.f_globals.get("__name__")).startswith(("importlib", "_frozen_importlib")):
+            frame = frame.f_back
+        file, line = (frame.f_code.co_filename, frame.f_lineno) if frame is not None else ("<unknown>", 0)
+        if file.startswith(inside):
+            return None
+        refused.append({"name": name.partition(".")[0], "file": file, "line": line})
+        raise ModuleNotFoundError(f"{name} is outside the import-time contract", name=name)
+
+
+sys.meta_path.insert(0, Contract)
+for name in [*sorted(allowed), *roots]:
+    try:
+        importlib.import_module(name)
+    except BaseException as exc:
+        failed.append({"module": name, "error": f"{type(exc).__name__}: {exc}"[:300]})
+with open(report, "w", encoding="utf-8") as stream:
+    json.dump({"refused": refused, "failed": failed}, stream)
+"""
+
+
+def tree_entries(ref: str, *paths: str) -> dict[str, list[str]]:
+    """Each path ``ref`` tracks (under ``paths``) with its mode, object type and object id."""
+    tree = {}
+    for row in git("ls-tree", "-rz", ref, "--", *paths).split(b"\0"):
+        if row:
+            meta, name = row.decode("utf-8").split("\t", 1)
+            tree[name] = meta.split()
+    return tree
+
+
+def _materialize(candidate: str, package: str, into: Path) -> list[str]:
+    """Write the candidate's tracked package files under ``into``; each entry it cannot write.
+
+    Blobs come from the object store, never from the worktree or ``git archive``, whose
+    attributes a candidate controls. Only regular files are written: a link or a submodule
+    could load code from outside the candidate's package.
+    """
+    from lu_machinery.ci import components
+
+    entries = tree_entries(candidate, package)
+    unsupported = [f"{name} is not a regular file" for name, meta in entries.items() if meta[0] not in {"100644", "100755"}]
+    blobs = tuple((name, meta[2]) for name, meta in entries.items() if meta[0] in {"100644", "100755"})
+    for name, data in components.indexed_python_sources(str(product_root()), blobs, ()).items():
+        path = into / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return unsupported
+
+
+def import_time_violations(candidate: str) -> list[str]:
+    """Each broken `IMPORT_TIME_ROOTS` contract in ``candidate``, with the import that breaks it.
+
+    Python itself decides what runs: each contract's roots are imported from the candidate's
+    committed package files in a fresh interpreter (`_CONTRACT_PROBE`), which runs only what an
+    import runs. A refused name, a root that fails to import, an unwritable entry and a probe
+    that times out, exits nonzero or leaves no readable report each break the contract. A
+    checkout whose candidate does not track this package's ``__init__.py`` (a product, with its
+    own tree) is not checked.
+    """
+    import sysconfig
+    import tempfile
+
+    package = _PACKAGE_DIR.name
+    if f"{package}/__init__.py" not in tree_entries(candidate, f"{package}/__init__.py"):
+        return []
+    problems: list[str] = []
+    sites = list(dict.fromkeys(sysconfig.get_path(key) for key in ("purelib", "platlib")))
+    with tempfile.TemporaryDirectory(prefix="import-contracts-") as scratch:
+        work = Path(scratch)
+        tree = work / "candidate"
+        problems.extend(f"import-time contracts: {why}" for why in _materialize(candidate, package, tree))
+        for label, roots, allowed in IMPORT_TIME_ROOTS:
+            report = work / "report.json"
+            report.unlink(missing_ok=True)
+            # A fixed interpreter and probe; the arguments are module names and paths, never a shell.
+            command = [sys.executable, "-I", "-S", "-B", "-c", _CONTRACT_PROBE, str(tree), package, str(report),
+                       ",".join(sorted(allowed)), ",".join(f"{package}.{root}" for root in roots), *sites]
+            env = {"PATH": os.defpath, "HOME": scratch, "TMPDIR": scratch, "LC_ALL": "C.UTF-8"}
+            try:
+                result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                    command, cwd=work, env=env, capture_output=True, text=True,
+                    timeout=IMPORT_PROBE_TIMEOUT, check=False,
+                )
+            except subprocess.TimeoutExpired:
+                problems.append(f"{label}: the import probe did not finish in {IMPORT_PROBE_TIMEOUT} s")
+                continue
+            try:
+                found = json_depth.loads(report.read_text(encoding="utf-8"), max_depth=8)
+                refused, failed = found["refused"], found["failed"]
+                if result.returncode or not isinstance(refused, list) or not isinstance(failed, list):
+                    raise ValueError
+                for entry in refused:
+                    where = f"{Path(entry['file']).relative_to(tree).as_posix()}:{int(entry['line'])}" if (
+                        Path(entry["file"]).is_relative_to(tree)) else f"{entry['file']}:{int(entry['line'])}"
+                    problems.append(f"{label}: {where} imports {entry['name']} at import time")
+                problems.extend(f"{label}: importing {entry['module']} failed ({entry['error']})" for entry in failed
+                                if "outside the import-time contract" not in entry["error"])
+            except (OSError, UnicodeError, ValueError, KeyError, TypeError, RecursionError):
+                detail = (result.stderr.strip().splitlines() or ["no output"])[-1][:300]
+                problems.append(f"{label}: the import probe exited {result.returncode} without a readable report ({detail})")
+    return list(dict.fromkeys(problems))
 
 
 @lru_cache(maxsize=2)
