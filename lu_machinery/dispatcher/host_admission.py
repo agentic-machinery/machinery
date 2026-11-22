@@ -6,10 +6,13 @@ The retained admission scanner and ownership ledger read the same hold format.
 
 import contextlib
 import http.client
+import ipaddress
 import os
+import socket
 import subprocess
 import sys
-import urllib.request
+import threading
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -79,25 +82,76 @@ def _monitor_json(read):
         return None
 
 
-# The planning view waits up to 2 s (state_helpers.DORMANT_READ_WAIT_S) to wake an idle active-task snapshot.
+# One deadline for the whole planning read. The view can wait up to 2 s
+# (state_helpers.DORMANT_READ_WAIT_S) to wake an idle active-task view.
 PLANNING_READ_TIMEOUT_S = 5.0
 PLANNING_BODY_LIMIT = 1 << 20
+PLANNING_PATH = "/api/fleet/model-stats/planning"
+
+
+def _planning_origin():
+    """Host, port and path prefix of the Monitor ``read_budget`` reads, or ``ValueError``.
+
+    Only plain HTTP to ``localhost`` or an IP literal, with no user information, query or fragment.
+    """
+    raw = os.environ.get("DELEGATE_MONITOR_API", "http://127.0.0.1:8765").rstrip("/")
+    base = urllib.parse.urlsplit(raw)
+    host = base.hostname
+    if base.scheme != "http" or host is None or any(mark in raw for mark in "@?#"):
+        raise ValueError("the planning view needs a plain http Monitor URL")
+    if host != "localhost":
+        ipaddress.ip_address(host)  # ValueError for a host name
+    return host, 80 if base.port is None else base.port, base.path
+
+
+def _planning_body(connection, path):
+    try:
+        connection.request("GET", path, headers={"Accept": "application/json"})
+        response = connection.getresponse()  # http.client follows no redirect
+        if response.status != 200:
+            raise ValueError(f"the planning view answered HTTP {response.status}")
+        body = response.read(PLANNING_BODY_LIMIT + 1)
+        if len(body) > PLANNING_BODY_LIMIT:
+            raise ValueError("the planning view is larger than its read limit")
+        if response.length:  # bytes its Content-Length still owes
+            raise http.client.IncompleteRead(body, response.length)
+        return body
+    finally:
+        connection.close()
 
 
 def read_planning():
-    """Monitor's planning view (``model-planning.v1``) from the Monitor ``read_budget`` reads.
+    """Monitor's planning view (``model-planning.v1``) within one end-to-end deadline.
 
-    An unreadable view keeps the fixed meter cap.
+    A reader thread does the request; past :data:`PLANNING_READ_TIMEOUT_S` its socket is shut down and
+    the read fails. Redirects, other statuses, a body above :data:`PLANNING_BODY_LIMIT` or short of its
+    ``Content-Length`` fail too. The caller turns every failure into the fixed meter cap.
     """
     from lu_machinery.common import json_depth
 
-    base = os.environ.get("DELEGATE_MONITOR_API", "http://127.0.0.1:8765").rstrip("/")
-    url = base + "/api/fleet/model-stats/planning"
-    with urllib.request.urlopen(url, timeout=PLANNING_READ_TIMEOUT_S) as response:
-        body = response.read(PLANNING_BODY_LIMIT + 1)
-    if len(body) > PLANNING_BODY_LIMIT:
-        raise ValueError("planning view larger than its read limit")
-    return json_depth.loads(body, max_depth=64)
+    host, port, prefix = _planning_origin()
+    connection = http.client.HTTPConnection(host, port, timeout=PLANNING_READ_TIMEOUT_S)
+    outcome = []
+
+    def fetch():
+        try:
+            outcome.append(_planning_body(connection, prefix + PLANNING_PATH))
+        except Exception as exc:  # handed to the caller below
+            outcome.append(exc)
+
+    reader = threading.Thread(target=fetch, name="planning-view-read", daemon=True)
+    reader.start()
+    reader.join(PLANNING_READ_TIMEOUT_S)
+    if reader.is_alive():
+        sock = connection.sock
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)  # wakes a blocked receive so the thread ends
+        raise TimeoutError("the planning view read passed its deadline")
+    [result] = outcome
+    if isinstance(result, Exception):
+        raise ValueError(f"the planning view read failed: {type(result).__name__}") from result
+    return json_depth.loads(result, max_depth=64)
 
 
 def _meter_budget(spec):
