@@ -157,11 +157,12 @@ def _orchestrator_marked(raw: bytes) -> bool:
 def stream_holders(stream, task_id):
     """The other orchestrator turns that may still run on ``stream`` (DRIVERS-1122).
 
-    A turn holds its stream while its record is active (an admission hold included) and,
-    after a supervisor crash, until its provider is proven gone. An unknown status, a
-    malformed orchestrator record and an unreadable record that names an orchestrator
-    each hold every stream: the reservation fails closed. Reads hot records only; a
-    record that names no orchestrator is never parsed.
+    A turn holds its stream until its record is terminal and its provider is proven gone
+    from well-formed launch evidence (``_provider_gone``): an admission hold, a live run, a
+    settled run whose provider lingers and a crashed run all hold it. An unknown status, a
+    malformed orchestrator record and an unreadable record that names an orchestrator each
+    hold every stream: the reservation fails closed. Reads hot records only; a record that
+    names no orchestrator is never parsed.
     """
     from lu_machinery.dispatcher.worker import _provider_alive
     from lu_machinery.orchestration.task_record_store import iter_task_records, parse_task_record
@@ -186,15 +187,32 @@ def stream_holders(stream, task_id):
         if other is None or record.get("task_id") == task_id or other != stream:
             continue
         status = record.get("status")
-        if not isinstance(status, str) or status in store.ACTIVE or status not in store.TERMINAL:
+        if not (isinstance(status, str) and status in store.TERMINAL):
             holders.append(str(record.get("task_id")))
-        elif status == "crashed" and not _provider_gone(_provider_alive, record):
-            holders.append(f"{record.get('task_id')} (crashed; provider not proven gone)")
+        elif not _provider_gone(_provider_alive, record):
+            holders.append(f"{record.get('task_id')} ({status}; provider not proven gone)")
     return holders
 
 
+# The launch modes a supervisor records (admission.spawn_supervisor).
+_LAUNCH_MODES = frozenset({"scope", "popen-fallback"})
+
+
 def _provider_gone(provider_alive, record):
-    """True only when the provider's process tree is proven gone; a damaged liveness field is not proof."""
+    """True only when a terminal turn's provider is proven gone, from well-formed launch evidence.
+
+    A launched run (one with a supervisor pid) names a known launch mode, and its liveness probe
+    answers False. A run that never launched has no pid, no launch mode and a recorded reason it
+    never started, or the probe proves it from its return reason. Anything else, a damaged field
+    or a probe error included, is not proof.
+    """
+    if "launch_mode" in record:
+        if not (isinstance(record["launch_mode"], str) and record["launch_mode"] in _LAUNCH_MODES):
+            return False
+    elif record.get("pid") is not None or record.get("process_start") is not None:
+        return False
+    elif isinstance(record.get("never_started_reason"), str) and record["never_started_reason"]:
+        return True
     try:
         return provider_alive(record) is False
     except Exception:  # a malformed liveness field never ends the scan or frees the stream
@@ -213,12 +231,11 @@ def legacy_lease_refusal(stream):
     unreachable, refused or malformed answer refuses, as does an active lease of an open or
     rolling session that has not expired.
     """
-    from lu_machinery.session_streams.model import parse_timestamp
-    from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError
+    from lu_machinery.session_supervisor.remote import RemoteEpicClient
 
     try:
         response = RemoteEpicClient().stream(stream, digest_limit=1)
-    except (RemoteSupervisorError, http.client.HTTPException, ValueError, RecursionError) as exc:
+    except Exception as exc:  # the lease authority's boundary: any failure is unknown, never "no lease"
         return f"orchestrator_lease_unknown: the Monitor stream lease probe failed ({type(exc).__name__})"
     if not isinstance(response, dict) or response.get("stream_id") != stream:
         return "orchestrator_lease_unknown: the Monitor answer names another stream"
@@ -227,17 +244,16 @@ def legacy_lease_refusal(stream):
     lease = response["lease"]
     if lease is None:  # the projection's explicit "no lease"
         return None
-    state = lease.get("state") if isinstance(lease, dict) else None
-    session = lease.get("session_state") if isinstance(lease, dict) else None
+    if not isinstance(lease, dict):
+        return "orchestrator_lease_unknown: the Monitor lease is malformed"
+    # Every part of a lease is checked before any of it decides, as Monitor writes each one for every lease.
+    state, session = lease.get("state"), lease.get("session_state")
     if not (isinstance(state, str) and state in _LEASE_STATES and isinstance(session, str) and session in _SESSION_STATES):
         return "orchestrator_lease_unknown: the Monitor lease or its session state is malformed"
-    if state != "active" or session not in ("open", "rolling"):
-        return None
-    try:
-        expired = datetime.now(UTC) >= parse_timestamp(lease["expires_at"])
-    except (KeyError, TypeError, ValueError):
+    expires = store.parse_utc_timestamp(lease.get("expires_at"))
+    if expires is None:
         return "orchestrator_lease_unknown: the Monitor lease expiry is unreadable"
-    if expired:
+    if state != "active" or session not in ("open", "rolling") or datetime.now(UTC) >= expires:
         return None
     holder = lease.get("holder") if isinstance(lease.get("holder"), dict) else {}
     return (f"orchestrator_stream_leased: {stream} has a live legacy driver lease "

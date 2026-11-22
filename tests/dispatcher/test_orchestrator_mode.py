@@ -27,6 +27,8 @@ TASK_ENV = ownership.TASK_ID_ENV
 
 
 _MISSING = object()
+_DEAD_PID = 2**22 + 1  # above the default pid_max, so never a live process
+_LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="popen-fallback", provider_pgid=None)
 
 
 def _lease(state="active", session_state="open", expires_in=600):
@@ -194,11 +196,20 @@ def test_concurrent_turns_on_one_stream_get_one_reservation(task_store):
 @pytest.mark.parametrize(
     ("fields", "held"),
     [
-        (dict(status="done"), False),
-        (dict(status="timeout"), False),
-        (dict(status="crashed", provider_pgid=None), False),
-        (dict(status="crashed", provider_pgid=os.getpgid(0)), True),  # its provider still runs
+        # A launched run releases its stream once terminal with its provider proven gone (no provider group).
+        (dict(status="done", **_LAUNCHED), False),
+        (dict(status="timeout", **_LAUNCHED), False),
+        (dict(status="crashed", **_LAUNCHED), False),
+        (dict(status="done", **{**_LAUNCHED, "provider_pgid": os.getpgid(0)}), True),  # settled, provider lingers
+        (dict(status="crashed", **{**_LAUNCHED, "provider_pgid": os.getpgid(0)}), True),  # its provider still runs
+        (dict(status="crashed", pid=_DEAD_PID), True),  # launched, but no launch mode: not proof
+        (dict(status="crashed", **{**_LAUNCHED, "launch_mode": "weird"}), True),
+        (dict(status="crashed", **{**_LAUNCHED, "launch_mode": ["scope"]}), True),
+        (dict(status="crashed", **{**_LAUNCHED, "launch_mode": None}), True),
         (dict(status="crashed"), True),  # provider liveness unknown
+        # A run that never launched: no pid, no launch mode, and a reason it never started.
+        (dict(status="failed", never_started_reason="placement"), False),
+        (dict(status="crashed", returncode_reason="dispatch_died_after_admission"), False),
         (dict(status="mystery"), True),
         (dict(status="spawning"), True),
         (dict(status=["running"]), True),  # a status of the wrong type is unknown, never an error
@@ -237,6 +248,11 @@ def test_a_stream_stays_reserved_until_its_turn_is_proven_finished(task_store, f
         ({key: value for key, value in _lease().items() if key != "session_state"}, "orchestrator_lease_unknown"),
         (_lease(state="held"), "orchestrator_lease_unknown"),
         (_lease(session_state=["open"]), "orchestrator_lease_unknown"),
+        # Every part of a lease is checked, whatever its state decides.
+        ({**_lease(state="released"), "expires_at": "soon"}, "orchestrator_lease_unknown"),
+        ({**_lease(state="expired"), "expires_at": None}, "orchestrator_lease_unknown"),
+        ({**_lease(session_state="closed"), "expires_at": "2026-11-22T20:00:00\x00+00:00"}, "orchestrator_lease_unknown"),
+        ({**_lease(), "expires_at": "2026-11-22 20:00:00Z"}, "orchestrator_lease_unknown"),
     ],
 )
 def test_a_live_legacy_lease_refuses_the_turn(monkeypatch, lease, refused):
@@ -250,8 +266,14 @@ def test_a_live_legacy_lease_refuses_the_turn(monkeypatch, lease, refused):
         assert reason.startswith(refused), reason
 
 
-def test_an_unreachable_monitor_refuses_the_turn(hermetic_monitor):
-    """Defect class: a Monitor outage reads as 'no lease' and admits a turn beside a live driver."""
+def test_an_unreachable_monitor_refuses_the_turn(hermetic_monitor, monkeypatch):
+    """Defect class: a Monitor outage or a malformed error reply reads as 'no lease' or escapes as a crash."""
+    assert host_admission.legacy_lease_refusal(STREAM).startswith("orchestrator_lease_unknown")
+
+    def malformed_error_body(self, stream_id, digest_limit=20):
+        raise AttributeError("'list' object has no attribute 'get'")  # what a JSON array error body raised
+
+    monkeypatch.setattr(remote.RemoteEpicClient, "stream", malformed_error_body)
     assert host_admission.legacy_lease_refusal(STREAM).startswith("orchestrator_lease_unknown")
 
 
@@ -333,6 +355,11 @@ def _settled(**fields):
         ({"receipt.recorded_at": _MISSING}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
         ({"receipt.recorded_at": "soon"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
         ({"receipt.recorded_at": "2026-11-22T20:00:00+02:00"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
+        ({"receipt.recorded_at": "2026-11-22\x0020:00:00+00:00"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
+        ({"receipt.recorded_at": "2026-11-22x20:00:00+00:00"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
+        ({"receipt.recorded_at": "２026-11-22T20:00:00+00:00"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
+        ({"receipt.recorded_at": "2026-13-22T20:00:00+00:00"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
+        ({"receipt.recorded_at": "2026-11-22T20:00:00Z"}, "done", None),
         ({"receipt.extra": "field"}, "no_deliverable", "orchestrator_handoff_receipt_invalid"),
         ({"status": "failed", "error": "provider exited unsuccessfully"}, "failed", None),
     ],
