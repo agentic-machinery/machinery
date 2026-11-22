@@ -48,6 +48,10 @@ _VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 # Same value grammar as lu_machinery.ci.check_agent_attribution (``X-Agent: <agent>/<task-id>``).
 _X_AGENT = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[A-Za-z0-9._-]+")
 _X_AGENT_EXAMPLE = "claude/claude-opus-5-5"
+# ``X-Verified`` lines (docs/runbooks/agent-attribution.md): only checks the cut already ran when it writes the commit.
+# The adopt PR opens before the contract canary runs, so its line must not name the canary.
+_ADOPT_VERIFIED = "X-Verified: release_cut preflight, wheel build, clean install and published asset SHA-256 check"
+_POST_RELEASE_VERIFIED = "X-Verified: release_cut changelog replay and version-file replay"
 _TAG_GLOB = "v[0-9]*.[0-9]*.[0-9]*"
 _PR_SUFFIX = re.compile(r"^(?P<text>.*?) \(#(?P<pr>\d+)\)$")
 _CONVENTIONAL = re.compile(r"^(?P<type>[a-z]+)(?:\([^)]*\))?!?: (?P<desc>.+)$")
@@ -836,7 +840,7 @@ class Cut:
         paths = self.update_adopt_inputs(consumer_lock, product)
         self.git(product, "add", *paths)
         self.git(product, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
-                 f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: {self.x_agent}")
+                 f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: {self.x_agent}\n{_ADOPT_VERIFIED}")
         self.run(["git", "-C", product, "push", self.product_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "adopt-body.md"
         pin_summary = (
@@ -1187,7 +1191,7 @@ class Cut:
         title = BUMP_TITLE.format(released=self.version, next=upcoming)
         self.git(clone, "add", "CHANGELOG.md", *version_files)
         self.git(clone, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
-                 f"{title}\n\nX-Agent: {self.x_agent}")
+                 f"{title}\n\nX-Agent: {self.x_agent}\n{_POST_RELEASE_VERIFIED}")
         self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "post-release-body.md"
         body.write_text(

@@ -14,6 +14,7 @@ import pytest
 
 from lu_machinery import release_cut
 from lu_machinery.agent_runtime.adapters.acpx import _check_node_artifact
+from lu_machinery.ci import check_agent_attribution as attribution
 from lu_machinery.common import repo_root
 from lu_machinery.dispatcher import git as git_module
 from lu_machinery.release_cut import Cut, CutError, main, preflight, record_changelog, release_notes
@@ -371,8 +372,15 @@ def test_release_shallow_clone_cannot_truncate_callers_linked_worktree_history(t
     assert (clone / ".git/shallow").read_text().strip() == head
 
 
-def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypatch):
-    """Defect classes: missing attribution, stale locks and credentials in uv subprocesses."""
+def _assert_declared(message: str, agent: str) -> None:
+    """The message declares exactly this X-Agent and one valid X-Verified line, as CI reads it."""
+    assert attribution.extract_attribution(message) == attribution.Attribution((agent,), 0)
+    assert attribution.classify_verification(message) == "present"
+    assert attribution.verification_findings(message, "0" * 40, None) == []
+
+
+def test_created_commit_message_declares_x_agent_and_x_verified(tmp_path, monkeypatch):
+    """Defect classes: missing attribution or MISSING_VERIFICATION on release PRs, stale locks and credentials in uv subprocesses."""
     machinery_seed = tmp_path / "machinery-seed"
     _init_repo(machinery_seed)
     (machinery_seed / "CHANGELOG.md").write_text(
@@ -445,7 +453,7 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     post = subprocess.run(
         ["git", "-C", str(machinery), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True,
     ).stdout
-    assert post.rstrip("\n").endswith("X-Agent: claude/claude-cto")
+    _assert_declared(post, "claude/claude-cto")
     assert cut.git(machinery, "show", "HEAD:uv.lock") == uv_lock.replace("0.1.22", "0.1.23").strip()
 
     lock = tmp_path / "consumer.lock"
@@ -455,7 +463,7 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
     adopt = subprocess.run(
         ["git", "-C", str(product), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True,
     ).stdout
-    assert adopt.rstrip("\n").endswith("X-Agent: claude/claude-cto")
+    _assert_declared(adopt, "claude/claude-cto")
     assert cut.git(product, "show", "HEAD:requirements-machinery.lock") == "lu-machinery==0.1.22"
 
     cut.version = "0.1.23"
@@ -503,7 +511,7 @@ def test_created_commit_message_ends_with_the_x_agent_trailer(tmp_path, monkeypa
         "pyproject.toml", "uv.lock",
     ]
     assert f"sha256:{digest}" in cut.git(product, "show", "HEAD:uv.lock")
-    assert cut.git(product, "log", "-1", "--format=%B").endswith("X-Agent: claude/claude-cto")
+    _assert_declared(cut.git(product, "log", "-1", "--format=%B"), "claude/claude-cto")
     (product / "uv.lock").write_text('package = "invalid"\n', encoding="utf-8")
     with pytest.raises(CutError, match="uv.lock package must be an array of tables"):
         release_cut.wheel_only_requirements("", product / "uv.lock")
