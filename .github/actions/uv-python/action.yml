@@ -11,7 +11,9 @@ inputs:
       or an X.Y minor version for a tool pinned to one ABI.
     default: pinned
   uv-version:
-    description: uv release (pins.txt UV_VERSION; pyproject.toml [tool.uv] required-version)
+    description: >-
+      uv release (pins.txt UV_VERSION and UV_LINUX_X86_64_SHA256, copied by ci-gate.yml and tests.yml; pyproject.toml [tool.uv] required-version; .github/actions/uv-python/uv-manifest.ndjson).
+      Replace uv-manifest.ndjson with that version's line from https://raw.githubusercontent.com/astral-sh/versions/main/v1/uv.ndjson.
     required: true
   uv-sha256:
     description: SHA-256 of uv-x86_64-unknown-linux-gnu.tar.gz for that release (pins.txt)
