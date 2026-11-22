@@ -217,7 +217,8 @@ def test_an_empty_unreleased_section_records_the_release_below_it():
         ("neworg/repo", "", True),
         ("evil/repo", "", False),
         ("org/repo", "[Unreleased]: https://github.com/neworg/repo/compare/v0.1.20...HEAD\n", False),
-        ("org/repo", "   [unreleased]: https://github.com/org/repo/compare/v0.1.20...HEAD\n", False),
+        ("org/repo", "   [ unreleased ]: https://github.com/org/repo/compare/v0.1.20...HEAD\n", False),
+        ("org/repo", "Example: [Unreleased]: https://github.com/org/repo/compare/v0.1.21...HEAD\n\n", True),
     ],
 )
 def test_unreleased_link_may_name_either_baked_slug_of_the_repository(monkeypatch, link_slug, stale, accepted):
@@ -237,7 +238,8 @@ def test_unreleased_link_may_name_either_baked_slug_of_the_repository(monkeypatc
             record_changelog(changelog, **cut, repo="neworg/repo")
         return
     recorded = record_changelog(changelog, **cut, repo="neworg/repo")
-    assert "v0.1.21...HEAD" not in recorded
+    assert recorded.startswith(stale)  # an example that defines nothing stays as written
+    assert recorded.count("v0.1.21...HEAD") == stale.count("v0.1.21...HEAD")
     assert recorded.endswith(
         "[Unreleased]: https://github.com/neworg/repo/compare/v0.1.22...HEAD\n"
         "[0.1.22]: https://github.com/neworg/repo/compare/v0.1.21...v0.1.22\n"

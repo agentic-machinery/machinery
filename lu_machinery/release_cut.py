@@ -330,13 +330,24 @@ def record_changelog(
         slugs = repository_slugs(repo)
     except FleetRepoError as exc:
         raise CutError(f"the fleet repository registry is unreadable: {exc}") from exc
-    # Markdown reference labels ignore case and allow three leading spaces: any such line defines
-    # the Unreleased link, so exactly one may exist, and it must compare the previous tag.
-    definitions = re.findall(r"^ {0,3}\[unreleased\]:.*\n?", text, flags=re.IGNORECASE | re.MULTILINE)
-    accepted = {f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD\n" for slug in slugs}
-    if text.count(unreleased) != 1 or len(definitions) != 1 or definitions[0] not in accepted:
+    # The CommonMark parser decides what defines the Unreleased link (labels ignore case and
+    # surrounding whitespace; fenced or inline examples define nothing). Exactly one definition may
+    # exist, its source must be the previous-tag compare link under a baked slug of the repository,
+    # and only that definition's own lines are rewritten.
+    from markdown_it import MarkdownIt
+
+    if "\r" in text:
+        # The parser counts lines after turning CR into LF; a span mapped back onto CR text would drift.
+        raise CutError("CHANGELOG.md must use LF line endings")
+    env: dict = {}
+    MarkdownIt("commonmark").parse(text, env)
+    definition = env.get("references", {}).get("UNRELEASED")
+    duplicates = [ref for ref in env.get("duplicate_refs", []) if ref.get("label") == "UNRELEASED"]
+    lines = text.split("\n")  # the parser's own line numbering
+    start, end = definition["map"] if definition else (0, 0)
+    accepted = {f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD" for slug in slugs}
+    if text.count(unreleased) != 1 or definition is None or duplicates or "\n".join(lines[start:end]) not in accepted:
         raise CutError("CHANGELOG.md lacks one Unreleased heading and its compare link to the previous tag")
-    link = definitions[0]
     unreleased_must_be_empty(text)
     heading = f'<a id="v{version}"></a>\n## [{version}] - {date}' + (" [YANKED]" if yanked else "")
     section = f"{heading}\n\n{notes.rstrip()}\n\n"
@@ -344,7 +355,8 @@ def record_changelog(
         f"[Unreleased]: https://github.com/{repo}/compare/v{version}...HEAD\n"
         f"[{version}]: https://github.com/{repo}/compare/v{since or previous}...v{version}\n"
     )
-    return text.replace(unreleased, unreleased + section, 1).replace(link, links, 1)
+    relinked = "".join(line + "\n" for line in lines[:start]) + links + "\n".join(lines[end:])
+    return relinked.replace(unreleased, unreleased + section, 1)
 
 
 def version_of(name: str, text: str) -> dict[str, str]:

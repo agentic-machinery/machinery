@@ -475,14 +475,21 @@ def _recovery_pr_head(
         or closeout.get("apply") is not True
         or closeout.get("ok") is not True
         or closeout.get("errors") != []
-        or cleanup_pr
+        or not isinstance(cleanup_pr, Mapping)
+        or {key: value for key, value in cleanup_pr.items() if key != "repository"}
         != {
             "number": pr["number"],
             "state": "MERGED",
             "head_ref_name": pr["head_branch"],
             "head_sha": pr.get("head_sha"),
-            **({"repository": ledger["identity"]["repository"]} if "repository" in cleanup_pr else {}),
         }
+        # merge_closeout records the canonical (folded) spelling of the row, which may be the
+        # other baked slug of the ledger's repository.
+        or ("repository" in cleanup_pr and not (
+            isinstance(cleanup_pr["repository"], str)
+            and any(cleanup_pr["repository"].casefold() == slug.casefold()
+                    for slug in _repository_slugs(ledger["identity"]["repository"]))
+        ))
         or branch.get("branch") != task["worktree_branch"]
         or branch.get("remote_gone") is not True
         or branch.get("local_gone") is not True
