@@ -105,9 +105,14 @@ def _planning_origin():
 
 
 def _planning_length(response):
-    """The one valid ``Content-Length`` of a 200 reply. Chunked or close-delimited replies are refused."""
+    """The one valid ``Content-Length`` of a 200 reply. Chunked or close-delimited replies are refused.
+
+    A header line the parser could not split ends its field list, so fields after it would go unchecked.
+    """
     if response.status != 200:
         raise ValueError(f"the planning view answered HTTP {response.status}")
+    if response.headers.defects or response.headers.get_payload():
+        raise ValueError("the planning view header block is malformed")
     lengths = response.headers.get_all("Content-Length") or []
     if response.headers.get_all("Transfer-Encoding") or len(lengths) != 1:
         raise ValueError("the planning view needs exactly one Content-Length and no Transfer-Encoding")

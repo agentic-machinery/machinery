@@ -279,6 +279,12 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
                 self.wfile.write(b"HTTP/1.0 200 OK\r\n\r\n" + body)
                 self.close_connection = True
                 return
+            if name in ("hidden_length", "hidden_chunked"):  # framing hidden behind a malformed header line
+                hidden = b"Content-Length: 1" if name == "hidden_length" else b"Transfer-Encoding: chunked"
+                self.wfile.write(f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n".encode()
+                                 + b"no colon here\r\n" + hidden + b"\r\n\r\n" + body)
+                self.close_connection = True
+                return
             self.send_response({"redirect": 302, "error": 503}.get(name, 200))
             if name == "redirect":
                 self.send_header("Location", self.path)
@@ -299,7 +305,8 @@ def test_paced_meter_cap_follows_the_forecast_not_the_live_count(tmp_path, probe
         monkeypatch.setattr(host_admission, "PLANNING_READ_TIMEOUT_S", 0.5)
         assert host_admission.read_planning() == json.loads(good)
         for name in ("redirect", "error", "short", "oversize", "not_json", "chunked", "close_delimited", "letters",
-                     "negative", "superscript", "repeated", "conflicting", *stalls):
+                     "negative", "superscript", "repeated", "conflicting", "hidden_length", "hidden_chunked",
+                     *stalls):
             mode["name"] = name
             started = time.monotonic()
             assert host_admission._monitor_json(host_admission.read_planning) is None, name
