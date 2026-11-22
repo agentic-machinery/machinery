@@ -328,6 +328,7 @@ jobs:
           import re
           import subprocess
           import sys
+          import sysconfig
           import tarfile
           import tempfile
           from pathlib import Path
@@ -354,9 +355,12 @@ jobs:
                   )
                   with tarfile.open(fileobj=io.BytesIO(snapshot)) as archive:
                       archive.extractall(base_tree, filter="data")
-                  # -I -S leaves only the standard library on the import path.
-                  # All selector imports come from this snapshot or the standard library.
+                  if not (Path(base_tree) / "lu_machinery" / "__init__.py").is_file():
+                      fail("base snapshot is missing the regular lu_machinery package")
+                  # The regular base package owns all its module paths. Add the venv's
+                  # locked dependencies directly, without running site startup hooks.
                   sys.path.insert(0, base_tree)
+                  sys.path.extend(dict.fromkeys(sysconfig.get_path(key) for key in ("purelib", "platlib")))
                   from lu_machinery.ci.gate import event_tier
                   from lu_machinery.ci.pr_affected_tests import changed_files, plan
               except (ImportError, OSError, subprocess.SubprocessError, tarfile.TarError) as exc:
@@ -384,7 +388,7 @@ jobs:
                       if selector_tests not in run_manifest.read_text(encoding="utf-8").splitlines():
                           fail(f"selector test must be a [run] file: {selector_tests}")
                   record = plan(parents[0], actual)
-              except (KeyError, OSError, TypeError, subprocess.SubprocessError, ValueError) as exc:
+              except (ImportError, KeyError, OSError, TypeError, subprocess.SubprocessError, ValueError) as exc:
                   detail = f": {exc}" if type(exc) is ValueError else ""
                   fail(f"affected-test plan failed: {type(exc).__name__}{detail}")
           if record["guards_exceed_safe_budget"]:
