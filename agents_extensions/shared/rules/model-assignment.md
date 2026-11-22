@@ -676,7 +676,7 @@ the system until it returns) is broken by ROLE SPLIT, not by a better single dri
 * Kimi is retired (OO-58). Session-cadence seats stay unchanged for agy (compaction loses
   orchestration state; a Gemini driver re-verifies lease and hydration after compaction), gemini CLI (retired → agy).
 
-  The review of record and landing follow the `review-loop` and `full-send` skills.
+  The review of record follows the `review-loop` skill; landing follows the keeper's custody path and `full-send` § Landing and closeout by a lead.
   **Shielded formal CF
   (`review-pr`, sealed multi-GB `lu-review-*` / `shielded-reviews` isolation) is
   RETIRED (operator 2026-08-07)** — fail-closed in the CLI. Do not reintroduce
@@ -1208,7 +1208,7 @@ The same table lives in `agents_extensions/shared/memory/MEMORY.md` rule #M0. Th
 ## PR cross-family review (direct only — operator 2026-08-06; sealed formal RETIRED 2026-08-07)
 
 Review rounds, settlement and recording: the `review-loop` skill; landing and cleanup:
-`full-send` and `workflow.md` § Merge policy. This file keeps only the routing policy.
+the keeper's custody path, `full-send` § Landing and closeout by a lead and `workflow.md` § Merge policy. This file keeps only the routing policy.
 
 **Reviewer evaluation.** The existing review evaluation protocol uses verified
 defects and clean controls. When qualifying a change to the reviewer's model,

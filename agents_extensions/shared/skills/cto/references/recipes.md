@@ -13,19 +13,10 @@ file only points there and adds what the CTO seat learned on top.
 - **Exit receipt in every new brief.** State that the worker ends at verified push, recorded
   exact-head verdict (or Trivial classification) and an accepted `pr_ownership keeper-transfer`
   receipt, never waits on CI, runners or the queue, and never reruns, enqueues, merges or runs
-  `merge_closeout`. Dispatch detached briefs only after you verify, on the installed release,
-  every item of this rollout gate:
-  1. it carries `keeper-transfer`;
-  2. the keeper cannot enqueue or merge a detached PR before it has acknowledged custody (an
-     early landing is otherwise a reported exception you dispose of);
-  3. a move to an unreviewed head alerts you before that head's review or CI readiness is read;
-  4. the keeper's landing write requires a fresh passing `verify_run` for every area the diff
-     touches (`verify` skill);
-  5. each recovery named below exists: the alert, the one same-head infrastructure recovery, and
-     the keeper's re-enqueue of an approved repaired head after an ejection.
-  Where any item is missing, do not dispatch a detached brief: the worker contract has no
-  fallback, and the older contract belongs only to briefs already started under it. In-flight
-  briefs keep their owner until an explicit transfer.
+  `merge_closeout`. No worker brief uses this detached contract until `claude-cto` records the
+  rollout acceptance criteria verified on merged keeper code; the criteria list lives with the
+  CTO (tracker disposition D-DETACH-RESIDUALS), not in this file. In-flight briefs keep their owner
+  until an explicit transfer.
 - **Keeper alert on CI failure, ejection or head move after approval.** Classify it from the
   evidence before releasing custody. An infrastructure failure with no failing test node and an
   unspent allowance is the one same-head recovery (the keeper's re-enqueue, or a CTO `run-rerun` with the evidence on the PR): dispatch no worker, because accepting

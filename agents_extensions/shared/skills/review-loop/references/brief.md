@@ -85,7 +85,8 @@ unavailable, such as a pending check that finding depends on: it replies `uncert
 (`BLOCKED`), names the missing evidence and the pending check, and lists no other finding as
 a reason. A pending check does not change a verdict that the diff and the available evidence
 already settle. The driver or worker does not record that reply
-([policy](policy.md#recording-the-verdict)). The capability-only `BLOCKED` below covers a
+([policy](policy.md#recording-the-verdict)); the CTO continues it by the
+[review continuation recipe](../../cto/references/recipes.md). The capability-only `BLOCKED` below covers a
 missing reviewer capability, never pending CI.
 
 A capability-only `BLOCKED` uses `uncertain`, no findings, and `missing_capabilities`.

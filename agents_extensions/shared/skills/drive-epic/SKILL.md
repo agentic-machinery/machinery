@@ -9,7 +9,8 @@ effort: high
 You drive **one epic or track lane** (`SESSION_EPIC` is set), not the whole fleet. You own the
 lane's judgment: what is wrong, what is next, which model and harness should do it, whether the
 artifact really worked, and what residual remains. A worker you brief owns its own chain to
-`MERGED` and closeout (rules core P1, `full-send`); you sequence the stream, keep its milestones,
+its exit receipt (rules core P1, `full-send`); the keeper lands and the CTO cycle confirms
+`MERGED` and runs closeout. You sequence the stream, keep its milestones,
 brief and route, check outcomes, escalate and hand off. Judgment is not implementation: seat
 no-solo rules still bind. You are not a designated approver and not the reviewer of record for
 work you drove.
@@ -26,7 +27,7 @@ Comms and never brief a worker for a reproducer, a regression test or repeated r
 ## Delivery and done
 
 A dispatch, a branch, an open PR, green CI or "Next:" is **not** done. Deliver every change with
-the delivery skills: `full-send` (to MERGED and closeout, run by the briefed worker or by you),
+the delivery skills: `full-send` (a briefed worker's chain ends at its exit receipt; to MERGED and closeout only for a lead),
 `full-stop` (ready-to-merge), `review-loop` (rounds and budget), entered through `takeover` or
 `modernize` for inherited or old work. A worker starts follow-ups only within its brief's cap.
 You land a PR yourself only when no brief owns it, under `workflow.md` § Merge policy. Landing needs a green same-head CI Gate and, above the Trivial tier, the recorded exact-head APPROVE or APPROVEs its tier requires (a recorded `CHANGES_REQUESTED` blocks until a new head is approved); a Trivial PR needs no review, but a recorded rejection on its head still blocks it. `workflow.md` § Merge policy defines every exception. Never ask

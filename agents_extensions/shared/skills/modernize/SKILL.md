@@ -11,9 +11,9 @@ belongs in the product, and "no conflicts" is never proof that it is current.
 
 **Who may run it.** A driver, or a worker under a brief that names the target. Modernizing
 authorizes rebasing and updating this task's branch. It does not authorize closing, changing
-the base branch or widening scope. The worker runs the whole chain itself (rules core P1): it
-lands the result through `full-send`, or stops at ready through `full-stop` when the brief
-says so. Closing a superseded PR is a driver act.
+the base branch or widening scope. The worker runs its whole chain itself (rules core P1): it
+delivers the result to its exit receipt through `full-send` (the keeper lands the PR), or stops
+at ready through `full-stop` when the brief says so. Closing a superseded PR is a driver act.
 
 **Chain.** `modernize branch codex/x then full-send`, `modernize area scripts/foo then
 full-stop`. Without a chain, stop after the verdict and the hand-off record.

@@ -107,7 +107,7 @@ reconcile queued instructions through the §4a inbox drain; unknown queue state 
 and a packet superseded by a queued instruction is never launched.
 
 Dispatch with a numbered brief (worktree → work → tests → ruff → conventional commit → push → PR;
-the worker runs `full-send` to MERGED and never arms auto-merge) and the evidence preamble (each
+the worker runs `full-send` to its exit receipt and never arms auto-merge) and the evidence preamble (each
 claim, its deterministic tool and quoted raw evidence). Pass the research flags
 (`--research-role`, `--research-task-family`, `--research-track`) and repeatable `--owned-path`
 for write dispatches. Workers commit and push their own work; dispatch v2 has no auto-finalize.

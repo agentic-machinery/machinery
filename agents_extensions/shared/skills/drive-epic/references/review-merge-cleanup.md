@@ -171,7 +171,7 @@ ids for suite results. Add no test and repeat no run.
 ## §7. Landing
 
 The gates are `workflow.md` § Merge policy; the delivery steps are `full-send` and `full-stop`,
-and the briefed worker enqueues its own PR once the Merge policy gates hold. Landing needs a green same-head CI Gate and, above the Trivial tier, the recorded exact-head APPROVE or APPROVEs its tier requires (a recorded `CHANGES_REQUESTED` blocks until a new head is approved); a Trivial PR needs no review, but a recorded rejection on its head still blocks it. `workflow.md` § Merge policy defines every exception. You land only a PR no brief owns, and flag another
+and a briefed worker never lands: the merge-queue keeper lands a PR held in worker custody. Landing needs a green same-head CI Gate and, above the Trivial tier, the recorded exact-head APPROVE or APPROVEs its tier requires (a recorded `CHANGES_REQUESTED` blocks until a new head is approved); a Trivial PR needs no review, but a recorded rejection on its head still blocks it. `workflow.md` § Merge policy defines every exception. You land only a PR no brief owns, and flag another
 lane's PR with `needs=merge` instead of merging it. Run the core inbox drain immediately before an
 enqueue and reconcile its messages with the approved head.
 
@@ -214,7 +214,7 @@ never authorizes a cutover.
 
 The publisher's enqueue, the dispatcher's settlement removal of each task's own worktree
 (`worktree_disposition`) and the post-merge `merge_closeout` own cleanup and its receipts:
-`workflow.md` § Post-merge cleanup is the single recipe, and `full-send` runs it. Queue success
+`workflow.md` § Post-merge cleanup is the single recipe, and the CTO cycle runs it (`full-send` § Landing and closeout by a lead). Queue success
 proves no cleanup. Before the next large dispatch you need the worker's exit, `MERGED` with the
 merge SHA, and `merge_closeout` exit 0 with a residue-free receipt; a non-zero exit or any
 residual blocks closeout, and nothing is forced. You remove a retained worktree only after its
