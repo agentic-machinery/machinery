@@ -95,6 +95,7 @@ SCHEMAS = {
             "body_file": "file",
             "match_head": "sha",
             "expect_queue": "queue_mode",
+            "recovery_run_id": "number",
         },
     ),
     "pr-update-branch": ({"number"}, {**COMMON, "number": "number"}),
@@ -658,6 +659,11 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
     recorder = rows[0].get("verdict_recorder") if len(rows) == 1 else None
     if type(recorder) is not bool:
         raise gate.PublishBlocked("OPSEC: merge refused: the repository's verdict_recorder setting is unverifiable.")
+    configured_recorder_login = rows[0].get("verdict_recorder_login") if len(rows) == 1 else None
+    if configured_recorder_login is not None and (
+        not isinstance(configured_recorder_login, str) or not re.fullmatch(r"\S+", configured_recorder_login)
+    ):
+        raise gate.PublishBlocked("OPSEC: merge refused: the repository's verdict_recorder_login is invalid.")
     try:
         documents = []
         for operation, selectors in (("comments", {"number": number}), ("pr-files", {"number": number}), ("identity", {})):
@@ -675,6 +681,7 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
             raise ValueError
         if not isinstance(login, str) or not re.fullmatch(r"\S+", login):
             raise ValueError
+        verdict_login = configured_recorder_login or login
         file_rows = [item for page in files for item in page]
         paths = pr_file_paths(file_rows)
         tier = classify_pr_files(file_rows)
@@ -682,7 +689,7 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
         low_tier = tier in {"trivial", "low"}
         content = changes_learner_content(paths)
         verdict = lookup_verdict(
-            [item for page in pages for item in page], head, login, learner_content=content, low_tier=low_tier,
+            [item for page in pages for item in page], head, verdict_login, learner_content=content, low_tier=low_tier,
         )
         state = verdict.state
     except github_client.GitHubRateLimited:
@@ -736,6 +743,44 @@ def _refuse_incomplete_seats(dest, number, head, runner, cwd, environment):
         if any(DEFAULT_STATUS_CONTEXT in (row.get("name"), row.get("context")) for row in rows):
             raise gate.PublishBlocked("OPSEC: merge refused: this head's review status has no verdict record.")
     return None
+
+
+def _keeper_custody_blocks_worker_recovery(dest: str, number: int, environment: dict[str, str]) -> None:
+    """Give the keeper sole ownership of the recovery allowance for PRs under keeper custody.
+
+    Dispatched workers (``LEARN_UKRAINIAN_DISPATCH_TASK_ID`` set) cannot consume the
+    recovery allowance of a PR transferred to keeper custody. A missing ownership
+    store means no keeper custody exists; an unreadable store fails closed.
+    """
+    caller_task = environment.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID")
+    if not caller_task:
+        return
+    from lu_machinery.orchestration import pr_ownership
+
+    slug = dest.split("/", 1)[1] if "/" in dest else dest
+    try:
+        custody = pr_ownership.keeper_custody_for(None, slug, number)
+    except Exception:
+        raise gate.PublishBlocked(
+            "RECOVERY_CUSTODY_UNKNOWN: ownership state unreadable; worker recovery refused"
+        ) from None
+    if custody is not None:
+        raise gate.PublishBlocked(
+            "RECOVERY_KEEPER_OWNED: PR is under keeper custody; only the keeper owns its recovery allowance"
+        )
+
+
+def _configured_verdict_login(dest: str, fallback: str) -> str:
+    rows = [
+        row for row in gate.catalog().values()
+        if gate.normalize_repository(str(row.get("github", ""))) == gate.normalize_repository(dest)
+    ]
+    configured = rows[0].get("verdict_recorder_login") if len(rows) == 1 else None
+    if configured is not None:
+        if not isinstance(configured, str) or not re.fullmatch(r"\S+", configured):
+            raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: invalid verdict_recorder_login configuration")
+        return configured
+    return fallback
 
 
 def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
@@ -809,8 +854,9 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             raise gate.PublishBlocked(unknown) from None
 
     if verb == "run-rerun":
-        run = fetch("run", number=fields["number"])
-        if not isinstance(run, dict) or run.get("id") != fields["number"]:
+        run_id = fields["number"]
+        run = fetch("run", number=run_id)
+        if not isinstance(run, dict) or run.get("id") != run_id:
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: run identity required")
         associations = run.get("pull_requests")
         event = run.get("event")
@@ -833,6 +879,27 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         if run.get("event") != "merge_group" and associations[0].get("head", {}).get("sha") != head:
             raise gate.PublishBlocked("RECOVERY_HEAD_MOVED: run belongs to another PR head")
         action = "run-rerun"
+        require_infra_diagnosis = False
+    elif verb == "pr-merge":
+        run_id = fields["recovery_run_id"]
+        number = fields["number"]
+        head = fields["match_head"]
+        run = fetch("run", number=run_id)
+        if not isinstance(run, dict) or run.get("id") != run_id:
+            raise gate.PublishBlocked("RECOVERY_RUN_INVALID: run identity required")
+        if run.get("event") != "merge_group":
+            raise gate.PublishBlocked("RECOVERY_RUN_INVALID: merge_group failed run required for re-enqueue")
+        if run.get("status") != "completed" or run.get("conclusion") not in {"failure", "cancelled", "timed_out", "action_required"}:
+            raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
+        if extract_pr_number(run.get("head_branch", "")) != number:
+            raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run does not identify this PR")
+        if not isinstance(head, str) or not recovery.SHA.fullmatch(head):
+            raise gate.PublishBlocked("RECOVERY_HEAD_UNKNOWN: open PR head required")
+        action = "re-enqueue"
+        require_infra_diagnosis = True
+    else:
+        raise gate.PublishBlocked("RECOVERY_ACTION_INVALID: unsupported recovery verb")
+    _keeper_custody_blocks_worker_recovery(dest, number, environment)
     path = recovery.ledger_path(cwd)
     prior = recovery.first_attempt(path, dest, number, head)
     if prior:
@@ -841,12 +908,20 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     files = fetch("pr-files", number=number)
     content = changes_learner_content(files)
     login = fetch("identity").get("login")
-    if not isinstance(login, str) or lookup_verdict(
-        comments, head, login, learner_content=content,
+    if not isinstance(login, str) or not login:
+        raise gate.PublishBlocked("RECOVERY_APPROVAL_MISSING: exact-head recorded approval required")
+    verdict_login = _configured_verdict_login(dest, login)
+    if lookup_verdict(
+        comments, head, verdict_login, learner_content=content,
     ).state != "APPROVED":
         raise gate.PublishBlocked("RECOVERY_APPROVAL_MISSING: exact-head recorded approval required")
     evidence = recovery.evidence_from_comments(
-        comments, number, head, authenticated_login=login, run_id=fields["number"]
+        comments,
+        number,
+        head,
+        authenticated_login=login,
+        run_id=run_id,
+        require_infra_diagnosis=require_infra_diagnosis,
     )
     failed_run = run
     if (type(failed_run.get("run_attempt")) is not int or failed_run["run_attempt"] < 1
@@ -2791,6 +2866,10 @@ def publish(
                     + ("on" if recovery_queue else "off") + " but --expect-queue was " + fields["expect_queue"]
                     + "; re-read queue-status and re-check the landing gate for that kind."
                 )
+            if "recovery_run_id" in fields and not recovery_queue:
+                raise gate.PublishBlocked(
+                    "RECOVERY_QUEUE_REQUIRED: same-head recovery re-enqueue requires an active merge queue."
+                )
             if recovery_queue:
                 try:
                     before = queue_probe()
@@ -3041,7 +3120,7 @@ def publish(
             _refuse_incomplete_seats(
                 dest, fields["number"], fields["match_head"], readiness_runner, cwd, environment,
             )
-        if verb == "run-rerun":
+        if verb == "run-rerun" or (verb == "pr-merge" and "recovery_run_id" in fields and not already_queued):
             reservation = _prepare_recovery(verb, fields, dest, cwd, environment, readiness_runner)
             if reservation:
                 path, number, head, action, evidence = reservation
@@ -3399,6 +3478,11 @@ def main(argv=None, *, runner=None):
                     "true or false: the merge queue state the landing gate was checked for; "
                     "refused before any write when the base branch differs; omitted skips the check"
                 )
+            if verb == "pr-merge" and key == "recovery_run_id":
+                kwargs["help"] = (
+                    "Positive failed merge_group Actions run ID for same-head infrastructure re-enqueue; "
+                    "atomically reserves the PR head's one recovery allowance; omitted for ordinary landing"
+                )
             if kind == "bool":
                 kwargs["action"] = argparse.BooleanOptionalAction
             elif kind in {"texts", "assets"}:
@@ -3535,6 +3619,7 @@ REST_READS = {
     "reviews": ("repos/{repo}/pulls/{number}/reviews", {"number": "number"}),
     "commits": ("repos/{repo}/pulls/{number}/commits", {"number": "number"}),
     "commit": ("repos/{repo}/commits/{sha}", {"sha": "sha"}),
+    "branch": ("repos/{repo}/branches/{branch}", {"branch": "ref"}),
     "compare": ("repos/{repo}/compare/{base}...{head}", {"base": "sha", "head": "sha"}),
     "pull": ("repos/{repo}/pulls/{number}", {"number": "number"}),
     "pr-files": ("repos/{repo}/pulls/{number}/files", {"number": "number"}),
@@ -3549,6 +3634,7 @@ REST_READS = {
     "artifact-archive": ("repos/{repo}/actions/artifacts/{number}/zip", {"number": "number"}),
     "issues": ("repos/{repo}/issues?state=open", {}),
     "runs": ("repos/{repo}/actions/runs?event=merge_group&created={start}..{end}", {"start": "timestamp", "end": "timestamp"}),
+    "head-runs": ("repos/{repo}/actions/runs?head_sha={sha}", {"sha": "sha"}),
     "deployments": ("repos/{repo}/deployments?sha={sha}", {"sha": "sha"}),
     "deployment-statuses": ("repos/{repo}/deployments/{number}/statuses", {"number": "number"}),
 }
@@ -3840,6 +3926,10 @@ def read(
             if any(segment in {"", ".", ".."} for segment in fields["ref"].split("/")):
                 raise gate.PublishBlocked("OPSEC: invalid read selector.")
             fields = {"ref": quote(fields["ref"], safe="")}
+        if operation == "branch" and "branch" in fields:
+            if any(segment in {"", ".", ".."} for segment in fields["branch"].split("/")):
+                raise gate.PublishBlocked("OPSEC: invalid read selector.")
+            fields = {"branch": quote(fields["branch"], safe="")}
         endpoint = endpoint.format(repo=gh_repo, **fields)
         endpoint += ("&" if "?" in endpoint else "?") + "per_page=100"
         argv = ["gh", "api", "--method", "GET", endpoint]

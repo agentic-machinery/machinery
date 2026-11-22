@@ -7138,11 +7138,6 @@
       "message": "Incompatible return value type (got \"None | bool\", expected \"bool\")"
     },
     {
-      "path": "lu_machinery/publish/recovery.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"None | dict[Any, Any]\""
-    },
-    {
       "path": "lu_machinery/research/observability.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"None\", target has type \"int\")"
