@@ -139,6 +139,9 @@ def _normalize_recipients(recipients: Iterable[str] | None) -> tuple[str, ...]:
 DURABLE_CTO_RECIPIENT = "claude-cto"
 """The one CTO recipient. A session identity ``claude-cto-<id>`` only claims and acknowledges."""
 
+AUTHORITY_MESSAGE_ID_RE = re.compile(r"(?:[a-z][a-z0-9-]*_|legacy-message-)[0-9a-f]{32}")
+_EXTERNAL_RECIPIENT_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+
 CLEANUP_EXPIRY_REASON = "expired_by_cleanup"
 """Dead-letter reason for rows the operator's ``deliveries expire-stale --apply`` expired.
 
@@ -249,7 +252,7 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     if cached is not None:
         return cached
     slots = agent_identity._load_registry_slots(paths[0])
-    external = _load_external_recipients(paths[0])
+    external, _availability = load_external_recipients(paths[0])
     lanes: tuple[str, ...] = ()
     with contextlib.suppress(Exception):
         lanes = tuple(lane.sender for lane in driver_lanes.load_registry(paths[1]).lanes)
@@ -266,25 +269,28 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     return roster
 
 
-def _load_external_recipients(path: Path) -> tuple[str, ...]:
-    """The ``external_recipients`` names declared in the slot roster file; empty when absent or unreadable.
-
-    These agents are not launcher slots, so ``_load_registry_slots`` never
-    reads them; only recipient admission does. They add names and never decide
-    whether the roster is complete.
-    """
+def load_external_recipients(
+    path: Path,
+) -> tuple[tuple[str, ...], Literal["available", "unavailable"]]:
+    """Read exact external recipient names, distinguishing an empty list from a failed read."""
     try:
         import yaml
     except ImportError:
-        return ()
+        return (), "unavailable"
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError):
-        return ()
-    names = data.get("external_recipients") if isinstance(data, dict) else None
-    if not isinstance(names, list):
-        return ()
-    return tuple(name.strip() for name in names if isinstance(name, str) and name.strip())
+    except (OSError, ValueError, yaml.YAMLError, RecursionError):
+        return (), "unavailable"
+    if not isinstance(data, dict):
+        return (), "unavailable"
+    names = data.get("external_recipients", [])
+    if not isinstance(names, list) or any(
+        not isinstance(name, str) or not _EXTERNAL_RECIPIENT_RE.fullmatch(name) for name in names
+    ):
+        return (), "unavailable"
+    if len(set(names)) != len(names):
+        return (), "unavailable"
+    return tuple(names), "available"
 
 
 def _registered_recipients() -> frozenset[str]:
@@ -571,9 +577,7 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
                 f"SELECT message_id FROM authority_deliveries d WHERE {where} ORDER BY message_id LIMIT ?",
                 (*params, limit),
             )]
-            if any(not isinstance(mid, str) or not re.fullmatch(
-                r"(?:[a-z][a-z0-9-]*_|legacy-message-)[0-9a-f]{32}", mid,
-            ) for mid in ids):
+            if any(not isinstance(mid, str) or not AUTHORITY_MESSAGE_ID_RE.fullmatch(mid) for mid in ids):
                 return {**unknown, "reason": "invalid_pending_message_id"}
         return {
             "count": count, "ids": ids, "truncated": count > len(ids),

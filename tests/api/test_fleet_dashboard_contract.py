@@ -22,6 +22,8 @@ def test_fleet_routes_are_registered_get_only_and_contracted() -> None:
         "/api/fleet/operations",
         "/api/fleet/agents",
         "/api/fleet/endpoints",
+        "/api/fleet/seats",
+        "/api/fleet/deliveries",
         "/api/fleet/requests",
         "/api/fleet/authority/jobs",
         "/api/fleet/migrations",

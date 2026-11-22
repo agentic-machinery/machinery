@@ -10,7 +10,9 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from lu_machinery import agent_identity
 from lu_machinery.api.monitor_context import MonitorContext, fixture_context, production_context
+from lu_machinery.fleet_comms.authority import AuthorityService
 from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.fleet_comms.migrations import MIGRATIONS, apply_migrations
 
@@ -24,6 +26,32 @@ def _client(ctx: MonitorContext | None = None) -> TestClient:
     app.state.ctx = ctx or production_context()
     app.include_router(router, prefix="/api/comms")
     return TestClient(app)
+
+
+def test_inbox_admits_only_exact_external_roster_names(tmp_path, monkeypatch):
+    """Defect class: an external recipient cannot read its queue or a near miss can reach the plane."""
+    root = tmp_path / "fleet-comms"
+    roster = tmp_path / "area_assignments.yaml"
+    roster.write_text("assignments: {test: {slots: [codex-test]}}\nexternal_recipients: [eggbot]\n")
+    monkeypatch.setattr(agent_identity, "ASSIGNMENTS_PATH", roster)
+    monkeypatch.setenv("FLEET_COMMS_ROOT", str(root))
+    monkeypatch.setenv("LEARN_UKRAINIAN_CP_AUTHORITY_FLEET_COMMS", "sqlite")
+    with AuthorityService(root=root) as service:
+        delivery = service.publish_message(sender="claude-cto", body="fixture body", recipients=("eggbot",))
+
+    client = _client(fixture_context(tmp_path))
+    snapshot = client.get("/api/comms/inbox", params={"agent": "eggbot"}).json()
+    assert snapshot["probe"] == "ok"
+    assert snapshot["count"] == 1
+    assert snapshot["ids"] == [delivery.message_id]
+    assert snapshot["content_included"] is False
+    for name in ("Eggbot", "eggbot ", "eggbot-session"):
+        unknown = client.get("/api/comms/inbox", params={"agent": name}).json()
+        assert (unknown["probe"], unknown["count"], unknown["ids"]) == ("unknown", None, [])
+
+    roster.write_text("external_recipients: [eggbot, false]\n")
+    unknown = client.get("/api/comms/inbox", params={"agent": "eggbot"}).json()
+    assert (unknown["probe"], unknown["count"], unknown["ids"]) == ("unknown", None, [])
 
 
 def test_read_plane_status_defaults_to_configured_mode(tmp_path: Path, monkeypatch) -> None:
@@ -189,9 +217,8 @@ def test_lifespan_refuses_pg_authority_the_seats_cannot_write(monkeypatch: pytes
     _stub_api_startup(monkeypatch)
 
     app = api_main.create_app(fixture_context(tmp_path))
-    with pytest.raises(ControlPlaneUnsupportedComponentError) as exc:
-        with TestClient(app):
-            pass
+    with pytest.raises(ControlPlaneUnsupportedComponentError) as exc, TestClient(app):
+        pass
     message = str(exc.value)
     assert "fleet_comms" in message
     assert "'pg'" in message

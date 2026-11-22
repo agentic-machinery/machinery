@@ -17,18 +17,27 @@ import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from lu_machinery import agent_identity
 from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fields
 from lu_machinery.common import json_depth
 from lu_machinery.control_plane import storage
 from lu_machinery.control_plane.health import read_failure_code
 from lu_machinery.fleet_comms import message_plane, migrations
+from lu_machinery.fleet_comms.authority import (
+    AUTHORITY_MESSAGE_ID_RE,
+    DURABLE_CTO_RECIPIENT,
+    AuthorityDeliveryState,
+    is_session_cto_recipient,
+    load_external_recipients,
+)
 from lu_machinery.fleet_comms.endpoints import load_endpoint_registry
 from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.fleet_comms.migrations import MIGRATIONS
@@ -44,7 +53,12 @@ from lu_machinery.guardrails.worktree_containment import (
     resolve_main_root_without_git,
 )
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, is_sqlite_connection, open_readonly
+from lu_machinery.ops import driver_lanes
+from lu_machinery.orchestration.launcher_aliases import load_launcher_bindings
+from lu_machinery.session_streams.inventory import stream_anchor_id
+from lu_machinery.session_streams.model import STREAM_ID_RE, isoformat_z, parse_timestamp
 
+from . import fleet_workers_collect, panel_values
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .product_contribution import fleet_batches
 from .runtime_router import get_acp_conversation, list_acp_conversations, recent_runtime_records
@@ -74,6 +88,13 @@ MAX_ACP_SCAN = 500
 MAX_ACTIVITY_SCAN = 500
 MAX_OPERATIONS_ITEMS = 50
 AUTHORITY_HEALTH_WINDOW_HOURS = 24
+
+_DELIVERY_STATES = frozenset(get_args(AuthorityDeliveryState))
+_DELIVERY_WINDOWS = {"24h": timedelta(days=1), "7d": timedelta(days=7)}
+_DELIVERY_KINDS = frozenset({
+    "message", "request", "system", "supervisory-request", "delivery-error", "discussion",
+    "discussion-root", "discussion-result", "ownership_requeue",
+})
 
 _BATCH_HEALTH = frozenset({"complete", "healthy", "stalled", "dead", "unknown"})
 _TRACK_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$")
@@ -160,18 +181,18 @@ def _read_connection(
     plane_root: Path | None = None,
 ) -> Iterator[tuple[Any | None, str]]:
     """Yield a query-only connection, never creating a database or schema."""
-    resolved_ctx = resolve_context(ctx)
-    db_path = (
-        plane_root / "comms.sqlite3"
-        if plane_root is not None
-        else _plane_db_path(resolved_ctx)
-    )
     authority = storage.resolve_authority(storage.StoreId.FLEET_COMMS)
     if authority is storage.Authority.PG and not pg_supported:
         # Detail routes still use SQLite-shaped SQL. Do not read a stale
         # local file or mistake this component limit for database absence.
         yield None, "authority_unsupported_component"
         return
+    resolved_ctx = resolve_context(ctx)
+    db_path = (
+        plane_root / "comms.sqlite3"
+        if plane_root is not None
+        else _plane_db_path(resolved_ctx)
+    )
     if authority is not storage.Authority.PG and not db_path.is_file():
         yield None, "db_missing"
         return
@@ -314,17 +335,21 @@ def _collection(
     key: str,
     items: list[dict[str, Any]],
     *,
-    total: int,
+    total: int | None,
     limit: int,
     offset: int,
     availability: str,
     filters: dict[str, Any],
 ) -> dict[str, Any]:
-    next_offset = offset + len(items) if offset + len(items) < total else None
+    next_offset = offset + len(items) if total is not None and offset + len(items) < total else None
     return {
         "read_only": True,
         "availability": availability,
-        "db_exists": availability not in {"db_missing", "db_unavailable"},
+        "db_exists": (
+            availability not in {"db_missing", "db_unavailable"}
+            if total is not None or availability == "db_missing"
+            else None
+        ),
         key: items,
         "total": total,
         "limit": limit,
@@ -1281,6 +1306,262 @@ def fleet_agents(
         "filters": {"agent": agent, "state": state},
         "configuration_policy": "configuration_json_omitted",
     }
+
+
+@dataclass(frozen=True)
+class _FleetSeat:
+    seat: str
+    kind: str
+    epic: str | None
+    recipients: tuple[str, ...]
+
+
+def _fleet_seat_roster() -> tuple[list[_FleetSeat], str, str]:
+    seats: list[_FleetSeat] = []
+    driver_roster = "available"
+    try:
+        lanes = driver_lanes.load_registry().lanes
+    except (OSError, ValueError, RuntimeError):
+        lanes = ()
+        driver_roster = "unavailable"
+    for lane in lanes:
+        cto = lane.name == "cto"
+        recipients = (
+            (DURABLE_CTO_RECIPIENT, lane.sender)
+            if cto and lane.sender != DURABLE_CTO_RECIPIENT
+            else (lane.sender,)
+        )
+        seats.append(_FleetSeat(lane.name, "cto" if cto else "driver", lane.epic, recipients))
+
+    external, external_roster = load_external_recipients(agent_identity.ASSIGNMENTS_PATH)
+    lane_names = {name for seat in seats for name in (seat.seat, *seat.recipients)}
+    if lane_names.intersection(external):
+        return seats, driver_roster, "unavailable"
+    seats.extend(_FleetSeat(name, "external", None, (name,)) for name in external)
+    return seats, driver_roster, external_roster
+
+
+def _seat_streams(seats: list[_FleetSeat], ctx: MonitorContext) -> dict[str, str]:
+    try:
+        bindings = load_launcher_bindings()
+    except (OSError, ValueError, RuntimeError):
+        return {}
+    streams = {}
+    for seat in seats:
+        if seat.epic is None:
+            continue
+        stream, _lane = bindings.get(seat.epic, (seat.epic, ""))
+        try:
+            stream_id = stream_anchor_id(stream, ctx.roots.state_root)
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if STREAM_ID_RE.fullmatch(stream_id):
+            streams[seat.seat] = stream_id
+    return streams
+
+
+def _panel_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        return parse_timestamp(value)
+    except ValueError:
+        return None
+
+
+def _fleet_panel(payload: dict[str, Any], *, unavailable: bool) -> JSONResponse:
+    headers = panel_values.snapshot_headers(None if unavailable else 0.0, FACADE_TTL_S)
+    return JSONResponse(payload, headers=headers)
+
+
+@router.get("/seats")
+def fleet_seats(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
+    """Project exact recipient backlog and live lease signals for the configured seats."""
+    seats, driver_roster, external_roster = _fleet_seat_roster()
+    roster_available = driver_roster == external_roster == "available"
+    seat_recipients = {seat.seat: seat.recipients for seat in seats}
+    mail = {}
+    try:
+        with _read_connection(ctx, pg_supported=False) as (connection, availability):
+            if connection is not None:
+                mail = {
+                    row["seat"]: row
+                    for row in connection.execute(
+                        """
+                        SELECT seat.key AS seat,
+                               COUNT(*) FILTER (WHERE d.state = 'queued') AS queued,
+                               MIN(d.created_at) FILTER (WHERE d.state = 'queued') AS oldest,
+                               MAX(d.completed_at) FILTER (
+                                   WHERE d.state = 'acknowledged' AND m.imported_source IS NULL
+                               ) AS last_ack
+                        FROM json_each(?) AS seat
+                        CROSS JOIN json_each(seat.value) AS recipient
+                        JOIN authority_deliveries AS d ON d.recipient = recipient.value
+                        LEFT JOIN authority_message_metadata AS m
+                            ON m.message_id = d.message_id AND d.state = 'acknowledged'
+                        WHERE d.state IN ('queued', 'acknowledged')
+                        GROUP BY seat.key
+                        """,
+                        (json.dumps(seat_recipients),),
+                    )
+                }
+    except PlaneRootAnchorError:
+        availability = "plane_root_unavailable"
+    except (sqlite3.Error, storage.ControlPlaneError, OSError, ValueError):
+        availability = "db_unavailable"
+
+    now = datetime.now(UTC)
+    leases, lease_availability = fleet_workers_collect._read_driver_leases(
+        db_path=ctx.roots.session_streams_db_path, now=now,
+    )
+    lease_by_stream = {lease["stream_id"]: lease for lease in leases} if lease_availability == "available" else {}
+    stream_by_seat = _seat_streams(seats, ctx)
+    items = []
+    for seat in seats:
+        stream_id = stream_by_seat.get(seat.seat)
+        lease = lease_by_stream.get(stream_id)
+        lease_state, lease_reason = "unknown", None
+        if seat.kind != "external":
+            if stream_id is None:
+                lease_reason = "stream_unresolved"
+            elif lease_availability != "available":
+                lease_reason = lease_availability
+            else:
+                lease_state = "live" if lease is not None else "no_lease"
+
+        stats = mail.get(seat.seat)
+        ack_at = _panel_datetime(stats["last_ack"]) if stats is not None else None
+        lease_at = _panel_datetime(lease["heartbeat_at"]) if lease is not None else None
+        last_activity_at, source = ack_at, "ack" if ack_at is not None else None
+        if lease_at is not None and (ack_at is None or lease_at > ack_at):
+            last_activity_at, source = lease_at, "lease"
+        queued = None
+        if availability == "available":
+            queued = stats["queued"] if stats is not None else 0
+        items.append({
+            "seat": seat.seat,
+            "kind": seat.kind,
+            "epic": seat.epic,
+            "queued": queued,
+            "oldest_queued_at": panel_values.timestamp(stats["oldest"]) if stats is not None else None,
+            "last_activity_at": panel_values.timestamp(last_activity_at.isoformat()) if last_activity_at else None,
+            "last_activity_source": source,
+            "lease_state": lease_state,
+            "lease_reason": lease_reason,
+        })
+    return _fleet_panel(
+        {
+            "read_only": True,
+            "availability": availability,
+            "driver_roster": driver_roster,
+            "external_roster": external_roster,
+            "lease_availability": lease_availability,
+            "seats": items,
+            "total": len(items) if availability == "available" and roster_available else None,
+        },
+        unavailable=not roster_available or availability != "available" or lease_availability != "available",
+    )
+
+
+def _delivery_item(row: sqlite3.Row, seat_ids: dict[str, str], now: datetime) -> dict[str, Any]:
+    message_id = row["message_id"]
+    sender = row["sender"]
+    created = _panel_datetime(row["created_at"])
+    completed = _panel_datetime(row["completed_at"])
+    end = now if row["completed_at"] is None else completed
+    return {
+        "message_id": message_id if isinstance(message_id, str) and AUTHORITY_MESSAGE_ID_RE.fullmatch(message_id) else None,
+        "sender": "cto" if is_session_cto_recipient(sender) else seat_ids.get(sender, "other"),
+        "recipient": seat_ids.get(row["recipient"], "other"),
+        "kind": panel_values.choice(row["kind"], _DELIVERY_KINDS, "other"),
+        "state": panel_values.choice(row["state"], _DELIVERY_STATES, "other"),
+        "attempt_count": panel_values.number(row["attempt_count"]),
+        "created_at": panel_values.timestamp(row["created_at"]),
+        "completed_at": panel_values.timestamp(row["completed_at"]),
+        "waited_s": (end - created).total_seconds() if created is not None and end is not None else None,
+    }
+
+
+@router.get("/deliveries")
+def fleet_deliveries(
+    seat: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    since: str | None = Query(default=None),
+    limit: int = Query(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    offset: int = Query(default=0, ge=0, le=2_147_483_647),
+    ctx: MonitorContext = Depends(get_ctx),
+) -> JSONResponse:
+    """Project a page of delivery records with fixed columns and labels."""
+    seats, driver_roster, external_roster = _fleet_seat_roster()
+    roster_available = driver_roster == external_roster == "available"
+    selected = next((item for item in seats if item.seat == seat), None)
+    if seat is not None and selected is None:
+        raise HTTPException(status_code=422, detail="unknown_seat")
+    if state is not None and state not in _DELIVERY_STATES:
+        raise HTTPException(status_code=422, detail="unknown_state")
+    if since is None:
+        since = "all" if state == "queued" else "7d"
+    elif since != "all" and since not in _DELIVERY_WINDOWS:
+        raise HTTPException(status_code=422, detail="unknown_since")
+
+    recipient_counts = Counter(name for item in seats for name in item.recipients)
+    seat_ids = {
+        name: item.seat
+        for item in seats
+        for name in item.recipients
+        if recipient_counts[name] == 1
+    }
+    now = datetime.now(UTC)
+    clauses = ["d.recipient IN (SELECT value FROM json_each(?))"]
+    params = [json.dumps(selected.recipients if selected is not None else list(recipient_counts))]
+    if state is not None:
+        clauses.append("d.state = ?")
+        params.append(state)
+    if since != "all":
+        clauses.append("d.created_at >= ?")
+        params.append(isoformat_z(now - _DELIVERY_WINDOWS[since]))
+    where_sql = " WHERE " + " AND ".join(clauses)
+
+    total = None
+    items: list[dict[str, Any]] = []
+    try:
+        with _read_connection(ctx, pg_supported=False) as (connection, availability):
+            if connection is not None and selected is None and not roster_available:
+                availability = "roster_unavailable"
+            elif connection is not None:
+                connection.execute("BEGIN")
+                rows = connection.execute(
+                    """
+                    SELECT d.message_id, d.recipient, d.state, d.attempt_count,
+                           d.created_at, d.completed_at, m.sender, m.kind
+                    FROM authority_deliveries AS d
+                    LEFT JOIN comms_messages AS m ON m.message_id = d.message_id
+                    """
+                    + where_sql
+                    + " ORDER BY d.created_at DESC, d.message_id, d.recipient LIMIT ? OFFSET ?",
+                    (*params, limit, offset),
+                ).fetchall()
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM authority_deliveries AS d" + where_sql, params,
+                ).fetchone()[0]
+                items = [_delivery_item(row, seat_ids, now) for row in rows]
+                total = count
+    except PlaneRootAnchorError:
+        availability = "plane_root_unavailable"
+    except (sqlite3.Error, storage.ControlPlaneError, OSError, ValueError):
+        availability = "db_unavailable"
+
+    payload = _collection(
+        "deliveries",
+        items,
+        total=total,
+        limit=limit,
+        offset=offset,
+        availability=availability,
+        filters={"seat": selected.seat if selected is not None else None, "state": state, "since": since},
+    )
+    payload.update(driver_roster=driver_roster, external_roster=external_roster)
+    return _fleet_panel(payload, unavailable=not roster_available or availability != "available")
 
 
 def _request_item(row: sqlite3.Row) -> dict[str, Any]:

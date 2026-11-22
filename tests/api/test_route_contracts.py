@@ -19,6 +19,18 @@ def test_fleet_comms_routes_keep_observer_contract(path: str) -> None:
     assert contract.response_schema_version == "comms.v2"
 
 
+@pytest.mark.parametrize("path", ["/api/fleet/seats", "/api/fleet/deliveries"])
+def test_fleet_panels_have_exact_read_only_contracts(path: str) -> None:
+    """Defect class: a Fleet panel inherits the umbrella contract instead of its own read policy."""
+    contract = contract_for_route(path)
+
+    assert contract is not None
+    assert contract.pattern == path
+    assert contract.match == "exact"
+    assert contract.locality == "cluster_authoritative"
+    assert contract.mutates is False
+
+
 def test_product_home_replaces_machinery_index_and_contract(tmp_path, monkeypatch):
     """Defect class: a packaged fallback shadows a declared product home and duplicates its contract."""
     from lu_machinery.api import main, route_contracts

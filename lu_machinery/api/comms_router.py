@@ -334,9 +334,11 @@ def comms_inbox(
     zero). Read the deliveries with ``<python> -I -m lu_machinery.fleet_comms
     deliveries receive --recipient <seat> --worker-id <seat>``.
     """
+    from lu_machinery import agent_identity  # noqa: PLC0415 — roster on demand
     from lu_machinery.fleet_comms.authority import (  # noqa: PLC0415 — authority stack on demand
         DURABLE_CTO_RECIPIENT,
         _load_roster,
+        load_external_recipients,
         pending_delivery_snapshot,
     )
     from lu_machinery.orchestration.handoff_slot_registry import (  # noqa: PLC0415 — roster on demand
@@ -344,19 +346,19 @@ def comms_inbox(
         registry_readable,
     )
 
-    # Only a seat is queried: the CTO's durable recipient or a registered handoff
-    # slot, by the roster's own spelling, so a request value never reaches the store
-    # lookups (task records, plane paths). The delivery roster also admits external
-    # recipients (outside the launcher fleet); they, and every other name, are
-    # unknown. An unreadable roster or registry (a registry symlink loop raises
-    # RuntimeError on 3.12) is unknown too, never a 500.
+    # Pass the configured spelling to the plane, including external recipients
+    # which have no launcher slot.
     try:
-        roster, _complete = _load_roster()
-        seat = next((name for name in sorted(roster) if name == agent), None)
-        if seat is not None and seat != DURABLE_CTO_RECIPIENT and not (
-            registry_readable() and is_registered_slot(seat)
-        ):
-            seat = None
+        external, _availability = load_external_recipients(agent_identity.ASSIGNMENTS_PATH)
+        seat = next((name for name in external if name == agent), None)
+        if seat is None:
+            roster, _complete = _load_roster()
+            seat = next(
+                (name for name in roster if name == agent and (
+                    name == DURABLE_CTO_RECIPIENT or (registry_readable() and is_registered_slot(name))
+                )),
+                None,
+            )
     except (MachineryConfigError, OSError, RuntimeError, ValueError):
         seat = None
     snapshot: dict = {"probe": "unknown"}
