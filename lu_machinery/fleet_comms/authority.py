@@ -279,7 +279,7 @@ def load_external_recipients(
         return (), "unavailable"
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, yaml.YAMLError, RecursionError):
+    except (OSError, ValueError, yaml.YAMLError, RecursionError):
         return (), "unavailable"
     if not isinstance(data, dict):
         return (), "unavailable"

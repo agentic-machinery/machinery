@@ -316,22 +316,35 @@ def test_fleet_seats_reports_unknown_lease_when_source_is_unavailable(fleet_pane
     (None, "unavailable"), ("[]\n", "unavailable"),
     ("external_recipients: eggbot\n", "unavailable"),
     ("external_recipients: [eggbot, 12]\n", "unavailable"),
+    ("external_recipients: [eggbot, " + "1" * 4301 + "]\n", "unavailable"),
     ("external_recipients: [eggbot, eggbot]\n", "unavailable"),
     ("external_recipients: [' eggbot']\n", "unavailable"),
 ])
 def test_fleet_seats_distinguishes_empty_and_unavailable_external_rosters(fleet_panels, config, expected):
     """Defect class: malformed roster input is treated as a shorter or empty external list."""
-    client, ctx, roster, _db = fleet_panels
+    client, ctx, roster, db = fleet_panels
     assert ctx.stores.session_streams_database is not None
     ctx.stores.session_streams_database.connect().close()
     if config is None:
         roster.unlink()
     else:
         roster.write_text(config)
+    _add_delivery(db, 1, "claude-cto", isoformat_z(datetime.now(UTC)))
     response = client.get("/api/fleet/seats")
     assert response.headers["X-Snapshot-State"] == ("fresh" if expected == "available" else "unavailable")
     assert response.json()["external_roster"] == expected
     assert {row["seat"] for row in response.json()["seats"]} == {"cto", "driver", "unresolved"}
+    assert response.json()["total"] == (3 if expected == "available" else None)
+    delivery_response = client.get("/api/fleet/deliveries")
+    assert delivery_response.headers["X-Snapshot-State"] == response.headers["X-Snapshot-State"]
+    assert delivery_response.json()["external_roster"] == expected
+    assert delivery_response.json()["availability"] == (
+        "available" if expected == "available" else "roster_unavailable"
+    )
+    assert delivery_response.json()["total"] == (1 if expected == "available" else None)
+    queue = client.get("/api/fleet/deliveries", params={"seat": "cto", "state": "queued"}).json()
+    cto = next(row for row in response.json()["seats"] if row["seat"] == "cto")
+    assert queue["total"] == cto["queued"] == 1
 
 
 def test_fleet_deliveries_is_body_free_and_queued_totals_include_older_and_orphan_rows(fleet_panels, monkeypatch):
@@ -391,6 +404,17 @@ def test_fleet_deliveries_is_body_free_and_queued_totals_include_older_and_orpha
     assert all("fixture-sentinel" not in response.text for response in (queue, page, ack))
     cto = next(row for row in client.get("/api/fleet/seats").json()["seats"] if row["seat"] == "cto")
     assert queue.json()["total"] == page.json()["total"] == cto["queued"]
+
+    # Both lanes observe their exact configured recipient. A shared address
+    # has no unambiguous delivery label even though both counts are known.
+    lane_data = json.loads(driver_lanes.DATA_FILE.read_text())
+    lane_data["lanes"][1]["sender"] = "claude-cto"
+    driver_lanes.DATA_FILE.write_text(json.dumps(lane_data))
+    shared = client.get("/api/fleet/deliveries", params={"seat": "driver", "state": "queued"}).json()
+    seats = {row["seat"]: row for row in client.get("/api/fleet/seats").json()["seats"]}
+    assert seats["driver"]["queued"] == shared["total"] == 1
+    assert shared["deliveries"][0]["recipient"] == "other"
+    assert seats["cto"]["queued"] == 3
 
     trace.clear()
     for name, value, detail in (

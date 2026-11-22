@@ -1326,7 +1326,11 @@ def _fleet_seat_roster() -> tuple[list[_FleetSeat], str, str]:
         driver_roster = "unavailable"
     for lane in lanes:
         cto = lane.name == "cto"
-        recipients = (DURABLE_CTO_RECIPIENT, lane.sender) if cto else (lane.sender,)
+        recipients = (
+            (DURABLE_CTO_RECIPIENT, lane.sender)
+            if cto and lane.sender != DURABLE_CTO_RECIPIENT
+            else (lane.sender,)
+        )
         seats.append(_FleetSeat(lane.name, "cto" if cto else "driver", lane.epic, recipients))
 
     external, external_roster = load_external_recipients(agent_identity.ASSIGNMENTS_PATH)
@@ -1374,7 +1378,8 @@ def _fleet_panel(payload: dict[str, Any], *, unavailable: bool) -> JSONResponse:
 def fleet_seats(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
     """Project exact recipient backlog and live lease signals for the configured seats."""
     seats, driver_roster, external_roster = _fleet_seat_roster()
-    seat_ids = {name: seat.seat for seat in seats for name in seat.recipients}
+    roster_available = driver_roster == external_roster == "available"
+    seat_recipients = {seat.seat: seat.recipients for seat in seats}
     mail = {}
     try:
         with _read_connection(ctx, pg_supported=False) as (connection, availability):
@@ -1383,20 +1388,21 @@ def fleet_seats(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
                     row["seat"]: row
                     for row in connection.execute(
                         """
-                        SELECT roster.value AS seat,
+                        SELECT seat.key AS seat,
                                COUNT(*) FILTER (WHERE d.state = 'queued') AS queued,
                                MIN(d.created_at) FILTER (WHERE d.state = 'queued') AS oldest,
                                MAX(d.completed_at) FILTER (
                                    WHERE d.state = 'acknowledged' AND m.imported_source IS NULL
                                ) AS last_ack
-                        FROM json_each(?) AS roster
-                        JOIN authority_deliveries AS d ON d.recipient = roster.key
+                        FROM json_each(?) AS seat
+                        CROSS JOIN json_each(seat.value) AS recipient
+                        JOIN authority_deliveries AS d ON d.recipient = recipient.value
                         LEFT JOIN authority_message_metadata AS m
                             ON m.message_id = d.message_id AND d.state = 'acknowledged'
                         WHERE d.state IN ('queued', 'acknowledged')
-                        GROUP BY roster.value
+                        GROUP BY seat.key
                         """,
-                        (json.dumps(seat_ids),),
+                        (json.dumps(seat_recipients),),
                     )
                 }
     except PlaneRootAnchorError:
@@ -1451,10 +1457,9 @@ def fleet_seats(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
             "external_roster": external_roster,
             "lease_availability": lease_availability,
             "seats": items,
-            "total": len(items) if availability == "available" else None,
+            "total": len(items) if availability == "available" and roster_available else None,
         },
-        unavailable=availability != "available" or "unavailable" in {driver_roster, external_roster}
-        or lease_availability != "available",
+        unavailable=not roster_available or availability != "available" or lease_availability != "available",
     )
 
 
@@ -1488,6 +1493,7 @@ def fleet_deliveries(
 ) -> JSONResponse:
     """Project a page of delivery records with fixed columns and labels."""
     seats, driver_roster, external_roster = _fleet_seat_roster()
+    roster_available = driver_roster == external_roster == "available"
     selected = next((item for item in seats if item.seat == seat), None)
     if seat is not None and selected is None:
         raise HTTPException(status_code=422, detail="unknown_seat")
@@ -1498,10 +1504,16 @@ def fleet_deliveries(
     elif since != "all" and since not in _DELIVERY_WINDOWS:
         raise HTTPException(status_code=422, detail="unknown_since")
 
-    seat_ids = {name: item.seat for item in seats for name in item.recipients}
+    recipient_counts = Counter(name for item in seats for name in item.recipients)
+    seat_ids = {
+        name: item.seat
+        for item in seats
+        for name in item.recipients
+        if recipient_counts[name] == 1
+    }
     now = datetime.now(UTC)
     clauses = ["d.recipient IN (SELECT value FROM json_each(?))"]
-    params = [json.dumps(selected.recipients if selected is not None else list(seat_ids))]
+    params = [json.dumps(selected.recipients if selected is not None else list(recipient_counts))]
     if state is not None:
         clauses.append("d.state = ?")
         params.append(state)
@@ -1514,7 +1526,9 @@ def fleet_deliveries(
     items: list[dict[str, Any]] = []
     try:
         with _read_connection(ctx, pg_supported=False) as (connection, availability):
-            if connection is not None:
+            if connection is not None and selected is None and not roster_available:
+                availability = "roster_unavailable"
+            elif connection is not None:
                 connection.execute("BEGIN")
                 rows = connection.execute(
                     """
@@ -1537,18 +1551,17 @@ def fleet_deliveries(
     except (sqlite3.Error, storage.ControlPlaneError, OSError, ValueError):
         availability = "db_unavailable"
 
-    return _fleet_panel(
-        _collection(
-            "deliveries",
-            items,
-            total=total,
-            limit=limit,
-            offset=offset,
-            availability=availability,
-            filters={"seat": selected.seat if selected is not None else None, "state": state, "since": since},
-        ),
-        unavailable=availability != "available" or "unavailable" in {driver_roster, external_roster},
+    payload = _collection(
+        "deliveries",
+        items,
+        total=total,
+        limit=limit,
+        offset=offset,
+        availability=availability,
+        filters={"seat": selected.seat if selected is not None else None, "state": state, "since": since},
     )
+    payload.update(driver_roster=driver_roster, external_roster=external_roster)
+    return _fleet_panel(payload, unavailable=not roster_available or availability != "available")
 
 
 def _request_item(row: sqlite3.Row) -> dict[str, Any]:
