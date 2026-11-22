@@ -7,6 +7,8 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Mapping
+from functools import partial
 from pathlib import Path
 
 from lu_machinery.ci._location import module_name
@@ -18,11 +20,11 @@ from lu_machinery.review.target_resolution import is_test_path
 SHA = re.compile(r"[0-9a-fA-F]{40}")
 
 
-def git(repo: Path, *args: str, data: bytes | None = None) -> bytes:
+def git(repo: Path, *args: str, data: bytes | None = None, env: Mapping[str, str] | None = None) -> bytes:
     result = subprocess.run(
         ["git", *args],
         cwd=repo,
-        env=sanitized_git_env(),
+        env=sanitized_git_env() if env is None else env,
         input=data,
         capture_output=True,
         timeout=60,
@@ -34,18 +36,20 @@ def git(repo: Path, *args: str, data: bytes | None = None) -> bytes:
     return result.stdout
 
 
-def measure(repo: Path, base: str, head: str) -> dict:
+def measure(repo: Path, base: str, head: str, *, git_env: Mapping[str, str] | None = None) -> dict:
+    """Measure an exact diff, optionally with a caller's isolated Git environment."""
     if not SHA.fullmatch(base) or not SHA.fullmatch(head):
         raise ValueError("base and head must be full 40-hex commit SHAs")
+    read_git = partial(git, repo, env=git_env)
     for sha in (base, head):
-        git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
-    bases = git(repo, "merge-base", "--all", base, head).decode("ascii").splitlines()
+        read_git("cat-file", "-e", f"{sha}^{{commit}}")
+    bases = read_git("merge-base", "--all", base, head).decode("ascii").splitlines()
     if len(bases) != 1 or not SHA.fullmatch(bases[0]):
         raise ValueError("exactly one merge-base is required")
     merge_base = bases[0]
     options = ("--no-ext-diff", "--no-textconv", "--find-renames", merge_base, head, "--")
-    deleted = set(git(repo, "diff", "--name-only", "-z", "--diff-filter=D", *options).split(b"\0"))
-    fields = git(repo, "diff", "--numstat", "-z", *options).split(b"\0")
+    deleted = set(read_git("diff", "--name-only", "-z", "--diff-filter=D", *options).split(b"\0"))
+    fields = read_git("diff", "--numstat", "-z", *options).split(b"\0")
     if fields.pop() != b"":
         raise ValueError("incomplete numstat output")
     entries = []
@@ -59,8 +63,7 @@ def measure(repo: Path, base: str, head: str) -> dict:
     paths = [entry[2] for entry in entries]
     attributes = {}
     if paths:
-        raw = git(
-            repo,
+        raw = read_git(
             "check-attr",
             f"--source={head}",
             "-z",
