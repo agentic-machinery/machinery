@@ -4,6 +4,7 @@ The tests own their data: a private task store, a scripted Monitor (an in-proces
 server for the subprocess dispatcher) and the dispatcher sandbox's stub provider.
 """
 
+import fcntl
 import io
 import json
 import os
@@ -247,20 +248,51 @@ def test_a_stream_stays_reserved_until_its_turn_is_proven_finished(task_store, m
     assert bool(holders) is held, holders
 
 
-@pytest.mark.parametrize("where", ["truncated", "escaped", "archived"])
-def test_no_record_state_hides_a_turn_from_the_stream_scan(task_store, where):
-    """Defect class: a truncated, escaped or archived turn record is skipped, so its stream is freed while it may run."""
+@pytest.mark.parametrize("where", ["truncated", "escaped", "archived", "identity-lost", "archive-unlistable"])
+def test_no_record_state_hides_a_turn_from_the_stream_scan(task_store, monkeypatch, where):
+    """Defect class: a damaged, identity-less, archived or unlistable turn record is skipped, freeing its stream."""
     text = json.dumps(_orchestrator_record("prior", status="crashed"))
     path = store.record_path("prior")
     if where == "truncated":
         text = text[: text.index('"orchestrator"')]
     elif where == "escaped":
         text = text.replace('"orchestrator"', '"orchestr\\u0061tor"')
+    elif where == "identity-lost":  # the record parser reads it as a foreign file
+        text = json.dumps({"orchestrator": {"stream": STREAM}})
     else:
         path = task_store / task_record_store.ARCHIVE_DIR_NAME / "prior.json"
         path.parent.mkdir()
     path.write_text(text)
+    if where == "archive-unlistable":
+        listdir = os.listdir
+
+        def refused(directory):
+            if os.path.basename(directory) == task_record_store.ARCHIVE_DIR_NAME:
+                raise PermissionError(directory)
+            return listdir(directory)
+
+        monkeypatch.setattr(os, "listdir", refused)
     assert host_admission.stream_holders(STREAM, "turn")
+
+
+def test_the_stream_scan_reads_the_store_under_the_archive_lock(task_store, monkeypatch):
+    """Defect class: an archive or restore move runs during the scan, so a record in transit is in neither listing."""
+    real, seen = host_admission._store_files, []
+
+    def listing(root):
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # what task_archive_lock(moving=True) takes for a move
+            seen.append("a move could run")
+        except BlockingIOError:
+            seen.append("moves wait")
+        finally:
+            os.close(fd)
+        return real(root)
+
+    monkeypatch.setattr(host_admission, "_store_files", listing)
+    host_admission.stream_holders(STREAM, "turn")
+    assert seen == ["moves wait"]
 
 
 # --- legacy lease --------------------------------------------------------------------------------------------------
@@ -452,16 +484,30 @@ def test_cleanup_never_salvages_or_publishes_a_rejected_turn(monkeypatch):
     assert seen["salvage"] is True  # unchanged for every other task
 
 
-def test_a_turn_whose_tree_settlement_did_not_remove_is_not_done(monkeypatch):
-    """Defect class: a leftover process dirties the tree after delivery's snapshot, and the turn still settles done."""
-    monkeypatch.setattr(worker, "_stop_task_services", lambda _record: None)
-    monkeypatch.setattr(worker.scratch, "settleable", lambda _record: False)
-    monkeypatch.setattr(worker, "_reap_worktree", lambda record, **_kwargs: record.update(
-        worktree_disposition="retained", worktree_disposition_reason="dirty"))
-    record = _settled()
-    worker._reap_settled(record)
-    assert record["status"] == "no_deliverable"
-    assert record["no_deliverable_reason"].startswith("orchestrator_product_write")
+@pytest.mark.parametrize(
+    ("launch_mode", "service_stop", "alive", "unproven"),
+    [
+        ("scope", None, False, False),  # services and processes ended and proven gone: the snapshot is final
+        ("scope", None, True, True),
+        ("scope", None, None, True),
+        ("scope", "false", False, True),  # a service the turn started is its own unit, not in the scope probe
+        ("popen-fallback", None, False, True),  # a descendant can leave the fallback launch's process group
+        (None, None, False, True),
+    ],
+)
+def test_a_turn_tree_is_judged_only_once_its_processes_are_proven_gone(task_store, monkeypatch, launch_mode,
+                                                                        service_stop, alive, unproven):
+    """Defect class: a leftover process or service writes the tree after delivery's snapshot, and the turn is done."""
+    monkeypatch.setattr(worker, "SETTLE_PATIENCE", 0)
+    monkeypatch.setattr(worker, "_end_own_scope", lambda _record: None)
+    monkeypatch.setattr(worker, "_provider_alive", lambda _record: alive)
+
+    def stop_services(record):
+        if service_stop is not None:
+            record["task_service_stops"] = [{"unit": "lu-task-x.service", "postcondition": service_stop}]
+
+    monkeypatch.setattr(worker, "_stop_task_services", stop_services)
+    assert worker._turn_tree_unproven(_settled(launch_mode=launch_mode)) is unproven
 
 
 def test_a_turn_gets_no_path_grant(task_store, tmp_path, monkeypatch):
@@ -527,7 +573,8 @@ def _release(box, task_id):
 
 
 def test_a_turn_end_to_end_reserves_links_children_and_settles_on_its_receipt(turn_box):
-    """Defect class: duplicate turns, unlinked children, late children of a settled turn, done without a handoff."""
+    """Defect class: duplicate turns, unlinked children, late children of a settled turn, done without a handoff,
+    and a fallback turn (unprovable process tree) judged done or freeing its stream."""
     box = turn_box
     task_id, nonce = box.turn("turn-1").stdout.splitlines()
     record = store.read("turn-1", tasks_root=box.tasks)
@@ -543,13 +590,15 @@ def test_a_turn_end_to_end_reserves_links_children_and_settles_on_its_receipt(tu
                                  "--handoff-ref", "note-41", task_env="turn-1").stdout)
     assert receipt["schema"] == store.HANDOFF_RECEIPT_SCHEMA and receipt["handoff_ref"] == "note-41"
     _release(box, "turn-1")
-    settled = box.settle((task_id, nonce))
-    assert settled["status"] == "done", settled
+    settled = box.settle((task_id, nonce), expected=1)
+    # The sandbox forces a fallback launch, which cannot prove its processes gone before its tree is judged.
+    assert (settled["status"], settled["no_deliverable_reason"].split(":")[0]) == (
+        "no_deliverable", "orchestrator_tree_unproven"), settled
     assert settled[store.HANDOFF_RECEIPT_KEY] == receipt
     late = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "child-late", "--prompt", "late",
                    task_env="turn-1", expected=2)
     assert "orchestrator_parent_not_running" in late.stderr
-    # The sandbox forces a fallback launch, which never proves its process tree gone: the settled turn keeps its stream.
+    # Nor does it prove the process tree gone afterwards: the settled turn keeps its stream.
     assert "provider not proven gone" in box.turn("turn-3", expected=3).stderr
     # A turn without a receipt settles no_deliverable.
     second = box.turn("turn-4", stream="epic:8").stdout.splitlines()
