@@ -254,6 +254,8 @@ def test_release_needs_the_reserving_task_and_run(task_store):
     ({"started": True}, "kept", False),  # a supervisor may run, whatever the record says
     ({"started": True}, "deleted", False),
     ({"started": True}, "replaced", False),
+    ({"started": True}, "damaged", False),  # and the damaged record never escapes the dispatch as an error
+    ({"started": False}, "damaged", True),
     ({"started": None}, "kept", False),  # damaged progress is not proof
     (None, "kept", False),  # no progress given
 ])
@@ -268,6 +270,8 @@ def test_a_pre_launch_abort_follows_the_dispatchers_own_launch_progress(task_sto
             path.unlink()
         elif record == "replaced":
             path.write_text(json.dumps({**hold, "run_nonce": "f" * 32}))
+        elif record == "damaged":
+            path.write_text("{")
     assert _reservation().exists() is not released
 
 

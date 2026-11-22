@@ -541,7 +541,8 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
         launch_started = launch is None or launch.get("started") is not False
         if hold is not None:
             path = store.record_path(task_id)
-            with contextlib.suppress(OSError), task_state_lock(path):
+            # An unreadable or damaged record (TaskRecordError is a ValueError) is left as it is.
+            with contextlib.suppress(OSError, ValueError), task_state_lock(path):
                 current = store.read(task_id, missing_ok=True)
                 if (current is not None and current.get("run_nonce") == hold["run_nonce"]
                         and current.get("status") in store.ACTIVE and legacy.is_admission_hold_record(current)
