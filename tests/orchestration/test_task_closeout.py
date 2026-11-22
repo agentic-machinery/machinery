@@ -2547,10 +2547,25 @@ def test_a02_dor_and_closeout_resolve_moved_repo_both_selector_states_and_same_i
         # Non-default repo never overwrites the shared public membership cache.
         assert check_issue_task_quality.write_membership_cache(_body_audit(), active_slug, {"epics": [10]}) is False
 
-        # GhGitHubAdapter.registered_stream_epics returns machinery's own roots, not public's [10, 42].
+        # GhGitHubAdapter.registered_stream_epics resolves once and returns machinery's own roots,
+        # never silently falling back to public's [10, 42] on a transient selector error (F1).
         adapter = task_closeout.GhGitHubAdapter(tmp_path)
         monkeypatch.setattr(adapter, "_json", lambda command: {"nameWithOwner": active_slug})
+        resolve_calls = 0
+        real_resolve = fleet_repos.resolve_active_fleet_repo
+
+        def counting_resolve(*args, **kwargs):
+            nonlocal resolve_calls
+            resolve_calls += 1
+            if resolve_calls > 1:
+                raise fleet_repos.FleetRepoError("transient selector failure")
+            return real_resolve(*args, **kwargs)
+
+        monkeypatch.setattr(fleet_repos, "resolve_active_fleet_repo", counting_resolve)
         assert adapter.registered_stream_epics(active_slug) == (active_slug, [10])
+        assert resolve_calls == 1
+        with pytest.raises(task_lifecycle.LifecycleError, match="not configured in the fleet"):
+            adapter.registered_stream_epics(active_slug)
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)

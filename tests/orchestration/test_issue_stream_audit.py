@@ -2088,6 +2088,19 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
         calls.clear()
         assert issue_stream_audit.main(["--repo", inactive_slug, "--check", "--json"]) == 2
         assert calls == []
+
+        # Malformed gh repo view payload raises typed ValueError instead of KeyError/TypeError (F3).
+        for bad_payload in ({}, {"owner": None, "name": "machinery"}, {"owner": {"login": 1}, "name": "machinery"}):
+            monkeypatch.setattr(issue_stream_audit, "_gh_json", lambda *a, payload=bad_payload, **k: payload)
+            with pytest.raises(ValueError, match="repository identity unavailable"):
+                issue_stream_audit._repo_owner_name(audit_root, repo_slug=active_slug)
+
+        # Missing/broken fleet catalog default fails closed instead of substituting 'public' (F1 sibling).
+        monkeypatch.setattr(
+            fleet_repos, "default_repo_key", lambda *_a, **_k: (_ for _ in ()).throw(fleet_repos.FleetRepoError("no default"))
+        )
+        with pytest.raises(ValueError, match="no default"):
+            load_registry(both_path, repo="machinery")
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)

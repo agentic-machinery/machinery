@@ -908,39 +908,62 @@ def _issue_node(read_runner, gh_repo, number, cwd, environment):
 
 
 def _catalog_fleet_repos():
-    """Convert ``gate.catalog()`` rows into ``FleetRepo`` objects for the A01 resolver."""
+    """Convert ``gate.catalog()`` rows into validated ``FleetRepo`` objects for the A01 resolver.
+
+    Fails closed on any malformed key, row, ``github``, or ``alternate_github`` entry so
+    broken dual-slug configuration can never downgrade into selector-free acceptance.
+    """
     from lu_machinery.orchestration import fleet_repos
 
     raw_catalog = gate.catalog()
-    if not isinstance(raw_catalog, dict):
+    if not isinstance(raw_catalog, dict) or not raw_catalog:
         raise gate.PublishBlocked("OPSEC: repository allowlist unavailable; write refused.")
     repos = {}
+    defaults = 0
     for key, row in raw_catalog.items():
         if not isinstance(key, str) or not key.strip() or not isinstance(row, dict):
-            continue
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         github = row.get("github")
         if not isinstance(github, str):
-            continue
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         normalized = gate.normalize_repository(github)
-        if normalized == "unknown":
-            continue
+        if not normalized.startswith("github.com/"):
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         slug = normalized.split("/", 1)[1]
+        default_raw = row.get("default", False)
+        if type(default_raw) is not bool:
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        if default_raw:
+            defaults += 1
+        repo_id = row.get("repository_id")
+        if repo_id is not None and (type(repo_id) is not int or repo_id <= 0):
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+        visibility = row.get("visibility")
+        if visibility is not None and (not isinstance(visibility, str) or visibility not in {"public", "private"}):
+            raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         alt_raw = row.get("alternate_github")
         alt_slug = None
-        if isinstance(alt_raw, str):
+        if alt_raw is not None:
+            if not isinstance(alt_raw, str):
+                raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
             alt_norm = gate.normalize_repository(alt_raw)
-            if alt_norm != "unknown":
-                alt_slug = alt_norm.split("/", 1)[1]
+            if not alt_norm.startswith("github.com/"):
+                raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
+            alt_slug = alt_norm.split("/", 1)[1]
+            if alt_slug.casefold() == slug.casefold() or repo_id is None or visibility is None:
+                raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
         repos[key] = fleet_repos.FleetRepo(
             key=key,
             github=slug,
             local_name=str(row.get("local_name") or key),
             role=str(row.get("role") or ""),
-            default=bool(row.get("default", False)),
-            repository_id=row.get("repository_id") if type(row.get("repository_id")) is int else None,
-            visibility=row.get("visibility") if isinstance(row.get("visibility"), str) else None,
+            default=default_raw,
+            repository_id=repo_id,
+            visibility=visibility,
             alternate_github=alt_slug,
         )
+    if defaults != 1:
+        raise gate.PublishBlocked("OPSEC: repository allowlist malformed; write refused.")
     return repos
 
 

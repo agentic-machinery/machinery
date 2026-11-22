@@ -163,14 +163,11 @@ def registry_for(repository: str) -> dict[str, list[int]] | None:
     try:
         catalog = fleet_repos.load_fleet_repos()
         active = fleet_repos.resolve_active_fleet_repo(repository, repos=catalog)
+        default_key = fleet_repos.default_repo_key(catalog)
     except fleet_repos.FleetRepoError:
         return None
     if active.active_github.casefold() != repository.casefold():
         return None
-    try:
-        default_key = fleet_repos.default_repo_key(catalog)
-    except fleet_repos.FleetRepoError:
-        default_key = None
     path = audit.REGISTRY_PATH
     if active.repo.role == "public-monorepo" or active.repo.default:
         try:

@@ -930,6 +930,24 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
             == 2
         )
         assert "REPO_REFUSED" in capsys.readouterr().err
+
+        # Malformed alternate_github in catalog fails closed instead of downgrading to selector-free single-slug (F2).
+        for bad_alt in (123, "agentic-machinery/machïnery", ["agentic-machinery/machinery"], ""):
+            bad_catalog = {
+                "public": {"github": public_slug, "default": True, "local_name": "p", "role": "public-monorepo"},
+                "machinery": {
+                    "github": "learn-ukrainian/machinery",
+                    "alternate_github": bad_alt,
+                    "repository_id": 1445647449,
+                    "visibility": "public",
+                    "local_name": "m",
+                    "role": "public-machinery",
+                },
+            }
+            with monkeypatch.context() as ctx:
+                ctx.setattr(gate, "catalog", lambda rows=bad_catalog: rows)
+                with pytest.raises(gate.PublishBlocked, match="allowlist malformed"):
+                    pub._fleet_catalog_row("learn-ukrainian/machinery", env={})
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)

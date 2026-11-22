@@ -6379,16 +6379,6 @@
     },
     {
       "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"list[dict[Any, Any]]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"str\""
-    },
-    {
-      "path": "lu_machinery/orchestration/issue_stream_audit.py",
       "code": "operator",
       "message": "Unsupported operand types for + (\"None\" and \"int\")"
     },

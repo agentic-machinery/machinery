@@ -652,10 +652,7 @@ def _load_registry_doc(path: Path) -> dict:
 def _default_repo_key(default_key: str | None = None) -> str:
     if default_key is not None:
         return default_key
-    try:
-        return fleet_repos.default_repo_key()
-    except fleet_repos.FleetRepoError:
-        return "public"
+    return fleet_repos.default_repo_key()
 
 
 _REPO_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -1018,7 +1015,10 @@ def fetch_open_issues(repo_root: Path | None = None, *, repo_slug: str | None = 
     if repo_slug is not None:
         args += ["-R", repo_slug]
     args += ["--state", "open", "--limit", "500", "--json", "number,title"]
-    return _gh_json(args, cwd=repo_root)
+    data = _gh_json(args, cwd=repo_root)
+    if not isinstance(data, list):
+        raise ValueError("open issues payload unavailable")
+    return data
 
 
 def fetch_issue_states(
@@ -1065,18 +1065,27 @@ def fetch_issue_states(
 _REPO_CACHE: dict[str, tuple[str, str]] = {}
 
 
+def _extract_repo_owner_name(data: object) -> tuple[str, str]:
+    owner = data.get("owner") if isinstance(data, dict) else None
+    login = owner.get("login") if isinstance(owner, dict) else None
+    name = data.get("name") if isinstance(data, dict) else None
+    if not (isinstance(login, str) and login.strip() and isinstance(name, str) and name.strip()):
+        raise ValueError("repository identity unavailable")
+    return (login, name)
+
+
 def _repo_owner_name(repo_root: Path | None = None, *, repo_slug: str | None = None) -> tuple[str, str]:
     """Resolve the actual owner/name once per repo root — GraphQL -f fields do
     NOT expand the gh {owner}/{repo} placeholders (REST paths do). Caught by
     live probe."""
     if repo_slug is not None:
         data = _gh_json(["repo", "view", repo_slug, "--json", "owner,name"], cwd=repo_root)
-        return (data["owner"]["login"], data["name"])
+        return _extract_repo_owner_name(data)
     repo_root = product_root(repo_root)
     key = str(repo_root)
     if key not in _REPO_CACHE:
         data = _gh_json(["repo", "view", "--json", "owner,name"], cwd=repo_root)
-        _REPO_CACHE[key] = (data["owner"]["login"], data["name"])
+        _REPO_CACHE[key] = _extract_repo_owner_name(data)
     return _REPO_CACHE[key]
 
 
@@ -2049,7 +2058,10 @@ def make_issue_resolver(report: dict) -> Callable[[str], bool]:
 def _node_id(number: int, *, repo_slug: str | None = None, cwd: Path | None = None) -> str:
     target = repo_slug if repo_slug is not None else "/".join(_repo_owner_name())
     data = _gh_json(Request("read-issue", repo=target, number=number), cwd=cwd)
-    return data["node_id"]
+    node_id = data.get("node_id") if isinstance(data, dict) else None
+    if not isinstance(node_id, str) or not node_id:
+        raise ValueError("issue node_id unavailable")
+    return node_id
 
 
 def migrate(report: dict, *, repo: str | None = None) -> int:

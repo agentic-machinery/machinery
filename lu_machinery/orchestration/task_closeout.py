@@ -217,17 +217,13 @@ class GhGitHubAdapter:
         if failure is not None:
             raise task_lifecycle.LifecycleError(failure)
         try:
-            from lu_machinery.orchestration import fleet_repos, issue_stream_audit
+            from lu_machinery.orchestration import issue_stream_audit
 
-            epic_repository = task_lifecycle.stream_registry_repository(repository)
-            repo_key: str | None = None
-            try:
-                catalog = fleet_repos.load_fleet_repos()
-                epic_active = fleet_repos.resolve_active_fleet_repo(epic_repository, repos=catalog)
-            except fleet_repos.FleetRepoError:
-                epic_active = None
-            if epic_active is not None and not epic_active.repo.default:
-                repo_key = epic_active.repo.key
+            if task_lifecycle.stream_registry_repository is task_lifecycle._DEFAULT_STREAM_REGISTRY_REPOSITORY:
+                epic_repository, repo_key = task_lifecycle.stream_registry_target(repository)
+            else:
+                epic_repository = task_lifecycle.stream_registry_repository(repository)
+                repo_key = None
             # Closed epics stay in the file for launcher and Work API consumers.
             # Membership roots are the audit registry only (#12176).
             registry = issue_stream_audit.load_registry(

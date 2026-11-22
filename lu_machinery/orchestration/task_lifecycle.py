@@ -198,13 +198,14 @@ def stream_epic_url_matches(identity: Mapping[str, Any], epic_repository: str) -
     return isinstance(url, str) and url.casefold() == stream_epic_url(epic_repository, identity["stream_epic"]).casefold()
 
 
-def stream_registry_repository(repository: str) -> str:
-    """Bind a fleet repository to the active slug that owns its stream roots."""
+def stream_registry_target(repository: str) -> tuple[str, str | None]:
+    """Bind a fleet repository to ``(active_slug, non_default_repo_key)`` in one A01 resolution."""
     if not repository_identity_valid(repository):
         raise LifecycleError("task repository is not configured in the fleet")
     try:
         catalog = fleet_repos.load_fleet_repos()
         active = fleet_repos.resolve_active_fleet_repo(repository, repos=catalog)
+        default_key = fleet_repos.default_repo_key(catalog)
     except fleet_repos.FleetRepoError as exc:
         raise LifecycleError(f"task repository is not configured in the fleet: {exc}") from None
     if active.active_github.casefold() != repository.casefold():
@@ -213,12 +214,8 @@ def stream_registry_repository(repository: str) -> str:
         )
     if not repository_identity_valid(active.active_github):
         raise LifecycleError("issue-stream registry must have one configured repository")
-    try:
-        default_key = fleet_repos.default_repo_key(catalog)
-    except fleet_repos.FleetRepoError:
-        default_key = None
     if active.repo.role == "public-monorepo" or active.repo.default:
-        return active.active_github
+        return active.active_github, None
     try:
         has_own_roots = issue_stream_audit.repo_has_roots(
             active.repo.key,
@@ -228,7 +225,7 @@ def stream_registry_repository(repository: str) -> str:
     except (OSError, ValueError) as exc:
         raise LifecycleError(f"cannot load the issue-stream registry: {exc}") from None
     if has_own_roots:
-        return active.active_github
+        return active.active_github, active.repo.key
     owners = [repo for repo in catalog.values() if repo.role == "public-monorepo"]
     if len(owners) != 1:
         raise LifecycleError("issue-stream registry must have one configured repository")
@@ -238,7 +235,15 @@ def stream_registry_repository(repository: str) -> str:
         raise LifecycleError(f"issue-stream registry repository could not be resolved: {exc}") from None
     if not repository_identity_valid(owner_active.active_github):
         raise LifecycleError("issue-stream registry must have one configured repository")
-    return owner_active.active_github
+    return owner_active.active_github, None
+
+
+def stream_registry_repository(repository: str) -> str:
+    """Bind a fleet repository to the active slug that owns its stream roots."""
+    return stream_registry_target(repository)[0]
+
+
+_DEFAULT_STREAM_REGISTRY_REPOSITORY = stream_registry_repository
 
 
 def membership_needs_audit(
