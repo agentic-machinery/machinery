@@ -52,6 +52,72 @@ Each entry's `transport` is `ssh` (the default) or `https`. SSH accepts
 configuration. HTTPS requires exactly `https://github.com/<org>/<repo>.git`
 or the same URL without `.git`; userinfo and alternative URL forms are refused.
 
+### Dual-slug bridge and host-owned selector
+
+Moved registry rows in `lu_machinery/config/fleet_repos.yaml` declare an immutable
+`repository_id` (from an authenticated GitHub readback), explicit `visibility`
+(`public` or `private`), and one `alternate_github` slug. Both baked slugs
+resolve to the same registry row.
+
+Active slug selection for dual-slug rows is controlled by the host-owned,
+read-only YAML file named by the `LU_FLEET_REPO_SELECTOR_FILE` setting (an
+absolute path outside any git checkout or writable worktree, with no host path
+baked into code):
+
+```yaml
+version: 1
+active_slugs:
+  machinery: learn-ukrainian/machinery
+  infra-private: learn-ukrainian/learn-ukrainian-infra-private
+```
+
+- **Fail-closed validation:** a missing, empty, relative, symlinked, unreadable,
+  malformed, duplicate-key, unknown-slug, missing-row, inside-worktree, or
+  worker-writable selector is refused before any credential mint or network call.
+  Resolution never defaults to the old slug.
+- **Host ownership vs read-only mount:** because an owner can `chmod u+w` a file
+  on a read-write filesystem, a non-root process accepts a selector only when
+  either:
+  1. The file, parent directory, and entire ancestor chain up to `/` are owned
+     by `root` (distinct from the worker uid) and not writable by the worker,
+     group, or others; or
+  2. When owned by the same uid as the checking process, both the file and
+     parent directory reside on a kernel-enforced read-only mount (`ST_RDONLY`,
+     such as a sandbox `--ro-bind`) with no write mode bits (`0400`/`0500`).
+  Same-uid selectors on a read-write filesystem are refused.
+- **Rollout precondition and non-network preflight:** `canonical_origins` and
+  `verification_credentials` fail closed on dual-slug rows (`machinery` and
+  `infra-private`) when `LU_FLEET_REPO_SELECTOR_FILE` is absent or invalid.
+  Before installing or running a release containing dual-slug rows on a host,
+  provision the host selector file, export `LU_FLEET_REPO_SELECTOR_FILE` to
+  every dispatcher, keeper, API, launcher, and service unit, and verify the
+  non-network preflight exits `0`:
+
+  ```bash
+  .venv/bin/python -m lu_machinery.orchestration.fleet_repos selector-check
+  ```
+
+  Unmodified consumers that read `canonical_origins` or
+  `verification_credentials` (`dispatcher/cli.py`, `dispatcher/git.py`,
+  `dispatcher/store.py`, `orchestration/dispatch_settle.py`,
+  `dispatcher/write_boundary.py`, `hygiene/branch_sweep.py`) depend on this
+  precondition; A01b owns consumer adoption (including `SelectorError` refusal
+  handling in `branch_sweep.py` and recording selector receipts).
+- **Active-slug-only credentials and identity verification:** only the selected
+  active slug receives credentials (`lu_machinery.common.git_credentials`
+  exact-path helper and `sibling_git` origin/fetch resolution). Authenticated
+  GitHub App responses must match the expected `repository_id`, active
+  `full_name`, and `visibility`; fallback to dedicated or legacy tokens is
+  refused when expected identity constraints are passed; HTTP redirects stay
+  refused.
+- **Receipts:** `lu_machinery.orchestration.fleet_repos.selector_receipt()` and
+  `ActiveFleetRepo.selector_receipt()` expose `selector_value` and
+  `selector_sha256` without host filesystem paths.
+- **Restart after flip:** `git_credentials.repository_registry` and
+  `fleet_repos._repository_catalog` are `@cache`d in-process. After flipping the
+  host selector file or updating `fleet_repos.yaml`, restart all long-running
+  services, APIs, keepers, and workers so cached registry views pick up the flip.
+
 HTTPS obtains an App installation credential in the parent process, requesting
 only `contents: read` for the registered repository. The mint response must
 identify exactly that repository, have no wider permissions (implicit metadata

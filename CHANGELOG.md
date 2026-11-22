@@ -9,6 +9,25 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.53"></a>
+## [0.1.53] - 2026-11-22
+
+### Added
+
+- Resolve GitHub App installation by repository owner ([#1187](https://github.com/learn-ukrainian/machinery/pull/1187))
+
+### Changed
+
+- State the disposition after two failed same-head reviews ([#1183](https://github.com/learn-ukrainian/machinery/pull/1183))
+- Reject read commands hidden in quoted hook scripts ([#1188](https://github.com/learn-ukrainian/machinery/pull/1188))
+
+### Fixed
+
+- Skip Git probes for unapproved history ([#1185](https://github.com/learn-ukrainian/machinery/pull/1185))
+- Resolve runtime repository slugs from the fleet registry ([#1186](https://github.com/learn-ukrainian/machinery/pull/1186))
+- Remove subscription meter pacing ([#1190](https://github.com/learn-ukrainian/machinery/pull/1190))
+- Read the secret-print guard's commands as POSIX shell words ([#1184](https://github.com/learn-ukrainian/machinery/pull/1184))
+
 <a id="v0.1.52"></a>
 ## [0.1.52] - 2026-11-22
 
@@ -1341,7 +1360,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.52...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.53...HEAD
+[0.1.53]: https://github.com/learn-ukrainian/machinery/compare/v0.1.52...v0.1.53
 [0.1.52]: https://github.com/learn-ukrainian/machinery/compare/v0.1.51...v0.1.52
 [0.1.51]: https://github.com/learn-ukrainian/machinery/compare/v0.1.50...v0.1.51
 [0.1.50]: https://github.com/learn-ukrainian/machinery/compare/v0.1.49...v0.1.50
