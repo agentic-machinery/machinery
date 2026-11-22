@@ -9,6 +9,18 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.51"></a>
+## [0.1.51] - 2026-11-22
+
+### Added
+
+- Add a scanned repository fork command ([#1172](https://github.com/learn-ukrainian/machinery/pull/1172))
+- Pace each subscription meter's cap from measured worker burn (#1133) ([#1173](https://github.com/learn-ukrainian/machinery/pull/1173))
+
+### Fixed
+
+- Resolve verified bot authors without a model ([#1171](https://github.com/learn-ukrainian/machinery/pull/1171))
+
 <a id="v0.1.50"></a>
 ## [0.1.50] - 2026-11-22
 
@@ -1317,7 +1329,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.50...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.51...HEAD
+[0.1.51]: https://github.com/learn-ukrainian/machinery/compare/v0.1.50...v0.1.51
 [0.1.50]: https://github.com/learn-ukrainian/machinery/compare/v0.1.49...v0.1.50
 [0.1.49]: https://github.com/learn-ukrainian/machinery/compare/v0.1.47...v0.1.49
 [0.1.48]: https://github.com/learn-ukrainian/machinery/compare/v0.1.47...v0.1.48
