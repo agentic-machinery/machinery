@@ -917,8 +917,10 @@ def _journal_cursor(previous: dict[str, Any]) -> tuple[list[str], dict[str, str]
     return [], {}, ["merge queue keeper: journal reset (malformed)"]
 
 
-def _quiet_lines(lines: list[str], previous: dict[str, Any], observed: str) -> list[str]:
-    """Drop PR lines that say the same thing as the previous apply. Decisions are already made."""
+def _quiet_lines(
+    lines: list[str], previous: dict[str, Any], observed: str, *, full_pass: bool
+) -> list[str]:
+    """Drop lines that repeat the previous apply. A pass that did not read the queue keeps that cursor."""
     try:
         now = datetime.fromisoformat(observed)
     except ValueError as exc:
@@ -948,13 +950,25 @@ def _quiet_lines(lines: list[str], previous: dict[str, Any], observed: str) -> l
                 emitted.append(line)
         else:
             emitted.append(line)
-    emitted.extend(f"cleared: {line}" for line in errors if line not in seen_errors)
-    previous["journal_steady"] = seen_steady
-    previous["journal_errors"] = seen_errors
+    if full_pass:
+        emitted.extend(f"cleared: {line}" for line in errors if line not in seen_errors)
+        previous["journal_steady"] = seen_steady
+        previous["journal_errors"] = seen_errors
+    else:
+        merged_steady = list(steady)
+        for line in seen_steady:
+            if line not in merged_steady:
+                merged_steady.append(line)
+        merged_errors = dict(errors)
+        merged_errors.update(seen_errors)
+        previous["journal_steady"] = merged_steady
+        previous["journal_errors"] = merged_errors
     return emitted
 
 
-def quiet_for_journal(path: Path, lines: list[str], observed: str | None = None) -> list[str]:
+def quiet_for_journal(
+    path: Path, lines: list[str], observed: str | None = None, *, full_pass: bool = True
+) -> list[str]:
     """What ``--apply`` prints. ``run`` still returns every line; the journal keeps the cursor.
 
     A missing or unreadable state file is printed in full and left untouched.
@@ -969,7 +983,7 @@ def quiet_for_journal(path: Path, lines: list[str], observed: str | None = None)
     if type(data) is not dict or type(data.get("queued")) is not dict:
         return lines
     try:
-        quiet = _quiet_lines(lines, data, observed)
+        quiet = _quiet_lines(lines, data, observed, full_pass=full_pass)
     except KeeperError:
         return lines
     _save(path, data)
@@ -1366,7 +1380,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Guard and replenish approved, green pull requests in configured merge queues.\nUse --report to inspect and --apply only for authorized local scheduling.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Examples:\n  .venv/bin/python -m {_MODULE} --report\n  .venv/bin/python -m {_MODULE} --apply\nHold mechanisms: labels (needs-operator-go, hold, do-not-merge, blocked) and the [hold] or [needs operator go] title marker.\nOutputs: PR states. --apply reprints a steady line only when it changes, and an unchanged error at most hourly. It also mutates queue/comments and local batch_state, and runs the\nownerless-PR alert to the CTO inbox (pr_ownership.py, every 5 minutes).\nThe keeper enqueues only a PR that was never in the merge queue (P4); every later enqueue is the owner's pr-merge. It\nholds such a PR, comments once per head and reports it to the CTO inbox once per head; an unread timeline holds a PR\nuntil a later pass reads it. A test failing merge_group runs of two PRs within 24 hours is reported to the CTO inbox.\nEnvironment: MQ_KEEPER_MIN_INTERVAL_SECONDS or an existing MQ_KEEPER_SLOW_FLAG file (300 s) throttles --apply.\nExit codes: 0 success/lock overlap/slow-mode skip; 1 lookup or mutation failure.\nRelated: #8564, integration_sweep.py, record_cf_verdict.py.",
+        epilog=f"Examples:\n  .venv/bin/python -m {_MODULE} --report\n  .venv/bin/python -m {_MODULE} --apply\nHold mechanisms: labels (needs-operator-go, hold, do-not-merge, blocked) and the [hold] or [needs operator go] title marker.\nOutputs: PR states. --apply reprints a steady line only when it changes, and an unchanged error at most hourly. A skip or stop that did not read the queue leaves those lines in place. It also mutates queue/comments and local batch_state, and runs the\nownerless-PR alert to the CTO inbox (pr_ownership.py, every 5 minutes).\nThe keeper enqueues only a PR that was never in the merge queue (P4); every later enqueue is the owner's pr-merge. It\nholds such a PR, comments once per head and reports it to the CTO inbox once per head; an unread timeline holds a PR\nuntil a later pass reads it. A test failing merge_group runs of two PRs within 24 hours is reported to the CTO inbox.\nEnvironment: MQ_KEEPER_MIN_INTERVAL_SECONDS or an existing MQ_KEEPER_SLOW_FLAG file (300 s) throttles --apply.\nExit codes: 0 success/lock overlap/slow-mode skip; 1 lookup or mutation failure.\nRelated: #8564, integration_sweep.py, record_cf_verdict.py.",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--report", action="store_true", help="Read-only report (default).")
@@ -1414,7 +1428,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         interval = _min_interval(os.environ)
         if _throttled(state_path, interval):
             shown = quiet_for_journal(
-                state_path, [f"merge queue keeper: slow mode, skipped interval={interval}s"]
+                state_path,
+                [f"merge queue keeper: slow mode, skipped interval={interval}s"],
+                full_pass=False,
             )
             for line in shown:
                 print(line)
@@ -1423,8 +1439,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             lines, failed = run(GitHub(root, args.repo), state_path, apply=args.apply)
         except GitHubRateLimited as exc:
             lines, failed = [f"merge queue keeper: skipped reset_at={exc.reset_at}"], False
+            full_pass = False
         except KeeperError as exc:
             lines, failed = [f"merge queue keeper failed: {exc}"], True
+            full_pass = False
+        else:
+            # The budget stop returns before any PR is read. It is not a full observation.
+            full_pass = not (len(lines) == 1 and lines[0].startswith("GraphQL budget stop:"))
         try:
             alert_lines = _deliver_alerts(state_path)
         except KeeperError as exc:
@@ -1437,7 +1458,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ownership_lines, ownership_failed = pr_ownership.keeper_tick()
         except Exception as exc:
             ownership_lines, ownership_failed = [f"pr ownership: FAILED ({type(exc).__name__})"], True
-        for line in [*quiet_for_journal(state_path, lines), *ownership_lines]:
+        for line in [*quiet_for_journal(state_path, lines, full_pass=full_pass), *ownership_lines]:
             print(line)
         return int(failed or ownership_failed)
 

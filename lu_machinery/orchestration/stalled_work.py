@@ -412,7 +412,9 @@ def _one_line(text: str) -> str:
 
 
 def _json_list(value: object) -> list[Any]:
-    return list(value) if isinstance(value, list) else []
+    if isinstance(value, list):
+        return value
+    return []
 
 
 def _row_digest(report: Mapping[str, Any]) -> str:
@@ -433,8 +435,9 @@ def journal_lines(
 
     A cadence skip and an unchanged clean report print nothing. Exit status stays with the report.
     """
-    state = {
-        "errors": _json_list(journal.get("errors")),
+    errors = _json_list(journal.get("errors"))
+    state: dict[str, Any] = {
+        "errors": errors,
         "errors_at": journal.get("errors_at"),
         "rows": journal.get("rows"),
     }
@@ -451,13 +454,14 @@ def journal_lines(
         current = []
     if current:
         lines: list[str] = []
-        if current != state["errors"]:
-            previous, seen = Counter(state["errors"]), Counter(current)
+        if current != errors:
+            previous, seen = Counter(errors), Counter(current)
             for text, count in sorted(seen.items()):
                 lines.extend(f"stalled-work: error: {text}" for _ in range(count - previous.get(text, 0)))
             for text, count in sorted(previous.items()):
                 lines.extend(f"stalled-work: cleared: {text}" for _ in range(count - seen.get(text, 0)))
-            state["errors"] = current
+            errors = current
+            state["errors"] = errors
             state["errors_at"] = now.isoformat()
         else:
             stamp = _parse_stamp(state["errors_at"])
@@ -465,7 +469,7 @@ def journal_lines(
                 lines.append(f"stalled-work: summary: {len(current)} error(s): {'; '.join(current)}")
                 state["errors_at"] = now.isoformat()
         return lines, state
-    lines = [f"stalled-work: cleared: {text}" for text in state["errors"]]
+    lines = [f"stalled-work: cleared: {text}" for text in errors]
     state["errors"] = []
     state["errors_at"] = None
     digest = _row_digest(report)
