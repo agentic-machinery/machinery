@@ -566,12 +566,17 @@ def _unit_text(units: list[_Unit]) -> str:
     return "".join(char for _, char in units) if all(kind == "src" for kind, _ in units) else ""
 
 
-def _brace_expand(units: list[_Unit], first: int = 0, budget: list[int] | None = None) -> list[list[_Unit]]:
+def _brace_expand(
+    units: list[_Unit], first: int = 0, budget: list[int] | None = None, starts: frozenset[int] = frozenset({0})
+) -> list[list[_Unit]]:
     """Expand the unquoted braces of one word, left to right, as Bash does.
 
-    Braces before `first` are already literal. `budget` caps the units built
-    across the whole expansion; past it, or past the word and opener limits,
-    the word is refused.
+    Braces before `first` are already literal. `starts` holds the indices that
+    begin the word, a brace alternative or the text after a brace, which Bash
+    expands as texts of their own: a brace closes inside its text, and a `{}`
+    that begins one is literal. `budget` caps the units built across the
+    whole expansion; past it, or past the word and opener limits, the word is
+    refused.
     """
     budget = [_BRACE_WORK] if budget is None else budget
     if sum(unit == ("src", "{") for unit in units) > _BRACE_OPENERS:
@@ -579,35 +584,51 @@ def _brace_expand(units: list[_Unit], first: int = 0, budget: list[int] | None =
     for start in range(first, len(units)):
         if units[start] != ("src", "{"):
             continue
+        if units[start + 1 : start + 2] == [("src", "}")]:
+            # Bash never opens a brace at a `{}` that begins a text (find's placeholder),
+            if start in starts:
+                continue
+            # nor at one after a backslash-escaped blank, which units cannot tell from a quoted one.
+            if start and units[start - 1] in {("lit", " "), ("lit", "\t")}:
+                raise ValueError("brace after a blank whose quoting is not modelled")
         depth = 0
         commas: list[int] = []
-        for end in range(start, len(units)):
+        dots = False
+        # Bash expands each text alone, so a brace closes inside the text it opens in.
+        limit = min((index for index in starts if index > start), default=len(units))
+        for end in range(start, limit):
             kind, char = units[end]
             if kind != "src":
                 continue
             if char == "{":
                 depth += 1
             elif char == "}":
-                # Bash reads a top-level `}` with no comma before it, and no
-                # sequence, as a literal and keeps looking (`{a},b}` is `a}` `b`).
-                if (
-                    depth == 1
-                    and not commas
-                    and (end - start > 64 or _brace_sequence(_unit_text(units[start + 1 : end])) is None)
-                ):
+                # Bash reads a top-level `}` before any comma or `..` as a
+                # literal and keeps looking (`{a},b}` is `a}` `b`).
+                if depth == 1 and not commas and not dots:
                     continue
                 depth -= 1
                 if not depth:
                     break
             elif char == "," and depth == 1:
                 commas.append(end)
+            elif (
+                char == "."
+                and depth == 1
+                and units[end + 1 : end + 2] == [("src", ".")]
+                and units[end + 2 : end + 3] != [("src", "}")]
+            ):
+                dots = True
         else:
             continue
         if commas:
             bounds = [start, *commas, end]
             alternatives = [units[left + 1 : right] for left, right in itertools.pairwise(bounds)]
         else:
-            sequence = _brace_sequence(_unit_text(units[start + 1 : end])) or []
+            sequence = _brace_sequence(_unit_text(units[start + 1 : end]))
+            if sequence is None:
+                # Neither a comma nor a valid sequence: Bash leaves this brace as written.
+                continue
             alternatives = [[("src", char) for char in value] for value in sequence]
         words: list[list[_Unit]] = []
         for alternative in alternatives:
@@ -615,8 +636,17 @@ def _brace_expand(units: list[_Unit], first: int = 0, budget: list[int] | None =
             budget[0] -= len(word)
             if budget[0] < 0:
                 raise ValueError("brace expansion too large")
+            shift = len(alternative) - (end + 1 - start)
+            inner = frozenset(
+                {
+                    *(index for index in starts if index < start),
+                    start,
+                    start + len(alternative),
+                    *(index + shift for index in starts if index > end),
+                }
+            )
             # The braces before `start` stayed literal, so the rest of the word is read from there.
-            words.extend(_brace_expand(word, start, budget))
+            words.extend(_brace_expand(word, start, budget, inner))
             if len(words) > _BRACE_LIMIT:
                 raise ValueError("brace expansion too large")
         return words
