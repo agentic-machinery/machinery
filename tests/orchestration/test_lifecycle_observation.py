@@ -599,25 +599,35 @@ def test_task_commit_range_refuses_ambiguous_absorbed_merge(observation_case):
     assert ledger.read_bytes() == before
 
 
-@pytest.mark.parametrize(("payload_slug", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
+@pytest.mark.parametrize(
+    ("payload_slug", "job_slug", "refusal"),
+    [
+        ("org/repo", "org/repo", None),
+        ("neworg/repo", "neworg/repo", None),
+        ("org/repo", "neworg/repo", None),
+        ("evil/repo", "evil/repo", "CLOSEOUT_MERGED_PR_MISMATCH"),
+        ("org/repo", "evil/repo", "CLOSEOUT_JOB_RUN_MISMATCH"),
+    ],
+)
 def test_merged_run_evidence_binds_either_baked_slug_of_the_ledger_repository(
-    bound_case, monkeypatch, payload_slug, accepted
+    bound_case, monkeypatch, payload_slug, job_slug, refusal
 ):
     """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
-    with the same repository name under another owner is accepted (ledger and evidence recorded as org/repo)."""
+    with the same repository name under another owner is accepted (ledger and evidence recorded as org/repo;
+    separate reads may mix the two baked slugs)."""
     transferred_catalog(monkeypatch)
     _, observation, pull, run, jobs = bound_case
     run_url = f"https://github.com/{payload_slug}/actions/runs/123"
     pull["html_url"] = f"https://github.com/{payload_slug}/pull/77"
     pull["base"]["repo"]["full_name"] = payload_slug
     run.update(html_url=run_url, repository={"full_name": payload_slug})
-    jobs[0]["html_url"] = f"{run_url}/job/456"
+    jobs[0]["html_url"] = f"https://github.com/{job_slug}/actions/runs/123/job/456"
     observation["github"]["pr"]["url"] = pull["html_url"]
 
-    if not accepted:
-        with pytest.raises(lo.ObservationRefusal, match="CLOSEOUT_MERGED_PR_MISMATCH"):
+    if refusal:
+        with pytest.raises(lo.ObservationRefusal, match=refusal):
             closeout_fixtures.derive(bound_case)
         return
     _, report = closeout_fixtures.derive(bound_case)
     assert report["run_url"] == run_url
-    assert [item["executed"][0]["url"] for item in report["criteria"]] == [f"{run_url}/job/456"]
+    assert [item["executed"][0]["url"] for item in report["criteria"]] == [jobs[0]["html_url"]]

@@ -210,14 +210,26 @@ def test_an_empty_unreleased_section_records_the_release_below_it():
     )
 
 
-@pytest.mark.parametrize(("link_slug", "accepted"), [("org/repo", True), ("neworg/repo", True), ("evil/repo", False)])
-def test_unreleased_link_may_name_either_baked_slug_of_the_repository(monkeypatch, link_slug, accepted):
+@pytest.mark.parametrize(
+    ("link_slug", "stale", "accepted"),
+    [
+        ("org/repo", "", True),
+        ("neworg/repo", "", True),
+        ("evil/repo", "", False),
+        ("org/repo", "[Unreleased]: https://github.com/neworg/repo/compare/v0.1.20...HEAD\n", False),
+        ("org/repo", "   [unreleased]: https://github.com/org/repo/compare/v0.1.20...HEAD\n", False),
+    ],
+)
+def test_unreleased_link_may_name_either_baked_slug_of_the_repository(monkeypatch, link_slug, stale, accepted):
     """Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
-    with the same repository name under another owner is accepted (CHANGELOG written before the transfer)."""
+    with the same repository name under another owner is accepted (CHANGELOG written before the transfer),
+    or a second, stale Unreleased definition survives the cut."""
     from tests.test_fleet_repos import transferred_catalog
 
     transferred_catalog(monkeypatch)
-    changelog = CHANGELOG.replace(f"[Unreleased]: https://github.com/{REPO}/", f"[Unreleased]: https://github.com/{link_slug}/")
+    changelog = stale + CHANGELOG.replace(
+        f"[Unreleased]: https://github.com/{REPO}/", f"[Unreleased]: https://github.com/{link_slug}/"
+    )
     cut = {"version": "0.1.22", "previous": "0.1.21", "date": "2026-11-16", "notes": "### Fixed\n\n- Generated\n"}
 
     if not accepted:

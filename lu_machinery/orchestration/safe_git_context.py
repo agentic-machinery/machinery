@@ -122,6 +122,9 @@ class SafeGitContext:
                 "[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
                 "\tfilemode = true\n\tsymlinks = true\n\tcommitGraph = false\n\tuseReplaceRefs = false\n"
                 '[protocol]\n\tallow = never\n[protocol "https"]\n\tallow = always\n'
+                # A transferred repository's other slug redirects; the credential header above must
+                # never follow it to a URL the selector did not choose (git_credentials does the same).
+                + "[http]\n\tfollowRedirects = false\n"
                 + ('[protocol "file"]\n\tallow = always\n' if self.local_remote else "")
                 + f'[remote "origin"]\n\turl = "{self.origin}"\n'
                 # Discover objects the destination already has before packing.

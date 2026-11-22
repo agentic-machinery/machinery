@@ -330,14 +330,13 @@ def record_changelog(
         slugs = repository_slugs(repo)
     except FleetRepoError as exc:
         raise CutError(f"the fleet repository registry is unreadable: {exc}") from exc
-    found = [
-        link
-        for link in dict.fromkeys(f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD\n" for slug in slugs)
-        if link in text
-    ]
-    if text.count(unreleased) != 1 or len(found) != 1 or text.count(found[0]) != 1:
+    # Markdown reference labels ignore case and allow three leading spaces: any such line defines
+    # the Unreleased link, so exactly one may exist, and it must compare the previous tag.
+    definitions = re.findall(r"^ {0,3}\[unreleased\]:.*\n?", text, flags=re.IGNORECASE | re.MULTILINE)
+    accepted = {f"[Unreleased]: https://github.com/{slug}/compare/v{previous}...HEAD\n" for slug in slugs}
+    if text.count(unreleased) != 1 or len(definitions) != 1 or definitions[0] not in accepted:
         raise CutError("CHANGELOG.md lacks one Unreleased heading and its compare link to the previous tag")
-    link = found[0]
+    link = definitions[0]
     unreleased_must_be_empty(text)
     heading = f'<a id="v{version}"></a>\n## [{version}] - {date}' + (" [YANKED]" if yanked else "")
     section = f"{heading}\n\n{notes.rstrip()}\n\n"

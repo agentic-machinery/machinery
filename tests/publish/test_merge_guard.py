@@ -150,12 +150,22 @@ def entire_runner(app, calls, *, head=HEAD, error=None, bound=None, extra_docume
     return runner
 
 
-@pytest.mark.parametrize(("run_slug", "accepted"), [("unit/public", True), ("neworg/public", True), ("evil/public", False)])
-def test_oo48_publisher_proves_entire_gates_at_the_metadata_head(monkeypatch, run_slug, accepted):
+@pytest.mark.parametrize(
+    ("run_slug", "rollup_slug", "accepted"),
+    [
+        ("unit/public", "unit/public", True),
+        ("neworg/public", "neworg/public", True),
+        ("unit/public", "neworg/public", True),
+        ("evil/public", "evil/public", False),
+        ("unit/public", "evil/public", False),
+    ],
+)
+def test_oo48_publisher_proves_entire_gates_at_the_metadata_head(monkeypatch, run_slug, rollup_slug, accepted):
     """Distinct vendor details and canonical check URLs must preserve App proof.
 
     Defect class: a payload naming the other baked slug of the same repository is refused, or a slug
-    with the same repository name under another owner is accepted (canonical check URL under run_slug).
+    with the same repository name under another owner is accepted (canonical check URL under run_slug
+    in the REST read and rollup_slug in the separate rollup read).
     """
     from tests.test_fleet_repos import transferred_catalog
 
@@ -176,7 +186,7 @@ def test_oo48_publisher_proves_entire_gates_at_the_metadata_head(monkeypatch, ru
              "details_url": "https://entire.com/gh/unit/public/trails/7"}]
     rollup = [{"__typename": "CheckRun", "name": row["name"], "status": row["status"].upper(),
                "conclusion": str(row.get("conclusion") or "").upper(),
-               "detailsUrl": row.get("html_url", row["details_url"])}
+               "detailsUrl": row.get("html_url", row["details_url"]).replace(f"/{run_slug}/", f"/{rollup_slug}/")}
               for row in rest]
     rollup.append({"__typename": "StatusContext", "context": "external-status", "state": "SUCCESS"})
     endpoint = f"repos/unit/public/commits/{HEAD}/check-runs?filter=all&per_page=100"

@@ -329,6 +329,8 @@ def test_rescue_origin_binds_either_baked_slug_and_pushes_to_the_active_one(sour
         active = "https://github.com/agentic-machinery/machinery.git"
         assert safe.checked("config", "remote.origin.url") == active
         assert safe.checked("config", f"http.{active}.extraHeader").startswith("Authorization: Basic ")
+        # The other baked slug redirects to the active one; the header must never follow a redirect.
+        assert safe.checked("config", "http.followRedirects") == "false"
 
 
 def test_source_repository_exclusions_are_preserved_as_data(source, tmp_path):

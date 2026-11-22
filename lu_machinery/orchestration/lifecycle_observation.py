@@ -399,6 +399,23 @@ def _repository_urls(repository: Any, path: str) -> tuple[str, ...]:
     return tuple(f"https://github.com/{slug}/{path}" for slug in _repository_slugs(repository))
 
 
+_MERGED_PR_KEYS = ("number", "url", "state", "head_sha", "head_branch", "merge_sha")
+
+
+def _same_merged_pr(left: Any, right: Any, repository: Any) -> bool:
+    """Whether two merged-PR records name one PR: equal fields, the URL under either baked slug.
+
+    A record saved before a transfer and a fresh read after it spell the URL with different slugs.
+    """
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    urls = _repository_urls(repository, f"pull/{left.get('number')}")
+    return all(
+        (left.get(key) in urls and right.get(key) in urls) if key == "url" else left.get(key) == right.get(key)
+        for key in _MERGED_PR_KEYS
+    )
+
+
 def _closeout_worktree_gone(closeout: Mapping[str, Any], task: Mapping[str, Any]) -> bool:
     """Prove the task's worktree was gone when its closeout ran.
 
@@ -546,9 +563,8 @@ def recover(
                 current_pr = GhGitHubAdapter(repo_root)._read_pr(ledger["identity"]["repository"], ledger["pr"]["number"])
             except tl.LifecycleError as exc:
                 raise ObservationRefusal("RECOVERY_MERGED_PR_UNAVAILABLE") from exc
-            if merged_pr is not None and any(
-                merged_pr.get(key) != current_pr.get(key)
-                for key in ("number", "url", "state", "head_sha", "head_branch", "merge_sha")
+            if merged_pr is not None and not _same_merged_pr(
+                merged_pr, current_pr, ledger["identity"]["repository"]
             ):
                 raise ObservationRefusal("RECOVERY_MERGED_PR_UNPROVEN")
             merged_pr = current_pr
@@ -571,17 +587,11 @@ def recover(
                 for name, source in sources.items():
                     if _source(source, repo_root)[1] != recovery["inputs"][name]:
                         raise ObservationRefusal("RECOVERY_DIGEST_MISMATCH")
-                if closeout_file is not None and recovery.get("merged_pr") != {
-                    key: (merged_pr or {}).get(key)
-                    for key in (
-                        "number",
-                        "url",
-                        "state",
-                        "head_sha",
-                        "head_branch",
-                        "merge_sha",
-                    )
-                }:
+                recorded = recovery.get("merged_pr")
+                if closeout_file is not None and not (
+                    isinstance(recorded, Mapping) and set(recorded) == set(_MERGED_PR_KEYS)
+                    and _same_merged_pr(recorded, merged_pr or {}, ledger["identity"]["repository"])
+                ):
                     raise ObservationRefusal("RECOVERY_MERGED_PR_UNPROVEN")
                 if (
                     "association" in recovery and child_pr is not None
@@ -733,7 +743,7 @@ def merged_run_evidence(
         if (
             type(job_id) is not int or job_id < 1 or job.get("run_id") != run_id
             or type(job.get("run_attempt")) is not int or job.get("run_attempt") != attempt or job.get("head_sha") != merge
-            or job.get("html_url") != f"{run_url}/job/{job_id}"
+            or job.get("html_url") not in _repository_urls(repository, f"actions/runs/{run_id}/job/{job_id}")
         ):
             raise ObservationRefusal("CLOSEOUT_JOB_RUN_MISMATCH")
     for name in updated["required_checks"]:

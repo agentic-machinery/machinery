@@ -1192,10 +1192,15 @@ def test_run_links_bind_either_baked_slug_of_the_scanned_repository(monkeypatch,
     endpoint = alerts_module._annotation_endpoint(
         "org", "repo", f"https://api.github.com/repos/{payload_slug}/check-runs/5",
     )
+    following = alerts_module._accept_next_link(
+        "org", "repo", f"https://api.github.com/repos/{payload_slug}/code-scanning/alerts?per_page=100&page=2",
+        "repos/org/repo/code-scanning/alerts", None,
+    )
 
     if accepted:
         assert error is None and record["html_url"] == run_url
         assert endpoint == "repos/org/repo/check-runs/5/annotations?per_page=100"
+        assert following == f"repos/{payload_slug}/code-scanning/alerts?per_page=100&page=2"
     else:
         assert (record, error) == (None, "run_not_on_default_branch")
-        assert endpoint is None
+        assert endpoint is None and following is None

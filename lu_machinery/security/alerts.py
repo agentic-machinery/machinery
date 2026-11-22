@@ -564,7 +564,11 @@ def _accept_next_link(
     if numeric:
         if numeric.group(2) != suffix or required_repo_id is None or numeric.group(1) != required_repo_id:
             return None
-    elif path != expected_path:
+    elif path != expected_path and path not in {
+        _repo_api(slug_owner, slug_name, suffix)
+        for slug_owner, _, slug_name in (slug.partition("/") for slug in _repository_slugs(owner, name))
+    }:
+        # The next page may name either baked slug of a transferred repository.
         return None
     return f"{path}?{query}" if query else path
 

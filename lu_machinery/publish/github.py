@@ -1209,8 +1209,8 @@ def _transfer_resolution(endpoint, number, reader, cwd, environment):
     ):
         raise ValueError("malformed issue")
     resolved["repository"] = match[1]
-    if not resolved["pull_request"] and resolved["url"].casefold() != (
-        f"https://github.com/{match[1]}/issues/{resolved['number']}".casefold()
+    if not resolved["pull_request"] and not _same_repository_url(
+        resolved["url"], match[1], f"issues/{resolved['number']}"
     ):
         raise ValueError("issue URL does not match its repository")
     return resolved
@@ -1365,6 +1365,10 @@ def _issue_transfer(fields, *, runner, cwd, environment, capture_output, text):
         raise _transfer_refused("the destination is the source repository")
     if source["privacy"] == "private" and destination["privacy"] != "private":
         raise _transfer_refused("an issue in a private-role repository never moves to a public-role repository")
+    # The result checks bind both endpoints through the fleet registry; prove it binds them
+    # now, before the mutation, so an unreadable registry cannot strand a sent transfer.
+    if not _repository_slugs(source["repository"]) or not _repository_slugs(destination["repository"]):
+        raise _transfer_refused("the fleet registry cannot bind the source or destination repository")
     number = fields["number"]
     environment["GH_HOST"] = "github.com"
     receipt = {
