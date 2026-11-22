@@ -197,11 +197,13 @@ def worktree_records(*args: str, root: Path) -> list[str] | None:
 def parse_updates(text: str) -> list[Update]:
     if not text:
         return []
+    if not text.endswith("\n"):
+        raise GateOutcome("invalid_ref_updates", "Could not read a complete ref update from Git.")
     updates = []
     for line in text.removesuffix("\n").split("\n"):
         # Git separates fields with spaces. A local revision expression can itself contain spaces.
         fields = line.rsplit(" ", 3)
-        if len(fields) != 4:
+        if len(fields) != 4 or not all(fields):
             raise GateOutcome("invalid_ref_updates", "Could not read a valid ref update from Git.")
         updates.append(Update(*fields))
     return updates
@@ -212,25 +214,41 @@ def entire_destination(remote: list[str]) -> str:
     if len(remote) != 2:
         return "UNKNOWN"
     try:
+        from lu_machinery.common.git_credentials import canonical_origins
+        from lu_machinery.opsec import prepublish
         from lu_machinery.opsec.git_push import destination
         from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
     except ImportError:
         return "UNKNOWN"
-    host, _, slug = destination(remote[1]).partition("/")
-    if host != "github.com":
+    url = remote[1]
+    identity = destination(url)
+    if not identity.startswith("github.com/"):
         return "UNKNOWN"
     try:
         repos = load_fleet_repos()
     except FleetRepoError:
         return "UNKNOWN"
-    matches = [repo for repo in repos.values() if repo.github.isascii() and repo.github.lower() == slug]
+    matches = [repo for repo in repos.values() if prepublish.normalize_repository(repo.github) == identity]
     if len(matches) != 1:
         return "UNKNOWN"
     repo = matches[0]
     if repo.role.startswith("public-"):
         return "PUBLIC"
-    if repo.role.startswith("private-") and not repo.default:
-        return "KNOWN_NONPUBLIC"
+    if not repo.role.startswith("private-") or repo.default:
+        return "UNKNOWN"
+    try:
+        origins = canonical_origins({"github": repo.github})
+    except ValueError:
+        return "UNKNOWN"
+    # Bind the private exemption to Git's original URL, before destination normalization.
+    if not url.isascii() or url.lower() not in {origin.lower() for origin in origins}:
+        return "UNKNOWN"
+    try:
+        # The scanner's registry reader also rejects duplicate YAML keys.
+        if prepublish.is_private(identity):
+            return "KNOWN_NONPUBLIC"
+    except prepublish.PublishBlocked:
+        pass
     return "UNKNOWN"
 
 
@@ -254,9 +272,9 @@ def refuse_public_entire_refs(updates: list[Update], remote: list[str]) -> None:
         from lu_machinery.opsec import git_push, prepublish
 
         environment = dict(os.environ)
-        executable = shutil.which(git_push.real_git(environment))
+        repository = git_push.Repository(git_push.real_git(environment), environment)
         try:
-            if executable and git_push.trusted_route(git_push.Repository(executable, environment), *remote):
+            if git_push.trusted_route(repository, *remote):
                 return
         except (OSError, subprocess.SubprocessError, prepublish.PublishBlocked):
             pass
