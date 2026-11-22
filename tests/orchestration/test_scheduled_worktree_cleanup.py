@@ -2065,24 +2065,24 @@ def test_atomic_write_keeps_replace_error_when_unlink_fails(tmp_path, monkeypatc
     assert "atomic write cleanup failed" in caplog.text
 
 
-@pytest.mark.parametrize(
-    ("module_name", "push"),
-    [
-        ("lu_machinery.orchestration.scheduled_worktree_cleanup",
-         ("push", "--force-with-lease=refs/heads/x:" + "a" * 40, "origin", ":refs/heads/x")),
-        ("lu_machinery.hygiene.branch_sweep",
-         ("push", "--porcelain", "--force-with-lease=refs/heads/x:" + "a" * 40, "origin", ":refs/heads/x")),
-    ],
-)
-def test_selector_failure_during_host_deletion_push_is_a_typed_refusal(tmp_path, monkeypatch, module_name, push):
-    """Defect class: a selector failure during push escapes as an uncaught exception instead of a typed refusal."""
-    import importlib
+def _branch_sweep_git(repo, *args):
+    from lu_machinery.hygiene import branch_sweep
 
+    return branch_sweep._git(repo, *args)
+
+
+@pytest.mark.parametrize(
+    ("run", "push"),
+    [
+        (cleanup._run_git, ("push", "--force-with-lease=refs/heads/x:" + "a" * 40, "origin", ":refs/heads/x")),
+        (_branch_sweep_git, ("push", "--porcelain", "--force-with-lease=refs/heads/x:" + "a" * 40, "origin", ":refs/heads/x")),
+    ],
+    ids=["scheduled_worktree_cleanup", "branch_sweep"],
+)
+def test_selector_failure_during_host_deletion_push_is_a_typed_refusal(tmp_path, monkeypatch, run, push):
+    """Defect class: a selector failure during push escapes as an uncaught exception instead of a typed refusal."""
     from lu_machinery.common.git_credentials import SELECTOR_ENV
     from lu_machinery.dispatcher import write_boundary
-
-    module = importlib.import_module(module_name)
-    run = getattr(module, "_run_git", None) or module._git
 
     def boundary_git(cwd, *args, network=False, **kwargs):
         if args[:2] == ("remote", "get-url"):
