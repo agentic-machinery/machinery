@@ -38,7 +38,7 @@ before round 1 and before every further round.
 "$PY" -m lu_machinery.review.tiers --repository "$REPOSITORY" --pr "$PR"
 ```
 
-`trivial` needs no review: stop here, seat no reviewer, and land on required CI. `low` gets the
+`trivial` needs no review: stop here, seat no reviewer, and go to `full-send` step 6 with `--trivial`. `low` gets the
 policy's quick red-team pass, with `--risk low` and break-it findings only. Other tiers continue
 below.
 

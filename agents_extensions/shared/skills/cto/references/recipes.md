@@ -28,7 +28,7 @@ file only points there and adds what the CTO seat learned on top.
   briefs keep their owner until an explicit transfer.
 - **Keeper alert on CI failure, ejection or head move after approval.** Classify it from the
   evidence before releasing custody. An infrastructure failure with no failing test node and an
-  unspent allowance is the keeper's one same-head recovery: dispatch no worker, because accepting
+  unspent allowance is the one same-head recovery (the keeper's re-enqueue, or a CTO `run-rerun` with the evidence on the PR): dispatch no worker, because accepting
   the PR replaces keeper custody. A code, own-check or head-move failure gets one fresh fix worker
   whose brief carries the current head, the run and job ids, the inherited review ledger and its
   remaining budget, and starts with `pr_ownership accept --pr <N> --repo <owner/name>`. A failing

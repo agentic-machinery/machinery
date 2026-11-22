@@ -121,9 +121,17 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 6. **Hand the PR to keeper custody, then exit.** This is the worker's last step: the merge-queue
    keeper watches CI and lands the PR, and the CTO cycle handles every later alert. Do not wait
    for CI, a runner or the queue; never rerun, enqueue, merge or run `merge_closeout`.
-   Check the live head equals the head of the recorded APPROVE, or of the Trivial classification
-   (a moved head returns to step 4). Save the recorder's JSON receipt from step 5 under
-   `batch_state/tasks/<task-id>.artifacts/`, then transfer custody:
+   On the live head check gate items 1, 2, 4 and 5 of [delivery](references/delivery.md#the-gate):
+   `gh pr view "$PR" --json state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus`
+   shows the head equals the head of the recorded APPROVE or Trivial classification (a moved head
+   returns to step 4) and the PR is open, not draft and not BEHIND or DIRTY; send any follow-ups to
+   `claude-cto` through Fleet Comms (`"$PY" -I -m lu_machinery.fleet_comms channel publish … --recipient
+   claude-cto`, never a `claude-cto-<id>` name). Take `$BASE` from `baseRefName`, and run
+   `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json`: a PR
+   already queued or merged ends as `BLOCKED early landing: <state>` with the verdict receipt, an
+   exception the CTO disposes of, never a custody receipt. Save the recorder's JSON receipt from
+   step 5 (a Trivial change has none) under `batch_state/tasks/<task-id>.artifacts/`, then transfer
+   custody:
 
    ```bash
    "$PY" -m lu_machinery.orchestration.pr_ownership keeper-transfer --pr "$PR" --repo "$REPO" \
@@ -136,12 +144,9 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    `BLOCKED`, never a fallback to watching CI. Exit 0 prints the keeper's acknowledgement,
    binding the repository, PR, base, head, your task and nonce, and the verdict. That receipt is
    the worker's proof of custody. Any other exit is a refusal: read its reason, fix what it names
-   (a moved head, a missing or stale verdict) or stop with `BLOCKED <refusal>`. If the keeper
-   landed or queued the PR before you transferred (the refusal says the PR is not open, or
-   `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json`
-   shows it queued), end `BLOCKED early landing: <state>` with the verdict receipt and the
-   `gh pr view "$PR" --json state,mergeCommit` reading. That is an exception the CTO disposes of,
-   never a custody receipt.
+   (a moved head, a missing or stale verdict) or stop with `BLOCKED <refusal>`. If the refusal says
+   the PR is no longer open, the keeper landed it first: end `BLOCKED early landing: MERGED` with the
+   verdict receipt and the `gh pr view "$PR" --json state,mergeCommit` reading.
 
    Then check `git status --porcelain` is empty, report `CUSTODY_ACCEPTED` with the receipt
    ([Report](#report)) and end your run. The linked issue stays open: the CTO cycle closes it with
@@ -197,7 +202,9 @@ CTO cycle after the keeper lands one. A worker never runs this section.
    `--delete-branch` or `--admin`.
 3. **Confirm `MERGED`** and the merge SHA: `gh pr view "$PR" --json state,mergeCommit`. If the
    queue ejects the PR, follow the kick recipe in [pr-watch](references/pr-watch.md).
-4. **Close out after the worker settles.** The CTO cycle reads the terminal result from
+4. **Close out after the worker settles.** A detached worker settles before the merge, so its
+   result carries no merge SHA: use the manual recipe below. For a task that settled after the
+   merge, the CTO cycle reads the terminal result from
    `dispatch wait <task-id> --run-nonce <nonce>` and requires the expected
    `delivery_merge_sha`, `worktree_disposition: removed`, and a residue-free `closeout` receipt
    with `returncode: 0`. If the result lists multiple `closeouts`, check them all. That receipt

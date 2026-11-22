@@ -61,7 +61,7 @@ supervisor per PR: the keeper from custody, then the CTO cycle on an alert.
   created), a checkout or network fetch failure before the change's code ran, or a provider
   capacity or outage error. A cancelled job alone is not evidence. Treat an evidenced
   infrastructure failure as a service problem. Write the evidence on the PR first (rules
-  core P4); then the keeper, which owns the allowance while it holds custody, uses the head's one
+  core P4); then the keeper (while it holds custody) or the CTO, never a worker, uses the head's one
   evidenced rerun, `"$PY" -m lu_machinery.publish run-rerun`, or one re-enqueue after an
   infrastructure ejection. A worker never reruns. A failing test node, an unknown diagnosis or a
   spent allowance goes to `claude-cto` as an alert.

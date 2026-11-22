@@ -61,7 +61,7 @@ are the tie-breakers.
      accountable driver — never ask the operator to merge. A PR may open before approval so CI
      runs (OO-53). Gates: `workflow.md` § Merge policy; worker steps: the `full-send` skill.
      This is the issue's Definition of Done, owned by the CTO cycle. A worker's own done is
-     earlier: verified push, recorded verdict and accepted custody receipt.
+     earlier: verified push, recorded verdict (none at Trivial) and accepted custody receipt.
    - **Git hygiene:** remote branch gone, local branch gone, dispatch worktree(s) gone
      (the dispatcher removes each task's own worktree at settlement; `merge_closeout` proves no
      worktree still holds the PR and removes none); no zombie refs for that PR.

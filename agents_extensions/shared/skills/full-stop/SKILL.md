@@ -70,7 +70,8 @@ merge-group CI is not yet proven; say so.
 
 End in exactly one of these states, naming the receiving driver:
 
-- `READY_TO_MERGE` — the gate passes; the PR is open, unmerged and protected.
+- `READY_TO_MERGE` — gate items 1, 2, 4 and 5 pass and the CI state is reported; the PR is open,
+  unmerged and protected. The receiving driver checks item 3.
 - `WAITING_ON <named approval>` — only that approval remains; confirm it is the real blocker.
 - `BLOCKED <reason>` — what blocks readiness, what you tried, and what is needed.
 - `ALREADY_MERGED_EXTERNALLY` — someone else merged it; report the merge SHA.
@@ -78,7 +79,11 @@ End in exactly one of these states, naming the receiving driver:
 Ready is never reported as delivered. The receiving driver verifies the whole gate on the live head
 with the hold still in place, then clears both hold markers (the `hold` label and the `[hold]`
 title marker) only as the last step before landing, in the same action, by the `full-send` lead
-path. Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
+path:
+
+```bash
+"$PY" -m lu_machinery.publish pr-edit --number "$PR" --remove-labels hold --title "$TITLE_WITHOUT_HOLD"
+``` Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
 planned is the CTO's (rules core P4).
 
 ## Report
