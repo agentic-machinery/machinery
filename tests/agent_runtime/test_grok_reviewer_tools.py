@@ -59,6 +59,197 @@ def _contains_command_tokens(tokens: list[str], command_tokens: list[str]) -> bo
     return [Path(tokens[0]).name, *tokens[1:width]] == command_tokens
 
 
+# Shell words a hook can ask a shell to re-parse. Path arguments are not in this set.
+_SHELL_BASENAMES = frozenset({"ash", "bash", "dash", "ksh", "sh", "zsh"})
+_SHELL_SEPARATORS = frozenset({";", "|", "&", "&&", "||", ";;", "|&", "(", ")"})
+_MAX_SHELL_NESTING = 8
+
+
+def _punctuation_words(text: str) -> list[str]:
+    """Split a script the way a shell splits words, keeping ``;`` and ``&&`` apart."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    return list(lexer)
+
+
+def _expand_dollar_quote(tokens: list[str]) -> list[str]:
+    """Drop the ``$`` that ``shlex`` leaves on an ANSI-C quote such as ``$'pwd'``."""
+    expanded: list[str] = []
+    for token in tokens:
+        if token in _SHELL_SEPARATORS:
+            expanded.append(token)
+            continue
+        inner: str | None = None
+        if token.startswith("$'") and token.endswith("'") and len(token) > 3:
+            inner = token[2:-1]
+        elif token.startswith("$") and not token.startswith("${") and len(token) > 1:
+            inner = token[1:]
+        if inner is None:
+            expanded.append(token)
+            continue
+        # An ANSI-C quote is one shell word. Re-splitting it would treat a
+        # literal semicolon or backtick in that word as outer shell syntax.
+        expanded.append(inner)
+    return expanded
+
+
+def _simple_commands(tokens: list[str]) -> list[list[str]]:
+    groups: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_SEPARATORS:
+            if current:
+                groups.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        groups.append(current)
+    return groups or [[]]
+
+
+def _closing_backtick(text: str, start: int) -> int | None:
+    index = start
+    limit = len(text)
+    while index < limit:
+        if text[index] == "\\" and index + 1 < limit:
+            index += 2
+            continue
+        if text[index] == "`":
+            return index
+        index += 1
+    return None
+
+
+def _backtick_scripts(text: str) -> list[str]:
+    """Interiors of backticks a shell would execute.
+
+    Single quotes and ANSI-C quotes keep a backtick literal, so a review-root
+    path wrapped by ``shlex.quote`` is one argument. Double quotes do not.
+    An unclosed executing backtick fails closed.
+    """
+    scripts: list[str] = []
+    index = 0
+    limit = len(text)
+    state = "out"
+    while index < limit:
+        char = text[index]
+        if state == "single":
+            if char == "'":
+                state = "out"
+            index += 1
+            continue
+        if state == "ansi":
+            if char == "\\" and index + 1 < limit:
+                index += 2
+                continue
+            if char == "'":
+                state = "out"
+            index += 1
+            continue
+        if char == "\\" and index + 1 < limit:
+            index += 2
+            continue
+        if state == "double":
+            if char == '"':
+                state = "out"
+                index += 1
+                continue
+            if char == "`":
+                end = _closing_backtick(text, index + 1)
+                if end is None:
+                    raise ValueError("unclosed backtick")
+                scripts.append(text[index + 1 : end])
+                index = end + 1
+                continue
+            index += 1
+            continue
+        if char == "'":
+            state = "single"
+            index += 1
+            continue
+        if char == '"':
+            state = "double"
+            index += 1
+            continue
+        if char == "$" and index + 1 < limit and text[index + 1] == "'":
+            state = "ansi"
+            index += 2
+            continue
+        if char == "`":
+            end = _closing_backtick(text, index + 1)
+            if end is None:
+                raise ValueError("unclosed backtick")
+            scripts.append(text[index + 1 : end])
+            index = end + 1
+            continue
+        index += 1
+    return scripts
+
+
+def _script_operands(tokens: list[str]) -> list[str]:
+    """Quoted scripts a shell ``-c`` or ``eval`` will execute."""
+    scripts: list[str] = []
+    for index, token in enumerate(tokens):
+        base = Path(token).name
+        if base == "eval" and index + 1 < len(tokens):
+            scripts.append(tokens[index + 1])
+            continue
+        if base not in _SHELL_BASENAMES:
+            continue
+        for follow in range(index + 1, len(tokens)):
+            flag = tokens[follow]
+            if flag in _SHELL_SEPARATORS:
+                break
+            if len(flag) > 1 and flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
+                if follow + 1 < len(tokens):
+                    scripts.append(tokens[follow + 1])
+                break
+    return scripts
+
+
+def _hook_hides_read_command(
+    hook_command: str, read_commands: tuple[str, ...], *, _depth: int = 0
+) -> str | None:
+    """Return a read command concealed in ``hook_command``, or None.
+
+    Words are split on shell punctuation, so ``echo;pwd`` cannot hide ``pwd``. A quoted
+    argument stays one word: ``--review-root .../pytest.pwds69p6`` does not match, and
+    neither does a quoted path that merely contains ``;`` or a literal backtick.
+    A script given to ``sh -c`` or ``eval`` is split again. Backticks are split again
+    only where a shell would execute them, including inside double quotes. The ``$``
+    left on an ANSI-C quote is removed. An unreadable or over-nested script fails closed.
+    """
+    if _depth > _MAX_SHELL_NESTING:
+        return "<shell nesting limit>"
+    try:
+        tokens = _expand_dollar_quote(_punctuation_words(hook_command))
+        substitutions = _backtick_scripts(hook_command)
+    except ValueError:
+        return "<unreadable shell command>"
+    for command in read_commands:
+        if command in tokens:
+            return command
+        try:
+            pieces = shlex.split(command)
+        except ValueError:
+            return command
+        if any(_contains_command_tokens(simple, pieces) for simple in _simple_commands(tokens)):
+            return command
+    fragments = [*_script_operands(tokens), *substitutions]
+    for fragment in fragments:
+        hidden = _hook_hides_read_command(fragment, read_commands, _depth=_depth + 1)
+        if hidden is not None:
+            return hidden
+    return None
+
+
+def _assert_hook_command_hides_no_read_command(hook_command: str, read_commands: tuple[str, ...]) -> None:
+    hidden = _hook_hides_read_command(hook_command, read_commands)
+    assert hidden is None, f"read command {hidden!r} hidden in hook command {hook_command!r}"
+
+
 def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path) -> None:
     # Seed a path containing "pwd" (as in CI tmp root pytest.pwds69p6) so a raw
     # substring assertion over the definition cannot silently pass on lucky tmp dirs.
@@ -101,9 +292,10 @@ def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path
             GROK_REVIEWER_READ_COMMANDS,
         )
 
-        # Check the prompt body, non-command frontmatter fields, and each hook's
-        # parsed command tokens so a read command cannot leak anywhere while
-        # arbitrary --review-root paths (like pytest.pwds69p6) do not false-positive.
+        # Check the prompt body, non-command frontmatter fields, and each hook
+        # command. Shell punctuation is split, but a quoted --review-root path
+        # stays one word, so pytest.pwds69p6 does not match. A compound script
+        # quoted for sh -c or eval is split again and must hide no read command.
         assert all(command not in body for command in GROK_REVIEWER_READ_COMMANDS)
         non_hook_text = json.dumps(
             {key: value for key, value in frontmatter.items() if key != "hooks"},
@@ -138,9 +330,7 @@ def test_reviewer_opt_in_denies_bash_and_guards_all_tracked_reads(tmp_path: Path
                     assert isinstance(hook_command, str)
                     hook_tokens = shlex.split(hook_command)
                     parsed_hook_commands.append(hook_tokens)
-                    for command in GROK_REVIEWER_READ_COMMANDS:
-                        assert command not in hook_tokens
-                        assert not _contains_command_tokens(hook_tokens, shlex.split(command))
+                    _assert_hook_command_hides_no_read_command(hook_command, GROK_REVIEWER_READ_COMMANDS)
         assert len(parsed_hook_commands) == 11
         assert any(
             len(tokens) >= 2 and tokens[-2:] == ["--review-root", str(review_root)]
