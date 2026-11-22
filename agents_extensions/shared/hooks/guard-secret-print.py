@@ -635,6 +635,9 @@ def _brace_expand(
             if sequence is None:
                 ends = _SEQUENCE_ENDPOINTS.match(spelled)
                 if ends and ends[1].lstrip("-").isdigit() == ends[2].lstrip("-").isdigit():
+                    # Bash 5.2 expands a brace nested in such a sequence and 5.3 keeps it literal.
+                    if ("src", "{") in units[start + 1 : end]:
+                        raise ValueError("brace inside an invalid-step sequence, which Bash versions read differently")
                     # Valid endpoints, invalid step: Bash keeps the whole brace and expands the text after it alone.
                     return _brace_expand(units, end + 1, budget, starts | {end + 1})
                 # Otherwise Bash leaves only this opening brace as written and reads on.
