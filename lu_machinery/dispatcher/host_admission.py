@@ -6,14 +6,17 @@ The retained admission scanner and ownership ledger read the same hold format.
 
 import contextlib
 import http.client
+import json
 import os
+import re
+import stat
 import subprocess
 import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, safe_open
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import store
 from lu_machinery.orchestration import dispatch_admission as legacy
@@ -152,106 +155,244 @@ def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None, orchestrat
     return decision
 
 
-def stream_holders(stream, task_id):
-    """The other orchestrator turns that may still run on ``stream`` (DRIVERS-1122).
+# One orchestrator turn's stream reservation (DRIVERS-1122): batch_state/streams/<stream>.reservation, beside
+# the task store whose admission lock serializes every dispatcher. That file alone says a stream is occupied:
+# no task record, archive or record damage frees or holds a stream. reserve() publishes it under the admission
+# lock before the turn's hold; settlement unlinks it last, once the run is proven gone (worker._release_stream).
+# Nothing else removes it: there is no expiry, reclaim or reconcile command in PR 1.
+# {"schema": RESERVATION_SCHEMA, "stream": "epic:<N>", "task_id": <id>, "run_nonce": <32 hex>,
+#  "worktree_path": <the turn's absolute tree path>, "reserved_at": <ISO-8601 UTC>}
+RESERVATION_SCHEMA = "lu.dispatch.stream-reservation.v1"
+RESERVATIONS_DIR_NAME = "streams"
+RESERVATION_SUFFIX = ".reservation"
+_RESERVATION_MAX_BYTES = 16 * 1024
+_RESERVATION_FIELDS = frozenset({"schema", "stream", "task_id", "run_nonce", "worktree_path", "reserved_at"})
+# The most entries a reservation directory holds before a scan refuses: one per stream, never this many.
+_RESERVATION_MAX_ENTRIES = 1024
+_NONCE = re.compile(r"[0-9a-f]{32}")
 
-    A turn holds its stream until its record is terminal and its provider is proven gone
-    (``_provider_gone``): an admission hold, a live run, a settled run whose provider lingers,
-    a crashed run and any fallback launch all hold it. The scan holds the task store's archive
-    lock, so no record is mid-way between the hot store and the archive, and it reads every
-    ``*.json`` file in both. An unknown status, an unlistable store, and a record that is
-    unreadable, vanished, damaged, malformed or a foreign-looking object that still names a turn
-    each hold every stream: the reservation fails closed.
+
+class ReservationUnsafe(Exception):
+    """A reservation (or its directory) that cannot be read as one: it holds, with this typed reason."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def reservations_dir() -> Path:
+    """``batch_state/streams``: beside the task store, whose admission lock guards every reservation write."""
+    return tasks_dir().parent / RESERVATIONS_DIR_NAME
+
+
+def _reservations_fd(*, create: bool) -> int | None:
+    """A descriptor of the verified reservation directory, or None when it does not exist (never with ``create``).
+
+    The directory is ``streams`` beside the task store, opened without following a symlink; it must be a
+    directory the current user owns that no group or other user can write.
     """
-    from lu_machinery.dispatcher.worker import _provider_alive
-    from lu_machinery.orchestration.task_record_store import parse_task_record, task_archive_lock
-
-    holders = []
-    root = tasks_dir()
-    with task_archive_lock(root):  # shared: archive and restore move records only under its exclusive side
-        try:
-            listed = _store_files(root)
-        except OSError as exc:
-            return [f"(the task store cannot be listed: {type(exc).__name__})"]
-        for path in listed:
-            try:
-                raw = path.read_bytes()
-                record = parse_task_record(path, raw)
-                other = legacy.orchestrator_stream(record) if isinstance(record, dict) else None
-            except (OSError, ValueError) as exc:
-                holders.append(f"{path.stem} (record unreadable or damaged: {type(exc).__name__})")
-                continue
-            if record is None and _names_a_turn(raw):
-                holders.append(f"{path.stem} (a turn record without its task identity)")
-                continue
-            if other is None or record.get("task_id") == task_id or other != stream:
-                continue
-            status = record.get("status")
-            if not (isinstance(status, str) and status in store.TERMINAL):
-                holders.append(str(record.get("task_id")))
-            elif not _provider_gone(_provider_alive, record):
-                holders.append(f"{record.get('task_id')} ({status}; provider not proven gone)")
-    return holders
-
-
-def _store_files(root):
-    """The record candidates in the hot store, then its archive: ``iter_task_records``'s selection, raising instead.
-
-    That iterator skips a directory it cannot read; here only an absent archive lists nothing. Dispatcher
-    sidecars (boundary and sandbox receipts, saved tool results) are not candidates.
-    """
-    from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME, _is_dispatcher_sidecar
-
-    archive = root / ARCHIVE_DIR_NAME
+    parent = tasks_dir().parent
     try:
-        archived = sorted(os.listdir(archive))
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except FileNotFoundError:
-        archived = []
-    paths = [root / name for name in sorted(os.listdir(root))] + [archive / name for name in archived]
-    return [path for path in paths if path.name.endswith(".json") and not _is_dispatcher_sidecar(path)]
-
-
-def _names_a_turn(raw):
-    """Whether bytes the record parser called foreign still decode to an object that names a turn."""
+        if create:
+            raise ReservationUnsafe("orchestrator_reservation_dir_unsafe: the task store's parent is missing") from None
+        return None
+    except OSError as exc:
+        raise ReservationUnsafe(f"orchestrator_reservation_dir_unreadable: {type(exc).__name__}") from None
     try:
-        value = json_depth.loads(raw.decode("utf-8"), max_depth=store._JSON_MAX_DEPTH)
-    except (ValueError, RecursionError):
-        return False
-    return isinstance(value, dict) and legacy.ORCHESTRATOR_KEY in value
-
-
-def _provider_gone(provider_alive, record):
-    """True only when a terminal turn's provider is proven gone, from affirmative evidence.
-
-    Only a scope launch can prove it: its cgroup holds every descendant, and the kernel never
-    removes a cgroup that still holds a process, so its probe (``worker._provider_alive``)
-    answering False is the proof. A popen-fallback launch records one process group, which a
-    descendant can leave, so nothing proves it gone; it holds its stream. A run that never
-    launched has no pid, process start, provider group, fallback survivors or ``launch_*``
-    field, and names a non-blank never-started reason or a never-ran return reason. Anything
-    else, a damaged field or a probe error included, is not proof.
-    """
-    if "launch_mode" in record:
-        if record["launch_mode"] != _SCOPE_LAUNCH:
-            return False
+        if create:
+            with contextlib.suppress(FileExistsError):
+                os.mkdir(RESERVATIONS_DIR_NAME, 0o700, dir_fd=parent_fd)
         try:
-            return provider_alive(record) is False
-        except Exception:  # a malformed liveness field never ends the scan or frees the stream
-            return False
-    if any(record.get(key) is not None for key in _LAUNCH_EVIDENCE) or any(
-            key.startswith("launch_") and value is not None for key, value in record.items()):
+            fd = os.open(RESERVATIONS_DIR_NAME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent_fd)
+        except FileNotFoundError:
+            if create:
+                raise ReservationUnsafe("orchestrator_reservation_dir_unsafe: the directory vanished") from None
+            return None
+        except OSError as exc:  # ELOOP: a symlink; ENOTDIR: a file
+            raise ReservationUnsafe(f"orchestrator_reservation_dir_unsafe: not a directory ({type(exc).__name__})") \
+                from None
+    finally:
+        os.close(parent_fd)
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        os.close(fd)
+        raise ReservationUnsafe("orchestrator_reservation_dir_unsafe: not owned by this user, or writable by others")
+    return fd
+
+
+def _unique_keys(pairs):
+    keys = [key for key, _value in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def _read_reservation(dir_fd: int, name: str) -> dict | None:
+    """The valid reservation stored at ``name``, or None when that entry is missing.
+
+    Read without following a symlink or blocking on a FIFO, and at most ``_RESERVATION_MAX_BYTES``; any other
+    state raises ``ReservationUnsafe``.
+    """
+    stream = name.removesuffix(RESERVATION_SUFFIX)
+    try:
+        fd = safe_open.safe_open_below(dir_fd, name, os.O_RDONLY, blocking=False)
+    except FileNotFoundError:
+        return None
+    except safe_open.UnsafeEntryError:
+        raise ReservationUnsafe(f"orchestrator_reservation_unsafe: {stream:.80}'s reservation is a symlink, not a "
+                                "regular file, or not owned by this user") from None
+    except OSError as exc:
+        raise ReservationUnsafe(f"orchestrator_reservation_unreadable: {stream:.80} ({type(exc).__name__})") from None
+    chunks, size = [], 0
+    try:
+        while size <= _RESERVATION_MAX_BYTES and (chunk := os.read(fd, _RESERVATION_MAX_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise ReservationUnsafe(f"orchestrator_reservation_unreadable: {stream:.80} ({type(exc).__name__})") from None
+    finally:
+        os.close(fd)
+    if size > _RESERVATION_MAX_BYTES:
+        raise ReservationUnsafe(f"orchestrator_reservation_oversized: {stream:.80}")
+    try:
+        value = json_depth.loads(b"".join(chunks).decode("utf-8"), max_depth=2, object_pairs_hook=_unique_keys)
+    except (ValueError, RecursionError):
+        value = None
+    if not (isinstance(value, dict) and set(value) == _RESERVATION_FIELDS and value["schema"] == RESERVATION_SCHEMA
+            and value["stream"] == stream and _valid_task_id(value["task_id"])
+            and isinstance(value["run_nonce"], str) and _NONCE.fullmatch(value["run_nonce"])
+            and isinstance(value["worktree_path"], str) and os.path.isabs(value["worktree_path"])
+            and store.parse_utc_timestamp(value["reserved_at"]) is not None):
+        raise ReservationUnsafe(f"orchestrator_reservation_malformed: {stream:.80}")
+    return value
+
+
+def _valid_task_id(value) -> bool:
+    try:
+        return isinstance(value, str) and bool(store.record_path(value))
+    except ValueError:
         return False
-    started, ran = record.get("never_started_reason"), record.get("returncode_reason")
-    return (isinstance(started, str) and bool(started.strip())) or (isinstance(ran, str) and ran in _NEVER_RAN)
 
 
-# The one launch whose probe sees every descendant (dispatch_isolation.LAUNCH_SCOPE).
-_SCOPE_LAUNCH = "scope"
-# Fields a supervisor writes once it runs (besides every ``launch_*`` field): any of them contradicts a
-# claim that the run never started.
-_LAUNCH_EVIDENCE = ("pid", "process_start", "provider_pgid", "fallback_survivors")
-# A launch the dispatcher itself recorded as never having produced a provider (worker._provider_alive).
-_NEVER_RAN = frozenset({"spawn_process_missing", "dispatch_died_after_admission", "spawn_setup_failed"})
+def _busy(reservation: dict) -> str:
+    return (f"orchestrator_stream_busy: {reservation['stream']} is reserved by turn {reservation['task_id']} "
+            f"(run {reservation['run_nonce']}) until its settlement proves the run gone")
+
+
+def stream_refusal(stream: str) -> str | None:
+    """Why ``stream`` is not free (reserved, or its reservation unreadable), or None; reads and writes nothing else."""
+    try:
+        fd = _reservations_fd(create=False)
+        if fd is None:
+            return None
+        try:
+            current = _read_reservation(fd, stream + RESERVATION_SUFFIX)
+        finally:
+            os.close(fd)
+    except ReservationUnsafe as exc:
+        return exc.reason
+    except OSError as exc:
+        return f"orchestrator_reservation_unreadable: {type(exc).__name__}"
+    return None if current is None else _busy(current)
+
+
+def _publish_reservation(dir_fd: int, stream: str, task_id: str, run_nonce: str, worktree_path: str) -> None:
+    """Create ``stream``'s reservation exclusively and make it durable; a crash part way leaves it held (malformed)."""
+    name = stream + RESERVATION_SUFFIX
+    if not (isinstance(worktree_path, str) and os.path.isabs(worktree_path)):
+        raise ReservationUnsafe("orchestrator_reservation_refused: the turn's tree path must be absolute")
+    body = json.dumps(dict(schema=RESERVATION_SCHEMA, stream=stream, task_id=task_id, run_nonce=run_nonce,
+                           worktree_path=worktree_path, reserved_at=store.now()), sort_keys=True).encode() + b"\n"
+    if len(body) > _RESERVATION_MAX_BYTES:
+        raise ReservationUnsafe("orchestrator_reservation_oversized: the turn's tree path is too long")
+    fd = safe_open.safe_open_below(dir_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        try:
+            view = memoryview(body)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(dir_fd)
+    except OSError:
+        # This call created the entry (O_EXCL) under the admission lock, and nothing has launched yet.
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=dir_fd)
+        raise
+
+
+def release_stream(stream: str, task_id: str, run_nonce: str) -> str | None:
+    """Unlink ``stream``'s reservation when it is exactly this run's; None once released, else why it stays.
+
+    Taken under the admission lock (never inside a task-state lock), like publication.
+    """
+    try:
+        with legacy.admission_lock(tasks_dir()):
+            fd = _reservations_fd(create=False)
+            if fd is None:
+                return "orchestrator_reservation_missing"
+            try:
+                name = stream + RESERVATION_SUFFIX
+                current = _read_reservation(fd, name)
+                if current is None:
+                    return "orchestrator_reservation_missing"
+                if current["task_id"] != task_id or current["run_nonce"] != run_nonce:
+                    return "orchestrator_reservation_foreign: the reservation names another task or run"
+                os.unlink(name, dir_fd=fd)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except ReservationUnsafe as exc:
+        return exc.reason
+    except (OSError, legacy.AdmissionLockTimeout) as exc:
+        return f"orchestrator_reservation_release_failed: {type(exc).__name__}"
+    return None
+
+
+def turn_writer_refusal(*, task_ids=(), tree=None) -> str | None:
+    """Why a task service or a ``--cwd`` attachment would add a writer to an orchestrator turn, or None.
+
+    It would when a reservation names one of ``task_ids`` or the tree ``tree``. Attribution is the
+    reservation, so a turn record that lost its ``orchestrator`` key is still a turn. A missing task store,
+    an unsafe or unlistable directory, a foreign entry or any unreadable reservation refuses as well:
+    whose it is is unknown.
+    """
+    from lu_machinery.session_streams.model import STREAM_ID_RE
+
+    if tree is not None:
+        from lu_machinery.dispatcher.worker import _same_tree
+
+    if not tasks_dir().is_dir():
+        return "orchestrator_reservation_unknown: the task store is missing"
+    try:
+        fd = _reservations_fd(create=False)
+        if fd is None:
+            return None
+        try:
+            names = os.listdir(fd)
+            if len(names) > _RESERVATION_MAX_ENTRIES:
+                return "orchestrator_reservation_unknown: the reservation directory holds too many entries"
+            for name in sorted(names):
+                stream = name.removesuffix(RESERVATION_SUFFIX)
+                if name == stream or not STREAM_ID_RE.fullmatch(stream) or not stream.startswith("epic:"):
+                    return "orchestrator_reservation_unknown: the reservation directory holds a foreign entry"
+                current = _read_reservation(fd, name)
+                if current is None:
+                    continue  # released since the listing
+                if current["task_id"] in task_ids or (tree is not None and _same_tree(current["worktree_path"], tree)):
+                    return (f"orchestrator_turn_writer_refused: {current['task_id']} is the orchestrator turn on "
+                            f"{stream}, which writes no product change")
+        finally:
+            os.close(fd)
+    except ReservationUnsafe as exc:
+        return exc.reason
+    except OSError as exc:
+        return f"orchestrator_reservation_unknown: {type(exc).__name__}"
+    return None
 
 
 # The states Monitor's /api/epics/v1 projection names (epics_router._lease_payload; SessionState).
@@ -312,18 +453,40 @@ def check_credit(agent, model, codex_account=None):
         raise Refused(f"❌ dispatch refused: {refusal}", 2)
 
 
+def _claim_stream(stream, task_id, run_nonce, tree):
+    """Publish ``stream``'s reservation for this run; None once published, else why the stream is not free.
+
+    The caller holds the admission lock. Only a missing entry in the verified directory is free: a valid
+    reservation, whatever task id or record it names, and an unsafe, unreadable or malformed one refuse.
+    """
+    try:
+        fd = _reservations_fd(create=True)
+        try:
+            current = _read_reservation(fd, stream + RESERVATION_SUFFIX)
+            if current is not None:
+                return _busy(current)
+            _publish_reservation(fd, stream, task_id, run_nonce, tree)
+        finally:
+            os.close(fd)
+    except ReservationUnsafe as exc:
+        return exc.reason
+    return None
+
+
 @contextlib.contextmanager
 def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, spec=None, orchestrator=None,
-            linkage=None):
+            linkage=None, tree=None):
     """Publish a creation hold for either mode; release unused setup only when its tree is absent.
 
-    An orchestrator turn (``orchestrator`` is its ``{"stream": ...}`` record field) reserves its stream
-    in the same step: under the admission lock, after the sweep settles dead records, another turn that
-    may still run on the stream refuses it, and the hold it publishes names the stream, so a concurrent
-    dispatch sees it. No ``--force-admission`` reason overrides the reservation. ``linkage`` (the parent
-    fields of a task dispatched from inside another run) is in the hold before anything spawns.
+    An orchestrator turn (``orchestrator`` is its ``{"stream": ...}`` record field, ``tree`` its planned
+    worktree path) first publishes its stream's reservation file in the same admission-locked step, so a
+    crash after it leaves the stream held; a stream with any reservation file refuses, and no
+    ``--force-admission`` reason or reused task id overrides it. When this dispatch ends before any
+    supervisor could start (no published record names a prompt file or a pid), the reservation is released;
+    otherwise only the turn's settlement releases it. ``linkage`` (the parent fields of a task dispatched
+    from inside another run) is in the hold before anything spawns.
     """
-    hold = None
+    hold = reservation = None
     meter, budget = _meter_budget(spec)
     try:
         refusal = None
@@ -331,12 +494,12 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
             with legacy.admission_lock(tasks_dir()):
                 current = evaluate(mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard(),
                                    meter=meter, budget=budget, orchestrator=orchestrator is not None)
-                holders = stream_holders(orchestrator["stream"], task_id) if orchestrator is not None else []
-                if holders:
-                    refusal = Refused(f"❌ orchestrator_stream_busy: {orchestrator['stream']} has another orchestrator "
-                                      f"turn that may still run: {', '.join(holders[:10])}", 3)
-                elif allows(current, force_reason):
+                if allows(current, force_reason):
                     nonce = uuid.uuid4().hex
+                    if orchestrator is not None:
+                        if busy := _claim_stream(orchestrator["stream"], task_id, nonce, tree):
+                            raise _StreamBusy(busy)
+                        reservation = (orchestrator["stream"], task_id, nonce)
                     owner = legacy.new_admission_hold(nonce)
                     hold = dict(schema_version=2, task_id=task_id, agent=agent, run_nonce=nonce, status="spawning", pid=None,
                                 mode=mode, started_at=owner["admitted_at"], finished_at=None, admission_hold=owner,
@@ -354,6 +517,8 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
                         store._write(path, hold, exclusive=True)
                 else:
                     refusal = Refused(f"❌ {current.refusal_line()}", 4 if current.disk_refused else 3)
+        except _StreamBusy as exc:
+            refusal = Refused(f"❌ {exc}", 3)
         except legacy.AdmissionLockTimeout as exc:
             raise Refused(f"❌ dispatch admission lock unavailable: {exc}; retry the dispatch", 3) from exc
         except (OSError, RuntimeError) as exc:
@@ -362,12 +527,16 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
             raise refusal
         yield hold
     finally:
+        # Unknown until the record shows otherwise: a supervisor may have started.
+        launched = hold is not None
         if hold is not None:
             path = store.record_path(task_id)
             with contextlib.suppress(OSError), task_state_lock(path):
                 current = store.read(task_id, missing_ok=True)
-                if (current is not None and current.get("run_nonce") == hold["run_nonce"]
-                        and current.get("status") in store.ACTIVE and legacy.is_admission_hold_record(current)
+                mine = current is not None and current.get("run_nonce") == hold["run_nonce"]
+                # A supervisor starts only from a published record that names its prompt file (store.create).
+                launched = mine and ("prompt_file" in current or current.get("pid") is not None)
+                if (mine and current.get("status") in store.ACTIVE and legacy.is_admission_hold_record(current)
                         and "prompt_file" not in current):  # store.create handed this record to the supervisor
                     tree_absent = not current.get("worktree_path")
                     if not tree_absent:
@@ -377,3 +546,10 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
                             tree_absent = True
                     if tree_absent:
                         path.unlink(missing_ok=True)
+        # A known pre-launch abort: nothing of this run can write, so its stream is free again.
+        if reservation is not None and not launched and (reason := release_stream(*reservation)):
+            print(f"dispatcher: {reservation[0]} stays reserved: {reason}", file=sys.stderr)
+
+
+class _StreamBusy(Exception):
+    """The stream already has a reservation, or one that cannot be read (its typed reason)."""

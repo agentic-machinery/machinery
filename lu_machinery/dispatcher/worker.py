@@ -724,14 +724,13 @@ def _turn_tree_unproven(record: dict) -> bool:
 
     A turn is judged on its final tree, so nothing it started may still write it when the snapshot is taken.
     Only a scope launch can prove that: its cgroup holds every descendant, while a fallback launch records one
-    process group, which a descendant can leave. A service is its own unit, so its stop must be verified too,
-    and another task still working in the turn's tree (dispatched there with --cwd) may write it as well.
+    process group, which a descendant can leave. No other task can write the tree: dispatch refuses a --cwd
+    attachment to it and a turn's task service (host_admission.turn_writer_refusal); any service stop is
+    still verified.
     """
     if record.get("launch_mode") != "scope":
         return True
     try:
-        if _borrowed(record):
-            return True
         _stop_task_services(record)
         stops = record.get("task_service_stops")
         if stops is not None and (not isinstance(stops, list) or any(
@@ -740,6 +739,34 @@ def _turn_tree_unproven(record: dict) -> bool:
         return _liveness_kept(record, _end_own_scope(record), time.monotonic() + SETTLE_PATIENCE) is not None
     except Exception:  # an unreadable boundary is not proof, and never ends this settlement
         return True
+
+
+def _release_stream(record: dict) -> None:
+    """Free a settled orchestrator turn's stream once nothing of its run can write (DRIVERS-1122).
+
+    Only on proof: the published record is terminal and still this run's turn, its launch was a scope whose
+    probe (``_provider_alive``) answers False, so every descendant has exited, and it lists no task service.
+    A fallback launch, a probe error, a damaged or replaced record and anything unknown keep the reservation;
+    so does a supervisor that dies first. The reservation file is released only for this task id and nonce.
+    """
+    from lu_machinery.dispatcher import host_admission
+    from lu_machinery.orchestration import dispatch_isolation
+    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+
+    try:
+        published = store.read(record["task_id"], record["run_nonce"])
+        if not isinstance(published, dict):
+            return
+        stream = orchestrator_stream(published)
+        if (stream is None or stream != orchestrator_stream(record) or not _finished(published)
+                or published.get("launch_mode") != "scope"
+                or dispatch_isolation.listed_task_services(published) != []
+                or _provider_alive(published) is not False):
+            return
+    except Exception:  # any unreadable state is not proof, and never ends this settlement
+        return
+    if reason := host_admission.release_stream(stream, published["task_id"], published["run_nonce"]):
+        print(f"dispatcher: {stream} stays reserved: {reason}", file=sys.stderr)
 
 
 def _enforce_delivery(record: dict) -> None:
@@ -896,10 +923,14 @@ def _provider_alive(record: dict) -> bool | None:
             return None
         cgroups = [*cgroups, *(sibling for sibling in siblings if sibling not in cgroups)]
         controllers = Path("/sys/fs/cgroup/cgroup.controllers").exists()
-        alive = False
+        alive = nested = False
         for cgroup in cgroups:
             try:
                 procs = Path("/sys/fs/cgroup" + cgroup, "cgroup.procs").read_text().split()
+                # cgroup.procs names only the scope's own members: a process moved into a child cgroup is in
+                # none of them, so the probe proves exit only for a leaf scope (systemd delegates none).
+                with os.scandir("/sys/fs/cgroup" + cgroup) as entries:
+                    nested = nested or any(entry.is_dir(follow_symlinks=False) for entry in entries)
             except FileNotFoundError:
                 # The kernel refuses to remove a cgroup that still holds processes, so a gone scope is empty.
                 if not controllers:
@@ -908,6 +939,8 @@ def _provider_alive(record: dict) -> bool | None:
             except OSError:
                 return None
             alive = alive or any(int(pid) != os.getpid() for pid in procs)
+        if not alive and nested:
+            return None
         # No scope under the unit's name is a gone scope, which held nothing, on a cgroup v2 host.
         return alive if cgroups or controllers else None
     if "provider_pgid" not in record:
@@ -2341,6 +2374,9 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     store.replace(record, path, require_existing=True)
                 except store.TaskRecordError:
                     store.publish_failed_record(record, path)
+            if "orchestrator" in record:
+                # Last, outside the task-state lock (admission's lock order): nothing may follow the release.
+                _release_stream(record)
         finally:
             if draft_fd is not None:
                 os.close(draft_fd)

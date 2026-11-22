@@ -418,7 +418,7 @@ def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
                          "(--initiator claude-cto, from outside any dispatched task)")
     if agent == "opencode" and args.provider == SAVANT_PROVIDER:
         raise ValueError("orchestrator_entry_refused: a Savant run cannot be an orchestrator turn")
-    # Every record scan skips a file named like a dispatcher sidecar, so such a turn would hold no stream.
+    # Every task-store scan (sweeps, child linkage) skips a file named like a dispatcher sidecar.
     if args.task_id is not None and task_record_store._is_dispatcher_sidecar(store.record_path(args.task_id)):
         raise ValueError("orchestrator_entry_refused: --task-id ends like a dispatcher sidecar file name")
     # Identity, not equality: --pr 0 is a given flag, though 0 == False.
@@ -818,13 +818,12 @@ def _dispatch(args) -> int:
         )
     if orchestrator is not None:
         # Monitor holds the legacy leases, so this probe runs outside the admission lock; the turn's own
-        # reservation is atomic in reserve(). A dry run also reports a busy stream, without a lock.
+        # reservation is published atomically in reserve(). A dry run reads the reservation file, writing nothing.
         with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
             if refusal := host_admission.legacy_lease_refusal(orchestrator["stream"]):
                 raise host_admission.Refused(f"❌ {refusal}", 3)
-            if args.dry_run and (holders := host_admission.stream_holders(orchestrator["stream"], task_id)):
-                raise host_admission.Refused(f"❌ orchestrator_stream_busy: {orchestrator['stream']} has another "
-                                             f"orchestrator turn that may still run: {', '.join(holders[:10])}", 3)
+            if args.dry_run and (busy := host_admission.stream_refusal(orchestrator["stream"])):
+                raise host_admission.Refused(f"❌ {busy}", 3)
     if args.dry_run:
         # The real run re-checks child_env after worktree creation in worker.py.
         invocation = runtime_context.build(spec, child_env(spec))
@@ -865,7 +864,7 @@ def _dispatch(args) -> int:
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,
                 spec=spec,
                 disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
-                orchestrator=orchestrator, linkage=linkage,
+                orchestrator=orchestrator, linkage=linkage, tree=str(worktree),
             ))
         with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
             if binding:
@@ -907,6 +906,9 @@ def _dispatch(args) -> int:
                 with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
                     if args.cwd and not worktree.is_dir():
                         raise ValueError("cwd worktree was removed before the task started")
+                    # An orchestrator turn's tree is judged unchanged at its settlement: no other task may write it.
+                    if args.cwd and (refusal := host_admission.turn_writer_refusal(tree=str(worktree))):
+                        raise ValueError(refusal)
                     if args.cwd and args.mode == "workspace-write" and git.agent_deploy_enrolled(worktree, sha):
                         # Another task in a borrowed tree could commit, enroll or redeploy at any moment, so only a
                         # tree this dispatch creates gets, and keeps, the deployment its start commit composes.

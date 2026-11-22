@@ -4,7 +4,7 @@ The tests own their data: a private task store, a scripted Monitor (an in-proces
 server for the subprocess dispatcher) and the dispatcher sandbox's stub provider.
 """
 
-import fcntl
+import contextlib
 import io
 import json
 import os
@@ -13,15 +13,15 @@ import sys
 import threading
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
-from lu_machinery.dispatcher import git, host_admission, ownership, store, worker
+from lu_machinery.dispatcher import environment, git, host_admission, ownership, store, worker
 from lu_machinery.orchestration import dispatch_admission, task_record_store
 from lu_machinery.session_supervisor import remote
 from tests.dispatcher.conftest import await_file, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-from tests.wait_helpers import wait_until
 
 STREAM = "epic:7"
 TASK_ENV = ownership.TASK_ID_ENV
@@ -152,147 +152,317 @@ def test_a_turn_takes_no_write_slot_but_keeps_the_host_checks(task_store, monkey
     assert (scan.live_on_meter, scan.last_meter_launch_age_s is not None) == (0, True)
 
 
-def test_concurrent_turns_on_one_stream_get_one_reservation(task_store):
-    """Defect class: two turns admitted at once on one stream (check-then-act race), or a stream never released."""
+# A dispatcher process that reserves a stream on "go", reports, and holds the reservation until "done" (stdin).
+_CONTENDER = """
+import sys
+from lu_machinery.dispatcher import host_admission
+task_id, stream = sys.argv[1:3]
+decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+print("ready", flush=True)
+sys.stdin.readline()
+try:
+    with host_admission.reserve(task_id, "workspace-write", decision, agent="claude", disk_guard=lambda: False,
+                                orchestrator={"stream": stream}, tree="/trees/" + task_id):
+        print("held", flush=True)
+        sys.stdin.readline()
+except host_admission.Refused as exc:
+    print("refused", exc.code, exc, flush=True)
+"""
+
+
+def _reservation(stream=STREAM):
+    return host_admission.reservations_dir() / f"{stream}{host_admission.RESERVATION_SUFFIX}"
+
+
+def _reserve(task_id, stream=STREAM, *, force_reason=None):
+    """Reserve ``stream`` for ``task_id`` as dispatch does; the hold's record is then handed on, as to a supervisor."""
     decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
-    contenders = 6
-    start, release = threading.Barrier(contenders + 1), threading.Event()
-    holds, refusals, errors = [], [], []
+    with host_admission.reserve(task_id, "workspace-write", decision, agent="claude", disk_guard=lambda: False,
+                                force_reason=force_reason, orchestrator={"stream": stream},
+                                tree=f"/trees/{task_id}") as hold:
+        store.replace({**hold, "prompt_file": "/prompts/turn.md"}, store.record_path(task_id))
+    return hold
 
-    def contend(task_id, stream):
-        try:
-            start.wait()
-            with host_admission.reserve(task_id, "workspace-write", decision, agent="claude", disk_guard=lambda: False,
-                                        orchestrator={"stream": stream}) as hold:
-                holds.append(hold)
-                release.wait(30)
-        except host_admission.Refused as exc:
-            refusals.append((task_id, exc.code, str(exc)))
-        except Exception as exc:  # surfaced below; a thread must not swallow it
-            errors.append(exc)
 
-    threads = [threading.Thread(target=contend, args=(f"turn-{n}", STREAM)) for n in range(contenders - 1)]
-    threads.append(threading.Thread(target=contend, args=("other-stream", "epic:8")))
-    for thread in threads:
-        thread.start()
-    start.wait()
+def test_dispatch_processes_contending_for_one_stream_get_one_reservation(task_store):
+    """Defect class: two dispatcher processes both admit a turn on one stream (check-then-act across processes),
+    one stream's reservation blocks another stream, or a hold that ends unused keeps its stream."""
+    contenders = [(f"turn-{n}", STREAM) for n in range(4)] + [("other", "epic:8")]
+    procs = [subprocess.Popen([sys.executable, "-c", _CONTENDER, task_id, stream], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for task_id, stream in contenders]
     try:
-        wait_until(lambda: len(holds) + len(refusals) + len(errors) == contenders, timeout=30,
-                   message="every contender reserved or was refused")
-        assert not errors
-        assert sorted(hold[dispatch_admission.ORCHESTRATOR_KEY]["stream"] for hold in holds) == ["epic:7", "epic:8"]
-        assert len(refusals) == contenders - 2
-        assert all(code == 3 and "orchestrator_stream_busy: epic:7" in text for _, code, text in refusals)
-        [winner] = [hold for hold in holds if hold["orchestrator"]["stream"] == STREAM]
-        assert store.read(winner["task_id"])["orchestrator"] == {"stream": STREAM}  # visible to every dispatcher
+        for proc in procs:
+            assert proc.stdout.readline() == "ready\n", proc.stderr.read()
+        for proc in procs:  # every process has its admission decision; now they all reserve at once
+            proc.stdin.write("go\n")
+            proc.stdin.flush()
+        results = [proc.stdout.readline() for proc in procs]
+        held = [task_id for (task_id, _stream), line in zip(contenders, results, strict=True) if line == "held\n"]
+        assert len(held) == 2 and "other" in held, results
+        [winner] = [task_id for task_id in held if task_id != "other"]
+        refused = [line for line in results if line.startswith("refused")]
+        assert len(refused) == 3
+        assert all(line.startswith(f"refused 3 ❌ orchestrator_stream_busy: {STREAM} is reserved by turn {winner} ")
+                   for line in refused), refused
+        assert json.loads(_reservation().read_text())["task_id"] == winner
+        assert json.loads(_reservation("epic:8").read_text())["task_id"] == "other"
     finally:
-        release.set()
-        for thread in threads:
-            thread.join(30)
-    # The holds ended unused, so the stream is free again.
-    with host_admission.reserve("turn-next", "workspace-write", decision, agent="claude", disk_guard=lambda: False,
-                                orchestrator={"stream": STREAM}) as hold:
-        assert hold["orchestrator"] == {"stream": STREAM}
+        for proc in procs:
+            with contextlib.suppress(BrokenPipeError, ValueError):
+                proc.stdin.write("done\n")
+                proc.stdin.close()
+            proc.wait(timeout=60)
+    # Each hold ended before any supervisor could start, so both streams are free again.
+    assert not _reservation().exists() and not _reservation("epic:8").exists()
+    assert _reserve("turn-next")["orchestrator"] == {"stream": STREAM}
+
+
+def test_a_crash_between_the_reservation_and_the_hold_leaves_the_stream_held(task_store):
+    """Defect class: a dispatcher that dies after reserving and before publishing its hold frees the stream."""
+    crash = ("import os, sys\nfrom lu_machinery.dispatcher import host_admission, store\n"
+             "store._write = lambda *_a, **_k: os._exit(9)\n" + _CONTENDER.split("print(\"ready\"", 1)[0]
+             + "with host_admission.reserve(task_id, 'workspace-write', decision, agent='claude', disk_guard=lambda: False,"
+             " orchestrator={'stream': stream}, tree='/trees/' + task_id):\n    pass\n")
+    result = subprocess.run([sys.executable, "-c", crash, "turn", STREAM], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 9, result.stderr
+    assert store.read("turn", missing_ok=True) is None  # no hold, no record
+    assert json.loads(_reservation().read_text())["task_id"] == "turn"
+    for task_id in ("turn", "turn-2"):  # neither the same task id nor another one gets the stream
+        with pytest.raises(host_admission.Refused, match="orchestrator_stream_busy: epic:7 is reserved by turn turn "):
+            _reserve(task_id)
+    assert host_admission.stream_refusal(STREAM).startswith("orchestrator_stream_busy")
+
+
+def test_release_needs_the_reserving_task_and_run(task_store):
+    """Defect class: a stale run (or another task) releases a stream that a newer turn reserved."""
+    hold = _reserve("turn")
+    for task_id, nonce in (("turn", "f" * 32), ("other", hold["run_nonce"]), ("turn", hold["run_nonce"].upper())):
+        assert host_admission.release_stream(STREAM, task_id, nonce).startswith("orchestrator_reservation_foreign")
+        assert _reservation().exists()
+    assert host_admission.release_stream(STREAM, "turn", hold["run_nonce"]) is None
+    assert not _reservation().exists()
+    assert host_admission.release_stream(STREAM, "turn", hold["run_nonce"]) == "orchestrator_reservation_missing"
+
+
+@pytest.mark.parametrize("damage", ["deleted", "archived", "truncated", "key-lost", "foreign", "fifo"])
+def test_occupancy_is_the_reservation_alone_whatever_the_task_records_say(task_store, damage):
+    """Defect class: a deleted, archived, damaged or identity-less turn record (or a non-regular file in the store)
+    frees, or blocks, a stream; a force reason or a reused task id bypasses a reservation."""
+    _reserve("turn")
+    path = store.record_path("turn")
+    if damage == "deleted":
+        path.unlink()
+    elif damage == "archived":
+        archive = task_store / task_record_store.ARCHIVE_DIR_NAME
+        archive.mkdir()
+        path.rename(archive / path.name)
+    elif damage == "truncated":
+        path.write_text(path.read_text()[:20])
+    elif damage == "key-lost":
+        path.write_text(json.dumps({key: value for key, value in json.loads(path.read_text()).items()
+                                    if key != "orchestrator"}))
+    elif damage == "foreign":
+        path.write_text(json.dumps({"orchestrator": {"stream": STREAM}}))
+    else:
+        path.unlink()
+        os.mkfifo(path)
+    for task_id in ("turn", "turn-2"):
+        with pytest.raises(host_admission.Refused, match="orchestrator_stream_busy: epic:7 is reserved by turn turn "):
+            _reserve(task_id, force_reason="operator says go")
+    # Another stream is untouched by this one's records, damaged or not.
+    assert _reserve("turn-8", stream="epic:8")["orchestrator"] == {"stream": "epic:8"}
+
+
+def _plant(kind, entry):
+    if kind == "symlink":
+        target = entry.with_name("elsewhere.json")
+        target.write_text("{}")
+        entry.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(entry)
+    elif kind == "directory":
+        entry.mkdir()
+    elif kind == "oversized":
+        entry.write_bytes(b" " * (64 * 1024))
+    elif kind == "empty":
+        entry.write_bytes(b"")
+    else:
+        hold = dict(schema=host_admission.RESERVATION_SCHEMA, stream=STREAM, task_id="turn", run_nonce="a" * 32,
+                    worktree_path="/trees/turn", reserved_at=store.now())
+        text = {
+            "not-json": "{",
+            "not-utf8": b"\xff\xfe".decode("latin-1"),
+            "a-list": "[]",
+            "duplicate-key": json.dumps(hold)[:-1] + ', "task_id": "other"}',
+            "extra-field": json.dumps({**hold, "expires_at": store.now()}),
+            "missing-field": json.dumps({key: value for key, value in hold.items() if key != "run_nonce"}),
+            "other-stream": json.dumps({**hold, "stream": "epic:8"}),
+            "bad-nonce": json.dumps({**hold, "run_nonce": "nonce"}),
+            "bad-task-id": json.dumps({**hold, "task_id": "../turn"}),
+            "relative-tree": json.dumps({**hold, "worktree_path": "trees/turn"}),
+            "bad-time": json.dumps({**hold, "reserved_at": "soon"}),
+            "other-schema": json.dumps({**hold, "schema": "v0"}),
+        }[kind]
+        entry.write_text(text, encoding="latin-1" if kind == "not-utf8" else "utf-8")
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory", "oversized", "empty", "not-json", "not-utf8",
+                                  "a-list", "duplicate-key", "extra-field", "missing-field", "other-stream",
+                                  "bad-nonce", "bad-task-id", "relative-tree", "bad-time", "other-schema"])
+def test_an_unsafe_or_malformed_reservation_holds_its_stream(task_store, kind):
+    """Defect class: a symlinked, non-regular (a FIFO must not block), oversized or malformed reservation file reads
+    as a free stream, or its damage frees or blocks another stream."""
+    directory = host_admission.reservations_dir()
+    directory.mkdir(mode=0o700)
+    _plant(kind, _reservation())
+    reason = host_admission.stream_refusal(STREAM)
+    assert reason is not None and reason.startswith("orchestrator_reservation_"), reason
+    with pytest.raises(host_admission.Refused, match="orchestrator_reservation_"):
+        _reserve("turn")
+    assert store.read("turn", missing_ok=True) is None  # refused before any hold
+    assert host_admission.release_stream(STREAM, "turn", "a" * 32) is not None  # never unlinked
+    assert os.path.lexists(_reservation())
+    assert _reserve("turn-8", stream="epic:8")["orchestrator"] == {"stream": "epic:8"}
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file", "group-writable"])
+def test_an_unsafe_reservation_directory_holds_every_stream(task_store, tmp_path, kind):
+    """Defect class: a planted reservation directory (a symlink, a file, writable by others) is trusted or replaced."""
+    directory = host_admission.reservations_dir()
+    if kind == "symlink":
+        (tmp_path / "planted").mkdir()
+        directory.symlink_to(tmp_path / "planted")
+    elif kind == "file":
+        directory.write_text("")
+    else:
+        directory.mkdir()
+        directory.chmod(0o770)
+    for stream in (STREAM, "epic:8"):
+        assert host_admission.stream_refusal(stream).startswith("orchestrator_reservation_dir_unsafe")
+        with pytest.raises(host_admission.Refused, match="orchestrator_reservation_dir_unsafe"):
+            _reserve("turn", stream=stream)
+    assert host_admission.turn_writer_refusal(task_ids={"worker"}).startswith("orchestrator_reservation_dir_unsafe")
+    if kind == "symlink":
+        assert not list((tmp_path / "planted").iterdir())  # nothing was written through the link
+
+
+def test_a_dry_run_reads_the_stream_without_writing(task_store):
+    """Defect class: a dry run creates the reservation directory or file, or misses a reserved stream."""
+    assert host_admission.stream_refusal(STREAM) is None
+    assert not host_admission.reservations_dir().exists()
+    _reserve("turn")
+    assert host_admission.stream_refusal(STREAM).startswith("orchestrator_stream_busy: epic:7 is reserved by turn turn ")
+    assert host_admission.stream_refusal("epic:8") is None
 
 
 @pytest.mark.parametrize(
-    ("fields", "held"),
+    ("change", "released"),
     [
-        # A terminal scope launch releases its stream once its cgroup probe answers False: the scope holds every
-        # descendant.
-        (dict(status="done", **_LAUNCHED), False),
-        (dict(status="timeout", **_LAUNCHED), False),
-        (dict(status="crashed", **_LAUNCHED), False),
-        (dict(status="done", **_LAUNCHED, probe=True), True),  # settled, provider lingers
-        (dict(status="crashed", **_LAUNCHED, probe=None), True),  # liveness unknown
-        (dict(status="crashed", **_LAUNCHED, probe="raise"), True),  # a probe error is not proof
-        # A fallback launch records one process group, which a descendant can leave: nothing proves it gone.
-        (dict(status="done", **{**_LAUNCHED, "launch_mode": "popen-fallback"}), True),
-        (dict(status="crashed", pid=_DEAD_PID), True),  # launched, but no launch mode: not proof
-        (dict(status="crashed", **{**_LAUNCHED, "launch_mode": "weird"}), True),
-        (dict(status="crashed", **{**_LAUNCHED, "launch_mode": ["scope"]}), True),
-        (dict(status="crashed", **{**_LAUNCHED, "launch_mode": None}), True),
-        (dict(status="crashed"), True),  # no launch evidence, and no reason it never started
-        # A run that never launched: no launch evidence at all, and a reason it never started.
-        (dict(status="failed", never_started_reason="placement"), False),
-        (dict(status="crashed", returncode_reason="dispatch_died_after_admission"), False),
-        (dict(status="failed", never_started_reason="placement", provider_pgid=os.getpgid(0)), True),  # contradicts
-        (dict(status="failed", never_started_reason="placement", launch_fallback_reason="no_bus"), True),
-        (dict(status="failed", never_started_reason="placement", launch_user_bus={"source": "caller"}), True),
-        (dict(status="failed", never_started_reason="   "), True),  # a blank reason names none
-        (dict(status="crashed", returncode_reason=["spawn_setup_failed"]), True),  # wrong type, never an error
-        (dict(status="failed", provider_pgid=None), True),  # no never-started reason
-        (dict(status="mystery"), True),
-        (dict(status="spawning"), True),
-        (dict(status=["running"]), True),  # a status of the wrong type is unknown, never an error
-        (dict(orchestrator={"stream": "epic:8"}), False),
-        # Malformed or non-canonical (dispatch admits only epic:<N>): holds every stream.
-        (dict(orchestrator={"stream": STREAM.upper()}), True),
-        (dict(orchestrator={"stream": "shared:practice"}), True),
-        (dict(orchestrator={"stream": "epic:07"}), True),
-        (dict(orchestrator="epic:7"), True),
+        ({}, True),  # terminal, a scope launch whose probe proves every descendant gone, no task service
+        ({"status": "timeout"}, True),
+        ({"probe": True}, False),  # a process of the run lingers
+        ({"probe": None}, False),  # liveness unknown
+        ({"probe": "raise"}, False),  # a probe error is not proof
+        ({"launch_mode": "popen-fallback"}, False),  # a descendant can leave a fallback launch's process group
+        ({"launch_mode": None}, False),
+        ({"status": "running"}, False),  # not terminal on disk
+        ({"status": ["done"]}, False),
+        ({"task_services": ["lu-task-x"]}, False),  # a service is its own unit, outside the scope probe
+        ({"task_services": "lu-task-x"}, False),  # an unreadable service list
+        ({"orchestrator": {"stream": "epic:8"}}, False),  # the published record names another stream
+        ({"orchestrator": None}, False),
+        ({"run_nonce": "f" * 32}, False),  # the published record is another run's
     ],
 )
-def test_a_stream_stays_reserved_until_its_turn_is_proven_finished(task_store, monkeypatch, fields, held):
-    """Defect class: a stream is released while a crashed turn's provider may still dispatch."""
+def test_settlement_releases_the_stream_only_on_proof_the_run_is_gone(task_store, monkeypatch, change, released):
+    """Defect class: settlement frees a stream while a process or service of the turn may still write, or from a
+    record that is not this run's terminal one."""
+    hold = _reserve("turn")
+    record = _orchestrator_record("turn", **{**_LAUNCHED, "status": "done", "run_nonce": hold["run_nonce"],
+                                             "launch_unit": "lu-worker-turn"})
+    published = {**record, **{key: value for key, value in change.items() if key != "probe"}}
+    path = store.record_path("turn")
+    path.write_text(json.dumps(published))  # raw: the store's writer refuses some of these states
 
-    def probe(record):  # the scope cgroup probe's answer, scripted per record
-        if record.get("probe", False) == "raise":
+    def probe(seen):
+        assert seen["run_nonce"] == published["run_nonce"]
+        if change.get("probe") == "raise":
             raise ValueError("a damaged liveness field")
-        return record.get("probe", False)
+        return change.get("probe", False)
 
     monkeypatch.setattr(worker, "_provider_alive", probe)
-    # Written raw: a damaged record on disk is one the store's own writer would refuse to produce.
-    store.record_path("prior").write_text(json.dumps(_orchestrator_record("prior", **fields)))
-    holders = host_admission.stream_holders(STREAM, "turn")
-    assert bool(holders) is held, holders
+    worker._release_stream(record)
+    assert _reservation().exists() is not released
 
 
-@pytest.mark.parametrize("where", ["truncated", "escaped", "archived", "identity-lost", "archive-unlistable"])
-def test_no_record_state_hides_a_turn_from_the_stream_scan(task_store, monkeypatch, where):
-    """Defect class: a damaged, identity-less, archived or unlistable turn record is skipped, freeing its stream."""
-    text = json.dumps(_orchestrator_record("prior", status="crashed"))
-    path = store.record_path("prior")
-    if where == "truncated":
-        text = text[: text.index('"orchestrator"')]
-    elif where == "escaped":
-        text = text.replace('"orchestrator"', '"orchestr\\u0061tor"')
-    elif where == "identity-lost":  # the record parser reads it as a foreign file
-        text = json.dumps({"orchestrator": {"stream": STREAM}})
-    else:
-        path = task_store / task_record_store.ARCHIVE_DIR_NAME / "prior.json"
-        path.parent.mkdir()
-    path.write_text(text)
-    if where == "archive-unlistable":
-        listdir = os.listdir
+def test_a_turn_tree_takes_no_other_writer(task_store, tmp_path, monkeypatch):
+    """Defect class: a --cwd task or a task service is added to an orchestrator turn while it runs or drains, also
+    when the turn's record lost its orchestrator key, so its tree changes after it was judged."""
+    from lu_machinery.orchestration import dispatch_isolation as iso
 
-        def refused(directory):
-            if os.path.basename(directory) == task_record_store.ARCHIVE_DIR_NAME:
-                raise PermissionError(directory)
-            return listdir(directory)
+    tree = tmp_path / "turn-tree"
+    tree.mkdir()
+    decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+    with host_admission.reserve("turn", "workspace-write", decision, agent="claude", disk_guard=lambda: False,
+                                orchestrator={"stream": STREAM}, tree=str(tree)) as hold:
+        store.replace({**hold, "prompt_file": "/prompts/turn.md"}, store.record_path("turn"))
+    # The record lost its orchestrator key: the reservation still attributes the turn and its tree.
+    store.record_path("turn").write_text(json.dumps({**hold, "prompt_file": "/prompts/turn.md", "orchestrator": None}))
+    refused = host_admission.turn_writer_refusal(tree=str(tree))
+    assert refused.startswith("orchestrator_turn_writer_refused: turn is the orchestrator turn on epic:7")
+    assert host_admission.turn_writer_refusal(tree=str(tmp_path)) is None  # any other tree
+    nonce = hold["run_nonce"]
+    scope = iso.scope_unit_name("turn", nonce)
+    base = tmp_path / "var-tmp"
+    base.mkdir()
+    monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
+    monkeypatch.setattr(environment, "TASK_SCRATCH_PATH_MAX", 4096)
+    record = {"task_id": "turn", "launch_mode": "scope", "launch_unit": scope, "run_nonce": nonce}
 
-        monkeypatch.setattr(os, "listdir", refused)
-    assert host_admission.stream_holders(STREAM, "turn")
+    def systemd(_argv):
+        pytest.fail("systemd was asked to start a turn's service")
+
+    for copy, inherited in (({**record, "orchestrator": {"stream": STREAM}}, None), (record, None),
+                            # a child process of the turn passing another task's record copy
+                            ({**record, "task_id": "worker", "launch_unit": iso.scope_unit_name("worker", nonce)},
+                             "turn")):
+        if inherited:
+            monkeypatch.setenv(TASK_ENV, inherited)
+        with pytest.raises(iso.DispatchIsolationError, match="orchestrator_turn_writer_refused"):
+            iso.start_task_service(copy, ["sleep", "30"], run=systemd)
+        assert "task_services" not in copy
+    assert not list(base.iterdir())  # no scratch side effect
+    # An ordinary task still starts its service.
+    monkeypatch.delenv(TASK_ENV)
+    worker_record = {**record, "task_id": "worker", "launch_unit": iso.scope_unit_name("worker", nonce)}
+    started = iso.start_task_service(worker_record, ["sleep", "30"],
+                                     run=lambda argv: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
+    assert worker_record["task_services"] == [started]
+    # A reservation that cannot be read is anyone's: both refuse.
+    _plant("not-json", _reservation("epic:9"))
+    assert host_admission.turn_writer_refusal(tree=str(tmp_path)).startswith("orchestrator_reservation_malformed")
+    with pytest.raises(iso.DispatchIsolationError, match="orchestrator_reservation_malformed"):
+        iso.start_task_service(dict(worker_record), ["sleep", "30"], run=systemd)
 
 
-def test_the_stream_scan_reads_the_store_under_the_archive_lock(task_store, monkeypatch):
-    """Defect class: an archive or restore move runs during the scan, so a record in transit is in neither listing."""
-    real, seen = host_admission._store_files, []
+@pytest.mark.skipif(not os.path.exists("/sys/fs/cgroup/cgroup.controllers"), reason="needs cgroup v2")
+def test_the_scope_probe_proves_exit_only_for_a_leaf_scope(task_store, monkeypatch):
+    """Defect class: a process moved into a child cgroup of the turn's scope is missing from its cgroup.procs, so
+    the probe reports the scope empty and settlement frees the stream."""
+    from lu_machinery.orchestration import dispatch_isolation as iso
 
-    def listing(root):
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # what task_archive_lock(moving=True) takes for a move
-            seen.append("a move could run")
-        except BlockingIOError:
-            seen.append("moves wait")
-        finally:
-            os.close(fd)
-        return real(root)
-
-    monkeypatch.setattr(host_admission, "_store_files", listing)
-    host_admission.stream_holders(STREAM, "turn")
-    assert seen == ["moves wait"]
+    own = next(line.split("::", 1)[1] for line in Path("/proc/self/cgroup").read_text().splitlines()
+               if line.startswith("0::"))
+    parent = own.rpartition("/")[0]  # holds the test's own cgroup as a child, and no process of its own
+    procs = Path(f"/sys/fs/cgroup{parent}/cgroup.procs")
+    if not parent or not procs.is_file() or procs.read_text().split():
+        pytest.skip("the test's cgroup has no parent that holds only child cgroups")
+    nonce = "0123456789abcdef0123456789abcdef"
+    unit = iso.scope_unit_name("turn", nonce)
+    monkeypatch.setattr(worker, "_run_scope_cgroups", lambda *_args: [parent])
+    launch = {"task_id": "turn", "run_nonce": nonce, "launch_mode": "scope", "launch_unit": unit,
+              "launch_cgroup": iso.scope_cgroup(unit, uid=os.getuid())}
+    assert worker._provider_alive(launch) is None
 
 
 # --- legacy lease --------------------------------------------------------------------------------------------------
@@ -582,6 +752,9 @@ def test_a_turn_end_to_end_reserves_links_children_and_settles_on_its_receipt(tu
     assert record["research_role"] == "driver"  # role policy sees a driving turn, not only authoring
     assert "orchestrator_stream_busy: epic:7" in box.turn("turn-2", expected=3).stderr
     await_file(box.tasks / "turn-1.started")  # the turn's provider runs, as when it dispatches
+    attach = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "borrower", "--prompt", "edit",
+                     "--cwd", record["worktree_path"], task_env="turn-1", expected=2)
+    assert "orchestrator_turn_writer_refused: turn-1 is the orchestrator turn on epic:7" in attach.stderr
     child = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "child-1",
                     "--prompt", "map the flags", task_env="turn-1").stdout.splitlines()
     linked = json.loads(box.run("wait", *child[:1], "--run-nonce", child[1], "--timeout", "15").stdout)
@@ -598,8 +771,9 @@ def test_a_turn_end_to_end_reserves_links_children_and_settles_on_its_receipt(tu
     late = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "child-late", "--prompt", "late",
                    task_env="turn-1", expected=2)
     assert "orchestrator_parent_not_running" in late.stderr
-    # Nor does it prove the process tree gone afterwards: the settled turn keeps its stream.
-    assert "provider not proven gone" in box.turn("turn-3", expected=3).stderr
+    # Nor does it prove the process tree gone afterwards: the settled turn keeps its stream's reservation.
+    assert f"orchestrator_stream_busy: {STREAM} is reserved by turn turn-1 (run {nonce})" in box.turn(
+        "turn-3", expected=3).stderr
     # A turn without a receipt settles no_deliverable.
     second = box.turn("turn-4", stream="epic:8").stdout.splitlines()
     _release(box, "turn-4")
