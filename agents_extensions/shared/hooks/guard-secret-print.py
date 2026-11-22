@@ -78,11 +78,11 @@ unterminated quote, is refused. This is defense-in-depth, not a sandbox.
 
 from __future__ import annotations
 
-import codecs
 import itertools
 import os
 import re
 import sys
+import unicodedata
 
 # Don't write __pycache__ next to deployed hooks (#9108).
 sys.dont_write_bytecode = True
@@ -262,7 +262,7 @@ WORKER_ENV_MODULE = "lu_machinery.session_supervisor"
 WORKER_ENV_MODULES = frozenset({WORKER_ENV_MODULE, "scripts.session_supervisor"})
 WORKER_ENV_COMMAND = "worker-env"
 
-_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*\Z")
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*\Z", re.DOTALL)
 _VAR_REF_RE = re.compile(
     r"\$(?:\{!(?P<indirect>[A-Za-z_][A-Za-z0-9_]*)\}|"
     r"\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)(?::[-=?+][^}]*)?\}|"
@@ -376,21 +376,25 @@ _PLAIN_VALUE = re.compile(r"[A-Za-z0-9_./:=,+@%-]+")
 _DESCRIPTOR = re.compile(r"[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\}")
 _NAME_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _PARAMETER_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]")
-_GLUED_FLAG = re.compile(r"-{1,2}[A-Za-z][A-Za-z0-9_-]*=?")
+# Operators after which the next word is a redirection target, not a command word.
+_REDIRECT_OPERATORS = frozenset({"<", ">", ">>", "<>", ">|", "&>", "&>>", "<<", "<<-", "<<<", ">&", "<&"})
+# Reserved words after which the next word is still in command position.
+_COMMAND_OPENERS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"})
 
 
 _UNDECIDABLE = "__UNDECIDABLE_SECRET_COMMAND__"
 
 
 class _Word(str):
-    """A shell word in canonical spelling.
+    """A shell word in canonical spelling, with the exact `value` the command receives.
 
-    `flag_split` reads an unquoted option glued to a quoted rest (`-e'ENV'`) as
-    the option and its value, the way main's program reader split them; empty
-    for every other word.
+    The spelling keeps an unquoted `NAME=` prefix visible and expansions inside
+    double quotes; `value` resolves every quote and escape and leaves each
+    expansion spelled; `dynamic` says whether the word holds an expansion.
     """
 
-    flag_split = ""
+    value = ""
+    dynamic = False
 
 
 def _expansion_end(text: str, start: int) -> int:
@@ -420,6 +424,9 @@ def _expansion_end(text: str, start: int) -> int:
             elif quote == '"' and (char == "`" or text.startswith(("${", "$("), end)):
                 end = _expansion_end(text, end)
                 continue
+        elif text.startswith("$'", end):
+            end = _ansi_c_end(text, end)
+            continue
         elif char in "'\"":
             quote = char
         elif char == "`" or text.startswith(("${", "$("), end):
@@ -453,7 +460,14 @@ def _ansi_c_value(text: str, start: int) -> tuple[str, int]:
     body = text[start + 2 : end]
     if not _ansi_c_modelled(body):
         raise ValueError("ANSI-C escape whose Bash meaning is not modelled")
-    return codecs.decode(body, "unicode_escape"), end + 1
+    return _ANSI_C_MODELLED_ESCAPE.sub(_ansi_c_escape, body), end + 1
+
+
+def _ansi_c_escape(match: re.Match[str]) -> str:
+    """The character one modelled ANSI-C escape stands for; literal text stays as written."""
+    if match[1] or match[2]:
+        return chr(int(match[1], 16) if match[1] else int(match[2], 8))
+    return {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}.get(match[0][1], match[0][1])
 
 
 def _double_quoted_parts(text: str, start: int) -> tuple[list[tuple[str, str]], int]:
@@ -487,24 +501,36 @@ def _spell(parts: list[tuple[str, str]]) -> str:
     if all(kind != "exp" for kind, _ in parts):
         value = "".join(text for _, text in parts)
         return value if _PLAIN_VALUE.fullmatch(value) else "'" + value.replace("'", "'\\''") + "'"
-    return '"' + "".join(text if kind == "exp" else re.sub(r'([\\"$`])', r"\\\1", text) for kind, text in parts) + '"'
+    # A plain `$NAME` is braced, so literal text after it can never extend the name.
+    return (
+        '"'
+        + "".join(
+            re.sub(r"\A\$([A-Za-z_][A-Za-z0-9_]*)\Z", r"${\1}", text)
+            if kind == "exp"
+            else re.sub(r'([\\"$`])', r"\\\1", text)
+            for kind, text in parts
+        )
+        + '"'
+    )
 
 
-def _canonical_word(parts: list[tuple[str, str]], fragments: list[str]) -> _Word:
+def _canonical_word(parts: list[tuple[str, str]]) -> _Word:
     """Spell one word; an unquoted `NAME=` prefix stays visible as an assignment."""
     prefix = ""
     if parts and parts[0][0] == "src" and (assignment := _NAME_ASSIGNMENT.match(parts[0][1])):
         prefix = assignment.group()
         parts = [("src", parts[0][1][len(prefix) :]), *parts[1:]]
-    word = _Word(prefix + _spell(parts))
-    if not prefix and len(fragments) > 1 and parts[0][0] == "src" and _GLUED_FLAG.fullmatch(fragments[0]):
-        word.flag_split = fragments[0].rstrip("=") + " " + "".join(fragments[1:])
+    spelled = _spell(parts)
+    word = _Word(prefix + spelled)
+    word.value = prefix + _strip_quotes(spelled)
+    word.dynamic = any(kind == "exp" for kind, _ in parts)
     return word
 
 
 # Brace expansion stops here rather than build more words; past it the command is refused.
 _BRACE_LIMIT = 1024
 _BRACE_OPENERS = 256
+_BRACE_WORK = 1_000_000
 _BRACED_PARAMETER = re.compile(r"(\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-]))")
 _BRACE_SEQUENCE = re.compile(r"(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])(?:\.\.(-?[0-9]+))?")
 # A unit is one unquoted character, one quoted or escaped character, or one expansion.
@@ -518,13 +544,19 @@ def _brace_sequence(text: str) -> list[str] | None:
         return None
     start, end, step_text = match.groups()
     step = abs(int(step_text or "1")) or 1
-    if start.lstrip("-").isdigit() != end.lstrip("-").isdigit():
+    numeric = start.lstrip("-").isdigit()
+    if numeric != end.lstrip("-").isdigit():
         return None
-    low, high = (int(start), int(end)) if start.lstrip("-").isdigit() else (ord(start), ord(end))
+    low, high = (int(start), int(end)) if numeric else (ord(start), ord(end))
     if abs(high - low) // step >= _BRACE_LIMIT:
         raise ValueError("brace expansion too large")
     values = range(low, high + (1 if high >= low else -1), step if high >= low else -step)
-    return [str(value) if start.lstrip("-").isdigit() else chr(value) for value in values]
+    if not numeric:
+        return [chr(value) for value in values]
+    # Bash pads every number to the widest endpoint when either endpoint has a leading zero.
+    padded = any(re.match(r"-?0[0-9]", endpoint) for endpoint in (start, end))
+    width = max(len(start), len(end)) if padded else 0
+    return [f"{value:0{width}d}" for value in values]
 
 
 def _unit_text(units: list[_Unit]) -> str:
@@ -532,12 +564,18 @@ def _unit_text(units: list[_Unit]) -> str:
     return "".join(char for _, char in units) if all(kind == "src" for kind, _ in units) else ""
 
 
-def _brace_expand(units: list[_Unit]) -> list[list[_Unit]]:
-    """Expand the unquoted braces of one word, left to right, as Bash does."""
+def _brace_expand(units: list[_Unit], first: int = 0, budget: list[int] | None = None) -> list[list[_Unit]]:
+    """Expand the unquoted braces of one word, left to right, as Bash does.
+
+    Braces before `first` are already literal. `budget` caps the units built
+    across the whole expansion; past it, or past the word and opener limits,
+    the word is refused.
+    """
+    budget = [_BRACE_WORK] if budget is None else budget
     if sum(unit == ("src", "{") for unit in units) > _BRACE_OPENERS:
         raise ValueError("too many braces to expand")
-    for start, (kind, char) in enumerate(units):
-        if kind != "src" or char != "{":
+    for start in range(first, len(units)):
+        if units[start] != ("src", "{"):
             continue
         depth = 0
         commas: list[int] = []
@@ -571,77 +609,98 @@ def _brace_expand(units: list[_Unit]) -> list[list[_Unit]]:
             alternatives = [[("src", char) for char in value] for value in sequence]
         words: list[list[_Unit]] = []
         for alternative in alternatives:
-            words.extend(_brace_expand([*units[:start], *alternative, *units[end + 1 :]]))
+            word = [*units[:start], *alternative, *units[end + 1 :]]
+            budget[0] -= len(word)
+            if budget[0] < 0:
+                raise ValueError("brace expansion too large")
+            # The braces before `start` stayed literal, so the rest of the word is read from there.
+            words.extend(_brace_expand(word, start, budget))
             if len(words) > _BRACE_LIMIT:
                 raise ValueError("brace expansion too large")
         return words
     return [units]
 
 
+def _brace_words(parts: list[tuple[str, str]]) -> list[_Word]:
+    """The canonical words Bash makes from one word by brace expansion."""
+    units = [
+        unit
+        for kind, text in parts
+        for unit in ([(kind, text)] if kind == "exp" or not text else [(kind, char) for char in text])
+    ]
+    words: list[_Word] = []
+    for word in _brace_expand(units):
+        # Bash drops an unquoted word that expands to nothing.
+        if not word or all(kind == "src" and not text for kind, text in word):
+            continue
+        merged: list[tuple[str, str]] = []
+        for kind, text in word:
+            if merged and kind != "exp" and merged[-1][0] == kind:
+                merged[-1] = (kind, merged[-1][1] + text)
+            else:
+                merged.append((kind, text))
+        # Parameters expand after braces, so a `$` that braces put before a
+        # name (`{$,}NAME`) is an expansion.
+        expanded = [
+            ("exp" if piece.startswith("$") and len(piece) > 1 else kind, piece)
+            for kind, text in merged
+            for piece in (_BRACED_PARAMETER.split(text) if kind == "src" else [text])
+            if piece or kind != "src"
+        ]
+        words.append(_canonical_word(expanded or [("src", "")]))
+    return words
+
+
 def _lex(command: str) -> list[str]:
     """Split shell text into operators and POSIX words, quotes and escapes resolved.
 
-    Each word comes back in a canonical spelling, so `_strip_quotes` gives its
-    exact value and a quoted operator character can never read as syntax.
-    Expansions stay spelled inside double quotes. Raises ValueError for text the
-    shell would not parse (an unterminated quote or expansion).
+    Each word comes back in a canonical spelling whose `value` is exact, and a
+    quoted operator character can never read as syntax. Expansions stay spelled
+    inside double quotes. Brace expansion follows Bash: never on a redirection
+    or here-string operand, nor on an assignment before the command name.
+    Raises ValueError for text the shell would not parse (an unterminated quote
+    or expansion).
     """
     if "\0" in command:
         # An argument string ends at NUL, so the shell would run a different command.
         raise ValueError("NUL in shell text")
     tokens: list[str] = []
     parts: list[tuple[str, str]] = []
-    fragments: list[str] = []
+    unquoted: list[str] = []
     started = False
-    unquoted_run = False
+    command_start = True
+    redirect_target = False
 
-    def add(kind: str, text: str, *, quoted: bool) -> None:
-        nonlocal started, unquoted_run
-        if quoted or not unquoted_run:
-            fragments.append("")
-        fragments[-1] += text
-        if kind == "src" and parts and parts[-1][0] == "src":
-            parts[-1] = ("src", parts[-1][1] + text)
+    def settle() -> None:
+        if unquoted:
+            parts.append(("src", "".join(unquoted)))
+            unquoted.clear()
+
+    def add(kind: str, text: str) -> None:
+        nonlocal started
+        if kind == "src":
+            unquoted.append(text)
         else:
+            settle()
             parts.append((kind, text))
         started = True
-        unquoted_run = not quoted
 
     def flush() -> None:
-        nonlocal started, unquoted_run
-        if (
-            started
-            and any(kind == "src" and "{" in text for kind, text in parts)
-            and not (parts[0][0] == "src" and _NAME_ASSIGNMENT.match(parts[0][1]))
-        ):
-            units = [
-                unit
-                for kind, text in parts
-                for unit in ([(kind, text)] if kind == "exp" or not text else [(kind, char) for char in text])
-            ]
-            for word in _brace_expand(units):
-                # Bash drops an unquoted word that expands to nothing.
-                if any(kind != "src" for kind, _ in word) or word:
-                    merged: list[tuple[str, str]] = []
-                    for kind, text in word:
-                        if merged and kind != "exp" and merged[-1][0] == kind:
-                            merged[-1] = (kind, merged[-1][1] + text)
-                        else:
-                            merged.append((kind, text))
-                    # Parameters expand after braces, so a `$` that braces put
-                    # before a name (`{$,}NAME`) is an expansion.
-                    expanded = [
-                        ("exp" if piece.startswith("$") and len(piece) > 1 else kind, piece)
-                        for kind, text in merged
-                        for piece in (_BRACED_PARAMETER.split(text) if kind == "src" else [text])
-                        if piece or kind != "src"
-                    ]
-                    tokens.append(_canonical_word(expanded or [("src", "")], []))
-        elif started:
-            tokens.append(_canonical_word(parts, fragments))
+        nonlocal started, command_start, redirect_target
+        settle()
+        if started:
+            target = redirect_target
+            assignment = (
+                command_start and not target and parts[0][0] == "src" and bool(_NAME_ASSIGNMENT.match(parts[0][1]))
+            )
+            braces = not target and not assignment and any(kind == "src" and "{" in text for kind, text in parts)
+            words = _brace_words(parts) if braces else [_canonical_word(parts)]
+            tokens.extend(words)
+            redirect_target = False
+            if not target and not assignment and not (words and words[0] in _COMMAND_OPENERS):
+                command_start = False
         parts.clear()
-        fragments.clear()
-        started = unquoted_run = False
+        started = False
 
     index = 0
     while index < len(command):
@@ -652,6 +711,7 @@ def _lex(command: str) -> list[str]:
         elif char in _OPERATOR_START:
             operator = next(op for op in _OPERATORS if command.startswith(op, index))
             index += len(operator)
+            settle()
             descriptor = "".join(text for _, text in parts)
             if (
                 char in "<>"
@@ -661,43 +721,41 @@ def _lex(command: str) -> list[str]:
                 and not (descriptor.isdigit() and int(descriptor) > 2147483647)
             ):
                 parts.clear()
-                fragments.clear()
-                started = unquoted_run = False
+                started = False
                 # Descriptor 0 is the default input; spell it as Bash reads it.
-                tokens.append(
-                    operator if descriptor.isdigit() and not int(descriptor) and char == "<" else descriptor + operator
-                )
-                continue
-            flush()
-            tokens.append(operator)
+                default = descriptor.isdigit() and not int(descriptor) and char == "<"
+                tokens.append(operator if default else descriptor + operator)
+            else:
+                flush()
+                tokens.append(operator)
+            redirect_target = operator in _REDIRECT_OPERATORS
+            if not redirect_target:
+                command_start = True
         elif char == "\\":
             if command.startswith("\\\n", index):
                 index += 2
                 continue
-            add("lit", command[index + 1 : index + 2] or "\\", quoted=False)
+            add("lit", command[index + 1 : index + 2] or "\\")
             index += 2
         elif char == "'":
             end = command.find("'", index + 1)
             if end < 0:
                 raise ValueError("unterminated single quote")
-            add("lit", command[index + 1 : end], quoted=True)
+            add("lit", command[index + 1 : end])
             index = end + 1
         elif command.startswith("$'", index):
             value, index = _ansi_c_value(command, index)
-            add("lit", value, quoted=True)
+            add("lit", value)
         elif char == '"' or command.startswith('$"', index):
             quoted_parts, index = _double_quoted_parts(command, index + (char == "$"))
-            fragments.append("")
-            for kind, text in quoted_parts or [("lit", "")]:
-                parts.append((kind, text))
-                fragments[-1] += text
+            settle()
+            parts.extend(quoted_parts or [("lit", "")])
             started = True
-            unquoted_run = False
         elif char in "$`" and (end := _parameter_end(command, index)) is not None:
-            add("exp", command[index:end], quoted=False)
+            add("exp", command[index:end])
             index = end
         else:
-            add("src", char, quoted=False)
+            add("src", char)
             index += 1
     flush()
     return tokens
@@ -712,7 +770,9 @@ def _tokenize(command: str) -> list[str]:
 
 
 def _strip_quotes(token: str) -> str:
-    """The value of a canonical word: single quotes hold `'\\''`, double quotes backslash escapes."""
+    """The value of a word: exact for a lexer word, else single quotes hold `'\\''` and double quotes escapes."""
+    if isinstance(token, _Word):
+        return token.value
     if len(token) >= 2 and token[0] == token[-1] == "'":
         return token[1:-1].replace("'\\''", "'")
     if len(token) >= 2 and token[0] == token[-1] == '"':
@@ -968,11 +1028,11 @@ def _command_at(seg: list[str]) -> tuple[str, list[str], int] | None:
                 if _is_assignment(seg[j]):
                     j += 1
                 elif token.startswith("--"):
-                    value_pending = token in {"--unset", "--chdir", "--split-string"}
+                    value_pending = token in {"--unset", "--chdir", "--split-string", "--argv0"}
                     j += 1
                 elif token.startswith("-"):
                     for index, letter in enumerate(token[1:], 1):
-                        if letter in "uCS":
+                        if letter in "uCSa":
                             value_pending = index == len(token) - 1
                             break
                     j += 1
@@ -1210,11 +1270,14 @@ def _raw_without_redirects(args: list[str]) -> list[str]:
     return result
 
 
-def _stdout_target(args: list[str]) -> str | None:
+def _stdout_target(args: list[str], substitutions: dict[str, tuple[str, str]] | None = None) -> str | None:
     destinations: dict[str, str | None] = {"1": None, "2": "/dev/stderr"}
+    # A command substitution can print any path, `/dev/stdout` included.
+    computed = [marker for marker, (prefix, _) in (substitutions or {}).items() if prefix in {"$(", "`"}]
     for index, token in enumerate(args[:-1]):
         raw = args[index + 1]
-        target = "/dev/stderr" if _redirect_target_dynamic(raw) else _strip_quotes(raw)
+        dynamic = _redirect_target_dynamic(raw) or any(marker in raw for marker in computed)
+        target = "/dev/stderr" if dynamic else _strip_quotes(raw)
         if token in {"&>", "&>>"}:
             destinations["1"] = destinations["2"] = target
             continue
@@ -1287,7 +1350,7 @@ def _env_dump_reason(
         if not reason or _has_override(segment):
             continue
         found = _command_at(segment)
-        target = _stdout_target(found[1]) if found else None
+        target = _stdout_target(found[1], substitutions) if found else None
         if target is not None:
             target = _normalized_path(target)
         # Process substitutions are output consumers, not capture filenames.
@@ -1409,7 +1472,8 @@ def _is_interpreter_command(cmd: str) -> bool:
 _LITERAL_JOIN = re.compile(r"[\s+.]*")
 _SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v", "0": "\0", "e": "\x1b"}
 _ESCAPE = re.compile(
-    r"\\(?:x\{(?P<xbrace>[0-9A-Fa-f]{1,6})\}|u\{(?P<ubrace>[0-9A-Fa-f]{1,6})\}|x(?P<hex>[0-9A-Fa-f]{2})"
+    r"\\(?:N\{(?:U\+(?P<nhex>[0-9A-Fa-f]{1,6})|(?P<name>[^}]+))\}"
+    r"|x\{(?P<xbrace>[0-9A-Fa-f]{1,6})\}|u\{(?P<ubrace>[0-9A-Fa-f]{1,6})\}|x(?P<hex>[0-9A-Fa-f]{2})"
     r"|u(?P<u4>[0-9A-Fa-f]{4})|U(?P<u8>[0-9A-Fa-f]{8})|(?P<octal>[0-7]{1,3})|(?P<other>.))",
     re.DOTALL,
 )
@@ -1421,13 +1485,21 @@ def _decoded(value: str, *, keep_unknown: bool) -> str:
     """Decode string escapes; an unknown escape keeps its backslash or drops it, as runtimes differ."""
 
     def replace(match: re.Match[str]) -> str:
-        number = next((match[name] for name in ("xbrace", "ubrace", "hex", "u4", "u8") if match[name]), None)
+        if match["name"]:
+            try:
+                return unicodedata.lookup(match["name"])
+            except KeyError:
+                return match[0]
+        number = next((match[name] for name in ("nhex", "xbrace", "ubrace", "hex", "u4", "u8") if match[name]), None)
         if number is not None or match["octal"]:
             code = int(number, 16) if number is not None else int(match["octal"], 8)
             return chr(code) if code <= 0x10FFFF else match[0]
         other = match["other"]
         if other in _SIMPLE_ESCAPES:
             return _SIMPLE_ESCAPES[other]
+        if other == "\n":
+            # An escaped newline continues the string.
+            return ""
         return match[0] if keep_unknown and other not in "\\'\"`\n$" else other
 
     return _ESCAPE.sub(replace, value)
@@ -1435,9 +1507,11 @@ def _decoded(value: str, *, keep_unknown: bool) -> str:
 
 def _literal_values(value: str) -> list[str]:
     """A literal's text as written and as the runtimes may decode its escapes."""
-    if "\\" not in value:
-        return [value]
-    return list(dict.fromkeys([value, _decoded(value, keep_unknown=True), _decoded(value, keep_unknown=False)]))
+    values = [value]
+    if "\\" in value:
+        values += [_decoded(value, keep_unknown=True), _decoded(value, keep_unknown=False)]
+    # A C string ends at NUL, so a runtime that passes it on runs the text before it.
+    return list(dict.fromkeys(text.split("\0", 1)[0] for text in values))
 
 
 def _joined_runs(literals: list[tuple[int, int, str]], program: str) -> list[str]:
@@ -1490,7 +1564,7 @@ def _scanned_literals(program: str, runtime: str) -> list[tuple[int, int, str]]:
     return literals
 
 
-def _program_texts(program: str, runtime: str) -> list[str]:
+def _program_texts(program: str, runtime: str, words: tuple[str, ...] = ()) -> list[str]:
     """Texts a program may pass to a shell: its string literals, joined runs and decodings.
 
     Literals are read three ways and every reading counts: paired left to right
@@ -1499,7 +1573,43 @@ def _program_texts(program: str, runtime: str) -> list[str]:
     """
     paired = [(match.start(), match.end(), match["value"]) for match in _PROGRAM_STRINGS.finditer(program)]
     texts = _joined_runs(paired, program) + _joined_runs(_scanned_literals(program, runtime), program)
-    return list(dict.fromkeys(value for text in texts for value in _literal_values(text)))
+    values = [value for text in texts for value in _literal_values(text)]
+    if runtime == "python":
+        # The program may be the whole text (a here-document) or one of the words.
+        values += [text.split("\0", 1)[0] for source in (program, *words) for text in _python_strings(source)]
+    return list(dict.fromkeys(values))
+
+
+def _python_strings(program: str) -> list[str]:
+    """Every string Python's own parser builds from the program's literals, without running it.
+
+    Constants come decoded, implicitly joined literals as one string, `+` joins of
+    literals folded, and f-strings with their fields read as empty. A program
+    Python cannot parse never runs, so it yields nothing here.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(program)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return []
+
+    def fold(node: ast.AST) -> str | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str | bytes):
+            return node.value.decode("latin-1") if isinstance(node.value, bytes) else node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, right = fold(node.left), fold(node.right)
+            return None if left is None or right is None else left + right
+        if isinstance(node, ast.JoinedStr):
+            return "".join(fold(value) or "" for value in node.values)
+        if isinstance(node, ast.FormattedValue):
+            return fold(node.value)
+        return None
+
+    try:
+        return [text for node in ast.walk(tree) if (text := fold(node)) is not None]
+    except RecursionError:
+        return []
 
 
 def _shell_pipelines(text: str) -> list[list[list[str]]]:
@@ -1527,7 +1637,7 @@ def _shell_pipelines(text: str) -> list[list[list[str]]]:
     return found
 
 
-def _program_reason(cmd: str, program: str) -> str | None:
+def _program_reason(cmd: str, program: str, words: tuple[str, ...] = ()) -> str | None:
     if not _is_interpreter_command(cmd):
         return None
     text, literals, boundaries, templates = _normalize_program(program)
@@ -1547,7 +1657,7 @@ def _program_reason(cmd: str, program: str) -> str | None:
     # A backtick literal runs its text in Ruby, Perl and PHP even without a call.
     backticks = cmd in {"ruby", "perl", "php"} and "`" in program
     if child_call or backticks:
-        for value in _program_texts(program, runtime):
+        for value in _program_texts(program, runtime, words):
             if any(_env_source_reason(segment) for pipeline in _shell_pipelines(value) for segment in pipeline):
                 return "inline program contains a literal environment dumper"
     for language, pattern in _CHILD_COMMAND_LITERALS:
@@ -1586,6 +1696,16 @@ def _program_reason(cmd: str, program: str) -> str | None:
     return None
 
 
+def _glued_option_readings(value: str) -> str:
+    """The value, or for an option word every split of its leading letters from a glued rest."""
+    if value.startswith("--") and "=" in value:
+        return value.replace("=", " ", 1)
+    letters = re.match(r"-([A-Za-z]{1,8})", value)
+    if not letters or len(value) <= 2:
+        return value
+    return " ".join(value[: 1 + count] + " " + value[1 + count :] for count in range(1, len(letters[1]) + 1))
+
+
 def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | None:
     found = _command_at(segment)
     if not found:
@@ -1596,14 +1716,18 @@ def _inline_program_reason(segment: list[str], dumped_files: set[str]) -> str | 
     reason = _worker_env_reason(segment)
     if reason:
         return reason
-    # Read the shell values of all arguments, and again with each option glued to
-    # a quoted rest split off. Do not infer which interpreter flags select program text.
-    programs = [" ".join(_strip_quotes(arg) for arg in args)]
-    split = " ".join(getattr(arg, "flag_split", "") or _strip_quotes(arg) for arg in args)
+    # Read the shell values of all arguments, and again with every short option
+    # that may hold a glued program (`-e'ENV'`, `-esystem(...)`) split after each of
+    # its letters, and long options split at `=`. Do not infer which flags select program text.
+    values = [_strip_quotes(arg) for arg in args]
+    programs = [" ".join(values)]
+    split = " ".join(_glued_option_readings(value) for value in values)
     if split != programs[0]:
         programs.append(split)
     for program in programs:
-        reason = _program_reason(cmd, program)
+        # Python's program may also be glued to its `-c` option.
+        glued = tuple(value[2:] for value in values if value.startswith("-c") and len(value) > 2)
+        reason = _program_reason(cmd, program, (*values, *glued))
         if reason:
             return reason
         if _is_python_command(cmd) and re.search(r"\b(?:open|read_text|read_bytes)\s*\(", program):
@@ -1965,62 +2089,82 @@ def _sensitive_file_reason(pipeline: list[list[str]], index: int, dumped_files: 
     return "command could expose contents of a sensitive file"
 
 
+def _ansi_c_end(text: str, start: int) -> int:
+    """Index after the `$'...'` string at `start`; backslashes escape inside it."""
+    end = start + 2
+    while end < len(text) and text[end] != "'":
+        end += 2 if text[end] == "\\" else 1
+    if end >= len(text):
+        raise ValueError("unterminated ANSI-C quote")
+    return end + 1
+
+
 def _substitution_spans(command: str, *, heredoc: bool = False) -> list[tuple[int, int, str]]:
-    """Executable command and process substitutions with their source spans."""
+    """Executable command and process substitutions with their source spans.
+
+    Quoting contexts nest as Bash reads them: single quotes and `$'...'` hide
+    substitutions, except inside a `${...}` opened within double quotes, where
+    single quotes only pair for finding `}` and `$(...)` still runs. In a
+    here-document body (`heredoc`), quotes are literal.
+    """
     spans: list[tuple[int, int, str]] = []
-    quote = ""
+    # Contexts: '"' double quotes, "}" a `${` opened unquoted, "}q" one opened in
+    # double quotes, "'q" single quotes inside a "}q".
+    stack: list[str] = []
     index = 0
     while index < len(command):
         char = command[index]
-        if char == "\\" and (quote != "'" or heredoc):
+        top = stack[-1] if stack else ""
+        if char == "\\":
             index += 2
             continue
-        if not heredoc and char == "'" and quote != '"':
-            quote = "" if quote else "'"
-        elif not heredoc and char == '"' and quote != "'":
-            quote = "" if quote else '"'
-        elif quote != "'" and char == "`":
-            end = index + 1
-            while end < len(command) and command[end] != "`":
-                end += 2 if command[end] == "\\" else 1
-            if end < len(command):
-                spans.append((index, end + 1, command[index + 1 : end]))
-                index = end
-        elif quote != "'" and (
-            command.startswith("$(", index) or (not heredoc and command[index : index + 2] in {"<(", ">("})
-        ):
-            if command.startswith("$((", index):
+        if top == "'q":
+            if char == "'":
+                stack.pop()
                 index += 1
                 continue
-            start = index + 2
-            depth = 1
-            quotes = [""]
-            end = start
-            while end < len(command) and depth:
-                current = command[end]
-                if current == "\\" and quotes[-1] != "'":
-                    end += 2
-                    continue
-                if command.startswith("$(", end) and not command.startswith("$((", end) and quotes[-1] != "'":
-                    depth += 1
-                    quotes.append("")
-                    end += 2
-                    continue
-                if current == "'" and quotes[-1] != '"':
-                    quotes[-1] = "" if quotes[-1] else "'"
-                elif current == '"' and quotes[-1] != "'":
-                    quotes[-1] = "" if quotes[-1] else '"'
-                elif not quotes[-1]:
-                    if current == "(":
-                        depth += 1
-                        quotes.append("")
-                    elif current == ")":
-                        depth -= 1
-                        quotes.pop()
-                end += 1
-            if not depth:
-                spans.append((index, end, command[start : end - 1]))
-                index = end - 1
+        elif not heredoc and char == "'" and top == "}q":
+            stack.append("'q")
+            index += 1
+            continue
+        elif not heredoc and top in {"", "}"} and (char == "'" or command.startswith("$'", index)):
+            try:
+                end = command.index("'", index + 1) + 1 if char == "'" else _ansi_c_end(command, index)
+            except ValueError:
+                break
+            index = end
+            continue
+        elif not heredoc and char == '"':
+            if top == '"':
+                stack.pop()
+            else:
+                stack.append('"')
+            index += 1
+            continue
+        if command.startswith("${", index):
+            stack.append("}q" if top in {'"', "}q", "'q"} else "}")
+            index += 2
+            continue
+        if char == "}" and top in {"}", "}q"}:
+            stack.pop()
+            index += 1
+            continue
+        if command.startswith("$((", index):
+            index += 1
+            continue
+        if (
+            char == "`"
+            or command.startswith("$(", index)
+            or (not heredoc and top in {"", "}"} and command[index : index + 2] in {"<(", ">("})
+        ):
+            try:
+                end = _expansion_end(command, index)
+            except ValueError:
+                break
+            body = command[index + 1 : end - 1] if char == "`" else command[index + 2 : end - 1]
+            spans.append((index, end, body))
+            index = end
+            continue
         index += 1
     return spans
 
@@ -2198,7 +2342,13 @@ def _xargs_target(args: list[str]) -> list[str]:
     return []
 
 
-def _segment_process_facts(segment: list[str], depth: int) -> set[str]:
+def _segment_process_facts(segment: list[str], depth: int, documents: dict[str, list[tuple[str, bool]]]) -> set[str]:
+    # Here-documents belong to their statement in order, whatever command reads them.
+    bodies = [
+        documents[delimiter].pop(0)[0]
+        for index, token in enumerate(segment[:-1])
+        if token in {"<<", "<<-"} and documents.get(delimiter := _strip_quotes(segment[index + 1]))
+    ]
     found = _command_at(segment)
     fed = False
     while found is not None and found[0] == "xargs":
@@ -2215,10 +2365,19 @@ def _segment_process_facts(segment: list[str], depth: int) -> set[str]:
     if cmd == "kill":
         # xargs appends its input to the operands, so a fed kill is never literal.
         return {"kill"} if fed or not _literal_pid_kill(args) else set()
-    if cmd in _PROCESS_SHELLS:
+    if cmd in SHELL_COMMANDS:
         facts: set[str] = set()
-        for script in _shell_script(args):
-            facts |= _process_facts(script, depth=depth + 1)
+        scripts = _shell_script(args) if cmd in _PROCESS_SHELLS else []
+        if cmd == "eval":
+            scripts.append(" ".join(_strip_quotes(arg) for arg in _raw_without_redirects(args)))
+        # A shell also runs its standard input: here-strings and here-documents.
+        for index, token in enumerate(args[:-1]):
+            if token == "<<<":
+                operand = args[index + 1]
+                computed = getattr(operand, "dynamic", False) or _SUBSTITUTION_MARKER in operand
+                scripts.append(_UNDECIDABLE if computed else _strip_quotes(operand))
+        for script in [*scripts, *bodies]:
+            facts |= {"limit"} if script == _UNDECIDABLE else _process_facts(script, depth=depth + 1)
         return facts
     return set()
 
@@ -2240,9 +2399,10 @@ def _process_facts(command: str, *, depth: int = 0) -> set[str]:
     facts: set[str] = set()
     for _, body in substitutions.values():
         facts |= _process_facts(body, depth=depth + 1)
+    documents = _heredoc_inputs(command)
     for pipeline in _pipelines(executable):
         for segment in pipeline:
-            facts |= _segment_process_facts(segment, depth)
+            facts |= _segment_process_facts(segment, depth, documents)
     return facts
 
 
@@ -2348,6 +2508,10 @@ def _main(argv: list[str] | None = None) -> int:
     command = _command(payload)
     if not command:
         return 0
+    if "\0" in command:
+        # The shell cannot receive NUL; what runs is not the text inspected. The override never covers it.
+        sys.stderr.write(_block_msg("command text holds a NUL character"))
+        return 2
 
     process_facts = _process_facts(command)
     if "pkill" in process_facts or {"pgrep", "kill"} <= process_facts:

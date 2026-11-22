@@ -1802,7 +1802,7 @@ def test_escaped_apostrophe_after_expandable_python_selector_reads_its_value(mon
     command = f'python3 "$DOC_PATH" {body}'
     assert "'\\''" in command
     assert _run(monkeypatch, command) == 0
-    secret = _shell_single_quote("it's done; import os; print(os.environ)")
+    secret = _shell_single_quote("import os; print(os.environ)  # it's done")
     assert _run(monkeypatch, f'python3 "$DOC_PATH" {secret}') == 2
 
 
@@ -1829,6 +1829,9 @@ def test_escaped_apostrophe_publisher_body_with_command_substitution_text_is_all
         ("env 2>'a'b >/dev/null", 0),
         ("env >'a'b", 0),
         ("env >'a'b; cat ab", 2),
+        ("env >$(echo /dev/stdout)", 2),
+        ("env >`echo /dev/stdout`", 2),
+        ("env > >(cut -d= -f1)", 0),
     ],
 )
 def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expected):
@@ -1848,6 +1851,11 @@ def test_redirect_operand_is_read_as_its_shell_word(monkeypatch, command, expect
         ("bash 0<<<env", 2),
         ("bash <<< 'echo \"its\"'\" ; env\" -s", 2),
         ("bash <<< 'echo hi' x", 0),
+        ("env <<< {a,b}", 2),
+        ("pkill <<< {a,--} -f target", 2),
+        ("bash 0<<<'pkill -f target'", 2),
+        ("bash <<'EOF'\npkill -f target\nEOF", 2),
+        ('bash <<<"$SCRIPT"', 2),
     ],
 )
 def test_here_string_operand_is_exactly_one_word(monkeypatch, command, expected):
@@ -1869,6 +1877,10 @@ def test_here_string_operand_is_exactly_one_word(monkeypatch, command, expected)
         ('x = "its"; import os # "\nos.system("env")', 2),
         ("import os;os.system(\"env\\necho it's\")", 2),
         ('x = "its"; import os # "\\nos.system("env")', 0),
+        ('import os;os.system("\\N{LATIN SMALL LETTER E}nv")', 2),
+        ('import os;os.system("e" # joined\n "nv")', 2),
+        ('import os;os.system("e" \\\n "nv")', 2),
+        ("import os;os.system(f\"e{''}nv\")", 2),
     ],
 )
 def test_interpreter_strings_are_read_decoded_joined_and_past_comments(monkeypatch, program, expected):
@@ -1894,6 +1906,10 @@ def test_interpreter_strings_are_read_decoded_joined_and_past_comments(monkeypat
         ("echo {a,b}", 0),
         ("cat {notes,todo}.txt", 0),
         ("echo '{.env,x}'", 0),
+        ("dd if={x,.env}", 2),
+        ("echo a={$,x}GH_TOKEN", 2),
+        ("X={a,.env} cat notes.txt", 0),
+        ("perl -e'system(\"env\");'{,}", 2),
     ],
 )
 def test_brace_expansion_words_are_read_as_bash_expands_them(monkeypatch, command, expected):
@@ -1916,6 +1932,9 @@ LEXER_CASES = [
     ('"{a,b}" \\{a,b}', ["{a,b}", "{a,b}"]),
     ("{a,b,} \"\"{,}", ["a", "b", "", ""]),
     ("\\;'|'", [";|"]),
+    ("{007..009}", ["007", "008", "009"]),
+    ("echo x={a,b}", ["echo", "x=a", "x=b"]),
+    ("$'caf\u00e9 \\x41'", ["caf\u00e9 A"]),
 ]
 
 
@@ -1941,7 +1960,7 @@ def test_lexer_word_values_match_bash(text, values):
 
 @pytest.mark.parametrize(
     "command",
-    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", 'bash -c "$CMD"'],
+    ["echo 'unterminated", 'echo "$(', "echo ${x", "echo {1..99999}", "env\x00", "echo inert #\x00", 'bash -c "$CMD"'],
 )
 @pytest.mark.parametrize("override", [False, True])
 def test_unparseable_text_is_refused(monkeypatch, command, override):
@@ -1950,3 +1969,26 @@ def test_unparseable_text_is_refused(monkeypatch, command, override):
     The secret override does not cover a command the process scan cannot read whole.
     """
     assert _run(monkeypatch, command, env_override=override) == 2
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "$GH_TOKEN"suffix',
+        "X=$'a\\nb' env",
+        'echo "${x:-"\'$(env)\'"}"',
+        "echo ${x:-$'\\''}; env; echo \\' }",
+        "bash -c x='1; pkill -f target'",
+        "env -a name",
+    ],
+    ids=["parameter-boundary", "assignment-newline", "quotes-in-parameter", "ansi-c-in-parameter", "assignment-script", "env-argv0"],
+)
+def test_round_one_reader_classes_are_refused(monkeypatch, command):
+    """Defect classes: a reader that lost the shell's word, name or quoting boundary.
+
+    A parameter name ends where Bash ends it, a prefix assignment may hold a
+    newline, quoting inside a double-quoted `${...}` does not hide `$(...)`,
+    `$'...'` inside `${...}` keeps its escapes, a script word with a `NAME=`
+    prefix reads as its value, and `env -a` takes a value.
+    """
+    assert _run(monkeypatch, command) == 2
