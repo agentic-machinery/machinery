@@ -234,6 +234,8 @@ def selecting(sources: dict[str, bytes]) -> set[str]:
 # that changes or deletes one of those files, or one of the listed files, runs the contract's
 # tests, which exercise every stage, variable and lazy path.
 _HOOK_FILES = (".githooks/", f"{_PACKAGE_DIR.name}/lib/project_interpreter.sh", f"{_PACKAGE_DIR.name}/install_git_hooks.sh")
+# Shared first-party namespace shipped beside `_PACKAGE_DIR` in the wheel (`pyproject.toml`).
+_SHARED_NAMESPACE = "agents_extensions.shared"
 IMPORT_TIME_CONTRACTS: tuple[tuple[str, tuple[str, ...], frozenset[str] | None, tuple[str, ...], tuple[str, ...]], ...] = (
     # The installed commit and push hooks' owned-path checker, with its task-record and grant
     # lookups, from a wheel installed without its dependencies. The tests copy this checkout's
@@ -287,9 +289,10 @@ IMPORT_PROBE_TIMEOUT = 60
 # None has no growth check: its closure only.
 _CONTRACT_PROBE = r"""
 import importlib, json, sys
-tree, package, report, allowed, roots, *sites = sys.argv[1:]
+tree, package, shared, report, allowed, roots, *sites = sys.argv[1:]
 check, roots = allowed != "*", roots.split(",")
 allowed = frozenset(filter(None, allowed.split(","))) if check else frozenset()
+shared_top = shared.partition(".")[0]
 sys.path[:0] = [tree]
 sys.path.extend(sites)
 inside = tuple(site.rstrip("/") + "/" for site in sites)
@@ -321,8 +324,17 @@ def refuse(name, frame):
 class Contract:
     @staticmethod
     def find_spec(name, path=None, target=None):
-        if name == package or name.startswith(package + "."):
+        if name == package or name.startswith(package + ".") or name == shared or name.startswith(shared + "."):
             tried.add(name)
+            return None
+        if name == shared_top:
+            return None
+        if name.startswith(shared_top + "."):
+            if check:
+                frame, lookup = caller(sys._getframe(1))
+                if not lookup:
+                    refuse(name, frame)
+            return None
         if not check or path is not None or name.partition(".")[0] in known:
             return None
         frame, lookup = caller(sys._getframe(1))
@@ -338,6 +350,10 @@ for name in [*sorted(allowed), *roots]:
     except BaseException as exc:
         failed.append({"module": name, "error": f"{type(exc).__name__}: {exc}"[:300]})
 prefix = tree.rstrip("/") + "/"
+for mod_name, module in list(sys.modules.items()):
+    if (mod_name == shared_top or mod_name.startswith(shared_top + ".")) and isinstance(
+            file := getattr(module, "__file__", None), str) and file.startswith(inside):
+        failed.append({"module": mod_name, "error": "ModuleNotFoundError: absent from candidate tree"})
 closure = sorted({file[len(prefix):] for module in list(sys.modules.values())
                   if isinstance(file := getattr(module, "__file__", None), str) and file.startswith(prefix)}
                  | {name.replace(".", "/") + suffix for name in tried for suffix in (".py", "/__init__.py")})
@@ -357,7 +373,7 @@ def tree_entries(ref: str, *paths: str) -> dict[str, list[str]]:
 
 
 def _materialize(candidate: str, package: str, into: Path) -> list[str]:
-    """Write the candidate's tracked package files under ``into``; each entry it cannot write.
+    """Write the candidate's tracked package and shared-namespace files under ``into``; each entry it cannot write.
 
     Blobs come from the object store, never from the worktree or ``git archive``, whose
     attributes a candidate controls. Only regular files are written: a link or a submodule
@@ -365,7 +381,7 @@ def _materialize(candidate: str, package: str, into: Path) -> list[str]:
     """
     from lu_machinery.ci import components
 
-    entries = tree_entries(candidate, package)
+    entries = tree_entries(candidate, package, _SHARED_NAMESPACE.replace(".", "/"))
     unsupported = [f"{name} is not a regular file" for name, meta in entries.items() if meta[0] not in {"100644", "100755"}]
     blobs = tuple((name, meta[2]) for name, meta in entries.items() if meta[0] in {"100644", "100755"})
     for name, data in components.indexed_python_sources(str(product_root()), blobs, ()).items():
@@ -375,23 +391,29 @@ def _materialize(candidate: str, package: str, into: Path) -> list[str]:
     return unsupported
 
 
-def import_time_contracts(candidate: str) -> tuple[list[str], dict[str, frozenset[str]]]:
+def import_time_contracts(candidate: str, base: str | None = None) -> tuple[list[str], dict[str, frozenset[str]]]:
     """Each broken `IMPORT_TIME_CONTRACTS` contract in ``candidate``, and each contract's closure.
 
     Python itself decides what runs: each contract's roots are imported from the candidate's
     committed package files in a fresh interpreter (`_CONTRACT_PROBE`), which runs only what an
     import runs. A refused name, a root that fails to import, an unwritable entry and a probe
     that times out, exits nonzero or leaves no readable report each break the contract. The
-    closure is the repository paths of the package files the roots loaded. A checkout whose
-    candidate does not track this package's ``__init__.py`` (a product, with its own tree) is
-    not checked and has no closures.
+    closure is the repository paths of the package files the roots loaded. A checkout where
+    neither ``base`` nor ``candidate`` tracks this package's ``__init__.py`` (a product, with
+    its own tree) is not checked and has no closures; removing it from a machinery checkout
+    fails closed.
     """
     import sysconfig
     import tempfile
 
     package = _PACKAGE_DIR.name
-    if f"{package}/__init__.py" not in tree_entries(candidate, f"{package}/__init__.py"):
+    init = f"{package}/__init__.py"
+    in_candidate = init in tree_entries(candidate, init)
+    in_base = base is not None and init in tree_entries(base, init)
+    if not in_candidate and not in_base:
         return [], {}
+    if not in_candidate:
+        return [f"import-time contracts: {init} was removed"], {}
     problems: list[str] = []
     closures: dict[str, frozenset[str]] = {}
     sites = list(dict.fromkeys(sysconfig.get_path(key) for key in ("purelib", "platlib")))
@@ -403,8 +425,9 @@ def import_time_contracts(candidate: str) -> tuple[list[str], dict[str, frozense
             report = work / "report.json"
             report.unlink(missing_ok=True)
             # A fixed interpreter and probe; the arguments are module names and paths, never a shell.
-            command = [sys.executable, "-I", "-S", "-B", "-c", _CONTRACT_PROBE, str(tree), package, str(report),
-                       "*" if allowed is None else ",".join(sorted(allowed)), ",".join(f"{package}.{root}" for root in roots),
+            command = [sys.executable, "-I", "-S", "-B", "-c", _CONTRACT_PROBE, str(tree), package, _SHARED_NAMESPACE,
+                       str(report), "*" if allowed is None else ",".join(sorted(allowed)),
+                       ",".join(f"{package}.{root}" for root in roots),
                        *(sites if allowed is None or allowed else ())]
             env = {"PATH": os.defpath, "HOME": scratch, "TMPDIR": scratch, "LC_ALL": "C.UTF-8"}
             try:
@@ -562,7 +585,7 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
     entries = {name: meta[0] for name, meta in tree_entries(candidate, "tests").items()}
     changed = changed_files(base, candidate)
     # Contract tests run the code in subprocesses, out of the scan's sight: check the contracts here.
-    broken, closures = import_time_contracts(candidate)
+    broken, closures = import_time_contracts(candidate, base)
     if broken:
         raise ValueError("import-time dependency contract broken: " + "; ".join(broken))
     guards = [safe_path(line, node=True) for line in product_tree_path(*GUARDS.parts).read_text(encoding="utf-8").splitlines()]
