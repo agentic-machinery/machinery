@@ -2749,7 +2749,7 @@ def publish(
                 argv.append("--force")
             argv += ["--", fields["name"]]
         else:
-            payload = {}
+            payload: dict[str, object] = {}
             if verb == "repo-fork":
                 endpoint, method = f"repos/{gh_repo}/forks", "POST"
                 payload = {"default_branch_only": True}
