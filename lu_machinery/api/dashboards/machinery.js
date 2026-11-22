@@ -7,7 +7,6 @@
   const RETRY_LIMIT = 10;
   const THEME_KEY = "machinery-theme";
   const THEMES = ["auto", "light", "dark"];
-  const CHANGELOG_URL = "https://github.com/learn-ukrainian/machinery/blob/main/CHANGELOG.md";
 
   // Single source of truth for machinery navigation. Planning (#584) joins this list when it lands.
   const NAV_PAGES = [
@@ -95,18 +94,23 @@
     return valid;
   }
 
-  function renderVersion(version) {
+  function renderVersion(version, repository) {
     if (typeof version !== "string" || !/^\d+(\.\d+)*[0-9A-Za-z.+!-]*$/.test(version)) {
       return "lu-machinery version unknown";
     }
-    return `<a href="${CHANGELOG_URL}#v${encodeURIComponent(version)}" title="What changed in this release">lu-machinery ${escapeHtml(version)}</a>`;
+    const label = `lu-machinery ${escapeHtml(version)}`;
+    if (typeof repository !== "string" || !/^[A-Za-z0-9-]{1,39}\/(?!\.\.?$)[A-Za-z0-9._-]{1,100}$/.test(repository)) {
+      return label;
+    }
+    const changelog = `https://github.com/${repository}/blob/main/CHANGELOG.md`;
+    return `<a href="${changelog}#v${encodeURIComponent(version)}" title="What changed in this release">${label}</a>`;
   }
 
   function loadVersion() {
     if (typeof document !== "object" || !document || !document.getElementById) return;
     const header = document.getElementById("machinery-version");
     if (!header) return;
-    header.innerHTML = renderVersion(header.dataset?.version);
+    header.innerHTML = renderVersion(header.dataset?.version, header.dataset?.repository);
   }
 
   function initChrome(options = {}) {
@@ -734,7 +738,6 @@
     REFRESH_MS,
     OPTIONAL_WAIT_MS,
     RETRY_LIMIT,
-    CHANGELOG_URL,
     NAV_PAGES,
     SITE_LINKS,
     FRESHNESS_LABELS,

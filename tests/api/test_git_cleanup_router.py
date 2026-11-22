@@ -9,10 +9,10 @@ from types import SimpleNamespace
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from lu_machinery.api import delegate_router, git_hygiene_router
-from lu_machinery.api import state_helpers
+from lu_machinery.api import delegate_router, git_hygiene_router, state_helpers
 from lu_machinery.api.main import app
 from lu_machinery.api.monitor_context import fixture_context
+from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -367,9 +367,24 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     repos = {"r0": {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [node]}},
              "r1": {"isPrivate": True, "pullRequests": {"totalCount": 1, "nodes": [node]}},
              "r2": {"pullRequests": {"totalCount": 1, "nodes": [node]}}}
-    _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
+    catalog = {
+        "machinery": FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery"),
+        "public": FleetRepo("public", "old-owner/product.pages", "product", "public-monorepo", default=True),
+        "infra-private": FleetRepo("infra-private", "other-owner/private-infra", "private-infra", "private-infra"),
+    }
+    monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: catalog)
+
+    def github_run(args, **_kwargs):
+        assert 'r0: repository(owner: "new-owner", name: "machinery")' in args[-1]
+        assert 'r1: repository(owner: "old-owner", name: "product.pages")' in args[-1]
+        assert 'r2: repository(owner: "other-owner", name: "private-infra")' in args[-1]
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"data": repos}))
+
+    monkeypatch.setattr(git_hygiene_router.github_client, "run", github_run)
     payload = git_hygiene_router.compute_pull_requests(tmp_path)
     public, private, unstated = payload["repositories"]
+    assert public["pull_requests"][0]["url"] == "https://github.com/new-owner/machinery/pull/7"
+    assert unstated["pull_requests"][0]["url"] == "https://github.com/other-owner/private-infra/pull/7"
     assert "title" not in public["pull_requests"][0]
     # An unrecorded branch suffix is withheld on a public repository too.
     assert public["pull_requests"][0]["task_reference"] is None

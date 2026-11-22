@@ -187,7 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dispatch.add_argument(
         "--task-card", metavar="CARD",
-        help="Task card, e.g. '#583', learn-ukrainian/machinery#583 or a card file. Each '## Dependencies' line must "
+        help="Task card, e.g. '#583', owner/name#583 or a card file. Each '## Dependencies' line must "
         "be #N or owner/repo#N alone, or 'none'; refuse while one is open, unreadable or another line. The record "
         "names the dependencies (default: no card, no check)",
     )

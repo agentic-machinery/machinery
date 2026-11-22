@@ -50,6 +50,7 @@ from lu_machinery.maintenance.claude_session_scratch import sweep_sessions
 from lu_machinery.orchestration import backup_failure_alert, disk_watermark_alert, worktree_git
 from lu_machinery.orchestration.execution_safe_git import GIT
 from lu_machinery.orchestration.execution_safe_git import run_git as safe_git
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
 from lu_machinery.orchestration.pool_headroom import _read_limit
 from lu_machinery.orchestration.task_record_store import iter_task_records, task_archive_lock
 from lu_machinery.orchestration.task_record_store import read_listed_task_record as read_task_record
@@ -75,7 +76,10 @@ def default_public_repo() -> Path:
 
 
 def default_private_repo(public_repo: Path) -> Path:
-    return public_repo.parent / "learn-ukrainian-infra-private"
+    repo = load_fleet_repos().get("infra-private")
+    if repo is None or not re.fullmatch(r"[A-Za-z0-9_-]+", repo.local_name):
+        raise FleetRepoError("fleet registry must give infra-private a sibling checkout name")
+    return public_repo.parent / repo.local_name
 
 
 def default_state_dir() -> Path:
@@ -1797,7 +1801,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         repo_roots = args.repo_root or [public := default_public_repo(), default_private_repo(public)]
-    except MachineryConfigError as exc:
+    except (MachineryConfigError, FleetRepoError) as exc:
         parser.error(str(exc))
     receipt = build_receipt(repo_roots, apply=bool(args.apply), **({"git_maintenance": True} if args.git_maintenance else {}))
     if args.git_maintenance:

@@ -15,10 +15,11 @@ from typing import Any
 import pytest
 
 from lu_machinery.fleet import hramatka_hygiene_check as hygiene
+from lu_machinery.orchestration.fleet_repos import FleetRepo
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 PUBLIC = hygiene.PUBLIC_REPOSITORY
-PRIVATE = hygiene.PRIVATE_REPOSITORY
+PRIVATE = "new-owner/private-infra"
 EPIC = hygiene.PUBLIC_EPIC
 BOARD = hygiene.PRIVATE_BOARD
 
@@ -30,6 +31,12 @@ CLEAN_BODY = (
 
 
 pytestmark = pytest.mark.usefixtures("github_command_boundary", "configured_roots")
+
+@pytest.fixture(autouse=True)
+def _fleet_repos(monkeypatch: pytest.MonkeyPatch) -> None:
+    repos = {"infra-private": FleetRepo("infra-private", PRIVATE, "private-infra", "private-infra")}
+    monkeypatch.setattr(hygiene, "load_fleet_repos", lambda: repos)
+
 
 def _run(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=check, timeout=30)

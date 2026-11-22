@@ -33,6 +33,7 @@ from lu_machinery.common.safe_unit_install import (
     remove_unit,
 )
 from lu_machinery.orchestration import scheduled_worktree_cleanup
+from lu_machinery.orchestration.fleet_repos import FleetRepoError
 
 LABEL = "com.learn-ukrainian.worktree-cleanup"
 DEFAULT_INTERVAL_MINUTES = 240
@@ -261,7 +262,7 @@ def _valid_persisted_plist(
 def status(
     *,
     public_repo: Path,
-    private_repo: Path,
+    private_repo: Path | None,
     home: Path,
     interval_minutes: int,
 ) -> tuple[dict[str, Any], int]:
@@ -275,7 +276,7 @@ def status(
             persisted = plistlib.loads(installed[0])
         except Exception as exc:
             parse_error = str(exc)
-    valid = _valid_persisted_plist(
+    valid = private_repo is not None and _valid_persisted_plist(
         persisted,
         public_repo=public_repo.resolve(),
         private_repo=private_repo.resolve(),
@@ -348,18 +349,40 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Unresolved: the unit helper must see a symlinked home to refuse it (#9875).
+    home = Path(os.path.abspath(args.home.expanduser()))
+    if args.command == "uninstall":
+        print(json.dumps(uninstall(home=home), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
     try:
         public_repo = (args.public_repo or scheduled_worktree_cleanup.default_public_repo()).expanduser().resolve()
     except MachineryConfigError as exc:
         parser.error(str(exc))
-    private_repo = (
-        args.private_repo.expanduser().resolve()
-        if args.private_repo is not None
-        else scheduled_worktree_cleanup.default_private_repo(public_repo).resolve()
-    )
-    # Unresolved: the unit helper must see a symlinked home to refuse it (#9875).
-    home = Path(os.path.abspath(args.home.expanduser()))
-    if args.command == "render":
+    registry_error = None
+    private_repo: Path | None
+    try:
+        private_repo = (
+            args.private_repo.expanduser().resolve()
+            if args.private_repo is not None
+            else scheduled_worktree_cleanup.default_private_repo(public_repo).resolve()
+        )
+    except FleetRepoError as exc:
+        private_repo = None
+        registry_error = str(exc)
+
+    if args.command == "status":
+        result, return_code = status(
+            public_repo=public_repo,
+            private_repo=private_repo,
+            home=home,
+            interval_minutes=args.interval_minutes,
+        )
+        if registry_error is not None:
+            result["registry_error"] = registry_error
+    elif private_repo is None:
+        parser.error(registry_error or "private checkout is unavailable")
+    elif args.command == "render":
         print(
             render_plist(
                 public_repo=public_repo,
@@ -370,23 +393,13 @@ def main(argv: list[str] | None = None) -> int:
             end="",
         )
         return 0
-    if args.command == "install":
+    else:
         result = install(
             public_repo=public_repo,
             private_repo=private_repo,
             home=home,
             interval_minutes=args.interval_minutes,
         )
-        return_code = 0
-    elif args.command == "status":
-        result, return_code = status(
-            public_repo=public_repo,
-            private_repo=private_repo,
-            home=home,
-            interval_minutes=args.interval_minutes,
-        )
-    else:
-        result = uninstall(home=home)
         return_code = 0
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return return_code

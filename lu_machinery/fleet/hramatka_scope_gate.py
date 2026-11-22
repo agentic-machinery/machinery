@@ -20,10 +20,10 @@ from enum import StrEnum
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import issue_stream_audit
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
 from lu_machinery.publish.github import read
 
 PUBLIC_REPOSITORY = "learn-ukrainian/learn-ukrainian.github.io"
-PRIVATE_REPOSITORY = "learn-ukrainian/learn-ukrainian-infra-private"
 HRAMATKA_STREAM = "hramatka"
 HRAMATKA_EPIC = 4542
 HRAMATKA_PRIVATE_BOARD = 349
@@ -75,19 +75,19 @@ class ScopeGateConfig:
     operator_only_issues: frozenset[IssueRef]
 
 
-HRAMATKA_SCOPE_GATE = ScopeGateConfig(
-    stream_name=HRAMATKA_STREAM,
-    public_repository=PUBLIC_REPOSITORY,
-    public_epic=HRAMATKA_EPIC,
-    private_repository=PRIVATE_REPOSITORY,
-    private_board=IssueRef(PRIVATE_REPOSITORY, HRAMATKA_PRIVATE_BOARD),
-    operator_only_issues=frozenset(
-        {
-            IssueRef(PRIVATE_REPOSITORY, 360),
-            IssueRef(PRIVATE_REPOSITORY, 212),
-        }
-    ),
-)
+def _default_scope_gate() -> ScopeGateConfig:
+    try:
+        private_repository = load_fleet_repos()["infra-private"].github
+    except KeyError as exc:
+        raise FleetRepoError("fleet registry is missing the infra-private repository") from exc
+    return ScopeGateConfig(
+        stream_name=HRAMATKA_STREAM,
+        public_repository=PUBLIC_REPOSITORY,
+        public_epic=HRAMATKA_EPIC,
+        private_repository=private_repository,
+        private_board=IssueRef(private_repository, HRAMATKA_PRIVATE_BOARD),
+        operator_only_issues=frozenset({IssueRef(private_repository, 360), IssueRef(private_repository, 212)}),
+    )
 
 
 @dataclass(frozen=True)
@@ -312,7 +312,7 @@ def evaluate_scope(
     issue: IssueRef,
     observation: IssueObservation | None,
     stream_registry: Mapping[str, Sequence[int]],
-    config: ScopeGateConfig = HRAMATKA_SCOPE_GATE,
+    config: ScopeGateConfig | None = None,
 ) -> GateDecision:
     """Classify one already-observed issue without a network call.
 
@@ -322,6 +322,8 @@ def evaluate_scope(
 
     if action not in ALL_ACTIONS:
         raise ValueError(f"unsupported action: {action}")
+    if config is None:
+        config = _default_scope_gate()
     if issue.repository not in {config.public_repository, config.private_repository}:
         raise ValueError("issue repository is not configured for the Hramatka scope gate")
     if action in EXEMPT_ACTIONS:
@@ -366,12 +368,14 @@ def decide_scope(
     issue: IssueRef,
     stream_registry: Mapping[str, Sequence[int]],
     reader: IssueReader = _gh_issue_observation,
-    config: ScopeGateConfig = HRAMATKA_SCOPE_GATE,
+    config: ScopeGateConfig | None = None,
 ) -> GateDecision:
     """Read authority only when the action needs a new-scope decision."""
 
     if action not in ALL_ACTIONS:
         raise ValueError(f"unsupported action: {action}")
+    if config is None:
+        config = _default_scope_gate()
     if issue.repository not in {config.public_repository, config.private_repository}:
         raise ValueError("issue repository is not configured for the Hramatka scope gate")
     if action in EXEMPT_ACTIONS or issue in config.operator_only_issues:
@@ -416,7 +420,7 @@ def main(
     *,
     reader: IssueReader = _gh_issue_observation,
     stream_registry: Mapping[str, Sequence[int]] | None = None,
-    config: ScopeGateConfig = HRAMATKA_SCOPE_GATE,
+    config: ScopeGateConfig | None = None,
 ) -> int:
     """Run the CLI, returning 0 only for a permitted new-scope decision."""
 

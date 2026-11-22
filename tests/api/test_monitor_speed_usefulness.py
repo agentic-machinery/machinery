@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import re
 import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
 
+from lu_machinery.api import main as monitor_main
 from lu_machinery.api import work_router
 from lu_machinery.api.main import app
 from lu_machinery.common.repo_root import machinery_path
-
+from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 
 def _node(script: str) -> None:
@@ -292,23 +294,28 @@ const runner = Machinery.createPanelRunner({panels: PANELS, optionalUrls: new Se
     )
 
 
-def test_refresh_header_names_a_failure_and_claims_updated_only_after_success():
+def test_refresh_header_names_a_failure_and_claims_updated_only_after_success(monkeypatch):
     """Defect class: the header says Updated when a panel refresh failed, or hides the running lu-machinery release."""
     health = TestClient(app).get("/api/health")
     assert health.status_code == 200
     version = health.json()["machinery_version"]
     assert version == importlib.metadata.version("lu-machinery")
+    machinery = FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery")
+    monkeypatch.setattr(monitor_main, "load_fleet_repos", lambda: {"machinery": machinery})
     served = TestClient(app).get("/machinery")
     assert served.status_code == 200
-    assert f'id="machinery-version" data-version="{version}"' in served.text
+    data = re.search(r'id="machinery-version" data-version="([^"]*)" data-repository="([^"]*)"', served.text)
+    assert data is not None
+    assert data.groups() == (version, "new-owner/machinery")
+    dataset = dict(zip(("version", "repository"), data.groups(), strict=True))
     assert "__MACHINERY_VERSION__" not in served.text
     script = _page_script("index.html")
     _node(
         _DOM
-        + f"const HEALTH = {json.dumps(health.text)};\nconst VERSION = {json.dumps(version)};\n"
+        + f"const dataset = {json.dumps(dataset)};\nconst VERSION = dataset.version;\n"
         + r"""
 globalThis.document = document;
-document.getElementById('machinery-version').dataset = {version: VERSION};
+document.getElementById('machinery-version').dataset = dataset;
 const realSetTimeout = setTimeout;
 globalThis.setTimeout = (fn, ms, ...args) => ms === 1500 || ms === 3000 ? 0 : realSetTimeout(fn, ms, ...args);
 let failSubscriptions = true;
@@ -325,7 +332,7 @@ globalThis.fetch = async (url) => {
 (async () => {
   await runner.refreshAll();
   assert.equal(document.getElementById('machinery-version').innerHTML,
-    `<a href="https://github.com/learn-ukrainian/machinery/blob/main/CHANGELOG.md#v${VERSION}" title="What changed in this release">lu-machinery ${VERSION}</a>`);
+    `<a href="https://github.com/new-owner/machinery/blob/main/CHANGELOG.md#v${VERSION}" title="What changed in this release">lu-machinery ${VERSION}</a>`);
   const status = document.getElementById('last-refresh');
   const retry = document.getElementById('refresh-retry');
   assert.match(status.textContent, /^Couldn't refresh, last attempt \d{2}:\d{2}:\d{2} UTC$/);

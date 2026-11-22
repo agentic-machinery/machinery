@@ -55,6 +55,7 @@ except ImportError:
     from ..path_safety import safe_join  # scripts.api package import (production)
 
 from lu_machinery.orchestration import issue_stream_audit as isa
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
 
 from . import config, subscriptions
 from . import delegate_router as delegate_api
@@ -1741,6 +1742,7 @@ def _attach_cold_start_research(response: dict[str, Any], role: str | None) -> N
 
 MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/"})
 _VERSION_PLACEHOLDER = "__MACHINERY_VERSION__"
+_MACHINERY_REPOSITORY_PLACEHOLDER = "__MACHINERY_REPOSITORY__"
 
 
 def _machinery_home_response(index: Path) -> HTMLResponse:
@@ -1751,7 +1753,12 @@ def _machinery_home_response(index: Path) -> HTMLResponse:
     With no distribution installed the value is empty and the header says unknown.
     """
     version = html.escape(_machinery_version() or "", quote=True)
-    return HTMLResponse(index.read_text(encoding="utf-8").replace(_VERSION_PLACEHOLDER, version))
+    try:
+        repository = load_fleet_repos()["machinery"].github
+    except (FleetRepoError, KeyError):
+        repository = ""
+    page = index.read_text(encoding="utf-8").replace(_VERSION_PLACEHOLDER, version)
+    return HTMLResponse(page.replace(_MACHINERY_REPOSITORY_PLACEHOLDER, html.escape(repository, quote=True)))
 
 
 def _safe_join(base: Path, *parts: str | Path) -> Path | None:

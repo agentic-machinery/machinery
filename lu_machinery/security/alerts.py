@@ -56,7 +56,7 @@ METRIC_FLEET_SECURITY_STATE = "lu_security_alerts_fleet_security_state"
 METRIC_FLEET_SECURITY_FINDINGS = "lu_security_alerts_fleet_security_findings"
 
 # A default-branch workflow is enrolled only when it calls this reusable workflow at a full SHA.
-_FLEET_SECURITY_WORKFLOW = "learn-ukrainian/machinery/.github/workflows/fleet-security.yml"
+_FLEET_SECURITY_WORKFLOW_PATH = ".github/workflows/fleet-security.yml"
 FLEET_SECURITY_STATES: tuple[str, ...] = (
     "missing_enrollment",
     "inaccessible_evidence",
@@ -122,7 +122,6 @@ _TOOL_DISABLED_PHRASES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-_FLEET_USES_PREFIX = _FLEET_SECURITY_WORKFLOW + "@"
 _FULL_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 _ALLOWED_RUN_EVENTS = frozenset({"push", "schedule", "workflow_dispatch"})
 _WORKFLOW_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml\Z")
@@ -488,6 +487,17 @@ def _split_github_slug(repo: FleetRepo) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
+def _fleet_security_workflow(repos: Mapping[str, FleetRepo] | None) -> str | None:
+    try:
+        catalog = load_fleet_repos() if repos is None else repos
+    except FleetRepoError:
+        return None
+    machinery = catalog.get("machinery")
+    if machinery is None or _split_github_slug(machinery) is None:
+        return None
+    return f"{machinery.github}/{_FLEET_SECURITY_WORKFLOW_PATH}"
+
+
 def _repo_numeric_id(document: Mapping[str, Any]) -> str | None:
     repo_id = document.get("id")
     if type(repo_id) is not int or repo_id <= 0:
@@ -846,6 +856,7 @@ def _read_workflow_callers(
     name: str,
     branch: str,
     timeout: float,
+    fleet_workflow: str,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], str | None]:
     """Return ``(callers, rejected_pins, error)``. A 404 directory is an empty caller list."""
     endpoint = _repo_api(owner, name, f"contents/.github/workflows?ref={quote(branch, safe='')}")
@@ -896,7 +907,7 @@ def _read_workflow_callers(
         if total_decoded > _MAX_WORKFLOW_BYTES:
             return [], [], "pagination_limit"
         workflow_path = f".github/workflows/{filename}"
-        file_callers, file_rejected, pin_error = _pins_in_workflow(text, workflow_path)
+        file_callers, file_rejected, pin_error = _pins_in_workflow(text, workflow_path, fleet_workflow)
         if pin_error:
             return [], [], pin_error
         for row in file_callers:
@@ -909,7 +920,7 @@ def _read_workflow_callers(
 
 
 def _pins_in_workflow(
-    text: str, workflow_path: str
+    text: str, workflow_path: str, fleet_workflow: str,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], str | None]:
     """Read job-level ``uses`` values. A line inside a script is not a caller."""
     try:
@@ -935,9 +946,9 @@ def _pins_in_workflow(
             continue
         if not isinstance(uses, str):
             return [], [], "workflow_file_unreadable"
-        if not uses.startswith(_FLEET_USES_PREFIX):
+        target, separator, ref = uses.partition("@")
+        if not separator or target != fleet_workflow:
             continue
-        ref = uses[len(_FLEET_USES_PREFIX) :]
         if _FULL_SHA_RE.fullmatch(ref):
             callers.append({"path": workflow_path, "pin": ref})
         else:
@@ -1194,7 +1205,13 @@ def _read_caller_evidence(
     return record, findings, None
 
 
-def read_fleet_security(client: Any, repo: FleetRepo, *, timeout: float) -> dict[str, Any]:
+def read_fleet_security(
+    client: Any,
+    repo: FleetRepo,
+    *,
+    timeout: float,
+    repos: Mapping[str, FleetRepo] | None = None,
+) -> dict[str, Any]:
     """Read one repository's fleet-security enrollment and CI evidence.
 
     ``missing_enrollment``, ``inaccessible_evidence`` and ``zero_findings`` are
@@ -1205,6 +1222,9 @@ def read_fleet_security(client: Any, repo: FleetRepo, *, timeout: float) -> dict
     slug = _split_github_slug(repo)
     if slug is None:
         return _fleet_record("inaccessible_evidence", reason="invalid_repository")
+    fleet_workflow = _fleet_security_workflow(repos)
+    if fleet_workflow is None:
+        return _fleet_record("inaccessible_evidence", reason="machinery_repository_unavailable")
     owner, name = slug
     described = _github_get(client, _repo_api(owner, name, "").rstrip("/"), timeout)
     if described.error or described.status not in {200, 304} or not isinstance(described.value, Mapping):
@@ -1214,7 +1234,7 @@ def read_fleet_security(client: Any, repo: FleetRepo, *, timeout: float) -> dict
     if branch is None:
         return _fleet_record("inaccessible_evidence", reason="invalid_default_branch")
     repo_id = _repo_numeric_id(described.value)
-    callers, rejected, list_error = _read_workflow_callers(client, owner, name, branch, timeout)
+    callers, rejected, list_error = _read_workflow_callers(client, owner, name, branch, timeout, fleet_workflow)
     if list_error:
         return _fleet_record("inaccessible_evidence", reason=list_error, rejected_pins=rejected)
     if not callers:
@@ -1300,7 +1320,7 @@ def scan_fleet_alerts(
             "github": repo.github,
             "source_ok": repo_ok,
             "tools": tools_payload,
-            "fleet_security": read_fleet_security(gh, repo, timeout=checked_timeout),
+            "fleet_security": read_fleet_security(gh, repo, timeout=checked_timeout, repos=catalog),
         }
 
     return {
@@ -1575,14 +1595,14 @@ def _build_dispatch_argv(
     return tuple(argv)
 
 
-def _render_fleet_section(fleet: Mapping[str, Any]) -> list[str]:
+def _render_fleet_section(fleet: Mapping[str, Any], *, fleet_workflow: str | None = None) -> list[str]:
     state = fleet.get("state")
     lines = ["", "## Fleet Security", ""]
     if state == "missing_enrollment":
         lines.append("State: `missing_enrollment`.")
         lines.append(
             "The default branch has no workflow that calls "
-            f"`{_FLEET_SECURITY_WORKFLOW}` at a full 40-character SHA."
+            f"`{fleet_workflow or _FLEET_SECURITY_WORKFLOW_PATH}` at a full 40-character SHA."
         )
         rejected = fleet.get("rejected_pins")
         if isinstance(rejected, list) and rejected:
@@ -1667,6 +1687,7 @@ def _render_brief_markdown(
     worker: WorkerSelection,
     alerts_payload: Mapping[str, Any],
     fleet_security: Mapping[str, Any],
+    fleet_workflow: str | None,
     owned_paths: Sequence[str],
     dispatch_command: str,
 ) -> str:
@@ -1760,7 +1781,7 @@ def _render_brief_markdown(
         )
         lines.extend(["", opsec_note])
 
-    lines.extend(_render_fleet_section(fleet_security))
+    lines.extend(_render_fleet_section(fleet_security, fleet_workflow=fleet_workflow))
 
     lines.extend(["", "## Suggested Owned Paths", ""])
     if owned_paths:
@@ -1931,7 +1952,7 @@ def build_fix_brief(
             f"refusing to generate fix brief for {resolved_key!r}: alert API error ({', '.join(errors)})"
         )
 
-    fleet_security = read_fleet_security(gh, repo, timeout=checked_timeout)
+    fleet_security = read_fleet_security(gh, repo, timeout=checked_timeout, repos=repo_catalog)
     if fleet_security.get("state") == "findings":
         for item in fleet_security.get("findings", ()):
             path = item.get("path") if isinstance(item, Mapping) else None
@@ -1953,6 +1974,7 @@ def build_fix_brief(
         worker=worker,
         alerts_payload=alerts_payload,
         fleet_security=fleet_security,
+        fleet_workflow=_fleet_security_workflow(repo_catalog),
         owned_paths=owned_paths,
         dispatch_command=dispatch_command,
     )
