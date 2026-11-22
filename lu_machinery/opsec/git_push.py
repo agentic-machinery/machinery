@@ -40,6 +40,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 # Executed by the hook as a file, so imports do not depend on the hook's cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -108,7 +109,8 @@ def destination(url: str) -> str:
 
     Accepts the URL, ssh and scp-like ([user@]host:path) forms git uses, with or
     without userinfo. Local paths, file URLs, remote helpers and anything else
-    without a hosted identity are unknown, which counts as public.
+    without a hosted identity are unknown, which counts as public. URL queries
+    and fragments also make the identity unknown.
     """
     value = url.strip()
     if not value or _is_local(value):
@@ -117,6 +119,16 @@ def destination(url: str) -> str:
     if not match:
         return "unknown"
     host, path = match.groups()
+    if "://" in value:
+        # Check the raw delimiters so even an empty query or fragment is ambiguous.
+        if value != url or "?" in value or "#" in value:
+            return "unknown"
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return "unknown"
+        if parsed.hostname != host.lower() or parsed.path != f"/{path}":
+            return "unknown"
     return gate.normalize_repository(f"{host}/{path.strip('/')}")
 
 

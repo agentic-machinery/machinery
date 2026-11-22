@@ -1209,29 +1209,53 @@ def test_the_public_head_is_the_registered_repository_the_push_goes_to(push_sand
 
 
 @pytest.mark.parametrize(
-    ("url", "catalog", "reply"),
+    ("url", "catalog", "reply", "expected_destination"),
     [
-        pytest.param("https://github.com/unit/fork-copy.git", FLEET, {"is_fork": False}, id="unregistered-non-fork"),
         pytest.param(
-            "https://github.com/unit/fork-copy.git", FLEET, {"parent": "Unit/Unknown"}, id="unregistered-parent"
+            "https://github.com/unit/fork-copy.git",
+            FLEET,
+            {"is_fork": False},
+            "github.com/unit/fork-copy",
+            id="unregistered-non-fork",
+        ),
+        pytest.param(
+            "https://github.com/unit/fork-copy.git",
+            FLEET,
+            {"parent": "Unit/Unknown"},
+            "github.com/unit/fork-copy",
+            id="unregistered-parent",
         ),
         pytest.param(
             "https://github.com/unit/fork-copy.git",
             FLEET,
             {"parent": CATALOG["infra-private"]["github"], "visibility": "PRIVATE"},
+            "github.com/unit/fork-copy",
             id="private-parent",
         ),
-        pytest.param("https://github.com/unit/fork-copy.git", FLEET, {"status": 1}, id="read-failure"),
-        pytest.param(None, FLEET, None, id="local-path"),
+        pytest.param(
+            "https://github.com/unit/fork-copy.git", FLEET, {"status": 1}, "github.com/unit/fork-copy", id="read-failure"
+        ),
+        pytest.param(None, FLEET, None, "unknown", id="local-path"),
         pytest.param(
             "https://github.com/unit/content.git",
             {**FLEET, "mirror": {**FLEET["content"], "local_name": "mirror"}},
             None,
+            "github.com/unit/content",
             id="ambiguous",
+        ),
+        # A host in a query or fragment must not make a different authority private.
+        pytest.param(
+            "https://127.0.0.1:9?@github.com/unit/private.git", FLEET, None, "unknown", id="query-host-mismatch"
+        ),
+        pytest.param(
+            "https://127.0.0.1:9#@github.com/unit/private.git", FLEET, None, "unknown", id="fragment-host-mismatch"
         ),
     ],
 )
-def test_an_unverified_destination_scans_all_history(push_sandbox, monkeypatch, capfd, url, catalog, reply):
+def test_an_unverified_destination_scans_all_history(
+    push_sandbox, monkeypatch, capfd, url, catalog, reply, expected_destination
+):
+    assert git_push.destination(url or str(push_sandbox.remote)) == expected_destination
     hit = push_sandbox.commit("published subject " + TOKEN)
     public_head = push_sandbox.commit("published clean")
     push_sandbox.commit("new clean work")
