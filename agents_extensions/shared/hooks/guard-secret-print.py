@@ -2053,26 +2053,33 @@ def _scan_command(
 
 # Main's parse refusals, the only results the folded rescan may replace.
 _UNPARSEABLE = frozenset({"shell command could not be parsed safely", "interpreter arguments could not be parsed safely"})
+# A word the shell reads as its own text: single-quoted spans, an escaped apostrophe,
+# and characters that are neither syntax nor expanded (no $ ` \ * ? [ ] { } ~ ! # ( ) & ; | < > " or space).
+_STATIC_WORD_RE = re.compile(r"(?:'[^']*'|\\'|[A-Za-z0-9_./:=,+@%-])+")
+# Bash builtins and keywords (bash 5.3 `compgen -b -k`): the shell itself reads their
+# words, as code (trap, coproc) or as arithmetic subscripts (let, declare, printf -v).
+_SHELL_BUILTINS = frozenset(
+    {
+        ":", "!", ".", "[", "[[", "]]", "{", "}", "alias", "bg", "bind", "break", "builtin", "caller", "case", "cd",
+        "command", "compgen", "complete", "compopt", "continue", "coproc", "declare", "dirs", "disown", "do", "done",
+        "echo", "elif", "else", "enable", "esac", "eval", "exec", "exit", "export", "false", "fc", "fg", "fi", "for",
+        "function", "getopts", "hash", "help", "history", "if", "in", "jobs", "kill", "let", "local", "logout",
+        "mapfile", "popd", "printf", "pushd", "pwd", "read", "readarray", "readonly", "return", "select", "set",
+        "shift", "shopt", "source", "suspend", "test", "then", "time", "times", "trap", "true", "type", "typeset",
+        "ulimit", "umask", "unalias", "unset", "until", "wait", "while",
+    }
+)
 # Python options that take no value and select no program text.
 _PYTHON_PLAIN_OPTIONS = frozenset({"-B", "-E", "-I", "-O", "-OO", "-P", "-q", "-s", "-S", "-u", "-b", "-bb"})
 
 
 def _runs_no_inline_program(cmd: str, args: list[str]) -> bool:
-    """Whether an interpreter runs a module or script file rather than program text from its words.
-
-    Every word up to and including the module or script name must be literal: an
-    expansion there (`"$DOC"`) could become an option that selects program text.
-    """
+    """Whether an interpreter runs a module or script file rather than program text from its words."""
     if not _is_python_command(cmd):
         return False
-    for index, raw in enumerate(args):
-        if not _is_single_quoted(raw) and re.search(r"[$`\\*?\[\]{}~!]", raw):
-            return False
-        arg = _strip_quotes(raw)
+    for index, arg in enumerate(_strip_quotes(arg) for arg in args):
         if arg == "-m":
-            return index + 1 < len(args) and (
-                _is_single_quoted(args[index + 1]) or not re.search(r"[$`\\*?\[\]{}~!]", args[index + 1])
-            )
+            return index + 1 < len(args)
         if not arg.startswith("-"):
             return True
         if arg not in _PYTHON_PLAIN_OPTIONS:
@@ -2083,15 +2090,19 @@ def _runs_no_inline_program(cmd: str, args: list[str]) -> bool:
 def _is_folded_simple_command(command: str) -> bool:
     """Whether command, read with `'\\''` folded, is one simple command that reads no word as code.
 
-    Its quote fragments must be its exact shell words, with no wrapper, assignment,
-    redirect, substitution or here-document, and no word the guard reads as code
-    (no shell, eval or source, no interpreter program text). Call with the fold on.
+    Every token must be a static word (no operator, grouping or expansion, so the
+    shell cannot pick another command or option), its quote fragments must be its
+    exact shell words, with no wrapper, assignment, redirect, substitution or
+    here-document, and no word the shell or the guard reads as code (no shell,
+    builtin or keyword, no interpreter program text). Call with the fold on.
     """
     try:
         executable, substitutions = _hide_substitutions(preprocess_shell_command(command))
     except ShellPreprocessLimit:
         return False
     if substitutions or _heredoc_inputs(command):
+        return False
+    if not all(_STATIC_WORD_RE.fullmatch(token) for token in _tokenize(executable, shell_words=True)):
         return False
     words = _pipelines(executable, shell_words=True)
     if _pipelines(executable) != words or len(words) != 1 or len(words[0]) != 1:
@@ -2101,7 +2112,9 @@ def _is_folded_simple_command(command: str) -> bool:
     if found is None or found[2] != 0 or _raw_without_redirects(segment) != segment:
         return False
     cmd, args, _ = found
-    return not (cmd in SHELL_COMMANDS or (_is_interpreter_command(cmd) and not _runs_no_inline_program(cmd, args)))
+    if cmd in SHELL_COMMANDS or cmd in _SHELL_BUILTINS:
+        return False
+    return not (_is_interpreter_command(cmd) and not _runs_no_inline_program(cmd, args))
 
 
 def _folded_simple_command_check[T](command: str, check: Callable[[str], T]) -> tuple[bool, T | None]:
