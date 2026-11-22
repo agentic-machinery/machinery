@@ -1,14 +1,17 @@
 ---
 name: full-send
-description: Deliver one approved change end to end, through review, PR, merge and closeout, with no human stops. Use when a worker has received a brief, or when the accountable driver of the change's stream, the integration owner or the CTO is told "full send" or must land a change; use full-stop when the brief says so.
+description: Deliver one approved change from its brief to its exit receipt (verified push, recorded exact-head review verdict, accepted keeper custody), with no human stops and no waiting on CI; the keeper lands it and the CTO cycle closes it out. Use when a worker has received a brief, or when the integration owner or the CTO must land a change no brief owns; use full-stop when the brief says so.
 argument-hint: "[pr <number> | issue <number> | branch <name>]"
 ---
 
 # Full send
 
-Own one change from its current state to `MERGED` with a clean closeout receipt. Nobody is
-watching: decide reversible in-scope questions yourself and list them in the report. This
-skill never overrides repository rules or the operator-only list (rules core P6).
+Own one change from its current state to its exit receipt: a verified push, a recorded
+exact-head review verdict and an accepted keeper custody receipt. The worker never waits on CI,
+runners or the queue. The merge-queue keeper lands the PR, and the CTO cycle confirms `MERGED`
+and runs the closeout. Nobody is watching: decide reversible in-scope questions yourself and
+list them in the report. This skill never overrides repository rules or the operator-only list
+(rules core P6).
 
 The landing order is `workflow.md` § Merge policy. The hand-off record, proof rules and the
 gate are in [delivery](references/delivery.md).
@@ -29,16 +32,18 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 
 ## Step 0 — who may run this (fail closed)
 
-- **The worker that receives a brief runs its chain to the end** (rules core P1): this skill;
-  or `takeover` or `modernize`, then this skill; or `full-stop` when the brief says so. It lands
-  only the change its brief names, within the brief's owned paths. The CTO sets the issue,
-  limits and routing and handles exceptions; the worker does the rest, from review to closeout.
+- **The worker that receives a brief runs its chain to its exit receipt** (rules core P1): this
+  skill; or `takeover` or `modernize`, then this skill; or `full-stop` when the brief says so. It
+  delivers only the change its brief names, within the brief's owned paths. The CTO sets the
+  issue, limits and routing and handles exceptions, alerts, `MERGED` and closeout; the worker
+  does the rest, from the change to custody.
    An approved extra path uses the request-and-grant exchange below, in the same task and worktree.
 - **Follow-up tasks stay inside the brief's cap.** A worker may dispatch follow-up tasks only up
   to the count and within the owned paths its brief sets. Anything outside the brief goes to the
   CTO as an issue proposal through Fleet Comms; the worker never opens issues (rules core P4).
 - The accountable driver of the change's stream, the integration owner and the CTO may also run
-  this skill.
+  this skill. Only they use [Landing and closeout by a lead](#landing-and-closeout-by-a-lead);
+  a worker never does.
 - **A stream driver lands only its own stream** (`workflow.md` § Merge policy, stream-scoped
   sweeps). The PR's linked issue must resolve to exactly one stream epic, and it must be yours:
   `curl -s http://127.0.0.1:8765/api/issues/streams` (built by
@@ -94,30 +99,60 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
      --base main --head "$BRANCH"
    ```
 
-   Do not wait for the `CI Gate`: start step 5 right away on that immutable head, and let CI
-   run in parallel (`gh pr checks "$PR"`; see [pr-watch](references/pr-watch.md)). Pending CI is
-   not successful CI. Fix a red gate through the authoring lane; every fix is a new head, and
-   both the review and the CI start over on it.
+   Do not wait for the `CI Gate`: start step 5 right away on that immutable head. CI runs in
+   parallel and the keeper watches it after step 6. Pending CI is not successful CI. Fix a red
+   check you can already see through the authoring lane; every fix is a new head, and both the
+   review and the CI start over on it.
    Before step 5, the author may optionally run the DeepSeek author pre-check
    ([below](#optional-deepseek-author-pre-check-ds-precheck-1101)) on the pinned pushed head.
 5. **Review with `review-loop`**, which you run yourself, at that pushed head, in parallel with
-   its PR CI; a Trivial-tier change has no review (review policy section 2), so go to step 6. It resolves the reviewer live (never from a family that authored the branch,
+   its PR CI; a Trivial-tier change has no review (review policy section 2), so go to step 6 with
+   `--trivial`. It resolves the reviewer live (never from a family that authored the branch,
    except any qualified non-author reviewer at the review policy's Low tier), dispatches it at
    the exact pushed head, keeps the budget and the ledger, and records the verdict. A fix that
-   moves the head returns to step 4: push, then run the next round on the new head while its
-   CI runs. The reviewer withholds APPROVE when evidence it needs to resolve a material
-   finding, such as CI results still pending, is not yet available; `review-loop` step 7 then
-   leaves that reply unrecorded and reruns once the evidence exists.
+   moves the head returns to step 4: push, then run the next round on the new head. The reviewer
+   withholds APPROVE when evidence it needs to resolve a material finding, such as CI results
+   still pending, is not yet available; `review-loop` step 7 then leaves that reply unrecorded and
+   transfers a continuation instead of waiting. Keep the recorder's receipt: step 6 needs it.
    Include the author task's `owned_path_grants` and `owned_path_grants_used` entries in the
    review-of-record brief, reading the current task record even when the author is still
    running. The reviewer checks each grant's paths against its reason and approval reference;
    a running author has no settlement usage list yet, so include all grants.
-6. **Watch it** ([pr-watch](references/pr-watch.md)): fix real findings and CI failures
-   through the authoring lane, prove each fix, and run a `review-loop` delta for every new
-   head. A failing test node is never rerun: fix it, or delete the test with the reason in the
-   commit and a note on its issue. One evidenced rerun for an infrastructure failure (no test
-   node failed), never more.
-7. **Check the gate on the live head** ([delivery](references/delivery.md#the-gate)). First
+6. **Hand the PR to keeper custody, then exit.** This is the worker's last step: the merge-queue
+   keeper watches CI and lands the PR, and the CTO cycle handles every later alert. Do not wait
+   for CI, a runner or the queue; never rerun, enqueue, merge or run `merge_closeout`.
+   Check the live head equals the head of the recorded APPROVE (a moved head returns to step 4),
+   save the recorder's JSON receipt from step 5 under `batch_state/tasks/<task-id>.artifacts/`,
+   then transfer custody:
+
+   ```bash
+   "$PY" -m lu_machinery.orchestration.pr_ownership keeper-transfer --pr "$PR" --repo "$REPO" \
+     --verdict-receipt-file "$RECEIPT"
+   ```
+
+   The command reads the run nonce from `LEARN_UKRAINIAN_RUN_NONCE` (or `--nonce`). For a
+   Trivial-tier change with no review, pass `--trivial` instead of the receipt. `keeper-transfer`
+   needs the lu-machinery release that contains it; an older release without the command means
+   `BLOCKED`, never a fallback to watching CI. Exit 0 prints the keeper's acknowledgement,
+   binding the repository, PR, base, head, your task and nonce, and the verdict. That receipt is
+   the worker's proof of custody. Any other exit is a refusal: read its reason, fix what it names
+   (a moved head, a missing or stale verdict) or stop with `BLOCKED <refusal>`.
+
+   Then check `git status --porcelain` is empty, report `CUSTODY_ACCEPTED` with the receipt
+   ([Report](#report)) and end your run. The linked issue stays open: the CTO cycle closes it with
+   the merged-outcome evidence after closeout.
+
+   After this step the PR is not yours. If CI fails, the queue ejects the PR or its head moves,
+   the keeper holds it and alerts `claude-cto`, who dispatches one fresh fix worker with the
+   current head, the evidence and the inherited review ledger. That worker starts at
+   [pr-watch](references/pr-watch.md#failing-ci) and accepts the PR with `pr_ownership accept`.
+
+## Landing and closeout by a lead
+
+For the integration owner or the CTO landing a PR that no brief or custody covers, and for the
+CTO cycle after the keeper lands one. A worker never runs this section.
+
+1. **Check the gate on the live head** ([delivery](references/delivery.md#the-gate)). First
    read the base branch's landing kind from `data.repository.pullRequest.isMergeQueueEnabled`
    (`$BASE` is the PR's `baseRefName`):
 
@@ -126,28 +161,23 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
    "$PY" -m lu_machinery.publish read queue-status --repo "$REPO" --number "$PR" --branch "$BASE"
    ```
 
-   `true` means a merge queue and `false` none; keep it as `$QUEUE` for step 8. Any other
-   reading (a failed read, a missing or non-boolean field) means stop; never guess. `headRefOid`
-   must equal the head of the recorded APPROVE and of green PR CI, which is the same in both
-   kinds: no blocking check on that head pending, red or cancelled, the `CI Gate` among them
-   where the repository runs one. `pr-merge`'s merge guard refuses otherwise before it enqueues
-   or merges. If CI evidence that arrived
-   after the verdict materially undermines it (for example a failure in code the review relied
-   on), get the reviewer's disposition before landing (step 8), through a round `budget-check`
-   admits; a fix that moves the head returns to step 4.
-   Send follow-ups to the CTO through Fleet Comms
-   (`"$PY" -I -m lu_machinery.fleet_comms channel publish … --recipient claude-cto`; the CTO's one durable recipient, never a `claude-cto-<id>` name).
-8. **Drain the inbox, then land** at the approved head, once step 7 holds for the kind you read.
-
-   - Merge queue: the merge-queue keeper may already have queued the PR, so check
+   `true` means a merge queue and `false` none; keep it as `$QUEUE`. Any other reading (a failed
+   read, a missing or non-boolean field) means stop; never guess. `headRefOid` must equal the
+   head of the recorded APPROVE and of green PR CI, which is the same in both kinds: no
+   blocking check on that head pending, red or cancelled, the `CI Gate` among them where the
+   repository runs one. `pr-merge`'s merge guard refuses otherwise before it enqueues or merges.
+   If CI evidence that arrived after the verdict materially undermines it (for example a failure
+   in code the review relied on), get the reviewer's disposition before landing, through a round
+   `budget-check` admits; a fix that moves the head returns to step 4 of [Steps](#steps).
+2. **Drain the inbox, then land** at the approved head, once the gate holds for the kind you read.
+   - Merge queue: the keeper may already have queued the PR, so check
      `"$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json`
      first. `pr-merge` enqueues, and landing also needs a green merge-group CI Gate on the real
      candidate. Queued is not merged. A PR the CTO labelled `merge-priority` after its
      exact-head approval enqueues at the front of the queue on its own (`workflow.md` § Merge
      policy, priority line); never apply that label yourself.
-   - No merge queue: `pr-merge` squash-merges the PR directly, pinned to the approved head.
-     Step 7 is the whole landing gate; no merge-group run exists to wait for, so its absence is
-     no reason to stop.
+   - No merge queue: `pr-merge` squash-merges the PR directly, pinned to the approved head. The
+     gate above is the whole landing gate; no merge-group run exists to wait for.
 
    ```bash
    "$PY" -m lu_machinery.publish pr-merge --repo "$REPO" --number "$PR" --match-head "$HEAD_SHA" \
@@ -156,45 +186,36 @@ dispatch. After one denial, retry once in a literal form before you stop; a seco
 
    `--expect-queue` is required here. `pr-merge` re-reads the flag before any write and refuses
    with `QUEUE_MODE_CHANGED` when it differs from `$QUEUE`, the way `--match-head` pins the head;
-   then return to step 7 and check the gate for the kind it now reports. Never `--auto`,
+   then return to step 1 and check the gate for the kind it now reports. Never `--auto`,
    `--delete-branch` or `--admin`.
-9. **Confirm `MERGED`** and the merge SHA: `gh pr view "$PR" --json state,mergeCommit`. If the
-   queue ejects the PR, follow the kick recipe in [pr-watch](references/pr-watch.md). If
-   waiting in the queue is the only step left and the integration owner has accepted queue
-   custody, `pr_ownership queue-exit` may release you. Then report `QUEUED_UNDER_CUSTODY`, and
-   the custodian does steps 9 to 11 ([pr-watch](references/pr-watch.md#queue-custody)).
-10. **Close out.** A dispatched worker that confirms `MERGED` reports the verified merge
-    SHA, checks that `git status --porcelain` is empty, and ends its run. The supervisor
-    removes the worktree at settlement and runs `merge_closeout`. The driver reads the
-    terminal result from `dispatch wait <task-id> --run-nonce <nonce>` and requires the expected
-    `delivery_merge_sha`, `worktree_disposition: removed`, and a
-    residue-free `closeout` receipt with `returncode: 0`. If the result lists multiple
-    `closeouts`, check them all. That receipt completes cleanup.
+3. **Confirm `MERGED`** and the merge SHA: `gh pr view "$PR" --json state,mergeCommit`. If the
+   queue ejects the PR, follow the kick recipe in [pr-watch](references/pr-watch.md).
+4. **Close out after the worker settles.** The CTO cycle reads the terminal result from
+   `dispatch wait <task-id> --run-nonce <nonce>` and requires the expected
+   `delivery_merge_sha`, `worktree_disposition: removed`, and a residue-free `closeout` receipt
+   with `returncode: 0`. If the result lists multiple `closeouts`, check them all. That receipt
+   completes cleanup.
 
-    For a missing receipt, read `closeout_missing_reason`, `worktree_disposition_reason`
-    or `merged_delivery_lookup`. For a failed receipt, read its `reason`, `stdout`
-    and `stderr`. Record the evidence and owner and resolve the failure safely. Recover
-    retained or errored worktrees through `workflow.md` § Post-merge cleanup, after
-    confirming publication and process exit. Never force removal.
+   For a missing receipt, read `closeout_missing_reason`, `worktree_disposition_reason`
+   or `merged_delivery_lookup`. For a failed receipt, read its `reason`, `stdout`
+   and `stderr`. Record the evidence and owner and resolve the failure safely. Recover
+   retained or errored worktrees through `workflow.md` § Post-merge cleanup, after
+   confirming publication and process exit. Never force removal.
 
-    Use the manual recipe if no dispatcher will settle the merged PR. This includes a PR
-    that merges after its delivering task settled, as can happen after a queue custody
-    handoff, a full-stop handoff, or a timeout without a successor settling the merge.
-    If a delivering task was involved, confirm it settled before the merge and has no
-    closeout receipt for it.
-    Wait for all worker and reviewer processes on the PR's worktrees to exit, then run from
-    outside those worktrees:
+   Use the manual recipe if no dispatcher will settle the merged PR (a PR that merges after its
+   delivering task settled, as the keeper's landing usually does). If a delivering task was
+   involved, confirm it settled and has no closeout receipt for it. Wait for all worker and
+   reviewer processes on the PR's worktrees to exit, then run from outside those worktrees:
 
-    ```bash
-    "$PY" -m lu_machinery.orchestration.merge_closeout "$PR" --repo <owner/name> --repo-root <checkout> --apply
-    ```
+   ```bash
+   "$PY" -m lu_machinery.orchestration.merge_closeout "$PR" --repo <owner/name> --repo-root <checkout> --apply
+   ```
 
-    Require exit 0 and a residue-free receipt. `merge_closeout` checks worktree and branch
-    residue and removes no worktree.
-11. **Dispose of the linked issues.** The worker reports the evidence it has on the merged
-    SHA before it exits. The driver or custodian closes each named issue as completed once
-    it has the step-10 receipt and the remaining acceptance evidence. If evidence is
-    missing, record the remaining work, owner and dependency (rules core P4).
+   Require exit 0 and a residue-free receipt. `merge_closeout` checks worktree and branch
+   residue and removes no worktree.
+5. **Dispose of the linked issues.** The CTO cycle closes each named issue as completed once
+   it has the closeout receipt and the remaining acceptance evidence on the merged SHA. If
+   evidence is missing, record the remaining work, owner and dependency (rules core P4).
 
 ## Optional DeepSeek author pre-check (DS-PRECHECK-1101)
 
@@ -227,7 +248,7 @@ first review of record, at most **one per PR lineage**.
 
 ## Run the change
 
-Before the commit, and again before landing (step 8), run `verify_run` for every area the diff touches. The map from area to command is `agents_extensions/shared/skills/verify/SKILL.md`. A non-zero exit blocks that commit or that landing. The JSON on stdout is the receipt; do not commit it. Skip the command only when the diff touches none of those areas.
+Before the commit, and again before the custody transfer (step 6), run `verify_run` for every area the diff touches. The map from area to command is `agents_extensions/shared/skills/verify/SKILL.md`. A non-zero exit blocks that commit or that transfer. The JSON on stdout is the receipt; do not commit it. Skip the command only when the diff touches none of those areas.
 
 ## Stop and escalate
 
@@ -243,11 +264,8 @@ Stop, and report `BLOCKED <reason>`, when: the proof cannot be obtained; the rec
 `budget-check` refuses the next review round, or a dispute is unresolved after two replies
 (`review-loop`; a base merge, a CI fix or a conflict resolution after approval is not a stop
 while `budget-check` admits it); a breaker trips; ownership
-or stream membership is lost; the change's own checks fail a second time, or CI fails for an
-unclear reason (a failing test node is fixed, never rerun; an evidenced infrastructure failure
-with no failing test node uses the head's one rerun and then escalates,
-[pr-watch](references/pr-watch.md#failing-ci)); another PR makes
-this one obsolete; or the next step is outside your authority or your brief. Escalate to the
+or stream membership is lost; the change's own checks fail a second time; `keeper-transfer` is
+refused or unavailable; another PR makes this one obsolete; or the next step is outside your authority or your brief. Escalate to the
 CTO and, for decisions in rules core P6, to the advisors. Reach the operator only for the
 operator-only list and for a review dispute unresolved after two replies.
 
@@ -321,10 +339,12 @@ head and completed work so a successor can resume.
 
 ## Report
 
-Lead with the outcome. Then: PR, merge SHA, the proof (commands and run ids), review rounds
-used of the budget with reviewer model, family and harness, the decisions you made, follow-ups
-with owners, how each linked issue was disposed of, the closeout receipt, and the residual
-owner or "none".
+Lead with the outcome. A worker reports `CUSTODY_ACCEPTED` with the PR, the exact head, the proof
+(commands and run ids), the recorded verdict receipt, the `keeper-transfer` acknowledgement,
+review rounds used of the budget with reviewer model, family and harness, the decisions you made,
+follow-ups with owners, the CI state last seen on that head (never waited for), and the
+residual owner or "none". A lead who landed a PR also reports the merge SHA, how each linked
+issue was disposed of and the closeout receipt.
 
 Learned from tstack's `full-send`, `babysit-pr` and `file-pr` skills (MIT, Theo Browne); the
 text is our own.

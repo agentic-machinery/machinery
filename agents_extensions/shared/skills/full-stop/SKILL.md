@@ -6,8 +6,9 @@ argument-hint: "[pr <number> | issue <number> | branch <name>]"
 
 # Full stop
 
-Run the same work as [full-send](../full-send/SKILL.md) steps 1 to 7, then hand the PR over
-ready to merge. Anyone may run this skill, including workers. Its terminal is `ready`, never
+Run the same work as [full-send](../full-send/SKILL.md) steps 1 to 5, then hand the PR over
+ready to merge. Do not run its step 6: the `hold` below keeps the keeper off the PR, and the
+receiving driver, not the worker, verifies landing readiness. Anyone may run this skill, including workers. Its terminal is `ready`, never
 `merge`.
 
 Recipes run with the primary checkout's interpreter, resolved once
@@ -55,14 +56,16 @@ then add the `hold` label and verify it before any approval is recorded:
 
 ## Stop at the gate
 
-Check the gate in [delivery](../full-send/references/delivery.md#the-gate) on the live head.
-Fetch the base, then read the live PR's state, head, base, checks, reviews and mergeability.
-`READY_TO_MERGE` means all of these hold on the current head: a recorded exact-head APPROVE,
-same-head green PR CI (no blocking check pending, red or cancelled, the PR `CI Gate` among them
-where the repository runs one; affected tests, not the full suite), proof complete, and
-protection verified. Report the base branch's `isMergeQueueEnabled` reading (`full-send`
-step 7) so the receiving driver lands with `--expect-queue` set to it. Where the base has a
-merge queue, the future merge-group CI is not yet proven; say so.
+Check items 1, 2, 4 and 5 of the gate in [delivery](../full-send/references/delivery.md#the-gate)
+on the live head. Fetch the base, then read the live PR's state, head, base, checks, reviews and
+mergeability. `READY_TO_MERGE` means all of these hold on the current head: a recorded exact-head
+APPROVE, proof complete, protection verified, and the PR open, not draft and not BEHIND or DIRTY.
+Do not wait for CI. Report the same-head CI state you read (green, pending or red, with run ids)
+and the base branch's `isMergeQueueEnabled` reading (`full-send` Landing and closeout by a lead,
+step 1) so the receiving driver checks item 3, same-head green PR CI with no blocking check
+pending, red or cancelled, and lands with `--expect-queue` set to that reading. Fix a red check
+you can already see through the authoring lane. Where the base has a merge queue, the future
+merge-group CI is not yet proven; say so.
 
 End in exactly one of these states, naming the receiving driver:
 
@@ -71,8 +74,8 @@ End in exactly one of these states, naming the receiving driver:
 - `BLOCKED <reason>` — what blocks readiness, what you tried, and what is needed.
 - `ALREADY_MERGED_EXTERNALLY` — someone else merged it; report the merge SHA.
 
-Ready is never reported as delivered. The receiving driver removes the hold and lands it with
-`full-send`. Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
+Ready is never reported as delivered. The receiving driver removes the hold, verifies the gate and
+lands it by the `full-send` lead path. Closing a PR is a driver act. Closing an issue as duplicate, obsolete or not
 planned is the CTO's (rules core P4).
 
 ## Report

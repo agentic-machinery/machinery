@@ -86,7 +86,11 @@ never fine.
    or every printed row is an unknown owner. Read the rows. Status does not repeat that scan.
    Two accept forms, and they do not combine. A mixed call prints the usage of each form and writes
    nothing. Neither form changes review, CI, enqueue or merge.
-   Queue custody is only for a predecessor that is still live and waiting in the merge queue. The
+   Keeper custody comes from a worker's `keeper-transfer` and needs no action from this seat until
+   the keeper alerts on a CI failure, ejection or head move; then dispatch one fresh fix worker
+   ([recipes](recipes.md#writes-and-merging)) and confirm `MERGED` and closeout after landing.
+   Queue custody is only for a predecessor that is still live and waiting in the merge queue
+   (a brief started before detached delivery). The
    successor runs `accept --pr <N> --repo <owner/name> --custody --from <predecessor-task>`. That
    hands ejection, stale approval, merge confirmation and closeout to the successor
    ([pr-watch](../../full-send/references/pr-watch.md#queue-custody)).

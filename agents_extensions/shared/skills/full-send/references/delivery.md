@@ -1,8 +1,8 @@
 # Delivery: hand-off record, proof and the gate
 
-Shared by `full-send` (terminal `merge`) and `full-stop` (terminal `ready`). The landing order
-itself stays in `workflow.md` § Merge policy; this file defines what the delivery skills carry
-and check.
+Shared by `full-send` (terminal `custody`: the keeper lands, the CTO cycle closes out) and
+`full-stop` (terminal `ready`). The landing order itself stays in `workflow.md` § Merge policy;
+this file defines what the delivery skills carry and check.
 
 ## Interpreter
 
@@ -32,7 +32,7 @@ handoff:
   driver: {name: "<accountable driver>", stream: "epic:<N>"}
   authoring: {task_id: "<id>", run_nonce: "<nonce>"}
   reviewers: [{task_id: "<id>", run_nonce: "<nonce>"}]
-  terminal: merge|ready
+  terminal: custody|ready
   base: {ref: main, merge_base: "<sha>"}
   head: {ref: "<branch>", observed: "<sha>"}
   worktree: "<dispatch worktree>"
@@ -116,7 +116,10 @@ Proof is evidence observed in this session: command output, a reproduction, a ru
 
 ## The gate
 
-Every item must hold on the **current** head. A moved head voids the verdict and the CI.
+Every item must hold on the **current** head. A moved head voids the verdict and the CI. The
+keeper (or a lead landing a PR that no brief or custody covers) checks the whole gate at landing.
+A worker's exit needs items 1, 2, 4 and 5 and the accepted custody receipt, and never waits for
+item 3.
 
 1. Proof covers every change in the diff.
 2. A recorded exact-head APPROVE from the reviewer of record (`review-loop`), with no open
@@ -130,24 +133,28 @@ Every item must hold on the **current** head. A moved head voids the verdict and
    the full suite) where the repository runs one. It may have finished before or after the
    review round. `pr-merge`'s merge guard enforces this before it enqueues or merges. Later CI
    evidence that materially undermines the recorded verdict needs reviewer disposition before
-   landing. Where the base branch has a merge queue (`isMergeQueueEnabled`, `full-send` step 7),
+   landing. The keeper reads this item; a worker never waits for it. Where the base branch has a merge queue (`isMergeQueueEnabled`, `full-send` Landing and closeout by a lead, step 1),
    PR CI never replaces the merge-group CI Gate on the real queue candidate (`workflow.md` §
    Merge policy); without one, these same-head checks are the last CI gate.
 4. Follow-ups sent to the CTO through Fleet Comms, or recorded on the parent issue when they
    share its outcome. A non-blocking follow-up never holds the merge.
 5. The PR is open, not a draft, mergeable and not BEHIND or DIRTY against its base.
 
-After the gate, `full-send` lands through `pr-merge` (`full-send` step 8), which enqueues where
-the base branch has a merge queue and merges directly where it has none. `--expect-queue` pins
+After the gate, the keeper (or a lead, `full-send` § Landing and closeout by a lead) lands through
+`pr-merge`, which enqueues where the base branch has a merge queue and merges directly where it
+has none. `--expect-queue` pins
 the kind the gate was checked for: `pr-merge` refuses before any write when the base differs.
-`full-stop` reports READY_TO_MERGE at the gate; in a merge-queue repository the future
+`full-stop` reports READY_TO_MERGE once items 1, 2, 4 and 5 hold, with the CI state it last saw;
+its receiving driver checks item 3 before landing. In a merge-queue repository the future
 merge-group CI is not yet proven at that point.
 
 ## Terminal states
 
-- `full-send`: `MERGED` with a clean closeout receipt, `BLOCKED <reason>`, or
-  `QUEUED_UNDER_CUSTODY` after `pr_ownership queue-exit` released the owner. In that case the
-  custodian owns `MERGED` and the closeout.
+- `full-send` worker: `CUSTODY_ACCEPTED` (verified push, recorded exact-head verdict and the
+  `pr_ownership keeper-transfer` acknowledgement) or `BLOCKED <reason>`. The keeper owns the
+  landing, and the CTO cycle owns `MERGED`, the closeout and the issue.
+- `full-send` lead landing without custody: `MERGED` with a clean closeout receipt, or
+  `BLOCKED <reason>`.
 - `full-stop`: exactly one of `READY_TO_MERGE`, `WAITING_ON <named approval>`,
   `BLOCKED <reason>`, `ALREADY_MERGED_EXTERNALLY`, naming the receiving driver.
 - Neither skill ends on "Next:". Ready is never reported as delivered.

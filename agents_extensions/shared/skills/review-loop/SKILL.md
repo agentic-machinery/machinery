@@ -178,9 +178,12 @@ interpreter does not select the primary checkout's Python modules.
    one stays charged. Any other failed execution (timeout, error, malformed reply) is rerun
    once at the same head; a second failure escalates.
 7. **Record the verdict on the open PR** (it is open at the reviewed head, `full-send` step 4; its CI may still be running).
-   Do not record a `BLOCKED` reply whose only reason is a check still pending on the head: wait
-   for that check to finish, then rerun once at the same head with its result inlined
-   ([policy](references/policy.md#recording-the-verdict)).
+   Do not record a `BLOCKED` reply whose only reason is a check still pending on the head, and do
+   not wait for that check. Leave the reply unpublished and transfer a review continuation to the
+   CTO: the exact head, the ledger and the remaining budget. The CTO starts the one allowed
+   same-head rerun when the evidence arrives, with its result inlined
+   ([policy](references/policy.md#recording-the-verdict)). The worker then ends with
+   `BLOCKED pending CI evidence` and that continuation; it transfers no keeper custody.
 
    ```bash
    "$PY" -m lu_machinery.review.record_cf_verdict --task-id "$REVIEW_TASK" --pr "$PR"

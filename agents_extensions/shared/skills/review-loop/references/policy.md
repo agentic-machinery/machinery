@@ -133,10 +133,11 @@ The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in 
   a new head.
 - **Pending CI is not a verdict.** Review runs in parallel with PR CI. A `BLOCKED` reply with no
   findings whose only reason is a named check still pending on the reviewed head is never
-  recorded: a recorded `BLOCKED` could not be cleared at that head. Wait for those checks to
-  finish on the head (`gh pr checks`), then use the one same-head rerun below, with the finished
-  CI evidence inlined in the brief. The dispatcher still counts the dispatched review against
-  the round budget. A second such reply escalates to the CTO.
+  recorded: a recorded `BLOCKED` could not be cleared at that head. Never wait for those checks.
+  The authoring worker transfers a review continuation (exact head, ledger, remaining budget) to
+  the CTO, who starts the one same-head rerun below when the finished CI evidence exists and
+  inlines it in the brief. The dispatcher still counts the dispatched review against the round
+  budget. A second such reply escalates to the CTO.
 - **A failed execution** (timeout, error, malformed reply, `BLOCKED`) is never approval. Rerun
   it once at the same head; a second failure escalates to the CTO. When a `BLOCKED` reply has
   zero findings and only a missing capability caused it, the CTO may record a capability

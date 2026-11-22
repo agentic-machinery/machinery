@@ -8,8 +8,22 @@ file only points there and adds what the CTO seat learned on top.
 - Delivery follows the `full-send` and `full-stop` skills; publishing follows
   `workflow.md` § Public GitHub publishing; CI recovery follows `docs/runbooks/ci-gate.md`.
 - Report an action's result only after checking its output; never build the report from an unchecked result in the same step.
-- The merge-queue keeper usually enqueues on its own; check its log before enqueueing by
+- The merge-queue keeper lands PRs held in worker custody; check its log before enqueueing by
   hand.
+- **Exit receipt in every new brief.** State that the worker ends at verified push, recorded
+  exact-head verdict and an accepted `pr_ownership keeper-transfer` receipt, never waits on CI,
+  runners or the queue, and never reruns, enqueues, merges or runs `merge_closeout`. Dispatch
+  detached briefs only where the keeper's custody and landing are verified and the installed
+  lu-machinery release carries `keeper-transfer`; otherwise name the older contract in the
+  brief. In-flight briefs keep their owner until an explicit transfer.
+- **Keeper alert on CI failure, ejection or head move after approval.** Read the evidence, then
+  dispatch one fresh fix worker whose brief carries the current head, the run and job ids, the
+  inherited review ledger and its remaining budget, and starts with
+  `pr_ownership accept --pr <N> --repo <owner/name>`. A failing test node is fixed, never rerun.
+  The keeper alone uses the head's one infrastructure rerun or re-enqueue.
+- **After the keeper lands a PR.** Confirm `MERGED` and the merge SHA with `gh`, wait for the
+  worker to settle, then run the closeout (`full-send` § Landing and closeout by a lead, steps
+  3 to 5) and close the issue with the merged-outcome evidence.
 - When the CTO rules that a PR must not land yet (for example until a review covers every item), it applies a hold the merge-queue keeper reads,
   the `hold` label (`HOLD_LABELS`) or the `[hold]` title marker (`HOLD_TITLE`) in `lu_machinery/orchestration/merge_queue_keeper.py`, in the same action
   as the ruling, and names the condition for removing it. An instruction to a lane alone does not stop the keeper.

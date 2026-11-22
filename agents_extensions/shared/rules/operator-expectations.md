@@ -33,14 +33,19 @@ are the tie-breakers.
    `core.bare=true` on primary is a **bug** to heal (`git config core.bare false` +
    `extensions.worktreeConfig=true`), never an intentional mode. PRs for everything — no
    direct commits to main. **Merge duty:** nobody arms auto-merge. The worker that
-   receives a brief runs its chain to the end (rules core P1): once required CI and independent
-   exact-head review at the review-policy tier both pass, it enqueues via
-   `.venv/bin/python -m lu_machinery.publish pr-merge --number <N> --match-head <approved head> --expect-queue <reading>` (`full-send` step 8), unless its brief says
-   `full-stop`. The accountable orchestrator lands what no brief owns and ensures every
-   approved PR lands in `main`. Never leave an approved, green PR unmerged.
+   receives a brief runs its chain to its exit receipt (rules core P1): verified push, a
+   recorded exact-head review verdict at the review-policy tier and an accepted keeper custody
+   receipt (`pr_ownership keeper-transfer`, `full-send` step 6; it needs the lu-machinery
+   release that carries that command). It never waits on CI, runners or the queue, and never
+   reruns, enqueues or merges; a `full-stop` brief ends at ready-to-merge instead. The
+   merge-queue keeper lands PRs held in custody once the P4 gate holds on the exact head. The
+   accountable orchestrator lands what no brief or custody covers and ensures every approved PR
+   lands in `main`. Never leave an approved, green PR unmerged.
    **Landing and cleanup:** follow `workflow.md` § Merge policy and its
-   Post-merge cleanup recipe; the steps are the `full-send` skill. Cleanup is mandatory before the next large
-   dispatch; non-zero or SKIPPED receipts block closeout, never use `--force`.
+   Post-merge cleanup recipe; the worker steps are the `full-send` skill. After a CI failure,
+   ejection or head move, the keeper alerts `claude-cto`, who dispatches one fresh fix worker with
+   the current head, evidence and inherited review ledger. The CTO cycle confirms `MERGED` and runs
+   the closeout. Cleanup is mandatory before the next large dispatch; non-zero or SKIPPED receipts block closeout, never use `--force`.
    A squash-merge alone is not done. **Do not
    create sealed `lu-review-*` trees** — shielded formal CF is retired. Close issues
    when acceptance criteria are met, with tool-backed evidence. `X-Agent` trailer on
@@ -52,9 +57,11 @@ are the tie-breakers.
    and hygiene is complete:
    - **User-visible outcome** verified against the stated denominator (tool-backed).
    - **Landing** (when code/docs changed): exact-head independent APPROVE at the review-policy tier
-     posted on the PR + CI Gate green on that **same** head + merged by the accountable
-     driver — never ask the operator to merge. A PR may open before approval so CI
-     runs (OO-53). Gates: `workflow.md` § Merge policy; steps: the `full-send` skill.
+     posted on the PR + CI Gate green on that **same** head + merged by the keeper or the
+     accountable driver — never ask the operator to merge. A PR may open before approval so CI
+     runs (OO-53). Gates: `workflow.md` § Merge policy; worker steps: the `full-send` skill.
+     This is the issue's Definition of Done, owned by the CTO cycle. A worker's own done is
+     earlier: verified push, recorded verdict and accepted custody receipt.
    - **Git hygiene:** remote branch gone, local branch gone, dispatch worktree(s) gone
      (the dispatcher removes each task's own worktree at settlement; `merge_closeout` proves no
      worktree still holds the PR and removes none); no zombie refs for that PR.
@@ -163,7 +170,7 @@ are the tie-breakers.
     (see item 12 — item 12 governs *inventing* new design, not re-opening approval on work
     already ordered or cleared). Agent-system PRs (agent definitions, skills, rules, hooks,
     launchers, settings sources) land like every other PR: independent cross-family review
-    at the exact head, CI Gate green on that head, then the driver enqueues, runs
+    at the exact head, CI Gate green on that head, then the keeper or driver lands it and the CTO cycle runs
     `merge_closeout`, and deploys with `npm run agents:deploy`. Never ask the operator to
     approve, merge, or deploy them. Routine host maintenance is driver work, done then
     reported, including with sudo where the host requires it: pull merged `main`, restart

@@ -172,7 +172,9 @@ longer waits for PR CI (designated approval and operator approval, 2026-11-09): 
 the head is pushed and the PR opened or updated, independent review runs in parallel
 with PR CI on that immutable head.
 This section holds the gates, trials and red-team policy. The step-by-step delivery is
-the `full-send` skill (the briefed worker or the accountable driver, to MERGED) or
+the `full-send` skill (the briefed worker, to its exit receipt: verified push, recorded
+exact-head verdict and accepted keeper custody; the keeper then lands the PR and the CTO cycle
+confirms `MERGED` and runs closeout) or
 `full-stop` (to ready-to-merge),
 with `review-loop` for review rounds and the budget.
 
@@ -206,13 +208,14 @@ with `review-loop` for review rounds and the budget.
    the `repo_wide` invariants), not the pytest shards. Where the base branch has a merge
    queue, the real merge-group candidate must pass the required **CI Gate**, which runs the
    full supported pytest suite, before landing; nightly and opt-in `workflow_dispatch` runs run the full suite too.
-3. Only then enqueue: a recorded exact-head APPROVE and a green PR CI Gate, both bound to the
+3. Only then enqueue (the merge-queue keeper, or a lead landing what no brief owns; a briefed
+   worker never waits on CI or enqueues): a recorded exact-head APPROVE and a green PR CI Gate, both bound to the
    current PR head. Never arm auto-merge ahead of either gate —
 early-armed auto-merge is how #7447–#7449 landed with empty reviews, and a moved head
 voids both approval and CI; re-establish both on the new head. Automated merge pipelines cannot replace review gates; land
 with the task-prescribed interpreter and `-m lu_machinery.publish pr-merge --number <N> --match-head <approved head>
 --expect-queue <true|false>` after both gates, passing the `isMergeQueueEnabled` reading the gate was checked for
-(`full-send` steps 7 and 8; never `--auto` as a substitute for review). Do **not** pass `--delete-branch` while this repo uses a
+(the keeper's landing check; never `--auto` as a substitute for review). Do **not** pass `--delete-branch` while this repo uses a
 merge queue (head deletion mid-queue can close without landing); delete the remote branch
 only after `MERGED`. Dispatched agents still do NOT self-enable auto-merge or apply merge-automation labels.
 `--auto` never bypasses blocking checks (#M-0.5 semantics unchanged).
@@ -339,14 +342,13 @@ stays. Before a branch sweep, inspect
 and prove no residue. Close linked issues only with all acceptance criteria
 verified on the delivered artifact; name any residual, owner and dependency.
 
-**The merging lane owns its PR closeout.** The lane that merged the PR runs the
-command above for that PR's own worktrees and branches, and the PR is not done
-until the receipt is clean (exit 0, residue-free). A briefed worker runs it from its
-own worktree, which is still in use, so its receipt reports that worktree and its
-local branch as its only residual and exits 1; the worker reports that receipt.
-The dispatcher removes both when the task settles; once the recorded
-`worktree_disposition` is `removed`, the driver re-runs the command and its exit 0
-receipt is the verified final closeout. Any other PR-scoped worktree
+**The CTO cycle owns each PR's closeout.** A briefed worker exits at its custody
+receipt, before the merge, and runs no closeout. The CTO cycle confirms `MERGED`, waits
+for the worker to settle, and runs the command above for that PR's own worktrees and
+branches; the PR is not done until the receipt is clean (exit 0, residue-free). The
+dispatcher removes the worker's worktree and local branch when the task settles; once the
+recorded `worktree_disposition` is `removed`, the exit 0 receipt is the verified final
+closeout. Any other PR-scoped worktree
 is removed only as the disposition paragraph above describes, never by hand.
 Cleanup does not wait for a central sweep. This is not a stream lease: launchers
 own stream leases, and no driver opens, resumes, claims, renews, releases or
@@ -355,8 +357,8 @@ replaces one. The non-zero and residual stop conditions above are unchanged.
 **Stream-scoped sweeps (user directive 2026-07-13 — parallel-stream chaos fix; supersedes the
 2026-07-07 one-hour out-of-lane backstop for TRACK sessions).** Multiple streams run in parallel, so a
 session's start/end sweep is **OWN-STREAM ONLY**: it may review or review-route
-**only** PRs in its own stream. Only the accountable lead, or the worker whose brief owns
-the PR, may enqueue them, after current-head approval at its review tier and green CI. Nobody arms
+**only** PRs in its own stream. Only the accountable lead, or the keeper holding the PR in
+worker custody, may enqueue them, after current-head approval at its review tier and green CI. Nobody arms
 auto-merge.
 
 **Stream membership is AUTHORITATIVE + FAIL-CLOSED.** A PR is *in-stream* iff its linked issue resolves
@@ -374,8 +376,9 @@ made two sessions grab the same PR, or one merge another live stream's paused PR
 holder: Codex-main; a ROLE, not a hardcoded session/model — the roster owns repo-wide queue +
 integration + final merge judgment). The scheduled GitHub Actions integration sweep reports PR
 state only; it never arms, enqueues, or dequeues. The local merge-queue keeper (#8564) is the
-automatic landing actor under the operator's 2026-09-23 decision. The accountable lead enqueues
-in-stream PRs once current-head approval at its review tier and green CI are verified.
+automatic landing actor under the operator's 2026-09-23 decision, for PRs a worker handed
+over in custody. The accountable lead enqueues in-stream PRs that no brief or custody covers once
+current-head approval at its review tier and green CI are verified.
 
 **Merge-cadence soft check (#5737 — operator/orchestrator expectation, not a hard gate).**
 No lane should routinely land **>5 PRs/day against one feature area**. Prefer one shippable
