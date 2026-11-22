@@ -40,6 +40,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 # Executed by the hook as a file, so imports do not depend on the hook's cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -99,25 +100,56 @@ def _is_local(url: str) -> bool:
     return colon < 0 or 0 <= slash < colon
 
 
-HOSTED_URL = re.compile(r"(?:https?|ssh|git|git\+ssh|ssh\+git)://(?:[^@/]+@)?([^/:@]+)(?::\d*)?/(.+)", re.I)
-SCP_URL = re.compile(r"(?:[^@/]+@)?([^/:@]+):([^:].*)")
+# RFC 3986 characters outside a query or fragment, less "?", "#", "[", "]" and "%". Each excluded character
+# (those five, backslash, space, controls, non-ASCII) is one that curl, Git, ssh or urlsplit may read as a
+# boundary differently, or drop; Git percent-decodes an ssh URL before it finds the host, so an encoded "/" or
+# "@" would move it. Either way the host the push reaches would not be the one classified.
+URL_CHARACTERS = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@/-]+")
+# Git matches its built-in schemes case-sensitively; "HTTPS://" or "Ssh://" runs a git-remote-<scheme> helper from PATH.
+HOSTED_URL = re.compile(r"(?:https?|ssh|git|git\+ssh|ssh\+git)://(?:[^@/]+@)?([^/:@]+)(?::(\d*))?/(.+)")
+# Git ends the host of [user@]host:path at the first colon and ssh splits user@host at an @, so userinfo has neither.
+SCP_URL = re.compile(r"(?:[^@/:]+@)?([^/:@]+):([^:].*)")
 
 
 def destination(url: str) -> str:
     """Canonical host/owner/name for a push URL, or unknown (never private by default).
 
     Accepts the URL, ssh and scp-like ([user@]host:path) forms git uses, with or
-    without userinfo. Local paths, file URLs, remote helpers and anything else
-    without a hosted identity are unknown, which counts as public.
+    without userinfo, only when the host is the one Git, curl and ssh connect to:
+    the URL holds only URL_CHARACTERS (so no query, fragment, bracketed host,
+    percent-encoding or whitespace) and has at most one @, and for the URL forms
+    the scheme is one of Git's own, spelled in lower case, and urlsplit reads the
+    same host, a valid port and the same path. The path must be owner/name under
+    that host. Local paths, file URLs, remote helpers and anything else without
+    such a hosted identity are unknown, which counts as public.
     """
-    value = url.strip()
-    if not value or _is_local(value):
+    if not URL_CHARACTERS.fullmatch(url) or _is_local(url):
         return "unknown"
-    match = HOSTED_URL.fullmatch(value) or (None if "://" in value else SCP_URL.fullmatch(value))
+    if "://" not in url:
+        match = SCP_URL.fullmatch(url)
+        if not match:
+            return "unknown"
+        host, path = match.groups()
+        return _hosted(host, path)
+    match = HOSTED_URL.fullmatch(url)
     if not match:
         return "unknown"
-    host, path = match.groups()
-    return gate.normalize_repository(f"{host}/{path.strip('/')}")
+    host, port, path = match.groups()
+    parts = urlsplit(url)
+    try:
+        # .port raises ValueError for a port outside 0-65535, which curl and Git refuse too.
+        same = (parts.hostname, parts.port, parts.path) == (host.lower(), int(port) if port else None, f"/{path}")
+    except ValueError:
+        return "unknown"
+    return _hosted(host, path) if same else "unknown"
+
+
+def _hosted(host: str, path: str) -> str:
+    """host/owner/name for an explicit host, never the normalizer's github.com owner/name shorthand."""
+    segments = path.strip("/").split("/")
+    if len(segments) != 2:
+        return "unknown"
+    return gate.normalize_repository("/".join([host, *segments]))
 
 
 def scan_environment(environment: dict[str, str]) -> dict[str, str]:
