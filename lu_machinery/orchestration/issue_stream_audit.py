@@ -13,7 +13,8 @@ Usage:
   .venv/bin/python -m scripts.orchestration.issue_stream_audit --migrate # body refs → native sub-issues
 
 Cache: batch_state/issue_stream_audit.json (gitignored runtime state) — written on
-every live run; the session-setup hook and /api/state/issues-health read it.
+every live default-repo run; /api/issues/streams, /api/epics/graph/v1, the Work/Orient
+streams projection, and Monitor API startup read it and share one host-wide refresh lock.
 
 GH incident #4708: manual epic checklists rot (fixed-but-open issues, auto-closed
 issues orphaning scope). This gate makes drift visible at every cold start.
@@ -118,6 +119,12 @@ def refresh_sidecar_paths(root: Path | None = None) -> tuple[Path, Path]:
         batch_state / "issue_stream_audit_refresh.lock",
     )
 
+
+# Default freshness window for the shared default-repo audit cache (seconds).
+DEFAULT_CACHE_MAX_AGE_S = 3600
+
+# Bounded wait when a foreground CLI audit joins an already-running refresh.
+_CLI_LOCK_WAIT_S = 180.0
 
 # Grace for the spawn→acquire race: the scheduler writes ``scheduled``, spawns
 # the worker, and releases the lock. The worker subprocess then acquires it.
@@ -482,31 +489,50 @@ def _classify_failure(exc: Exception) -> str:
     return "audit_failed"
 
 
-def schedule_refresh(*, force: bool = False) -> dict:
-    """Single-flight refresh scheduler for both stale-fallback and
+def _validate_max_age(max_age_s: object) -> float:
+    """Validate a cache freshness bound in seconds; fail closed on invalid input."""
+    if isinstance(max_age_s, bool) or not isinstance(max_age_s, (int, float)):
+        raise ValueError("max_age_s must be a non-negative finite number")
+    try:
+        numeric = float(max_age_s)
+    except OverflowError:
+        raise ValueError("max_age_s must be a non-negative finite number") from None
+    if not math.isfinite(numeric) or numeric < 0:
+        raise ValueError("max_age_s must be a non-negative finite number")
+    return numeric
+
+
+def schedule_refresh(*, force: bool = False, max_age_s: float = DEFAULT_CACHE_MAX_AGE_S) -> dict:
+    """Single-flight refresh scheduler for startup, stale-fallback, and
     ``?fresh=true`` paths.
 
-    Takes the lock, atomically writes ``scheduled`` with a fresh opaque
-    ``run_id``, spawns the detached worker, and releases. The worker then
-    acquires and holds the lock for the entire audit.
+    Takes the lock, re-checks cache freshness (unless ``force=True``),
+    atomically writes ``scheduled`` with a fresh opaque ``run_id``, spawns the
+    detached worker, and releases. The worker then acquires and holds the lock
+    for the entire audit.
 
-    ``force=True`` (explicit ``?fresh=true``) bypasses the automatic cooldown
-    but is still single-flight — an active run is observed, not duplicated.
+    ``force=False`` (startup warmup and stale-fallback paths) skips scheduling
+    when a valid cache younger than ``max_age_s`` is already on disk, closing
+    both the startup-restart storm and concurrent stale-read races.
+    ``force=True`` (explicit ``?fresh=true``) bypasses freshness and cooldown
+    but is still single-flight — an active run is joined, not duplicated.
 
     Returns the reconciled internal state *after* scheduling (or observing an
-    active run). The caller builds the public view via
+    active/fresh state). The caller builds the public view via
     :func:`public_refresh_view`.
     """
-    now = time.time()
+    validated_max_age = _validate_max_age(max_age_s)
     fd = _try_lock_nb()
     if fd is None:
-        # Lock held by a scheduler or worker — an active run is in progress.
+        # Lock held by a scheduler, detached worker, or foreground CLI audit —
+        # an active run is in progress.
         raw = _validate_refresh_state(_read_refresh_state_raw())
         if raw is None:
             raw = _default_refresh_state()
         return raw
 
     try:
+        now = time.time()
         raw = _validate_refresh_state(_read_refresh_state_raw())
         if raw is None:
             raw = _default_refresh_state()
@@ -523,6 +549,11 @@ def schedule_refresh(*, force: bool = False) -> dict:
 
         # ``running`` can't survive free-lock reconciliation.
         assert reconciled["phase"] == "idle"
+
+        # Freshness gate under the exclusive lock: serve the cache while it is
+        # younger than ``max_age_s`` instead of spawning a redundant refresh.
+        if not force and read_cache(validated_max_age) is not None:
+            return reconciled
 
         # Cooldown gate for automatic requests.
         cooldown = reconciled.get("cooldown_until")
@@ -560,6 +591,99 @@ def schedule_refresh(*, force: bool = False) -> dict:
             _write_refresh_state_atomic(scheduled)
 
         return scheduled
+    finally:
+        _release_lock(fd)
+
+
+def _run_default_audit_single_flight(
+    *,
+    max_age_s: float,
+    max_confirmed_age_days: int,
+    repo: str | None,
+    force: bool,
+    wait_timeout_s: float = _CLI_LOCK_WAIT_S,
+) -> dict:
+    """Coordinate a foreground default-repo CLI audit with the host-wide lock.
+
+    If a refresh is already running, wait for it to finish and join the fresh
+    cache it published instead of duplicating a second live GitHub audit.
+    While running, hold the shared lock and record ``running`` in the sidecar
+    so concurrent ``schedule_refresh()`` callers join instead of spawning.
+    """
+    validated_max_age = _validate_max_age(max_age_s)
+    waited = False
+    fd = _try_lock_nb()
+    if fd is None:
+        waited = True
+        fd = _acquire_lock_blocking(timeout_s=wait_timeout_s)
+        if fd is None:
+            raise RuntimeError("issue-stream audit refresh already in progress (lock wait timed out)")
+
+    try:
+        cached = read_cache(validated_max_age)
+        if cached is not None and (not force or waited):
+            return cached
+
+        now = time.time()
+        raw = _validate_refresh_state(_read_refresh_state_raw())
+        if raw is None:
+            raw = _default_refresh_state()
+        reconciled = _reconcile_state(raw, now=now, lock_is_free=True)
+        run_id = secrets.token_hex(8)
+        ts = int(now)
+        _write_refresh_state_atomic(
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "phase": "running",
+                "requested_at": ts,
+                "started_at": ts,
+                "last_outcome": reconciled.get("last_outcome", "none"),
+                "last_outcome_at": reconciled.get("last_outcome_at"),
+                "failure_code": reconciled.get("failure_code") if reconciled.get("last_outcome") == "failed" else None,
+                "cooldown_until": None,
+            }
+        )
+        try:
+            report = run_audit(max_confirmed_age_days=max_confirmed_age_days, repo=repo)
+        except Exception as exc:
+            code = _classify_failure(exc)
+            fail_ts = int(time.time())
+            current = _validate_refresh_state(_read_refresh_state_raw())
+            if current is not None and current.get("run_id") == run_id:
+                with contextlib.suppress(OSError):
+                    _write_refresh_state_atomic(
+                        {
+                            "schema_version": 1,
+                            "run_id": None,
+                            "phase": "idle",
+                            "requested_at": None,
+                            "started_at": None,
+                            "last_outcome": "failed",
+                            "last_outcome_at": fail_ts,
+                            "failure_code": code,
+                            "cooldown_until": fail_ts + FAILURE_COOLDOWN_S,
+                        }
+                    )
+            raise
+
+        current = _validate_refresh_state(_read_refresh_state_raw())
+        if current is not None and current.get("run_id") == run_id:
+            ok_ts = int(time.time())
+            _write_refresh_state_atomic(
+                {
+                    "schema_version": 1,
+                    "run_id": None,
+                    "phase": "idle",
+                    "requested_at": None,
+                    "started_at": None,
+                    "last_outcome": "succeeded",
+                    "last_outcome_at": ok_ts,
+                    "failure_code": None,
+                    "cooldown_until": None,
+                }
+            )
+        return report
     finally:
         _release_lock(fd)
 
@@ -2006,7 +2130,8 @@ def _is_valid_cached_report(report: object) -> bool:
     )
 
 
-def read_cache(max_age_s: int) -> dict | None:
+def read_cache(max_age_s: float = DEFAULT_CACHE_MAX_AGE_S) -> dict | None:
+    validated_max_age = _validate_max_age(max_age_s)
     path = state_root() / "batch_state/issue_stream_audit.json"
     try:
         report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
@@ -2017,7 +2142,8 @@ def read_cache(max_age_s: int) -> dict | None:
     generated_at = _epoch_or_none(report.get("generated_at"))
     if generated_at is None:
         return None
-    if time.time() - generated_at > max_age_s:
+    age = time.time() - generated_at
+    if age > validated_max_age or age < -CACHE_FUTURE_SKEW_S:
         return None
     return report
 
@@ -2411,7 +2537,7 @@ def main(argv: list[str] | None = None) -> int:
         help="exit 1 on membership invariant failures; milestone warnings remain non-fatal",
     )
     parser.add_argument("--from-cache", action="store_true")
-    parser.add_argument("--max-age", type=int, default=3600)
+    parser.add_argument("--max-age", type=int, default=DEFAULT_CACHE_MAX_AGE_S)
     parser.add_argument(
         "--max-confirmed-age-days",
         type=int,
@@ -2426,11 +2552,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.refresh_worker:
         return _run_refresh_worker(args.refresh_worker)
+    if args.max_age < 0:
+        parser.error("--max-age must be non-negative")
     if args.max_confirmed_age_days < 1:
         parser.error("--max-confirmed-age-days must be positive")
-    if args.repo is not None and args.from_cache:
+    is_default_repo = True
+    if args.repo is not None:
         active = resolve_audit_repo(args.repo)
-        if not active.repo.default:
+        is_default_repo = active.repo.default
+        if args.from_cache and not is_default_repo:
             parser.error("--from-cache is only available for the default repository")
 
     report = read_cache(args.max_age) if args.from_cache else None
@@ -2439,7 +2569,15 @@ def main(argv: list[str] | None = None) -> int:
             # Hook path: never block a session start on the network.
             print("issue-stream audit: no fresh cache (run the auditor to refresh)")
             return 0
-        report = run_audit(max_confirmed_age_days=args.max_confirmed_age_days, repo=args.repo)
+        if is_default_repo and not args.migrate:
+            report = _run_default_audit_single_flight(
+                max_age_s=args.max_age,
+                max_confirmed_age_days=args.max_confirmed_age_days,
+                repo=args.repo,
+                force=not args.from_cache,
+            )
+        else:
+            report = run_audit(max_confirmed_age_days=args.max_confirmed_age_days, repo=args.repo)
 
     if args.migrate:
         created = migrate(report, repo=args.repo)

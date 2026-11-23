@@ -1039,6 +1039,166 @@ def test_refresh_state_atomic_replace_never_exposes_partial_json(tmp_path, monke
     assert failures == []
 
 
+def test_schedule_refresh_skips_spawn_when_cache_is_fresh_and_refreshes_when_stale_or_skewed(
+    tmp_path, monkeypatch, capsys
+):
+    """Defect class: startup/fallback refreshers spawn redundant live audits while a valid cache is fresh,
+    or suppress refreshes forever on a future-skewed timestamp."""
+    _refresh_paths(tmp_path, monkeypatch)
+    now = 10_000.0
+    clock = [now]
+    monkeypatch.setattr(issue_stream_audit.time, "time", lambda: clock[0])
+
+    cache_path = issue_stream_audit.state_root() / "batch_state" / "issue_stream_audit.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cached_report = {
+        "generated_at": int(now) - 60,
+        "ok": False,
+        "open_total": 2,
+        "streams": {"infra": [100]},
+        "orphans": [{"number": 42, "title": "orphan drift stays visible"}],
+        "multi_homed": [],
+        "pending_native_link": [],
+        "closed_or_missing_epics": [],
+        "warnings": [],
+    }
+    cache_path.write_text(json.dumps(cached_report), encoding="utf-8")
+
+    spawned: list[str] = []
+    monkeypatch.setattr(issue_stream_audit, "_spawn_worker", lambda run_id: spawned.append(run_id) or True)
+    monkeypatch.setattr(
+        issue_stream_audit,
+        "run_audit",
+        lambda **_k: (_ for _ in ()).throw(AssertionError("live audit must not run while cache is fresh")),
+    )
+
+    # Fresh cache (including drift ok=False): schedule_refresh(force=False) skips spawn;
+    # CLI --from-cache serves the cached drift directly.
+    skipped = issue_stream_audit.schedule_refresh(force=False)
+    assert skipped["phase"] == "idle"
+    assert spawned == []
+    assert issue_stream_audit.main(["--from-cache", "--json"]) == 0
+    served = json.loads(capsys.readouterr().out)
+    assert served["ok"] is False
+    assert served["orphans"] == [{"number": 42, "title": "orphan drift stays visible"}]
+
+    # Invalid max_age_s fails closed with ValueError.
+    for bad_max_age in (-1, True, float("nan"), float("inf"), 10**400):
+        with pytest.raises(ValueError, match="max_age_s"):
+            issue_stream_audit.schedule_refresh(max_age_s=bad_max_age)
+
+    # Future-skewed cache (> CACHE_FUTURE_SKEW_S ahead) fails closed and refreshes.
+    skewed_report = {**cached_report, "generated_at": int(now) + issue_stream_audit.CACHE_FUTURE_SKEW_S + 60}
+    cache_path.write_text(json.dumps(skewed_report), encoding="utf-8")
+    assert issue_stream_audit.read_cache(3600) is None
+    skew_scheduled = issue_stream_audit.schedule_refresh(force=False)
+    assert skew_scheduled["phase"] == "scheduled"
+    assert len(spawned) == 1
+
+    # Reset sidecar to idle and test stale expiry: stale cache triggers refresh while still readable via 7d window.
+    issue_stream_audit._write_refresh_state_atomic(issue_stream_audit._default_refresh_state())
+    stale_report = {**cached_report, "generated_at": int(now) - 3601}
+    cache_path.write_text(json.dumps(stale_report), encoding="utf-8")
+    assert issue_stream_audit.read_cache(3600) is None
+    assert issue_stream_audit.read_cache(7 * 24 * 3600)["orphans"] == cached_report["orphans"]
+    stale_scheduled = issue_stream_audit.schedule_refresh(force=False)
+    assert stale_scheduled["phase"] == "scheduled"
+    assert len(spawned) == 2
+
+    # Explicit force=True bypasses freshness on a fresh cache.
+    issue_stream_audit._write_refresh_state_atomic(issue_stream_audit._default_refresh_state())
+    cache_path.write_text(json.dumps(cached_report), encoding="utf-8")
+    forced = issue_stream_audit.schedule_refresh(force=True)
+    assert forced["phase"] == "scheduled"
+    assert len(spawned) == 3
+
+
+def test_single_flight_refresh_joins_in_flight_worker_and_blocks_post_completion_duplicate(
+    tmp_path, monkeypatch, capsys
+):
+    """Defect class: concurrent CLI/API callers duplicate a live audit while one refresh is running
+    or right after a worker finishes publishing a fresh cache (TOCTOU)."""
+    _refresh_paths(tmp_path, monkeypatch)
+    cache_path = issue_stream_audit.state_root() / "batch_state" / "issue_stream_audit.json"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    fresh_report = {
+        "generated_at": int(time.time()),
+        "ok": True,
+        "open_total": 1,
+        "streams": {"infra": [100]},
+        "orphans": [],
+        "multi_homed": [],
+        "pending_native_link": [],
+        "closed_or_missing_epics": [],
+        "warnings": [],
+    }
+
+    spawned: list[str] = []
+    monkeypatch.setattr(issue_stream_audit, "_spawn_worker", lambda run_id: spawned.append(run_id) or True)
+
+    entered = threading.Event()
+    release = threading.Event()
+    audit_calls: list[int] = []
+
+    def _slow_run_audit(**_kwargs):
+        audit_calls.append(1)
+        entered.set()
+        assert release.wait(timeout=5)
+        fresh_report["generated_at"] = int(time.time())
+        cache_path.write_text(json.dumps(fresh_report), encoding="utf-8")
+        return dict(fresh_report)
+
+    monkeypatch.setattr(issue_stream_audit, "run_audit", _slow_run_audit)
+
+    # Schedule one worker and start it in a background thread holding the host-wide lock.
+    scheduled = issue_stream_audit.schedule_refresh(force=False)
+    assert scheduled["phase"] == "scheduled"
+    assert len(spawned) == 1
+    worker_rc: list[int] = []
+    worker_thread = threading.Thread(
+        target=lambda: worker_rc.append(issue_stream_audit._run_refresh_worker(scheduled["run_id"]))
+    )
+    worker_thread.start()
+    assert entered.wait(timeout=5)
+
+    # While worker holds the lock: another schedule_refresh joins without spawning,
+    # and a foreground CLI audit waits on the lock then joins the worker's fresh cache.
+    joined_state = issue_stream_audit.schedule_refresh(force=False)
+    assert joined_state["phase"] == "running"
+    assert len(spawned) == 1
+
+    cli_waiting = threading.Event()
+    real_acquire_blocking = issue_stream_audit._acquire_lock_blocking
+
+    def _tracked_acquire_blocking(timeout_s: float):
+        cli_waiting.set()
+        return real_acquire_blocking(timeout_s)
+
+    monkeypatch.setattr(issue_stream_audit, "_acquire_lock_blocking", _tracked_acquire_blocking)
+
+    cli_rc: list[int] = []
+    cli_thread = threading.Thread(target=lambda: cli_rc.append(issue_stream_audit.main(["--from-cache", "--json"])))
+    cli_thread.start()
+    assert cli_waiting.wait(timeout=5)
+    release.set()
+
+    worker_thread.join(timeout=5)
+    cli_thread.join(timeout=5)
+    assert not worker_thread.is_alive()
+    assert not cli_thread.is_alive()
+    assert worker_rc == [0]
+    assert cli_rc == [0]
+    assert len(audit_calls) == 1
+    assert json.loads(capsys.readouterr().out)["open_total"] == 1
+
+    # Post-completion TOCTOU: a lagging caller that observed stale cache before the worker
+    # finished now enters schedule_refresh(force=False) and must skip spawning.
+    post_state = issue_stream_audit.schedule_refresh(force=False)
+    assert post_state["phase"] == "idle"
+    assert post_state["last_outcome"] == "succeeded"
+    assert len(spawned) == 1
+
+
 # --------------------------------------------------------------------------- #
 # #8661 — PR #8660 cross-family review follow-ups: registry validation branch
 # tests, per-node traversal degradation, closed_epics upkeep warning, and the
