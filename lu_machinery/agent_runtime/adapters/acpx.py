@@ -96,7 +96,7 @@ import sys
 import tarfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -1394,11 +1394,7 @@ def _versioned_node_keg_dirs(required_major: int) -> tuple[Path, ...]:
     )
 
 
-def _probe_node_semver(
-    candidate: Path,
-    *,
-    env: Mapping[str, str] | None = None,
-) -> tuple[int, int, int] | None:
+def _probe_node_semver(candidate: Path) -> tuple[int, int, int] | None:
     """Run ``<candidate> --version`` once; return semver if it is Node-shaped."""
     try:
         # A resolved Node candidate and a literal flag in an argv list; no shell runs.
@@ -1408,7 +1404,7 @@ def _probe_node_semver(
             text=True,
             timeout=5,
             check=False,
-            env=_acp_probe_env() if env is None else dict(env),
+            env=_acp_probe_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -1422,46 +1418,6 @@ def _probe_node_semver(
     if match is None:
         return None
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
-
-
-def resolve_node_binary(
-    *,
-    search_dirs: Sequence[Path],
-    matches_version: Callable[[tuple[int, int, int]], bool],
-    probe_env: Mapping[str, str] | None = None,
-    candidate_filter: Callable[[Path, Path, tuple[int, int, int]], bool] | None = None,
-) -> tuple[Path, Path, tuple[int, int, int]] | None:
-    """Select the highest matching-semver ``node`` across ``search_dirs``.
-
-    Returns ``(candidate_path, resolved_path, semver)`` for the winning binary,
-    or ``None`` when no candidate qualifies. Equal versions keep the earlier
-    candidate so ordering stays deterministic.
-    """
-    seen: set[tuple[str, str] | str] = set()
-    best: tuple[Path, Path, tuple[int, int, int]] | None = None
-    for directory in search_dirs:
-        candidate = directory / "node"
-        try:
-            resolved = candidate.resolve(strict=True)
-        except (OSError, RuntimeError):
-            # Python 3.12 raises RuntimeError on symlink loops; 3.13+ uses OSError(ELOOP).
-            continue
-        key: tuple[str, str] | str = (
-            (str(resolved), str(directory)) if candidate_filter is not None else str(resolved)
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        if not (resolved.is_file() and os.access(resolved, os.X_OK)):
-            continue
-        version = _probe_node_semver(resolved, env=probe_env)
-        if version is None or not matches_version(version):
-            continue
-        if candidate_filter is not None and not candidate_filter(candidate, resolved, version):
-            continue
-        if best is None or version > best[2]:
-            best = (candidate, resolved, version)
-    return best
 
 
 def _resolve_host_node_binary(*, adapter_label: str = "ACPX") -> Path:
@@ -1480,20 +1436,38 @@ def _resolve_host_node_binary(*, adapter_label: str = "ACPX") -> Path:
     as a substitute.
     """
     required_major = _required_node_major(adapter_label=adapter_label)
-    search_dirs: list[Path] = [
-        Path(part)
-        for part in os.environ.get("PATH", "").split(os.pathsep)
-        if part
-        # Unlike shutil.which, empty PATH parts are not the cwd — never exec untrusted ./node.
-    ]
-    search_dirs.extend(_versioned_node_keg_dirs(required_major))
-    search_dirs.extend(_NODE_HOST_BIN_DIRS)
-    found = resolve_node_binary(
-        search_dirs=search_dirs,
-        matches_version=lambda version: version[0] == required_major,
-        probe_env=_acp_probe_env(),
-    )
-    if found is None:
+    candidates: list[Path] = []
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if not part:
+            # Unlike shutil.which, empty PATH parts are not the cwd — never exec untrusted ./node.
+            continue
+        candidates.append(Path(part) / "node")
+    for root in (*_versioned_node_keg_dirs(required_major), *_NODE_HOST_BIN_DIRS):
+        candidates.append(root / "node")
+    seen: set[str] = set()
+    best: Path | None = None
+    best_version: tuple[int, int, int] | None = None
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            # Python 3.12 raises RuntimeError on symlink loops; 3.13+ uses OSError(ELOOP).
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not (resolved.is_file() and os.access(resolved, os.X_OK)):
+            continue
+        version = _probe_node_semver(resolved)
+        if version is None:
+            continue
+        if version[0] != required_major:
+            continue
+        if best_version is None or version > best_version:
+            best = resolved
+            best_version = version
+    if best is None:
         raise AcpxShadowRefusalError(
             f"{adapter_label}: no Node {required_major}.x binary found on PATH or "
             f"fixed host install locations (Homebrew node@{required_major} keg, "
@@ -1503,7 +1477,7 @@ def _resolve_host_node_binary(*, adapter_label: str = "ACPX") -> Path:
             "``#!/usr/bin/env node`` shim (#6953)",
             failure_code="node_runtime_unavailable",
         )
-    return found[1]
+    return best
 
 
 def _shebang_uses_env_node(path: Path) -> bool:

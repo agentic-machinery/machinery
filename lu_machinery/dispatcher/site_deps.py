@@ -37,7 +37,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,7 +83,7 @@ _MAX_MAJOR_EXPANSION = 16
 _NVMRC_RE = re.compile(r"^v?(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?)?$")
 _SEMVER_OP_SPACE_RE = re.compile(r"(>=|<=|>|<|=|\^|~)\s+")
 _SEMVER_TOKEN_RE = re.compile(
-    r"^(?P<op>>=|<=|>|<|=|\^|~|v)?"
+    r"^(?P<op>>=|<=|>|<|=|\^|~)?v?"
     r"(?P<major>0|[1-9]\d*)"
     r"(?:\.(?P<minor>0|[1-9]\d*|x|X|\*)(?:\.(?P<patch>0|[1-9]\d*|x|X|\*))?)?$"
 )
@@ -170,12 +170,12 @@ def _has_unsafe_chars(text: str) -> bool:
 
 
 def _parse_comparator(token: str, *, field: str) -> _SemverInterval:
+    if token in {"*", "x", "X"}:
+        return _SemverInterval((0, 0, 0), None)
     match = _SEMVER_TOKEN_RE.fullmatch(token)
     if match is None:
         raise NodeToolchainError(f"{field} has unsupported version specifier {token!r}", code="node_pin_invalid")
     op = match.group("op") or "="
-    if op == "v":
-        op = "="
     major = int(match.group("major"))
     raw_minor = match.group("minor")
     raw_patch = match.group("patch")
@@ -438,19 +438,15 @@ def _companion_npm(candidate_dir: Path, resolved_node: Path) -> tuple[Path, Path
     return None
 
 
-def _probe_npm_semver(npm_bin: Path, bin_dir: Path) -> tuple[int, int, int] | None:
-    probe_env = {
-        "PATH": os.pathsep.join(dict.fromkeys([str(bin_dir), *SYSTEM_PATH])),
-        "LANG": "C.UTF-8",
-    }
+def _probe_version(binary: Path, *, env: Mapping[str, str]) -> tuple[int, int, int] | None:
     try:
         proc = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-            [str(npm_bin), "--version"],
+            [str(binary), "--version"],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
-            env=probe_env,
+            env=dict(env),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -463,6 +459,47 @@ def _probe_npm_semver(npm_bin: Path, bin_dir: Path) -> tuple[int, int, int] | No
     if match is None:
         return None
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _probe_npm_semver(npm_bin: Path, bin_dir: Path) -> tuple[int, int, int] | None:
+    probe_env = {
+        "PATH": os.pathsep.join(dict.fromkeys([str(bin_dir), *SYSTEM_PATH])),
+        "LANG": "C.UTF-8",
+    }
+    return _probe_version(npm_bin, env=probe_env)
+
+
+def _resolve_node_binary(
+    *,
+    search_dirs: Sequence[Path],
+    matches_version: Callable[[tuple[int, int, int]], bool],
+    probe_env: Mapping[str, str],
+    candidate_filter: Callable[[Path, Path, tuple[int, int, int]], bool],
+) -> tuple[Path, Path, tuple[int, int, int]] | None:
+    """Select the highest matching-semver ``node`` across ``search_dirs`` (stdlib-only for file-path callers)."""
+    seen: set[tuple[str, str]] = set()
+    best: tuple[Path, Path, tuple[int, int, int]] | None = None
+    for directory in search_dirs:
+        candidate = directory / "node"
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            # Python 3.12 raises RuntimeError on symlink loops; 3.13+ uses OSError(ELOOP).
+            continue
+        key = (str(resolved), str(directory))
+        if key in seen:
+            continue
+        seen.add(key)
+        if not (resolved.is_file() and os.access(resolved, os.X_OK)):
+            continue
+        version = _probe_version(resolved, env=probe_env)
+        if version is None or not matches_version(version):
+            continue
+        if not candidate_filter(candidate, resolved, version):
+            continue
+        if best is None or version > best[2]:
+            best = (candidate, resolved, version)
+    return best
 
 
 def resolve_toolchain_dir(
@@ -478,9 +515,11 @@ def resolve_toolchain_dir(
     templates = _configured_toolchain_templates(env)
     search_dirs: list[Path] = []
     seen_dirs: set[str] = set()
+    skipped_templates: list[str] = []
     for template in templates:
         if "{major}" in template:
             if pin.majors is None:
+                skipped_templates.append(template)
                 continue
             for major in pin.majors:
                 expanded = template.replace("{major}", str(major))
@@ -495,8 +534,6 @@ def resolve_toolchain_dir(
         if text not in seen_dirs:
             seen_dirs.add(text)
             search_dirs.append(path_dir)
-
-    from lu_machinery.agent_runtime.adapters.acpx import resolve_node_binary
 
     probe_env = {"PATH": os.pathsep.join(SYSTEM_PATH), "LANG": "C.UTF-8"}
     matched_dirs: dict[tuple[Path, Path], Path] = {}
@@ -520,7 +557,7 @@ def resolve_toolchain_dir(
         matched_dirs[(candidate, resolved_node)] = bin_dir
         return True
 
-    found = resolve_node_binary(
+    found = _resolve_node_binary(
         search_dirs=search_dirs,
         matches_version=pin.matches_node,
         probe_env=probe_env,
@@ -528,10 +565,15 @@ def resolve_toolchain_dir(
     )
     if found is None:
         searched = ", ".join(str(directory) for directory in search_dirs) or "(none)"
+        skipped = (
+            f"; skipped templated dirs (pin does not bound Node majors): {', '.join(skipped_templates)}"
+            if skipped_templates
+            else ""
+        )
         extra = f"; rejected matching-node candidates: {'; '.join(npm_rejections)}" if npm_rejections else ""
         raise NodeToolchainError(
             f"no matching Node/npm toolchain for pin [{pin.description}]; "
-            f"searched directories: {searched}{extra}; "
+            f"searched directories: {searched}{skipped}{extra}; "
             f"install the pinned toolchain or set {NODE_TOOLCHAIN_DIRS_ENV}",
             code="node_toolchain_unavailable",
         )

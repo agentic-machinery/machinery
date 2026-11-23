@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -346,9 +348,58 @@ def test_semver_ranges_highest_match_and_symlink_loop_handling(tmp_path: Path, m
     monkeypatch.delenv("AGENT_ORIGINAL_PATH", raising=False)
     monkeypatch.setenv(site_deps.NODE_TOOLCHAIN_DIRS_ENV, str(tmp_path / "absent" / "{major}" / "bin"))
 
-    for engines in ({"node": "22.x"}, {"node": ">= 22.20.0 < 23"}, {"node": "^22.23.0"}, {"node": "~22.23.0"}):
+    for engines in (
+        {"node": "22.x"},
+        {"node": ">= 22.20.0 < 23"},
+        {"node": ">=v22.20.0 <v23"},
+        {"node": "^22.23.0"},
+        {"node": "^v22.23.0"},
+        {"node": "~22.23.0"},
+        {"node": "*"},
+    ):
         wt, site = _make_worktree(tmp_path / f"wt-{abs(hash(engines['node']))}", engines=engines)
         assert site_deps.resolve_toolchain_dir(wt, site) == newer.resolve()
+
+
+def test_unbounded_major_refusal_names_skipped_templated_dirs(tmp_path: Path):
+    """Defect class: open-ended engines.node silently omitting {major} template from refusal."""
+    wt, site = _make_worktree(tmp_path / "wt", engines={"node": ">=v99"})
+    template = str(tmp_path / "toolchains" / "{major}" / "bin")
+    with pytest.raises(site_deps.NodeToolchainError) as raised:
+        site_deps.resolve_toolchain_dir(
+            wt, site, env={site_deps.NODE_TOOLCHAIN_DIRS_ENV: template, "PATH": "/bin"}
+        )
+    assert raised.value.code == "node_toolchain_unavailable"
+    assert template in str(raised.value)
+    assert "skipped templated dirs" in str(raised.value)
+
+
+def test_file_path_isolated_cli_runs_without_importing_installed_lu_machinery(tmp_path: Path):
+    """Defect class: file-path python -I site_deps.py importing an older installed lu_machinery copy."""
+    toolchains = tmp_path / "toolchains"
+    toolchains.mkdir()
+    bin_24 = _write_fake_toolchain(
+        toolchains / "24", node_version="v24.22.3", npm_version="11.19.1", npm_ci_marker=True
+    )
+    wt, site = _make_worktree(tmp_path / "repo", nvmrc="24.22.3\n", engines={"node": "24.22.3", "npm": "11.19.1"})
+    subprocess.run(["git", "-C", str(wt), "init", "-b", "main"], check=True, capture_output=True, text=True, timeout=30)
+    env = {
+        "PATH": os.pathsep.join(["/usr/bin", "/bin"]),
+        site_deps.NODE_TOOLCHAIN_DIRS_ENV: str(toolchains / "{major}" / "bin"),
+    }
+    proc = subprocess.run(
+        [sys.executable, "-I", str(Path(site_deps.__file__).resolve()), "ensure", "--worktree", str(wt)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    payload = json.loads(proc.stdout)
+    assert payload["state"] == "installed"
+    selected = (site / "node_modules" / "pkg" / "selected.txt").read_text(encoding="utf-8").strip()
+    assert selected.startswith(f"v24.22.3|11.19.1|{bin_24.resolve()}{os.pathsep}")
 
 
 def test_unpinned_worktree_returns_none_and_preserves_default_tool_lookup(tmp_path: Path):
