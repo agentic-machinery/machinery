@@ -149,16 +149,6 @@ EOF
     -o Acquire::Retries=1
     -o Acquire::https::Timeout=10
   )
-  for i in "${!missing[@]}"; do
-    case "${missing[i]}" in
-      libpq-dev|libpq-dev:*)
-        # The runner may retain PGDG's libpq5 when libpq-dev is absent.
-        # Ubuntu's libpq-dev needs the exact matching Noble library.
-        missing[i]+=/noble
-        apt_opts+=(--allow-downgrades)
-        ;;
-    esac
-  done
 
   if ! "$bwrap_ready"; then
     deb=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb

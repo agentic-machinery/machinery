@@ -70,8 +70,10 @@ if [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
   RUNNER_TEMP="$canary/present" bash -- "$setup" postgresql-16 libpq-dev | tee "$canary/present.log"
   grep -Fxq 'Native CI packages are already ready' "$canary/present.log"
 
-  sudo apt-get --yes --no-download remove -- postgresql-16 libpq-dev
-  for extra in postgresql-16 libpq-dev; do
+  # The runner image installs PostgreSQL and libpq from PGDG as a unit.
+  # Remove that set to model an image without the preinstalled extras.
+  sudo apt-get --yes --no-download remove -- postgresql-16 postgresql-client-16 libpq-dev libpq5
+  for extra in postgresql-16 postgresql-client-16 libpq-dev libpq5; do
     status="$(dpkg-query -W -f='${db:Status-Status}' -- "$extra" 2>/dev/null)" || status=
     [[ "$status" != installed ]]
   done
@@ -85,7 +87,7 @@ if [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
     echo "::error::The unavailable snapshot case succeeded" >&2
     exit 1
   fi
-  cat "$canary/unavailable.log"
+  sed 's/^::error::/expected refusal: /' "$canary/unavailable.log"
   grep -Fq "Could not update package indexes from Ubuntu snapshot $bad_pin" "$canary/unavailable.log"
   for extra in postgresql-16 libpq-dev; do
     status="$(dpkg-query -W -f='${db:Status-Status}' -- "$extra" 2>/dev/null)" || status=
