@@ -56,8 +56,8 @@ is not built yet: you follow it as an instruction, and no tool enforces it.
 Do these in order. Dispatch and land nothing until step 7 passes.
 
 1. `date -u`. Read your own run nonce and start SHA from `dispatch status "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"`
-   (the dispatcher does not export the nonce). Read the brief ([template](#brief-template)): milestone issue, stream epic, previous
-   note ID (or `none`), the previous run's reconciled child list, legacy lane off, lane key, inbox
+   (the dispatcher does not export the nonce). Read the brief ([template](#brief-template)): milestone
+   issue, stream epic, previous note ID (or `none`), the previous run's reconciled child list, legacy lane off, lane key, inbox
    slot, worker cap, stop rule, stop-new-work time, hard deadline. A missing field is `blocked`.
 2. Probe `lu-driver-state render --help`. If it fails, it is `blocked`: report the exact command and
    error, dispatch nothing, and do not edit tracker state by hand.
@@ -66,20 +66,20 @@ Do these in order. Dispatch and land nothing until step 7 passes.
    `handoff_note` the brief does not name means two predecessors, so it is `blocked`.
    `none` is allowed only when the brief says "first run approved by the CTO".
 4. Drain the stream inbox with the brief's slot, one message at a time: read, apply, record the
-   delivery ID in your tracker item, then ack
-   (`deliveries receive --recipient <slot> --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"`, then `ack`;
-   syntax in the SKILL.md inbox drain; a task-ID worker identity on a stream slot is not yet proven
-   by a canary run). Exit 1 from `receive` means no delivery. A typed error (exit 3) is `blocked`; a `delivery-error` notice is
-   reported with its delivery ID and reason, acked, and stops dependent work
-   ([full-send](../../full-send/SKILL.md), "Ask the CTO and wait for the answer"). A delivery of kind
-   `supervisory-request` needs `deliveries consume` (a driver generation, which a run lacks) before it can
-   be acked: leave it unacked, record its ID, and end `blocked`. An empty receive does not prove the inbox is clear: a predecessor
-   with another worker ID may still hold a delivery lease. Check `deliveries pending --recipient <slot>`;
-   a non-zero count with nothing claimable means do not start dependent work until the lease expires
-   (end `handoff`, naming it). A message that widens
-   the brief or changes the stop rule is recorded, not applied: stop new work on that scope and
-   ask once in your report. A delivery you already applied before a crash is not repeated: check
-   its ID in the tracker first.
+   delivery ID in your tracker item, then ack. Commands: the SKILL.md inbox drain, with
+   `--recipient <slot> --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"` (a task-ID worker identity on a
+   stream slot is not yet proven by a canary run).
+   - `receive` exit 1: no delivery. Exit 3 (typed error): `blocked`.
+   - A `delivery-error` notice: report its delivery ID and reason, ack it, stop dependent work
+     ([full-send](../../full-send/SKILL.md), "Ask the CTO and wait for the answer").
+   - A `supervisory-request` delivery needs `deliveries consume` (a driver generation, which a run
+     lacks) before it can be acked: leave it unacked, record its ID, end `blocked`.
+   - An empty receive does not prove the inbox is clear: a predecessor with another worker ID may still
+     hold a delivery lease. Check `deliveries pending --recipient <slot>`. A non-zero count with nothing
+     claimable means no dependent work until the lease expires: end `handoff`, naming it.
+   - A message that widens the brief or changes the stop rule is recorded, not applied: stop new work on
+     that scope and ask once in your report.
+   - A delivery you already applied before a crash is not repeated: check its ID in the tracker first.
 5. Read live state, every item from tool output this turn: the milestone issue and its checklist;
    each PR in the note (`gh pr view`: state, head, merge commit; recorded verdict and its head;
    same-head `CI Gate`; queue status per [review-merge-cleanup](review-merge-cleanup.md)); every
@@ -89,7 +89,7 @@ Do these in order. Dispatch and land nothing until step 7 passes.
 6. Compare the note with live state. If the note is missing, unreadable, from another stream, or
    disagrees with live state on a fact an action depends on (a PR merged or its head moved, a child
    you did not expect is running, an issue closed), stop. Write one `blocked` note that says what
-   differs, record nothing as done, report, exit. Live state wins; the CTO decides what to repair.
+   differs, record nothing as done, report, exit. Live state wins; the CTO decides what to repair. A cold-start `blocked` run has no children: it goes to "Ending" step 3.
 7. The brief must carry the CTO's reconciled child list for the previous run: every child ID and
    full nonce, or "none, checked". The note alone is not enough: a run killed after a dispatch and
    before its tracker item leaves a child the note lacks. No such list, or "unknown", is `blocked`.
