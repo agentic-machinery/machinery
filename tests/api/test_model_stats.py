@@ -658,8 +658,7 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
 
 
-def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
-    """Defect class: false landing attribution from prose, quotes, code fences, suffixed values or another branch."""
+def _git_fixture(tmp_path, monkeypatch) -> Path:
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
@@ -670,6 +669,12 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-q", "--template=")
+    return repo
+
+
+def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
+    """Defect class: false landing attribution from prose, quotes, code fences, suffixed values or another branch."""
+    repo = _git_fixture(tmp_path, monkeypatch)
     messages = [
         # A squash merge appends its own paragraph after the trailer: the line still counts.
         "feat: real (#1)\n\nRefs #9\n\nX-Agent: codex/t-real\n\nCo-authored-by: A <a@example.invalid>\n",
@@ -684,7 +689,7 @@ def test_landing_joins_only_exact_x_agent_trailer_lines(tmp_path, monkeypatch):
         _git(repo, "commit", "-q", "--allow-empty", "-m", message)
     _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     _git(repo, "commit", "-q", "--allow-empty", "-m", "unmerged\n\nX-Agent: codex/t-branch\n")
-    monkeypatch.setattr(stats, "load_fleet_repos", lambda: {"fixture": SimpleNamespace(key="fixture")})
+    monkeypatch.setattr(stats, "load_fleet_repos", lambda: {"fixture": FleetRepo("fixture", "example/repo", "repo", "test")})
     monkeypatch.setattr(stats, "resolve_fleet_repo", lambda key, **_: (None, repo))
 
     landing = stats.scan_landing(tmp_path, datetime.now(UTC) - timedelta(days=1))
@@ -965,7 +970,7 @@ def test_page_view_string_leaves_stay_closed_for_every_window(tmp_path, monkeypa
         *stats.WINDOWS, stats.SCHEMA_VERSION, "ok", *stats.STATUSES, "other", *rows.VERDICTS,
         *stats.UNPARSED_REASON_KEYS, *stats._PAGE_CLASSES, stats.ALL_CLASSES, rows.UNKNOWN_EFFORT,
         stats.ALL_EFFORTS, *rows.POOLS, *stats.FINDING_OUTCOMES, *stats.AFTER_BLOCK, *stats._RISK_ORDER,
-        *stats.VALID_RISKS, "unknown", *stats.START_REFUSAL_CODES, *{value for value in stats._NOT_CONCRETE.values()},
+        *stats.VALID_RISKS, *stats._SIZE_ORDER, *stats.START_REFUSAL_CODES, *{v for v in stats._NOT_CONCRETE.values()},
         "catalog", "joint", "not_in_catalog", "write", "review", *repo_keys, "read", "unavailable",
         "registry_unavailable",
     }
@@ -2030,6 +2035,129 @@ def test_author_results_split_by_risk_tier(tmp_path):
     # PR 17's joint author stays joint on the page too, so either member's picker selection finds it.
     for view in ("windows", "page_windows"):
         assert ("gpt-6.1-sol+grok-4.7", 1) in [(a["model"], a["prs"]) for a in snapshot[view]["7d"]["authors"]]
+
+
+def _merged_history(tmp_path, monkeypatch):
+    repo = _git_fixture(tmp_path, monkeypatch)
+    fleet_repo = FleetRepo("machinery", "learn-ukrainian/machinery", "repo", "test")
+    monkeypatch.setattr(stats, "load_fleet_repos", lambda: {"machinery": fleet_repo})
+    monkeypatch.setattr(stats, "resolve_fleet_repo", lambda key, **_: (fleet_repo, repo))
+
+    def merge(title: str, day: float, *, lines: int = 0, body: str = "") -> str:
+        if lines:
+            path = f"change-{title.rpartition('#')[2].rstrip(')')}.txt"
+            (repo / path).write_text("new line\n" * lines)
+            _git(repo, "add", "--", path)
+        at = (NOW + timedelta(days=day)).isoformat()
+        monkeypatch.setenv("GIT_COMMITTER_DATE", at)
+        _git(repo, "commit", "-q", "--allow-empty", "--date", at, "-m", title, "-m", body)
+        sha = _git(repo, "rev-parse", "HEAD").strip()
+        _git(repo, "update-ref", "refs/remotes/origin/main", sha)
+        return sha
+
+    merge("Initial commit", -31)
+    return merge
+
+
+def test_author_quality_stratifies_published_rounds_by_risk_and_landed_diff_size(tmp_path, monkeypatch):
+    """Defect class: combining PRs on opposite size boundaries or dropping rejected PRs without a landed diff."""
+    merge = _merged_history(tmp_path, monkeypatch)
+    batch_state, tasks = _state(tmp_path)
+    for number, size in ((31, 100), (32, 101), (33, 1000), (34, 1001), (36, 10)):
+        merge(f"Feature (#{number})", -2, lines=size)
+    grok = {"repo": "machinery", "review_author_model": "grok-4.7"}
+    _review(tasks, "size31a", "incorrect", ["P1", "P2"], pr=31, pinned_head="a" * 40, **grok,
+            started_at=(NOW - timedelta(days=4)).isoformat(), finished_at=(NOW - timedelta(days=3)).isoformat())
+    _review(tasks, "size31b", "correct", [], pr=31, pinned_head="b" * 40, **grok, review_risk="high")
+    for number, sha in ((32, "c"), (33, "d"), (34, "e")):
+        _review(tasks, f"size{number}", "correct", [], pr=number, pinned_head=sha * 40, **grok)
+    _review(tasks, "size35", "incorrect", ["P2"], pr=35, pinned_head="f" * 40, **grok)
+    _review(tasks, "size36", "correct", [], pr=36, pinned_head="1" * 40, **grok, review_risk="critical")
+    rows.backfill(tasks, batch_state)
+    approve, changes = "APPROVED", "CHANGES_REQUESTED"
+    assert _publish(batch_state, ("size31a", 31, "a" * 40, changes), ("size31b", 31, "b" * 40, approve),
+                    ("size32", 32, "c" * 40, approve), ("size33", 33, "d" * 40, approve),
+                    ("size34", 34, "e" * 40, approve), ("size35", 35, "f" * 40, changes),
+                    ("size36", 36, "1" * 40, approve)) == 7
+
+    snapshot = stats.collect(batch_state, tmp_path, NOW)
+    with _serve(snapshot, tmp_path, monkeypatch) as client:
+        response = client.get("/api/fleet/model-stats?window=7d&view=page")
+    assert response.status_code == 200
+    (author,) = response.json()["author_risks"]
+    critical, medium = author["by_risk"]
+    assert (critical["risk"], critical["prs"], critical["by_size"][0]["size"]) == ("critical", 1, "small")
+    assert (medium["risk"], medium["prs"]) == ("medium", 5)
+    assert medium["rounds_per_pr"] == {"value": 1.2, "n": 5, "low_sample": True}
+    assert [(band["size"], band["prs"], band["rounds_per_pr"]["value"], band["first_round_approved"]["value"],
+             band["approved_eventually"]["value"], band["p0_p2_per_pr"]["value"], band["low_sample"])
+            for band in medium["by_size"]] == [
+        ("small", 1, 2.0, 0.0, 1.0, 2.0, True), ("medium", 2, 1.0, 1.0, 1.0, 0.0, True),
+        ("large", 1, 1.0, 1.0, 1.0, 0.0, True), ("unknown", 1, 1.0, 0.0, 0.0, 1.0, True),
+    ]
+
+
+def test_post_merge_rework_deduplicates_same_repo_fixes_in_a_complete_week(tmp_path, monkeypatch):
+    """Defect class: counting references from another repo, unrelated PRs, duplicate fixes or incomplete weeks."""
+    merge = _merged_history(tmp_path, monkeypatch)
+    batch_state, tasks = _state(tmp_path)
+    terra, sol = "gpt-6.1-terra", "gpt-6.2-sol"
+    for number, day, model in ((11, -13, terra), (12, -12, sol), (13, -11, terra), (14, -10, sol), (15, -1, terra)):
+        _record(tasks, f"written-{number}", repo="machinery", model=model,
+                started_at=(NOW - timedelta(days=20)).isoformat())
+        if number == 15:
+            continue
+        sha = merge(f"Feature (#{number})", day, body=f"X-Agent: codex/written-{number}")
+        if number == 14:
+            reverted_sha = sha
+    merge("fix: repair #11 (#21)", -9, body="Refs other/repo#12\n\n```\nExample #13\n```")
+    merge("docs: cite #12 (#22)", -8, body="https://example.invalid/leaky-commit-body")
+    merge("fix: repair #11 again (#23)", -6)
+    merge("fix: late repair for #12 (#24)", -4)
+    merge("Revert feature (#25)", -3, body=f"This reverts commit {reverted_sha}.")
+    merge("Feature (#15)", -1, body="X-Agent: codex/written-15")
+    merge("fix: repair recent #15 (#26)", -0.5)
+    rows.backfill(tasks, batch_state)
+
+    snapshot = stats.collect(batch_state, tmp_path, NOW)
+    with _serve(snapshot, tmp_path, monkeypatch) as client:
+        response = client.get("/api/fleet/model-stats?window=7d&view=page")
+        day = client.get("/api/fleet/model-stats?window=24h&view=page").json()
+    assert response.status_code == 200 and "leaky-commit-body" not in response.text
+    assert day["post_merge_rework_proxy"] == []
+    assert [(r["model"], r["reworked"], r["rate"]) for r in response.json()["post_merge_rework_proxy"]] == [
+        (terra, 1, {"value": 0.5, "n": 2, "low_sample": True}), (sol, 1, {"value": 0.5, "n": 2, "low_sample": True}),
+    ]
+
+
+def test_no_deliverable_counts_closed_cause_labels_from_settled_records(tmp_path, monkeypatch):
+    """Defect class: collapsing stated causes, leaking their details, or making old rows unreadable."""
+    batch_state, tasks = _state(tmp_path)
+    for task, reason, extra in (
+        ("outside", "outside_owned_paths: /private/escaped-path", {}), ("scope", "scope-breaker stop: note", {}),
+        ("empty", "no_commits_or_unknown", {}), ("unknown", None, {}),
+        ("deadline", None, {"error": "process deadline exceeded"}),
+        ("other", "worktree_dirty_or_unknown", {}),
+    ):
+        _record(tasks, task, status="no_deliverable", no_deliverable_reason=reason, **extra)
+    _record(tasks, "landed-with-old-error", no_deliverable_reason="outside_owned_paths")
+    path = tasks / "outside.json"
+    old = rows.summary_row(path, json.loads(path.read_text()), path.stat().st_mtime_ns)
+    assert old is not None
+    old.pop("no_deliverable_cause")
+    rows.append_row(batch_state, old)
+    assert _row(_window(batch_state, stats.Landing()), "gpt-6.1-sol", "write")["no_deliverable_causes"][
+        "no_commits_or_unknown"] == 1
+    assert rows.backfill(tasks, batch_state)["refreshed"] == 1
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
+    with _serve(snapshot, tmp_path, monkeypatch) as client:
+        response = client.get("/api/fleet/model-stats?window=7d&view=page")
+    assert response.status_code == 200 and "escaped-path" not in response.text
+    model = _row(response.json(), "gpt-6.1-sol", "write")
+    assert model["status"]["no_deliverable"] == 6
+    assert model["no_deliverable_causes"] == model["by_effort"][0]["no_deliverable_causes"] == {
+        "outside_owned_paths": 1, "scope_breaker_stop": 1, "no_commits_or_unknown": 2, "deadline": 1, "other": 1,
+    }
 
 
 def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_one(tmp_path, monkeypatch):

@@ -78,6 +78,7 @@ MAX_SAMPLE_SCAN_BYTES = 16 * 1024
 ACTIVE = frozenset({"spawning", "running"})
 VERDICTS = ("correct", "incorrect", "uncertain", "unparsed")
 UNPARSED_REASONS = ("missing_result", "too_big", "bad_format", "bad_fields")
+NO_DELIVERABLE_CAUSES = ("outside_owned_paths", "scope_breaker_stop", "no_commits_or_unknown", "deadline", "other")
 _RECORDED_VERDICTS = {"APPROVED": "correct", "CHANGES_REQUESTED": "incorrect", "BLOCKED": "uncertain"}
 PRIORITIES = ("P0", "P1", "P2", "P3")
 _ESCAPE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
@@ -751,6 +752,21 @@ def _iso(value: object) -> str | None:
     return moment.isoformat() if moment else None
 
 
+def _no_deliverable_cause(record: Mapping[str, Any]) -> str | None:
+    """Retain the stated cause category, dropping free text such as a list of paths."""
+    reason = record.get("no_deliverable_reason") or record.get("error")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    code = re.sub(r"[-\s]+", "_", reason.partition(":")[0].strip().casefold())
+    if code in {"scope_breaker", "scope_breaker_stop"}:
+        return "scope_breaker_stop"
+    if code in {"deadline", "hard_deadline", "deadline_exceeded", "process_deadline_exceeded"}:
+        return "deadline"
+    if code in {"outside_owned_paths", "no_commits_or_unknown"}:
+        return code
+    return "other"
+
+
 def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | None = None) -> dict[str, Any] | None:
     """The summary row of a settled task record, or None for an active or foreign record or an invalid task id.
 
@@ -795,6 +811,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "class": task_class,
         "status": NEVER_STARTED if refusal else label(status, "other"),
         "never_started_reason": refusal,
+        "no_deliverable_cause": _no_deliverable_cause(record) if status == "no_deliverable" and not refusal else None,
         "started_at": _iso(record.get("started_at")),
         "finished_at": _iso(record.get("finished_at")),
         "duration_s": _number(record.get("duration_s")),
@@ -1134,6 +1151,8 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
         _optional(row.get("duration_s"), _measure),
         _optional(row.get("never_started_reason"), lambda v: isinstance(v, str) and v in _REFUSAL_CODES
                   and row.get("status") == NEVER_STARTED),
+        _optional(row.get("no_deliverable_cause"), lambda v: isinstance(v, str) and v in NO_DELIVERABLE_CAUSES
+                  and row.get("status") == "no_deliverable"),
         isinstance(tokens_, dict) and tokens_.keys() == {"fresh_input", "cached_input", "output"}
         and all(_count_value(v) for v in tokens_.values()),
         _optional(allowance, lambda a: isinstance(a, dict) and a.keys() == {"pool", "start", "finish"}
@@ -1215,7 +1234,8 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
     if not isinstance(stored, int) or stored < source:
         return True
     return stored == source and any(present.get(key) != candidate.get(key) for key in (
-        "role", "class", "review", "effort", "pinned_head", "never_started_reason", "review_evidence_absent",
+        "role", "class", "review", "effort", "pinned_head", "never_started_reason", "no_deliverable_cause",
+        "review_evidence_absent",
     ))
 
 

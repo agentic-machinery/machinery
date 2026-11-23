@@ -211,6 +211,9 @@
   <section class="wide"><h2>Write tasks <span class="meta" id="write-meta"></span></h2>
     <p class="note">The count above includes settled writes with known effort. The unknown effort rows show the excluded tasks. Compare similar work for a higher landed share and fewer hours per merge.</p>
     <div id="write">Loading…</div></section>
+  <section class="wide"><h2>No deliverable by cause</h2>
+    <p class="note">Counts use the cause recorded at dispatch settlement. Missing causes count under No commits or unknown.</p>
+    <div id="delivery-causes">Loading…</div></section>
   <section class="wide"><h2>Reviews <span class="meta" id="reviews-meta"></span></h2>
     <p class="note">The count above includes settled reviews and other read-only tasks with known effort. PR comparisons list reviewer effort and include PRs with known effort across the counted reviews. Evidence absent counts tasks with neither review metadata nor a readable verdict. Look for fewer unreadable or unfinished results.</p>
     <div id="review">Loading…</div>
@@ -219,8 +222,18 @@
     <p class="note">The count above covers reviewed PRs for the shown authors, and higher first-round approval and fewer rounds are better for similar PRs. After a blocked first round, the percentages show approval on a new head, approval on the same head, or no approval in the window.</p>
     <div id="author">Loading…</div></section>
   <section class="wide"><h2>Authors by risk tier <span class="meta" id="risk-meta"></span></h2>
-    <p class="note">Author figures from published reviews only, split by the risk tier of each PR's first published review. Compare authors within one tier, where the work is alike; higher first-round approval and fewer findings per PR are better.</p>
+    <p class="note">Author figures use the risk tier of each PR's first published review. Compare authors within one tier and diff size band. Size is additions plus deletions at merge. PRs without a measurable landed diff have unknown size.</p>
+    <label>Diff size <select id="risk-size">
+      <option value="all">All sizes</option>
+      <option value="small">0–100 lines</option>
+      <option value="medium">101–1,000 lines</option>
+      <option value="large">Over 1,000 lines</option>
+      <option value="unknown">Unknown</option>
+    </select></label>
     <div id="risk">Loading…</div></section>
+  <section class="wide"><h2>Post-merge rework proxy</h2>
+    <p class="note">Share of attributed merges named by a later fix or revert within seven days in the same repository. The selected window applies to the end of those seven days. Merges need a full week of local history to count.</p>
+    <div id="rework">Loading…</div></section>
   <section class="wide"><details><summary>What the records can tell you</summary><div id="limits" class="note"></div></details>
     <p class="note" id="idle"></p></section>
 </main>
@@ -372,7 +385,8 @@ function pickerModels(data) {
   return [...new Set([
     ...(data.idle_catalog_models || []),
     ...(data.models || []).map((m) => m.model),
-    ...[...(data.authors || []), ...(data.author_risks || [])].flatMap((a) => members(a.model)),
+    ...[...(data.authors || []), ...(data.author_risks || []), ...(data.post_merge_rework_proxy || [])]
+      .flatMap((a) => members(a.model)),
     ...(data.first_round_matrix || []).flatMap((c) => [...members(c.author), c.reviewer]),
     ...(data.reviewer_accuracy?.findings || []).map((r) => r.model),
   ])].sort();
@@ -824,16 +838,40 @@ function accuracy(data) {
 }
 // A findings rate counts only PRs with a known findings count, so it carries its own low-sample mark.
 const rateOf = (r) => r && r.value !== null && r.value !== undefined ? `${num(r.value, 2)}${r.low_sample ? LOW : ""}` : "—";
-function risks(authors) {
-  const rows = authors.flatMap((a) => (a.by_risk || []).map((r, i) => `<tr><td>${i ? "" : named(a)}</td><td>${esc(r.risk)}${effortNote(r)}</td>`
-    + `${cell(nOf({n: r.prs, low_sample: r.low_sample}))}${cell(pct(r.first_round_approved))}`
-    + `${cell(rateOf(r.blocking_per_pr))}${cell(rateOf(r.p0_p2_per_pr))}</tr>`));
+function risks(authors, size) {
+  let count = 0;
+  const rows = authors.flatMap((a) => (a.by_risk || []).flatMap((tier) => {
+    const r = size === "all" ? tier : tier.by_size?.find((band) => band.size === size);
+    return r ? [{...r, risk: tier.risk}] : [];
+  }).map((r, i) => {
+    count += r.prs;
+    return `<tr><td>${i ? "" : named(a)}</td><td>${esc(r.risk)}${effortNote(r)}</td>`
+      + `${cell(nOf({n: r.prs, low_sample: r.low_sample}))}${cell(rate(r.rounds_per_pr))}`
+      + `${cell(pct(r.first_round_approved))}${cell(pct(r.approved_eventually))}`
+      + `${cell(rateOf(r.blocking_per_pr))}${cell(rateOf(r.p0_p2_per_pr))}</tr>`;
+  }));
+  $("risk-meta").textContent = `${current.label} · ${num(count)} PRs with a published review`;
   const without = authors.filter((a) => a.prs_without_review_of_record)
     .map((a) => `${named(a)}: ${num(a.prs_without_review_of_record)}`);
   const note = without.length
     ? `<p class="note"><strong class="warn">Reviewed PRs with no published first review in this selection, left out:</strong> ${without.join(", ")}</p>` : "";
-  return (rows.length ? table(["Author model", "Risk tier", "PRs", "Approved first round", "Blocking / PR", "P0–P2 / PR"], rows, [0, 1])
+  return (rows.length ? table(["Author model", "Risk tier", "PRs", "Rounds / PR", "Approved first round", "Approved eventually",
+    "Blocking / PR", "P0–P2 / PR"], rows, [0, 1])
     : '<p class="muted">No PR with a published review in this selection.</p>') + note;
+}
+function deliveryCauses(writes) {
+  const causes = ["outside_owned_paths", "scope_breaker_stop", "no_commits_or_unknown", "deadline", "other"];
+  const rows = writes.filter((m) => keepModel(m.model) && m.status.no_deliverable && m.no_deliverable_causes)
+    .map((m) => `<tr><td>${named(m)}</td>${cell(num(m.status.no_deliverable))}`
+      + causes.map((cause) => cell(num(m.no_deliverable_causes[cause]))).join("") + "</tr>");
+  return rows.length ? table(["Model", "No deliverable", "Outside owned paths", "Scope-breaker stop",
+    "No commits or unknown", "Deadline", "Other recorded cause"], rows) : '<p class="muted">No delivery causes in this selection.</p>';
+}
+function reworkRate(data) {
+  const rows = (data.post_merge_rework_proxy || []).filter((a) => keepAuthor(a.model)).map((a) =>
+    `<tr><td>${named(a)}</td>${cell(nOf(a.rate))}${cell(num(a.reworked))}${cell(pct(a.rate))}</tr>`);
+  return rows.length ? table(["Author model", "Merges observed for 7 days", "Named by a fix or revert", "Rework share"], rows)
+    : '<p class="muted">No attributed merge with seven days of follow-up in this selection.</p>';
 }
 function boxes(items) {
   const timed = (items || []).filter((item) => item.p90 !== null && keepModel(item.model));
@@ -1001,6 +1039,7 @@ function render() {
   $("write-meta").textContent = `${label}; n = ${total(writes)} tasks`;
   $("write").innerHTML = table(["Model / effort", "Tasks", "Done", "No deliverable", "Not done", "Landed", "Landed %",
     "Wall h per landed", "Median min", "p90 min"], withClasses(data.models, "write", writeRow, 10));
+  $("delivery-causes").innerHTML = deliveryCauses(writes);
   $("reviews-meta").textContent = `${label}; n = ${total(reviews)} tasks`;
   $("never-started").innerHTML = neverStarted(data.models);
   $("review").innerHTML = table(["Model / effort", "Tasks", "Not done", "Approve / changes / block", "Unreadable",
@@ -1018,9 +1057,8 @@ function render() {
       + `${cell(after(a, "approved_on_new_head"))}${cell(after(a, "approved_on_same_head"))}${cell(after(a, "not_approved"))}`
       + `${cell(rate(a.blocking_per_pr))}${cell(rate(a.p0_p2_per_pr))}</tr>`], 11));
   const authorRisks = (data.author_risks || []).filter((a) => keepAuthor(a.model));
-  const riskPrs = authorRisks.reduce((s, a) => s + (a.by_risk || []).reduce((t, r) => t + r.prs, 0), 0);
-  $("risk-meta").textContent = `${label} · ${num(riskPrs)} PRs with a published review`;
-  $("risk").innerHTML = risks(authorRisks);
+  $("risk").innerHTML = risks(authorRisks, $("risk-size").value);
+  $("rework").innerHTML = reworkRate(data);
   $("accuracy-meta").textContent = label;
   $("accuracy").innerHTML = accuracy(data);
   const allowance = (data.allowance || []).filter((a) => keepModel(a.model));
@@ -1264,6 +1302,7 @@ $("pareto-class").addEventListener("change", () => { if (current) { renderCharts
 $("pareto-x").addEventListener("change", () => { if (current) { renderCharts(); updateTableScroll(); } });
 $("trends-metric").addEventListener("change", () => { if (current) { renderCharts(); updateTableScroll(); } });
 $("matrix-class").addEventListener("change", render);
+$("risk-size").addEventListener("change", render);
 $("level-model").addEventListener("change", renderLevels);
 function updateStickyOffset() {
   const header = document.querySelector("header");
