@@ -17,7 +17,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import unicodedata
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -423,7 +422,7 @@ def _validate(verb, fields):
             raise gate.PublishBlocked(f"OPSEC: invalid publisher field {key}.")
     if verb == "pr-create" and any(not fields.get(key) for key in ("base", "head")):
         raise gate.PublishBlocked("OPSEC: PR creation requires explicit base and head names.")
-    if verb == "pr-create" and "milestone" in fields and not _valid_milestone_text(fields["milestone"]):
+    if verb == "pr-create" and "milestone" in fields and not valid_milestone_text(fields["milestone"]):
         raise gate.PublishBlocked("MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
     if verb == "pr-merge" and "subject" in fields and not "".join(
         gate.normalize_for_scan(fields["subject"]).splitlines()[:1]
@@ -1279,16 +1278,7 @@ _CLOSING_ISSUE_RE = re.compile(
 _MAX_PR_CLOSING_ISSUES = 20
 
 
-def valid_milestone_text(value: object) -> bool:
-    """True for a non-blank, single-line milestone title or number without control/format characters."""
-    return (
-        isinstance(value, str)
-        and bool(value.strip())
-        and not any(unicodedata.category(char).startswith("C") or char in "\u2028\u2029" for char in value)
-    )
-
-
-_valid_milestone_text = valid_milestone_text
+valid_milestone_text = github_client.valid_milestone_text
 
 
 def _strip_markdown_code(text: str) -> str:
@@ -1320,58 +1310,13 @@ def _pr_closing_issues(body: str, gh_repo: str) -> list[int]:
 
 def match_milestone_pages(pages: object, raw_milestone: str, *, repo: str) -> tuple[int, str]:
     """Match *raw_milestone* (title or positive integer) to one open milestone in *pages*."""
-    if not valid_milestone_text(raw_milestone):
-        raise gate.PublishBlocked("MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
-    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
-        raise gate.PublishBlocked(
-            f"MILESTONE_REFUSED: repository milestones payload for {repo} is malformed; nothing was created."
-        )
-    rows: list[tuple[int, str, str]] = []
-    for page in pages:
-        for row in page:
-            if not isinstance(row, dict):
-                raise gate.PublishBlocked(
-                    f"MILESTONE_REFUSED: repository milestones payload for {repo} is malformed; nothing was created."
-                )
-            num = row.get("number")
-            title = row.get("title")
-            state = row.get("state")
-            if (
-                type(num) is not int
-                or num <= 0
-                or not isinstance(title, str)
-                or not valid_milestone_text(title)
-                or not isinstance(state, str)
-                or state not in {"open", "closed"}
-            ):
-                raise gate.PublishBlocked(
-                    f"MILESTONE_REFUSED: repository milestones payload for {repo} is malformed; nothing was created."
-                )
-            rows.append((num, title, state))
-    by_title = [entry for entry in rows if entry[1] == raw_milestone]
-    by_number = (
-        [entry for entry in rows if entry[0] == int(raw_milestone)]
-        if re.fullmatch(r"[1-9][0-9]*", raw_milestone)
-        else []
-    )
-    matched: dict[int, tuple[int, str, str]] = {}
-    for entry in (*by_title, *by_number):
-        matched[entry[0]] = entry
-    if not matched:
-        raise gate.PublishBlocked(
-            f"MILESTONE_REFUSED: milestone {raw_milestone!r} does not exist in {repo}; nothing was created."
-        )
-    if len(matched) > 1:
-        raise gate.PublishBlocked(
-            f"MILESTONE_AMBIGUOUS: milestone {raw_milestone!r} matches multiple milestones in {repo}; nothing was created."
-        )
-    ((chosen_num, chosen_title, chosen_state),) = matched.values()
-    if chosen_state != "open":
-        raise gate.PublishBlocked(
-            f"MILESTONE_REFUSED: milestone {chosen_title!r} (#{chosen_num}) in {repo} is "
-            f"{chosen_state}, not open; nothing was created."
-        )
-    return chosen_num, chosen_title
+    try:
+        return github_client.match_milestone_pages(pages, raw_milestone, require_open=True)
+    except github_client.GitHubMilestoneError as exc:
+        prefix = "MILESTONE_AMBIGUOUS" if exc.reason == "milestone_ambiguous" else "MILESTONE_REFUSED"
+        if exc.reason == "invalid_milestone":
+            raise gate.PublishBlocked(f"{prefix}: {exc}.") from None
+        raise gate.PublishBlocked(f"{prefix}: {exc} in {repo}; nothing was created.") from None
 
 
 def extract_issue_milestone(document: object, *, number: int, repo: str) -> tuple[int, str] | None:
@@ -1495,9 +1440,6 @@ def is_not_found_result(result) -> bool:
     return False
 
 
-_is_not_found_result = is_not_found_result
-
-
 def _resolve_linked_issue_milestone(
     read_runner, dest, gh_repo, body, cwd, environment, *, injected: bool = False,
 ) -> tuple[int, str] | None:
@@ -1594,12 +1536,7 @@ def _apply_pr_milestone(created, milestone_number, milestone_title, dest, gh_rep
             updated = json_depth.loads(raw_out, max_depth=512)
         except (ValueError, TypeError):
             updated = None
-    applied_ms = updated.get("milestone") if isinstance(updated, dict) else None
-    if (
-        not isinstance(applied_ms, dict)
-        or type(applied_ms.get("number")) is not int
-        or applied_ms["number"] != milestone_number
-    ):
+    if not github_client.confirm_pr_milestone(updated, milestone_number, pr_number=number):
         raise gate.PublishBlocked(
             f"MILESTONE_FAILED: {which} was created but milestone {milestone_title!r} (#{milestone_number}) "
             "was not confirmed on the PR; verify with pr-edit."
