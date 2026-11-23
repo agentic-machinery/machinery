@@ -13,6 +13,7 @@ lookups read both: machinery first, then product
 from __future__ import annotations
 
 import os
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -87,9 +88,15 @@ class PageContract:
 
     @property
     def nav_label(self) -> str:
-        """The name the Monitor navigation shows: the declared label, else one derived from the file name."""
-        if self.label:
-            return self.label
+        """The name the Monitor navigation shows: the declared label, else one derived from the file name.
+
+        A declared label is one line of visible text: control, format (bidi) and line or paragraph
+        separator characters are dropped and runs of whitespace collapse. A label with nothing left
+        falls back to the derived name, so no link is ever unnamed.
+        """
+        visible = "".join(ch for ch in self.label if unicodedata.category(ch) not in {"Cc", "Cf", "Zl", "Zp"})
+        if label := " ".join(visible.split()):
+            return label
         if self.url == "/":
             return "Home"
         return Path(self.file).stem.replace("-", " ").replace("_", " ").capitalize()

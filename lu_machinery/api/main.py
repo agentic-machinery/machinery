@@ -100,7 +100,7 @@ from .project_state_router import router as project_state_router
 from .repository_authority import build_repository_authority, cwd_role
 from .resilience import get_resilience_snapshot, resilience_middleware
 from .rollover_router import collect_rollover_orient_data
-from .route_contracts import PAGE_CONTRACTS, all_page_contracts
+from .route_contracts import PAGE_CONTRACTS, PageContract, all_page_contracts
 from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
@@ -1749,30 +1749,45 @@ _NAV_PLACEHOLDER = "__MACHINERY_NAV__"
 _NAV_PATH = re.compile(r"/(?![/\\])[^\s\\\x00-\x1f\x7f]*")
 
 
+def _machinery_page_paths() -> frozenset[str]:
+    """Every path the machinery dashboards answer for a machinery page.
+
+    ``/x`` and ``/x.html`` both serve a machinery file ahead of any product file, as does
+    ``/index`` (the Overview). ``/index.html`` is not listed: a product that declares a
+    home owns it.
+    """
+    paths = {"/index", "/machinery/"}
+    for page in PAGE_CONTRACTS:
+        paths.update({page.url, f"{page.url}.html", f"/{page.file}"})
+    paths.discard("/index.html")
+    return frozenset(paths)
+
+
 def _machinery_nav_html(current_file: str | None, product: Any) -> str:
-    """The shared Monitor navigation, from the page contracts: machinery pages, then the product's.
+    """The shared Monitor navigation: every machinery page once, then the pages the product declares.
 
     The current page is the machinery page whose file is being served. A product page is
     listed only because the product declares it, so no page is named here that the
-    installed product does not serve. A declared URL that is not a same-site absolute path is skipped.
+    installed product does not serve. A declared URL is skipped when it is not a same-site
+    absolute path, repeats one already listed, or is a path the machinery dashboards serve
+    (a product contract that reuses a machinery URL replaces the contract, never the page).
     """
-    machinery_urls = {page.url for page in PAGE_CONTRACTS}
-    links: list[str] = []
-    product_started = False
+    machinery_paths = _machinery_page_paths()
+
+    def link(page: PageContract, attrs: str) -> str:
+        return f'<a href="{html.escape(page.url, quote=True)}"{attrs}>{html.escape(page.nav_label)}</a>'
+
+    links = [link(page, ' aria-current="page"' if page.file == current_file else "") for page in PAGE_CONTRACTS]
+    listed = {page.url for page in PAGE_CONTRACTS}
+    first_product = True
     for page in all_page_contracts(product):
+        if page in PAGE_CONTRACTS or page.url in listed or page.url in machinery_paths:
+            continue
         if not _NAV_PATH.fullmatch(page.url):
             continue
-        classes: list[str] = []
-        if page.url not in machinery_urls:
-            classes.append("product")
-            if not product_started:
-                classes.append("first")
-                product_started = True
-        current = ' aria-current="page"' if page.url in machinery_urls and page.file == current_file else ""
-        cls = f' class="{" ".join(classes)}"' if classes else ""
-        links.append(
-            f'<a href="{html.escape(page.url, quote=True)}"{cls}{current}>{html.escape(page.nav_label)}</a>'
-        )
+        listed.add(page.url)
+        links.append(link(page, ' class="product first"' if first_product else ' class="product"'))
+        first_product = False
     return "".join(links)
 
 

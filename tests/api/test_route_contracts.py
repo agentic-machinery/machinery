@@ -92,13 +92,22 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path):
     from lu_machinery.api import main, route_contracts
     from lu_machinery.api.product_contribution import ProductContribution
 
-    (tmp_path / "index.html").write_text('<nav id="machinery-nav">__MACHINERY_NAV__</nav>')
+    for contract in route_contracts.PAGE_CONTRACTS:
+        (tmp_path / contract.file).write_text('<nav id="machinery-nav">__MACHINERY_NAV__</nav>')
     base = replace(route_contracts.PAGE_CONTRACTS[0], label="")
     product = ProductContribution(
         page_contracts=(
             replace(base, file="index.html", url="/"),
             replace(base, file="curriculum-dashboard.html", url="/curriculum-dashboard.html"),
             replace(base, file="labelled.html", url="/labelled", label='Q&A "x"'),
+            replace(base, file="again.html", url="/labelled", label="Repeated URL"),
+            replace(base, file="blank.html", url="/blank", label="  \t "),
+            replace(base, file="bidi.html", url="/bidi", label="a\u202eb\n  c\x00"),
+            # Contracts that reuse a machinery URL or alias replace the contract, never the machinery page.
+            replace(base, file="product-fleet.html", url="/fleet", label="Product fleet"),
+            replace(base, file="fleet.html", url="/fleet", label="Second fleet"),
+            replace(base, file="alias.html", url="/fleet.html"),
+            replace(base, file="overview.html", url="/index"),
             replace(base, file="elsewhere.html", url="//example.invalid/x"),
             replace(base, file="relative.html", url="relative"),
             replace(base, file="backslash.html", url="/\\example.invalid"),
@@ -107,18 +116,22 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path):
     )
     request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=product))})
     context = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=tmp_path))
-    body = main.serve_static("machinery", request, context).body.decode("utf-8")
-    links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', body)
     machinery = [(c.url, html.escape(c.nav_label)) for c in route_contracts.PAGE_CONTRACTS]
-    assert [(href, label) for href, _, label in links[: len(machinery)]] == machinery
-    # The product group follows, starts once, is never current, escapes its labels and skips non-path URLs.
-    assert links[len(machinery) :] == [
-        ("/", ' class="product first"', "Home"),
-        ("/curriculum-dashboard.html", ' class="product"', "Curriculum dashboard"),
-        ("/labelled", ' class="product"', "Q&amp;A &quot;x&quot;"),
-    ]
-    assert body.count('aria-current="page"') == 1
-    assert 'href="/machinery" aria-current="page"' in body
+    for contract in route_contracts.PAGE_CONTRACTS:
+        for path in (contract.url.lstrip("/"), contract.file):
+            body = main.serve_static(path, request, context).body.decode("utf-8")
+            links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', body)
+            assert [(href, label) for href, _, label in links[: len(machinery)]] == machinery, path
+            # The product group follows, starts once, is never current, escapes its labels, keeps a
+            # readable one-line label, and skips repeats, machinery paths and non-path URLs.
+            assert links[len(machinery) :] == [
+                ("/", ' class="product first"', "Home"),
+                ("/curriculum-dashboard.html", ' class="product"', "Curriculum dashboard"),
+                ("/labelled", ' class="product"', "Q&amp;A &quot;x&quot;"),
+                ("/blank", ' class="product"', "Blank"),
+                ("/bidi", ' class="product"', "ab c"),
+            ], path
+            assert [href for href, attrs, _ in links if 'aria-current="page"' in attrs] == [contract.url], path
 
 
 def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
