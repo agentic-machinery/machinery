@@ -1209,11 +1209,13 @@ def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
     # merged PR can share that starting head. Branch candidates still require a task trailer or acceptance.
     commits = record.get("commits_ahead")
     if head and type(commits) is int and commits > 0 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
-        listed = _gh("api", "--paginate", f"repos/{repo}/commits/{head}/pulls", missing_commit=True)
-        parsed = json_depth.loads(listed or "[]", max_depth=512)
-        if not isinstance(parsed, list):
+        # --slurp keeps every page on the client's conditional path: without it a page that is not
+        # a list is re-sent as a native gh read, which is never conditional.
+        listed = _gh("api", "--paginate", "--slurp", f"repos/{repo}/commits/{head}/pulls", missing_commit=True)
+        pages = json_depth.loads(listed or "[]", max_depth=512)
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
             raise ValueError("commit pull-request listing has unexpected shape")
-        for pr in parsed:
+        for pr in (pr for page in pages for pr in page):
             if not isinstance(pr, dict):
                 raise ValueError("commit pull-request row has unexpected shape")
             candidate = pr.get("number")

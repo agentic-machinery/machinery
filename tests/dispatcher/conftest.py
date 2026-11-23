@@ -462,14 +462,15 @@ def merged_delivery_world(tmp_path, monkeypatch):
                           world.record["worktree_branch"])
             out = json.dumps({"headRefName": branch, **world.prs[number]})
         elif words[0] == "api" and endpoint.endswith("/pulls"):
-            out = json.dumps([
+            assert "--slurp" in words, words
+            out = json.dumps([[
                 {
                     "number": pr["number"],
                     "head": {"sha": pr["headRefOid"], "repo": {"full_name": repo_name}},
                     "base": {"repo": {"full_name": "other/repo" if pr.get("isCrossRepository") else repo_name}},
                 }
                 for pr in world.listed if "headRefOid" in pr
-            ])
+            ]])
         elif words[0] == "api" and "/commits?" in endpoint:
             assert "--slurp" in words, words
             number = int(endpoint.split("/")[4])

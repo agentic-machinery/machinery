@@ -1392,7 +1392,9 @@ def test_9852_init_binds_registry_to_identity_repository(tmp_path, monkeypatch, 
     registry_path.write_text("streams:\n  infra:\n    epics: [10]\n")
     packaged_path = task_closeout.machinery_path
     monkeypatch.setattr(task_closeout, "machinery_path", lambda relative: registry_path if relative == "config/issue_streams.yaml" else packaged_path(relative))
-    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: {
+    real_load = fleet_repos.load_fleet_repos
+    # Stub only the default registry; the cached bundled catalog (an explicit path) stays real.
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: real_load(path) if path is not None else {
         "public": fleet_repos.FleetRepo("public", "org/repo", "repo", "public-monorepo", True),
     })
     monkeypatch.setattr(task_closeout.GhGitHubAdapter, "read_issue", _stub_read_issue(parent_epic=parent_epic))
@@ -1480,7 +1482,9 @@ def test_cmd_init_accepts_native_membership_without_a_live_audit(
 ) -> None:
     identity_path = _write_json(tmp_path / "identity.json", _identity_dict())
     epic_repo = "org/product"
-    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: {
+    real_load = fleet_repos.load_fleet_repos
+    # Stub only the default registry; the cached bundled catalog (an explicit path) stays real.
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: real_load(path) if path is not None else {
         "public": fleet_repos.FleetRepo("public", epic_repo, "product", "public-monorepo", True),
         "machinery": fleet_repos.FleetRepo("machinery", "org/repo", "repo", "public-machinery"),
     })
