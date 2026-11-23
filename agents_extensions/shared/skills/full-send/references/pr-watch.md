@@ -9,9 +9,10 @@ the accountable driver's cycle.
 
 - No watcher, polling or `sleep` loop, and no second watcher: every reader spends one GitHub limit.
 - Wait on your own dispatch tasks (`"$PY" -m lu_machinery.dispatch wait <task> --run-nonce <nonce>`,
-  see `review-loop`) and the keeper's queue observations. Read GitHub only after a push (CI), at
-  the gate before enqueue, merge or hand-off, after enqueue, for the final `MERGED` and to
-  diagnose a failure or ejection:
+  see `review-loop`) and the keeper's queue observations. Read GitHub only when a `full-send` or
+  `full-stop` step needs it (CI after a push, protection before a push, the gate before enqueue,
+  merge or hand-off, the queue after enqueue, the final `MERGED`, diagnosing a failure or
+  ejection), never on an interval:
 
   ```bash
   gh pr view "$PR" --json state,isDraft,headRefOid,mergeable,mergeStateStatus,autoMergeRequest
