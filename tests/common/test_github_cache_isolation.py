@@ -48,11 +48,28 @@ def _rows(store):
         ).fetchall()
 
 
-def test_client_without_cache_dir_stays_on_the_test_override():
+@pytest.mark.parametrize("legacy", [False, True])
+def test_client_without_cache_dir_stays_on_the_test_override(legacy):
     store = gh.GitHubClient(env={"GH_REPO": "o/r", "PATH": os.environ.get("PATH", "")})
     assert store.cache_dir.resolve() == Path(os.environ["LU_GITHUB_CACHE_DIR"]).resolve()
     production = production_github_cache_directory()
     assert production is None or store.cache_dir.resolve() != Path(production).resolve()
+    store.cache_dir.mkdir(parents=True, exist_ok=True)
+    if legacy:
+        with sqlite3.connect(store.cache_dir / "cache.sqlite3") as db:
+            db.execute("CREATE TABLE usage (at REAL, caller TEXT, endpoint TEXT, status INTEGER, landing INTEGER)")
+    store.transport = lambda *_args: gh.Response(200, {}, b"{}")
+    assert store.request("GET", "user").error is None
+    result = gh.run(
+        ["gh", "pr", "status"],
+        client=store,
+        runner=lambda args, **kwargs: subprocess.CompletedProcess(args, 0, b"{}", b""),
+        capture_output=True,
+    )
+    assert result.returncode == 0
+    rows = gh.github_usage.top(store.cache_dir)
+    assert sum(row["requests"] for row in rows) == 2
+    assert sum(row["charged"] for row in rows) == 2
 
 
 def _production_cache_writable(production):
