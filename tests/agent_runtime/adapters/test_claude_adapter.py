@@ -215,7 +215,7 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         {"allowed_tools": "Read, Bash(git log --format=%H,%s), mcp__sources__*, mcp__*, mcp__other__tool, mcp*"},
     )
     assert explicit[explicit.index("--allowedTools") + 1] == "Read,Bash(git log --format=%H,%s)"
-    for bad_allowed in ("mcp__sources__verify_word", "mcp__*", "Read(foo,mcp__sources__verify_word"):
+    for bad_allowed in ("", "   ", "mcp__sources__verify_word", "mcp__*", "Read(foo,mcp__sources__verify_word"):
         with pytest.raises(ValueError):
             _read_only(consumer, {"allowed_tools": bad_allowed})
 

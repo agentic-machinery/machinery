@@ -620,8 +620,6 @@ def _is_mcp_allow_rule(tool_lower: str) -> bool:
 
 def _strip_mcp_allow_rules(raw: str) -> str:
     """Drop MCP/Sources allow rules when a read-only run loads no MCP servers."""
-    if not raw.strip():
-        return ""
     rules: list[str] = []
     buf: list[str] = []
     depth = 0

@@ -1518,15 +1518,39 @@ def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
         for bad in (None, "", " ", "\t\n", 123, ["x"]):
             with pytest.raises(fleet_repos.FleetRepoError, match=field):
                 load({"primary": {**lu_row, field: bad}})
+        for bad_path in ("tools/server.py", "policy/admission_policy.v1.json", "typo"):
+            with pytest.raises(fleet_repos.FleetRepoError, match=f"{field} must be"):
+                load({"primary": {**lu_row, field: bad_path}})
+            with pytest.raises(fleet_repos.FleetRepoError, match=f"{field} must be"):
+                load(
+                    {
+                        "primary": {
+                            **lu_row,
+                            "github": "learn-ukrainian/renamed",
+                            "alternate_github": "learn-ukrainian/learn-ukrainian.github.io",
+                            "repository_id": 1,
+                            "visibility": "public",
+                            field: bad_path,
+                        }
+                    }
+                )
         for github in ("learn-ukrainian/learn-ukrainian.github.io", "Learn-Ukrainian/LEARN-UKRAINIAN.github.io"):
             with pytest.raises(fleet_repos.FleetRepoError, match=f"{field} is required"):
                 load({"primary": {**{k: v for k, v in lu_row.items() if k != field}, "github": github}})
 
-    # A declaration naming any other location refuses where the file is read.
+    # Read-time defense in depth: a row constructed with a non-canonical location refuses where read.
     consumer = _checkout(tmp_path / "consumer", _KUBE_DOJO_URL)
-    elsewhere = {"github": "kube-dojo/kube-dojo.github.io", "local_name": "kube-dojo"}
-    elsewhere |= {"sources_server": "tools/server.py", "admission_policy": "policy/admission_policy.v1.json"}
-    catalog = load({"primary": lu_row, "kube-dojo": elsewhere})
+    catalog = {
+        **load({"primary": lu_row}),
+        "kube-dojo": fleet_repos.FleetRepo(
+            key="kube-dojo",
+            github="kube-dojo/kube-dojo.github.io",
+            local_name="kube-dojo",
+            role="",
+            sources_server="tools/server.py",
+            admission_policy="policy/admission_policy.v1.json",
+        ),
+    }
     monkeypatch.setattr(fleet_repos, "_bundled_catalog", lambda: catalog)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
     with pytest.raises(ValueError, match="sources_server must be"):

@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH
 from lu_machinery.common.git_credentials import (
     SELECTOR_ENV,
     SelectorError,
@@ -41,12 +42,16 @@ from lu_machinery.common.git_credentials import (
     verify_authenticated_repository,
 )
 from lu_machinery.common.repo_root import PRODUCT_MARKER
+from lu_machinery.orchestration.product_policy import POLICY_REL
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
 _VALID_VISIBILITIES = frozenset({"public", "private"})
 # A row carrying the Learn Ukrainian slug must declare both product files: it never gets consumer defaults.
 _LEARN_UKRAINIAN_SLUG = "learn-ukrainian/learn-ukrainian.github.io"
-_PRODUCT_FILE_FIELDS = ("sources_server", "admission_policy")
+_PRODUCT_FILE_CANONICAL: dict[str, str] = {
+    "sources_server": SERVER_RELATIVE_PATH.as_posix(),
+    "admission_policy": POLICY_REL,
+}
 # Local config keys read to identify a checkout. An include or a URL rewrite can make Git use an
 # origin other than the literal remote.origin.url, so their presence refuses identification.
 _CHECKOUT_IDENTITY_KEYS = r"^(remote\.origin\.url|include\..*|includeif\..*|url\..*)$"
@@ -141,11 +146,13 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
         repository_id = body.get("repository_id")
         visibility = body.get("visibility")
         alternate_github = body.get("alternate_github")
-        product_files = {field: body[field] for field in _PRODUCT_FILE_FIELDS if field in body}
+        product_files = {field: body[field] for field in _PRODUCT_FILE_CANONICAL if field in body}
         for field, value in product_files.items():
-            # The reader of each file checks the value against the one location it reads.
             if not isinstance(value, str) or not value.strip():
                 raise FleetRepoError(f"fleet_repos[{key!r}].{field} must be a repo-relative file path")
+            canonical = _PRODUCT_FILE_CANONICAL[field]
+            if value != canonical:
+                raise FleetRepoError(f"fleet_repos[{key!r}].{field} must be {canonical!r}")
         if not isinstance(github, str) or "/" not in github:
             raise FleetRepoError(f"fleet_repos[{key!r}].github must be owner/name")
         if not isinstance(local_name, str) or not local_name.strip():
@@ -164,7 +171,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
                     f"fleet_repos[{key!r}] with alternate_github requires repository_id and visibility"
                 )
         if _LEARN_UKRAINIAN_SLUG in {github.lower(), str(alternate_github).lower()}:
-            for field in _PRODUCT_FILE_FIELDS:
+            for field in _PRODUCT_FILE_CANONICAL:
                 if field not in product_files:
                     raise FleetRepoError(f"fleet_repos[{key!r}].{field} is required for Learn Ukrainian")
         if default:
@@ -517,15 +524,19 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     unregistered root that keeps every Learn Ukrainian requirement. Only a standalone primary
     checkout is identified: Git must report ``root`` as the top of its work tree, ``root/.git``
     as its shared Git directory, and an execution-safe ``rev-parse --show-toplevel`` on
-    ``root``'s parent must fail as not inside any enclosing Git repository (reading no parent
-    index or tree). A linked worktree, a separate Git directory, a bare repository's worktree,
-    or any checkout nested inside another Git repository (including an embedded-Git submodule)
-    is never identified, because Git cannot name the checkout whose curriculum marker would
-    decide it. ``None`` is also returned when Git fails, times out or cannot run; ``root``
-    carries ``PRODUCT_MARKER``, has a non-directory or symlink marker ancestor, or cannot be
-    checked for it; the config has an include or a URL rewrite; ``origin`` has no URL or
-    several; the URL names Learn Ukrainian; or the URL is not exactly the HTTPS or SSH form of
-    one registered slug (ASCII, case-insensitive, optional ``.git``).
+    ``root``'s parent must traverse all ancestors and fail with Git's exact
+    ``not a git repository (or any of the parent directories): .git`` diagnostic (failing closed
+    on filesystem mount boundaries and reading no parent index or tree). A linked worktree, a
+    separate Git directory, a bare repository's worktree, or any checkout nested inside another
+    Git repository (including an embedded-Git submodule) is never identified, because Git cannot
+    name the checkout whose curriculum marker would decide it. ``None`` is also returned when Git
+    fails, times out or cannot run; ``root`` carries ``PRODUCT_MARKER``, has a non-directory or
+    symlink marker ancestor, or cannot be checked for it; the config has an include or a URL
+    rewrite; ``origin`` has no URL or several; the URL names Learn Ukrainian; or the URL is not
+    exactly the HTTPS or SSH form of one registered slug (ASCII, case-insensitive, optional
+    ``.git``). Trust boundary: Learn Ukrainian stays strict when either ``PRODUCT_MARKER`` or a
+    Learn Ukrainian ``origin`` is present; simultaneous marker removal and ``origin`` rewriting
+    is out of scope for checkout-local identification.
     """
     # Lazy: execution_safe_git imports PyYAML, and this module is reached from dependency-free hooks.
     from lu_machinery.orchestration.execution_safe_git import run_git
@@ -562,7 +573,7 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
             parent_top is None
             or parent_top.returncode != 128
             or parent_top.stdout
-            or not parent_top.stderr.startswith(b"fatal: not a git repository (or any ")
+            or parent_top.stderr != b"fatal: not a git repository (or any of the parent directories): .git\n"
         ):
             return None
     marker = Path(PRODUCT_MARKER)

@@ -290,19 +290,21 @@ A product checkout (`LU_PRODUCT_ROOT`) is matched to its `lu_machinery/config/fl
 row by its Git `origin` URL, read by `git` itself (`fleet_repos.fleet_repo_for_checkout`).
 A row may omit `sources_server` and `admission_policy`:
 
-- Without `sources_server`, a read-only Claude run loads no MCP server (`--strict-mcp-config`
-  with an empty config) and refuses a caller's `mcp_config_path`. Codex and AGY read-only runs
-  still require the Learn Ukrainian Sources server.
+- Without `sources_server`, a read-only `agent_runtime` Claude run loads no MCP server
+  (`--strict-mcp-config` with an empty config) and refuses a caller's `mcp_config_path`.
+  Codex, AGY, and dispatcher write-provider runs still require the Learn Ukrainian Sources server.
 - Without `admission_policy`, dispatch admission uses the machinery default policy: no
   Ukrainian content or review seats and no learner payload paths.
 
 Only a standalone primary checkout is matched: Git must report the root as its work-tree top,
-`<root>/.git` as its Git directory, and the checkout's parent must not be inside any enclosing Git
-repository. A linked worktree, a separate Git directory, a checkout nested inside another Git
+`<root>/.git` as its Git directory, and the checkout's parent must traverse all parent directories
+and fail as not inside any enclosing Git repository (failing closed on filesystem mount
+boundaries). A linked worktree, a separate Git directory, a checkout nested inside another Git
 repository, a checkout that cannot be matched (no or several `origin` URLs, an include or URL
 rewrite in its config, a Git failure) or one that carries `curriculum/l2-uk-en/curriculum.yaml`
-keeps both Learn Ukrainian files and refuses without them. Point `LU_PRODUCT_ROOT` at the
-consumer's standalone primary checkout.
+keeps both Learn Ukrainian files and refuses without them. Learn Ukrainian stays strict whenever
+either `curriculum/l2-uk-en/curriculum.yaml` or a Learn Ukrainian `origin` URL is present. Point
+`LU_PRODUCT_ROOT` at the consumer's standalone primary checkout.
 
 ### GPT-6 Codex role routing
 
