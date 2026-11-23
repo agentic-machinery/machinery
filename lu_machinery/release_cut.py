@@ -29,6 +29,7 @@ import textwrap
 import threading
 import time
 import tomllib
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
@@ -84,6 +85,26 @@ _SITE_PATHS = "import sysconfig; print(sysconfig.get_path('purelib')); print(sys
 
 class CutError(Exception):
     """A refused precondition or a failed step; the message names the cause."""
+
+
+def _validate_release_milestone(value: object, *, repo_label: str) -> str:
+    """Validate one configured release milestone string, failing closed with a typed reason."""
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or any(unicodedata.category(char).startswith("C") or char in "\u2028\u2029" for char in value)
+    ):
+        raise CutError(
+            f"MILESTONE_REFUSED: {repo_label} release_milestone must be a non-blank single-line string, got {value!r}"
+        )
+    return value
+
+
+def configured_release_milestone(repo_config: Mapping[str, object], *, repo_label: str) -> str | None:
+    """Read optional ``release_milestone`` from one fleet_repos row; omit means None, invalid refuses."""
+    if "release_milestone" not in repo_config:
+        return None
+    return _validate_release_milestone(repo_config["release_milestone"], repo_label=repo_label)
 
 
 class UvPreflightError(CutError):
@@ -514,6 +535,8 @@ class Cut:
     git_identity: tuple[str, ...] = ()
     tag_pushed: bool = False  # the tag push was attempted; only the remote says whether it landed
     adopt_pr: int | None = None
+    machinery_milestone: str | None = None
+    product_milestone: str | None = None
 
     # Plumbing
 
@@ -592,6 +615,38 @@ class Cut:
 
     def publisher(self, *args: str) -> str:
         return self.run([self.host_python, "-I", "-m", "lu_machinery.publish", *args], timeout=600).stdout
+
+    def verify_milestone(self, repo: str, milestone: str | None, *, label: str) -> tuple[int, str] | None:
+        """Verify one configured release milestone against live repository milestones before publishing."""
+        if milestone is None:
+            return None
+        checked = _validate_release_milestone(milestone, repo_label=f"{label} ({repo})")
+        from lu_machinery.opsec.prepublish import PublishBlocked
+        from lu_machinery.publish import github as publish_github
+
+        try:
+            return publish_github.resolve_repo_milestone(
+                repo, checked, cwd=self.primary, env=self.env(),
+            )
+        except PublishBlocked as exc:
+            raise CutError(str(exc)) from None
+
+    def report_release_milestones(self, *, include_adopt: bool = True) -> None:
+        """Verify and print the release PR milestones configured for this cut."""
+        self.step = "release milestones"
+        adopt = (
+            self.verify_milestone(self.product_repo, self.product_milestone, label="adopt")
+            if include_adopt
+            else None
+        )
+        post = self.verify_milestone(self.machinery_repo, self.machinery_milestone, label="post-release")
+        parts: list[str] = []
+        if include_adopt:
+            adopt_desc = f"{adopt[1]} (#{adopt[0]})" if adopt is not None else "none"
+            parts.append(f"adopt ({self.product_repo})={adopt_desc}")
+        post_desc = f"{post[1]} (#{post[0]})" if post is not None else "none"
+        parts.append(f"post-release ({self.machinery_repo})={post_desc}")
+        self.say("release milestones: " + ", ".join(parts))
 
     # Preflight and build
 
@@ -857,9 +912,12 @@ class Cut:
             "it still needs a review of record and a green CI Gate.\n",
             encoding="utf-8",
         )
-        out = self.publisher("pr-create", "--repo", self.product_repo, "--title",
-                             f"chore(deps): adopt lu-machinery {self.version}", "--body-file", str(body),
-                             "--base", "main", "--head", branch, "--draft")
+        argv = ["pr-create", "--repo", self.product_repo, "--title",
+                f"chore(deps): adopt lu-machinery {self.version}", "--body-file", str(body),
+                "--base", "main", "--head", branch, "--draft"]
+        if self.product_milestone is not None:
+            argv.extend(["--milestone", _validate_release_milestone(self.product_milestone, repo_label=self.product_repo)])
+        out = self.publisher(*argv)
         self.adopt_pr = pr_number(out)
         self.say(f"opened draft adopt PR #{self.adopt_pr}")
 
@@ -1203,8 +1261,11 @@ class Cut:
             "Opened by the release cut (`docs/release.md`). It needs a review of record and a green CI Gate.\n",
             encoding="utf-8",
         )
-        number = pr_number(self.publisher("pr-create", "--repo", self.machinery_repo, "--title", title,
-                                          "--body-file", str(body), "--base", "main", "--head", branch))
+        argv = ["pr-create", "--repo", self.machinery_repo, "--title", title,
+                "--body-file", str(body), "--base", "main", "--head", branch]
+        if self.machinery_milestone is not None:
+            argv.extend(["--milestone", _validate_release_milestone(self.machinery_milestone, repo_label=self.machinery_repo)])
+        number = pr_number(self.publisher(*argv))
         self.say(f"opened post-release PR #{number}")
         return number
 
@@ -1240,6 +1301,7 @@ def execute(cut: Cut) -> int:
     decision, titles, built = cut.preflight()
     cut.built = built
     cut.say(f"preflight: {decision.action}: {decision.reason}")
+    cut.report_release_milestones(include_adopt=True)
     if decision.action == "skip":
         return 0
     if decision.action == "refuse" and not cut.dry_run:
@@ -1449,7 +1511,14 @@ def _run(args: argparse.Namespace) -> int:
 
     machinery_checkout, machinery = resolve_repo("machinery")
     machinery_repo = machinery["github"]
-    product_repo = resolve_repo()[1]["github"]
+    _, product = resolve_repo()
+    product_repo = product["github"]
+    try:
+        machinery_milestone = configured_release_milestone(machinery, repo_label=f"machinery ({machinery_repo})")
+        product_milestone = configured_release_milestone(product, repo_label=f"product ({product_repo})")
+    except CutError as exc:
+        print(f"release cut refused: {exc}", file=sys.stderr)
+        return 1
     work = args.work or Path(tempfile.mkdtemp(prefix=".lu-release-cut-", dir=Path.home()))
     work.mkdir(parents=True, exist_ok=True)
     if any(path.name != "home" for path in work.iterdir()):
@@ -1466,7 +1535,8 @@ def _run(args: argparse.Namespace) -> int:
               machinery_remote=args.machinery_remote or f"https://github.com/{machinery_repo}.git",
               product_remote=args.product_remote or f"https://github.com/{product_repo}.git",
               machinery_repo=machinery_repo, product_repo=product_repo, host_python=project_interpreter(),
-              primary=primary_root(), alert=not args.no_alert, x_agent=args.x_agent)
+              primary=primary_root(), alert=not args.no_alert, x_agent=args.x_agent,
+              machinery_milestone=machinery_milestone, product_milestone=product_milestone)
     name, email = (cut.git(machinery_checkout, "config", "--get", key, check=False) for key in ("user.name", "user.email"))
     if name and email:
         cut.git_identity = ("-c", f"user.name={name}", "-c", f"user.email={email}")
@@ -1497,6 +1567,7 @@ def _run(args: argparse.Namespace) -> int:
 
 def open_post_release(cut: Cut) -> int:
     """Bootstrap or retry: the post-release PR for the newest tag on main."""
+    cut.report_release_milestones(include_adopt=False)
     clone = cut.work / "machinery"
     cut.run(["git", "clone", "--quiet", "--no-checkout", cut.machinery_remote, clone], timeout=900)
     head = cut.git(clone, "rev-parse", "refs/remotes/origin/main^{commit}")

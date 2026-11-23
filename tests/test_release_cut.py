@@ -983,3 +983,113 @@ def test_check_changelog_cli_refuses_occupied_unreleased_and_accepts_empty(tmp_p
 
     assert main(["check-changelog", "--path", str(tmp_path)]) == 1
     assert "not a regular file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", [None, "", "   ", 13, True, ["v1"], "line1\nline2", "bad\x00ms"])
+def test_release_milestone_setting_accepts_omitted_or_valid_and_refuses_invalid(bad):
+    """Defect class: invalid release_milestone config silently falls back to no milestone instead of failing closed."""
+    assert release_cut.configured_release_milestone({}, repo_label="machinery") is None
+    assert (
+        release_cut.configured_release_milestone(
+            {"release_milestone": "v0.11.0 - CI and GitHub budget reliability"}, repo_label="machinery",
+        )
+        == "v0.11.0 - CI and GitHub budget reliability"
+    )
+    with pytest.raises(CutError, match="MILESTONE_REFUSED"):
+        release_cut.configured_release_milestone({"release_milestone": bad}, repo_label="machinery")
+
+
+def test_release_prs_pass_configured_milestones_and_dry_run_reports_them(tmp_path, monkeypatch, capsys):
+    """Defect class: release_cut opens adopt/post-release PRs without the repo's configured release_milestone."""
+    from lu_machinery.opsec.prepublish import PublishBlocked
+    from lu_machinery.publish import github as publish_github
+
+    machinery_seed = tmp_path / "machinery-seed"
+    _init_repo(machinery_seed)
+    (machinery_seed / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n"
+        "[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.21...HEAD\n",
+        encoding="utf-8",
+    )
+    (machinery_seed / "pyproject.toml").write_text('[project]\nname = "lu-machinery"\nversion = "0.1.22"\n', encoding="utf-8")
+    (machinery_seed / "package.json").write_text(json.dumps({"name": "lu-machinery-acp", "version": "0.1.22"}, indent=2) + "\n", encoding="utf-8")
+    (machinery_seed / "package-lock.json").write_text(
+        json.dumps({"name": "lu-machinery-acp", "version": "0.1.22", "packages": {"": {"version": "0.1.22"}}}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _git(machinery_seed, "add", "CHANGELOG.md", "pyproject.toml", "package.json", "package-lock.json")
+    _git(machinery_seed, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "version files")
+
+    product_seed = tmp_path / "product-seed"
+    _init_repo(product_seed)
+    work = tmp_path / "work"
+    work.mkdir()
+    machinery = work / "machinery"
+    product = work / "product"
+    _bare_checkout(machinery_seed, tmp_path / "machinery.git", machinery)
+    _bare_checkout(product_seed, tmp_path / "product.git", product)
+
+    cut = Cut(
+        work=work, dry_run=False, machinery_remote=str(tmp_path / "machinery.git"),
+        product_remote=str(tmp_path / "product.git"), machinery_repo=REPO,
+        product_repo="learn-ukrainian/learn-ukrainian.github.io", host_python=Path(sys.executable), primary=tmp_path,
+        alert=False, x_agent="claude/claude-opus-5-5", version="0.1.22", previous="0.1.21", baseline="0.1.21",
+        git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"),
+        machinery_milestone="v0.11.0 - CI and GitHub budget reliability",
+        product_milestone="Machinery simplification (product side)",
+    )
+    original_run = cut.run
+    cut.run = lambda argv, **kwargs: (
+        subprocess.CompletedProcess([], 0, "", "") if "push" in [str(part) for part in argv] else original_run(argv, **kwargs)
+    )
+    published_calls: list[tuple[str, ...]] = []
+
+    def fake_publisher(*args: str) -> str:
+        published_calls.append(args)
+        repo = args[args.index("--repo") + 1]
+        return f"https://github.com/{repo}/pull/701\n"
+
+    cut.publisher = fake_publisher
+
+    assert cut.post_release("### Changed\n\n- Note\n") == 701
+    assert "--milestone" in published_calls[-1]
+    assert published_calls[-1][published_calls[-1].index("--milestone") + 1] == "v0.11.0 - CI and GitHub budget reliability"
+
+    lock = tmp_path / "consumer.lock"
+    lock.write_text("lu-machinery==0.1.22\n", encoding="utf-8")
+    cut.open_adopt_pr(lock, product)
+    assert "--milestone" in published_calls[-1]
+    assert published_calls[-1][published_calls[-1].index("--milestone") + 1] == "Machinery simplification (product side)"
+
+    # Dry-run milestone verification reports resolved milestone and fails closed on invalid milestone.
+    def fake_resolve(repo: str, milestone: str, **_kwargs):
+        if milestone == "bad-milestone":
+            raise PublishBlocked("MILESTONE_REFUSED: milestone 'bad-milestone' does not exist")
+        return (13, milestone) if repo == REPO else (9, milestone)
+
+    monkeypatch.setattr(publish_github, "resolve_repo_milestone", fake_resolve)
+    cut.product_milestone = None
+    cut.report_release_milestones(include_adopt=True)
+    out = capsys.readouterr().out
+    assert "adopt (learn-ukrainian/learn-ukrainian.github.io)=none" in out
+    assert "post-release (learn-ukrainian/machinery)=v0.11.0 - CI and GitHub budget reliability (#13)" in out
+
+    cut.machinery_milestone = "bad-milestone"
+    with pytest.raises(CutError, match="MILESTONE_REFUSED"):
+        cut.report_release_milestones(include_adopt=True)
+
+
+def test_run_refuses_invalid_configured_release_milestone(monkeypatch, tmp_path, capsys):
+    """Defect class: a malformed release_milestone in fleet_repos.yaml reaches git clone instead of failing fast."""
+    primary = tmp_path / "primary"
+    _init_repo(primary)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setattr(
+        git_module,
+        "resolve_repo",
+        lambda name=None: (primary, {"github": f"learn-ukrainian/{name or 'learn-ukrainian'}", "release_milestone": ""}),
+    )
+    monkeypatch.setattr(repo_root, "primary_root", lambda *args, **kwargs: primary)
+    monkeypatch.setattr(repo_root, "project_interpreter", lambda: Path(sys.executable))
+    assert main(["cut", "--dry-run", "--no-alert", "--work", str(tmp_path / "w"), "--x-agent", "claude/claude-opus-5-5"]) == 1
+    assert "MILESTONE_REFUSED" in capsys.readouterr().err

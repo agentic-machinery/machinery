@@ -273,12 +273,17 @@ parsing.
 ```
 
 `cut --dry-run` runs everything except the tag, the publish, the two PRs and
-the live canary (it prints the canary's plan). It is an optional
+the live canary (it prints the canary's plan and verifies/reports the configured
+release PR milestones). It is an optional
 diagnostic for the build and acceptance steps, never a readiness check and
 never a step before every cut: it can go on to build after the preflight
 would have refused the live cut. Cut as soon as readiness is established
-(see Release when ready). The command does these steps in
-order:
+(see Release when ready). Each repository's optional `release_milestone` key in
+`lu_machinery/config/fleet_repos.yaml` sets the milestone attached to its
+release PRs (the adopt PR in the product repository and the post-release PR in
+machinery). An invalid, closed, or ambiguous milestone is refused before
+publication; omitting the key leaves the PR without a milestone. The command
+does these steps in order:
 
 1. **Preflight**, on a fresh clone of machinery `main`, whose HEAD is `$SHA`
    and whose last tag is `v<previous>`. It skips (exit 0, `unchanged`) when

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -77,7 +78,7 @@ SCHEMAS = {
     "repo-fork": ({"repo"}, COMMON),
     "pr-create": (
         {"title", "body", "base", "head"},
-        {**COMMON, **TEXT, "base": "text", "head": "text", "draft": "bool"},
+        {**COMMON, **TEXT, "base": "text", "head": "text", "draft": "bool", "milestone": "text"},
     ),
     "pr-edit": ({"number"}, {**COMMON, **EDIT, "number": "number"}),
     "pr-comment": ({"number", "body"}, {**COMMON, "number": "number", "body": "text", "body_file": "file"}),
@@ -422,6 +423,8 @@ def _validate(verb, fields):
             raise gate.PublishBlocked(f"OPSEC: invalid publisher field {key}.")
     if verb == "pr-create" and any(not fields.get(key) for key in ("base", "head")):
         raise gate.PublishBlocked("OPSEC: PR creation requires explicit base and head names.")
+    if verb == "pr-create" and "milestone" in fields and not _valid_milestone_text(fields["milestone"]):
+        raise gate.PublishBlocked("MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
     if verb == "pr-merge" and "subject" in fields and not "".join(
         gate.normalize_for_scan(fields["subject"]).splitlines()[:1]
     ).strip():
@@ -1261,6 +1264,286 @@ def _link_created_issue(created, parent, parent_node, gh_repo, read_runner, runn
             f"LINK_FAILED: {which} was created but not linked to parent #{parent}; "
             "link it with the issue-link verb before doing anything else."
         )
+
+
+# --- pr-create milestone resolution and application -----------------------------------------
+
+_FENCED_CODE_RE = re.compile(r"(?ms)^[ \t]{0,3}(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)")
+_INLINE_CODE_RE = re.compile(r"(`+)([^`]*?)\1")
+_HTML_COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
+_CLOSING_ISSUE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s+"
+    r"(?:(?P<url>https://github\.com/(?P<url_repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(?P<url_num>[1-9][0-9]*))"
+    r"|(?:(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(?P<num>[1-9][0-9]*)))(?!\d)"
+)
+_MAX_PR_CLOSING_ISSUES = 20
+
+
+def _valid_milestone_text(value: object) -> bool:
+    """True for a non-blank, single-line milestone title or number without control/format characters."""
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and not any(unicodedata.category(char).startswith("C") or char in "\u2028\u2029" for char in value)
+    )
+
+
+def _strip_markdown_code(text: str) -> str:
+    """Drop fenced/inline code spans and HTML comments so examples/templates do not link issues."""
+    without_fences = _FENCED_CODE_RE.sub("", text)
+    without_comments = _HTML_COMMENT_RE.sub("", without_fences)
+    return _INLINE_CODE_RE.sub("", without_comments)
+
+
+def _pr_closing_issues(body: str, gh_repo: str) -> list[int]:
+    """Same-repository issue numbers referenced by GitHub closing keywords in *body*."""
+    cleaned = _strip_markdown_code(body)
+    found: list[int] = []
+    for match in _CLOSING_ISSUE_RE.finditer(cleaned):
+        if match.group("url"):
+            ref_repo = match.group("url_repo")
+            if not _same_repository(ref_repo, gh_repo):
+                continue
+            number = int(match.group("url_num"))
+        else:
+            ref_repo = match.group("slug")
+            if ref_repo is not None and not _same_repository(ref_repo, gh_repo):
+                continue
+            number = int(match.group("num"))
+        if number not in found:
+            found.append(number)
+    return found
+
+
+def match_milestone_pages(pages: object, raw_milestone: str, *, repo: str) -> tuple[int, str]:
+    """Match *raw_milestone* (title or positive integer) to one open milestone in *pages*."""
+    if not _valid_milestone_text(raw_milestone):
+        raise gate.PublishBlocked("MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: repository milestones payload for {repo} is malformed; nothing was created."
+        )
+    rows: list[dict[str, object]] = []
+    for page in pages:
+        for row in page:
+            if (
+                not isinstance(row, dict)
+                or type(row.get("number")) is not int
+                or row["number"] <= 0
+                or not _valid_milestone_text(row.get("title"))
+                or row.get("state") not in {"open", "closed"}
+            ):
+                raise gate.PublishBlocked(
+                    f"MILESTONE_REFUSED: repository milestones payload for {repo} is malformed; nothing was created."
+                )
+            rows.append(row)
+    by_title = [row for row in rows if row["title"] == raw_milestone]
+    by_number = (
+        [row for row in rows if row["number"] == int(raw_milestone)]
+        if re.fullmatch(r"[1-9][0-9]*", raw_milestone)
+        else []
+    )
+    matched: dict[int, dict[str, object]] = {}
+    for row in (*by_title, *by_number):
+        matched[int(row["number"])] = row
+    if not matched:
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: milestone {raw_milestone!r} does not exist in {repo}; nothing was created."
+        )
+    if len(matched) > 1:
+        raise gate.PublishBlocked(
+            f"MILESTONE_AMBIGUOUS: milestone {raw_milestone!r} matches multiple milestones in {repo}; nothing was created."
+        )
+    (chosen,) = matched.values()
+    if chosen["state"] != "open":
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: milestone {chosen['title']!r} (#{chosen['number']}) in {repo} is "
+            f"{chosen['state']}, not open; nothing was created."
+        )
+    return int(chosen["number"]), str(chosen["title"])
+
+
+def extract_issue_milestone(document: object, *, number: int, repo: str) -> tuple[int, str] | None:
+    """Return ``(milestone_number, title)`` for one open-milestoned issue payload, or ``None``."""
+    if not isinstance(document, dict) or type(document.get("number")) is not int or document["number"] != number:
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: linked issue #{number} in {repo} returned malformed metadata; nothing was created."
+        )
+    if "pull_request" in document:
+        return None
+    raw = document.get("milestone")
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, dict)
+        or type(raw.get("number")) is not int
+        or raw["number"] <= 0
+        or not _valid_milestone_text(raw.get("title"))
+        or raw.get("state") not in {"open", "closed"}
+    ):
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: linked issue #{number} in {repo} has malformed milestone metadata; nothing was created."
+        )
+    if raw["state"] != "open":
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: linked issue #{number} milestone {raw['title']!r} (#{raw['number']}) in {repo} "
+            f"is {raw['state']}, not open; nothing was created."
+        )
+    return int(raw["number"]), str(raw["title"])
+
+
+def resolve_repo_milestone(
+    repo: str,
+    raw_milestone: str,
+    *,
+    runner=None,
+    cwd=None,
+    env=None,
+) -> tuple[int, str]:
+    """Validate *raw_milestone* against the live milestones of *repo*."""
+    if not _valid_milestone_text(raw_milestone):
+        raise gate.PublishBlocked("MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
+    environment = _validated_environment(env)
+    work = Path(cwd or Path.cwd())
+    dest = repository(work, environment, repo)
+    if dest == "unknown":
+        raise gate.PublishBlocked("OPSEC: publisher repository unresolved; provide --repo.")
+    gh_repo = dest.split("/", 1)[1]
+    return _resolve_explicit_milestone(
+        merge_readiness_runner(runner), dest, gh_repo, raw_milestone, work, environment,
+    )
+
+
+def _resolve_explicit_milestone(read_runner, dest, gh_repo, raw_milestone, cwd, environment) -> tuple[int, str]:
+    try:
+        result = read(
+            "milestones", repo=dest, runner=read_runner, cwd=cwd, env=environment,
+            capture_output=True, text=True, check=False, timeout=15, paginate=True, slurp=True,
+        )
+    except github_client.GitHubRateLimited:
+        raise
+    except Exception:
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: repository milestones for {gh_repo} are unreadable; nothing was created."
+        ) from None
+    if result.returncode:
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: repository milestones for {gh_repo} are unreadable; nothing was created."
+        )
+    try:
+        pages = json_depth.loads(result.stdout, max_depth=512)
+    except (ValueError, TypeError):
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: repository milestones payload for {gh_repo} is malformed; nothing was created."
+        ) from None
+    return match_milestone_pages(pages, raw_milestone, repo=gh_repo)
+
+
+def _is_not_found_result(result) -> bool:
+    observation = getattr(result, "github_result", None)
+    if observation is not None and observation.status == 404:
+        return True
+    detail = f"{getattr(result, 'stderr', '') or ''}\n{getattr(result, 'stdout', '') or ''}"
+    return "404" in detail or "not found" in detail.lower()
+
+
+def _resolve_linked_issue_milestone(read_runner, dest, gh_repo, body, cwd, environment) -> tuple[int, str] | None:
+    issue_numbers = _pr_closing_issues(body, gh_repo)
+    if not issue_numbers:
+        return None
+    if len(issue_numbers) > _MAX_PR_CLOSING_ISSUES:
+        raise gate.PublishBlocked(
+            f"MILESTONE_AMBIGUOUS: PR body references more than {_MAX_PR_CLOSING_ISSUES} closing issues; "
+            "specify --milestone explicitly; nothing was created."
+        )
+    resolved: dict[int, str] = {}
+    for number in issue_numbers:
+        try:
+            result = read(
+                "issue", repo=dest, number=number, runner=read_runner, cwd=cwd, env=environment,
+                capture_output=True, text=True, check=False, timeout=15,
+            )
+        except github_client.GitHubRateLimited:
+            raise
+        except Exception:
+            raise gate.PublishBlocked(
+                f"MILESTONE_REFUSED: linked issue #{number} in {gh_repo} is unreadable; nothing was created."
+            ) from None
+        if result.returncode:
+            if _is_not_found_result(result):
+                continue
+            raise gate.PublishBlocked(
+                f"MILESTONE_REFUSED: linked issue #{number} in {gh_repo} is unreadable; nothing was created."
+            )
+        try:
+            document = json_depth.loads(result.stdout, max_depth=512)
+        except (ValueError, TypeError):
+            raise gate.PublishBlocked(
+                f"MILESTONE_REFUSED: linked issue #{number} in {gh_repo} returned malformed JSON; nothing was created."
+            ) from None
+        milestone = extract_issue_milestone(document, number=number, repo=gh_repo)
+        if milestone is not None:
+            resolved[milestone[0]] = milestone[1]
+    if not resolved:
+        return None
+    if len(resolved) > 1:
+        titles = ", ".join(sorted(resolved.values()))
+        raise gate.PublishBlocked(
+            f"MILESTONE_AMBIGUOUS: linked issues {issue_numbers} have conflicting milestones ({titles}); "
+            "specify --milestone explicitly; nothing was created."
+        )
+    ((ms_number, ms_title),) = resolved.items()
+    return ms_number, ms_title
+
+
+def _apply_pr_milestone(created, milestone_number, milestone_title, dest, gh_repo, runner, cwd, environment, temp):
+    """Apply the pre-validated milestone to the newly created PR via Issues PATCH."""
+    match = re.search(r"/pull/(\d+)\s*$", created)
+    number = int(match.group(1)) if match else None
+    limited = applied = None
+    try:
+        if number:
+            frozen = temp / "pr-milestone.json"
+            frozen.write_bytes(json.dumps({"milestone": milestone_number}).encode("utf-8"))
+            applied = _send(
+                [
+                    "gh", "api", "--method", "PATCH", f"repos/{gh_repo}/issues/{number}",
+                    "--input", str(frozen), *_hostname_flag(dest),
+                ],
+                environment=environment, runner=runner, cwd=cwd, capture_output=True, text=True,
+                check=False, timeout=30,
+            )
+            limited = github_client.refusal_of(applied, injected=runner is not None)
+    except github_client.GitHubRateLimited as exc:
+        limited = exc
+    except Exception:
+        applied = None
+    which = f"PR #{number}" if number else "The new PR"
+    if limited is not None:
+        print(
+            f"MILESTONE_PENDING: {which} was created but milestone {milestone_title!r} (#{milestone_number}) "
+            "was not applied; apply it with pr-edit after the rate limit resets.",
+            file=sys.stderr,
+        )
+        raise limited
+    if applied is None or applied.returncode:
+        raise gate.PublishBlocked(
+            f"MILESTONE_FAILED: {which} was created but milestone {milestone_title!r} (#{milestone_number}) "
+            "was not applied; apply it with pr-edit."
+        )
+    raw_out = str(applied.stdout or "").strip()
+    if raw_out:
+        try:
+            updated = json_depth.loads(raw_out, max_depth=512)
+        except (ValueError, TypeError):
+            updated = None
+        if isinstance(updated, dict) and "milestone" in updated:
+            applied_ms = updated.get("milestone")
+            if not isinstance(applied_ms, dict) or applied_ms.get("number") != milestone_number:
+                raise gate.PublishBlocked(
+                    f"MILESTONE_FAILED: {which} was created but milestone {milestone_title!r} (#{milestone_number}) "
+                    "was not confirmed on the PR; verify with pr-edit."
+                )
 
 
 # --- issue-transfer (C-4682) ---------------------------------------------------------------
@@ -2927,6 +3210,16 @@ def publish(
             raise
         except Exception:
             raise gate.PublishBlocked("OPSEC: checker unavailable; write refused.") from None
+        pr_milestone = None
+        if verb == "pr-create":
+            if "milestone" in fields:
+                pr_milestone = _resolve_explicit_milestone(
+                    readiness_runner, dest, gh_repo, fields["milestone"], cwd, environment,
+                )
+            elif "body" in fields:
+                pr_milestone = _resolve_linked_issue_milestone(
+                    readiness_runner, dest, gh_repo, fields["body"], cwd, environment,
+                )
         if verb == "code-scanning-dismiss":
             return _publish_code_scanning_dismiss(
                 fields, gh_repo=gh_repo, dest=dest, runner=readiness_runner, cwd=cwd,
@@ -3004,7 +3297,8 @@ def publish(
             ):
                 for item in fields.get(key, []):
                     argv.append(flag + "=" + item)
-            option("milestone")
+            if verb != "pr-create":
+                option("milestone")
             if fields.get("remove_milestone"):
                 argv.append("--remove-milestone")
             for key in ("base", "head"):
@@ -3126,13 +3420,15 @@ def publish(
                 path, number, head, action, evidence = reservation
                 recovery.consume(path, dest, number, head, action, evidence)
         linking = parent_node is not None
+        applying_milestone = pr_milestone is not None
+        capture_created = linking or applying_milestone
         result = subprocess.CompletedProcess(argv, 0, "" if text else b"", "" if text else b"") if already_queued else _send(
             argv,
             environment=environment,
             runner=runner,
             cwd=cwd,
-            capture_output=capture_output or linking,
-            text=text or linking,
+            capture_output=capture_output or capture_created,
+            text=text or capture_created,
             check=check,
             timeout=timeout,
             stdout=stdout,
@@ -3145,6 +3441,20 @@ def publish(
             )
             if not capture_output:
                 print(str(result.stdout or "").strip())
+        if applying_milestone and result.returncode == 0:
+            _apply_pr_milestone(
+                str(result.stdout or "").strip(), pr_milestone[0], pr_milestone[1], dest, gh_repo, runner,
+                cwd, environment, temp,
+            )
+            if not capture_output:
+                print(str(result.stdout or "").strip())
+        if capture_created and not capture_output and result.returncode != 0 and result.stderr:
+            sys.stderr.write(str(result.stderr))
+        if capture_created and capture_output and not text:
+            if isinstance(result.stdout, str):
+                result.stdout = result.stdout.encode("utf-8")
+            if isinstance(result.stderr, str):
+                result.stderr = result.stderr.encode("utf-8")
         if verb == "pr-merge" and recovery_queue and not already_queued and result.returncode == 0:
             _confirm_enqueued(
                 gh_repo, fields["number"], fields["match_head"], dest, temp, (readiness_runner, runner), cwd, environment,
@@ -3414,6 +3724,11 @@ def main(argv=None, *, runner=None):
                 kwargs["help"] = "Required GitHub owner/name, such as kube-dojo/kubedojo-labs. No default."
             if verb == "issue-create" and key == "parent":
                 kwargs["help"] = "Open registered epic number, such as 123. Required for ordinary issues in the registry repository."
+            if verb == "pr-create" and key == "milestone":
+                kwargs["help"] = (
+                    "Open repository milestone title or number (e.g. 'v0.11.0 - CI and GitHub budget reliability' or '13'); "
+                    "omitted inherits the linked closing issue's milestone if resolved"
+                )
             if verb == "issue-create" and key == "epic":
                 kwargs["help"] = (
                     "CTO seat only. Create a root in the stream registry repository, with no --parent "
@@ -3633,6 +3948,7 @@ REST_READS = {
     "run-artifacts": ("repos/{repo}/actions/runs/{number}/artifacts", {"number": "number"}),
     "artifact-archive": ("repos/{repo}/actions/artifacts/{number}/zip", {"number": "number"}),
     "issues": ("repos/{repo}/issues?state=open", {}),
+    "milestones": ("repos/{repo}/milestones?state=all", {}),
     "runs": ("repos/{repo}/actions/runs?event=merge_group&created={start}..{end}", {"start": "timestamp", "end": "timestamp"}),
     "head-runs": ("repos/{repo}/actions/runs?head_sha={sha}", {"sha": "sha"}),
     "deployments": ("repos/{repo}/deployments?sha={sha}", {"sha": "sha"}),

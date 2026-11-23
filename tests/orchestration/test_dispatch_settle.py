@@ -823,3 +823,123 @@ def test_reconciliation_cleans_recycled_pid_after_settlement(tmp_path: Path) -> 
 def _synthetic_publishing_rules(synthetic_opsec, publisher_transport, monkeypatch):
     """Use synthetic private tooling and an explicit destination for send spies."""
     monkeypatch.setenv("GH_REPO", "unit/public")
+
+
+def _patch_push_dependencies(monkeypatch: pytest.MonkeyPatch, run_impl) -> None:
+    def fake_git(_cwd, *command, **_kwargs):
+        if command == ("symbolic-ref", "HEAD"):
+            return "refs/heads/codex/t1\n"
+        if command[0] == "rev-parse":
+            return "1" * 40 + "\n"
+        if command[0] == "remote":
+            return "https://github.com/example/repo.git\n"
+        return ""
+
+    monkeypatch.setattr(ds, "_run", run_impl)
+    monkeypatch.setattr(ds.write_boundary, "_git", fake_git)
+    monkeypatch.setattr(ds, "verification_credentials", lambda _url: [])
+    monkeypatch.setattr(ds, "_find_pr", lambda *_args: (None, None))
+
+
+def test_settle_push_inherits_linked_issue_milestone_and_leaves_unmilestoned_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class: dispatch_settle opens PRs without inheriting their linked issue's milestone or refuses when unset."""
+    from lu_machinery.publish.github import Request
+
+    issues = {
+        42: {"number": 42, "milestone": {"number": 13, "title": "v0.11.0 - CI and GitHub budget reliability", "state": "open"}},
+        43: {"number": 43, "milestone": None},
+    }
+    creates: list[Request] = []
+
+    def fake_run(command, **_kwargs):
+        if command == ["gh", "repo", "view", "--json", "defaultBranchRef"]:
+            return subprocess.CompletedProcess(command, 0, '{"defaultBranchRef":{"name":"main"}}', "")
+        if isinstance(command, Request) and command.verb == "read-issue":
+            return subprocess.CompletedProcess(command, 0, json.dumps(issues[command.fields["number"]]), "")
+        if isinstance(command, Request) and command.verb == "pr-create":
+            creates.append(command)
+            return subprocess.CompletedProcess(command, 0, "https://example.invalid/pr/10", "")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    _patch_push_dependencies(monkeypatch, fake_run)
+    actions = ds.push_and_maybe_open_pr(
+        tmp_path, "codex/t1", open_pr=True, title="fix: thing", body="Body", linked_issues=[42],
+    )
+    assert actions == ["pushed", "pr_created:https://example.invalid/pr/10"]
+    assert creates[-1].fields["milestone"] == "v0.11.0 - CI and GitHub budget reliability"
+
+    # Unmilestoned linked issue: no milestone passed, no refusal.
+    creates.clear()
+    actions = ds.push_and_maybe_open_pr(
+        tmp_path, "codex/t1", open_pr=True, title="fix: unmilestoned", body="Body", linked_issues=[43],
+    )
+    assert actions == ["pushed", "pr_created:https://example.invalid/pr/10"]
+    assert "milestone" not in creates[-1].fields
+
+
+def test_settle_push_refuses_invalid_closed_or_ambiguous_milestones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class: dispatch_settle creates a PR when its milestone is blank, closed, or ambiguous across linked issues."""
+    from lu_machinery.publish.github import Request
+
+    issues = {
+        1: {"number": 1, "milestone": {"number": 10, "title": "Milestone A", "state": "open"}},
+        2: {"number": 2, "milestone": {"number": 11, "title": "Milestone B", "state": "open"}},
+        3: {"number": 3, "milestone": {"number": 12, "title": "Closed M", "state": "closed"}},
+    }
+    creates: list[Request] = []
+
+    def fake_run(command, **_kwargs):
+        if command == ["gh", "repo", "view", "--json", "defaultBranchRef"]:
+            return subprocess.CompletedProcess(command, 0, '{"defaultBranchRef":{"name":"main"}}', "")
+        if isinstance(command, Request) and command.verb == "read-issue":
+            return subprocess.CompletedProcess(command, 0, json.dumps(issues[command.fields["number"]]), "")
+        if isinstance(command, Request) and command.verb == "pr-create":
+            creates.append(command)
+            return subprocess.CompletedProcess(command, 0, "https://example.invalid/pr/99", "")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    _patch_push_dependencies(monkeypatch, fake_run)
+
+    # Blank explicit milestone -> MILESTONE_REFUSED, no pr-create.
+    actions = ds.push_and_maybe_open_pr(
+        tmp_path, "codex/t1", open_pr=True, title="t", body="b", milestone="   ",
+    )
+    assert any(a.startswith("pr_create_failed:MILESTONE_REFUSED:") for a in actions), actions
+    assert creates == []
+
+    # Conflicting linked-issue milestones -> MILESTONE_AMBIGUOUS, no pr-create.
+    actions = ds.push_and_maybe_open_pr(
+        tmp_path, "codex/t1", open_pr=True, title="t", body="b", linked_issues=[1, 2],
+    )
+    assert any(a.startswith("pr_create_failed:MILESTONE_AMBIGUOUS:") for a in actions), actions
+    assert creates == []
+
+    # Closed linked-issue milestone -> MILESTONE_REFUSED, no pr-create.
+    actions = ds.push_and_maybe_open_pr(
+        tmp_path, "codex/t1", open_pr=True, title="t", body="b", linked_issues=[3],
+    )
+    assert any(a.startswith("pr_create_failed:MILESTONE_REFUSED:") for a in actions), actions
+    assert creates == []
+
+
+def test_task_linked_issues_filters_foreign_repositories() -> None:
+    """Defect class: a foreign-repo issue in dor_preflight or linked_issues leaks into same-repo milestone lookup."""
+    task = {
+        "repository": "learn-ukrainian/machinery",
+        "linked_issues": [
+            {"issue": 100, "repository": "learn-ukrainian/learn-ukrainian.github.io"},
+            {"issue": 200, "repository": "learn-ukrainian/machinery"},
+        ],
+        "dor_preflight": {
+            "issues": [200, 300, 400],
+            "issue_repositories": [
+                {"issue": 300, "repo": "learn-ukrainian/learn-ukrainian.github.io"},
+                {"issue": 400, "repo": "learn-ukrainian/machinery"},
+            ],
+        },
+    }
+    assert ds._task_linked_issues(task) == [200, 400]

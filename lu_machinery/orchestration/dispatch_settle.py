@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -34,9 +35,15 @@ from lu_machinery.guardrails.delegate_ownership import (
     OwnershipLedger,
     default_ledger_path,
 )
-from lu_machinery.opsec.prepublish import publication_boundary, publication_cli
+from lu_machinery.opsec.prepublish import PublishBlocked, publication_boundary, publication_cli
 from lu_machinery.orchestration.dead_worker_state import mark_dead_worker_terminal, mark_missing_worktree_failed
-from lu_machinery.publish.github import Request, request_run
+from lu_machinery.publish.github import (
+    Request,
+    _same_repository,
+    _valid_milestone_text,
+    extract_issue_milestone,
+    request_run,
+)
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -289,6 +296,105 @@ def _find_pr(branch: str | None, cwd: Path) -> tuple[str | None, int | None]:
     return url, number
 
 
+def _positive_int(value: Any) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
+def _task_linked_issues(data: dict[str, Any]) -> list[int]:
+    """Same-repository linked issue numbers already recorded on a dispatch task."""
+    raw_repo = data.get("repository") or data.get("repository_id")
+    task_repo = raw_repo.strip() if isinstance(raw_repo, str) and raw_repo.strip() else None
+    found: list[int] = []
+
+    def add(number: int | None) -> None:
+        if number is not None and number not in found:
+            found.append(number)
+
+    for key in ("github_issue_number", "issue_number", "issue"):
+        add(_positive_int(data.get(key)))
+
+    linked = data.get("linked_issues")
+    if isinstance(linked, list):
+        for entry in linked:
+            if (number := _positive_int(entry)) is not None:
+                add(number)
+                continue
+            if not isinstance(entry, dict):
+                continue
+            number = _positive_int(entry.get("issue")) or _positive_int(entry.get("number"))
+            if number is None:
+                continue
+            entry_repo = entry.get("repository") or entry.get("repo")
+            if (
+                isinstance(entry_repo, str)
+                and entry_repo.strip()
+                and task_repo is not None
+                and not _same_repository(entry_repo.strip(), task_repo)
+            ):
+                continue
+            add(number)
+
+    preflight = data.get("dor_preflight")
+    if isinstance(preflight, dict):
+        foreign_counts: dict[int, int] = {}
+        raw_foreign = preflight.get("issue_repositories")
+        if isinstance(raw_foreign, list):
+            for entry in raw_foreign:
+                if not isinstance(entry, dict):
+                    continue
+                number = _positive_int(entry.get("issue")) or _positive_int(entry.get("number"))
+                entry_repo = entry.get("repo") or entry.get("repository")
+                if number is None or not isinstance(entry_repo, str) or not entry_repo.strip():
+                    continue
+                if task_repo is not None and _same_repository(entry_repo.strip(), task_repo):
+                    add(number)
+                else:
+                    foreign_counts[number] = foreign_counts.get(number, 0) + 1
+        raw_issues = preflight.get("issues")
+        if isinstance(raw_issues, list):
+            counts: dict[int, int] = {}
+            order: list[int] = []
+            for raw_issue in raw_issues:
+                number = _positive_int(raw_issue)
+                if number is None:
+                    continue
+                if number not in counts:
+                    order.append(number)
+                counts[number] = counts.get(number, 0) + 1
+            for number in order:
+                if counts[number] - foreign_counts.get(number, 0) > 0:
+                    add(number)
+    return found
+
+
+def _resolve_milestone_from_issues(worktree: Path, issue_numbers: Sequence[int]) -> str | None:
+    """Resolve one open milestone title from *issue_numbers*, or None when none is set."""
+    resolved: dict[int, str] = {}
+    for number in issue_numbers:
+        proc = _run(Request("read-issue", number=number), cwd=worktree)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[:120]
+            raise ValueError(f"MILESTONE_REFUSED: linked issue #{number} is unreadable ({detail or 'failed'})")
+        try:
+            document = json_depth.loads(proc.stdout, max_depth=512)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"MILESTONE_REFUSED: linked issue #{number} returned malformed JSON") from exc
+        try:
+            milestone = extract_issue_milestone(document, number=number, repo="origin")
+        except PublishBlocked as exc:
+            raise ValueError(str(exc)) from None
+        if milestone is not None:
+            resolved[milestone[0]] = milestone[1]
+    if not resolved:
+        return None
+    if len(resolved) > 1:
+        titles = ", ".join(sorted(resolved.values()))
+        raise ValueError(
+            f"MILESTONE_AMBIGUOUS: linked issues {list(issue_numbers)} have conflicting milestones ({titles})"
+        )
+    return next(iter(resolved.values()))
+
+
 def push_and_maybe_open_pr(
     worktree: Path,
     branch: str,
@@ -296,6 +402,8 @@ def push_and_maybe_open_pr(
     open_pr: bool,
     title: str | None,
     body: str | None,
+    milestone: str | None = None,
+    linked_issues: Sequence[int] | None = None,
 ) -> list[str]:
     actions: list[str] = []
     try:
@@ -342,8 +450,23 @@ def push_and_maybe_open_pr(
     except (ValueError, KeyError, TypeError):
         actions.append("pr_create_failed:default_branch_unresolved")
         return actions
+    resolved_milestone: str | None = None
+    if milestone is not None:
+        if not _valid_milestone_text(milestone):
+            actions.append("pr_create_failed:MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
+            return actions
+        resolved_milestone = milestone
+    elif linked_issues:
+        try:
+            resolved_milestone = _resolve_milestone_from_issues(worktree, linked_issues)
+        except ValueError as exc:
+            actions.append(f"pr_create_failed:{str(exc)[:300]}")
+            return actions
+    request_fields: dict[str, Any] = {"head": branch, "base": base, "title": pr_title, "body": pr_body}
+    if resolved_milestone is not None:
+        request_fields["milestone"] = resolved_milestone
     create = _run(
-        Request("pr-create", head=branch, base=base, title=pr_title, body=pr_body),
+        Request("pr-create", **request_fields),
         cwd=worktree,
     )
     if create.returncode != 0:
@@ -361,6 +484,7 @@ def settle_task(
     open_pr: bool = False,
     pr_title: str | None = None,
     pr_body: str | None = None,
+    pr_milestone: str | None = None,
     push: bool = False,
     release_stale: bool = True,
 ) -> SettleReport:
@@ -415,6 +539,8 @@ def settle_task(
                 open_pr=open_pr,
                 title=pr_title,
                 body=pr_body,
+                milestone=pr_milestone,
+                linked_issues=_task_linked_issues(data),
             )
         )
         pr_url, pr_number = _find_pr(branch, worktree)
@@ -511,6 +637,7 @@ def _cmd_task(args: argparse.Namespace) -> int:
         open_pr=args.open_pr,
         pr_title=args.pr_title,
         pr_body=args.pr_body,
+        pr_milestone=args.pr_milestone,
         push=args.push,
         release_stale=not args.no_release_stale,
     )
@@ -570,6 +697,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     task.add_argument("--pr-title", default=None)
     task.add_argument("--pr-body", default=None)
+    task.add_argument("--pr-milestone", default=None, help="Explicit open milestone title or number for --open-pr")
     task.add_argument("--no-release-stale", action="store_true")
     task.add_argument("--json", action="store_true")
     task.add_argument(
