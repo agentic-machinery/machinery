@@ -12,12 +12,17 @@ A code point is printable when it is the ASCII space or its general category is 
 bitmap of ``0x110000`` bits (code point ``cp`` at byte ``cp >> 3``, bit ``cp & 7``); its SHA-256
 identifies the table's printability.
 
-Inputs are the interpreters named with ``--python``. Each runs with ``-I -S`` and imports only
-``json``, ``sys`` and ``unicodedata``. Exactly one Unicode 15.0.0 table is required, and several
-interpreters may share a Unicode version only if their bitmaps are identical. The output records
+Inputs are the interpreters named with ``--python``, one per Python minor version. Each runs with
+``-I -S``, imports only ``json``, ``sys`` and ``unicodedata``, and prints one ASCII positional JSON array
+(no object, so no member can repeat) of its minor version, its ``unidata_version`` and its
+printable ranges in canonical form (ascending, non-overlapping, non-adjacent). Any other dump, or
+a failed, timed-out or unreadable run, stops the generator with the interpreter and the reason.
+Exactly one Unicode 15.0.0 table is required, and several interpreters may share a Unicode version
+only if their bitmaps are identical. The output records
 each input's Python minor version, ``unidata_version`` and bitmap digest, never its path or patch
 release, so it is a pure function of the tables: any patch release of the same minor versions
-regenerates it byte for byte (``--check``), and a table that differs changes its digest.
+regenerates it byte for byte (``--check`` compares raw bytes), and a table that differs changes
+its digest.
 
 Usage, from the checkout root (``--write`` replaces the sibling module of the imported generator)::
 
@@ -42,7 +47,7 @@ from lu_machinery.common import json_depth
 CODE_POINTS = 0x110000
 BASELINE_UNIDATA_VERSION = "15.0.0"
 OUTPUT = Path(__file__).with_name("unicode_printable.py")
-# The dump is an object holding a list of [lo, hi] lists.
+# The dump is [python, unidata_version, [[lo, hi], ...]].
 _DUMP_DEPTH = 3
 
 # Runs in each input interpreter with -I -S: the printable ranges of its own unicodedata table.
@@ -56,19 +61,21 @@ for cp in range(0x110000):
             ranges[-1][1] = cp
         else:
             ranges.append([cp, cp])
-json.dump(
-    {"python": "%d.%d" % sys.version_info[:2], "unidata_version": unicodedata.unidata_version, "printable": ranges},
-    sys.stdout,
-)
+json.dump(["%d.%d" % sys.version_info[:2], unicodedata.unidata_version, ranges], sys.stdout)
 """
 
 
 def ranges_bitmap(ranges: Iterable[Iterable[int]]) -> bytes:
-    """The printability bitmap of inclusive ``(lo, hi)`` code-point ranges."""
+    """The printability bitmap of inclusive ``(lo, hi)`` ranges in canonical form, else ``ValueError``.
+
+    Canonical: ascending, non-overlapping and non-adjacent, each inside ``0..0x10FFFF``.
+    """
     bits = bytearray(CODE_POINTS // 8)
+    prev_hi = -2
     for lo, hi in ranges:
-        if not 0 <= lo <= hi < CODE_POINTS:
-            raise ValueError(f"code-point range out of bounds: {lo}..{hi}")
+        if not prev_hi + 1 < lo <= hi < CODE_POINTS:
+            raise ValueError(f"code-point range not canonical: {lo}..{hi} after ..{prev_hi}")
+        prev_hi = hi
         for cp in range(lo, hi + 1):
             bits[cp >> 3] |= 1 << (cp & 7)
     return bytes(bits)
@@ -103,23 +110,37 @@ def _version_key(version: str) -> tuple[int, ...]:
 
 
 def _dump(interpreter: str) -> tuple[str, str, bytes]:
-    """``(python_version, unidata_version, bitmap)`` of *interpreter*'s table."""
-    proc = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        [interpreter, "-I", "-S", "-c", _DUMP], capture_output=True, check=True, timeout=600
-    )
-    data = json_depth.loads(proc.stdout, max_depth=_DUMP_DEPTH)
-    if not isinstance(data, dict) or set(data) != {"python", "unidata_version", "printable"}:
-        raise SystemExit(f"{interpreter}: unexpected table dump")
-    python, version, printable = data["python"], data["unidata_version"], data["printable"]
+    """``(python_minor_version, unidata_version, bitmap)`` of *interpreter*'s table, else ``SystemExit``."""
+    try:
+        proc = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            [interpreter, "-I", "-S", "-c", _DUMP], capture_output=True, check=False, timeout=600
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SystemExit(f"{interpreter}: table dump did not run: {exc.__class__.__name__}: {exc}") from None
+    if proc.returncode != 0:
+        raise SystemExit(f"{interpreter}: table dump exited {proc.returncode}")
+    try:
+        # json.dump writes ASCII: any other byte, a BOM included, is not a dump this code wrote.
+        data = json_depth.loads(proc.stdout.decode("ascii"), max_depth=_DUMP_DEPTH)
+    except (ValueError, RecursionError) as exc:
+        raise SystemExit(f"{interpreter}: table dump is not valid JSON: {exc}") from None
     if not (
-        isinstance(python, str)
-        and isinstance(version, str)
-        and all(part.isdigit() and part.isascii() for text in (python, version) for part in text.split("."))
-        and isinstance(printable, list)
-        and all(isinstance(pair, list) and len(pair) == 2 and all(type(cp) is int for cp in pair) for pair in printable)
+        isinstance(data, list)
+        and len(data) == 3
+        and all(
+            isinstance(text, str) and all(part.isascii() and part.isdigit() for part in text.split("."))
+            for text in data[:2]
+        )
+        and isinstance(data[2], list)
+        and all(isinstance(pair, list) and len(pair) == 2 and all(type(cp) is int for cp in pair) for pair in data[2])
     ):
-        raise SystemExit(f"{interpreter}: unexpected table dump")
-    return python, version, ranges_bitmap(printable)
+        raise SystemExit(f"{interpreter}: table dump is not [python, unidata_version, [[lo, hi], ...]]")
+    python, version, printable = data
+    try:
+        bits = ranges_bitmap(printable)
+    except ValueError as exc:
+        raise SystemExit(f"{interpreter}: {exc}") from None
+    return python, version, bits
 
 
 def render(interpreters: Iterable[str]) -> str:
@@ -128,6 +149,8 @@ def render(interpreters: Iterable[str]) -> str:
     inputs: list[tuple[str, str, str]] = []
     for interpreter in interpreters:
         python, version, bits = _dump(interpreter)
+        if any(python == seen for seen, _, _ in inputs):
+            raise SystemExit(f"Python {python} given twice: name one interpreter per minor version")
         if tables.setdefault(version, bits) != bits:
             raise SystemExit(f"Python {python}: Unicode {version} table differs from another {version} input")
         inputs.append((python, version, hashlib.sha256(bits).hexdigest()))
@@ -202,12 +225,17 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if reason else 0
     if not args.python:
         parser.error("--write and --check need --python")
-    text = render(args.python)
+    data = render(args.python).encode("utf-8")
     if args.write:
-        OUTPUT.write_text(text, encoding="utf-8")
+        OUTPUT.write_bytes(data)
         return 0
-    if OUTPUT.read_text(encoding="utf-8") != text:
-        print(f"{OUTPUT.name} differs from its regeneration: run --write", file=sys.stderr)
+    try:
+        current = OUTPUT.read_bytes()
+    except OSError as exc:
+        print(f"{OUTPUT.name} is unreadable: {exc}", file=sys.stderr)
+        return 1
+    if current != data:
+        print(f"{OUTPUT.name} differs from its regeneration byte for byte: run --write", file=sys.stderr)
         return 1
     return 0
 
