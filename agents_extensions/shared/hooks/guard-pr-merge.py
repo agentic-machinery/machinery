@@ -1604,7 +1604,7 @@ def _judge(args: list[str], cwd: str | None = None) -> str | None:
             f"PR {pr} is a DRAFT",
             "Draft PRs are never merged or armed — a draft is by definition not review-ready\n"
             "(the #189 incident: a draft was squash-merged before anyone reviewed it). Mark it\n"
-            f"ready (`python -m {_PUBLISHER} pr-ready --number <N>`) and get the review gate first.",
+            f"ready (`.venv/bin/python -m {_PUBLISHER} pr-ready --number <N>`) and get the review gate first.",
         )
     if reason == "check states unverifiable":
         return _block_msg(
@@ -1682,7 +1682,7 @@ def main() -> int:
         if merge.refusal:
             sys.stderr.write(_block_msg(
                 merge.refusal,
-                _PIN_GUIDANCE + f" To disarm auto-merge, use `python -m {_PUBLISHER} pr-disarm --number <N>`.",
+                _PIN_GUIDANCE + f" To disarm auto-merge, use `.venv/bin/python -m {_PUBLISHER} pr-disarm --number <N>`.",
             ))
             return 2
         if _UNREADABLE_MARKER in merge.args:

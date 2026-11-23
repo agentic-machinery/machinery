@@ -65,7 +65,8 @@ def test_probe_builds_adapter_then_runs_plain_binary_version(monkeypatch, tmp_pa
     assert calls[0]["stdin"] is lane_probe.subprocess.DEVNULL
 
 
-def test_probe_keeps_npx_package_in_version_command(monkeypatch, tmp_path):
+def test_probe_refuses_npx_package_command_without_spawning(monkeypatch, tmp_path):
+    """Fail-closed defect class: an npx package command must not probe bare `npx --version` or spawn npx."""
     _registered_lane(monkeypatch)
     adapter = _FakeAdapter(["npx", "@anthropic-ai/claude-code@latest", "-p", "ignored"])
     commands: list[list[str]] = []
@@ -78,8 +79,9 @@ def test_probe_keeps_npx_package_in_version_command(monkeypatch, tmp_path):
 
     result = lane_probe.probe_lane("fake", cwd=tmp_path)
 
-    assert result["status"] == "healthy"
-    assert commands == [["npx", "@anthropic-ai/claude-code@latest", "--version"]]
+    assert result["status"] == "unhealthy"
+    assert result["reason"] == "adapter command has no fixed version probe"
+    assert commands == []
 
 
 def test_probe_reports_build_failure_without_running_a_command(monkeypatch, tmp_path):

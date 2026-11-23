@@ -10,21 +10,25 @@ Issue: #1179
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
 import pytest
-from lu_machinery.utils.claude_version import _parse_claude_semver, _reset_cache_for_tests, remember_support, supports_exclude_dynamic_system_prompt_sections
-import json
 import yaml
 from jsonschema import validate
-from lu_machinery.docs.docs_inventory import build
-from lu_machinery.docs.docs_inventory import canonical
-from lu_machinery.docs.docs_inventory import digest
-from lu_machinery.docs.docs_inventory import main
-from lu_machinery.docs.docs_inventory import metadata
+
+from lu_machinery.docs.docs_inventory import build, canonical, digest, main, metadata
+from lu_machinery.utils.claude_version import (
+    _parse_claude_semver,
+    _reset_cache_for_tests,
+    remember_support,
+    supports_exclude_dynamic_system_prompt_sections,
+)
 from tests.helpers.product_tree import configured_roots as configured_roots
+
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
@@ -202,13 +206,14 @@ def test_cache_hits_on_repeat():
 
 
 def test_cache_scoped_by_prefix():
-    """Different prefixes get independent cache entries — each probed once."""
+    """Different prefixes get independent cache entries; multi-word npx prefixes are not probed."""
     mock = MagicMock(return_value=_mock_run(stdout="2.1.98"))
     with patch("lu_machinery.utils.claude_version.subprocess.run", mock):
-        supports_exclude_dynamic_system_prompt_sections(["claude"])
-        supports_exclude_dynamic_system_prompt_sections(["npx", "@anthropic-ai/claude-code@latest"])
-        supports_exclude_dynamic_system_prompt_sections(["/usr/local/bin/claude"])
-    assert mock.call_count == 3, "each unique prefix should be probed exactly once"
+        assert supports_exclude_dynamic_system_prompt_sections(["claude"]) is True
+        assert supports_exclude_dynamic_system_prompt_sections(["/opt/claude/bin/claude"]) is True
+        assert supports_exclude_dynamic_system_prompt_sections(["/usr/local/bin/claude"]) is True
+        assert supports_exclude_dynamic_system_prompt_sections(["npx", "@anthropic-ai/claude-code@latest"]) is False
+    assert mock.call_count == 3, "each unique single-word prefix should be probed once; npx prefix is not probed"
 
 
 def test_remember_support_overwrites_cached_verdict():
