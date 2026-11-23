@@ -723,17 +723,39 @@ def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) ->
     return None
 
 
+_PRE_LAUNCH_TERMINAL_REASONS = frozenset({
+    "spawn_process_missing",
+    "dispatch_died_after_admission",
+    "spawn_setup_failed",
+    "dispatch_isolation_failed",
+})
+
+
 def _terminal_child_unsettled_state(other: dict) -> str | None:
     """Return ``'live'`` or ``'unknown'`` when a terminal child lacks proof that its processes and services stopped."""
     from lu_machinery.orchestration import dispatch_isolation
 
     never_started = other.get("never_started_reason")
-    if (isinstance(never_started, str) and never_started
-            and other.get("pid") is None and other.get("provider_pgid") is None
-            and other.get("launch_unit") is None):
-        return None
+    if never_started is not None and not isinstance(never_started, str):
+        return "unknown"
     disp_reason = other.get("worktree_disposition_reason")
+    if disp_reason is not None and not isinstance(disp_reason, str):
+        return "unknown"
     survivors = other.get("fallback_survivors")
+    if survivors is not None and not isinstance(survivors, dict):
+        return "unknown"
+    launch_mode = other.get("launch_mode")
+    if launch_mode is not None and not isinstance(launch_mode, str):
+        return "unknown"
+    rc_reason = other.get("returncode_reason")
+    if rc_reason is not None and not isinstance(rc_reason, str):
+        return "unknown"
+
+    if (isinstance(never_started, str) and never_started
+            and other.get("pid") is None and other.get("process_start") is None
+            and other.get("provider_pgid") is None and other.get("launch_unit") is None
+            and other.get("launch_cgroup") is None):
+        return None
     if disp_reason == "provider_processes_alive" or (isinstance(survivors, dict) and bool(survivors)):
         return "live"
     if disp_reason in {"provider_liveness_unknown", "task_record_damaged"}:
@@ -757,23 +779,33 @@ def _terminal_child_unsettled_state(other: dict) -> str | None:
         }
         if not set(listed_services).issubset(stopped_units):
             return "unknown"
-    has_launch_evidence = (
-        other.get("launch_mode") in {"scope", "popen-fallback"}
-        or other.get("pid") is not None
-        or other.get("provider_pgid") is not None
-        or other.get("launch_unit") is not None
-        or other.get("launch_cgroup") is not None
+    pre_launch_terminated = (
+        isinstance(rc_reason, str)
+        and rc_reason in _PRE_LAUNCH_TERMINAL_REASONS
+        and other.get("pid") is None
+        and other.get("process_start") is None
+        and other.get("provider_pgid") is None
+        and other.get("launch_unit") is None
+        and other.get("launch_cgroup") is None
     )
-    if not has_launch_evidence:
-        return "unknown"
-    try:
-        alive = _provider_alive(other)
-    except Exception:
-        return "unknown"
-    if alive is True:
-        return "live"
-    if alive is None:
-        return "unknown"
+    if not pre_launch_terminated:
+        has_launch_evidence = (
+            launch_mode in {"scope", "popen-fallback"}
+            or other.get("pid") is not None
+            or other.get("provider_pgid") is not None
+            or other.get("launch_unit") is not None
+            or other.get("launch_cgroup") is not None
+        )
+        if not has_launch_evidence:
+            return "unknown"
+        try:
+            alive = _provider_alive(other)
+        except Exception:
+            return "unknown"
+        if alive is True:
+            return "live"
+        if alive is None:
+            return "unknown"
     if (other.get("mode") == "workspace-write" and other.get("worktree_path")
             and other.get("worktree_disposition") is None):
         return "unknown"
@@ -920,10 +952,10 @@ def _enforce_orchestrator(record: dict) -> None:
     _record_turn_children(record, scan)
     if (record["status"] == "failed" and not record.get("provider_terminal_failure")
             and str(record.get("error") or "").startswith("agy_child_still_running:")):
-        cause = _child_state_refusal(scan) or (
+        agy_cause = _child_state_refusal(scan) or (
             f"orchestrator_orphaned_children: child state blocks completion ({record['error']})"
         )
-        record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
+        record.update(status="no_deliverable", error=agy_cause, no_deliverable_reason=agy_cause)
         return
     if record["status"] != "done":
         return
@@ -1272,7 +1304,7 @@ def _children_at(record: dict, deadline: float, checkpoint) -> list[str]:
 
 
 def _agy_follow_up(spec: TaskSpec, record: dict, parsed: ParsedResult, started: float,
-                   hard_timeout: float, resumes: int, checkpoint) -> tuple[str | None, ParsedResult]:
+                   hard_timeout: float, resumes: int, checkpoint, *, exit_code: int = 0) -> tuple[str | None, ParsedResult]:
     """Resume an AGY workspace-write turn that closed while its work was still open.
 
     Returns ``(conversation id, parsed)`` to launch again, or ``(None, parsed)``
@@ -1285,6 +1317,9 @@ def _agy_follow_up(spec: TaskSpec, record: dict, parsed: ParsedResult, started: 
     if spec.agent != "agy" or spec.mode != "workspace-write":
         return None, parsed
     incomplete = parsed.error == "agy: incomplete run"
+    if "orchestrator" in record and (exit_code != 0 or (parsed.error is not None and not incomplete)):
+        # Preserve genuine terminal AGY provider failures; settlement still scans children and holds the lease.
+        return None, parsed
     children = _running_children(record)
     if not incomplete and not children:
         return None, parsed
@@ -2408,7 +2443,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             # Once parsed, the whole stream decides the model, whatever settlement follows (not the running value).
             resolved_model = parsed.resolved_model
             conversation, parsed = _agy_follow_up(
-                spec, record, parsed, started, hard_timeout, continuations, checkpoint)
+                spec, record, parsed, started, hard_timeout, continuations, checkpoint, exit_code=exit_code)
             if conversation is not None:
                 pending_conversation = conversation
                 continuations += 1

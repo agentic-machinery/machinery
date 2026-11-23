@@ -283,15 +283,41 @@ Before running an attributed force release, verify quiescence in three steps:
 2. **Prove the turn scope and services are gone on the recorded host:** check
    `systemctl --user list-units 'lu-worker-<task-id>*'` and confirm no scope or listed
    task service remains active.
-3. **Prove full child quiescence:** inspect `child_tasks`, `orphaned_child_tasks`,
-   `unknown_child_tasks`, and `unreadable_child_records` on the turn record, and list
-   all task records linked to the exact turn (`parent_task_id == <task-id>` and
-   `parent_run_nonce == <run-nonce>`) via `.venv/bin/python -m lu_machinery.dispatch list --all`.
-   Confirm every child is terminal with its processes/scope and task services proven gone
-   (no `worktree_disposition_reason` of `provider_processes_alive` or
-   `provider_liveness_unknown`). If any child is `spawning`, `running`, `unknown`, or
-   unreadable, keep the stream held — custody reassignment alone does not satisfy
-   quiescence.
+3. **Prove full child quiescence with a strict inventory:** inspect `child_tasks`,
+   `orphaned_child_tasks`, `unknown_child_tasks`, and `unreadable_child_records` on the
+   turn record, then run a strict inventory over both hot and archived task records
+   (never `dispatch list --all`, which skips unreadable records):
+
+   ```bash
+   .venv/bin/python -c '
+   import json, sys
+   from lu_machinery.dispatcher import store
+   from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME
+   root = store.tasks_dir()
+   list(root.iterdir())
+   archive = root / ARCHIVE_DIR_NAME
+   try:
+       archive.lstat()
+   except FileNotFoundError:
+       pass
+   else:
+       list(archive.iterdir())
+   tid, nonce = sys.argv[1], sys.argv[2]
+   rows = [
+       {k: r.get(k) for k in ("task_id", "run_nonce", "status", "worktree_disposition_reason")}
+       for r in store.list_tasks(include_archive=True, strict=True)
+       if r.get("parent_task_id") == tid and r.get("parent_run_nonce") in (None, nonce)
+   ]
+   print(json.dumps(rows, indent=2))
+   ' <task-id> <run-nonce>
+   ```
+
+   Confirm the inventory exits 0 with zero unreadable hot/archived records and that every
+   linked child is terminal with its processes/scope and task services proven gone (no
+   `worktree_disposition_reason` of `provider_processes_alive` or
+   `provider_liveness_unknown`). If the strict inventory fails, or any child is `spawning`,
+   `running`, `unknown`, or unreadable, keep the stream held — custody reassignment alone
+   does not satisfy quiescence.
 
 Once all three checks pass, re-read Monitor to confirm the same holder is still current,
 then run the attributed operator release:

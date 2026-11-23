@@ -662,27 +662,29 @@ def _handoff_ref_reuse_refusal(record: dict, stream: str, refs: set[str]) -> str
     except (OSError, ValueError):
         return "orchestrator_handoff_note_unverified: cannot resolve task store for handoff_note reuse"
 
-    def scan_directory(directory: Path, *, required: bool) -> list[Path]:
-        try:
-            with os.scandir(directory) as entries:
-                names = []
-                for entry in entries:
-                    if not entry.name.endswith(".json") or entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES):
-                        continue
-                    if entry.is_file():
-                        names.append(entry.name)
-                names.sort()
-                return [directory / name for name in names]
-        except FileNotFoundError:
-            if required:
-                raise
-            return []
+    def scan_directory(directory: Path) -> list[Path]:
+        with os.scandir(directory) as entries:
+            names = []
+            for entry in entries:
+                if not entry.name.endswith(".json") or entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES):
+                    continue
+                if entry.is_file() or entry.is_symlink():
+                    names.append(entry.name)
+            names.sort()
+            return [directory / name for name in names]
 
     try:
         with task_archive_lock(root):
-            candidates = scan_directory(root, required=True)
+            candidates = scan_directory(root)
             archive_dir = root / ARCHIVE_DIR_NAME
-            candidates.extend(scan_directory(archive_dir, required=False))
+            try:
+                archive_dir.lstat()
+            except FileNotFoundError:
+                archive_present = False
+            else:
+                archive_present = True
+            if archive_present:
+                candidates.extend(scan_directory(archive_dir))
             relocated: set[Path] = set()
             for listed in candidates:
                 if listed in relocated:
