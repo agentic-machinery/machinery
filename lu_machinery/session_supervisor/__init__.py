@@ -40,6 +40,7 @@ from lu_machinery.session_streams.model import (
     sha256_text,
 )
 from lu_machinery.session_streams.store import (
+    TURN_HOLDER_HARNESS,
     LifecycleError,
     SessionStreamError,
     SessionStreamStore,
@@ -433,6 +434,14 @@ class SessionSupervisor:
                 ),
             )
             return True
+        recovery_note = (
+            "Dispatch-turn leases require exact-holder close or attributed operator release."
+            if status.holder_harness == TURN_HOLDER_HARNESS
+            else (
+                "If that process is yours, exit it cleanly; do not force-close a live holder. "
+                "Dead holders auto-recover on relaunch even before TTL expiry."
+            )
+        )
         raise SupervisorError(
             f"stream {stream_id} already has live session "
             f"{status.session_id or 'unknown'} "
@@ -440,8 +449,7 @@ class SessionSupervisor:
             f"holder {status.holder_agent or '?'}/{status.holder_harness or '?'} "
             f"pid={status.holder_process_id} alive={status.holder_process_alive}. "
             f"{status.reason}. "
-            f"If that process is yours, exit it cleanly; do not force-close a live holder. "
-            f"Dead holders auto-recover on relaunch even before TTL expiry."
+            f"{recovery_note}"
         ) from conflict
 
     def build_capsule(

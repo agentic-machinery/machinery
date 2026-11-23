@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import unicodedata
 import uuid
@@ -587,17 +588,26 @@ def begin_settlement(record: dict) -> None:
 
 # One orchestrator turn's handoff receipt (DRIVERS-1122), a field of its own task record:
 # {"schema": HANDOFF_RECEIPT_SCHEMA, "receipt_id": <sha256>, "stream": "epic:<N>", "task_id": <id>,
-#  "run_nonce": <nonce>, "handoff_ref": <the handoff note's id>, "recorded_at": <ISO-8601 UTC>}.
-# receipt_id is the SHA-256 of the compact JSON list [schema, stream, task_id, run_nonce, handoff_ref].
+#  "run_nonce": <nonce>, "handoff_ref": <the handoff note's id>, "outcome": "done"|"blocked"|"handoff",
+#  "recorded_at": <ISO-8601 UTC>}.
+# receipt_id is the SHA-256 of the compact JSON list [schema, stream, task_id, run_nonce, handoff_ref, outcome].
 HANDOFF_RECEIPT_KEY = "orchestrator_handoff_receipt"
 HANDOFF_RECEIPT_SCHEMA = "lu.dispatch.orchestrator-handoff-receipt.v1"
+HANDOFF_RECEIPT_OUTCOMES = frozenset({"done", "blocked", "handoff"})
 _HANDOFF_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:#/-]{0,255}")
-_HANDOFF_RECEIPT_FIELDS = frozenset({"schema", "receipt_id", "stream", "task_id", "run_nonce", "handoff_ref", "recorded_at"})
+_HANDOFF_RECEIPT_FIELDS = frozenset({
+    "schema", "receipt_id", "stream", "task_id", "run_nonce", "handoff_ref", "outcome", "recorded_at",
+})
+DRIVER_STATE_CLI_ENV = "LU_DRIVER_STATE_CLI"
+DRIVER_STATE_CLI_DEFAULT = "lu-driver-state"
+_DRIVER_STATE_TIMEOUT_S = 30
 
 
 # An ISO-8601 UTC date-time as now() (+00:00) or Monitor (Z) writes it: ASCII digits, a T separator, at most
 # microseconds. datetime.fromisoformat alone also accepts other separators and forms.
 _UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
+# Driver-state Postgres export formats created_utc with either a space or T separator.
+_DRIVER_STATE_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
 
 
 def parse_utc_timestamp(value: object) -> datetime | None:
@@ -610,9 +620,102 @@ def parse_utc_timestamp(value: object) -> datetime | None:
         return None
 
 
-def handoff_receipt_id(stream: str, task_id: str, run_nonce: str, handoff_ref: str) -> str:
-    key = [HANDOFF_RECEIPT_SCHEMA, stream, task_id, run_nonce, handoff_ref]
+def _parse_driver_state_utc(value: object) -> datetime | None:
+    if not isinstance(value, str) or not _DRIVER_STATE_UTC.fullmatch(value):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def handoff_receipt_id(
+    stream: str, task_id: str, run_nonce: str, handoff_ref: str, outcome: str = "done",
+) -> str:
+    key = [HANDOFF_RECEIPT_SCHEMA, stream, task_id, run_nonce, handoff_ref, outcome]
     return digest(json.dumps(key, separators=(",", ":")).encode())
+
+
+def _driver_state_cli() -> str | None:
+    name = os.environ.get(DRIVER_STATE_CLI_ENV, DRIVER_STATE_CLI_DEFAULT)
+    if not name:
+        return None
+    return shutil.which(name)
+
+
+def _handoff_ref_reuse_refusal(record: dict, stream: str, refs: set[str]) -> str | None:
+    """Return a refusal when another turn on ``stream`` already referenced any ref in ``refs`` or store is unreadable."""
+    own_task = record.get("task_id")
+    own_nonce = record.get("run_nonce")
+    try:
+        others = list_tasks(include_archive=True, strict=False)
+    except (OSError, ValueError):
+        return "orchestrator_handoff_note_unverified: cannot inspect task records for handoff_note reuse"
+    for other in others:
+        if other.get("task_id") == own_task and other.get("run_nonce") == own_nonce:
+            continue
+        receipt = other.get(HANDOFF_RECEIPT_KEY)
+        if not isinstance(receipt, dict):
+            continue
+        if receipt.get("stream") == stream and receipt.get("handoff_ref") in refs:
+            return "orchestrator_handoff_note_reused: handoff_note is already referenced by another turn on this stream"
+    return None
+
+
+def verify_handoff_note(record: dict, stream: str, handoff_ref: str) -> str | None:
+    """Verify the referenced driver-state handoff_note via ``lu-driver-state show``, or return a typed refusal."""
+    from lu_machinery.dispatcher.environment import stream_lane
+
+    try:
+        expected_lane = stream_lane(stream)
+    except ValueError as exc:
+        return f"orchestrator_handoff_note_unverified: {exc}"
+    started = parse_utc_timestamp(record.get("started_at"))
+    if started is None:
+        return "orchestrator_handoff_note_unverified: turn started_at timestamp is missing or invalid"
+    cli = _driver_state_cli()
+    if not cli:
+        return "orchestrator_handoff_note_unverified: lu-driver-state CLI is unavailable"
+    try:
+        completed = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            [cli, "show", "--", handoff_ref],
+            capture_output=True,
+            text=True,
+            timeout=_DRIVER_STATE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return f"orchestrator_handoff_note_unverified: lu-driver-state show failed ({type(exc).__name__})"
+    if completed.returncode != 0:
+        return f"orchestrator_handoff_note_missing: lu-driver-state show exited {completed.returncode}"
+    try:
+        note = json_depth.loads(completed.stdout, max_depth=_JSON_MAX_DEPTH)
+    except (ValueError, RecursionError):
+        return "orchestrator_handoff_note_invalid: lu-driver-state show returned invalid JSON"
+    if not isinstance(note, dict):
+        return "orchestrator_handoff_note_invalid: lu-driver-state show did not return a note object"
+    note_id = note.get("id")
+    note_alias = note.get("alias")
+    if not isinstance(note_id, str) or not note_id or handoff_ref not in {note_id, note_alias}:
+        return "orchestrator_handoff_note_invalid: note identity does not match handoff_ref"
+    if note.get("kind") != "handoff_note":
+        return f"orchestrator_handoff_note_wrong_kind: expected kind handoff_note, got {note.get('kind')!r}"
+    status = note.get("status")
+    if not isinstance(status, str) or not status or status == "dropped":
+        return f"orchestrator_handoff_note_invalid: handoff_note status {status!r} is not active"
+    if note.get("lane") != expected_lane:
+        return f"orchestrator_handoff_note_wrong_lane: expected lane {expected_lane!r}, got {note.get('lane')!r}"
+    created = _parse_driver_state_utc(note.get("created_utc"))
+    if created is None:
+        return "orchestrator_handoff_note_invalid: handoff_note created_utc is missing or invalid"
+    if created <= started:
+        return "orchestrator_handoff_note_reused: handoff_note was created before or at turn start"
+    refs = {handoff_ref, note_id}
+    if isinstance(note_alias, str) and note_alias:
+        refs.add(note_alias)
+    if reuse_refusal := _handoff_ref_reuse_refusal(record, stream, refs):
+        return reuse_refusal
+    return None
 
 
 def handoff_receipt_refusal(record: dict) -> str | None:
@@ -628,21 +731,26 @@ def handoff_receipt_refusal(record: dict) -> str | None:
         stream = None
     expected = dict(schema=HANDOFF_RECEIPT_SCHEMA, stream=stream, task_id=record.get("task_id"),
                     run_nonce=record.get("run_nonce"))
+    outcome = receipt.get("outcome") if isinstance(receipt, dict) else None
     if (not isinstance(receipt, dict) or stream is None or set(receipt) != _HANDOFF_RECEIPT_FIELDS
             or parse_utc_timestamp(receipt.get("recorded_at")) is None
+            or not isinstance(outcome, str) or outcome not in HANDOFF_RECEIPT_OUTCOMES
             or any(receipt.get(key) != value for key, value in expected.items())
             or not isinstance(receipt.get("handoff_ref"), str) or not _HANDOFF_REF.fullmatch(receipt["handoff_ref"])
             or receipt.get("receipt_id") != handoff_receipt_id(stream, record["task_id"], record["run_nonce"],
-                                                               receipt["handoff_ref"])):
+                                                               receipt["handoff_ref"], outcome)):
         return "orchestrator_handoff_receipt_invalid"
     return None
 
 
-def record_handoff_receipt(task_id: str, run_nonce: str, stream: str, handoff_ref: str) -> dict:
+def record_handoff_receipt(
+    task_id: str, run_nonce: str, stream: str, handoff_ref: str, outcome: str = "done",
+) -> dict:
     """Record the running orchestrator turn's one handoff receipt; an identical retry returns the first.
 
     Only the turn itself records it (its own dispatched task id), while it runs and before settlement
-    starts; a different receipt for the same run refuses.
+    starts; a different receipt for the same run refuses. The referenced handoff_note is verified via
+    ``lu-driver-state show`` before the receipt is written.
     """
     from lu_machinery.dispatcher import ownership
     from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
@@ -652,6 +760,8 @@ def record_handoff_receipt(task_id: str, run_nonce: str, stream: str, handoff_re
     if not isinstance(handoff_ref, str) or not _HANDOFF_REF.fullmatch(handoff_ref):
         raise ValueError("handoff_receipt_refused: --handoff-ref must be 1-256 characters of letters, digits and ._:#/-, "
                          "starting with a letter or digit")
+    if not isinstance(outcome, str) or outcome not in HANDOFF_RECEIPT_OUTCOMES:
+        raise ValueError("handoff_receipt_refused: --outcome must be one of done, blocked, handoff")
     path = record_path(task_id)
     with task_state_lock(path):
         record = read(task_id, run_nonce)
@@ -663,8 +773,11 @@ def record_handoff_receipt(task_id: str, run_nonce: str, stream: str, handoff_re
             expected = None
         if expected is None or expected != stream:
             raise ValueError("handoff_receipt_refused: the task is not an orchestrator turn on this stream")
-        receipt = dict(schema=HANDOFF_RECEIPT_SCHEMA, receipt_id=handoff_receipt_id(stream, task_id, run_nonce, handoff_ref),
-                       stream=stream, task_id=task_id, run_nonce=run_nonce, handoff_ref=handoff_ref)
+        receipt = dict(
+            schema=HANDOFF_RECEIPT_SCHEMA,
+            receipt_id=handoff_receipt_id(stream, task_id, run_nonce, handoff_ref, outcome),
+            stream=stream, task_id=task_id, run_nonce=run_nonce, handoff_ref=handoff_ref, outcome=outcome,
+        )
         if HANDOFF_RECEIPT_KEY in record:
             existing = record[HANDOFF_RECEIPT_KEY]
             if (handoff_receipt_refusal(record) is None and isinstance(existing, dict)
@@ -675,6 +788,8 @@ def record_handoff_receipt(task_id: str, run_nonce: str, stream: str, handoff_re
         if (record.get("schema_version") != 2 or not isinstance(status, str) or status not in ACTIVE
                 or record.get("settling_at")):
             raise ValueError("handoff_receipt_refused: the turn is not running, or its settlement has started")
+        if note_refusal := verify_handoff_note(record, stream, handoff_ref):
+            raise ValueError(f"handoff_receipt_refused: {note_refusal}")
         receipt["recorded_at"] = now()
         record[HANDOFF_RECEIPT_KEY] = receipt
         _write(path, record)

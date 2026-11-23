@@ -16,7 +16,7 @@ from typing import Any
 from lu_machinery.common import json_depth
 
 from .model import EntryType, Lease, LeaseHolder, isoformat_z, parse_timestamp, utc_now
-from .store import SessionStreamStore
+from .store import TURN_HOLDER_HARNESS, SessionStreamStore
 
 
 @dataclass(frozen=True)
@@ -76,6 +76,23 @@ def remote_lease_reason(
     *, holder_agent: str, holder_harness: str, expires_at: str, now: datetime | None = None,
 ) -> str:
     """Describe Monitor recovery without treating local process state as authority."""
+    if holder_harness == TURN_HOLDER_HARNESS:
+        horizon = "expiry unknown"
+        if expires_at:
+            try:
+                horizon = (
+                    f"expired {expires_at}"
+                    if (now or utc_now()) >= parse_timestamp(expires_at)
+                    else f"expires {expires_at}"
+                )
+            except ValueError:
+                horizon = f"expiry unreadable ({expires_at})"
+        return (
+            f"dispatch-turn lease held by {holder_agent or '?'}/{holder_harness} ({horizon}) — "
+            "TTL takeover and local PID recovery refused; wait for exact-holder close or run "
+            "attributed operator release (session_supervisor release --force) after verifying "
+            "the turn scope and children are gone"
+        )
     if not expires_at:
         return "remote lease expiry is unknown — inspect Monitor before claiming; local PID recovery refused"
     if (now or utc_now()) >= parse_timestamp(expires_at):
@@ -142,24 +159,27 @@ def diagnose_handoff(
     if expires_at:
         expired = current >= parse_timestamp(expires_at)
     holder_kind = str(lease.get("holder_kind") or "process")
+    holder_agent = str(lease.get("holder_agent") or "")
+    holder_harness = str(lease.get("holder_harness") or "")
     pid = int(lease.get("holder_process_id") or 0)
+    is_turn = holder_harness == TURN_HOLDER_HARNESS
     remote_ttl = any(
         event.get("session_id") == session_id
         and json_depth.loads(event.get("proof_json") or "{}", max_depth=512).get("kind") == "remote_epic_claim.v1"
         for event in dump.get("session_events", ())
     )
     probe = getattr(store, "_process_probe", None)
-    alive = None if remote_ttl else (bool(probe(pid)) if callable(probe) else _process_alive(pid))
+    alive = None if (remote_ttl or is_turn) else (bool(probe(pid)) if callable(probe) else _process_alive(pid))
 
     lease_state = str(lease.get("state") or "")
     # Dead holder PID is claimable even before wall-clock TTL expires. A crashed
     # local process cannot renew; requiring expiry left launchers blocked for the
-    # full launcher TTL (often 6h). Live holders remain untouchable.
-    claimable = not remote_ttl and lease_state == "active" and holder_kind == "process" and not alive
-    if remote_ttl:
+    # full launcher TTL (often 6h). Live holders and dispatch-turn leases remain untouchable.
+    claimable = not remote_ttl and not is_turn and lease_state == "active" and holder_kind == "process" and not alive
+    if is_turn or remote_ttl:
         reason = remote_lease_reason(
-            holder_agent=str(lease.get("holder_agent") or ""),
-            holder_harness=str(lease.get("holder_harness") or ""),
+            holder_agent=holder_agent,
+            holder_harness=holder_harness,
             expires_at=expires_at,
             now=current,
         )

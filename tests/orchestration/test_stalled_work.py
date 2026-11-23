@@ -572,3 +572,164 @@ def test_invalid_config(host, options, env):
     with pytest.raises(SystemExit) as exc:
         mod.main(["stalled", *options])
     assert exc.value.code == 2
+
+
+def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(host, tmp_path):
+    """Defect class (DRIVERS PR 3 item 5): a held dispatch-turn lease after a terminal or overdue turn
+    goes unnoticed or spams claude-cto, or diagnose_handoff / recover_expired_driver advise TTL takeover."""
+    from lu_machinery.session_streams.handoff import diagnose_handoff
+    from lu_machinery.session_streams.model import LeaseHolder
+    from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS, SessionStreamDatabase, SessionStreamStore
+    from lu_machinery.session_supervisor import LaunchRole, SessionSupervisor, SupervisorError
+    from lu_machinery.session_supervisor.remote import RemoteEpicClient
+    from tests.epics_monitor_stub import epics_monitor_stub
+
+    terminal_nonce = "1" * 32
+    overdue_nonce = "2" * 32
+    healthy_nonce = "3" * 32
+    released_nonce = "4" * 32
+
+    host.record(
+        "turn-terminal",
+        status="done",
+        mode="orchestrator",
+        orchestrator={"stream": "epic:11151"},
+        run_nonce=terminal_nonce,
+        worktree_branch=None,
+        finished_at=(NOW - timedelta(minutes=5)).isoformat(),
+    )
+    host.record(
+        "turn-overdue",
+        status="running",
+        mode="orchestrator",
+        orchestrator={"stream": "epic:11152"},
+        run_nonce=overdue_nonce,
+        worktree_branch=None,
+        started_at=(NOW - timedelta(hours=3)).isoformat(),
+        scope_runtime_max_s=3600,
+        scope_stop_timeout_s=30,
+        hard_timeout=3000,
+    )
+    host.record(
+        "turn-healthy",
+        status="running",
+        mode="orchestrator",
+        orchestrator={"stream": "epic:11153"},
+        run_nonce=healthy_nonce,
+        worktree_branch=None,
+        started_at=(NOW - timedelta(minutes=10)).isoformat(),
+        scope_runtime_max_s=7800,
+        scope_stop_timeout_s=30,
+        hard_timeout=7200,
+    )
+
+    def stream_row(stream_id, task_id, nonce, *, state="active", expires_delta=1800, gen=1):
+        return {
+            "stream_id": stream_id,
+            "lease": {
+                "stream_id": stream_id,
+                "session_id": f"turn-session-{nonce}",
+                "lease_id": f"turn-lease-{nonce}",
+                "generation": gen,
+                "fencing_token": gen,
+                "state": state,
+                "session_state": "closed" if state == "released" else "open",
+                "heartbeat_at": (NOW - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+                "expires_at": (NOW + timedelta(seconds=expires_delta)).isoformat().replace("+00:00", "Z"),
+                "ttl_seconds": 3600,
+                "version": 1,
+                "age_seconds": 600,
+                "holder": {
+                    "agent": "claude",
+                    "harness": TURN_HOLDER_HARNESS,
+                    "instance_id": nonce,
+                    "task_id": task_id,
+                    "process_id": 999999,
+                    "holder_kind": "process",
+                    "host_id": None,
+                },
+            },
+        }
+
+    streams = [
+        stream_row("epic:11151", "turn-terminal", terminal_nonce, state="active", expires_delta=1800, gen=2),
+        stream_row("epic:11152", "turn-overdue", overdue_nonce, state="expired", expires_delta=-120, gen=4),
+        stream_row("epic:11153", "turn-healthy", healthy_nonce, state="active", expires_delta=3000, gen=1),
+        stream_row("epic:11154", "turn-released", released_nonce, state="released", expires_delta=1800, gen=1),
+    ]
+    report = mod.scan(
+        host.tasks,
+        {SLUG: host.tmp_path},
+        repos=REPOS,
+        now=NOW,
+        adapter_factory=lambda path: mod.GitHubAdapter(path, runner=host.gh),
+        stream_fetcher=lambda: streams,
+    )
+    assert report["errors"] == []
+    by_task = {row["task_id"]: row for row in report["rows"]}
+    assert set(by_task) == {"turn-terminal", "turn-overdue"}
+    assert by_task["turn-terminal"]["kind"] == "held_turn_lease"
+    assert by_task["turn-terminal"]["lane"] == "claude-cto"
+    assert by_task["turn-terminal"]["reason"] == "terminal_turn:done"
+    assert by_task["turn-overdue"]["reason"] == "overdue_turn_lease_expired"
+
+    # Routing sends exactly one deduplicated alert per held turn lease to claude-cto across cycles.
+    with AuthorityService(root=host.tmp_path / "fleet") as service:
+        cycle1 = mod.route(report, cycle=1, service=service)
+        cycle2 = mod.route(report, cycle=2, service=service)
+        assert len(cycle1) == 2
+        assert cycle2 == cycle1
+        for mid in cycle1:
+            msg = service.get_message(mid)
+            assert msg.recipient == "claude-cto"
+            body = service.read_message_body(mid)
+            assert "exact holder" in body and "attributed operator release" in body
+
+    # diagnose_handoff and SessionSupervisor.recover_expired_driver (local and remote) never advise TTL takeover.
+    local_store = SessionStreamStore(SessionStreamDatabase(tmp_path / "local-streams.db"))
+    holder = LeaseHolder("claude", TURN_HOLDER_HARNESS, terminal_nonce, process_id=999999, task_id="turn-terminal")
+    claimed_at = datetime.now(UTC) - timedelta(seconds=120)
+    local_store.claim_remote_session(
+        stream_id="epic:11151",
+        holder=holder,
+        lineage_id="lin-1",
+        ttl_seconds=60,
+        session_id=f"turn-session-{terminal_nonce}",
+        lease_id=f"turn-lease-{terminal_nonce}",
+        now=claimed_at,
+    )
+    check_now = datetime.now(UTC)
+    diag = diagnose_handoff(local_store, "epic:11151", now=check_now)
+    assert diag.lease_expired is True
+    assert diag.holder_harness == TURN_HOLDER_HARNESS
+    assert diag.claimable_force_close is False
+    assert diag.holder_process_alive is None
+    assert "TTL" in diag.reason and "exact-holder close" in diag.reason and "attributed operator release" in diag.reason
+
+    candidate = LeaseHolder("codex", "codex-cli", "candidate-1", process_id=4242)
+    local_sup = SessionSupervisor(local_store, repo_root=tmp_path)
+    with pytest.raises(SupervisorError) as local_exc:
+        local_sup.recover_expired_driver(role=LaunchRole.DRIVER, stream_id="epic:11151", holder=candidate)
+    local_msg = str(local_exc.value)
+    assert "exact-holder close" in local_msg and "attributed operator release" in local_msg
+    assert "TTL takeover and local PID recovery refused" in local_msg
+
+    monitor_store = SessionStreamStore(SessionStreamDatabase(tmp_path / "remote-streams.db"))
+    monitor_store.claim_remote_session(
+        stream_id="epic:11151",
+        holder=holder,
+        lineage_id="lin-1",
+        ttl_seconds=60,
+        session_id=f"turn-session-{terminal_nonce}",
+        lease_id=f"turn-lease-{terminal_nonce}",
+        now=claimed_at,
+    )
+    with epics_monitor_stub(monitor_store) as base:
+        client = RemoteEpicClient(base=base)
+        remote_sup = SessionSupervisor(None, remote=client, repo_root=tmp_path)
+        with pytest.raises(SupervisorError) as remote_exc:
+            remote_sup.recover_expired_driver(role=LaunchRole.DRIVER, stream_id="epic:11151", holder=candidate)
+        remote_msg = str(remote_exc.value)
+        assert "exact-holder close" in remote_msg and "attributed operator release" in remote_msg
+        assert "session_supervisor release --force" in remote_msg
+        assert "TTL takeover and local PID recovery refused" in remote_msg

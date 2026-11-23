@@ -31,6 +31,8 @@ from lu_machinery.orchestration.integration_sweep import GitHubAdapter, SweepErr
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
 from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_PATH, TAXONOMY_PATH, _load_yaml
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
+from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
+from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError, RemoteUnreachableError
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -42,6 +44,16 @@ UNPUSHED_STATUSES = frozenset({"needs_finalize", "failed", "timeout", "timed_out
 TERMINAL = RELEASED_TASK_STATUSES | UNPUSHED_STATUSES
 MAX_AGE_DAYS = 14
 GRACE_SECONDS = 2 * 3600
+# A held dispatch-turn lease after settlement or past its run budget is surfaced to claude-cto
+# (DRIVERS-1122). Short settle grace avoids racing an in-flight supervisor release call.
+TURN_LEASE_SETTLE_GRACE_SECONDS = 60
+TURN_LEASE_OVERDUE_GRACE_SECONDS = 900
+TURN_LEASE_RECORDLESS_GRACE_SECONDS = 120
+_TURN_LEASE_RECOVERY_ADVICE = (
+    "Confirm the turn scope and child tasks are gone; never use TTL takeover for dispatch-turn leases. "
+    "Close as the exact holder or run an attributed operator release (session_supervisor release --force; "
+    "see docs/runbooks/session-supervisor.md)."
+)
 # A persistent scan error stays in the journal without a line on every keeper minute.
 _SUMMARY = timedelta(hours=1)
 _CHECKPOINT_KEYS = frozenset({"report", "route"})
@@ -177,6 +189,125 @@ def finished(candidate: stale.Candidate) -> datetime:
     return stale._parse_ts(candidate.record.get("finished_at")) or datetime.fromtimestamp(candidate.mtime_ns / 1e9, UTC)
 
 
+def _fetch_remote_streams() -> list[dict[str, Any]]:
+    payload = RemoteEpicClient().streams()
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        raise RemoteSupervisorError("Monitor API returned malformed streams list")
+    return [entry for entry in streams if isinstance(entry, dict)]
+
+
+def _turn_overdue_budget_seconds(record: Mapping[str, Any]) -> float | None:
+    runtime_max = record.get("scope_runtime_max_s")
+    stop_timeout = record.get("scope_stop_timeout_s")
+    if (
+        isinstance(runtime_max, (int, float))
+        and not isinstance(runtime_max, bool)
+        and runtime_max > 0
+    ):
+        stop = (
+            float(stop_timeout)
+            if isinstance(stop_timeout, (int, float)) and not isinstance(stop_timeout, bool) and stop_timeout >= 0
+            else 30.0
+        )
+        return float(runtime_max) + stop
+    hard_timeout = record.get("hard_timeout")
+    if isinstance(hard_timeout, (int, float)) and not isinstance(hard_timeout, bool) and hard_timeout > 0:
+        return float(hard_timeout) + TURN_LEASE_OVERDUE_GRACE_SECONDS
+    return None
+
+
+def _held_turn_lease_rows(
+    candidates: list[stale.Candidate],
+    streams: list[dict[str, Any]],
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Surface held dispatch-turn leases whose turn record is terminal, overdue, or missing (DRIVERS-1122)."""
+    by_task = {c.task_id: c for c in candidates}
+    found: list[dict[str, Any]] = []
+    for entry in streams:
+        stream_id = entry.get("stream_id")
+        lease = entry.get("lease")
+        if not isinstance(stream_id, str) or not stream_id or not isinstance(lease, dict):
+            continue
+        state = lease.get("state")
+        if not isinstance(state, str) or state == "released":
+            continue
+        holder = lease.get("holder")
+        if not isinstance(holder, dict) or holder.get("harness") != TURN_HOLDER_HARNESS:
+            continue
+        task_id = holder.get("task_id")
+        run_nonce = holder.get("instance_id")
+        lease_id = lease.get("lease_id")
+        generation = lease.get("generation")
+        expires_at = stale._parse_ts(lease.get("expires_at"))
+        heartbeat_at = stale._parse_ts(lease.get("heartbeat_at"))
+        lease_expired = state == "expired" or (expires_at is not None and expires_at <= now)
+        candidate = by_task.get(task_id) if isinstance(task_id, str) and task_id else None
+
+        reason: str | None = None
+        since: datetime | None = None
+        if candidate is not None:
+            rec = candidate.record
+            rec_nonce = rec.get("run_nonce")
+            if isinstance(run_nonce, str) and isinstance(rec_nonce, str) and rec_nonce != run_nonce:
+                reason = "turn_record_superseded"
+                since = expires_at or heartbeat_at
+            else:
+                status = rec.get("status")
+                if status in TERMINAL:
+                    settled = finished(candidate)
+                    if lease_expired or (now - settled).total_seconds() >= TURN_LEASE_SETTLE_GRACE_SECONDS:
+                        reason = f"terminal_turn:{status}"
+                        since = settled
+                else:
+                    started = stale._parse_ts(rec.get("started_at"))
+                    budget = _turn_overdue_budget_seconds(rec)
+                    record_overdue = (
+                        started is not None
+                        and budget is not None
+                        and (now - started).total_seconds() >= budget
+                    )
+                    if lease_expired or record_overdue:
+                        reason = "overdue_turn_lease_expired" if lease_expired else "overdue_turn_record"
+                        if lease_expired and expires_at is not None:
+                            since = expires_at
+                        elif started is not None and budget is not None:
+                            since = started + timedelta(seconds=budget)
+                        else:
+                            since = heartbeat_at
+        elif lease_expired:
+            reason = "missing_turn_record_expired"
+            since = expires_at or heartbeat_at
+        elif heartbeat_at is not None and (now - heartbeat_at).total_seconds() >= TURN_LEASE_RECORDLESS_GRACE_SECONDS:
+            reason = "missing_turn_record"
+            since = heartbeat_at
+
+        if reason is None:
+            continue
+        found.append(
+            {
+                "task_id": task_id if isinstance(task_id, str) and task_id else "unknown",
+                "lane": "claude-cto",
+                "repository": "monitor",
+                "kind": "held_turn_lease",
+                "commit": None,
+                "pr": None,
+                "stream_id": stream_id,
+                "lease_id": lease_id if isinstance(lease_id, str) else None,
+                "generation": generation if isinstance(generation, int) and not isinstance(generation, bool) else None,
+                "run_nonce": run_nonce if isinstance(run_nonce, str) else None,
+                "lease_state": state,
+                "reason": reason,
+                "recovery": _TURN_LEASE_RECOVERY_ADVICE,
+                "since": since.isoformat() if since else None,
+                "age_hours": round((now - since).total_seconds() / 3600, 2) if since else None,
+            }
+        )
+    return found
+
+
 def scan(
     tasks: Path,
     checkouts: Mapping[str, Path | None],
@@ -184,6 +315,7 @@ def scan(
     repos: Mapping[str, FleetRepo],
     now: datetime,
     adapter_factory=GitHubAdapter,
+    stream_fetcher=None,
 ) -> dict[str, Any]:
     """Use batched fresh remote refs, complete open PRs, and trusted exact-head verdicts."""
     candidates, errors = load_records(tasks, now)
@@ -352,6 +484,19 @@ def scan(
                     add(matches[0] if matches else None, "changes_requested", pr["headRefOid"], since, pr["number"])
             except (SweepError, RuntimeError, OSError, ValueError) as exc:
                 errors.append(f"{slug} PR #{pr['number']}: comments unavailable ({type(exc).__name__})")
+    if stream_fetcher is not None:
+        has_turn_records = any(isinstance(c.record.get("orchestrator"), dict) for c in candidates)
+        try:
+            streams = stream_fetcher()
+        except RemoteUnreachableError:
+            if has_turn_records:
+                errors.append("monitor: turn lease state unavailable (RemoteUnreachableError)")
+            streams = None
+        except (RemoteSupervisorError, RuntimeError, OSError, ValueError) as exc:
+            errors.append(f"monitor: turn lease state unavailable ({type(exc).__name__})")
+            streams = None
+        if streams is not None:
+            rows.extend(_held_turn_lease_rows(candidates, streams, now=now))
     rows.sort(key=lambda row: (row["lane"], row["task_id"], row["kind"]))
     return {"rows": rows, "errors": errors, "terminal_records": terminal_count, "open_prs": open_count}
 
@@ -361,8 +506,13 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
     if report["errors"]:
         raise ValueError("routing refused: incomplete report")
     groups = defaultdict(list)
+    turn_lease_rows: list[dict[str, Any]] = []
     for row in report["rows"]:
-        groups[row["lane"]].append({k: v for k, v in row.items() if k != "age_hours"})
+        stripped = {k: v for k, v in row.items() if k != "age_hours"}
+        if row.get("kind") == "held_turn_lease":
+            turn_lease_rows.append(stripped)
+        else:
+            groups[row["lane"]].append(stripped)
     messages = []
     # A separate summary is still sent when unknown owners route to the CTO.
     packets = [(lane, "lane", rows) for lane, rows in sorted(groups.items())]
@@ -381,6 +531,26 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
             idempotency_key=key,
         )
         messages.append(message.message_id)
+    for row in sorted(
+        turn_lease_rows,
+        key=lambda r: (str(r.get("stream_id")), str(r.get("lease_id")), str(r.get("generation")), str(r.get("task_id"))),
+    ):
+        payload = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        stream_key = str(row.get("stream_id") or "unknown")
+        lease_key = str(row.get("lease_id") or row.get("task_id") or hashlib.sha256(payload.encode()).hexdigest()[:16])
+        gen_key = str(row["generation"]) if row.get("generation") is not None else "unknown"
+        key = f"stalled:held-turn-lease:{stream_key}:{lease_key}:{gen_key}"
+        message = service.enqueue_supervisory_request(
+            sender="claude-cto",
+            recipient="claude-cto",
+            body=(
+                f"Held dispatch-turn lease on {stream_key} ({row.get('reason')}). "
+                f"{_TURN_LEASE_RECOVERY_ADVICE}\n{payload}"
+            ),
+            correlation_id=f"held-turn-lease:{stream_key}:{lease_key}:{gen_key}",
+            idempotency_key=key,
+        )
+        messages.append(message.message_id)
     return messages
 
 
@@ -394,7 +564,13 @@ def run(args, *, now: datetime) -> dict[str, Any]:
         except MissingFleetCheckout:
             checkout = None
         checkouts[repo.github] = checkout
-    report = scan(args.tasks_dir, checkouts, repos=repos, now=now)
+    report = scan(
+        args.tasks_dir,
+        checkouts,
+        repos=repos,
+        now=now,
+        stream_fetcher=_fetch_remote_streams,
+    )
     if args.route and not report["errors"]:
         with AuthorityService(root=None) as service:
             report["messages"] = route(report, cycle=int(now.timestamp()) // args.cadence_seconds, service=service)
