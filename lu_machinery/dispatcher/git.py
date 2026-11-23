@@ -1865,9 +1865,13 @@ def settle_worktree(record: dict, borrowed=lambda: False, salvage: bool = False,
             return disposition("retained", CODE_UNAVAILABLE, removal.error)
         return disposition("error", "worktree_remove_failed", removal.error or removal.reason)
     try:
-        # The task branch goes only when its tip is published or reachable from another ref.
-        if not published and _git(repo, "rev-list", "-n1", head, "--not", f"--exclude=refs/heads/{branch}", "--all",
-                                  isolate=True):
+        # The task branch goes when its tip is published, reachable from another ref, or a
+        # read-only task's own unchanged start (the task authored no commits of its own).
+        unchanged_read_only = record["mode"] == "read-only" and not committed
+        if not published and not unchanged_read_only and _git(
+            repo, "rev-list", "-n1", head, "--not", f"--exclude=refs/heads/{branch}", "--all",
+            isolate=True,
+        ):
             return disposition("removed", "branch_kept_unmerged")
         _git(repo, "update-ref", "-d", f"refs/heads/{branch}", head, isolate=True)
     except (OSError, subprocess.SubprocessError):
