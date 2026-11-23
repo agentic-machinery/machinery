@@ -9,6 +9,23 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.62"></a>
+## [0.1.62] - 2026-11-23
+
+### Added
+
+- Set PR milestones on pr-create, dispatch_settle, and release_cut ([#1269](https://github.com/learn-ukrainian/machinery/pull/1269))
+
+### Changed
+
+- Keep the settlement commit association read on conditional REST ([#1267](https://github.com/learn-ukrainian/machinery/pull/1267))
+
+### Fixed
+
+- Put worktree-pinned Node and npm on worker PATH ([#1266](https://github.com/learn-ukrainian/machinery/pull/1266))
+- Publish the original merge-queue candidate ([#1271](https://github.com/learn-ukrainian/machinery/pull/1271))
+- Record typed setup refusal code on provider setup failure ([#1272](https://github.com/learn-ukrainian/machinery/pull/1272))
+
 <a id="v0.1.61"></a>
 ## [0.1.61] - 2026-11-23
 
@@ -1486,7 +1503,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.61...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.62...HEAD
+[0.1.62]: https://github.com/learn-ukrainian/machinery/compare/v0.1.61...v0.1.62
 [0.1.61]: https://github.com/learn-ukrainian/machinery/compare/v0.1.60...v0.1.61
 [0.1.60]: https://github.com/learn-ukrainian/machinery/compare/v0.1.59...v0.1.60
 [0.1.59]: https://github.com/learn-ukrainian/machinery/compare/v0.1.58...v0.1.59
