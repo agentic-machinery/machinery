@@ -180,9 +180,23 @@ class ReservationUnsafe(Exception):
         self.reason = reason
 
 
+def _task_store() -> Path:
+    """The task store's canonical path: every symlink and ``..`` resolved, as the kernel resolves them.
+
+    Its admission lock is a file opened inside the store through the same links, and its reservations are
+    derived from this path, so every spelling of one store is one admission domain. A path that cannot be
+    resolved raises ReservationUnsafe.
+    """
+    try:
+        return Path(os.path.realpath(tasks_dir()))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ReservationUnsafe(f"orchestrator_reservation_unknown: the task store path cannot be resolved "
+                                f"({type(exc).__name__})") from None
+
+
 def reservations_dir() -> Path:
     """``batch_state/streams``: beside the task store, whose admission lock guards every reservation write."""
-    return tasks_dir().parent / RESERVATIONS_DIR_NAME
+    return _task_store().parent / RESERVATIONS_DIR_NAME
 
 
 # Only a task store named ``tasks`` reserves, so <parent>/tasks and <parent>/streams are one admission domain:
@@ -191,8 +205,12 @@ TASKS_DIR_NAME = "tasks"
 
 
 def domain_refusal() -> str | None:
-    """Why this task store cannot hold stream reservations, or None."""
-    if tasks_dir().name != TASKS_DIR_NAME:
+    """Why this task store cannot hold stream reservations, or None. The name is the canonical path's."""
+    try:
+        name = _task_store().name
+    except ReservationUnsafe as exc:
+        return exc.reason
+    if name != TASKS_DIR_NAME:
         return (f"orchestrator_domain_refused: the task store must be a directory named {TASKS_DIR_NAME!r}, so its "
                 "admission lock is the only one guarding its reservations")
     return None
@@ -201,10 +219,10 @@ def domain_refusal() -> str | None:
 def _reservations_fd(*, create: bool) -> int | None:
     """A descriptor of the verified reservation directory, or None when it does not exist (never with ``create``).
 
-    The directory is ``streams`` beside the task store, opened without following a symlink; it must be a
-    directory the current user owns that no group or other user can write.
+    The directory is ``streams`` beside the task store's canonical path, opened without following a symlink;
+    it must be a directory the current user owns that no group or other user can write.
     """
-    parent = tasks_dir().parent
+    parent = _task_store().parent
     try:
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -389,9 +407,13 @@ def turn_writer_refusal(*, task_ids=(), tree=None) -> str | None:
     if tree is not None:
         from lu_machinery.dispatcher.worker import _same_tree
 
-    if not tasks_dir().is_dir():
-        return "orchestrator_reservation_unknown: the task store is missing"
     try:
+        try:
+            store_is_dir = stat.S_ISDIR(os.stat(_task_store()).st_mode)
+        except FileNotFoundError:
+            store_is_dir = False
+        if not store_is_dir:
+            return "orchestrator_reservation_unknown: the task store is missing"
         fd = _reservations_fd(create=False)
         if fd is None:
             return None
