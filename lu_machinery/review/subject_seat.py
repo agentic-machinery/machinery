@@ -194,7 +194,8 @@ class SubjectExclusion:
     fail_closed_reason: str | None = None
 
 
-def _uses_legacy_scripts_layout(repository: str | None) -> bool:
+def uses_legacy_scripts_layout(repository: str | None) -> bool:
+    """Keep legacy subject protection unless the fleet catalog identifies a consumer."""
     # Only a known consumer repository can opt out of legacy subject protection.
     if not isinstance(repository, str) or not repository.isascii():
         return True
@@ -210,9 +211,7 @@ def normalize_owned_path(path: str, *, legacy_scripts: bool = True) -> str:
     while text.startswith("./"):
         text = text[2:]
     text = text.rstrip("/")
-    if text.startswith("scripts/"):
-        if not legacy_scripts:
-            return text
+    if legacy_scripts and text.startswith("scripts/"):
         relocated = f"{_MACHINERY}/{text.removeprefix('scripts/')}"
         if relocated in _BOUNDARY_SEATS or relocated.startswith((_ADAPTER_PREFIX, _PROVIDER_PREFIX)):
             return relocated
@@ -272,7 +271,7 @@ def classify_owned_path(path: str, *, repository: str | None = None) -> OwnedPat
     Unrelated paths (a README, a generic timing hook) do not imply a subject
     seat. Ambiguous paths must not be turned into a guess.
     """
-    return _classify_normalized_path(normalize_owned_path(path, legacy_scripts=_uses_legacy_scripts_layout(repository)))
+    return _classify_normalized_path(normalize_owned_path(path, legacy_scripts=uses_legacy_scripts_layout(repository)))
 
 
 def _classify_normalized_path(rel: str) -> OwnedPathClassification:
@@ -337,7 +336,7 @@ def prepare_subject_exclusion(
         return SubjectExclusion(frozenset(), frozenset(), (), str(exc))
 
     evidence: list[str] = []
-    legacy_scripts = _uses_legacy_scripts_layout(repository)
+    legacy_scripts = uses_legacy_scripts_layout(repository)
     for raw_path in owned_paths:
         rel = normalize_owned_path(raw_path, legacy_scripts=legacy_scripts)
         classification = _classify_normalized_path(rel)

@@ -33,6 +33,7 @@ from lu_machinery.common.repo_root import MachineryConfigError
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.fleet import claude_account_lane, credit_lane
 from lu_machinery.identity import UNKNOWN_AUTHOR_FAMILY, resolve_author_family
+from lu_machinery.orchestration.execution_safe_git import safe_git_env
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, canonical_repository
 from lu_machinery.review.evidence import compute_target_input_fingerprint
 from lu_machinery.review.findings import FindingEvent, FindingsLedger, FindingsLedgerError
@@ -50,6 +51,7 @@ from lu_machinery.review.scope_baseline import (
     check_expansion_breaker,
 )
 from lu_machinery.review.security_paths import git_changed_paths
+from lu_machinery.review.subject_seat import uses_legacy_scripts_layout
 from lu_machinery.review.target_resolution import (
     ReviewTarget,
     TargetResolutionError,
@@ -413,9 +415,7 @@ def _cmd_record_cycle(args: argparse.Namespace) -> int:
     return 0
 
 
-def _checkout_git(repo_root: Path, *args: str) -> str:
-    env = sanitized_git_env()
-    env.pop("GIT_CONFIG", None)
+def _checkout_git(repo_root: Path, *args: str, env: dict[str, str] | None = None) -> str:
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo_root), *args],
@@ -424,21 +424,22 @@ def _checkout_git(repo_root: Path, *args: str) -> str:
             errors="replace",
             check=False,
             timeout=30,
-            env=env,
+            env=sanitized_git_env() if env is None else env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CloseoutStateError(f"git {args[0]} unavailable") from exc
     if proc.returncode:
         raise CloseoutStateError(f"git {args[0]} failed")
-    return proc.stdout.strip()
+    return proc.stdout
 
 
 def _checkout_repository(repo_root: Path) -> str:
     """``owner/name`` of the checkout's GitHub origin, which task records must name."""
-    url = _checkout_git(repo_root, "config", "--local", "--get-all", "remote.origin.url")
+    url = _checkout_git(repo_root, "config", "--null", "--includes", "--get-all", "remote.origin.url", env=safe_git_env())
     match = re.fullmatch(
-        r"(?:https?://(?:[^/@\s]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:|git://github\.com/)"
-        r"([a-z0-9_.-]+/[a-z0-9_.-]+?)(?:\.git)?/?",
+        r"(?:https://(?:[^/@\s\x00]+@)?github\.com(?::443)?/|http://(?:[^/@\s\x00]+@)?github\.com(?::80)?/"
+        r"|ssh://git@github\.com(?::22)?/|git@github\.com:|git://github\.com/)"
+        r"([a-z0-9_.-]+/[a-z0-9_.-]+?)(?:\.git)?/?\x00",
         url,
         re.ASCII | re.IGNORECASE,
     )
@@ -504,8 +505,10 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
             origin = _checkout_repository(repo_root)
         except CloseoutStateError:
             origin = None
-        if origin and repository:
+        if repository and (origin or not uses_legacy_scripts_layout(repository)):
             try:
+                if origin is None:
+                    raise CloseoutStateError("review_repository_unverified: consumer repository needs a verified origin")
                 if canonical_repository(origin) != canonical_repository(repository):
                     raise CloseoutStateError("review_repository_mismatch: --repository does not match target origin")
             except (CloseoutStateError, FleetRepoError) as exc:
@@ -1964,7 +1967,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "GitHub owner/name for subject paths and committed author task records. "
-            "Must match the target checkout's GitHub origin when present. "
+            "Must match the target checkout's GitHub origin when present. A consumer override "
+            "for a target requires a verified origin. "
             "Default: the target checkout's origin. Example: owner/repo"
         ),
     )

@@ -29,6 +29,7 @@ from lu_machinery.review.reviewer_resolver import resolve_author_family
 from lu_machinery.review.reviewer_resolver import resolve_family
 from lu_machinery.review.reviewer_resolver import resolve_reviewer
 from lu_machinery.review.subject_seat import candidate_matches_subject_seat
+from lu_machinery.review.subject_seat import classify_owned_path
 from lu_machinery.review.subject_seat import normalize_subject_family
 from lu_machinery.review.subject_seat import normalize_subject_seat
 from lu_machinery.review.subject_seat import prepare_subject_exclusion
@@ -1347,9 +1348,12 @@ def test_scripts_boundary_is_relocated_only_for_legacy_or_unknown_repositories(r
     assert subject.seats == ({"codex"} if legacy_scripts else set())
     assert subject.evidence == ((canonical,) if legacy_scripts else ())
 
-    with_canonical = prepare_subject_exclusion(owned_paths=(legacy, canonical), repository=repository)
-    assert with_canonical.seats == {"codex"}
-    assert with_canonical.evidence == (canonical,)
+    for canonical_path in (canonical, f"scripts/{canonical}"):
+        with_canonical = prepare_subject_exclusion(owned_paths=(legacy, canonical_path), repository=repository)
+        assert with_canonical.seats == {"codex"}
+        assert with_canonical.evidence == (canonical,)
+    nested_reviewer_hook = "scripts/agents_extensions/shared/hooks/guard-reviewer-publish.py"
+    assert classify_owned_path(nested_reviewer_hook, repository=repository).kind == "ambiguous"
 
 
 @pytest.mark.usefixtures('configured_roots')

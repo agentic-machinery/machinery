@@ -308,16 +308,37 @@ def test_resolve_reviewer_uses_the_consumer_origin_for_adapter_deletions(tmp_pat
     assert receipt["resolved_risk"] == "critical"
     assert receipt["branch_facts"]["subject_seats"] == []
 
-    # A caller cannot opt a machinery target out of its boundary protections.
-    repo.git("remote", "set-url", "origin", "https://github.com/learn-ukrainian/machinery.git")
+    def check_origin_refusal(reason):
+        assert closeout_cli.main([*resolve, "--repository", repository]) == 1
+        refusal = json.loads(capsys.readouterr().out)
+        assert refusal["selected"] is None
+        assert refusal["fail_closed_reason"].startswith(reason)
+        assert json.loads((tmp_path / "review.json").read_text())["resolved_reviewer"] == refusal
+
+    # A caller's Git config cannot override a checkout's repository identity.
+    machinery_url = "https://github.com/learn-ukrainian/machinery.git"
+    repo.git("remote", "set-url", "origin", machinery_url)
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", f"https://github.com/{repository}.git")
-    assert closeout_cli.main([*resolve, "--repository", repository]) == 1
-    refusal = json.loads(capsys.readouterr().out)
-    assert refusal["selected"] is None
-    assert "review_repository_mismatch" in refusal["fail_closed_reason"]
-    assert json.loads((tmp_path / "review.json").read_text())["resolved_reviewer"] == refusal
+    check_origin_refusal("review_repository_mismatch")
+
+    repo.git("config", "--local", "--unset-all", "remote.origin.url")
+    repo.git("config", "--local", "extensions.worktreeConfig", "true")
+    repo.git("config", "--worktree", "remote.origin.url", "ssh://git@github.com:22/learn-ukrainian/machinery.git")
+    check_origin_refusal("review_repository_mismatch")
+    repo.git("config", "--worktree", "--unset-all", "remote.origin.url")
+    check_origin_refusal("review_repository_unverified")
+
+    included = tmp_path / "origin.gitconfig"
+    included.write_text(f'[remote "origin"]\n\turl = {machinery_url}\n', encoding="utf-8")
+    repo.git("config", "--local", "include.path", str(included))
+    check_origin_refusal("review_repository_mismatch")
+    repo.git("config", "--local", "--add", "remote.origin.url", f"https://github.com/{repository}.git")
+    check_origin_refusal("review_repository_unverified")
+    repo.git("config", "--local", "--unset-all", "include.path")
+    repo.git("config", "--local", "--add", "remote.origin.url", "")
+    check_origin_refusal("review_repository_unverified")
 
 
 @pytest.mark.parametrize("repository", [None, "", "owner", "other/repo", "owner/repo/extra"])
