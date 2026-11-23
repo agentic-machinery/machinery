@@ -26,8 +26,10 @@ is not built yet: you follow it as an instruction, and no tool enforces it.
   (`<task> --run-nonce --stream --handoff-ref`), and `done` only for a clean tree at the start SHA
   plus a receipt that matches a pattern and its own hash.
 - So task status `done` proves a receipt and a clean tree, **nothing more**. A blocked run that
-  records a receipt also settles `done`. The CTO reads the outcome on the first line of your note
-  and checks the milestone checklist itself.
+  records a receipt also settles `done`, and a run can die after writing `OUTCOME: done`. So a `done`
+  note is provisional. The CTO and the next run accept it only when the run's task ID and full nonce
+  show a settled `done` status, its receipt names that note, and the note's checklist holds on live
+  state. Missing or conflicting evidence leaves the outcome unresolved: treat it as `blocked`.
 - **Exclusion today is local.** The dispatcher probes Monitor once (it refuses when a legacy lease is
   active or Monitor is unreachable), then takes a local reservation file. That stops a second
   dispatched run on the stream. It does **not** stop a legacy lane launcher that claims the stream
@@ -66,7 +68,8 @@ Do these in order. Dispatch and land nothing until step 7 passes.
 3. Read the previous note: `lu-driver-state show <id>`. It must exist, be a `handoff_note`, name
    your lane and stream, and read in full. Then `lu-driver-state render --lane <lane>`: a newer
    `handoff_note` the brief does not name means two predecessors, so it is `blocked`.
-   `none` is allowed only when the brief says "first run approved by the CTO".
+   `none` is allowed only when the brief says "first run approved by the CTO". If the note says
+   `OUTCOME: done`, apply the acceptance rule in "What is live" before you rely on it.
 4. Drain the stream inbox with the brief's slot, one message at a time: read, apply, record the
    delivery ID in your tracker item, then ack. Commands: the SKILL.md inbox drain, with
    `--recipient <slot> --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"` (a task-ID worker identity on a
@@ -145,11 +148,13 @@ After each pass:
    `rate_limited`, `cancelled`, `crashed` or `no_deliverable`). Exit 2, a missing task or a nonce
    mismatch leaves the child unresolved: it keeps counting against the cap and blocks "Ending".
 4. Several children: wait on one, then `status` the others each pass. Do not poll in a tight loop.
-5. Each pass uses `--timeout` of 300 or the seconds left before the stop-new-work time, whichever is
-   smaller, and sets the Bash call's own timeout to that value plus 15 seconds. `--timeout` is a
-   client limit only: `wait` can still block on a child that is settling. If the Bash call is cut
-   off, the child is unresolved: carry its ID and nonce into the note. With no time left, do not
-   start a pass: go to "Ending".
+5. Let `left` be the seconds before the stop-new-work time. Each pass uses `--timeout` of 300 or
+   `left` minus 15, whichever is smaller, and sets the Bash call's own timeout to `left`, so the
+   call is cut off at the cutoff itself. `--timeout` is a client limit only: `wait` can still block
+   on a child that is settling. Every follow-up read in this loop (`dispatch status`, the inbox)
+   is one call with a Bash timeout of at most `left`. A cut-off call leaves its child unresolved:
+   carry its ID and nonce into the note. With `left` of 30 or less, start no pass: go to
+   "Ending".
 
 The loop is the mitigation, not the proof: the practice canary must show that a healthy quiet child
 never trips the silence timeout.
