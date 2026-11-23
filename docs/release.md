@@ -216,9 +216,9 @@ official provenance, exact steady versions, explicit compatibility lanes and
 reviewed updates. Separate open implementation rows on
 [#1144](https://github.com/learn-ukrainian/machinery/issues/1144) track
 pinning the [pytest bootstrap](../lu_machinery/ci/setup_bubblewrap.sh) native
-package closure, pinning the filesystem parity probe container image digest,
-and tightening steady-job runtime version selectors alongside explicit
-compatibility lanes.
+package closure and tightening steady-job runtime version selectors alongside
+explicit compatibility lanes. The filesystem parity probe uses a digest-pinned
+container image.
 
 ## Cut a release
 
