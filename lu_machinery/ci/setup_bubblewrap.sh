@@ -130,11 +130,12 @@ if [ "${#missing[@]}" -gt 0 ] || ! "$bwrap_ready"; then
   trap 'sudo rm -rf -- "$apt_dir"' EXIT
   chmod 0755 "$apt_dir"
   mkdir -- "$apt_dir/lists" "$apt_dir/archives"
+  # All CI native packages (bubblewrap deps, apparmor, postgresql-16, libpq-dev) live in main.
   cat > "$apt_dir/ubuntu.sources" <<EOF
 Types: deb
 URIs: ${snapshot_url}/
 Suites: noble noble-updates noble-security
-Components: main restricted universe multiverse
+Components: main
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 Snapshot: no
 EOF
@@ -146,7 +147,7 @@ EOF
     -o Dir::Cache::pkgcache=
     -o Dir::Cache::srcpkgcache=
     -o Acquire::Languages=none
-    -o Acquire::Retries=1
+    -o Acquire::Retries=3
     -o Acquire::https::Timeout=10
   )
 
@@ -164,7 +165,10 @@ EOF
 
   echo "Installing missing native packages from Ubuntu snapshot ${snapshot}: ${missing[*]}"
   apt_deadline=$((SECONDS + 195))
-  if ! sudo timeout --kill-after=5 60 env -u APT_CONFIG apt-get "${apt_opts[@]}" update --error-on=any; then
+  # Reserve 55 s for the first apt install and 5 s kill grace per command.
+  update_cap=$((apt_deadline - SECONDS - 65))
+  if [ "$update_cap" -lt 1 ] ||
+    ! sudo timeout --kill-after=5 "$update_cap" env -u APT_CONFIG apt-get "${apt_opts[@]}" update --error-on=any; then
     echo "::error::Could not update package indexes from Ubuntu snapshot ${snapshot}" >&2
     exit 1
   fi
