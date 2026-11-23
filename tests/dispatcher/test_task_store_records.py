@@ -396,4 +396,289 @@ def test_unborn_head_with_revision_named_path_gets_no_review_reply(tmp_path, mon
     assert ("result" in record, record["result_unavailable"]) == (False, "parent_head_unavailable")
 
 
+def _write_ownership_state(tmp_path: Path, handoffs: dict[str, dict]) -> Path:
+    state_file = tmp_path / "pr_ownership" / "state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps({
+        "schema": 1,
+        "last_tick": None,
+        "episodes": {},
+        "handoffs": handoffs,
+        "history": [],
+        "outbox": [],
+        "heal_attempts": {},
+    }))
+    return state_file
+
+
+def _review_with_pr_successor(
+    tmp_path,
+    monkeypatch,
+    *,
+    parent_status="timeout",
+    archive_parent=False,
+    review_pr=1277,
+    review_branch="release/start-0.1.63",
+    review_repo="org/repo",
+    successor_status="running",
+    successor_repo="org/repo",
+    successor_publish_branch="release/start-0.1.63",
+    successor_worktree_branch="codex/successor",
+    write_handoff=True,
+    handoff_repo="org/repo",
+    handoff_pr=1277,
+    handoff_entry=None,
+):
+    """A settled (or active) parent's PR review and a running takeover successor at its head."""
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.delenv(worker.write_boundary.BROKER_ENV, raising=False)
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    tree = tmp_path / "successor-tree"
+    tree.mkdir()
+    run_git(tree, "init", "-b", successor_worktree_branch)
+    run_git(tree, "-c", "user.email=s@example.invalid", "-c", "user.name=S", "commit", "--allow-empty", "-m", "head")
+    head = run_git(tree, "rev-parse", "HEAD")
+
+    parent_record = {
+        "schema_version": 2,
+        "task_id": "parent",
+        "status": parent_status,
+        "run_nonce": "p1",
+        "repository_id": review_repo,
+        "worktree_branch": "codex/parent",
+        "worktree_path": str(tmp_path / "parent-tree"),
+    }
+    parent_dir = tasks / "archive" if archive_parent else tasks
+    parent_dir.mkdir(exist_ok=True)
+    (parent_dir / "parent.json").write_text(json.dumps(parent_record))
+
+    successor_record: dict = {
+        "schema_version": 2,
+        "task_id": "successor",
+        "status": successor_status,
+        "run_nonce": "s1",
+        "repository_id": successor_repo,
+        "worktree_branch": successor_worktree_branch,
+        "worktree_path": str(tree),
+    }
+    if successor_publish_branch is not None:
+        successor_record["publish_branch"] = successor_publish_branch
+    (tasks / "successor.json").write_text(json.dumps(successor_record))
+
+    review_record: dict = {
+        "schema_version": 2,
+        "task_id": "pr-review",
+        "status": "done",
+        "run_nonce": "r1",
+        "parent_task_id": "parent",
+        "mode": "read-only",
+        "repository_id": review_repo,
+        "review_branch": review_branch,
+        "pinned_head": head,
+        "result_file": str(tasks / "pr-review.result"),
+        "result_sha256": hashlib.sha256(REPLY.encode()).hexdigest(),
+    }
+    if review_pr is not None:
+        review_record["pr"] = review_pr
+    (tasks / "pr-review.json").write_text(json.dumps(review_record))
+    (tasks / "pr-review.result").write_text(REPLY)
+
+    if write_handoff:
+        entry = handoff_entry if handoff_entry is not None else {
+            "successor": "successor",
+            "predecessor": None,
+            "accepted_at": "2026-11-23T15:00:00+00:00",
+            "head": head,
+            "custody": [],
+            "rerun_allowance": "unspent",
+        }
+        _write_ownership_state(tmp_path, {f"{handoff_repo.casefold()}#{handoff_pr}": entry})
+    return tree, head
+
+
+@pytest.mark.parametrize(("parent_status", "archive_parent", "successor_repo"), [
+    ("timeout", False, "org/repo"),
+    ("done", True, "Org/Repo"),
+    ("no_deliverable", False, "org/repo"),
+])
+def test_settled_parent_pr_successor_reads_exact_head_review_reply(
+    tmp_path, monkeypatch, parent_status, archive_parent, successor_repo
+):
+    """Defect: a settled parent's accepted PR successor is refused the sealed review reply."""
+    _review_with_pr_successor(
+        tmp_path, monkeypatch, parent_status=parent_status, archive_parent=archive_parent,
+        successor_repo=successor_repo,
+    )
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+
+    record, code = worker.wait("pr-review", "r1", reply=True)
+    assert (code, record.get("result"), record.get("result_unavailable")) == (0, REPLY, None)
+    # Without --reply the output stays an exact copy of the record.
+    assert worker.wait("pr-review", "r1")[0] == json.loads((tmp_path / "tasks/pr-review.json").read_text())
+
+    # Digest verification still applies on the successor path.
+    (tmp_path / "tasks/pr-review.result").write_text("tampered\n")
+    tampered, _code = worker.wait("pr-review", "r1", reply=True)
+    assert "result" not in tampered
+    assert tampered["result_unavailable"].startswith("result_unreadable: terminal_result_digest_mismatch")
+
+
+@pytest.mark.parametrize("case", [
+    "no_state",
+    "other_pr",
+    "other_repo",
+    "other_successor",
+    "decision_custody",
+    "keeper_custody",
+    "review_without_pr",
+    "review_bool_pr",
+])
+def test_pr_successor_without_accepted_ownership_gets_no_review_reply(tmp_path, monkeypatch, case):
+    """Control: a caller without accepted task ownership of the review's PR stays refused."""
+    from lu_machinery.orchestration import pr_ownership
+
+    kwargs: dict = {}
+    if case == "no_state":
+        kwargs["write_handoff"] = False
+    elif case == "other_pr":
+        kwargs["handoff_pr"] = 9999
+    elif case == "other_repo":
+        kwargs["handoff_repo"] = "org/other"
+    elif case == "other_successor":
+        kwargs["handoff_entry"] = {
+            "successor": "someone-else",
+            "predecessor": None,
+            "accepted_at": "2026-11-23T15:00:00+00:00",
+            "head": HEAD,
+            "custody": [],
+            "rerun_allowance": "unspent",
+        }
+    elif case == "decision_custody":
+        kwargs["handoff_entry"] = {
+            "successor": "successor",
+            "predecessor": None,
+            "accepted_at": "2026-11-23T15:00:00+00:00",
+            "head": HEAD,
+            "custody": [],
+            "rerun_allowance": "unspent",
+            "reason": "held for decision",
+            "decision_owner": "successor",
+            "pr_state": "OPEN",
+        }
+    elif case == "keeper_custody":
+        digest = pr_ownership._keeper_custody_digest(
+            repository="org/repo", pr=1277, base="main", head=HEAD, worker_task="parent",
+            worker_nonce="p1", review_classification="trivial", verdict_receipt=None,
+        )
+        kwargs["handoff_entry"] = {
+            "successor": pr_ownership.SENDER,
+            "predecessor": "parent",
+            "accepted_at": "2026-11-23T15:00:00+00:00",
+            "acknowledged_at": "2026-11-23T15:00:00+00:00",
+            "custody": list(pr_ownership.KEEPER_CUSTODY_COVERS),
+            "custody_mode": "keeper",
+            "keeper_state": "active",
+            "repository": "org/repo",
+            "pr": 1277,
+            "base": "main",
+            "head": HEAD,
+            "worker_task": "parent",
+            "worker_nonce": "p1",
+            "review_classification": "trivial",
+            "verdict_receipt": None,
+            "custody_sha256": digest,
+            "rerun_allowance": "unspent",
+        }
+    elif case == "review_without_pr":
+        kwargs["review_pr"] = None
+    elif case == "review_bool_pr":
+        kwargs["review_pr"] = True
+    _review_with_pr_successor(tmp_path, monkeypatch, **kwargs)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, pr_ownership.SENDER if case == "keeper_custody" else "successor")
+
+    record, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, "caller_not_parent")
+
+
+def test_corrupt_ownership_state_fails_closed_for_pr_successor(tmp_path, monkeypatch):
+    """Defect class: unreadable or malformed ownership state must fail closed with a typed reason."""
+    _review_with_pr_successor(tmp_path, monkeypatch, write_handoff=False)
+    state_file = tmp_path / "pr_ownership" / "state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text("{corrupt")
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+
+    record, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, "ownership_state_unavailable")
+
+
+@pytest.mark.parametrize(("parent_status", "expected"), [
+    ("running", "parent_still_running"),
+    ("spawning", "parent_still_running"),
+    ("corrupt_status", "parent_record_unavailable"),
+])
+def test_pr_successor_refused_while_parent_is_not_settled(tmp_path, monkeypatch, parent_status, expected):
+    """Control: accepted PR ownership cannot read a review whose parent has not settled."""
+    _review_with_pr_successor(tmp_path, monkeypatch, parent_status=parent_status)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+
+    record, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, expected)
+
+
+def test_pr_successor_refused_on_moved_head_branch_mismatch_or_bad_caller(tmp_path, monkeypatch):
+    """Control: successor reply requires exact head, matching PR branch/repo, active caller and run nonce."""
+    tree, _head = _review_with_pr_successor(tmp_path, monkeypatch)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+
+    # Omitted nonce refuses.
+    no_nonce, _code = worker.wait("pr-review", None, reply=True)
+    assert ("result" in no_nonce, no_nonce["result_unavailable"]) == (False, "run_nonce_required")
+
+    # Wrong nonce raises before reply.
+    with pytest.raises(ValueError, match="run nonce mismatch"):
+        worker.wait("pr-review", "stale", reply=True)
+
+    # Head moved refuses.
+    run_git(tree, "-c", "user.email=s@example.invalid", "-c", "user.name=S", "commit", "--allow-empty", "-m", "fix")
+    moved, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in moved, moved["result_unavailable"]) == (False, "head_moved")
+
+    # Unborn HEAD refuses with successor_head_unavailable.
+    run_git(tree, "update-ref", "-d", "HEAD")
+    unborn, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in unborn, unborn["result_unavailable"]) == (False, "successor_head_unavailable")
+
+
+@pytest.mark.parametrize(("kwargs", "expected"), [
+    ({"review_branch": "codex/successor"}, "review_not_of_successor_branch"),
+    ({"successor_publish_branch": "", "successor_worktree_branch": "release/start-0.1.63"},
+     "review_not_of_successor_branch"),
+    ({"successor_repo": "org/other"}, "review_not_of_successor_branch"),
+    ({"successor_status": "done"}, "successor_not_running"),
+])
+def test_pr_successor_refused_on_branch_repo_or_settled_caller(tmp_path, monkeypatch, kwargs, expected):
+    """Control: review branch must match the successor's PR head branch, repo and active status."""
+    _review_with_pr_successor(tmp_path, monkeypatch, **kwargs)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+
+    record, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in record, record["result_unavailable"]) == (False, expected)
+
+
+def test_pr_successor_refused_when_parent_or_successor_record_missing(tmp_path, monkeypatch):
+    """Control: missing parent or successor task records fail closed with typed reasons."""
+    _review_with_pr_successor(tmp_path, monkeypatch)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "successor")
+    (tmp_path / "tasks/successor.json").unlink()
+    missing_successor, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in missing_successor, missing_successor["result_unavailable"]) == (
+        False, "successor_record_unavailable"
+    )
+    (tmp_path / "tasks/parent.json").unlink()
+    missing_parent, _code = worker.wait("pr-review", "r1", reply=True)
+    assert ("result" in missing_parent, missing_parent["result_unavailable"]) == (False, "parent_record_unavailable")
+
+
 pytestmark = pytest.mark.usefixtures("configured_roots")

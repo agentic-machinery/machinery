@@ -2426,49 +2426,121 @@ def _read_only(record: dict | None) -> dict:
     return record
 
 
-def _own_review_reply(record: dict, nonce: str | None) -> dict:
-    """A done review's sealed reply, for the run that dispatched it on its own exact head (#1075).
-
-    Write workers run outside the write boundary (#619), whose broker no longer hands an author its review's reply,
-    and their launch context forbids reading another task's records. So ``wait --reply`` returns the reply (its
-    digest checked by the recorder) to that author only: the caller is the review's running parent, the wait names
-    the review's run nonce, the review is of the parent's publish branch or worktree branch, and the parent's
-    worktree is still at the reviewed head. Anyone else gets a typed reason, no
-    reply. Opt-in, so plain ``wait`` output stays an exact copy of the record (task_record_store.is_identical_copy).
-    """
-    if record.get("status") != "done" or not record.get("review_branch"):
-        return {"result_unavailable": "not_a_done_review"}
-    caller = os.environ.get(ownership.TASK_ID_ENV)
-    if not caller or caller != record.get("parent_task_id"):
-        return {"result_unavailable": "caller_not_parent"}
-    if nonce is None:
-        return {"result_unavailable": "run_nonce_required"}
+def _read_status_record(task_id: str) -> dict | None:
+    """Read a task record with a string status; None when missing, unreadable, or malformed."""
     try:
-        parent = store.read(caller)
+        loaded = store.read(task_id)
     except (OSError, ValueError):
-        parent = None
-    if not isinstance(parent, dict) or not isinstance(parent.get("status"), str):
-        return {"result_unavailable": "parent_record_unavailable"}
-    if parent["status"] not in store.ACTIVE:
-        return {"result_unavailable": "parent_not_running"}
-    branches = {
-        branch for branch in (parent.get("publish_branch"), parent.get("worktree_branch"))
-        if isinstance(branch, str) and branch
-    }
-    if parent.get("repository_id") != record.get("repository_id") or _text(record["review_branch"]) not in branches:
-        return {"result_unavailable": "review_not_of_parent_branch"}
+        return None
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("status"), str):
+        return None
+    return loaded
+
+
+def _record_repo_id(record: dict) -> str | None:
+    """The record's non-empty ``repository_id``, or None when missing or conflicting with ``repository``."""
+    repo_id = _text(record.get("repository_id"))
+    if not repo_id:
+        return None
+    repo = record.get("repository")
+    if repo is not None:
+        repo_text = _text(repo)
+        if not repo_text or repo_text.casefold() != repo_id.casefold():
+            return None
+    return repo_id
+
+
+def _worktree_head(tree: object) -> str | None:
+    """Resolve ``HEAD^{commit}`` of an absolute worktree root; None when unreadable or resolved elsewhere."""
     # Git walks up from a directory that lost its own repository, so the top level it names must be the tree.
-    tree = parent.get("worktree_path")
     try:
         if not isinstance(tree, str) or not Path(tree).is_absolute():
             raise ValueError("worktree path is not absolute")
-        top, head = git._git(Path(tree), "rev-parse", "--path-format=absolute", "--show-toplevel", "--verify", "HEAD^{commit}",
-                             isolate=True).split("\n")
+        top, head = git._git(
+            Path(tree), "rev-parse", "--path-format=absolute", "--show-toplevel", "--verify", "HEAD^{commit}",
+            isolate=True,
+        ).split("\n")
         if Path(top).resolve(strict=True) != Path(tree).resolve(strict=True):
             raise ValueError("Git resolved another worktree")
+        return head
     except (ValueError, OSError, RuntimeError, subprocess.SubprocessError):
-        return {"result_unavailable": "parent_head_unavailable"}
-    if not record.get("pinned_head") or head != record["pinned_head"]:
+        return None
+
+
+def _own_review_reply(record: dict, nonce: str | None) -> dict:
+    """A done review's sealed reply, for its running parent or a settled parent's accepted PR successor (#1075).
+
+    Write workers run outside the write boundary (#619), whose broker no longer hands an author its review's reply,
+    and their launch context forbids reading another task's records. So ``wait --reply`` returns the reply (its
+    digest checked by the recorder) to:
+    - the review's running parent task on its publish branch or worktree branch at the reviewed head, or
+    - when the review's parent task has settled (known terminal status), a running caller that holds the recorded
+      accepted PR ownership for that review's PR and repository, on that PR's head branch at the reviewed head.
+    Both paths require ``--run-nonce``. Anyone else gets a typed reason, no reply. Opt-in, so plain ``wait``
+    output stays an exact copy of the record (task_record_store.is_identical_copy).
+    """
+    review_branch = _text(record.get("review_branch"))
+    if record.get("status") != "done" or not review_branch:
+        return {"result_unavailable": "not_a_done_review"}
+    caller = _text(os.environ.get(ownership.TASK_ID_ENV))
+    parent_id = _text(record.get("parent_task_id"))
+    if not caller or not parent_id:
+        return {"result_unavailable": "caller_not_parent"}
+    if caller == parent_id:
+        if nonce is None:
+            return {"result_unavailable": "run_nonce_required"}
+        holder = _read_status_record(caller)
+        if holder is None:
+            return {"result_unavailable": "parent_record_unavailable"}
+        if holder["status"] not in store.ACTIVE:
+            return {"result_unavailable": "parent_not_running"}
+        branches = {
+            branch for branch in (holder.get("publish_branch"), holder.get("worktree_branch"))
+            if isinstance(branch, str) and branch
+        }
+        if holder.get("repository_id") != record.get("repository_id") or review_branch not in branches:
+            return {"result_unavailable": "review_not_of_parent_branch"}
+        head_unavailable = "parent_head_unavailable"
+    else:
+        pr_number = record.get("pr")
+        repo_id = _record_repo_id(record)
+        if type(pr_number) is not int or pr_number <= 0 or not repo_id:
+            return {"result_unavailable": "caller_not_parent"}
+        from lu_machinery.orchestration import pr_ownership
+
+        try:
+            owner = pr_ownership.accepted_handoffs().get((repo_id.casefold(), pr_number))
+        except (pr_ownership.OwnershipError, OSError, ValueError, RecursionError):
+            return {"result_unavailable": "ownership_state_unavailable"}
+        if owner != caller:
+            return {"result_unavailable": "caller_not_parent"}
+        if nonce is None:
+            return {"result_unavailable": "run_nonce_required"}
+        parent = _read_status_record(parent_id)
+        if parent is None:
+            return {"result_unavailable": "parent_record_unavailable"}
+        if parent["status"] in store.ACTIVE:
+            return {"result_unavailable": "parent_still_running"}
+        if parent["status"] not in store.TERMINAL:
+            return {"result_unavailable": "parent_record_unavailable"}
+        holder = _read_status_record(caller)
+        if holder is None:
+            return {"result_unavailable": "successor_record_unavailable"}
+        if holder["status"] not in store.ACTIVE:
+            return {"result_unavailable": "successor_not_running"}
+        holder_repo = _record_repo_id(holder)
+        if "publish_branch" in holder and holder["publish_branch"] is not None:
+            holder_branch = _text(holder["publish_branch"])
+        else:
+            holder_branch = _text(holder.get("worktree_branch"))
+        if not holder_repo or holder_repo.casefold() != repo_id.casefold() or review_branch != holder_branch:
+            return {"result_unavailable": "review_not_of_successor_branch"}
+        head_unavailable = "successor_head_unavailable"
+    head = _worktree_head(holder.get("worktree_path"))
+    if head is None:
+        return {"result_unavailable": head_unavailable}
+    pinned_head = _text(record.get("pinned_head"))
+    if not pinned_head or head != pinned_head:
         return {"result_unavailable": "head_moved"}
     from lu_machinery.review import record_cf_verdict as recorder
 
