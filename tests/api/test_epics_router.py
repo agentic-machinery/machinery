@@ -253,10 +253,15 @@ def test_router_live_claim_conflict_names_holder_and_expiry(tmp_path: Path, monk
 @pytest.mark.parametrize("turn_first", [True, False])
 def test_router_turn_conflict_has_its_stable_detail_prefix(tmp_path: Path, monkeypatch, turn_first: bool) -> None:
     """Defect class T1: a turn/legacy conflict reaches the dispatcher as a bare 409 it cannot tell from an invariant
-    failure, so a held stream reads as unknown, or an invariant 409 reads as a held stream."""
-    from lu_machinery.session_streams.store import TURN_CONFLICT_PREFIX, TURN_HOLDER_HARNESS
+    failure, so a held stream reads as unknown, or an invariant 409 reads as a held stream.
+    Also verifies the 409 detail is built from fixed text, never echoed from TurnLeaseUnclearedError text."""
+    from lu_machinery.session_streams.store import (
+        TURN_CONFLICT_PREFIX,
+        TURN_HOLDER_HARNESS,
+        TurnLeaseUnclearedError,
+    )
 
-    client = _client(tmp_path, monkeypatch)
+    client, store = _client_and_store(tmp_path, monkeypatch)
     turn = {"harness": TURN_HOLDER_HARNESS, "instance_id": "a" * 32, "task_id": "turn-a"}
     first, second = ({**turn}, {}) if turn_first else ({}, {**turn})
     held = client.post("/api/epics/v1/epic:7178/claim", json={
@@ -266,14 +271,26 @@ def test_router_turn_conflict_has_its_stable_detail_prefix(tmp_path: Path, monke
     later = epics_router.parse_timestamp("2099-01-01T00:00:00Z")  # long past the holder's TTL
     monkeypatch.setattr(epics_router, "utc_now", lambda: later)
     monkeypatch.setattr("lu_machinery.session_streams.store.utc_now", lambda: later)
-    competing = client.post("/api/epics/v1/epic:7178/claim", json={
+    claim_body = {
         "session_id": "other-session", "lease_id": "other-lease", "lineage_id": "other", "agent": "claude",
-        "harness": "codex-cli", "instance_id": "other-instance", "process_id": 5678, **second})
+        "harness": "codex-cli", "instance_id": "other-instance", "process_id": 5678, **second}
+    competing = client.post("/api/epics/v1/epic:7178/claim", json=claim_body)
     assert competing.status_code == 409
     detail = competing.json()["detail"]
     assert detail.startswith(f"{TURN_CONFLICT_PREFIX}: "), detail
     holder = TURN_HOLDER_HARNESS if turn_first else "codex-cli"
     assert f"current holder=claude/{holder}" in detail and "expires_at=" in detail
+
+    def _raise_with_sentinel(**_kwargs):
+        raise TurnLeaseUnclearedError("internal-exception-sentinel")
+
+    monkeypatch.setattr(store, "claim_remote_session", _raise_with_sentinel)
+    masked = client.post("/api/epics/v1/epic:7178/claim", json=claim_body)
+    assert masked.status_code == 409
+    masked_detail = masked.json()["detail"]
+    assert masked_detail.startswith(f"{TURN_CONFLICT_PREFIX}: "), masked_detail
+    assert "internal-exception-sentinel" not in masked.text
+    assert f"current holder=claude/{holder}" in masked_detail and "expires_at=" in masked_detail
 
 
 def test_router_responses_have_no_paths_or_host_network_tokens(tmp_path: Path, monkeypatch) -> None:
