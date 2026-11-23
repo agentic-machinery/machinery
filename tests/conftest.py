@@ -88,7 +88,7 @@ import tempfile
 import threading
 import warnings
 import weakref
-from collections.abc import Callable, Collection, Generator, Mapping
+from collections.abc import Callable, Collection, Generator, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -910,6 +910,41 @@ def _restore_process_umask() -> Generator[None, None, None]:
     os.umask(prior)
     yield
     os.umask(prior)
+
+
+_FUNCTOOLS_CACHE_TYPE = type(_secret_fragment_index)
+
+
+def _clear_module_functools_caches(*module_parts: str) -> None:
+    """Clear every functools cache on an already-imported module without importing it."""
+    module = _loaded_module(*module_parts)
+    module_dict = getattr(module, "__dict__", None)
+    if not isinstance(module_dict, dict):
+        return
+    for value in tuple(module_dict.values()):
+        if isinstance(value, _FUNCTOOLS_CACHE_TYPE):
+            value.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _clear_fleet_repos_caches() -> Iterator[None]:
+    """Keep every test independent of prior fleet_repos cache warming.
+
+    ``lu_machinery.orchestration.fleet_repos._repository_catalog`` and
+    ``lu_machinery.common.git_credentials.repository_registry`` are
+    ``@functools.cache``d in-process. Clearing every functools cache on those
+    already-loaded modules before and after each test prevents an earlier test
+    on the same xdist worker from hiding an order-dependent ``load_fleet_repos``
+    or registry stub, without importing PyYAML for sessions that never load
+    either module.
+    """
+    _clear_module_functools_caches("lu_machinery", "orchestration", "fleet_repos")
+    _clear_module_functools_caches("lu_machinery", "common", "git_credentials")
+    try:
+        yield
+    finally:
+        _clear_module_functools_caches("lu_machinery", "orchestration", "fleet_repos")
+        _clear_module_functools_caches("lu_machinery", "common", "git_credentials")
 
 
 @pytest.fixture(autouse=True)
