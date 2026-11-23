@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import ast
 import unicodedata
+from bisect import bisect_right
 from functools import lru_cache
+from operator import itemgetter
 from pathlib import Path
 
+from lu_machinery.agent_runtime.unicode_printable import CORRECTIONS
 from lu_machinery.common.repo_root import product_root
 
 # The Sources server is product-owned (C-4843): its path is the configured product checkout's.
@@ -19,22 +22,30 @@ SERVER_RELATIVE_PATH = Path(".mcp/servers/sources/server.py")
 
 
 def printable_text(text: str) -> bool:
-    """Whether every character of *text* is printable, with the same answer on every supported Python.
+    """Whether every character of *text* is printable in Unicode 15.0.0, on every supported Python.
 
     The shared character baseline of the no-Sources consumer path: checkout identification's
     mountinfo reader and the Claude allowlist guard both use it. A character must be the ASCII
-    space, or lie outside the Unicode ``C*`` (control, format, surrogate, private use, unassigned)
-    and ``Z*`` (separator) categories in both the frozen Unicode 3.2.0 table
-    (``unicodedata.ucd_3_2_0``, identical in every CPython) and the running interpreter's table.
-    The interpreter's table alone changes with the Python version for newly assigned code points.
-    The frozen table alone misses later reclassifications such as U+00AD SOFT HYPHEN (``Pd`` in
-    3.2.0, ``Cf`` since 4.0). Code points assigned after Unicode 3.2.0 are therefore refused.
+    space, or lie outside the Unicode 15.0.0 ``C*`` (control, format, surrogate, private use,
+    unassigned) and ``Z*`` (separator) general categories. Each CPython ships its own Unicode
+    version's table (3.12: 15.0.0, 3.13: 15.1.0, 3.14: 16.0.0), so the running table's answer is
+    flipped on the ranges :data:`~lu_machinery.agent_runtime.unicode_printable.CORRECTIONS` records
+    for that table, generated and verified over every code point by
+    :mod:`~lu_machinery.agent_runtime.unicode_printable_gen`. A table with no recorded correction is
+    unverified and never consulted: only printable ASCII (U+0020..U+007E) is accepted on it.
     """
-    return all(
-        ch == " "
-        or (unicodedata.ucd_3_2_0.category(ch)[0] not in "CZ" and unicodedata.category(ch)[0] not in "CZ")
-        for ch in text
-    )
+    corrections = CORRECTIONS.get(unicodedata.unidata_version)
+    for ch in text:
+        if " " <= ch <= "~":
+            continue
+        if corrections is None:
+            return False
+        cp = ord(ch)
+        idx = bisect_right(corrections, cp, key=itemgetter(0)) - 1
+        corrected = idx >= 0 and cp <= corrections[idx][1]
+        if (unicodedata.category(ch)[0] not in "CZ") == corrected:
+            return False
+    return True
 
 
 def sources_server_path() -> Path | None:

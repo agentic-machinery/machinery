@@ -1602,9 +1602,8 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
             valid_root_line + _rec(b"/mnt/unrelated\rdir"),  # CR in path (PR1297-F3 reversed)
             valid_root_line + _rec("/mnt/\u202ertl".encode()),  # bidi format character (Cf)
             valid_root_line + _rec("/mnt/\u00a0nbsp".encode()),  # non-ASCII separator (Zs)
-            valid_root_line + _rec("/mnt/\U0001fae9".encode()),  # Cn on Python 3.12, So on 3.14
-            valid_root_line + _rec("/mnt/\u20b4".encode()),  # assigned after Unicode 3.2.0: refused everywhere
-            valid_root_line + _rec("/mnt/a\u00adb".encode()),  # SOFT HYPHEN: Pd in 3.2.0, Cf since 4.0
+            valid_root_line + _rec("/mnt/\U0001fae9".encode()),  # Cn in Unicode 15.0 (So since 16.0): refused everywhere
+            valid_root_line + _rec("/mnt/a\u00adb".encode()),  # SOFT HYPHEN: Cf, refused everywhere
             valid_root_line + _rec(b"/mnt/hash\\043"),  # '#' escape the path writer never emits
             valid_root_line + _rec(b"/mnt/"),  # non-normalized mount point
             valid_root_line + _rec(b"/mnt//x"),
@@ -1642,8 +1641,9 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
         mp.setattr(task_scratch, "_MOUNTINFO_PATH", tmp_path / "missing-mountinfo")
         assert fleet_repos.fleet_repo_for_checkout(primary) is None
     # Canonical kernel encodings of unrelated mounts keep the consumer eligible: escaped space and
-    # backslash, literal '#' in paths, UTF-8 names, nsfs roots, deleted mount points, mangle()'s '#'
-    # escape in fs type and source (FUSE subtype and source), and escaped super-option commas.
+    # backslash, literal '#' in paths, UTF-8 names (including code points assigned after Unicode 3.2.0
+    # and printable in 15.0, PR1300-F2), nsfs roots, deleted mount points, mangle()'s '#' escape in fs
+    # type and source (FUSE subtype and source), and escaped super-option commas.
     real_mi_bytes = task_scratch._MOUNTINFO_PATH.read_bytes()
     unrelated_valid_mi = tmp_path / "mountinfo-canonical-escapes"
     unrelated_valid_mi.write_bytes(
@@ -1652,6 +1652,7 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
         + "999002 1 0:4 net:[4026532617] /run/netns/дані rw shared:5 - nsfs nsfs rw\n".encode()
         + b"999003 1 0:52 / /mnt/gone\\040(deleted) rw,relatime - overlay overlay rw,lowerdir=/a\\054b\n"
         + b"999004 1 0:53 / /mnt/fuse#dir rw - fuse.sample\\043type sample\\043source rw,user_id=0\n"
+        + "999005 1 8:1 / /mnt/\u20b4\u2184 rw - ext4 /dev/sda1 rw\n".encode()
     )
     with monkeypatch.context() as mp:
         mp.setattr(task_scratch, "_MOUNTINFO_PATH", unrelated_valid_mi)
@@ -1661,6 +1662,7 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
         assert parsed[999002] == "/run/netns/дані"
         assert parsed[999003] == "/mnt/gone (deleted)"
         assert parsed[999004] == "/mnt/fuse#dir"
+        assert parsed[999005] == "/mnt/\u20b4\u2184"
         identified_with_unrelated = fleet_repos.fleet_repo_for_checkout(primary)
         assert identified_with_unrelated is not None and identified_with_unrelated.key == "kube-dojo"
     fake_fdinfo_dir = tmp_path / "fdinfo"

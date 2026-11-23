@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,8 @@ from lu_machinery.agent_runtime.adapters.claude import (
     _mcp_server_names,
 )
 from lu_machinery.agent_runtime.errors import AgentUnavailableError
+from lu_machinery.agent_runtime.sources_read_only import printable_text
+from lu_machinery.agent_runtime.unicode_printable_gen import verify_runtime
 
 
 def test_claude_stream_single_turn_byte_identical() -> None:
@@ -279,8 +282,11 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         {"allowed_tools": "Read, Bash(git log --format=%H,%s), mcp__sources__*, mcp__*, mcp__other__tool, mcp*"},
     )
     assert explicit[explicit.index("--allowedTools") + 1] == "Read,Bash(git log --format=%H,%s)"
-    # Printable, NFKC-normalized non-ASCII qualifiers (Cyrillic, U+2019, accented Latin) stay supported.
-    unicode_rules = "Read(/\u0434\u0430\u043d\u0456/\u0444\u2019.md) Read(/donn\u00e9es/a.md),mcp__sources__verify_word"
+    # Printable, NFKC-normalized non-ASCII qualifiers (Cyrillic, U+2019, accented Latin, and code points
+    # assigned after Unicode 3.2.0 that are printable in 15.0: U+20B4, U+2184, PR1300-F2) stay supported.
+    unicode_rules = (
+        "Read(/\u0434\u0430\u043d\u0456/\u0444\u2019.md) Read(/donn\u00e9es/a.md) Read(\u20b4\u2184),mcp__sources__verify_word"
+    )
     unicode_path = _read_only(consumer, {"allowed_tools": unicode_rules})
     assert unicode_path[unicode_path.index("--allowedTools") + 1] == unicode_rules.rsplit(",", 1)[0].replace(" ", ",")
     for bad_allowed in (
@@ -303,13 +309,11 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         "Read\nGrep",
         "Read\u00a0Grep",
         "Read\u2028Grep",
-        # Fail closed by class (PR1297-F2, CTO class decision): every Unicode category C* and Z* except
-        # the ASCII space in either the frozen Unicode 3.2.0 table or the interpreter's own, so the
-        # same answer on every Python version; non-NFKC input; backslash escapes the tokenizer does
-        # not model.
-        "Read(notes-\U0001fae9.md)",  # Cn on Python 3.12, So on 3.14
-        "Read(\u20b4)",  # assigned after Unicode 3.2.0: refused on every version
-        "Read(a\u00adb)",  # SOFT HYPHEN: Pd in Unicode 3.2.0, Cf since 4.0
+        # Fail closed by class (PR1297-F2, CTO class decision): every Unicode 15.0 category C* and Z*
+        # except the ASCII space, the same answer on every supported Python; non-NFKC input; backslash
+        # escapes the tokenizer does not model.
+        "Read(notes-\U0001fae9.md)",  # Cn in Unicode 15.0 (So since 16.0): refused on every version
+        "Read(a\u00adb)",  # SOFT HYPHEN: Cf
         "Read(\ud800)",  # Cs unpaired surrogate
         "Read(\ue000)",  # Co private use
         "Read(\u0378)",  # Cn unassigned
@@ -345,6 +349,20 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
     ):
         with pytest.raises(ValueError, match="declares no Sources server"):
             _read_only(consumer, tool_config)
+
+
+def test_printable_text_gives_the_unicode_15_answer_and_refuses_an_unverified_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (PR1300-F2): the shared printable baseline of the allowlist guard and the
+    mountinfo reader follows the running interpreter's Unicode table, or applies generated
+    corrections that are stale or keyed to the wrong table, so the same text classifies differently
+    on supported Pythons; or a table with no verified correction is consulted instead of refused."""
+    assert verify_runtime() is None
+    monkeypatch.setattr(unicodedata, "unidata_version", "99.0.0")
+    assert printable_text(" Read(a~b.md)")
+    for unverified in ("\u20b4", "\u0434", "\u00e9", "\x7f", "\x00"):
+        assert not printable_text(unverified)
 
 
 @pytest.mark.parametrize(

@@ -545,8 +545,8 @@ def _decode_mountinfo_field(field: bytes, *, escaped: frozenset[int] = frozenset
     Only the octal escapes the kernel writes for that field (*escaped*) are accepted; a raw
     backslash or any other escape is refused. The decoded text must be non-empty and
     :func:`~lu_machinery.agent_runtime.sources_read_only.printable_text`, so control bytes such as
-    CR, escaped tab or newline, format and separator characters, code points assigned after
-    Unicode 3.2.0, and undecodable bytes (which :func:`os.fsdecode` maps to lone surrogates,
+    CR, escaped tab or newline, format and separator characters, code points unassigned in
+    Unicode 15.0.0, and undecodable bytes (which :func:`os.fsdecode` maps to lone surrogates,
     category ``Cs``) all refuse the field, with the same result on every supported Python.
     """
     out = bytearray()
