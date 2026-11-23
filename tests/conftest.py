@@ -88,7 +88,7 @@ import tempfile
 import threading
 import warnings
 import weakref
-from collections.abc import Callable, Collection, Generator, Iterator, Mapping
+from collections.abc import Callable, Collection, Generator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -460,6 +460,26 @@ SESSION_IDENTITY_ENV_VARS = (
 )
 
 
+_FUNCTOOLS_CACHE_TYPE = type(functools.lru_cache(maxsize=1)(lambda: None))
+
+
+def _clear_module_functools_caches(*module_parts: str) -> None:
+    """Clear every genuine functools cache on an already-imported module without importing it."""
+    module = _loaded_module(*module_parts)
+    module_dict = getattr(module, "__dict__", None)
+    if not isinstance(module_dict, dict):
+        return
+    for value in tuple(module_dict.values()):
+        if type(value) is _FUNCTOOLS_CACHE_TYPE:
+            value.cache_clear()
+
+
+def _clear_fleet_repos_functools_caches() -> None:
+    """Clear every functools cache on loaded fleet_repos and git_credentials modules."""
+    _clear_module_functools_caches("lu_machinery", "orchestration", "fleet_repos")
+    _clear_module_functools_caches("lu_machinery", "common", "git_credentials")
+
+
 @pytest.hookimpl(wrapper=True, tryfirst=True)
 def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> Generator[None, object, object]:
     """Run every test without the launching agent session's identity (#8778).
@@ -470,22 +490,29 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None) -> 
 
     Inherited credentials were already removed at import, before collection.
     Variables published later by the suite remain available to its tests.
+    Also clears loaded ``fleet_repos`` / ``git_credentials`` functools caches
+    before setup and after all teardowns (including ``monkeypatch`` undo) have
+    restored the original cached wrappers.
     """
-    with pytest.MonkeyPatch.context() as patch:
-        for name in SESSION_IDENTITY_ENV_VARS:
-            patch.delenv(name, raising=False)
-        parent = getattr(item, "callspec", None)
-        mode = parent.params.get("_launcher_parent_environment") if parent is not None else None
-        if mode is not None:
-            from tests.launcher_sandbox import SEAT_CONTAMINATION
+    _clear_fleet_repos_functools_caches()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            for name in SESSION_IDENTITY_ENV_VARS:
+                patch.delenv(name, raising=False)
+            parent = getattr(item, "callspec", None)
+            mode = parent.params.get("_launcher_parent_environment") if parent is not None else None
+            if mode is not None:
+                from tests.launcher_sandbox import SEAT_CONTAMINATION
 
-            # Before fixtures of any scope, including checkout builders.
-            for name, value in SEAT_CONTAMINATION.items():
-                if mode == "polluted":
-                    patch.setenv(name, value)
-                else:
-                    patch.delenv(name, raising=False)
-        return (yield)
+                # Before fixtures of any scope, including checkout builders.
+                for name, value in SEAT_CONTAMINATION.items():
+                    if mode == "polluted":
+                        patch.setenv(name, value)
+                    else:
+                        patch.delenv(name, raising=False)
+            return (yield)
+    finally:
+        _clear_fleet_repos_functools_caches()
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
@@ -912,39 +939,20 @@ def _restore_process_umask() -> Generator[None, None, None]:
     os.umask(prior)
 
 
-_FUNCTOOLS_CACHE_TYPE = type(_secret_fragment_index)
-
-
-def _clear_module_functools_caches(*module_parts: str) -> None:
-    """Clear every functools cache on an already-imported module without importing it."""
-    module = _loaded_module(*module_parts)
-    module_dict = getattr(module, "__dict__", None)
-    if not isinstance(module_dict, dict):
-        return
-    for value in tuple(module_dict.values()):
-        if isinstance(value, _FUNCTOOLS_CACHE_TYPE):
-            value.cache_clear()
-
-
 @pytest.fixture(autouse=True)
-def _clear_fleet_repos_caches() -> Iterator[None]:
+def _clear_fleet_repos_caches() -> None:
     """Keep every test independent of prior fleet_repos cache warming.
 
     ``lu_machinery.orchestration.fleet_repos._repository_catalog`` and
     ``lu_machinery.common.git_credentials.repository_registry`` are
     ``@functools.cache``d in-process. Clearing every functools cache on those
-    already-loaded modules before and after each test prevents an earlier test
-    on the same xdist worker from hiding an order-dependent ``load_fleet_repos``
-    or registry stub, without importing PyYAML for sessions that never load
-    either module.
+    already-loaded modules before each test (with post-teardown clearing in
+    ``pytest_runtest_protocol`` after ``monkeypatch`` restores original
+    wrappers) prevents an earlier test or fixture in the same worker process
+    from hiding an order-dependent ``load_fleet_repos`` or registry stub,
+    without importing PyYAML for sessions that never load either module.
     """
-    _clear_module_functools_caches("lu_machinery", "orchestration", "fleet_repos")
-    _clear_module_functools_caches("lu_machinery", "common", "git_credentials")
-    try:
-        yield
-    finally:
-        _clear_module_functools_caches("lu_machinery", "orchestration", "fleet_repos")
-        _clear_module_functools_caches("lu_machinery", "common", "git_credentials")
+    _clear_fleet_repos_functools_caches()
 
 
 @pytest.fixture(autouse=True)
@@ -3130,8 +3138,13 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             raise
 
 
-def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> None:
+@pytest.hookimpl(wrapper=True, trylast=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> Generator[None, object, object]:
     _set_live_network_allowed(False)
+    try:
+        return (yield)
+    finally:
+        _clear_fleet_repos_functools_caches()
 
 
 @pytest.fixture(autouse=True)
