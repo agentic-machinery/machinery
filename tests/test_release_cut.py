@@ -950,3 +950,36 @@ def test_success_reaps_only_rebuildable_scratch_and_failure_preserves_it(monkeyp
     assert (boundary / "accept").read_text() == "retain on refusal"
     assert sentinel.read_text() == "untouched"
     assert outside.stat().st_mode & 0o777 == 0o555
+
+
+def test_check_changelog_cli_refuses_occupied_unreleased_and_accepts_empty(tmp_path, capsys):
+    """Defect class: a PR that writes under CHANGELOG.md Unreleased passes CI and breaks release preflight, as on #1243."""
+    clean = tmp_path / "clean.md"
+    clean.write_text(CHANGELOG, encoding="utf-8")
+    assert main(["check-changelog", "--path", str(clean)]) == 0
+    assert "Unreleased section is empty" in capsys.readouterr().out
+
+    post_release = tmp_path / "post-release.md"
+    post_release.write_text(
+        record_changelog(CHANGELOG, version="0.1.22", previous="0.1.21", date="2026-11-23",
+                         notes="### Fixed\n\n- Generated\n", repo=REPO),
+        encoding="utf-8",
+    )
+    assert main(["check-changelog", "--path", str(post_release)]) == 0
+    assert "Unreleased section is empty" in capsys.readouterr().out
+
+    occupied = tmp_path / "occupied.md"
+    occupied.write_text(CHANGELOG.replace("## [Unreleased]\n\n", "## [Unreleased]\n\n" + HAND_WRITTEN), encoding="utf-8")
+    assert main(["check-changelog", "--path", str(occupied)]) == 1
+    assert "Unreleased is not empty" in capsys.readouterr().err
+
+    symlink = tmp_path / "link.md"
+    symlink.symlink_to(clean)
+    assert main(["check-changelog", "--path", str(symlink)]) == 1
+    assert "check-changelog failed" in capsys.readouterr().err
+
+    assert main(["check-changelog", "--path", str(tmp_path / "missing.md")]) == 1
+    assert "check-changelog failed" in capsys.readouterr().err
+
+    assert main(["check-changelog", "--path", str(tmp_path)]) == 1
+    assert "not a regular file" in capsys.readouterr().err
