@@ -275,6 +275,44 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
 
 .summary-stats span b { font-variant-numeric: tabular-nums; }
 
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: flex-end;
+  margin: 0 0 8px;
+}
+
+.filters label {
+  display: flex;
+  flex: 1 1 8rem;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.filters select {
+  width: 100%;
+  max-width: 100%;
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+  margin: 8px 0 0;
+}
+
 @media (max-width: 640px) {
   header { padding: 8px 10px; }
   main { padding: 10px; gap: 10px; }
@@ -283,14 +321,14 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
   /* One line per row; each table scrolls sideways inside its card instead of the page growing tall. */
   th, td { white-space: nowrap; }
   td br { display: none; }
-  /* The subscriptions table stacks instead: every account is a card, so no column sits off-screen. */
-  #subs table, #subs tbody, #subs tr, #subs td, #subs th { display: block; white-space: normal; }
-  #subs thead { display: none; }
-  #subs tr { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; padding: 4px 8px; }
-  #subs tr.group { border: 0; padding: 0; margin: 10px 0 4px; }
-  #subs th[colspan] { border: 0; padding: 0; }
-  #subs td { display: flex; gap: 8px; padding: 2px 0; border: 0; min-width: 0; overflow-wrap: anywhere; }
-  #subs td::before { content: attr(data-label); flex: 0 0 7.5em; color: var(--muted); font-size: 12px; }
-  #subs td:first-child { font-weight: 600; }
-  #subs td:first-child::before { display: none; }
+  /* A .stacked section stacks each row into a card, so no column sits off-screen. */
+  .stacked table, .stacked tbody, .stacked tr, .stacked td, .stacked th { display: block; white-space: normal; }
+  .stacked thead { display: none; }
+  .stacked tr { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 8px; padding: 4px 8px; }
+  .stacked tr.group { border: 0; padding: 0; margin: 10px 0 4px; }
+  .stacked th[colspan], .stacked table.subs th[colspan] { border: 0; padding: 0; }
+  .stacked td, .stacked table.subs td { display: flex; gap: 8px; padding: 2px 0; border: 0; min-width: 0; overflow-wrap: anywhere; }
+  .stacked td::before { content: attr(data-label); flex: 0 0 7.5em; color: var(--muted); font-size: 12px; }
+  .stacked td:first-child { font-weight: 600; }
+  .stacked td:first-child::before { display: none; }
 }

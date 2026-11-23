@@ -6460,11 +6460,6 @@
     {
       "path": "lu_machinery/orchestration/merge_queue_keeper.py",
       "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"list[dict[str, Any]]\""
-    },
-    {
-      "path": "lu_machinery/orchestration/merge_queue_keeper.py",
-      "code": "no-any-return",
       "message": "Returning Any from function declared to return \"str\""
     },
     {
