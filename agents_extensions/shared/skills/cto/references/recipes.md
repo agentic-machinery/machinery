@@ -38,6 +38,7 @@ publish_order "$TMPDIR/order.txt" "<registered-slot>" "<unique-order-key>"
 recipient is `claude-cto`.
 
 Wait at least 15 seconds after claiming a delivery before acknowledging it, then read the `ack.sh` output.
+Acknowledge only the delivery ids whose bodies you read in this step; never pass the whole claim list to ack.sh.
 
 Preserve required message references per `docs/runbooks/driver-seat-cli-move.md` § 5.
 
