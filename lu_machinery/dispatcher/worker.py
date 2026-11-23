@@ -540,7 +540,8 @@ def _guard_launch_cleanup(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
 def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, progress: dict | None = None) -> None:
     """Publish the task record and spawn its supervisor.
 
-    ``progress`` is the caller's launch progress: ``progress["started"]`` is set immediately before the first
+    ``progress`` is the caller's launch progress: ``progress["record"]`` is set immediately before the record
+    that names the prompt file can be published, and ``progress["started"]`` immediately before the first
     supervisor spawn attempt, so a failure before it (record, prompt or log setup) proves no supervisor ran.
     """
     from lu_machinery.orchestration.dispatch_admission import new_admission_hold
@@ -553,6 +554,8 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, p
     path = store.record_path(spec.task_id)
     logs = path.parent / "logs"
     try:
+        if progress is not None:
+            progress["record"] = True  # from here a record of this run may name the prompt file
         try:
             store.create(record, prompt)
         except FileExistsError as exc:

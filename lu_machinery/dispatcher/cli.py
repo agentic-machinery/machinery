@@ -861,7 +861,7 @@ def _dispatch(args) -> int:
             with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
                 stack.enter_context(git.worktree_lock(repo))
                 checks.check_review_budget(args, info, sha)
-        launch = {"started": False}  # worker.start sets it just before it spawns a supervisor
+        launch = {"record": False, "started": False}  # worker.start marks each just before that step
         with admission.record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
             hold = stack.enter_context(host_admission.reserve(
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,

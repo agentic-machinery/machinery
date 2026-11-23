@@ -507,8 +507,10 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     worktree path) first publishes its stream's reservation file in the same admission-locked step, so a
     crash after it leaves the stream held; a stream with any reservation file refuses, and no
     ``--force-admission`` reason or reused task id overrides it. ``launch`` is the caller's own launch
-    progress: it sets ``launch["started"] = True`` before it starts a supervisor. Only a dispatch that ends
-    before that releases the reservation here; otherwise only the turn's settlement releases it. ``linkage`` (the parent fields of a task dispatched
+    progress: it sets ``launch["record"] = True`` before it can publish a record naming the prompt file and
+    ``launch["started"] = True`` before it starts a supervisor. Only a dispatch that ends before a supervisor
+    start, and either before that record or with this run's unclaimed hold read back, releases the reservation
+    here; otherwise only the turn's settlement releases it. ``linkage`` (the parent fields of a task dispatched
     from inside another run) is in the hold before anything spawns.
     """
     hold = reservation = None
@@ -554,32 +556,38 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     finally:
         # Read before anything else here can fail: missing progress means a supervisor may have started.
         launch_started = launch is None or launch.get("started") is not False
+        # Once the record may have been handed over (store.create), only reading it back as this run's unclaimed
+        # hold proves that no record of the run names a prompt file or pid; a lost or damaged one is not proof.
+        unclaimed = launch is not None and launch.get("record", False) is False
         try:
             if hold is not None:
-                _discard_unused_hold(task_id, hold["run_nonce"])
+                unclaimed = _discard_unused_hold(task_id, hold["run_nonce"]) or unclaimed
         finally:
-            # A known pre-launch abort: this dispatch never started a supervisor, so nothing of the run can
-            # write. The hold's cleanup is independent: whatever it finds or raises, this still runs.
-            if reservation is not None and not launch_started and (reason := release_stream(*reservation)):
+            # A known pre-launch abort: this dispatch never started a supervisor and no record of the run can
+            # start one. The hold's cleanup is independent: whatever it finds or raises, this still runs.
+            if (reservation is not None and not launch_started and unclaimed
+                    and (reason := release_stream(*reservation))):
                 print(f"dispatcher: {reservation[0]} stays reserved: {reason}", file=sys.stderr)
 
 
 def _discard_unused_hold(task_id, run_nonce):
-    """Remove this run's creation hold if no supervisor took it over and its tree does not exist.
+    """True when this run's record reads back naming no pid and no prompt file: no supervisor can start for it.
 
-    A record that is unreadable, damaged (TaskRecordError is a ValueError), another run's, or carries a field
-    of the wrong type is left as it is.
+    That record, if it is still the active creation hold, is removed when its tree does not exist; one whose
+    status or tree path has the wrong type is kept. A record that is missing, unreadable, damaged (TaskRecordError is a ValueError),
+    another run's or handed to the supervisor is False and left as it is.
     """
     path = store.record_path(task_id)
+    unclaimed = False
     with contextlib.suppress(OSError, ValueError), task_state_lock(path):
         current = store.read(task_id, missing_ok=True)
         if not isinstance(current, dict):
-            return
+            return False
         status, tree = current.get("status"), current.get("worktree_path")
-        if (current.get("run_nonce") == run_nonce and isinstance(status, str) and status in store.ACTIVE
-                and legacy.is_admission_hold_record(current)
-                and "prompt_file" not in current  # store.create handed this record to the supervisor
-                and (tree is None or isinstance(tree, str))):
+        unclaimed = (current.get("run_nonce") == run_nonce and "pid" in current and current["pid"] is None
+                     and "prompt_file" not in current)  # store.create handed this record to the supervisor
+        if (unclaimed and isinstance(status, str) and status in store.ACTIVE
+                and legacy.is_admission_hold_record(current) and (tree is None or isinstance(tree, str))):
             tree_absent = not tree
             if not tree_absent:
                 try:
@@ -588,6 +596,7 @@ def _discard_unused_hold(task_id, run_nonce):
                     tree_absent = True
             if tree_absent:
                 path.unlink(missing_ok=True)
+    return unclaimed
 
 
 class _StreamBusy(Exception):
