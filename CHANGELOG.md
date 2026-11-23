@@ -9,6 +9,30 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.63"></a>
+## [0.1.63] - 2026-11-23
+
+### Added
+
+- Monitor stream lease is the one turn exclusion authority (DRIVERS-1122 PR 2) ([#1290](https://github.com/learn-ukrainian/machinery/pull/1290))
+
+### Changed
+
+- Clear fleet_repos functools caches around each test ([#1275](https://github.com/learn-ukrainian/machinery/pull/1275))
+- Prioritize critical path and acknowledge read deliveries ([#1291](https://github.com/learn-ukrainian/machinery/pull/1291))
+
+### Fixed
+
+- Validate, PATCH, and confirm PR milestones on create ([#1273](https://github.com/learn-ukrainian/machinery/pull/1273))
+- Delete zero-commit read-only task branches at settlement ([#1274](https://github.com/learn-ukrainian/machinery/pull/1274))
+- Report PR identity on post-create failures, scope milestone row validation, refuse pr create --label ([#1276](https://github.com/learn-ukrainian/machinery/pull/1276))
+- Invoke release's own publisher and simplify manual post-release recovery ([#1281](https://github.com/learn-ukrainian/machinery/pull/1281))
+- Allow settled parent's PR successor to read review reply ([#1282](https://github.com/learn-ukrainian/machinery/pull/1282))
+- Judge a consumer repository's scripts/ paths as its own files ([#1293](https://github.com/learn-ukrainian/machinery/pull/1293))
+- Build turn-conflict 409 detail from fixed text ([#1296](https://github.com/learn-ukrainian/machinery/pull/1296))
+- Defer coding below 1% subscription allowance ([#1298](https://github.com/learn-ukrainian/machinery/pull/1298))
+- Target the open machinery milestone ([#1301](https://github.com/learn-ukrainian/machinery/pull/1301))
+
 <a id="v0.1.62"></a>
 ## [0.1.62] - 2026-11-23
 
@@ -1503,7 +1527,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.62...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.63...HEAD
+[0.1.63]: https://github.com/learn-ukrainian/machinery/compare/v0.1.62...v0.1.63
 [0.1.62]: https://github.com/learn-ukrainian/machinery/compare/v0.1.61...v0.1.62
 [0.1.61]: https://github.com/learn-ukrainian/machinery/compare/v0.1.60...v0.1.61
 [0.1.60]: https://github.com/learn-ukrainian/machinery/compare/v0.1.59...v0.1.60
