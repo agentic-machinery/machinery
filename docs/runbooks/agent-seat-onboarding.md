@@ -296,11 +296,13 @@ A row may omit `sources_server` and `admission_policy`:
 - Without `admission_policy`, dispatch admission uses the machinery default policy: no
   Ukrainian content or review seats and no learner payload paths.
 
-Only a primary checkout is matched: Git must report the root as its work-tree top and `<root>/.git`
-as its Git directory. A linked worktree, a separate Git directory, a checkout that cannot be
-matched (no or several `origin` URLs, an include or URL rewrite in its config, a Git failure) or
-one that carries `curriculum/l2-uk-en/curriculum.yaml` keeps both Learn Ukrainian files and
-refuses without them. Point `LU_PRODUCT_ROOT` at the consumer's primary checkout.
+Only a standalone primary checkout is matched: Git must report the root as its work-tree top,
+`<root>/.git` as its Git directory, and the checkout's parent must not be inside any enclosing Git
+repository. A linked worktree, a separate Git directory, a checkout nested inside another Git
+repository, a checkout that cannot be matched (no or several `origin` URLs, an include or URL
+rewrite in its config, a Git failure) or one that carries `curriculum/l2-uk-en/curriculum.yaml`
+keeps both Learn Ukrainian files and refuses without them. Point `LU_PRODUCT_ROOT` at the
+consumer's standalone primary checkout.
 
 ### GPT-6 Codex role routing
 

@@ -510,20 +510,21 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
 def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None = None) -> FleetRepo | None:
     """The registered row whose GitHub ``origin`` the Git checkout at ``root`` declares, else ``None``.
 
-    Git reads the checkout's metadata, never Python: ``git rev-parse``, ``git ls-files`` and
-    ``git config`` run through :func:`~lu_machinery.orchestration.execution_safe_git.run_git`, which
-    strips every inherited ``GIT_*`` variable, disables global and system config, and turns off
+    Git reads the checkout's metadata, never Python: ``git rev-parse`` and ``git config`` run
+    through :func:`~lu_machinery.orchestration.execution_safe_git.run_git`, which strips every
+    inherited ``GIT_*`` variable, disables global and system config, and turns off
     repository-configured hooks and filesystem monitors. Callers treat ``None`` as an
-    unregistered root that keeps every Learn Ukrainian requirement. Only a primary checkout is
-    identified: Git must report ``root`` as the top of its work tree, ``root/.git`` as its shared
-    Git directory, and an execution-safe parent lookup must confirm ``root`` is not tracked inside
-    an enclosing Git repository (failing closed if the parent metadata or index cannot be verified).
-    A linked worktree, a separate Git directory, a bare repository's worktree or a submodule
-    (including an embedded-Git submodule) is never identified, because Git cannot name the checkout
-    whose curriculum marker would decide it. ``None`` is also returned when Git fails, times out or
-    cannot run; ``root`` carries ``PRODUCT_MARKER``, has a non-directory or symlink marker ancestor,
-    or cannot be checked for it; the config has an include or a URL rewrite; ``origin`` has no URL
-    or several; the URL names Learn Ukrainian; or the URL is not exactly the HTTPS or SSH form of
+    unregistered root that keeps every Learn Ukrainian requirement. Only a standalone primary
+    checkout is identified: Git must report ``root`` as the top of its work tree, ``root/.git``
+    as its shared Git directory, and an execution-safe ``rev-parse --show-toplevel`` on
+    ``root``'s parent must fail as not inside any enclosing Git repository (reading no parent
+    index or tree). A linked worktree, a separate Git directory, a bare repository's worktree,
+    or any checkout nested inside another Git repository (including an embedded-Git submodule)
+    is never identified, because Git cannot name the checkout whose curriculum marker would
+    decide it. ``None`` is also returned when Git fails, times out or cannot run; ``root``
+    carries ``PRODUCT_MARKER``, has a non-directory or symlink marker ancestor, or cannot be
+    checked for it; the config has an include or a URL rewrite; ``origin`` has no URL or
+    several; the URL names Learn Ukrainian; or the URL is not exactly the HTTPS or SSH form of
     one registered slug (ASCII, case-insensitive, optional ``.git``).
     """
     # Lazy: execution_safe_git imports PyYAML, and this module is reached from dependency-free hooks.
@@ -557,24 +558,11 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
         return None
     if resolved.parent != resolved:
         parent_top = git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=resolved.parent)
-        if parent_top is None:
-            return None
-        if parent_top.returncode == 0:
-            parent_lines = parent_top.stdout.split(b"\n")
-            if len(parent_lines) != 2 or parent_lines[1]:
-                return None
-            try:
-                super_top = Path(os.fsdecode(parent_lines[0])).resolve(strict=True)
-                rel = resolved.relative_to(super_top).as_posix()
-            except (OSError, RuntimeError, ValueError):
-                return None
-            if not rel or rel == ".":
-                return None
-            tracked = git("ls-files", "--stage", "-z", "--", f":(literal){rel}", cwd=super_top)
-            if tracked is None or tracked.returncode != 0 or tracked.stdout:
-                return None
-        elif parent_top.returncode != 128 or not parent_top.stderr.startswith(
-            b"fatal: not a git repository (or any "
+        if (
+            parent_top is None
+            or parent_top.returncode != 128
+            or parent_top.stdout
+            or not parent_top.stderr.startswith(b"fatal: not a git repository (or any ")
         ):
             return None
     marker = Path(PRODUCT_MARKER)

@@ -1369,10 +1369,10 @@ def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
     gitfile.mkdir()
     (gitfile / ".git").write_text(f"gitdir:{consumer / '.git'}\n", encoding="utf-8")
     roots["gitfile-no-space"] = gitfile
-    # An embedded-Git submodule tracked by a superproject (#1287 R1 F2, R2 F2/F5).
+    # An embedded-Git submodule inside an enclosing superproject (#1287 R1–R3 F2, R2 F5).
     # Configure a hostile core.fsmonitor hook on the superprojects after commit; checkout
-    # identification must never execute it and must still fail closed if the parent index
-    # or config is corrupt.
+    # identification must never execute it and must still fail closed when the parent index
+    # is corrupt or missing or the parent config is corrupt.
     hook_marker = tmp_path / "fsmonitor-hook-ran"
     hook = tmp_path / "evil-fsmonitor.sh"
     hook.write_text(f"#!/bin/sh\ntouch '{hook_marker}'\necho '1'\n", encoding="utf-8")
@@ -1380,6 +1380,7 @@ def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
     for name, corrupt in (
         ("embedded-git-submodule", None),
         ("embedded-git-submodule-corrupt-index", "index"),
+        ("embedded-git-submodule-missing-index", "missing-index"),
         ("embedded-git-submodule-corrupt-config", "config"),
     ):
         superproject = _checkout(tmp_path / f"super-{name}", _LEARN_UKRAINIAN_URL)
@@ -1389,6 +1390,8 @@ def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
         _git(superproject, "config", "core.fsmonitor", str(hook))
         if corrupt == "index":
             (superproject / ".git" / "index").write_bytes(b"corrupt")
+        elif corrupt == "missing-index":
+            (superproject / ".git" / "index").unlink()
         elif corrupt == "config":
             with (superproject / ".git" / "config").open("a", encoding="utf-8") as cfg:
                 cfg.write("[broken-header\n")
@@ -1427,6 +1430,7 @@ _UNIDENTIFIABLE = [
     "symlinked-git-dir",
     "embedded-git-submodule",
     "embedded-git-submodule-corrupt-index",
+    "embedded-git-submodule-missing-index",
     "embedded-git-submodule-corrupt-config",
     "non-directory-marker-ancestor",
     "symlink-marker-ancestor",
