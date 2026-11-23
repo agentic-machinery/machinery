@@ -24,6 +24,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import textwrap
 import threading
@@ -502,6 +503,41 @@ def adopt_manifest(text: str, release_base: str, version: str) -> tuple[str, str
 # --- Steps ------------------------------------------------------------------------------------
 
 
+def _running_publisher_base() -> tuple[list[str | Path], Path | None]:
+    """Command prefix and optional PYTHONPATH for the lu_machinery package running this cut.
+
+    Used only before ``install()`` builds ``work/accept`` (preflight CI-receipt reads) and in
+    standalone ``post-release``, so publisher calls never fall back to the consumer's stale
+    ``host_python`` when running from a newer venv or source checkout.
+    """
+    import lu_machinery
+
+    if not sys.executable:
+        raise CutError("cannot locate the running Python interpreter for lu_machinery.publish")
+    python = Path(sys.executable).absolute()
+    package_file: object = getattr(lu_machinery, "__file__", None)
+    if not isinstance(package_file, str) or not package_file:
+        raise CutError("cannot locate the running lu_machinery package for lu_machinery.publish")
+    try:
+        resolved_package = Path(package_file).resolve(strict=True)
+    except OSError as exc:
+        raise CutError(f"cannot resolve running lu_machinery package {package_file!r}: {exc}") from exc
+    if resolved_package.parent.name != "lu_machinery":
+        raise CutError(f"unexpected lu_machinery package path: {resolved_package}")
+    package_root = resolved_package.parents[1]
+    site_roots = [
+        Path(path).resolve()
+        for key in ("purelib", "platlib")
+        if (path := sysconfig.get_path(key))
+    ]
+    if package_root in site_roots:
+        return [python, "-I", "-m", "lu_machinery.publish"], None
+    root_text = str(package_root)
+    if os.pathsep in root_text or "\n" in root_text or "\r" in root_text:
+        raise CutError(f"unsafe lu_machinery package root for PYTHONPATH: {root_text!r}")
+    return [python, "-P", "-s", "-m", "lu_machinery.publish"], package_root
+
+
 @dataclass
 class Cut:
     """One run's state: the work directory, its log and what has been published."""
@@ -534,6 +570,8 @@ class Cut:
     adopt_pr: int | None = None
     machinery_milestone: str | None = None
     product_milestone: str | None = None
+    publisher_python: Path | None = None
+    keep_collection_overlay: bool = False
 
     # Plumbing
 
@@ -610,8 +648,20 @@ class Cut:
             cwd=self.primary, stdin=body.encode(), timeout=120,
         )
 
+    def publisher_invocation(self, *args: str) -> tuple[list[str | Path], dict[str, str]]:
+        """Command and environment for ``lu_machinery.publish`` using the release's own code."""
+        if self.publisher_python is not None:
+            return [self.publisher_python.absolute(), "-I", "-m", "lu_machinery.publish", *args], self.env()
+        base, package_root = _running_publisher_base()
+        if package_root is None:
+            return [*base, *args], self.env()
+        env = {key: value for key, value in self.env().items() if not key.startswith("PYTHON")}
+        env["PYTHONPATH"] = str(package_root)
+        return [*base, *args], env
+
     def publisher(self, *args: str) -> str:
-        return self.run([self.host_python, "-I", "-m", "lu_machinery.publish", *args], timeout=600).stdout
+        argv, env = self.publisher_invocation(*args)
+        return self.run(argv, env=env, timeout=600).stdout
 
     def verify_milestone(self, repo: str, milestone: str | None, *, label: str) -> tuple[int, str] | None:
         """Verify one configured release milestone against live repository milestones before publishing."""
@@ -824,7 +874,7 @@ class Cut:
         """Clean machinery-only environment: install, pip check and isolated import."""
         self.step = "clean install"
         venv = self.work / "accept"
-        python = self.venv(venv)
+        python = self.venv(venv).absolute()
         self.run([python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--force-reinstall",
                   "--no-index", "--find-links", self.work / "wheelhouse", "--require-hashes", "--only-binary=:all:",
                   "-r", consumer_lock], env=self.scratch_env())
@@ -832,7 +882,8 @@ class Cut:
         shown = self.run([python, "-I", "-c", _SHOW_LU], env=self.scratch_env()).stdout.split()
         if shown[0] != built_version or not Path(shown[1]).resolve().is_relative_to(venv.resolve()):
             raise CutError(f"clean environment imported {shown}, not {built_version} from {venv}")
-        self.say(f"clean install and import: lu-machinery {shown[0]}")
+        self.publisher_python = python
+        self.say(f"clean install and import: lu-machinery {shown[0]} (publisher: {python} -I)")
         return python
 
     # Publish
@@ -1077,19 +1128,24 @@ class Cut:
         paths = self.run([self.host_python, "-I", "-c", _SITE_PATHS]).stdout.split()
         site = self.run([python, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"]).stdout.strip()
         lines = "".join(f"import site; site.addsitedir({path!r})\n" for path in dict.fromkeys(paths))
-        Path(site, "zz-release-cut-consumer.pth").write_text(lines, encoding="utf-8")
-        shown = self.run([python, "-c", _SHOW_LU], cwd=product, env=self.scratch_env()).stdout.split()
-        if shown[0] != self.built or not Path(shown[1]).resolve().is_relative_to(Path(site).resolve()):
-            raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
-        # The product's project_interpreter() reads LEARN_UKRAINIAN_PYTHON; the candidate names itself rather
-        # than inheriting the caller's value or none.
-        result = self.run([python, "-m", "pytest", "--collect-only", "-q", "tests"], cwd=product, timeout=1800,
-                          env=self.env(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PYTHON=str(python)), check=False)
-        summary = (result.stdout.strip().splitlines() or ["no output"])[-1]
-        if result.returncode:
-            raise CutError(f"product test collection failed (exit {result.returncode}): {summary}")
-        self.say(f"product collection at {self.git(product, 'rev-parse', 'HEAD')[:12]}: {summary}")
-        return summary
+        overlay = Path(site, "zz-release-cut-consumer.pth")
+        overlay.write_text(lines, encoding="utf-8")
+        try:
+            shown = self.run([python, "-c", _SHOW_LU], cwd=product, env=self.scratch_env()).stdout.split()
+            if shown[0] != self.built or not Path(shown[1]).resolve().is_relative_to(Path(site).resolve()):
+                raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
+            # The product's project_interpreter() reads LEARN_UKRAINIAN_PYTHON; the candidate names itself rather
+            # than inheriting the caller's value or none.
+            result = self.run([python, "-m", "pytest", "--collect-only", "-q", "tests"], cwd=product, timeout=1800,
+                              env=self.env(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PYTHON=str(python)), check=False)
+            summary = (result.stdout.strip().splitlines() or ["no output"])[-1]
+            if result.returncode:
+                raise CutError(f"product test collection failed (exit {result.returncode}): {summary}")
+            self.say(f"product collection at {self.git(product, 'rev-parse', 'HEAD')[:12]}: {summary}")
+            return summary
+        finally:
+            if not self.keep_collection_overlay:
+                overlay.unlink(missing_ok=True)
 
     def contract_canary(self) -> subprocess.CompletedProcess[str]:
         """The candidate's canary orchestration and sealed candidate receipt gate."""
@@ -1190,8 +1246,12 @@ class Cut:
         if tagged is None or release is None:
             return f"remote state of {tag} unknown (tag {tagged}, release {release}); nothing withdrawn"
         if release == "released":
+            resume = (
+                f"{shlex.quote(str(self.publisher_python))} -I -m lu_machinery.release_cut post-release"
+                if self.publisher_python is not None else "release_cut post-release"
+            )
             return (f"{tag} is a full release; nothing withdrawn. Remaining: mark the adopt PR "
-                    f"{adopt if adopt is not None else 'unknown'} ready, then run release_cut post-release")
+                    f"{adopt if adopt is not None else 'unknown'} ready, then run {resume}")
         done: list[str] = []
 
         def attempt(label: str, action) -> None:
@@ -1310,6 +1370,7 @@ def execute(cut: Cut) -> int:
     files = cut.build(built)
     consumer_lock = cut.wheelhouse(files, built)
     python = cut.install(consumer_lock, built)
+    cut.publisher_python = python
     product = cut.work / "product"
     ci = cut.ci
     pending = "Pre-release: acceptance is running. Adopt only after this release is no longer a pre-release.\n"
@@ -1345,7 +1406,11 @@ def execute(cut: Cut) -> int:
     if cut.dry_run:
         notes = release_body(cut, section, files, consumer_lock, ci, "Dry run: nothing tagged or published.")
         (cut.work / "notes-dry-run.md").write_text(notes, encoding="utf-8")
-        cut.say(f"dry run complete; notes preview at {cut.work / 'notes-dry-run.md'}")
+        pub_argv, _ = cut.publisher_invocation()
+        cut.say(
+            f"dry run complete; publisher: {shlex.join(str(part) for part in pub_argv)}; "
+            f"notes preview at {cut.work / 'notes-dry-run.md'}"
+        )
         return 0
     prefix = Path(info["prefix"])
     acceptance = (
@@ -1491,9 +1556,10 @@ def _consumer_collection(args: argparse.Namespace) -> int:
         (work / name).mkdir()
     product = args.product.absolute()
     # Not resolved: a venv interpreter is a symlink, and resolving it leaves the venv.
+    # CI's next step runs key consumer tests in this overlay venv.
     cut = Cut(work=work, dry_run=True, machinery_remote="", product_remote="", machinery_repo="", product_repo="",
               host_python=args.product_python.absolute(), primary=product, alert=False, x_agent="",
-              built=args.version)
+              built=args.version, keep_collection_overlay=True)
     try:
         cut.consumer_collection(args.python.absolute(), product)
     except (CutError, OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
@@ -1516,7 +1582,7 @@ def _run(args: argparse.Namespace) -> int:
     except CutError as exc:
         print(f"release cut refused: {exc}", file=sys.stderr)
         return 1
-    work = args.work or Path(tempfile.mkdtemp(prefix=".lu-release-cut-", dir=Path.home()))
+    work = (args.work or Path(tempfile.mkdtemp(prefix=".lu-release-cut-", dir=Path.home()))).absolute()
     work.mkdir(parents=True, exist_ok=True)
     if any(path.name != "home" for path in work.iterdir()):
         print(f"--work {work} must be empty", file=sys.stderr)
@@ -1565,6 +1631,9 @@ def _run(args: argparse.Namespace) -> int:
 def open_post_release(cut: Cut) -> int:
     """Bootstrap or retry: the post-release PR for the newest tag on main."""
     cut.report_release_milestones(include_adopt=False)
+    pub_argv, pub_env = cut.publisher_invocation()
+    prefix = f"PYTHONPATH={shlex.quote(pub_env['PYTHONPATH'])} " if "PYTHONPATH" in pub_env else ""
+    cut.say(f"post-release publisher: {prefix}{shlex.join(str(part) for part in pub_argv)}")
     clone = cut.work / "machinery"
     cut.run(["git", "clone", "--quiet", "--no-checkout", cut.machinery_remote, clone], timeout=900)
     head = cut.git(clone, "rev-parse", "refs/remotes/origin/main^{commit}")

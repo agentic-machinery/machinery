@@ -1123,3 +1123,227 @@ def test_execute_skips_and_refuses_before_live_milestone_lookup(tmp_path, monkey
     with pytest.raises(CutError, match="CI Gate has not passed"):
         release_cut.execute(cut)
     assert called == []
+
+
+def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monkeypatch):
+    """Defect class: release_cut invokes the consumer's stale host_python publisher instead of the release's own
+    publisher, failing with OPSEC: invalid publisher arguments when the release passes a new flag (0.1.62 skew)."""
+    import lu_machinery
+
+    machinery_seed = tmp_path / "machinery-seed"
+    _init_repo(machinery_seed)
+    (machinery_seed / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n"
+        "[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.61...HEAD\n",
+        encoding="utf-8",
+    )
+    (machinery_seed / "pyproject.toml").write_text('[project]\nname = "lu-machinery"\nversion = "0.1.62"\n', encoding="utf-8")
+    (machinery_seed / "package.json").write_text(
+        json.dumps({"name": "lu-machinery-acp", "version": "0.1.62"}, indent=2) + "\n", encoding="utf-8",
+    )
+    (machinery_seed / "package-lock.json").write_text(
+        json.dumps({"name": "lu-machinery-acp", "version": "0.1.62", "packages": {"": {"version": "0.1.62"}}}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _git(machinery_seed, "add", "CHANGELOG.md", "pyproject.toml", "package.json", "package-lock.json")
+    _git(machinery_seed, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "version files")
+
+    product_seed = tmp_path / "product-seed"
+    _init_repo(product_seed)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "home").mkdir()
+    (work / "tmp").mkdir()
+    machinery = work / "machinery"
+    product = work / "product"
+    _bare_checkout(machinery_seed, tmp_path / "machinery.git", machinery)
+    _bare_checkout(product_seed, tmp_path / "product.git", product)
+
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    host_log = tmp_path / "host-publish.log"
+    accept_log = tmp_path / "accept-publish.log"
+
+    # Simulate the new release's verified clean-install interpreter: requires -I, primary env, and accepts --milestone.
+    accept_script = (
+        "#!/bin/sh\nset -eu\n"
+        'if [ "${1:-}" = "-I" ] && [ "${2:-}" = "-m" ] && [ "${3:-}" = "pip" ]; then exit 0; fi\n'
+        'if [ "${1:-}" = "-I" ] && [ "${2:-}" = "-c" ]; then\n'
+        f'  printf "0.1.62 %s/accept/lib/python3.14/site-packages/lu_machinery/__init__.py\\n" {shlex.quote(str(work))}\n'
+        "  exit 0\n"
+        "fi\n"
+        '[ "${1:-}" = "-I" ] || { printf "missing -I: %s\\n" "$*" >&2; exit 11; }\n'
+        '[ "${2:-}" = "-m" ] && [ "${3:-}" = "lu_machinery.publish" ] || { printf "bad module: %s\\n" "$*" >&2; exit 12; }\n'
+        f'[ "${{LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}" = {shlex.quote(str(primary))} ] || {{ printf "bad primary=%s\\n" "${{LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}" >&2; exit 14; }}\n'
+        f'[ "${{LU_PRODUCT_ROOT:-}}" = {shlex.quote(str(primary))} ] || {{ printf "bad product=%s\\n" "${{LU_PRODUCT_ROOT:-}}" >&2; exit 15; }}\n'
+        f'printf "%s\\n" "$*" >> {shlex.quote(str(accept_log))}\n'
+        'case "${4:-}" in\n'
+        '  pr-create) printf "https://github.com/learn-ukrainian/machinery/pull/1275\\n";;\n'
+        '  *) ;;\n'
+        'esac\n'
+    )
+
+    # Simulate the consumer's stale host_python (0.1.61): creates accept venv, but rejects --milestone on pr-create.
+    host_python = tmp_path / "host-venv/bin/python"
+    host_python.parent.mkdir(parents=True)
+    accept_template = tmp_path / "accept-python-template"
+    accept_template.write_text(accept_script, encoding="utf-8")
+    accept_template.chmod(0o755)
+    host_python.write_text(
+        "#!/bin/sh\nset -eu\n"
+        'if [ "${1:-}" = "-I" ] && [ "${2:-}" = "-m" ] && [ "${3:-}" = "venv" ]; then\n'
+        '  mkdir -p "$4/bin"\n'
+        f'  cp {shlex.quote(str(accept_template))} "$4/bin/python"\n'
+        '  chmod 755 "$4/bin/python"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "${2:-}" = "-m" ] && [ "${3:-}" = "lu_machinery.publish" ]; then\n'
+        f'  printf "%s\\n" "$*" >> {shlex.quote(str(host_log))}\n'
+        '  case " $* " in\n'
+        '    *" --milestone "*) printf "OPSEC: invalid publisher arguments\\n" >&2; exit 2;;\n'
+        '  esac\n'
+        '  exit 0\n'
+        "fi\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    host_python.chmod(0o755)
+
+    cut = Cut(
+        work=work, dry_run=False, machinery_remote=str(tmp_path / "machinery.git"),
+        product_remote=str(tmp_path / "product.git"), machinery_repo=REPO,
+        product_repo="learn-ukrainian/learn-ukrainian.github.io", host_python=host_python, primary=primary,
+        alert=False, x_agent="claude/claude-opus-5-5", version="0.1.62", previous="0.1.61", baseline="0.1.61",
+        git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"),
+        machinery_milestone="v0.11.0 - CI and GitHub budget reliability",
+        product_milestone="Machinery simplification (product side)",
+    )
+    cut.head = cut.git(machinery, "rev-parse", "HEAD")
+
+    dist = work / "dist"
+    dist.mkdir()
+    wheel = dist / "lu_machinery-0.1.62-py3-none-any.whl"
+    sdist = dist / "lu_machinery-0.1.62.tar.gz"
+    wheel.write_bytes(b"wheel")
+    sdist.write_bytes(b"sdist")
+    sums = dist / "SHA256SUMS"
+    sums.write_text("".join(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n" for p in (wheel, sdist)), encoding="utf-8")
+    files = {"wheel": wheel, "sdist": sdist, "sums": sums}
+    lock = work / "consumer.lock"
+    lock.write_text("lu-machinery==0.1.62\n", encoding="utf-8")
+
+    original_run = cut.run
+
+    def run(argv, **kwargs):
+        command = [str(part) for part in argv]
+        if command[:2] == ["git", "-C"] and "push" in command:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:2] == ["gh", "release"]:
+            published = Path(command[command.index("-D") + 1])
+            published.mkdir()
+            for path in files.values():
+                (published / path.name).write_bytes(path.read_bytes())
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(argv, **kwargs)
+
+    cut.run = run
+
+    # 1. After install(), every publisher verb in cut runs accept/bin/python -I (never stale host_python).
+    installed = cut.install(lock, "0.1.62")
+    assert installed == work / "accept/bin/python"
+    pub_argv, pub_env = cut.publisher_invocation("pr-create", "--milestone", "v0.11.0")
+    assert pub_argv == [installed, "-I", "-m", "lu_machinery.publish", "pr-create", "--milestone", "v0.11.0"]
+    assert "PYTHONPATH" not in pub_env
+    cut.publish(files, "notes\n")
+    cut.open_adopt_pr(lock, product)
+    cut.promote("final notes\n")
+    assert cut.post_release("### Fixed\n\n- Fix\n") == 1275
+
+    assert not host_log.exists(), f"stale host_python must never run lu_machinery.publish: {host_log.read_text()}"
+    verbs = [line.split()[3] for line in accept_log.read_text(encoding="utf-8").splitlines()]
+    assert verbs == ["release-create", "pr-create", "release-edit", "pr-ready", "pr-create"]
+    lines = accept_log.read_text(encoding="utf-8").splitlines()
+    assert "--milestone" in lines[1] and "--milestone" in lines[4]
+
+    # Cleanup after full release points resume instructions at the verified accept interpreter.
+    monkeypatch.setattr(cut, "remote_state", lambda: (True, "released", [1275]))
+    resume_msg = cut.clean_up("post-release PR")
+    assert f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release" in resume_msg
+
+    # 2. Before install() / standalone post-release (publisher_python=None): never falls back to stale host_python.
+    cut.publisher_python = None
+    monkeypatch.setenv("PYTHONWARNINGS", "error")
+    monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "userbase"))
+    argv, env = cut.publisher_invocation("read", "run", "--repo", REPO, "--number", "7")
+    expected_root = Path(lu_machinery.__file__).resolve().parents[1]
+    assert argv == [Path(sys.executable), "-P", "-s", "-m", "lu_machinery.publish", "read", "run", "--repo", REPO, "--number", "7"]
+    assert env["PYTHONPATH"] == str(expected_root)
+    assert "PYTHONWARNINGS" not in env and "PYTHONUSERBASE" not in env
+
+    # Installed venv invocation (e.g. resuming post-release with accept/bin/python -I) uses -I with no PYTHONPATH.
+    fake_site = work / "accept/lib/python3.14/site-packages"
+    fake_init = fake_site / "lu_machinery/__init__.py"
+    fake_init.parent.mkdir(parents=True)
+    fake_init.write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "executable", str(installed))
+    monkeypatch.setattr(lu_machinery, "__file__", str(fake_init))
+    monkeypatch.setattr(release_cut.sysconfig, "get_path", lambda key: str(fake_site) if key in {"purelib", "platlib"} else None)
+    argv_installed, env_installed = cut.publisher_invocation("pr-create", "--milestone", "v0.11.0")
+    assert argv_installed == [installed, "-I", "-m", "lu_machinery.publish", "pr-create", "--milestone", "v0.11.0"]
+    assert "PYTHONPATH" not in env_installed
+    # Actually invoke publisher through this post-release resume path while host_python stays stale.
+    out = cut.publisher("pr-create", "--repo", REPO, "--milestone", "v0.11.0")
+    assert "/pull/1275" in out
+    assert not host_log.exists()
+
+    # Fail-closed checks when running interpreter/package metadata is invalid or unsafe for PYTHONPATH.
+    unsafe_dir = tmp_path / f"bad{os.pathsep}root" / "lu_machinery"
+    unsafe_dir.mkdir(parents=True)
+    unsafe_init = unsafe_dir / "__init__.py"
+    unsafe_init.write_text("", encoding="utf-8")
+    monkeypatch.setattr(lu_machinery, "__file__", str(unsafe_init))
+    with pytest.raises(CutError, match="unsafe lu_machinery package root"):
+        cut.publisher_invocation("pr-create")
+    monkeypatch.setattr(lu_machinery, "__file__", None)
+    with pytest.raises(CutError, match="cannot locate the running lu_machinery package"):
+        cut.publisher_invocation("pr-create")
+    monkeypatch.setattr(sys, "executable", "")
+    with pytest.raises(CutError, match="cannot locate the running Python interpreter"):
+        cut.publisher_invocation("pr-create")
+
+    # 3. consumer_collection removes its .pth overlay when keep_collection_overlay=False (cut path), even on failure.
+    overlay_site = tmp_path / "overlay-site"
+    overlay_site.mkdir()
+    overlay_cut = Cut(
+        work=tmp_path, dry_run=True, machinery_remote="", product_remote="", machinery_repo=REPO,
+        product_repo="learn-ukrainian/learn-ukrainian", host_python=host_python, primary=primary,
+        alert=False, x_agent="claude/claude-opus-5-5", built="0.1.62",
+    )
+
+    def overlay_run(cmd, **_kwargs):
+        parts = [str(part) for part in cmd]
+        if "pytest" in parts:
+            assert (overlay_site / "zz-release-cut-consumer.pth").is_file()
+            return subprocess.CompletedProcess(parts, 0, "10 tests collected\n", "")
+        if "purelib" in parts[-1]:
+            return subprocess.CompletedProcess(parts, 0, f"{overlay_site}\n", "")
+        if parts[-1] == release_cut._SITE_PATHS:
+            return subprocess.CompletedProcess(parts, 0, f"{tmp_path / 'host-site'}\n", "")
+        if parts[-1] == release_cut._SHOW_LU:
+            return subprocess.CompletedProcess(parts, 0, f"0.1.62\n{overlay_site}/lu_machinery/__init__.py\n", "")
+        return subprocess.CompletedProcess(parts, 0, "d" * 40 + "\n", "")
+
+    overlay_cut.run = overlay_run
+    assert overlay_cut.consumer_collection(installed, product) == "10 tests collected"
+    assert not (overlay_site / "zz-release-cut-consumer.pth").exists()
+    overlay_cut.run = lambda cmd, **_k: (
+        subprocess.CompletedProcess([str(p) for p in cmd], 1, "collection error\n", "")
+        if "pytest" in [str(p) for p in cmd] else overlay_run(cmd, **_k)
+    )
+    with pytest.raises(CutError, match="product test collection failed"):
+        overlay_cut.consumer_collection(installed, product)
+    assert not (overlay_site / "zz-release-cut-consumer.pth").exists()
+    overlay_cut.run = overlay_run
+    overlay_cut.keep_collection_overlay = True
+    assert overlay_cut.consumer_collection(installed, product) == "10 tests collected"
+    assert (overlay_site / "zz-release-cut-consumer.pth").is_file()
