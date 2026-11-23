@@ -115,17 +115,11 @@ def orchestrator_identity(stream: str, *, agent: str, model: str | None = None) 
     area_spec = assignments.get(area_id) if isinstance(assignments, dict) else None
     if not isinstance(area_spec, dict):
         raise ValueError(f"orchestrator_stream_unregistered: {stream} (area {area_id}) missing from area_assignments.yaml")
-    slots = [slot for slot in (area_spec.get("slots") or []) if isinstance(slot, str)]
     if not handoff_slot_registry.registry_readable():
         raise ValueError("orchestrator_slot_unregistered: fleet handoff slot registry is unreadable")
     prefix = _provider_slot_prefix(agent, model)
     candidate_slot = f"{prefix}-{slot_lane}"
-    if slots:
-        slot_allowed = candidate_slot in slots and handoff_slot_registry.is_registered_slot(candidate_slot)
-    else:
-        # Empty-roster areas (e.g. monitor) accept <provider>-<area> aliases validated by handoff_slot_registry.
-        slot_allowed = handoff_slot_registry.is_registered_slot(candidate_slot)
-    if not slot_allowed:
+    if not handoff_slot_registry.is_registered_slot(candidate_slot):
         raise ValueError(
             f"orchestrator_slot_unregistered: {candidate_slot!r} is not a registered launcher slot "
             f"for {stream} (area {area_id})"

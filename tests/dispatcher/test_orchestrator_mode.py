@@ -1358,6 +1358,25 @@ def test_live_unknown_or_unreadable_child_blocks_turn_done_keeps_lease_and_recor
                               worktree_disposition="retained", worktree_disposition_reason="provider_liveness_unknown"))
     )
     assert turn["status"] == "no_deliverable" and turn["unknown_child_tasks"] == ["child-liveness-unk"] and rel == []
+    # Malformed non-scalar terminal-child metadata classifies as unknown instead of raising TypeError (F2).
+    for bad_field in ({"worktree_disposition_reason": ["bad"]}, {"launch_mode": ["bad"]}):
+        turn, rel = _run_case(
+            lambda t, bad=bad_field: _write(dict(
+                schema_version=2, task_id="child-malformed-meta", agent="claude", mode="workspace-write",
+                status="done", run_nonce=full_nonce, parent_task_id=t["task_id"],
+                parent_run_nonce=t["run_nonce"], parent_stream=STREAM, **bad,
+            ))
+        )
+        assert turn["status"] == "no_deliverable" and turn["unknown_child_tasks"] == ["child-malformed-meta"] and rel == []
+
+    # Verified pre-launch terminal hold (dispatch_died_after_admission, no pid/launch) is cleared (F14).
+    turn, rel = _run_case(
+        lambda t: _write(dict(schema_version=2, task_id="child-prelaunch-died", agent="claude", mode="workspace-write",
+                              status="crashed", pid=None, process_start=None,
+                              returncode_reason="dispatch_died_after_admission", run_nonce=full_nonce,
+                              parent_task_id=t["task_id"], parent_run_nonce=t["run_nonce"], parent_stream=STREAM))
+    )
+    assert turn["status"] == "done" and len(rel) == 1
 
     turn, rel = _run_case(
         lambda t: _write(dict(schema_version=2, task_id="child-done", agent="claude", mode="workspace-write",
@@ -1388,6 +1407,17 @@ def test_live_unknown_or_unreadable_child_blocks_turn_done_keeps_lease_and_recor
     genuine_fail = {**turn, "status": "failed", "error": "provider exited unsuccessfully", "provider_terminal_failure": True}
     worker._enforce_delivery(genuine_fail)
     assert genuine_fail["status"] == "failed"
+    # Terminal AGY provider failure with an active child is never overwritten by _agy_follow_up (F8).
+    conv_err, parsed_err = worker._agy_follow_up(
+        spec, turn, ParsedResult(None, None, "agy: provider error"), started=0.0, hard_timeout=0.0,
+        resumes=0, checkpoint=lambda: None, exit_code=1,
+    )
+    assert conv_err is None and parsed_err.error == "agy: provider error" and parsed_err.incomplete is False
+    conv_err0, parsed_err0 = worker._agy_follow_up(
+        spec, turn, ParsedResult(None, None, "agy: missing final text"), started=0.0, hard_timeout=0.0,
+        resumes=0, checkpoint=lambda: None, exit_code=0,
+    )
+    assert conv_err0 is None and parsed_err0.error == "agy: missing final text" and parsed_err0.incomplete is False
 
 
 def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_store, tmp_path, monkeypatch):
@@ -1423,7 +1453,7 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
         with pytest.raises(ValueError, match=expected_code):
             store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, bad_ref, outcome="done")
 
-    # Unreadable archived history fails closed instead of swallowing errors (F3).
+    # Unreadable archived history (corrupt record or dangling archive symlink) fails closed (F3).
     archive_dir = task_store / "archive"
     archive_dir.mkdir(exist_ok=True)
     bad_archive = archive_dir / "corrupt-prior.json"
@@ -1431,6 +1461,11 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
     with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
         store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
     bad_archive.unlink()
+    archive_dir.rmdir()
+    archive_dir.symlink_to(tmp_path / "missing-archive-target")
+    with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
+        store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
+    archive_dir.unlink()
 
     with pytest.raises(ValueError, match="--outcome"):
         store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="bogus")
@@ -1514,6 +1549,22 @@ def test_orchestrator_turn_exports_unique_inbox_worker_registered_slot_and_sessi
     env_overflow = environment.child_env(spec_overflow)
     assert env_overflow["SESSION_HANDOFF_AGENT"] == "claude-epics"
     assert env_overflow["SESSION_EPIC"] == "epics"
+
+    # Monitor stream retains legacy provider aliases alongside dedicated slots (F7).
+    monitor_stream = f"epic:{_STREAMS['monitor'][0]}"
+    for agent_name, model_name, expected_slot in (
+        ("claude", "claude-sonnet-5-5", "claude-monitor"),
+        ("codex", "gpt-6.2-sol", "codex-monitor"),
+        ("agy", "gemini-4-neon-high", "gemini-monitor"),
+    ):
+        spec_mon = TaskSpec(
+            f"turn-mon-{agent_name}", agent_name, model_name, "high", "workspace-write",
+            tmp_path, tmp_path / "p", tmp_path / "r",
+            options={"orchestrator_stream": monitor_stream, "orchestrator_run_nonce": f"nonce-mon-{agent_name}"},
+        )
+        env_mon = environment.child_env(spec_mon)
+        assert env_mon["SESSION_HANDOFF_AGENT"] == expected_slot
+        assert env_mon["SESSION_EPIC"] == "monitor"
 
     # Provider without a registered slot on this stream refuses instead of falling back to another seat (F7).
     spec_wrong_slot = TaskSpec(
