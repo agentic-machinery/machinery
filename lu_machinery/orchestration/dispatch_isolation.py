@@ -346,6 +346,25 @@ def _systemctl(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return _run(argv, user_manager_env(os.environ), 30)
 
 
+def scope_stop_result(unit: str, *, timeout_s: float = 2.0) -> str | None:
+    """Query systemd's ``Result`` property for ``<unit>.scope``, or None when unavailable."""
+    if not isinstance(unit, str) or not unit or unit.startswith("-") or "/" in unit:
+        return None
+    scope = unit if unit.endswith(_SCOPE_SUFFIX) else f"{unit}{_SCOPE_SUFFIX}"
+    try:
+        completed = _run(
+            ["systemctl", "--user", "show", "-p", "Result", "--value", "--", scope],
+            user_manager_env(os.environ),
+            timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    value = (completed.stdout or "").strip()
+    return value or None
+
+
 def _service_gone(proc: subprocess.CompletedProcess[str]) -> bool:
     """Whether ``systemctl is-active`` proves the service stopped: a terminal state (inactive, failed, or unknown
     with exit 3 or 4). A transitional state such as deactivating, which can still hold processes, or an empty or

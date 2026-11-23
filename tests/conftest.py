@@ -436,6 +436,7 @@ SESSION_IDENTITY_ENV_VARS = (
     # Dispatch worker identity (scripts/dispatcher/environment.py).
     "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
     "LEARN_UKRAINIAN_DISPATCH_AGENT",
+    "LU_INBOX_WORKER",
     "LU_TASK_SCRATCH",
     "LU_X_AGENT_TRAILER",
     "LU_RUNTIME_INITIATOR",
@@ -1682,6 +1683,8 @@ def _hermetic_dispatch_admission_host(monkeypatch):
     """
     for name in (
         "DISPATCH_MAX_LIVE_WRITE_WORKERS",
+        "DISPATCH_MAX_LIVE_ORCHESTRATORS",
+        "DISPATCH_MAX_CHILDREN_PER_TURN",
         "DISPATCH_MIN_MEM_AVAILABLE_GIB",
         "DISPATCH_MAX_LOAD_PER_CPU",
         "DISPATCH_WORKER_MEM_RESERVE_GIB",

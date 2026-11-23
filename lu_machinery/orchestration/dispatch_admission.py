@@ -176,6 +176,8 @@ DEFAULT_LOCK_TIMEOUT_S = 60.0
 PROC_ROOT = Path("/proc")
 
 ENV_MAX_LIVE_WRITE_WORKERS = "DISPATCH_MAX_LIVE_WRITE_WORKERS"
+ENV_MAX_LIVE_ORCHESTRATORS = "DISPATCH_MAX_LIVE_ORCHESTRATORS"
+ENV_MAX_CHILDREN_PER_TURN = "DISPATCH_MAX_CHILDREN_PER_TURN"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN"
 ENV_MIN_METER_LAUNCH_INTERVAL_S = "DISPATCH_MIN_METER_LAUNCH_INTERVAL_S"
@@ -215,6 +217,8 @@ ENV_ADMISSION_FILE = "DISPATCH_ADMISSION_ENV_FILE"
 ADMISSION_ENV_FILE_NAME = "dispatch-admission.env"
 _THRESHOLD_ENV_NAMES = (
     ENV_MAX_LIVE_WRITE_WORKERS,
+    ENV_MAX_LIVE_ORCHESTRATORS,
+    ENV_MAX_CHILDREN_PER_TURN,
     ENV_MAX_LIVE_WRITE_WORKERS_PER_METER,
     ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN,
     ENV_MIN_METER_LAUNCH_INTERVAL_S,
@@ -260,6 +264,8 @@ class Thresholds:
     max_live_write_workers_per_meter: int = config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER
     max_live_write_workers_per_meter_unknown: int = config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN
     min_meter_launch_interval_s: float = config.DISPATCH_MIN_METER_LAUNCH_INTERVAL_S
+    max_live_orchestrators: int = config.DISPATCH_MAX_LIVE_ORCHESTRATORS
+    max_children_per_turn: int = config.DISPATCH_MAX_CHILDREN_PER_TURN
 
     def __post_init__(self) -> None:
         unknown_cap = self.max_live_write_workers_per_meter_unknown
@@ -267,6 +273,12 @@ class Thresholds:
             raise ValueError(
                 f"{ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN}={unknown_cap!r} must be a positive whole number"
             )
+        for env_name, cap in (
+            (ENV_MAX_LIVE_ORCHESTRATORS, self.max_live_orchestrators),
+            (ENV_MAX_CHILDREN_PER_TURN, self.max_children_per_turn),
+        ):
+            if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+                raise ValueError(f"{env_name}={cap!r} must be a non-negative whole number")
 
 
 class MeterDefer(StrEnum):
@@ -396,6 +408,7 @@ class AdmissionDecision:
     disk: DiskCheck | None = None
     psi_shadow: dict[str, Any] | None = None
     meter: MeterCheck | None = None
+    live_orchestrator_ids: tuple[str, ...] = ()
 
     @property
     def live_write_workers(self) -> int:
@@ -521,6 +534,8 @@ class AdmissionDecision:
             "failures": list(self.failures),
             "live_write_workers": self.live_write_workers,
             "max_live_write_workers": limits.max_live_write_workers if limits else None,
+            "live_orchestrators": len(self.live_orchestrator_ids),
+            "max_live_orchestrators": limits.max_live_orchestrators if limits else None,
             "mem_available_gib": round(mem, 2) if mem is not None else None,
             "min_mem_available_gib": limits.min_mem_available_gib if limits else None,
             "load1": probe.load1 if probe else None,
@@ -604,6 +619,8 @@ def config_defaults() -> Thresholds:
         max_live_write_workers_per_meter=int(config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER),
         max_live_write_workers_per_meter_unknown=int(config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN),
         min_meter_launch_interval_s=float(config.DISPATCH_MIN_METER_LAUNCH_INTERVAL_S),
+        max_live_orchestrators=int(config.DISPATCH_MAX_LIVE_ORCHESTRATORS),
+        max_children_per_turn=int(config.DISPATCH_MAX_CHILDREN_PER_TURN),
     )
 
 
@@ -727,6 +744,12 @@ def load_thresholds(environ: Mapping[str, str] | None = None) -> Thresholds:
         ),
         max_live_write_workers_per_meter_unknown=unknown_meter_cap,
         min_meter_launch_interval_s=interval,
+        max_live_orchestrators=int(
+            _env_number(env, ENV_MAX_LIVE_ORCHESTRATORS, defaults.max_live_orchestrators, integer=True)
+        ),
+        max_children_per_turn=int(
+            _env_number(env, ENV_MAX_CHILDREN_PER_TURN, defaults.max_children_per_turn, integer=True)
+        ),
     )
     validate_disk_watermarks(limits)
     return limits
@@ -1606,6 +1629,67 @@ class WorkerScan:
     live_on_meter: int = 0
     last_meter_launch_age_s: float | None = None
     meter_recently_rate_limited: bool = False
+    live_orchestrator_ids: tuple[str, ...] = ()
+
+
+def _is_orchestrator_turn(state: Mapping[str, Any]) -> bool:
+    try:
+        return orchestrator_stream(state) is not None
+    except ValueError:
+        return False
+
+
+def count_turn_children(
+    tasks_dir: Path,
+    parent_task_id: str,
+    parent_run_nonce: str | None = None,
+) -> int:
+    """Count non-refused child tasks dispatched by one orchestrator turn; fail closed on unreadable hot records."""
+    from lu_machinery.orchestration.task_record_store import (
+        TaskIdentityMismatch,
+        is_identical_copy,
+        iter_task_records,
+        parse_task_record,
+        read_task_record_bytes,
+        task_archive_lock,
+    )
+
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+    with task_archive_lock(tasks_dir):
+        for listed in iter_task_records(tasks_dir, include_archive=False):
+            seen_names.add(listed.name)
+            try:
+                path, raw = read_task_record_bytes(listed, tasks_dir=tasks_dir)
+                if path != listed:
+                    continue
+                record = parse_task_record(path, raw)
+            except TaskIdentityMismatch as exc:
+                if is_identical_copy(exc):
+                    continue
+                raise ValueError(f"unreadable task record {listed.name}: cannot verify turn child count") from None
+            except (OSError, ValueError, RecursionError):
+                raise ValueError(f"unreadable task record {listed.name}: cannot verify turn child count") from None
+            if not isinstance(record, dict) or not isinstance(record.get("task_id"), str):
+                raise ValueError(f"unreadable task record {listed.name}: cannot verify turn child count")
+            if (record.get("parent_task_id") == parent_task_id
+                    and not record.get("never_started_reason")
+                    and (parent_run_nonce is None or record.get("parent_run_nonce") in (None, parent_run_nonce))):
+                seen_ids.add(record["task_id"])
+        for listed in iter_task_records(tasks_dir, include_archive=True):
+            if listed.name in seen_names:
+                continue
+            try:
+                path, raw = read_task_record_bytes(listed, tasks_dir=tasks_dir)
+                record = parse_task_record(path, raw)
+            except (TaskIdentityMismatch, OSError, ValueError, RecursionError):
+                continue
+            if (isinstance(record, dict) and isinstance(record.get("task_id"), str)
+                    and record.get("parent_task_id") == parent_task_id
+                    and not record.get("never_started_reason")
+                    and (parent_run_nonce is None or record.get("parent_run_nonce") in (None, parent_run_nonce))):
+                seen_ids.add(record["task_id"])
+    return len(seen_ids)
 
 
 def iter_active_records(
@@ -1656,6 +1740,7 @@ def scan_task_records(
     alive = pid_alive or process_alive
     clock = now or datetime.now(UTC)
     live: list[str] = []
+    live_orchestrators: list[str] = []
     dead: list[tuple[Path, dict[str, Any]]] = []
     live_on_meter = 0
     last_meter_launch_age_s: float | None = None
@@ -1671,6 +1756,7 @@ def scan_task_records(
         task_id = str(state.get("task_id") or path.stem)
         mode = state.get("mode")
         launches_writer = isinstance(mode, str) and mode in WRITE_CAPABLE_MODES
+        is_orchestrator = _is_orchestrator_turn(state)
         write_capable = _holds_write_slot(state, launches_writer)
         matches_meter = meter is not None and _meter_record(state) == meter
         on_meter = matches_meter and write_capable
@@ -1692,7 +1778,7 @@ def scan_task_records(
             if is_orphaned_pidless_record(state):
                 dead.append((path, state))
                 continue
-            if not write_capable or state.get("status") != "spawning":
+            if (not write_capable and not is_orchestrator) or state.get("status") != "spawning":
                 continue
             owner = _dispatcher_owner(state)
             owner_pid = _parse_pid(owner.get("owner_pid")) if owner is not None else None
@@ -1707,8 +1793,11 @@ def scan_task_records(
                 else:
                     owner_live = alive(owner_pid)
                 if owner_live:
-                    live.append(task_id)
-                    live_on_meter += on_meter
+                    if write_capable:
+                        live.append(task_id)
+                        live_on_meter += on_meter
+                    if is_orchestrator:
+                        live_orchestrators.append(task_id)
                 continue
             age = _age_s(state.get("started_at"), clock)
             if age is not None and age < -PIDLESS_CLOCK_SKEW_S:
@@ -1718,17 +1807,29 @@ def scan_task_records(
                     -age,
                 )
             elif age is not None and age <= PIDLESS_SPAWNING_GRACE_S:
-                live.append(task_id)
-                live_on_meter += on_meter
+                if write_capable:
+                    live.append(task_id)
+                    live_on_meter += on_meter
+                if is_orchestrator:
+                    live_orchestrators.append(task_id)
             continue
         worker_live = record_liveness(state) is not False if record_liveness is not None else alive(pid)
         if worker_live:
             if write_capable:
                 live.append(task_id)
                 live_on_meter += on_meter
+            if is_orchestrator:
+                live_orchestrators.append(task_id)
         else:
             dead.append((path, state))
-    return WorkerScan(tuple(live), tuple(dead), live_on_meter, last_meter_launch_age_s, meter_recently_rate_limited)
+    return WorkerScan(
+        tuple(live),
+        tuple(dead),
+        live_on_meter,
+        last_meter_launch_age_s,
+        meter_recently_rate_limited,
+        tuple(live_orchestrators),
+    )
 
 
 def host_failures(probe: HostProbe, limits: Thresholds) -> list[str]:
@@ -1911,6 +2012,11 @@ def evaluate(
             f"live write workers {live}/{limits.max_live_write_workers} reached the cap "
             f"({ENV_MAX_LIVE_WRITE_WORKERS}={limits.max_live_write_workers})"
         )
+    if orchestrator and len(scan.live_orchestrator_ids) >= limits.max_live_orchestrators:
+        failures.append(
+            f"live orchestrator turns {len(scan.live_orchestrator_ids)}/{limits.max_live_orchestrators} reached the cap "
+            f"({ENV_MAX_LIVE_ORCHESTRATORS}={limits.max_live_orchestrators})"
+        )
     meter_check = None
     if meter is not None:
         telemetry, monitor_defer = _meter_defer(
@@ -1972,6 +2078,7 @@ def evaluate(
         slots=slots,
         disk=disk,
         meter=meter_check,
+        live_orchestrator_ids=scan.live_orchestrator_ids,
     )
     return replace(
         decision,

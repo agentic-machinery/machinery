@@ -2,6 +2,7 @@
 
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
@@ -34,11 +35,88 @@ def task_scratch_path(task_id: str) -> Path:
     store.record_path(task_id)  # raises ValueError for an id the task store would refuse
     return TASK_SCRATCH_BASE / task_id
 
+
+@dataclass(frozen=True, slots=True)
+class OrchestratorIdentity:
+    """Resolved lane, SESSION_EPIC and registered Fleet slot for one orchestrator turn."""
+
+    stream: str
+    lane: str
+    session_epic: str
+    slot: str
+
+
+def _provider_slot_prefix(agent: str, model: str | None = None) -> str:
+    if agent == "agy":
+        return "gemini"
+    if agent == "cursor" and isinstance(model, str) and model.startswith("grok"):
+        return "grok"
+    return agent
+
+
+def stream_lane(stream: str) -> str:
+    """The canonical driver-state lane / SESSION_EPIC for a registered ``epic:<N>`` stream."""
+    from lu_machinery.orchestration.issue_stream_audit import load_registry
+    from lu_machinery.orchestration.launcher_aliases import load_launcher_bindings
+
+    if not isinstance(stream, str) or not stream.startswith("epic:") or not stream[5:].isdigit():
+        raise ValueError(f"orchestrator_stream_unregistered: {stream!r} is not a canonical epic:<N> stream")
+    epic_number = int(stream[5:])
+    registry = load_registry()
+    stream_keys = [key for key, epics in registry.items() if epic_number in epics]
+    if len(stream_keys) != 1:
+        raise ValueError(f"orchestrator_stream_unregistered: {stream} is not uniquely registered in issue_streams.yaml")
+    stream_key = stream_keys[0]
+    bindings = load_launcher_bindings()
+    matched_lanes = {lane for mapped_stream, lane in bindings.values() if mapped_stream == stream_key}
+    if len(matched_lanes) > 1:
+        raise ValueError(f"orchestrator_stream_unregistered: {stream} resolves to multiple launcher lanes")
+    if matched_lanes:
+        slot_lane = next(iter(matched_lanes))
+        if bindings.get(slot_lane, (None, None))[0] == stream_key:
+            return slot_lane
+    return stream_key
+
+
+def orchestrator_identity(stream: str, *, agent: str, model: str | None = None) -> OrchestratorIdentity:
+    """Resolve lane, SESSION_EPIC and registered slot for an orchestrator turn; fail closed if unregistered."""
+    from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, resolve_area_by_epic
+    from lu_machinery.orchestration.issue_stream_audit import load_registry
+    from lu_machinery.orchestration.launcher_aliases import load_launcher_bindings
+    from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_PATH, _load_yaml
+
+    session_epic = stream_lane(stream)
+    epic_number = int(stream[5:])
+    registry = load_registry()
+    stream_key = next(key for key, epics in registry.items() if epic_number in epics)
+    bindings = load_launcher_bindings()
+    matched_lanes = {lane for mapped_stream, lane in bindings.values() if mapped_stream == stream_key}
+    slot_lane = next(iter(matched_lanes)) if len(matched_lanes) == 1 else session_epic
+    try:
+        area = resolve_area_by_epic(epic_number)
+        assignments = _load_yaml(ASSIGNMENTS_PATH).get("assignments", {})
+    except (FleetTaxonomyError, OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f"orchestrator_stream_unregistered: {stream} has no registered area ({type(exc).__name__})") from None
+    area_spec = assignments.get(area.id) if isinstance(assignments, dict) else None
+    slots = [slot for slot in (area_spec.get("slots") or []) if isinstance(slot, str)] if isinstance(area_spec, dict) else []
+    if not slots:
+        raise ValueError(f"orchestrator_stream_unregistered: {stream} (area {area.id}) has no registered slot")
+    prefix = _provider_slot_prefix(agent, model)
+    preferred = f"{prefix}-{slot_lane}"
+    if preferred in slots:
+        slot = preferred
+    else:
+        suffix = f"-{slot_lane}"
+        slot = next((item for item in slots if item.endswith(suffix)), slots[0])
+    return OrchestratorIdentity(stream=stream, lane=session_epic, session_epic=session_epic, slot=slot)
+
 # LU_SENSE_PROOF_DIR is a host path with no secret in the name; pack-verify reads the proofs inside it.
 # LU_FLEET_REPO_SELECTOR_FILE names the host-owned, read-only dual-slug selector; passing its path grants nothing.
 # LU_NODE_TOOLCHAIN_DIRS configures host Node toolchain roots (e.g. /opt/lu-node/{major}/bin), never a credential.
+# LU_DRIVER_STATE_CLI configures the host lu-driver-state CLI executable path for handoff-note checks, never a credential.
 _CONTEXT = (
-    "PATH", "HOME", "LANG", "TERM", "TMPDIR", "LU_SENSE_PROOF_DIR", SELECTOR_ENV, site_deps.NODE_TOOLCHAIN_DIRS_ENV,
+    "PATH", "HOME", "LANG", "TERM", "TMPDIR", "LU_SENSE_PROOF_DIR", SELECTOR_ENV,
+    site_deps.NODE_TOOLCHAIN_DIRS_ENV, store.DRIVER_STATE_CLI_ENV,
 )
 _AUTH = {
     "codex": ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME"),
@@ -193,4 +271,14 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
             configured = os.environ.get(name, "")
             if configured:
                 env[name] = configured
+    options = getattr(spec, "options", None)
+    orch_stream = options.get("orchestrator_stream") if isinstance(options, dict) else None
+    if orch_stream:
+        run_nonce = options.get("orchestrator_run_nonce") if isinstance(options, dict) else None
+        if not isinstance(run_nonce, str) or not run_nonce:
+            raise ValueError("orchestrator_env_invalid: orchestrator turn requires a non-empty run nonce")
+        identity = orchestrator_identity(orch_stream, agent=spec.agent, model=spec.model)
+        env["LU_INBOX_WORKER"] = f"{spec.task_id}-{run_nonce}"
+        env["SESSION_HANDOFF_AGENT"] = identity.slot
+        env["SESSION_EPIC"] = identity.session_epic
     return env

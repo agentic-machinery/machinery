@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -277,6 +278,8 @@ def build_parser() -> argparse.ArgumentParser:
     handoff.add_argument("--stream", required=True, help="The stream the turn reserved, e.g. epic:1122")
     handoff.add_argument("--handoff-ref", required=True,
                          help="ID of the turn's one handoff note, e.g. 4711 (1-256 of letters, digits, ._:#/-)")
+    handoff.add_argument("--outcome", choices=("done", "blocked", "handoff"), default="done",
+                         help="Turn outcome: done settles done; blocked and handoff settle non-done with typed reasons (default: done)")
     for name in ("wait", "status", "cancel", "list"):
         sub = subs.add_parser(name, help=f"{name.capitalize()} task records")
         if name == "list":
@@ -286,8 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("task_id", help="Task ID returned by dispatch")
             sub.add_argument("--run-nonce", help="Expected run identity (default: omit check)")
         if name == "wait":
-            sub.add_argument("--timeout", type=float, default=0, help="Wait seconds; 0 is unlimited (default: 0)")
+            sub.add_argument("--timeout", type=float, default=0,
+                             help="Bounded wait seconds before returning 124; 0 is unlimited (default: 0; turns use e.g. 300 in a loop)")
             sub.add_argument("--poll-interval", type=float, default=1, help="Read interval in seconds (default: 1)")
+            sub.add_argument("--keepalive-interval", type=float, default=60,
+                             help="Emit a stderr keepalive line every SECS while waiting to avoid stdout silence timeout; 0 disables (default: 60)")
             sub.add_argument("--reply", action="store_true",
                              help="Add the sealed reply of a done review this task dispatched, as result, or a typed "
                                   "result_unavailable (needs --run-nonce; default: the record only)")
@@ -446,9 +452,11 @@ def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
         raise ValueError(f"orchestrator_entry_refused: an orchestrator turn takes no {flags}")
     # A turn drives its stream: role policy (model_pause.dispatch_roles) must see that, not only authoring.
     from lu_machinery.agent_runtime.model_pause import normalize_role
+    from lu_machinery.dispatcher.environment import orchestrator_identity
 
     if args.research_role is not None and normalize_role(args.research_role) != "driving":
         raise ValueError("orchestrator_entry_refused: an orchestrator turn's --research-role is driver")
+    orchestrator_identity(stream, agent=agent, model=args.model)
     args.research_role = args.research_role or "driver"
     return {"stream": stream}
 
@@ -605,6 +613,8 @@ def _dispatch(args) -> int:
         if args.cwd and (linkage.get("parent_stream") is not None or parent.startswith(host_admission.TURN_TASK_PREFIX)):
             raise ValueError("orchestrator_turn_writer_refused: a task an orchestrator turn dispatches cannot borrow "
                              "a tree (--cwd)")
+    with admission.record_refusal(args, agent, StartRefusal.CAPACITY):
+        host_admission.check_turn_child_cap(linkage)
     repo, info = git.resolve_repo(args.repo)
     # Absent unless given, so an omitted --read-path leaves every other route's advisory binding unchanged.
     read_paths = getattr(args, "read_path", [])
@@ -731,6 +741,10 @@ def _dispatch(args) -> int:
     prompt_path.content = prompt
     options = {key: str(value) for key, value in vars(args).items()
                if value is not None and key not in {"prompt", "input", "read_path"}}
+    turn_run_nonce = uuid.uuid4().hex if orchestrator is not None else None
+    if orchestrator is not None and turn_run_nonce is not None:
+        options["orchestrator_stream"] = orchestrator["stream"]
+        options["orchestrator_run_nonce"] = turn_run_nonce
     if read_paths:
         options["read_paths"] = json.dumps(read_paths, separators=(",", ":"))
     if bound_inputs:
@@ -890,7 +904,7 @@ def _dispatch(args) -> int:
                 checks.check_review_budget(args, info, sha)
         launch = {"record": False, "started": False}  # worker.start marks each just before that step
         # A turn's run nonce exists before its lease is claimed, which names it; the hold, record and scope keep it.
-        turn = {} if orchestrator is None else {"run_nonce": uuid.uuid4().hex, "turn_ttl_s": turn_ttl_s}
+        turn = {} if orchestrator is None else {"run_nonce": turn_run_nonce, "turn_ttl_s": turn_ttl_s}
         with admission.record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
             hold = stack.enter_context(host_admission.reserve(
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,
@@ -1105,7 +1119,9 @@ def main(argv=None) -> int:
             print(json.dumps(result, indent=2))
             return 0
         if args.command == "handoff-receipt":
-            receipt = store.record_handoff_receipt(args.task_id, args.run_nonce, args.stream, args.handoff_ref)
+            receipt = store.record_handoff_receipt(
+                args.task_id, args.run_nonce, args.stream, args.handoff_ref, outcome=args.outcome,
+            )
             print(json.dumps(receipt, indent=2))
             return 0
         code = 0
@@ -1116,9 +1132,14 @@ def main(argv=None) -> int:
             if args.status is not None:
                 result = [record for record in result if record.get("status") == args.status]
         elif args.command == "wait":
-            if args.timeout < 0 or args.poll_interval <= 0:
-                raise ValueError("timeout must be nonnegative and poll interval positive")
-            result, code = worker.wait(args.task_id, args.run_nonce, args.timeout, args.poll_interval, reply=args.reply)
+            if (not math.isfinite(args.timeout) or not math.isfinite(args.poll_interval)
+                    or not math.isfinite(args.keepalive_interval)
+                    or args.timeout < 0 or args.poll_interval <= 0 or args.keepalive_interval < 0):
+                raise ValueError("timeout and keepalive interval must be finite nonnegative and poll interval finite positive")
+            result, code = worker.wait(
+                args.task_id, args.run_nonce, args.timeout, args.poll_interval,
+                reply=args.reply, keepalive_interval=args.keepalive_interval,
+            )
         elif args.command == "cancel":
             result = worker.cancel(args.task_id, args.run_nonce)
         else:

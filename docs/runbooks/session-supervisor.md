@@ -260,6 +260,49 @@ once that successor claim commits. Remote unavailability fails closed.
 Clean exits release only their exact lease envelope. Attributed `release --force`
 is an exceptional, separately authorized operator action, never automatic recovery.
 
+### Dispatch-turn lease recovery (DRIVERS-1122)
+
+Orchestrator turns claim a Monitor stream lease with holder harness `dispatch-turn`.
+Unlike legacy launcher leases, a `dispatch-turn` lease is **never** auto-superseded by
+TTL/CAS or local PID force-close (`409 turn_lease_uncleared`): expiry only signals that
+an operator should investigate, because TTL expiry alone does not prove the turn's
+systemd scope or child tasks have stopped.
+
+When a turn crashes, loses a claim or release response, settles with live/unknown/unreadable
+children, or survives a host reboot, the stream remains held. `stalled_work` surfaces any
+held `dispatch-turn` lease whose turn record is terminal or overdue as a `held_turn_lease`
+row and sends one deduplicated alert to `claude-cto`. `diagnose_handoff` and
+`recover_expired_driver` refuse TTL takeover and direct recovery here.
+
+Before running an attributed force release, verify quiescence in three steps:
+
+1. **Inspect the turn record and Monitor projection:** confirm the holder `task_id`,
+   `instance_id` (run nonce), `session_id`, `lease_id`, `generation`, and `fencing_token`
+   via `.venv/bin/python -m lu_machinery.dispatch status <task-id>` and
+   `GET /api/epics/v1/epic:<N>`.
+2. **Prove the turn scope and services are gone on the recorded host:** check
+   `systemctl --user list-units 'lu-worker-<task-id>*'` and confirm no scope or listed
+   task service remains active.
+3. **Reconcile child tasks:** check `child_tasks` and `orphaned_child_tasks` on the turn
+   record (and live tasks with `parent_stream == epic:<N>` via
+   `.venv/bin/python -m lu_machinery.dispatch list --status running`) and confirm every
+   child has settled or has an explicit CTO custody owner.
+
+Once all three checks pass, re-read Monitor to confirm the same holder is still current,
+then run the attributed operator release:
+
+```bash
+.venv/bin/python -m lu_machinery.session_supervisor release \
+  --role driver --stream epic:<N> --force \
+  --actor-agent <operator-or-cto-actor> \
+  --actor-host-id <host-id> \
+  --reason "quiescence verified: <task-id> scope gone and children reconciled"
+```
+
+After release, read `GET /api/epics/v1/epic:<N>` separately to confirm `state=released`
+and `session_state=closed` before admitting a successor turn. If quiescence cannot be
+proven, keep the hold in place.
+
 Explicit `--local` mode can recover a local process lease before TTL expiry when
 the exact holder PID is absent and the distinct candidate process is live.
 It cannot use local PID evidence to close a lease acquired through Monitor,
