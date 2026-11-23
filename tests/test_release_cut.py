@@ -1474,8 +1474,18 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     # Explicit source-checkout fixture outside site-packages so behavior is identical in wheel-installed CI.
     src_root = tmp_path / "source-checkout"
     src_init = src_root / "lu_machinery/__init__.py"
-    src_init.parent.mkdir(parents=True)
+    src_pub_main = src_root / "lu_machinery/publish/__main__.py"
+    src_pub_main.parent.mkdir(parents=True)
     src_init.write_text("", encoding="utf-8")
+    (src_root / "lu_machinery/publish/__init__.py").write_text("", encoding="utf-8")
+    src_pub_main.write_text(
+        "import json, os, sys\n"
+        "python_vars = sorted(k for k in os.environ if k.startswith('PYTHON'))\n"
+        "print(json.dumps({'argv': sys.argv[1:], 'python_vars': python_vars, "
+        "'primary': os.environ.get('LEARN_UKRAINIAN_PRIMARY_REPO_ROOT'), "
+        "'product': os.environ.get('LU_PRODUCT_ROOT'), 'lu_python': os.environ.get('LU_PYTHON')}))\n",
+        encoding="utf-8",
+    )
     with monkeypatch.context() as src_ctx:
         src_ctx.setattr(lu_machinery, "__file__", str(src_init))
         argv, env = cut.publisher_invocation("read", "run", "--repo", REPO, "--number", "7")
@@ -1484,8 +1494,31 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     assert env["PYTHONPATH"] == str(src_root.resolve())
     assert "PYTHONWARNINGS" not in env and "PYTHONUSERBASE" not in env
     assert manual_src is not None
-    assert f"PYTHONPATH={shlex.quote(str(src_root.resolve()))}" in manual_src
-    assert "-P -s -m lu_machinery.publish pr-create" in manual_src
+    assert "-I -c" in manual_src
+    # Execute the emitted source-checkout manual command in a fresh shell with hostile PYTHON* settings
+    # (including PYTHONHOME pointing at an empty directory) to prove full isolation matching publisher_invocation().
+    empty_pyhome = tmp_path / "empty-pythonhome"
+    empty_pyhome.mkdir()
+    hostile_shell_env = {
+        **clean_shell_env,
+        "PYTHONHOME": str(empty_pyhome),
+        "PYTHONPATH": str(tmp_path / "stale-pythonpath"),
+        "PYTHONWARNINGS": "error",
+        "PYTHONUSERBASE": str(tmp_path / "bad-userbase"),
+    }
+    manual_src_result = subprocess.run(
+        ["/bin/sh", "-c", manual_src], cwd=tmp_path, env=hostile_shell_env,
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert manual_src_result.returncode == 0, f"source manual command failed: {manual_src_result.stderr}"
+    manual_src_payload = json.loads(manual_src_result.stdout)
+    assert manual_src_payload == {
+        "argv": ["pr-create", "--repo", REPO, "--head", "release/start-0.1.63"],
+        "python_vars": [],
+        "primary": str(primary.absolute()),
+        "product": str(primary.absolute()),
+        "lu_python": str(host_python.absolute()),
+    }
 
     # Installed venv invocation (e.g. resuming post-release with accept/bin/python -I) uses -I with no PYTHONPATH.
     fake_site = work / "accept/lib/python3.14/site-packages"
@@ -1503,7 +1536,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     assert "/pull/1275" in out
     assert not host_log.exists()
 
-    # Fail-closed checks when running interpreter/package metadata is invalid, looping, or unsafe for PYTHONPATH.
+    # Fail-closed checks when running interpreter/package metadata is invalid, looping, malformed, or unsafe.
     loop_site = tmp_path / "loop-site"
     loop_site.symlink_to(loop_site)
     with monkeypatch.context() as loop_ctx:
@@ -1514,8 +1547,49 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     with monkeypatch.context() as loop_ctx:
         loop_ctx.setattr(lu_machinery, "__file__", str(src_init))
         loop_ctx.setattr(release_cut.sysconfig, "get_path", lambda key: str(loop_site / "site-packages") if key == "purelib" else None)
-        with pytest.raises(CutError, match="cannot inspect running interpreter purelib path"):
+        with pytest.raises(CutError, match="cannot resolve running interpreter purelib path"):
             cut.publisher_invocation("pr-create")
+    # Dangling symlink at ancestor (e.g. broken venv/lib -> missing) or leaf must refuse, not fall through.
+    dangling_lib = tmp_path / "dangling-lib"
+    dangling_lib.symlink_to(tmp_path / "missing-target")
+    with monkeypatch.context() as malformed_ctx:
+        malformed_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        malformed_ctx.setattr(
+            release_cut.sysconfig, "get_path",
+            lambda key: str(dangling_lib / "python3.14/site-packages") if key == "purelib" else None,
+        )
+        with pytest.raises(CutError, match="cannot resolve running interpreter purelib path"):
+            cut.publisher_invocation("pr-create")
+    with monkeypatch.context() as malformed_ctx:
+        malformed_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        malformed_ctx.setattr(release_cut.sysconfig, "get_path", lambda key: str(dangling_lib) if key == "platlib" else None)
+        with pytest.raises(CutError, match="cannot resolve running interpreter platlib path"):
+            cut.publisher_invocation("pr-create")
+    # Non-directory leaf or ancestor occupying purelib/platlib must refuse, while genuinely absent optional path passes.
+    file_site = tmp_path / "file-site"
+    file_site.write_text("not a dir\n", encoding="utf-8")
+    with monkeypatch.context() as malformed_ctx:
+        malformed_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        malformed_ctx.setattr(release_cut.sysconfig, "get_path", lambda key: str(file_site) if key == "purelib" else None)
+        with pytest.raises(CutError, match="running interpreter purelib path .* is not a directory"):
+            cut.publisher_invocation("pr-create")
+    with monkeypatch.context() as malformed_ctx:
+        malformed_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        malformed_ctx.setattr(
+            release_cut.sysconfig, "get_path",
+            lambda key: str(file_site / "site-packages") if key == "platlib" else None,
+        )
+        with pytest.raises(CutError, match="running interpreter platlib path .* has non-directory ancestor"):
+            cut.publisher_invocation("pr-create")
+    with monkeypatch.context() as absent_ctx:
+        absent_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        absent_ctx.setattr(
+            release_cut.sysconfig, "get_path",
+            lambda key: str(tmp_path / "absent-lib64/python3.14/site-packages") if key == "platlib" else None,
+        )
+        argv_absent, env_absent = cut.publisher_invocation("pr-create")
+        assert argv_absent[:4] == [installed, "-P", "-s", "-m"]
+        assert env_absent["PYTHONPATH"] == str(src_root.resolve())
     loop_pkg = tmp_path / "loop-pkg"
     loop_pkg.symlink_to(loop_pkg)
     with monkeypatch.context() as loop_ctx:

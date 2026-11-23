@@ -81,6 +81,12 @@ _RELEASE_INVENTORY = ("from importlib.resources import files; "
                       "print(files('lu_machinery').joinpath('agent_deploy/release.v1.json').read_text())")
 _NODE_SEAL = f"from pathlib import Path; import sys; {_ACPX}seal_node_dependencies as s; print(s(cache=Path(sys.argv[1])))"
 _SITE_PATHS = "import sysconfig; print(sysconfig.get_path('purelib')); print(sysconfig.get_path('platlib'))"
+_SOURCE_PUBLISHER_RUN = (
+    "import os, runpy, sys; "
+    "[os.environ.pop(k, None) for k in list(os.environ) if k.startswith('PYTHON')]; "
+    "sys.path.insert(0, sys.argv.pop(1)); "
+    "runpy.run_module('lu_machinery.publish', run_name='__main__', alter_sys=True)"
+)
 
 
 class CutError(Exception):
@@ -503,6 +509,45 @@ def adopt_manifest(text: str, release_base: str, version: str) -> tuple[str, str
 # --- Steps ------------------------------------------------------------------------------------
 
 
+def _resolve_site_root(key: str, raw: str) -> Path | None:
+    """Resolve one sysconfig site-packages path, returning None only when genuinely absent.
+
+    Fails closed with ``CutError`` on dangling symlinks (at the path or any ancestor), symlink loops,
+    permission errors, or non-directory ancestors or leaves.
+    """
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise CutError(f"running interpreter {key} path must be absolute: {raw!r}")
+    for ancestor in reversed(candidate.parents):
+        try:
+            os.lstat(ancestor)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise CutError(f"cannot inspect running interpreter {key} path {raw!r}: {exc}") from exc
+        try:
+            resolved_ancestor = ancestor.resolve(strict=True)
+            ancestor_stat = os.stat(resolved_ancestor)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise CutError(f"cannot resolve running interpreter {key} path {raw!r}: {exc}") from exc
+        if not stat.S_ISDIR(ancestor_stat.st_mode):
+            raise CutError(f"running interpreter {key} path {raw!r} has non-directory ancestor {ancestor}")
+    try:
+        os.lstat(candidate)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise CutError(f"cannot inspect running interpreter {key} path {raw!r}: {exc}") from exc
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved_stat = os.stat(resolved)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CutError(f"cannot resolve running interpreter {key} path {raw!r}: {exc}") from exc
+    if not stat.S_ISDIR(resolved_stat.st_mode):
+        raise CutError(f"running interpreter {key} path {raw!r} is not a directory")
+    return resolved
+
+
 def _running_publisher_base() -> tuple[list[str | Path], Path | None]:
     """Command prefix and optional PYTHONPATH for the lu_machinery package running this cut.
 
@@ -520,9 +565,10 @@ def _running_publisher_base() -> tuple[list[str | Path], Path | None]:
         raise CutError("cannot locate the running lu_machinery package for lu_machinery.publish")
     try:
         resolved_package = Path(package_file).resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
+        package_stat = os.stat(resolved_package)
+    except (OSError, RuntimeError, ValueError) as exc:
         raise CutError(f"cannot resolve running lu_machinery package {package_file!r}: {exc}") from exc
-    if resolved_package.parent.name != "lu_machinery":
+    if not stat.S_ISREG(package_stat.st_mode) or resolved_package.parent.name != "lu_machinery":
         raise CutError(f"unexpected lu_machinery package path: {resolved_package}")
     package_root = resolved_package.parents[1]
     site_roots: list[Path] = []
@@ -530,17 +576,9 @@ def _running_publisher_base() -> tuple[list[str | Path], Path | None]:
         raw = sysconfig.get_path(key)
         if not raw:
             continue
-        candidate = Path(raw)
-        try:
-            os.lstat(candidate)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            raise CutError(f"cannot inspect running interpreter {key} path {raw!r}: {exc}") from exc
-        try:
-            site_roots.append(candidate.resolve(strict=True))
-        except (OSError, RuntimeError) as exc:
-            raise CutError(f"cannot resolve running interpreter {key} path {raw!r}: {exc}") from exc
+        resolved = _resolve_site_root(key, raw)
+        if resolved is not None:
+            site_roots.append(resolved)
     if package_root in site_roots:
         return [python, "-I", "-m", "lu_machinery.publish"], None
     root_text = str(package_root)
@@ -1271,7 +1309,10 @@ class Cut:
             return None
         prefix = self._recovery_env_prefix()
         if "PYTHONPATH" in pub_env:
-            prefix += f" PYTHONPATH={shlex.quote(pub_env['PYTHONPATH'])}"
+            manual_argv: list[str | Path] = [
+                pub_argv[0], "-I", "-c", _SOURCE_PUBLISHER_RUN, pub_env["PYTHONPATH"], *argv,
+            ]
+            return f"{prefix} {shlex.join(str(part) for part in manual_argv)}"
         return f"{prefix} {shlex.join(str(part) for part in pub_argv)}"
 
     def clean_up(self, cause: str) -> str:
