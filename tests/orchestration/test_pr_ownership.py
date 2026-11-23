@@ -3,6 +3,7 @@
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -462,11 +463,13 @@ def test_unreadable_source_is_unknown_and_never_counts_toward_grace(tmp_path):
     unknown = own.custody_view(state)
     assert unknown["evidence"] == "unknown" and unknown["why"] == "RuntimeError"
     assert unknown["waiting_for_grace"] == [] and unknown["recorded_custody"] == []
-    # The clock restarts once the source is readable again: no alert at minute 60.
-    own.keeper_tick(now=at(60), observe=ownerless_now, **good)
-    assert own.keeper_tick(now=at(70), observe=ownerless_now, **good)[0][0].endswith("undelivered=0")
+    assert own.keeper_tick(now=at(9), observe=lambda h: pytest.fail("scan before cadence"), **good) == ([], False)
+    assert own.custody_view(own.load(path))["evidence"] == "unknown"
+    # The clock restarts once the source is readable again.
+    own.keeper_tick(now=at(10), observe=ownerless_now, **good)
+    assert own.keeper_tick(now=at(20), observe=ownerless_now, **good)[0][0].endswith("undelivered=0")
     assert inbox(tmp_path) == []
-    own.keeper_tick(now=at(75), observe=ownerless_now, **good)
+    own.keeper_tick(now=at(25), observe=ownerless_now, **good)
     assert len(inbox(tmp_path)) == 1
     # A raised alert survives an unknown tick.
     own.keeper_tick(now=at(80), observe=broken, **good)
@@ -483,11 +486,14 @@ def test_undelivered_alert_stays_in_the_outbox_and_is_resent_unchanged(tmp_path)
     lines, failed = own.keeper_tick(now=at(15), path=path, observe=observe, service_factory=down)
     assert failed and "undelivered=1" in lines[0]
     (entry,) = own.load(path)["outbox"]
-    # The owner reason changes before the retry; the frozen payload does not.
-    changed = lambda handoffs: ({KEY}, {KEY: own.Finding(REPO, 42, "codex/x", "new reason", "new")})  # noqa: E731
-    lines, failed = own.keeper_tick(now=at(16), path=path, observe=changed, service_factory=fleet(tmp_path))
+    tick = dict(path=path, observe=lambda h: pytest.fail("delivery retry read GitHub"))
+    assert own.keeper_tick(now=at(16), service_factory=down, **tick)[1] is True
+    lines, failed = own.keeper_tick(now=at(17), service_factory=fleet(tmp_path), **tick)
     assert not failed and "undelivered=0" in lines[0]
     assert [body for _, _, body in inbox(tmp_path)] == [entry["body"]]
+    assert own.load(path)["last_tick"] == {"at": at(15).isoformat(), "ok": True}
+    assert own.keeper_tick(now=at(19), service_factory=fleet(tmp_path), **tick) == ([], False)
+    assert "open=1" in own.keeper_tick(now=at(20), path=path, observe=observe, service_factory=fleet(tmp_path))[0][0]
 
 
 def test_delivered_but_unsaved_entry_is_a_noop_on_retry(tmp_path):
@@ -840,11 +846,22 @@ def test_keeper_keeps_its_queue_result_when_the_ownership_tick_raises(tmp_path, 
     assert "#42 enqueued" in capsys.readouterr().out
 
 
-def test_rate_limit_is_a_skip_for_the_ownership_tick(tmp_path):
-    from lu_machinery.common.github_client import GitHubRateLimited
+@pytest.mark.parametrize(("reason", "reset", "retry"), [
+    ("pool_exhausted", 60, 60),
+    ("retry_after", 20, 20),
+    ("retry_after", 7, 10),
+    ("secondary_hold", None, 10),
+])
+def test_head_rate_limit_delays_next_scan_without_ownerless_evidence(tmp_path, monkeypatch, reason, reset, retry):
+    from lu_machinery.common.github_client import Result
+
+    reset_at = int(at(reset).timestamp()) if reset is not None else None
+    refusal = Result(status=429, error="github_rate_limited", reset_at=reset_at, reason=reason)
+    monkeypatch.setattr(own.github_client, "run", lambda *a, **k: SimpleNamespace(returncode=75, github_result=refusal))
 
     def limited(handoffs):
-        raise GitHubRateLimited("2026-10-28T13:00:00Z")
+        own._with_head_commit(REPO, {"number": 42, "headRefOid": HEAD})
+        pytest.fail("rate limit was not propagated")
 
     path = tmp_path / "s.json"
     own.keeper_tick(now=at(0), path=path, observe=lambda h: ({KEY}, {KEY: ownerless()}),
@@ -854,6 +871,15 @@ def test_rate_limit_is_a_skip_for_the_ownership_tick(tmp_path):
     state = own.load(path)
     assert state["last_tick"]["ok"] is False  # queue-exit stays closed
     assert state["episodes"] == {}  # rate-limited time never counts toward grace
+    lines, failed = own.keeper_tick(now=at(retry) - timedelta(seconds=1), path=path,
+                                    observe=lambda h: pytest.fail("scan before retry deadline"),
+                                    service_factory=fleet(tmp_path))
+    assert (lines, failed) == ([], False)
+    assert own.custody_view(own.load(path))["evidence"] == "unknown"
+    lines, failed = own.keeper_tick(now=at(retry), path=path, observe=lambda h: ({KEY}, {KEY: ownerless()}),
+                                    service_factory=fleet(tmp_path))
+    assert not failed and "open=1" in lines[0]
+    assert own.load(path)["episodes"][KEY]["since"] == at(retry).isoformat()
 
 
 def test_retry_after_a_channel_context_change_reconciles_instead_of_stalling(tmp_path):

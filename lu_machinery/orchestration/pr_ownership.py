@@ -28,6 +28,8 @@ in the raw ledger and does not add a row. A missing tick, or a tick that names
 an ``error``, is ``evidence`` ``unknown`` even when a recorded decision owner
 remains. Neither custody form changes review, CI, enqueue or merge.
 
+Failed observations wait for the next scan interval or a later GitHub reset.
+The keeper can retry saved notices between scans using the outbox alone.
 State is one JSON file next to the shared dispatch task store, written under a lock.
 """
 
@@ -360,7 +362,7 @@ def load(path: Path) -> dict[str, Any]:
         last = data.get("last_tick")
         if last is not None:
             _at(last["at"])
-            if not isinstance(last.get("ok"), bool):
+            if not isinstance(last.get("ok"), bool) or type(last.get("reset_at", 0)) is not int:
                 raise TypeError("last_tick")
         if not isinstance(data.setdefault("history", []), list):
             raise TypeError("history")
@@ -744,6 +746,8 @@ def _with_head_commit(slug: str, pr: dict[str, Any]) -> dict[str, Any]:
         ["gh", "api", f"repos/{slug}/git/commits/{oid}"],
         capture_output=True, text=True, check=False, timeout=60,
     )
+    if (refusal := github_client.refusal_of(proc)) is not None:
+        raise refusal
     try:
         message = json_depth.loads(proc.stdout, max_depth=512).get("message") if proc.returncode == 0 else None
     except (ValueError, AttributeError):
@@ -875,7 +879,6 @@ def keeper_tick(
     service_factory: Callable[[], Any] = _default_service,
 ) -> tuple[list[str], bool]:
     """Run one throttled ownership check; returns (log lines, failed)."""
-    now = now or datetime.now(UTC)
     path = path or state_path()
     try:
         return _tick(now, path, observe, service_factory)
@@ -893,39 +896,64 @@ def _unknown_interval(data: dict[str, Any]) -> None:
         data["episodes"].pop(key)
 
 
+def _deliver_outbox(data: dict[str, Any], service_factory: Callable[[], Any]) -> list[str]:
+    outbox = data["outbox"]
+    if not outbox:
+        return []
+    try:
+        with service_factory() as service:
+            errors = deliver(outbox, service)
+    except Exception as exc:
+        errors = [f"CTO inbox unavailable: {type(exc).__name__}"]
+    last = data.get("last_tick")
+    if last and "error" not in last:
+        last["ok"] = not errors
+    return [f"pr ownership delivery FAILED: {error}" for error in errors]
+
+
 def _tick(now, path, observe, service_factory) -> tuple[list[str], bool]:
     with locked(path) as data:
-        last = data.get("last_tick") or {}
-        if last.get("ok") and now - _at(last["at"]) < TICK_INTERVAL:
-            return [], False
+        tick_at = now or datetime.now(UTC)
+        last = data.get("last_tick")
+        reset_at = last.get("reset_at") if last else None
+        if last and (
+            tick_at - _at(last["at"]) < TICK_INTERVAL
+            or (reset_at is not None and tick_at.timestamp() < reset_at)
+        ):
+            outbox = data["outbox"]
+            if not outbox:
+                return [], False
+            errors = _deliver_outbox(data, service_factory)
+            return [f"pr ownership: undelivered={len(outbox)}", *errors], bool(errors)
         try:
             keys, findings = observe(_handoff_map(data))
-        except GitHubRateLimited:
-            # The queue pass reports this as a skip; so does the ownership check.
-            _unknown_interval(data)
-            data["last_tick"] = {"at": now.isoformat(), "ok": False, "error": "GitHubRateLimited"}
-            return ["pr ownership: skipped (GitHub rate limited); raised alerts unchanged"], False
         except Exception as exc:  # any unreadable source is unknown
             _unknown_interval(data)
-            data["last_tick"] = {"at": now.isoformat(), "ok": False, "error": type(exc).__name__}
-            return [f"pr ownership: UNKNOWN ({type(exc).__name__}); raised alerts unchanged"], True
+            failed_at = now or datetime.now(UTC)
+            last = {"at": failed_at.isoformat(), "ok": False, "error": type(exc).__name__}
+            limited = isinstance(exc, GitHubRateLimited)
+            if limited and type(exc.reset_at) is int:
+                last["reset_at"] = exc.reset_at
+            data["last_tick"] = last
+            if data["outbox"]:
+                _save(path, data)  # keep the backoff if delivery is interrupted
+            errors = _deliver_outbox(data, service_factory)
+            reason = "skipped (GitHub rate limited); observation UNKNOWN" if limited else f"UNKNOWN ({type(exc).__name__})"
+            return [f"pr ownership: {reason}; raised alerts unchanged", *errors], not limited or bool(errors)
         findings = {
             key: finding for key, finding in findings.items()
             if not decision_custody(data["handoffs"].get(key))
             and not keeper_custody(data["handoffs"].get(key))
         }
-        notices = step(data, keys, findings, now)
-        seated = _heal_ownerless(data, findings, notices, now)
-        outbox = data.setdefault("outbox", [])
+        notices = step(data, keys, findings, tick_at)
+        seated = _heal_ownerless(data, findings, notices, tick_at)
+        outbox = data["outbox"]
         _reconcile_seated_outbox(outbox, set(seated))
         outbox.extend(outbox_entries(notices))
-        _save(path, data)  # the frozen payloads exist on disk before any delivery
-        try:
-            with service_factory() as service:
-                errors = deliver(outbox, service)
-        except Exception as exc:
-            errors = [f"CTO inbox unavailable: {type(exc).__name__}"]
-        data["last_tick"] = {"at": now.isoformat(), "ok": not errors}
+        data["last_tick"] = {"at": tick_at.isoformat(), "ok": not outbox}
+        if outbox:
+            _save(path, data)  # preserve the scan time and payloads before delivery
+        errors = _deliver_outbox(data, service_factory)
         unknown = sorted(key for key, finding in findings.items() if finding.unknown)
         outstanding = sorted(key for key, episode in data["episodes"].items() if episode["alerted_at"])
         lines = [
@@ -935,7 +963,7 @@ def _tick(now, path, observe, service_factory) -> tuple[list[str], bool]:
         ]
         lines += [f"pr ownership alert outstanding: {key}" for key in outstanding]
         lines += [f"pr ownership unknown: {key}" for key in unknown]
-        lines += [f"pr ownership delivery FAILED: {error}" for error in errors]
+        lines += errors
         return lines, bool(errors)
 
 
