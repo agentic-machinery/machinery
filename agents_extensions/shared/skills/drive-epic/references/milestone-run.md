@@ -71,22 +71,38 @@ Do these in order. Dispatch and land nothing until step 7 passes.
    identity (or approved first run), the previous run's reconciled child list, lane key, inbox slot,
    actor, worker cap, stop rule, stop-new-work time and hard deadline. A missing required field is
    `blocked`. The brief's `epic:<N>` must equal your record's stream: a mismatch or an unreadable
-   record is `blocked` before any inbox or milestone action. `/abs/path/.venv/bin/python` in this file
-   is the brief's interpreter.
+   record is `blocked` before any inbox or milestone action. The brief must also carry the line
+   "Association verified by the CTO for epic:<N>: lane <lane>, slot <slot>", with the same lane and
+   slot as its Lane key and Inbox slot fields; a missing or different line is `blocked`. Run
+   `/abs/path/.venv/bin/python -m lu_machinery.session_streams inventory`: its `records` must list
+   your stream as a `stream_id`, otherwise `blocked`. The lane and slot attestation is the CTO's;
+   the dispatcher-side check is **[after PR 3 lands]**. `/abs/path/.venv/bin/python` in this file
+   is the brief's interpreter; `dispatch <sub>` means `/abs/path/.venv/bin/python -m lu_machinery.dispatch <sub>`;
+   `lu-driver-state` is the host wrapper command.
 2. Probe `lu-driver-state render --help`. If it fails, it is `blocked`: report the exact command and
    error, dispatch nothing, and do not edit tracker state by hand.
 3. Read the previous note: `lu-driver-state show <id>`. It must exist, be a `handoff_note`, name
-   your lane and stream, and read in full. Then `lu-driver-state render --lane <lane>`: a newer
+   your lane, inbox slot and stream exactly as the brief does (a difference is `blocked`), and read
+   in full. Then `lu-driver-state render --lane <lane>`: a newer
    `handoff_note` the brief does not name means two predecessors, so it is `blocked`.
    `none` is allowed only when the brief says "first run approved by the CTO". Match the note's
    run identity to the brief. If the outcome is `done`, use the
    [reader check](#accepting-a-done-note) before you rely on it.
-4. Drain the stream inbox with the brief's slot, one message at a time: record the delivery ID in a
-   tracker item before you apply it (`applying <id>: <action>`), apply, mark that item `applied`, then
-   ack. Commands: the SKILL.md inbox drain, with the brief's interpreter in place of the relative
-   `.venv/bin/python` (an automatically created worktree has no `.venv`) and
+4. Drain the stream inbox with the brief's slot, one message at a time, keyed by delivery ID. Commands:
+   the SKILL.md inbox drain, with the brief's interpreter in place of the relative `.venv/bin/python`
+   (an automatically created worktree has no `.venv`) and
    `--recipient <slot> --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"` (a task-ID worker identity on a
-   stream slot is not yet proven by a canary run). The same interpreter runs `receive`, `ack` and `pending`.
+   stream slot is not yet proven by a canary run). The same interpreter runs `receive`, `ack` and
+   `pending`. Each delivery has at most one tracker item, with source `delivery:<id>`. Read it before
+   acting:
+
+   | Tracker item for this delivery ID | Do |
+   | --- | --- |
+   | none | New. If it is one of the `recorded` kinds below, write it that way and ack. Otherwise write the item as `applying <id>: <action>` before you act, act, mark it `applied`, then ack. |
+   | `recorded` | Only recorded, not applied (see below). Ack it; do not record it again. |
+   | `applying` | The crash fell inside the action. Read the live state the action changes: ack when that proves the effect, apply only the missing part when it proves none, otherwise `blocked` for the CTO to reconcile. |
+   | `applied` | Ack it. |
+
    - `receive` exit 1: no delivery. Exit 3 (typed error): `blocked`.
    - A `delivery-error` notice: report its delivery ID and reason, ack it, stop dependent work
      ([full-send](../../full-send/SKILL.md), "Ask the CTO and wait for the answer").
@@ -97,13 +113,10 @@ Do these in order. Dispatch and land nothing until step 7 passes.
      `probe: ok` and `count: 0`. A positive count with nothing claimable means no dependent work until
      the lease expires: end `handoff`, naming it. Any other answer (exit 3, `probe: unknown`, a null
      count) is `blocked`.
-   - A message that widens the brief or changes the stop rule is recorded, not applied: stop new work on
-     that scope and ask once in your report. A message that orders a dispatch or a landing is recorded
-     as a `next_action` tracker item and acked; it runs only after step 7 passes.
-   - A delivery already in the tracker is not repeated blindly: `applied` means ack it. `applying` without
-     `applied` means the crash fell inside the action, so read the live state the action changes. Ack
-     only when that read proves the action took effect, or apply only the missing part when it proves
-     none did. Any other result is `blocked` for the CTO to reconcile.
+   - A message that widens the brief or changes the stop rule is `recorded`, not applied: stop new work on
+     that scope and ask once in your report. So is any message that orders an action beyond reading or
+     recording (a dispatch, landing, cancel, grant or issue or PR edit): write it as a `next_action`
+     item, ack it, and run it only after step 7 passes. Running it later closes that same item.
 5. Read live state, every item from tool output this turn: the milestone issue and its checklist;
    each PR in the note (`gh pr view`: state, head, merge commit; recorded verdict and its head;
    same-head `CI Gate`; queue status per [review-merge-cleanup](review-merge-cleanup.md)); every
@@ -120,15 +133,16 @@ Do these in order. Dispatch and land nothing until step 7 passes.
 7. The brief must carry the CTO's reconciled child list for the previous run: every child ID and
    full nonce, or "none, checked". The note alone is not enough: a run killed after a dispatch and
    before its tracker item leaves a child the note lacks. No such list, or "unknown", is `blocked`.
-   Every child the previous note names as not settled must also appear in the list, including children
-   it inherited from an earlier run; a note child the list omits is `blocked`. Check each listed child
-   with `dispatch status`: every child needs a successful read with the same ID and the same full
-   nonce, or the run is `blocked` (an unreadable or mismatched child is unresolved, never assumed
-   finished). Each child's record must also name the previous run as `parent_task_id` and its full
-   nonce as `parent_run_nonce`, unless the previous note carries that child as inherited: an unrelated
-   record in the list is not custody of the previous run, so the list is `blocked`. Whether the list
-   is complete is the CTO's reconciliation; a run cannot enumerate tasks it was not given. A child
-   still live is not duplicated: wait for it; it counts against the worker cap.
+   Every child the previous note names as not settled must also appear in the list, including
+   children inherited from an earlier run; a note child the list omits is `blocked`. Check each listed
+   child with `dispatch status`: every child needs a successful read with the same ID and the same
+   full nonce, or the run is `blocked` (an unreadable or mismatched child is unresolved, never assumed
+   finished). The record's `parent_task_id`, `parent_run_nonce` and `parent_stream` are the child's
+   origin. They must equal the origin the previous note records for that child, and the origin stream
+   must be yours. A child the note does not carry must show the previous run as its origin. A missing,
+   conflicting or foreign origin makes the list `blocked`. Whether the list is complete is the CTO's
+   reconciliation; a run cannot enumerate tasks it was not given. A child still live is not
+   duplicated: wait for it; it counts against the worker cap.
 
 ## 2. During the run
 
@@ -208,10 +222,11 @@ Order matters, because the dispatcher checks only the receipt's shape today.
    - `blocked`: it cannot continue without a decision, grant, outage end or cap ruling.
    - `handoff`: work remains and nothing blocks it (deadline or context).
 
-   Then: time (`date -u`), lane and stream (the verified `epic:<N>`), run task ID and full nonce,
-   previous note ID, per criterion its state and
-   evidence, every child (ID, full nonce, status), PR heads with review and CI, applied delivery
-   IDs, residual with owner, resume condition, next actions, and the one question for the CTO if
+   Then: time (`date -u`), lane, inbox slot and stream (the verified `epic:<N>`; after a stream
+   mismatch, the brief's stream and the record's stream both), run task ID and full nonce, previous
+   note ID, per criterion its state and evidence, every child (ID, full nonce, status and origin:
+   `parent_task_id`, `parent_run_nonce`, `parent_stream` from its record), PR heads with review and
+   CI, applied and recorded delivery IDs, residual with owner, resume condition, next actions, and the one question for the CTO if
    there is one. If the note is wrong afterwards, add to it with `lu-driver-state note <id>`; never
    write a second note.
    If the read-back or receipt fails after the note says `done`, add
@@ -270,11 +285,13 @@ your note and do not try to fix them.
 | A PR is mid-landing when you must end | If its worker owns it, leave it. If you landed it, finish: confirm `MERGED`. Otherwise name the PR, head and gates in the note and let the CTO assign custody (`pr_ownership`); never leave an unowned PR unnamed. |
 | Mail arrives between runs | The next run drains it at cold start. Brief children to reply to the CTO or the slot, never to your task ID. |
 | Mail arrives that conflicts with the brief | Record it, do not widen scope, end `handoff` or `blocked` and ask once. |
-| You applied a message and were killed before the ack | The successor has another worker ID, so its receive returns the delivery only after the lease expires. Use the `pending` count (cold start, step 4). When it returns, read its delivery ID in the tracker: `applied` means ack; `applying` without `applied` means read the live state first (cold start, step 4); never repeat the action blindly. |
+| You applied a message and were killed before the ack | The successor has another worker ID, so its receive returns the delivery only after the lease expires. Use the `pending` count (cold start, step 4). When it returns, apply the delivery-state table (cold start, step 4); never repeat an action blindly. |
 | A healthy child is quiet while you wait | [The wait loop](#the-wait-loop) covers it. |
 | The receipt is refused or the note is incomplete | One note only; fix it with `lu-driver-state note`. Do not invent a second ID. Report `blocked`. |
 
-**The CTO's side** (not run steps; **[after PR 3 lands]** unless noted): settlement flags a live child
+**The CTO's side** (not run steps; **[after PR 3 lands]** unless noted): the lane and slot attestation
+in the brief (a wrong attestation on a first run is the CTO's to answer for, and the dispatcher check
+is **[after PR 3 lands]**); settlement flags a live child
 and the next run is held until custody is reconciled; the held-stream alert and recovery runbook;
 the CTO startup reads every `turn-*` task; the practice-stream mail check across
 slots; per-stream and fleet caps on runs.
@@ -287,6 +304,7 @@ The CTO fills every field. A run treats an empty field as `blocked`.
 MILESTONE RUN <stream> <milestone issue>
 Mode: milestone run (drive-epic references/milestone-run.md). Not a lane driver.
 Stream epic: #<N> (--stream epic:<N>)      Lane key: <lane>      Inbox slot: <slot>
+Association verified by the CTO for epic:<N>: lane <lane>, slot <slot>
 Interpreter: <absolute path of the project's .venv/bin/python>
 Milestone issue: #<M>, acceptance-criteria ledger hash <sha256>
 Previous note ID: <id> | none (first run approved by the CTO)
