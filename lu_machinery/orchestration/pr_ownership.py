@@ -931,15 +931,19 @@ def _tick(now, path, observe, service_factory) -> tuple[list[str], bool]:
             _unknown_interval(data)
             failed_at = now or datetime.now(UTC)
             last = {"at": failed_at.isoformat(), "ok": False, "error": type(exc).__name__}
-            limited = isinstance(exc, GitHubRateLimited)
-            if limited and type(exc.reset_at) is int:
-                last["reset_at"] = exc.reset_at
+            if isinstance(exc, GitHubRateLimited):
+                if type(exc.reset_at) is int:
+                    last["reset_at"] = exc.reset_at
+                reason = "skipped (GitHub rate limited); observation UNKNOWN"
+                failed = False
+            else:
+                reason = f"UNKNOWN ({type(exc).__name__})"
+                failed = True
             data["last_tick"] = last
             if data["outbox"]:
                 _save(path, data)  # keep the backoff if delivery is interrupted
             errors = _deliver_outbox(data, service_factory)
-            reason = "skipped (GitHub rate limited); observation UNKNOWN" if limited else f"UNKNOWN ({type(exc).__name__})"
-            return [f"pr ownership: {reason}; raised alerts unchanged", *errors], not limited or bool(errors)
+            return [f"pr ownership: {reason}; raised alerts unchanged", *errors], failed or bool(errors)
         findings = {
             key: finding for key, finding in findings.items()
             if not decision_custody(data["handoffs"].get(key))
