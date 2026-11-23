@@ -1386,6 +1386,69 @@ def test_scripts_relocation_follows_the_reviewed_repository(repository, relocate
 
 
 @pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "origin,flag,relocated",
+    [
+        # Owned-path-only preview: the explicit repository decides; none keeps the legacy relocation.
+        (None, "kube-dojo/kube-dojo.github.io", False),
+        (None, "learn-ukrainian/machinery", True),
+        (None, None, True),
+        # Local-target preview: the checkout's origin decides when no repository is passed.
+        ("https://github.com/kube-dojo/kube-dojo.github.io.git", None, False),
+        ("https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", None, True),
+        ("https://example.invalid/not-github.git", None, True),
+    ],
+)
+def test_reviewer_preview_without_branch_facts_judges_scripts_paths_by_repository(
+    tmp_path, capsys, monkeypatch, origin, flag, relocated
+):
+    """Defect class: a resolve-reviewer preview without branch facts dropped the reviewed repository."""
+    import os
+    import subprocess
+
+    from lu_machinery.review import closeout_cli
+
+    state = tmp_path / "state.json"
+    if origin is not None:
+        for key in list(os.environ):
+            if key.startswith("GIT_"):
+                monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        for argv in (
+            ["init", "-q", "-b", "main"],
+            ["config", "user.email", "test@example.invalid"],
+            ["config", "user.name", "test"],
+            ["remote", "add", "origin", origin],
+            ["commit", "-q", "--allow-empty", "-m", "base"],
+        ):
+            subprocess.run(["git", "-C", str(checkout), *argv], check=True)
+        (checkout / "note.md").write_text("local change\n", encoding="utf-8")
+        assert closeout_cli.main(["--state-file", str(state), "target", "--mode", "local", "--repo-root", str(checkout)]) == 0
+        capsys.readouterr()
+    snapshot = tmp_path / "routing.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    argv = ["--state-file", str(state), "resolve-reviewer", "--author-model", "claude-opus-5-5",
+            "--review-profile", "infra", "--domain", "infra", "--risk", "critical",
+            "--routing-snapshot-file", str(snapshot)]
+    for path in _FORKED_ADAPTERS:
+        argv += ["--owned-path", path]
+    if flag is not None:
+        argv += ["--repository", flag]
+    code = closeout_cli.main(argv)
+    payload = json.loads(capsys.readouterr().out)
+    governed = [entry["name"] for entry in payload["trace"] if "subject exclusion" in (entry.get("reason") or "")]
+    if relocated:
+        assert code == 1 and payload["selected"] is None
+        assert "openai_frontier" in governed
+    else:
+        assert code == 0 and payload["selected"]["family"] != "anthropic"
+        assert governed == []
+
+
+@pytest.mark.usefixtures('configured_roots')
 def test_resolve_reviewer_without_subject_information_matches_empty_subject_fields():
     """AC-02: explicit empty subject inputs do not change the trace."""
     authors = (
