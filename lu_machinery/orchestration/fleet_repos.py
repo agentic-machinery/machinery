@@ -53,8 +53,20 @@ _GITHUB_ORIGIN_RE = re.compile(
     r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}?)(?:\.git)?$"
 )
 _GIT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
-_GIT_SECTION_NAME_RE = re.compile(r"^[A-Za-z0-9-]+$")
+_GIT_SECTION_CHAR_RE = re.compile(r"^[A-Za-z0-9-]$")
+_GIT_LEGACY_SUB_CHAR_RE = re.compile(r"^[A-Za-z0-9.-]$")
+_GIT_KEY_CHAR_RE = re.compile(r"^[A-Za-z0-9-]$")
+_GIT_TRUE_VALUES = frozenset({"true", "yes", "on", "1"})
 _GIT_FALSE_VALUES = frozenset({"false", "no", "off", "0", ""})
+
+
+def _is_learn_ukrainian_entry(key: str, github: str, alternate_github: str | None) -> bool:
+    """True when a catalog row is the reserved ``public`` key or carries the Learn Ukrainian slug."""
+    return (
+        key.casefold() == "public"
+        or github.casefold() == _LEARN_UKRAINIAN_SLUG
+        or (isinstance(alternate_github, str) and alternate_github.casefold() == _LEARN_UKRAINIAN_SLUG)
+    )
 
 
 def _validate_repo_relpath(key: str, field: str, value: Any) -> str:
@@ -193,9 +205,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
                 raise FleetRepoError(
                     f"fleet_repos[{key!r}] with alternate_github requires repository_id and visibility"
                 )
-        if github.casefold() == _LEARN_UKRAINIAN_SLUG or (
-            isinstance(alternate_github, str) and alternate_github.casefold() == _LEARN_UKRAINIAN_SLUG
-        ):
+        if _is_learn_ukrainian_entry(key, github, alternate_github):
             if sources_server is None:
                 raise FleetRepoError(f"fleet_repos[{key!r}].sources_server is required for Learn Ukrainian")
             if admission_policy is None:
@@ -629,185 +639,226 @@ def _read_bounded_regular_utf8(path: Path, max_bytes: int) -> str | None:
         return None
 
 
-def _parse_git_section_header(line: str) -> tuple[str, str | None] | None:
-    """Parse one Git config ``[section]``, ``[section "sub"]``, or legacy ``[section.sub]`` header.
-
-    Returns ``(lowered_section, subsection_or_None)``, or ``None`` for any malformed header.
-    """
-    if not line.startswith("["):
+def _read_single_line_metadata_file(path: Path) -> str | None:
+    """Read a bounded regular UTF-8 single-line Git metadata file (no leading/trailing blank lines)."""
+    raw = _read_bounded_regular_utf8(path, _MAX_GITFILE_BYTES)
+    if raw is None:
         return None
-    index = 1
-    length = len(line)
-    while index < length and line[index] in " \t":
-        index += 1
-    start = index
-    while index < length and line[index] not in ' \t."]':
-        index += 1
-    section = line[start:index]
-    if not section or _GIT_SECTION_NAME_RE.fullmatch(section) is None:
-        return None
-    lowered_section = section.lower()
-
-    subsection: str | None = None
-    if index < length and line[index] == ".":
-        # Legacy Git syntax: [section.subsection] (subsection is lowercased per git-config(1)).
-        index += 1
-        sub_start = index
-        while index < length and line[index] != "]":
-            index += 1
-        raw_sub = line[sub_start:index]
-        if not raw_sub or any(ch in " \t" for ch in raw_sub):
-            return None
-        subsection = raw_sub.lower()
+    if raw.endswith("\r\n"):
+        line = raw[:-2]
+    elif raw.endswith("\n"):
+        line = raw[:-1]
     else:
-        ws_start = index
-        while index < length and line[index] in " \t":
-            index += 1
-        if index < length and line[index] == '"':
-            if index == ws_start:
-                return None
-            index += 1
-            chars: list[str] = []
-            closed = False
-            while index < length:
-                ch = line[index]
-                if ch == "\\":
-                    if index + 1 >= length:
-                        return None
-                    chars.append(line[index + 1])
-                    index += 2
-                elif ch == '"':
-                    closed = True
-                    index += 1
-                    break
-                else:
-                    chars.append(ch)
-                    index += 1
-            if not closed:
-                return None
-            subsection = "".join(chars)
-            while index < length and line[index] in " \t":
-                index += 1
-
-    if index >= length or line[index] != "]":
+        line = raw
+    if not line or "\n" in line or "\r" in line:
         return None
-    tail = line[index + 1 :].strip()
-    if tail and not tail.startswith(("#", ";")):
+    if any(unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for ch in line):
         return None
-    return lowered_section, subsection
+    return line
 
 
-def _parse_git_value(raw: str) -> str | None:
-    """Parse one Git config right-hand value (quotes, escapes, inline comments), or ``None`` if invalid."""
-    chars: list[str] = []
-    in_quotes = False
-    index = 0
-    length = len(raw)
-    while index < length:
-        ch = raw[index]
-        if ch == "\\":
-            if index + 1 >= length:
-                return None
-            nxt = raw[index + 1]
-            if nxt == "n":
-                chars.append("\n")
-            elif nxt == "t":
-                chars.append("\t")
-            elif nxt == "b":
-                chars.append("\b")
-            elif nxt in ('"', "\\"):
-                chars.append(nxt)
-            else:
-                return None
-            index += 2
-        elif ch == '"':
-            in_quotes = not in_quotes
-            index += 1
-        elif not in_quotes and ch in ("#", ";"):
-            break
-        else:
-            chars.append(ch)
-            index += 1
-    if in_quotes:
-        return None
-    return "".join(chars).strip()
+def _parse_git_config_text(text: str) -> tuple[list[str], bool, bool] | None:
+    """Strictly parse Git config text using ``git/config.c`` lexical rules.
 
-
-def _unfold_git_config_lines(text: str) -> list[str] | None:
-    """Join Git backslash-continued lines; refuse dangling EOF continuation."""
+    Returns ``(origin_urls, unsafe_directives, worktree_config_enabled)`` or ``None`` for any
+    syntactically invalid or ambiguous input. Comments run to newline (backslashes inside comments
+    never fold the next line), section headers reject leading/trailing bracket padding, and quoted
+    whitespace in values is preserved verbatim.
+    """
     if text.startswith("\ufeff"):
         text = text[1:]
-    logical: list[str] = []
-    pending = ""
-    for raw_line in text.splitlines():
-        combined = pending + raw_line
-        # Count trailing backslashes: an odd count continues onto the next line.
-        trailing = len(combined) - len(combined.rstrip("\\"))
-        if trailing % 2 == 1:
-            pending = combined[:-1]
-        else:
-            logical.append(combined)
-            pending = ""
-    if pending:
-        return None
-    return logical
-
-
-def _parse_single_git_config(path: Path) -> tuple[list[str], bool, bool] | None:
-    """Strictly parse one Git config file.
-
-    Returns ``(origin_urls, unsafe_directives, worktree_config_enabled)`` or ``None`` if missing,
-    unreadable, or syntactically invalid.
-    """
-    text = _read_bounded_regular_utf8(path, _MAX_GIT_CONFIG_BYTES)
-    if text is None:
-        return None
-    lines = _unfold_git_config_lines(text)
-    if lines is None:
+    text = text.replace("\r\n", "\n")
+    if "\r" in text:
         return None
 
+    length = len(text)
+    index = 0
     section: str | None = None
     subsection: str | None = None
     unsafe = False
     worktree_config = False
     urls: list[str] = []
 
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith(("#", ";")):
+    while index < length:
+        while index < length and text[index] in " \t\n":
+            index += 1
+        if index >= length:
+            break
+
+        ch = text[index]
+        if ch in ("#", ";"):
+            while index < length and text[index] != "\n":
+                index += 1
+            if index < length:
+                index += 1
             continue
-        if line.startswith("["):
-            parsed_sec = _parse_git_section_header(line)
-            if parsed_sec is None:
+
+        if ch == "[":
+            index += 1
+            sec_start = index
+            while index < length and _GIT_SECTION_CHAR_RE.fullmatch(text[index]) is not None:
+                index += 1
+            if index == sec_start or index >= length:
                 return None
-            section, subsection = parsed_sec
+            section = text[sec_start:index].lower()
+            delim = text[index]
+            if delim == "]":
+                subsection = None
+                index += 1
+            elif delim == ".":
+                index += 1
+                sub_start = index
+                while index < length and _GIT_LEGACY_SUB_CHAR_RE.fullmatch(text[index]) is not None:
+                    index += 1
+                if index == sub_start or index >= length or text[index] != "]":
+                    return None
+                subsection = text[sub_start:index].lower()
+                index += 1
+            elif delim in " \t":
+                while index < length and text[index] in " \t":
+                    index += 1
+                if index >= length or text[index] != '"':
+                    return None
+                index += 1
+                sub_chars: list[str] = []
+                closed = False
+                while index < length:
+                    sub_ch = text[index]
+                    if sub_ch == "\n":
+                        return None
+                    if sub_ch == "\\":
+                        index += 1
+                        if index >= length or text[index] == "\n":
+                            return None
+                        sub_chars.append(text[index])
+                        index += 1
+                    elif sub_ch == '"':
+                        closed = True
+                        index += 1
+                        break
+                    else:
+                        sub_chars.append(sub_ch)
+                        index += 1
+                if not closed or index >= length or text[index] != "]":
+                    return None
+                subsection = "".join(sub_chars)
+                index += 1
+            else:
+                return None
             if section in ("include", "includeif", "url"):
                 unsafe = True
             continue
+
         if section is None:
             return None
-        if "=" in line:
-            raw_key, raw_val = line.split("=", 1)
-            key = raw_key.strip().lower()
-            if _GIT_KEY_RE.fullmatch(key) is None:
-                return None
-            val = _parse_git_value(raw_val)
-            if val is None:
-                return None
-        else:
-            key = line.split("#", 1)[0].split(";", 1)[0].strip().lower()
-            if _GIT_KEY_RE.fullmatch(key) is None:
-                return None
+        if not (("a" <= ch <= "z") or ("A" <= ch <= "Z")):
+            return None
+        key_start = index
+        while index < length and _GIT_KEY_CHAR_RE.fullmatch(text[index]) is not None:
+            index += 1
+        key = text[key_start:index].lower()
+        while index < length and text[index] in " \t":
+            index += 1
+
+        if index >= length or text[index] == "\n":
             val = "true"
+            if index < length:
+                index += 1
+        elif text[index] in ("#", ";"):
+            val = "true"
+            while index < length and text[index] != "\n":
+                index += 1
+            if index < length:
+                index += 1
+        elif text[index] == "=":
+            index += 1
+            while index < length and text[index] in " \t":
+                index += 1
+            in_quotes = False
+            chars: list[str] = []
+            pending_ws: list[str] = []
+            while index < length:
+                c = text[index]
+                if c == "\n":
+                    if in_quotes:
+                        return None
+                    index += 1
+                    break
+                if c == "\\":
+                    index += 1
+                    if index >= length:
+                        return None
+                    nxt = text[index]
+                    if nxt == "\n":
+                        index += 1
+                        continue
+                    if pending_ws:
+                        chars.extend(pending_ws)
+                        pending_ws.clear()
+                    if nxt == "n":
+                        chars.append("\n")
+                    elif nxt == "t":
+                        chars.append("\t")
+                    elif nxt == "b":
+                        chars.append("\b")
+                    elif nxt in ('"', "\\"):
+                        chars.append(nxt)
+                    else:
+                        return None
+                    index += 1
+                elif c == '"':
+                    if not in_quotes and pending_ws:
+                        chars.extend(pending_ws)
+                        pending_ws.clear()
+                    in_quotes = not in_quotes
+                    index += 1
+                elif in_quotes:
+                    chars.append(c)
+                    index += 1
+                elif c in ("#", ";"):
+                    while index < length and text[index] != "\n":
+                        index += 1
+                    if index < length:
+                        index += 1
+                    break
+                elif c in (" ", "\t"):
+                    if chars:
+                        pending_ws.append(c)
+                    index += 1
+                else:
+                    if pending_ws:
+                        chars.extend(pending_ws)
+                        pending_ws.clear()
+                    chars.append(c)
+                    index += 1
+            if in_quotes:
+                return None
+            val = "".join(chars)
+        else:
+            return None
 
         if key in ("insteadof", "pushinsteadof"):
             unsafe = True
         if section == "extensions" and key == "worktreeconfig":
-            worktree_config = val.lower() not in _GIT_FALSE_VALUES
+            lowered_val = val.lower()
+            if lowered_val in _GIT_TRUE_VALUES:
+                worktree_config = True
+            elif lowered_val in _GIT_FALSE_VALUES:
+                worktree_config = False
+            else:
+                return None
         elif section == "remote" and subsection == "origin" and key == "url":
             urls.append(val)
 
     return urls, unsafe, worktree_config
+
+
+def _parse_single_git_config(path: Path) -> tuple[list[str], bool, bool] | None:
+    """Strictly parse one bounded regular Git config file, or ``None`` if missing/invalid."""
+    text = _read_bounded_regular_utf8(path, _MAX_GIT_CONFIG_BYTES)
+    if text is None:
+        return None
+    return _parse_git_config_text(text)
 
 
 def _read_origin_urls(git_dir: Path, worktree_gitdir: Path | None = None) -> tuple[list[str], bool] | None:
@@ -840,16 +891,26 @@ def _read_origin_urls(git_dir: Path, worktree_gitdir: Path | None = None) -> tup
     return urls, unsafe
 
 
+def _has_no_commondir_redirect(git_dir: Path) -> bool:
+    """True only when ``git_dir / 'commondir'`` is absent (``ENOENT``); any file, link, or error refuses."""
+    try:
+        os.lstat(git_dir / "commondir")
+    except OSError as exc:
+        return exc.errno == errno.ENOENT
+    return False
+
+
 def _resolve_verified_git_metadata(resolved_root: Path) -> tuple[Path, Path | None, Path | None] | None:
     """Verify ``resolved_root/.git`` and return ``(primary, common_git_dir, worktree_gitdir)``.
 
     - No ``.git`` entry (``ENOENT``): returns ``(resolved_root, None, None)``.
-    - Real ``.git`` directory: returns ``(resolved_root, resolved_root / '.git', None)``.
-    - Regular ``.git`` gitfile: validates bounded UTF-8 ``gitdir:`` pointing to an existing real
-      ``<primary>/.git/worktrees/<name>`` directory whose ``gitdir`` back-pointer resolves back
-      to ``resolved_root / '.git'`` and whose ``commondir`` resolves to ``<primary>/.git``.
-    - Any symlink, missing/forged back-pointer, unreadable, oversized, or malformed metadata
-      returns ``None`` (fail closed).
+    - Real ``.git`` directory with no ``commondir`` redirect: returns ``(resolved_root, root/.git, None)``.
+    - Regular ``.git`` gitfile: requires a single-line ``gitdir:`` header at byte 0, verifies the
+      worktree admin directory, ``worktrees``, and ``.git`` directories with ``lstat`` before
+      following symlinks, checks that ``<primary>/.git`` has no ``commondir`` redirect, and
+      verifies the ``commondir`` and ``gitdir`` back-pointers.
+    - Any symlink, missing/forged back-pointer, redirect, unreadable, oversized, or malformed
+      metadata returns ``None`` (fail closed).
     """
     root_git = resolved_root / ".git"
     try:
@@ -862,63 +923,118 @@ def _resolve_verified_git_metadata(resolved_root: Path) -> tuple[Path, Path | No
     if stat.S_ISLNK(root_git_stat.st_mode):
         return None
     if stat.S_ISDIR(root_git_stat.st_mode):
+        if not _has_no_commondir_redirect(root_git):
+            return None
         return resolved_root, root_git, None
     if not stat.S_ISREG(root_git_stat.st_mode):
         return None
 
-    gitfile_text = _read_bounded_regular_utf8(root_git, _MAX_GITFILE_BYTES)
-    if gitfile_text is None:
+    gitfile_line = _read_single_line_metadata_file(root_git)
+    if gitfile_line is None or not gitfile_line.startswith("gitdir:"):
         return None
-    non_empty = [line for line in gitfile_text.splitlines() if line.strip()]
-    if len(non_empty) != 1 or not non_empty[0].startswith("gitdir:"):
+    raw_gitdir = gitfile_line[len("gitdir:") :].lstrip(" ")
+    if not raw_gitdir or raw_gitdir.endswith("/"):
         return None
-    raw_gitdir = non_empty[0][len("gitdir:") :].strip()
-    if not raw_gitdir or any(unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for ch in raw_gitdir):
+    if os.path.isabs(raw_gitdir) and ".." in Path(raw_gitdir).parts:
         return None
     candidate_gitdir = Path(raw_gitdir) if os.path.isabs(raw_gitdir) else (resolved_root / raw_gitdir)
+    norm_gitdir = Path(os.path.normpath(str(candidate_gitdir)))
+    if (
+        norm_gitdir.name in ("", ".", "..")
+        or norm_gitdir.parent.name != "worktrees"
+        or norm_gitdir.parent.parent.name != ".git"
+    ):
+        return None
+
+    # Verify the metadata directories with lstat before following symlinks.
     try:
-        wt_gitdir = resolve_path(candidate_gitdir, strict=True)
-        wt_stat = os.lstat(wt_gitdir)
-    except (OSError, RuntimeError, ValueError):
-        return None
-    if not stat.S_ISDIR(wt_stat.st_mode):
-        return None
-    if wt_gitdir.parent.name != "worktrees" or wt_gitdir.parent.parent.name != ".git":
-        return None
-    common_git_dir = wt_gitdir.parent.parent
-    try:
-        common_stat = os.lstat(common_git_dir)
+        cand_stat = os.lstat(candidate_gitdir)
+        norm_wt_stat = os.lstat(norm_gitdir)
+        norm_wts_stat = os.lstat(norm_gitdir.parent)
+        norm_common_stat = os.lstat(norm_gitdir.parent.parent)
     except OSError:
         return None
-    if not stat.S_ISDIR(common_stat.st_mode):
+    if not (
+        stat.S_ISDIR(cand_stat.st_mode)
+        and stat.S_ISDIR(norm_wt_stat.st_mode)
+        and stat.S_ISDIR(norm_wts_stat.st_mode)
+        and stat.S_ISDIR(norm_common_stat.st_mode)
+        and (cand_stat.st_dev, cand_stat.st_ino) == (norm_wt_stat.st_dev, norm_wt_stat.st_ino)
+    ):
+        return None
+
+    try:
+        primary = resolve_path(norm_gitdir.parent.parent.parent, strict=True)
+        resolved_cand = resolve_path(candidate_gitdir, strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    common_git_dir = primary / ".git"
+    wt_gitdir = common_git_dir / "worktrees" / norm_gitdir.name
+    if resolved_cand != wt_gitdir or not primary.is_dir():
+        return None
+    try:
+        common_stat = os.lstat(common_git_dir)
+        wts_stat = os.lstat(common_git_dir / "worktrees")
+        wt_stat = os.lstat(wt_gitdir)
+    except OSError:
+        return None
+    if not (
+        stat.S_ISDIR(common_stat.st_mode)
+        and stat.S_ISDIR(wts_stat.st_mode)
+        and stat.S_ISDIR(wt_stat.st_mode)
+        and (common_stat.st_dev, common_stat.st_ino) == (norm_common_stat.st_dev, norm_common_stat.st_ino)
+        and (wts_stat.st_dev, wts_stat.st_ino) == (norm_wts_stat.st_dev, norm_wts_stat.st_ino)
+        and (wt_stat.st_dev, wt_stat.st_ino) == (cand_stat.st_dev, cand_stat.st_ino)
+    ):
+        return None
+    if not _has_no_commondir_redirect(common_git_dir):
         return None
 
     # Verify the worktree admin entry's commondir points to common_git_dir and its gitdir points back here.
-    commondir_text = _read_bounded_regular_utf8(wt_gitdir / "commondir", _MAX_GITFILE_BYTES)
-    backptr_text = _read_bounded_regular_utf8(wt_gitdir / "gitdir", _MAX_GITFILE_BYTES)
-    if commondir_text is None or backptr_text is None:
+    commondir_line = _read_single_line_metadata_file(wt_gitdir / "commondir")
+    backptr_line = _read_single_line_metadata_file(wt_gitdir / "gitdir")
+    if commondir_line is None or backptr_line is None:
         return None
-    commondir_lines = [line.strip() for line in commondir_text.splitlines() if line.strip()]
-    backptr_lines = [line.strip() for line in backptr_text.splitlines() if line.strip()]
-    if len(commondir_lines) != 1 or len(backptr_lines) != 1:
+    commondir_target = Path(commondir_line) if os.path.isabs(commondir_line) else (wt_gitdir / commondir_line)
+    raw_backptr = Path(backptr_line) if os.path.isabs(backptr_line) else (wt_gitdir / backptr_line)
+    if raw_backptr.name != ".git":
         return None
     try:
-        resolved_common = resolve_path(
-            Path(commondir_lines[0]) if os.path.isabs(commondir_lines[0]) else (wt_gitdir / commondir_lines[0]),
-            strict=True,
-        )
-        raw_backptr = Path(backptr_lines[0]) if os.path.isabs(backptr_lines[0]) else (wt_gitdir / backptr_lines[0])
+        commondir_stat = os.lstat(commondir_target)
+        backptr_stat = os.lstat(raw_backptr)
+        resolved_common = resolve_path(commondir_target, strict=True)
         resolved_backptr_parent = resolve_path(raw_backptr.parent, strict=True)
-        primary = resolve_path(common_git_dir.parent, strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
-    if resolved_common != common_git_dir:
+    if (
+        not stat.S_ISDIR(commondir_stat.st_mode)
+        or (commondir_stat.st_dev, commondir_stat.st_ino) != (common_stat.st_dev, common_stat.st_ino)
+        or resolved_common != common_git_dir
+    ):
         return None
-    if raw_backptr.name != ".git" or resolved_backptr_parent != resolved_root:
-        return None
-    if not primary.is_dir():
+    if (
+        not stat.S_ISREG(backptr_stat.st_mode)
+        or (backptr_stat.st_dev, backptr_stat.st_ino) != (root_git_stat.st_dev, root_git_stat.st_ino)
+        or resolved_backptr_parent != resolved_root
+    ):
         return None
     return primary, common_git_dir, wt_gitdir
+
+
+def _learn_ukrainian_row(catalog: Mapping[str, FleetRepo]) -> FleetRepo | None:
+    """Return the verified Learn Ukrainian catalog row, or ``None`` if absent or inconsistent."""
+    slug_matches = [
+        row for row in catalog.values() if any(s.casefold() == _LEARN_UKRAINIAN_SLUG for s in row.slugs)
+    ]
+    if len(slug_matches) != 1:
+        return None
+    lu_row = slug_matches[0]
+    for key, row in catalog.items():
+        if key.casefold() == "public" and row is not lu_row:
+            return None
+    if lu_row.sources_server is None or lu_row.admission_policy is None:
+        return None
+    return lu_row
 
 
 def consumer_repo_for_root(
@@ -931,14 +1047,16 @@ def consumer_repo_for_root(
     Fail-closed rules:
     - A symlinked ``root`` resolves to its real target first, and linked worktrees resolve to
       their primary checkout only after bounded verification of the gitfile, worktree admin
-      directory, ``commondir``, and ``gitdir`` back-pointer. Unresolvable, dangling, or malformed
-      metadata returns ``None``.
+      directory, ``commondir``, and ``gitdir`` back-pointer (checked with ``lstat`` before
+      symlink resolution). Unresolvable, redirected, dangling, or malformed metadata returns
+      ``None``.
     - Any checkout carrying ``PRODUCT_MARKER`` (on ``root`` or its primary) always resolves to
-      the default (``public``) Learn Ukrainian row and can never match a non-default consumer.
+      the verified Learn Ukrainian catalog row (never to an unrelated ``default: true`` row) and
+      returns ``None`` if that association is missing or inconsistent.
     - When the primary has a ``.git`` directory, ``.git/config`` (and ``config.worktree`` when
-      ``extensions.worktreeConfig`` is enabled) is parsed strictly in Git-compatible syntax
-      (including UTF-8 BOM, ``[remote "origin"]``, and legacy ``[remote.origin]``). Missing or
-      malformed config, ``[include]``/``[includeIf]``/``[url]``/``insteadOf`` directives, or
+      ``extensions.worktreeConfig`` is enabled) is parsed strictly with Git-compatible lexical
+      rules (including UTF-8 BOM, ``[remote "origin"]``, and legacy ``[remote.origin]``). Missing
+      or malformed config, ``[include]``/``[includeIf]``/``[url]``/``insteadOf`` directives, or
       multiple/unregistered ``origin`` URLs return ``None`` rather than falling back to basename.
     - Only when no ``.git`` exists or a valid ``.git/config`` declares zero ``origin`` URLs and
       no unsafe directives does the primary checkout's directory name match a unique ``local_name``.
@@ -957,14 +1075,13 @@ def consumer_repo_for_root(
         return None
     primary, common_git_dir, worktree_gitdir = git_meta
 
-    # Learn Ukrainian marker always pins to the default (public) row, never a non-LU consumer.
+    # Learn Ukrainian marker always pins to the verified Learn Ukrainian row, never a non-LU consumer.
     for candidate in (resolved_root, primary):
         marker = _marker_state(candidate)
         if marker == "unreadable":
             return None
         if marker == "present":
-            defaults = [row for row in catalog.values() if row.default]
-            return defaults[0] if len(defaults) == 1 else None
+            return _learn_ukrainian_row(catalog)
 
     if common_git_dir is not None:
         parsed = _read_origin_urls(common_git_dir, worktree_gitdir)

@@ -232,13 +232,20 @@ def test_read_only_claude_adapter_skips_sources_wiring_for_consumer_without_sour
     assert not any("mcp__sources__" in rule for rule in disallowed)
 
     # Explicit attempts to allow or wire a sources server in a consumer without one fail closed,
-    # including bare server-wide rules, relative paths resolved against cwd, inline JSON, and bad types.
+    # including space-delimited rules, glob/server-wide rules, relative paths resolved against cwd,
+    # missing or symlinked explicit files, inline JSON with bad entry types, and unsupported types.
     for bad_allowed in (
         "Read,mcp__sources__verify_word",
         "Read,mcp__sources",
         "Read,MCP__SOURCES",
         "Read,mcp__sources(verify_word)",
         "Read,mcp__*",
+        "Read mcp__sources",
+        "Bash(git status) mcp__sources__verify_word",
+        "Read mcp__s*",
+        "Read *",
+        "   ",
+        "Read,(unbalanced",
         ["Read"],
     ):
         with pytest.raises(ValueError):
@@ -253,11 +260,19 @@ def test_read_only_claude_adapter_skips_sources_wiring_for_consumer_without_sour
             )
     sources_mcp = consumer / "relative.mcp.json"
     sources_mcp.write_text('{"mcpServers":{"sources":{"command":"/bin/true"}}}', encoding="utf-8")
+    symlink_mcp = consumer / "linked.mcp.json"
+    safe_mcp = consumer / "safe.mcp.json"
+    safe_mcp.write_text('{"mcpServers":{"docs":{"command":"/bin/true"}}}', encoding="utf-8")
+    symlink_mcp.symlink_to(safe_mcp)
     for bad_mcp in (
         str(sources_mcp),
         "relative.mcp.json",
         Path("relative.mcp.json"),
+        "missing.mcp.json",
+        "linked.mcp.json",
         '{"mcpServers":{"sources":{"command":"/bin/true"}}}',
+        '{"mcpServers":{"docs":[]}}',
+        '{"mcpServers":{"docs":"not-an-object"}}',
         {"mcpServers": {}},
         "   ",
     ):
@@ -271,9 +286,8 @@ def test_read_only_claude_adapter_skips_sources_wiring_for_consumer_without_sour
                 session_id=None,
                 tool_config={"mcp_config_path": bad_mcp},
             )
-    # A clean relative non-sources MCP config is resolved against cwd and forwarded consistently.
-    safe_mcp = consumer / "safe.mcp.json"
-    safe_mcp.write_text('{"mcpServers":{"docs":{"command":"/bin/true"}}}', encoding="utf-8")
+    # A clean relative non-sources MCP config is read once and forwarded as canonical inline JSON
+    # (never reopened by Claude), and space-delimited allowed_tools are normalized consistently.
     safe_plan = ClaudeAdapter().build_invocation(
         prompt="inspect",
         mode="read-only",
@@ -281,9 +295,12 @@ def test_read_only_claude_adapter_skips_sources_wiring_for_consumer_without_sour
         model=None,
         task_id="consumer-safe-mcp",
         session_id=None,
-        tool_config={"mcp_config_path": "safe.mcp.json"},
+        tool_config={"mcp_config_path": "safe.mcp.json", "allowed_tools": "Read Bash(git status) mcp__docs__*"},
     )
-    assert safe_plan.cmd[safe_plan.cmd.index("--mcp-config") + 1] == str(safe_mcp)
+    forwarded_mcp = safe_plan.cmd[safe_plan.cmd.index("--mcp-config") + 1]
+    assert json.loads(forwarded_mcp) == {"mcpServers": {"docs": {"command": "/bin/true"}}}
+    assert str(safe_mcp) not in forwarded_mcp
+    assert safe_plan.cmd[safe_plan.cmd.index("--allowedTools") + 1] == "Read,Bash(git status),mcp__docs__*"
 
 
 @pytest.mark.parametrize(

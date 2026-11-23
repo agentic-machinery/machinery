@@ -239,14 +239,17 @@ Issue: #1184
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Mapping, Sequence
 from functools import cache
 from pathlib import Path
@@ -572,9 +575,11 @@ def _mcp_server_names(path: Path) -> tuple[str, ...]:
     if not isinstance(servers, dict):
         raise ValueError(f"ClaudeAdapter: MCP config {path} must be a JSON object with an mcpServers object")
     names: list[str] = []
-    for name in servers:
+    for name, entry in servers.items():
         if not isinstance(name, str) or not _MCP_SERVER_NAME_RE.fullmatch(name):
             raise ValueError(f"ClaudeAdapter: MCP server name {name!r} in {path} cannot be expressed in --allowedTools")
+        if not isinstance(entry, dict):
+            raise ValueError(f"ClaudeAdapter: MCP server {name!r} in {path} must be a JSON object")
         names.append(name)
     return tuple(names)
 
@@ -623,57 +628,139 @@ def _reviewer_mcp_config() -> str:
     return json.dumps(isolated_sources_mcp_config(python_bin, server), separators=(",", ":"))
 
 
+_MAX_MCP_CONFIG_BYTES = 256 * 1024
+
+
+def _split_claude_permission_rules(raw: str) -> tuple[str, ...]:
+    """Split a Claude ``--allowedTools`` string on commas or spaces outside balanced parentheses."""
+    if any(unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for ch in raw):
+        raise ValueError("ClaudeAdapter: allowed_tools contains forbidden control characters")
+    tokens: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in raw:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            if depth == 0:
+                raise ValueError("ClaudeAdapter: allowed_tools has unbalanced parentheses")
+            depth -= 1
+            buf.append(ch)
+        elif depth == 0 and (ch == "," or ch.isspace()):
+            if buf:
+                tokens.append("".join(buf))
+                buf.clear()
+        else:
+            buf.append(ch)
+    if depth != 0:
+        raise ValueError("ClaudeAdapter: allowed_tools has unbalanced parentheses")
+    if buf:
+        tokens.append("".join(buf))
+    if not tokens:
+        raise ValueError("ClaudeAdapter: allowed_tools must not be blank")
+    return tuple(tokens)
+
+
 def _rule_targets_sources_mcp(rule: str) -> bool:
-    """True when a Claude permission rule grants server-wide or tool-specific access to ``sources``."""
+    """True when a Claude permission rule grants server-wide, wildcard, or tool-specific ``sources`` access."""
     lowered = rule.strip().casefold()
+    tool_part = lowered.split("(", 1)[0]
     server_rule = f"mcp__{SOURCES_MCP_SERVER}"
     return (
-        lowered == server_rule
-        or lowered.startswith((f"{server_rule}__", f"{server_rule}("))
-        or lowered in {"mcp", "mcp__*"}
-        or lowered.startswith("mcp__*__")
+        tool_part == server_rule
+        or tool_part.startswith(f"{server_rule}__")
+        or tool_part == "mcp"
+        or fnmatch.fnmatchcase(server_rule, tool_part)
+        or fnmatch.fnmatchcase(f"{server_rule}__probe", tool_part)
     )
 
 
-def _inline_mcp_server_names(raw_json: str) -> tuple[str, ...]:
-    """Return MCP server names from an inline ``--mcp-config`` JSON string; invalid shapes fail closed."""
+def _read_explicit_mcp_config_file(path: Path) -> str:
+    """Read an explicit MCP config file once with bounded, non-symlink regular-file checks."""
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise ValueError(f"ClaudeAdapter: explicit MCP config {path} is missing or unreadable: {exc}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"ClaudeAdapter: explicit MCP config {path} must be a regular non-symlink file")
+    if info.st_size > _MAX_MCP_CONFIG_BYTES:
+        raise ValueError(
+            f"ClaudeAdapter: explicit MCP config {path} exceeds {_MAX_MCP_CONFIG_BYTES} bytes"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"ClaudeAdapter: explicit MCP config {path} is unreadable: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError(f"ClaudeAdapter: explicit MCP config {path} changed during read")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(_MAX_MCP_CONFIG_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"ClaudeAdapter: explicit MCP config {path} is unreadable: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > _MAX_MCP_CONFIG_BYTES:
+        raise ValueError(f"ClaudeAdapter: explicit MCP config {path} exceeds {_MAX_MCP_CONFIG_BYTES} bytes")
+    if b"\x00" in raw:
+        raise ValueError(f"ClaudeAdapter: explicit MCP config {path} contains NUL bytes")
+    try:
+        return raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"ClaudeAdapter: explicit MCP config {path} is not valid UTF-8: {exc}") from exc
+
+
+def _validate_and_serialize_mcp_config(raw_json: str, *, source: str) -> tuple[tuple[str, ...], str]:
+    """Validate an MCP config JSON document (including server entry types) and return canonical inline JSON."""
     try:
         data = json_depth.loads(raw_json, max_depth=_JSON_MAX_DEPTH)
     except (json.JSONDecodeError, RecursionError) as exc:
-        raise ValueError(f"ClaudeAdapter: inline MCP config is invalid JSON: {exc}") from exc
+        raise ValueError(f"ClaudeAdapter: MCP config {source} is invalid JSON: {exc}") from exc
     servers = data.get("mcpServers") if isinstance(data, dict) else None
     if not isinstance(servers, dict):
-        raise ValueError("ClaudeAdapter: inline MCP config must be a JSON object with an mcpServers object")
+        raise ValueError(f"ClaudeAdapter: MCP config {source} must be a JSON object with an mcpServers object")
     names: list[str] = []
-    for name in servers:
+    for name, entry in servers.items():
         if not isinstance(name, str) or not _MCP_SERVER_NAME_RE.fullmatch(name):
-            raise ValueError(f"ClaudeAdapter: inline MCP server name {name!r} is invalid")
+            raise ValueError(f"ClaudeAdapter: MCP server name {name!r} in {source} is invalid")
+        if not isinstance(entry, dict):
+            raise ValueError(f"ClaudeAdapter: MCP server {name!r} in {source} must be a JSON object")
         names.append(name)
-    return tuple(names)
+    return tuple(names), json.dumps(data, separators=(",", ":"))
 
 
 def _refuse_undeclared_sources_in_readonly(
     tc: dict[str, Any], *, cwd: Path, review_isolation: bool
-) -> str | None:
+) -> tuple[str | None, str | None]:
     """Fail closed if a read-only caller wires ``sources`` when the consumer declares no Sources server.
 
-    Returns the validated, normalized ``--mcp-config`` argument to forward (resolving relative paths
-    against ``cwd`` so the guard and Claude CLI inspect the exact same file), or ``None`` when no
-    explicit ``mcp_config_path`` was provided.
+    Returns ``(validated_mcp_inline_json, validated_allowed_tools_csv)``. Explicit MCP files are
+    read once with bounded regular-file checks and forwarded as inline JSON so Claude consumes the
+    exact validated document without reopening the path. Permission rules are tokenized on both
+    commas and spaces (matching ``claude --allowedTools``) and forwarded in canonical comma form.
     """
     if review_isolation:
-        return None
+        return None, None
+    validated_allowed: str | None = None
     explicit_allowed = tc.get("allowed_tools")
     if explicit_allowed is not None:
         if not isinstance(explicit_allowed, str):
-            raise ValueError("ClaudeAdapter: allowed_tools must be a comma-separated string")
-        tokens = [token.strip() for token in explicit_allowed.split(",") if token.strip()]
-        if any(_rule_targets_sources_mcp(token) for token in tokens):
-            raise ValueError(
-                "ClaudeAdapter: read-only mode cannot allow mcp__sources when the consumer declares no sources_server"
-            )
+            raise ValueError("ClaudeAdapter: allowed_tools must be a comma- or space-separated string")
+        if explicit_allowed:
+            tokens = _split_claude_permission_rules(explicit_allowed)
+            if any(_rule_targets_sources_mcp(token) for token in tokens):
+                raise ValueError(
+                    "ClaudeAdapter: read-only mode cannot allow mcp__sources when the consumer declares no sources_server"
+                )
+            validated_allowed = ",".join(tokens)
+
     if "mcp_config_path" not in tc or tc["mcp_config_path"] is None or tc["mcp_config_path"] == "":
-        return None
+        return None, validated_allowed
     explicit_mcp = tc["mcp_config_path"]
     if not isinstance(explicit_mcp, (str, Path)):
         raise ValueError("ClaudeAdapter: mcp_config_path must be a path or inline JSON string")
@@ -681,21 +768,18 @@ def _refuse_undeclared_sources_in_readonly(
     if not raw.strip() or "\x00" in raw:
         raise ValueError("ClaudeAdapter: mcp_config_path is invalid")
     if raw.lstrip().startswith("{"):
-        names = _inline_mcp_server_names(raw)
-        if any(name.casefold() == SOURCES_MCP_SERVER for name in names):
-            raise ValueError(
-                "ClaudeAdapter: read-only mode cannot wire a sources MCP server when the consumer declares no sources_server"
-            )
-        return raw
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        candidate = cwd / candidate
-    names = _mcp_server_names(candidate)
+        names, serialized = _validate_and_serialize_mcp_config(raw, source="inline")
+    else:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        file_text = _read_explicit_mcp_config_file(candidate)
+        names, serialized = _validate_and_serialize_mcp_config(file_text, source=str(candidate))
     if any(name.casefold() == SOURCES_MCP_SERVER for name in names):
         raise ValueError(
             "ClaudeAdapter: read-only mode cannot wire a sources MCP server when the consumer declares no sources_server"
         )
-    return str(candidate)
+    return serialized, validated_allowed
 
 
 _DEPLOYED_HOOKS_PREFIX = "$CLAUDE_PROJECT_DIR/.claude/hooks/"
@@ -1153,8 +1237,9 @@ class ClaudeAdapter:
         # declaration raises here rather than launching without the denies.
         sources_readers, sources_writers = sources_tool_sets() if mode == "read-only" else ((), ())
         validated_mcp_config: str | None = None
+        validated_allowed_tools: str | None = None
         if mode == "read-only" and not sources_readers and not sources_writers:
-            validated_mcp_config = _refuse_undeclared_sources_in_readonly(
+            validated_mcp_config, validated_allowed_tools = _refuse_undeclared_sources_in_readonly(
                 tc, cwd=cwd, review_isolation=review_isolation
             )
         if mode == "danger":
@@ -1194,7 +1279,8 @@ class ClaudeAdapter:
         elif mcp_config_arg and not review_isolation:
             cmd.extend(["--mcp-config", str(mcp_config_arg)])
         if explicit_allowed_tools and not review_isolation:
-            cmd.extend(["--allowedTools", str(tc["allowed_tools"])])
+            allowed_arg = validated_allowed_tools if validated_allowed_tools is not None else str(tc["allowed_tools"])
+            cmd.extend(["--allowedTools", allowed_arg])
 
         # Cache-warmth optimization (CC 2.1.98+)
         if cli_version and cli_version >= _EFFORT_MIN_VERSION:
