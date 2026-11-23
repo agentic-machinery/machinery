@@ -193,6 +193,7 @@ the inventory.
 | [Dispatched site dependencies](../lu_machinery/dispatcher/site_deps.py) | `npm ci` reads the target checkout's site lock into a staging directory with a fresh home. The lock determines reuse of the resulting tree. |
 | [Clean-machine drill](../drill/clean-machine/README.md), [filesystem parity probe](../lu_machinery/ci/linux_fs_parity.sh), [attribution](runbooks/agent-attribution.md) and [venv repair](../lu_machinery/hygiene/check_venv_integrity.py) | The drill checks the published wheel against `SHA256SUMS` and installs from the hashed consumer lock. The parity probe verifies its uv archive and installs from a hashed lock export in a container. Attribution and venv repair use hashed pip requirements. |
 | [CI scanner and uv downloads](../.github/workflows/pins.txt) | CI checks scanner and uv archive SHA-256 values before use, including scanner cache hits. The fleet security jobs run scanners with a cleared environment and a temporary home. |
+| [Claude adapter](../lu_machinery/agent_runtime/adapters/claude.py) | The provider CLI (`claude`) is provisioned natively before dispatch, with no automatic install or package-runner fallback. Ordinary dispatch refuses missing or incompatible binaries with a typed error; isolated review selects its trusted binary separately. |
 
 The five workflows and two composite actions contain 44 external `uses`
 references. Each pins a full commit SHA. The five workflows start with
@@ -207,15 +208,17 @@ Dependabot applies the seven-day cooldown to grouped npm and Actions version
 updates. Under the pinned npm 10 release, runtime installs use the committed
 lock, and the cooldown applies at update time through Dependabot.
 
-The following native inputs still need a scope or exception decision on
-[#1144](https://github.com/learn-ukrainian/machinery/issues/1144). The
-[pytest bootstrap](../lu_machinery/ci/setup_bubblewrap.sh) verifies the
-bubblewrap package hash, but missing PostgreSQL and libpq packages and
-transitive native dependencies can resolve from signed Ubuntu repositories.
-The filesystem parity probe defaults to a mutable container tag. The pytest
-Node setup selects a Node 22 patch through `.nvmrc`. CI's managed Python and
-Node downloads use the upstream toolchain distribution paths. These paths
-need a native toolchain disposition before claiming full coverage.
+Documented native-toolchain exception on
+[#1144](https://github.com/learn-ukrainian/machinery/issues/1144) (row 13):
+hosted runner OS packages and managed runtime distribution (upstream Python
+and Node toolchain distribution paths) are inherited trust roots, kept with
+official provenance, exact steady versions, explicit compatibility lanes and
+reviewed updates. Separate open implementation rows on
+[#1144](https://github.com/learn-ukrainian/machinery/issues/1144) track
+pinning the [pytest bootstrap](../lu_machinery/ci/setup_bubblewrap.sh) native
+package closure, pinning the filesystem parity probe container image digest,
+and tightening steady-job runtime version selectors alongside explicit
+compatibility lanes.
 
 ## Cut a release
 

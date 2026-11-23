@@ -2535,30 +2535,35 @@ def test_claude_adapter_keeps_hooks_when_api_key_set(tmp_path, monkeypatch):
 
 @pytest.mark.real_claude_cli_gate
 def test_claude_adapter_rejects_old_cli_version(tmp_path):
-    """An unsupported Claude CLI version must fail before launching the task."""
+    """An unsupported Claude CLI version must fail with a typed error and no @latest upgrade advice."""
     from lu_machinery.agent_runtime.adapters import claude as claude_adapter_mod
 
     claude_adapter_mod._probe_claude_cli_version.cache_clear()
     adapter = ClaudeAdapter()
-    with patch(
-        "lu_machinery.agent_runtime.adapters.claude.subprocess.run",
-        return_value=subprocess.CompletedProcess(
-            args=["claude", "--version"],
-            returncode=0,
-            stdout="2.1.115\n",
-            stderr="",
+    with (
+        patch(
+            "lu_machinery.agent_runtime.adapters.claude.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["claude", "--version"],
+                returncode=0,
+                stdout="2.1.115\n",
+                stderr="",
+            ),
         ),
+        pytest.raises(claude_adapter_mod.ClaudeCliUnavailableError, match=r"Claude CLI < 2\.1\.116") as refused,
     ):
-        with pytest.raises(RuntimeError, match=r"Claude CLI < 2\.1\.116"):
-            adapter.build_invocation(
-                prompt="hello",
-                mode="read-only",
-                cwd=tmp_path,
-                model=None,
-                task_id=None,
-                session_id=None,
-                tool_config={"cmd_prefix": ["claude"]},
-            )
+        adapter.build_invocation(
+            prompt="hello",
+            mode="read-only",
+            cwd=tmp_path,
+            model=None,
+            task_id=None,
+            session_id=None,
+            tool_config={"cmd_prefix": ["claude"]},
+        )
+    assert refused.value.reason == "incompatible"
+    assert "@latest" not in str(refused.value)
+    assert "npm install" not in str(refused.value)
     claude_adapter_mod._probe_claude_cli_version.cache_clear()
 
 
@@ -2602,10 +2607,9 @@ def test_claude_adapter_default_prefix_prefers_local_binary_over_npx(tmp_path, m
     assert "npx" not in plan.cmd
 
 
-def test_claude_adapter_default_prefix_falls_back_to_npx_when_local_missing(tmp_path, monkeypatch):
-    """When no local `claude` binary is installed, ``npx @latest`` remains the
-    documented fallback (it works on machines where the npm package still
-    resolves to a runnable CLI). #4875."""
+def test_claude_adapter_default_prefix_refuses_npx_fallback_when_local_missing(tmp_path, monkeypatch):
+    """When no provisioned native `claude` binary exists, ordinary dispatch must
+    refuse with a typed error instead of falling back to `npx` (#1144)."""
     from lu_machinery.agent_runtime.adapters import claude as claude_adapter_mod
 
     def _which(name: str) -> str | None:
@@ -2617,30 +2621,7 @@ def test_claude_adapter_default_prefix_falls_back_to_npx_when_local_missing(tmp_
     monkeypatch.setattr(claude_adapter_mod.Path, "home", staticmethod(lambda: tmp_path))
 
     adapter = ClaudeAdapter()
-    plan = adapter.build_invocation(
-        prompt="hello",
-        mode="read-only",
-        cwd=tmp_path,
-        model=None,
-        task_id=None,
-        session_id=None,
-        tool_config=None,
-    )
-
-    assert plan.cmd[0:2] == ["npx", "@anthropic-ai/claude-code@latest"]
-
-
-def test_claude_adapter_default_prefix_raises_when_neither_present(tmp_path, monkeypatch):
-    """If neither claude nor npx is on PATH, fail loudly with a clear error
-    instead of silently producing an empty/broken cmd. #1684/#4875."""
-    from lu_machinery.agent_runtime.adapters import claude as claude_adapter_mod
-
-    monkeypatch.setattr(claude_adapter_mod.shutil, "which", lambda _name: None)
-    # Hermetic: the dev machine may have a real ~/.local/bin/claude.
-    monkeypatch.setattr(claude_adapter_mod.Path, "home", staticmethod(lambda: tmp_path))
-
-    adapter = ClaudeAdapter()
-    with pytest.raises(RuntimeError, match=r"neither a `claude` binary nor `npx`"):
+    with pytest.raises(claude_adapter_mod.ClaudeCliUnavailableError, match=r"provisioned native `claude` CLI") as refused:
         adapter.build_invocation(
             prompt="hello",
             mode="read-only",
@@ -2650,6 +2631,34 @@ def test_claude_adapter_default_prefix_raises_when_neither_present(tmp_path, mon
             session_id=None,
             tool_config=None,
         )
+    assert refused.value.reason == "missing"
+    assert "@latest" not in str(refused.value)
+    assert "npm install" not in str(refused.value)
+
+
+def test_claude_adapter_default_prefix_raises_when_neither_present(tmp_path, monkeypatch):
+    """If no provisioned native `claude` binary is present, fail loudly with a
+    typed error naming the CLI and native provisioning (#1144)."""
+    from lu_machinery.agent_runtime.adapters import claude as claude_adapter_mod
+
+    monkeypatch.setattr(claude_adapter_mod.shutil, "which", lambda _name: None)
+    # Hermetic: the dev machine may have a real ~/.local/bin/claude.
+    monkeypatch.setattr(claude_adapter_mod.Path, "home", staticmethod(lambda: tmp_path))
+
+    adapter = ClaudeAdapter()
+    with pytest.raises(claude_adapter_mod.ClaudeCliUnavailableError, match=r"provisioned native `claude` CLI") as refused:
+        adapter.build_invocation(
+            prompt="hello",
+            mode="read-only",
+            cwd=tmp_path,
+            model=None,
+            task_id=None,
+            session_id=None,
+            tool_config=None,
+        )
+    assert refused.value.reason == "missing"
+    assert "native installer" in str(refused.value)
+    assert "Node.js" not in str(refused.value)
 
 
 def test_claude_adapter_default_bin_probes_home_install_dir(tmp_path, monkeypatch):
