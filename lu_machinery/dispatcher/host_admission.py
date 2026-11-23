@@ -12,7 +12,9 @@ import re
 import stat
 import subprocess
 import sys
+import urllib.error
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,9 +33,10 @@ from lu_machinery.orchestration.task_record_store import task_state_lock
 
 
 class Refused(ValueError):
-    def __init__(self, message: str, code: int):
+    def __init__(self, message: str, code: int, *, admission_record: dict | None = None):
         super().__init__(message)
         self.code = code
+        self.admission_record = admission_record
 
 
 def _write(path, record):
@@ -76,28 +79,44 @@ def _head(root):
         return None
 
 
-def _monitor_json(read):
+def _monitor_json(read) -> tuple[Mapping | None, str | None]:
     try:
-        return read()
-    except (OSError, ValueError, RecursionError, http.client.HTTPException):
-        return None
+        data = read()
+    except urllib.error.HTTPError as exc:
+        return None, f"http_{exc.code}"
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            return None, "timeout"
+        return None, "unreachable"
+    except TimeoutError:
+        return None, "timeout"
+    except http.client.HTTPException:
+        return None, "http_error"
+    except OSError:
+        return None, "unreachable"
+    except (ValueError, RecursionError):
+        return None, "invalid_budget"
+    if not isinstance(data, Mapping):
+        return None, "invalid_budget"
+    return data, None
 
 
 def _meter_budget(spec):
     """Read the routing budget outside the admission lock for a metered write."""
     if spec is None or spec.mode not in legacy.WRITE_CAPABLE_MODES:
-        return None, None
+        return None, None, None
     meter = legacy.subscription_meter(
         spec.agent, model=spec.model, claude_account=spec.claude_account, codex_account=spec.codex_account,
     )
     if meter is None:
-        return None, None
+        return None, None, None
     from lu_machinery.dispatcher.pool_selector import read_budget
 
-    return meter, _monitor_json(read_budget)
+    budget, budget_error = _monitor_json(read_budget)
+    return meter, budget, budget_error
 
 
-def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None, orchestrator=False):
+def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budget=None, budget_error=None, orchestrator=False):
     """Copy-adapted from delegate._evaluate_dispatch_admission, including v2 liveness.
 
     Disk admission measures, alerts and refuses; it never removes anything. Each task's creator
@@ -107,7 +126,7 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budge
         mode, tasks_dir(), pid_alive=legacy.process_alive,
         record_liveness=lambda record: worker_liveness(record, pid_alive=legacy.process_alive),
         on_dead=heal_dead if sweep else None, thresholds=thresholds, disk_guard=disk_guard,
-        meter=meter, meter_budget=budget, orchestrator=orchestrator,
+        meter=meter, meter_budget=budget, meter_budget_error=budget_error, orchestrator=orchestrator,
     )
 
 
@@ -126,11 +145,16 @@ def report(decision, *, force_reason=None):
         print(f"🚦 dispatch admission: admitted — {decision.summary()}", file=sys.stderr)
     elif allows(decision, force_reason):
         print(
-            f"⚠️  dispatch admission overridden by --force-admission ({force_reason!r}): {'; '.join(decision.failures)}",
+            f"⚠️  dispatch admission overridden by --force-admission ({force_reason!r}): "
+            f"{'; '.join(decision.failures)}; {decision.meter_status_clause()}",
             file=sys.stderr,
         )
     else:
-        raise Refused(f"❌ {decision.refusal_line()}", 4 if decision.disk_refused else 3)
+        raise Refused(
+            f"❌ {decision.refusal_line()}",
+            4 if decision.disk_refused else 3,
+            admission_record=decision.to_record(force_reason=force_reason),
+        )
 
 
 def precheck(mode, *, force_reason=None):
@@ -146,9 +170,12 @@ def precheck(mode, *, force_reason=None):
 
 def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None, orchestrator=None):
     try:
-        meter, budget = _meter_budget(spec)
-        decision = evaluate(mode, sweep=not dry_run, disk_guard=disk_guard, meter=meter, budget=budget,
-                            orchestrator=orchestrator is not None)
+        meter, budget, budget_error = _meter_budget(spec)
+        decision = evaluate(
+            mode, sweep=not dry_run, disk_guard=disk_guard,
+            meter=meter, budget=budget, budget_error=budget_error,
+            orchestrator=orchestrator is not None,
+        )
     except ValueError as exc:
         raise Refused(f"❌ invalid dispatch admission threshold: {exc}", 2) from exc
     report(decision, force_reason=force_reason)
@@ -555,14 +582,19 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     from inside another run) is in the hold before anything spawns.
     """
     hold = reservation = None
-    meter, budget = _meter_budget(spec)
+    meter, budget, budget_error = _meter_budget(spec)
     try:
         refusal = None
+        locked = None
         try:
             with legacy.admission_lock(tasks_dir()):
-                current = evaluate(mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard(),
-                                   meter=meter, budget=budget, orchestrator=orchestrator is not None)
+                current = evaluate(
+                    mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard(),
+                    meter=meter, budget=budget, budget_error=budget_error,
+                    orchestrator=orchestrator is not None,
+                )
                 if allows(current, force_reason):
+                    locked = current
                     nonce = uuid.uuid4().hex
                     if orchestrator is not None:
                         if busy := _claim_stream(orchestrator["stream"], task_id, nonce, tree):
@@ -584,7 +616,11 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
                             raise RuntimeError(f"task record for {task_id!r} exists; refusing to overwrite it")
                         store._write(path, hold, exclusive=True)
                 else:
-                    refusal = Refused(f"❌ {current.refusal_line()}", 4 if current.disk_refused else 3)
+                    refusal = Refused(
+                        f"❌ {current.refusal_line()}",
+                        4 if current.disk_refused else 3,
+                        admission_record=current.to_record(force_reason=force_reason),
+                    )
         except _StreamBusy as exc:
             refusal = Refused(f"❌ {exc}", 3)
         except legacy.AdmissionLockTimeout as exc:
@@ -593,6 +629,10 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
             raise Refused(f"❌ could not publish the admission hold for {task_id!r}: {exc}", 1) from exc
         if refusal is not None:
             raise refusal
+        if (locked is not None and not locked.exempt and decision is not None
+                and (locked.meter_telemetry, locked.meter_effective_cap)
+                != (decision.meter_telemetry, decision.meter_effective_cap)):
+            report(locked, force_reason=force_reason)
         yield hold
     finally:
         # Read before anything else here can fail: missing progress means a supervisor may have started.

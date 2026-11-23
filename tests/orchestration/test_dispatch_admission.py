@@ -6,8 +6,10 @@ probe, never from allocating memory or generating load.
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import urllib.error
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -76,6 +78,7 @@ def test_fixed_meter_ceiling_defers_only_the_meter_at_its_limit(tmp_path, probe)
     _record(tasks, "codex-b", agent="codex", codex_account="b-sub")
     limits = adm.load_thresholds({
         "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER": "1",
+        "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN": "5",
         "DISPATCH_MIN_METER_LAUNCH_INTERVAL_S": "0",
     })
     blocked = adm.evaluate("workspace-write", tasks, thresholds=limits,
@@ -85,10 +88,12 @@ def test_fixed_meter_ceiling_defers_only_the_meter_at_its_limit(tmp_path, probe)
 
     assert not blocked.admitted
     assert blocked.meter is not None and blocked.meter.defer == adm.MeterDefer.CAP
-    assert "meter codex:b: live write workers 1/1 (fixed ceiling)" in blocked.refusal_line()
+    assert blocked.meter.cap == 1
+    assert blocked.meter.telemetry == "unavailable:no_budget"
+    assert "meter codex:b: live write workers 1/1 (effective cap 1, telemetry=unavailable:no_budget)" in blocked.refusal_line()
     assert "subscription_meter_defer=cap" in blocked.refusal_line()
     assert admitted.admitted
-    assert "meter codex:a: live write workers 0/1 (fixed ceiling)" in admitted.summary()
+    assert "meter codex:a: live write workers 0/1 (effective cap 1, telemetry=unavailable:no_budget)" in admitted.summary()
 
 
 def test_meter_cadence_measures_from_the_last_launch_even_if_it_finished(tmp_path, probe):
@@ -112,38 +117,174 @@ def test_meter_cadence_measures_from_the_last_launch_even_if_it_finished(tmp_pat
 
 
 def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, probe, monkeypatch):
-    """Defect class: throttled or depleted meters admit writes, or unknown usage bypasses the ceiling."""
+    """Defect class: throttled or depleted meters admit writes, stale readings trigger quota denials, or unknown usage gets full cap."""
     tasks = tmp_path / "tasks"
     now = datetime.now(UTC)
     limits = replace(adm.load_thresholds({}), max_live_write_workers=10, min_meter_launch_interval_s=0)
     assert limits.max_live_write_workers_per_meter == 8
+    assert limits.max_live_write_workers_per_meter_unknown == 2
     for index in range(8):
         _record(tasks, f"worker-{index}", agent="codex")
 
-    def decide(row, *, stale=False):
-        budget = {"diagnostics": {"stale": stale}, "generated_at": now.isoformat(),
-                  "codex_accounts": {"codex:a": row}}
+    def decide(row, *, stale=False, generated_at=None, meter="codex:a", extra=None):
+        budget = {
+            "diagnostics": {"stale": stale, "data_age_s": 1200 if stale else 0},
+            "generated_at": now.isoformat() if generated_at is None else generated_at,
+            "codex_accounts": {"codex:a": row},
+            **(extra or {}),
+        }
         return adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
-                            meter="codex:a", meter_budget=budget, now=now)
+                            meter=meter, meter_budget=budget, now=now)
 
+    recent_rl = (now - timedelta(seconds=60)).isoformat()
+    expired_rl = (now - timedelta(seconds=899)).isoformat()
+    boundary_rl = (now - timedelta(seconds=300)).isoformat()
     for row, reason in (
-        ({"status": "rate_limited"}, "rate_limited"),
-        ({"status": "cool", "runtime": {"rate_limited": 1}}, "rate_limited"),
-        ({"status": "near_cap"}, "near_cap"),
-        ({"remaining_pct": 0}, "exhausted"),
+        ({"status": "rate_limited", "runtime": {"last_rate_limited_at": recent_rl}}, "rate_limited"),
+        ({"status": "cool", "runtime": {"rate_limited": 1, "last_rate_limited_at": recent_rl}}, "rate_limited"),
+        ({"status": "near_cap", "freshness": "fresh", "age_s": 0, "remaining_pct": 1.0}, "near_cap"),
+        ({"status": "cool", "freshness": "fresh", "age_s": 0, "remaining_pct": 0}, "exhausted"),
     ):
         decision = decide(row)
         assert not decision.admitted
         assert f"subscription_meter_defer={reason}" in decision.refusal_line()
-    fresh = {
-        "status": "cool", "freshness": "fresh", "age_s": 0,
-        "forecast": {"remaining_pct": 20, "reset_at": (now + timedelta(hours=2)).isoformat(),
-                     "burn_pct_per_hour": 20},
+
+    # Expired or unattributed Monitor runtime vetoes do not trigger rate_limited deferral.
+    empty_tasks = tmp_path / "empty-tasks"
+    for rt_row in (
+        {"status": "cool", "freshness": "fresh", "age_s": 0, "remaining_pct": 50,
+         "runtime": {"rate_limited": 1, "headroom_blocked": True, "last_rate_limited_at": expired_rl}},
+        {"status": "cool", "freshness": "fresh", "age_s": 0, "remaining_pct": 50,
+         "runtime": {"rate_limited": 1, "last_rate_limited_at": boundary_rl}},
+        {"status": "cool", "freshness": "fresh", "age_s": 0, "remaining_pct": 50,
+         "runtime": {"rate_limited": 1}},
+    ):
+        result = adm.evaluate(
+            "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+            meter="codex:a",
+            meter_budget={"generated_at": now.isoformat(), "codex_accounts": {"codex:a": rt_row}},
+            now=now,
+        )
+        assert result.admitted
+        assert result.meter is not None and result.meter.telemetry == "fresh" and result.meter.cap == 8
+
+    # Quota denials apply only to verified fresh readings; stale/unverified rows use the reduced cap.
+    for unverified in (
+        {"status": "near_cap", "remaining_pct": 0},
+        {"status": "exhausted", "freshness": "fresh", "age_s": 0, "stale": True, "remaining_pct": 0},
+        {"status": "exhausted", "freshness": "fresh", "age_s": 900, "remaining_pct": 0},
+    ):
+        result = adm.evaluate(
+            "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+            meter="codex:a",
+            meter_budget={"generated_at": now.isoformat(), "codex_accounts": {"codex:a": unverified}},
+            now=now,
+        )
+        assert result.admitted
+        assert result.meter is not None and result.meter.cap == 2 and result.meter.telemetry != "fresh"
+
+    # Cached row age includes elapsed snapshot time; invalid/expired snapshot timestamps degrade to unknown cap.
+    aged_ok = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="codex:a",
+        meter_budget={
+            "generated_at": (now - timedelta(seconds=500)).isoformat(),
+            "codex_accounts": {"codex:a": {"status": "cool", "freshness": "fresh", "age_s": 399, "remaining_pct": 50}},
+        },
+        now=now,
+    )
+    assert aged_ok.admitted and aged_ok.meter is not None and aged_ok.meter.telemetry == "fresh" and aged_ok.meter.cap == 8
+    aged_stale = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="codex:a",
+        meter_budget={
+            "generated_at": (now - timedelta(seconds=500)).isoformat(),
+            "codex_accounts": {"codex:a": {"status": "cool", "freshness": "fresh", "age_s": 400, "remaining_pct": 0}},
+        },
+        now=now,
+    )
+    assert aged_stale.admitted and aged_stale.meter is not None
+    assert aged_stale.meter.telemetry == "stale:probe_age_exceeded" and aged_stale.meter.cap == 2
+    for bad_ts, expected_tel in (
+        ("", "unavailable:snapshot_timestamp_missing"),
+        ("not-a-timestamp", "unavailable:snapshot_timestamp_invalid"),
+        ((now + timedelta(seconds=5)).isoformat(), "unavailable:snapshot_timestamp_invalid"),
+        ((now - timedelta(seconds=900)).isoformat(), "stale:snapshot_expired"),
+    ):
+        bad_result = adm.evaluate(
+            "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+            meter="codex:a",
+            meter_budget={
+                "generated_at": bad_ts,
+                "codex_accounts": {"codex:a": {"status": "cool", "freshness": "fresh", "age_s": 0, "remaining_pct": 50}},
+            },
+            now=now,
+        )
+        assert bad_result.admitted and bad_result.meter is not None
+        assert bad_result.meter.telemetry == expected_tel and bad_result.meter.cap == 2
+
+    # AGY Claude/GPT does not inherit Gemini's fresh label when its own window is absent.
+    gemini_without_cg = {
+        "generated_at": now.isoformat(),
+        "agents": {"gemini": {"status": "cool", "freshness": "fresh", "age_s": 10, "remaining_pct": 70}},
     }
-    for result in (decide({}), decide(fresh, stale=True), decide(fresh)):
+    agy_missing_cg = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="agy:claude_gpt", meter_budget=gemini_without_cg, now=now,
+    )
+    assert agy_missing_cg.admitted and agy_missing_cg.meter is not None
+    assert agy_missing_cg.meter.telemetry == "unavailable:allowance_missing" and agy_missing_cg.meter.cap == 2
+    gemini_with_cg = {
+        "generated_at": now.isoformat(),
+        "agents": {
+            "gemini": {
+                "status": "cool", "freshness": "fresh", "age_s": 10, "remaining_pct": 70,
+                "claude_gpt_windows": {"five_hour": {"remaining_pct": 100}, "weekly": {"remaining_pct": 0}},
+            },
+        },
+    }
+    agy_exhausted_cg = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="agy:claude_gpt", meter_budget=gemini_with_cg, now=now,
+    )
+    assert not agy_exhausted_cg.admitted and agy_exhausted_cg.meter is not None
+    assert agy_exhausted_cg.meter.telemetry == "fresh" and agy_exhausted_cg.meter.defer == adm.MeterDefer.EXHAUSTED
+
+    # Grok+Cursor requires verified bindings for fresh cap; unverified bindings stay on reduced cap.
+    verified_gc = {
+        "generated_at": now.isoformat(),
+        "agents": {
+            "grok": {"status": "cool", "freshness": "fresh", "age_s": 10, "remaining_pct": 50},
+            "cursor": {"status": "cool", "freshness": "fresh", "age_s": 15, "remaining_pct": 60},
+        },
+    }
+    gc_fresh = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=verified_gc, now=now,
+    )
+    assert gc_fresh.admitted and gc_fresh.meter is not None and gc_fresh.meter.telemetry == "fresh" and gc_fresh.meter.cap == 8
+    unverified_gc = {
+        "generated_at": now.isoformat(),
+        "agents": {
+            "grok": {"status": "cool", "freshness": "fresh", "age_s": 10, "remaining_pct": 50},
+            "cursor": {"status": "need_login"},
+        },
+    }
+    gc_unverified = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=unverified_gc, now=now,
+    )
+    assert gc_unverified.admitted and gc_unverified.meter is not None
+    assert gc_unverified.meter.telemetry == "unavailable:binding_unverified" and gc_unverified.meter.cap == 2
+
+    # Fresh reading with 8 live hits cap 8; aggregate stale flag does not lower a fresh meter's cap;
+    # missing row drops to unknown cap 2.
+    fresh = {"status": "cool", "freshness": "fresh", "age_s": 0, "remaining_pct": 20}
+    for result, expected_cap in ((decide({}), 2), (decide(fresh, stale=True), 8), (decide(fresh), 8)):
         assert not result.admitted
-        assert result.meter is not None and result.meter.cap == 8
+        assert result.meter is not None and result.meter.cap == expected_cap
         assert result.meter.defer == adm.MeterDefer.CAP
+
     _record(tasks, "claude-b-limited", status="rate_limited", agent="claude", claude_account="b",
             finished_at=now.isoformat())
     for account, expected in (("b", adm.MeterDefer.RATE_LIMITED), ("a", None)):
@@ -162,7 +303,193 @@ def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, pro
                            claude_account=None, codex_account="b-sub")
     result = host_admission.check(spec.mode, dry_run=True, disk_guard=False, spec=spec)
     assert result.admitted
-    assert "meter codex:b: live write workers 0/8 (fixed ceiling)" in result.summary()
+    assert "meter codex:b: live write workers 0/2 (effective cap 2, telemetry=unavailable:invalid_budget)" in result.summary()
+
+    # Monitor HTTP errors and timeouts map to typed unavailable reasons.
+    def _raise(exc):
+        def _fn():
+            raise exc
+        return _fn
+
+    assert host_admission._monitor_json(_raise(urllib.error.HTTPError("http://x", 403, "Forbidden", {}, io.BytesIO()))) == (None, "http_403")
+    assert host_admission._monitor_json(_raise(urllib.error.HTTPError("http://x", 503, "Warming", {}, io.BytesIO()))) == (None, "http_503")
+    assert host_admission._monitor_json(_raise(urllib.error.URLError(TimeoutError("timed out")))) == (None, "timeout")
+    assert host_admission._monitor_json(_raise(ConnectionRefusedError("refused"))) == (None, "unreachable")
+
+
+def test_stale_lane_does_not_disable_another_meters_quota_deferral(tmp_path, probe):
+    """Defect class: one lane's stale row or global diagnostics.stale disables another meter's quota deferral."""
+    tasks = tmp_path / "tasks"
+    now = datetime.now(UTC)
+    limits = replace(adm.load_thresholds({}), max_live_write_workers=10, min_meter_launch_interval_s=0)
+    budget = {
+        "diagnostics": {"stale": True, "data_age_s": 1400},
+        "generated_at": (now - timedelta(seconds=1200)).isoformat(),
+        "claude_accounts": {
+            "claude:a": {
+                "status": "ok", "stale": False, "age_s": 45.0,
+                "updated": (now - timedelta(seconds=45)).isoformat(),
+                "weekly": {"left_pct": 0.0}, "session5h": {"left_pct": 50.0},
+            },
+        },
+        "agents": {
+            "grok": {"status": "exhausted", "freshness": "stale_last_good", "stale": True, "age_s": 1400, "remaining_pct": 0.0},
+            "cursor": {"status": "cool", "freshness": "fresh", "age_s": 20, "remaining_pct": 50.0},
+        },
+    }
+    # Claude account rows are refreshed on serve and defer even when cached snapshot and another lane are stale.
+    claude_a = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="claude:a", meter_budget=budget, now=now,
+    )
+    assert not claude_a.admitted
+    assert claude_a.meter is not None
+    assert claude_a.meter.telemetry == "fresh"
+    assert claude_a.meter.cap == 8
+    assert claude_a.meter.defer == adm.MeterDefer.EXHAUSTED
+
+    # With a fresh snapshot timestamp, fresh codex:a still defers despite grok being stale and diagnostics.stale=True.
+    budget_fresh_snap = {
+        **budget,
+        "generated_at": (now - timedelta(seconds=30)).isoformat(),
+        "codex_accounts": {
+            "codex:a": {"status": "near_cap", "freshness": "fresh", "stale": False, "age_s": 30, "remaining_pct": 1.0},
+        },
+    }
+    codex_a = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="codex:a", meter_budget=budget_fresh_snap, now=now,
+    )
+    assert not codex_a.admitted
+    assert codex_a.meter is not None
+    assert codex_a.meter.telemetry == "fresh"
+    assert codex_a.meter.defer == adm.MeterDefer.NEAR_CAP
+
+    # The stale grok+cursor meter itself does not apply quota denials and falls back to the unknown cap.
+    gc = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=budget_fresh_snap, now=now,
+    )
+    assert gc.admitted
+    assert gc.meter is not None
+    assert gc.meter.telemetry == "stale:probe_stale"
+    assert gc.meter.cap == 2
+
+
+def test_unknown_meter_admits_at_most_the_unknown_cap(tmp_path, probe):
+    """Defect class: an unknown or stale meter admits up to the full 8-worker ceiling instead of the reduced unknown cap."""
+    tasks = tmp_path / "tasks"
+    now = datetime.now(UTC)
+    limits = replace(adm.load_thresholds({}), max_live_write_workers=10, min_meter_launch_interval_s=0)
+
+    first = adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                         meter="codex:b", meter_budget=None, meter_budget_error="http_503", now=now)
+    assert first.admitted and first.meter is not None and first.meter.cap == 2
+    assert first.meter.telemetry == "unavailable:http_503"
+
+    _record(tasks, "codex-b-1", agent="codex", codex_account="b-sub", started_at=now.isoformat())
+    second = adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                          meter="codex:b", meter_budget=None, meter_budget_error="http_503", now=now)
+    assert second.admitted and second.meter is not None and second.meter.live == 1 and second.meter.cap == 2
+
+    _record(tasks, "codex-b-2", agent="codex", codex_account="b-sub", started_at=now.isoformat())
+    third = adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                         meter="codex:b", meter_budget=None, meter_budget_error="http_503", now=now)
+    assert not third.admitted and third.meter is not None
+    assert third.meter.live == 2 and third.meter.cap == 2 and third.meter.defer == adm.MeterDefer.CAP
+
+    # A verified fresh reading on the same meter restores the full cap of 8.
+    fresh_budget = {
+        "generated_at": now.isoformat(),
+        "codex_accounts": {"codex:b": {"status": "cool", "freshness": "fresh", "stale": False, "age_s": 5, "remaining_pct": 60}},
+    }
+    fresh_third = adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                               meter="codex:b", meter_budget=fresh_budget, now=now)
+    assert fresh_third.admitted and fresh_third.meter is not None
+    assert fresh_third.meter.telemetry == "fresh" and fresh_third.meter.cap == 8
+
+    # Configurable unknown cap is honored and clamped to the normal cap.
+    raised = replace(
+        adm.load_thresholds({"DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN": "3"}),
+        max_live_write_workers=10, min_meter_launch_interval_s=0,
+    )
+    admitted_at_3 = adm.evaluate("workspace-write", tasks, thresholds=raised, pid_alive=lambda _pid: True,
+                                 meter="codex:b", meter_budget=None, now=now)
+    assert admitted_at_3.admitted and admitted_at_3.meter is not None and admitted_at_3.meter.cap == 3
+
+    clamped = replace(
+        adm.load_thresholds({
+            "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER": "2",
+            "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN": "5",
+        }),
+        max_live_write_workers=10, min_meter_launch_interval_s=0,
+    )
+    refused_clamped = adm.evaluate("workspace-write", tasks, thresholds=clamped, pid_alive=lambda _pid: True,
+                                   meter="codex:b", meter_budget=None, now=now)
+    assert not refused_clamped.admitted and refused_clamped.meter is not None and refused_clamped.meter.cap == 2
+
+
+def test_admit_line_names_the_telemetry_state(tmp_path, probe):
+    """Defect class: admission output or task record omits telemetry state or effective cap."""
+    tasks = tmp_path / "tasks"
+    now = datetime.now(UTC)
+    limits = replace(adm.load_thresholds({}), max_live_write_workers=10, min_meter_launch_interval_s=0)
+
+    # Fresh
+    fresh = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True, meter="codex:a",
+        meter_budget={"generated_at": now.isoformat(),
+                      "codex_accounts": {"codex:a": {"status": "cool", "freshness": "fresh", "age_s": 5, "remaining_pct": 80}}},
+        now=now,
+    )
+    assert "effective cap 8, telemetry=fresh" in fresh.summary()
+    rec = fresh.to_record()
+    assert rec["meter_telemetry"] == "fresh" and rec["meter_effective_cap"] == 8 and rec["meter"] == "codex:a"
+
+    # Stale
+    stale = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True, meter="codex:a",
+        meter_budget={"generated_at": (now - timedelta(seconds=950)).isoformat(),
+                      "codex_accounts": {"codex:a": {"status": "cool", "freshness": "fresh", "age_s": 5, "remaining_pct": 80}}},
+        now=now,
+    )
+    assert "effective cap 2, telemetry=stale:snapshot_expired" in stale.summary()
+    assert stale.to_record()["meter_telemetry"] == "stale:snapshot_expired"
+    assert stale.to_record()["meter_effective_cap"] == 2
+
+    # Unavailable
+    unavailable = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True, meter="codex:a",
+        meter_budget=None, meter_budget_error="http_403", now=now,
+    )
+    assert "effective cap 2, telemetry=unavailable:http_403" in unavailable.summary()
+    assert unavailable.to_record()["meter_telemetry"] == "unavailable:http_403"
+
+    # Not checked (unmetered write + early host-only precheck)
+    unmetered = adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True, now=now)
+    assert "meter telemetry=not checked, effective cap=none" in unmetered.summary()
+    assert unmetered.to_record()["meter_telemetry"] == "not checked"
+    assert unmetered.to_record()["meter_effective_cap"] is None
+
+    probe["probe"] = adm.HostProbe(mem_available_bytes=1 * _GIB, load1=40.0, cpu_count=8, proc_available=True)
+    early = adm.precheck("workspace-write", thresholds=limits)
+    assert early is not None
+    assert "meter telemetry=not checked, effective cap=none" in early.refusal_line()
+    assert early.to_record()["meter_telemetry"] == "not checked"
+    assert early.to_record()["meter_effective_cap"] is None
+
+    # A meter refusal with --force-admission is not marked forced in the task record.
+    exhausted = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True, meter="codex:a",
+        meter_budget={"generated_at": now.isoformat(),
+                      "codex_accounts": {"codex:a": {"status": "cool", "freshness": "fresh", "age_s": 5, "remaining_pct": 0}}},
+        now=now,
+    )
+    assert not exhausted.admitted and exhausted.meter_refused
+    forced_meter_rec = exhausted.to_record(force_reason="attempted override")
+    assert forced_meter_rec["forced"] is False
+    assert forced_meter_rec["meter_telemetry"] == "fresh"
+    assert forced_meter_rec["meter_defer"] == "exhausted"
 
 
 def test_grok_and_cursor_share_one_meter(tmp_path, probe):
@@ -413,6 +740,10 @@ def test_defaults_allow_cap_slots_and_refuse_below_the_floor(tmp_path, probe):
     [
         (adm.ENV_MAX_LIVE_WRITE_WORKERS, "five"),
         (adm.ENV_MAX_LIVE_WRITE_WORKERS, "2.5"),
+        (adm.ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN, "0"),
+        (adm.ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN, "-1"),
+        (adm.ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN, "2.5"),
+        (adm.ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN, "two"),
         (adm.ENV_MIN_MEM_AVAILABLE_GIB, "-1"),
         (adm.ENV_MAX_LOAD_PER_CPU, "nan"),
     ],

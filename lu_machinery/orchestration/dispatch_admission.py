@@ -177,6 +177,7 @@ PROC_ROOT = Path("/proc")
 
 ENV_MAX_LIVE_WRITE_WORKERS = "DISPATCH_MAX_LIVE_WRITE_WORKERS"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER"
+ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN"
 ENV_MIN_METER_LAUNCH_INTERVAL_S = "DISPATCH_MIN_METER_LAUNCH_INTERVAL_S"
 ENV_MIN_MEM_AVAILABLE_GIB = "DISPATCH_MIN_MEM_AVAILABLE_GIB"
 ENV_MAX_LOAD_PER_CPU = "DISPATCH_MAX_LOAD_PER_CPU"
@@ -215,6 +216,7 @@ ADMISSION_ENV_FILE_NAME = "dispatch-admission.env"
 _THRESHOLD_ENV_NAMES = (
     ENV_MAX_LIVE_WRITE_WORKERS,
     ENV_MAX_LIVE_WRITE_WORKERS_PER_METER,
+    ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN,
     ENV_MIN_METER_LAUNCH_INTERVAL_S,
     ENV_MIN_MEM_AVAILABLE_GIB,
     ENV_MAX_LOAD_PER_CPU,
@@ -224,6 +226,9 @@ _THRESHOLD_ENV_NAMES = (
     ENV_DISK_REFUSE_USED_PERCENT,
     ENV_DISK_ALERT_USED_PERCENT,
 )
+
+METER_TELEMETRY_NOT_CHECKED = "not checked"
+_SAFE_REASON_TOKEN_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # Pid-less ``spawning`` record naming the dispatcher that holds an admitted
 # slot until the worker exists (#8717).
@@ -253,7 +258,15 @@ class Thresholds:
     disk_refuse_used_percent: float = _DEFAULT_DISK_REFUSE_USED_PERCENT
     disk_alert_used_percent: float = _DEFAULT_DISK_ALERT_USED_PERCENT
     max_live_write_workers_per_meter: int = config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER
+    max_live_write_workers_per_meter_unknown: int = config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN
     min_meter_launch_interval_s: float = config.DISPATCH_MIN_METER_LAUNCH_INTERVAL_S
+
+    def __post_init__(self) -> None:
+        unknown_cap = self.max_live_write_workers_per_meter_unknown
+        if isinstance(unknown_cap, bool) or not isinstance(unknown_cap, int) or unknown_cap <= 0:
+            raise ValueError(
+                f"{ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN}={unknown_cap!r} must be a positive whole number"
+            )
 
 
 class MeterDefer(StrEnum):
@@ -272,11 +285,12 @@ class MeterCheck:
     interval_s: float
     defer: MeterDefer | None
     retry_in_s: float = 0.0
+    telemetry: str = "unavailable:no_budget"
 
     def clause(self) -> str:
         clause = (
             f"meter {self.meter}: live write workers {self.live}/{self.cap} "
-            f"(fixed ceiling), launch interval {self.interval_s:g}s"
+            f"(effective cap {self.cap}, telemetry={self.telemetry}), launch interval {self.interval_s:g}s"
         )
         if self.defer is not None:
             clause += f", subscription_meter_defer={self.defer}"
@@ -387,15 +401,29 @@ class AdmissionDecision:
     def live_write_workers(self) -> int:
         return len(self.live_task_ids)
 
+    @property
+    def meter_telemetry(self) -> str:
+        return self.meter.telemetry if self.meter is not None else METER_TELEMETRY_NOT_CHECKED
+
+    @property
+    def meter_effective_cap(self) -> int | None:
+        return self.meter.cap if self.meter is not None else None
+
+    def meter_status_clause(self) -> str:
+        if self.meter is not None:
+            return self.meter.clause()
+        return f"meter telemetry={METER_TELEMETRY_NOT_CHECKED}, effective cap=none"
+
     def summary(self) -> str:
         """Measured value against threshold for every check, in one clause list."""
         if self.exempt or self.thresholds is None or self.probe is None:
             return f"mode {self.mode} is exempt (read-only dispatches are not admission-checked)"
         limits = self.thresholds
         probe = self.probe
-        parts = [f"live write workers {self.live_write_workers}/{limits.max_live_write_workers}"]
-        if self.meter is not None:
-            parts.append(self.meter.clause())
+        parts = [
+            f"live write workers {self.live_write_workers}/{limits.max_live_write_workers}",
+            self.meter_status_clause(),
+        ]
         mem = probe.mem_available_gib
         parts.append(
             f"MemAvailable {mem:.1f} GiB (floor {limits.min_mem_available_gib:g} GiB)"
@@ -445,19 +473,22 @@ class AdmissionDecision:
 
     def refusal_line(self) -> str:
         """One line: the failed checks with value and threshold, and how to override."""
+        details = "; ".join(self.failures)
+        if not self.meter_refused:
+            details = f"{details}; {self.meter_status_clause()}"
         if self.disk_refused:
             return (
-                f"dispatch admission refused for a {self.mode} worker: {'; '.join(self.failures)}. "
+                f"dispatch admission refused for a {self.mode} worker: {details}. "
                 "Free space on the .worktrees filesystem (remove settled dispatch worktrees "
                 f"with `python -m {_PACKAGE}.worktree_claims remove`) and retry; --force-admission cannot override a full disk."
             )
         if self.meter_refused:
             return (
-                f"dispatch admission deferred for a {self.mode} worker: {'; '.join(self.failures)}. "
+                f"dispatch admission deferred for a {self.mode} worker: {details}. "
                 "Retry when the subscription meter has room. --force-admission cannot override meter limits."
             )
         return (
-            f"dispatch admission refused for a {self.mode} worker: {'; '.join(self.failures)}. "
+            f"dispatch admission refused for a {self.mode} worker: {details}. "
             "Wait for a worker to finish or for the host to recover, raise the threshold through the named "
             'environment variable, or pass --force-admission "<reason>" to override.'
         )
@@ -486,7 +517,7 @@ class AdmissionDecision:
         return {
             "checked_at": datetime.now(UTC).isoformat(),
             "admitted": self.admitted,
-            "forced": force_reason is not None and not self.admitted,
+            "forced": force_reason is not None and not self.admitted and not (self.disk_refused or self.meter_refused),
             "force_reason": force_reason,
             "failures": list(self.failures),
             "live_write_workers": self.live_write_workers,
@@ -518,6 +549,14 @@ class AdmissionDecision:
             "disk_check_skipped": disk.probe.skipped if disk else None,
             "disk_alert": disk.alert if disk else None,
             "disk_refused": self.disk_refused,
+            "meter": self.meter.meter if self.meter else None,
+            "meter_live_write_workers": self.meter.live if self.meter else None,
+            "meter_effective_cap": self.meter_effective_cap,
+            "meter_normal_cap": limits.max_live_write_workers_per_meter if limits else None,
+            "meter_unknown_cap": limits.max_live_write_workers_per_meter_unknown if limits else None,
+            "meter_telemetry": self.meter_telemetry,
+            "meter_defer": str(self.meter.defer) if self.meter and self.meter.defer is not None else None,
+            "meter_refused": self.meter_refused,
             "swept_crashed": list(self.dead_task_ids) if self.swept else [],
             "psi_shadow": self.psi_shadow,
         }
@@ -563,8 +602,9 @@ def config_defaults() -> Thresholds:
         disk_reap_used_percent=float(config.DISPATCH_DISK_REAP_USED_PERCENT),
         disk_refuse_used_percent=float(config.DISPATCH_DISK_REFUSE_USED_PERCENT),
         disk_alert_used_percent=float(config.DISPATCH_DISK_ALERT_USED_PERCENT),
-        max_live_write_workers_per_meter=config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER,
-        min_meter_launch_interval_s=config.DISPATCH_MIN_METER_LAUNCH_INTERVAL_S,
+        max_live_write_workers_per_meter=int(config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER),
+        max_live_write_workers_per_meter_unknown=int(config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN),
+        min_meter_launch_interval_s=float(config.DISPATCH_MIN_METER_LAUNCH_INTERVAL_S),
     )
 
 
@@ -649,6 +689,19 @@ def load_thresholds(environ: Mapping[str, str] | None = None) -> Thresholds:
     for name in (ENV_DISK_REAP_USED_PERCENT, ENV_DISK_REFUSE_USED_PERCENT, ENV_DISK_ALERT_USED_PERCENT):
         if _env_number(env, name, 0.0, integer=False) > 100:
             raise ValueError(f"{name}={env[name]!r} must be a percentage of at most 100")
+    unknown_meter_cap = int(
+        _env_number(
+            env,
+            ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN,
+            defaults.max_live_write_workers_per_meter_unknown,
+            integer=True,
+        )
+    )
+    if unknown_meter_cap <= 0:
+        raw_unknown = env.get(ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN, unknown_meter_cap)
+        raise ValueError(
+            f"{ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN}={raw_unknown!r} must be a positive whole number"
+        )
     limits = Thresholds(
         max_live_write_workers=int(
             _env_number(env, ENV_MAX_LIVE_WRITE_WORKERS, defaults.max_live_write_workers, integer=True)
@@ -673,6 +726,7 @@ def load_thresholds(environ: Mapping[str, str] | None = None) -> Thresholds:
         max_live_write_workers_per_meter=int(
             _env_number(env, ENV_MAX_LIVE_WRITE_WORKERS_PER_METER, defaults.max_live_write_workers_per_meter, integer=True)
         ),
+        max_live_write_workers_per_meter_unknown=unknown_meter_cap,
         min_meter_launch_interval_s=interval,
     )
     validate_disk_watermarks(limits)
@@ -1146,6 +1200,50 @@ def _left_percent(window: Mapping[str, Any]) -> float | int | None:
     return value if 0 <= value <= 100 else None
 
 
+def _safe_reason_token(raw: object, default: str) -> str:
+    if isinstance(raw, str):
+        candidate = raw.strip().lower()
+        if _SAFE_REASON_TOKEN_RE.fullmatch(candidate):
+            return candidate
+    return default
+
+
+def _usable_remaining_pct(record: Mapping[str, Any]) -> float | None:
+    from lu_machinery.fleet import credit_lane
+
+    remaining = credit_lane.plan_remaining_pct(record)
+    if remaining is None or not 0 <= remaining <= 100:
+        return None
+    return remaining
+
+
+def _probe_telemetry(
+    record: Mapping[str, Any],
+    max_age_s: float,
+    *,
+    stale_reason: str = "probe_stale",
+    missing_reason: str = "probe_unavailable",
+) -> str:
+    from lu_machinery.fleet import credit_lane
+
+    state, _ = credit_lane.probe_freshness(record, max_age_s)
+    if state == credit_lane.FRESH:
+        return "fresh"
+    native = _mapping(record.get("codexbar"))
+    freshness = record.get("freshness", native.get("freshness"))
+    flagged = native.get("stale") is True or record.get("stale") is True
+    if state == credit_lane.STALE:
+        if flagged or (isinstance(freshness, str) and freshness.startswith("stale")):
+            return f"stale:{stale_reason}"
+        return "stale:probe_age_exceeded"
+    if freshness != "fresh":
+        if freshness is None and missing_reason == "probe_unavailable":
+            return "unavailable:freshness_missing"
+        return f"unavailable:{missing_reason}"
+    raw_age = record.get("age_s", native.get("age_s"))
+    return "unavailable:age_missing" if raw_age is None else "unavailable:age_invalid"
+
+
 def _meter_observation(meter: str, budget: Mapping[str, Any]) -> tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
     """Use account or group quota data. Runtime blocks remain attributed to their route."""
     agents = _mapping(budget.get("agents"))
@@ -1173,7 +1271,7 @@ def _meter_observation(meter: str, budget: Mapping[str, Any]) -> tuple[Mapping[s
         record = (
             credit_lane.merge_grok_cursor_record(grok, cursor)
             if credit_lane.grok_cursor_bindings_verified(grok, cursor)
-            else grok or cursor
+            else {}
         )
         return record, (grok, cursor)
     gemini = _mapping(agents.get("gemini"))
@@ -1183,9 +1281,11 @@ def _meter_observation(meter: str, budget: Mapping[str, Any]) -> tuple[Mapping[s
         )
         primary, secondary = _mapping(groups.get("five_hour")), _mapping(groups.get("weekly"))
         native = _mapping(gemini.get("codexbar"))
+        freshness = gemini.get("freshness") if gemini.get("freshness") is not None else native.get("freshness")
+        age_s = gemini.get("age_s") if gemini.get("age_s") is not None else native.get("age_s")
         return {
-            "freshness": gemini.get("freshness", native.get("freshness")),
-            "age_s": gemini.get("age_s", native.get("age_s")),
+            "freshness": freshness,
+            "age_s": age_s,
             "stale": gemini.get("stale") is True or native.get("stale") is True,
             "codexbar": {
                 "primary_remaining_pct": primary.get("remaining_pct"),
@@ -1195,12 +1295,20 @@ def _meter_observation(meter: str, budget: Mapping[str, Any]) -> tuple[Mapping[s
     return gemini, (gemini,)
 
 
-def _meter_rate_limited(record: Mapping[str, Any], meter: str) -> bool:
+def _meter_rate_limited(record: Mapping[str, Any], meter: str, now: datetime) -> bool:
+    from lu_machinery.agent_runtime.usage import LANE_RUNTIME_WINDOW_S
+
     runtime = _mapping(record.get("runtime"))
     count = runtime.get("rate_limited")
-    if record.get("status") == "rate_limited":
-        return True
-    if runtime.get("headroom_blocked") is not True and not (type(count) is int and count > 0):
+    flagged = (
+        record.get("status") == "rate_limited"
+        or runtime.get("headroom_blocked") is True
+        or (type(count) is int and count > 0)
+    )
+    if not flagged:
+        return False
+    event_age = _age_s(runtime.get("last_rate_limited_at"), now)
+    if event_age is None or not 0 <= event_age < LANE_RUNTIME_WINDOW_S:
         return False
     models = runtime.get("models_rate_limited")
     if not meter.startswith("agy:") or not isinstance(models, list) or not models:
@@ -1210,27 +1318,87 @@ def _meter_rate_limited(record: Mapping[str, Any], meter: str) -> bool:
     )
 
 
-def _meter_defer(meter: str, budget: Mapping[str, Any], now: datetime) -> MeterDefer | None:
+def _meter_defer(
+    meter: str,
+    budget: Mapping[str, Any] | None,
+    now: datetime,
+    *,
+    budget_error: str | None = None,
+) -> tuple[str, MeterDefer | None]:
     from lu_machinery.fleet import credit_lane
 
-    diagnostics = _mapping(budget.get("diagnostics"))
+    if budget is None:
+        return f"unavailable:{_safe_reason_token(budget_error, 'no_budget')}", None
+    if not isinstance(budget, Mapping):
+        return "unavailable:invalid_budget", None
     max_age = credit_lane.probe_max_age_s()
-    age = _age_s(budget.get("generated_at"), now)
-    if credit_lane.snapshot_freshness(diagnostics)[0] != credit_lane.FRESH or age is None or not 0 <= age < max_age:
-        return None
     record, routes = _meter_observation(meter, budget)
-    if any(_meter_rate_limited(route, meter) for route in routes):
-        return MeterDefer.RATE_LIMITED
-    if credit_lane.probe_freshness(record, max_age)[0] == credit_lane.STALE:
-        return None
-    remaining = credit_lane.plan_remaining_pct(record)
+    runtime_defer = (
+        MeterDefer.RATE_LIMITED if any(_meter_rate_limited(route, meter, now) for route in routes) else None
+    )
+
+    if meter.startswith("claude:"):
+        row = routes[0]
+        if not row:
+            return "unavailable:meter_missing", runtime_defer
+        row_reason = _safe_reason_token(row.get("reason"), "")
+        telemetry = _probe_telemetry(
+            record,
+            max_age,
+            stale_reason=row_reason or "probe_stale",
+            missing_reason=row_reason or "probe_unavailable",
+        )
+        if telemetry == "fresh" and row.get("updated") is not None:
+            updated_age = _age_s(row.get("updated"), now)
+            if updated_age is None or not math.isfinite(updated_age) or updated_age < 0:
+                telemetry = "unavailable:updated_invalid"
+            elif updated_age >= max_age:
+                telemetry = "stale:probe_age_exceeded"
+        if telemetry != "fresh":
+            return telemetry, runtime_defer
+        remaining = _usable_remaining_pct(record)
+        if remaining is None:
+            return "unavailable:allowance_missing", runtime_defer
+    else:
+        raw_generated_at = budget.get("generated_at")
+        if raw_generated_at is None or raw_generated_at == "":
+            return "unavailable:snapshot_timestamp_missing", runtime_defer
+        snapshot_age = _age_s(raw_generated_at, now)
+        if snapshot_age is None or not math.isfinite(snapshot_age) or snapshot_age < 0:
+            return "unavailable:snapshot_timestamp_invalid", runtime_defer
+        if snapshot_age >= max_age:
+            return "stale:snapshot_expired", runtime_defer
+        remaining_max_age = max_age - snapshot_age
+        if meter == "grok+cursor":
+            grok, cursor = routes
+            if not grok and not cursor:
+                return "unavailable:meter_missing", runtime_defer
+            if not record:
+                return "unavailable:binding_unverified", runtime_defer
+            for component in (grok, cursor):
+                comp_telemetry = _probe_telemetry(component, remaining_max_age)
+                if comp_telemetry.startswith("stale:"):
+                    return comp_telemetry, runtime_defer
+        elif meter == "agy:claude_gpt":
+            if not routes[0]:
+                return "unavailable:meter_missing", runtime_defer
+        elif not record:
+            return "unavailable:meter_missing", runtime_defer
+        telemetry = _probe_telemetry(record, remaining_max_age)
+        if telemetry != "fresh":
+            return telemetry, runtime_defer
+        remaining = _usable_remaining_pct(record)
+        if remaining is None:
+            return "unavailable:allowance_missing", runtime_defer
+
+    if runtime_defer is not None:
+        return "fresh", runtime_defer
     status = record.get("status")
     if status in ("exhausted", "pool_exhausted") or remaining == 0:
-        return MeterDefer.EXHAUSTED
-    if status == "near_cap" or (remaining is not None and 0 < remaining <= 100
-                                and credit_lane.allowance_status(remaining) == "near_cap"):
-        return MeterDefer.NEAR_CAP
-    return None
+        return "fresh", MeterDefer.EXHAUSTED
+    if status == "near_cap" or credit_lane.allowance_status(remaining) == "near_cap":
+        return "fresh", MeterDefer.NEAR_CAP
+    return "fresh", None
 
 
 def new_admission_hold(run_nonce: str) -> dict[str, Any]:
@@ -1366,7 +1534,7 @@ def scan_task_records(
         matches_meter = meter is not None and _meter_record(state) == meter
         on_meter = matches_meter and write_capable
         # Cadence paces provider launches, so an orchestrator turn's launch counts here though it holds no slot.
-        if matches_meter and launches_writer and not state.get("never_started_reason"):
+        if matches_meter and launches_writer and min_interval_s > 0 and not state.get("never_started_reason"):
             launch_age = _age_s(state.get("started_at"), clock)
             if launch_age is not None and -PIDLESS_CLOCK_SKEW_S <= launch_age < min_interval_s:
                 launch_age = max(0.0, launch_age)
@@ -1561,6 +1729,7 @@ def evaluate(
     record_shadow: bool = True,
     meter: str | None = None,
     meter_budget: Mapping[str, Any] | None = None,
+    meter_budget_error: str | None = None,
     now: datetime | None = None,
     orchestrator: bool = False,
 ) -> AdmissionDecision:
@@ -1603,11 +1772,15 @@ def evaluate(
         )
     meter_check = None
     if meter is not None:
-        cap = limits.max_live_write_workers_per_meter
-        defer = (
-            MeterDefer.RATE_LIMITED if scan.meter_recently_rate_limited
-            else _meter_defer(meter, meter_budget or {}, clock)
+        telemetry, monitor_defer = _meter_defer(
+            meter, meter_budget, clock, budget_error=meter_budget_error,
         )
+        effective_unknown_cap = min(
+            limits.max_live_write_workers_per_meter,
+            limits.max_live_write_workers_per_meter_unknown,
+        )
+        cap = limits.max_live_write_workers_per_meter if telemetry == "fresh" else effective_unknown_cap
+        defer = MeterDefer.RATE_LIMITED if scan.meter_recently_rate_limited else monitor_defer
         interval = limits.min_meter_launch_interval_s
         retry_in = 0.0
         if defer is None and not orchestrator and scan.live_on_meter >= cap:
@@ -1615,7 +1788,7 @@ def evaluate(
         if defer is None and scan.last_meter_launch_age_s is not None:
             defer = MeterDefer.CADENCE
             retry_in = interval - scan.last_meter_launch_age_s
-        meter_check = MeterCheck(meter, scan.live_on_meter, cap, interval, defer, retry_in)
+        meter_check = MeterCheck(meter, scan.live_on_meter, cap, interval, defer, retry_in, telemetry)
         if defer is not None:
             failures.append(meter_check.clause())
     failures.extend(host_failures(probe, limits))
