@@ -81,12 +81,6 @@ _RELEASE_INVENTORY = ("from importlib.resources import files; "
                       "print(files('lu_machinery').joinpath('agent_deploy/release.v1.json').read_text())")
 _NODE_SEAL = f"from pathlib import Path; import sys; {_ACPX}seal_node_dependencies as s; print(s(cache=Path(sys.argv[1])))"
 _SITE_PATHS = "import sysconfig; print(sysconfig.get_path('purelib')); print(sysconfig.get_path('platlib'))"
-_SOURCE_PUBLISHER_RUN = (
-    "import os, sys; "
-    "env = {k: v for k, v in os.environ.items() if not k.startswith('PYTHON')}; "
-    "env['PYTHONPATH'] = sys.argv[1]; "
-    "os.execve(sys.argv[2], sys.argv[2:], env)"
-)
 
 
 class CutError(Exception):
@@ -1302,17 +1296,18 @@ class Cut:
         return f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={root} LU_PRODUCT_ROOT={root} LU_PYTHON={host_py}"
 
     def _manual_post_release_command(self, argv: Sequence[str]) -> str | None:
-        """Shell-quoted publisher command to open the post-release PR from an already pushed branch."""
+        """Shell-quoted publisher command for installed-venv / work/accept runs only.
+
+        Source-checkout runs return None so manual recovery never emits a shell bootstrap that
+        could fall through to a stale installed package if the checkout moves or a venv preloads.
+        """
         try:
             pub_argv, pub_env = self.publisher_invocation(*argv)
         except CutError:
             return None
+        if "PYTHONPATH" in pub_env or pub_argv[1:4] != ["-I", "-m", "lu_machinery.publish"]:
+            return None
         prefix = self._recovery_env_prefix()
-        if "PYTHONPATH" in pub_env:
-            manual_argv: list[str | Path] = [
-                pub_argv[0], "-I", "-S", "-c", _SOURCE_PUBLISHER_RUN, pub_env["PYTHONPATH"], *pub_argv,
-            ]
-            return f"{prefix} {shlex.join(str(part) for part in manual_argv)}"
         return f"{prefix} {shlex.join(str(part) for part in pub_argv)}"
 
     def clean_up(self, cause: str) -> str:
@@ -1423,7 +1418,19 @@ class Cut:
                     f"Manual recovery: if {branch} is already pushed on {self.machinery_repo} with no open PR, "
                     f"verify its commit and open the PR with:\n  {manual}"
                 ) from exc
-            raise
+            milestone_step = (
+                f" (passing --milestone {shlex.quote(self.machinery_milestone)})"
+                if self.machinery_milestone is not None
+                else ""
+            )
+            guidance = (
+                f"if {branch} is already pushed on {self.machinery_repo} with no open PR:\n"
+                f"  1. Verify the pushed commit on {branch} and confirm no open PR exists.\n"
+                f"  2. Follow docs/release.md to open the PR manually against main "
+                f"from {branch} using preserved body {body.absolute()}{milestone_step}."
+            )
+            self.say(f"post-release push failed; {guidance}")
+            raise CutError(f"{exc}\nManual recovery: {guidance}") from exc
         number = pr_number(self.publisher(*argv))
         self.say(f"opened post-release PR #{number}")
         return number

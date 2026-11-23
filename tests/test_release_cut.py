@@ -1474,19 +1474,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     # Explicit source-checkout fixture outside site-packages so behavior is identical in wheel-installed CI.
     src_root = tmp_path / "source-checkout"
     src_init = src_root / "lu_machinery/__init__.py"
-    src_pub_main = src_root / "lu_machinery/publish/__main__.py"
-    src_pub_main.parent.mkdir(parents=True)
+    src_init.parent.mkdir(parents=True)
     src_init.write_text("", encoding="utf-8")
-    (src_root / "lu_machinery/publish/__init__.py").write_text("", encoding="utf-8")
-    src_pub_main.write_text(
-        "import json, os, sys\n"
-        "python_vars = sorted(k for k in os.environ if k.startswith('PYTHON'))\n"
-        "print(json.dumps({'source': 'CHECKOUT', 'argv': sys.argv[1:], 'python_vars': python_vars, "
-        "'pythonpath': os.environ.get('PYTHONPATH'), "
-        "'primary': os.environ.get('LEARN_UKRAINIAN_PRIMARY_REPO_ROOT'), "
-        "'product': os.environ.get('LU_PRODUCT_ROOT'), 'lu_python': os.environ.get('LU_PYTHON')}))\n",
-        encoding="utf-8",
-    )
     with monkeypatch.context() as src_ctx:
         src_ctx.setattr(lu_machinery, "__file__", str(src_init))
         argv, env = cut.publisher_invocation("read", "run", "--repo", REPO, "--number", "7")
@@ -1494,69 +1483,37 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     assert argv == [Path(sys.executable), "-P", "-s", "-m", "lu_machinery.publish", "read", "run", "--repo", REPO, "--number", "7"]
     assert env["PYTHONPATH"] == str(src_root.resolve())
     assert "PYTHONWARNINGS" not in env and "PYTHONUSERBASE" not in env
-    assert manual_src is not None
-    assert "-I -S -c" in manual_src
-    # Execute the emitted source-checkout manual command in a fresh shell with hostile PYTHON* settings
-    # (including PYTHONHOME pointing at an empty directory) to prove full isolation matching publisher_invocation().
-    empty_pyhome = tmp_path / "empty-pythonhome"
-    empty_pyhome.mkdir()
-    hostile_shell_env = {
-        **clean_shell_env,
-        "PYTHONHOME": str(empty_pyhome),
-        "PYTHONPATH": str(tmp_path / "stale-pythonpath"),
-        "PYTHONWARNINGS": "error",
-        "PYTHONUSERBASE": str(tmp_path / "bad-userbase"),
-    }
-    manual_src_result = subprocess.run(
-        ["/bin/sh", "-c", manual_src], cwd=tmp_path, env=hostile_shell_env,
-        capture_output=True, text=True, check=False, timeout=30,
-    )
-    assert manual_src_result.returncode == 0, f"source manual command failed: {manual_src_result.stderr}"
-    manual_src_payload = json.loads(manual_src_result.stdout)
-    assert manual_src_payload == {
-        "source": "CHECKOUT",
-        "argv": ["pr-create", "--repo", REPO, "--head", "release/start-0.1.63"],
-        "python_vars": ["PYTHONPATH"],
-        "pythonpath": str(src_root.resolve()),
-        "primary": str(primary.absolute()),
-        "product": str(primary.absolute()),
-        "lu_python": str(host_python.absolute()),
-    }
-    # Startup-preload regression (R2 F1): in a real consumer venv with a competing installed lu_machinery wheel
-    # preloaded via both a .pth file and sitecustomize.py, the copied command still runs CHECKOUT, never INSTALLED.
-    preload_venv = tmp_path / "preload-venv"
-    subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(preload_venv)], check=True, timeout=30)
-    preload_python = (preload_venv / "bin/python").absolute()
-    preload_site = Path(subprocess.run(
-        [str(preload_python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
-        check=True, capture_output=True, text=True, timeout=30,
-    ).stdout.strip())
-    (preload_site / "lu_machinery/publish").mkdir(parents=True)
-    (preload_site / "lu_machinery/__init__.py").write_text("", encoding="utf-8")
-    (preload_site / "lu_machinery/publish/__init__.py").write_text("", encoding="utf-8")
-    (preload_site / "lu_machinery/publish/__main__.py").write_text(
-        "import json; print(json.dumps({'source': 'INSTALLED'}))\n", encoding="utf-8",
-    )
-    (preload_site / "zz_preload_lu.pth").write_text("import lu_machinery\n", encoding="utf-8")
-    (preload_site / "sitecustomize.py").write_text("import lu_machinery\n", encoding="utf-8")
-    with monkeypatch.context() as preload_ctx:
-        preload_ctx.setattr(sys, "executable", str(preload_python))
-        preload_ctx.setattr(lu_machinery, "__file__", str(src_init))
-        preload_ctx.setattr(
-            release_cut.sysconfig, "get_path",
-            lambda key: str(preload_site) if key in {"purelib", "platlib"} else None,
-        )
-        manual_preload = cut._manual_post_release_command(["pr-create", "--repo", REPO, "--head", "release/start-0.1.63"])
-    assert manual_preload is not None
-    preload_result = subprocess.run(
-        ["/bin/sh", "-c", manual_preload], cwd=tmp_path, env=hostile_shell_env,
-        capture_output=True, text=True, check=False, timeout=30,
-    )
-    assert preload_result.returncode == 0, f"preload manual command failed: {preload_result.stderr}"
-    preload_payload = json.loads(preload_result.stdout)
-    assert isinstance(preload_payload, dict) and preload_payload["source"] == "CHECKOUT"
+    # Source-checkout mode omits a copy-paste shell command and instead prints preserved body path, branch, and
+    # plain manual steps referencing docs/release.md so delayed execution can never fall through to a stale wheel.
+    assert manual_src is None
+    cut.git(machinery, "switch", "--quiet", "main")
+    cut.git(machinery, "branch", "-D", "release/start-0.1.63")
+    push_fail_enabled = True
+    capsys.readouterr()
+    with monkeypatch.context() as src_push_ctx:
+        src_push_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        src_push_ctx.setattr(cut, "run", run_with_push_failure)
+        with pytest.raises(CutError) as src_push_exc:
+            cut.post_release("### Fixed\n\n- Fix\n")
+    push_fail_enabled = False
+    src_err = str(src_push_exc.value)
+    src_out = capsys.readouterr().out
+    assert "non-fast-forward" in src_err
+    assert "Manual recovery:" in src_err
+    assert "post-release push failed;" in src_out
+    for expected in (
+        "release/start-0.1.63",
+        str((work / "post-release-body.md").absolute()),
+        "docs/release.md",
+        shlex.quote(cut.machinery_milestone),
+    ):
+        assert expected in src_err
+        assert expected in src_out
+    assert "PYTHONPATH=" not in src_err and "-I -S" not in src_err and "lu_machinery.publish" not in src_err
+    assert (work / "post-release-body.md").is_file()
 
-    # Installed venv invocation (e.g. resuming post-release with accept/bin/python -I) uses -I with no PYTHONPATH.
+    # Installed venv invocation (e.g. resuming post-release with accept/bin/python -I) uses -I with no PYTHONPATH
+    # and still emits an exact copy-paste manual command on push failure.
     fake_site = work / "accept/lib/python3.14/site-packages"
     fake_init = fake_site / "lu_machinery/__init__.py"
     fake_init.parent.mkdir(parents=True, exist_ok=True)
@@ -1567,6 +1524,10 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     argv_installed, env_installed = cut.publisher_invocation("pr-create", "--milestone", "v0.11.0")
     assert argv_installed == [installed, "-I", "-m", "lu_machinery.publish", "pr-create", "--milestone", "v0.11.0"]
     assert "PYTHONPATH" not in env_installed
+    manual_installed = cut._manual_post_release_command(["pr-create", "--repo", REPO, "--head", "release/start-0.1.63"])
+    assert manual_installed is not None
+    assert f"{shlex.quote(str(installed))} -I -m lu_machinery.publish pr-create" in manual_installed
+    assert "PYTHONPATH=" not in manual_installed
     # Actually invoke publisher through this post-release resume path while host_python stays stale.
     out = cut.publisher("pr-create", "--repo", REPO, "--milestone", "v0.11.0")
     assert "/pull/1275" in out
@@ -1607,7 +1568,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     with monkeypatch.context() as malformed_ctx:
         malformed_ctx.setattr(lu_machinery, "__file__", str(src_init))
         malformed_ctx.setattr(release_cut.sysconfig, "get_path", lambda key: str(file_site) if key == "purelib" else None)
-        with pytest.raises(CutError, match="running interpreter purelib path .* is not a directory"):
+        with pytest.raises(CutError, match=r"running interpreter purelib path .* is not a directory"):
             cut.publisher_invocation("pr-create")
     with monkeypatch.context() as malformed_ctx:
         malformed_ctx.setattr(lu_machinery, "__file__", str(src_init))
@@ -1615,7 +1576,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
             release_cut.sysconfig, "get_path",
             lambda key: str(file_site / "site-packages") if key == "platlib" else None,
         )
-        with pytest.raises(CutError, match="running interpreter platlib path .* has non-directory ancestor"):
+        with pytest.raises(CutError, match=r"running interpreter platlib path .* has non-directory ancestor"):
             cut.publisher_invocation("pr-create")
     with monkeypatch.context() as absent_ctx:
         absent_ctx.setattr(lu_machinery, "__file__", str(src_init))
