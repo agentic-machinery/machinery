@@ -62,7 +62,7 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(mod.stale, "collect_repo_facts", lambda *a: facts)
     monkeypatch.setattr(mod.stale, "fleet_fetch_target", lambda *a: target)
     monkeypatch.setattr(mod.stale, "_git", git)
-    monkeypatch.setattr(mod.stale, "gh_pull_page", lambda slug, page: closed if page == 1 else [])
+    monkeypatch.setattr(mod, "closed_pull_pager", lambda slug: lambda _slug, page: closed if page == 1 else [])
 
     def record(task="one", **changes):
         data = {
@@ -195,8 +195,32 @@ def test_incomplete_merged_pr_evidence_is_unknown(host):
     def unavailable(*args):
         raise RuntimeError("unavailable")
 
-    host.monkeypatch.setattr(mod.stale, "gh_pull_page", unavailable)
+    host.monkeypatch.setattr(mod, "closed_pull_pager", lambda slug: unavailable)
     assert host.scan()["errors"] == [f"{SLUG}: merged PR evidence incomplete"]
+
+
+def test_closed_pull_pager_keeps_fields_and_pages_without_full_rest_bodies(monkeypatch):
+    node = {"number": 41, "url": "https://example.test/41", "updatedAt": NOW.isoformat(),
+            "mergedAt": NOW.isoformat(), "headRefName": "codex/fix", "headRefOid": REMOTE,
+            "headRepository": {"nameWithOwner": SLUG}, "mergeCommit": {"oid": BASE}}
+    calls = []
+
+    class Client:
+        def request(self, method, endpoint, *, payload, fresh):
+            calls.append(payload)
+            assert method == "POST" and endpoint == "graphql" and fresh
+            assert "body" not in payload["query"]
+            first = payload["variables"]["cursor"] is None
+            return mod.github_client.Result({"data": {"repository": {"nameWithOwner": SLUG,
+                "pullRequests": {"nodes": [node] * 100 if first else [node],
+                                 "pageInfo": {"hasNextPage": first, "endCursor": "next" if first else "end"}}}}})
+
+    monkeypatch.setattr(mod.github_client, "GitHubClient", Client)
+    pager = mod.closed_pull_pager(SLUG)
+    index = mod.stale.build_pull_index(SLUG, oldest_start=None, pager=pager, max_pages=3)
+    assert index.error is None and index.covered_since is None and index.pages == 2
+    assert REMOTE in index.merged_by_sha and BASE in index.merged_by_sha
+    assert [call["variables"]["cursor"] for call in calls] == [None, "next"]
 
 
 @pytest.mark.parametrize("case", ["pr", "merged", "young", "old", "abandoned", "abandon_receipt", "review"])

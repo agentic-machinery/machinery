@@ -55,6 +55,7 @@ _JSON_MAX_DEPTH = 512
 
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 CACHE_MAX_BYTES = 64 * 1024 * 1024
+CACHE_MAX_BODY_BYTES = 256 * 1024
 # Only identifiable response rows participate in maintenance and reuse. CASE
 # prevents malformed headers from making JSON functions abort the transaction.
 _CACHE_RESPONSE = """typeof(scope)='text' AND typeof(key)='text'
@@ -1151,10 +1152,14 @@ def _maintain_cache(db, now, ttl, max_bytes):
     ).fetchone()
     if oldest is None:
         return
-    if oldest <= now - ttl or largest > max_bytes:
+    oversized_body = largest > CACHE_MAX_BODY_BYTES and db.execute(
+        f"SELECT 1 FROM cache WHERE ({_CACHE_RESPONSE}) AND {_CACHE_BYTES}>? "
+        "AND length(CAST(body AS BLOB))>? LIMIT 1", (CACHE_MAX_BODY_BYTES, CACHE_MAX_BODY_BYTES),
+    ).fetchone() is not None
+    if oldest <= now - ttl or largest > max_bytes or oversized_body:
         db.execute(
-            f"DELETE FROM cache WHERE ({_CACHE_RESPONSE}) AND (at<=? OR {_CACHE_BYTES}>?)",
-            (now - ttl, max_bytes),
+            f"DELETE FROM cache WHERE ({_CACHE_RESPONSE}) AND (at<=? OR {_CACHE_BYTES}>? OR length(CAST(body AS BLOB))>?)",
+            (now - ttl, max_bytes, CACHE_MAX_BODY_BYTES),
         )
         total = db.execute(
             f"SELECT coalesce(sum({_CACHE_BYTES}),0) FROM cache WHERE {_CACHE_RESPONSE}"
@@ -1715,7 +1720,10 @@ class GitHubClient:
                                 ):
                                     _store_budget(db, self.scope, name, rate["remaining"], rate["reset"], now=now)
                         if cacheable and response.body:
-                            _store_cache(db, self.scope, key, response.body, h, now)
+                            if len(response.body) <= CACHE_MAX_BODY_BYTES:
+                                _store_cache(db, self.scope, key, response.body, h, now)
+                            else:
+                                db.execute("DELETE FROM cache WHERE scope=? AND key=? AND at<=?", (self.scope, key, now))
                     break
                 except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError) as error:
                     if _transient_lock(error):
