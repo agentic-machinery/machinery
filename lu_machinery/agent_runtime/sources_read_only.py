@@ -8,6 +8,7 @@ The side-effect audit tests these annotations against actual persistent writes.
 from __future__ import annotations
 
 import ast
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,6 +16,25 @@ from lu_machinery.common.repo_root import product_root
 
 # The Sources server is product-owned (C-4843): its path is the configured product checkout's.
 SERVER_RELATIVE_PATH = Path(".mcp/servers/sources/server.py")
+
+
+def printable_text(text: str) -> bool:
+    """Whether every character of *text* is printable, with the same answer on every supported Python.
+
+    The shared character baseline of the no-Sources consumer path: checkout identification's
+    mountinfo reader and the Claude allowlist guard both use it. A character must be the ASCII
+    space, or lie outside the Unicode ``C*`` (control, format, surrogate, private use, unassigned)
+    and ``Z*`` (separator) categories in both the frozen Unicode 3.2.0 table
+    (``unicodedata.ucd_3_2_0``, identical in every CPython) and the running interpreter's table.
+    The interpreter's table alone changes with the Python version for newly assigned code points.
+    The frozen table alone misses later reclassifications such as U+00AD SOFT HYPHEN (``Pd`` in
+    3.2.0, ``Cf`` since 4.0). Code points assigned after Unicode 3.2.0 are therefore refused.
+    """
+    return all(
+        ch == " "
+        or (unicodedata.ucd_3_2_0.category(ch)[0] not in "CZ" and unicodedata.category(ch)[0] not in "CZ")
+        for ch in text
+    )
 
 
 def sources_server_path() -> Path | None:

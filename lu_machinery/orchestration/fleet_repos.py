@@ -25,7 +25,6 @@ import re
 import stat
 import subprocess
 import sys
-import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
@@ -33,7 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH
+from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH, printable_text
 from lu_machinery.common.git_credentials import (
     SELECTOR_ENV,
     SelectorError,
@@ -528,9 +527,6 @@ _MOUNTINFO_ESCAPE_RE = re.compile(rb"\\([0-7]{3})")
 _MOUNTINFO_PATH_ESCAPED = frozenset(b" \t\n\\")
 _MOUNTINFO_MANGLE_ESCAPED = _MOUNTINFO_PATH_ESCAPED | frozenset(b"#")
 _MOUNTINFO_SUPER_OPTS_ESCAPED = _MOUNTINFO_MANGLE_ESCAPED | frozenset(b",=")
-# A frozen Unicode baseline that ships unchanged in every CPython, so the printable set does not
-# move with the interpreter's own Unicode version (3.12 and 3.14 classify new code points differently).
-_UCD = unicodedata.ucd_3_2_0
 # One fdinfo line: a canonical lowercase key, exactly ":\t", then printable non-space ASCII.
 _FDINFO_LINE_RE = re.compile(rb"([a-z][a-z_]*):\t([\x21-\x7e]+)")
 
@@ -548,10 +544,10 @@ def _decode_mountinfo_field(field: bytes, *, escaped: frozenset[int] = frozenset
 
     Only the octal escapes the kernel writes for that field (*escaped*) are accepted; a raw
     backslash or any other escape is refused. The decoded text must be non-empty and
-    printable in the frozen Unicode 3.2.0 table (no category ``C*`` or ``Z*`` character except the
-    ASCII space), so control bytes such as CR, escaped tab or newline, code points that table does
-    not assign (``Cn``), and undecodable bytes (which :func:`os.fsdecode` maps to lone surrogates,
-    category ``Cs``) all refuse the field.
+    :func:`~lu_machinery.agent_runtime.sources_read_only.printable_text`, so control bytes such as
+    CR, escaped tab or newline, format and separator characters, code points assigned after
+    Unicode 3.2.0, and undecodable bytes (which :func:`os.fsdecode` maps to lone surrogates,
+    category ``Cs``) all refuse the field, with the same result on every supported Python.
     """
     out = bytearray()
     pos = 0
@@ -567,9 +563,7 @@ def _decode_mountinfo_field(field: bytes, *, escaped: frozenset[int] = frozenset
         return None
     out += field[pos:]
     text = os.fsdecode(bytes(out))
-    if not text or any(ch != " " and _UCD.category(ch)[0] in "CZ" for ch in text):
-        return None
-    return text
+    return text if text and printable_text(text) else None
 
 
 def _canonical_mount_point(text: str | None) -> str | None:

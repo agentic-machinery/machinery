@@ -248,6 +248,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Mapping, Sequence
 from functools import cache
 from pathlib import Path
@@ -267,7 +268,7 @@ from ..env_sanitize import (
 from ..errors import AgentUnavailableError
 from ..jsonl import jsonl_lines
 from ..result import ParseResult
-from ..sources_read_only import sources_server_path, sources_tool_sets
+from ..sources_read_only import printable_text, sources_server_path, sources_tool_sets
 from ..tool_calls import normalize_tool_calls, parse_json_events
 from ._output_schema import json_value, load_output_schema, plan_output_schema, schema_metadata, structured_result
 from .base import InvocationPlan
@@ -650,14 +651,15 @@ def _validate_allow_rule(rule: str) -> str:
 def _strip_mcp_allow_rules(raw: object) -> str:
     """Drop MCP/Sources allow rules when a read-only run loads no MCP servers.
 
-    Fail closed by class before tokenizing: the list must be printable ASCII (U+0020-U+007E) and
-    free of backslashes. That refuses every Unicode ``C*`` and ``Z*`` character except the ASCII
-    space, and every non-normalized form, without depending on the interpreter's Unicode version;
-    the tokenizer models no escape syntax, so an escape could split differently in the CLI.
+    Fail closed by class before tokenizing: the list must satisfy
+    :func:`~lu_machinery.agent_runtime.sources_read_only.printable_text` (no Unicode ``C*`` or ``Z*``
+    character except the ASCII space, the same answer on every supported Python), be
+    NFKC-normalized, and hold no backslash (the tokenizer models no escape syntax, so an escape
+    could split differently in the CLI).
     """
     if not isinstance(raw, str):
         raise ValueError("ClaudeAdapter: allowed_tools must be a string")
-    if not (raw.isascii() and raw.isprintable()) or "\\" in raw:
+    if not printable_text(raw) or "\\" in raw or not unicodedata.is_normalized("NFKC", raw):
         raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
     if not raw.strip(" "):
         raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")

@@ -279,6 +279,10 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         {"allowed_tools": "Read, Bash(git log --format=%H,%s), mcp__sources__*, mcp__*, mcp__other__tool, mcp*"},
     )
     assert explicit[explicit.index("--allowedTools") + 1] == "Read,Bash(git log --format=%H,%s)"
+    # Printable, NFKC-normalized non-ASCII qualifiers (Cyrillic, U+2019, accented Latin) stay supported.
+    unicode_rules = "Read(/\u0434\u0430\u043d\u0456/\u0444\u2019.md) Read(/donn\u00e9es/a.md),mcp__sources__verify_word"
+    unicode_path = _read_only(consumer, {"allowed_tools": unicode_rules})
+    assert unicode_path[unicode_path.index("--allowedTools") + 1] == unicode_rules.rsplit(",", 1)[0].replace(" ", ",")
     for bad_allowed in (
         "",
         "   ",
@@ -299,11 +303,13 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         "Read\nGrep",
         "Read\u00a0Grep",
         "Read\u2028Grep",
-        # Fail closed by class (PR1297-F2, CTO class decision): only printable ASCII, so every Unicode
-        # category C* and Z* except the ASCII space and every non-normalized form, the same on every
-        # Python version, and no backslash escapes the tokenizer does not model.
+        # Fail closed by class (PR1297-F2, CTO class decision): every Unicode category C* and Z* except
+        # the ASCII space in either the frozen Unicode 3.2.0 table or the interpreter's own, so the
+        # same answer on every Python version; non-NFKC input; backslash escapes the tokenizer does
+        # not model.
         "Read(notes-\U0001fae9.md)",  # Cn on Python 3.12, So on 3.14
-        "Read(/\u0434\u0430\u043d\u0456/\u0444.md)",  # printable non-ASCII (Cyrillic)
+        "Read(\u20b4)",  # assigned after Unicode 3.2.0: refused on every version
+        "Read(a\u00adb)",  # SOFT HYPHEN: Pd in Unicode 3.2.0, Cf since 4.0
         "Read(\ud800)",  # Cs unpaired surrogate
         "Read(\ue000)",  # Co private use
         "Read(\u0378)",  # Cn unassigned

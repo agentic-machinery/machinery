@@ -1602,7 +1602,9 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
             valid_root_line + _rec(b"/mnt/unrelated\rdir"),  # CR in path (PR1297-F3 reversed)
             valid_root_line + _rec("/mnt/\u202ertl".encode()),  # bidi format character (Cf)
             valid_root_line + _rec("/mnt/\u00a0nbsp".encode()),  # non-ASCII separator (Zs)
-            valid_root_line + _rec("/mnt/\U0001fae9".encode()),  # unassigned in the frozen Unicode 3.2.0 table
+            valid_root_line + _rec("/mnt/\U0001fae9".encode()),  # Cn on Python 3.12, So on 3.14
+            valid_root_line + _rec("/mnt/\u20b4".encode()),  # assigned after Unicode 3.2.0: refused everywhere
+            valid_root_line + _rec("/mnt/a\u00adb".encode()),  # SOFT HYPHEN: Pd in 3.2.0, Cf since 4.0
             valid_root_line + _rec(b"/mnt/hash\\043"),  # '#' escape the path writer never emits
             valid_root_line + _rec(b"/mnt/"),  # non-normalized mount point
             valid_root_line + _rec(b"/mnt//x"),
