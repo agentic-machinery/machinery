@@ -554,25 +554,40 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     finally:
         # Read before anything else here can fail: missing progress means a supervisor may have started.
         launch_started = launch is None or launch.get("started") is not False
-        if hold is not None:
-            path = store.record_path(task_id)
-            # An unreadable or damaged record (TaskRecordError is a ValueError) is left as it is.
-            with contextlib.suppress(OSError, ValueError), task_state_lock(path):
-                current = store.read(task_id, missing_ok=True)
-                if (current is not None and current.get("run_nonce") == hold["run_nonce"]
-                        and current.get("status") in store.ACTIVE and legacy.is_admission_hold_record(current)
-                        and "prompt_file" not in current):  # store.create handed this record to the supervisor
-                    tree_absent = not current.get("worktree_path")
-                    if not tree_absent:
-                        try:
-                            Path(current["worktree_path"]).lstat()
-                        except FileNotFoundError:
-                            tree_absent = True
-                    if tree_absent:
-                        path.unlink(missing_ok=True)
-        # A known pre-launch abort: this dispatch never started a supervisor, so nothing of the run can write.
-        if reservation is not None and not launch_started and (reason := release_stream(*reservation)):
-            print(f"dispatcher: {reservation[0]} stays reserved: {reason}", file=sys.stderr)
+        try:
+            if hold is not None:
+                _discard_unused_hold(task_id, hold["run_nonce"])
+        finally:
+            # A known pre-launch abort: this dispatch never started a supervisor, so nothing of the run can
+            # write. The hold's cleanup is independent: whatever it finds or raises, this still runs.
+            if reservation is not None and not launch_started and (reason := release_stream(*reservation)):
+                print(f"dispatcher: {reservation[0]} stays reserved: {reason}", file=sys.stderr)
+
+
+def _discard_unused_hold(task_id, run_nonce):
+    """Remove this run's creation hold if no supervisor took it over and its tree does not exist.
+
+    A record that is unreadable, damaged (TaskRecordError is a ValueError), another run's, or carries a field
+    of the wrong type is left as it is.
+    """
+    path = store.record_path(task_id)
+    with contextlib.suppress(OSError, ValueError), task_state_lock(path):
+        current = store.read(task_id, missing_ok=True)
+        if not isinstance(current, dict):
+            return
+        status, tree = current.get("status"), current.get("worktree_path")
+        if (current.get("run_nonce") == run_nonce and isinstance(status, str) and status in store.ACTIVE
+                and legacy.is_admission_hold_record(current)
+                and "prompt_file" not in current  # store.create handed this record to the supervisor
+                and (tree is None or isinstance(tree, str))):
+            tree_absent = not tree
+            if not tree_absent:
+                try:
+                    Path(tree).lstat()
+                except FileNotFoundError:
+                    tree_absent = True
+            if tree_absent:
+                path.unlink(missing_ok=True)
 
 
 class _StreamBusy(Exception):

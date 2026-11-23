@@ -537,7 +537,12 @@ def _guard_launch_cleanup(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
                 "launch cleanup failed for %s: %s", spec.task_id, _launch_cleanup_text(again))
 
 
-def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float) -> None:
+def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, progress: dict | None = None) -> None:
+    """Publish the task record and spawn its supervisor.
+
+    ``progress`` is the caller's launch progress: ``progress["started"]`` is set immediately before the first
+    supervisor spawn attempt, so a failure before it (record, prompt or log setup) proves no supervisor ran.
+    """
     from lu_machinery.orchestration.dispatch_admission import new_admission_hold
 
     source = getattr(providers.load(spec.agent), "MODEL_SOURCE", None)
@@ -557,6 +562,8 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float) -> N
         with open(logs / f"{spec.task_id}.stderr.log", "ab", opener=lambda p, f: os.open(p, f, 0o600)) as err:
             mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
             try:
+                if progress is not None:
+                    progress["started"] = True  # from here on a supervisor may run
                 process, launch = admission.spawn_supervisor(
                     [sys.executable, "-I", "-m", "lu_machinery.dispatcher.worker", str(path)],
                     task_id=spec.task_id, run_nonce=record["run_nonce"], cwd=state_root(),
@@ -1863,6 +1870,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     resolved_model = sources_calls = source = transport_warning = None
     started = time.monotonic()
     cancel_requested = interruptible = False
+    record_damaged = False  # a TaskRecordError was seen: a later cancel status never erases that for the release
 
     def cancelled(_signum, _frame):
         # A handler's exception lands at an arbitrary bytecode, where Python can drop it (a weakref
@@ -1966,6 +1974,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 scratch.start(record, spec.task_id)
                 store.replace(record, path, require_existing=True)
             except (OSError, ValueError) as exc:
+                if isinstance(exc, store.TaskRecordError):
+                    record_damaged = True
                 status, error = "failed", f"task_scratch_unavailable: {exc}"
                 start_refusal = StartRefusal.SETUP
                 return
@@ -2268,7 +2278,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     except subprocess.TimeoutExpired:
         status, error = "timeout", "process deadline exceeded"
     except store.TaskRecordError as exc:
-        status, error = "crashed", exc.code
+        status, error, record_damaged = "crashed", exc.code, True
     except OSError as exc:
         if child is None and not record.get("review_attempt"):
             status, error, start_refusal = "failed", f"provider_setup_refused: {type(exc).__name__}", StartRefusal.SETUP
@@ -2289,7 +2299,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 try:
                     store.begin_settlement(record)
                 except store.TaskRecordError as exc:
-                    status, error = "crashed", exc.code
+                    status, error, record_damaged = "crashed", exc.code, True
                     start_refusal = None
             # A killed launcher leaves its scratch; residue is recorded, never raised.
             if _in_boundary(spec) and (residue := write_boundary.discard(spec.task_id)):
@@ -2382,7 +2392,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     record_lost = True
             if "orchestrator" in record:
                 # Last, outside the task-state lock (admission's lock order): nothing may follow the release.
-                _release_stream(record, evidence_lost=record_lost
+                _release_stream(record, evidence_lost=record_lost or record_damaged
                                 or record.get("worktree_disposition_reason") == "task_record_damaged")
         finally:
             if draft_fd is not None:
