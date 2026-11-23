@@ -9,6 +9,17 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.59"></a>
+## [0.1.59] - 2026-11-23
+
+### Added
+
+- Compare authors by review risk and diff size ([#1261](https://github.com/learn-ukrainian/machinery/pull/1261))
+
+### Fixed
+
+- Reuse fresh audit cache when scheduling ([#1259](https://github.com/learn-ukrainian/machinery/pull/1259))
+
 <a id="v0.1.58"></a>
 ## [0.1.58] - 2026-11-23
 
@@ -1457,7 +1468,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.58...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.59...HEAD
+[0.1.59]: https://github.com/learn-ukrainian/machinery/compare/v0.1.58...v0.1.59
 [0.1.58]: https://github.com/learn-ukrainian/machinery/compare/v0.1.57...v0.1.58
 [0.1.57]: https://github.com/learn-ukrainian/machinery/compare/v0.1.56...v0.1.57
 [0.1.56]: https://github.com/learn-ukrainian/machinery/compare/v0.1.55...v0.1.56
