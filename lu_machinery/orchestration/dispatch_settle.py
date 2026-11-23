@@ -25,7 +25,7 @@ from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from lu_machinery.common import json_depth
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.git_credentials import verification_credentials
 from lu_machinery.common.repo_root import state_root
 from lu_machinery.dispatcher import write_boundary
@@ -39,11 +39,13 @@ from lu_machinery.opsec.prepublish import PublishBlocked, publication_boundary, 
 from lu_machinery.orchestration.dead_worker_state import mark_dead_worker_terminal, mark_missing_worktree_failed
 from lu_machinery.publish.github import (
     Request,
-    _same_repository,
-    _valid_milestone_text,
     extract_issue_milestone,
+    is_not_found_result,
     request_run,
+    same_repository,
+    valid_milestone_text,
 )
+from lu_machinery.work.sources_public import public_repository_id
 
 # This package's import name, from the unresolved file location: never from __package__, which a
 # short import spelling (orchestration.x with scripts/ on sys.path) shortens. Its dotted parts
@@ -310,8 +312,16 @@ def _task_linked_issues(data: dict[str, Any]) -> list[int]:
         if number is not None and number not in found:
             found.append(number)
 
-    for key in ("github_issue_number", "issue_number", "issue"):
-        add(_positive_int(data.get(key)))
+    issue_repo = data.get("issue_repository") or data.get("github_issue_repository")
+    top_level_same_repo = not (
+        isinstance(issue_repo, str)
+        and issue_repo.strip()
+        and task_repo is not None
+        and not same_repository(issue_repo.strip(), task_repo)
+    )
+    if top_level_same_repo:
+        for key in ("github_issue_number", "issue_number", "issue"):
+            add(_positive_int(data.get(key)))
 
     linked = data.get("linked_issues")
     if isinstance(linked, list):
@@ -329,7 +339,7 @@ def _task_linked_issues(data: dict[str, Any]) -> list[int]:
                 isinstance(entry_repo, str)
                 and entry_repo.strip()
                 and task_repo is not None
-                and not _same_repository(entry_repo.strip(), task_repo)
+                and not same_repository(entry_repo.strip(), task_repo)
             ):
                 continue
             add(number)
@@ -346,12 +356,17 @@ def _task_linked_issues(data: dict[str, Any]) -> list[int]:
                 entry_repo = entry.get("repo") or entry.get("repository")
                 if number is None or not isinstance(entry_repo, str) or not entry_repo.strip():
                     continue
-                if task_repo is not None and _same_repository(entry_repo.strip(), task_repo):
+                if task_repo is not None and same_repository(entry_repo.strip(), task_repo):
                     add(number)
                 else:
                     foreign_counts[number] = foreign_counts.get(number, 0) + 1
+        # Un-annotated dor_preflight.issues belong to the canonical public repository
+        # (matching delegate_router._linked_issues_from_dor); only include them when
+        # the task targets that repository (or has no recorded repository).
+        canonical_public = public_repository_id()
+        include_unannotated = task_repo is None or same_repository(canonical_public, task_repo)
         raw_issues = preflight.get("issues")
-        if isinstance(raw_issues, list):
+        if include_unannotated and isinstance(raw_issues, list):
             counts: dict[int, int] = {}
             order: list[int] = []
             for raw_issue in raw_issues:
@@ -372,7 +387,12 @@ def _resolve_milestone_from_issues(worktree: Path, issue_numbers: Sequence[int])
     resolved: dict[int, str] = {}
     for number in issue_numbers:
         proc = _run(Request("read-issue", number=number), cwd=worktree)
+        limited = github_client.refusal_of(proc, injected=True)
+        if limited is not None:
+            raise limited
         if proc.returncode != 0:
+            if is_not_found_result(proc):
+                continue
             detail = (proc.stderr or proc.stdout or "").strip()[:120]
             raise ValueError(f"MILESTONE_REFUSED: linked issue #{number} is unreadable ({detail or 'failed'})")
         try:
@@ -452,7 +472,7 @@ def push_and_maybe_open_pr(
         return actions
     resolved_milestone: str | None = None
     if milestone is not None:
-        if not _valid_milestone_text(milestone):
+        if not valid_milestone_text(milestone):
             actions.append("pr_create_failed:MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
             return actions
         resolved_milestone = milestone

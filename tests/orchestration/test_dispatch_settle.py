@@ -878,11 +878,31 @@ def test_settle_push_inherits_linked_issue_milestone_and_leaves_unmilestoned_unc
     assert actions == ["pushed", "pr_created:https://example.invalid/pr/10"]
     assert "milestone" not in creates[-1].fields
 
+    # Structured HTTP 404 linked issue: skipped consistently with publish/github (no milestone, no refusal).
+    def fake_run_404(command, **_kwargs):
+        if command == ["gh", "repo", "view", "--json", "defaultBranchRef"]:
+            return subprocess.CompletedProcess(command, 0, '{"defaultBranchRef":{"name":"main"}}', "")
+        if isinstance(command, Request) and command.verb == "read-issue":
+            return subprocess.CompletedProcess(command, 1, "", "gh: Not Found (HTTP 404)")
+        if isinstance(command, Request) and command.verb == "pr-create":
+            creates.append(command)
+            return subprocess.CompletedProcess(command, 0, "https://example.invalid/pr/11", "")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    creates.clear()
+    monkeypatch.setattr(ds, "_run", fake_run_404)
+    actions = ds.push_and_maybe_open_pr(
+        tmp_path, "codex/t1", open_pr=True, title="fix: missing", body="Body", linked_issues=[99999],
+    )
+    assert actions == ["pushed", "pr_created:https://example.invalid/pr/11"]
+    assert "milestone" not in creates[-1].fields
+
 
 def test_settle_push_refuses_invalid_closed_or_ambiguous_milestones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Defect class: dispatch_settle creates a PR when its milestone is blank, closed, or ambiguous across linked issues."""
+    from lu_machinery.common import github_client
     from lu_machinery.publish.github import Request
 
     issues = {
@@ -896,7 +916,13 @@ def test_settle_push_refuses_invalid_closed_or_ambiguous_milestones(
         if command == ["gh", "repo", "view", "--json", "defaultBranchRef"]:
             return subprocess.CompletedProcess(command, 0, '{"defaultBranchRef":{"name":"main"}}', "")
         if isinstance(command, Request) and command.verb == "read-issue":
-            return subprocess.CompletedProcess(command, 0, json.dumps(issues[command.fields["number"]]), "")
+            num = command.fields["number"]
+            if num == 500:
+                return subprocess.CompletedProcess(command, 1, "", "HTTP 500 Internal Server Error (request-404)")
+            if num == 429:
+                body = json.dumps({"error": "github_rate_limited", "reset_at": "2099-01-01T00:00:00Z", "reason": "secondary"})
+                return subprocess.CompletedProcess(command, 75, "", body)
+            return subprocess.CompletedProcess(command, 0, json.dumps(issues[num]), "")
         if isinstance(command, Request) and command.verb == "pr-create":
             creates.append(command)
             return subprocess.CompletedProcess(command, 0, "https://example.invalid/pr/99", "")
@@ -925,21 +951,49 @@ def test_settle_push_refuses_invalid_closed_or_ambiguous_milestones(
     assert any(a.startswith("pr_create_failed:MILESTONE_REFUSED:") for a in actions), actions
     assert creates == []
 
+    # Non-404 error containing '404' substring -> MILESTONE_REFUSED, no pr-create.
+    actions = ds.push_and_maybe_open_pr(
+        tmp_path, "codex/t1", open_pr=True, title="t", body="b", linked_issues=[500],
+    )
+    assert any(a.startswith("pr_create_failed:MILESTONE_REFUSED:") for a in actions), actions
+    assert creates == []
+
+    # Rate-limited linked-issue lookup propagates GitHubRateLimited instead of MILESTONE_REFUSED.
+    with pytest.raises(github_client.GitHubRateLimited):
+        ds.push_and_maybe_open_pr(
+            tmp_path, "codex/t1", open_pr=True, title="t", body="b", linked_issues=[429],
+        )
+    assert creates == []
+
 
 def test_task_linked_issues_filters_foreign_repositories() -> None:
-    """Defect class: a foreign-repo issue in dor_preflight or linked_issues leaks into same-repo milestone lookup."""
-    task = {
+    """Defect class: a foreign-repo or un-annotated public dor_preflight issue leaks into another repo's lookup."""
+    # Un-annotated dor_preflight.issues belong to the canonical public repo (learn-ukrainian.github.io),
+    # so a machinery task must NOT treat un-annotated dor_preflight.issues [9001] as machinery#9001.
+    machinery_task = {
         "repository": "learn-ukrainian/machinery",
         "linked_issues": [
             {"issue": 100, "repository": "learn-ukrainian/learn-ukrainian.github.io"},
             {"issue": 200, "repository": "learn-ukrainian/machinery"},
         ],
         "dor_preflight": {
-            "issues": [200, 300, 400],
+            "issues": [9001, 300, 400],
             "issue_repositories": [
                 {"issue": 300, "repo": "learn-ukrainian/learn-ukrainian.github.io"},
                 {"issue": 400, "repo": "learn-ukrainian/machinery"},
             ],
         },
     }
-    assert ds._task_linked_issues(task) == [200, 400]
+    assert ds._task_linked_issues(machinery_task) == [200, 400]
+
+    # On a public-repo task, un-annotated dor_preflight.issues DO belong to that task's repository.
+    public_task = {
+        "repository": "learn-ukrainian/learn-ukrainian.github.io",
+        "dor_preflight": {
+            "issues": [9001, 400],
+            "issue_repositories": [
+                {"issue": 400, "repo": "learn-ukrainian/machinery"},
+            ],
+        },
+    }
+    assert ds._task_linked_issues(public_task) == [9001]

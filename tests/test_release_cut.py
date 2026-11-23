@@ -1093,3 +1093,33 @@ def test_run_refuses_invalid_configured_release_milestone(monkeypatch, tmp_path,
     monkeypatch.setattr(repo_root, "project_interpreter", lambda: Path(sys.executable))
     assert main(["cut", "--dry-run", "--no-alert", "--work", str(tmp_path / "w"), "--x-agent", "claude/claude-opus-5-5"]) == 1
     assert "MILESTONE_REFUSED" in capsys.readouterr().err
+
+
+def test_execute_skips_and_refuses_before_live_milestone_lookup(tmp_path, monkeypatch):
+    """Defect class: live milestone lookup runs before preflight skip/refuse, breaking exit-0 skips or masking refusal reasons."""
+    from lu_machinery.publish import github as publish_github
+
+    called: list[tuple[str, str]] = []
+
+    def fail_if_called(repo: str, milestone: str, **_kwargs):
+        called.append((repo, milestone))
+        raise AssertionError("resolve_repo_milestone must not run on skip or non-dry-run refuse")
+
+    monkeypatch.setattr(publish_github, "resolve_repo_milestone", fail_if_called)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    cut = Cut(
+        work=work, dry_run=False, machinery_remote="", product_remote="", machinery_repo=REPO,
+        product_repo="learn-ukrainian/learn-ukrainian.github.io", host_python=Path(sys.executable), primary=tmp_path,
+        alert=False, x_agent="claude/claude-opus-5-5", machinery_milestone="v0.11.0",
+    )
+
+    cut.preflight = lambda: (release_cut.Decision("skip", "no changes since v0.1.21", "0.1.22"), [], "0.1.22")
+    assert release_cut.execute(cut) == 0
+    assert called == []
+
+    cut.preflight = lambda: (release_cut.Decision("refuse", "CI Gate has not passed", "0.1.22"), [], "0.1.22")
+    with pytest.raises(CutError, match="CI Gate has not passed"):
+        release_cut.execute(cut)
+    assert called == []

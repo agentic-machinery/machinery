@@ -1279,13 +1279,16 @@ _CLOSING_ISSUE_RE = re.compile(
 _MAX_PR_CLOSING_ISSUES = 20
 
 
-def _valid_milestone_text(value: object) -> bool:
+def valid_milestone_text(value: object) -> bool:
     """True for a non-blank, single-line milestone title or number without control/format characters."""
     return (
         isinstance(value, str)
         and bool(value.strip())
         and not any(unicodedata.category(char).startswith("C") or char in "\u2028\u2029" for char in value)
     )
+
+
+_valid_milestone_text = valid_milestone_text
 
 
 def _strip_markdown_code(text: str) -> str:
@@ -1302,12 +1305,12 @@ def _pr_closing_issues(body: str, gh_repo: str) -> list[int]:
     for match in _CLOSING_ISSUE_RE.finditer(cleaned):
         if match.group("url"):
             ref_repo = match.group("url_repo")
-            if not _same_repository(ref_repo, gh_repo):
+            if not same_repository(ref_repo, gh_repo):
                 continue
             number = int(match.group("url_num"))
         else:
             ref_repo = match.group("slug")
-            if ref_repo is not None and not _same_repository(ref_repo, gh_repo):
+            if ref_repo is not None and not same_repository(ref_repo, gh_repo):
                 continue
             number = int(match.group("num"))
         if number not in found:
@@ -1317,35 +1320,43 @@ def _pr_closing_issues(body: str, gh_repo: str) -> list[int]:
 
 def match_milestone_pages(pages: object, raw_milestone: str, *, repo: str) -> tuple[int, str]:
     """Match *raw_milestone* (title or positive integer) to one open milestone in *pages*."""
-    if not _valid_milestone_text(raw_milestone):
+    if not valid_milestone_text(raw_milestone):
         raise gate.PublishBlocked("MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
     if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
         raise gate.PublishBlocked(
             f"MILESTONE_REFUSED: repository milestones payload for {repo} is malformed; nothing was created."
         )
-    rows: list[dict[str, object]] = []
+    rows: list[tuple[int, str, str]] = []
     for page in pages:
         for row in page:
+            if not isinstance(row, dict):
+                raise gate.PublishBlocked(
+                    f"MILESTONE_REFUSED: repository milestones payload for {repo} is malformed; nothing was created."
+                )
+            num = row.get("number")
+            title = row.get("title")
+            state = row.get("state")
             if (
-                not isinstance(row, dict)
-                or type(row.get("number")) is not int
-                or row["number"] <= 0
-                or not _valid_milestone_text(row.get("title"))
-                or row.get("state") not in {"open", "closed"}
+                type(num) is not int
+                or num <= 0
+                or not isinstance(title, str)
+                or not valid_milestone_text(title)
+                or not isinstance(state, str)
+                or state not in {"open", "closed"}
             ):
                 raise gate.PublishBlocked(
                     f"MILESTONE_REFUSED: repository milestones payload for {repo} is malformed; nothing was created."
                 )
-            rows.append(row)
-    by_title = [row for row in rows if row["title"] == raw_milestone]
+            rows.append((num, title, state))
+    by_title = [entry for entry in rows if entry[1] == raw_milestone]
     by_number = (
-        [row for row in rows if row["number"] == int(raw_milestone)]
+        [entry for entry in rows if entry[0] == int(raw_milestone)]
         if re.fullmatch(r"[1-9][0-9]*", raw_milestone)
         else []
     )
-    matched: dict[int, dict[str, object]] = {}
-    for row in (*by_title, *by_number):
-        matched[int(row["number"])] = row
+    matched: dict[int, tuple[int, str, str]] = {}
+    for entry in (*by_title, *by_number):
+        matched[entry[0]] = entry
     if not matched:
         raise gate.PublishBlocked(
             f"MILESTONE_REFUSED: milestone {raw_milestone!r} does not exist in {repo}; nothing was created."
@@ -1354,13 +1365,13 @@ def match_milestone_pages(pages: object, raw_milestone: str, *, repo: str) -> tu
         raise gate.PublishBlocked(
             f"MILESTONE_AMBIGUOUS: milestone {raw_milestone!r} matches multiple milestones in {repo}; nothing was created."
         )
-    (chosen,) = matched.values()
-    if chosen["state"] != "open":
+    ((chosen_num, chosen_title, chosen_state),) = matched.values()
+    if chosen_state != "open":
         raise gate.PublishBlocked(
-            f"MILESTONE_REFUSED: milestone {chosen['title']!r} (#{chosen['number']}) in {repo} is "
-            f"{chosen['state']}, not open; nothing was created."
+            f"MILESTONE_REFUSED: milestone {chosen_title!r} (#{chosen_num}) in {repo} is "
+            f"{chosen_state}, not open; nothing was created."
         )
-    return int(chosen["number"]), str(chosen["title"])
+    return chosen_num, chosen_title
 
 
 def extract_issue_milestone(document: object, *, number: int, repo: str) -> tuple[int, str] | None:
@@ -1374,22 +1385,30 @@ def extract_issue_milestone(document: object, *, number: int, repo: str) -> tupl
     raw = document.get("milestone")
     if raw is None:
         return None
+    if not isinstance(raw, dict):
+        raise gate.PublishBlocked(
+            f"MILESTONE_REFUSED: linked issue #{number} in {repo} has malformed milestone metadata; nothing was created."
+        )
+    ms_num = raw.get("number")
+    ms_title = raw.get("title")
+    ms_state = raw.get("state")
     if (
-        not isinstance(raw, dict)
-        or type(raw.get("number")) is not int
-        or raw["number"] <= 0
-        or not _valid_milestone_text(raw.get("title"))
-        or raw.get("state") not in {"open", "closed"}
+        type(ms_num) is not int
+        or ms_num <= 0
+        or not isinstance(ms_title, str)
+        or not valid_milestone_text(ms_title)
+        or not isinstance(ms_state, str)
+        or ms_state not in {"open", "closed"}
     ):
         raise gate.PublishBlocked(
             f"MILESTONE_REFUSED: linked issue #{number} in {repo} has malformed milestone metadata; nothing was created."
         )
-    if raw["state"] != "open":
+    if ms_state != "open":
         raise gate.PublishBlocked(
-            f"MILESTONE_REFUSED: linked issue #{number} milestone {raw['title']!r} (#{raw['number']}) in {repo} "
-            f"is {raw['state']}, not open; nothing was created."
+            f"MILESTONE_REFUSED: linked issue #{number} milestone {ms_title!r} (#{ms_num}) in {repo} "
+            f"is {ms_state}, not open; nothing was created."
         )
-    return int(raw["number"]), str(raw["title"])
+    return ms_num, ms_title
 
 
 def resolve_repo_milestone(
@@ -1401,7 +1420,7 @@ def resolve_repo_milestone(
     env=None,
 ) -> tuple[int, str]:
     """Validate *raw_milestone* against the live milestones of *repo*."""
-    if not _valid_milestone_text(raw_milestone):
+    if not valid_milestone_text(raw_milestone):
         raise gate.PublishBlocked("MILESTONE_REFUSED: milestone must be a non-blank single-line value.")
     environment = _validated_environment(env)
     work = Path(cwd or Path.cwd())
@@ -1410,11 +1429,19 @@ def resolve_repo_milestone(
         raise gate.PublishBlocked("OPSEC: publisher repository unresolved; provide --repo.")
     gh_repo = dest.split("/", 1)[1]
     return _resolve_explicit_milestone(
-        merge_readiness_runner(runner), dest, gh_repo, raw_milestone, work, environment,
+        merge_readiness_runner(runner),
+        dest,
+        gh_repo,
+        raw_milestone,
+        work,
+        environment,
+        injected=runner is not None,
     )
 
 
-def _resolve_explicit_milestone(read_runner, dest, gh_repo, raw_milestone, cwd, environment) -> tuple[int, str]:
+def _resolve_explicit_milestone(
+    read_runner, dest, gh_repo, raw_milestone, cwd, environment, *, injected: bool = False,
+) -> tuple[int, str]:
     try:
         result = read(
             "milestones", repo=dest, runner=read_runner, cwd=cwd, env=environment,
@@ -1426,6 +1453,9 @@ def _resolve_explicit_milestone(read_runner, dest, gh_repo, raw_milestone, cwd, 
         raise gate.PublishBlocked(
             f"MILESTONE_REFUSED: repository milestones for {gh_repo} are unreadable; nothing was created."
         ) from None
+    limited = github_client.refusal_of(result, injected=injected)
+    if limited is not None:
+        raise limited
     if result.returncode:
         raise gate.PublishBlocked(
             f"MILESTONE_REFUSED: repository milestones for {gh_repo} are unreadable; nothing was created."
@@ -1439,15 +1469,38 @@ def _resolve_explicit_milestone(read_runner, dest, gh_repo, raw_milestone, cwd, 
     return match_milestone_pages(pages, raw_milestone, repo=gh_repo)
 
 
-def _is_not_found_result(result) -> bool:
+_HTTP_404_RE = re.compile(r"\bHTTP\s+404\b")
+
+
+def is_not_found_result(result) -> bool:
+    """True only when *result* carries a structured HTTP 404 observation or gh/GitHub 404 response."""
     observation = getattr(result, "github_result", None)
-    if observation is not None and observation.status == 404:
+    if observation is not None:
+        return bool(observation.status == 404)
+    stderr = str(getattr(result, "stderr", "") or "")
+    if _HTTP_404_RE.search(stderr):
         return True
-    detail = f"{getattr(result, 'stderr', '') or ''}\n{getattr(result, 'stdout', '') or ''}"
-    return "404" in detail or "not found" in detail.lower()
+    stdout = str(getattr(result, "stdout", "") or "").strip()
+    if stdout:
+        try:
+            doc = json_depth.loads(stdout, max_depth=64)
+        except (ValueError, TypeError):
+            doc = None
+        if isinstance(doc, dict):
+            status = doc.get("status")
+            if status in (404, "404"):
+                return True
+            if status is None and doc.get("message") == "Not Found":
+                return True
+    return False
 
 
-def _resolve_linked_issue_milestone(read_runner, dest, gh_repo, body, cwd, environment) -> tuple[int, str] | None:
+_is_not_found_result = is_not_found_result
+
+
+def _resolve_linked_issue_milestone(
+    read_runner, dest, gh_repo, body, cwd, environment, *, injected: bool = False,
+) -> tuple[int, str] | None:
     issue_numbers = _pr_closing_issues(body, gh_repo)
     if not issue_numbers:
         return None
@@ -1469,8 +1522,11 @@ def _resolve_linked_issue_milestone(read_runner, dest, gh_repo, body, cwd, envir
             raise gate.PublishBlocked(
                 f"MILESTONE_REFUSED: linked issue #{number} in {gh_repo} is unreadable; nothing was created."
             ) from None
+        limited = github_client.refusal_of(result, injected=injected)
+        if limited is not None:
+            raise limited
         if result.returncode:
-            if _is_not_found_result(result):
+            if is_not_found_result(result):
                 continue
             raise gate.PublishBlocked(
                 f"MILESTONE_REFUSED: linked issue #{number} in {gh_repo} is unreadable; nothing was created."
@@ -1532,18 +1588,22 @@ def _apply_pr_milestone(created, milestone_number, milestone_title, dest, gh_rep
             "was not applied; apply it with pr-edit."
         )
     raw_out = str(applied.stdout or "").strip()
+    updated = None
     if raw_out:
         try:
             updated = json_depth.loads(raw_out, max_depth=512)
         except (ValueError, TypeError):
             updated = None
-        if isinstance(updated, dict) and "milestone" in updated:
-            applied_ms = updated.get("milestone")
-            if not isinstance(applied_ms, dict) or applied_ms.get("number") != milestone_number:
-                raise gate.PublishBlocked(
-                    f"MILESTONE_FAILED: {which} was created but milestone {milestone_title!r} (#{milestone_number}) "
-                    "was not confirmed on the PR; verify with pr-edit."
-                )
+    applied_ms = updated.get("milestone") if isinstance(updated, dict) else None
+    if (
+        not isinstance(applied_ms, dict)
+        or type(applied_ms.get("number")) is not int
+        or applied_ms["number"] != milestone_number
+    ):
+        raise gate.PublishBlocked(
+            f"MILESTONE_FAILED: {which} was created but milestone {milestone_title!r} (#{milestone_number}) "
+            "was not confirmed on the PR; verify with pr-edit."
+        )
 
 
 # --- issue-transfer (C-4682) ---------------------------------------------------------------
@@ -1859,7 +1919,7 @@ def _repository_slugs(repository):
         return ()
 
 
-def _same_repository(left, right):
+def same_repository(left, right):
     """Whether two owner/name spellings name one repository, ignoring case; either baked slug of a row counts."""
     # Slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
     if not isinstance(left, str) or not isinstance(right, str) or not left.isascii() or not right.isascii():
@@ -1867,6 +1927,9 @@ def _same_repository(left, right):
     return left.casefold() == right.casefold() or any(
         left.casefold() == slug.casefold() for slug in _repository_slugs(right)
     )
+
+
+_same_repository = same_repository
 
 
 def _repository_urls(repository, path):
@@ -3215,10 +3278,12 @@ def publish(
             if "milestone" in fields:
                 pr_milestone = _resolve_explicit_milestone(
                     readiness_runner, dest, gh_repo, fields["milestone"], cwd, environment,
+                    injected=runner is not None,
                 )
             elif "body" in fields:
                 pr_milestone = _resolve_linked_issue_milestone(
                     readiness_runner, dest, gh_repo, fields["body"], cwd, environment,
+                    injected=runner is not None,
                 )
         if verb == "code-scanning-dismiss":
             return _publish_code_scanning_dismiss(
@@ -3441,7 +3506,7 @@ def publish(
             )
             if not capture_output:
                 print(str(result.stdout or "").strip())
-        if applying_milestone and result.returncode == 0:
+        if pr_milestone is not None and result.returncode == 0:
             _apply_pr_milestone(
                 str(result.stdout or "").strip(), pr_milestone[0], pr_milestone[1], dest, gh_repo, runner,
                 cwd, environment, temp,

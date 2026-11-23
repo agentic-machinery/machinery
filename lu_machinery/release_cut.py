@@ -29,7 +29,6 @@ import textwrap
 import threading
 import time
 import tomllib
-import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
@@ -89,11 +88,9 @@ class CutError(Exception):
 
 def _validate_release_milestone(value: object, *, repo_label: str) -> str:
     """Validate one configured release milestone string, failing closed with a typed reason."""
-    if (
-        not isinstance(value, str)
-        or not value.strip()
-        or any(unicodedata.category(char).startswith("C") or char in "\u2028\u2029" for char in value)
-    ):
+    from lu_machinery.publish.github import valid_milestone_text
+
+    if not isinstance(value, str) or not valid_milestone_text(value):
         raise CutError(
             f"MILESTONE_REFUSED: {repo_label} release_milestone must be a non-blank single-line string, got {value!r}"
         )
@@ -1301,11 +1298,11 @@ def execute(cut: Cut) -> int:
     decision, titles, built = cut.preflight()
     cut.built = built
     cut.say(f"preflight: {decision.action}: {decision.reason}")
-    cut.report_release_milestones(include_adopt=True)
     if decision.action == "skip":
         return 0
     if decision.action == "refuse" and not cut.dry_run:
         raise CutError(decision.reason)
+    cut.report_release_milestones(include_adopt=True)
     if cut.dry_run:
         cut.version = built
     section = cut.section = release_notes(titles, cut.machinery_repo)

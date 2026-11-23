@@ -4036,3 +4036,87 @@ def test_pr_create_applies_explicit_and_inherited_milestones_and_refuses_invalid
                 runner=fake_runner, cwd=tmp_path, capture_output=True, text=True, **kwargs,
             )
         assert all(call[0][:3] != ["gh", "pr", "create"] for call in sent), (kwargs, sent)
+
+
+def test_pr_create_milestone_patch_confirmation_not_found_and_rate_limit(tmp_path, monkeypatch):
+    """Defect class: unconfirmed PATCH passes silently, non-404 with '404' skips, or rate limit becomes MILESTONE_REFUSED."""
+    from lu_machinery.common import github_client
+    from lu_machinery.opsec import prepublish as gate
+    from lu_machinery.publish import github as pub
+
+    monkeypatch.setattr(gate, "check_texts", lambda *_a, **_kw: None)
+    milestones_page = [[{"number": 13, "title": "v0.11.0", "state": "open"}]]
+
+    # 1. PATCH responses that do not confirm milestone #13 must fail closed with MILESTONE_FAILED.
+    for bad_patch_stdout in (
+        "",
+        "not-json",
+        json.dumps({"number": 77}),
+        json.dumps({"number": 77, "milestone": None}),
+        json.dumps({"number": 77, "milestone": {"number": 99}}),
+        json.dumps({"number": 77, "milestone": {"number": True}}),
+    ):
+        def patch_runner(argv, _out=bad_patch_stdout, **_kwargs):
+            if argv[:4] == ["gh", "api", "--method", "GET"] and "/milestones?" in argv[4]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps(milestones_page), "")
+            if argv[:3] == ["gh", "pr", "create"]:
+                return subprocess.CompletedProcess(argv, 0, "https://github.com/unit/public/pull/77\n", "")
+            if argv[:4] == ["gh", "api", "--method", "PATCH"]:
+                return subprocess.CompletedProcess(argv, 0, _out, "")
+            raise AssertionError(f"unexpected argv: {argv!r}")
+
+        with pytest.raises(gate.PublishBlocked, match="MILESTONE_FAILED"):
+            pub.publish(
+                "pr-create", repo="unit/public", title="feat: patch", body="Body", base="main", head="feat/p",
+                milestone="v0.11.0", runner=patch_runner, cwd=tmp_path, capture_output=True, text=True,
+            )
+
+    # 2. A 500 error whose stderr contains '404' (e.g. request ID) must NOT be treated as 404.
+    def server_error_404_id_runner(argv, **_kwargs):
+        proc = subprocess.CompletedProcess(argv, 1, "", "HTTP 500 Internal Server Error (request-404)")
+        proc.github_result = github_client.Result(status=500, error="server_error", reason="request-404")
+        return proc
+
+    with pytest.raises(gate.PublishBlocked, match="MILESTONE_REFUSED"):
+        pub.publish(
+            "pr-create", repo="unit/public", title="feat: 500", body="Closes #42\n", base="main", head="feat/e",
+            runner=server_error_404_id_runner, cwd=tmp_path, capture_output=True, text=True,
+        )
+
+    # Also without github_result (raw subprocess stderr with request-404): must fail closed.
+    def raw_500_runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "HTTP 500 Internal Server Error (request-404)")
+
+    with pytest.raises(gate.PublishBlocked, match="MILESTONE_REFUSED"):
+        pub.publish(
+            "pr-create", repo="unit/public", title="feat: raw500", body="Closes #42\n", base="main", head="feat/e2",
+            runner=raw_500_runner, cwd=tmp_path, capture_output=True, text=True,
+        )
+
+    # 3. Rate-limited milestone/issue reads must return a typed rate-limit refusal (not MILESTONE_REFUSED) and never create a PR.
+    rl_calls: list[list[str]] = []
+
+    def rate_limited_runner(argv, **_kwargs):
+        rl_calls.append(list(argv))
+        body = json.dumps({"error": "github_rate_limited", "reset_at": "2099-01-01T00:00:00Z", "reason": "secondary"})
+        return subprocess.CompletedProcess(argv, 75, "", body)
+
+    rl_explicit = pub.publish(
+        "pr-create", repo="unit/public", title="feat: rl1", body="Body", base="main", head="feat/r1",
+        milestone="v0.11.0", runner=rate_limited_runner, cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert rl_explicit.returncode == 75
+    assert github_client.refusal_of(rl_explicit) is not None
+    assert all(call[:3] != ["gh", "pr", "create"] for call in rl_calls)
+
+    rl_calls.clear()
+    rl_linked = pub.publish(
+        "pr-create", repo="unit/public", title="feat: rl2", body="Closes #42\n", base="main", head="feat/r2",
+        runner=rate_limited_runner, cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert rl_linked.returncode == 75
+    assert github_client.refusal_of(rl_linked) is not None
+    assert all(call[:3] != ["gh", "pr", "create"] for call in rl_calls)
+
+    with pytest.raises(github_client.GitHubRateLimited):
+        pub.resolve_repo_milestone("unit/public", "v0.11.0", runner=rate_limited_runner, cwd=tmp_path)
