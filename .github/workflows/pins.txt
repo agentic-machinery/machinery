@@ -105,6 +105,9 @@ CI_GATE_PYTHON=.python-version
 #   .python-version (3.14.10 on 2026-11-20).
 #   .github/actions/uv-python checks the interpreter it puts on PATH.
 #   UV_PYTHON_PREFERENCE=only-managed keeps uv off the runner's own Pythons.
+LINUX_FS_PARITY_IMAGE=python@sha256:3c3ba8ad4c85eb63b7568f806434f14e33370056985da7fdf2673621cb1d7e93
+#   python:3.12-bookworm linux/amd64 manifest from Docker Hub, checked 2026-11-23.
+#   The parity probe requires x86_64 for its uv archive.
 UV_VERSION=0.13.9
 #   https://github.com/astral-sh/uv/releases/tag/0.13.9 (published 2026-11-17).
 #   pyproject.toml [tool.uv] required-version pins the same release.

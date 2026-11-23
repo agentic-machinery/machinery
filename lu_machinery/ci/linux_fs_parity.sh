@@ -4,7 +4,6 @@
 # list focused so this remains a fast local parity probe rather than a suite.
 set -euo pipefail
 
-readonly image="${LINUX_FS_PARITY_IMAGE:-python:3.12-bookworm}"
 script_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly script_dir
 source "$script_dir/../lib/project_interpreter.sh"
@@ -21,6 +20,22 @@ if [[ ! -f "$pins" || ! -r "$pins" ]]; then
   echo "linux_fs_parity: cannot read machinery pins at $pins" >&2
   exit 1
 fi
+
+if [[ ${LINUX_FS_PARITY_IMAGE+x} ]]; then
+  image="$LINUX_FS_PARITY_IMAGE"
+else
+  mapfile -t images < <(sed -n 's/^LINUX_FS_PARITY_IMAGE=//p' "$pins")
+  if [[ ${#images[@]} -ne 1 ]]; then
+    echo "linux_fs_parity: machinery pins must contain one LINUX_FS_PARITY_IMAGE" >&2
+    exit 1
+  fi
+  image="${images[0]}"
+fi
+if ! [[ "$image" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "linux_fs_parity: image must be digest-qualified as name@sha256:<64 lowercase hex characters>" >&2
+  exit 1
+fi
+readonly image
 
 # The container has no uv. It installs the pins.txt uv release, checks that
 # archive, and exports pytest from the mounted uv.lock. The prune list only
