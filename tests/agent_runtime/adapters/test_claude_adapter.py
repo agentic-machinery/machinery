@@ -279,6 +279,9 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         {"allowed_tools": "Read, Bash(git log --format=%H,%s), mcp__sources__*, mcp__*, mcp__other__tool, mcp*"},
     )
     assert explicit[explicit.index("--allowedTools") + 1] == "Read,Bash(git log --format=%H,%s)"
+    # Printable, NFKC-normalized non-ASCII qualifiers stay supported.
+    unicode_path = _read_only(consumer, {"allowed_tools": "Read(/дані/файл’.md),mcp__sources__verify_word"})
+    assert unicode_path[unicode_path.index("--allowedTools") + 1] == "Read(/дані/файл’.md)"
     for bad_allowed in (
         "",
         "   ",
@@ -299,6 +302,23 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         "Read\nGrep",
         "Read\u00a0Grep",
         "Read\u2028Grep",
+        # Fail closed by class (PR1297-F2, CTO class decision): every Unicode category C* and Z*
+        # except the ASCII space, non-NFKC input, and backslash escapes the tokenizer does not model.
+        "Read(\ud800)",  # Cs unpaired surrogate
+        "Read(\ue000)",  # Co private use
+        "Read(\u0378)",  # Cn unassigned
+        "Read(\u200b)",  # Cf zero-width space
+        "Read(\u202e)",  # Cf bidi override
+        "Read(\x7f)",  # Cc DEL
+        "Read(\x85)",  # Cc NEL
+        "Read(a\u3000b)",  # Zs ideographic space
+        "Read(a\u2029b)",  # Zp
+        "Read(\uff21)",  # fullwidth A (NFKC-compatibility form)
+        "Read(e\u0301)",  # decomposed (non-NFKC) accent
+        "Read(\ufb01le)",  # ligature (non-NFKC)
+        "Read\uff08x\uff09",  # fullwidth parentheses around a would-be qualifier
+        "Bash(echo \\)),mcp__sources__verify_word",  # backslash escape
+        "Read(a\\,b)",
         "Read,mcp__sources__verify_word(x)",
         "Read,mcp__other__tool(x)",
         "Read,mcp__*(x)",

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import stat
 import subprocess
@@ -516,10 +517,16 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
 
 _FDINFO_DIR = Path("/proc/self/fdinfo")
 _KERNEL_UINT_RE = re.compile(rb"^(?:0|[1-9][0-9]{0,9})$")
-_MOUNTINFO_PATH_BYTES_RE = re.compile(rb"^/(?:[^\\\x00\t\n ]|\\[0-3][0-7]{2})*$")
-_MOUNTINFO_OCTAL_RE = re.compile(rb"\\([0-3][0-7]{2})")
 _KERNEL_INT32_MAX = 0x7FFFFFFF
 _KERNEL_UINT32_MAX = 0xFFFFFFFF
+# The kernel's seq_escape() octal-escapes exactly these bytes in mountinfo text fields
+# (fs/proc_namespace.c); seq_show_option() also escapes "," and "=" in super options. Any other
+# escape, and any raw backslash, is non-canonical.
+_MOUNTINFO_ESCAPE_RE = re.compile(rb"\\([0-7]{3})")
+_MOUNTINFO_ESCAPED = frozenset(b" \t\n\\")
+_MOUNTINFO_SUPER_OPTS_ESCAPED = _MOUNTINFO_ESCAPED | frozenset(b",=")
+# One fdinfo line: a canonical lowercase key, exactly ":\t", then printable non-space ASCII.
+_FDINFO_LINE_RE = re.compile(rb"([a-z][a-z_]*):\t([\x21-\x7e]+)")
 
 
 def _parse_kernel_int(token: bytes, *, max_value: int) -> int | None:
@@ -530,18 +537,45 @@ def _parse_kernel_int(token: bytes, *, max_value: int) -> int | None:
     return value if value <= max_value else None
 
 
-def _unescape_mountinfo_path(field: bytes) -> str | None:
-    """Validate and losslessly decode one kernel-escaped ``mountinfo`` path field."""
-    if not _MOUNTINFO_PATH_BYTES_RE.fullmatch(field):
+def _decode_mountinfo_field(field: bytes, *, escaped: frozenset[int] = frozenset()) -> str | None:
+    """Decode one kernel-escaped ``mountinfo`` text field, or ``None`` unless it is canonical and printable.
+
+    Only the octal escapes the kernel writes for that field (*escaped*) are accepted; a raw
+    backslash or any other escape is refused. The decoded text must be non-empty and
+    :meth:`str.isprintable` (no Unicode category ``C*`` or ``Z*`` character except the ASCII
+    space), so control bytes such as CR, escaped tab or newline, and undecodable bytes (which
+    :func:`os.fsdecode` maps to lone surrogates, category ``Cs``) all refuse the field.
+    """
+    out = bytearray()
+    pos = 0
+    for match in _MOUNTINFO_ESCAPE_RE.finditer(field):
+        literal = field[pos : match.start()]
+        byte = int(match.group(1), 8)
+        if b"\\" in literal or byte not in escaped:
+            return None
+        out += literal
+        out.append(byte)
+        pos = match.end()
+    if b"\\" in field[pos:]:
         return None
-    raw = _MOUNTINFO_OCTAL_RE.sub(lambda m: bytes([int(m.group(1), 8)]), field)
-    if b"\x00" in raw:
+    out += field[pos:]
+    text = os.fsdecode(bytes(out))
+    return text if text and text.isprintable() else None
+
+
+def _canonical_mount_point(text: str | None) -> str | None:
+    """*text* if it is an absolute, normalized path as ``d_path()`` prints it, else ``None``."""
+    if text is None or not text.startswith("/") or text.startswith("//") or posixpath.normpath(text) != text:
         return None
-    return os.fsdecode(raw)
+    return text
 
 
 def _read_mount_table() -> dict[int, str] | None:
-    """Strictly parse ``/proc/self/mountinfo`` into ``{mount_id: mount_point}``, or ``None`` on any error."""
+    """Strictly parse ``/proc/self/mountinfo`` into ``{mount_id: mount_point}``, or ``None`` on any error.
+
+    Fail closed by class: one malformed, non-canonical or non-printable field in any line, a
+    duplicate mount ID, an empty line or a missing final newline refuses the whole table.
+    """
     from lu_machinery.common import task_scratch
 
     try:
@@ -552,8 +586,6 @@ def _read_mount_table() -> dict[int, str] | None:
         return None
     table: dict[int, str] = {}
     for line in raw[:-1].split(b"\n"):
-        if not line:
-            return None
         fields = line.split(b" ")
         try:
             sep = fields.index(b"-")
@@ -561,26 +593,26 @@ def _read_mount_table() -> dict[int, str] | None:
             return None
         if sep < 6 or len(fields) != sep + 4:
             return None
-        mount_id_b, parent_id_b, dev_b, root_b, mount_point_b, mount_opts_b = fields[:6]
+        mount_id_b, parent_id_b, dev_b, root_b, mount_point_b = fields[:5]
         mount_id = _parse_kernel_int(mount_id_b, max_value=_KERNEL_INT32_MAX)
-        parent_id = _parse_kernel_int(parent_id_b, max_value=_KERNEL_INT32_MAX)
         major_b, colon, minor_b = dev_b.partition(b":")
-        major = _parse_kernel_int(major_b, max_value=_KERNEL_UINT32_MAX) if colon else None
-        minor = _parse_kernel_int(minor_b, max_value=_KERNEL_UINT32_MAX) if colon else None
-        root_path = _unescape_mountinfo_path(root_b)
-        mount_point = _unescape_mountinfo_path(mount_point_b)
+        mount_point = _canonical_mount_point(_decode_mountinfo_field(mount_point_b, escaped=_MOUNTINFO_ESCAPED))
+        fstype_b, source_b, super_opts_b = fields[sep + 1 :]
         if (
             mount_id is None
-            or parent_id is None
-            or major is None
-            or minor is None
-            or root_path is None
-            or mount_point is None
-            or not mount_opts_b
-            or b"\x00" in mount_opts_b
-            or any(not opt or b"\x00" in opt for opt in fields[6:sep])
-            or any(not tail or b"\x00" in tail for tail in fields[sep + 1 :])
             or mount_id in table
+            or mount_point is None
+            or _parse_kernel_int(parent_id_b, max_value=_KERNEL_INT32_MAX) is None
+            or not colon
+            or _parse_kernel_int(major_b, max_value=_KERNEL_UINT32_MAX) is None
+            or _parse_kernel_int(minor_b, max_value=_KERNEL_UINT32_MAX) is None
+            # Mount options and optional fields are fixed kernel tokens: never escaped.
+            or any(_decode_mountinfo_field(opt) is None for opt in fields[5:sep])
+            or any(
+                _decode_mountinfo_field(text, escaped=_MOUNTINFO_ESCAPED) is None
+                for text in (root_b, fstype_b, source_b)
+            )
+            or _decode_mountinfo_field(super_opts_b, escaped=_MOUNTINFO_SUPER_OPTS_ESCAPED) is None
         ):
             return None
         table[mount_id] = mount_point
@@ -588,28 +620,27 @@ def _read_mount_table() -> dict[int, str] | None:
 
 
 def _read_fd_mount_id(fd: int) -> int | None:
-    """Strictly read the single ``mnt_id`` from ``/proc/self/fdinfo/<fd>``, or ``None`` on any error."""
+    """Strictly read the single ``mnt_id`` from ``/proc/self/fdinfo/<fd>``, or ``None`` on any error.
+
+    Fail closed by class: every line must be ``<key>:\\t<value>`` with a canonical lowercase key
+    (no padding or case variants) and a printable non-space ASCII value; a duplicate key of any
+    name, an empty line, a missing final newline, or anything but exactly one bounded ``mnt_id``
+    refuses the file.
+    """
     try:
         raw = (_FDINFO_DIR / str(fd)).read_bytes()
     except OSError:
         return None
-    if not raw or not raw.endswith(b"\n") or not raw.isascii() or b"\x00" in raw:
+    if not raw.endswith(b"\n"):
         return None
-    mount_ids: list[int] = []
+    values: dict[bytes, bytes] = {}
     for line in raw[:-1].split(b"\n"):
-        if not line or b"\r" in line:
+        match = _FDINFO_LINE_RE.fullmatch(line)
+        if match is None or match.group(1) in values:
             return None
-        key, sep, value = line.partition(b":")
-        if not sep or not key.strip(b" \t"):
-            return None
-        if key.strip(b" \t").lower() == b"mnt_id":
-            if key != b"mnt_id":
-                return None
-            mount_id = _parse_kernel_int(value.strip(b" \t"), max_value=_KERNEL_INT32_MAX)
-            if mount_id is None:
-                return None
-            mount_ids.append(mount_id)
-    return mount_ids[0] if len(mount_ids) == 1 else None
+        values[match.group(1)] = match.group(2)
+    mount_id = values.get(b"mnt_id")
+    return None if mount_id is None else _parse_kernel_int(mount_id, max_value=_KERNEL_INT32_MAX)
 
 
 def _crosses_mount_boundary(resolved: Path) -> bool:

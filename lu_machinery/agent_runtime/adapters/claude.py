@@ -648,12 +648,18 @@ def _validate_allow_rule(rule: str) -> str:
 
 
 def _strip_mcp_allow_rules(raw: object) -> str:
-    """Drop MCP/Sources allow rules when a read-only run loads no MCP servers."""
+    """Drop MCP/Sources allow rules when a read-only run loads no MCP servers.
+
+    Fail closed by class before tokenizing: the list must be :meth:`str.isprintable` (no Unicode
+    category ``C*`` -- ``Cc``, ``Cf``, ``Cs``, ``Co``, ``Cn`` -- and no ``Z*`` separator except
+    the ASCII space), NFKC-normalized, and free of backslashes (this tokenizer models no escape
+    syntax, so an escape could split differently in the CLI).
+    """
     import unicodedata
 
     if not isinstance(raw, str):
         raise ValueError("ClaudeAdapter: allowed_tools must be a string")
-    if any(ord(ch) < 32 or ord(ch) == 127 or unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in raw):
+    if not raw.isprintable() or "\\" in raw or not unicodedata.is_normalized("NFKC", raw):
         raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
     if not raw.strip(" "):
         raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
