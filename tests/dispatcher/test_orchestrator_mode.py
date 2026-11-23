@@ -412,6 +412,15 @@ def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_stor
     assert monitor.store.lease_projection("epic:8") is None
 
 
+def test_a_dry_run_reads_a_projection_whose_session_disagrees_with_its_lease_as_unknown(monkeypatch):
+    """Defect class T1: a dry run reports a stream free from a projection whose own session state contradicts its
+    lease (an open session beside a released lease, or beside no lease)."""
+    for lease, session in ((_lease(state="released", session_state="closed"), "open"), (None, "open")):
+        monkeypatch.setattr(remote.RemoteEpicClient, "stream", lambda self, stream_id, digest_limit=20, lease=lease,
+                            session=session: {"stream_id": stream_id, "session_state": session, "lease": lease})
+        assert host_admission.turn_lease_probe(STREAM).startswith("orchestrator_lease_unknown"), (lease, session)
+
+
 @pytest.mark.parametrize(
     ("lease", "refused"),
     [
@@ -440,6 +449,19 @@ def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_stor
         (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "robot"}),
          "orchestrator_lease_unknown"),
         (_lease(holder={**_lease()["holder"], "agent": ""}), "orchestrator_lease_unknown"),
+        # An app thread's holder carries a canonical UUID task id and no pid, as Monitor itself requires.
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
+                                                                  "process_id": None, "task_id": None}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
+                                                                  "process_id": None, "task_id": "turn-1"}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
+                                                                  "process_id": None,
+                                                                  "task_id": "0b9a3a9e-6a8e-4f53-9d0c-7d6f1e2a4b5c"}),
+         None),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": True}),
+         "orchestrator_lease_unknown"),
         ({**_lease(), "expires_at": "soon"}, "orchestrator_lease_unknown"),
         ("lease", "orchestrator_lease_unknown"),
         (_MISSING, "orchestrator_lease_unknown"),  # no lease field is not the projection's explicit null
@@ -451,8 +473,9 @@ def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_stor
 def test_a_dry_run_reads_any_active_lease_as_busy(monkeypatch, lease, refused):
     """Defect class T1: a dry run reports a stream free that a turn's claim would be refused on (an expired but
     uncleared lease), or reads an unreadable lease as none."""
+    session = lease.get("session_state") if isinstance(lease, dict) else None
     monkeypatch.setattr(remote.RemoteEpicClient, "stream", lambda self, stream_id, digest_limit=20: {
-        "stream_id": stream_id, **({} if lease is _MISSING else {"lease": lease})})
+        "stream_id": stream_id, "session_state": session, **({} if lease is _MISSING else {"lease": lease})})
     reason = host_admission.turn_lease_probe(STREAM)
     if refused is None:
         assert reason is None
@@ -757,6 +780,35 @@ def test_no_task_borrows_a_turn_tree(task_store, tmp_path, monkeypatch):
     assert "cannot be read" in host_admission.turn_tree_refusal(trees / "masked")
     store.record_path("mismatch").write_text(json.dumps({**ordinary, "task_id": "other"}))  # names another task
     assert "cannot be read" in host_admission.turn_tree_refusal(trees / "mismatch")
+    # A record observed in the hot store that is gone when read never lets an older archived copy decide.
+    store._write(store.record_path("moving-turn"), _orchestrator_record("moving-turn"))
+    stale = _orchestrator_record("moving-turn")
+    stale.pop("orchestrator")
+    store._write(archive / "moving-turn.json", stale)
+    real_read_text = Path.read_text
+
+    def vanishing(path, *args, **kwargs):
+        if path == store.record_path("moving-turn"):
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real_read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_text", vanishing)
+        assert "cannot be read" in host_admission.turn_tree_refusal(trees / "moving-turn")
+    # Archive and restore move records under the archive lock, which the lookup holds across both names.
+    from lu_machinery.orchestration import task_record_store
+
+    taken = []
+    real_lock = task_record_store.task_archive_lock
+
+    def lock(tasks_dir, **kwargs):
+        taken.append((tasks_dir, kwargs))
+        return real_lock(tasks_dir, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(task_record_store, "task_archive_lock", lock)
+        host_admission.turn_tree_refusal(trees / "worker-0")
+    assert taken == [(task_store, {})]
     plain = _orchestrator_record("worker-1")
     plain.pop("orchestrator")
     _write(plain)

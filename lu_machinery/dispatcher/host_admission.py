@@ -288,14 +288,25 @@ def _positive(value) -> bool:
 
 
 def _valid_holder(holder) -> bool:
-    """A holder as Monitor's projection writes it (epics_router._lease_payload; LeaseHolder.validate)."""
+    """A holder as Monitor's projection writes it (epics_router._lease_payload), by Monitor's own rule.
+
+    ``LeaseHolder.validate`` decides identities, an app thread's canonical UUID task id and a process holder's
+    pid; a JSON boolean is never a pid.
+    """
+    from lu_machinery.session_streams.model import HolderKind, LeaseHolder
+
     if not (isinstance(holder, dict) and set(holder) == set(_HOLDER_FIELDS)
-            and all(_text(holder[name]) for name in ("agent", "harness", "instance_id"))
-            and all(holder[name] is None or _text(holder[name]) for name in ("task_id", "host_id"))):
+            and all(isinstance(holder[name], str) for name in ("agent", "harness", "instance_id", "holder_kind"))
+            and holder["holder_kind"] in {kind.value for kind in HolderKind}
+            and (holder["process_id"] is None or _positive(holder["process_id"]))):
         return False
-    if holder["holder_kind"] == "process":
-        return _positive(holder["process_id"])
-    return holder["holder_kind"] == "app_thread" and holder["process_id"] is None
+    try:
+        LeaseHolder(agent=holder["agent"], harness=holder["harness"], instance_id=holder["instance_id"],
+                    process_id=holder["process_id"], task_id=holder["task_id"],
+                    holder_kind=HolderKind(holder["holder_kind"]), host_id=holder["host_id"]).validate()
+    except (ValueError, TypeError):
+        return False
+    return True
 
 
 def _valid_lease_identity(lease, stream: str) -> bool:
@@ -459,8 +470,7 @@ def turn_tree_refusal(tree) -> str | None:
     whatever records exist; a tree whose name is a task id whose record is a turn, or cannot be read, refuses too.
     The name is the tree's real one, whatever spelling (``TREE/sub/..``) the caller used.
     """
-    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
-    from lu_machinery.orchestration.task_record_store import archived_task_record_path
+    from lu_machinery.orchestration.task_record_store import archived_task_record_path, task_archive_lock
 
     try:
         name = Path(os.path.realpath(tree)).name
@@ -473,19 +483,37 @@ def turn_tree_refusal(tree) -> str | None:
     except ValueError:
         return None  # no task id names it
     unreadable = f"orchestrator_turn_writer_refused: the record of {name:.128}, which may own this tree, cannot be read"
-    # The hot record decides; the archive only once the hot entry is proven absent. Each entry is read itself, so
-    # an inaccessible, non-regular or inconsistent one is never skipped for another.
-    for candidate in (hot, archived_task_record_path(hot.parent, name)):
+    try:
+        # Archive and restore move records under this lock, so no owner is between the two names while both are read.
+        with task_archive_lock(hot.parent):
+            return _owner_refusal(name, (hot, archived_task_record_path(hot.parent, name)), unreadable)
+    except (OSError, ValueError):
+        return unreadable
+
+
+def _owner_refusal(name: str, locations, unreadable: str) -> str | None:
+    """The refusal the first present owner record of ``name`` gives, in ``locations`` order (hot, then archive).
+
+    Only a location proven absent (``lstat``: not found) yields to the next. A record once observed decides: it must
+    be a regular file that reads as an object naming ``name``, or the tree's owner is unknown and the tree refused.
+    """
+    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+
+    for candidate in locations:
         try:
-            if not stat.S_ISREG(os.lstat(candidate).st_mode):
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):  # an inaccessible record is not an absent one
+            return unreadable
+        try:
+            if not stat.S_ISREG(info.st_mode):
                 return unreadable
             record = json_depth.loads(candidate.read_text(encoding="utf-8"), max_depth=store._JSON_MAX_DEPTH)
             if not (isinstance(record, dict) and record.get("task_id") == name):
                 return unreadable
             stream = orchestrator_stream(record)
-        except FileNotFoundError:
-            continue
-        except (OSError, ValueError, RecursionError):  # inaccessible, damaged, or a turn with an unknown stream
+        except (OSError, ValueError, RecursionError):  # vanished since observed, damaged, or an unknown turn stream
             return unreadable
         if stream is not None:
             return f"orchestrator_turn_writer_refused: {name:.128} is the orchestrator turn on {stream}"
@@ -507,11 +535,12 @@ def turn_lease_probe(stream):
         return f"orchestrator_lease_unknown: the Monitor stream lease read failed ({type(exc).__name__})"
     if not isinstance(response, dict) or response.get("stream_id") != stream:
         return "orchestrator_lease_unknown: the Monitor answer names another stream"
-    if "lease" not in response:
-        return "orchestrator_lease_unknown: the Monitor answer has no lease field"
+    if "lease" not in response or "session_state" not in response:
+        return "orchestrator_lease_unknown: the Monitor answer has no lease or session state field"
     lease = response["lease"]
-    if lease is None:  # the projection's explicit "no lease"
-        return None
+    if lease is None:  # the projection's explicit "no lease", which has no session either
+        return None if response["session_state"] is None else (
+            "orchestrator_lease_unknown: the Monitor answer names a session but no lease")
     if not isinstance(lease, dict):
         return "orchestrator_lease_unknown: the Monitor lease is malformed"
     # Every part of a lease is checked before any of it decides, as Monitor writes each one for every lease.
@@ -520,7 +549,7 @@ def turn_lease_probe(stream):
         return "orchestrator_lease_unknown: the Monitor lease or its session state is malformed"
     if store.parse_utc_timestamp(lease.get("expires_at")) is None:
         return "orchestrator_lease_unknown: the Monitor lease expiry is unreadable"
-    if not (_valid_lease_identity(lease, stream)
+    if not (_valid_lease_identity(lease, stream) and response["session_state"] == session
             and (session in ("closed", "expired") if state == "released" else session in ("open", "rolling"))):
         return "orchestrator_lease_unknown: the Monitor lease is incomplete or its states disagree"
     if state == "released":
