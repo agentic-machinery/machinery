@@ -237,11 +237,11 @@ def _reservations_fd(*, create: bool) -> int | None:
     """A descriptor of the verified reservation directory, or None when it does not exist (never with ``create``).
 
     The directory is ``streams`` beside the task store's canonical path, opened without following a symlink;
-    it must be a directory the current user owns that no group or other user can write.
+    it must be a directory the current user owns that no group or other user can write. A missing task store
+    refuses (ReservationUnsafe): where its reservations are is then unknown, so they are never read as absent.
     """
-    store_path = _task_store(missing_ok=not create)
-    if store_path is None:
-        return None
+    store_path = _task_store()
+    assert store_path is not None  # without missing_ok a missing store raises
     parent = store_path.parent
     try:
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
