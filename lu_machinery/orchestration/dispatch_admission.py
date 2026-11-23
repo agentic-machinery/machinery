@@ -108,6 +108,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -273,12 +274,12 @@ class Thresholds:
             raise ValueError(
                 f"{ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN}={unknown_cap!r} must be a positive whole number"
             )
-        for env_name, cap in (
-            (ENV_MAX_LIVE_ORCHESTRATORS, self.max_live_orchestrators),
-            (ENV_MAX_CHILDREN_PER_TURN, self.max_children_per_turn),
+        for env_name, cap, ceiling in (
+            (ENV_MAX_LIVE_ORCHESTRATORS, self.max_live_orchestrators, config.DISPATCH_MAX_LIVE_ORCHESTRATORS),
+            (ENV_MAX_CHILDREN_PER_TURN, self.max_children_per_turn, config.DISPATCH_MAX_CHILDREN_PER_TURN),
         ):
-            if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
-                raise ValueError(f"{env_name}={cap!r} must be a non-negative whole number")
+            if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0 or cap > ceiling:
+                raise ValueError(f"{env_name}={cap!r} must be a whole number between 0 and {ceiling}")
 
 
 class MeterDefer(StrEnum):
@@ -500,6 +501,11 @@ class AdmissionDecision:
                 f"dispatch admission deferred for a {self.mode} worker: {details}. "
                 "Retry when the subscription meter has room. --force-admission cannot override meter limits."
             )
+        if self.orchestrator_cap_refused:
+            return (
+                f"dispatch admission refused for a {self.mode} worker: {details}. "
+                "Wait for a live orchestrator turn to finish; --force-admission cannot override the orchestrator cap."
+            )
         return (
             f"dispatch admission refused for a {self.mode} worker: {details}. "
             "Wait for a worker to finish or for the host to recover, raise the threshold through the named "
@@ -530,7 +536,11 @@ class AdmissionDecision:
         return {
             "checked_at": datetime.now(UTC).isoformat(),
             "admitted": self.admitted,
-            "forced": force_reason is not None and not self.admitted and not (self.disk_refused or self.meter_refused),
+            "forced": (
+                force_reason is not None
+                and not self.admitted
+                and not (self.disk_refused or self.meter_refused or self.orchestrator_cap_refused)
+            ),
             "force_reason": force_reason,
             "failures": list(self.failures),
             "live_write_workers": self.live_write_workers,
@@ -1642,56 +1652,109 @@ def _is_orchestrator_turn(state: Mapping[str, Any]) -> bool:
         return False
 
 
+def read_regular_task_record_bytes(path: Path) -> bytes:
+    """Read ``path`` only after proving it is a regular file without blocking on FIFOs or devices."""
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"non-regular task record {path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            raise ValueError(f"non-regular task record {path.name}")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def is_safe_identical_copy(exc: task_record_store.TaskIdentityMismatch) -> bool:
+    """Whether ``exc`` is an exact copy of its named regular-file sibling, read without blocking."""
+    named = task_record_store.task_record_path(exc.path.parent, exc.record["task_id"])
+    if named == exc.path:
+        return False
+    try:
+        raw = read_regular_task_record_bytes(named)
+        other = task_record_store.parse_task_record(named, raw)
+    except (OSError, ValueError, RecursionError):
+        return False
+    return isinstance(other, dict) and json.dumps(other, sort_keys=True) == json.dumps(exc.record, sort_keys=True)
+
+
+def scan_record_candidates(directory: Path) -> list[Path]:
+    """Enumerate every non-sidecar ``.json`` entry in ``directory`` without filtering out dangling or non-regular files."""
+    with os.scandir(directory) as entries:
+        names = [
+            entry.name
+            for entry in entries
+            if entry.name.endswith(".json") and not entry.name.endswith(task_record_store._DISPATCHER_SIDECAR_SUFFIXES)
+        ]
+    names.sort()
+    return [directory / name for name in names]
+
+
+def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -> list[dict[str, Any]]:
+    """Return every verified task record under ``tasks_dir`` (and archive) while holding ``task_archive_lock``.
+
+    Fails closed on any directory traversal error, unreachable existing archive entry, dangling
+    symlink, non-regular ``.json`` candidate (FIFO, socket, device, directory), corrupt or
+    non-object record, or misnamed record that is not an exact copy of its named sibling.
+    """
+    records: list[dict[str, Any]] = []
+    with task_record_store.task_archive_lock(tasks_dir):
+        candidates = scan_record_candidates(tasks_dir)
+        if include_archive:
+            archive_dir = tasks_dir / task_record_store.ARCHIVE_DIR_NAME
+            try:
+                archive_dir.lstat()
+            except FileNotFoundError:
+                archive_present = False
+            else:
+                archive_present = True
+            if archive_present:
+                candidates.extend(scan_record_candidates(archive_dir))
+        for listed in candidates:
+            try:
+                raw = read_regular_task_record_bytes(listed)
+                parsed = task_record_store.parse_task_record(listed, raw)
+            except task_record_store.TaskIdentityMismatch as exc:
+                if is_safe_identical_copy(exc):
+                    continue
+                raise ValueError(f"unreadable task record {listed.name}") from None
+            except (OSError, ValueError, RecursionError):
+                raise ValueError(f"unreadable task record {listed.name}") from None
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("task_id"), str) or not parsed["task_id"]:
+                raise ValueError(f"unreadable task record {listed.name}")
+            records.append(parsed)
+    return records
+
+
 def count_turn_children(
     tasks_dir: Path,
     parent_task_id: str,
     parent_run_nonce: str | None = None,
 ) -> int:
-    """Count non-refused child tasks dispatched by one orchestrator turn; fail closed on unreadable hot records."""
-    from lu_machinery.orchestration.task_record_store import (
-        TaskIdentityMismatch,
-        is_identical_copy,
-        iter_task_records,
-        parse_task_record,
-        read_task_record_bytes,
-        task_archive_lock,
-    )
-
+    """Count non-refused child tasks dispatched by one orchestrator turn; fail closed on any unreadable record."""
+    try:
+        records = strict_task_inventory_in(tasks_dir, include_archive=True)
+    except ValueError as exc:
+        raise ValueError(f"{exc}: cannot verify turn child count") from None
     seen_ids: set[str] = set()
-    seen_names: set[str] = set()
-    with task_archive_lock(tasks_dir):
-        for listed in iter_task_records(tasks_dir, include_archive=False):
-            seen_names.add(listed.name)
-            try:
-                path, raw = read_task_record_bytes(listed, tasks_dir=tasks_dir)
-                if path != listed:
-                    continue
-                record = parse_task_record(path, raw)
-            except TaskIdentityMismatch as exc:
-                if is_identical_copy(exc):
-                    continue
-                raise ValueError(f"unreadable task record {listed.name}: cannot verify turn child count") from None
-            except (OSError, ValueError, RecursionError):
-                raise ValueError(f"unreadable task record {listed.name}: cannot verify turn child count") from None
-            if not isinstance(record, dict) or not isinstance(record.get("task_id"), str):
-                raise ValueError(f"unreadable task record {listed.name}: cannot verify turn child count")
-            if (record.get("parent_task_id") == parent_task_id
-                    and not record.get("never_started_reason")
-                    and (parent_run_nonce is None or record.get("parent_run_nonce") in (None, parent_run_nonce))):
-                seen_ids.add(record["task_id"])
-        for listed in iter_task_records(tasks_dir, include_archive=True):
-            if listed.name in seen_names:
-                continue
-            try:
-                path, raw = read_task_record_bytes(listed, tasks_dir=tasks_dir)
-                record = parse_task_record(path, raw)
-            except (TaskIdentityMismatch, OSError, ValueError, RecursionError):
-                continue
-            if (isinstance(record, dict) and isinstance(record.get("task_id"), str)
-                    and record.get("parent_task_id") == parent_task_id
-                    and not record.get("never_started_reason")
-                    and (parent_run_nonce is None or record.get("parent_run_nonce") in (None, parent_run_nonce))):
-                seen_ids.add(record["task_id"])
+    for record in records:
+        if record.get("parent_task_id") != parent_task_id:
+            continue
+        never_started = record.get("never_started_reason")
+        if never_started is not None and not isinstance(never_started, str):
+            raise ValueError(f"malformed never_started_reason on {record['task_id']}: cannot verify turn child count")
+        if never_started:
+            continue
+        rec_parent_nonce = record.get("parent_run_nonce")
+        if rec_parent_nonce is not None and (not isinstance(rec_parent_nonce, str) or not rec_parent_nonce):
+            raise ValueError(f"malformed parent_run_nonce on {record['task_id']}: cannot verify turn child count")
+        if parent_run_nonce is None or rec_parent_nonce in (None, parent_run_nonce):
+            seen_ids.add(record["task_id"])
     return len(seen_ids)
 
 

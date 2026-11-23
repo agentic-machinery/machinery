@@ -698,7 +698,22 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
             msg = service.get_message(mid)
             assert msg.recipient == "claude-cto"
             body = service.read_message_body(mid)
-            assert "exact holder" in body and "attributed operator release" in body
+            assert "exact fenced lease envelope" in body and "never unfenced session_supervisor release --force" in body
+
+        # PR1299-F4: verified held_turn_lease alerts still route even when an unrelated corrupt task record
+        # produces a scan error (while ordinary stalled-work rows remain gated on error-free scans).
+        (host.tasks / "truncated-unrelated.json").write_text("{", encoding="utf-8")
+        report_err = mod.scan(
+            host.tasks,
+            {SLUG: host.tmp_path},
+            repos=REPOS,
+            now=NOW + timedelta(minutes=10),
+            adapter_factory=lambda path: mod.GitHubAdapter(path, runner=host.gh),
+            stream_fetcher=lambda: streams_cycle2,
+        )
+        assert report_err["errors"]
+        assert mod.route(report_err, cycle=3, service=service) == cycle1
+        (host.tasks / "truncated-unrelated.json").unlink()
 
     # diagnose_handoff and SessionSupervisor.recover_expired_driver (local and remote) never advise TTL takeover.
     local_store = SessionStreamStore(SessionStreamDatabase(tmp_path / "local-streams.db"))
@@ -719,18 +734,18 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
     assert diag.holder_harness == TURN_HOLDER_HARNESS
     assert diag.claimable_force_close is False
     assert diag.holder_process_alive is None
-    assert "TTL" in diag.reason and "exact-holder close" in diag.reason and "attributed operator release" in diag.reason
+    assert "TTL" in diag.reason and "exact fenced lease envelope" in diag.reason
 
     candidate = LeaseHolder("codex", "codex-cli", "candidate-1", process_id=4242)
     local_sup = SessionSupervisor(local_store, repo_root=tmp_path)
     with pytest.raises(SupervisorError) as local_exc:
         local_sup.recover_expired_driver(role=LaunchRole.DRIVER, stream_id="epic:11151", holder=candidate)
     local_msg = str(local_exc.value)
-    assert "exact-holder close" in local_msg and "attributed operator release" in local_msg
+    assert "exact fenced lease envelope" in local_msg
     assert "TTL takeover and local PID recovery refused" in local_msg
 
     monitor_store = SessionStreamStore(SessionStreamDatabase(tmp_path / "remote-streams.db"))
-    monitor_store.claim_remote_session(
+    claimed_lease, _ = monitor_store.claim_remote_session(
         stream_id="epic:11151",
         holder=holder,
         lineage_id="lin-1",
@@ -745,6 +760,24 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
         with pytest.raises(SupervisorError) as remote_exc:
             remote_sup.recover_expired_driver(role=LaunchRole.DRIVER, stream_id="epic:11151", holder=candidate)
         remote_msg = str(remote_exc.value)
-        assert "exact-holder close" in remote_msg and "attributed operator release" in remote_msg
-        assert "session_supervisor release --force" in remote_msg
+        assert "exact fenced lease envelope" in remote_msg
         assert "TTL takeover and local PID recovery refused" in remote_msg
+
+        # PR1299-F5: fenced exact-envelope release closes the checked expired lease and rejects a stale envelope
+        # once a successor holds a new generation (never closing the successor).
+        from lu_machinery.session_supervisor.remote import RemoteLeaseLostError
+
+        rel = client.release(claimed_lease)
+        assert rel["outcome"] == "released" and rel["lease"]["lease_id"] == claimed_lease.lease_id
+        successor = LeaseHolder("claude", TURN_HOLDER_HARNESS, overdue_nonce, process_id=999998, task_id="turn-next")
+        monitor_store.claim_remote_session(
+            stream_id="epic:11151",
+            holder=successor,
+            lineage_id="lin-2",
+            ttl_seconds=3600,
+            session_id=f"turn-session-{overdue_nonce}",
+            lease_id=f"turn-lease-{overdue_nonce}",
+        )
+        with pytest.raises(RemoteLeaseLostError):
+            client.release(claimed_lease)
+        assert client.stream("epic:11151")["lease"]["lease_id"] == f"turn-lease-{overdue_nonce}"

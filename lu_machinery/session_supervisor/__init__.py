@@ -435,7 +435,8 @@ class SessionSupervisor:
             )
             return True
         recovery_note = (
-            "Dispatch-turn leases require exact-holder close or attributed operator release."
+            "Dispatch-turn leases require fenced exact-envelope close after quiescence verification "
+            "(see docs/runbooks/session-supervisor.md)."
             if status.holder_harness == TURN_HOLDER_HARNESS
             else (
                 "If that process is yours, exit it cleanly; do not force-close a live holder. "

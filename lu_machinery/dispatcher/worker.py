@@ -819,8 +819,12 @@ def _scan_turn_children(record: dict) -> dict:
     active task store cannot hide a running child. Archived records are also checked best-effort so
     settled children stay recorded with their full run nonces.
     """
+    from lu_machinery.orchestration.dispatch_admission import (
+        is_safe_identical_copy,
+        read_regular_task_record_bytes,
+        scan_record_candidates,
+    )
     from lu_machinery.orchestration.task_record_store import (
-        _DISPATCHER_SIDECAR_SUFFIXES,
         ARCHIVE_DIR_NAME,
         TaskIdentityMismatch,
         parse_task_record,
@@ -864,24 +868,14 @@ def _scan_turn_children(record: dict) -> dict:
         elif unsettled := _terminal_child_unsettled_state(other):
             (live if unsettled == "live" else unknown).append(child_id)
 
-    def _scan_dir_candidates(directory: Path) -> list[Path]:
-        with os.scandir(directory) as entries:
-            names = [
-                entry.name
-                for entry in entries
-                if entry.name.endswith(".json") and not entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES)
-            ]
-        names.sort()
-        return [directory / name for name in names]
-
     try:
         with task_archive_lock(root):
-            for listed in _scan_dir_candidates(root):
+            for listed in scan_record_candidates(root):
                 try:
-                    raw = store._read_regular_task_record_bytes(listed)
+                    raw = read_regular_task_record_bytes(listed)
                     parsed = parse_task_record(listed, raw)
                 except TaskIdentityMismatch as exc:
-                    if not store._is_safe_identical_copy(exc):
+                    if not is_safe_identical_copy(exc):
                         unreadable.append(listed.name)
                     continue
                 except (OSError, ValueError, RecursionError):
@@ -893,12 +887,12 @@ def _scan_turn_children(record: dict) -> dict:
                 classify(parsed, listed.stem)
             archive_dir = root / ARCHIVE_DIR_NAME
             try:
-                archive_candidates = _scan_dir_candidates(archive_dir)
+                archive_candidates = scan_record_candidates(archive_dir)
             except OSError:
                 archive_candidates = []
             for listed in archive_candidates:
                 try:
-                    raw = store._read_regular_task_record_bytes(listed)
+                    raw = read_regular_task_record_bytes(listed)
                     parsed = parse_task_record(listed, raw)
                 except (TaskIdentityMismatch, OSError, ValueError, RecursionError):
                     continue
@@ -2193,11 +2187,6 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             if dispatch_isolation.scope_stop_result(unit) == "timeout":
                 scope_runtime_timeout = True
                 return True
-        scope_max = record.get("scope_runtime_max_s")
-        if (isinstance(scope_max, (int, float)) and not isinstance(scope_max, bool)
-                and scope_max > 0 and (time.monotonic() - started) >= scope_max - 2.0):
-            scope_runtime_timeout = True
-            return True
         scope_runtime_timeout = False
         return False
 
@@ -2719,6 +2708,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     if transport_warning and record["status"] == "done":
                         record["transport_warning"] = transport_warning
                     if ((children := record.get("orphaned_child_tasks")) and record["status"] != "done"
+                            and record.get("kill_reason") != "scope_runtime_max_timeout"
                             and not str(record.get("error") or "").startswith("orchestrator_orphaned_children:")):
                         record["error"] = f"orphaned_child_tasks: {', '.join(children)}; {record['error']}"
                     try:

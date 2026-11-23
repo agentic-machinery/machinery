@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import shutil
-import stat
 import subprocess
 import unicodedata
 import uuid
@@ -28,7 +27,6 @@ from lu_machinery.orchestration.task_record_store import (
     read_task_record_bytes,
     relocated_result_file,
     task_archive_lock,
-    task_record_path,
     task_state_lock,
 )
 
@@ -645,86 +643,11 @@ def _driver_state_cli() -> str | None:
     return shutil.which(name)
 
 
-def _read_regular_task_record_bytes(path: Path) -> bytes:
-    """Read ``path`` only after proving it is a regular file without blocking on FIFOs or devices."""
-    st = os.stat(path)
-    if not stat.S_ISREG(st.st_mode):
-        raise ValueError(f"non-regular task record {path.name}")
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
-    fd = os.open(path, flags)
-    try:
-        fst = os.fstat(fd)
-        if not stat.S_ISREG(fst.st_mode):
-            raise ValueError(f"non-regular task record {path.name}")
-    except BaseException:
-        os.close(fd)
-        raise
-    with os.fdopen(fd, "rb") as handle:
-        return handle.read()
-
-
-def _is_safe_identical_copy(exc: TaskIdentityMismatch) -> bool:
-    """Check ``is_identical_copy`` only when the sibling target is a regular file."""
-    named = task_record_path(exc.path.parent, exc.record["task_id"])
-    try:
-        if not stat.S_ISREG(os.stat(named).st_mode):
-            return False
-    except OSError:
-        return False
-    return is_identical_copy(exc)
-
-
 def strict_task_inventory(*, include_archive: bool = True) -> list[dict]:
-    """Return every verified task record under hot (and archive) while holding ``task_archive_lock``.
+    """Return every verified task record under hot (and archive) while holding ``task_archive_lock``."""
+    from lu_machinery.orchestration.dispatch_admission import strict_task_inventory_in
 
-    Fails closed on any directory traversal error, unreachable existing archive entry, dangling
-    symlink, non-regular ``.json`` candidate (FIFO, socket, device, directory), corrupt or
-    non-object record, or misnamed record that is not an exact copy of its named sibling.
-    """
-    from lu_machinery.orchestration.task_record_store import (
-        _DISPATCHER_SIDECAR_SUFFIXES,
-        ARCHIVE_DIR_NAME,
-    )
-
-    root = tasks_dir()
-
-    def scan_directory(directory: Path) -> list[Path]:
-        with os.scandir(directory) as entries:
-            names = [
-                entry.name
-                for entry in entries
-                if entry.name.endswith(".json") and not entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES)
-            ]
-        names.sort()
-        return [directory / name for name in names]
-
-    records: list[dict] = []
-    with task_archive_lock(root):
-        candidates = scan_directory(root)
-        if include_archive:
-            archive_dir = root / ARCHIVE_DIR_NAME
-            try:
-                archive_dir.lstat()
-            except FileNotFoundError:
-                archive_present = False
-            else:
-                archive_present = True
-            if archive_present:
-                candidates.extend(scan_directory(archive_dir))
-        for listed in candidates:
-            try:
-                raw = _read_regular_task_record_bytes(listed)
-                parsed = parse_task_record(listed, raw)
-            except TaskIdentityMismatch as exc:
-                if _is_safe_identical_copy(exc):
-                    continue
-                raise ValueError(f"unreadable task record {listed.name}") from None
-            except (OSError, ValueError, RecursionError):
-                raise ValueError(f"unreadable task record {listed.name}") from None
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("task_id"), str) or not parsed["task_id"]:
-                raise ValueError(f"unreadable task record {listed.name}")
-            records.append(parsed)
-    return records
+    return strict_task_inventory_in(tasks_dir(), include_archive=include_archive)
 
 
 def _handoff_ref_reuse_refusal(record: dict, stream: str, refs: set[str]) -> str | None:

@@ -274,7 +274,7 @@ held `dispatch-turn` lease whose turn record is terminal or overdue as a `held_t
 row and sends one deduplicated alert to `claude-cto`. `diagnose_handoff` and
 `recover_expired_driver` refuse TTL takeover and direct recovery here.
 
-Before running an attributed force release, verify quiescence in three steps:
+Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
 
 1. **Inspect the turn record and Monitor projection:** confirm the holder `task_id`,
    `instance_id` (run nonce), `session_id`, `lease_id`, `generation`, and `fencing_token`
@@ -313,20 +313,59 @@ Before running an attributed force release, verify quiescence in three steps:
    `running`, `unknown`, or unreadable, keep the stream held — custody reassignment alone
    does not satisfy quiescence.
 
-Once all three checks pass, re-read Monitor to confirm the same holder is still current,
-then run the attributed operator release:
+Once all three checks pass, close **only the exact checked lease** using Monitor's fenced
+exact-envelope release (`POST /api/epics/v1/epic:<N>/release` with `session_id`, `lease_id`,
+`generation`, `fencing_token`, and exact `holder`). Monitor verifies all fields atomically
+inside its transaction and refuses with `409 LEASE LOST` (`RemoteLeaseLostError`) if the
+original holder already closed and a successor claimed the stream:
 
 ```bash
-.venv/bin/python -m lu_machinery.session_supervisor release \
-  --role driver --stream epic:<N> --force \
-  --actor-agent <operator-or-cto-actor> \
-  --actor-host-id <host-id> \
-  --reason "quiescence verified: <task-id> scope gone and children reconciled"
+.venv/bin/python -c '
+import sys
+from lu_machinery.session_streams.model import HolderKind, Lease, LeaseHolder
+from lu_machinery.session_supervisor.remote import RemoteEpicClient
+stream_id, expected_lease_id, expected_gen = sys.argv[1], sys.argv[2], int(sys.argv[3])
+client = RemoteEpicClient()
+raw = client.stream(stream_id)["lease"]
+assert raw["state"] in ("active", "expired"), raw
+assert raw["lease_id"] == expected_lease_id and raw["generation"] == expected_gen, raw
+h = raw["holder"]
+lease = Lease(
+    stream_id=raw["stream_id"],
+    session_id=raw["session_id"],
+    lease_id=raw["lease_id"],
+    generation=raw["generation"],
+    fencing_token=raw["fencing_token"],
+    holder=LeaseHolder(
+        agent=h["agent"],
+        harness=h["harness"],
+        instance_id=h["instance_id"],
+        process_id=h["process_id"],
+        holder_kind=HolderKind(h.get("holder_kind", "process")),
+        task_id=h.get("task_id"),
+        host_id=h.get("host_id"),
+    ),
+    heartbeat_at=raw["heartbeat_at"],
+    expires_at=raw["expires_at"],
+    ttl_seconds=raw["ttl_seconds"],
+    version=raw["version"],
+)
+res = client.release(lease)
+rel = res["lease"]
+assert res["outcome"] == "released" and rel["lease_id"] == expected_lease_id and rel["generation"] == expected_gen, res
+after = client.stream(stream_id)["lease"]
+assert after["state"] == "released" and after["session_state"] == "closed", after
+assert after["lease_id"] == expected_lease_id and after["generation"] == expected_gen, after
+print(f"released {stream_id} lease_id={expected_lease_id} generation={expected_gen}")
+' epic:<N> <lease-id> <generation>
 ```
 
-After release, read `GET /api/epics/v1/epic:<N>` separately to confirm `state=released`
-and `session_state=closed` before admitting a successor turn. If quiescence cannot be
-proven, keep the hold in place.
+Do **not** use `session_supervisor release --force` for `dispatch-turn` lease recovery:
+`release --force` is scoped only by `stream_id` and is not fenced to a specific `lease_id`
+and `generation`, so a concurrent successor claim between pre-check and release could be
+closed erroneously. Withhold unfenced `--force` unless Monitor is stopped or successor
+claims are excluded externally. If quiescence cannot be proven or Monitor returns
+`409 LEASE LOST`, keep the current hold in place and re-inspect before taking any action.
 
 Explicit `--local` mode can recover a local process lease before TTL expiry when
 the exact holder PID is absent and the distinct candidate process is live.

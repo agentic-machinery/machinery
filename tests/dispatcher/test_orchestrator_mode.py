@@ -734,7 +734,6 @@ def test_settlement_releases_the_lease_only_on_proof_the_run_is_gone(task_store,
 def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, monitor, monkeypatch):
     """Defect class T4: a release reaches another Monitor, names another run's lease, retries or force-releases after
     an outage, or a late release frees the successor that an operator's force release let in."""
-    monkeypatch.setenv("DISPATCH_MAX_LIVE_ORCHESTRATORS", "4")
     hold = _reserve("turn-1", launch={"started": True})  # launched: only settlement releases it
     envelope, nonce = hold["turn_lease"], hold["run_nonce"]
     exact = dict(stream=STREAM, task_id="turn-1", run_nonce=nonce)
@@ -799,6 +798,7 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
     assert monitor.client.stream(STREAM)["lease"]["state"] == "active"  # the outage kept it
     monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
                            reason="the turn's scope is proven gone")
+    store.replace({**hold, "status": "crashed"})
     successor = _legacy_claim(monitor.client)[0]
     before = monitor.store.dump_stream(STREAM)
     assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_fenced")
@@ -1696,19 +1696,23 @@ def test_bounded_wait_with_keepalive_survives_silence_timeout(task_store, tmp_pa
     assert payload["task_id"] == "child-slow" and payload["status"] == "running"
 
 
-def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(task_store, monkeypatch):
-    """Item 6 defect class: orchestrator turns bypass the fleet-wide live turn cap (default 2) or dispatch more
-    children than the per-turn child cap (default 4)."""
-    # Defaults: 2 live orchestrators, 4 children per turn.
+def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(task_store, tmp_path, monkeypatch):
+    """Item 6 defect class: orchestrator turns bypass the fleet-wide live turn cap (ceiling 2) or dispatch more
+    children than the per-turn child cap (ceiling 4), or miscount when the store has unreadable records."""
+    # Defaults and frozen ceilings: at most 2 live orchestrators, at most 4 children per turn (PR1299-F1).
     defaults = dispatch_admission.load_thresholds({})
     assert (defaults.max_live_orchestrators, defaults.max_children_per_turn) == (2, 4)
-    custom = dispatch_admission.load_thresholds({
-        "DISPATCH_MAX_LIVE_ORCHESTRATORS": "3",
-        "DISPATCH_MAX_CHILDREN_PER_TURN": "6",
+    lower = dispatch_admission.load_thresholds({
+        "DISPATCH_MAX_LIVE_ORCHESTRATORS": "1",
+        "DISPATCH_MAX_CHILDREN_PER_TURN": "2",
     })
-    assert (custom.max_live_orchestrators, custom.max_children_per_turn) == (3, 6)
+    assert (lower.max_live_orchestrators, lower.max_children_per_turn) == (1, 2)
+    with pytest.raises(ValueError, match="DISPATCH_MAX_LIVE_ORCHESTRATORS"):
+        dispatch_admission.load_thresholds({"DISPATCH_MAX_LIVE_ORCHESTRATORS": "3"})
+    with pytest.raises(ValueError, match="DISPATCH_MAX_CHILDREN_PER_TURN"):
+        dispatch_admission.load_thresholds({"DISPATCH_MAX_CHILDREN_PER_TURN": "5"})
 
-    # Fleet-wide live orchestrator cap: 2 live turns block a 3rd, raising the cap admits it.
+    # Fleet-wide live orchestrator cap: 2 live turns block a 3rd even with force_reason, and env cannot raise it.
     live_pid = os.getpid()
     live_ident = worker._identity(live_pid)
     for idx, stream in enumerate((STREAM, OTHER_STREAM), start=1):
@@ -1719,7 +1723,9 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     assert not host_admission.allows(refused, force_reason="operator override")  # F9: hard cap
     assert any("live orchestrator turns 2/2 reached the cap" in f for f in refused.failures), refused.failures
     monkeypatch.setenv("DISPATCH_MAX_LIVE_ORCHESTRATORS", "3")
-    assert host_admission.evaluate("workspace-write", sweep=False, orchestrator=True).admitted
+    with pytest.raises(ValueError, match="DISPATCH_MAX_LIVE_ORCHESTRATORS"):
+        host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+    monkeypatch.delenv("DISPATCH_MAX_LIVE_ORCHESTRATORS")
 
     # Sidecar-shaped child task IDs are refused before publishing any hold (F1).
     ro_decision = host_admission.evaluate("read-only", sweep=False)
@@ -1730,16 +1736,33 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     ):
         pass
 
-    # Per-turn child cap: 4 non-refused children block the 5th (even read-only / --force-admission);
-    # refused attempts (never_started_reason) do not consume the cap.
+    # Per-turn child cap: 3 non-refused children + 1 refused attempt (never_started_reason) is admitted (3 < 4),
+    # while a 4th non-refused child blocks the 5th (even read-only / --force-admission) and env cannot raise past 4.
     parent_nonce = "nonce-turn-cap-1"
     linkage = {"parent_task_id": "turn-cap-1", "parent_run_nonce": parent_nonce, "parent_stream": STREAM}
-    for i in range(4):
+    for i in range(3):
         _write(dict(schema_version=2, task_id=f"c-{i}", agent="claude", mode="workspace-write",
                     status="done" if i < 2 else "running", run_nonce=f"cn-{i}", **linkage))
-    # Refused attempt with never_started_reason should not affect count when cap is raised to 5.
     _write(dict(schema_version=2, task_id="c-refused", agent="claude", mode="workspace-write",
                 status="failed", never_started_reason="admission_capacity", run_nonce="cn-refused", **linkage))
+    host_admission.check_turn_child_cap(linkage)  # 3 < 4 admitted (refused attempt not counted)
+
+    # Unreadable hot record (dangling symlink or FIFO symlink) fails closed at child admission (PR1299-F2).
+    dangling = task_store / "dangling-cap.json"
+    dangling.symlink_to(tmp_path / "missing-cap.json")
+    with pytest.raises(host_admission.Refused, match=r"orchestrator_child_cap_unknown:.*dangling-cap\.json"):
+        host_admission.check_turn_child_cap(linkage)
+    dangling.unlink()
+    cap_fifo = tmp_path / "cap.fifo"
+    os.mkfifo(cap_fifo)
+    fifo_link = task_store / "fifo-cap.json"
+    fifo_link.symlink_to(cap_fifo)
+    with pytest.raises(host_admission.Refused, match=r"orchestrator_child_cap_unknown:.*fifo-cap\.json"):
+        host_admission.check_turn_child_cap(linkage)
+    fifo_link.unlink()
+
+    _write(dict(schema_version=2, task_id="c-3", agent="claude", mode="workspace-write",
+                status="running", run_nonce="cn-3", **linkage))
     with pytest.raises(host_admission.Refused, match=r"orchestrator_child_cap_reached:.*4/4"):
         host_admission.check_turn_child_cap(linkage)
     ro_decision = host_admission.evaluate("read-only", sweep=False)
@@ -1750,7 +1773,9 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     ):
         pass
     monkeypatch.setenv("DISPATCH_MAX_CHILDREN_PER_TURN", "5")
-    host_admission.check_turn_child_cap(linkage)  # 4 < 5 admitted (refused attempt not counted)
+    with pytest.raises(host_admission.Refused, match="orchestrator_child_cap_unknown"):
+        host_admission.check_turn_child_cap(linkage)
+    monkeypatch.delenv("DISPATCH_MAX_CHILDREN_PER_TURN")
 
 
 def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp_path, monkeypatch):
@@ -1792,15 +1817,24 @@ def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp
     timed_out = _run_with_sigterm("turn-rmax-timeout", "timeout")
     assert timed_out["status"] == "timeout"
     assert timed_out["kill_reason"] == "scope_runtime_max_timeout"
-    assert "RuntimeMaxSec" in timed_out["error"] and "cancelled by client" not in timed_out["error"]
+    assert timed_out["error"] == "scope RuntimeMaxSec exceeded"
 
-    client_cancel = _run_with_sigterm("turn-rmax-cancel", "success")
+    # Client SIGTERM near the deadline with Result=success or unavailable systemd stays cancelled (PR1299-F3).
+    client_cancel = _run_with_sigterm("turn-rmax-cancel", "success", scope_runtime_max_s=1)
     assert (client_cancel["status"], client_cancel["error"]) == ("cancelled", "cancelled by client")
+    assert client_cancel.get("kill_reason") != "scope_runtime_max_timeout"
+    unconfirmed_cancel = _run_with_sigterm("turn-rmax-unconfirmed", None, scope_runtime_max_s=1)
+    assert (unconfirmed_cancel["status"], unconfirmed_cancel["error"]) == ("cancelled", "cancelled by client")
+    assert unconfirmed_cancel.get("kill_reason") != "scope_runtime_max_timeout"
 
-    # Fallback when systemd is unavailable but scope_runtime_max_s already elapsed.
-    fallback_timeout = _run_with_sigterm("turn-rmax-fallback", None, scope_runtime_max_s=1)
-    assert fallback_timeout["status"] == "timeout"
-    assert fallback_timeout["kill_reason"] == "scope_runtime_max_timeout"
+    # Confirmed scope timeout with an active child preserves exact timeout error while recording child diagnostics (PR1299-F3).
+    _write(dict(schema_version=2, task_id="child-during-rmax", agent="claude", mode="workspace-write",
+                status="running", run_nonce="nonce-child-rmax", parent_task_id="turn-rmax-child"))
+    timed_out_child = _run_with_sigterm("turn-rmax-child", "timeout")
+    assert timed_out_child["status"] == "timeout"
+    assert timed_out_child["kill_reason"] == "scope_runtime_max_timeout"
+    assert timed_out_child["error"] == "scope RuntimeMaxSec exceeded"
+    assert timed_out_child["orphaned_child_tasks"] == ["child-during-rmax"]
 
     # Late RuntimeMaxSec SIGTERM after provider watchdog already set status=timeout still records scope cause (F10).
     from lu_machinery.dispatcher.watchdog import DeadlineExpired

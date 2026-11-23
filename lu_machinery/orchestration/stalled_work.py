@@ -51,8 +51,8 @@ TURN_LEASE_OVERDUE_GRACE_SECONDS = 900
 TURN_LEASE_RECORDLESS_GRACE_SECONDS = 120
 _TURN_LEASE_RECOVERY_ADVICE = (
     "Confirm the turn scope and child tasks are gone; never use TTL takeover for dispatch-turn leases. "
-    "Close as the exact holder or run an attributed operator release (session_supervisor release --force; "
-    "see docs/runbooks/session-supervisor.md)."
+    "Close using the exact fenced lease envelope (RemoteEpicClient.release / host_admission.release_turn; "
+    "see docs/runbooks/session-supervisor.md; never unfenced session_supervisor release --force)."
 )
 # A persistent scan error stays in the journal without a line on every keeper minute.
 _SUMMARY = timedelta(hours=1)
@@ -502,9 +502,13 @@ def scan(
 
 
 def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> list[str]:
-    """Retry stable messages in a cycle; unresolved rows return in the next cycle."""
-    if report["errors"]:
-        raise ValueError("routing refused: incomplete report")
+    """Retry stable messages in a cycle; unresolved rows return in the next cycle.
+
+    Ordinary stalled-work routing requires an error-free report. Verified ``held_turn_lease``
+    rows still emit their deduplicated CTO alert when unrelated scan errors (such as a damaged
+    task record or forge failure) occur, so the error that caused a turn to hold its lease never
+    suppresses the recovery alert.
+    """
     groups = defaultdict(list)
     turn_lease_rows: list[dict[str, Any]] = []
     for row in report["rows"]:
@@ -513,24 +517,28 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
             turn_lease_rows.append(stripped)
         else:
             groups[row["lane"]].append(stripped)
+    incomplete = bool(report["errors"])
+    if incomplete and not turn_lease_rows:
+        raise ValueError("routing refused: incomplete report")
     messages = []
-    # A separate summary is still sent when unknown owners route to the CTO.
-    packets = [(lane, "lane", rows) for lane, rows in sorted(groups.items())]
-    if groups:
-        packets.append(("claude-cto", "summary", [r for _, rs in sorted(groups.items()) for r in rs]))
-    for lane, kind, rows in packets:
-        rows = sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
-        payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(payload.encode()).hexdigest()
-        key = f"stalled:{cycle}:{kind}:{lane}:{digest}"
-        message = service.enqueue_supervisory_request(
-            sender="claude-cto",
-            recipient=lane,
-            body=f"Stalled work {kind}. Return each row to its owning lane until landed or explicitly abandoned.\n{payload}",
-            correlation_id=f"stalled:{cycle}",
-            idempotency_key=key,
-        )
-        messages.append(message.message_id)
+    if not incomplete:
+        # A separate summary is still sent when unknown owners route to the CTO.
+        packets = [(lane, "lane", rows) for lane, rows in sorted(groups.items())]
+        if groups:
+            packets.append(("claude-cto", "summary", [r for _, rs in sorted(groups.items()) for r in rs]))
+        for lane, kind, rows in packets:
+            rows = sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
+            payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
+            digest = hashlib.sha256(payload.encode()).hexdigest()
+            key = f"stalled:{cycle}:{kind}:{lane}:{digest}"
+            message = service.enqueue_supervisory_request(
+                sender="claude-cto",
+                recipient=lane,
+                body=f"Stalled work {kind}. Return each row to its owning lane until landed or explicitly abandoned.\n{payload}",
+                correlation_id=f"stalled:{cycle}",
+                idempotency_key=key,
+            )
+            messages.append(message.message_id)
     for row in sorted(
         turn_lease_rows,
         key=lambda r: (str(r.get("stream_id")), str(r.get("lease_id")), str(r.get("generation")), str(r.get("task_id"))),
@@ -579,7 +587,8 @@ def run(args, *, now: datetime) -> dict[str, Any]:
         now=now,
         stream_fetcher=_fetch_remote_streams,
     )
-    if args.route and not report["errors"]:
+    has_held_turn_leases = any(row.get("kind") == "held_turn_lease" for row in report["rows"])
+    if args.route and (not report["errors"] or has_held_turn_leases):
         with AuthorityService(root=None) as service:
             report["messages"] = route(report, cycle=int(now.timestamp()) // args.cadence_seconds, service=service)
     return report
