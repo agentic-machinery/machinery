@@ -14,7 +14,7 @@ from lu_machinery.common.repo_root import (
     project_interpreter,
 )
 from lu_machinery.common.task_store_paths import tasks_dir
-from lu_machinery.dispatcher import store
+from lu_machinery.dispatcher import site_deps, store
 from lu_machinery.dispatcher.types import TaskSpec
 
 # A worker's scratch lives at /var/tmp/<task-id>, exported as LU_TASK_SCRATCH. A write worker's TMPDIR is that
@@ -36,7 +36,10 @@ def task_scratch_path(task_id: str) -> Path:
 
 # LU_SENSE_PROOF_DIR is a host path with no secret in the name; pack-verify reads the proofs inside it.
 # LU_FLEET_REPO_SELECTOR_FILE names the host-owned, read-only dual-slug selector; passing its path grants nothing.
-_CONTEXT = ("PATH", "HOME", "LANG", "TERM", "TMPDIR", "LU_SENSE_PROOF_DIR", SELECTOR_ENV)
+# LU_NODE_TOOLCHAIN_DIRS configures host Node toolchain roots (e.g. /opt/lu-node/{major}/bin), never a credential.
+_CONTEXT = (
+    "PATH", "HOME", "LANG", "TERM", "TMPDIR", "LU_SENSE_PROOF_DIR", SELECTOR_ENV, site_deps.NODE_TOOLCHAIN_DIRS_ENV,
+)
 _AUTH = {
     "codex": ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME"),
     "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY", "CLAUDE_CONFIG_DIR"),
@@ -94,6 +97,13 @@ def probe_env(spec: TaskSpec) -> dict[str, str]:
     return env
 
 
+def _safe_resolve(entry: str) -> Path | None:
+    try:
+        return Path(entry).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
 def child_env(spec: TaskSpec) -> dict[str, str]:
     source = os.environ
     if spec.agent == "codex":
@@ -117,20 +127,38 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
             env.pop("CLAUDE_CONFIG_DIR", None)
         else:
             env["CLAUDE_CONFIG_DIR"] = config_dir
+    toolchain_dir = site_deps.resolve_toolchain_dir(spec.worktree, env=env)
     shims = npm_shim_dir()
     if shims is not None:
-        original_path = os.pathsep.join(
-            entry for entry in env.get("PATH", os.defpath).split(os.pathsep)
-            if Path(entry).resolve() != shims
-            and Path(entry).parts[-3:] != _NPM_SHIM_PARTS
-            and Path(entry).resolve().parts[-3:] != _NPM_SHIM_PARTS
-        )
+        original_entries = []
+        for entry in env.get("PATH", os.defpath).split(os.pathsep):
+            if not entry:
+                continue
+            resolved = _safe_resolve(entry)
+            if (
+                resolved == shims
+                or Path(entry).parts[-3:] == _NPM_SHIM_PARTS
+                or (resolved is not None and resolved.parts[-3:] == _NPM_SHIM_PARTS)
+                or (toolchain_dir is not None and (entry == str(toolchain_dir) or resolved == toolchain_dir))
+            ):
+                continue
+            original_entries.append(entry)
+        if toolchain_dir is not None:
+            original_entries.insert(0, str(toolchain_dir))
+        original_path = os.pathsep.join(original_entries)
         env.update(
-            PATH=f"{shims}{os.pathsep}{original_path}", AGENT_ORIGINAL_PATH=original_path,
+            PATH=f"{shims}{os.pathsep}{original_path}" if original_path else str(shims),
+            AGENT_ORIGINAL_PATH=original_path,
             LEARN_UKRAINIAN_PYTHON=str(project_interpreter(env=source)),
         )
     elif any((spec.worktree / name).is_symlink() for name in ("node_modules", "site/node_modules")):
         raise ValueError("npm/npx guard unavailable for shared node_modules links")
+    elif toolchain_dir is not None:
+        base_entries = [
+            entry for entry in env.get("PATH", os.defpath).split(os.pathsep)
+            if entry and entry != str(toolchain_dir) and _safe_resolve(entry) != toolchain_dir
+        ]
+        env["PATH"] = os.pathsep.join([str(toolchain_dir), *base_entries])
     env.update(
         LEARN_UKRAINIAN_DISPATCH_TASK_ID=spec.task_id,
         LEARN_UKRAINIAN_DISPATCH_AGENT=spec.agent,

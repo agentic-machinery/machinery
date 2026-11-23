@@ -24,6 +24,7 @@ that differ in a native build share only the files that really are identical.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -78,6 +79,7 @@ NODE_TOOLCHAIN_DIRS_ENV = "LU_NODE_TOOLCHAIN_DIRS"
 DEFAULT_NODE_TOOLCHAIN_DIRS = ("/opt/lu-node/{major}/bin",)
 _SHIM_TAILS = frozenset({("agent_runtime", "shims"), ("dispatcher", "npm_shims")})
 _NVMRC_MAX_BYTES = 1024
+_PACKAGE_JSON_MAX_BYTES = 1024 * 1024
 _ENGINE_SPEC_MAX_CHARS = 256
 _MAX_MAJOR_EXPANSION = 16
 _NVMRC_RE = re.compile(r"^v?(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?)?$")
@@ -150,7 +152,7 @@ class _WorktreeNodePin:
     """Effective Node and npm version constraints read from a worktree."""
 
     node_intervals: tuple[_SemverInterval, ...] | None
-    npm_range: _SemverRange | None
+    npm_intervals: tuple[_SemverInterval, ...] | None
     majors: tuple[int, ...] | None
     description: str
 
@@ -160,9 +162,9 @@ class _WorktreeNodePin:
         return any(interval.matches(version) for interval in self.node_intervals)
 
     def matches_npm(self, version: tuple[int, int, int]) -> bool:
-        if self.npm_range is None:
+        if self.npm_intervals is None:
             return True
-        return self.npm_range.matches(version)
+        return any(interval.matches(version) for interval in self.npm_intervals)
 
 
 def _has_unsafe_chars(text: str) -> bool:
@@ -300,67 +302,156 @@ def _bounded_majors(intervals: tuple[_SemverInterval, ...]) -> tuple[int, ...] |
     return tuple(sorted(majors, reverse=True)) if majors else None
 
 
-def _read_worktree_pins(worktree: Path, site: Path) -> _WorktreeNodePin | None:
-    root_nvmrc = _read_nvmrc(worktree / ".nvmrc", label=".nvmrc")
-    site_nvmrc = _read_nvmrc(site / ".nvmrc", label=f"{SITE}/.nvmrc")
-    nvmrc: _SemverRange | None = root_nvmrc
-    if root_nvmrc is not None and site_nvmrc is not None:
-        overlap = root_nvmrc.intersect(site_nvmrc)
-        if not overlap:
-            raise NodeToolchainError(
-                f".nvmrc ({root_nvmrc.raw!r}) conflicts with {SITE}/.nvmrc ({site_nvmrc.raw!r})",
-                code="node_pin_conflict",
-            )
-        nvmrc = _SemverRange(raw=f"{root_nvmrc.raw} & {site_nvmrc.raw}", intervals=overlap)
-    elif site_nvmrc is not None:
-        nvmrc = site_nvmrc
-
-    package_path = site / "package.json"
+def _read_package_engines(
+    path: Path, *, label: str, required: bool
+) -> tuple[_SemverRange | None, _SemverRange | None]:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
-        package = _json_loads(package_path.read_text(encoding="utf-8"), max_depth=512)
-    except (OSError, ValueError, RecursionError) as exc:
-        raise NodeToolchainError(f"cannot read {SITE}/package.json: {exc}", code="node_pin_invalid") from exc
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        if required:
+            raise NodeToolchainError(f"cannot read {label}: {exc}", code="node_pin_invalid") from exc
+        return None, None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise NodeToolchainError(
+                f"{label} ({path}) must be a regular file, not a symlink or directory",
+                code="node_pin_invalid",
+            ) from exc
+        raise NodeToolchainError(f"cannot read {label} ({path}): {exc}", code="node_pin_invalid") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise NodeToolchainError(
+                f"{label} ({path}) must be a regular file, not a symlink or directory",
+                code="node_pin_invalid",
+            )
+        if info.st_size > _PACKAGE_JSON_MAX_BYTES:
+            raise NodeToolchainError(
+                f"{label} ({path}) exceeds {_PACKAGE_JSON_MAX_BYTES} bytes",
+                code="node_pin_invalid",
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            raw = handle.read(_PACKAGE_JSON_MAX_BYTES + 1)
+    except OSError as exc:
+        raise NodeToolchainError(f"cannot read {label} ({path}): {exc}", code="node_pin_invalid") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) > _PACKAGE_JSON_MAX_BYTES:
+        raise NodeToolchainError(
+            f"{label} ({path}) exceeds {_PACKAGE_JSON_MAX_BYTES} bytes",
+            code="node_pin_invalid",
+        )
+    try:
+        package = _json_loads(raw.decode("utf-8"), max_depth=512)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise NodeToolchainError(f"cannot read {label}: {exc}", code="node_pin_invalid") from exc
     if not isinstance(package, dict):
-        raise NodeToolchainError(f"{SITE}/package.json must be a JSON object", code="node_pin_invalid")
+        raise NodeToolchainError(f"{label} must be a JSON object", code="node_pin_invalid")
     engines = package.get("engines")
     node_engine: _SemverRange | None = None
     npm_engine: _SemverRange | None = None
     if engines is not None:
         if not isinstance(engines, dict):
-            raise NodeToolchainError(f"{SITE}/package.json engines must be a JSON object", code="node_pin_invalid")
+            raise NodeToolchainError(f"{label} engines must be a JSON object", code="node_pin_invalid")
         if "node" in engines:
-            node_engine = _parse_semver_range(engines["node"], field=f"{SITE}/package.json engines.node")
+            node_engine = _parse_semver_range(engines["node"], field=f"{label} engines.node")
         if "npm" in engines:
-            npm_engine = _parse_semver_range(engines["npm"], field=f"{SITE}/package.json engines.npm")
+            npm_engine = _parse_semver_range(engines["npm"], field=f"{label} engines.npm")
+    return node_engine, npm_engine
 
-    node_intervals: tuple[_SemverInterval, ...] | None = None
-    if nvmrc is not None and node_engine is not None:
-        overlap = nvmrc.intersect(node_engine)
+
+def _intersect_ranges(sources: Sequence[tuple[str, _SemverRange]]) -> tuple[_SemverInterval, ...] | None:
+    if not sources:
+        return None
+    acc_label, acc_range = sources[0]
+    intervals = acc_range.intervals
+    for label, semver_range in sources[1:]:
+        overlap = _SemverRange(raw=acc_range.raw, intervals=intervals).intersect(semver_range)
         if not overlap:
             raise NodeToolchainError(
-                f"worktree .nvmrc ({nvmrc.raw!r}) conflicts with {SITE}/package.json engines.node ({node_engine.raw!r})",
+                f"{acc_label} ({acc_range.raw!r}) conflicts with {label} ({semver_range.raw!r})",
                 code="node_pin_conflict",
             )
-        node_intervals = overlap
-    elif nvmrc is not None:
-        node_intervals = nvmrc.intervals
-    elif node_engine is not None:
-        node_intervals = node_engine.intervals
+        intervals = overlap
+        acc_label = f"{acc_label} & {label}"
+        acc_range = _SemverRange(raw=f"{acc_range.raw} & {semver_range.raw}", intervals=overlap)
+    return intervals
 
-    if node_intervals is None and npm_engine is None:
+
+def _read_worktree_pins(worktree: Path, site: Path | None = None) -> _WorktreeNodePin | None:
+    if site is None:
+        try:
+            worktree_info = worktree.stat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise NodeToolchainError(f"cannot inspect worktree ({worktree}): {exc}", code="node_pin_invalid") from exc
+        if not stat.S_ISDIR(worktree_info.st_mode):
+            raise NodeToolchainError(f"worktree ({worktree}) is not a directory", code="node_pin_invalid")
+        candidate_site = worktree / SITE
+        effective_site: Path | None = None
+        try:
+            site_info = candidate_site.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise NodeToolchainError(
+                f"cannot inspect {SITE} ({candidate_site}): {exc}", code="node_pin_invalid"
+            ) from exc
+        else:
+            if stat.S_ISLNK(site_info.st_mode):
+                raise NodeToolchainError(
+                    f"{SITE} ({candidate_site}) must be a directory, not a symlink", code="node_pin_invalid"
+                )
+            if stat.S_ISDIR(site_info.st_mode):
+                effective_site = candidate_site
+    else:
+        if site.is_symlink():
+            raise NodeToolchainError(
+                f"{SITE} ({site}) must be a directory, not a symlink", code="node_pin_invalid"
+            )
+        effective_site = site
+
+    node_sources: list[tuple[str, _SemverRange]] = []
+    npm_sources: list[tuple[str, _SemverRange]] = []
+
+    root_nvmrc = _read_nvmrc(worktree / ".nvmrc", label=".nvmrc")
+    if root_nvmrc is not None:
+        node_sources.append((".nvmrc", root_nvmrc))
+    if effective_site is not None:
+        site_nvmrc = _read_nvmrc(effective_site / ".nvmrc", label=f"{SITE}/.nvmrc")
+        if site_nvmrc is not None:
+            node_sources.append((f"{SITE}/.nvmrc", site_nvmrc))
+
+    root_node, root_npm = _read_package_engines(worktree / "package.json", label="package.json", required=False)
+    if root_node is not None:
+        node_sources.append(("package.json engines.node", root_node))
+    if root_npm is not None:
+        npm_sources.append(("package.json engines.npm", root_npm))
+
+    if effective_site is not None:
+        site_node, site_npm = _read_package_engines(
+            effective_site / "package.json", label=f"{SITE}/package.json", required=site is not None
+        )
+        if site_node is not None:
+            node_sources.append((f"{SITE}/package.json engines.node", site_node))
+        if site_npm is not None:
+            npm_sources.append((f"{SITE}/package.json engines.npm", site_npm))
+
+    node_intervals = _intersect_ranges(node_sources)
+    npm_intervals = _intersect_ranges(npm_sources)
+
+    if node_intervals is None and npm_intervals is None:
         return None
 
-    parts: list[str] = []
-    if nvmrc is not None:
-        parts.append(f".nvmrc={nvmrc.raw!r}")
-    if node_engine is not None:
-        parts.append(f"{SITE}/package.json engines.node={node_engine.raw!r}")
-    if npm_engine is not None:
-        parts.append(f"{SITE}/package.json engines.npm={npm_engine.raw!r}")
+    parts = [f"{label}={semver_range.raw!r}" for label, semver_range in (*node_sources, *npm_sources)]
     majors = _bounded_majors(node_intervals) if node_intervals is not None else None
     return _WorktreeNodePin(
         node_intervals=node_intervals,
-        npm_range=npm_engine,
+        npm_intervals=npm_intervals,
         majors=majors,
         description=", ".join(parts),
     )
@@ -412,12 +503,21 @@ def _configured_toolchain_templates(env: Mapping[str, str] | None = None) -> tup
 
 def _non_shim_path_dirs(env: Mapping[str, str] | None = None) -> list[Path]:
     source = os.environ if env is None else env
-    search = source.get("AGENT_ORIGINAL_PATH") or source.get("PATH", os.defpath)
+    raw_paths: list[str] = []
+    if source.get("PATH"):
+        raw_paths.append(source["PATH"])
+    if source.get("AGENT_ORIGINAL_PATH"):
+        raw_paths.append(source["AGENT_ORIGINAL_PATH"])
+    if not raw_paths:
+        raw_paths.append(os.defpath)
     dirs: list[Path] = []
-    for entry in search.split(os.pathsep):
-        if not entry or not Path(entry).is_absolute() or _is_shim_dir(entry):
-            continue
-        dirs.append(Path(entry))
+    seen: set[str] = set()
+    for search in raw_paths:
+        for entry in search.split(os.pathsep):
+            if not entry or entry in seen or not Path(entry).is_absolute() or _is_shim_dir(entry):
+                continue
+            seen.add(entry)
+            dirs.append(Path(entry))
     return dirs
 
 
@@ -432,6 +532,9 @@ def _companion_npm(candidate_dir: Path, resolved_node: Path) -> tuple[Path, Path
             resolved_npm = npm_path.resolve(strict=True)
             resolved_dir = bin_dir.resolve(strict=True)
         except (OSError, RuntimeError):
+            continue
+        dir_text = str(resolved_dir)
+        if os.pathsep in dir_text or _has_unsafe_chars(dir_text):
             continue
         if resolved_npm.is_file() and os.access(npm_path, os.X_OK):
             return resolved_dir, npm_path
@@ -504,7 +607,7 @@ def _resolve_node_binary(
 
 def resolve_toolchain_dir(
     worktree: Path,
-    site: Path,
+    site: Path | None = None,
     *,
     env: Mapping[str, str] | None = None,
 ) -> Path | None:

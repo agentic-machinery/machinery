@@ -261,6 +261,15 @@ def sandbox(tmp_path, hermetic_monitor, configured_roots, sources_product_root, 
     # manager and starts every stub worker in a real ``lu-worker-*`` scope.
     env = {**os.environ, "LU_TASKS_DIR": str(tasks), "LU_DISPATCH_ISOLATION": "fallback", "LU_PRODUCT_ROOT": str(repo), "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(repo)}
     env.pop("PYTHONPATH", None)
+    if "LU_NODE_TOOLCHAIN_DIRS" not in env:
+        from lu_machinery.dispatcher import site_deps
+
+        try:
+            toolchain_dir = site_deps.resolve_toolchain_dir(repo, env=env)
+        except site_deps.NodeToolchainError:
+            toolchain_dir = None
+        if toolchain_dir is not None:
+            env["LU_NODE_TOOLCHAIN_DIRS"] = str(toolchain_dir)
     # The dispatcher launches its supervisor and hooks as `sys.executable -I -m lu_machinery...`, so neither
     # the working directory nor PYTHONPATH reaches them. This interpreter's site imports the overlay first,
     # then the installed wheel, so those children run the same test doubles as the dispatcher itself.

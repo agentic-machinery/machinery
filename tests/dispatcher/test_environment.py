@@ -4,6 +4,7 @@
 
 import contextlib
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -13,11 +14,13 @@ from pathlib import Path
 import pytest
 
 from lu_machinery.common.git_credentials import SELECTOR_ENV
-from lu_machinery.dispatcher import agy_sandbox, environment, git, store, worker, write_boundary
+from lu_machinery.dispatcher import agy_sandbox, environment, git, site_deps, store, worker, write_boundary
 from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from tests.dispatcher.conftest import await_file as await_file
 from tests.dispatcher.conftest import prior_worktree as prior_worktree
 from tests.dispatcher.conftest import run_git as run_git
+from tests.dispatcher.test_providers_b import _bwrap_usable, _github_meta_path
+from tests.dispatcher.test_site_deps_node import _write_fake_toolchain
 from tests.helpers.product_tree import configured_roots as configured_roots
 
 PROOF_DIR = "LU_SENSE_PROOF_DIR"
@@ -432,5 +435,278 @@ def test_sandbox_dispatch_never_starts_a_host_systemd_scope(sandbox):
     assert record["status"] == "done"
     assert record["launch_mode"] == "popen-fallback" and "launch_unit" not in record
     assert record["launch_fallback_reason"] == "forced: LU_DISPATCH_ISOLATION=fallback"
+
+
+def _make_pinned_worktree(
+    root: Path,
+    *,
+    nvmrc: str | None = None,
+    root_engines: dict[str, str] | None = None,
+    site_engines: dict[str, str] | None = None,
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    if nvmrc is not None:
+        (root / ".nvmrc").write_text(nvmrc, encoding="utf-8")
+    if root_engines is not None:
+        (root / "package.json").write_text(
+            json.dumps({"name": "root-fixture", "version": "1.0.0", "engines": root_engines}),
+            encoding="utf-8",
+        )
+    if site_engines is not None:
+        site = root / "site"
+        site.mkdir(parents=True, exist_ok=True)
+        (site / "package.json").write_text(
+            json.dumps({"name": "site-fixture", "version": "1.0.0", "engines": site_engines}),
+            encoding="utf-8",
+        )
+    return root
+
+
+def test_child_env_pins_worktree_node_and_npm_after_shims(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Defect class: worker shell inherits host Node 22 instead of worktree-pinned Node 24/npm 11 or bypasses npm shims."""
+    toolchains = tmp_path / "toolchains"
+    toolchains.mkdir()
+    bin_22 = _write_fake_toolchain(
+        toolchains / "22", node_version="v22.23.4", npm_version="10.9.9", symlink_layout=True
+    )
+    bin_24 = _write_fake_toolchain(
+        toolchains / "24", node_version="v24.22.3", npm_version="11.19.1", symlink_layout=True, npm_uses_env_node=True
+    )
+    ambient_path = os.pathsep.join([str(bin_22), "/usr/bin", "/bin"])
+    monkeypatch.setenv("PATH", ambient_path)
+    monkeypatch.delenv("AGENT_ORIGINAL_PATH", raising=False)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    toolchain_setting = str(toolchains / "{major}" / "bin")
+    monkeypatch.setenv(site_deps.NODE_TOOLCHAIN_DIRS_ENV, toolchain_setting)
+
+    product_wt = _make_pinned_worktree(
+        tmp_path / "product-wt",
+        nvmrc="24.22.3\n",
+        root_engines={"node": "24.22.3", "npm": "11.19.1"},
+        site_engines={"node": "24.22.3", "npm": "11.19.1"},
+    )
+    machinery_wt = _make_pinned_worktree(
+        tmp_path / "machinery-wt",
+        nvmrc="22\n",
+        root_engines={"node": "22.x"},
+    )
+
+    product_spec = TaskSpec(
+        "prod-node", "agy", "stub", None, "workspace-write", product_wt, tmp_path / "p", tmp_path / "f"
+    )
+    machinery_spec = TaskSpec(
+        "mach-node", "agy", "stub", None, "workspace-write", machinery_wt, tmp_path / "p", tmp_path / "f"
+    )
+
+    prod_env = environment.child_env(product_spec)
+    mach_env = environment.child_env(machinery_spec)
+
+    shims = environment.npm_shim_dir()
+    assert shims is not None
+    assert prod_env[site_deps.NODE_TOOLCHAIN_DIRS_ENV] == toolchain_setting
+    assert prod_env["PATH"].split(os.pathsep)[:2] == [str(shims), str(bin_24.resolve())]
+    assert prod_env["AGENT_ORIGINAL_PATH"].split(os.pathsep)[0] == str(bin_24.resolve())
+    assert mach_env["PATH"].split(os.pathsep)[:2] == [str(shims), str(bin_22.resolve())]
+    assert mach_env["AGENT_ORIGINAL_PATH"].split(os.pathsep)[0] == str(bin_22.resolve())
+
+    # Real resolution through PATH: node resolves directly to pinned binary; npm goes through shim to pinned npm.
+    for worktree, env, exp_node, exp_npm in (
+        (product_wt, prod_env, "v24.22.3", "11.19.1"),
+        (machinery_wt, mach_env, "v22.23.4", "10.9.9"),
+    ):
+        node_out = subprocess.run(
+            ["node", "--version"], cwd=worktree, env=env, capture_output=True, text=True, timeout=10, check=True
+        )
+        npm_out = subprocess.run(
+            ["npm", "--version"], cwd=worktree, env=env, capture_output=True, text=True, timeout=10, check=True
+        )
+        which_npm = subprocess.run(
+            ["/bin/sh", "-c", "command -v npm"], cwd=worktree, env=env, capture_output=True, text=True, timeout=10, check=True
+        )
+        assert node_out.stdout.strip() == exp_node
+        assert npm_out.stdout.strip() == exp_npm
+        assert Path(which_npm.stdout.strip()).resolve().parent == shims
+
+    # Guard semantics stay intact: a shared node_modules symlink still refuses destructive npm install.
+    shared_target = tmp_path / "shared-node-modules"
+    shared_target.mkdir()
+    (product_wt / "node_modules").symlink_to(shared_target)
+    refused = subprocess.run(
+        ["npm", "install"], cwd=product_wt, env=prod_env, capture_output=True, text=True, timeout=10, check=False
+    )
+    assert refused.returncode == 1 and "shim refused" in refused.stderr
+
+    # Nested/repeated dispatch: idempotent on same worktree, and switches cleanly from 24 back to 22.
+    monkeypatch.setenv("PATH", prod_env["PATH"])
+    monkeypatch.setenv("AGENT_ORIGINAL_PATH", prod_env["AGENT_ORIGINAL_PATH"])
+    repeated_prod = environment.child_env(product_spec)
+    assert repeated_prod["PATH"].split(os.pathsep).count(str(bin_24.resolve())) == 1
+    switched_mach = environment.child_env(machinery_spec)
+    assert switched_mach["PATH"].split(os.pathsep)[:2] == [str(shims), str(bin_22.resolve())]
+    assert switched_mach["AGENT_ORIGINAL_PATH"].split(os.pathsep)[0] == str(bin_22.resolve())
+
+
+def test_child_env_refuses_unavailable_or_invalid_worktree_node_pin_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Defect class: silent fallback to wrong Node version when pinned toolchain is absent or pin files are hostile."""
+    toolchains = tmp_path / "toolchains"
+    toolchains.mkdir()
+    bin_22 = _write_fake_toolchain(toolchains / "22", node_version="v22.23.4", npm_version="10.9.9")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(bin_22), "/usr/bin", "/bin"]))
+    monkeypatch.delenv("AGENT_ORIGINAL_PATH", raising=False)
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    monkeypatch.setenv(site_deps.NODE_TOOLCHAIN_DIRS_ENV, str(toolchains / "{major}" / "bin"))
+
+    # Missing Node 24 toolchain -> node_toolchain_unavailable.
+    missing_wt = _make_pinned_worktree(
+        tmp_path / "missing-24", nvmrc="24.22.3\n", site_engines={"node": "24.22.3", "npm": "11.19.1"}
+    )
+    missing_spec = TaskSpec("miss", "codex", "stub", None, "workspace-write", missing_wt, tmp_path / "p", tmp_path / "f")
+    with pytest.raises(site_deps.NodeToolchainError) as raised:
+        environment.child_env(missing_spec)
+    assert raised.value.code == "node_toolchain_unavailable"
+    assert "24.22.3" in str(raised.value) and "11.19.1" in str(raised.value)
+
+    # Conflicting root package.json vs site/package.json npm pins -> node_pin_conflict.
+    conflict_wt = _make_pinned_worktree(
+        tmp_path / "conflict-npm",
+        nvmrc="22\n",
+        root_engines={"node": "22.x", "npm": "10.9.9"},
+        site_engines={"node": "22.x", "npm": "11.19.1"},
+    )
+    with pytest.raises(site_deps.NodeToolchainError) as conflict:
+        environment.child_env(replace(missing_spec, worktree=conflict_wt))
+    assert conflict.value.code == "node_pin_conflict"
+
+    # Symlinked package.json or site directory -> node_pin_invalid.
+    outside_pkg = tmp_path / "outside-package.json"
+    outside_pkg.write_text(json.dumps({"engines": {"node": "22.x"}}), encoding="utf-8")
+    symlink_pkg_wt = tmp_path / "symlink-pkg"
+    symlink_pkg_wt.mkdir()
+    (symlink_pkg_wt / "package.json").symlink_to(outside_pkg)
+    with pytest.raises(site_deps.NodeToolchainError) as sym_pkg:
+        environment.child_env(replace(missing_spec, worktree=symlink_pkg_wt))
+    assert sym_pkg.value.code == "node_pin_invalid"
+
+    symlink_site_wt = tmp_path / "symlink-site"
+    symlink_site_wt.mkdir()
+    (symlink_site_wt / "site").symlink_to(tmp_path)
+    with pytest.raises(site_deps.NodeToolchainError) as sym_site:
+        environment.child_env(replace(missing_spec, worktree=symlink_site_wt))
+    assert sym_site.value.code == "node_pin_invalid"
+
+    # Invalid LU_NODE_TOOLCHAIN_DIRS -> node_toolchain_config_invalid.
+    monkeypatch.setenv(site_deps.NODE_TOOLCHAIN_DIRS_ENV, "relative/{major}/bin")
+    with pytest.raises(site_deps.NodeToolchainError) as bad_cfg:
+        environment.child_env(missing_spec)
+    assert bad_cfg.value.code == "node_toolchain_config_invalid"
+
+
+def test_child_env_handles_absent_worktree_and_no_shims_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Defect class: pre-creation cli child_env failing before worktree exists, or missing shims dropping pinned PATH."""
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    monkeypatch.delenv(site_deps.NODE_TOOLCHAIN_DIRS_ENV, raising=False)
+
+    absent_spec = TaskSpec(
+        "not-yet-created", "codex", "stub", None, "workspace-write", tmp_path / "does-not-exist", tmp_path / "p", tmp_path / "f"
+    )
+    absent_env = environment.child_env(absent_spec)
+    assert site_deps.NODE_TOOLCHAIN_DIRS_ENV not in absent_env
+
+    # When shims are unavailable and no shared node_modules symlink exists, pinned toolchain still leads PATH.
+    toolchains = tmp_path / "toolchains"
+    toolchains.mkdir()
+    bin_24 = _write_fake_toolchain(toolchains / "24", node_version="v24.22.3", npm_version="11.19.1")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv(site_deps.NODE_TOOLCHAIN_DIRS_ENV, str(toolchains / "{major}" / "bin"))
+    monkeypatch.setattr(environment, "npm_shim_dir", lambda: None)
+    pinned_wt = _make_pinned_worktree(tmp_path / "pinned-no-shims", nvmrc="24.22.3\n")
+    no_shim_env = environment.child_env(replace(absent_spec, worktree=pinned_wt))
+    assert no_shim_env["PATH"].split(os.pathsep)[0] == str(bin_24.resolve())
+
+
+def test_agy_sandbox_node_toolchain_reads_admits_bin_and_modules_and_refuses_unsafe_roots(tmp_path: Path):
+    """Defect class: AGY sandbox exposing forbidden roots/credentials/primary checkout or omitting npm's lib/node_modules."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    primary = tmp_path / "primary"
+    (primary / "bin").mkdir(parents=True)
+    worktree = tmp_path / "worktree"
+    (worktree / "bin").mkdir(parents=True)
+
+    toolchains = tmp_path / "toolchains"
+    toolchains.mkdir()
+    bin_24 = _write_fake_toolchain(
+        toolchains / "24", node_version="v24.22.3", npm_version="11.19.1", symlink_layout=True
+    )
+    resolved_bin = bin_24.resolve()
+    reads = agy_sandbox._node_toolchain_reads(resolved_bin, home=home, reject_root=primary, worktree=worktree)
+    assert reads == [resolved_bin, resolved_bin.parent / "lib" / "node_modules"]
+
+    for forbidden in (Path("/"), home, home / ".ssh", primary / "bin", worktree / "bin"):
+        with pytest.raises(agy_sandbox.Refused, match="node_toolchain_sandbox_refused"):
+            agy_sandbox._node_toolchain_reads(forbidden, home=home, reject_root=primary, worktree=worktree)
+
+
+@pytest.mark.skipif(not _bwrap_usable(), reason="needs a usable unprivileged bubblewrap")
+def test_agy_sandbox_exposes_pinned_node_toolchain_read_only_and_refuses_missing_pin(tmp_path: Path):
+    """Defect class: read-only AGY bubblewrap sandbox hiding /opt/lu-node or failing to put pinned Node on PATH."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    run_git(repo, "init", "-q", "-b", "main")
+    (repo / ".nvmrc").write_text("24.22.3\n", encoding="utf-8")
+    (repo / "site").mkdir()
+    (repo / "site" / "package.json").write_text(
+        json.dumps({"name": "site-fixture", "engines": {"node": "24.22.3", "npm": "11.19.1"}}),
+        encoding="utf-8",
+    )
+    run_git(repo, "add", ".nvmrc", "site/package.json")
+    run_git(repo, "-c", "user.email=s@example.invalid", "-c", "user.name=S", "commit", "-q", "-m", "pin node 24")
+    worktree = tmp_path / "worktree"
+    run_git(repo, "worktree", "add", "-q", "--detach", str(worktree), "main")
+
+    toolchains = tmp_path / "toolchains"
+    toolchains.mkdir()
+    _write_fake_toolchain(
+        toolchains / "24", node_version="v24.22.3", npm_version="11.19.1", symlink_layout=True, npm_uses_env_node=True
+    )
+    app = tmp_path / "agy-home"
+    app.mkdir()
+    (app / "antigravity-oauth-token").write_text("token", encoding="utf-8")
+
+    def _run_sandbox(task_id: str, toolchain_env: str) -> tuple[subprocess.CompletedProcess[str], dict]:
+        receipt_path = tmp_path / f"{task_id}.sandbox.json"
+        argv = [
+            sys.executable, "-I", "-c", agy_sandbox._BOOTSTRAP,
+            str(agy_sandbox.machinery_path("dispatcher/agy_sandbox.py").parents[2]),
+            "--task-id", task_id, "--worktree", str(worktree),
+            "--scratch", str(tmp_path / f"scratch-{task_id}"),
+            "--receipt", str(receipt_path),
+            "--", "/bin/sh", "-c", 'printf "%s|%s\\n" "$(node --version)" "$(npm --version)"',
+        ]
+        env = {
+            **os.environ,
+            "AGY_APP_DATA_DIR": str(app),
+            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(repo),
+            "PATH": _github_meta_path(tmp_path),
+            site_deps.NODE_TOOLCHAIN_DIRS_ENV: toolchain_env,
+        }
+        proc = subprocess.run(argv, env=env, cwd=worktree, capture_output=True, text=True, timeout=120, check=False)
+        return proc, json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    ok_proc, ok_receipt = _run_sandbox("agy-node-ok", str(toolchains / "{major}" / "bin"))
+    assert (ok_proc.returncode, ok_receipt["status"]) == (0, "ran"), (ok_receipt.get("reason"), ok_proc.stderr)
+    assert ok_receipt["canary"]["passed"] is True
+    assert ok_proc.stdout.strip() == "v24.22.3|11.19.1"
+
+    missing_proc, missing_receipt = _run_sandbox("agy-node-missing", str(tmp_path / "absent" / "{major}" / "bin"))
+    assert missing_proc.returncode == agy_sandbox.REFUSED
+    assert missing_receipt["status"] == "refused"
+    assert str(missing_receipt.get("reason", "")).startswith("node_toolchain_unavailable:")
+
 
 pytestmark = [pytest.mark.usefixtures('configured_roots')]
