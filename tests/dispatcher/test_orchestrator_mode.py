@@ -361,7 +361,7 @@ def _conflict(detail):
         ({"lease.holder.process_id": float(os.getpid())}, "orchestrator_lease_unknown"),  # equal, but not an integer
         ({"lease.generation": True}, "orchestrator_lease_unknown"),
         ({"lease.fencing_token": 0}, "orchestrator_lease_unknown"),
-        ({"lease.ttl_seconds": 7200}, "orchestrator_lease_unknown"),
+        ({"ttl": 7200}, "orchestrator_lease_unknown"),  # valid 7200s projection, wrong TTL for this 3600s claim
         ({"lease.ttl_seconds": True}, "orchestrator_lease_unknown"),
         ({"lease.version": True}, "orchestrator_lease_unknown"),
         ({"lease.version": 0}, "orchestrator_lease_unknown"),
@@ -375,8 +375,10 @@ def _conflict(detail):
         ({"session_state": "closed"}, "orchestrator_lease_unknown"),  # top-level disagrees with nested open
         ({"session_state": _MISSING}, "orchestrator_lease_unknown"),
         ({"lease.expires_at": "soon"}, "orchestrator_lease_unknown"),
-        ({"lease.expires_at": "2026-01-01T00:00:00Z"}, "orchestrator_lease_unknown"),  # already past
-        ({"lease.expires_at": "2099-01-01T00:00:00Z"}, "orchestrator_lease_unknown"),  # beyond the TTL asked for
+        ({"lease.heartbeat_at": "2025-12-31T23:00:00Z", "lease.expires_at": "2026-01-01T00:00:00Z"},
+         "orchestrator_lease_unknown"),  # valid 3600s projection, already past
+        ({"lease.heartbeat_at": "2098-12-31T23:00:00Z", "lease.expires_at": "2099-01-01T00:00:00Z"},
+         "orchestrator_lease_unknown"),  # valid 3600s projection, beyond the TTL asked for
     ],
 )
 def test_a_claim_answer_that_is_not_exactly_this_turns_new_lease_starts_nothing(task_store, monkeypatch, answer,
@@ -712,12 +714,12 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
             if mode == "http_error":
                 raise urllib.error.HTTPError(request.full_url, 409, "Conflict", {},
                                              io.BytesIO(b'{"detail":"request refused"}'))
-            return SimpleNamespace(status=409, read=lambda: b'{"detail":"request refused"}',
-                                   __enter__=lambda s: s, __exit__=lambda *_a: False)
+            return contextlib.nullcontext(SimpleNamespace(status=409, read=lambda: b'{"detail":"request refused"}'))
 
         with monkeypatch.context() as patch:
             patch.setattr(urllib.request, "urlopen", unrelated_409)
-            assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
+            reason = host_admission.release_turn(envelope, **exact)
+            assert reason.startswith("orchestrator_lease_release_unknown: (RemoteSupervisorError)"), (mode, reason)
         assert len(reached) == 1, mode
     calls = []
 
