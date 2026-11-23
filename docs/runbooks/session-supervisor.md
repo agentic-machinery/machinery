@@ -331,13 +331,38 @@ successor claimed the stream:
 import sys
 from lu_machinery.session_streams.model import HolderKind, Lease, LeaseHolder
 from lu_machinery.session_supervisor.remote import RemoteEpicClient
-stream_id, expected_lease_id, expected_gen = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+def require(cond, msg, detail=None):
+    if not cond:
+        raise SystemExit(f"refused: {msg}: {detail!r}")
+
+require(len(sys.argv) == 4, "usage: <stream-id> <lease-id> <generation>", sys.argv[1:])
+stream_id, expected_lease_id = sys.argv[1], sys.argv[2]
+try:
+    expected_gen = int(sys.argv[3])
+except ValueError:
+    raise SystemExit(f"refused: generation must be an integer: {sys.argv[3]!r}")
+require(expected_gen > 0, "generation must be positive", expected_gen)
+
 client = RemoteEpicClient()
-raw = client.stream(stream_id).get("lease")
-assert isinstance(raw, dict) and raw.get("state") == "expired", raw
-assert raw["lease_id"] == expected_lease_id and raw["generation"] == expected_gen, raw
-h = raw["holder"]
-assert h["harness"] == "dispatch-turn", h
+proj = client.stream(stream_id)
+require(isinstance(proj, dict), "malformed stream projection", proj)
+raw = proj.get("lease")
+require(isinstance(raw, dict), "malformed lease projection", raw)
+require(raw.get("state") == "expired", "lease is not expired", raw)
+require(
+    raw.get("stream_id") == stream_id
+    and raw.get("lease_id") == expected_lease_id
+    and type(raw.get("generation")) is int
+    and raw["generation"] == expected_gen,
+    "lease identity mismatch",
+    raw,
+)
+h = raw.get("holder")
+require(isinstance(h, dict), "malformed lease holder", raw)
+require(h.get("harness") == "dispatch-turn", "holder is not dispatch-turn", h)
+holder_kind_raw = h.get("holder_kind", "process")
+require(isinstance(holder_kind_raw, str), "malformed holder_kind", h)
 lease = Lease(
     stream_id=raw["stream_id"],
     session_id=raw["session_id"],
@@ -349,7 +374,7 @@ lease = Lease(
         harness=h["harness"],
         instance_id=h["instance_id"],
         process_id=h["process_id"],
-        holder_kind=HolderKind(h.get("holder_kind", "process")),
+        holder_kind=HolderKind(holder_kind_raw),
         task_id=h.get("task_id"),
         host_id=h.get("host_id"),
     ),
@@ -358,12 +383,34 @@ lease = Lease(
     ttl_seconds=raw["ttl_seconds"],
     version=raw["version"],
 )
+lease.holder.validate()
 res = client.release(lease)
-rel = res["lease"]
-assert res["outcome"] == "released" and rel["lease_id"] == expected_lease_id and rel["generation"] == expected_gen, res
-after = client.stream(stream_id)["lease"]
-assert after["state"] == "released" and after["session_state"] == "closed", after
-assert after["lease_id"] == expected_lease_id and after["generation"] == expected_gen, after
+require(isinstance(res, dict), "malformed release response", res)
+rel = res.get("lease")
+require(
+    res.get("outcome") == "released"
+    and isinstance(rel, dict)
+    and rel.get("stream_id") == stream_id
+    and rel.get("lease_id") == expected_lease_id
+    and type(rel.get("generation")) is int
+    and rel["generation"] == expected_gen,
+    "unexpected release acknowledgement",
+    res,
+)
+after_proj = client.stream(stream_id)
+require(isinstance(after_proj, dict), "malformed post-release projection", after_proj)
+after = after_proj.get("lease")
+require(
+    isinstance(after, dict)
+    and after.get("state") == "released"
+    and after.get("session_state") == "closed"
+    and after.get("stream_id") == stream_id
+    and after.get("lease_id") == expected_lease_id
+    and type(after.get("generation")) is int
+    and after["generation"] == expected_gen,
+    "post-release state mismatch",
+    after,
+)
 print(f"released {stream_id} lease_id={expected_lease_id} generation={expected_gen}")
 ' epic:<N> <lease-id> <generation>
 ```
