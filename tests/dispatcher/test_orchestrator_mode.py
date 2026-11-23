@@ -312,7 +312,8 @@ def _answer(nonce, ttl=3600, **changes):
                  ttl_seconds=ttl, version=1, age_seconds=0,
                  holder=dict(agent="claude", harness=TURN_HOLDER_HARNESS, instance_id=nonce, task_id="turn-1",
                              process_id=os.getpid(), holder_kind="process", host_id=None))
-    answer = {"stream_id": STREAM, "session_state": "open", "outcome": "claimed", "lease": lease}
+    answer = {"schema": "remote-epic-lifecycle.v1", "stream_id": STREAM, "session_state": "open", "outcome": "claimed",
+              "lease": lease}
     for key, value in changes.items():
         target, name = (lease, key.removeprefix("lease.")) if key.startswith("lease.") else (answer, key)
         if name.startswith("holder."):
@@ -343,6 +344,9 @@ def _conflict(detail):
         (remote.RemoteUnreachableError("Monitor API unreachable; no remote claim was made"), "orchestrator_lease_unknown"),
         (TimeoutError("the answer was lost"), "orchestrator_lease_unknown"),
         (AttributeError("'list' object has no attribute 'get'"), "orchestrator_lease_unknown"),
+        ({"schema": _MISSING}, "orchestrator_lease_unknown"),
+        ({"schema": "remote-epic-lifecycle.v2"}, "orchestrator_lease_unknown"),
+        ({"schema": True}, "orchestrator_lease_unknown"),
         ({"outcome": "replayed"}, "orchestrator_lease_unknown"),
         ({"outcome": "recovered"}, "orchestrator_lease_unknown"),
         ({"outcome": _MISSING}, "orchestrator_lease_unknown"),
@@ -441,11 +445,20 @@ def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_stor
 
 def test_a_dry_run_reads_a_projection_whose_session_disagrees_with_its_lease_as_unknown(monkeypatch):
     """Defect class T1: a dry run reports a stream free from a projection whose own session state contradicts its
-    lease (an open session beside a released lease, or beside no lease)."""
+    lease (an open session beside a released lease, or beside no lease), or whose lifecycle schema is unsupported."""
     for lease, session in ((_lease(state="released", session_state="closed"), "open"), (None, "open")):
         monkeypatch.setattr(remote.RemoteEpicClient, "stream", lambda self, stream_id, digest_limit=20, lease=lease,
-                            session=session: {"stream_id": stream_id, "session_state": session, "lease": lease})
+                            session=session: {"schema": "remote-epic-lifecycle.v1", "stream_id": stream_id,
+                                              "session_state": session, "lease": lease})
         assert host_admission.turn_lease_probe(STREAM).startswith("orchestrator_lease_unknown"), (lease, session)
+    for bad_schema in (_MISSING, "remote-epic-lifecycle.v2", True):
+        for lease, session in ((None, None), (_lease(state="released", session_state="closed"), "closed")):
+            payload = {"stream_id": STREAM, "session_state": session, "lease": lease}
+            if bad_schema is not _MISSING:
+                payload["schema"] = bad_schema
+            monkeypatch.setattr(remote.RemoteEpicClient, "stream",
+                                lambda self, stream_id, digest_limit=20, payload=payload: payload)
+            assert host_admission.turn_lease_probe(STREAM).startswith("orchestrator_lease_unknown"), (bad_schema, lease)
 
 
 @pytest.mark.parametrize(
@@ -517,7 +530,8 @@ def test_a_dry_run_reads_any_active_lease_as_busy(monkeypatch, lease, refused):
     uncleared lease), or reads an unreadable lease as none."""
     session = lease.get("session_state") if isinstance(lease, dict) else None
     monkeypatch.setattr(remote.RemoteEpicClient, "stream", lambda self, stream_id, digest_limit=20: {
-        "stream_id": stream_id, "session_state": session, **({} if lease is _MISSING else {"lease": lease})})
+        "schema": "remote-epic-lifecycle.v1", "stream_id": stream_id, "session_state": session,
+        **({} if lease is _MISSING else {"lease": lease})})
     reason = host_admission.turn_lease_probe(STREAM)
     if refused is None:
         assert reason is None
@@ -691,14 +705,20 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
         base_ack = {**envelope["lease"], "state": "released", "session_state": "closed",
                     "heartbeat_at": "1970-01-01T00:00:00Z", "expires_at": "1970-01-01T00:00:00Z",
                     "version": 1, "age_seconds": 0}
-        for answer in ({"outcome": "released"},
-                       {"outcome": "released", "lease": {**base_ack, "session_state": "open"}},
-                       {"outcome": "released", "lease": {**base_ack, "state": "active"}},
-                       {"outcome": "released", "lease": {**base_ack, "ttl_seconds": True}},
-                       {"outcome": "released", "lease": {**base_ack, "expires_at": "soon"}},
-                       {"outcome": "released", "lease": {**base_ack, "heartbeat_at": "2099-01-01T00:00:00Z"}},
-                       {"outcome": "released", "lease": {**base_ack, "version": True}},
-                       {"outcome": "released", "session_state": "open", "lease": base_ack}):
+        valid_ack = {"schema": "remote-epic-lifecycle.v1", "outcome": "released", "lease": base_ack}
+        patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, **k: valid_ack)
+        assert host_admission.release_turn(envelope, **exact) is None
+        for answer in ({"outcome": "released", "lease": base_ack},
+                       {**valid_ack, "schema": "remote-epic-lifecycle.v2"},
+                       {**valid_ack, "schema": True},
+                       {"schema": "remote-epic-lifecycle.v1", "outcome": "released"},
+                       {**valid_ack, "lease": {**base_ack, "session_state": "open"}},
+                       {**valid_ack, "lease": {**base_ack, "state": "active"}},
+                       {**valid_ack, "lease": {**base_ack, "ttl_seconds": True}},
+                       {**valid_ack, "lease": {**base_ack, "expires_at": "soon"}},
+                       {**valid_ack, "lease": {**base_ack, "heartbeat_at": "2099-01-01T00:00:00Z"}},
+                       {**valid_ack, "lease": {**base_ack, "version": True}},
+                       {**valid_ack, "session_state": "open"}):
             patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, answer=answer, **k: answer)
             assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
     assert contacted == []

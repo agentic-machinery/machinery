@@ -358,7 +358,8 @@ def _valid_projection_lease(lease: object, stream: str, *, match_ttl: bool = Tru
 def _claimed_lease(response, stream: str, holder: dict, session_id: str, lease_id: str, ttl_s: int) -> dict | None:
     """The lease envelope part of a claim answer, when it is exactly the new lease this claim asked for."""
     lease = response.get("lease") if isinstance(response, dict) else None
-    if not (isinstance(response, dict) and response.get("outcome") == "claimed" and response.get("stream_id") == stream
+    if not (isinstance(response, dict) and response.get("schema") == _REMOTE_LIFECYCLE_SCHEMA
+            and response.get("outcome") == "claimed" and response.get("stream_id") == stream
             and response.get("session_state") == "open" and _valid_projection_lease(lease, stream)):
         return None
     expires = store.parse_utc_timestamp(lease.get("expires_at"))
@@ -468,7 +469,8 @@ def release_turn(envelope, *, stream: str, task_id: str, run_nonce: str) -> str 
         return (f"orchestrator_lease_release_unknown: ({type(exc).__name__}); the lease stays held until its exact "
                 "holder or an operator releases it")
     acknowledged = response.get("lease") if isinstance(response, dict) else None
-    if not (isinstance(response, dict) and response.get("outcome") == "released"
+    if not (isinstance(response, dict) and response.get("schema") == _REMOTE_LIFECYCLE_SCHEMA
+            and response.get("outcome") == "released"
             and ("stream_id" not in response or response["stream_id"] == stream)
             and ("session_state" not in response or response["session_state"] == "closed")
             and _valid_projection_lease(acknowledged, stream, match_ttl=False)
@@ -575,7 +577,9 @@ def turn_lease_probe(stream):
         response = RemoteEpicClient().stream(stream, digest_limit=0)
     except Exception as exc:  # the lease authority's boundary: any failure is unknown, never "no lease"
         return f"orchestrator_lease_unknown: the Monitor stream lease read failed ({type(exc).__name__})"
-    if not isinstance(response, dict) or response.get("stream_id") != stream:
+    if not isinstance(response, dict) or response.get("schema") != _REMOTE_LIFECYCLE_SCHEMA:
+        return "orchestrator_lease_unknown: the Monitor answer uses an unsupported schema"
+    if response.get("stream_id") != stream:
         return "orchestrator_lease_unknown: the Monitor answer names another stream"
     if "lease" not in response or "session_state" not in response:
         return "orchestrator_lease_unknown: the Monitor answer has no lease or session state field"
@@ -594,7 +598,8 @@ def turn_lease_probe(stream):
             f"expires {lease['expires_at']!s:.40})")
 
 
-# The states Monitor's /api/epics/v1 projection names (epics_router._lease_payload; SessionState).
+# The schema and states Monitor's /api/epics/v1 projection names (epics_router.SCHEMA, _lease_payload; SessionState).
+_REMOTE_LIFECYCLE_SCHEMA = "remote-epic-lifecycle.v1"
 _LEASE_STATES = frozenset({"active", "released", "expired"})
 _SESSION_STATES = frozenset({"open", "rolling", "closed", "expired"})
 
