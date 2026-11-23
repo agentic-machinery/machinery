@@ -109,6 +109,9 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
             assert b"/machinery.js" in response.body
             root_response = main.serve_static("", request, context)
             assert b"/machinery.css" in root_response.body
+            # /index is the same page, with the release and repository filled in like /machinery.
+            alias_response = main.serve_static("index", request, context)
+            assert alias_response.body == response.body
         else:
             assert response.path == dashboards / page.file
             html_response = main.serve_static(page.file, request, context)
@@ -158,7 +161,7 @@ const assert = require('node:assert/strict');
 const M = require(process.argv[1]);
 const urls = JSON.parse(process.argv[2]);
 assert.deepEqual(M.NAV_PAGES.map(p => p.href), urls);
-for (const path of ['/', '/index.html', '/machinery', '/machinery/']) {
+for (const path of ['/', '/index', '/index.html', '/machinery', '/machinery/']) {
   const html = M.renderNavHtml(path);
   assert.match(html, /href="\/machinery" aria-current="page">Overview</, path);
   assert.equal((html.match(/aria-current="page"/g) || []).length, 1, path);
@@ -168,6 +171,13 @@ for (const url of urls.filter(u => u !== '/machinery')) {
   assert.ok(html.includes(`href="${url}" aria-current="page"`), url);
   assert.equal((html.match(/aria-current="page"/g) || []).length, 1, url);
 }
+// Product pages are one click away from every machinery page, and are never marked current.
+assert.deepEqual(M.PRODUCT_PAGES.map(p => p.href), ['/', '/curriculum-dashboard.html', '/artifacts/']);
+for (const url of [...urls, '/index']) {
+  const html = M.renderNavHtml(url);
+  for (const page of M.PRODUCT_PAGES) assert.ok(html.includes(`href="${page.href}"`), `${url} -> ${page.href}`);
+}
+assert.equal((M.renderNavHtml('/fleet').match(/class="product/g) || []).length, M.PRODUCT_PAGES.length);
 assert.equal(M.safeHttpUrl('https://github.com/learn-ukrainian/machinery/pull/1'), 'https://github.com/learn-ukrainian/machinery/pull/1');
 assert.equal(M.safeHttpUrl('javascript:alert(1)'), null);
 assert.equal(M.safeHttpUrl('data:text/html,x'), null);

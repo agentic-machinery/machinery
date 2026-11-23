@@ -1740,7 +1740,7 @@ def _attach_cold_start_research(response: dict[str, Any], role: str | None) -> N
 # ==================== STATIC FILES (MUST BE LAST) ====================
 
 
-MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/"})
+MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/", "index"})
 _VERSION_PLACEHOLDER = "__MACHINERY_VERSION__"
 _MACHINERY_REPOSITORY_PLACEHOLDER = "__MACHINERY_REPOSITORY__"
 

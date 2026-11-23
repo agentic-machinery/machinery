@@ -95,6 +95,16 @@ nav.pages a:hover {
   border-color: var(--line);
 }
 
+/* Product pages follow the machinery pages as a second group, outlined so the two read apart. */
+nav.pages a.product {
+  border-style: dashed;
+  border-color: var(--line);
+}
+
+nav.pages a.product.first {
+  margin-left: 12px;
+}
+
 nav.pages a[aria-current="page"] {
   background: var(--soft);
   border-color: var(--link);
