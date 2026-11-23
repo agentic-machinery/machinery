@@ -355,7 +355,9 @@ def test_dispatch_refuses_a_write_worker_at_the_cap_with_one_line(admission_disp
     refusal = [line for line in capsys.readouterr().err.splitlines() if "admission" in line]
     assert refusal == [
         "❌ dispatch admission refused for a workspace-write worker: live write workers 0/0 reached the cap "
-        "(DISPATCH_MAX_LIVE_WRITE_WORKERS=0). Wait for a worker to finish or for the host to recover, raise the "
+        "(DISPATCH_MAX_LIVE_WRITE_WORKERS=0); meter codex:a: live write workers 0/2 "
+        "(effective cap 2, telemetry=unavailable:unreachable), launch interval 30s. "
+        "Wait for a worker to finish or for the host to recover, raise the "
         'threshold through the named environment variable, or pass --force-admission "<reason>" to override.'
     ]
     assert not (admission_dispatch.box.tasks / "adm-worker.json").exists()
@@ -451,7 +453,12 @@ def test_file_cache_does_not_count_against_the_pool(admission_dispatch, tmp_path
 
 def test_locked_recheck_refuses_a_dispatch_that_lost_the_race(admission_dispatch, monkeypatch, capsys):
     """Ported from tests/test_delegate_admission.py::test_locked_recheck_refuses_a_dispatch_that_lost_the_race."""
+    import io
+    import urllib.error
+    from datetime import UTC, datetime
+
     from lu_machinery.dispatcher import host_admission as admission
+    from lu_machinery.dispatcher import pool_selector
     from lu_machinery.orchestration import dispatch_admission
 
     monkeypatch.setenv("DISPATCH_MAX_LIVE_WRITE_WORKERS", "1")
@@ -470,10 +477,45 @@ def test_locked_recheck_refuses_a_dispatch_that_lost_the_race(admission_dispatch
     monkeypatch.setattr(git, "create_worktree", lambda *_a, **_k: pytest.fail("must not create a worktree"))
     assert admission_dispatch.dispatch() == 3
     assert len(calls) == 2
-    assert "live write workers 1/1 reached the cap" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "live write workers 1/1 reached the cap" in err
+    assert "telemetry=unavailable:unreachable" in err
     assert not admission_dispatch.spawned
-    _assert_pre_start_refusal(_admission_refusal("adm-worker"), "admission_capacity")
+    refused_record = _admission_refusal("adm-worker")
+    _assert_pre_start_refusal(refused_record, "admission_capacity")
+    assert refused_record["admission"]["meter"] == "codex:a"
+    assert refused_record["admission"]["meter_effective_cap"] == 2
+    assert refused_record["admission"]["meter_telemetry"] == "unavailable:unreachable"
     assert dispatch_admission.scan_task_records(admission_dispatch.box.tasks).live_task_ids == ("competitor",)
+
+    # Locked recheck also enforces the reduced unknown cap when telemetry degrades between check and reserve.
+    monkeypatch.setenv("DISPATCH_MAX_LIVE_WRITE_WORKERS", "10")
+    monkeypatch.setenv("DISPATCH_MIN_METER_LAUNCH_INTERVAL_S", "0")
+    monkeypatch.setattr(admission, "evaluate", real_evaluate)
+    for idx in range(2):
+        store.replace(dict(schema_version=2, task_id=f"meter-live-{idx}", agent="codex", status="running",
+                           mode="workspace-write", pid=os.getpid(), process_start=worker._identity(os.getpid())))
+    reads = {"n": 0}
+    now_iso = datetime.now(UTC).isoformat()
+
+    def degrading_budget():
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return {"generated_at": now_iso,
+                    "codex_accounts": {"codex:a": {"status": "cool", "freshness": "fresh", "age_s": 5, "remaining_pct": 80}}}
+        raise urllib.error.HTTPError("http://127.0.0.1:8765/api/state/routing-budget", 403, "Forbidden", {}, io.BytesIO())
+
+    monkeypatch.setattr(pool_selector, "read_budget", degrading_budget)
+    assert admission_dispatch.dispatch(task_id="adm-degraded") == 3
+    err = capsys.readouterr().err
+    assert "effective cap 8, telemetry=fresh" in err
+    assert "effective cap 2, telemetry=unavailable:http_403" in err
+    assert "subscription_meter_defer=cap" in err
+    degraded_refusal = _admission_refusal("adm-degraded")
+    _assert_pre_start_refusal(degraded_refusal, "admission_capacity")
+    assert degraded_refusal["admission"]["meter_telemetry"] == "unavailable:http_403"
+    assert degraded_refusal["admission"]["meter_effective_cap"] == 2
+    assert degraded_refusal["admission"]["meter_defer"] == "cap"
 
 
 def test_admitted_dispatch_holds_its_slot_while_the_worktree_is_created(admission_dispatch, monkeypatch):
@@ -779,14 +821,42 @@ def test_codex_effort_outside_model_efforts_refused(model, effort, offered):
 
 def test_force_admission_records_the_reason(admission_dispatch, monkeypatch, capsys):
     """Ported from tests/test_delegate_admission.py::test_force_admission_records_the_reason."""
+    from lu_machinery.dispatcher import host_admission as admission
+
     monkeypatch.setenv("DISPATCH_MAX_LIVE_WRITE_WORKERS", "0")
     assert admission_dispatch.dispatch("--force-admission", "hotfix #1234 while one worker drains") == 0
-    assert "overridden by --force-admission ('hotfix #1234 while one worker drains')" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "overridden by --force-admission ('hotfix #1234 while one worker drains')" in err
+    assert "effective cap 2, telemetry=unavailable:unreachable" in err
     decision = store.read("adm-worker")["admission"]
     assert decision["admitted"] is False
     assert decision["forced"] is True
     assert decision["force_reason"] == "hotfix #1234 while one worker drains"
     assert decision["max_live_write_workers"] == 0
+    assert decision["meter"] == "codex:a"
+    assert decision["meter_effective_cap"] == 2
+    assert decision["meter_telemetry"] == "unavailable:unreachable"
+
+    # F6: a forced override that first becomes necessary under the lock reports the override line.
+    monkeypatch.setenv("DISPATCH_MAX_LIVE_WRITE_WORKERS", "2")
+    monkeypatch.setenv("DISPATCH_MIN_METER_LAUNCH_INTERVAL_S", "0")
+    real_evaluate = admission.evaluate
+    eval_calls = []
+
+    def evaluate_tight_on_lock(mode, **kwargs):
+        eval_calls.append(kwargs)
+        if len(eval_calls) == 2:
+            store.replace(dict(schema_version=2, task_id="race-other", status="running", mode="workspace-write",
+                               pid=os.getpid(), process_start=worker._identity(os.getpid())))
+        return real_evaluate(mode, **kwargs)
+
+    monkeypatch.setattr(admission, "evaluate", evaluate_tight_on_lock)
+    assert admission_dispatch.dispatch("--force-admission", "locked host race", task_id="adm-locked-force") == 0
+    locked_err = capsys.readouterr().err
+    assert "admitted —" in locked_err
+    assert "overridden by --force-admission ('locked host race')" in locked_err
+    locked_rec = store.read("adm-locked-force")["admission"]
+    assert locked_rec["forced"] is True and locked_rec["admitted"] is False
 
 
 def test_force_admission_requires_a_reason(admission_dispatch, capsys):
@@ -827,6 +897,15 @@ def test_force_admission_skips_the_early_refusal(admission_dispatch, monkeypatch
 
     overloaded = dispatch_admission.HostProbe(mem_available_bytes=1024**3, load1=40.0, cpu_count=8, proc_available=True)
     monkeypatch.setattr(dispatch_admission, "probe_host", lambda: overloaded)
+    # Without --force-admission, the early host-only precheck refuses and labels meter telemetry "not checked".
+    assert admission_dispatch.dispatch(task_id="adm-early") == 3
+    early_err = capsys.readouterr().err
+    assert "meter telemetry=not checked, effective cap=none" in early_err
+    early_refusal = _admission_refusal("adm-early")
+    _assert_pre_start_refusal(early_refusal, "admission_capacity")
+    assert early_refusal["admission"]["meter_telemetry"] == "not checked"
+    assert early_refusal["admission"]["meter_effective_cap"] is None
+
     assert admission_dispatch.dispatch("--force-admission", "drain one worker") == 0
     assert "overridden by --force-admission ('drain one worker'): MemAvailable 1.0 GiB" in capsys.readouterr().err
     assert store.read("adm-worker")["admission"]["forced"] is True
@@ -834,10 +913,34 @@ def test_force_admission_skips_the_early_refusal(admission_dispatch, monkeypatch
 
 def test_early_refusal_reports_an_invalid_threshold_as_an_invalid_request(admission_dispatch, monkeypatch, capsys):
     """Ported from tests/test_delegate_admission.py::test_early_refusal_reports_an_invalid_threshold_as_an_invalid_request."""
+    from lu_machinery.orchestration import dispatch_admission
+
     monkeypatch.setenv("DISPATCH_MIN_MEM_AVAILABLE_GIB", "-1")
     assert admission_dispatch.dispatch() == 2
-    assert "invalid dispatch admission threshold: DISPATCH_MIN_MEM_AVAILABLE_GIB='-1' must be zero or more" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "invalid dispatch admission threshold: DISPATCH_MIN_MEM_AVAILABLE_GIB='-1' must be zero or more" in err
+    assert "meter telemetry=not checked, effective cap=none" in err
     assert not admission_dispatch.spawned
+    invalid_refusal = _admission_refusal("adm-worker")
+    assert invalid_refusal["admission"]["meter_telemetry"] == "not checked"
+    assert invalid_refusal["admission"]["meter_effective_cap"] is None
+    assert invalid_refusal["admission"]["forced"] is False
+
+    # F7: admission-lock timeout also emits and persists typed meter telemetry ("not checked").
+    monkeypatch.delenv("DISPATCH_MIN_MEM_AVAILABLE_GIB")
+
+    def busy_lock(*_a, **_k):
+        raise dispatch_admission.AdmissionLockTimeout("lock held by test")
+
+    monkeypatch.setattr(dispatch_admission, "admission_lock", busy_lock)
+    assert admission_dispatch.dispatch(task_id="adm-lock-timeout") == 3
+    lock_err = capsys.readouterr().err
+    assert "dispatch admission lock unavailable" in lock_err
+    assert "meter telemetry=not checked, effective cap=none" in lock_err
+    lock_refusal = _admission_refusal("adm-lock-timeout")
+    assert lock_refusal["admission"]["meter_telemetry"] == "not checked"
+    assert lock_refusal["admission"]["meter_effective_cap"] is None
+    assert lock_refusal["admission"]["forced"] is False
 
 
 def test_read_only_dispatch_on_an_overloaded_host_is_exempt(admission_dispatch, monkeypatch, capsys):
