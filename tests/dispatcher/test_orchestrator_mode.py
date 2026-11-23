@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1419,6 +1420,41 @@ def test_live_unknown_or_unreadable_child_blocks_turn_done_keeps_lease_and_recor
     )
     assert conv_err0 is None and parsed_err0.error == "agy: missing final text" and parsed_err0.incomplete is False
 
+    # F15: AGY incomplete=True alongside nonzero exit (e.g. background-work diagnostic + exit 9) still waits
+    # for active children and returns the resumable conversation when time remains.
+    from lu_machinery.dispatcher.providers import agy as agy_provider
+
+    agy_conv_id = "11111111-2222-3333-4444-555555555555"
+    agy_stdout = (
+        '{"event":"init","init":{"model":"gemini-4-neon-high"}}\n'
+        '{"event":"result","result":{"status":"SUCCESS","response":"Working."}}\n'
+    )
+    parsed_f15 = agy_provider.parse(agy_stdout, "terminating 1 background task(s)\n", 9, None)
+    assert parsed_f15.incomplete is True and parsed_f15.error == "agy: exited with status 9"
+    spec.final_file.with_suffix(".log").write_text(f"Created conversation {agy_conv_id}\n", encoding="utf-8")
+    waited_children: list[str] = []
+
+    def _finish_child_during_wait(rec, _deadline, _checkpoint):
+        waited_children.extend(worker._running_children(rec))
+        return []
+
+    monkeypatch.setattr(worker, "_children_at", _finish_child_during_wait)
+    conv_f15, out_f15 = worker._agy_follow_up(
+        spec, turn, parsed_f15, started=time.monotonic(), hard_timeout=60.0,
+        resumes=0, checkpoint=lambda: None, exit_code=9,
+    )
+    assert waited_children == ["child-agy-live"]
+    assert conv_f15 == agy_conv_id and out_f15.incomplete is True
+
+    # Non-regular FIFO symlink in the hot task store fails closed in _scan_turn_children without blocking (F16 class).
+    hot_fifo = tmp_path / "hot.fifo"
+    os.mkfifo(hot_fifo)
+    hot_fifo_link = task_store / "child-fifo.json"
+    hot_fifo_link.symlink_to(hot_fifo)
+    scan_fifo = worker._scan_turn_children(turn)
+    assert "child-fifo.json" in scan_fifo["unreadable"]
+    hot_fifo_link.unlink()
+
 
 def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_store, tmp_path, monkeypatch):
     """Item 2 defect class: syntax-only handoff receipt certifies missing, wrong-kind, wrong-lane, dropped or reused
@@ -1453,7 +1489,9 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
         with pytest.raises(ValueError, match=expected_code):
             store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, bad_ref, outcome="done")
 
-    # Unreadable archived history (corrupt record or dangling archive symlink) fails closed (F3).
+    # Unreadable archived history (corrupt record, dangling archive symlink, dangling record symlink,
+    # non-object JSON array, or FIFO symlink target) fails closed in both handoff verification and
+    # strict_task_inventory without blocking (F3, F11, F16).
     archive_dir = task_store / "archive"
     archive_dir.mkdir(exist_ok=True)
     bad_archive = archive_dir / "corrupt-prior.json"
@@ -1461,11 +1499,37 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
     with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
         store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
     bad_archive.unlink()
+    dangling_rec = archive_dir / "dangling-child.json"
+    dangling_rec.symlink_to(tmp_path / "missing-record.json")
+    with pytest.raises(ValueError, match=r"unreadable task record dangling-child\.json"):
+        store.strict_task_inventory(include_archive=True)
+    with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
+        store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
+    dangling_rec.unlink()
+    array_rec = archive_dir / "array-child.json"
+    array_rec.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"unreadable task record array-child\.json"):
+        store.strict_task_inventory(include_archive=True)
+    with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
+        store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
+    array_rec.unlink()
+    fifo_target = tmp_path / "handoff-check.fifo"
+    os.mkfifo(fifo_target)
+    fifo_link = archive_dir / "fifo-child.json"
+    fifo_link.symlink_to(fifo_target)
+    with pytest.raises(ValueError, match=r"unreadable task record fifo-child\.json"):
+        store.strict_task_inventory(include_archive=True)
+    with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
+        store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
+    fifo_link.unlink()
     archive_dir.rmdir()
     archive_dir.symlink_to(tmp_path / "missing-archive-target")
     with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
         store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
+    with pytest.raises(OSError):
+        store.strict_task_inventory(include_archive=True)
     archive_dir.unlink()
+    assert [r["task_id"] for r in store.strict_task_inventory(include_archive=True)] == ["turn-verify"]
 
     with pytest.raises(ValueError, match="--outcome"):
         store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="bogus")

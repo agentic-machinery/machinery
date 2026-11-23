@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import unicodedata
 import uuid
@@ -27,6 +28,7 @@ from lu_machinery.orchestration.task_record_store import (
     read_task_record_bytes,
     relocated_result_file,
     task_archive_lock,
+    task_record_path,
     task_state_lock,
 )
 
@@ -643,39 +645,63 @@ def _driver_state_cli() -> str | None:
     return shutil.which(name)
 
 
-def _handoff_ref_reuse_refusal(record: dict, stream: str, refs: set[str]) -> str | None:
-    """Return a refusal when another turn on ``stream`` already referenced any ref in ``refs`` or history is unreadable."""
+def _read_regular_task_record_bytes(path: Path) -> bytes:
+    """Read ``path`` only after proving it is a regular file without blocking on FIFOs or devices."""
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"non-regular task record {path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            raise ValueError(f"non-regular task record {path.name}")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def _is_safe_identical_copy(exc: TaskIdentityMismatch) -> bool:
+    """Check ``is_identical_copy`` only when the sibling target is a regular file."""
+    named = task_record_path(exc.path.parent, exc.record["task_id"])
+    try:
+        if not stat.S_ISREG(os.stat(named).st_mode):
+            return False
+    except OSError:
+        return False
+    return is_identical_copy(exc)
+
+
+def strict_task_inventory(*, include_archive: bool = True) -> list[dict]:
+    """Return every verified task record under hot (and archive) while holding ``task_archive_lock``.
+
+    Fails closed on any directory traversal error, unreachable existing archive entry, dangling
+    symlink, non-regular ``.json`` candidate (FIFO, socket, device, directory), corrupt or
+    non-object record, or misnamed record that is not an exact copy of its named sibling.
+    """
     from lu_machinery.orchestration.task_record_store import (
         _DISPATCHER_SIDECAR_SUFFIXES,
         ARCHIVE_DIR_NAME,
-        TaskIdentityMismatch,
-        is_identical_copy,
-        parse_task_record,
-        read_task_record_bytes,
-        task_archive_lock,
     )
 
-    own_task = record.get("task_id")
-    own_nonce = record.get("run_nonce")
-    try:
-        root = tasks_dir()
-    except (OSError, ValueError):
-        return "orchestrator_handoff_note_unverified: cannot resolve task store for handoff_note reuse"
+    root = tasks_dir()
 
     def scan_directory(directory: Path) -> list[Path]:
         with os.scandir(directory) as entries:
-            names = []
-            for entry in entries:
-                if not entry.name.endswith(".json") or entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES):
-                    continue
-                if entry.is_file() or entry.is_symlink():
-                    names.append(entry.name)
-            names.sort()
-            return [directory / name for name in names]
+            names = [
+                entry.name
+                for entry in entries
+                if entry.name.endswith(".json") and not entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES)
+            ]
+        names.sort()
+        return [directory / name for name in names]
 
-    try:
-        with task_archive_lock(root):
-            candidates = scan_directory(root)
+    records: list[dict] = []
+    with task_archive_lock(root):
+        candidates = scan_directory(root)
+        if include_archive:
             archive_dir = root / ARCHIVE_DIR_NAME
             try:
                 archive_dir.lstat()
@@ -685,39 +711,47 @@ def _handoff_ref_reuse_refusal(record: dict, stream: str, refs: set[str]) -> str
                 archive_present = True
             if archive_present:
                 candidates.extend(scan_directory(archive_dir))
-            relocated: set[Path] = set()
-            for listed in candidates:
-                if listed in relocated:
+        for listed in candidates:
+            try:
+                raw = _read_regular_task_record_bytes(listed)
+                parsed = parse_task_record(listed, raw)
+            except TaskIdentityMismatch as exc:
+                if _is_safe_identical_copy(exc):
                     continue
-                try:
-                    path, raw = read_task_record_bytes(listed, tasks_dir=root)
-                    if path != listed:
-                        relocated.add(path)
-                    other = parse_task_record(path, raw)
-                except TaskIdentityMismatch as exc:
-                    if is_identical_copy(exc):
-                        continue
-                    return f"orchestrator_handoff_note_unverified: unreadable task record {listed.name}"
-                except (OSError, ValueError, RecursionError):
-                    return f"orchestrator_handoff_note_unverified: unreadable task record {listed.name}"
-                if not isinstance(other, dict) or not isinstance(other.get("task_id"), str):
-                    return f"orchestrator_handoff_note_unverified: unreadable task record {listed.name}"
-                if other.get("task_id") == own_task and other.get("run_nonce") == own_nonce:
-                    continue
-                receipt = other.get(HANDOFF_RECEIPT_KEY)
-                if receipt is None:
-                    continue
-                if not isinstance(receipt, dict):
-                    return f"orchestrator_handoff_note_unverified: malformed handoff receipt on {other['task_id']}"
-                if receipt.get("stream") != stream:
-                    continue
-                other_ref = receipt.get("handoff_ref")
-                if not isinstance(other_ref, str):
-                    return f"orchestrator_handoff_note_unverified: malformed handoff_ref on {other['task_id']}"
-                if other_ref in refs:
-                    return "orchestrator_handoff_note_reused: handoff_note is already referenced by another turn on this stream"
+                raise ValueError(f"unreadable task record {listed.name}") from None
+            except (OSError, ValueError, RecursionError):
+                raise ValueError(f"unreadable task record {listed.name}") from None
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("task_id"), str) or not parsed["task_id"]:
+                raise ValueError(f"unreadable task record {listed.name}")
+            records.append(parsed)
+    return records
+
+
+def _handoff_ref_reuse_refusal(record: dict, stream: str, refs: set[str]) -> str | None:
+    """Return a refusal when another turn on ``stream`` already referenced any ref in ``refs`` or history is unreadable."""
+    own_task = record.get("task_id")
+    own_nonce = record.get("run_nonce")
+    try:
+        others = strict_task_inventory(include_archive=True)
+    except ValueError as exc:
+        return f"orchestrator_handoff_note_unverified: {exc}"
     except OSError:
         return "orchestrator_handoff_note_unverified: cannot inspect task records for handoff_note reuse"
+    for other in others:
+        if other.get("task_id") == own_task and other.get("run_nonce") == own_nonce:
+            continue
+        receipt = other.get(HANDOFF_RECEIPT_KEY)
+        if receipt is None:
+            continue
+        if not isinstance(receipt, dict):
+            return f"orchestrator_handoff_note_unverified: malformed handoff receipt on {other['task_id']}"
+        if receipt.get("stream") != stream:
+            continue
+        other_ref = receipt.get("handoff_ref")
+        if not isinstance(other_ref, str):
+            return f"orchestrator_handoff_note_unverified: malformed handoff_ref on {other['task_id']}"
+        if other_ref in refs:
+            return "orchestrator_handoff_note_reused: handoff_note is already referenced by another turn on this stream"
     return None
 
 

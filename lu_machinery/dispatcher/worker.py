@@ -820,11 +820,10 @@ def _scan_turn_children(record: dict) -> dict:
     settled children stay recorded with their full run nonces.
     """
     from lu_machinery.orchestration.task_record_store import (
+        _DISPATCHER_SIDECAR_SUFFIXES,
+        ARCHIVE_DIR_NAME,
         TaskIdentityMismatch,
-        is_identical_copy,
-        iter_task_records,
         parse_task_record,
-        read_task_record_bytes,
         task_archive_lock,
     )
 
@@ -865,36 +864,45 @@ def _scan_turn_children(record: dict) -> dict:
         elif unsettled := _terminal_child_unsettled_state(other):
             (live if unsettled == "live" else unknown).append(child_id)
 
-    seen_names: set[str] = set()
+    def _scan_dir_candidates(directory: Path) -> list[Path]:
+        with os.scandir(directory) as entries:
+            names = [
+                entry.name
+                for entry in entries
+                if entry.name.endswith(".json") and not entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES)
+            ]
+        names.sort()
+        return [directory / name for name in names]
+
     try:
         with task_archive_lock(root):
-            for listed in iter_task_records(root, include_archive=False):
-                seen_names.add(listed.name)
+            for listed in _scan_dir_candidates(root):
                 try:
-                    path, raw = read_task_record_bytes(listed, tasks_dir=root)
-                    if path != listed:
-                        continue
-                    parsed = parse_task_record(path, raw)
+                    raw = store._read_regular_task_record_bytes(listed)
+                    parsed = parse_task_record(listed, raw)
                 except TaskIdentityMismatch as exc:
-                    if not is_identical_copy(exc):
+                    if not store._is_safe_identical_copy(exc):
                         unreadable.append(listed.name)
                     continue
                 except (OSError, ValueError, RecursionError):
                     unreadable.append(listed.name)
                     continue
-                if not isinstance(parsed, dict) or not isinstance(parsed.get("task_id"), str):
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("task_id"), str) or not parsed["task_id"]:
                     unreadable.append(listed.name)
                     continue
                 classify(parsed, listed.stem)
-            for listed in iter_task_records(root, include_archive=True):
-                if listed.name in seen_names:
-                    continue
+            archive_dir = root / ARCHIVE_DIR_NAME
+            try:
+                archive_candidates = _scan_dir_candidates(archive_dir)
+            except OSError:
+                archive_candidates = []
+            for listed in archive_candidates:
                 try:
-                    path, raw = read_task_record_bytes(listed, tasks_dir=root)
-                    parsed = parse_task_record(path, raw)
+                    raw = store._read_regular_task_record_bytes(listed)
+                    parsed = parse_task_record(listed, raw)
                 except (TaskIdentityMismatch, OSError, ValueError, RecursionError):
                     continue
-                if isinstance(parsed, dict):
+                if isinstance(parsed, dict) and parsed.get("task_id") not in children:
                     classify(parsed, listed.stem)
     except (OSError, ValueError):
         unreadable.append("task_store_unreadable")
@@ -1316,8 +1324,12 @@ def _agy_follow_up(spec: TaskSpec, record: dict, parsed: ParsedResult, started: 
 
     if spec.agent != "agy" or spec.mode != "workspace-write":
         return None, parsed
-    incomplete = parsed.error == "agy: incomplete run"
-    if "orchestrator" in record and (exit_code != 0 or (parsed.error is not None and not incomplete)):
+    incomplete = parsed.incomplete or parsed.error == "agy: incomplete run"
+    if "orchestrator" in record and (
+        parsed.rate_limited
+        or parsed.start_refusal is not None
+        or (not incomplete and (exit_code != 0 or parsed.error is not None))
+    ):
         # Preserve genuine terminal AGY provider failures; settlement still scans children and holds the lease.
         return None, parsed
     children = _running_children(record)

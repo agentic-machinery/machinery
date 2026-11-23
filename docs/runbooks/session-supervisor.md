@@ -292,27 +292,21 @@ Before running an attributed force release, verify quiescence in three steps:
    .venv/bin/python -c '
    import json, sys
    from lu_machinery.dispatcher import store
-   from lu_machinery.orchestration.task_record_store import ARCHIVE_DIR_NAME
-   root = store.tasks_dir()
-   list(root.iterdir())
-   archive = root / ARCHIVE_DIR_NAME
-   try:
-       archive.lstat()
-   except FileNotFoundError:
-       pass
-   else:
-       list(archive.iterdir())
    tid, nonce = sys.argv[1], sys.argv[2]
    rows = [
-       {k: r.get(k) for k in ("task_id", "run_nonce", "status", "worktree_disposition_reason")}
-       for r in store.list_tasks(include_archive=True, strict=True)
-       if r.get("parent_task_id") == tid and r.get("parent_run_nonce") in (None, nonce)
+       {k: r.get(k) for k in ("task_id", "run_nonce", "parent_run_nonce", "status", "worktree_disposition_reason")}
+       for r in store.strict_task_inventory(include_archive=True)
+       if r.get("parent_task_id") == tid
+       and (not isinstance(r.get("parent_run_nonce"), str) or not r.get("parent_run_nonce") or r.get("parent_run_nonce") == nonce)
    ]
    print(json.dumps(rows, indent=2))
    ' <task-id> <run-nonce>
    ```
 
-   Confirm the inventory exits 0 with zero unreadable hot/archived records and that every
+   `store.strict_task_inventory(include_archive=True)` holds `task_archive_lock` across both
+   enumeration and reads of the hot and archived stores and raises on any dangling symlink,
+   non-regular candidate (FIFO, socket, device, directory), corrupt or non-object JSON record,
+   unreadable directory, or misnamed record. Confirm the inventory exits 0 and that every
    linked child is terminal with its processes/scope and task services proven gone (no
    `worktree_disposition_reason` of `provider_processes_alive` or
    `provider_liveness_unknown`). If the strict inventory fails, or any child is `spawning`,
