@@ -1600,8 +1600,10 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
             valid_root_line + _rec(b"/bad\\000"),  # escaped NUL
             valid_root_line + _rec(b"/mnt/unrelated\xff"),  # undecodable path byte (PR1297-F3 reversed)
             valid_root_line + _rec(b"/mnt/unrelated\rdir"),  # CR in path (PR1297-F3 reversed)
-            valid_root_line + _rec("/mnt/‮rtl".encode()),  # bidi format character (Cf)
-            valid_root_line + _rec("/mnt/ nbsp".encode()),  # non-ASCII separator (Zs)
+            valid_root_line + _rec("/mnt/\u202ertl".encode()),  # bidi format character (Cf)
+            valid_root_line + _rec("/mnt/\u00a0nbsp".encode()),  # non-ASCII separator (Zs)
+            valid_root_line + _rec("/mnt/\U0001fae9".encode()),  # unassigned in the frozen Unicode 3.2.0 table
+            valid_root_line + _rec(b"/mnt/hash\\043"),  # '#' escape the path writer never emits
             valid_root_line + _rec(b"/mnt/"),  # non-normalized mount point
             valid_root_line + _rec(b"/mnt//x"),
             valid_root_line + _rec(b"/mnt/../x"),
@@ -1638,7 +1640,8 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
         mp.setattr(task_scratch, "_MOUNTINFO_PATH", tmp_path / "missing-mountinfo")
         assert fleet_repos.fleet_repo_for_checkout(primary) is None
     # Canonical kernel encodings of unrelated mounts keep the consumer eligible: escaped space and
-    # backslash, UTF-8 names, nsfs roots, deleted mount points and escaped super-option commas.
+    # backslash, literal '#' in paths, UTF-8 names, nsfs roots, deleted mount points, mangle()'s '#'
+    # escape in fs type and source (FUSE subtype and source), and escaped super-option commas.
     real_mi_bytes = task_scratch._MOUNTINFO_PATH.read_bytes()
     unrelated_valid_mi = tmp_path / "mountinfo-canonical-escapes"
     unrelated_valid_mi.write_bytes(
@@ -1646,6 +1649,7 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
         + b"999001 1 8:1 /src /mnt/with\\040space\\134slash rw - ext4 /dev/sda1 rw\n"
         + "999002 1 0:4 net:[4026532617] /run/netns/дані rw shared:5 - nsfs nsfs rw\n".encode()
         + b"999003 1 0:52 / /mnt/gone\\040(deleted) rw,relatime - overlay overlay rw,lowerdir=/a\\054b\n"
+        + b"999004 1 0:53 / /mnt/fuse#dir rw - fuse.sample\\043type sample\\043source rw,user_id=0\n"
     )
     with monkeypatch.context() as mp:
         mp.setattr(task_scratch, "_MOUNTINFO_PATH", unrelated_valid_mi)
@@ -1654,6 +1658,7 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
         assert parsed[999001] == "/mnt/with space\\slash"
         assert parsed[999002] == "/run/netns/дані"
         assert parsed[999003] == "/mnt/gone (deleted)"
+        assert parsed[999004] == "/mnt/fuse#dir"
         identified_with_unrelated = fleet_repos.fleet_repo_for_checkout(primary)
         assert identified_with_unrelated is not None and identified_with_unrelated.key == "kube-dojo"
     fake_fdinfo_dir = tmp_path / "fdinfo"
@@ -1719,6 +1724,20 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
 
         mp.setattr(execution_safe_git, "run_git", _fake_mount_stop)
         assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    # The process root is never a consumer, even when Git reports it as a registered standalone
+    # checkout: it has no parent to discover from and is itself a mount point (PR1294-F2 at "/").
+    with monkeypatch.context() as mp:
+        def _fake_root_checkout(args, *, cwd, **kw):
+            if "--show-toplevel" in args:
+                return subprocess.CompletedProcess(args, 0, b"/\n/.git\n", b"")
+            if "config" in args:
+                origin = b"remote.origin.url\n" + _KUBE_DOJO_URL.encode() + b"\0"
+                return subprocess.CompletedProcess(args, 0, origin, b"")
+            return real_run_git(args, cwd=cwd, **kw)
+
+        mp.setattr(execution_safe_git, "run_git", _fake_root_checkout)
+        mp.setattr(fleet_repos, "_read_mount_table", lambda: None)
+        assert fleet_repos.fleet_repo_for_checkout(Path("/")) is None
 
     # Linked worktree of that same primary fails closed on both policy and Sources server.
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(linked))

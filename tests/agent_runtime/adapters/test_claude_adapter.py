@@ -279,9 +279,6 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         {"allowed_tools": "Read, Bash(git log --format=%H,%s), mcp__sources__*, mcp__*, mcp__other__tool, mcp*"},
     )
     assert explicit[explicit.index("--allowedTools") + 1] == "Read,Bash(git log --format=%H,%s)"
-    # Printable, NFKC-normalized non-ASCII qualifiers stay supported.
-    unicode_path = _read_only(consumer, {"allowed_tools": "Read(/дані/файл’.md),mcp__sources__verify_word"})
-    assert unicode_path[unicode_path.index("--allowedTools") + 1] == "Read(/дані/файл’.md)"
     for bad_allowed in (
         "",
         "   ",
@@ -302,8 +299,11 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         "Read\nGrep",
         "Read\u00a0Grep",
         "Read\u2028Grep",
-        # Fail closed by class (PR1297-F2, CTO class decision): every Unicode category C* and Z*
-        # except the ASCII space, non-NFKC input, and backslash escapes the tokenizer does not model.
+        # Fail closed by class (PR1297-F2, CTO class decision): only printable ASCII, so every Unicode
+        # category C* and Z* except the ASCII space and every non-normalized form, the same on every
+        # Python version, and no backslash escapes the tokenizer does not model.
+        "Read(notes-\U0001fae9.md)",  # Cn on Python 3.12, So on 3.14
+        "Read(/\u0434\u0430\u043d\u0456/\u0444.md)",  # printable non-ASCII (Cyrillic)
         "Read(\ud800)",  # Cs unpaired surrogate
         "Read(\ue000)",  # Co private use
         "Read(\u0378)",  # Cn unassigned

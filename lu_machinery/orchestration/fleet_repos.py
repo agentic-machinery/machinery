@@ -25,6 +25,7 @@ import re
 import stat
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
@@ -519,12 +520,17 @@ _FDINFO_DIR = Path("/proc/self/fdinfo")
 _KERNEL_UINT_RE = re.compile(rb"^(?:0|[1-9][0-9]{0,9})$")
 _KERNEL_INT32_MAX = 0x7FFFFFFF
 _KERNEL_UINT32_MAX = 0xFFFFFFFF
-# The kernel's seq_escape() octal-escapes exactly these bytes in mountinfo text fields
-# (fs/proc_namespace.c); seq_show_option() also escapes "," and "=" in super options. Any other
-# escape, and any raw backslash, is non-canonical.
+# The octal escapes each kernel mountinfo writer emits (fs/proc_namespace.c): seq_dentry() and
+# seq_path_root() for the root and mount point; mangle() for the fs type and the default source;
+# seq_show_option() and filesystem writers for super options. Any other escape, and any raw
+# backslash, is non-canonical.
 _MOUNTINFO_ESCAPE_RE = re.compile(rb"\\([0-7]{3})")
-_MOUNTINFO_ESCAPED = frozenset(b" \t\n\\")
-_MOUNTINFO_SUPER_OPTS_ESCAPED = _MOUNTINFO_ESCAPED | frozenset(b",=")
+_MOUNTINFO_PATH_ESCAPED = frozenset(b" \t\n\\")
+_MOUNTINFO_MANGLE_ESCAPED = _MOUNTINFO_PATH_ESCAPED | frozenset(b"#")
+_MOUNTINFO_SUPER_OPTS_ESCAPED = _MOUNTINFO_MANGLE_ESCAPED | frozenset(b",=")
+# A frozen Unicode baseline that ships unchanged in every CPython, so the printable set does not
+# move with the interpreter's own Unicode version (3.12 and 3.14 classify new code points differently).
+_UCD = unicodedata.ucd_3_2_0
 # One fdinfo line: a canonical lowercase key, exactly ":\t", then printable non-space ASCII.
 _FDINFO_LINE_RE = re.compile(rb"([a-z][a-z_]*):\t([\x21-\x7e]+)")
 
@@ -542,9 +548,10 @@ def _decode_mountinfo_field(field: bytes, *, escaped: frozenset[int] = frozenset
 
     Only the octal escapes the kernel writes for that field (*escaped*) are accepted; a raw
     backslash or any other escape is refused. The decoded text must be non-empty and
-    :meth:`str.isprintable` (no Unicode category ``C*`` or ``Z*`` character except the ASCII
-    space), so control bytes such as CR, escaped tab or newline, and undecodable bytes (which
-    :func:`os.fsdecode` maps to lone surrogates, category ``Cs``) all refuse the field.
+    printable in the frozen Unicode 3.2.0 table (no category ``C*`` or ``Z*`` character except the
+    ASCII space), so control bytes such as CR, escaped tab or newline, code points that table does
+    not assign (``Cn``), and undecodable bytes (which :func:`os.fsdecode` maps to lone surrogates,
+    category ``Cs``) all refuse the field.
     """
     out = bytearray()
     pos = 0
@@ -560,7 +567,9 @@ def _decode_mountinfo_field(field: bytes, *, escaped: frozenset[int] = frozenset
         return None
     out += field[pos:]
     text = os.fsdecode(bytes(out))
-    return text if text and text.isprintable() else None
+    if not text or any(ch != " " and _UCD.category(ch)[0] in "CZ" for ch in text):
+        return None
+    return text
 
 
 def _canonical_mount_point(text: str | None) -> str | None:
@@ -596,7 +605,7 @@ def _read_mount_table() -> dict[int, str] | None:
         mount_id_b, parent_id_b, dev_b, root_b, mount_point_b = fields[:5]
         mount_id = _parse_kernel_int(mount_id_b, max_value=_KERNEL_INT32_MAX)
         major_b, colon, minor_b = dev_b.partition(b":")
-        mount_point = _canonical_mount_point(_decode_mountinfo_field(mount_point_b, escaped=_MOUNTINFO_ESCAPED))
+        mount_point = _canonical_mount_point(_decode_mountinfo_field(mount_point_b, escaped=_MOUNTINFO_PATH_ESCAPED))
         fstype_b, source_b, super_opts_b = fields[sep + 1 :]
         if (
             mount_id is None
@@ -608,10 +617,9 @@ def _read_mount_table() -> dict[int, str] | None:
             or _parse_kernel_int(minor_b, max_value=_KERNEL_UINT32_MAX) is None
             # Mount options and optional fields are fixed kernel tokens: never escaped.
             or any(_decode_mountinfo_field(opt) is None for opt in fields[5:sep])
-            or any(
-                _decode_mountinfo_field(text, escaped=_MOUNTINFO_ESCAPED) is None
-                for text in (root_b, fstype_b, source_b)
-            )
+            or _decode_mountinfo_field(root_b, escaped=_MOUNTINFO_PATH_ESCAPED) is None
+            or _decode_mountinfo_field(fstype_b, escaped=_MOUNTINFO_MANGLE_ESCAPED) is None
+            or _decode_mountinfo_field(source_b, escaped=_MOUNTINFO_MANGLE_ESCAPED) is None
             or _decode_mountinfo_field(super_opts_b, escaped=_MOUNTINFO_SUPER_OPTS_ESCAPED) is None
         ):
             return None
@@ -720,6 +728,9 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
         resolved = root.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
+    if resolved.parent == resolved:
+        # The process root has no parent to discover from and is itself a mount point: never a consumer.
+        return None
 
     def git(*args: str, cwd: Path = resolved) -> subprocess.CompletedProcess[Any] | None:
         try:
@@ -739,17 +750,16 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     lines = [] if layout is None or layout.returncode != 0 else layout.stdout.split(b"\n")
     if len(lines) != 3 or lines[2] or [Path(os.fsdecode(line)) for line in lines[:2]] != [resolved, resolved / ".git"]:
         return None
-    if resolved.parent != resolved:
-        if _crosses_mount_boundary(resolved):
-            return None
-        parent_top = git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=resolved.parent)
-        if (
-            parent_top is None
-            or parent_top.returncode != 128
-            or parent_top.stdout
-            or parent_top.stderr != b"fatal: not a git repository (or any of the parent directories): .git\n"
-        ):
-            return None
+    if _crosses_mount_boundary(resolved):
+        return None
+    parent_top = git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=resolved.parent)
+    if (
+        parent_top is None
+        or parent_top.returncode != 128
+        or parent_top.stdout
+        or parent_top.stderr != b"fatal: not a git repository (or any of the parent directories): .git\n"
+    ):
+        return None
     marker = Path(PRODUCT_MARKER)
     for rel_marker in (*reversed(marker.parents[:-1]), marker):
         try:
