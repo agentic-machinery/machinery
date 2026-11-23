@@ -407,23 +407,21 @@ function pageHref(offset) {
   return `${text ? `?${text}` : "?"}#messages`;
 }
 
-let revealedMessages = false;
+let revealPending = typeof location === "object" && location?.hash === "#messages" ? "load" : null;
+
+function prepareMessagesAnchor() {
+  const target = document.getElementById("messages");
+  const header = document.querySelector("header");
+  target.style.scrollMarginTop = `${header.getBoundingClientRect().height}px`;
+  return target;
+}
 
 function revealMessages() {
-  if (revealedMessages) return;
-  if (typeof location !== "object" || !location || location.hash !== "#messages") return;
-  if (typeof document !== "object" || !document || typeof document.getElementById !== "function") return;
-  const target = document.getElementById("messages");
-  const seats = document.getElementById("seats-content");
-  if (!target || typeof target.getBoundingClientRect !== "function") return;
-  if (!seats || typeof seats.querySelector !== "function" || seats.querySelector("p.error")) return;
-  const header = typeof document.querySelector === "function" ? document.querySelector("header") : null;
-  const headerHeight = header && typeof header.getBoundingClientRect === "function"
-    ? header.getBoundingClientRect().height : 0;
-  const scrolled = typeof window === "object" && window && typeof window.scrollY === "number" ? window.scrollY : 0;
-  if (typeof window !== "object" || !window || typeof window.scrollTo !== "function") return;
-  window.scrollTo(0, Math.max(0, target.getBoundingClientRect().top + scrolled - headerHeight));
-  revealedMessages = true;
+  if (!revealPending) return;
+  if (revealPending === "load" && document.querySelector("#seats-content p.error")) return;
+  revealPending = null;
+  if (location.hash !== "#messages") return;
+  prepareMessagesAnchor().scrollIntoView();
 }
 
 function renderMessages(payload) {
@@ -476,13 +474,16 @@ function renderMessages(payload) {
     ]);
   }
   const offset = Number.isInteger(payload.offset) && payload.offset >= 0 ? payload.offset : 0;
-  const start = built.length ? offset + 1 : 0;
   const end = offset + built.length;
   const prev = offset > 0 && Number.isInteger(payload.limit) && payload.limit > 0
     ? pageHref(Math.max(0, offset - payload.limit)) : "";
   const next = Number.isInteger(payload.next_offset) && payload.next_offset > offset ? pageHref(payload.next_offset) : "";
-  const links = [prev ? `<a href="${escapeHtml(prev)}">Previous</a>` : "", next ? `<a href="${escapeHtml(next)}">Next</a>` : ""].filter(Boolean).join(" ");
-  const pager = `<p class="pager"><span>${start}–${end} of ${payload.total}</span>${links ? ` ${links}` : ""}</p>`;
+  const items = [
+    built.length && end <= payload.total ? `<span>${offset + 1}–${end} of ${payload.total}</span>` : "",
+    prev ? `<a href="${escapeHtml(prev)}">Previous</a>` : "",
+    next ? `<a href="${escapeHtml(next)}">Next</a>` : "",
+  ].filter(Boolean);
+  const pager = items.length ? `<p class="pager">${items.join(" ")}</p>` : "";
   recoverNotice("messages", "Messages");
   if (!built.length) return `<p class="muted">No rows on this page.</p>${pager}`;
   return table(["When", "From to To", "Kind", "Message id", "State", "Attempts", "Waited"], built, true) + pager;
@@ -501,7 +502,7 @@ function renderChips(latest) {
   }
   // A panel retry can update chips before the first full refresh finishes.
   // Measure the header after the runner inserts the chips.
-  if (latest.seats && !revealedMessages && PANELS.every(panel => panel.ok !== undefined)) {
+  if (revealPending && (latest.seats || revealPending === "navigation") && panelsSettled()) {
     queueMicrotask(revealMessages);
   }
   return out.join("");
@@ -548,6 +549,16 @@ const PANELS = [
 
 const runner = createPanelRunner({panels: PANELS, renderChips});
 
+function panelsSettled() {
+  return PANELS.every(panel => panel.ok !== undefined);
+}
+
+function prepareSamePageNavigation() {
+  // An early click still needs the offset after the initial chips render.
+  revealPending = panelsSettled() ? null : "navigation";
+  prepareMessagesAnchor();
+}
+
 function currentPath() {
   return typeof location === "object" && location && typeof location.pathname === "string" && location.pathname
     ? location.pathname : "/fleet";
@@ -555,6 +566,7 @@ function currentPath() {
 
 function assignPage(search) {
   if (typeof location !== "object" || !location || typeof location.assign !== "function") return;
+  if (search === location.search) prepareSamePageNavigation();
   location.assign(`${currentPath()}${search}#messages`);
 }
 
@@ -577,11 +589,18 @@ function bindMessageFilters() {
   if (document._fleetFiltersBound) return;
   document._fleetFiltersBound = true;
   document.addEventListener("click", event => {
-    const target = event.target && typeof event.target.closest === "function"
-      ? event.target.closest("[data-clear-filters]") : null;
-    if (!target) return;
-    event.preventDefault();
-    assignPage("");
+    const target = event.target;
+    if (typeof target?.closest !== "function") return;
+    if (target.closest("[data-clear-filters]")) {
+      event.preventDefault();
+      assignPage("");
+      return;
+    }
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const link = target.closest('a[href$="#messages"]');
+    if (link && link.origin === location.origin && link.pathname === location.pathname && link.search === location.search) {
+      prepareSamePageNavigation();
+    }
   });
   const form = document.getElementById("message-filters");
   if (!form || !form.dataset || typeof form.addEventListener !== "function" || form.dataset.bound) return;
