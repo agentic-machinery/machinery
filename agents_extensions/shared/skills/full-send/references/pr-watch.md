@@ -7,21 +7,23 @@ the accountable driver's cycle.
 
 ## Waiting
 
-- Do not write a watcher, polling loop or `sleep` loop, and do not run a second watcher on the
-  same PR: every watcher shares one GitHub rate limit.
-- Arm waits on the original tasks (`"$PY" -m lu_machinery.dispatch wait <task> --run-nonce <nonce>`, see
-  `review-loop`). Check CI and the queue on each driver cycle:
+- No watcher, polling or `sleep` loop, and no second watcher: every reader spends one GitHub limit.
+- Wait on your own dispatch tasks (`"$PY" -m lu_machinery.dispatch wait <task> --run-nonce <nonce>`,
+  see `review-loop`) and the keeper's queue observations. Read GitHub only when a `full-send` or
+  `full-stop` step needs it (CI after a push, protection before a push, the gate before enqueue,
+  merge or hand-off, the queue after enqueue, the final `MERGED`, diagnosing a failure or
+  ejection), never on an interval:
 
   ```bash
   gh pr view "$PR" --json state,isDraft,headRefOid,mergeable,mergeStateStatus,autoMergeRequest
   gh pr checks "$PR"
-  "$PY" -m lu_machinery.publish read checks --sha "$HEAD_SHA"   # REST, when GraphQL is spent
   "$PY" -m lu_machinery.gh_merge_queue_status "$PR" --repo "$REPO" --branch "$BASE" --json
   ```
 
-- A review round does not wait for PR CI (the `CI Gate` where the repository runs one): it runs
-  in parallel with CI on the head under review (`full-send` steps 4 and 5). Pending CI is not
-  successful CI, so the gate (not the review) waits for green before landing.
+- A spent GitHub budget means wait for its reset, never fall back from GraphQL to REST to poll.
+- A review round runs in parallel with PR CI (the `CI Gate` where the repository runs one) on the
+  head under review (`full-send` steps 4 and 5). Pending CI is not successful CI: the gate, not
+  the review, waits for green before landing.
 - While CI or a review runs, dispatch the next ready item instead of idling (drive-epic §2c).
 - An event is news, not a decision: re-check the gate yourself.
 
