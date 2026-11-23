@@ -135,6 +135,40 @@ _logger = logging.getLogger(__name__)
 
 WRITE_CAPABLE_MODES = frozenset({"workspace-write", "danger"})
 ACTIVE_STATUSES = frozenset({"running", "spawning"})
+# An orchestrator turn's task record names its stream here, as {"stream": "epic:<N>"} (DRIVERS-1122).
+ORCHESTRATOR_KEY = "orchestrator"
+
+
+def orchestrator_stream(record: Mapping[str, Any]) -> str | None:
+    """The stream an orchestrator turn's record reserves, or None for any other task.
+
+    A record that carries the key with any other shape, or names anything but a canonical
+    ``epic:<N>`` stream (the only spelling dispatch admits), raises ``ValueError``: it is an
+    orchestrator turn whose stream is unknown, never an ordinary task.
+    """
+    from lu_machinery.session_streams.model import STREAM_ID_RE
+
+    if ORCHESTRATOR_KEY not in record:
+        return None
+    value = record[ORCHESTRATOR_KEY]
+    stream = value.get("stream") if isinstance(value, dict) else None
+    if not isinstance(stream, str) or not STREAM_ID_RE.fullmatch(stream) or not stream.startswith("epic:"):
+        raise ValueError("orchestrator record names no canonical stream")
+    return stream
+
+
+def _holds_write_slot(state: Mapping[str, Any], write_capable: bool) -> bool:
+    """A write-capable record takes a write slot unless it is a well-formed orchestrator turn.
+
+    An orchestrator turn writes no product tree, so it holds neither the host nor the meter slot;
+    a malformed orchestrator record still counts.
+    """
+    if not write_capable:
+        return False
+    try:
+        return orchestrator_stream(state) is None
+    except ValueError:
+        return True
 PIDLESS_SPAWNING_GRACE_S = 120.0
 PIDLESS_CLOCK_SKEW_S = 30.0
 LOCK_FILE_NAME = "dispatch-admission.lock"
@@ -1327,10 +1361,12 @@ def scan_task_records(
     for path, state in iter_active_records(tasks_dir, recent_since=recent_since):
         task_id = str(state.get("task_id") or path.stem)
         mode = state.get("mode")
-        write_capable = isinstance(mode, str) and mode in WRITE_CAPABLE_MODES
+        launches_writer = isinstance(mode, str) and mode in WRITE_CAPABLE_MODES
+        write_capable = _holds_write_slot(state, launches_writer)
         matches_meter = meter is not None and _meter_record(state) == meter
         on_meter = matches_meter and write_capable
-        if on_meter and not state.get("never_started_reason"):
+        # Cadence paces provider launches, so an orchestrator turn's launch counts here though it holds no slot.
+        if matches_meter and launches_writer and not state.get("never_started_reason"):
             launch_age = _age_s(state.get("started_at"), clock)
             if launch_age is not None and -PIDLESS_CLOCK_SKEW_S <= launch_age < min_interval_s:
                 launch_age = max(0.0, launch_age)
@@ -1526,6 +1562,7 @@ def evaluate(
     meter: str | None = None,
     meter_budget: Mapping[str, Any] | None = None,
     now: datetime | None = None,
+    orchestrator: bool = False,
 ) -> AdmissionDecision:
     """Decide whether a ``mode`` dispatch may start a worker on this host now.
 
@@ -1539,7 +1576,10 @@ def evaluate(
     the alert. Invalid threshold environment variables raise
     ``ValueError``. A missing or incompatible product policy raises
     ``ProductPolicyError`` (a ``ValueError``) for every mode, read-only
-    included, before anything is read or swept (#12680).
+    included, before anything is read or swept (#12680). ``orchestrator=True``
+    admits an orchestrator turn, which takes no write slot: the host and per-meter
+    write-worker caps do not apply to it, while every host, pool, test-slot, disk
+    and meter budget, rate-limit and cadence check still does (DRIVERS-1122).
     """
     load_product_policy()
     if mode not in WRITE_CAPABLE_MODES:
@@ -1556,7 +1596,7 @@ def evaluate(
     probe = probe_host()
     failures: list[str] = []
     live = len(scan.live_task_ids)
-    if live >= limits.max_live_write_workers:
+    if not orchestrator and live >= limits.max_live_write_workers:
         failures.append(
             f"live write workers {live}/{limits.max_live_write_workers} reached the cap "
             f"({ENV_MAX_LIVE_WRITE_WORKERS}={limits.max_live_write_workers})"
@@ -1570,7 +1610,7 @@ def evaluate(
         )
         interval = limits.min_meter_launch_interval_s
         retry_in = 0.0
-        if defer is None and scan.live_on_meter >= cap:
+        if defer is None and not orchestrator and scan.live_on_meter >= cap:
             defer = MeterDefer.CAP
         if defer is None and scan.last_meter_launch_age_s is not None:
             defer = MeterDefer.CADENCE

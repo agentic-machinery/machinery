@@ -429,13 +429,26 @@ def start_task_service(
 
     The unit name is recorded on ``record`` and in the task scratch before the
     start, so settlement can stop it if this process dies after systemd has
-    the service. Refuses a launch that is not this task's own scope.
+    the service. Refuses a launch that is not this task's own scope, and an
+    orchestrator turn's service (DRIVERS-1122): the turn is judged on its tree
+    after its scope drains, which a service would outlive. That refusal comes
+    before any scratch or systemd side effect.
     """
+    from lu_machinery.dispatcher import host_admission
+    from lu_machinery.dispatcher.ownership import TASK_ID_ENV
+
     task_id, scope, nonce = record.get("task_id"), record.get("launch_unit"), record.get("run_nonce")
     if record.get("launch_mode") != LAUNCH_SCOPE or not isinstance(task_id, str) or not isinstance(scope, str):
         raise DispatchIsolationError("a task service requires this task's scope launch")
     if not isinstance(nonce, str) or not scope_unit_matches(scope, task_id=task_id, run_nonce=nonce):
         raise DispatchIsolationError("launch unit is not this task's scope")
+    # The reservation file attributes a turn, so a record copy without its orchestrator key is still one, as is
+    # any process that inherited the turn's task id.
+    if "orchestrator" in record:
+        raise DispatchIsolationError("orchestrator_turn_writer_refused: an orchestrator turn starts no task service")
+    inherited = os.environ.get(TASK_ID_ENV)
+    if refusal := host_admission.turn_writer_refusal(task_ids={task_id, *([inherited] if inherited else [])}):
+        raise DispatchIsolationError(refusal)
     unit = task_service_name(task_id)
     if not task_service_matches(unit, task_id=task_id):
         raise DispatchIsolationError("refusing a unit name that is not this task's")

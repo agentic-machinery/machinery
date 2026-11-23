@@ -263,6 +263,9 @@ def _write(path: Path, record: dict, exclusive: bool = False, *, grant: dict | N
                 raise TaskRecordError("TASK_RECORD_REPLACED: run nonce mismatch")
             if "owned_path_grants" in current:
                 record["owned_path_grants"] = current["owned_path_grants"]
+            if HANDOFF_RECEIPT_KEY in current:
+                # Written once by the turn itself (record_handoff_receipt); no stale copy drops it.
+                record[HANDOFF_RECEIPT_KEY] = current[HANDOFF_RECEIPT_KEY]
             if current.get("settling_at"):
                 record["settling_at"] = current["settling_at"]
             # A hold or malformed hold outranks a stale supervisor copy. False is an
@@ -510,6 +513,8 @@ def _grant_worktree(record: dict) -> Path:
     sealed = ("review_attempt", "advisory_envelope", "advisory_binding_sha256", "advisory_binding",
               "advisory_role", "advisory_task", "driver_brief", "bounded", "bounded_implementation")
     options = record.get("options") or {}
+    if "orchestrator" in record:
+        raise ValueError("grants are refused for orchestrator turns, which write no product paths")
     if (record.get("mode") != "workspace-write"
             or any(record.get(key) is not None for key in sealed)
             or any(options.get(key) not in (None, "None", False, "False", "") for key in sealed)
@@ -571,6 +576,104 @@ def begin_settlement(record: dict) -> None:
         replace(current, path)
         record["settling_at"] = current["settling_at"]
         record["owned_path_grants"] = current.get("owned_path_grants", [])
+        if HANDOFF_RECEIPT_KEY in current:
+            record[HANDOFF_RECEIPT_KEY] = current[HANDOFF_RECEIPT_KEY]
+
+
+# One orchestrator turn's handoff receipt (DRIVERS-1122), a field of its own task record:
+# {"schema": HANDOFF_RECEIPT_SCHEMA, "receipt_id": <sha256>, "stream": "epic:<N>", "task_id": <id>,
+#  "run_nonce": <nonce>, "handoff_ref": <the handoff note's id>, "recorded_at": <ISO-8601 UTC>}.
+# receipt_id is the SHA-256 of the compact JSON list [schema, stream, task_id, run_nonce, handoff_ref].
+HANDOFF_RECEIPT_KEY = "orchestrator_handoff_receipt"
+HANDOFF_RECEIPT_SCHEMA = "lu.dispatch.orchestrator-handoff-receipt.v1"
+_HANDOFF_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:#/-]{0,255}")
+_HANDOFF_RECEIPT_FIELDS = frozenset({"schema", "receipt_id", "stream", "task_id", "run_nonce", "handoff_ref", "recorded_at"})
+
+
+# An ISO-8601 UTC date-time as now() (+00:00) or Monitor (Z) writes it: ASCII digits, a T separator, at most
+# microseconds. datetime.fromisoformat alone also accepts other separators and forms.
+_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
+
+
+def parse_utc_timestamp(value: object) -> datetime | None:
+    """``value`` as an aware UTC datetime when it is exactly such a timestamp, else None."""
+    if not isinstance(value, str) or not _UTC_TIMESTAMP.fullmatch(value):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:  # a field out of range, such as month 13
+        return None
+
+
+def handoff_receipt_id(stream: str, task_id: str, run_nonce: str, handoff_ref: str) -> str:
+    key = [HANDOFF_RECEIPT_SCHEMA, stream, task_id, run_nonce, handoff_ref]
+    return digest(json.dumps(key, separators=(",", ":")).encode())
+
+
+def handoff_receipt_refusal(record: dict) -> str | None:
+    """Why ``record`` carries no valid handoff receipt for its own stream, task and run, or None when it does."""
+    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+
+    receipt = record.get(HANDOFF_RECEIPT_KEY)
+    if receipt is None:
+        return "orchestrator_handoff_receipt_missing"
+    try:
+        stream = orchestrator_stream(record)
+    except ValueError:
+        stream = None
+    expected = dict(schema=HANDOFF_RECEIPT_SCHEMA, stream=stream, task_id=record.get("task_id"),
+                    run_nonce=record.get("run_nonce"))
+    if (not isinstance(receipt, dict) or stream is None or set(receipt) != _HANDOFF_RECEIPT_FIELDS
+            or parse_utc_timestamp(receipt.get("recorded_at")) is None
+            or any(receipt.get(key) != value for key, value in expected.items())
+            or not isinstance(receipt.get("handoff_ref"), str) or not _HANDOFF_REF.fullmatch(receipt["handoff_ref"])
+            or receipt.get("receipt_id") != handoff_receipt_id(stream, record["task_id"], record["run_nonce"],
+                                                               receipt["handoff_ref"])):
+        return "orchestrator_handoff_receipt_invalid"
+    return None
+
+
+def record_handoff_receipt(task_id: str, run_nonce: str, stream: str, handoff_ref: str) -> dict:
+    """Record the running orchestrator turn's one handoff receipt; an identical retry returns the first.
+
+    Only the turn itself records it (its own dispatched task id), while it runs and before settlement
+    starts; a different receipt for the same run refuses.
+    """
+    from lu_machinery.dispatcher import ownership
+    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+
+    if os.environ.get(ownership.TASK_ID_ENV) != task_id:
+        raise ValueError("handoff_receipt_refused: only the orchestrator turn itself records its handoff receipt")
+    if not isinstance(handoff_ref, str) or not _HANDOFF_REF.fullmatch(handoff_ref):
+        raise ValueError("handoff_receipt_refused: --handoff-ref must be 1-256 characters of letters, digits and ._:#/-, "
+                         "starting with a letter or digit")
+    path = record_path(task_id)
+    with task_state_lock(path):
+        record = read(task_id, run_nonce)
+        if record is None:
+            raise ValueError("task not found")
+        try:
+            expected = orchestrator_stream(record)
+        except ValueError:
+            expected = None
+        if expected is None or expected != stream:
+            raise ValueError("handoff_receipt_refused: the task is not an orchestrator turn on this stream")
+        receipt = dict(schema=HANDOFF_RECEIPT_SCHEMA, receipt_id=handoff_receipt_id(stream, task_id, run_nonce, handoff_ref),
+                       stream=stream, task_id=task_id, run_nonce=run_nonce, handoff_ref=handoff_ref)
+        if HANDOFF_RECEIPT_KEY in record:
+            existing = record[HANDOFF_RECEIPT_KEY]
+            if (handoff_receipt_refusal(record) is None and isinstance(existing, dict)
+                    and all(existing.get(key) == value for key, value in receipt.items())):
+                return existing
+            raise ValueError("handoff_receipt_conflict: this run already holds a different or invalid handoff receipt")
+        status = record.get("status")
+        if (record.get("schema_version") != 2 or not isinstance(status, str) or status not in ACTIVE
+                or record.get("settling_at")):
+            raise ValueError("handoff_receipt_refused: the turn is not running, or its settlement has started")
+        receipt["recorded_at"] = now()
+        record[HANDOFF_RECEIPT_KEY] = receipt
+        _write(path, record)
+    return receipt
 
 
 def list_tasks(status: str | None = None, include_archive=False, *, strict=False) -> list[dict]:

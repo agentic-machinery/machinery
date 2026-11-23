@@ -537,7 +537,13 @@ def _guard_launch_cleanup(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
                 "launch cleanup failed for %s: %s", spec.task_id, _launch_cleanup_text(again))
 
 
-def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float) -> None:
+def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, progress: dict | None = None) -> None:
+    """Publish the task record and spawn its supervisor.
+
+    ``progress`` is the caller's launch progress: ``progress["record"]`` is set immediately before the record
+    that names the prompt file can be published, and ``progress["started"]`` immediately before the first
+    supervisor spawn attempt, so a failure before it (record, prompt or log setup) proves no supervisor ran.
+    """
     from lu_machinery.orchestration.dispatch_admission import new_admission_hold
 
     source = getattr(providers.load(spec.agent), "MODEL_SOURCE", None)
@@ -548,6 +554,8 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float) -> N
     path = store.record_path(spec.task_id)
     logs = path.parent / "logs"
     try:
+        if progress is not None:
+            progress["record"] = True  # from here a record of this run may name the prompt file
         try:
             store.create(record, prompt)
         except FileExistsError as exc:
@@ -557,6 +565,8 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float) -> N
         with open(logs / f"{spec.task_id}.stderr.log", "ab", opener=lambda p, f: os.open(p, f, 0o600)) as err:
             mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
             try:
+                if progress is not None:
+                    progress["started"] = True  # from here on a supervisor may run
                 process, launch = admission.spawn_supervisor(
                     [sys.executable, "-I", "-m", "lu_machinery.dispatcher.worker", str(path)],
                     task_id=spec.task_id, run_nonce=record["run_nonce"], cwd=state_root(),
@@ -697,8 +707,86 @@ def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) ->
     return None
 
 
+def _enforce_orchestrator(record: dict) -> None:
+    """An orchestrator turn delivers its handoff receipt, never a product change (DRIVERS-1122).
+
+    It settles ``done`` only when its worktree is clean and still at its start commit, and its record
+    holds the one valid receipt for its stream, task and run; anything else, unknown state included,
+    is ``no_deliverable``. A merged pull request never stands in. A provider failure keeps its status.
+    """
+    record["owned_path_grants_used"] = []
+    if record["status"] != "done":
+        return
+    cause: str | None
+    start = record.get("worktree_start_sha", record.get("worktree_base_sha"))
+    if (record.get("commits_ahead") != 0 or record.get("worktree_dirty_on_exit") is not False
+            or not isinstance(start, str) or record.get("head_sha") != start):
+        cause = ("orchestrator_product_write: the turn's worktree left its start commit, has changes, or its "
+                 "state is unknown")
+    else:
+        cause = store.handoff_receipt_refusal(record)
+    if cause:
+        record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
+
+
+def _turn_tree_unproven(record: dict) -> bool:
+    """End a finished turn's services and leftover processes; True unless they are proven gone (DRIVERS-1122).
+
+    A turn is judged on its final tree, so nothing it started may still write it when the snapshot is taken.
+    Only a scope launch can prove that: its cgroup holds every descendant, while a fallback launch records one
+    process group, which a descendant can leave. No other task can write the tree: dispatch refuses a --cwd
+    attachment to it and a turn's task service (host_admission.turn_writer_refusal); any service stop is
+    still verified.
+    """
+    if record.get("launch_mode") != "scope":
+        return True
+    try:
+        _stop_task_services(record)
+        stops = record.get("task_service_stops")
+        if stops is not None and (not isinstance(stops, list) or any(
+                not isinstance(row, dict) or row.get("postcondition") != "true" for row in stops)):
+            return True
+        return _liveness_kept(record, _end_own_scope(record), time.monotonic() + SETTLE_PATIENCE) is not None
+    except Exception:  # an unreadable boundary is not proof, and never ends this settlement
+        return True
+
+
+def _release_stream(record: dict, *, evidence_lost: bool) -> None:
+    """Free a settled orchestrator turn's stream once nothing of its run can write (DRIVERS-1122).
+
+    Only on proof: the published record is terminal and still this run's turn, its launch was a scope whose
+    probe (``_provider_alive``) answers False, so every descendant has exited, and it lists no task service.
+    ``evidence_lost`` (the record was found damaged, replaced or missing and had to be rebuilt) keeps the
+    reservation, as do a fallback launch, a probe error and anything unknown; so does a supervisor that dies
+    first. The reservation file is released only for this task id and nonce.
+    """
+    if evidence_lost:
+        return
+    from lu_machinery.dispatcher import host_admission
+    from lu_machinery.orchestration import dispatch_isolation
+    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+
+    try:
+        published = store.read(record["task_id"], record["run_nonce"])
+        if not isinstance(published, dict):
+            return
+        stream = orchestrator_stream(published)
+        if (stream is None or stream != orchestrator_stream(record) or not _finished(published)
+                or published.get("launch_mode") != "scope"
+                or dispatch_isolation.listed_task_services(published) != []
+                or _provider_alive(published) is not False):
+            return
+    except Exception:  # any unreadable state is not proof, and never ends this settlement
+        return
+    if reason := host_admission.release_stream(stream, published["task_id"], published["run_nonce"]):
+        print(f"dispatcher: {stream} stays reserved: {reason}", file=sys.stderr)
+
+
 def _enforce_delivery(record: dict) -> None:
     if record["mode"] == "read-only":
+        return
+    if "orchestrator" in record:
+        _enforce_orchestrator(record)
         return
     provider_failed = record["status"] == "failed" and record.get("provider_terminal_failure") is True
     if record["status"] != "done" and not provider_failed:
@@ -848,10 +936,14 @@ def _provider_alive(record: dict) -> bool | None:
             return None
         cgroups = [*cgroups, *(sibling for sibling in siblings if sibling not in cgroups)]
         controllers = Path("/sys/fs/cgroup/cgroup.controllers").exists()
-        alive = False
+        alive = nested = False
         for cgroup in cgroups:
             try:
                 procs = Path("/sys/fs/cgroup" + cgroup, "cgroup.procs").read_text().split()
+                # cgroup.procs names only the scope's own members: a process moved into a child cgroup is in
+                # none of them, so the probe proves exit only for a leaf scope (systemd delegates none).
+                with os.scandir("/sys/fs/cgroup" + cgroup) as entries:
+                    nested = nested or any(entry.is_dir(follow_symlinks=False) for entry in entries)
             except FileNotFoundError:
                 # The kernel refuses to remove a cgroup that still holds processes, so a gone scope is empty.
                 if not controllers:
@@ -860,6 +952,8 @@ def _provider_alive(record: dict) -> bool | None:
             except OSError:
                 return None
             alive = alive or any(int(pid) != os.getpid() for pid in procs)
+        if not alive and nested:
+            return None
         # No scope under the unit's name is a gone scope, which held nothing, on a cgroup v2 host.
         return alive if cgroups or controllers else None
     if "provider_pgid" not in record:
@@ -950,7 +1044,8 @@ def _agy_follow_up(spec: TaskSpec, record: dict, parsed: ParsedResult, started: 
     if spec.agent != "agy" or spec.mode != "workspace-write":
         return None, parsed
     incomplete = parsed.error == "agy: incomplete run"
-    children = _running_children(record)
+    # An orchestrator turn dispatches its wave and exits; its children outlive it by design (DRIVERS-1122).
+    children = [] if "orchestrator" in record else _running_children(record)
     if not incomplete and not children:
         return None, parsed
     deadline = started + hard_timeout if hard_timeout > 0 else time.monotonic()
@@ -1359,9 +1454,13 @@ def _reap_settled(record: dict, patience: float = 0, salvage: bool = False) -> N
     A failed closeout is visible to the waiting dispatching seat as a failed task, with the receipt retained.
     """
     _stop_task_services(record)
+    # An orchestrator turn publishes nothing: no merged delivery is its result, and no salvage commits or
+    # pushes what it left in its tree, which stays retained like any other dirty tree (DRIVERS-1122).
+    if "orchestrator" in record:
+        salvage = False
     # Attribution needs the checkout's origin. Keep it even when removal is refused.
     request = merged = None
-    if record.get("mode") == "workspace-write" and "closeout" not in record:
+    if record.get("mode") == "workspace-write" and "closeout" not in record and "orchestrator" not in record:
         merged = git.merged_delivery(record)
     if merged:
         deliveries = merged.get("pull_requests", [merged])
@@ -1422,6 +1521,24 @@ def _settle_task_scratch(record: dict, *, liveness_kept: bool = False) -> None:
     scratch.settle(record, provider_gone, hold=services_running)
 
 
+def _liveness_kept(record: dict, stopped, deadline: float) -> str | None:
+    """Why the provider's process tree may still run after ``_end_own_scope`` returned ``stopped``; None once gone.
+
+    Waits until ``deadline`` for the tree to empty. A failed fallback stop names each survivor it saw.
+    """
+    if record.get("launch_mode") == "popen-fallback" and stopped is not None and not stopped.ok:
+        # Only the process group's id is recorded for a fallback launch, so a descendant that left it is
+        # invisible to the liveness check below. Name each survivor so a later retry still sees it.
+        survivors = {str(proc.pid): identity for proc in stopped.survivors if (identity := _identity(proc.pid))}
+        record["fallback_survivors"] = survivors
+        return "provider_processes_alive" if survivors else "provider_liveness_unknown"
+    while (alive := _provider_alive(record)) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if alive is not False:
+        return "provider_processes_alive" if alive else "provider_liveness_unknown"
+    return None
+
+
 def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
                    verified_merged_head: str | None = None) -> None:
     """Record the task worktree's disposition and remove the task's caches.
@@ -1436,18 +1553,7 @@ def _reap_worktree(record: dict, patience: float = 0, salvage: bool = False, *,
     record.pop("worktree_disposition_detail", None)  # a retry replaces an earlier attempt's detail
     stopped = _end_own_scope(record)
     try:
-        if record.get("launch_mode") == "popen-fallback" and stopped is not None and not stopped.ok:
-            # Only the process group's id is recorded for a fallback launch, so a descendant that left it is
-            # invisible to the liveness check below. Name each survivor so a later retry still sees it.
-            survivors = {str(proc.pid): identity for proc in stopped.survivors if (identity := _identity(proc.pid))}
-            record["fallback_survivors"] = survivors
-            record.update(worktree_disposition="retained",
-                          worktree_disposition_reason="provider_processes_alive" if survivors else "provider_liveness_unknown")
-            return
-        while (alive := _provider_alive(record)) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if alive is not False:
-            reason = "provider_processes_alive" if alive else "provider_liveness_unknown"
+        if (reason := _liveness_kept(record, stopped, deadline)) is not None:
             record.update(worktree_disposition="retained", worktree_disposition_reason=reason)
             return
 
@@ -1767,6 +1873,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     resolved_model = sources_calls = source = transport_warning = None
     started = time.monotonic()
     cancel_requested = interruptible = False
+    record_damaged = False  # a TaskRecordError was seen: a later cancel status never erases that for the release
 
     def cancelled(_signum, _frame):
         # A handler's exception lands at an arbitrary bytecode, where Python can drop it (a weakref
@@ -1870,6 +1977,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 scratch.start(record, spec.task_id)
                 store.replace(record, path, require_existing=True)
             except (OSError, ValueError) as exc:
+                if isinstance(exc, store.TaskRecordError):
+                    record_damaged = True
                 status, error = "failed", f"task_scratch_unavailable: {exc}"
                 start_refusal = StartRefusal.SETUP
                 return
@@ -2172,7 +2281,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     except subprocess.TimeoutExpired:
         status, error = "timeout", "process deadline exceeded"
     except store.TaskRecordError as exc:
-        status, error = "crashed", exc.code
+        status, error, record_damaged = "crashed", exc.code, True
     except OSError as exc:
         if child is None and not record.get("review_attempt"):
             status, error, start_refusal = "failed", f"provider_setup_refused: {type(exc).__name__}", StartRefusal.SETUP
@@ -2193,7 +2302,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 try:
                     store.begin_settlement(record)
                 except store.TaskRecordError as exc:
-                    status, error = "crashed", exc.code
+                    status, error, record_damaged = "crashed", exc.code, True
                     start_refusal = None
             # A killed launcher leaves its scratch; residue is recorded, never raised.
             if _in_boundary(spec) and (residue := write_boundary.discard(spec.task_id)):
@@ -2233,11 +2342,17 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 record["sources_mcp_call_count"] = sources_calls
             if record.get("require_review_verdict") is True:
                 record["dispatcher_code"] = _dispatcher_code()
+            tree_unproven = "orchestrator" in record and _turn_tree_unproven(record)
+            record_lost = False
             record.update(git.snapshot_delivery(spec, record))
             if error and error.startswith("TASK_RECORD_"):
                 record.update(worktree_disposition="retained", worktree_disposition_reason="task_record_damaged")
             else:
                 _enforce_delivery(record)
+                if tree_unproven and record["status"] == "done":
+                    cause = ("orchestrator_tree_unproven: the turn's processes were not proven gone before its tree "
+                             "was checked")
+                    record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
             if children := _running_children(record):
                 # A run that ends while a task it dispatched still runs left that result unconsumed (#12156).
                 record["orphaned_child_tasks"] = children
@@ -2268,6 +2383,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                         store.replace(record, path, require_existing=True)
                     except store.TaskRecordError:
                         store.publish_failed_record(record, path)
+                        record_lost = True
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, mask)
                 if record.get("worktree_disposition_reason") != "task_record_damaged":
@@ -2276,6 +2392,11 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     store.replace(record, path, require_existing=True)
                 except store.TaskRecordError:
                     store.publish_failed_record(record, path)
+                    record_lost = True
+            if "orchestrator" in record:
+                # Last, outside the task-state lock (admission's lock order): nothing may follow the release.
+                _release_stream(record, evidence_lost=record_lost or record_damaged
+                                or record.get("worktree_disposition_reason") == "task_record_damaged")
         finally:
             if draft_fd is not None:
                 os.close(draft_fd)
