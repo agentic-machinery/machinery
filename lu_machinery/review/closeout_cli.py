@@ -33,6 +33,7 @@ from lu_machinery.common.repo_root import MachineryConfigError
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.fleet import claude_account_lane, credit_lane
 from lu_machinery.identity import UNKNOWN_AUTHOR_FAMILY, resolve_author_family
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, canonical_repository
 from lu_machinery.review.evidence import compute_target_input_fingerprint
 from lu_machinery.review.findings import FindingEvent, FindingsLedger, FindingsLedgerError
 from lu_machinery.review.model_catalog import VALID_REVIEW_PROFILES, VALID_RISKS
@@ -413,14 +414,17 @@ def _cmd_record_cycle(args: argparse.Namespace) -> int:
 
 
 def _checkout_git(repo_root: Path, *args: str) -> str:
+    env = sanitized_git_env()
+    env.pop("GIT_CONFIG", None)
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo_root), *args],
             capture_output=True,
             text=True,
+            errors="replace",
             check=False,
             timeout=30,
-            env=sanitized_git_env(),
+            env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CloseoutStateError(f"git {args[0]} unavailable") from exc
@@ -431,8 +435,13 @@ def _checkout_git(repo_root: Path, *args: str) -> str:
 
 def _checkout_repository(repo_root: Path) -> str:
     """``owner/name`` of the checkout's GitHub origin, which task records must name."""
-    url = _checkout_git(repo_root, "config", "--get", "remote.origin.url")
-    match = re.search(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url)
+    url = _checkout_git(repo_root, "config", "--local", "--get-all", "remote.origin.url")
+    match = re.fullmatch(
+        r"(?:https?://(?:[^/@\s]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:|git://github\.com/)"
+        r"([a-z0-9_.-]+/[a-z0-9_.-]+?)(?:\.git)?/?",
+        url,
+        re.ASCII | re.IGNORECASE,
+    )
     if not match:
         raise CloseoutStateError("repository unknown: pass --repository owner/name")
     return match.group(1)
@@ -480,6 +489,7 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
     if args.review_profile.strip().casefold() in {"code", "infra"} and target is None and not args.owned_path:
         raise CloseoutStateError("review_target_required: resolve the target first or supply --owned-path")
     changed_paths = target.changed_paths if target else ()
+    repository = args.repository
     facts = None
     if target:
         # numstat display paths compact renames (a/{old => new}/file). Read
@@ -490,6 +500,21 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
         if not isinstance(repo_root_value, str) or not repo_root_value:
             raise CloseoutStateError("target_repo_root_missing")
         repo_root = Path(repo_root_value)
+        try:
+            origin = _checkout_repository(repo_root)
+        except CloseoutStateError:
+            origin = None
+        if origin and repository:
+            try:
+                if canonical_repository(origin) != canonical_repository(repository):
+                    raise CloseoutStateError("review_repository_mismatch: --repository does not match target origin")
+            except (CloseoutStateError, FleetRepoError) as exc:
+                failed_repository = {"selected": None, "fail_closed_reason": str(exc)}
+                state["resolved_reviewer"] = failed_repository
+                _save_state(args.state_file, state)
+                print(json.dumps(failed_repository, indent=2))
+                return 1
+        repository = repository or origin
         try:
             base_sha = rev_parse(repo_root, "HEAD") if target.mode == "local" else target.base_sha
             if base_sha is None:
@@ -506,6 +531,8 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
                 head_sha = target.head_sha
                 if head_sha is None:
                     raise CloseoutStateError("target_sha_invalid")
+                if repository is None:
+                    raise CloseoutStateError("repository unknown: pass --repository owner/name")
                 raw_base = target_args.get("base")
                 exclude = authorship_exclude_sha(repo_root, base_branch=raw_base if isinstance(raw_base, str) else None)
                 # Resolution previews the explicit plan on the frozen target.
@@ -518,7 +545,7 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
                 )
                 task_root = (Path(args.task_root) if args.task_root else tasks_dir()).absolute()
                 facts = collect_branch_review_facts(
-                    repository=args.repository or _checkout_repository(repo_root),
+                    repository=repository,
                     repo_root=repo_root,
                     base_tip_sha=base_sha,
                     head_sha=head_sha,
@@ -592,6 +619,7 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
             subject_seats=frozenset(args.subject_seat or []),
             subject_families=frozenset(args.subject_family or []),
             owned_paths=tuple(args.owned_path or []),
+            repository=repository,
             **common,
         )
     resolution = resolve_reviewer(inputs, review_mode=args.review_mode)
@@ -1935,8 +1963,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--repository",
         default=None,
         help=(
-            "GitHub owner/name that author task records must name, for a committed target's "
-            "complete authorship. Default: the target checkout's origin. Example: owner/repo"
+            "GitHub owner/name for subject paths and committed author task records. "
+            "Must match the target checkout's GitHub origin when present. "
+            "Default: the target checkout's origin. Example: owner/repo"
         ),
     )
     p_reviewer.add_argument(

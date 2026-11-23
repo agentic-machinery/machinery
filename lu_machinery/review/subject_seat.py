@@ -21,6 +21,7 @@ from typing import Literal, Protocol
 
 from lu_machinery.agent_identity import normalize_seat
 from lu_machinery.identity import _VALID_CONCRETE_FAMILIES
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, resolve_fleet_repo_by_slug
 
 ClassificationKind = Literal["seat", "ambiguous", "unrelated"]
 
@@ -193,13 +194,25 @@ class SubjectExclusion:
     fail_closed_reason: str | None = None
 
 
-def normalize_owned_path(path: str) -> str:
-    """Normalize current and pre-extraction subject paths for all review callers."""
+def _uses_legacy_scripts_layout(repository: str | None) -> bool:
+    # Only a known consumer repository can opt out of legacy subject protection.
+    if not isinstance(repository, str) or not repository.isascii():
+        return True
+    try:
+        return resolve_fleet_repo_by_slug(repository).key in {"machinery", "public"}
+    except FleetRepoError:
+        return True
+
+
+def normalize_owned_path(path: str, *, legacy_scripts: bool = True) -> str:
+    """Normalize current subject paths and, where applicable, pre-extraction paths."""
     text = str(path).strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
     text = text.rstrip("/")
     if text.startswith("scripts/"):
+        if not legacy_scripts:
+            return text
         relocated = f"{_MACHINERY}/{text.removeprefix('scripts/')}"
         if relocated in _BOUNDARY_SEATS or relocated.startswith((_ADAPTER_PREFIX, _PROVIDER_PREFIX)):
             return relocated
@@ -253,13 +266,16 @@ def adapter_subject_index() -> Mapping[str, frozenset[str]]:
     return {path: frozenset(seats) for path, seats in by_file.items()}
 
 
-def classify_owned_path(path: str) -> OwnedPathClassification:
+def classify_owned_path(path: str, *, repository: str | None = None) -> OwnedPathClassification:
     """Classify one owned path as one seat, ambiguous, or unrelated.
 
     Unrelated paths (a README, a generic timing hook) do not imply a subject
     seat. Ambiguous paths must not be turned into a guess.
     """
-    rel = normalize_owned_path(path)
+    return _classify_normalized_path(normalize_owned_path(path, legacy_scripts=_uses_legacy_scripts_layout(repository)))
+
+
+def _classify_normalized_path(rel: str) -> OwnedPathClassification:
     boundary_seat = _BOUNDARY_SEATS.get(rel)
     if boundary_seat is not None:
         return OwnedPathClassification("seat", frozenset({boundary_seat}), boundary_seat)
@@ -307,6 +323,7 @@ def prepare_subject_exclusion(
     subject_seats: frozenset[str] = frozenset(),
     subject_families: frozenset[str] = frozenset(),
     owned_paths: tuple[str, ...] = (),
+    repository: str | None = None,
 ) -> SubjectExclusion:
     """Resolve explicit seats/families plus unambiguous owned paths.
 
@@ -320,9 +337,10 @@ def prepare_subject_exclusion(
         return SubjectExclusion(frozenset(), frozenset(), (), str(exc))
 
     evidence: list[str] = []
+    legacy_scripts = _uses_legacy_scripts_layout(repository)
     for raw_path in owned_paths:
-        classification = classify_owned_path(raw_path)
-        rel = normalize_owned_path(raw_path)
+        rel = normalize_owned_path(raw_path, legacy_scripts=legacy_scripts)
+        classification = _classify_normalized_path(rel)
         if classification.kind == "seat":
             seats.update(classification.seats)
             evidence.append(rel)

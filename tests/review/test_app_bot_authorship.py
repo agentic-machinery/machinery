@@ -271,6 +271,55 @@ def test_resolve_reviewer_automation_requires_verified_commit_authorship(
         assert receipt["selected"]["family"] != "anthropic"
 
 
+def test_resolve_reviewer_uses_the_consumer_origin_for_adapter_deletions(tmp_path, monkeypatch, capsys):
+    repo = mini_repo(tmp_path, monkeypatch)
+    paths = tuple(
+        f"scripts/agent_runtime/adapters/{adapter}.py"
+        for adapter in ("agy", "claude", "codex", "deepseek", "gemini")
+    )
+    for path in paths:
+        file = repo.root / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("old copy\n", encoding="utf-8")
+    repo.git("add", "scripts")
+    repo.git("commit", "-qm", "Forked adapters")
+    base = repo.publish("feature", to="main")
+    repo.change(OPUS, "rm", *paths, message="Drop forked adapters")
+    repository = "kube-dojo/kube-dojo.github.io"
+    repo.git("remote", "set-url", "origin", f"https://github.com/{repository}.git")
+    monkeypatch.setattr(closeout_cli.claude_account_lane, "resolve_route_account", lambda *_a, **_kw: HOST_ACCOUNT)
+    snapshot = tmp_path / "routing.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    state = ["--state-file", str(tmp_path / "review.json")]
+    assert closeout_cli.main([
+        *state, "target", "--mode", "branch", "--branch", "feature", "--base", "origin/main",
+        "--repo-root", str(repo.root),
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["base_sha"] == base
+
+    resolve = [
+        *state, "resolve-reviewer", "--author-model", OPUS.split("/", 1)[1], "--domain", "infra",
+        "--review-profile", "infra", "--risk", "high", "--routing-snapshot-file", str(snapshot),
+        "--task-root", str(tmp_path / "tasks"),
+    ]
+    assert closeout_cli.main(resolve) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["selected"]["family"] != "anthropic"
+    assert receipt["resolved_risk"] == "critical"
+    assert receipt["branch_facts"]["subject_seats"] == []
+
+    # A caller cannot opt a machinery target out of its boundary protections.
+    repo.git("remote", "set-url", "origin", "https://github.com/learn-ukrainian/machinery.git")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.origin.url")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", f"https://github.com/{repository}.git")
+    assert closeout_cli.main([*resolve, "--repository", repository]) == 1
+    refusal = json.loads(capsys.readouterr().out)
+    assert refusal["selected"] is None
+    assert "review_repository_mismatch" in refusal["fail_closed_reason"]
+    assert json.loads((tmp_path / "review.json").read_text())["resolved_reviewer"] == refusal
+
+
 @pytest.mark.parametrize("repository", [None, "", "owner", "other/repo", "owner/repo/extra"])
 def test_repository_is_required_and_bound_to_all_commit_urls(repository):
     assert verified_app_bot_login(dependabot(), SHA, repository) is None

@@ -1325,6 +1325,61 @@ def test_extracted_seat_boundary_paths_preserve_subject_exclusion(path, seat):
 
 
 @pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "repository,legacy_scripts",
+    [
+        ("kube-dojo/kube-dojo.github.io", False),
+        ("KUBE-DOJO/KUBE-DOJO.GITHUB.IO", False),
+        ("learn-ukrainian/learn-ukrainian.github.io", True),
+        ("learn-ukrainian/machinery", True),
+        ("agentic-machinery/machinery", True),
+        (None, True),
+        ("unregistered/repository", True),
+        ("Kube-dojo/kube-dojo.github.io", True),
+    ],
+)
+def test_scripts_boundary_is_relocated_only_for_legacy_or_unknown_repositories(repository, legacy_scripts):
+    path = "agent_runtime/adapters/codex.py"
+    canonical = f"lu_machinery/{path}"
+    legacy = "./scripts\\agent_runtime\\adapters\\codex.py"
+
+    subject = prepare_subject_exclusion(owned_paths=(legacy,), repository=repository)
+    assert subject.seats == ({"codex"} if legacy_scripts else set())
+    assert subject.evidence == ((canonical,) if legacy_scripts else ())
+
+    with_canonical = prepare_subject_exclusion(owned_paths=(legacy, canonical), repository=repository)
+    assert with_canonical.seats == {"codex"}
+    assert with_canonical.evidence == (canonical,)
+
+
+@pytest.mark.usefixtures('configured_roots')
+def test_consumer_adapter_deletions_leave_critical_reviewers_eligible():
+    paths = tuple(
+        f"scripts/agent_runtime/adapters/{adapter}.py"
+        for adapter in ("agy", "claude", "codex", "deepseek", "gemini")
+    )
+    inputs = ResolverInputs(
+        author_model="claude-opus-5-5",
+        review_profile="infra",
+        domain="infra",
+        risk="high",
+        changed_paths=paths,
+        owned_paths=paths,
+        claude_account=HOST_ACCOUNT,
+    )
+    consumer = resolve_reviewer(replace(inputs, repository="kube-dojo/kube-dojo.github.io"))
+    assert consumer.selected is not None
+    assert consumer.selected.family != "anthropic"
+    assert consumer.resolved_risk == "critical"
+    assert not any("subject exclusion" in (entry.reason or "") for entry in consumer.trace)
+
+    for repository in (None, "learn-ukrainian/machinery", "learn-ukrainian/learn-ukrainian.github.io"):
+        protected = resolve_reviewer(replace(inputs, repository=repository))
+        assert protected.selected is None
+        assert "security-sensitive target" in protected.fail_closed_reason
+
+
+@pytest.mark.usefixtures('configured_roots')
 def test_resolve_reviewer_without_subject_information_matches_empty_subject_fields():
     """AC-02: explicit empty subject inputs do not change the trace."""
     authors = (
