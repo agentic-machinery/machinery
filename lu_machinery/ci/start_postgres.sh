@@ -57,3 +57,52 @@ if [ -z "$expected_dir" ] || [ "$dsn_dir" != "$expected_dir" ]; then
   pg_lsclusters >&2
   exit 1
 fi
+
+# Temporary PR-only acceptance probe for machinery #1144 row 11.
+if [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]; then
+  setup="$(dirname -- "${BASH_SOURCE[0]}")/setup_bubblewrap.sh"
+  canary="$(mktemp -d -- "$RUNNER_TEMP/snapshot-canary.XXXXXXXX")"
+  chmod 0755 "$canary"
+  mkdir -p -- "$canary/present" "$canary/absent" "$canary/unavailable" \
+    "$canary/checkout/.github/workflows" "$canary/checkout/lu_machinery/ci"
+
+  sha256sum "$setup" .github/workflows/pins.txt
+  RUNNER_TEMP="$canary/present" bash -- "$setup" postgresql-16 libpq-dev
+  if compgen -G "$canary/present/apt-snapshot.*" >/dev/null; then
+    echo "::error::The preinstalled package case opened an APT workspace" >&2
+    exit 1
+  fi
+
+  sudo apt-get --yes --no-download remove -- postgresql-16 libpq-dev
+  for extra in postgresql-16 libpq-dev; do
+    status="$(dpkg-query -W -f='${db:Status-Status}' -- "$extra" 2>/dev/null)" || status=
+    [[ "$status" != installed ]]
+  done
+
+  bad_pin=20230302T030400Z
+  cp -- "$setup" "$canary/checkout/lu_machinery/ci/setup_bubblewrap.sh"
+  sed "s/^CI_UBUNTU_SNAPSHOT=.*/CI_UBUNTU_SNAPSHOT=$bad_pin/" \
+    .github/workflows/pins.txt > "$canary/checkout/.github/workflows/pins.txt"
+  if RUNNER_TEMP="$canary/unavailable" bash -- "$canary/checkout/lu_machinery/ci/setup_bubblewrap.sh" \
+    postgresql-16 libpq-dev > "$canary/unavailable.log" 2>&1; then
+    echo "::error::The unavailable snapshot case succeeded" >&2
+    exit 1
+  fi
+  cat "$canary/unavailable.log"
+  grep -Fq "Could not update package indexes from Ubuntu snapshot $bad_pin" "$canary/unavailable.log"
+  for extra in postgresql-16 libpq-dev; do
+    status="$(dpkg-query -W -f='${db:Status-Status}' -- "$extra" 2>/dev/null)" || status=
+    [[ "$status" != installed ]]
+  done
+
+  RUNNER_TEMP="$canary/absent" bash -- "$setup" postgresql-16 libpq-dev
+  for extra in postgresql-16 libpq-dev; do
+    [[ "$(dpkg-query -W -f='${db:Status-Status}' -- "$extra")" == installed ]]
+  done
+  if ! pg_isready -h localhost -p 5432 -q; then
+    sudo pg_ctlcluster 16 main start
+  fi
+  PGPASSWORD=postgres psql "$LEARN_UKRAINIAN_CP_PG_DSN" -v ON_ERROR_STOP=1 -qtAc 'SELECT 1'
+
+  echo 'SNAPSHOT-CANARY PASS: preinstalled packages skipped APT, absent packages installed, unavailable snapshot refused'
+fi
