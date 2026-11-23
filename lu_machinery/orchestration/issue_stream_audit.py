@@ -2009,14 +2009,14 @@ def _is_valid_warning(warning: object) -> bool:
             and _is_positive_int(warning.get("parent"))
         )
     if code == "closed_epic_reopened":
-        return _is_positive_int(warning.get("epic")) and _is_nonempty_str(warning.get("stream"))
+        return _is_positive_int(warning.get("epic")) and isinstance(warning.get("stream"), str)
     if code == "milestone_row_marked":
-        return _is_nonempty_str(warning.get("stream")) and _is_nonempty_str(warning.get("marker"))
+        return isinstance(warning.get("stream"), str) and _is_nonempty_str(warning.get("marker"))
     if code in {"milestone_closed_issue", "milestone_issue_state_unavailable"}:
-        return _is_nonempty_str(warning.get("stream")) and _is_positive_int(warning.get("issue"))
+        return isinstance(warning.get("stream"), str) and _is_positive_int(warning.get("issue"))
     if code == "milestone_confirmed_at_stale":
         return (
-            _is_nonempty_str(warning.get("stream"))
+            isinstance(warning.get("stream"), str)
             and _is_nonempty_str(warning.get("confirmed_at"))
             and _is_nonneg_int(warning.get("age_days"))
             and _is_positive_int(warning.get("max_age_days"))

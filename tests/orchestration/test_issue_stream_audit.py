@@ -2387,6 +2387,20 @@ def test_cache_rejects_future_and_malformed_warnings(tmp_path, monkeypatch):
     assert issue_stream_audit.read_cache() is None
     cache.write_text(json.dumps({**report, 'generated_at': 10300, 'warnings': [{'code': 'traversal_incomplete', 'issue': 1}]}))
     assert issue_stream_audit.read_cache() is not None
+    emitted = issue_stream_audit.milestone_warnings(
+        [{'stream': '', 'marker': 'STALE', 'issue_numbers': {123}, 'confirmed_at': None}],
+        {123: 'CLOSED'},
+    )
+    valid = [
+        {'code': 'truncated_depth', 'depth': 8, 'frontier': [1]},
+        {'code': 'unresolved_subissue', 'issue': 1},
+        {'code': 'cross_repo_subissue', 'repository': 'owner/repo', 'issue': 1, 'parent': 2},
+        {'code': 'closed_epic_reopened', 'stream': 's', 'epic': 1},
+        {'code': 'milestone_issue_state_unavailable', 'stream': '', 'issue': 1},
+        {'code': 'milestone_confirmed_at_stale', 'stream': '', 'confirmed_at': '2026-01-01', 'age_days': 30, 'max_age_days': 14},
+    ]
+    cache.write_text(json.dumps({**report, 'warnings': emitted + valid}))
+    assert issue_stream_audit.read_cache() is not None
 
 
 def test_schedule_refresh_skips_fresh_cache_but_force_and_stale_spawn(tmp_path, monkeypatch):
