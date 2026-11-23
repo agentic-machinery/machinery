@@ -107,6 +107,7 @@ never fine.
    List every task result or lane message awaiting a CTO grant or approval, with its age.
    Never hold work back to save allowance. Each cycle, rank pools by required burn,
    the percent left divided by hours until the reset or an earlier drain deadline.
+   Fill free worker slots from the top operator order's critical path first; when that path is serialized behind one change, put a worker on removing the serialization before starting other work.
    Fill the most urgent pool first with eligible, ready work. Before going quiet, queue long-running
    work under the same conditions on every pool. Name any blocker.
    Report any dispatcher cap that leaves a pool idle to the owning lane as a defect to fix.
