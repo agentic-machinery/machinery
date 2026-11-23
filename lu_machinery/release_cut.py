@@ -35,9 +35,6 @@ from functools import partial
 from pathlib import Path
 from typing import Literal
 
-from packaging.requirements import Requirement
-from packaging.utils import canonicalize_name
-
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
 
@@ -420,6 +417,8 @@ def _manifest_table(container: dict, key: str) -> dict:
 
 def _adopt_cooldown_exemption(text: str, uv: dict) -> str:
     """Keep the lock's command-line exemption in the manifest used by locked installs."""
+    from packaging.utils import canonicalize_name
+
     key = "exclude-newer-package"
     overrides = _manifest_table(uv, key)
     for name, value in overrides.items():
@@ -446,6 +445,9 @@ def _adopt_cooldown_exemption(text: str, uv: dict) -> str:
 
 def adopt_manifest(text: str, release_base: str, version: str) -> tuple[str, str]:
     """Update the release wheel pin and keep its cooldown exemption in the lock inputs."""
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
     manifest = tomllib.loads(text)
     uv = _manifest_table(_manifest_table(manifest, "tool"), "uv")
     source = _manifest_table(uv, "sources").get("lu-machinery")
@@ -1345,10 +1347,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"  .venv/bin/python -I -m lu_machinery.release_cut post-release --x-agent {_X_AGENT_EXAMPLE}\n"
         "  accept/bin/python -I -m lu_machinery.release_cut consumer-collection --python accept/bin/python \\\n"
         "      --product product --product-python product-venv/bin/python --version 0.1.24\n"
+        "  .venv/bin/python -m lu_machinery.release_cut check-changelog\n"
         "Outputs: step lines on stdout; successful cuts keep cut.log, dist, wheelhouse and release evidence;\n"
         "failed or interrupted cuts keep the entire work directory.\n"
-        "Exit codes: 0 released, skipped as unchanged, dry run passed or consumer collection passed; 1 refused\n"
-        "or failed (cut and post-release alert claude-cto); 2 invalid input.\n"
+        "Exit codes: 0 released, skipped as unchanged, dry run passed, consumer collection passed or changelog\n"
+        "check passed; 1 refused or failed (cut and post-release alert claude-cto); 2 invalid input.\n"
         "Related: docs/release.md#cut-a-release.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1374,7 +1377,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                          help="Product environment's interpreter; its site-packages follow the candidate's")
     collect.add_argument("--version", required=True, help="lu-machinery version the candidate must resolve to")
     collect.add_argument("--work", type=Path, help="Empty work directory (default: a new temporary directory)")
+    check_text = "Verify that CHANGELOG.md has an empty Unreleased section (CI Gate)"
+    check_changelog = sub.add_parser("check-changelog", help=check_text, description=check_text)
+    check_changelog.add_argument("--path", type=Path, default=Path("CHANGELOG.md"),
+                                 help="Changelog file to check (default: CHANGELOG.md)")
     args = parser.parse_args(argv)
+    if args.command == "check-changelog":
+        return _check_changelog(args)
     # Runtime admission refuses group- or other-writable Node and agent artifacts, and every path the cut
     # writes (venvs, pip and npm installs, the prepared Node prefix) is made by this process or a child that
     # inherits its umask. Add 022 to the caller's mask for the whole run; a stricter mask is kept.
@@ -1386,6 +1395,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _locked_run(args)
     finally:
         os.umask(previous_umask)
+
+
+def _check_changelog(args: argparse.Namespace) -> int:
+    """Run ``unreleased_must_be_empty`` on one regular changelog file for CI Gate."""
+    path: Path = args.path
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                print(f"check-changelog failed ({path}): not a regular file", file=sys.stderr)
+                return 1
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                text = handle.read()
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        unreleased_must_be_empty(text)
+    except (CutError, OSError, UnicodeError, ValueError) as exc:
+        print(f"check-changelog failed ({path}): {exc}", file=sys.stderr)
+        return 1
+    print(f"CHANGELOG.md check passed: {path} Unreleased section is empty")
+    return 0
 
 
 def _consumer_collection(args: argparse.Namespace) -> int:

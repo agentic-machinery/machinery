@@ -10,7 +10,8 @@
 # upstream evidence are recorded in pins.txt beside this file; bump them
 # together there.
 #
-# - Jobs: Ruff over lu_machinery/ with the lint settings in pyproject.toml; compileall
+# - Jobs: Ruff over lu_machinery/ with the lint settings in pyproject.toml,
+#   plus unbounded JSON reader lint and CHANGELOG.md empty-Unreleased check; compileall
 #   of lu_machinery on the pinned Python and the supported floor; the mypy ratchet (lu_machinery.lint.mypy_ratchet:
 #   new errors fail, the baseline only shrinks); the test-wait lint L4
 #   (lu_machinery.lint.lint_test_waits: a new sleep, timer poll, flaky or rerun
@@ -350,6 +351,9 @@ jobs:
 
       - name: Refuse unbounded JSON readers
         run: python -m lu_machinery.lint.json_readers
+
+      - name: Refuse non-empty CHANGELOG.md Unreleased section
+        run: python -m lu_machinery.release_cut check-changelog
 
   compileall:
     needs: [main-proof]
