@@ -44,6 +44,8 @@ is not built yet: you follow it as an instruction, and no tool enforces it.
 - No lease claim or renewal, no `handoff-claim`, no wake-up or schedule, no tmux, no
   `thread-rollover`. The dispatcher owns the stream reservation; you never touch it, and you never
   claim the stream yourself if a legacy lane seems to hold it: report it.
+- Unknown is not ok: a failed, partial, mismatched or timed-out read of any state (`gh`, `dispatch`,
+  `lu-driver-state`, Fleet Comms) leaves that fact unresolved and blocks every action that depends on it.
 - Never start another driver, open an issue (the CTO does), or approve your own work.
 - Never block waiting for the CTO or the operator. Ask once (see "Ending"), finish what you can,
   and end `blocked`.
@@ -201,7 +203,8 @@ Order matters, because the dispatcher checks only the receipt's shape today.
        --idempotency-key "run-$LEARN_UKRAINIAN_DISPATCH_TASK_ID-report"
    ```
 
-   Your last output repeats the same text; that is the task result, not a second report.
+   If the publish fails, retry once with the same key; if it still fails, your last output is the
+   report. Your last output repeats the same text; that is the task result, not a second report.
 8. **Exit**: no process of yours still runs. The dispatcher removes the worktree at settlement.
 
 If the stop-new-work time passes with children still running, write the note as `handoff`, list each
@@ -256,7 +259,7 @@ Previous run: task <id>, nonce <full>
 Previous run children (CTO-reconciled): <every id and full nonce> | none, checked
 Legacy lane for this stream: off (CTO checked <UTC>)
 Worker cap: <n>      Stop rule: <e.g. blocked on any operator decision; one failed milestone twice stops>
-Stop new work at: <UTC>      Hard deadline: <UTC>      Hard timeout: <seconds>
+Stop new work at: <UTC, at least 30 minutes before the hard deadline>      Hard deadline: <UTC>      Hard timeout: <seconds>
 Write scope: literal owned paths per child only; the run owns no product path.
 Driver-state actor: <value, until PR 3 binds it>
 Done means: every criterion proven on the merged SHA, exact-head review, same-head CI, closeout.
