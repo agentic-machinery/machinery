@@ -1,14 +1,13 @@
-# Scanner pins for the learn-ukrainian/machinery security scans (issue
+# Dependency pins for the learn-ukrainian/machinery CI and security scans (issue
 # #12682, machinery move contract v3 section 5), its pre-publication gate
 # (amendment PUBLIC-1104 item 3), its bootstrap CI Gate (machinery move
 # plan v1 section 4 step 4) and the shared fleet security workflow
-# (fleet-security.yml, machinery #1080). This file is the record. tests.yml
-# reads NODE_VERSION and NPM_VERSION directly. Where they use a pin,
-# fleet-security.yml, ci-gate.yml and prepublication-gate.sh carry the same
-# values and are not read from here.
-# Bump a pin by changing it here, in fleet-security.yml, in ci-gate.yml and,
-# where it carries the pin, in prepublication-gate.sh together, with the new
-# upstream evidence. Never move to an older release to clear a finding.
+# (fleet-security.yml, machinery #1080). This file is the record.
+# tests.yml reads NODE_VERSION and NPM_VERSION directly.
+# lu_machinery/ci/setup_bubblewrap.sh reads CI_UBUNTU_SNAPSHOT directly.
+# When a workflow or script carries a copy of a pin, update it together
+# with this file and record the new upstream evidence.
+# Never move to an older release to clear a finding.
 # Upstream checks below were made on 2026-11-03 (fleet security pins checked 2026-11-21).
 
 # TruffleHog (secret scan)
