@@ -80,7 +80,8 @@ def stream_lane(stream: str) -> str:
 
 def orchestrator_identity(stream: str, *, agent: str, model: str | None = None) -> OrchestratorIdentity:
     """Resolve lane, SESSION_EPIC and registered slot for an orchestrator turn; fail closed if unregistered."""
-    from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, resolve_area_by_epic
+    from lu_machinery.orchestration import handoff_slot_registry
+    from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, load_fleet_taxonomy, resolve_area
     from lu_machinery.orchestration.issue_stream_audit import load_registry
     from lu_machinery.orchestration.launcher_aliases import load_launcher_bindings
     from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_PATH, _load_yaml
@@ -93,22 +94,43 @@ def orchestrator_identity(stream: str, *, agent: str, model: str | None = None) 
     matched_lanes = {lane for mapped_stream, lane in bindings.values() if mapped_stream == stream_key}
     slot_lane = next(iter(matched_lanes)) if len(matched_lanes) == 1 else session_epic
     try:
-        area = resolve_area_by_epic(epic_number)
+        taxonomy = load_fleet_taxonomy()
         assignments = _load_yaml(ASSIGNMENTS_PATH).get("assignments", {})
     except (FleetTaxonomyError, OSError, ValueError, KeyError, TypeError) as exc:
-        raise ValueError(f"orchestrator_stream_unregistered: {stream} has no registered area ({type(exc).__name__})") from None
-    area_spec = assignments.get(area.id) if isinstance(assignments, dict) else None
-    slots = [slot for slot in (area_spec.get("slots") or []) if isinstance(slot, str)] if isinstance(area_spec, dict) else []
-    if not slots:
-        raise ValueError(f"orchestrator_stream_unregistered: {stream} (area {area.id}) has no registered slot")
+        raise ValueError(f"orchestrator_stream_unregistered: {stream} registry unavailable ({type(exc).__name__})") from None
+    resolved_areas: list[str] = []
+    for key in dict.fromkeys((stream_key, slot_lane)):
+        try:
+            resolved_areas.append(resolve_area(key).id)
+        except FleetTaxonomyError:
+            continue
+    epic_area = taxonomy.epic_to_area.get(epic_number)
+    if epic_area is not None:
+        resolved_areas.append(epic_area.id)
+    unique_areas = set(resolved_areas)
+    if len(unique_areas) != 1:
+        detail = "registries disagree on area" if len(unique_areas) > 1 else "has no registered area"
+        raise ValueError(f"orchestrator_stream_unregistered: {stream} {detail}")
+    area_id = next(iter(unique_areas))
+    area_spec = assignments.get(area_id) if isinstance(assignments, dict) else None
+    if not isinstance(area_spec, dict):
+        raise ValueError(f"orchestrator_stream_unregistered: {stream} (area {area_id}) missing from area_assignments.yaml")
+    slots = [slot for slot in (area_spec.get("slots") or []) if isinstance(slot, str)]
+    if not handoff_slot_registry.registry_readable():
+        raise ValueError("orchestrator_slot_unregistered: fleet handoff slot registry is unreadable")
     prefix = _provider_slot_prefix(agent, model)
-    preferred = f"{prefix}-{slot_lane}"
-    if preferred in slots:
-        slot = preferred
+    candidate_slot = f"{prefix}-{slot_lane}"
+    if slots:
+        slot_allowed = candidate_slot in slots and handoff_slot_registry.is_registered_slot(candidate_slot)
     else:
-        suffix = f"-{slot_lane}"
-        slot = next((item for item in slots if item.endswith(suffix)), slots[0])
-    return OrchestratorIdentity(stream=stream, lane=session_epic, session_epic=session_epic, slot=slot)
+        # Empty-roster areas (e.g. monitor) accept <provider>-<area> aliases validated by handoff_slot_registry.
+        slot_allowed = handoff_slot_registry.is_registered_slot(candidate_slot)
+    if not slot_allowed:
+        raise ValueError(
+            f"orchestrator_slot_unregistered: {candidate_slot!r} is not a registered launcher slot "
+            f"for {stream} (area {area_id})"
+        )
+    return OrchestratorIdentity(stream=stream, lane=session_epic, session_epic=session_epic, slot=candidate_slot)
 
 # LU_SENSE_PROOF_DIR is a host path with no secret in the name; pack-verify reads the proofs inside it.
 # LU_FLEET_REPO_SELECTOR_FILE names the host-owned, read-only dual-slug selector; passing its path grants nothing.

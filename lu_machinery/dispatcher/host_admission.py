@@ -130,9 +130,11 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budge
 
 
 def allows(decision, force_reason):
-    """Force may override host checks, except the disk and subscription meter."""
+    """Force may override host checks, except the disk, subscription meter, and fleet orchestrator cap."""
     return decision.exempt or decision.admitted or (
-        force_reason is not None and not (decision.disk_refused or decision.meter_refused)
+        force_reason is not None and not (
+            decision.disk_refused or decision.meter_refused or decision.orchestrator_cap_refused
+        )
     )
 
 
@@ -663,6 +665,10 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     back as that failed, pid-less launch holding this lease (C-6991). Otherwise only the turn's settlement does. ``linkage`` (the parent fields of a task dispatched from inside another run) is in the hold
     before anything spawns.
     """
+    from lu_machinery.orchestration import task_record_store
+
+    if task_record_store._is_dispatcher_sidecar(store.record_path(task_id)):
+        raise ValueError("task_id_refused: task_id ends like a dispatcher sidecar file name")
     if orchestrator is not None and not (isinstance(run_nonce, str) and isinstance(turn_ttl_s, int)):
         raise ValueError("an orchestrator turn's hold needs its run nonce and lease TTL")
     hold = turn_lease = None

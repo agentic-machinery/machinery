@@ -1341,17 +1341,37 @@ def test_live_unknown_or_unreadable_child_blocks_turn_done_keeps_lease_and_recor
     assert "child-corrupt.json" in turn["unreadable_child_records"]
     assert rel == []
 
-    # 4. Terminal child with full nonce: settles done, records full nonce, and releases stream cleanly.
+    # 4. Terminal child still retaining live/unknown processes fails closed (F2); settled terminal child passes.
+    turn, rel = _run_case(
+        lambda t: _write(dict(schema_version=2, task_id="child-lingering", agent="claude", mode="workspace-write",
+                              status="done", run_nonce=full_nonce, parent_task_id=t["task_id"],
+                              parent_run_nonce=t["run_nonce"], parent_stream=STREAM,
+                              launch_mode="scope", pid=_DEAD_PID, process_start="boot:1",
+                              worktree_disposition="retained", worktree_disposition_reason="provider_processes_alive"))
+    )
+    assert turn["status"] == "no_deliverable" and turn["orphaned_child_tasks"] == ["child-lingering"] and rel == []
+    turn, rel = _run_case(
+        lambda t: _write(dict(schema_version=2, task_id="child-liveness-unk", agent="claude", mode="workspace-write",
+                              status="done", run_nonce=full_nonce, parent_task_id=t["task_id"],
+                              parent_run_nonce=t["run_nonce"], parent_stream=STREAM,
+                              launch_mode="scope", pid=_DEAD_PID, process_start="boot:1",
+                              worktree_disposition="retained", worktree_disposition_reason="provider_liveness_unknown"))
+    )
+    assert turn["status"] == "no_deliverable" and turn["unknown_child_tasks"] == ["child-liveness-unk"] and rel == []
+
     turn, rel = _run_case(
         lambda t: _write(dict(schema_version=2, task_id="child-done", agent="claude", mode="workspace-write",
                               status="done", run_nonce=full_nonce, parent_task_id=t["task_id"],
-                              parent_run_nonce=t["run_nonce"], parent_stream=STREAM))
+                              parent_run_nonce=t["run_nonce"], parent_stream=STREAM,
+                              launch_mode="scope", pid=_DEAD_PID, process_start="boot:1",
+                              launch_unit="lu-worker-child-done", worktree_disposition="removed"))
     )
     assert turn["status"] == "done"
     assert turn["child_tasks"] == [{"task_id": "child-done", "run_nonce": full_nonce, "status": "done"}]
     assert len(rel) == 1
 
-    # 5. _agy_follow_up no longer bypasses running children for orchestrator turns.
+    # 5. _agy_follow_up waits on running children for orchestrator turns, and settlement maps its child deadline
+    # to no_deliverable / orchestrator_orphaned_children while genuine provider failures stay failed (F8).
     _write(dict(schema_version=2, task_id="child-agy-live", agent="claude", mode="workspace-write",
                 status="running", run_nonce=full_nonce, parent_task_id=turn["task_id"],
                 parent_run_nonce=turn["run_nonce"], parent_stream=STREAM))
@@ -1361,6 +1381,13 @@ def test_live_unknown_or_unreadable_child_blocks_turn_done_keeps_lease_and_recor
                                          resumes=0, checkpoint=lambda: None)
     assert conv is None and parsed.incomplete is True
     assert parsed.error == "agy_child_still_running: child-agy-live"
+    agy_expired = {**turn, "status": "failed", "error": parsed.error, "provider_terminal_failure": False}
+    worker._enforce_delivery(agy_expired)
+    assert agy_expired["status"] == "no_deliverable"
+    assert agy_expired["no_deliverable_reason"].startswith("orchestrator_orphaned_children:")
+    genuine_fail = {**turn, "status": "failed", "error": "provider exited unsuccessfully", "provider_terminal_failure": True}
+    worker._enforce_delivery(genuine_fail)
+    assert genuine_fail["status"] == "failed"
 
 
 def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_store, tmp_path, monkeypatch):
@@ -1371,6 +1398,8 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
         "note-wrong-kind": _fresh_note("note-wrong-kind", kind="task"),
         "note-wrong-lane": _fresh_note("note-wrong-lane", lane="atlas"),
         "note-dropped": _fresh_note("note-dropped", status="dropped"),
+        "note-completed": _fresh_note("note-completed", status="done"),
+        "note-bad-alias": _fresh_note("note-bad-alias", alias=["not-a-string"]),
         "note-old": _fresh_note("note-old", created_utc=past),
         "note-done": _fresh_note("note-done"),
         "note-blocked": _fresh_note("note-blocked"),
@@ -1387,10 +1416,21 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
         ("note-wrong-kind", "orchestrator_handoff_note_wrong_kind"),
         ("note-wrong-lane", "orchestrator_handoff_note_wrong_lane"),
         ("note-dropped", "orchestrator_handoff_note_invalid"),
+        ("note-completed", "orchestrator_handoff_note_invalid"),
+        ("note-bad-alias", "orchestrator_handoff_note_invalid"),
         ("note-old", "orchestrator_handoff_note_reused"),
     ):
         with pytest.raises(ValueError, match=expected_code):
             store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, bad_ref, outcome="done")
+
+    # Unreadable archived history fails closed instead of swallowing errors (F3).
+    archive_dir = task_store / "archive"
+    archive_dir.mkdir(exist_ok=True)
+    bad_archive = archive_dir / "corrupt-prior.json"
+    bad_archive.write_text("{", encoding="utf-8")
+    with pytest.raises(ValueError, match="orchestrator_handoff_note_unverified"):
+        store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="done")
+    bad_archive.unlink()
 
     with pytest.raises(ValueError, match="--outcome"):
         store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, "note-done", outcome="bogus")
@@ -1464,6 +1504,26 @@ def test_orchestrator_turn_exports_unique_inbox_worker_registered_slot_and_sessi
     assert env_core["SESSION_HANDOFF_AGENT"] == "gemini-core"
     assert env_core["SESSION_EPIC"] == "curriculum-upgrade"
 
+    # Registered overflow epic resolves via its stream area even when omitted from taxonomy epic_to_area (F6).
+    overflow_stream = f"epic:{_STREAMS['epics'][-1]}"
+    spec_overflow = TaskSpec(
+        "turn-overflow", "claude", "claude-sonnet-5-5", "high", "workspace-write",
+        tmp_path, tmp_path / "p", tmp_path / "r",
+        options={"orchestrator_stream": overflow_stream, "orchestrator_run_nonce": "nonce-overflow"},
+    )
+    env_overflow = environment.child_env(spec_overflow)
+    assert env_overflow["SESSION_HANDOFF_AGENT"] == "claude-epics"
+    assert env_overflow["SESSION_EPIC"] == "epics"
+
+    # Provider without a registered slot on this stream refuses instead of falling back to another seat (F7).
+    spec_wrong_slot = TaskSpec(
+        "turn-agy-practice", "agy", "gemini-4-neon-high", "high", "workspace-write",
+        tmp_path, tmp_path / "p", tmp_path / "r",
+        options={"orchestrator_stream": STREAM, "orchestrator_run_nonce": "nonce-wrong-slot"},
+    )
+    with pytest.raises(ValueError, match="orchestrator_slot_unregistered"):
+        environment.child_env(spec_wrong_slot)
+
     # Ordinary worker exports none of the orchestrator identity vars.
     plain = TaskSpec("worker-1", "claude", "claude-sonnet-5-5", "high", "workspace-write",
                      tmp_path, tmp_path / "p", tmp_path / "r")
@@ -1498,18 +1558,23 @@ def test_bounded_wait_with_keepalive_survives_silence_timeout(task_store, tmp_pa
     argv = [
         sys.executable, "-c",
         "from lu_machinery.dispatcher import cli; raise SystemExit(cli.main("
-        "['wait', 'child-slow', '--run-nonce', 'nonce-slow', '--timeout', '1.4', "
+        "['wait', 'child-slow', '--run-nonce', 'nonce-slow', '--timeout', '2.0', "
         "'--poll-interval', '0.1', '--keepalive-interval', '0.25']))",
     ]
     env = {**os.environ, "LU_TASKS_DIR": str(task_store)}
     with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
         proc = subprocess.Popen(argv, stdout=out, stderr=err, env=env)
-        inv = Invocation(argv=argv, stdin=None, env=env, final_file=None)
-        watchdog.communicate(
-            proc, inv, stdout_path, stderr_path,
-            hard_timeout=10.0, silence_timeout=0.7, initial_response_timeout=0.7,
-            liveness=lambda: (), output_sizes=(0, 0),
-        )
+        try:
+            inv = Invocation(argv=argv, stdin=None, env=env, final_file=None)
+            watchdog.communicate(
+                proc, inv, stdout_path, stderr_path,
+                hard_timeout=15.0, silence_timeout=1.0, initial_response_timeout=1.5,
+                liveness=lambda: (), output_sizes=(0, 0),
+            )
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
     assert proc.returncode == 124
     assert "wait keepalive: child-slow status=running" in stderr_path.read_text(encoding="utf-8")
     payload = json.loads(stdout_path.read_text(encoding="utf-8"))
@@ -1535,10 +1600,20 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
         _write(_orchestrator_record(f"turn-cap-{idx}", pid=live_pid, process_start=live_ident,
                                     orchestrator={"stream": stream}))
     refused = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
-    assert not refused.admitted
+    assert not refused.admitted and refused.orchestrator_cap_refused is True
+    assert not host_admission.allows(refused, force_reason="operator override")  # F9: hard cap
     assert any("live orchestrator turns 2/2 reached the cap" in f for f in refused.failures), refused.failures
     monkeypatch.setenv("DISPATCH_MAX_LIVE_ORCHESTRATORS", "3")
     assert host_admission.evaluate("workspace-write", sweep=False, orchestrator=True).admitted
+
+    # Sidecar-shaped child task IDs are refused before publishing any hold (F1).
+    ro_decision = host_admission.evaluate("read-only", sweep=False)
+    with (
+        pytest.raises(ValueError, match="task_id_refused"),
+        host_admission.reserve("child.write-boundary", "read-only", ro_decision, agent="claude",
+                               disk_guard=lambda: False),
+    ):
+        pass
 
     # Per-turn child cap: 4 non-refused children block the 5th (even read-only / --force-admission);
     # refused attempts (never_started_reason) do not consume the cap.
@@ -1611,6 +1686,37 @@ def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp
     fallback_timeout = _run_with_sigterm("turn-rmax-fallback", None, scope_runtime_max_s=1)
     assert fallback_timeout["status"] == "timeout"
     assert fallback_timeout["kill_reason"] == "scope_runtime_max_timeout"
+
+    # Late RuntimeMaxSec SIGTERM after provider watchdog already set status=timeout still records scope cause (F10).
+    from lu_machinery.dispatcher.watchdog import DeadlineExpired
+
+    real_begin_settlement = store.begin_settlement
+
+    def raise_watchdog_timeout(*_args, **_kwargs):
+        raise DeadlineExpired(["codex"], "stdout_silence_timeout", 60.0)
+
+    def settle_with_late_sigterm(record_arg):
+        real_begin_settlement(record_arg)
+        _signal.raise_signal(_signal.SIGTERM)
+
+    monkeypatch.setattr(worker.headroom, "check_runtime", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker, "communicate", raise_watchdog_timeout)
+    monkeypatch.setattr(store, "begin_settlement", settle_with_late_sigterm)
+    monkeypatch.setattr(dispatch_isolation, "scope_stop_result", lambda _unit: "timeout")
+    spec = worker.TaskSpec(
+        "turn-rmax-late", "codex", "echo", None, "read-only", work,
+        work / "turn-rmax-late.prompt", task_store / "turn-rmax-late.result",
+    )
+    spec.prompt_file.write_bytes(b"prompt")
+    rec = store.new_record(spec, {"key": "public", "github": "example/public"}, "main",
+                           "a" * 40, {"research_owned_path": []})
+    rec["prompt_file"] = str(task_store / "turn-rmax-late.prompt")
+    rec.update(launch_mode="scope", launch_unit="lu-worker-turn-rmax-late-abcd1234", scope_runtime_max_s=1200)
+    path = store.create(rec, b"prompt")
+    worker.supervise(path, {}, 60)
+    late = json.loads(path.read_text(encoding="utf-8"))
+    assert late["status"] == "timeout" and late["kill_reason"] == "scope_runtime_max_timeout"
+    assert "RuntimeMaxSec" in late["error"]
 
 
 def _release(box, task_id):

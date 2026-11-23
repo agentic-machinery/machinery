@@ -673,10 +673,25 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
     assert by_task["turn-terminal"]["reason"] == "terminal_turn:done"
     assert by_task["turn-overdue"]["reason"] == "overdue_turn_lease_expired"
 
-    # Routing sends exactly one deduplicated alert per held turn lease to claude-cto across cycles.
+    # Routing sends exactly one deduplicated alert per held turn lease to claude-cto across cycles,
+    # even when the lease transitions from active to expired between scans (F5).
+    streams_cycle2 = [
+        stream_row("epic:11151", "turn-terminal", terminal_nonce, state="expired", expires_delta=-300, gen=2),
+        stream_row("epic:11152", "turn-overdue", overdue_nonce, state="expired", expires_delta=-420, gen=4),
+        stream_row("epic:11153", "turn-healthy", healthy_nonce, state="active", expires_delta=2700, gen=1),
+        stream_row("epic:11154", "turn-released", released_nonce, state="released", expires_delta=1500, gen=1),
+    ]
+    report2 = mod.scan(
+        host.tasks,
+        {SLUG: host.tmp_path},
+        repos=REPOS,
+        now=NOW + timedelta(minutes=5),
+        adapter_factory=lambda path: mod.GitHubAdapter(path, runner=host.gh),
+        stream_fetcher=lambda: streams_cycle2,
+    )
     with AuthorityService(root=host.tmp_path / "fleet") as service:
         cycle1 = mod.route(report, cycle=1, service=service)
-        cycle2 = mod.route(report, cycle=2, service=service)
+        cycle2 = mod.route(report2, cycle=2, service=service)
         assert len(cycle1) == 2
         assert cycle2 == cycle1
         for mid in cycle1:

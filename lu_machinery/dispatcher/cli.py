@@ -601,8 +601,12 @@ def _dispatch(args) -> int:
             raise ValueError("--print-advisory-binding requires --task-id and a non-stdin prompt")
         print(checks.advisory_binding(args, prompt)[2])
         return 0
+    from lu_machinery.orchestration import task_record_store
+
     task_id = args.task_id or uuid.uuid4().hex
     path = store.record_path(task_id)
+    if task_record_store._is_dispatcher_sidecar(path):
+        raise ValueError("task_id_refused: --task-id ends like a dispatcher sidecar file name")
     if store.read(task_id, missing_ok=True) is not None:
         raise ValueError("task id already exists; choose a new task id")
     with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):

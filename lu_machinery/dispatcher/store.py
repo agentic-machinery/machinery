@@ -644,21 +644,78 @@ def _driver_state_cli() -> str | None:
 
 
 def _handoff_ref_reuse_refusal(record: dict, stream: str, refs: set[str]) -> str | None:
-    """Return a refusal when another turn on ``stream`` already referenced any ref in ``refs`` or store is unreadable."""
+    """Return a refusal when another turn on ``stream`` already referenced any ref in ``refs`` or history is unreadable."""
+    from lu_machinery.orchestration.task_record_store import (
+        _DISPATCHER_SIDECAR_SUFFIXES,
+        ARCHIVE_DIR_NAME,
+        TaskIdentityMismatch,
+        is_identical_copy,
+        parse_task_record,
+        read_task_record_bytes,
+        task_archive_lock,
+    )
+
     own_task = record.get("task_id")
     own_nonce = record.get("run_nonce")
     try:
-        others = list_tasks(include_archive=True, strict=False)
+        root = tasks_dir()
     except (OSError, ValueError):
+        return "orchestrator_handoff_note_unverified: cannot resolve task store for handoff_note reuse"
+
+    def scan_directory(directory: Path, *, required: bool) -> list[Path]:
+        try:
+            with os.scandir(directory) as entries:
+                names = []
+                for entry in entries:
+                    if not entry.name.endswith(".json") or entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES):
+                        continue
+                    if entry.is_file():
+                        names.append(entry.name)
+                names.sort()
+                return [directory / name for name in names]
+        except FileNotFoundError:
+            if required:
+                raise
+            return []
+
+    try:
+        with task_archive_lock(root):
+            candidates = scan_directory(root, required=True)
+            archive_dir = root / ARCHIVE_DIR_NAME
+            candidates.extend(scan_directory(archive_dir, required=False))
+            relocated: set[Path] = set()
+            for listed in candidates:
+                if listed in relocated:
+                    continue
+                try:
+                    path, raw = read_task_record_bytes(listed, tasks_dir=root)
+                    if path != listed:
+                        relocated.add(path)
+                    other = parse_task_record(path, raw)
+                except TaskIdentityMismatch as exc:
+                    if is_identical_copy(exc):
+                        continue
+                    return f"orchestrator_handoff_note_unverified: unreadable task record {listed.name}"
+                except (OSError, ValueError, RecursionError):
+                    return f"orchestrator_handoff_note_unverified: unreadable task record {listed.name}"
+                if not isinstance(other, dict) or not isinstance(other.get("task_id"), str):
+                    return f"orchestrator_handoff_note_unverified: unreadable task record {listed.name}"
+                if other.get("task_id") == own_task and other.get("run_nonce") == own_nonce:
+                    continue
+                receipt = other.get(HANDOFF_RECEIPT_KEY)
+                if receipt is None:
+                    continue
+                if not isinstance(receipt, dict):
+                    return f"orchestrator_handoff_note_unverified: malformed handoff receipt on {other['task_id']}"
+                if receipt.get("stream") != stream:
+                    continue
+                other_ref = receipt.get("handoff_ref")
+                if not isinstance(other_ref, str):
+                    return f"orchestrator_handoff_note_unverified: malformed handoff_ref on {other['task_id']}"
+                if other_ref in refs:
+                    return "orchestrator_handoff_note_reused: handoff_note is already referenced by another turn on this stream"
+    except OSError:
         return "orchestrator_handoff_note_unverified: cannot inspect task records for handoff_note reuse"
-    for other in others:
-        if other.get("task_id") == own_task and other.get("run_nonce") == own_nonce:
-            continue
-        receipt = other.get(HANDOFF_RECEIPT_KEY)
-        if not isinstance(receipt, dict):
-            continue
-        if receipt.get("stream") == stream and receipt.get("handoff_ref") in refs:
-            return "orchestrator_handoff_note_reused: handoff_note is already referenced by another turn on this stream"
     return None
 
 
@@ -696,12 +753,17 @@ def verify_handoff_note(record: dict, stream: str, handoff_ref: str) -> str | No
         return "orchestrator_handoff_note_invalid: lu-driver-state show did not return a note object"
     note_id = note.get("id")
     note_alias = note.get("alias")
-    if not isinstance(note_id, str) or not note_id or handoff_ref not in {note_id, note_alias}:
+    if note_alias is not None and not isinstance(note_alias, str):
+        return "orchestrator_handoff_note_invalid: note alias must be a string or null"
+    valid_refs = {note_id} if isinstance(note_id, str) and note_id else set()
+    if isinstance(note_alias, str) and note_alias:
+        valid_refs.add(note_alias)
+    if not isinstance(note_id, str) or not note_id or handoff_ref not in valid_refs:
         return "orchestrator_handoff_note_invalid: note identity does not match handoff_ref"
     if note.get("kind") != "handoff_note":
         return f"orchestrator_handoff_note_wrong_kind: expected kind handoff_note, got {note.get('kind')!r}"
     status = note.get("status")
-    if not isinstance(status, str) or not status or status == "dropped":
+    if not isinstance(status, str) or not status or status in ("done", "dropped"):
         return f"orchestrator_handoff_note_invalid: handoff_note status {status!r} is not active"
     if note.get("lane") != expected_lane:
         return f"orchestrator_handoff_note_wrong_lane: expected lane {expected_lane!r}, got {note.get('lane')!r}"

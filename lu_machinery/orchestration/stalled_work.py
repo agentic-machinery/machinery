@@ -535,7 +535,15 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
         turn_lease_rows,
         key=lambda r: (str(r.get("stream_id")), str(r.get("lease_id")), str(r.get("generation")), str(r.get("task_id"))),
     ):
-        payload = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        identity = {
+            "kind": "held_turn_lease",
+            "stream_id": row.get("stream_id"),
+            "lease_id": row.get("lease_id"),
+            "generation": row.get("generation"),
+            "task_id": row.get("task_id"),
+            "run_nonce": row.get("run_nonce"),
+        }
+        payload = json.dumps(identity, sort_keys=True, separators=(",", ":"))
         stream_key = str(row.get("stream_id") or "unknown")
         lease_key = str(row.get("lease_id") or row.get("task_id") or hashlib.sha256(payload.encode()).hexdigest()[:16])
         gen_key = str(row["generation"]) if row.get("generation") is not None else "unknown"
@@ -544,7 +552,7 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
             sender="claude-cto",
             recipient="claude-cto",
             body=(
-                f"Held dispatch-turn lease on {stream_key} ({row.get('reason')}). "
+                f"Held dispatch-turn lease on {stream_key} (lease_id={lease_key}, generation={gen_key}). "
                 f"{_TURN_LEASE_RECOVERY_ADVICE}\n{payload}"
             ),
             correlation_id=f"held-turn-lease:{stream_key}:{lease_key}:{gen_key}",
