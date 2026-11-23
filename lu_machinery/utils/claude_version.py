@@ -7,9 +7,9 @@ versions reject the flag as an unknown option, so we version-gate it.
 
 This module is the **single source of truth** for "which Claude Code CLI
 supports which feature." All callers pass their own ``cmd_prefix`` (e.g.
-``CLAUDE_CMD`` for the bridge, ``["claude"]`` for direct invocations,
-``[_get_claude_bin()]`` for pipeline dispatch) and the result is cached
-per-prefix so every binary gets probed exactly once per process.
+``["claude"]`` for direct invocations, ``[_get_claude_bin()]`` for pipeline
+dispatch) and the result is cached per-prefix so every binary gets probed
+exactly once per process.
 
 Thread-safe (bridge + dispatch can race from different threads) but
 process-local (separate processes probe independently once each, which
@@ -53,14 +53,10 @@ from collections.abc import Sequence
 _MIN_VERSION: tuple[int, int, int] = (2, 1, 98)
 
 # Per-prefix cache. Keyed by ``tuple(cmd_prefix)`` so, e.g.,
-# ``("claude",)`` and ``("npx", "@anthropic-ai/claude-code@latest")`` remain
+# ``("claude",)`` and ``("/usr/local/bin/claude",)`` remain
 # independent entries — one may be 2.1.98, the other may not.
 _CACHE: dict[tuple[str, ...], bool] = {}
 _CACHE_LOCK = threading.Lock()
-
-# The npx fallback prefix the bridge and the Claude adapter run when no native
-# binary is installed.
-CLAUDE_NPX_PREFIX: tuple[str, str] = ("npx", "@anthropic-ai/claude-code@latest")
 
 
 def run_version_probe(
@@ -71,26 +67,15 @@ def run_version_probe(
     env: dict[str, str] | None = None,
     stdin: int | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
-    """Run ``<program> --version`` for a one-word prefix or the Claude npx prefix.
+    """Run ``<program> --version`` for a one-word executable prefix.
 
-    Each argv is a literal, so the headless-spawn rule (#9750) can see that only
-    the fixed ``--version`` flag reaches the CLI. Any other prefix shape is not
+    The argv uses a literal ``--version`` flag, so the headless-spawn rule (#9750)
+    can see that only ``--version`` reaches the CLI. Any other prefix shape is not
     probed: the return is ``None``. Spawn errors propagate to the caller.
     """
     if len(cmd_prefix) == 1:
         return subprocess.run(
             [cmd_prefix[0], "--version"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=cwd,
-            env=env,
-            stdin=stdin,
-            check=False,
-        )
-    if tuple(cmd_prefix) == CLAUDE_NPX_PREFIX:
-        return subprocess.run(
-            ["npx", "@anthropic-ai/claude-code@latest", "--version"],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -165,7 +150,6 @@ def supports_exclude_dynamic_system_prompt_sections(
     Args:
         cmd_prefix: The exact argv prefix to probe. Examples:
             ``["claude"]``
-            ``["npx", "@anthropic-ai/claude-code@latest"]``
             ``["/Users/foo/.local/bin/claude"]``
             A bare string ``"claude"`` is ALSO accepted and treated as a
             single-element list (defensive — ``Sequence[str]`` would

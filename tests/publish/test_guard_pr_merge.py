@@ -664,8 +664,9 @@ def test_disable_auto_is_not_a_merge(monkeypatch):
     )
 
 
-def test_draft_is_blocked(monkeypatch):
+def test_draft_is_blocked(monkeypatch, capsys):
     assert _run(monkeypatch, _pinned_merge(), meta={"isDraft": True, "baseRefName": "main", "url": _URL}) == 2
+    assert "`.venv/bin/python -m lu_machinery.publish pr-ready --number <N>`" in capsys.readouterr().err
 
 
 def test_red_non_advisory_check_is_blocked(monkeypatch):
@@ -711,7 +712,7 @@ def test_pending_publisher_merge_is_blocked(monkeypatch):
 
 def test_raw_auto_merge_is_refused(monkeypatch, capsys):
     assert _run(monkeypatch, "gh pr merge 5 --auto --squash") == 2
-    assert "publish pr-disarm" in capsys.readouterr().err
+    assert "`.venv/bin/python -m lu_machinery.publish pr-disarm --number <N>`" in capsys.readouterr().err
 
 
 def test_unknown_pr_fails_closed(monkeypatch):
