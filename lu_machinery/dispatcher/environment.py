@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
+from lu_machinery.common.git_credentials import SELECTOR_ENV
 from lu_machinery.common.repo_root import (
     INTERPRETER_ENV,
     PRIMARY_ROOT_ENV,
@@ -34,7 +35,8 @@ def task_scratch_path(task_id: str) -> Path:
     return TASK_SCRATCH_BASE / task_id
 
 # LU_SENSE_PROOF_DIR is a host path with no secret in the name; pack-verify reads the proofs inside it.
-_CONTEXT = ("PATH", "HOME", "LANG", "TERM", "TMPDIR", "LU_SENSE_PROOF_DIR")
+# LU_FLEET_REPO_SELECTOR_FILE names the host-owned, read-only dual-slug selector; passing its path grants nothing.
+_CONTEXT = ("PATH", "HOME", "LANG", "TERM", "TMPDIR", "LU_SENSE_PROOF_DIR", SELECTOR_ENV)
 _AUTH = {
     "codex": ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME"),
     "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY", "CLAUDE_CONFIG_DIR"),
