@@ -1563,6 +1563,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     open_prs_response: dict[str, object] = {"returncode": 0, "stdout": "[]", "stderr": ""}
     open_prs_hook: list[object] = []
     pr_view_override: list[object] = []
+    ls_tree_override: list[object] = []
     push_commands: list[list[str]] = []
     race_callback: list[object] = []
     ls_remote_callback: list[object] = []
@@ -1587,6 +1588,9 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
                 check=True, capture_output=True, text=True, timeout=30,
             ).stdout.strip()
             return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head_oid}), "")
+        if command[:2] == ["git", "-C"] and "ls-tree" in command and ls_tree_override:
+            override = ls_tree_override.pop(0)
+            return override(command)
         if command[:2] == ["git", "-C"] and "ls-remote" in command:
             if ls_remote_callback:
                 cb = ls_remote_callback.pop(0)
@@ -1817,7 +1821,8 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
         cut.post_release(section)
     assert push_commands == []
 
-    # 6d. Single commit omitting the tracked uv.lock version bump is refused as incomplete bookkeeping.
+    # 6d. Single commit omitting the tracked uv.lock version bump is refused as incomplete bookkeeping,
+    # and a failing parent-tree ls-tree lookup (exit 128) is refused rather than treated as lockfile absence.
     _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
     for name in release_cut.VERSION_FILES:
         path = helper / name
@@ -1833,8 +1838,12 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*did not update uv\.lock"):
         cut.post_release(section)
     assert push_commands == []
+    ls_tree_override.append(lambda cmd: (_ for _ in ()).throw(CutError("git -C ls-tree exited 128: fatal: bad object")))
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*could not inspect uv\.lock"):
+        cut.post_release(section)
+    assert push_commands == []
 
-    # 6e. Single commit adding a comment to uv.lock (semantically equal TOML, non-bookkeeping text edit) is refused.
+    # 6e. Single commit adding a comment or changing LF to CRLF in uv.lock is refused via raw blob byte replay.
     _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
     for name in release_cut.VERSION_FILES:
         path = helper / name
@@ -1850,6 +1859,16 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     )
     _raw_git(helper, "add", "CHANGELOG.md", *release_cut.VERSION_FILES, "uv.lock")
     _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", bookkeeping_msg)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*non-bookkeeping changes in uv\.lock"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    (helper / "uv.lock").write_bytes(
+        b'version = 1\r\n\r\n[[package]]\r\nname = "lu-machinery"\r\nversion = "0.1.63"\r\n',
+    )
+    _raw_git(helper, "add", "uv.lock")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--amend", "--no-edit")
     _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
     with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*non-bookkeeping changes in uv\.lock"):
         cut.post_release(section)
@@ -1913,3 +1932,17 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*failed package\.json replay"):
         cut.post_release(section)
     assert push_commands == []
+
+    # 6j. Deeply nested JSON/TOML payloads (RecursionError at depth limit) translate into typed CutError refusals.
+    deep_json = "[" * 513 + "]" * 513
+    with pytest.raises(CutError, match=r"package\.json: invalid JSON"):
+        release_cut.bump_version_file("package.json", deep_json, "0.1.62", "0.1.63")
+    deep_toml = "a = " + "[" * 1500 + "]" * 1500 + "\n"
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED: cannot parse uv\.lock"):
+        release_cut._verify_uv_lock_version_bump(deep_toml, deep_toml, old="0.1.62", new="0.1.63")
+    open_prs_hook.append(lambda cmd: subprocess.CompletedProcess(cmd, 0, deep_json, ""))
+    with pytest.raises(CutError, match=r"POST_RELEASE_PR_STATE_UNKNOWN: malformed open PR list"):
+        cut._refuse_open_post_release_pr(branch)
+    pr_view_override.append(lambda cmd: subprocess.CompletedProcess(cmd, 0, deep_json, ""))
+    with pytest.raises(CutError, match=r"POST_RELEASE_PR_STATE_UNKNOWN: malformed PR view response"):
+        cut._verify_created_post_release_pr_head(1277, expected_oid=first_oid, branch=branch)

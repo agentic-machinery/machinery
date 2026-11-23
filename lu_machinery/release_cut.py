@@ -92,7 +92,7 @@ def _verify_uv_lock_version_bump(parent_text: str, remote_text: str, *, old: str
     try:
         parent_doc = tomllib.loads(parent_text)
         remote_doc = tomllib.loads(remote_text)
-    except (tomllib.TOMLDecodeError, ValueError) as exc:
+    except (tomllib.TOMLDecodeError, ValueError, RecursionError) as exc:
         raise CutError(f"POST_RELEASE_BRANCH_REFUSED: cannot parse uv.lock on remote post-release branch ({exc})") from exc
     packages = parent_doc.get("package")
     if not isinstance(packages, list):
@@ -411,7 +411,7 @@ def bump_version_file(name: str, text: str, old: str, new: str) -> str:
         return line.sub(f'version = "{new}"', text, count=1)
     try:
         data = json_depth.loads(text, max_depth=512)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise CutError(f"{name}: invalid JSON ({exc})") from exc
     if not isinstance(data, dict):
         raise CutError(f"{name}: expected JSON object")
@@ -1405,7 +1405,7 @@ class Cut:
             )
         try:
             rows = json_depth.loads(listed.stdout, max_depth=512)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise CutError(f"POST_RELEASE_PR_STATE_UNKNOWN: malformed open PR list for {branch}") from exc
         if not isinstance(rows, list) or any(
             not isinstance(row, dict) or type(row.get("number")) is not int for row in rows
@@ -1435,7 +1435,7 @@ class Cut:
             )
         try:
             payload = json_depth.loads(viewed.stdout, max_depth=512)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise CutError(
                 f"POST_RELEASE_PR_STATE_UNKNOWN: malformed PR view response for #{number}"
             ) from exc
@@ -1449,6 +1449,30 @@ class Cut:
                 f"POST_RELEASE_BRANCH_REFUSED: post-release PR #{number} for {branch} resolved to "
                 f"{head_oid[:12]}, expected verified commit {expected_oid[:12]}"
             )
+
+    def _git_blob_text(self, clone: Path, spec: str, *, branch: str, fetched_oid: str) -> str:
+        """Read exact UTF-8 text of a Git blob from raw bytes without newline normalization."""
+        command = ["git", "-C", str(clone), "cat-file", "blob", spec]
+        try:
+            # Fixed git read verb with verified commit OID and allowlisted path; no shell runs.
+            result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+                command, cwd=self.work, env=self.env(), capture_output=True, text=False, timeout=120, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: could not read {spec} on {branch} ({fetched_oid[:12]}): {exc}"
+            ) from exc
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip().splitlines()[-1:] or ["no output"]
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: could not read {spec} on {branch} ({fetched_oid[:12]}): {detail[0]}"
+            )
+        try:
+            return result.stdout.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: non-UTF-8 blob {spec} on {branch} ({fetched_oid[:12]}): {exc}"
+            ) from exc
 
     def _inspect_existing_post_release_branch(
         self, clone: Path, *, branch: str, title: str, upcoming: str,
@@ -1475,14 +1499,30 @@ class Cut:
                 f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has "
                 f"{len(ahead)} commit(s) ahead of main; expected only 1 generated bookkeeping commit"
             )
-        parents = self.git(clone, "rev-list", "--parents", "-n", "1", fetched_oid).split()[1:]
+        try:
+            parents = self.git(clone, "rev-list", "--parents", "-n", "1", fetched_oid).split()[1:]
+        except (CutError, OSError, subprocess.SubprocessError, UnicodeError) as exc:
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: could not read parents of {branch} ({fetched_oid[:12]}): {exc}"
+            ) from exc
         if len(parents) != 1:
             raise CutError(
                 f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has "
                 f"{len(parents)} parent(s); refusing merge or root commit"
             )
         remote_parent = parents[0]
-        msg_lines = self.run(["git", "-C", clone, "log", "-1", "--format=%B", fetched_oid]).stdout.rstrip("\n").split("\n")
+        try:
+            raw_msg = self.run(["git", "-C", clone, "log", "-1", "--format=%B", fetched_oid], timeout=120).stdout
+            raw_diff = self.run(
+                ["git", "-C", clone, "diff-tree", "--no-commit-id", "-r", "--raw", "--no-renames", "-z",
+                 remote_parent, fetched_oid],
+                timeout=120,
+            ).stdout
+        except (CutError, OSError, subprocess.SubprocessError, UnicodeError) as exc:
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: could not read commit details for {branch} ({fetched_oid[:12]}): {exc}"
+            ) from exc
+        msg_lines = raw_msg.rstrip("\n").split("\n")
         if (
             len(msg_lines) != 4
             or msg_lines[0] != title
@@ -1495,10 +1535,6 @@ class Cut:
                 f"does not match the generated bookkeeping commit for {self.version} -> {upcoming}"
             )
         remote_x_agent = msg_lines[2].removeprefix("X-Agent: ")
-        raw_diff = self.run(
-            ["git", "-C", clone, "diff-tree", "--no-commit-id", "-r", "--raw", "--no-renames", "-z",
-             remote_parent, fetched_oid],
-        ).stdout
         tokens = raw_diff.split("\0")
         if tokens and tokens[-1] == "":
             tokens.pop()
@@ -1537,11 +1573,11 @@ class Cut:
                 raise CutError(
                     f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) did not update {name}"
                 )
+            parent_text = self._git_blob_text(clone, f"{remote_parent}:{name}", branch=branch, fetched_oid=fetched_oid)
+            remote_text = self._git_blob_text(clone, f"{fetched_oid}:{name}", branch=branch, fetched_oid=fetched_oid)
             try:
-                parent_text = self.run(["git", "-C", clone, "show", f"{remote_parent}:{name}"]).stdout
-                remote_text = self.run(["git", "-C", clone, "show", f"{fetched_oid}:{name}"]).stdout
                 expected_text = bump_version_file(name, parent_text, self.version, upcoming)
-            except (CutError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as exc:
+            except (CutError, ValueError, KeyError, TypeError, RecursionError) as exc:
                 raise CutError(
                     f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) failed {name} replay: {exc}"
                 ) from exc
@@ -1550,13 +1586,8 @@ class Cut:
                     f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has non-bookkeeping changes in {name}"
                 )
         if "CHANGELOG.md" in changed_paths:
-            try:
-                parent_cl = self.run(["git", "-C", clone, "show", f"{remote_parent}:CHANGELOG.md"]).stdout
-                remote_cl = self.run(["git", "-C", clone, "show", f"{fetched_oid}:CHANGELOG.md"]).stdout
-            except (CutError, OSError, subprocess.SubprocessError) as exc:
-                raise CutError(
-                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) lacks CHANGELOG.md: {exc}"
-                ) from exc
+            parent_cl = self._git_blob_text(clone, f"{remote_parent}:CHANGELOG.md", branch=branch, fetched_oid=fetched_oid)
+            remote_cl = self._git_blob_text(clone, f"{fetched_oid}:CHANGELOG.md", branch=branch, fetched_oid=fetched_oid)
             yanked_suffix = r" \[YANKED\]" if yanked else ""
             heading_re = re.compile(
                 rf'^<a id="v{re.escape(self.version)}"></a>\n'
@@ -1590,36 +1621,33 @@ class Cut:
                     f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has non-bookkeeping changes in CHANGELOG.md"
                 )
         else:
-            try:
-                parent_cl = self.run(["git", "-C", clone, "show", f"{remote_parent}:CHANGELOG.md"]).stdout
-            except (CutError, OSError, subprocess.SubprocessError) as exc:
-                raise CutError(
-                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) lacks CHANGELOG.md: {exc}"
-                ) from exc
+            parent_cl = self._git_blob_text(clone, f"{remote_parent}:CHANGELOG.md", branch=branch, fetched_oid=fetched_oid)
             if f"\n## [{self.version}]" not in parent_cl:
                 raise CutError(
                     f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) did not update CHANGELOG.md"
                 )
         try:
-            parent_has_uv_lock = (
-                self.run(["git", "-C", clone, "cat-file", "-e", f"{remote_parent}:uv.lock"], check=False).returncode == 0
-            )
+            lock_listing = self.run(
+                ["git", "-C", clone, "ls-tree", "-z", "--name-only", remote_parent, "--", "uv.lock"],
+                timeout=120,
+            ).stdout
         except (CutError, OSError, subprocess.SubprocessError, UnicodeError) as exc:
             raise CutError(
                 f"POST_RELEASE_BRANCH_REFUSED: could not inspect uv.lock on {branch} ({fetched_oid[:12]}): {exc}"
             ) from exc
+        lock_entries = [entry for entry in lock_listing.split("\0") if entry]
+        if lock_entries not in ([], ["uv.lock"]):
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: unexpected ls-tree output for uv.lock on {branch} ({fetched_oid[:12]})"
+            )
+        parent_has_uv_lock = lock_entries == ["uv.lock"]
         if parent_has_uv_lock:
             if "uv.lock" not in changed_paths:
                 raise CutError(
                     f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) did not update uv.lock"
                 )
-            try:
-                parent_lock = self.run(["git", "-C", clone, "show", f"{remote_parent}:uv.lock"]).stdout
-                remote_lock = self.run(["git", "-C", clone, "show", f"{fetched_oid}:uv.lock"]).stdout
-            except (CutError, OSError, subprocess.SubprocessError) as exc:
-                raise CutError(
-                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) lacks uv.lock: {exc}"
-                ) from exc
+            parent_lock = self._git_blob_text(clone, f"{remote_parent}:uv.lock", branch=branch, fetched_oid=fetched_oid)
+            remote_lock = self._git_blob_text(clone, f"{fetched_oid}:uv.lock", branch=branch, fetched_oid=fetched_oid)
             _verify_uv_lock_version_bump(parent_lock, remote_lock, old=self.version, new=upcoming)
         elif "uv.lock" in changed_paths:
             raise CutError(
