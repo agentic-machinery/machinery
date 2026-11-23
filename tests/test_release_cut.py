@@ -441,10 +441,14 @@ def test_created_commit_message_declares_x_agent_and_x_verified(tmp_path, monkey
     original_run = cut.run
 
     def run(argv, **kwargs):
-        if "push" in [str(part) for part in argv]:
+        command = [str(part) for part in argv]
+        if "push" in command:
             assert kwargs.get("env") is None
             assert cut.env()["GH_TOKEN"] == "fixture-gh"
             return subprocess.CompletedProcess([], 0, "", "")
+        if command[:3] == ["gh", "pr", "view"]:
+            head_oid = original_run(["git", "-C", machinery, "rev-parse", "HEAD"]).stdout.strip()
+            return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head_oid}), "")
         return original_run(argv, **kwargs)
 
     cut.run = run
@@ -1039,9 +1043,17 @@ def test_release_prs_pass_configured_milestones_and_dry_run_reports_them(tmp_pat
         product_milestone="Machinery simplification (product side)",
     )
     original_run = cut.run
-    cut.run = lambda argv, **kwargs: (
-        subprocess.CompletedProcess([], 0, "", "") if "push" in [str(part) for part in argv] else original_run(argv, **kwargs)
-    )
+
+    def milestone_run(argv, **kwargs):
+        command = [str(part) for part in argv]
+        if "push" in command:
+            return subprocess.CompletedProcess([], 0, "", "")
+        if command[:3] == ["gh", "pr", "view"]:
+            head_oid = original_run(["git", "-C", machinery, "rev-parse", "HEAD"]).stdout.strip()
+            return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head_oid}), "")
+        return original_run(argv, **kwargs)
+
+    cut.run = milestone_run
     published_calls: list[tuple[str, ...]] = []
 
     def fake_publisher(*args: str) -> str:
@@ -1268,6 +1280,9 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         command = [str(part) for part in argv]
         if command[:2] == ["git", "-C"] and "push" in command:
             return subprocess.CompletedProcess(command, 0, "", "")
+        if command[:3] == ["gh", "pr", "view"]:
+            head_oid = original_run(["git", "-C", machinery, "rev-parse", "HEAD"]).stdout.strip()
+            return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head_oid}), "")
         if command[:2] == ["gh", "release"]:
             published = Path(command[command.index("-D") + 1])
             published.mkdir()
@@ -1546,21 +1561,41 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     )
 
     open_prs_response: dict[str, object] = {"returncode": 0, "stdout": "[]", "stderr": ""}
+    open_prs_hook: list[object] = []
+    pr_view_override: list[object] = []
     push_commands: list[list[str]] = []
     race_callback: list[object] = []
+    ls_remote_callback: list[object] = []
     original_run = cut.run
 
     def run(argv, **kwargs):
         command = [str(part) for part in argv]
         if command[:3] == ["gh", "pr", "list"]:
+            if open_prs_hook:
+                hook = open_prs_hook.pop(0)
+                return hook(command)
             return subprocess.CompletedProcess(
                 command, int(open_prs_response["returncode"]),
                 str(open_prs_response["stdout"]), str(open_prs_response["stderr"]),
             )
+        if command[:3] == ["gh", "pr", "view"]:
+            if pr_view_override:
+                override = pr_view_override.pop(0)
+                return override(command)
+            head_oid = subprocess.run(
+                [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"],
+                check=True, capture_output=True, text=True, timeout=30,
+            ).stdout.strip()
+            return subprocess.CompletedProcess(command, 0, json.dumps({"headRefOid": head_oid}), "")
+        if command[:2] == ["git", "-C"] and "ls-remote" in command:
+            if ls_remote_callback:
+                cb = ls_remote_callback.pop(0)
+                cb()
+            return original_run(argv, **kwargs)
         if command[:2] == ["git", "-C"] and "push" in command:
             push_commands.append(command)
             if race_callback:
-                cb = race_callback.pop()
+                cb = race_callback.pop(0)
                 cb()
             # Use the real git binary for local tmp_path bare-repo pushes so the worker PATH shim does not intercept fixtures.
             return original_run([git_module.GIT_BINARY, *command[1:]], **kwargs)
@@ -1570,6 +1605,21 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     section = "### Fixed\n\n- Release fix ([#1270](https://github.com/learn-ukrainian/machinery/pull/1270))\n"
     branch = "release/start-0.1.63"
 
+    def _raw_git(repo: Path, *args: str) -> None:
+        subprocess.run([git_module.GIT_BINARY, "-C", str(repo), *args], check=True, capture_output=True, text=True, timeout=30)
+
+    # 0. Absent-branch push uses a create-only lease: refuses if the branch appears at main after the absence check.
+    def create_branch_at_main_mid_flight() -> None:
+        _raw_git(bare, "branch", branch, "main")
+
+    race_callback.append(create_branch_at_main_mid_flight)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*create-only push"):
+        cut.post_release(section)
+    assert len(push_commands) == 1
+    assert f"--force-with-lease=refs/heads/{branch}:" in push_commands[0]
+    _raw_git(bare, "branch", "-D", branch)
+    push_commands.clear()
+
     # 1. Initial cut pushes release/start-0.1.63 to the remote, then fails at pr-create (0.1.62 14:49Z scenario).
     def failing_publisher(*_args: str) -> str:
         raise CutError("OPSEC: invalid publisher arguments")
@@ -1578,21 +1628,72 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     with pytest.raises(CutError, match="OPSEC: invalid publisher arguments"):
         cut.post_release(section)
     first_oid = subprocess.run(
-        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     assert len(push_commands) == 1
 
     # 2. Resuming with no open PR and unchanged main reuses the identical bookkeeping commit without pushing.
     push_commands.clear()
-    cut.publisher = lambda *_args: f"https://github.com/{REPO}/pull/1277\n"
+    publisher_calls: list[tuple[str, ...]] = []
+
+    def tracking_publisher(*args: str) -> str:
+        publisher_calls.append(args)
+        return f"https://github.com/{REPO}/pull/1277\n"
+
+    cut.publisher = tracking_publisher
     assert cut.post_release(section) == 1277
     assert push_commands == []
+    assert len(publisher_calls) == 1
     reused_oid = subprocess.run(
-        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     assert reused_oid == first_oid
 
-    # 3. Refuse when an open PR already exists or when gh pr list fails (fail closed before pushing).
+    # 2b. Reuse path rechecks open PRs and remote tip before pr-create, refusing if a commit or PR appeared.
+    helper = tmp_path / "helper"
+    subprocess.run([git_module.GIT_BINARY, "clone", "--quiet", str(bare), str(helper)], check=True, capture_output=True, text=True, timeout=30)
+    _raw_git(helper, "config", "user.name", "Release Cut")
+    _raw_git(helper, "config", "user.email", "release-cut@example.invalid")
+
+    publisher_calls.clear()
+    # Second gh pr list (pre-reuse recheck) returns an open PR that appeared after initial inspection.
+    open_prs_hook.extend([
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, "[]", ""),
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, json.dumps([{"number": 1280}]), ""),
+    ])
+    with pytest.raises(CutError, match=r"POST_RELEASE_PR_EXISTS.*#1280"):
+        cut.post_release(section)
+    assert publisher_calls == []
+
+    # Second ls-remote (pre-reuse tip check) observes a second commit pushed after inspection.
+    def push_second_commit_before_reuse() -> None:
+        _raw_git(helper, "fetch", "--quiet", "origin", branch)
+        _raw_git(helper, "switch", "--quiet", "-C", branch, f"origin/{branch}")
+        (helper / "raced.txt").write_text("late commit\n", encoding="utf-8")
+        _raw_git(helper, "add", "raced.txt")
+        _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "wip: late commit")
+        _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "origin", branch)
+
+    ls_remote_callback.extend([lambda: None, push_second_commit_before_reuse])
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*moved from"):
+        cut.post_release(section)
+    assert publisher_calls == []
+    # Reset bare branch back to first_oid for remaining checks.
+    _raw_git(bare, "update-ref", f"refs/heads/{branch}", first_oid)
+
+    # 2c. Created PR head verification refuses head mismatch or unreadable gh pr view.
+    pr_view_override.append(
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, json.dumps({"headRefOid": "f" * 40}), "")
+    )
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*expected verified commit"):
+        cut.post_release(section)
+    pr_view_override.append(
+        lambda cmd: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 120))
+    )
+    with pytest.raises(CutError, match=r"POST_RELEASE_PR_STATE_UNKNOWN.*could not verify head"):
+        cut.post_release(section)
+
+    # 3. Refuse when an open PR already exists or when gh pr list fails or times out (fail closed before pushing).
     open_prs_response.update(returncode=0, stdout=json.dumps([{"number": 1277}]), stderr="")
     with pytest.raises(CutError, match=r"POST_RELEASE_PR_EXISTS.*#1277"):
         cut.post_release(section)
@@ -1604,8 +1705,21 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     assert push_commands == []
     open_prs_response.update(returncode=0, stdout="[]", stderr="")
 
-    # 3b. Different valid X-Agent trailer on an otherwise identical bookkeeping commit updates via --force-with-lease.
+    open_prs_hook.append(lambda cmd: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd, 120)))
+    with pytest.raises(CutError, match="POST_RELEASE_PR_STATE_UNKNOWN"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    # 3b. Different valid X-Agent trailer rechecks open PRs immediately before update push, then updates via lease.
     cut.x_agent = "codex/gpt-6.2-sol"
+    open_prs_hook.extend([
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, "[]", ""),
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, json.dumps([{"number": 1281}]), ""),
+    ])
+    with pytest.raises(CutError, match=r"POST_RELEASE_PR_EXISTS.*#1281"):
+        cut.post_release(section)
+    assert push_commands == []
+
     assert cut.post_release(section) == 1277
     assert len(push_commands) == 1
     assert f"--force-with-lease=refs/heads/{branch}:{first_oid}" in push_commands[0]
@@ -1615,15 +1729,9 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     cut.x_agent = "claude/claude-opus-5-5"
     push_commands.clear()
 
-    def _raw_git(repo: Path, *args: str) -> None:
-        subprocess.run([git_module.GIT_BINARY, "-C", str(repo), *args], check=True, capture_output=True, text=True, timeout=30)
-
     # 4. When main advances, resuming verifies the existing remote bookkeeping commit and updates it with
     # --force-with-lease (never bare --force).
-    helper = tmp_path / "helper"
-    subprocess.run([git_module.GIT_BINARY, "clone", "--quiet", str(bare), str(helper)], check=True, capture_output=True, text=True, timeout=30)
-    _raw_git(helper, "config", "user.name", "Release Cut")
-    _raw_git(helper, "config", "user.email", "release-cut@example.invalid")
+    _raw_git(helper, "switch", "--quiet", "main")
     (helper / "README.md").write_text("unrelated main advance\n", encoding="utf-8")
     _raw_git(helper, "add", "README.md")
     _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "docs: advance main")
@@ -1663,7 +1771,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
         _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "origin", branch)
 
     race_callback.append(simulate_concurrent_push)
-    with pytest.raises(CutError, match="exited 1"):
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*changed before update"):
         cut.post_release(section)
     raced_oid = subprocess.run(
         [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
@@ -1709,7 +1817,24 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
         cut.post_release(section)
     assert push_commands == []
 
-    # 6d. Single commit with valid version bumps and changelog, but hand-edited uv.lock content.
+    # 6d. Single commit omitting the tracked uv.lock version bump is refused as incomplete bookkeeping.
+    _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
+    for name in release_cut.VERSION_FILES:
+        path = helper / name
+        path.write_text(release_cut.bump_version_file(name, path.read_text(encoding="utf-8"), "0.1.62", "0.1.63"), encoding="utf-8")
+    (helper / "CHANGELOG.md").write_text(
+        record_changelog((helper / "CHANGELOG.md").read_text(encoding="utf-8"), version="0.1.62", previous="0.1.61",
+                         date="2026-11-23", notes=section, repo=REPO, since="0.1.61"),
+        encoding="utf-8",
+    )
+    _raw_git(helper, "add", "CHANGELOG.md", *release_cut.VERSION_FILES)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", bookkeeping_msg)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*did not update uv\.lock"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    # 6e. Single commit adding a comment to uv.lock (semantically equal TOML, non-bookkeeping text edit) is refused.
     _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
     for name in release_cut.VERSION_FILES:
         path = helper / name
@@ -1720,7 +1845,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
         encoding="utf-8",
     )
     (helper / "uv.lock").write_text(
-        'version = 1\n\n[[package]]\nname = "lu-machinery"\nversion = "0.1.63"\n\n[[package]]\nname = "extra"\nversion = "1.0.0"\n',
+        'version = 1\n# hand comment\n\n[[package]]\nname = "lu-machinery"\nversion = "0.1.63"\n',
         encoding="utf-8",
     )
     _raw_git(helper, "add", "CHANGELOG.md", *release_cut.VERSION_FILES, "uv.lock")
@@ -1730,7 +1855,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
         cut.post_release(section)
     assert push_commands == []
 
-    # 6e. Single commit modifying an unexpected file.
+    # 6f. Single commit modifying an unexpected file.
     _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
     (helper / "README.md").write_text("tampered\n", encoding="utf-8")
     _raw_git(helper, "add", "README.md")
@@ -1740,7 +1865,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
         cut.post_release(section)
     assert push_commands == []
 
-    # 6f. Single commit with a non-bookkeeping commit message.
+    # 6g. Single commit with a non-bookkeeping commit message.
     _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
     (helper / "pyproject.toml").write_text('[project]\nname = "lu-machinery"\nversion = "0.1.63"\n', encoding="utf-8")
     _raw_git(helper, "add", "pyproject.toml")
@@ -1750,9 +1875,41 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
         cut.post_release(section)
     assert push_commands == []
 
-    # 6g. Branch already pointing at main (0 commits ahead).
+    # 6h. Branch already pointing at main (0 commits ahead).
     _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
     _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
     with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*0 commit\(s\) ahead"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    # 6i. Malformed array-shaped parent package.json fails closed with CutError (never TypeError).
+    with pytest.raises(CutError, match=r"package\.json: expected JSON object"):
+        release_cut.bump_version_file("package.json", "[]\n", "0.1.62", "0.1.63")
+    _raw_git(helper, "switch", "--quiet", "main")
+    good_pkg_json = (helper / "package.json").read_text(encoding="utf-8")
+    (helper / "package.json").write_text("[]\n", encoding="utf-8")
+    _raw_git(helper, "add", "package.json")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "fixture: array package.json")
+    bad_parent_oid = subprocess.run(
+        [git_module.GIT_BINARY, "-C", str(helper), "rev-parse", "HEAD"], check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip()
+    _raw_git(helper, "switch", "--quiet", "-C", branch, bad_parent_oid)
+    for name in ("pyproject.toml", "package-lock.json"):
+        path = helper / name
+        path.write_text(release_cut.bump_version_file(name, path.read_text(encoding="utf-8"), "0.1.62", "0.1.63"), encoding="utf-8")
+    (helper / "package.json").write_text(json.dumps({"name": "lu-machinery-acp", "version": "0.1.63"}, indent=2) + "\n", encoding="utf-8")
+    _raw_git(helper, "add", *release_cut.VERSION_FILES)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", bookkeeping_msg)
+    bad_branch_oid = subprocess.run(
+        [git_module.GIT_BINARY, "-C", str(helper), "rev-parse", "HEAD"], check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip()
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    _raw_git(helper, "switch", "--quiet", "main")
+    (helper / "package.json").write_text(good_pkg_json, encoding="utf-8")
+    _raw_git(helper, "add", "package.json")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "fixture: restore valid package.json")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "origin", "main")
+    assert bad_branch_oid != bad_parent_oid
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*failed package\.json replay"):
         cut.post_release(section)
     assert push_commands == []

@@ -449,17 +449,21 @@ ends with the `--x-agent` trailer.
 
 `post-release` opens the post-release PR for the newest tag on `main`. It
 keeps a changelog section that already exists, which covers a release cut by
-hand. If a previous failed cut already pushed `release/start-<next>` without
-opening a PR, `post-release` checks that no open PR exists for that branch and
-that the remote branch holds only the single generated bookkeeping commit; if
-so, it reuses the branch directly (when unchanged on current `main`) or updates
-it with `--force-with-lease`. It refuses with a typed error
-(`POST_RELEASE_PR_EXISTS`, `POST_RELEASE_PR_STATE_UNKNOWN`, or
-`POST_RELEASE_BRANCH_REFUSED`) if an open PR exists, PR state is unreadable, or
-the branch holds anything else. When resuming `post-release` after a cut whose
-adopt PR has not yet been installed on the host, run it with the failed cut's
-preserved clean-install interpreter (the command printed in the cleanup notice,
-which also carries `LU_PYTHON` for custom host interpreters) or from the
+hand. When `release/start-<next>` is absent, `post-release` pushes with a
+create-only `--force-with-lease` so it cannot fast-forward an unexpectedly
+created branch. If a previous failed cut already pushed `release/start-<next>`
+without opening a PR, `post-release` checks that no open PR exists for that
+branch and that the remote branch holds only the single complete generated
+bookkeeping commit (including exact `uv.lock` replay when tracked); if so, it
+rechecks PR state and the remote tip before reusing the branch directly (when
+unchanged on current `main`) or updating it with `--force-with-lease`, and
+verifies the created PR's `headRefOid` matches the verified commit. It refuses
+with a typed error (`POST_RELEASE_PR_EXISTS`, `POST_RELEASE_PR_STATE_UNKNOWN`,
+or `POST_RELEASE_BRANCH_REFUSED`) if an open PR exists, PR state is unreadable,
+or the branch holds anything else. When resuming `post-release` after a cut
+whose adopt PR has not yet been installed on the host, run it with the failed
+cut's preserved clean-install interpreter (the command printed in the cleanup
+notice, which also carries `LU_PYTHON` for custom host interpreters) or from the
 machinery checkout so `pr-create` uses the released publisher:
 
 ```bash
