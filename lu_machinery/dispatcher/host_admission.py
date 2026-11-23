@@ -677,4 +677,3 @@ def _discard_unused_hold(task_id, run_nonce):
             if tree_absent:
                 path.unlink(missing_ok=True)
     return unclaimed
-
