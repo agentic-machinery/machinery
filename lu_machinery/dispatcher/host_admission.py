@@ -404,7 +404,10 @@ def turn_tree_refusal(tree) -> str | None:
     """
     from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
 
-    name = Path(os.path.realpath(tree)).name
+    try:
+        name = Path(os.path.realpath(tree)).name
+    except (OSError, ValueError):  # a spelling the filesystem cannot resolve names no tree it can vouch for
+        return "orchestrator_turn_writer_refused: the tree's real path cannot be resolved"
     if name.startswith(TURN_TASK_PREFIX):
         return f"orchestrator_turn_writer_refused: {name:.128} is an orchestrator turn's tree, which no other task writes"
     try:
