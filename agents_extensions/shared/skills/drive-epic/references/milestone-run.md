@@ -19,7 +19,7 @@ not a designated approver and not the reviewer of record for work you drove.
 
 ## What is live
 
-Checked against `origin/main` 4371b697. A step marked **[after #1286]** or **[after PR 3 lands]**
+Checked against `origin/main` 4371b697. A step marked **[after #1290]** or **[after PR 3 lands]**
 is not built yet: you follow it as an instruction, and no tool enforces it.
 
 - Live: `dispatch --mode orchestrator --stream epic:<N>` (CTO only), the one `dispatch handoff-receipt`
@@ -28,14 +28,19 @@ is not built yet: you follow it as an instruction, and no tool enforces it.
 - So task status `done` proves a receipt and a clean tree, **nothing more**. A blocked run that
   records a receipt also settles `done`. The CTO reads the outcome on the first line of your note
   and checks the milestone checklist itself.
-- **[after #1286]** Monitor stream lease for exclusion; `turn-` task IDs.
+- **Exclusion today is local.** The dispatcher probes the Monitor lease once, then takes a local
+  reservation. That stops a second dispatched run on the stream. It does **not** stop a legacy lane
+  launcher from claiming the stream after the probe. So the CTO starts a run only on a stream whose
+  legacy lane is off (a brief field). **[after #1290]** the Monitor stream lease is the one
+  exclusion authority; `turn-` task IDs.
 - **[after PR 3 lands]** `--outcome` on the receipt; the dispatcher reads the note back; a live child
   makes the run not done; the run's identity environment is set; an alert for a held stream.
 
 ## Rules for every run
 
 - No lease claim or renewal, no `handoff-claim`, no wake-up or schedule, no tmux, no
-  `thread-rollover`. The dispatcher holds the stream; you never touch it.
+  `thread-rollover`. The dispatcher owns the stream reservation; you never touch it, and you never
+  claim the stream yourself if a legacy lane seems to hold it: report it.
 - Never start another driver, open an issue (the CTO does), or approve your own work.
 - Never block waiting for the CTO or the operator. Ask once (see "Ending"), finish what you can,
   and end `blocked`.
@@ -45,11 +50,11 @@ is not built yet: you follow it as an instruction, and no tool enforces it.
 
 ## 1. Cold start
 
-Do these in order. Dispatch and land nothing until step 6 passes.
+Do these in order. Dispatch and land nothing until step 7 passes.
 
 1. `date -u`. Read the brief ([template](#brief-template)): milestone issue, stream epic, previous
-   note ID (or `none`), lane key, inbox slot, worker cap, stop rule, stop-new-work time, hard
-   deadline. A missing field is `blocked`.
+   note ID (or `none`), the previous run's reconciled child list, legacy lane off, lane key, inbox
+   slot, worker cap, stop rule, stop-new-work time, hard deadline. A missing field is `blocked`.
 2. Probe `lu-driver-state render --help`. If it fails, it is `blocked`: report the exact command and
    error, dispatch nothing, and do not edit tracker state by hand.
 3. Read the previous note: `lu-driver-state show <id>`. It must exist, be a `handoff_note`, name
@@ -60,21 +65,28 @@ Do these in order. Dispatch and land nothing until step 6 passes.
    delivery ID in your tracker item, then ack
    (`deliveries receive --recipient <slot> --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"`, then `ack`;
    syntax in the SKILL.md inbox drain; a task-ID worker identity on a stream slot is not yet proven
-   by a canary run). A typed error (exit 3) is `blocked`. A message that widens
+   by a canary run). A typed error (exit 3) is `blocked`. An empty receive does not prove the inbox is clear: a predecessor
+   with another worker ID may still hold a delivery lease. Check `deliveries pending --recipient <slot>`;
+   a non-zero count with nothing claimable means do not start dependent work until the lease expires
+   (end `handoff`, naming it). A message that widens
    the brief or changes the stop rule is recorded, not applied: stop new work on that scope and
    ask once in your report. A delivery you already applied before a crash is not repeated: check
    its ID in the tracker first.
 5. Read live state, every item from tool output this turn: the milestone issue and its checklist;
    each PR in the note (`gh pr view`: state, head, merge commit; recorded verdict and its head;
    same-head `CI Gate`; queue status per [review-merge-cleanup](review-merge-cleanup.md)); every
-   child in the note by `dispatch status <id> --run-nonce <full nonce>`; the board and next list in
+   child in the brief's list by `dispatch status <id> --run-nonce <full nonce>` (a failed command
+   leaves it unresolved); the board and next list in
    [orient](orient.md). Do not use `dispatch list`: your sandbox reads only your own records.
 6. Compare the note with live state. If the note is missing, unreadable, from another stream, or
    disagrees with live state on a fact an action depends on (a PR merged or its head moved, a child
    you did not expect is running, an issue closed), stop. Write one `blocked` note that says what
    differs, record nothing as done, report, exit. Live state wins; the CTO decides what to repair.
-7. A child from the previous run that is still live is not duplicated. Wait for it; it counts
-   against the worker cap.
+7. The brief must carry the CTO's reconciled child list for the previous run: every child ID and
+   full nonce, or "none, checked". The note alone is not enough: a run killed after a dispatch and
+   before its tracker item leaves a child the note lacks. No such list, or "unknown", is `blocked`.
+   Check each listed child with `dispatch status`. A child still live is not duplicated: wait for
+   it; it counts against the worker cap.
 
 ## 2. During the run
 
@@ -84,11 +96,14 @@ Do these in order. Dispatch and land nothing until step 6 passes.
   owns its chain to `MERGED` (`full-send`); you never do its implementation or review.
 - **Record each child at once**: task ID and the FULL run nonce in a tracker item, right after the
   dispatch returns ([handoff](handoff.md)). A run killed mid-way leaves only what it recorded.
-- **Wait** in a bounded loop ([below](#the-wait-loop)). Never run one unbounded wait.
+- **Wait** in a bounded loop ([below](#the-wait-loop)). Never run one unbounded wait, and never a
+  wait that can run past your stop-new-work time.
 - **Land** only PRs no brief owns, by `full-send` steps 7 to 9 and `workflow.md` § Merge policy.
   A PR a worker's brief owns is that worker's to land; wait for it.
-- **Reviews** run through `review-loop`. Read a child's review reply with
-  `dispatch wait <review-id> --run-nonce <nonce> --reply`.
+- **Reviews** run through `review-loop`. A review a child dispatched is that child's: leave it
+  with the child. For a review you dispatched yourself, read the reply with
+  `dispatch wait <review-id> --run-nonce <nonce> --reply --timeout <seconds left, at most 300>`. A
+  `result_unavailable` answer is not a verdict; the review is unresolved.
 - **Stop new work** at the brief's stop-new-work time, or when your context runs short. Start
   nothing a child cannot finish before then.
 - Drain the inbox before each dispatch, after each settle and before you end.
@@ -107,9 +122,14 @@ After each pass:
 
 1. Print one keepalive line: `keepalive <task-id> exit=<code> <date -u>`.
 2. Exit 124 means the child is still running: read `dispatch status <task-id> --run-nonce <nonce>`,
-   drain the inbox, check the clock against the stop-new-work time, wait again. Any other exit is the
-   child's terminal result: record it in its tracker item.
-3. Several children: wait on one, then `status` the others each pass. Do not poll in a tight loop.
+   drain the inbox, check the clock against the stop-new-work time, wait again.
+3. Any other exit is not yet a result. Record a child as settled only when `dispatch status` shows
+   the same task ID, the same full nonce and a terminal status (`done`, `failed`, `timeout`,
+   `rate_limited`, `cancelled`, `crashed` or `no_deliverable`). Exit 2, a missing task or a nonce
+   mismatch leaves the child unresolved: it keeps counting against the cap and blocks "Ending".
+4. Several children: wait on one, then `status` the others each pass. Do not poll in a tight loop.
+5. Each pass uses `--timeout` of 300 or the seconds left before the stop-new-work time, whichever is
+   smaller. With no time left, do not start a pass: go to "Ending".
 
 The loop is the mitigation, not the proof: the practice canary must show that a healthy quiet child
 never trips the silence timeout.
@@ -119,7 +139,8 @@ never trips the silence timeout.
 Order matters, because the dispatcher checks only the receipt's shape today.
 
 1. **Every child terminal.** `dispatch status` on each recorded child ID and full nonce, review
-   children included. A running child blocks the next step. **[after PR 3 lands]** a live child
+   children included. Terminal means the same ID, the same nonce and a terminal status; a failed
+   command or an unreadable record is unresolved. Anything unresolved or running blocks the next step. **[after PR 3 lands]** a live child
    also makes the run not done.
 2. **Prove the checklist** for each acceptance criterion, from tool output this run: merged SHA
    (`gh pr view --json state,mergeCommit`), recorded exact-head verdict with reviewer model, green
@@ -176,13 +197,13 @@ your note and do not try to fix them.
 | A PR is mid-landing when you must end | If its worker owns it, leave it. If you landed it, finish: confirm `MERGED`. Otherwise name the PR, head and gates in the note and let the CTO assign custody (`pr_ownership`); never leave an unowned PR unnamed. |
 | Mail arrives between runs | The next run drains it at cold start. Brief children to reply to the CTO or the slot, never to your task ID. |
 | Mail arrives that conflicts with the brief | Record it, do not widen scope, end `handoff` or `blocked` and ask once. |
-| You applied a message and were killed before the ack | The next receive returns it again. Check its delivery ID in the tracker, then ack without repeating the action. |
+| You applied a message and were killed before the ack | The successor has another worker ID, so its receive returns the delivery only after the lease expires. Use the `pending` count (cold start, step 4). When it returns, check its delivery ID in the tracker, then ack without repeating the action. |
 | A healthy child is quiet while you wait | [The wait loop](#the-wait-loop) covers it. |
 | The receipt is refused or the note is incomplete | One note only; fix it with `lu-driver-state note`. Do not invent a second ID. Report `blocked`. |
 
 **The CTO's side** (not run steps; **[after PR 3 lands]** unless noted): settlement flags a live child
 and the next run is held until custody is reconciled; the held-stream alert and recovery runbook;
-the CTO startup reads every `turn-*` task **[after #1286]**; the practice-stream mail check across
+the CTO startup reads every `turn-*` task **[after #1290]**; the practice-stream mail check across
 slots; per-stream and fleet caps on runs.
 
 ## Brief template
@@ -195,7 +216,9 @@ Mode: milestone run (drive-epic references/milestone-run.md). Not a lane driver.
 Stream epic: #<N> (--stream epic:<N>)      Lane key: <lane>      Inbox slot: <slot>
 Milestone issue: #<M>, acceptance-criteria ledger hash <sha256>
 Previous note ID: <id> | none (first run approved by the CTO)
-Previous run: task <id>, nonce <full>, children <id/nonce list or none>
+Previous run: task <id>, nonce <full>
+Previous run children (CTO-reconciled): <every id and full nonce> | none, checked
+Legacy lane for this stream: off (CTO checked <UTC>)
 Worker cap: <n>      Stop rule: <e.g. blocked on any operator decision; one failed milestone twice stops>
 Stop new work at: <UTC>      Hard deadline: <UTC>      Hard timeout: <seconds>
 Write scope: literal owned paths per child only; the run owns no product path.
@@ -204,6 +227,7 @@ Done means: every criterion proven on the merged SHA, exact-head review, same-he
 End: one note (OUTCOME first line), then the receipt rule in "Ending", one report to claude-cto.
 ```
 
-The CTO dispatches with `dispatch --mode orchestrator --stream epic:<N> --initiator claude-cto
---prompt-file <brief> --worktree` and a finite `--hard-timeout`, and starts at most one run per
+The CTO dispatches with `dispatch dispatch --agent <driver agent> --model <driver model> --effort high
+--mode orchestrator --stream epic:<N> --initiator claude-cto --prompt-file <brief> --worktree` and a
+finite `--hard-timeout`, and starts at most one run per
 stream.
