@@ -514,13 +514,85 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
     return next(iter(canonical)) if canonical else scoped_repository
 
 
-def _crosses_mount_boundary(resolved: Path) -> bool:
-    """Whether *resolved* or any ancestor below ``/`` crosses a mount boundary, or mount data is unavailable."""
+_FDINFO_DIR = Path("/proc/self/fdinfo")
+_MOUNTINFO_INT_RE = re.compile(r"^[0-9]+$")
+_MOUNTINFO_DEV_RE = re.compile(r"^[0-9]+:[0-9]+$")
+_MOUNTINFO_PATH_RE = re.compile(r"^/(?:[^\\\x00]|\\[0-7]{3})*$")
+
+
+def _read_mount_table() -> dict[int, str] | None:
+    """Strictly parse ``/proc/self/mountinfo`` into ``{mount_id: mount_point}``, or ``None`` on any error."""
     from lu_machinery.common import task_scratch
 
-    mounts = task_scratch.mount_points()
-    if mounts is None or "/" not in mounts:
+    try:
+        raw = task_scratch._MOUNTINFO_PATH.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text or not text.endswith("\n"):
+        return None
+    table: dict[int, str] = {}
+    for line in text[:-1].split("\n"):
+        if not line or "\r" in line:
+            return None
+        fields = line.split(" ")
+        try:
+            sep = fields.index("-")
+        except ValueError:
+            return None
+        if sep < 6 or len(fields) != sep + 4:
+            return None
+        mount_id_s, parent_id_s, dev_s, root_s, mount_point_s, mount_opts = fields[:6]
+        if (
+            not _MOUNTINFO_INT_RE.fullmatch(mount_id_s)
+            or not _MOUNTINFO_INT_RE.fullmatch(parent_id_s)
+            or not _MOUNTINFO_DEV_RE.fullmatch(dev_s)
+            or not _MOUNTINFO_PATH_RE.fullmatch(root_s)
+            or not _MOUNTINFO_PATH_RE.fullmatch(mount_point_s)
+            or not mount_opts
+            or any(not opt for opt in fields[6:sep])
+            or any(not tail for tail in fields[sep + 1 :])
+        ):
+            return None
+        mount_id = int(mount_id_s)
+        if mount_id in table:
+            return None
+        table[mount_id] = task_scratch._unescape_mountinfo(mount_point_s)
+    return table if "/" in table.values() else None
+
+
+def _read_fd_mount_id(fd: int) -> int | None:
+    """Strictly read the single ``mnt_id`` from ``/proc/self/fdinfo/<fd>``, or ``None`` on any error."""
+    try:
+        raw = (_FDINFO_DIR / str(fd)).read_bytes()
+        text = raw.decode("ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text or not text.endswith("\n"):
+        return None
+    mount_ids: list[int] = []
+    for line in text[:-1].split("\n"):
+        if not line or "\r" in line:
+            return None
+        key, sep, value = line.partition(":")
+        if not sep or not key.strip():
+            return None
+        if key.strip().lower() == "mnt_id":
+            if key != "mnt_id":
+                return None
+            stripped = value.strip(" \t")
+            if not _MOUNTINFO_INT_RE.fullmatch(stripped):
+                return None
+            mount_ids.append(int(stripped))
+    return mount_ids[0] if len(mount_ids) == 1 else None
+
+
+def _crosses_mount_boundary(resolved: Path) -> bool:
+    """Whether *resolved* or any ancestor below ``/`` crosses a mount boundary, or mount data is unavailable."""
+    table = _read_mount_table()
+    if table is None:
         return True
+    mounts = frozenset(table.values())
     if any(str(ancestor) in mounts for ancestor in (resolved, *resolved.parents) if ancestor.parent != ancestor):
         return True
     flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -534,9 +606,14 @@ def _crosses_mount_boundary(resolved: Path) -> bool:
         except (OSError, ValueError):
             return True
         try:
-            root_mount_id = task_scratch.fd_mount_id(root_fd)
-            checkout_mount_id = task_scratch.fd_mount_id(checkout_fd)
-            if root_mount_id is None or checkout_mount_id is None or checkout_mount_id != root_mount_id:
+            root_mount_id = _read_fd_mount_id(root_fd)
+            checkout_mount_id = _read_fd_mount_id(checkout_fd)
+            if (
+                root_mount_id is None
+                or checkout_mount_id is None
+                or checkout_mount_id != root_mount_id
+                or table.get(root_mount_id) != "/"
+            ):
                 return True
             try:
                 if os.fstat(checkout_fd).st_dev != os.lstat(resolved.parent).st_dev:
@@ -560,8 +637,9 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     unregistered root that keeps every Learn Ukrainian requirement. Only a standalone primary
     checkout is identified: Git must report ``root`` as the top of its work tree, ``root/.git``
     as its shared Git directory, no mount boundary (cross-device or same-filesystem bind mount)
-    may lie at ``root`` or any ancestor below ``/`` (verified via ``task_scratch.mount_points()``
-    and ``task_scratch.fd_mount_id()``, failing closed on unreadable mount data), and an
+    may lie at ``root`` or any ancestor below ``/`` (strictly verified against
+    ``/proc/self/mountinfo`` and ``/proc/self/fdinfo/<fd>``, failing closed on unreadable or
+    malformed mount data), and an
     execution-safe ``rev-parse --show-toplevel`` on ``root``'s parent must traverse all ancestors
     and fail with Git's exact ``not a git repository (or any of the parent directories): .git``
     diagnostic (reading no parent index or tree). A linked worktree, a

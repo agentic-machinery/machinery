@@ -1290,12 +1290,11 @@ def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path
     import os
     import subprocess
 
-    from lu_machinery.common import task_scratch
-    from lu_machinery.orchestration import execution_safe_git
+    from lu_machinery.orchestration import execution_safe_git, fleet_repos
 
     real_run_git = execution_safe_git.run_git
-    real_mount_points = task_scratch.mount_points
-    real_fd_mount_id = task_scratch.fd_mount_id
+    real_mount_table = fleet_repos._read_mount_table
+    real_fd_mount_id = fleet_repos._read_fd_mount_id
     parent = root.resolve().parent
     scratch_ancestors = frozenset(str(p) for p in (parent, *parent.parents) if p.parent != p)
     flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -1311,9 +1310,9 @@ def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path
     finally:
         os.close(parent_fd)
 
-    def wrapped_mount_points() -> frozenset[str] | None:
-        mounts = real_mount_points()
-        return None if mounts is None else mounts - scratch_ancestors
+    def wrapped_mount_table() -> dict[int, str] | None:
+        table = real_mount_table()
+        return None if table is None else {mid: mp for mid, mp in table.items() if mp not in scratch_ancestors}
 
     def wrapped_fd_mount_id(fd: int) -> int | None:
         mount_id = real_fd_mount_id(fd)
@@ -1344,8 +1343,8 @@ def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path
             )
         return result
 
-    monkeypatch.setattr(task_scratch, "mount_points", wrapped_mount_points)
-    monkeypatch.setattr(task_scratch, "fd_mount_id", wrapped_fd_mount_id)
+    monkeypatch.setattr(fleet_repos, "_read_mount_table", wrapped_mount_table)
+    monkeypatch.setattr(fleet_repos, "_read_fd_mount_id", wrapped_fd_mount_id)
     monkeypatch.setattr(execution_safe_git, "run_git", wrapped_run_git)
 
 
@@ -1544,8 +1543,9 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
     assert sources_server_path() is None
 
     # Mount boundaries fail closed at the checkout root, at any ancestor (including same-device
-    # bind mounts where st_dev matches and st_ino differs), on unreadable/malformed mount data,
-    # on cross-device parent stat mismatch/error, and during parent discovery (PR1294-F2).
+    # bind mounts where st_dev matches and st_ino differs), on unreadable/malformed mountinfo
+    # or fdinfo metadata, on cross-device parent stat mismatch/error, and during parent discovery
+    # (PR1294-F2 / PR1297-F1).
     import os
     import subprocess
     from types import SimpleNamespace
@@ -1557,23 +1557,58 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
     root_st = os.lstat("/")
     real_lstat = os.lstat
     real_run_git = execution_safe_git.run_git
-    for fake_mounts in (
-        frozenset({"/", str(resolved_primary)}),
-        frozenset({"/", str(resolved_primary.parent)}),
-        frozenset(),
+    for fake_table in (
+        {42: "/", 99: str(resolved_primary)},
+        {42: "/", 99: str(resolved_primary.parent)},
+        {},
         None,
     ):
         with monkeypatch.context() as mp:
-            mp.setattr(task_scratch, "mount_points", lambda _m=fake_mounts: _m)
+            mp.setattr(fleet_repos, "_read_mount_table", lambda _t=fake_table: _t)
             assert fleet_repos.fleet_repo_for_checkout(primary) is None
     for fake_fd_mount in (
         lambda fd, _r=(root_st.st_dev, root_st.st_ino): 42 if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == _r else 99,
         lambda _fd: None,
     ):
         with monkeypatch.context() as mp:
-            mp.setattr(task_scratch, "mount_points", lambda: frozenset({"/"}))
-            mp.setattr(task_scratch, "fd_mount_id", fake_fd_mount)
+            mp.setattr(fleet_repos, "_read_mount_table", lambda: {42: "/"})
+            mp.setattr(fleet_repos, "_read_fd_mount_id", fake_fd_mount)
             assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    # Parser-level and end-to-end refusal on raw malformed /proc/self/mountinfo and /proc/self/fdinfo files.
+    valid_root_line = "42 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+    for idx, bad_mountinfo in enumerate(
+        (
+            valid_root_line + "99 42 8:1\n",  # truncated record after valid root
+            valid_root_line + "99 42 8:1 / /mnt\n",  # invalid 5-field record missing '-'
+            valid_root_line + "42 1 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # duplicate mount id
+            valid_root_line.rstrip("\n"),  # missing trailing newline
+            "",
+        )
+    ):
+        fake_mi = tmp_path / f"mountinfo-{idx}"
+        fake_mi.write_text(bad_mountinfo, encoding="utf-8")
+        with monkeypatch.context() as mp:
+            mp.setattr(task_scratch, "_MOUNTINFO_PATH", fake_mi)
+            assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    with monkeypatch.context() as mp:
+        mp.setattr(task_scratch, "_MOUNTINFO_PATH", tmp_path / "missing-mountinfo")
+        assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    fake_fdinfo_dir = tmp_path / "fdinfo"
+    fake_fdinfo_dir.mkdir()
+    for fd_num, bad_fdinfo in (
+        (101, "pos:\t0\nflags:\t012200000\nmnt_id:\t42\nmnt_id:\t99\nino:\t2\n"),  # conflicting ids
+        (102, "pos:\t0\nmnt_id:\t42\nmnt_id:\t42\n"),  # duplicate id
+        (103, "pos:\t0\nmnt_id:\tbad\n"),  # non-integer id
+        (104, "pos:\t0\nino:\t2\n"),  # missing mnt_id
+        (105, "pos:\t0\nmnt_id:\t42"),  # missing trailing newline
+    ):
+        (fake_fdinfo_dir / str(fd_num)).write_text(bad_fdinfo, encoding="ascii")
+        with monkeypatch.context() as mp:
+            mp.setattr(fleet_repos, "_FDINFO_DIR", fake_fdinfo_dir)
+            assert fleet_repos._read_fd_mount_id(fd_num) is None
+    with monkeypatch.context() as mp:
+        mp.setattr(fleet_repos, "_FDINFO_DIR", fake_fdinfo_dir)
+        assert fleet_repos.fleet_repo_for_checkout(primary) is None
     for mode in ("cross-dev", "lstat-error"):
         with monkeypatch.context() as mp:
             def _fake_lstat(path, *, _mode=mode, _real=real_lstat, _parent=resolved_primary.parent):

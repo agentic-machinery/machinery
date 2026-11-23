@@ -195,12 +195,11 @@ def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path
     import os
     import subprocess
 
-    from lu_machinery.common import task_scratch
-    from lu_machinery.orchestration import execution_safe_git
+    from lu_machinery.orchestration import execution_safe_git, fleet_repos
 
     real_run_git = execution_safe_git.run_git
-    real_mount_points = task_scratch.mount_points
-    real_fd_mount_id = task_scratch.fd_mount_id
+    real_mount_table = fleet_repos._read_mount_table
+    real_fd_mount_id = fleet_repos._read_fd_mount_id
     parent = root.resolve().parent
     scratch_ancestors = frozenset(str(p) for p in (parent, *parent.parents) if p.parent != p)
     flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -216,9 +215,9 @@ def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path
     finally:
         os.close(parent_fd)
 
-    def wrapped_mount_points() -> frozenset[str] | None:
-        mounts = real_mount_points()
-        return None if mounts is None else mounts - scratch_ancestors
+    def wrapped_mount_table() -> dict[int, str] | None:
+        table = real_mount_table()
+        return None if table is None else {mid: mp for mid, mp in table.items() if mp not in scratch_ancestors}
 
     def wrapped_fd_mount_id(fd: int) -> int | None:
         mount_id = real_fd_mount_id(fd)
@@ -249,8 +248,8 @@ def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path
             )
         return result
 
-    monkeypatch.setattr(task_scratch, "mount_points", wrapped_mount_points)
-    monkeypatch.setattr(task_scratch, "fd_mount_id", wrapped_fd_mount_id)
+    monkeypatch.setattr(fleet_repos, "_read_mount_table", wrapped_mount_table)
+    monkeypatch.setattr(fleet_repos, "_read_fd_mount_id", wrapped_fd_mount_id)
     monkeypatch.setattr(execution_safe_git, "run_git", wrapped_run_git)
 
 
@@ -280,7 +279,25 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         {"allowed_tools": "Read, Bash(git log --format=%H,%s), mcp__sources__*, mcp__*, mcp__other__tool, mcp*"},
     )
     assert explicit[explicit.index("--allowedTools") + 1] == "Read,Bash(git log --format=%H,%s)"
-    for bad_allowed in ("", "   ", "mcp__sources__verify_word", "mcp__*", "Read(foo,mcp__sources__verify_word"):
+    for bad_allowed in (
+        "",
+        "   ",
+        ["Read"],
+        123,
+        "['Read']",
+        "(orphan),mcp__sources__verify_word",
+        "Read(file)Grep",
+        "Read(a)(b)",
+        "Read()",
+        "Read(   )",
+        ",Read",
+        "Read,",
+        "Read,,Grep",
+        "Bash (git status)",
+        "mcp__sources__verify_word",
+        "mcp__*",
+        "Read(foo,mcp__sources__verify_word",
+    ):
         with pytest.raises(ValueError):
             _read_only(consumer, {"allowed_tools": bad_allowed})
 

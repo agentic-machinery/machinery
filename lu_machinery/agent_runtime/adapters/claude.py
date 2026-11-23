@@ -608,6 +608,7 @@ def _sources_writer_denies(tools: tuple[str, ...]) -> list[str]:
 
 
 _EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
+_ALLOW_RULE_NAME_RE = re.compile(r"^[A-Za-z_*?][A-Za-z0-9_.*?-]*$")
 
 
 def _is_mcp_allow_rule(tool_lower: str) -> bool:
@@ -618,31 +619,70 @@ def _is_mcp_allow_rule(tool_lower: str) -> bool:
     )
 
 
-def _strip_mcp_allow_rules(raw: str) -> str:
+def _validate_allow_rule(rule: str) -> str:
+    """Validate one Claude allowlist rule (``Tool`` or ``Tool(qualifier)``) and return its lowercase tool name."""
+    if not rule or any(ord(ch) < 32 or ord(ch) == 127 for ch in rule):
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    if "(" not in rule and ")" not in rule:
+        if not _ALLOW_RULE_NAME_RE.fullmatch(rule):
+            raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+        return rule.lower()
+    open_idx = rule.find("(")
+    name = rule[:open_idx]
+    if open_idx <= 0 or not rule.endswith(")") or not _ALLOW_RULE_NAME_RE.fullmatch(name):
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    depth = 0
+    for idx, ch in enumerate(rule[open_idx:], start=open_idx):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0 or (depth == 0 and idx != len(rule) - 1):
+                raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    if depth != 0 or not rule[open_idx + 1 : -1].strip():
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    return name.lower()
+
+
+def _strip_mcp_allow_rules(raw: object) -> str:
     """Drop MCP/Sources allow rules when a read-only run loads no MCP servers."""
+    if not isinstance(raw, str):
+        raise ValueError("ClaudeAdapter: allowed_tools must be a string")
+    if not raw.strip():
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
     rules: list[str] = []
     buf: list[str] = []
     depth = 0
+    expect_rule = True
     for ch in raw:
         if ch == "(":
             depth += 1
             buf.append(ch)
+            expect_rule = False
         elif ch == ")":
             depth -= 1
             if depth < 0:
                 raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
             buf.append(ch)
-        elif depth == 0 and (ch == "," or ch.isspace()):
+        elif depth == 0 and ch == ",":
+            if expect_rule:
+                raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+            if buf:
+                rules.append("".join(buf))
+                buf.clear()
+            expect_rule = True
+        elif depth == 0 and ch.isspace():
             if buf:
                 rules.append("".join(buf))
                 buf.clear()
         else:
             buf.append(ch)
-    if depth != 0:
+            expect_rule = False
+    if depth != 0 or expect_rule:
         raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
     if buf:
         rules.append("".join(buf))
-    kept = [rule for rule in rules if not _is_mcp_allow_rule(rule.split("(", 1)[0].strip().lower())]
+    kept = [rule for rule in rules if not _is_mcp_allow_rule(_validate_allow_rule(rule))]
     if not kept:
         raise ValueError(
             "ClaudeAdapter: this repository declares no Sources server; allowed_tools contains no non-MCP tools"
@@ -1163,9 +1203,8 @@ class ClaudeAdapter:
         elif mcp_config_path and not review_isolation:
             cmd.extend(["--mcp-config", str(mcp_config_path)])
         if explicit_allowed_tools and not review_isolation:
-            allowed = str(tc["allowed_tools"])
-            if no_sources_readonly:
-                allowed = _strip_mcp_allow_rules(allowed)
+            raw_allowed = tc["allowed_tools"]
+            allowed = _strip_mcp_allow_rules(raw_allowed) if no_sources_readonly else str(raw_allowed)
             cmd.extend(["--allowedTools", allowed])
 
         # Cache-warmth optimization (CC 2.1.98+)
