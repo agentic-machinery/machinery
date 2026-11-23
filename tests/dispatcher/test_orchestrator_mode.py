@@ -39,7 +39,8 @@ def _lease(state="active", session_state="open", expires_in=600, **fields):
     """Monitor's projection of one lease on STREAM, as its stream route answers."""
     expires = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
     return {"stream_id": STREAM, "session_id": "session-1", "lease_id": "lease-1", "generation": 2,
-            "fencing_token": 2, "state": state, "session_state": session_state, "expires_at": expires,
+            "fencing_token": 2, "state": state, "session_state": session_state, "heartbeat_at": store.now(),
+            "expires_at": expires, "ttl_seconds": 900, "version": 1, "age_seconds": 0,
             "holder": {"agent": "claude", "harness": "codex-cli", "instance_id": "legacy-1", "task_id": None,
                        "process_id": 4321, "holder_kind": "process", "host_id": None}, **fields}
 
@@ -92,6 +93,12 @@ def _write(record):
          "takes no --require-review-verdict"),
         (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn-1.sandbox"],
          "ends like a dispatcher sidecar"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn-review.next"],
+         "Monitor-safe token"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn-1.2.3.4"],
+         "Monitor-safe token"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn-vps"],
+         "Monitor-safe token"),
         (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--research-role", "advisory"],
          "--research-role is driver"),
     ],
@@ -299,7 +306,7 @@ def _answer(nonce, ttl=3600, **changes):
                  ttl_seconds=ttl, version=1, age_seconds=0,
                  holder=dict(agent="claude", harness=TURN_HOLDER_HARNESS, instance_id=nonce, task_id="turn-1",
                              process_id=os.getpid(), holder_kind="process", host_id=None))
-    answer = {"stream_id": STREAM, "outcome": "claimed", "lease": lease}
+    answer = {"stream_id": STREAM, "session_state": "open", "outcome": "claimed", "lease": lease}
     for key, value in changes.items():
         target, name = (lease, key.removeprefix("lease.")) if key.startswith("lease.") else (answer, key)
         if name.startswith("holder."):
@@ -349,6 +356,14 @@ def _conflict(detail):
         ({"lease.generation": True}, "orchestrator_lease_unknown"),
         ({"lease.fencing_token": 0}, "orchestrator_lease_unknown"),
         ({"lease.ttl_seconds": 7200}, "orchestrator_lease_unknown"),
+        ({"lease.ttl_seconds": True}, "orchestrator_lease_unknown"),
+        ({"lease.version": True}, "orchestrator_lease_unknown"),
+        ({"lease.version": 0}, "orchestrator_lease_unknown"),
+        ({"lease.age_seconds": -1}, "orchestrator_lease_unknown"),
+        ({"lease.age_seconds": True}, "orchestrator_lease_unknown"),
+        ({"lease.heartbeat_at": "soon"}, "orchestrator_lease_unknown"),
+        ({"session_state": "closed"}, "orchestrator_lease_unknown"),  # top-level disagrees with nested open
+        ({"session_state": _MISSING}, "orchestrator_lease_unknown"),
         ({"lease.expires_at": "soon"}, "orchestrator_lease_unknown"),
         ({"lease.expires_at": "2026-01-01T00:00:00Z"}, "orchestrator_lease_unknown"),  # already past
         ({"lease.expires_at": "2099-01-01T00:00:00Z"}, "orchestrator_lease_unknown"),  # beyond the TTL asked for
@@ -461,6 +476,15 @@ def test_a_dry_run_reads_a_projection_whose_session_disagrees_with_its_lease_as_
                                                                   "task_id": "0b9a3a9e-6a8e-4f53-9d0c-7d6f1e2a4b5c"}),
          None),
         (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": True}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", ttl_seconds=True), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", version=True), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", age_seconds=True), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", heartbeat_at="soon"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", session_id="bad.example"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", session_id="[redacted]"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_id="bad.example"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "host_id": "bad.host"}),
          "orchestrator_lease_unknown"),
         ({**_lease(), "expires_at": "soon"}, "orchestrator_lease_unknown"),
         ("lease", "orchestrator_lease_unknown"),
@@ -646,11 +670,24 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
         for monitor_spelling in (monitor.base.replace("127.0.0.1", "localhost"), "", "http://example.invalid:80", 7):
             reason = host_admission.release_turn({**envelope, "monitor": monitor_spelling}, **exact)
             assert reason.startswith("orchestrator_lease_release_refused"), (monitor_spelling, reason)
+        base_ack = {**envelope["lease"], "state": "released", "session_state": "closed",
+                    "heartbeat_at": store.now(), "version": 1, "age_seconds": 0}
         for answer in ({"outcome": "released"},
-                       {"outcome": "released", "lease": {**envelope["lease"], "state": "released", "session_state": "open"}},
-                       {"outcome": "released", "lease": {**envelope["lease"], "state": "active", "session_state": "closed"}}):
+                       {"outcome": "released", "lease": {**base_ack, "session_state": "open"}},
+                       {"outcome": "released", "lease": {**base_ack, "state": "active"}},
+                       {"outcome": "released", "lease": {**base_ack, "ttl_seconds": True}},
+                       {"outcome": "released", "lease": {**base_ack, "expires_at": "soon"}},
+                       {"outcome": "released", "lease": {**base_ack, "version": True}},
+                       {"outcome": "released", "session_state": "open", "lease": base_ack}):
             patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, answer=answer, **k: answer)
             assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
+        # A 409 whose detail is not Monitor's recognized LEASE LOST is unknown, never fenced.
+        def unrelated_409(request, timeout=0):
+            return SimpleNamespace(status=409, read=lambda: b'{"detail":"request refused"}',
+                                   __enter__=lambda s: s, __exit__=lambda *_a: False)
+        patch.setattr(remote.RemoteEpicClient, "release",
+                      lambda self, lease: remote.RemoteEpicClient(base=self.base, opener=unrelated_409).release(lease))
+        assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
     assert contacted == []
     calls = []
 
@@ -780,20 +817,23 @@ def test_no_task_borrows_a_turn_tree(task_store, tmp_path, monkeypatch):
     assert "cannot be read" in host_admission.turn_tree_refusal(trees / "masked")
     store.record_path("mismatch").write_text(json.dumps({**ordinary, "task_id": "other"}))  # names another task
     assert "cannot be read" in host_admission.turn_tree_refusal(trees / "mismatch")
+    store.record_path("invalid-schema").write_text(json.dumps({"task_id": "invalid-schema", "schema_version": True,
+                                                               "status": "running"}))  # damaged record fails closed
+    assert "cannot be read" in host_admission.turn_tree_refusal(trees / "invalid-schema")
     # A record observed in the hot store that is gone when read never lets an older archived copy decide.
     store._write(store.record_path("moving-turn"), _orchestrator_record("moving-turn"))
     stale = _orchestrator_record("moving-turn")
     stale.pop("orchestrator")
     store._write(archive / "moving-turn.json", stale)
-    real_read_text = Path.read_text
+    real_read_bytes = Path.read_bytes
 
     def vanishing(path, *args, **kwargs):
         if path == store.record_path("moving-turn"):
             raise FileNotFoundError(2, "No such file or directory", str(path))
-        return real_read_text(path, *args, **kwargs)
+        return real_read_bytes(path, *args, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(Path, "read_text", vanishing)
+        patch.setattr(Path, "read_bytes", vanishing)
         assert "cannot be read" in host_admission.turn_tree_refusal(trees / "moving-turn")
     # Archive and restore move records under the archive lock, which the lookup holds across both names.
     from lu_machinery.orchestration import task_record_store

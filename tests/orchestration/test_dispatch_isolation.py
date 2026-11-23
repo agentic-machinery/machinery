@@ -1025,6 +1025,19 @@ def test_a_bounded_scope_carries_its_limits_and_never_falls_back(tmp_path: Path)
         iso.spawn_detached_worker([_PY, "-c", "pass"], task_id="turn-2", run_nonce="n", popen=popen,
                                   probe_env={"LU_DISPATCH_ISOLATION": "fallback"}, allow_fallback=False,
                                   runtime_max_s=7800, stop_timeout_s=30)
+    # An unreadable caller cgroup never hides pre-launch proof when fallback is unconditionally refused.
+    def unavailable_cgroup():
+        raise iso.DispatchIsolationError("fallback-refused: caller-cgroup-unavailable")
+
+    real_detector = iso._caller_in_driver_scope
+    iso._caller_in_driver_scope = unavailable_cgroup
+    try:
+        with pytest.raises(iso.LaunchNotStarted, match="forced"):
+            iso.spawn_detached_worker([_PY, "-c", "pass"], task_id="turn-2b", run_nonce="n2", popen=popen,
+                                      probe_env={"LU_DISPATCH_ISOLATION": "fallback"}, allow_fallback=False,
+                                      runtime_max_s=7800, stop_timeout_s=30)
+    finally:
+        iso._caller_in_driver_scope = real_detector
 
 
 def test_a_refusal_after_systemd_run_started_is_never_a_launch_that_never_started(tmp_path: Path):

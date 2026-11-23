@@ -735,10 +735,10 @@ def _fallback(
     never_started: bool = False,
 ) -> tuple[subprocess.Popen[Any], WorkerLaunch]:
     refused = LaunchNotStarted if never_started else DispatchIsolationError
-    if _caller_in_driver_scope():
-        raise refused("fallback-refused: inside-driver-scope; " + reason)
     if not allow_fallback:
         raise refused(reason)
+    if _caller_in_driver_scope():
+        raise refused("fallback-refused: inside-driver-scope; " + reason)
     _warn(reason)
     proc = popen(list(cmd), **_popen_kwargs(env=env, stdin=stdin, stdout=stdout, stderr=stderr))
     return proc, WorkerLaunch(mode=LAUNCH_FALLBACK, fallback_reason=reason, user_bus=user_bus.as_state())

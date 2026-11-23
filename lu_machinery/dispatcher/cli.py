@@ -433,6 +433,11 @@ def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
     # Every task-store scan (sweeps, child linkage) skips a file named like a dispatcher sidecar.
     if args.task_id is not None and task_record_store._is_dispatcher_sidecar(store.record_path(args.task_id)):
         raise ValueError("orchestrator_entry_refused: --task-id ends like a dispatcher sidecar file name")
+    # Monitor's claim route validates holder.task_id with the same public projection token rule (C-7010).
+    from lu_machinery.api.occupancy_sanitize import safe_field
+
+    if safe_field(args.task_id, role="task_id") != args.task_id:
+        raise ValueError("orchestrator_entry_refused: a turn's --task-id must be a Monitor-safe token")
     # Identity, not equality: --pr 0 is a given flag, though 0 == False.
     given = [name for name in _ORCHESTRATOR_REFUSED
              if (value := getattr(args, name, None)) is not None and value is not False and value != []]

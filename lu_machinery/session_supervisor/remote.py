@@ -129,11 +129,14 @@ class RemoteEpicClient:
                 raise RemoteUnavailableError(f"Monitor API temporarily unavailable ({exc.code})") from None
             try:
                 raw = exc.read().decode("utf-8")
-                detail = json_depth.loads(raw, max_depth=512).get("detail", "request refused")
+                parsed = json_depth.loads(raw, max_depth=512)
+                detail = parsed.get("detail", "request refused") if isinstance(parsed, dict) else "request refused"
             except (ValueError, json.JSONDecodeError, OSError):
                 detail = "request refused"
             if exc.code == 409 and not path.endswith("/claim"):
-                raise RemoteLeaseLostError("LEASE LOST: Monitor fenced the exact lease") from None
+                if detail == "LEASE LOST":
+                    raise RemoteLeaseLostError("LEASE LOST: Monitor fenced the exact lease") from None
+                raise RemoteSupervisorError(f"Monitor API refused request (409): {detail}") from None
             if exc.code == 409:
                 raise RemoteClaimConflictError(
                     f"Monitor API refused request (409): {detail}", detail=detail if isinstance(detail, str) else ""
@@ -149,17 +152,20 @@ class RemoteEpicClient:
         if status >= 500:
             raise RemoteUnavailableError(f"Monitor API temporarily unavailable ({status})")
         if status >= 400:
-            if status == 409 and not path.endswith("/claim"):
-                raise RemoteLeaseLostError("LEASE LOST: Monitor fenced the exact lease")
             if status == 404:
                 raise RemoteSupervisorError(
                     f"Monitor API refused request (404): missing route {path}; "
                     "deploy a Monitor build that includes /api/epics/v1"
                 )
             try:
-                detail = json_depth.loads(raw, max_depth=512).get("detail", "request refused")
+                parsed = json_depth.loads(raw, max_depth=512)
+                detail = parsed.get("detail", "request refused") if isinstance(parsed, dict) else "request refused"
             except (ValueError, json.JSONDecodeError, OSError):
                 detail = "request refused"
+            if status == 409 and not path.endswith("/claim"):
+                if detail == "LEASE LOST":
+                    raise RemoteLeaseLostError("LEASE LOST: Monitor fenced the exact lease")
+                raise RemoteSupervisorError(f"Monitor API returned an error ({status}): {detail}")
             if status == 409:
                 raise RemoteClaimConflictError(
                     f"Monitor API returned an error ({status}): {detail}", detail=detail if isinstance(detail, str) else ""

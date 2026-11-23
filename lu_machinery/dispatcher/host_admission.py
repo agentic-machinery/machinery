@@ -17,7 +17,6 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
-from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import store
 from lu_machinery.orchestration import dispatch_admission as legacy
@@ -279,24 +278,35 @@ def same_typed(value, expected) -> bool:
     return type(value) is type(expected) and value == expected
 
 
-def _text(value) -> bool:
-    return isinstance(value, str) and bool(value)
+def _valid_token(value) -> bool:
+    """A public Monitor projection token, by Monitor's own sanitizer (epics_router._token)."""
+    from lu_machinery.api.occupancy_sanitize import safe_field
+
+    return isinstance(value, str) and safe_field(value, role="task_id") == value
 
 
 def _positive(value) -> bool:
     return type(value) is int and value > 0
 
 
+def _non_negative(value) -> bool:
+    return type(value) is int and value >= 0
+
+
 def _valid_holder(holder) -> bool:
     """A holder as Monitor's projection writes it (epics_router._lease_payload), by Monitor's own rule.
 
     ``LeaseHolder.validate`` decides identities, an app thread's canonical UUID task id and a process holder's
-    pid; a JSON boolean is never a pid.
+    pid; Monitor's projection sanitizers decide public tokens and opaque host ids; a JSON boolean is never a pid.
     """
+    from lu_machinery.api.occupancy_sanitize import opaque_host_id
     from lu_machinery.session_streams.model import HolderKind, LeaseHolder
 
     if not (isinstance(holder, dict) and set(holder) == set(_HOLDER_FIELDS)
-            and all(isinstance(holder[name], str) for name in ("agent", "harness", "instance_id", "holder_kind"))
+            and all(_valid_token(holder[name]) for name in ("agent", "harness", "instance_id"))
+            and (holder["task_id"] is None or _valid_token(holder["task_id"]))
+            and (holder["host_id"] is None or (isinstance(holder["host_id"], str) and opaque_host_id(holder["host_id"])))
+            and isinstance(holder["holder_kind"], str)
             and holder["holder_kind"] in {kind.value for kind in HolderKind}
             and (holder["process_id"] is None or _positive(holder["process_id"]))):
         return False
@@ -312,24 +322,39 @@ def _valid_holder(holder) -> bool:
 def _valid_lease_identity(lease, stream: str) -> bool:
     """A lease on ``stream`` whose identity, fence and holder are all well formed."""
     return (isinstance(lease, dict) and lease.get("stream_id") == stream
-            and _text(lease.get("session_id")) and _text(lease.get("lease_id"))
+            and _valid_token(lease.get("session_id")) and _valid_token(lease.get("lease_id"))
             and _positive(lease.get("generation")) and _positive(lease.get("fencing_token"))
             and _valid_holder(lease.get("holder")))
+
+
+def _valid_projection_lease(lease, stream: str) -> bool:
+    """A lease payload as Monitor's projection writes it (epics_router._lease_payload)."""
+    from lu_machinery.session_streams.store import MAX_TTL_SECONDS
+
+    if not _valid_lease_identity(lease, stream):
+        return False
+    state, session = lease.get("state"), lease.get("session_state")
+    return (isinstance(state, str) and state in _LEASE_STATES
+            and isinstance(session, str) and session in _SESSION_STATES
+            and (session in ("closed", "expired") if state == "released" else session in ("open", "rolling"))
+            and _positive(lease.get("version"))
+            and _positive(lease.get("ttl_seconds")) and lease["ttl_seconds"] <= MAX_TTL_SECONDS
+            and _non_negative(lease.get("age_seconds"))
+            and store.parse_utc_timestamp(lease.get("heartbeat_at")) is not None
+            and store.parse_utc_timestamp(lease.get("expires_at")) is not None)
 
 
 def _claimed_lease(response, stream: str, holder: dict, session_id: str, lease_id: str, ttl_s: int) -> dict | None:
     """The lease envelope part of a claim answer, when it is exactly the new lease this claim asked for."""
     lease = response.get("lease") if isinstance(response, dict) else None
     if not (isinstance(response, dict) and response.get("outcome") == "claimed" and response.get("stream_id") == stream
-            and isinstance(lease, dict)):
+            and response.get("session_state") == "open" and _valid_projection_lease(lease, stream)):
         return None
     expires = store.parse_utc_timestamp(lease.get("expires_at"))
     remaining = None if expires is None else (expires - datetime.now(UTC)).total_seconds()
-    if not (lease.get("stream_id") == stream and lease.get("session_id") == session_id
-            and lease.get("lease_id") == lease_id and lease.get("state") == "active"
-            and lease.get("session_state") == "open" and same_typed(lease.get("holder"), holder)
-            and all(type(lease.get(name)) is int and lease[name] > 0 for name in ("generation", "fencing_token"))
-            and type(lease.get("ttl_seconds")) is int and lease["ttl_seconds"] == ttl_s
+    if not (lease["session_id"] == session_id and lease["lease_id"] == lease_id
+            and lease["state"] == "active" and lease["session_state"] == "open"
+            and same_typed(lease["holder"], holder) and lease["ttl_seconds"] == ttl_s
             and remaining is not None and 0 < remaining <= ttl_s + TURN_TTL_MARGIN_S):
         return None
     return {name: lease[name] for name in _TURN_LEASE_FIELDS}
@@ -382,7 +407,7 @@ def claim_turn(stream: str, task_id: str, run_nonce: str, *, agent: str, ttl_s: 
 def _turn_lease(envelope, *, stream: str, task_id: str, run_nonce: str):
     """The Monitor base and Lease an envelope names, when it is exactly this turn's; ValueError otherwise."""
     from lu_machinery.session_streams.model import HolderKind, Lease, LeaseHolder
-    from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
+    from lu_machinery.session_streams.store import MAX_TTL_SECONDS, TURN_HOLDER_HARNESS
     from lu_machinery.session_supervisor.remote import RemoteSupervisorError, monitor_url
 
     lease = envelope.get("lease") if isinstance(envelope, dict) else None
@@ -392,7 +417,8 @@ def _turn_lease(envelope, *, stream: str, task_id: str, run_nonce: str):
             and _valid_lease_identity(lease, stream) and holder["harness"] == TURN_HOLDER_HARNESS
             and holder["instance_id"] == run_nonce and holder["task_id"] == task_id
             and holder["holder_kind"] == "process" and holder["host_id"] is None
-            and store.parse_utc_timestamp(lease["expires_at"]) is not None and _positive(lease["ttl_seconds"])
+            and store.parse_utc_timestamp(lease["expires_at"]) is not None
+            and _positive(lease["ttl_seconds"]) and lease["ttl_seconds"] <= MAX_TTL_SECONDS
             and isinstance(envelope["monitor"], str)):
         raise ValueError("the turn's lease envelope is not this run's")
     try:
@@ -431,8 +457,11 @@ def release_turn(envelope, *, stream: str, task_id: str, run_nonce: str) -> str 
         return (f"orchestrator_lease_release_unknown: ({type(exc).__name__}); the lease stays held until its exact "
                 "holder or an operator releases it")
     acknowledged = response.get("lease") if isinstance(response, dict) else None
-    if not (isinstance(response, dict) and response.get("outcome") == "released" and isinstance(acknowledged, dict)
-            and acknowledged.get("state") == "released" and acknowledged.get("session_state") == "closed"
+    if not (isinstance(response, dict) and response.get("outcome") == "released"
+            and ("stream_id" not in response or response["stream_id"] == stream)
+            and ("session_state" not in response or response["session_state"] == "closed")
+            and _valid_projection_lease(acknowledged, stream)
+            and acknowledged["state"] == "released" and acknowledged["session_state"] == "closed"
             and all(same_typed(acknowledged.get(name), envelope["lease"][name])
                     for name in ("stream_id", "session_id", "lease_id", "generation", "fencing_token", "holder"))):
         return "orchestrator_lease_release_unknown: Monitor's answer does not acknowledge this exact lease"
@@ -495,9 +524,11 @@ def _owner_refusal(name: str, locations, unreadable: str) -> str | None:
     """The refusal the first present owner record of ``name`` gives, in ``locations`` order (hot, then archive).
 
     Only a location proven absent (``lstat``: not found) yields to the next. A record once observed decides: it must
-    be a regular file that reads as an object naming ``name``, or the tree's owner is unknown and the tree refused.
+    be a regular file that validates through ``parse_task_record`` and names ``name``, or the tree's owner is unknown
+    and the tree refused.
     """
     from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+    from lu_machinery.orchestration.task_record_store import parse_task_record
 
     for candidate in locations:
         try:
@@ -509,7 +540,7 @@ def _owner_refusal(name: str, locations, unreadable: str) -> str | None:
         try:
             if not stat.S_ISREG(info.st_mode):
                 return unreadable
-            record = json_depth.loads(candidate.read_text(encoding="utf-8"), max_depth=store._JSON_MAX_DEPTH)
+            record = parse_task_record(candidate, candidate.read_bytes())
             if not (isinstance(record, dict) and record.get("task_id") == name):
                 return unreadable
             stream = orchestrator_stream(record)
@@ -541,17 +572,9 @@ def turn_lease_probe(stream):
     if lease is None:  # the projection's explicit "no lease", which has no session either
         return None if response["session_state"] is None else (
             "orchestrator_lease_unknown: the Monitor answer names a session but no lease")
-    if not isinstance(lease, dict):
-        return "orchestrator_lease_unknown: the Monitor lease is malformed"
-    # Every part of a lease is checked before any of it decides, as Monitor writes each one for every lease.
-    state, session = lease.get("state"), lease.get("session_state")
-    if not (isinstance(state, str) and state in _LEASE_STATES and isinstance(session, str) and session in _SESSION_STATES):
-        return "orchestrator_lease_unknown: the Monitor lease or its session state is malformed"
-    if store.parse_utc_timestamp(lease.get("expires_at")) is None:
-        return "orchestrator_lease_unknown: the Monitor lease expiry is unreadable"
-    if not (_valid_lease_identity(lease, stream) and response["session_state"] == session
-            and (session in ("closed", "expired") if state == "released" else session in ("open", "rolling"))):
-        return "orchestrator_lease_unknown: the Monitor lease is incomplete or its states disagree"
+    if not (_valid_projection_lease(lease, stream) and response["session_state"] == lease["session_state"]):
+        return "orchestrator_lease_unknown: the Monitor lease is malformed or its states disagree"
+    state = lease["state"]
     if state == "released":
         return None
     holder = lease["holder"]
