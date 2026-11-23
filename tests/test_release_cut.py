@@ -1159,23 +1159,43 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     _bare_checkout(machinery_seed, tmp_path / "machinery.git", machinery)
     _bare_checkout(product_seed, tmp_path / "product.git", product)
 
-    primary = tmp_path / "primary"
-    primary.mkdir()
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    primary = fleet / "learn-ukrainian"
+    _init_repo(primary)
+    sibling_machinery = fleet / "machinery"
+    _init_repo(sibling_machinery)
     host_log = tmp_path / "host-publish.log"
     accept_log = tmp_path / "accept-publish.log"
 
     # Simulate the new release's verified clean-install interpreter: requires -I, primary env, and accepts --milestone.
     accept_script = (
         "#!/bin/sh\nset -eu\n"
+        'venv_root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"\n'
         'if [ "${1:-}" = "-I" ] && [ "${2:-}" = "-m" ] && [ "${3:-}" = "pip" ]; then exit 0; fi\n'
         'if [ "${1:-}" = "-I" ] && [ "${2:-}" = "-c" ]; then\n'
-        f'  printf "0.1.62 %s/accept/lib/python3.14/site-packages/lu_machinery/__init__.py\\n" {shlex.quote(str(work))}\n'
+        '  case "${3:-}" in\n'
+        '    *purelib*) printf "%s/lib/python3.14/site-packages\\n" "$venv_root";;\n'
+        '    *) printf "0.1.62 %s/lib/python3.14/site-packages/lu_machinery/__init__.py\\n" "$venv_root";;\n'
+        '  esac\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "${1:-}" = "-c" ]; then\n'
+        '  printf "0.1.62 %s/lib/python3.14/site-packages/lu_machinery/__init__.py\\n" "$venv_root"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pytest" ]; then\n'
+        '  [ -f "$venv_root/lib/python3.14/site-packages/zz-release-cut-consumer.pth" ]\n'
+        '  printf "10 tests collected\\n"\n'
         "  exit 0\n"
         "fi\n"
         '[ "${1:-}" = "-I" ] || { printf "missing -I: %s\\n" "$*" >&2; exit 11; }\n'
         '[ "${2:-}" = "-m" ] && [ "${3:-}" = "lu_machinery.publish" ] || { printf "bad module: %s\\n" "$*" >&2; exit 12; }\n'
         f'[ "${{LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}" = {shlex.quote(str(primary))} ] || {{ printf "bad primary=%s\\n" "${{LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}" >&2; exit 14; }}\n'
         f'[ "${{LU_PRODUCT_ROOT:-}}" = {shlex.quote(str(primary))} ] || {{ printf "bad product=%s\\n" "${{LU_PRODUCT_ROOT:-}}" >&2; exit 15; }}\n'
+        'if [ -e "$venv_root/lib/python3.14/site-packages/zz-release-cut-consumer.pth" ]; then\n'
+        '  printf "contaminated publisher venv: overlay present\\n" >&2; exit 16\n'
+        "fi\n"
         f'printf "%s\\n" "$*" >> {shlex.quote(str(accept_log))}\n'
         'case "${4:-}" in\n'
         '  pr-create) printf "https://github.com/learn-ukrainian/machinery/pull/1275\\n";;\n'
@@ -1183,7 +1203,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         'esac\n'
     )
 
-    # Simulate the consumer's stale host_python (0.1.61): creates accept venv, but rejects --milestone on pr-create.
+    # Simulate the consumer's stale host_python (0.1.61): creates venvs, returns site paths, rejects --milestone.
     host_python = tmp_path / "host-venv/bin/python"
     host_python.parent.mkdir(parents=True)
     accept_template = tmp_path / "accept-python-template"
@@ -1192,9 +1212,13 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     host_python.write_text(
         "#!/bin/sh\nset -eu\n"
         'if [ "${1:-}" = "-I" ] && [ "${2:-}" = "-m" ] && [ "${3:-}" = "venv" ]; then\n'
-        '  mkdir -p "$4/bin"\n'
+        '  mkdir -p "$4/bin" "$4/lib/python3.14/site-packages"\n'
         f'  cp {shlex.quote(str(accept_template))} "$4/bin/python"\n'
         '  chmod 755 "$4/bin/python"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "${1:-}" = "-I" ] && [ "${2:-}" = "-c" ]; then\n'
+        f'  printf "%s\\n" {shlex.quote(str(tmp_path / "host-site"))}\n'
         "  exit 0\n"
         "fi\n"
         'if [ "${2:-}" = "-m" ] && [ "${3:-}" = "lu_machinery.publish" ]; then\n'
@@ -1217,6 +1241,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"),
         machinery_milestone="v0.11.0 - CI and GitHub budget reliability",
         product_milestone="Machinery simplification (product side)",
+        built="0.1.62",
     )
     cut.head = cut.git(machinery, "rev-parse", "HEAD")
 
@@ -1265,21 +1290,112 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     lines = accept_log.read_text(encoding="utf-8").splitlines()
     assert "--milestone" in lines[1] and "--milestone" in lines[4]
 
-    # Cleanup after full release points resume instructions at the verified accept interpreter with --x-agent.
+    # Cleanup after full release emits a complete resume command with required roots and --x-agent.
     monkeypatch.setattr(cut, "remote_state", lambda: (True, "released", [1275]))
     resume_msg = cut.clean_up("post-release PR")
-    expected_resume = f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release --x-agent claude/claude-opus-5-5"
+    quoted_root = shlex.quote(str(primary.absolute()))
+    expected_resume = (
+        f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root} LU_PRODUCT_ROOT={quoted_root} "
+        f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release --x-agent claude/claude-opus-5-5"
+    )
     assert expected_resume in resume_msg
-    # Confirm the emitted CLI args parse cleanly through main().
-    resume_argv = shlex.split(expected_resume)[4:]
-    parsed_resume: list[tuple[str, str]] = []
-    with monkeypatch.context() as cli_ctx:
-        cli_ctx.setattr(release_cut, "_locked_run", lambda args: parsed_resume.append((args.command, args.x_agent)) or 0)
-        cli_ctx.setattr(release_cut, "x_agent_value", lambda value, **_k: value)
-        assert main(resume_argv) == 0
-    assert parsed_resume == [("post-release", "claude/claude-opus-5-5")]
+    # Execute the emitted env-prefixed command in a fresh shell with no root env vars inherited, exercising
+    # real argument parsing, x_agent_value attribution, resolve_repo("machinery"), and release-cut.lock.
+    probe_runner = tmp_path / "resume-probe-python"
+    pkg_parent = Path(lu_machinery.__file__).resolve().parents[1]
+    probe_runner.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(pkg_parent)!r})\n"
+        "from pathlib import Path\n"
+        "from lu_machinery import release_cut\n"
+        "from lu_machinery.common.repo_root import primary_root\n"
+        "from lu_machinery.dispatcher.git import resolve_repo\n"
+        "def stub_run(args):\n"
+        f"    assert primary_root().resolve() == Path({str(primary)!r}).resolve()\n"
+        f"    assert resolve_repo('machinery')[0].resolve() == Path({str(sibling_machinery)!r}).resolve()\n"
+        "    print('LOCKED_OK', args.command, args.x_agent)\n"
+        "    return 0\n"
+        "release_cut._run = stub_run\n"
+        "raise SystemExit(release_cut.main(sys.argv[4:]))\n",
+        encoding="utf-8",
+    )
+    probe_runner.chmod(0o755)
+    emitted_for_probe = expected_resume.replace(shlex.quote(str(installed)), shlex.quote(str(probe_runner)), 1)
+    clean_shell_env = {
+        key: value for key, value in os.environ.items()
+        if key not in {"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT", "LU_TASKS_DIR"}
+    }
+    probe_result = subprocess.run(
+        ["/bin/sh", "-c", emitted_for_probe], cwd=tmp_path, env=clean_shell_env,
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert probe_result.returncode == 0, f"emitted resume command failed: {probe_result.stderr}"
+    assert "LOCKED_OK post-release claude/claude-opus-5-5" in probe_result.stdout
+    assert (sibling_machinery / ".git/release-cut.lock").is_file()
 
-    # 2. Before install() / standalone post-release (publisher_python=None): never falls back to stale host_python.
+    # 2. Cut-time consumer_collection uses a disposable venv under work/tmp, keeping work/accept unmutated for
+    # promotion and failure rollback even when overlay write raises ENOSPC.
+    assert cut.consumer_collection(installed, product) == "10 tests collected"
+    accept_overlay = work / "accept/lib/python3.14/site-packages/zz-release-cut-consumer.pth"
+    assert not accept_overlay.exists()
+    collection_dirs = sorted((work / "tmp").glob("collection-*"))
+    assert len(collection_dirs) == 1
+    assert (collection_dirs[0] / "lib/python3.14/site-packages/zz-release-cut-consumer.pth").is_file()
+
+    real_write_text = Path.write_text
+
+    def failing_overlay_write(self_path, data, *args, **kwargs):
+        if self_path.name == "zz-release-cut-consumer.pth":
+            real_write_text(self_path, data, *args, **kwargs)
+            raise OSError(28, "No space left on device")
+        return real_write_text(self_path, data, *args, **kwargs)
+
+    with monkeypatch.context() as write_ctx:
+        write_ctx.setattr(Path, "write_text", failing_overlay_write)
+        with pytest.raises(OSError, match="No space left on device"):
+            cut.consumer_collection(installed, product)
+    assert not accept_overlay.exists()
+
+    # Rollback after a pre-release failure still runs release-edit, pr-close and yanked post-release on clean accept.
+    accept_log.write_text("", encoding="utf-8")
+    # Reset machinery branch state so post_release(yanked=True) can create release/start-0.1.63 cleanly.
+    cut.git(machinery, "switch", "--quiet", "main")
+    cut.git(machinery, "branch", "-D", "release/start-0.1.63")
+    monkeypatch.setattr(cut, "remote_state", lambda: (True, "prerelease", [1275]))
+    rollback_summary = cut.clean_up("consumer test collection")
+    assert "FAILED" not in rollback_summary, rollback_summary
+    rollback_verbs = [line.split()[3] for line in accept_log.read_text(encoding="utf-8").splitlines()]
+    assert rollback_verbs == ["release-edit", "pr-close", "pr-create"]
+    assert not host_log.exists()
+
+    # Standalone consumer_collection (publisher_python=None, as in CI) writes and keeps the overlay in the given venv.
+    standalone_site = tmp_path / "standalone-site"
+    standalone_site.mkdir()
+    standalone_cut = Cut(
+        work=tmp_path, dry_run=True, machinery_remote="", product_remote="", machinery_repo=REPO,
+        product_repo="learn-ukrainian/learn-ukrainian", host_python=host_python, primary=primary,
+        alert=False, x_agent="claude/claude-opus-5-5", built="0.1.62",
+    )
+
+    def standalone_run(cmd, **_kwargs):
+        parts = [str(part) for part in cmd]
+        if "pytest" in parts:
+            assert (standalone_site / "zz-release-cut-consumer.pth").is_file()
+            return subprocess.CompletedProcess(parts, 0, "10 tests collected\n", "")
+        if "purelib" in parts[-1]:
+            return subprocess.CompletedProcess(parts, 0, f"{standalone_site}\n", "")
+        if parts[-1] == release_cut._SITE_PATHS:
+            return subprocess.CompletedProcess(parts, 0, f"{tmp_path / 'host-site'}\n", "")
+        if parts[-1] == release_cut._SHOW_LU:
+            return subprocess.CompletedProcess(parts, 0, f"0.1.62\n{standalone_site}/lu_machinery/__init__.py\n", "")
+        return subprocess.CompletedProcess(parts, 0, "d" * 40 + "\n", "")
+
+    standalone_cut.run = standalone_run
+    assert standalone_cut.consumer_collection(installed, product) == "10 tests collected"
+    assert (standalone_site / "zz-release-cut-consumer.pth").is_file()
+
+    # 3. Before install() / standalone post-release (publisher_python=None): never falls back to stale host_python.
     cut.publisher_python = None
     monkeypatch.setenv("PYTHONWARNINGS", "error")
     monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "userbase"))
@@ -1298,7 +1414,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     # Installed venv invocation (e.g. resuming post-release with accept/bin/python -I) uses -I with no PYTHONPATH.
     fake_site = work / "accept/lib/python3.14/site-packages"
     fake_init = fake_site / "lu_machinery/__init__.py"
-    fake_init.parent.mkdir(parents=True)
+    fake_init.parent.mkdir(parents=True, exist_ok=True)
     fake_init.write_text("", encoding="utf-8")
     monkeypatch.setattr(sys, "executable", str(installed))
     monkeypatch.setattr(lu_machinery, "__file__", str(fake_init))
@@ -1343,75 +1459,3 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     monkeypatch.setattr(sys, "executable", "")
     with pytest.raises(CutError, match="cannot locate the running Python interpreter"):
         cut.publisher_invocation("pr-create")
-
-    # 3. consumer_collection removes its .pth overlay when keep_collection_overlay=False (even on write/collection
-    # failure) and blocks publisher if removal itself fails; keep_collection_overlay=True retains it for CI.
-    overlay_site = tmp_path / "overlay-site"
-    overlay_site.mkdir()
-    overlay_cut = Cut(
-        work=tmp_path, dry_run=True, machinery_remote="", product_remote="", machinery_repo=REPO,
-        product_repo="learn-ukrainian/learn-ukrainian", host_python=host_python, primary=primary,
-        alert=False, x_agent="claude/claude-opus-5-5", built="0.1.62", publisher_python=installed,
-    )
-
-    def overlay_run(cmd, **_kwargs):
-        parts = [str(part) for part in cmd]
-        if "pytest" in parts:
-            assert (overlay_site / "zz-release-cut-consumer.pth").is_file()
-            return subprocess.CompletedProcess(parts, 0, "10 tests collected\n", "")
-        if "purelib" in parts[-1]:
-            return subprocess.CompletedProcess(parts, 0, f"{overlay_site}\n", "")
-        if parts[-1] == release_cut._SITE_PATHS:
-            return subprocess.CompletedProcess(parts, 0, f"{tmp_path / 'host-site'}\n", "")
-        if parts[-1] == release_cut._SHOW_LU:
-            return subprocess.CompletedProcess(parts, 0, f"0.1.62\n{overlay_site}/lu_machinery/__init__.py\n", "")
-        return subprocess.CompletedProcess(parts, 0, "d" * 40 + "\n", "")
-
-    overlay_cut.run = overlay_run
-    assert overlay_cut.consumer_collection(installed, product) == "10 tests collected"
-    assert not (overlay_site / "zz-release-cut-consumer.pth").exists()
-
-    # Partial write failure (e.g. ENOSPC after creating the .pth) must still remove the overlay.
-    real_write_text = Path.write_text
-
-    def failing_write(self_path, data, *args, **kwargs):
-        if self_path == overlay_site / "zz-release-cut-consumer.pth":
-            real_write_text(self_path, data, *args, **kwargs)
-            raise OSError(28, "No space left on device")
-        return real_write_text(self_path, data, *args, **kwargs)
-
-    with monkeypatch.context() as write_ctx:
-        write_ctx.setattr(Path, "write_text", failing_write)
-        with pytest.raises(OSError, match="No space left on device"):
-            overlay_cut.consumer_collection(installed, product)
-    assert not (overlay_site / "zz-release-cut-consumer.pth").exists()
-
-    # Unlink failure must block publisher_invocation so rollback cannot use a contaminated accept venv.
-    real_unlink = Path.unlink
-
-    def failing_unlink(self_path, *args, **kwargs):
-        if self_path == overlay_site / "zz-release-cut-consumer.pth":
-            raise PermissionError("simulated unlink refusal")
-        return real_unlink(self_path, *args, **kwargs)
-
-    with monkeypatch.context() as unlink_ctx:
-        unlink_ctx.setattr(Path, "unlink", failing_unlink)
-        with pytest.raises(PermissionError, match="simulated unlink refusal"):
-            overlay_cut.consumer_collection(installed, product)
-    assert (overlay_site / "zz-release-cut-consumer.pth").is_file()
-    with pytest.raises(CutError, match="refusing publisher: failed to remove consumer overlay"):
-        overlay_cut.publisher_invocation("release-edit")
-    (overlay_site / "zz-release-cut-consumer.pth").unlink()
-    overlay_cut._publisher_blocked_reason = None
-
-    overlay_cut.run = lambda cmd, **_k: (
-        subprocess.CompletedProcess([str(p) for p in cmd], 1, "collection error\n", "")
-        if "pytest" in [str(p) for p in cmd] else overlay_run(cmd, **_k)
-    )
-    with pytest.raises(CutError, match="product test collection failed"):
-        overlay_cut.consumer_collection(installed, product)
-    assert not (overlay_site / "zz-release-cut-consumer.pth").exists()
-    overlay_cut.run = overlay_run
-    overlay_cut.keep_collection_overlay = True
-    assert overlay_cut.consumer_collection(installed, product) == "10 tests collected"
-    assert (overlay_site / "zz-release-cut-consumer.pth").is_file()

@@ -582,8 +582,7 @@ class Cut:
     machinery_milestone: str | None = None
     product_milestone: str | None = None
     publisher_python: Path | None = None
-    keep_collection_overlay: bool = False
-    _publisher_blocked_reason: str | None = field(default=None, init=False)
+    _consumer_lock: Path | None = field(default=None, init=False)
 
     # Plumbing
 
@@ -662,8 +661,6 @@ class Cut:
 
     def publisher_invocation(self, *args: str) -> tuple[list[str | Path], dict[str, str]]:
         """Command and environment for ``lu_machinery.publish`` using the release's own code."""
-        if self._publisher_blocked_reason is not None:
-            raise CutError(self._publisher_blocked_reason)
         if self.publisher_python is not None:
             return [self.publisher_python.absolute(), "-I", "-m", "lu_machinery.publish", *args], self.env()
         base, package_root = _running_publisher_base()
@@ -884,10 +881,8 @@ class Cut:
         )
         return consumer
 
-    def install(self, consumer_lock: Path, built_version: str) -> Path:
-        """Clean machinery-only environment: install, pip check and isolated import."""
-        self.step = "clean install"
-        venv = self.work / "accept"
+    def _install_venv(self, venv: Path, consumer_lock: Path, built_version: str) -> Path:
+        """Install the locked wheelhouse offline into ``venv``, run pip check, and verify isolated import."""
         python = self.venv(venv).absolute()
         self.run([python, "-I", "-m", "pip", "install", "--disable-pip-version-check", "--force-reinstall",
                   "--no-index", "--find-links", self.work / "wheelhouse", "--require-hashes", "--only-binary=:all:",
@@ -896,8 +891,15 @@ class Cut:
         shown = self.run([python, "-I", "-c", _SHOW_LU], env=self.scratch_env()).stdout.split()
         if shown[0] != built_version or not Path(shown[1]).resolve().is_relative_to(venv.resolve()):
             raise CutError(f"clean environment imported {shown}, not {built_version} from {venv}")
+        return python
+
+    def install(self, consumer_lock: Path, built_version: str) -> Path:
+        """Clean machinery-only environment: install, pip check and isolated import."""
+        self.step = "clean install"
+        python = self._install_venv(self.work / "accept", consumer_lock, built_version)
         self.publisher_python = python
-        self.say(f"clean install and import: lu-machinery {shown[0]} (publisher: {python} -I)")
+        self._consumer_lock = consumer_lock
+        self.say(f"clean install and import: lu-machinery {built_version} (publisher: {python} -I)")
         return python
 
     # Publish
@@ -1139,33 +1141,38 @@ class Cut:
     def consumer_collection(self, python: Path, product: Path) -> str:
         """Collect the product's tests with the candidate first and the product venv's packages after it (R5)."""
         self.step = "consumer test collection"
+        # During a release cut, keep the verified publisher venv (work/accept) completely unmutated so
+        # promotion and rollback always run a pure machinery-only environment; attach the consumer .pth
+        # overlay to a disposable offline install under work/tmp instead.
+        same_venv = False
+        if self.publisher_python is not None:
+            same_venv = python.absolute() == self.publisher_python.absolute()
+            if not same_venv:
+                try:
+                    same_venv = python.parent.parent.resolve(strict=True) == self.publisher_python.parent.parent.resolve(strict=True)
+                except (OSError, RuntimeError) as exc:
+                    raise CutError(f"cannot resolve candidate environment path for collection: {exc}") from exc
+        if same_venv:
+            tmp_dir = self.work / "tmp"
+            tmp_dir.mkdir(exist_ok=True)
+            overlay_venv = Path(tempfile.mkdtemp(prefix="collection-", dir=tmp_dir))
+            python = self._install_venv(overlay_venv, self._consumer_lock or (self.work / "consumer.lock"), self.built)
         paths = self.run([self.host_python, "-I", "-c", _SITE_PATHS]).stdout.split()
         site = self.run([python, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"]).stdout.strip()
         lines = "".join(f"import site; site.addsitedir({path!r})\n" for path in dict.fromkeys(paths))
-        overlay = Path(site, "zz-release-cut-consumer.pth")
-        try:
-            overlay.write_text(lines, encoding="utf-8")
-            shown = self.run([python, "-c", _SHOW_LU], cwd=product, env=self.scratch_env()).stdout.split()
-            if shown[0] != self.built or not Path(shown[1]).resolve().is_relative_to(Path(site).resolve()):
-                raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
-            # The product's project_interpreter() reads LEARN_UKRAINIAN_PYTHON; the candidate names itself rather
-            # than inheriting the caller's value or none.
-            result = self.run([python, "-m", "pytest", "--collect-only", "-q", "tests"], cwd=product, timeout=1800,
-                              env=self.env(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PYTHON=str(python)), check=False)
-            summary = (result.stdout.strip().splitlines() or ["no output"])[-1]
-            if result.returncode:
-                raise CutError(f"product test collection failed (exit {result.returncode}): {summary}")
-            self.say(f"product collection at {self.git(product, 'rev-parse', 'HEAD')[:12]}: {summary}")
-            return summary
-        finally:
-            if not self.keep_collection_overlay:
-                try:
-                    overlay.unlink(missing_ok=True)
-                except OSError as exc:
-                    self._publisher_blocked_reason = (
-                        f"refusing publisher: failed to remove consumer overlay {overlay}: {exc}"
-                    )
-                    raise
+        Path(site, "zz-release-cut-consumer.pth").write_text(lines, encoding="utf-8")
+        shown = self.run([python, "-c", _SHOW_LU], cwd=product, env=self.scratch_env()).stdout.split()
+        if shown[0] != self.built or not Path(shown[1]).resolve().is_relative_to(Path(site).resolve()):
+            raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
+        # The product's project_interpreter() reads LEARN_UKRAINIAN_PYTHON; the candidate names itself rather
+        # than inheriting the caller's value or none.
+        result = self.run([python, "-m", "pytest", "--collect-only", "-q", "tests"], cwd=product, timeout=1800,
+                          env=self.env(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PYTHON=str(python)), check=False)
+        summary = (result.stdout.strip().splitlines() or ["no output"])[-1]
+        if result.returncode:
+            raise CutError(f"product test collection failed (exit {result.returncode}): {summary}")
+        self.say(f"product collection at {self.git(product, 'rev-parse', 'HEAD')[:12]}: {summary}")
+        return summary
 
     def contract_canary(self) -> subprocess.CompletedProcess[str]:
         """The candidate's canary orchestration and sealed candidate receipt gate."""
@@ -1266,10 +1273,14 @@ class Cut:
         if tagged is None or release is None:
             return f"remote state of {tag} unknown (tag {tagged}, release {release}); nothing withdrawn"
         if release == "released":
+            root = shlex.quote(str(self.primary.absolute()))
+            env_prefix = f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={root} LU_PRODUCT_ROOT={root}"
             x_agent_flag = f" --x-agent {shlex.quote(self.x_agent)}" if self.x_agent else ""
             resume = (
-                f"{shlex.quote(str(self.publisher_python))} -I -m lu_machinery.release_cut post-release{x_agent_flag}"
-                if self.publisher_python is not None else f"release_cut post-release{x_agent_flag}"
+                f"{env_prefix} {shlex.quote(str(self.publisher_python.absolute()))} -I -m lu_machinery.release_cut "
+                f"post-release{x_agent_flag}"
+                if self.publisher_python is not None
+                else f"{env_prefix} release_cut post-release{x_agent_flag}"
             )
             return (f"{tag} is a full release; nothing withdrawn. Remaining: mark the adopt PR "
                     f"{adopt if adopt is not None else 'unknown'} ready, then run {resume}")
@@ -1576,10 +1587,9 @@ def _consumer_collection(args: argparse.Namespace) -> int:
         (work / name).mkdir()
     product = args.product.absolute()
     # Not resolved: a venv interpreter is a symlink, and resolving it leaves the venv.
-    # CI's next step runs key consumer tests in this overlay venv.
     cut = Cut(work=work, dry_run=True, machinery_remote="", product_remote="", machinery_repo="", product_repo="",
               host_python=args.product_python.absolute(), primary=product, alert=False, x_agent="",
-              built=args.version, keep_collection_overlay=True)
+              built=args.version)
     try:
         cut.consumer_collection(args.python.absolute(), product)
     except (CutError, OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
