@@ -571,6 +571,68 @@ def test_stale_local_ref_never_yields_read_only_checkout_at_stale_commit(sandbox
     assert not (sandbox.tasks / "stale-local-ref-short.json").exists()
 
 
+def _read_only_remote_commit_worktree(tmp_path: Path, monkeypatch, task_id: str) -> tuple[Path, Path, dict]:
+    """Create a real read-only worktree at an unreferenced commit, matching review_branch_start."""
+    repo, tasks = tmp_path / "repo", tmp_path / "tasks"
+    repo.mkdir()
+    tasks.mkdir()
+    run_git(repo, "init", "-b", "main")
+    run_git(repo, "config", "user.email", "stub@example.invalid")
+    run_git(repo, "config", "user.name", "Stub")
+    (repo / "README.md").write_text("base\n")
+    run_git(repo, "add", "README.md")
+    run_git(repo, "commit", "-m", "base")
+    main_sha = run_git(repo, "rev-parse", "HEAD")
+    remote_head = run_git(repo, "commit-tree", "HEAD^{tree}", "-p", main_sha, "-m", "remote pr head")
+    assert run_git(repo, "rev-list", "-n1", remote_head, "--not", "--all") == remote_head
+    branch = f"codex/{task_id}"
+    tree = repo / ".worktrees" / "dispatch" / "codex" / task_id
+    run_git(repo, "worktree", "add", "-b", branch, str(tree), remote_head)
+    record = {
+        "schema_version": 2,
+        "task_id": task_id,
+        "mode": "read-only",
+        "status": "done",
+        "worktree_path": str(tree),
+        "worktree_branch": branch,
+        "worktree_base_sha": main_sha,
+        "worktree_start_sha": remote_head,
+        "worktree_remote_url": str(tmp_path / "origin.git"),
+    }
+    (tasks / f"{task_id}.json").write_text(json.dumps(record))
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.setattr(git, "resolve_repo", lambda _key=None: (repo, {}))
+    return repo, tree, record
+
+
+def test_read_only_zero_commit_branch_is_deleted_at_settlement(tmp_path: Path, monkeypatch):
+    """Defect class: a read-only task on a remote-only commit leaked its zero-commit branch as branch_kept_unmerged."""
+    repo, tree, record = _read_only_remote_commit_worktree(tmp_path, monkeypatch, "ro-zero-commit")
+
+    outcome = git.settle_worktree(record)
+
+    assert outcome == {"worktree_disposition": "removed", "worktree_disposition_reason": "clean"}
+    assert not tree.exists()
+    assert record["worktree_branch"] not in local_branches(repo)
+
+
+def test_read_only_branch_with_commit_is_kept_as_unmerged(tmp_path: Path, monkeypatch):
+    """Defect class: deleting a read-only task branch that gained a commit would drop unmerged work."""
+    repo, tree, record = _read_only_remote_commit_worktree(tmp_path, monkeypatch, "ro-with-commit")
+    (tree / "local-only.txt").write_text("unmerged commit on read-only branch\n")
+    run_git(tree, "add", "local-only.txt")
+    run_git(tree, "commit", "-m", "commit on read-only branch")
+    committed_head = run_git(tree, "rev-parse", "HEAD")
+    assert committed_head != record["worktree_start_sha"]
+
+    outcome = git.settle_worktree(record)
+
+    assert outcome == {"worktree_disposition": "removed", "worktree_disposition_reason": "branch_kept_unmerged"}
+    assert not tree.exists()
+    assert record["worktree_branch"] in local_branches(repo)
+    assert run_git(repo, "rev-parse", f"refs/heads/{record['worktree_branch']}") == committed_head
+
+
 def _published_branch(sandbox, name):
     """Push ``name`` to origin at a commit that is not the local ``name`` (if any)."""
     remote_head = run_git(sandbox.repo, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "remote pr head")

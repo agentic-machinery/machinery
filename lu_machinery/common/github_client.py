@@ -40,6 +40,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC
@@ -2488,6 +2489,196 @@ def _read_command(client, kind, action, options, positional, *, timeout, fresh):
     return result
 
 
+MILESTONE_ERROR_REASONS = frozenset(
+    {
+        "invalid_milestone",
+        "malformed_milestones",
+        "milestone_not_found",
+        "milestone_ambiguous",
+        "milestone_closed",
+        "pr_number_missing",
+        "milestone_patch_failed",
+        "milestone_unconfirmed",
+    }
+)
+"""The closed set of typed reasons a PR/issue milestone operation is refused or fails."""
+
+_MILESTONE_RESULT_MAP: dict[str, tuple[int, str]] = {
+    "invalid_milestone": (400, "github_milestone_error"),
+    "malformed_milestones": (502, "github_milestone_error"),
+    "milestone_not_found": (404, "github_milestone_not_found"),
+    "milestone_ambiguous": (409, "github_milestone_ambiguous"),
+    "milestone_closed": (422, "github_milestone_closed"),
+    "pr_number_missing": (502, "github_milestone_failed"),
+    "milestone_patch_failed": (502, "github_milestone_failed"),
+    "milestone_unconfirmed": (502, "github_milestone_failed"),
+}
+_MILESTONE_RESULT_ERRORS = frozenset(error for _, error in _MILESTONE_RESULT_MAP.values())
+
+
+class GitHubMilestoneError(ValueError):
+    """A GitHub milestone could not be validated, matched, or confirmed."""
+
+    code = "github_milestone_error"
+
+    def __init__(self, reason: str, message: str = "") -> None:
+        if reason not in MILESTONE_ERROR_REASONS:
+            raise AssertionError(f"untyped GitHub milestone error: {reason!r}")
+        self.reason = reason
+        super().__init__(message or f"{self.code} reason={reason}")
+
+
+def valid_milestone_text(value: object) -> bool:
+    """True for a non-blank, single-line milestone title or number without control/format characters."""
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and not any(unicodedata.category(char).startswith("C") or char in "\u2028\u2029" for char in value)
+    )
+
+
+def match_milestone_pages(pages: object, raw_milestone: object, *, require_open: bool = True) -> tuple[int, str]:
+    """Match *raw_milestone* (title or positive integer) to one milestone in paginated *pages*."""
+    if not isinstance(raw_milestone, str) or not valid_milestone_text(raw_milestone):
+        raise GitHubMilestoneError("invalid_milestone", "milestone must be a non-blank single-line value")
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+        raise GitHubMilestoneError("malformed_milestones", "repository milestones payload is malformed")
+    rows: dict[int, tuple[int, str, str]] = {}
+    for page in pages:
+        for row in page:
+            if not isinstance(row, dict):
+                raise GitHubMilestoneError("malformed_milestones", "repository milestones payload is malformed")
+            num = row.get("number")
+            title = row.get("title")
+            state = row.get("state")
+            if (
+                type(num) is not int
+                or num <= 0
+                or not isinstance(title, str)
+                or not valid_milestone_text(title)
+                or not isinstance(state, str)
+                or state not in {"open", "closed"}
+            ):
+                raise GitHubMilestoneError("malformed_milestones", "repository milestones payload is malformed")
+            entry = (num, title, state)
+            existing = rows.get(num)
+            if existing is not None and existing != entry:
+                raise GitHubMilestoneError("malformed_milestones", "repository milestones payload is inconsistent")
+            rows[num] = entry
+    by_title = [entry for entry in rows.values() if entry[1] == raw_milestone]
+    by_number = (
+        [entry for entry in rows.values() if str(entry[0]) == raw_milestone]
+        if re.fullmatch(r"[1-9][0-9]*", raw_milestone)
+        else []
+    )
+    matched: dict[int, tuple[int, str, str]] = {}
+    for entry in (*by_title, *by_number):
+        matched[entry[0]] = entry
+    if not matched:
+        raise GitHubMilestoneError("milestone_not_found", f"milestone {raw_milestone!r} does not exist")
+    if len(matched) > 1:
+        raise GitHubMilestoneError("milestone_ambiguous", f"milestone {raw_milestone!r} matches multiple milestones")
+    ((chosen_num, chosen_title, chosen_state),) = matched.values()
+    if require_open and chosen_state != "open":
+        raise GitHubMilestoneError(
+            "milestone_closed",
+            f"milestone {chosen_title!r} (#{chosen_num}) is {chosen_state}, not open",
+        )
+    return chosen_num, chosen_title
+
+
+def confirm_pr_milestone(document: object, milestone_number: int, *, pr_number: int | None = None) -> bool:
+    """True when a GitHub issue/PR response confirms ``milestone.number == milestone_number``."""
+    if type(milestone_number) is not int or milestone_number <= 0:
+        return False
+    if not isinstance(document, dict):
+        return False
+    if pr_number is not None and "number" in document and (
+        type(document["number"]) is not int or document["number"] != pr_number
+    ):
+        return False
+    applied = document.get("milestone")
+    return (
+        isinstance(applied, dict)
+        and type(applied.get("number")) is int
+        and applied["number"] == milestone_number
+    )
+
+
+def _milestone_error_result(
+    reason: str,
+    *,
+    value: Any = None,
+    status: int | None = None,
+    reset_at: int | None = None,
+    headers: dict[str, str] | None = None,
+) -> Result:
+    default_status, error = _MILESTONE_RESULT_MAP[reason]
+    return Result(
+        value=value,
+        status=default_status if status is None else status,
+        error=error,
+        reset_at=reset_at,
+        headers=dict(headers) if headers else {},
+        reason=reason,
+    )
+
+
+def _resolve_milestone_option(client, root, target, *, timeout, require_open: bool):
+    """Validate and resolve a ``--milestone`` option against live repository milestones."""
+    if not isinstance(target, str) or not valid_milestone_text(target):
+        return _milestone_error_result("invalid_milestone")
+    milestones = _pages(
+        client, f"{root}/milestones?state=all&per_page=100", timeout=timeout, fresh=True, paginate=True
+    )
+    if isinstance(milestones, Result):
+        return milestones
+    try:
+        number, title = match_milestone_pages([page.value for page in milestones], target, require_open=require_open)
+    except GitHubMilestoneError as exc:
+        return _milestone_error_result(exc.reason)
+    return number, title, milestones
+
+
+def _apply_pr_milestone(client, root, created, milestone_number, *, timeout, observations=()):
+    """Apply a pre-validated milestone to a newly created PR via Issues PATCH and confirm it."""
+    pr_number = created.value.get("number") if isinstance(created.value, dict) else None
+    if type(pr_number) is not int or pr_number <= 0:
+        return _milestone_error_result("pr_number_missing", value=created.value, headers=created.headers)
+    patched = client.request(
+        "PATCH",
+        f"{root}/issues/{pr_number}",
+        payload={"milestone": milestone_number},
+        timeout=timeout,
+        fresh=True,
+    )
+    if patched.error:
+        if patched.error == "github_rate_limited":
+            return Result(
+                value=created.value,
+                status=patched.status,
+                error=patched.error,
+                reset_at=patched.reset_at,
+                headers=patched.headers,
+                reason=patched.reason,
+            )
+        return _milestone_error_result(
+            "milestone_patch_failed",
+            value=created.value,
+            status=patched.status,
+            reset_at=patched.reset_at,
+            headers=patched.headers,
+        )
+    if not confirm_pr_milestone(patched.value, milestone_number, pr_number=pr_number):
+        return _milestone_error_result(
+            "milestone_unconfirmed",
+            value=created.value,
+            headers=patched.headers,
+        )
+    created.value = {**created.value, "milestone": patched.value["milestone"]}
+    return _merge_observation(created, *observations, patched)
+
+
 def _write_command(client, kind, action, options, positional, *, timeout, input=None):
     if (
         client.env.get("AGENT_NO_MERGE") == "1"
@@ -2512,6 +2703,7 @@ def _write_command(client, kind, action, options, positional, *, timeout, input=
             return _unprepared(exc.reason)
         except UnicodeDecodeError:
             return _unprepared("body_unreadable")
+    pr_milestone = None
     if kind in {"pr", "issue"}:
         endpoint = root + ("/pulls" if kind == "pr" else "/issues")
         if action == "create":
@@ -2630,16 +2822,20 @@ def _write_command(client, kind, action, options, positional, *, timeout, input=
             if "--remove-milestone" in options:
                 payload["milestone"] = None
             elif "--milestone" in options:
-                milestones = _pages(
-                    client, f"{root}/milestones?state=all&per_page=100", timeout=timeout, fresh=True, paginate=True
+                resolved = _resolve_milestone_option(
+                    client,
+                    root,
+                    _opt(options, "--milestone"),
+                    timeout=timeout,
+                    require_open=(kind == "pr" and action == "create"),
                 )
-                if isinstance(milestones, Result):
-                    return milestones
-                target = _opt(options, "--milestone")
-                matched = next((r["number"] for page in milestones for r in page.value if r["title"] == target), None)
-                if matched is None:
-                    return Result(error="github_milestone_not_found")
-                payload["milestone"] = matched
+                if isinstance(resolved, Result):
+                    return resolved
+                milestone_number, _, milestone_pages = resolved
+                if kind == "pr" and action == "create":
+                    pr_milestone = (milestone_number, milestone_pages)
+                else:
+                    payload["milestone"] = milestone_number
     elif kind == "run" and action == "cancel":
         endpoint, method = f"{root}/actions/runs/{number}/cancel", "POST"
     elif kind == "run" and action == "rerun":
@@ -2649,7 +2845,12 @@ def _write_command(client, kind, action, options, positional, *, timeout, input=
         )
     else:
         return Result(error="github_unsupported_command")
-    return client.request(method, endpoint, payload=payload, timeout=timeout, fresh=True)
+    result = client.request(method, endpoint, payload=payload, timeout=timeout, fresh=True)
+    if result.error or pr_milestone is None:
+        return result
+    return _apply_pr_milestone(
+        client, root, result, pr_milestone[0], timeout=timeout, observations=pr_milestone[1]
+    )
 
 
 def _format_value(value, options, *, api=False):
@@ -4469,6 +4670,18 @@ def _result_process(args, result, options, kwargs, *, api=True):
             detail["errors"] = _graphql_error_detail(result.value)
             if result.reason:
                 detail["reason"] = result.reason
+        elif result.error in _MILESTONE_RESULT_ERRORS:
+            if result.reason:
+                detail["reason"] = result.reason
+            if result.reason == "milestone_patch_failed":
+                detail["status"] = result.status
+            if (
+                result.error == "github_milestone_failed"
+                and isinstance(result.value, dict)
+                and type(result.value.get("number")) is int
+                and result.value["number"] > 0
+            ):
+                detail["pr_number"] = result.value["number"]
         output = json.dumps(detail).encode()
         error = output
         code = 75 if result.error == "github_rate_limited" else 1
