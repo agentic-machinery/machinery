@@ -71,6 +71,8 @@ def test_each_field_class_accepts_valid_and_refuses_invalid(kind: str, data) -> 
         fields.pop(key.removesuffix("_file"), None)
     if verb == "pr-create" and key in {"base", "head"} and not fields[key]:
         fields[key] = "main"
+    if verb == "pr-create" and key == "milestone" and not fields[key].strip():
+        fields[key] = "v0.11.0"
     if verb == "pr-merge" and key == "subject" and not fields[key].strip():
         fields[key] = "Subject"
     if verb == "ruleset-merge-queue" and key in pub.MERGE_QUEUE_INT_BOUNDS:
@@ -126,6 +128,51 @@ def test_cross_field_refusal_classes(verb: str, fields: dict) -> None:
 def test_blank_merge_subjects_are_refused(blank: str) -> None:
     with pytest.raises(PublishBlocked):
         pub._validate("pr-merge", {"number": 1, "subject": blank})
+
+
+@given(
+    bad=st.one_of(
+        st.text(alphabet=" \t\r\n", max_size=20),
+        st.sampled_from(["v1\nline2", "v1\r", "v1\x00", "v1\x7f", "v1\u2028", "v1\u2029", "v1\u202e", "v1\u200b"]),
+    )
+)
+def test_pr_create_blank_or_control_milestones_are_refused(bad: str) -> None:
+    """Defect class: pr-create accepts blank or control/bidi-character milestone strings before transport."""
+    with pytest.raises(PublishBlocked, match=r"MILESTONE_REFUSED|invalid publisher field milestone"):
+        pub._validate(
+            "pr-create",
+            {"title": "T", "body": "B", "base": "main", "head": "feature", "milestone": bad},
+        )
+
+
+def test_pr_create_milestone_matching_and_closing_issue_extraction() -> None:
+    """Defect class: missing, closed, or ambiguous milestones are accepted, or quoted code/comments link false issues."""
+    pages = [[
+        {"number": 13, "title": "v0.11.0 - CI and GitHub budget reliability", "state": "open"},
+        {"number": 2, "title": "13", "state": "open"},
+        {"number": 4, "title": "v0.9.0 - Shipped", "state": "closed"},
+    ]]
+    assert pub.match_milestone_pages(pages, "v0.11.0 - CI and GitHub budget reliability", repo="unit/public") == (
+        13, "v0.11.0 - CI and GitHub budget reliability",
+    )
+    with pytest.raises(PublishBlocked, match="MILESTONE_AMBIGUOUS"):
+        pub.match_milestone_pages(pages, "13", repo="unit/public")
+    with pytest.raises(PublishBlocked, match="MILESTONE_REFUSED"):
+        pub.match_milestone_pages(pages, "v0.9.0 - Shipped", repo="unit/public")
+    with pytest.raises(PublishBlocked, match="MILESTONE_REFUSED"):
+        pub.match_milestone_pages(pages, "nonexistent", repo="unit/public")
+
+    body = (
+        "Summary\n\n"
+        "<!-- Closes #666 -->\n"
+        "```md\nCloses #999\n```\n"
+        "Example: `Fixes #888`\n"
+        "Closes other/repo#777\n"
+        "Fixes #42\n"
+        "Resolves unit/public#43\n"
+        "Closes https://github.com/unit/public/issues/42\n"
+    )
+    assert pub._pr_closing_issues(body, "unit/public") == [42, 43]
 
 
 @given(name=st.text(alphabet="abcXYZ019_.-", min_size=1, max_size=20), bad=st.sampled_from([*map(chr, range(32)), "\x7f", "/", "\\", "#"]))

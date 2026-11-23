@@ -26,6 +26,12 @@
 # secret-scanning alerts for this repository. Set `security_alerts: false` to
 # opt a repository out of scanning and metrics.
 #
+# `release_milestone` (optional, non-blank single-line string) names the open
+# milestone title (or milestone number) attached by `lu_machinery.release_cut`
+# to release PRs opened in this repository (adopt PR in the product repository,
+# post-release PR in machinery). Omitting the key leaves release PRs without a
+# milestone; an invalid, closed, or ambiguous value refuses before publication.
+#
 # Dual-slug transfer bridge (PLAN NEW-ORG-1122 A01):
 # - `alternate_github` (optional, owner/name) names the one exact alternate slug
 #   for a repository being transferred. Both `github` and `alternate_github`
@@ -121,6 +127,7 @@ repos:
     role: public-machinery
     verdict_recorder: true
     required_workflow: .github/workflows/ci-gate.yml
+    release_milestone: "v0.11.0 - CI and GitHub budget reliability"
   # ukrainian-llm-eval: the public model-evaluation repository (EVAL-PROJECT-1103). Reuses the
   # public-labs role: consumers only read the "public-" / "private" prefix, and it runs studies.
   ukrainian-llm-eval:
