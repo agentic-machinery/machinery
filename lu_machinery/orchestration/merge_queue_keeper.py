@@ -546,6 +546,25 @@ class GitHub:
         ``ERROR``), never log values."""
         return _extract_failed_tests(self.job_log(job_id))
 
+    def read_source_blob(
+        self,
+        number: int,
+        head: str,
+        path: str,
+        *,
+        base_name: str | None = None,
+        removed: bool = False,
+    ) -> str | None:
+        """Read a bounded source blob at the exact PR head (or diff base for removals)."""
+        return _read_git_blob_for_verify(
+            self.root,
+            number=number,
+            head=head,
+            base_name=base_name,
+            path=path,
+            removed=removed,
+        )
+
 
 def _extract_failed_tests(log: str) -> list[str]:
     """Extract sanitized pytest ``FAILED``/``ERROR`` test node IDs from a job log."""
@@ -572,37 +591,6 @@ _TEST_FAILURE_PATTERNS = (
     re.compile(r'\b(?:failures|errors)="[1-9][0-9]*"'),
 )
 
-_RUNNER_LOST_RE = re.compile(
-    r"the (?:self-hosted |hosted )?runner[^\r\n]*lost communication"
-    r"|the runner has received a shutdown signal"
-    r"|runner\.listener[^\r\n]*(?:exited|terminated)",
-    re.I,
-)
-_NETWORK_FETCH_RE = re.compile(
-    r"could not resolve host|temporary failure in name resolution"
-    r"|connection reset by peer|tls handshake timeout"
-    r"|remote:\s*internal server error|failed to download action"
-    r"|http\s*50[234]\b|\b50[234]\s+(?:bad gateway|service unavailable|gateway timeout)",
-    re.I,
-)
-_DISK_FULL_RE = re.compile(r"no space left on device", re.I)
-
-_PRE_EXECUTION_STEP_EXACT = frozenset({"set up job", "complete job"})
-_PRE_EXECUTION_STEP_PREFIXES = (
-    "run actions/checkout",
-    "actions/checkout",
-    "checkout",
-    "run actions/setup-",
-    "actions/setup-",
-    "run astral-sh/setup-uv",
-    "set up python",
-    "setup python",
-    "install uv",
-    "restore cache",
-    "cache ",
-    "download action",
-)
-
 _SYSTEMD_UNIT_SUFFIXES = (".service", ".timer", ".target", ".service.j2", ".timer.j2", ".target.j2")
 _SOURCES_UNIT_SUFFIXES = (".service", ".timer", ".service.j2", ".timer.j2")
 _VERIFY_WORD_RE = re.compile(r"\bverify_words?\b")
@@ -617,12 +605,6 @@ def _str_in(value: object, allowed: Collection[str]) -> bool:
     return isinstance(value, str) and value in allowed
 
 
-def _is_pre_execution_setup_step(name: str) -> bool:
-    """True only for GitHub Actions bootstrap/checkout/setup steps before project code runs."""
-    lower = name.strip().casefold()
-    return lower in _PRE_EXECUTION_STEP_EXACT or lower.startswith(_PRE_EXECUTION_STEP_PREFIXES)
-
-
 def _has_test_failure(log: str) -> tuple[bool, list[str]]:
     """Return ``(failed, node_ids)``; any test or JUnit failure pattern disqualifies infrastructure recovery."""
     nodes = _extract_failed_tests(log)
@@ -633,69 +615,204 @@ def _has_test_failure(log: str) -> tuple[bool, list[str]]:
     return False, []
 
 
-def _infra_signal_from_job(job: Mapping[str, Any], log: str) -> str | None:
-    """Return a fixed OPSEC-safe infrastructure diagnosis string, or None when unproven.
+def _infra_signal_from_job(job: Mapping[str, Any]) -> str | None:
+    """Return a fixed OPSEC-safe infrastructure diagnosis string from trusted Actions job metadata, else None.
 
-    Fail closed per rules core P4: only trusted runner termination (with no failed project step),
-    zero executed steps on a non-cancelled failure, or a network/disk failure inside a
-    pre-execution setup/checkout step with zero executed project steps counts as infrastructure.
+    Fail closed per rules core P4: never classify from author-controlled job logs or workflow step
+    display names. Accept only platform-proven pre-execution failures:
+      1. Zero executed steps (``steps == []``) on a non-cancelled failure/timeout/startup_failure.
+      2. GitHub Actions' runner-synthesized step 1 (``number == 1``, ``name == 'Set up job'``)
+         failed or aborted while zero subsequent workflow steps (``number > 1``) executed.
     """
     raw_conclusion = job.get("conclusion")
     if not isinstance(raw_conclusion, str):
         return None
+    job_status = job.get("status")
+    if job_status is not None and job_status != "completed":
+        return None
     conclusion = raw_conclusion.lower()
     raw_steps = job.get("steps")
-    steps: list[Mapping[str, Any]] | None = None
-    if raw_steps is not None:
-        if not isinstance(raw_steps, list) or not all(isinstance(step, Mapping) for step in raw_steps):
-            return None
-        steps = raw_steps
-        for step in steps:
-            step_conc = step.get("conclusion")
-            step_status = step.get("status")
-            if step_conc is not None and not isinstance(step_conc, str):
-                return None
-            if step_status is not None and not isinstance(step_status, str):
-                return None
-    non_setup_failed = bool(
-        steps
-        and any(
-            step.get("conclusion") == "failure"
-            and not (isinstance(step.get("name"), str) and _is_pre_execution_setup_step(step["name"]))
-            for step in steps
-        )
-    )
-    if non_setup_failed:
+    if not isinstance(raw_steps, list) or not all(isinstance(step, Mapping) for step in raw_steps):
         return None
-    if _RUNNER_LOST_RE.search(log):
-        return "runner lost communication before tests ran"
-    if steps is not None and len(steps) == 0 and conclusion in {"failure", "timed_out", "startup_failure"}:
+    steps: list[Mapping[str, Any]] = raw_steps
+    for step in steps:
+        if (
+            not isinstance(step.get("name"), str)
+            or type(step.get("number")) is not int
+            or step["number"] < 1
+            or (step.get("conclusion") is not None and not isinstance(step.get("conclusion"), str))
+            or (step.get("status") is not None and not isinstance(step.get("status"), str))
+        ):
+            return None
+    if len(steps) == 0 and conclusion in {"failure", "timed_out", "startup_failure"}:
         return "job failed with no executed steps"
-    if steps:
-        bad_steps = [
-            step
-            for step in steps
-            if _str_in(step.get("conclusion"), {"failure", "cancelled", "timed_out"})
-        ]
-        all_bad_are_setup = bool(bad_steps) and all(
-            isinstance(step.get("name"), str) and _is_pre_execution_setup_step(step["name"])
-            for step in bad_steps
+    if not steps:
+        return None
+    first = steps[0]
+    if first["number"] != 1 or first["name"].strip().casefold() != "set up job":
+        return None
+    rest = steps[1:]
+    if any(step["number"] <= 1 for step in rest):
+        return None
+    # Zero workflow/user steps (number > 1) may have executed or started.
+    any_workflow_step_ran = any(
+        not (
+            step.get("status") in {None, "queued"}
+            or (step.get("status") == "completed" and step.get("conclusion") == "skipped")
         )
-        project_step_ran = any(
-            isinstance(step.get("name"), str)
-            and not _is_pre_execution_setup_step(step["name"])
-            and (
-                step.get("status") == "completed"
-                and step.get("conclusion") not in {None, "skipped"}
-            )
-            for step in steps
-        )
-        if all_bad_are_setup and not project_step_ran:
-            if _NETWORK_FETCH_RE.search(log):
-                return "transient network or service fetch failure before project code ran"
-            if _DISK_FULL_RE.search(log):
-                return "runner disk exhausted before project code ran"
+        for step in rest
+    )
+    if any_workflow_step_ran:
+        return None
+    first_conc = first.get("conclusion")
+    first_status = first.get("status")
+    if (
+        _str_in(first_conc, {"failure", "timed_out"})
+        or (first_status == "in_progress" and first_conc is None and conclusion in {"failure", "timed_out"})
+    ):
+        return "job failed in GitHub Actions Set up job before any workflow step ran"
     return None
+
+
+def _safe_git_branch(base_name: str | None) -> bool:
+    return (
+        isinstance(base_name, str)
+        and bool(base_name)
+        and not base_name.startswith(("-", "/"))
+        and ".." not in base_name
+        and not any(ch.isspace() for ch in base_name)
+    )
+
+
+def _safe_remote_origin(repo_root: Path) -> str | None:
+    try:
+        origin = subprocess.run(
+            ["git", "-C", str(repo_root), "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    remote_url = origin.stdout.strip() if origin.returncode == 0 else ""
+    if not remote_url or remote_url.startswith("-"):
+        return None
+    return remote_url
+
+
+def _cat_bounded_git_blob(
+    git_prefix: Sequence[str],
+    spec: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Read one Git blob by ``<rev>:<path>`` if and only if its size is within ``_VERIFY_SOURCE_READ_LIMIT``."""
+    size_proc = subprocess.run(
+        [*git_prefix, "cat-file", "-s", spec],
+        env=dict(env) if env is not None else None,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if size_proc.returncode != 0:
+        return None
+    try:
+        size = int(size_proc.stdout.strip())
+    except ValueError:
+        return None
+    if size < 0 or size > _VERIFY_SOURCE_READ_LIMIT:
+        return None
+    blob_proc = subprocess.run(
+        [*git_prefix, "cat-file", "-p", spec],
+        env=dict(env) if env is not None else None,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if blob_proc.returncode != 0:
+        return None
+    return blob_proc.stdout.decode("utf-8", errors="ignore")
+
+
+def _read_git_blob_for_verify(
+    repo_root: Path | None,
+    *,
+    number: int | None,
+    head: str | None,
+    base_name: str | None,
+    path: str,
+    removed: bool = False,
+) -> str | None:
+    """Read a bounded Git blob at the exact PR ``head`` (or diff base for removals), never the working tree."""
+    from lu_machinery.review import record_cf_verdict
+
+    if (
+        repo_root is None
+        or not path
+        or path.startswith(("/", "-"))
+        or ".." in Path(path).parts
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)
+    ):
+        return None
+    if not isinstance(head, str) or not SHA.fullmatch(head):
+        return None
+    local_prefix = ["git", "-C", str(repo_root), "--no-replace-objects"]
+    try:
+        if not removed:
+            local_blob = _cat_bounded_git_blob(local_prefix, f"{head}:{path}")
+            if local_blob is not None:
+                return local_blob
+        else:
+            if _safe_git_branch(base_name):
+                for base_ref in (f"refs/remotes/origin/{base_name}", f"refs/heads/{base_name}"):
+                    mb = subprocess.run(
+                        [*local_prefix, "merge-base", base_ref, head],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=10,
+                    )
+                    base_rev = mb.stdout.strip() if mb.returncode == 0 and SHA.fullmatch(mb.stdout.strip()) else base_ref
+                    local_blob = _cat_bounded_git_blob(local_prefix, f"{base_rev}:{path}")
+                    if local_blob is not None:
+                        return local_blob
+        if number is None:
+            return None
+        remote_url = _safe_remote_origin(repo_root)
+        if not remote_url:
+            return None
+        refspecs = [f"+refs/pull/{number}/head:refs/keeper/pr"]
+        if removed and _safe_git_branch(base_name):
+            refspecs.append(f"+refs/heads/{base_name}:refs/keeper/base")
+        with record_cf_verdict.isolated_object_store(repo_root) as env:
+            fetch_env = {**env, "GIT_TERMINAL_PROMPT": "0"}
+            fetched = subprocess.run(
+                ["git", "fetch", "--no-tags", "--quiet", "--no-recurse-submodules", remote_url, *refspecs],
+                env=fetch_env,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if fetched.returncode != 0:
+                return None
+            if not removed:
+                return _cat_bounded_git_blob(["git"], f"{head}:{path}", env=env)
+            if not _safe_git_branch(base_name):
+                return None
+            mb = subprocess.run(
+                ["git", "merge-base", "refs/keeper/base", head],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            base_rev = mb.stdout.strip() if mb.returncode == 0 and SHA.fullmatch(mb.stdout.strip()) else "refs/keeper/base"
+            return _cat_bounded_git_blob(["git"], f"{base_rev}:{path}", env=env)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
 
 
 def _repo_verify_run_areas(repository: str) -> tuple[str, ...]:
@@ -733,13 +850,23 @@ def _repo_verify_run_areas(repository: str) -> tuple[str, ...]:
     return tuple(area for area in ops_verify_run.AREAS if area in configured)
 
 
+def _norm_pr_path(raw: object) -> str:
+    if not isinstance(raw, str):
+        return ""
+    norm = raw.strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.lstrip("/")
+
+
 def _touches_verify_word_caller(
     norm: str,
     *,
     patches_by_path: Mapping[str, str],
-    repo_root: Path | None,
+    removed: bool,
+    blob_reader: Callable[[str, bool], str | None],
 ) -> bool:
-    """True when a non-test/non-doc code path calls ``verify_word`` (per ``verify/SKILL.md``)."""
+    """True when a non-test/non-doc code path calls ``verify_word`` (or its exact blob cannot be inspected)."""
     if norm == "lu_machinery/ops/verify_run.py":
         return True
     if not norm.casefold().endswith(_VERIFY_WORD_CODE_SUFFIXES):
@@ -747,18 +874,11 @@ def _touches_verify_word_caller(
     patch = patches_by_path.get(norm)
     if isinstance(patch, str) and _VERIFY_WORD_RE.search(patch):
         return True
-    if repo_root is not None and ".." not in Path(norm).parts:
-        candidate = repo_root / norm
-        try:
-            if (
-                candidate.is_file()
-                and candidate.stat().st_size <= _VERIFY_SOURCE_READ_LIMIT
-                and _VERIFY_WORD_RE.search(candidate.read_text(encoding="utf-8", errors="ignore"))
-            ):
-                return True
-        except OSError:
-            pass
-    return False
+    blob = blob_reader(norm, removed)
+    if blob is None:
+        # Fail closed: when the exact PR-head (or diff-base) blob cannot be inspected, require Sources verification.
+        return True
+    return bool(_VERIFY_WORD_RE.search(blob))
 
 
 def _verify_run_areas_for_files(
@@ -767,36 +887,50 @@ def _verify_run_areas_for_files(
     repository: str,
     file_rows: Sequence[Mapping[str, Any]] | None = None,
     repo_root: Path | None = None,
+    head: str | None = None,
+    base_name: str | None = None,
+    number: int | None = None,
+    blob_reader: Callable[[str, bool], str | None] | None = None,
 ) -> tuple[str, ...]:
-    """Map PR diff paths (and ``verify_word`` callers) to required ``verify_run`` areas (per ``verify/SKILL.md``)."""
+    """Map PR diff paths (and exact-tree ``verify_word`` callers) to required ``verify_run`` areas."""
     allowed = set(_repo_verify_run_areas(repository))
     if not allowed:
         return ()
     patches_by_path: dict[str, str] = {}
+    status_by_path: dict[str, str] = {}
+    previous_by_path: dict[str, str] = {}
     if file_rows:
         for row in file_rows:
             if not isinstance(row, Mapping):
                 continue
+            cleaned_name = _norm_pr_path(row.get("filename"))
+            cleaned_prev = _norm_pr_path(row.get("previous_filename"))
+            status = row.get("status")
+            if cleaned_name and isinstance(status, str):
+                status_by_path[cleaned_name] = status.casefold()
+            if cleaned_name and cleaned_prev:
+                previous_by_path[cleaned_name] = cleaned_prev
             patch = row.get("patch")
-            if not isinstance(patch, str):
-                continue
-            for field in ("filename", "previous_filename"):
-                raw_name = row.get(field)
-                if isinstance(raw_name, str):
-                    cleaned = raw_name.strip().replace("\\", "/")
-                    while cleaned.startswith("./"):
-                        cleaned = cleaned[2:]
-                    cleaned = cleaned.lstrip("/")
-                    if cleaned:
-                        patches_by_path[cleaned] = patch
+            if isinstance(patch, str):
+                if cleaned_name:
+                    patches_by_path[cleaned_name] = patch
+                if cleaned_prev:
+                    patches_by_path[cleaned_prev] = patch
+
+    def default_blob_reader(path: str, removed: bool) -> str | None:
+        return _read_git_blob_for_verify(
+            repo_root,
+            number=number,
+            head=head,
+            base_name=base_name,
+            path=path,
+            removed=removed,
+        )
+
+    reader = blob_reader or default_blob_reader
     matched: set[str] = set()
     for raw_path in files:
-        if not isinstance(raw_path, str):
-            continue
-        norm = raw_path.strip().replace("\\", "/")
-        while norm.startswith("./"):
-            norm = norm[2:]
-        norm = norm.lstrip("/")
+        norm = _norm_pr_path(raw_path)
         if not norm or norm.startswith(("tests/", "docs/")):
             continue
         lower = norm.casefold()
@@ -811,7 +945,21 @@ def _verify_run_areas_for_files(
         if (
             norm.startswith((".mcp/servers/sources/", "lu_machinery/sources/", "scripts/verification/"))
             or ("sources" in base_lower and base_lower.endswith(_SOURCES_UNIT_SUFFIXES))
-            or _touches_verify_word_caller(norm, patches_by_path=patches_by_path, repo_root=repo_root)
+            or _touches_verify_word_caller(
+                norm,
+                patches_by_path=patches_by_path,
+                removed=status_by_path.get(norm) == "removed",
+                blob_reader=reader,
+            )
+            or (
+                norm in previous_by_path
+                and _touches_verify_word_caller(
+                    previous_by_path[norm],
+                    patches_by_path=patches_by_path,
+                    removed=True,
+                    blob_reader=reader,
+                )
+            )
         ):
             matched.add("sources")
         if (
@@ -830,11 +978,36 @@ def _run_verify_gate(
     repository: str,
     verify_runner: Callable[[Sequence[str]], Mapping[str, Any]] | None,
     file_rows: Sequence[Mapping[str, Any]] | None = None,
-    repo_root: Path | None = None,
+    gh: GitHub | None = None,
+    number: int | None = None,
+    head: str | None = None,
+    base_name: str | None = None,
 ) -> tuple[bool, tuple[str, ...], str]:
     """Run ``verify_run`` for every touched required area; fail closed on error or bad receipt."""
+    blob_reader: Callable[[str, bool], str | None] | None = None
+    gh_reader = getattr(gh, "read_source_blob", None) if gh is not None else None
+    if callable(gh_reader) and number is not None and isinstance(head, str):
+        reader_fn = gh_reader
+        num_ref = number
+        head_ref = head
+        base_ref = base_name
+
+        def _gh_blob_reader(path: str, removed: bool) -> str | None:
+            result = reader_fn(num_ref, head_ref, path, base_name=base_ref, removed=removed)
+            return result if isinstance(result, str) else None
+
+        blob_reader = _gh_blob_reader
     try:
-        areas = _verify_run_areas_for_files(files, repository=repository, file_rows=file_rows, repo_root=repo_root)
+        areas = _verify_run_areas_for_files(
+            files,
+            repository=repository,
+            file_rows=file_rows,
+            repo_root=gh.root if gh is not None else None,
+            head=head,
+            base_name=base_name,
+            number=number,
+            blob_reader=blob_reader,
+        )
     except KeeperError as exc:
         return False, ops_verify_run.AREAS, str(exc)
     if not areas:
@@ -1160,6 +1333,18 @@ def _throttled(state_path: Path, seconds: int, now: datetime | None = None) -> b
     return 0 <= elapsed < seconds - INTERVAL_SLACK_SECONDS
 
 
+def _valid_outbox_entry(entry: object) -> bool:
+    return (
+        isinstance(entry, dict)
+        and isinstance(entry.get("key"), str)
+        and bool(entry["key"].strip())
+        and isinstance(entry.get("kind"), str)
+        and bool(entry["kind"].strip())
+        and isinstance(entry.get("body"), str)
+        and bool(entry["body"].strip())
+    )
+
+
 def _load(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"queued": {}}
@@ -1187,6 +1372,10 @@ def _load(path: Path) -> dict[str, Any]:
             for k, v in data.get("pending_closeout", {}).items()
         )
         or not isinstance(data.get("hold_alerts", {}), dict)
+        or not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in data.get("hold_alerts", {}).items()
+        )
         or not isinstance(data.get("base_ci_alerts", {}), dict)
         or not isinstance(data.get("infra_reruns", {}), dict)
         or not isinstance(data.get("report_heads", {}), dict)
@@ -1201,6 +1390,7 @@ def _load(path: Path) -> dict[str, Any]:
         )
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
         or not isinstance(data.get("cto_outbox", []), list)
+        or not all(_valid_outbox_entry(entry) for entry in data.get("cto_outbox", []))
     ):
         raise KeeperError("keeper state malformed")
     # Records of the deleted recovery-evidence and grant ceremony (#11648). They
@@ -1238,10 +1428,13 @@ def _save_report_delta(
     lock_path: Path | None,
     hold_alerts: Mapping[str, str],
     cto_outbox: Sequence[Mapping[str, Any]],
-    report_heads: Mapping[str, str],
-    open_numbers: set[str],
+    report_heads: Mapping[str, tuple[str | None, str]],
 ) -> None:
-    """Serialize report-mode alert/head-observation writes against apply ticks via lock + merge."""
+    """Serialize report-mode alert/head-observation writes against apply ticks via lock + CAS merge.
+
+    Head observations advance only when the on-disk predecessor still matches what this report
+    read before acquiring the lock; closed-PR pruning is left exclusively to serialized apply ticks.
+    """
     effective_lock = lock_path or state_path.with_suffix(".lock")
     effective_lock.parent.mkdir(parents=True, exist_ok=True)
     with effective_lock.open("a+") as lock:
@@ -1253,16 +1446,17 @@ def _save_report_delta(
                 sent.setdefault(alert_key, stamp)
         if cto_outbox:
             outbox = latest.setdefault("cto_outbox", [])
-            existing_keys = {entry.get("key") for entry in outbox if isinstance(entry, Mapping)}
+            existing_keys = {entry["key"] for entry in outbox}
             for entry in cto_outbox:
-                if entry.get("key") not in existing_keys:
+                entry_key = entry.get("key")
+                if isinstance(entry_key, str) and entry_key not in existing_keys:
                     outbox.append(dict(entry))
-                    existing_keys.add(entry.get("key"))
+                    existing_keys.add(entry_key)
         if report_heads:
             heads = latest.setdefault("report_heads", {})
-            for pr_num, sha in report_heads.items():
-                heads[pr_num] = sha
-            latest["report_heads"] = {k: v for k, v in heads.items() if k in open_numbers}
+            for pr_num, (expected_prior, new_sha) in report_heads.items():
+                if heads.get(pr_num) == expected_prior:
+                    heads[pr_num] = new_sha
         _save(state_path, latest)
 
 
@@ -1349,11 +1543,12 @@ def _ejected_predecessor_heads(previous: Mapping[str, Any], number: int, head: s
     return found
 
 
-def _comment_has_repair_verified(comments: Sequence[Mapping[str, Any]], head: str, login: str) -> bool:
-    """True when a trusted unedited exact-head ``APPROVED`` comment carries ``REPAIR_VERIFIED``."""
+def _comment_repair_verified_digests(comments: Sequence[Mapping[str, Any]], head: str, login: str) -> set[str]:
+    """Return ``REPAIR_VERIFIED`` SHA-256 digests from trusted unedited exact-head ``APPROVED`` comments."""
     from lu_machinery.review.repair_round import REPAIR_VERIFIED
     from lu_machinery.review.verdict_parser import _structured_explanation
 
+    digests: set[str] = set()
     for row in reversed(comments):
         if not isinstance(row, Mapping):
             continue
@@ -1374,9 +1569,100 @@ def _comment_has_repair_verified(comments: Sequence[Mapping[str, Any]], head: st
             continue
         reply = rest.partition("\n</details>")[0]
         explanation = _structured_explanation(reply)
-        if REPAIR_VERIFIED.findall(reply if explanation is None else explanation):
-            return True
-    return False
+        for match in REPAIR_VERIFIED.findall(reply if explanation is None else explanation):
+            if isinstance(match, str):
+                digests.add(match.lower())
+    return digests
+
+
+def _prove_repair_delta_digest(
+    repo_root: Path,
+    *,
+    number: int,
+    approved: str,
+    head: str,
+    expected_digests: Collection[str],
+) -> bool:
+    """Verify ``sha256(git diff --binary --full-index <approved> <head>)`` matches ``expected_digests``.
+
+    Checks local Git objects first; when missing locally, fetches PR head and ``approved`` into an
+    isolated throwaway object store without mutating ``repo_root``.
+    """
+    from lu_machinery.review import record_cf_verdict
+
+    if not expected_digests or not SHA.fullmatch(approved) or not SHA.fullmatch(head):
+        return False
+    diff_flags = [
+        "diff",
+        "--binary",
+        "--full-index",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        approved,
+        head,
+    ]
+    local_env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    local_env.update({"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull, "GIT_NO_LAZY_FETCH": "1"})
+    try:
+        local_diff = subprocess.run(
+            ["git", "-C", str(repo_root), "--no-replace-objects", *diff_flags],
+            env=local_env,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if local_diff.returncode == 0:
+            return hashlib.sha256(local_diff.stdout).hexdigest() in expected_digests
+        remote_url = _safe_remote_origin(repo_root)
+        if not remote_url:
+            return False
+        with record_cf_verdict.isolated_object_store(repo_root) as env:
+            fetch_env = {**env, "GIT_TERMINAL_PROMPT": "0"}
+            fetched = subprocess.run(
+                [
+                    "git",
+                    "fetch",
+                    "--no-tags",
+                    "--quiet",
+                    "--no-recurse-submodules",
+                    remote_url,
+                    f"+refs/pull/{number}/head:refs/keeper/pr",
+                ],
+                env=fetch_env,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if fetched.returncode != 0:
+                return False
+            have_approved = subprocess.run(
+                ["git", "cat-file", "-e", f"{approved}^{{commit}}"],
+                env=fetch_env,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            if have_approved.returncode != 0:
+                subprocess.run(
+                    ["git", "fetch", "--no-tags", "--quiet", "--no-recurse-submodules", remote_url, approved],
+                    env=fetch_env,
+                    capture_output=True,
+                    check=False,
+                    timeout=30,
+                )
+            iso_diff = subprocess.run(
+                ["git", "--no-replace-objects", *diff_flags],
+                env=env,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if iso_diff.returncode != 0:
+                return False
+            return hashlib.sha256(iso_diff.stdout).hexdigest() in expected_digests
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
 
 
 def _prove_clean_base_merge(
@@ -1392,7 +1678,7 @@ def _prove_clean_base_merge(
 
     First checks local Git objects in ``repo_root``; when objects are missing locally, fetches
     the base ref and PR head ref into an isolated throwaway bare object store without mutating
-    ``repo_root``, then runs ``clean_base_merge_descent`` against that isolated store.
+    ``repo_root``, then runs ``clean_base_merge_descent`` checks directly inside that isolated store.
     """
     from lu_machinery.review import record_cf_verdict
 
@@ -1401,22 +1687,8 @@ def _prove_clean_base_merge(
     ):
         return True
     try:
-        origin = subprocess.run(
-            ["git", "-C", str(repo_root), "config", "--get", "remote.origin.url"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-        remote_url = origin.stdout.strip() if origin.returncode == 0 else ""
-        if (
-            not remote_url
-            or remote_url.startswith("-")
-            or not base_name
-            or base_name.startswith(("-", "/"))
-            or ".." in base_name
-            or any(ch.isspace() for ch in base_name)
-        ):
+        remote_url = _safe_remote_origin(repo_root)
+        if not remote_url or not _safe_git_branch(base_name):
             return False
         with record_cf_verdict.isolated_object_store(repo_root) as env:
             fetch_env = {**env, "GIT_TERMINAL_PROMPT": "0"}
@@ -1559,8 +1831,17 @@ def _default_repair_proof(
             return "repair-verified"
     priors = _prior_approved_heads(comments, head, verdict_login)
     ejected_priors = [prior for prior in priors if prior in ejected_set]
-    if ejected_priors and _comment_has_repair_verified(comments, head, verdict_login):
-        return "repair-verified"
+    digests = _comment_repair_verified_digests(comments, head, verdict_login)
+    if ejected_priors and digests:
+        for prior in ejected_priors:
+            if _prove_repair_delta_digest(
+                gh.root,
+                number=number,
+                approved=prior,
+                head=head,
+                expected_digests=digests,
+            ):
+                return "repair-verified"
     if ejected_priors and isinstance(base_name, str) and base_name:
         try:
             base_tip = gh.branch_head(base_name)
@@ -1596,9 +1877,8 @@ def _attempt_pr_ci_infra_rerun(
 ) -> tuple[str, str]:
     """Perform at most one evidenced ``run-rerun`` for a PR CI infrastructure failure with no failing test node.
 
-    Wait while GitHub still reports the same reserved attempt; a distinct completed failure on
-    the same head, any failing test node, or any unproven/malformed/unreadable failure fails
-    closed, holds in repair custody, and alerts ``claude-cto`` once.
+    Wait while GitHub still reports the reserved attempt, while the rerun attempt is active, or while
+    stale red check rows lag a successful rerun; exhaust only on a confirmed distinct completed failure.
     """
     failed_run_ids = _failed_check_run_ids(check_rows, head)
     rerun_key = f"{number}:{head}"
@@ -1610,15 +1890,28 @@ def _attempt_pr_ci_infra_rerun(
             try:
                 observed_run = gh.run_detail(reserved_run_id)
             except KeeperError:
-                observed_run = {}
+                return "pending", f"#{number} held: infra-rerun-pending (run={reserved_run_id})"
             observed_attempt = observed_run.get("run_attempt")
+            observed_status = observed_run.get("status")
+            observed_conc = observed_run.get("conclusion")
             if (
                 observed_run.get("head_sha") == head
                 and type(observed_attempt) is int
                 and type(reserved_attempt) is int
-                and observed_attempt == reserved_attempt
             ):
-                return "pending", f"#{number} held: infra-rerun-pending (run={reserved_run_id})"
+                if observed_attempt == reserved_attempt:
+                    return "pending", f"#{number} held: infra-rerun-pending (run={reserved_run_id})"
+                if observed_attempt > reserved_attempt:
+                    if observed_status != "completed":
+                        return (
+                            "pending",
+                            f"#{number} held: infra-rerun-pending (run={reserved_run_id} attempt={observed_attempt})",
+                        )
+                    if not _str_in(observed_conc, _FAILED_RUN_CONCLUSIONS):
+                        return (
+                            "pending",
+                            f"#{number} held: infra-rerun-pending (run={reserved_run_id} attempt={observed_attempt} checks-refreshing)",
+                        )
         hold_in_repair(
             number,
             reason=f"infra-rerun-exhausted:{checks_reason}",
@@ -1739,7 +2032,7 @@ def _attempt_pr_ci_infra_rerun(
                 run_ids=[run_id],
             )
             return "test-failure", f"#{number} held: test-failure ({checks_reason})"
-        signal = _infra_signal_from_job(job, log)
+        signal = _infra_signal_from_job(job)
         if signal is not None:
             signals.append(signal)
     has_existing_evidence = False
@@ -2418,7 +2711,7 @@ def run(
     report_state_dirty = False
     report_alerts_delta: dict[str, str] = {}
     report_outbox_delta: list[dict[str, Any]] = []
-    report_heads_delta: dict[str, str] = {}
+    report_heads_delta: dict[str, tuple[str | None, str]] = {}
     direct_merged_this_tick = 0
     base_ci_cache: dict[str, tuple[str, str | None, list[int]]] = {}
     observed = datetime.now(UTC).isoformat()
@@ -2509,6 +2802,11 @@ def run(
             verdict = lookup_verdict(
                 comments, head, verdict_login, learner_content=learner_content, low_tier=low_tier,
             )
+        except KeeperError:
+            comments = []
+            verdict = Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
+            comment_safe = False
+        try:
             check_rows = gh.checks(head)
             checks = (
                 _direct_check_state(check_rows, head, direct_config.required_checks)
@@ -2516,9 +2814,7 @@ def run(
                 else _check_state(check_rows, head)
             )
         except KeeperError:
-            comments, checks, check_rows = [], "CI-unknown", []
-            verdict = Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
-            comment_safe = False
+            check_rows, checks = [], "CI-unknown"
         if comment_safe and _recorded_approval_for_head(comments, head, verdict_login, low_tier=low_tier):
             approved_before = True
         if approved_before:
@@ -2601,11 +2897,11 @@ def run(
                 + verdict_detail(verdict.reason, verdict.comment_id, verdict.superseded_markers)
             )
             prior_observed_head = previous.get("report_heads", {}).get(key)
-            if SHA.fullmatch(head):
+            if SHA.fullmatch(head) and comment_safe and verdict.state != "unknown":
                 if apply:
                     previous.setdefault("report_heads", {})[key] = head
                 elif prior_observed_head != head:
-                    report_heads_delta[key] = head
+                    report_heads_delta[key] = (prior_observed_head, head)
                     report_state_dirty = True
             unreviewed_move_old = (
                 _unreviewed_move_source(
@@ -2869,7 +3165,10 @@ def run(
                     repository=canonical_repo,
                     verify_runner=verify_runner,
                     file_rows=fresh_file_rows,
-                    repo_root=gh.root,
+                    gh=gh,
+                    number=number,
+                    head=head,
+                    base_name=base_name if isinstance(base_name, str) else None,
                 )
                 if not verify_ok:
                     verify_reason = f"verify-run-failed:{','.join(verify_areas)}"
@@ -3021,11 +3320,11 @@ def run(
             tracked_mq = previous.get("tracked", {}).get(key)
             tracked_mq_head = tracked_mq.get("head") if isinstance(tracked_mq, dict) else None
             mq_prior_observed = previous.get("report_heads", {}).get(key)
-            if SHA.fullmatch(head):
+            if SHA.fullmatch(head) and comment_safe and verdict.state != "unknown":
                 if apply:
                     previous.setdefault("report_heads", {})[key] = head
                 elif mq_prior_observed != head:
-                    report_heads_delta[key] = head
+                    report_heads_delta[key] = (mq_prior_observed, head)
                     report_state_dirty = True
             if comment_safe and verdict.state in MISSING_CF_STATES and not review_satisfied(tier, verdict.state):
                 mq_unreviewed_move_old = _unreviewed_move_source(
@@ -3334,7 +3633,10 @@ def run(
                         repository=canonical_repo,
                         verify_runner=verify_runner,
                         file_rows=file_rows,
-                        repo_root=gh.root,
+                        gh=gh,
+                        number=number,
+                        head=head,
+                        base_name=base_name if isinstance(base_name, str) else None,
                     )
                     if not verify_ok:
                         verify_reason = f"verify-run-failed:{','.join(verify_areas)}"
@@ -3475,7 +3777,10 @@ def run(
                             repository=canonical_repo,
                             verify_runner=verify_runner,
                             file_rows=file_rows,
-                            repo_root=gh.root,
+                            gh=gh,
+                            number=number,
+                            head=head,
+                            base_name=base_name if isinstance(base_name, str) else None,
                         )
                         if not verify_ok:
                             verify_reason = f"verify-run-failed:{','.join(verify_areas)}"
@@ -3526,7 +3831,10 @@ def run(
                         repository=canonical_repo,
                         verify_runner=verify_runner,
                         file_rows=file_rows,
-                        repo_root=gh.root,
+                        gh=gh,
+                        number=number,
+                        head=head,
+                        base_name=base_name if isinstance(base_name, str) else None,
                     )
                     if not verify_ok:
                         verify_reason = f"verify-run-failed:{','.join(verify_areas)}"
@@ -3696,7 +4004,6 @@ def run(
             hold_alerts=report_alerts_delta,
             cto_outbox=report_outbox_delta,
             report_heads=report_heads_delta,
-            open_numbers=open_numbers,
         )
     return lines, failed
 
