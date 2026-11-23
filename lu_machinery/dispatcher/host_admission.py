@@ -181,34 +181,39 @@ class ReservationUnsafe(Exception):
 
 
 def _task_store(*, missing_ok: bool = False) -> Path | None:
-    """The task store's canonical path, once the kernel has looked up the configured spelling as a directory.
+    """The task store, only when its configured spelling is its own real path: one store, one spelling.
 
-    The kernel's own lookup (``os.stat``, as the admission lock's open inside the store) rejects a spelling it
-    cannot walk (a file before ``..``, a missing component, a loop, an overlong name); only then is every
-    symlink and ``..`` resolved, so every working spelling of one store is one admission domain. A missing
-    store is None with ``missing_ok``; any other failure raises ReservationUnsafe.
+    A symlink, ``..`` or relative component would let a second spelling reach the same admission lock but
+    another reservation directory, so any spelling whose real path differs refuses, naming the real path. The
+    kernel then looks it up (``os.stat``): a missing store is None with ``missing_ok``, and any other failure or a
+    non-directory refuses. Every refusal raises ReservationUnsafe with a typed reason.
     """
     configured = tasks_dir()
     try:
+        real = os.path.realpath(configured)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ReservationUnsafe(f"orchestrator_reservation_unknown: the task store path cannot be resolved "
+                                f"({type(exc).__name__})") from None
+    if real != str(configured):
+        raise ReservationUnsafe(f"orchestrator_domain_refused: name the task store by its real path {real!r}, "
+                                "so it has one admission domain")
+    try:
         info = os.stat(configured)
-        canonical = Path(os.path.realpath(configured))
     except FileNotFoundError:
         if missing_ok:
             return None
         raise ReservationUnsafe("orchestrator_reservation_unknown: the task store is missing") from None
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise ReservationUnsafe(f"orchestrator_reservation_unknown: the task store path cannot be looked up "
+    except (OSError, ValueError) as exc:
+        raise ReservationUnsafe(f"orchestrator_reservation_unknown: the task store cannot be looked up "
                                 f"({type(exc).__name__})") from None
     if not stat.S_ISDIR(info.st_mode):
         raise ReservationUnsafe("orchestrator_reservation_unknown: the task store is not a directory")
-    return canonical
+    return configured
 
 
 def reservations_dir() -> Path:
     """``batch_state/streams``: beside the task store, whose admission lock guards every reservation write."""
-    store_path = _task_store()
-    assert store_path is not None  # without missing_ok a missing store raises
-    return store_path.parent / RESERVATIONS_DIR_NAME
+    return tasks_dir().parent / RESERVATIONS_DIR_NAME
 
 
 # Only a task store named ``tasks`` reserves, so <parent>/tasks and <parent>/streams are one admission domain:
@@ -217,17 +222,16 @@ TASKS_DIR_NAME = "tasks"
 
 
 def domain_refusal() -> str | None:
-    """Why this task store cannot hold stream reservations, or None. The name is the canonical path's.
+    """Why this task store cannot hold stream reservations, or None.
 
-    A store not created yet is judged by its configured name; reservation (under the admission lock, which
+    A store not created yet passes the spelling checks alone; reservation (under the admission lock, which
     creates the store) checks again.
     """
     try:
-        store_path = _task_store(missing_ok=True)
+        _task_store(missing_ok=True)
     except ReservationUnsafe as exc:
         return exc.reason
-    name = tasks_dir().name if store_path is None else store_path.name
-    if name != TASKS_DIR_NAME:
+    if tasks_dir().name != TASKS_DIR_NAME:
         return (f"orchestrator_domain_refused: the task store must be a directory named {TASKS_DIR_NAME!r}, so its "
                 "admission lock is the only one guarding its reservations")
     return None
@@ -236,13 +240,12 @@ def domain_refusal() -> str | None:
 def _reservations_fd(*, create: bool) -> int | None:
     """A descriptor of the verified reservation directory, or None when it does not exist (never with ``create``).
 
-    The directory is ``streams`` beside the task store's canonical path, opened without following a symlink;
-    it must be a directory the current user owns that no group or other user can write. A missing task store
-    refuses (ReservationUnsafe): where its reservations are is then unknown, so they are never read as absent.
+    The directory is ``streams`` beside the task store (named by its real path), opened without following a
+    symlink; it must be a directory the current user owns that no group or other user can write. A missing
+    or wrongly named task store refuses (ReservationUnsafe): its reservations are never read as absent.
     """
-    store_path = _task_store()
-    assert store_path is not None  # without missing_ok a missing store raises
-    parent = store_path.parent
+    _task_store()
+    parent = tasks_dir().parent
     try:
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except FileNotFoundError:
