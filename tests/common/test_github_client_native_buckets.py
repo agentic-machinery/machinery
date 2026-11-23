@@ -790,3 +790,284 @@ def test_control_fix_preserves_endpoint_and_space_contract(endpoint, expected, b
     assert gh._canonical_endpoint(endpoint) == expected
     if bucket is not None:
         assert gh._endpoint_bucket(expected[1]) == bucket
+
+
+def _milestone_client(tmp_path, handler, *, remaining=5000):
+    calls = []
+
+    def transport(method, endpoint, headers, body, timeout):
+        parsed = json.loads(body.decode("utf-8")) if body else None
+        calls.append((method, endpoint, parsed))
+        return handler(method, endpoint, parsed)
+
+    store = gh.GitHubClient(cache_dir=tmp_path, transport=transport, clock=lambda: NOW, env={"GH_HOST": "github.com"})
+    with store._db() as db:
+        gh._store_budget(db, store.scope, "core", remaining, FUTURE)
+    return store, calls
+
+
+def test_pr_create_milestone_validates_patches_issue_and_confirms_and_keeps_plain_create_unchanged(tmp_path):
+    """Defect class: gh pr create --milestone drops milestones on POST /pulls, misses pagination, or changes plain creates."""
+    page1 = [{"number": 4, "title": "v0.9.0", "state": "closed"}]
+    page2 = [{"number": 13, "title": "v0.11.0", "state": "open"}, {"number": 21, "title": "Реліз — v0.12", "state": "open"}]
+
+    def handler(method, endpoint, payload):
+        if method == "GET" and endpoint.endswith("/milestones?state=all&per_page=100"):
+            return gh.Response(
+                200,
+                {"Link": '<https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page=2>; rel="next"'},
+                json.dumps(page1).encode(),
+            )
+        if method == "GET" and endpoint.endswith("page=2"):
+            return gh.Response(200, {}, json.dumps(page2).encode())
+        if method == "POST" and endpoint == "repos/o/r/pulls":
+            assert "milestone" not in payload
+            return gh.Response(201, {}, json.dumps({"number": 77, "html_url": "https://github.com/o/r/pull/77"}).encode())
+        if method == "PATCH" and endpoint == "repos/o/r/issues/77":
+            return gh.Response(200, {}, json.dumps({"number": 77, "milestone": {"number": payload["milestone"]}}).encode())
+        raise AssertionError(f"unexpected request: {method} {endpoint} {payload!r}")
+
+    # 1. Explicit milestone by title (on page 2) with --draft: POST /pulls omits milestone, PATCH /issues/77 sets & confirms it.
+    store, calls = _milestone_client(tmp_path / "title", handler)
+    result = gh.run(
+        ["gh", "pr", "create", "--repo", "o/r", "--title", "feat: x", "--body", "b", "--base", "main", "--head", "f", "--draft", "--milestone", "v0.11.0"],
+        client=store,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "https://github.com/o/r/pull/77\n"
+    assert result.github_result.value["milestone"] == {"number": 13}
+    assert [(m, e) for m, e, _ in calls] == [
+        ("GET", "repos/o/r/milestones?state=all&per_page=100"),
+        ("GET", "https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page=2"),
+        ("POST", "repos/o/r/pulls"),
+        ("PATCH", "repos/o/r/issues/77"),
+    ]
+    assert calls[2][2]["draft"] is True and "milestone" not in calls[2][2]
+    assert calls[3][2] == {"milestone": 13}
+
+    # 2. Explicit milestone by positive integer string and Unicode title both resolve & PATCH.
+    for selector, expected_num in (("13", 13), ("Реліз — v0.12", 21)):
+        store, calls = _milestone_client(tmp_path / f"sel-{expected_num}", handler)
+        result = gh.run(
+            ["gh", "pr", "create", "--repo", "o/r", "--title", "t", "--body", "b", "--base", "main", "--head", "f", "--milestone", selector],
+            client=store,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        assert calls[-1] == ("PATCH", "repos/o/r/issues/77", {"milestone": expected_num})
+
+    # 3. No --milestone: single POST /pulls only, zero milestone reads or issue PATCHes.
+    store, calls = _milestone_client(tmp_path / "plain", handler)
+    result = gh.run(
+        ["gh", "pr", "create", "--repo", "o/r", "--title", "t", "--body", "b", "--base", "main", "--head", "f"],
+        client=store,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "https://github.com/o/r/pull/77\n"
+    assert calls == [("POST", "repos/o/r/pulls", {"title": "t", "body": "b", "base": "main", "head": "f", "draft": False})]
+
+
+@pytest.mark.parametrize(
+    "bad_milestone",
+    ["", "   ", "\t", "v1\nline2", "v1\r", "v1\x00", "v1\x7f", "v1\u2028", "v1\u2029", "v1\u202e", "v1\u200b"],
+)
+def test_pr_create_milestone_refuses_invalid_text_before_any_http_call(tmp_path, bad_milestone):
+    """Defect class: gh pr create --milestone sends HTTP traffic or creates a PR for blank/control/bidi milestone text."""
+    store, calls = _milestone_client(tmp_path, lambda *a: (_ for _ in ()).throw(AssertionError(f"unexpected call {a!r}")))
+    result = gh.run(
+        ["gh", "pr", "create", "--repo", "o/r", "--title", "t", "--body", "b", "--base", "main", "--head", "f", f"--milestone={bad_milestone}"],
+        client=store,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert result.github_result.error == "github_milestone_error"
+    assert result.github_result.reason == "invalid_milestone"
+    assert json.loads(result.stderr)["reason"] == "invalid_milestone"
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("selector", "pages", "expected_error", "expected_reason"),
+    [
+        ("missing", [[{"number": 13, "title": "v0.11.0", "state": "open"}]], "github_milestone_not_found", "milestone_not_found"),
+        ("9" * 5000, [[{"number": 13, "title": "v0.11.0", "state": "open"}]], "github_milestone_not_found", "milestone_not_found"),
+        (
+            "13",
+            [[{"number": 13, "title": "v0.11.0", "state": "open"}, {"number": 2, "title": "13", "state": "open"}]],
+            "github_milestone_ambiguous",
+            "milestone_ambiguous",
+        ),
+        ("v0.9.0", [[{"number": 4, "title": "v0.9.0", "state": "closed"}]], "github_milestone_closed", "milestone_closed"),
+        ("v0.11.0", [{"not": "a-list"}], "github_milestone_error", "malformed_milestones"),
+        ("v0.11.0", [[{"number": True, "title": "v0.11.0", "state": "open"}]], "github_milestone_error", "malformed_milestones"),
+        ("v0.11.0", [[{"number": 13, "title": "v0.11.0", "state": "draft"}]], "github_milestone_error", "malformed_milestones"),
+        (
+            "v0.11.0",
+            [[{"number": 13, "title": "v0.11.0", "state": "open"}], [{"number": 13, "title": "v0.11.0", "state": "closed"}]],
+            "github_milestone_error",
+            "malformed_milestones",
+        ),
+    ],
+)
+def test_pr_create_milestone_precreate_refusals_never_post_pull_request(tmp_path, selector, pages, expected_error, expected_reason):
+    """Defect class: missing, ambiguous, closed, or malformed milestones create an orphan PR instead of failing closed."""
+    def handler(method, endpoint, payload):
+        assert method == "GET"
+        if "page=2" in endpoint:
+            return gh.Response(200, {}, json.dumps(pages[1]).encode())
+        headers = {"Link": '<https://api.github.com/repos/o/r/milestones?state=all&per_page=100&page=2>; rel="next"'} if len(pages) > 1 else {}
+        return gh.Response(200, headers, json.dumps(pages[0]).encode())
+
+    store, calls = _milestone_client(tmp_path, handler)
+    result = gh.run(
+        ["gh", "pr", "create", "--repo", "o/r", "--title", "t", "--body", "b", "--base", "main", "--head", "f", "--milestone", selector],
+        client=store,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert result.github_result.error == expected_error
+    assert result.github_result.reason == expected_reason
+    detail = json.loads(result.stderr)
+    assert detail["error"] == expected_error and detail["reason"] == expected_reason
+    assert all(method == "GET" for method, _, _ in calls)
+
+
+def test_pr_create_milestone_postcreate_failures_and_rate_limits_fail_closed(tmp_path):
+    """Defect class: missing PR number, failed/rate-limited PATCH, or unconfirmed PATCH response passes silently."""
+    open_ms = json.dumps([{"number": 13, "title": "v0.11.0", "state": "open"}]).encode()
+    argv = ["gh", "pr", "create", "--repo", "o/r", "--title", "t", "--body", "b", "--base", "main", "--head", "f", "--milestone", "v0.11.0"]
+
+    # 1. Core budget exhausted before GET /milestones -> exit 75, zero HTTP requests.
+    store, calls = _milestone_client(tmp_path / "rl-pre", lambda *a: (_ for _ in ()).throw(AssertionError("unexpected")), remaining=0)
+    res = gh.run(argv, client=store, capture_output=True, text=True)
+    assert res.returncode == 75 and gh.refusal_of(res) is not None and calls == []
+
+    # 2. POST /pulls returns HTTP 422 -> no PATCH sent.
+    def post_422(method, endpoint, _payload):
+        if method == "GET":
+            return gh.Response(200, {}, open_ms)
+        return gh.Response(422, {}, b'{"message":"Validation Failed"}')
+
+    store, calls = _milestone_client(tmp_path / "post-422", post_422)
+    res = gh.run(argv, client=store, capture_output=True, text=True)
+    assert res.returncode == 1 and res.github_result.error == "github_http_error"
+    assert [m for m, _, _ in calls] == ["GET", "POST"]
+
+    # 3. POST /pulls omits or corrupts PR number -> pr_number_missing, no PATCH sent.
+    for idx, bad_pr in enumerate(({}, {"number": None}, {"number": True}, {"number": 0}, {"number": "77"})):
+        def bad_post(method, endpoint, _payload, _doc=bad_pr):
+            if method == "GET":
+                return gh.Response(200, {}, open_ms)
+            return gh.Response(201, {}, json.dumps(_doc).encode())
+
+        store, calls = _milestone_client(tmp_path / f"bad-pr-{idx}", bad_post)
+        res = gh.run(argv, client=store, capture_output=True, text=True)
+        assert res.returncode == 1
+        assert res.github_result.error == "github_milestone_failed"
+        assert res.github_result.reason == "pr_number_missing"
+        assert "pr_number" not in json.loads(res.stderr)
+        assert [m for m, _, _ in calls] == ["GET", "POST"]
+
+    # 4. PATCH /issues/77 returns HTTP 403 -> milestone_patch_failed with status and pr_number.
+    def patch_403(method, endpoint, _payload):
+        if method == "GET":
+            return gh.Response(200, {}, open_ms)
+        if method == "POST":
+            return gh.Response(201, {}, json.dumps({"number": 77, "html_url": "https://github.com/o/r/pull/77"}).encode())
+        return gh.Response(403, {}, b'{"message":"Forbidden"}')
+
+    store, _ = _milestone_client(tmp_path / "patch-403", patch_403)
+    res = gh.run(argv, client=store, capture_output=True, text=True)
+    assert res.returncode == 1 and res.github_result.error == "github_milestone_failed"
+    assert res.github_result.reason == "milestone_patch_failed"
+    detail = json.loads(res.stderr)
+    assert detail["status"] == 403 and detail["pr_number"] == 77
+
+    # 5. PATCH /issues/77 hits rate limit -> exit 75, typed GitHubRateLimited, created PR preserved on github_result.value.
+    def patch_rl(method, endpoint, _payload):
+        if method == "GET":
+            return gh.Response(200, {}, open_ms)
+        if method == "POST":
+            return gh.Response(
+                201,
+                {"X-RateLimit-Remaining": "10", "X-RateLimit-Reset": str(FUTURE), "X-RateLimit-Resource": "core"},
+                json.dumps({"number": 77, "html_url": "https://github.com/o/r/pull/77"}).encode(),
+            )
+        raise AssertionError("PATCH should be refused locally once core drops below LANDING_RESERVE")
+
+    store, _ = _milestone_client(tmp_path / "patch-rl", patch_rl)
+    res = gh.run(argv, client=store, capture_output=True, text=True)
+    assert res.returncode == 75
+    assert gh.refusal_of(res) is not None
+    assert res.github_result.reason == "core_below_landing_reserve"
+    assert res.github_result.value["number"] == 77
+
+    # 6. PATCH /issues/77 returns 200 without confirming exact PR + milestone number -> milestone_unconfirmed.
+    for idx, bad_body in enumerate(
+        (
+            b"",
+            b"not-json",
+            b"{}",
+            json.dumps({"number": 77}).encode(),
+            json.dumps({"number": 77, "milestone": None}).encode(),
+            json.dumps({"number": 77, "milestone": {"number": 99}}).encode(),
+            json.dumps({"number": 77, "milestone": {"number": True}}).encode(),
+            json.dumps({"number": 99, "milestone": {"number": 13}}).encode(),
+            json.dumps({"number": True, "milestone": {"number": 13}}).encode(),
+        )
+    ):
+        def unconfirmed(method, endpoint, _payload, _body=bad_body):
+            if method == "GET":
+                return gh.Response(200, {}, open_ms)
+            if method == "POST":
+                return gh.Response(201, {}, json.dumps({"number": 77, "html_url": "https://github.com/o/r/pull/77"}).encode())
+            return gh.Response(200, {}, _body)
+
+        store, _ = _milestone_client(tmp_path / f"unconf-{idx}", unconfirmed)
+        res = gh.run(argv, client=store, capture_output=True, text=True)
+        assert res.returncode == 1
+        assert res.github_result.error == "github_milestone_failed"
+        assert res.github_result.reason == "milestone_unconfirmed"
+        assert json.loads(res.stderr)["pr_number"] == 77
+
+
+def test_edit_milestone_allows_closed_and_publish_reuses_client_helpers_without_private_aliases(tmp_path):
+    """Defect class: pr/issue edit rejects closed milestones, or publish/github.py duplicates milestone logic or keeps redundant aliases."""
+    from lu_machinery.opsec import prepublish as gate
+    from lu_machinery.publish import github as pub
+
+    closed_ms = json.dumps([{"number": 4, "title": "v0.9.0", "state": "closed"}]).encode()
+
+    def handler(method, endpoint, payload):
+        if method == "GET":
+            return gh.Response(200, {}, closed_ms)
+        if method == "PATCH" and endpoint == "repos/o/r/issues/55":
+            return gh.Response(200, {}, json.dumps({"number": 55, "html_url": "https://github.com/o/r/pull/55"}).encode())
+        raise AssertionError(f"unexpected {method} {endpoint} {payload!r}")
+
+    store, calls = _milestone_client(tmp_path, handler)
+    res = gh.run(
+        ["gh", "pr", "edit", "55", "--repo", "o/r", "--milestone", "v0.9.0"],
+        client=store,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    assert calls[-1] == ("PATCH", "repos/o/r/issues/55", {"milestone": 4})
+
+    assert pub.valid_milestone_text is gh.valid_milestone_text
+    assert not hasattr(pub, "_valid_milestone_text")
+    assert not hasattr(pub, "_is_not_found_result")
+    with pytest.raises(gate.PublishBlocked, match="MILESTONE_REFUSED"):
+        pub.match_milestone_pages(
+            [[{"number": 13, "title": "v0.11.0", "state": "open"}], [{"number": 13, "title": "v0.11.0", "state": "closed"}]],
+            "v0.11.0",
+            repo="o/r",
+        )
