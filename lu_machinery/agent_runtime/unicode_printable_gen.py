@@ -32,15 +32,18 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import subprocess
 import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
+from lu_machinery.common import json_depth
+
 CODE_POINTS = 0x110000
 BASELINE_UNIDATA_VERSION = "15.0.0"
 OUTPUT = Path(__file__).with_name("unicode_printable.py")
+# The dump is an object holding a list of [lo, hi] lists.
+_DUMP_DEPTH = 3
 
 # Runs in each input interpreter with -I -S: the printable ranges of its own unicodedata table.
 _DUMP = """\
@@ -104,7 +107,7 @@ def _dump(interpreter: str) -> tuple[str, str, bytes]:
     proc = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         [interpreter, "-I", "-S", "-c", _DUMP], capture_output=True, check=True, timeout=600
     )
-    data = json.loads(proc.stdout)
+    data = json_depth.loads(proc.stdout, max_depth=_DUMP_DEPTH)
     if not isinstance(data, dict) or set(data) != {"python", "unidata_version", "printable"}:
         raise SystemExit(f"{interpreter}: unexpected table dump")
     python, version, printable = data["python"], data["unidata_version"], data["printable"]
