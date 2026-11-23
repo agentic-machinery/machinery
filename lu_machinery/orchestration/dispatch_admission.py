@@ -1770,24 +1770,35 @@ def _verified_live_orchestrators(
         is_orchestrator = orchestrator_stream(state) is not None
         if not is_orchestrator or status not in ACTIVE_STATUSES:
             continue
-        pid = _parse_pid(state.get("pid"))
+        raw_pid = state.get("pid")
+        pid = _parse_pid(raw_pid)
+        if raw_pid is not None and pid is None:
+            raise ValueError(f"malformed pid on {task_id}")
         if pid is None:
-            if is_orphaned_pidless_record(state) or status != "spawning":
+            if status != "spawning":
+                raise ValueError(f"missing pid on running orchestrator turn {task_id}")
+            if is_orphaned_pidless_record(state):
                 continue
             owner = _dispatcher_owner(state)
-            owner_pid = _parse_pid(owner.get("owner_pid")) if owner is not None else None
-            if owner is not None and owner_pid is not None:
-                if "owner_identity" in owner:
-                    from lu_machinery.orchestration.dead_worker_state import worker_liveness
+            if owner is not None:
+                raw_owner_pid = owner.get("owner_pid")
+                owner_pid = _parse_pid(raw_owner_pid)
+                if raw_owner_pid is not None and owner_pid is None:
+                    raise ValueError(f"malformed owner_pid on spawning orchestrator turn {task_id}")
+                if owner_pid is not None:
+                    if "owner_identity" in owner:
+                        from lu_machinery.orchestration.dead_worker_state import worker_liveness
 
-                    owner_live = worker_liveness({"pid": owner_pid, "worker_identity": owner["owner_identity"]}) is not False
-                else:
-                    owner_live = alive(owner_pid)
-                if owner_live:
-                    live_ids.append(task_id)
-                continue
+                        owner_live = worker_liveness({"pid": owner_pid, "worker_identity": owner["owner_identity"]}) is not False
+                    else:
+                        owner_live = alive(owner_pid)
+                    if owner_live:
+                        live_ids.append(task_id)
+                    continue
             age = _age_s(state.get("started_at"), now)
-            if age is not None and -PIDLESS_CLOCK_SKEW_S <= age <= PIDLESS_SPAWNING_GRACE_S:
+            if age is None:
+                raise ValueError(f"unverifiable spawning orchestrator turn {task_id}")
+            if -PIDLESS_CLOCK_SKEW_S <= age <= PIDLESS_SPAWNING_GRACE_S:
                 live_ids.append(task_id)
             continue
         worker_live = record_liveness(state) is not False if record_liveness is not None else alive(pid)

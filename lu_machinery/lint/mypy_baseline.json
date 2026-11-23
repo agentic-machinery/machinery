@@ -6233,16 +6233,6 @@
       "message": "Returning Any from function declared to return \"bytes | str\""
     },
     {
-      "path": "lu_machinery/orchestration/dispatch_admission.py",
-      "code": "index",
-      "message": "Value of type \"None | dict[str, Any]\" is not indexable"
-    },
-    {
-      "path": "lu_machinery/orchestration/dispatch_admission.py",
-      "code": "operator",
-      "message": "Unsupported right operand type for in (\"None | dict[str, Any]\")"
-    },
-    {
       "path": "lu_machinery/orchestration/dispatch_settle.py",
       "code": "no-any-return",
       "message": "Returning Any from function declared to return \"CompletedProcess[str]\""

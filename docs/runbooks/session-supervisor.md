@@ -301,52 +301,62 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
        refuse("usage: <task-id> <run-nonce>", sys.argv[1:])
    tid, nonce = sys.argv[1], sys.argv[2]
    try:
-       rec = store.read(tid, nonce, missing_ok=True)
-   except (OSError, ValueError, store.TaskRecordError) as exc:
-       refuse("turn record unreadable or nonce mismatch", f"{type(exc).__name__}: {exc}")
-   rec = rec if isinstance(rec, dict) else {"task_id": tid, "run_nonce": nonce}
+       store.record_path(tid)
+       records = store.strict_task_inventory(include_archive=True)
+   except (OSError, ValueError) as exc:
+       refuse("task store or turn record unreadable", f"{type(exc).__name__}: {exc}")
+   if any(r.get("task_id") == tid and (not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce")) for r in records):
+       refuse("malformed run_nonce on turn record", tid)
+   matches = [r for r in records if r.get("task_id") == tid and r.get("run_nonce") == nonce]
+   recs = matches or [{"task_id": tid, "run_nonce": nonce}]
    env = di.user_manager_env(os.environ)
    gone = {"inactive", "failed", "unknown"}
 
    def check_unit_stopped(unit):
        if not isinstance(unit, str) or not unit or unit.startswith("-") or "/" in unit:
            refuse("malformed unit name", unit)
-       proc = subprocess.run(
-           ["systemctl", "--user", "is-active", "--", unit],
-           env=env, capture_output=True, text=True, timeout=15,
-       )
+       try:
+           proc = subprocess.run(
+               ["systemctl", "--user", "is-active", "--", unit],
+               env=env, capture_output=True, text=True, timeout=15,
+           )
+       except (OSError, subprocess.TimeoutExpired) as exc:
+           refuse("systemctl is-active failed", f"{type(exc).__name__}: {exc}")
        lines = (proc.stdout or "").strip().splitlines()
        state = lines[-1] if lines else ""
        if proc.returncode == 0 or state not in gone or (state == "unknown" and proc.returncode not in {3, 4}):
            refuse("unit not proven stopped", {"unit": unit, "rc": proc.returncode, "state": state})
 
    def list_units(pattern):
-       proc = subprocess.run(
-           ["systemctl", "--user", "list-units", "--all", "--no-legend", "--plain", "--", pattern],
-           env=env, capture_output=True, text=True, timeout=15,
-       )
+       try:
+           proc = subprocess.run(
+               ["systemctl", "--user", "list-units", "--all", "--no-legend", "--plain", "--", pattern],
+               env=env, capture_output=True, text=True, timeout=15,
+           )
+       except (OSError, subprocess.TimeoutExpired) as exc:
+           refuse("systemctl list-units failed", f"{type(exc).__name__}: {exc}")
        if proc.returncode != 0:
            refuse("systemctl list-units failed", {"pattern": pattern, "rc": proc.returncode, "stderr": proc.stderr})
        return [line.split()[0] for line in (proc.stdout or "").splitlines() if line.strip()]
 
-   launch_unit = rec.get("launch_unit")
-   if launch_unit is not None:
-       if not isinstance(launch_unit, str) or not launch_unit or "/" in launch_unit or launch_unit.startswith("-"):
-           refuse("malformed launch_unit", launch_unit)
-       scope = launch_unit if launch_unit.endswith(".scope") else f"{launch_unit}.scope"
-       check_unit_stopped(scope)
+   for rec in recs:
+       launch_unit = rec.get("launch_unit")
+       if launch_unit is not None:
+           if not isinstance(launch_unit, str) or not launch_unit or "/" in launch_unit or launch_unit.startswith("-"):
+               refuse("malformed launch_unit", launch_unit)
+           scope = launch_unit if launch_unit.endswith(".scope") else f"{launch_unit}.scope"
+           check_unit_stopped(scope)
+       services = di.listed_task_services(rec)
+       if services is None:
+           refuse("task service list unreadable", tid)
+       for name in services:
+           stem = di._service_stem(name, task_id=tid)
+           if stem is None:
+               refuse("invalid task service name", name)
+           check_unit_stopped(f"{stem}.service")
 
    for unit in list_units(f"{di._unit_prefix(tid, nonce)}*.scope"):
        check_unit_stopped(unit)
-
-   services = di.listed_task_services(rec)
-   if services is None:
-       refuse("task service list unreadable", tid)
-   for name in services:
-       stem = di._service_stem(name, task_id=tid)
-       if stem is None:
-           refuse("invalid task service name", name)
-       check_unit_stopped(f"{stem}.service")
 
    for unit in list_units(f"lu-task-{di._task_service_tag(tid)}-*.service"):
        check_unit_stopped(unit)
@@ -400,6 +410,8 @@ successor claimed the stream:
 ```bash
 .venv/bin/python -c '
 import sys
+from datetime import UTC, datetime
+from lu_machinery.dispatcher.store import parse_utc_timestamp
 from lu_machinery.session_streams.model import HolderKind, Lease, LeaseHolder
 from lu_machinery.session_supervisor.remote import RemoteEpicClient
 
@@ -435,8 +447,13 @@ require(
     "lease identity mismatch",
     raw,
 )
-for field in ("session_id", "heartbeat_at", "expires_at"):
-    require(is_nonempty_str(raw.get(field)), f"malformed lease {field}", raw)
+require(is_nonempty_str(raw.get("session_id")), "malformed lease session_id", raw)
+hb_dt = parse_utc_timestamp(raw.get("heartbeat_at"))
+require(hb_dt is not None, "malformed lease heartbeat_at", raw)
+exp_dt = parse_utc_timestamp(raw.get("expires_at"))
+require(exp_dt is not None, "malformed lease expires_at", raw)
+require(hb_dt <= exp_dt, "lease heartbeat_at is after expires_at", raw)
+require(exp_dt <= datetime.now(UTC), "lease expires_at is not in the past", raw)
 for field in ("fencing_token", "ttl_seconds", "version"):
     require(is_pos_int(raw.get(field)), f"malformed lease {field}", raw)
 h = raw.get("holder")

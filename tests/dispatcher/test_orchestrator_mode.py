@@ -1754,7 +1754,8 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     assert not host_admission.allows(refused, force_reason="operator override")  # F9: hard cap
     assert any("live orchestrator turns 2/2 reached the cap" in f for f in refused.failures), refused.failures
 
-    # PR1304-F2: truncating one of two live turn records keeps the live-turn cap closed (outside --force-admission).
+    # PR1304-F2: truncating one of two live turn records or corrupting its PID (list/bool/None) keeps the
+    # live-turn cap closed (outside --force-admission).
     cap2_path = store.record_path("turn-cap-2")
     cap2_saved = cap2_path.read_text(encoding="utf-8")
     cap2_path.write_text("{", encoding="utf-8")
@@ -1762,6 +1763,14 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     assert not corrupt_refused.admitted and corrupt_refused.orchestrator_cap_refused is True
     assert not host_admission.allows(corrupt_refused, force_reason="operator override")
     assert any("orchestrator_cap_unknown:" in f for f in corrupt_refused.failures), corrupt_refused.failures
+    for bad_pid in ([123], True, None):
+        bad_doc = json.loads(cap2_saved)
+        bad_doc["pid"] = bad_pid
+        cap2_path.write_text(json.dumps(bad_doc), encoding="utf-8")
+        pid_refused = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+        assert not pid_refused.admitted and pid_refused.orchestrator_cap_refused is True
+        assert not host_admission.allows(pid_refused, force_reason="operator override")
+        assert any("orchestrator_cap_unknown:" in f for f in pid_refused.failures), pid_refused.failures
     cap2_path.write_text(cap2_saved, encoding="utf-8")
 
     monkeypatch.setenv("DISPATCH_MAX_LIVE_ORCHESTRATORS", "3")
@@ -1948,6 +1957,23 @@ def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp
     assert timed_out_child["kill_reason"] == "scope_runtime_max_timeout"
     assert timed_out_child["error"] == "scope RuntimeMaxSec exceeded"
     assert timed_out_child["orphaned_child_tasks"] == ["child-during-rmax"]
+
+    # PR1304-F5 (R2): if RuntimeMaxSec was confirmed first and a late client cancel marks the exact run before
+    # final publication, kill_reason=scope_runtime_max_timeout is cleared and orphaned-child diagnostics apply.
+    _write(dict(schema_version=2, task_id="child-during-late-cancel", agent="claude", mode="workspace-write",
+                status="running", run_nonce="nonce-child-late-cancel", parent_task_id="turn-late-cancel-wins"))
+    real_begin_settlement_r2 = store.begin_settlement
+
+    def settle_with_late_client_cancel(record_arg):
+        real_begin_settlement_r2(record_arg)
+        worker._mark_client_cancel(record_arg["task_id"], record_arg["run_nonce"])
+
+    monkeypatch.setattr(store, "begin_settlement", settle_with_late_client_cancel)
+    late_cancel_wins = _run_with_sigterm("turn-late-cancel-wins", True, scope_runtime_max_s=1200)
+    monkeypatch.setattr(store, "begin_settlement", real_begin_settlement_r2)
+    assert late_cancel_wins["status"] == "cancelled"
+    assert late_cancel_wins.get("kill_reason") is None
+    assert late_cancel_wins["error"] == "orphaned_child_tasks: child-during-late-cancel; cancelled by client"
 
     # Late RuntimeMaxSec SIGTERM after provider watchdog already set status=timeout still records scope cause (F10).
     from lu_machinery.dispatcher.watchdog import DeadlineExpired

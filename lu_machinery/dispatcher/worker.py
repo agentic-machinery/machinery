@@ -2621,6 +2621,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             status, error = "timeout", "scope RuntimeMaxSec exceeded"
             record["kill_reason"] = "scope_runtime_max_timeout"
         else:
+            if record.get("kill_reason") == "scope_runtime_max_timeout":
+                record.pop("kill_reason", None)
             status, error = "cancelled", "cancelled by client"
     except DeadlineExpired as exc:
         status, error = "timeout", exc.diagnostic
@@ -2644,6 +2646,8 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 status, error = "timeout", "scope RuntimeMaxSec exceeded"
                 record["kill_reason"] = "scope_runtime_max_timeout"
             else:
+                if record.get("kill_reason") == "scope_runtime_max_timeout":
+                    record.pop("kill_reason", None)
                 status, error = "cancelled", "cancelled by client"
         try:
             if child and (child.returncode is None or status in {"cancelled", "timeout", "crashed"}):
@@ -2724,9 +2728,12 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                             record.pop("no_deliverable_reason", None)
                             record.update(status="timeout", error="scope RuntimeMaxSec exceeded",
                                           kill_reason="scope_runtime_max_timeout")
-                        elif record["status"] != "cancelled":
-                            record.pop("no_deliverable_reason", None)
-                            record.update(status="cancelled", error="cancelled by client")
+                        else:
+                            if record.get("kill_reason") == "scope_runtime_max_timeout":
+                                record.pop("kill_reason", None)
+                            if record["status"] != "cancelled":
+                                record.pop("no_deliverable_reason", None)
+                                record.update(status="cancelled", error="cancelled by client")
                     # The status is final here: a Savant write run's patch is named only when it settles done.
                     _settle_savant_patch(record, path, draft_fd)
                     if start_refusal is not None and record["status"] in {"failed", "rate_limited"}:
