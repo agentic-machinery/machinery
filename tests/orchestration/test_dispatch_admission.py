@@ -1291,19 +1291,16 @@ def test_consumer_without_admission_policy_uses_fail_closed_machinery_default(tm
     from lu_machinery.orchestration import product_policy
 
     consumer = _checkout(tmp_path / "renamed-kd", _KUBE_DOJO_URL)
-    worktree = tmp_path / "linked-kd"
-    _git(consumer, "worktree", "add", "-q", "-b", "wt", str(worktree))
-    for root in (consumer, worktree):
-        monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
-        policy = adm.load_product_policy()
-        assert policy.origin == product_policy.MACHINERY_DEFAULT_ORIGIN
-        assert not adm.is_content_seat("curriculum-orchestrator")
-        assert not any(adm.ukrainian_content_family_allowed(f) for f in ("anthropic", "google", "openai"))
-        assert not adm.is_ukrainian_review_seat("agy", "google")
-        assert not adm.requires_ukrainian_review(["curriculum/l2-uk-en/a1/lesson.md", "src/index.ts"])
-        assert adm.required_review_receipts(["google"]) == frozenset({"google", "openai"})
-        assert adm.precheck("workspace-write", thresholds=_LIMITS) is None
-        assert adm.evaluate("workspace-write", tmp_path / "tasks", thresholds=_LIMITS).admitted
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+    policy = adm.load_product_policy()
+    assert policy.origin == product_policy.MACHINERY_DEFAULT_ORIGIN
+    assert not adm.is_content_seat("curriculum-orchestrator")
+    assert not any(adm.ukrainian_content_family_allowed(f) for f in ("anthropic", "google", "openai"))
+    assert not adm.is_ukrainian_review_seat("agy", "google")
+    assert not adm.requires_ukrainian_review(["curriculum/l2-uk-en/a1/lesson.md", "src/index.ts"])
+    assert adm.required_review_receipts(["google"]) == frozenset({"google", "openai"})
+    assert adm.precheck("workspace-write", thresholds=_LIMITS) is None
+    assert adm.evaluate("workspace-write", tmp_path / "tasks", thresholds=_LIMITS).admitted
 
     # An explicit path is always read.
     with pytest.raises(product_policy.ProductPolicyError) as explicit_missing:
@@ -1341,16 +1338,26 @@ def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
     _mark_curriculum(marked_primary)
     _git(marked_primary, "worktree", "add", "-q", "-b", "wt", str(tmp_path / "marked-linked"))
     roots["marked-primary"] = tmp_path / "marked-linked"
-    # Git metadata kept apart from the primary checkout (--separate-git-dir): Git cannot confirm the
-    # primary, so neither that checkout nor its linked worktree is identified (#1285 R1 F6).
-    separate = tmp_path / "separate-primary"
-    _git(tmp_path, "init", "-q", f"--separate-git-dir={tmp_path / 'separate-meta'}", str(separate))
-    _git(separate, "commit", "-q", "--allow-empty", "-m", "init")
-    _git(separate, "config", "remote.origin.url", _KUBE_DOJO_URL)
-    _mark_curriculum(separate)
-    _git(separate, "worktree", "add", "-q", "-b", "wt", str(tmp_path / "separate-linked"))
-    roots["separate-git-dir"] = separate
-    roots["separate-git-dir-linked"] = tmp_path / "separate-linked"
+    # Only a primary checkout is identified: a linked worktree's shared Git directory is not its own
+    # .git, and with Git metadata kept apart (--separate-git-dir, even in a directory named .git) Git
+    # cannot name the checkout that carries the marker (#1285 R1 and R2 F6).
+    consumer_linked = _checkout(tmp_path / "consumer-primary", _KUBE_DOJO_URL)
+    _git(consumer_linked, "worktree", "add", "-q", "-b", "wt", str(tmp_path / "consumer-linked"))
+    roots["linked-worktree"] = tmp_path / "consumer-linked"
+    for name, metadata in (("separate-git-dir", "separate-meta"), ("separate-dot-git", "storage/.git")):
+        original = tmp_path / f"{name}-original"
+        (tmp_path / name / metadata).parent.mkdir(parents=True)
+        _git(tmp_path, "init", "-q", f"--separate-git-dir={tmp_path / name / metadata}", str(original))
+        _git(original, "commit", "-q", "--allow-empty", "-m", "init")
+        _git(original, "config", "remote.origin.url", _KUBE_DOJO_URL)
+        _mark_curriculum(original)
+        _git(original, "worktree", "add", "-q", "-b", "wt", str(tmp_path / f"{name}-linked"))
+        roots[name] = original
+        roots[f"{name}-linked"] = tmp_path / f"{name}-linked"
+    # A .git symlink to the Git directory of a checkout that carries the marker.
+    (tmp_path / "symlinked-git").mkdir()
+    (tmp_path / "symlinked-git" / ".git").symlink_to(roots["marker"] / ".git")
+    roots["symlinked-git-dir"] = tmp_path / "symlinked-git"
     # A subdirectory of a consumer is not a checkout top; a symlink resolves to its target.
     consumer = _checkout(tmp_path / "consumer", _KUBE_DOJO_URL)
     (consumer / "sub").mkdir()
@@ -1381,8 +1388,12 @@ _UNIDENTIFIABLE = [
     "subdirectory",
     "symlink-to-learn-ukrainian",
     "gitfile-no-space",
+    "linked-worktree",
     "separate-git-dir",
     "separate-git-dir-linked",
+    "separate-dot-git",
+    "separate-dot-git-linked",
+    "symlinked-git-dir",
 ]
 
 

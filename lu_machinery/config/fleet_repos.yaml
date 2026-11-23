@@ -36,8 +36,9 @@
 # server and dispatch admission policy at the only locations machinery reads:
 # `.mcp/servers/sources/server.py` and `scripts/curriculum/admission_policy.v1.json`
 # (any other value refuses where the file is read). A row carrying the
-# Learn Ukrainian slug must declare both. A product checkout is matched to its row by
-# its Git `origin` (`fleet_repos.fleet_repo_for_checkout`); a row that omits
+# Learn Ukrainian slug must declare both. A primary product checkout (never a linked
+# worktree) is matched to its row by its Git `origin`
+# (`fleet_repos.fleet_repo_for_checkout`); a row that omits
 # `sources_server` runs read-only Claude with no MCP server at all, and one that
 # omits `admission_policy` gets the machinery default policy (no Ukrainian seats or
 # learner payloads). A checkout that cannot be matched, or that carries the
