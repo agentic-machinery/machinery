@@ -641,6 +641,7 @@ tests/dispatcher/test_core_scope_verification.py
 tests/dispatcher/test_core_worktree_entry.py
 tests/dispatcher/test_drive_epic_review_docs.py
 tests/dispatcher/test_environment.py
+tests/dispatcher/test_git_settlement_reads.py
 tests/dispatcher/test_installed_dispatch_linked_worktree.py
 tests/dispatcher/test_opencode_provider.py
 tests/dispatcher/test_orchestrator_mode.py

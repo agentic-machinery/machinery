@@ -76,8 +76,9 @@ def test_merged_task_survives_missing_branch_search_and_provider_error(
                               "headRefOid": head, "headRefName": record["worktree_branch"],
                               "mergeCommit": {"oid": merge}, "isCrossRepository": False})
         elif words[0] == "api" and f"commits/{head}/pulls" in words[-1]:
-            out = json.dumps([{"number": number, "head": {"sha": head, "repo": {"full_name": "org/repo"}},
-                               "base": {"repo": {"full_name": "org/repo"}}}])
+            assert "--slurp" in words, words
+            out = json.dumps([[{"number": number, "head": {"sha": head, "repo": {"full_name": "org/repo"}},
+                                "base": {"repo": {"full_name": "org/repo"}}}]])
         elif words[0] == "api" and "/commits?" in words[-1]:
             assert "--slurp" in words, words
             out = json.dumps([[{"commit": {"message": f"deliver\n\nX-Agent: {agent}/{task}\n"}}]])
@@ -235,13 +236,14 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
         elif words[:2] == ["pr", "view"]:
             out = json.dumps(pr)
         elif words[0] == "api" and words[-1].endswith("/pulls"):
+            assert "--slurp" in words, words
             if case in {"merged-other-head", "unpublished-snapshot"}:
-                return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+                return SimpleNamespace(returncode=0, stdout="[[]]", stderr="")
             if case == "commit-unavailable":
                 return real_run(args, client=client, runner=Mock(side_effect=AssertionError("native fallthrough")),
                                 **kwargs)
-            out = json.dumps([{"number": 7, "head": {"sha": pr["headRefOid"], "repo": {"full_name": "org/repo"}},
-                               "base": {"repo": {"full_name": "org/repo"}}}])
+            out = json.dumps([[{"number": 7, "head": {"sha": pr["headRefOid"], "repo": {"full_name": "org/repo"}},
+                                "base": {"repo": {"full_name": "org/repo"}}}]])
         elif words[0] == "api" and "/commits?" in words[-1]:
             assert "--slurp" in words, words
             out = json.dumps([[{"commit": {
@@ -407,7 +409,8 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
                               "headRefOid": head, "headRefName": branch,
                               "mergeCommit": {"oid": merge}, "isCrossRepository": False})
         elif words[0] == "api" and words[-1].endswith("/pulls"):
-            out = "[]"
+            assert "--slurp" in words, words
+            out = "[[]]"
         elif words[0] == "api" and "/commits?" in words[-1]:
             assert "--slurp" in words, words
             out = json.dumps([[{"commit": {"message": "deliver\n\nX-Agent: claude/rescue-stacked\n"}}]])
