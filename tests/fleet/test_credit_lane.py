@@ -1626,3 +1626,73 @@ def test_consumers_do_not_rederive_owner_decisions(path):
 )
 def test_allowance_status_subscription_near_cap_boundary(remaining, status):
     assert credit_lane.allowance_status(remaining) == status
+
+
+def _cursor_budget(monkeypatch, tmp_path, *, hours_to_reset: float, cycle_start: bool = True) -> tuple[dict, list]:
+    """A Grok+Cursor 7-day cycle at 90.8% used (the 2026-11-23 shape), read by the real adapter and producer."""
+    import io
+
+    from lu_machinery.agent_runtime.adapters import cursor as cursor_mod
+    from lu_machinery.api import state_router
+    from tests.api.test_routing_budget import _configure_base
+
+    end = NOW + timedelta(hours=hours_to_reset)
+    end_ms = int(end.timestamp() * 1000)
+    usage = {"billingCycleEnd": str(end_ms), "planUsage": {"autoPercentUsed": 90.8, "totalPercentUsed": 90.8}}
+    if cycle_start:
+        usage["billingCycleStart"] = str(end_ms - 7 * 24 * 3600 * 1000)
+    sand = {"usagePercent": 90.8, "nextResetTimestampUtc": end.isoformat().replace("+00:00", "Z"),
+            "hasNonZeroIncludedLimit": True}
+
+    class _Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def urlopen(req, timeout=0):
+        return _Response(json.dumps(usage if "GetCurrentPeriodUsage" in req.full_url else sand).encode())
+
+    monkeypatch.setattr(cursor_mod, "probe_cursor_login", lambda **kw: {"is_authenticated": True})
+    monkeypatch.setattr(cursor_mod, "_load_cursor_access_token", lambda: "tok")
+    monkeypatch.setattr(cursor_mod.urllib.request, "urlopen", urlopen)
+    probe = {**cursor_mod.probe_cursor_provider_windows(timeout_s=3), "freshness": "fresh", "stale": False, "age_s": 60.0}
+    budget_path = _configure_base(monkeypatch, tmp_path)
+    monkeypatch.setattr(state_router, "get_cursor_lane_usage", lambda **kw: copy.deepcopy(probe))
+    data = state_router.compute_routing_budget(
+        NOW, budget_config_path=budget_path, tasks_dir=tmp_path / "tasks", project_root=tmp_path,
+        curriculum_root=tmp_path, batch_state_dir=tmp_path,
+    )
+    cursor = data["agents"]["cursor"]
+    admission = {"generated_at": NOW.isoformat(), "diagnostics": {"stale": False}, "agents": {"cursor": cursor}}
+    return cursor, [admission, data["recommendation"]["warnings"]]
+
+
+def test_low_cursor_pool_that_lasts_to_reset_is_not_near_cap(monkeypatch, tmp_path):
+    """9% left, 10 h to the cycle reset, burning slower than the cycle: no threshold-only near_cap
+    (defect class: a used-percent ladder deferring a pool that lasts to reset)."""
+    from lu_machinery.orchestration import dispatch_admission
+
+    cursor, (admission, warnings) = _cursor_budget(monkeypatch, tmp_path, hours_to_reset=10)
+    assert cursor["provider_windows"]["auto"]["window_minutes"] == 7 * 24 * 60
+    assert cursor["status"] == "cool"
+    assert any("Auto allowance lasts to its reset" in w for w in warnings)
+    assert dispatch_admission._meter_defer("grok+cursor", admission, NOW) is None
+    facts = credit_lane.routing_facts("cursor", cursor, model=None, snapshot_metadata={"stale": False}, now=NOW)
+    assert facts.capacity != credit_lane.CAPACITY_AVOID
+
+
+def test_low_cursor_pool_that_runs_out_or_has_no_pace_stays_near_cap(monkeypatch, tmp_path):
+    """27 h to reset at this burn runs out first; without the cycle start there is no pace: near_cap stays."""
+    from lu_machinery.orchestration import dispatch_admission
+
+    for index, (hours_to_reset, cycle_start) in enumerate([(27, True), (10, False)]):
+        root = tmp_path / str(index)
+        root.mkdir()
+        cursor, (admission, _warnings) = _cursor_budget(
+            monkeypatch, root, hours_to_reset=hours_to_reset, cycle_start=cycle_start
+        )
+        assert cursor["status"] == "near_cap", (hours_to_reset, cycle_start)
+        defer = dispatch_admission._meter_defer("grok+cursor", admission, NOW)
+        assert defer == dispatch_admission.MeterDefer.NEAR_CAP, (hours_to_reset, cycle_start)

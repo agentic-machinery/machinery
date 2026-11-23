@@ -876,8 +876,43 @@ def _monthly_window_block(
     *,
     label: str,
     resets_at: str | None,
+    window_minutes: int | None = None,
 ) -> dict[str, Any]:
-    return _usage_window_block(used_pct, label=label, window="monthly", resets_at=resets_at)
+    block = _usage_window_block(used_pct, label=label, window="monthly", resets_at=resets_at)
+    if window_minutes is not None:
+        block["window_minutes"] = window_minutes
+    return block
+
+
+# A billing cycle longer than this is not a reading we can pace (a month is at most 31 days).
+_MAX_BILLING_CYCLE_MINUTES = 31 * 24 * 60
+
+
+def _billing_cycle_minutes(start_ms: object, end_ms: object) -> int | None:
+    """Length in whole minutes of the billing cycle the usage payload reports, or ``None``.
+
+    Both bounds must be non-negative integer milliseconds (an ``int`` or a digit
+    string, as the dashboard API sends them), the end after the start, the
+    length a whole number of minutes and at most :data:`_MAX_BILLING_CYCLE_MINUTES`.
+    Anything else is unknown, so no pace is computed from it.
+    """
+    bounds: list[int] = []
+    for raw in (start_ms, end_ms):
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, int) and raw >= 0:
+            bounds.append(raw)
+        # Epoch milliseconds have 13 digits; a longer string is not a timestamp (and
+        # int() refuses strings past the interpreter's digit limit).
+        elif isinstance(raw, str) and 0 < len(raw) <= 16 and raw.isascii() and raw.isdigit():
+            bounds.append(int(raw))
+        else:
+            return None
+    length_ms = bounds[1] - bounds[0]
+    if length_ms <= 0 or length_ms % 60_000:
+        return None
+    minutes = length_ms // 60_000
+    return minutes if minutes <= _MAX_BILLING_CYCLE_MINUTES else None
 
 
 def _empty_cursor_provider_windows(*, resets_at: str | None = None) -> dict[str, dict[str, Any]]:
@@ -1012,9 +1047,15 @@ def probe_cursor_provider_windows(*, timeout_s: float = 8.0) -> dict[str, Any]:
     api_pct = float(api_used) if isinstance(api_used, (int, float)) else None
     total_pct = float(total_used) if isinstance(total_used, (int, float)) else None
     resets_at = _ms_to_iso_z(payload.get("billingCycleEnd"))
+    # The cycle length lets the routing owner pace the Auto pool on its own window.
+    cycle_minutes = _billing_cycle_minutes(payload.get("billingCycleStart"), payload.get("billingCycleEnd"))
 
-    auto_block = _monthly_window_block(auto_pct, label="Cursor Models (Auto)", resets_at=resets_at)
-    api_block = _monthly_window_block(api_pct, label="Other Models (API)", resets_at=resets_at)
+    auto_block = _monthly_window_block(
+        auto_pct, label="Cursor Models (Auto)", resets_at=resets_at, window_minutes=cycle_minutes
+    )
+    api_block = _monthly_window_block(
+        api_pct, label="Other Models (API)", resets_at=resets_at, window_minutes=cycle_minutes
+    )
     grok_timeout = max(2.0, min(timeout_s, 5.0))
     try:
         grok_block = _probe_cursor_grok_bot_window(token=token, timeout_s=grok_timeout)
@@ -1027,7 +1068,9 @@ def probe_cursor_provider_windows(*, timeout_s: float = 8.0) -> dict[str, Any]:
         "grok_bot": grok_block,
     }
     if total_pct is not None:
-        provider_windows["total"] = _monthly_window_block(total_pct, label="Total (included)", resets_at=resets_at)
+        provider_windows["total"] = _monthly_window_block(
+            total_pct, label="Total (included)", resets_at=resets_at, window_minutes=cycle_minutes
+        )
 
     # Burn/status tracks the Auto-routing pool (operator: pin ``auto`` to spend Auto).
     burn_pct = auto_pct

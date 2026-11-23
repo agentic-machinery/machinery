@@ -1169,6 +1169,50 @@ def pace_forecast(
     }
 
 
+def cursor_auto_lasts(
+    record: Mapping[str, Any] | None,
+    *,
+    snapshot_stale: bool = False,
+    policy: CreditPolicy | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """True when Cursor's own Auto window lasts to its reset, so its burn-ladder status yields.
+
+    The Cursor adapter labels the lane from used-percent alone (>= 75% ``hot``,
+    >= 90% ``near_cap``). A pool that lasts to its reset is spent, not held, so
+    that label yields only to positive evidence from the same reading:
+    :func:`pace_forecast` on the Auto window itself (its billing-cycle length,
+    remaining and reset) is available, fresh and says ``will_last_to_reset``.
+    The Auto window must be the tightest reported window, and a tied window
+    must reset at the same instant (the same cycle). More than the used-up
+    line must be left, and the runtime record must say it is not
+    headroom-blocked. Anything else is ``False``: the ladder status stays.
+    """
+    data = record if isinstance(record, Mapping) else {}
+    if data.get("status_source") != "cursor_auto":
+        return False
+    runtime = data.get("runtime")
+    if not isinstance(runtime, Mapping) or runtime.get("headroom_blocked") is not False:
+        return False
+    auto = _auto_window(data)
+    auto_rem = _block_remaining(auto)
+    auto_reset = _reset_time(_block_reset(auto))
+    auto_mins, auto_ok = _parse_window_minutes(auto)
+    if auto_rem is None or auto_reset is None or auto_mins is None or not auto_ok:
+        return False
+    if auto_rem <= _NEAR_CAP_REMAINING_PCT or plan_remaining_pct(data) != auto_rem:
+        return False
+    native = _sub_mapping(data, "codexbar")
+    weekly_rem = _number(native.get("weekly_remaining_pct"))
+    if weekly_rem is not None and weekly_rem <= auto_rem and _reset_time(native.get("weekly_resets_at")) != auto_reset:
+        return False
+    rem, reset, mins, ok, error = _matched_pace_window(data)
+    if error is not None or not ok or rem != auto_rem or _reset_time(reset) != auto_reset or mins != auto_mins:
+        return False
+    forecast = pace_forecast(data, snapshot_metadata={"stale": snapshot_stale}, policy=policy, now=now)
+    return forecast["available"] is True and forecast["source"] == "usage_pace" and forecast["will_last_to_reset"] is True
+
+
 _GROK_CURSOR_SEVERITY = {"idle": 0, "cool": 0, "warm": 1, "hot": 2, "near_cap": 3}
 
 

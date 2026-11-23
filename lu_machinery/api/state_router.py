@@ -1621,6 +1621,13 @@ def _compute_dispatch_routing_budget(
     # Build warnings for any lane in deficit (authoritative or fallback)
     for lane in SUBSCRIPTION_LANES:
         if lane in agents:
+            ladder = agents[lane].get("status")
+            if lane == "cursor" and ladder in {"hot", "near_cap"} and credit_lane.cursor_auto_lasts(
+                agents[lane], snapshot_stale=is_stale, now=current_time
+            ):
+                # The Auto burn ladder reads used-percent only; the pool's own pace says it lasts.
+                agents[lane]["status"] = "cool"
+                warnings.append(f"lane cursor: Auto allowance lasts to its reset at current pace — cool, not {ladder}")
             deficit = credit_lane.pace_deficit_state(
                 lane,
                 agents[lane],
