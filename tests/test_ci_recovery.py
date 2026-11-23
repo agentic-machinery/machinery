@@ -12,6 +12,7 @@ from threading import Barrier
 from unittest.mock import Mock
 
 import pytest
+import yaml
 
 from lu_machinery.opsec import prepublish as gate
 from lu_machinery.orchestration import merge_queue_keeper as keeper
@@ -69,6 +70,7 @@ class Transport:
         self.files = [[{"filename": "lu_machinery/example.py", "status": "modified"}]]
         self.compare_rows = {"base_commit": {"sha": "d" * 40}, "merge_base_commit": {"sha": "d" * 40}, "status": "ahead", "files": [{"filename": "lu_machinery/earlier-pr.py"}, {"filename": "lu_machinery/this-pr.py"}]}
         self.candidate_record = {"base_sha": "d" * 40, "head_sha": TESTED, "head_ref": "refs/heads/gh-readonly-queue/main/pr-42-" + "e" * 40, "run_id": 123, "run_attempt": 1}
+        self.candidate_file = None
 
 
     def __call__(self, argv, **kwargs):
@@ -217,7 +219,10 @@ class Transport:
             elif endpoint.endswith("/actions/artifacts/77/zip"):
                 with io.BytesIO() as buffer:
                     with zipfile.ZipFile(buffer, "w") as archive:
-                        archive.writestr("queue-candidate.json", json.dumps(self.candidate_record))
+                        if self.candidate_file is None:
+                            archive.writestr("queue-candidate.json", json.dumps(self.candidate_record))
+                        else:
+                            archive.write(self.candidate_file, arcname=self.candidate_file.name)
                     kwargs["stdout"].write(buffer.getvalue())
                 return subprocess.CompletedProcess(argv, 0, "", "")
             elif "/compare/" in endpoint:
@@ -555,6 +560,55 @@ def test_cli_uses_the_same_allowance(setup, capsys):
     assert pub.main(["run-rerun", "--repo", "unit/public", "--number", "123"], runner=transport) == 0
     assert pub.main(["run-rerun", "--repo", "unit/public", "--number", "123"], runner=transport) == 2
     assert transport.writes == [["gh", "run", "rerun", "123", "--repo", "unit/public", "--failed"]]
+
+
+def test_machinery_workflow_artifact_authorizes_queue_recovery(setup):
+    root, transport = setup
+    workflow = Path(__file__).resolve().parents[1] / ".github/workflows/ci-gate.yml"
+    gate_job = yaml.load(workflow.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)["jobs"]["ci-gate"]
+    record, upload, *_ = gate_job["steps"]
+    assert gate_job["if"] == "always()"
+    assert record["if"] == upload["if"] == "github.event_name == 'merge_group'"
+    assert upload["with"]["name"] == "ci-queue-candidate"
+    assert upload["with"]["path"] == "${{ runner.temp }}/queue-candidate.json"
+    assert upload["with"]["if-no-files-found"] == "error"
+
+    expected = transport.candidate_record
+    event = root / "merge group.json"
+    event.write_text(json.dumps({
+        "action": "checks_requested",
+        "merge_group": {
+            "base_ref": "refs/heads/main",
+            "base_sha": expected["base_sha"],
+            "head_ref": expected["head_ref"],
+            "head_sha": TESTED,
+        },
+    }), encoding="utf-8")
+    subprocess.run(
+        ["bash", "-c", record["run"]],
+        cwd=root,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "GITHUB_EVENT_PATH": str(event),
+            "GITHUB_REF": expected["head_ref"],
+            "GITHUB_SHA": TESTED,
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "RUNNER_TEMP": str(root),
+        },
+        check=True,
+        timeout=10,
+    )
+    transport.candidate_file = root / "queue-candidate.json"
+    assert json.loads(transport.candidate_file.read_bytes()) == expected
+    transport.proof.update(diagnosis="infrastructure", undermines_approval=False, failed_tests=[])
+    result = pub.publish(
+        "pr-merge", number=42, repo="unit/public", match_head=HEAD, expect_queue="true",
+        recovery_run_id=123, cwd=root, env={}, runner=transport,
+    )
+    assert result.returncode == 0
+    assert len(transport.writes) == 1
+    assert transport.queued
 
 
 def test_pull_request_run_uses_pr_head_not_tested_merge_sha(setup):

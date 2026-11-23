@@ -1536,6 +1536,34 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Publish the original candidate before a failed dependency fails the gate.
+      - name: Record original queue candidate
+        if: github.event_name == 'merge_group'
+        run: |
+          set -euo pipefail
+          jq -ces --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" \
+            --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" '
+            select(length == 1) | .[0]
+            | select(.action == "checks_requested") | .merge_group
+            | select(.base_ref == "refs/heads/main" and .head_ref == $ref and .head_sha == $sha)
+            | select(.head_ref | test("\\Arefs/heads/gh-readonly-queue/main/pr-[1-9][0-9]*-[0-9a-f]{40}\\z"))
+            | select(.base_sha != .head_sha and
+                ([.base_sha, .head_sha] | all(type == "string" and test("\\A[0-9a-f]{40}\\z"))))
+            | select([$run_id, $run_attempt] | all(type == "number" and . > 0 and . == floor))
+            | {base_sha, head_sha, head_ref, run_id: $run_id, run_attempt: $run_attempt}
+            ' "$GITHUB_EVENT_PATH" > "$RUNNER_TEMP/queue-candidate.json"
+
+      - name: Preserve original queue candidate for recovery
+        if: github.event_name == 'merge_group'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-queue-candidate
+          path: ${{ runner.temp }}/queue-candidate.json
+          if-no-files-found: error
+          retention-days: 14
+          # A manual rerun shares the run ID. Keep one record for the current attempt.
+          overwrite: true
+
       - name: Require every job to succeed
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
