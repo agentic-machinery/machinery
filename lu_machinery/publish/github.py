@@ -1516,14 +1516,24 @@ def _apply_pr_milestone(created, milestone_number, milestone_title, dest, gh_rep
         limited = exc
     except Exception:
         applied = None
-    which = f"PR #{number}" if number else "The new PR"
+    created_pr = github_client.created_pr_detail({"number": number, "html_url": created}) or None
+    pr_url = created_pr.get("pr_url") if created_pr else None
+    which = (
+        f"PR #{number} ({pr_url})"
+        if number and pr_url
+        else f"PR #{number}"
+        if number
+        else f"The new PR ({pr_url})"
+        if pr_url
+        else "The new PR"
+    )
     if limited is not None:
         print(
             f"MILESTONE_PENDING: {which} was created but milestone {milestone_title!r} (#{milestone_number}) "
             "was not applied; apply it with pr-edit after the rate limit resets.",
             file=sys.stderr,
         )
-        raise limited
+        raise github_client.GitHubRateLimited(limited.reset_at, limited.reason, created_pr=created_pr)
     if applied is None or applied.returncode:
         raise gate.PublishBlocked(
             f"MILESTONE_FAILED: {which} was created but milestone {milestone_title!r} (#{milestone_number}) "
