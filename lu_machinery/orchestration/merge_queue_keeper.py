@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -12,7 +13,7 @@ import subprocess
 import sys
 import unicodedata
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
 from lu_machinery.gh_merge_queue_status import extract_pr_number
 from lu_machinery.github_check_rollup import bind_workflow_runs, group_collapsed_by_name, project_check_runs
+from lu_machinery.ops import verify_run as ops_verify_run
 from lu_machinery.opsec.prepublish import (
     PublishBlocked,
     check_texts,
@@ -31,13 +33,20 @@ from lu_machinery.opsec.prepublish import (
     publication_boundary,
     publication_cli,
 )
+from lu_machinery.opsec.prepublish import (
+    catalog as prepublish_catalog,
+)
 from lu_machinery.orchestration import pr_ownership
 from lu_machinery.orchestration.integration_sweep import (
     COMMENTS_UNAVAILABLE,
     NEEDS_COVERAGE,
     NEEDS_SEAT,
+    REPLY_OPENER,
+    TRUSTED_ASSOCIATIONS,
     Verdict,
     _author_login,
+    _edited,
+    _field,
     changes_learner_content,
     classify_pr,
     lookup_verdict,
@@ -506,9 +515,17 @@ class GitHub:
 
     def jobs(self, run_id: int) -> list[dict[str, Any]]:
         data = self.json(Request("read-jobs", repo=self.repository, number=run_id))
-        if not isinstance(data, dict) or not isinstance(data.get("jobs"), list) or data.get("total_count", 0) > 100:
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("jobs"), list)
+            or not all(isinstance(job, dict) for job in data["jobs"])
+        ):
             raise KeeperError("merge_group job page incomplete")
-        return data["jobs"]
+        if "total_count" in data:
+            total = data["total_count"]
+            if type(total) is not int or total > 100 or total != len(data["jobs"]):
+                raise KeeperError("merge_group job page incomplete")
+        return list(data["jobs"])
 
     def failed_tests(self, job_id: int) -> list[str]:
         """Extract only a failing test node's relative source identifier (pytest ``FAILED`` or
@@ -527,6 +544,528 @@ class GitHub:
             ) and identifier not in tests:
                 tests.append(identifier)
         return tests
+
+
+_SYSTEMD_UNIT_SUFFIXES = (".service", ".timer", ".target", ".service.j2", ".timer.j2", ".target.j2")
+_SOURCES_UNIT_SUFFIXES = (".service", ".timer", ".service.j2", ".timer.j2")
+_VERIFY_WORD_RE = re.compile(r"\bverify_words?\b")
+_VERIFY_WORD_CODE_SUFFIXES = (".py", ".sh", ".ts", ".js", ".mjs")
+_VERIFY_SOURCE_READ_LIMIT = 262_144
+_UNSAFE_REF_CHARS = frozenset(":~^?*\\[\x7f")
+
+
+def _str_in(value: object, allowed: Collection[str]) -> bool:
+    """Safe string set-membership check; never raises TypeError on unhashable JSON values."""
+    return isinstance(value, str) and value in allowed
+
+
+def _local_git_env() -> dict[str, str]:
+    """Sanitized environment for local Git inspections, stripped of ambient ``GIT_*`` overrides."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update({
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": os.devnull,
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    return env
+
+
+def _safe_git_branch(base_name: str | None) -> bool:
+    return (
+        isinstance(base_name, str)
+        and bool(base_name)
+        and not base_name.startswith(("-", "/"))
+        and not base_name.endswith(("/", "."))
+        and ".." not in base_name
+        and "@{" not in base_name
+        and not any(ch.isspace() or ord(ch) < 32 or ch in _UNSAFE_REF_CHARS for ch in base_name)
+    )
+
+
+def _safe_remote_origin(repo_root: Path) -> str | None:
+    try:
+        origin = subprocess.run(
+            ["git", "-C", str(repo_root), "config", "--get", "remote.origin.url"],
+            env=_local_git_env(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    remote_url = origin.stdout.strip() if origin.returncode == 0 else ""
+    if not remote_url or remote_url.startswith("-") or any(ord(ch) < 32 or ord(ch) == 127 for ch in remote_url):
+        return None
+    return remote_url
+
+
+def _cat_bounded_git_blob(
+    spec: str,
+    *,
+    repo_root: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Read one Git blob by ``<rev>:<path>`` if and only if its size is within ``_VERIFY_SOURCE_READ_LIMIT``."""
+    run_env = dict(env) if env is not None else _local_git_env()
+    if repo_root is not None:
+        size_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "--no-replace-objects", "cat-file", "-s", spec],
+            env=run_env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    else:
+        size_proc = subprocess.run(
+            ["git", "--no-replace-objects", "cat-file", "-s", spec],
+            env=run_env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    if size_proc.returncode != 0:
+        return None
+    try:
+        size = int(size_proc.stdout.strip())
+    except ValueError:
+        return None
+    if size < 0 or size > _VERIFY_SOURCE_READ_LIMIT:
+        return None
+    if repo_root is not None:
+        blob_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "--no-replace-objects", "cat-file", "-p", spec],
+            env=run_env,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    else:
+        blob_proc = subprocess.run(
+            ["git", "--no-replace-objects", "cat-file", "-p", spec],
+            env=run_env,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    if blob_proc.returncode != 0:
+        return None
+    return blob_proc.stdout.decode("utf-8", errors="ignore")
+
+
+def _fetch_isolated_pr_refs(
+    remote_url: str,
+    iso_env: Mapping[str, str],
+    *,
+    number: int,
+    base_name: str | None = None,
+    approved: str | None = None,
+) -> bool:
+    """Fetch PR head (plus optional base branch and approved commit) into an isolated object store."""
+    env = dict(iso_env)
+    if base_name is not None:
+        fetched = subprocess.run(
+            [
+                "git",
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--no-recurse-submodules",
+                remote_url,
+                f"+refs/pull/{number}/head:refs/keeper/pr",
+                f"+refs/heads/{base_name}:refs/keeper/base",
+            ],
+            env=env,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    else:
+        fetched = subprocess.run(
+            [
+                "git",
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "--no-recurse-submodules",
+                remote_url,
+                f"+refs/pull/{number}/head:refs/keeper/pr",
+            ],
+            env=env,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    if fetched.returncode != 0:
+        return False
+    if approved is not None:
+        have_approved = subprocess.run(
+            ["git", "--no-replace-objects", "cat-file", "-e", f"{approved}^{{commit}}"],
+            env=env,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        if have_approved.returncode != 0:
+            subprocess.run(
+                ["git", "fetch", "--no-tags", "--quiet", "--no-recurse-submodules", remote_url, approved],
+                env=env,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+    return True
+
+
+class _VerifyBlobReader:
+    """Lazily populated single-fetch Git blob reader scoped to one ``verify_run`` pass."""
+
+    def __init__(
+        self,
+        repo_root: Path | None,
+        *,
+        number: int | None,
+        head: str | None,
+        base_name: str | None,
+    ) -> None:
+        self.repo_root = repo_root
+        self.number = number if type(number) is int and number > 0 else None
+        self.head = head if isinstance(head, str) and SHA.fullmatch(head) else None
+        self.base_name = base_name if _safe_git_branch(base_name) else None
+        self._stack = contextlib.ExitStack()
+        self._iso_attempted = False
+        self._iso_env: dict[str, str] | None = None
+        self._diff_base_resolved = False
+        self._diff_base_sha: str | None = None
+        self._diff_base_isolated = False
+
+    def __enter__(self) -> _VerifyBlobReader:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stack.close()
+
+    def _ensure_isolated(self) -> dict[str, str] | None:
+        if self._iso_attempted:
+            return self._iso_env
+        self._iso_attempted = True
+        if self.repo_root is None or self.number is None or self.head is None:
+            return None
+        remote_url = _safe_remote_origin(self.repo_root)
+        if not remote_url:
+            return None
+        from lu_machinery.review import record_cf_verdict
+
+        try:
+            env = self._stack.enter_context(record_cf_verdict.isolated_object_store(self.repo_root))
+            iso_env = {**env, "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1"}
+            if not _fetch_isolated_pr_refs(remote_url, iso_env, number=self.number, base_name=self.base_name):
+                return None
+            have_head = subprocess.run(
+                ["git", "--no-replace-objects", "cat-file", "-e", f"{self.head}^{{commit}}"],
+                env=iso_env,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            if have_head.returncode != 0:
+                return None
+            self._iso_env = iso_env
+            return self._iso_env
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
+    def _proven_diff_base(self) -> tuple[str | None, bool]:
+        """Return ``(merge_base_sha, use_isolated_store)``; fail closed (``None``) when unproven."""
+        if self._diff_base_resolved:
+            return self._diff_base_sha, self._diff_base_isolated
+        self._diff_base_resolved = True
+        if self.repo_root is None or self.head is None or self.base_name is None:
+            return None, False
+        # When a PR number and remote origin exist, prove merge-base against the live fetched
+        # remote base and exact PR head in the isolated store (never a stale local tracking ref).
+        if self.number is not None and _safe_remote_origin(self.repo_root) is not None:
+            iso_env = self._ensure_isolated()
+            if iso_env is None:
+                return None, False
+            mb = subprocess.run(
+                ["git", "--no-replace-objects", "merge-base", "refs/keeper/base", self.head],
+                env=iso_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            candidate = mb.stdout.strip()
+            if mb.returncode == 0 and SHA.fullmatch(candidate):
+                self._diff_base_sha = candidate
+                self._diff_base_isolated = True
+                return candidate, True
+            return None, False
+        # Local-only repository fallback (no PR number/remote): still requires a proven merge-base.
+        local_env = _local_git_env()
+        for base_ref in (f"refs/remotes/origin/{self.base_name}", f"refs/heads/{self.base_name}"):
+            mb = subprocess.run(
+                ["git", "-C", str(self.repo_root), "--no-replace-objects", "merge-base", base_ref, self.head],
+                env=local_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            candidate = mb.stdout.strip()
+            if mb.returncode == 0 and SHA.fullmatch(candidate):
+                self._diff_base_sha = candidate
+                self._diff_base_isolated = False
+                return candidate, False
+        return None, False
+
+    def read(self, path: str, removed: bool) -> str | None:
+        """Read a bounded Git blob at the exact PR ``head`` (or proven diff base for removals)."""
+        if (
+            self.repo_root is None
+            or self.head is None
+            or not path
+            or path.startswith(("/", "-"))
+            or ".." in Path(path).parts
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in path)
+        ):
+            return None
+        try:
+            if not removed:
+                local_blob = _cat_bounded_git_blob(f"{self.head}:{path}", repo_root=self.repo_root)
+                if local_blob is not None:
+                    return local_blob
+                iso_env = self._ensure_isolated()
+                if iso_env is None:
+                    return None
+                return _cat_bounded_git_blob(f"{self.head}:{path}", env=iso_env)
+            base_sha, use_iso = self._proven_diff_base()
+            if base_sha is None:
+                return None
+            if use_iso:
+                return _cat_bounded_git_blob(f"{base_sha}:{path}", env=self._iso_env)
+            return _cat_bounded_git_blob(f"{base_sha}:{path}", repo_root=self.repo_root)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
+
+def _repo_verify_run_areas(repository: str) -> tuple[str, ...]:
+    """Return the verify_run areas ``repository`` marks as required (default: all verify_run areas).
+
+    Reads the optional ``verify_run_areas`` list from the matching repository row in
+    ``lu_machinery/config/fleet_repos.yaml`` (via ``prepublish.catalog``). An unreadable
+    catalog or malformed area list fails closed with ``KeeperError``.
+    """
+    target = normalize_repository(repository)
+    try:
+        catalog = prepublish_catalog()
+    except PublishBlocked as exc:
+        raise KeeperError(f"verify_run repository catalog unavailable: {exc}") from exc
+    if not isinstance(catalog, Mapping):
+        raise KeeperError("verify_run repository catalog malformed")
+    matches: list[Mapping[str, Any]] = []
+    for row in catalog.values():
+        if not isinstance(row, Mapping):
+            continue
+        slugs = [row.get("github"), row.get("alternate_github")]
+        if any(isinstance(slug, str) and normalize_repository(slug) == target for slug in slugs):
+            matches.append(row)
+    if len(matches) > 1:
+        raise KeeperError(f"ambiguous repository catalog entry for {repository}")
+    if not matches or "verify_run_areas" not in matches[0]:
+        return ops_verify_run.AREAS
+    configured = matches[0]["verify_run_areas"]
+    if (
+        not isinstance(configured, list)
+        or not all(isinstance(area, str) and area in ops_verify_run.AREAS for area in configured)
+        or len(set(configured)) != len(configured)
+    ):
+        raise KeeperError(f"invalid verify_run_areas configuration for {repository}")
+    return tuple(area for area in ops_verify_run.AREAS if area in configured)
+
+
+def _norm_pr_path(raw: object) -> str:
+    if not isinstance(raw, str):
+        return ""
+    norm = raw.strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.lstrip("/")
+
+
+def _verify_run_areas_for_files(
+    files: Sequence[str],
+    *,
+    repository: str,
+    file_rows: Sequence[Mapping[str, Any]] | None = None,
+    repo_root: Path | None = None,
+    head: str | None = None,
+    base_name: str | None = None,
+    number: int | None = None,
+    blob_reader: Callable[[str, bool], str | None] | None = None,
+) -> tuple[str, ...]:
+    """Map PR diff paths (and exact-tree ``verify_word`` callers) to required ``verify_run`` areas."""
+    allowed = set(_repo_verify_run_areas(repository))
+    if not allowed:
+        return ()
+    patches_by_path: dict[str, str] = {}
+    status_by_path: dict[str, str] = {}
+    previous_by_path: dict[str, str] = {}
+    if file_rows:
+        for row in file_rows:
+            if not isinstance(row, Mapping):
+                continue
+            cleaned_name = _norm_pr_path(row.get("filename"))
+            cleaned_prev = _norm_pr_path(row.get("previous_filename"))
+            status = row.get("status")
+            if cleaned_name and isinstance(status, str):
+                status_by_path[cleaned_name] = status.casefold()
+            if cleaned_name and cleaned_prev:
+                previous_by_path[cleaned_name] = cleaned_prev
+            patch = row.get("patch")
+            if isinstance(patch, str):
+                if cleaned_name:
+                    patches_by_path[cleaned_name] = patch
+                if cleaned_prev:
+                    patches_by_path[cleaned_prev] = patch
+
+    matched: set[str] = set()
+    previous_paths = set(previous_by_path.values())
+    blob_candidates: list[tuple[str, bool]] = []
+    seen_candidates: set[tuple[str, bool]] = set()
+    for raw_path in files:
+        norm = _norm_pr_path(raw_path)
+        if not norm or norm.startswith(("tests/", "docs/")):
+            continue
+        lower = norm.casefold()
+        base = norm.rsplit("/", 1)[-1]
+        base_lower = base.casefold()
+        if "api" in allowed and (
+            norm.startswith(("lu_machinery/api/", "scripts/api/", "scripts/project_api/", "dashboards/"))
+            or base in {"route_contracts.py", "page_contracts.py"}
+            or (lower.endswith(".html") and "dashboard" in lower)
+        ):
+            matched.add("api")
+        if "host" in allowed and (
+            norm.startswith(("packaging/systemd/", "lu_machinery/packaging/systemd/"))
+            or "/systemd/" in f"/{norm}"
+            or base == "learn-ukrainian-loopback.target"
+            or base_lower.endswith(_SYSTEMD_UNIT_SUFFIXES)
+        ):
+            matched.add("host")
+        if "sources" in allowed and "sources" not in matched:
+            if (
+                norm.startswith((".mcp/servers/sources/", "lu_machinery/sources/", "scripts/verification/"))
+                or norm == "lu_machinery/ops/verify_run.py"
+                or ("sources" in base_lower and base_lower.endswith(_SOURCES_UNIT_SUFFIXES))
+            ):
+                matched.add("sources")
+            else:
+                # A path that appears only as a rename's previous_filename does not exist at PR head;
+                # inspect it at the proven diff base (removed=True), never at PR head.
+                is_removed = status_by_path.get(norm) == "removed" or (
+                    norm in previous_paths and norm not in status_by_path
+                )
+                for cand_path, cand_removed in (
+                    (norm, is_removed),
+                    *((previous_by_path[norm], True) for _ in (0,) if norm in previous_by_path),
+                ):
+                    if not cand_path.casefold().endswith(_VERIFY_WORD_CODE_SUFFIXES):
+                        continue
+                    patch = patches_by_path.get(cand_path)
+                    if isinstance(patch, str) and _VERIFY_WORD_RE.search(patch):
+                        matched.add("sources")
+                        break
+                    pair = (cand_path, cand_removed)
+                    if pair not in seen_candidates:
+                        seen_candidates.add(pair)
+                        blob_candidates.append(pair)
+
+    if "sources" in allowed and "sources" not in matched and blob_candidates:
+        with contextlib.ExitStack() as stack:
+            reader = (
+                blob_reader
+                if blob_reader is not None
+                else stack.enter_context(
+                    _VerifyBlobReader(repo_root, number=number, head=head, base_name=base_name)
+                ).read
+            )
+            for cand_path, cand_removed in blob_candidates:
+                blob = reader(cand_path, cand_removed)
+                # Fail closed: an unreadable PR-head or proven-base blob requires Sources verification.
+                if blob is None or _VERIFY_WORD_RE.search(blob):
+                    matched.add("sources")
+                    break
+
+    return tuple(area for area in ops_verify_run.AREAS if area in matched and area in allowed)
+
+
+def _run_verify_gate(
+    files: Sequence[str],
+    *,
+    repository: str,
+    verify_runner: Callable[[Sequence[str]], Mapping[str, Any]] | None,
+    file_rows: Sequence[Mapping[str, Any]] | None = None,
+    gh: GitHub | None = None,
+    number: int | None = None,
+    head: str | None = None,
+    base_name: str | None = None,
+) -> tuple[bool, tuple[str, ...], str]:
+    """Run ``verify_run`` for every touched required area; fail closed on error or bad receipt."""
+    blob_reader: Callable[[str, bool], str | None] | None = None
+    gh_reader = getattr(gh, "read_source_blob", None) if gh is not None else None
+    if callable(gh_reader) and number is not None and isinstance(head, str):
+        reader_fn = gh_reader
+        num_ref = number
+        head_ref = head
+        base_ref = base_name
+
+        def _gh_blob_reader(path: str, removed: bool) -> str | None:
+            result = reader_fn(num_ref, head_ref, path, base_name=base_ref, removed=removed)
+            return result if isinstance(result, str) else None
+
+        blob_reader = _gh_blob_reader
+    try:
+        areas = _verify_run_areas_for_files(
+            files,
+            repository=repository,
+            file_rows=file_rows,
+            repo_root=gh.root if gh is not None else None,
+            head=head,
+            base_name=base_name,
+            number=number,
+            blob_reader=blob_reader,
+        )
+    except KeeperError as exc:
+        return False, ops_verify_run.AREAS, str(exc)
+    if not areas:
+        return True, (), ""
+    runner = verify_runner or ops_verify_run.run
+    try:
+        receipt = runner(areas)
+    except (ops_verify_run.VerifyFailure, KeeperError, OSError, ValueError, TypeError) as exc:
+        return False, areas, f"{type(exc).__name__}: {exc}"
+    if not isinstance(receipt, Mapping) or receipt.get("ok") is not True or not isinstance(receipt.get("areas"), list):
+        failed_areas: list[str] = []
+        if isinstance(receipt, Mapping) and isinstance(receipt.get("areas"), list):
+            for entry in receipt["areas"]:
+                if isinstance(entry, Mapping) and isinstance(entry.get("area"), str) and entry.get("ok") is not True:
+                    failed_areas.append(entry["area"])
+        reported = tuple(a for a in areas if a in failed_areas) if failed_areas else areas
+        return False, reported, "verify_run receipt not ok"
+    by_area: dict[str, Mapping[str, Any]] = {
+        entry["area"]: entry
+        for entry in receipt["areas"]
+        if isinstance(entry, Mapping) and isinstance(entry.get("area"), str)
+    }
+    bad = tuple(area for area in areas if area not in by_area or by_area[area].get("ok") is not True)
+    if bad:
+        return False, bad, "verify_run area missing or failed"
+    return True, areas, ""
 
 
 def _hold(row: Mapping[str, Any]) -> bool | None:
@@ -826,6 +1365,18 @@ def _throttled(state_path: Path, seconds: int, now: datetime | None = None) -> b
     return 0 <= elapsed < seconds - INTERVAL_SLACK_SECONDS
 
 
+def _valid_outbox_entry(entry: object) -> bool:
+    return (
+        isinstance(entry, dict)
+        and isinstance(entry.get("key"), str)
+        and bool(entry["key"].strip())
+        and isinstance(entry.get("kind"), str)
+        and bool(entry["kind"].strip())
+        and isinstance(entry.get("body"), str)
+        and bool(entry["body"].strip())
+    )
+
+
 def _load(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"queued": {}}
@@ -853,9 +1404,24 @@ def _load(path: Path) -> dict[str, Any]:
             for k, v in data.get("pending_closeout", {}).items()
         )
         or not isinstance(data.get("hold_alerts", {}), dict)
+        or not all(
+            isinstance(k, str) and isinstance(v, str)
+            for k, v in data.get("hold_alerts", {}).items()
+        )
         or not isinstance(data.get("base_ci_alerts", {}), dict)
+        or not isinstance(data.get("report_heads", {}), dict)
+        or not all(
+            isinstance(k, str) and k.isdigit() and isinstance(v, str) and SHA.fullmatch(v)
+            for k, v in data.get("report_heads", {}).items()
+        )
+        or not isinstance(data.get("repaired_reenqueues", {}), dict)
+        or not all(
+            isinstance(k, str) and k.isdigit() and isinstance(v, dict)
+            for k, v in data.get("repaired_reenqueues", {}).items()
+        )
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
         or not isinstance(data.get("cto_outbox", []), list)
+        or not all(_valid_outbox_entry(entry) for entry in data.get("cto_outbox", []))
     ):
         raise KeeperError("keeper state malformed")
     # Records of the deleted recovery-evidence and grant ceremony (#11648). They
@@ -887,6 +1453,44 @@ def _save(path: Path, data: dict[str, Any]) -> None:
     os.replace(temp, path)
 
 
+def _save_report_delta(
+    state_path: Path,
+    *,
+    lock_path: Path | None,
+    hold_alerts: Mapping[str, str],
+    cto_outbox: Sequence[Mapping[str, Any]],
+    report_heads: Mapping[str, tuple[str | None, str]],
+) -> None:
+    """Serialize report-mode alert/head-observation writes against apply ticks via lock + CAS merge.
+
+    Head observations advance only when the on-disk predecessor still matches what this report
+    read before acquiring the lock; closed-PR pruning is left exclusively to serialized apply ticks.
+    """
+    effective_lock = lock_path or state_path.with_suffix(".lock")
+    effective_lock.parent.mkdir(parents=True, exist_ok=True)
+    with effective_lock.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        latest = _load(state_path)
+        if hold_alerts:
+            sent = latest.setdefault("hold_alerts", {})
+            for alert_key, stamp in hold_alerts.items():
+                sent.setdefault(alert_key, stamp)
+        if cto_outbox:
+            outbox = latest.setdefault("cto_outbox", [])
+            existing_keys = {entry["key"] for entry in outbox}
+            for entry in cto_outbox:
+                entry_key = entry.get("key")
+                if isinstance(entry_key, str) and entry_key not in existing_keys:
+                    outbox.append(dict(entry))
+                    existing_keys.add(entry_key)
+        if report_heads:
+            heads = latest.setdefault("report_heads", {})
+            for pr_num, (expected_prior, new_sha) in report_heads.items():
+                if heads.get(pr_num) == expected_prior:
+                    heads[pr_num] = new_sha
+        _save(state_path, latest)
+
+
 def _ever_approved(comments: list[dict[str, Any]], login: str) -> bool:
     heads = set()
     for row in comments:
@@ -913,6 +1517,337 @@ def _recorded_approval_for_head(
         and lookup_verdict([row], head, login, low_tier=low_tier).state in {"APPROVED", NEEDS_SEAT}
         for row in comments
     )
+
+
+def _prior_approved_heads(comments: Sequence[Mapping[str, Any]], head: str, login: str) -> list[str]:
+    """Newest-first distinct prior heads with a trusted unedited recorded ``APPROVED`` marker."""
+    priors: list[str] = []
+    for row in reversed(comments):
+        if not isinstance(row, Mapping):
+            continue
+        if (
+            _author_login(row) != login
+            or _field(row, "author_association", "authorAssociation") not in TRUSTED_ASSOCIATIONS
+            or _edited(row)
+        ):
+            continue
+        body = row.get("body")
+        if not isinstance(body, str):
+            continue
+        marker = parse_marker(body)
+        if marker and marker["sha"] != head and marker["verdict"] == "APPROVED" and marker["sha"] not in priors:
+            priors.append(marker["sha"])
+    return priors
+
+
+def _unreviewed_move_source(
+    comments: Sequence[Mapping[str, Any]],
+    head: str,
+    login: str,
+    *,
+    previous_approved: object,
+    tracked_head: object,
+    previous_observed: object = None,
+) -> str | None:
+    """Return the prior head SHA when a previously approved/tracked/observed PR moved to ``head``."""
+    if isinstance(previous_approved, str) and SHA.fullmatch(previous_approved) and previous_approved != head:
+        return previous_approved
+    if isinstance(tracked_head, str) and SHA.fullmatch(tracked_head) and tracked_head != head:
+        return tracked_head
+    if isinstance(previous_observed, str) and SHA.fullmatch(previous_observed) and previous_observed != head:
+        return previous_observed
+    priors = _prior_approved_heads(comments, head, login)
+    return priors[0] if priors else None
+
+
+def _ejected_predecessor_heads(previous: Mapping[str, Any], number: int, head: str) -> set[str]:
+    """Return confirmed ejected predecessor SHAs (distinct from ``head``) recorded for PR ``number``."""
+    prefix = f"{number}:"
+    found: set[str] = set()
+    raw_ejections = previous.get("ejections")
+    if isinstance(raw_ejections, Mapping):
+        for item in raw_ejections:
+            if isinstance(item, str) and item.startswith(prefix):
+                prior = item.split(":", 1)[1]
+                if prior != head and SHA.fullmatch(prior):
+                    found.add(prior)
+    return found
+
+
+def _comment_repair_verified_digests(comments: Sequence[Mapping[str, Any]], head: str, login: str) -> set[str]:
+    """Return ``REPAIR_VERIFIED`` SHA-256 digests from trusted unedited exact-head ``APPROVED`` comments."""
+    from lu_machinery.review.repair_round import REPAIR_VERIFIED
+    from lu_machinery.review.verdict_parser import _structured_explanation
+
+    digests: set[str] = set()
+    for row in reversed(comments):
+        if not isinstance(row, Mapping):
+            continue
+        if (
+            _author_login(row) != login
+            or _field(row, "author_association", "authorAssociation") not in TRUSTED_ASSOCIATIONS
+            or _edited(row)
+        ):
+            continue
+        body = row.get("body")
+        if not isinstance(body, str):
+            continue
+        marker = parse_marker(body)
+        if not marker or marker["sha"] != head or marker["verdict"] != "APPROVED":
+            continue
+        _, opened, rest = body.partition(REPLY_OPENER)
+        if not opened:
+            continue
+        reply = rest.partition("\n</details>")[0]
+        explanation = _structured_explanation(reply)
+        for match in REPAIR_VERIFIED.findall(reply if explanation is None else explanation):
+            if isinstance(match, str):
+                digests.add(match.lower())
+    return digests
+
+
+def _prove_repair_delta_digest(
+    repo_root: Path,
+    *,
+    number: int,
+    approved: str,
+    head: str,
+    expected_digests: Collection[str],
+) -> bool:
+    """Verify ``sha256(git diff --binary --full-index <approved> <head>)`` matches ``expected_digests``.
+
+    Checks local Git objects first; when missing locally, fetches PR head and ``approved`` into an
+    isolated throwaway object store without mutating ``repo_root``.
+    """
+    from lu_machinery.review import record_cf_verdict
+
+    if not expected_digests or not SHA.fullmatch(approved) or not SHA.fullmatch(head):
+        return False
+    local_env = _local_git_env()
+    try:
+        local_diff = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "--no-replace-objects",
+                "diff",
+                "--binary",
+                "--full-index",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                approved,
+                head,
+            ],
+            env=local_env,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if local_diff.returncode == 0:
+            return hashlib.sha256(local_diff.stdout).hexdigest() in expected_digests
+        remote_url = _safe_remote_origin(repo_root)
+        if not remote_url:
+            return False
+        with record_cf_verdict.isolated_object_store(repo_root) as env:
+            iso_env = {**env, "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1"}
+            if not _fetch_isolated_pr_refs(remote_url, iso_env, number=number, approved=approved):
+                return False
+            iso_diff = subprocess.run(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    "diff",
+                    "--binary",
+                    "--full-index",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    approved,
+                    head,
+                ],
+                env=iso_env,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if iso_diff.returncode != 0:
+                return False
+            return hashlib.sha256(iso_diff.stdout).hexdigest() in expected_digests
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+
+def _prove_clean_base_merge(
+    repo_root: Path,
+    *,
+    number: int,
+    base_name: str,
+    approved: str,
+    head: str,
+    base_tip: str,
+) -> bool:
+    """Prove ``head`` is a clean base merge of ``approved`` and ``base_tip``.
+
+    First checks local Git objects in ``repo_root``; when objects are missing locally, fetches
+    the base ref and PR head ref into an isolated throwaway bare object store without mutating
+    ``repo_root``, then runs ``clean_base_merge_descent`` checks directly inside that isolated store.
+    """
+    from lu_machinery.review import record_cf_verdict
+
+    if not SHA.fullmatch(approved) or not SHA.fullmatch(head) or not SHA.fullmatch(base_tip):
+        return False
+    if record_cf_verdict.clean_base_merge_descent(
+        repo_root, approved=approved, head=head, base_tip=base_tip,
+    ):
+        return True
+    try:
+        remote_url = _safe_remote_origin(repo_root)
+        if not remote_url or not _safe_git_branch(base_name):
+            return False
+        with record_cf_verdict.isolated_object_store(repo_root) as env:
+            iso_env = {**env, "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1"}
+            if not _fetch_isolated_pr_refs(remote_url, iso_env, number=number, base_name=base_name, approved=approved):
+                return False
+            parents_proc = subprocess.run(
+                ["git", "--no-replace-objects", "rev-list", "--parents", "-n", "1", head],
+                env=iso_env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            if parents_proc.returncode != 0:
+                return False
+            parts = parents_proc.stdout.strip().split()
+            if len(parts) != 3 or parts[0] != head or parts[1] != approved or not SHA.fullmatch(parts[2]):
+                return False
+            second_parent = parts[2]
+            ancestry = subprocess.run(
+                ["git", "--no-replace-objects", "merge-base", "--is-ancestor", second_parent, base_tip],
+                env=iso_env,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if ancestry.returncode != 0:
+                return False
+            merge = subprocess.run(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    "merge-tree",
+                    "--write-tree",
+                    "--name-only",
+                    "-z",
+                    "--no-messages",
+                    approved,
+                    second_parent,
+                ],
+                env=iso_env,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            if merge.returncode != 0:
+                return False
+            fields = merge.stdout.decode("utf-8").split("\0")
+            if len(fields) != 2 or fields[1] != "" or not SHA.fullmatch(fields[0]):
+                return False
+            diff = subprocess.run(
+                [
+                    "git",
+                    "--no-replace-objects",
+                    "show",
+                    "--remerge-diff",
+                    "--format=",
+                    "--name-only",
+                    "-z",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    head,
+                    "--",
+                ],
+                env=iso_env,
+                capture_output=True,
+                check=True,
+                timeout=30,
+            )
+            return not (set(diff.stdout.decode("utf-8").split("\0")) - {""})
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        return False
+
+
+def _default_repair_proof(
+    gh: GitHub,
+    *,
+    canonical_repo: str,
+    number: int,
+    head: str,
+    base_name: str | None,
+    head_branch: str | None,
+    comments: Sequence[Mapping[str, Any]],
+    verdict_login: str,
+    repair_receipt_root: Path | None,
+    ejected_heads: Collection[str],
+) -> str | None:
+    """Return ``'repair-verified'`` or ``'clean-base-merge'`` bound to an ejected predecessor head, else None."""
+    from lu_machinery.review import repair_round
+
+    ejected_set = {sha for sha in ejected_heads if isinstance(sha, str) and SHA.fullmatch(sha) and sha != head}
+    if not ejected_set:
+        return None
+    if repair_receipt_root is not None and repair_receipt_root.is_dir():
+        try:
+            receipt = repair_round.receipt_at(
+                repair_receipt_root,
+                repository=canonical_repo,
+                number=number,
+                branch=head_branch or "",
+                head=head,
+            )
+        except repair_round.RepairRefused:
+            receipt = None
+        if (
+            isinstance(receipt, Mapping)
+            and receipt.get("state") == "consumed"
+            and receipt.get("candidate_head") == head
+            and receipt.get("pr") == number
+            and str(receipt.get("repository", "")).casefold() == canonical_repo.casefold()
+            and _str_in(receipt.get("approved_head"), ejected_set)
+        ):
+            return "repair-verified"
+    priors = _prior_approved_heads(comments, head, verdict_login)
+    ejected_priors = [prior for prior in priors if prior in ejected_set]
+    digests = _comment_repair_verified_digests(comments, head, verdict_login)
+    if ejected_priors and digests:
+        for prior in ejected_priors:
+            if _prove_repair_delta_digest(
+                gh.root,
+                number=number,
+                approved=prior,
+                head=head,
+                expected_digests=digests,
+            ):
+                return "repair-verified"
+    if ejected_priors and isinstance(base_name, str) and base_name:
+        try:
+            base_tip = gh.branch_head(base_name)
+        except KeeperError:
+            return None
+        for prior in ejected_priors:
+            if _prove_clean_base_merge(
+                gh.root,
+                number=number,
+                base_name=base_name,
+                approved=prior,
+                head=head,
+                base_tip=base_tip,
+            ):
+                return "clean-base-merge"
+    return None
 
 
 def _cf_unknown_detail(cause: str, verdict: Verdict) -> str:
@@ -1041,17 +1976,27 @@ def _queue_hold_alert(
     reason: str,
     run_ids: Sequence[int],
     observed: str,
+    dedup_reason: str | None = None,
+    in_custody: bool = True,
 ) -> bool:
-    """Freeze one deduplicated CTO inbox alert for a held PR with old/current SHA and run IDs."""
-    alert_key = f"merge-queue-keeper:{kind}:{repo}:{number}:{old_head}:{current_head}:{marker_value(reason)}"
+    """Freeze one deduplicated CTO inbox alert for a held or unreviewed-moved PR with SHAs and run IDs."""
+    key_reason = dedup_reason if dedup_reason is not None else reason
+    alert_key = f"merge-queue-keeper:{kind}:{repo}:{number}:{old_head}:{current_head}:{marker_value(key_reason)}"
     sent = previous.setdefault("hold_alerts", {})
     if alert_key in sent:
         return False
-    body = (
-        f"Merge queue keeper: {repo}#{number} held ({display_text(reason, DISPLAY_REASON_LIMIT)}). "
-        f"old_sha={old_head} current_sha={current_head} run_ids={_run_ids(run_ids)}. "
-        "Keeper repair custody stays held until a claude-cto successor accepts ownership."
-    )
+    if in_custody:
+        body = (
+            f"Merge queue keeper: {repo}#{number} held ({display_text(reason, DISPLAY_REASON_LIMIT)}). "
+            f"old_sha={old_head} current_sha={current_head} run_ids={_run_ids(run_ids)}. "
+            "Keeper repair custody stays held until a claude-cto successor accepts ownership."
+        )
+    else:
+        body = (
+            f"Merge queue keeper: {repo}#{number} alert ({display_text(reason, DISPLAY_REASON_LIMIT)}). "
+            f"old_sha={old_head} current_sha={current_head} run_ids={_run_ids(run_ids)}. "
+            "No keeper repair custody is held; inspect and dispatch as needed."
+        )
     _queue_cto_report(previous, kind, alert_key, body)
     sent[alert_key] = observed
     return True
@@ -1490,6 +2435,10 @@ def run(
     direct_config: DirectLandingConfig | None = None,
     ownership_path: Path | None = None,
     closeout_runner: Callable[[int, str, Path], tuple[str, str]] | None = None,
+    verify_runner: Callable[[Sequence[str]], Mapping[str, Any]] | None = None,
+    repair_prover: Callable[..., str | None] | None = None,
+    repair_receipt_root: Path | None = None,
+    lock_path: Path | None = None,
 ) -> tuple[list[str], bool]:
     branches = gh.branch_names()
     snap = gh.snapshot(branches)
@@ -1510,6 +2459,11 @@ def run(
         direct_config is not None
         and normalize_repository(gh.repository) == normalize_repository(direct_config.repository)
     )
+    detach_active = direct_config is not None or ownership_path is not None
+    report_state_dirty = False
+    report_alerts_delta: dict[str, str] = {}
+    report_outbox_delta: list[dict[str, Any]] = []
+    report_heads_delta: dict[str, tuple[str | None, str]] = {}
     direct_merged_this_tick = 0
     base_ci_cache: dict[str, tuple[str, str | None, list[int]]] = {}
     observed = datetime.now(UTC).isoformat()
@@ -1536,12 +2490,21 @@ def run(
             pr_ownership.load(ownership_path)["handoffs"].get(pr_ownership.pr_key(canonical_repo, number))
         )
 
-    def hold_in_repair(number: int, *, reason: str, old_head: str, current_head: str, run_ids: Sequence[int]) -> None:
+    def hold_in_repair(
+        number: int,
+        *,
+        reason: str,
+        old_head: str,
+        current_head: str,
+        run_ids: Sequence[int],
+        dedup_reason: str | None = None,
+    ) -> None:
         nonlocal failed
         safe_reason = _repair_reason(reason)
+        has_custody = False
         if ownership_path is not None and ownership_path.exists():
             try:
-                pr_ownership.record_keeper_repair(
+                recorded_handoff = pr_ownership.record_keeper_repair(
                     ownership_path,
                     repo=canonical_repo,
                     number=number,
@@ -1549,6 +2512,7 @@ def run(
                     head=current_head,
                     run_ids=list(run_ids),
                 )
+                has_custody = recorded_handoff is not None
             except (pr_ownership.OwnershipError, OSError) as exc:
                 failed = True
                 lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
@@ -1562,7 +2526,137 @@ def run(
             reason=safe_reason,
             run_ids=run_ids,
             observed=observed,
+            dedup_reason=dedup_reason,
+            in_custody=has_custody,
         )
+
+    def observe_head_move(
+        number: int,
+        *,
+        pr_row: Mapping[str, Any],
+        key: str,
+        head: str,
+        comments: Sequence[Mapping[str, Any]],
+        comment_safe: bool,
+        verdict: Verdict,
+        tier: ReviewTier,
+        custody: Mapping[str, Any] | None,
+        custody_error: str | None,
+        old_head: str,
+        tracked_head: object,
+        check_rows: Sequence[Mapping[str, Any]],
+    ) -> tuple[str | None, str | None]:
+        nonlocal report_state_dirty
+        prior_observed = previous.get("report_heads", {}).get(key)
+        if SHA.fullmatch(head) and ((comment_safe and verdict.state != "unknown") or custody_error == "head-moved"):
+            if apply:
+                previous.setdefault("report_heads", {})[key] = head
+            elif prior_observed != head:
+                report_heads_delta[key] = (prior_observed, head)
+                report_state_dirty = True
+        eligible_non_custody = pr_row.get("isDraft") is False and _hold(pr_row) is False
+        unreviewed_old = (
+            _unreviewed_move_source(
+                comments,
+                head,
+                verdict_login,
+                previous_approved=previous.get("approved", {}).get(key),
+                tracked_head=tracked_head,
+                # Only report mode treats observed-only heads as a move source; apply mode requires
+                # keeper custody, tracking, or a prior recorded APPROVED so WIP pushes never spam CTO.
+                previous_observed=prior_observed if not apply else None,
+            )
+            if eligible_non_custody and comment_safe and verdict.state in MISSING_CF_STATES and not review_satisfied(tier, verdict.state)
+            else None
+        )
+        repair_old = (
+            str(custody.get("observed_head") or custody["head"])
+            if (
+                custody is not None
+                and custody["keeper_state"] == "repair"
+                and custody["head"] != head
+                and custody.get("observed_head") != head
+                and comment_safe
+                and verdict.state in MISSING_CF_STATES
+                and not review_satisfied(tier, verdict.state)
+            )
+            else None
+        )
+        if not apply:
+            if custody_error == "head-moved":
+                prev_len = len(previous.get("cto_outbox", []))
+                if _queue_hold_alert(
+                    previous,
+                    repo=canonical_repo,
+                    number=number,
+                    kind="repair-hold",
+                    old_head=old_head,
+                    current_head=head,
+                    reason="head-moved",
+                    run_ids=_failed_check_run_ids(check_rows, head),
+                    observed=observed,
+                    in_custody=custody is not None,
+                ):
+                    report_state_dirty = True
+                    for entry in previous.get("cto_outbox", [])[prev_len:]:
+                        report_outbox_delta.append(dict(entry))
+                        report_alerts_delta[entry["key"]] = observed
+                    lines.append(f"#{number} unreviewed head move alerted to the CTO: {old_head[:12]}->{head[:12]}")
+            elif repair_old is not None or (custody is None and unreviewed_old is not None):
+                alert_old = repair_old or unreviewed_old
+                assert alert_old is not None
+                prev_len = len(previous.get("cto_outbox", []))
+                if _queue_hold_alert(
+                    previous,
+                    repo=canonical_repo,
+                    number=number,
+                    kind="head-moved-unreviewed",
+                    old_head=alert_old,
+                    current_head=head,
+                    reason="head-moved-unreviewed",
+                    run_ids=(),
+                    observed=observed,
+                    in_custody=repair_old is not None,
+                ):
+                    report_state_dirty = True
+                    for entry in previous.get("cto_outbox", [])[prev_len:]:
+                        report_outbox_delta.append(dict(entry))
+                        report_alerts_delta[entry["key"]] = observed
+                    lines.append(f"#{number} unreviewed head move alerted to the CTO: {alert_old[:12]}->{head[:12]}")
+        return unreviewed_old, repair_old
+
+    def check_verify_or_hold(
+        number: int,
+        *,
+        files: Sequence[str],
+        file_rows: Sequence[Mapping[str, Any]],
+        head: str,
+        old_head: str,
+        base_name: object,
+        run_ids: Sequence[int] = (),
+    ) -> bool:
+        verify_ok, verify_areas, _verify_detail = _run_verify_gate(
+            files,
+            repository=canonical_repo,
+            verify_runner=verify_runner,
+            file_rows=file_rows,
+            gh=gh,
+            number=number,
+            head=head,
+            base_name=base_name if isinstance(base_name, str) else None,
+        )
+        if not verify_ok:
+            verify_reason = f"verify-run-failed:{','.join(verify_areas)}"
+            hold_in_repair(
+                number,
+                reason=verify_reason,
+                old_head=old_head,
+                current_head=head,
+                run_ids=run_ids,
+            )
+            lines.append(f"#{number} held: {verify_reason}")
+            return False
+        return True
 
     for pr in snap["prs"]:
         number, head, node_id = pr.get("number"), pr.get("headRefOid"), pr.get("id")
@@ -1587,6 +2681,7 @@ def run(
         # Whether the PR changes learner content, which takes the Ukrainian seats; None when unread.
         learner_content: bool | None = None
         file_rows: list[dict[str, Any]] = []
+        files: list[str] = []
         tier: ReviewTier = "high"
         low_tier = False
         try:
@@ -1599,6 +2694,11 @@ def run(
             verdict = lookup_verdict(
                 comments, head, verdict_login, learner_content=learner_content, low_tier=low_tier,
             )
+        except KeeperError:
+            comments = []
+            verdict = Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
+            comment_safe = False
+        try:
             check_rows = gh.checks(head)
             checks = (
                 _direct_check_state(check_rows, head, direct_config.required_checks)
@@ -1606,9 +2706,7 @@ def run(
                 else _check_state(check_rows, head)
             )
         except KeeperError:
-            comments, checks, check_rows = [], "CI-unknown", []
-            verdict = Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
-            comment_safe = False
+            check_rows, checks = [], "CI-unknown"
         if comment_safe and _recorded_approval_for_head(comments, head, verdict_login, low_tier=low_tier):
             approved_before = True
         if approved_before:
@@ -1690,7 +2788,24 @@ def run(
                 f"#{number} head={head[:12]} state={state} reason={reason} queued=False armed={armed}"
                 + verdict_detail(verdict.reason, verdict.comment_id, verdict.superseded_markers)
             )
-            if not apply or not budget:
+            if apply and not budget:
+                continue
+            unreviewed_move_old, repair_unreviewed_old = observe_head_move(
+                number,
+                pr_row=pr,
+                key=key,
+                head=head,
+                comments=comments,
+                comment_safe=comment_safe,
+                verdict=verdict,
+                tier=tier,
+                custody=custody,
+                custody_error=custody_error,
+                old_head=old_head,
+                tracked_head=tracked_head,
+                check_rows=check_rows,
+            )
+            if not apply:
                 continue
             try:
                 if (
@@ -1713,13 +2828,43 @@ def run(
                     )
                     lines.append(f"#{number} held: {custody_error}")
                     continue
-                if custody_error is None and checks.startswith(("CI-red-", "CI-cancelled-")) and (custody is not None or tracked_entry is not None):
+                if repair_unreviewed_old is not None or (custody_error is None and custody is None and unreviewed_move_old is not None):
+                    alert_old = repair_unreviewed_old or unreviewed_move_old
+                    assert alert_old is not None
+                    if _queue_hold_alert(
+                        previous,
+                        repo=canonical_repo,
+                        number=number,
+                        kind="head-moved-unreviewed",
+                        old_head=alert_old,
+                        current_head=head,
+                        reason="head-moved-unreviewed",
+                        run_ids=(),
+                        observed=observed,
+                        in_custody=repair_unreviewed_old is not None,
+                    ):
+                        lines.append(
+                            f"#{number} unreviewed head move alerted to the CTO: {alert_old[:12]}->{head[:12]}"
+                        )
+                if custody_error is None and checks.startswith(("CI-red-", "CI-cancelled-")) and (
+                    custody is not None
+                    or tracked_entry is not None
+                    or (
+                        repo_matches_direct
+                        and base_matches
+                        and comment_safe
+                        and review_satisfied(tier, verdict.state)
+                        and pr.get("isDraft") is False
+                        and _hold(pr) is False
+                    )
+                ):
                     hold_in_repair(
                         number,
                         reason=checks,
                         old_head=old_head,
                         current_head=head,
                         run_ids=_failed_check_run_ids(check_rows, head),
+                        dedup_reason="ci-failure",
                     )
                     lines.append(f"#{number} held: {checks}")
                     continue
@@ -1762,6 +2907,8 @@ def run(
                             current_head=current_head,
                             run_ids=(),
                         )
+                        if SHA.fullmatch(current_head):
+                            previous.setdefault("report_heads", {})[key] = current_head
                     lines.append(f"#{number} held: {fresh_reason}")
                     continue
                 fresh_comments = gh.comments(number)
@@ -1789,13 +2936,25 @@ def run(
                     custody_error=fresh_custody_error,
                 )
                 if fresh_reason != "ready":
-                    if fresh_checks.startswith(("CI-red-", "CI-cancelled-")) and (custody is not None or tracked_entry is not None):
+                    if fresh_checks.startswith(("CI-red-", "CI-cancelled-")) and (
+                        custody is not None
+                        or tracked_entry is not None
+                        or (
+                            fresh_custody_error is None
+                            and repo_matches_direct
+                            and base_matches
+                            and review_satisfied(fresh_tier, fresh_verdict.state)
+                            and current.get("isDraft") is False
+                            and _hold(current) is False
+                        )
+                    ):
                         hold_in_repair(
                             number,
                             reason=fresh_checks,
                             old_head=old_head,
                             current_head=head,
                             run_ids=_failed_check_run_ids(fresh_check_rows, head),
+                            dedup_reason="ci-failure",
                         )
                     elif fresh_verdict.state in {"CHANGES_REQUESTED", "BLOCKED"} and (custody is not None or tracked_entry is not None):
                         hold_in_repair(
@@ -1806,6 +2965,15 @@ def run(
                             run_ids=(),
                         )
                     lines.append(f"#{number} held: {fresh_reason}" + _cf_unknown_detail(fresh_reason, fresh_verdict))
+                    continue
+                if not check_verify_or_hold(
+                    number,
+                    files=fresh_files,
+                    file_rows=fresh_file_rows,
+                    head=head,
+                    old_head=old_head,
+                    base_name=base_name,
+                ):
                     continue
                 # Persist custody/tracking BEFORE sending the direct-merge write so a lost response still reconciles.
                 previous.setdefault("tracked", {})[key] = {
@@ -1916,10 +3084,85 @@ def run(
             f"#{number} head={head[:12]} state={state} reason={shown} queued={queued} armed={armed}"
             + verdict_detail(verdict.reason, verdict.comment_id, verdict.superseded_markers)
         )
+        if apply and not budget:
+            continue
+        mq_custody: dict[str, Any] | None = None
+        mq_custody_error: str | None = None
+        mq_old_head = head
+        mq_unreviewed_move_old: str | None = None
+        mq_repair_unreviewed_old: str | None = None
+        if detach_active:
+            if ownership_path is not None:
+                try:
+                    mq_custody = custody_for(number)
+                except (pr_ownership.OwnershipError, OSError) as exc:
+                    mq_custody = None
+                    mq_custody_error = "custody-unknown"
+                    failed = True
+                    lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
+            if mq_custody is not None:
+                mq_old_head = str(mq_custody["head"])
+                if mq_custody["keeper_state"] == "repair":
+                    mq_custody_error = "repair-custody"
+                elif mq_custody["repository"].casefold() != canonical_repo.casefold() or mq_custody["base"] != base_name:
+                    mq_custody_error = "custody-mismatch"
+                elif mq_custody["head"] != head or (
+                    mq_custody["review_classification"] == "verdict"
+                    and isinstance(mq_custody.get("verdict_receipt"), dict)
+                    and mq_custody["verdict_receipt"].get("head") != head
+                ):
+                    mq_custody_error = "head-moved"
+                elif mq_custody["review_classification"] == "trivial" and tier != "trivial":
+                    mq_custody_error = "custody-tier-mismatch"
+            tracked_mq = previous.get("tracked", {}).get(key)
+            tracked_mq_head = tracked_mq.get("head") if isinstance(tracked_mq, dict) else None
+            mq_unreviewed_move_old, mq_repair_unreviewed_old = observe_head_move(
+                number,
+                pr_row=pr,
+                key=key,
+                head=head,
+                comments=comments,
+                comment_safe=comment_safe,
+                verdict=verdict,
+                tier=tier,
+                custody=mq_custody,
+                custody_error=mq_custody_error,
+                old_head=mq_old_head,
+                tracked_head=tracked_mq_head,
+                check_rows=check_rows,
+            )
         if not apply:
             continue
-        if not budget:
-            continue
+        if detach_active:
+            if mq_custody_error in {"head-moved", "custody-mismatch", "custody-tier-mismatch"}:
+                hold_in_repair(
+                    number,
+                    reason=mq_custody_error,
+                    old_head=mq_old_head,
+                    current_head=head,
+                    run_ids=_failed_check_run_ids(check_rows, head),
+                )
+                if queued is not True and not armed:
+                    lines.append(f"#{number} held: {mq_custody_error}")
+                    continue
+            elif mq_repair_unreviewed_old is not None or (mq_custody_error is None and mq_custody is None and mq_unreviewed_move_old is not None):
+                alert_old = mq_repair_unreviewed_old or mq_unreviewed_move_old
+                assert alert_old is not None
+                if _queue_hold_alert(
+                    previous,
+                    repo=canonical_repo,
+                    number=number,
+                    kind="head-moved-unreviewed",
+                    old_head=alert_old,
+                    current_head=head,
+                    reason="head-moved-unreviewed",
+                    run_ids=(),
+                    observed=observed,
+                    in_custody=mq_repair_unreviewed_old is not None,
+                ):
+                    lines.append(
+                        f"#{number} unreviewed head move alerted to the CTO: {alert_old[:12]}->{head[:12]}"
+                    )
         if queue_enabled is False:
             continue
         if not isinstance(queued, bool) and not armed:
@@ -1932,6 +3175,7 @@ def run(
         try:
             current_verdict = Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
             current_checks = "CI-unknown"
+            mq_fresh_check_rows: list[dict[str, Any]] = []
             verdict_lookup_ok = False
             try:
                 current = gh.current(number)
@@ -1952,6 +3196,60 @@ def run(
                     if current.get("baseRefName") != pr.get("baseRefName")
                     else "state-changed"
                 )
+                if reason == "head-moved" and detach_active and isinstance(current_head, str) and SHA.fullmatch(current_head):
+                    if mq_custody is not None:
+                        hold_in_repair(
+                            number,
+                            reason="head-moved",
+                            old_head=head,
+                            current_head=current_head,
+                            run_ids=(),
+                        )
+                        previous.setdefault("report_heads", {})[key] = current_head
+                        if queued is not True and not armed:
+                            lines.append(f"#{number} held: head-moved")
+                    else:
+                        try:
+                            moved_comments = gh.comments(number)
+                            moved_file_rows = gh.pr_file_rows(number)
+                            moved_files = pr_file_paths(moved_file_rows)
+                            moved_tier = classify_pr_files(moved_file_rows)
+                            moved_low = moved_tier in {"trivial", "low"}
+                            moved_learner = changes_learner_content(moved_files)
+                            moved_verdict = lookup_verdict(
+                                moved_comments,
+                                current_head,
+                                verdict_login,
+                                learner_content=moved_learner,
+                                low_tier=moved_low,
+                            )
+                        except KeeperError:
+                            moved_verdict = Verdict("unknown", reason=COMMENTS_UNAVAILABLE)
+                            moved_tier = "high"
+                        if moved_verdict.state != "unknown":
+                            if (
+                                current.get("isDraft") is False
+                                and _hold(current) is False
+                                and (approved_before or tracked_mq_head == head or head in _prior_approved_heads(moved_comments, current_head, verdict_login))
+                                and moved_verdict.state in MISSING_CF_STATES
+                                and not review_satisfied(moved_tier, moved_verdict.state)
+                                and _queue_hold_alert(
+                                    previous,
+                                    repo=canonical_repo,
+                                    number=number,
+                                    kind="head-moved-unreviewed",
+                                    old_head=head,
+                                    current_head=current_head,
+                                    reason="head-moved-unreviewed",
+                                    run_ids=(),
+                                    observed=observed,
+                                    in_custody=False,
+                                )
+                            ):
+                                lines.append(
+                                    f"#{number} unreviewed head move alerted to the CTO: {head[:12]}->{current_head[:12]}"
+                                )
+                            previous.setdefault("report_heads", {})[key] = current_head
             else:
                 try:
                     current_comments = gh.comments(number)
@@ -1978,8 +3276,10 @@ def run(
                         approved_before = True
                         approved_now[key] = head
                 try:
-                    current_checks = _check_state(gh.checks(head), head)
+                    mq_fresh_check_rows = gh.checks(head)
+                    current_checks = _check_state(mq_fresh_check_rows, head)
                 except KeeperError:
+                    mq_fresh_check_rows = []
                     current_checks = "CI-unknown"
                 if queued is not True and not ejected and not ejection_unknown:
                     try:
@@ -2063,6 +3363,7 @@ def run(
                 and reason == "ejected"
                 and exited
                 and queued is False
+                and mq_custody_error is None
                 and verdict_lookup_ok
                 and current_verdict.state == "APPROVED"
                 and current_checks == "ok"
@@ -2071,7 +3372,15 @@ def run(
             ):
                 runs = previous.get("ejections", {}).get(drop_key, [])
                 recovery_run_id = failed_run if type(failed_run) is int else (runs[-1] if runs else None)
-                if type(recovery_run_id) is int:
+                if type(recovery_run_id) is int and check_verify_or_hold(
+                    number,
+                    files=files,
+                    file_rows=file_rows,
+                    head=head,
+                    old_head=mq_old_head,
+                    base_name=base_name,
+                    run_ids=runs,
+                ):
                     try:
                         recovery.evidence_from_comments(
                             comments,
@@ -2105,33 +3414,145 @@ def run(
                             run_ids=runs,
                         )
                         lines.append(f"#{number} held: infra-recovery-refused ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
-            elif reason == "ready":
-                if ownership_path is not None:
-                    try:
-                        custody = custody_for(number)
-                    except (pr_ownership.OwnershipError, OSError) as exc:
-                        failed = True
-                        lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
-                        continue
-                    if custody is not None:
-                        if custody["keeper_state"] == "repair":
-                            lines.append(f"#{number} held: repair-custody")
-                            continue
-                        if custody["head"] != head:
-                            hold_in_repair(
-                                number,
-                                reason="head-moved",
-                                old_head=str(custody["head"]),
-                                current_head=head,
-                                run_ids=(),
-                            )
-                            lines.append(f"#{number} held: head-moved")
-                            continue
-                        previous.setdefault("tracked", {})[key] = {
-                            "number": number, "repo": canonical_repo, "base": base_name,
-                            "head": head, "mode": "queue", "status": "enqueuing", "updated_at": observed,
+            elif (
+                detach_active
+                and queued is False
+                and mq_custody_error is None
+                and current_checks.startswith(("CI-red-", "CI-cancelled-"))
+                and (
+                    mq_custody is not None
+                    or (
+                        verdict_lookup_ok
+                        and review_satisfied(tier, current_verdict.state)
+                        and current.get("isDraft") is False
+                        and _hold(current) is False
+                    )
+                )
+            ):
+                hold_in_repair(
+                    number,
+                    reason=current_checks,
+                    old_head=mq_old_head,
+                    current_head=head,
+                    run_ids=_failed_check_run_ids(mq_fresh_check_rows, head),
+                    dedup_reason="ci-failure",
+                )
+                lines.append(f"#{number} held: {current_checks}")
+            elif (
+                direct_config is not None
+                and direct_config.allow_infra_reenqueue
+                and reason == "queued-before"
+                and not exited
+                and queued is False
+                and verdict_lookup_ok
+                and current_verdict.state == "APPROVED"
+                and current_checks == "ok"
+                and _gate_hold(gh, number, head, previous) is None
+            ):
+                ejected_heads = _ejected_predecessor_heads(previous, number, head)
+                if mq_custody_error is not None:
+                    lines.append(f"#{number} held: {mq_custody_error}")
+                elif not ejected_heads:
+                    lines.append(f"#{number} held: queued-before")
+                elif key in previous.get("repaired_reenqueues", {}):
+                    hold_in_repair(
+                        number,
+                        reason="repaired-reenqueue-exhausted",
+                        old_head=mq_old_head,
+                        current_head=head,
+                        run_ids=(),
+                    )
+                    lines.append(f"#{number} held: repaired-reenqueue-exhausted")
+                else:
+                    head_branch = (
+                        current.get("headRefName")
+                        if isinstance(current.get("headRefName"), str)
+                        else pr.get("headRefName") if isinstance(pr.get("headRefName"), str) else None
+                    )
+                    proof = (
+                        repair_prover(
+                            gh,
+                            canonical_repo=canonical_repo,
+                            number=number,
+                            head=head,
+                            base_name=base_name if isinstance(base_name, str) else None,
+                            head_branch=head_branch,
+                            comments=comments,
+                            verdict_login=verdict_login,
+                            repair_receipt_root=repair_receipt_root,
+                            ejected_heads=ejected_heads,
+                        )
+                        if repair_prover is not None
+                        else _default_repair_proof(
+                            gh,
+                            canonical_repo=canonical_repo,
+                            number=number,
+                            head=head,
+                            base_name=base_name if isinstance(base_name, str) else None,
+                            head_branch=head_branch,
+                            comments=comments,
+                            verdict_login=verdict_login,
+                            repair_receipt_root=repair_receipt_root,
+                            ejected_heads=ejected_heads,
+                        )
+                    )
+                    if proof not in {"repair-verified", "clean-base-merge"}:
+                        lines.append(f"#{number} held: queued-before")
+                    elif check_verify_or_hold(
+                        number,
+                        files=files,
+                        file_rows=file_rows,
+                        head=head,
+                        old_head=mq_old_head,
+                        base_name=base_name,
+                    ):
+                        previous.setdefault("repaired_reenqueues", {})[key] = {
+                            "head": head,
+                            "proof": proof,
+                            "at": observed,
                         }
+                        if ownership_path is not None:
+                            previous.setdefault("tracked", {})[key] = {
+                                "number": number, "repo": canonical_repo, "base": base_name,
+                                "head": head, "mode": "queue", "status": "re-enqueuing", "updated_at": observed,
+                            }
                         _save(state_path, previous)
+                        jumped = gh.enqueue(number, head)
+                        if not gh.membership(number):
+                            after_enqueue = gh.current(number)
+                            if _auto_merge_armed(after_enqueue):
+                                lines.append(f"#{number} armed")
+                            else:
+                                raise KeeperError("repaired re-enqueue returned success without queue membership or armed auto-merge")
+                        else:
+                            queued_now[key] = head
+                            if key in previous.get("tracked", {}):
+                                previous["tracked"][key]["status"] = "queued"
+                            lines.append(
+                                f"#{number} re-enqueued (repaired:{proof})"
+                                + (" at the front (priority)" if jumped else "")
+                            )
+                        estimated_remaining -= 30
+                        reason = "ready"
+            elif reason == "ready":
+                if mq_custody_error is not None:
+                    lines.append(f"#{number} held: {mq_custody_error}")
+                    continue
+                if (detach_active or verify_runner is not None) and not check_verify_or_hold(
+                    number,
+                    files=files,
+                    file_rows=file_rows,
+                    head=head,
+                    old_head=mq_old_head,
+                    base_name=base_name,
+                ):
+                    continue
+                if ownership_path is not None and mq_custody is not None:
+                    previous.setdefault("tracked", {})[key] = {
+                        "number": number, "repo": canonical_repo, "base": base_name,
+                        "head": head, "mode": "queue", "status": "enqueuing", "updated_at": observed,
+                    }
+                    _save(state_path, previous)
                 jumped = gh.enqueue(number, head)
                 if not gh.membership(number):
                     after_enqueue = gh.current(number)
@@ -2223,6 +3644,14 @@ def run(
                 previous[name] = {
                     item: value for item, value in previous[name].items() if item.split(":", 1)[0] in open_numbers
                 }
+        if "repaired_reenqueues" in previous:
+            previous["repaired_reenqueues"] = {
+                item: value for item, value in previous["repaired_reenqueues"].items() if item in open_numbers
+            }
+        if "report_heads" in previous:
+            previous["report_heads"] = {
+                item: value for item, value in previous["report_heads"].items() if item in open_numbers
+            }
         if "hold_alerts" in previous:
             keep_numbers = open_numbers | set(previous.get("pending_closeout", {}))
             previous["hold_alerts"] = {
@@ -2268,6 +3697,14 @@ def run(
         reports[report_key] = observed
     if apply:
         _save(state_path, previous)
+    elif report_state_dirty:
+        _save_report_delta(
+            state_path,
+            lock_path=lock_path,
+            hold_alerts=report_alerts_delta,
+            cto_outbox=report_outbox_delta,
+            report_heads=report_heads_delta,
+        )
     return lines, failed
 
 
@@ -2372,8 +3809,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     lock_path = args.lock_file.resolve() if args.lock_file is not None else root / "batch_state/locks/merge_queue_keeper.lock"
     run_kwargs: dict[str, Any] = {}
     if direct_config is not None:
+        from lu_machinery.common.task_store_paths import tasks_dir
+        from lu_machinery.review.repair_round import RECEIPT_DIR
+
         run_kwargs["direct_config"] = direct_config
         run_kwargs["ownership_path"] = pr_ownership.state_path()
+        run_kwargs["repair_receipt_root"] = tasks_dir().parent / RECEIPT_DIR
+        run_kwargs["lock_path"] = lock_path
     if not args.apply:
         try:
             lines, failed = run(
@@ -2388,6 +3830,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         except KeeperError as exc:
             print(f"merge queue keeper failed: {exc}")
             return 1
+        if direct_config is not None and state_path.exists():
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    alert_lines = _deliver_alerts(state_path)
+                except KeeperError as exc:
+                    alert_lines = [f"CTO alert delivery FAILED: {exc}"]
+            lines, failed = [*lines, *alert_lines], failed or bool(alert_lines)
         for line in lines:
             print(line)
         return int(failed)

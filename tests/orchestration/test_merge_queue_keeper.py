@@ -520,6 +520,9 @@ class DirectFakeGitHub(FakeGitHub):
             row["headRefOid"]: checks(row["headRefOid"]) for row in self.rows
         }
         self.files_by_pr: dict[int, list[str]] = {row["number"]: ["scripts/example.py"] for row in self.rows}
+        self.file_rows_by_pr: dict[int, list[dict[str, Any]]] = {}
+        self.blobs_by_ref: dict[tuple[str, str], str | None] = {}
+        self.read_source_blob: Any = self._fake_read_source_blob
         self.base_heads: dict[str, str] = {"main": BASE_SHA}
         self.base_runs_by_sha: dict[str, list[dict[str, Any]]] = {
             BASE_SHA: [{
@@ -552,7 +555,22 @@ class DirectFakeGitHub(FakeGitHub):
         return list(self.comments_by_pr.get(number, []))
 
     def pr_file_rows(self, number: int) -> list[dict[str, Any]]:
+        if number in self.file_rows_by_pr:
+            return [dict(row) for row in self.file_rows_by_pr[number]]
         return [{"filename": path, "status": "modified"} for path in self.files_by_pr.get(number, ["scripts/example.py"])]
+
+    def _fake_read_source_blob(
+        self,
+        number: int,
+        head: str,
+        path: str,
+        *,
+        base_name: str | None = None,
+        removed: bool = False,
+    ) -> str | None:
+        if (head, path) in self.blobs_by_ref:
+            return self.blobs_by_ref[(head, path)]
+        return ""
 
     def checks(self, head: str) -> list[dict[str, Any]]:
         return list(self.checks_by_head.get(head, []))
@@ -1190,3 +1208,861 @@ def test_recovery_concurrent_rerun_vs_reenqueue_and_keeper_sole_ownership(
     with pytest.raises(gate.PublishBlocked, match="RECOVERY_ALLOWANCE_SPENT"):
         pub.publish("run-rerun", number=123, repo="unit/public", cwd=tmp_path, env={}, runner=transport)
     assert len(writes) == 1
+
+
+def test_head_moved_to_unreviewed_head_alerts_once_in_custody_and_report_mode(tmp_path: Path) -> None:
+    """Defect class: PR in keeper custody (merge-queue) or report mode moved to unreviewed head misses immediate CTO alert."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.orchestration import pr_ownership as own
+    from lu_machinery.orchestration.fleet_repos import FleetRepo
+
+    own_path = tmp_path / "pr_ownership.json"
+    fleet = {"public": FleetRepo("public", "unit/public", "unit-public", "public-monorepo", True)}
+    worker = {"task_id": "w1", "worktree_branch": "codex/x", "status": "running", "repository": "unit/public", "run_nonce": "n1"}
+    own.acknowledge_keeper_transfer(
+        own_path,
+        repo="unit/public",
+        number=42,
+        pr={"state": "OPEN", "isDraft": False, "headRefOid": HEAD_A, "headRefName": "codex/x", "baseRefName": "main", "isCrossRepository": False},
+        worker_task="w1",
+        worker_nonce="n1",
+        records=[worker],
+        now=datetime(2026, 9, 23, 12, 0, tzinfo=UTC),
+        rerun="unspent",
+        repos=fleet,
+        verdict_receipt={"pr": 42, "head": HEAD_A, "task": "rev1", "verdict": "APPROVED", "status": "posted"},
+        live=lambda r: r is not None and r.get("status") == "running",
+    )
+
+    # Merge-queue mode, apply=True: HEAD_B has NO recorded verdict and pending CI (not ready),
+    # yet keeper custody MUST alert claude-cto immediately on this tick and never duplicate.
+    mq = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_B)], repository="unit/public")
+    mq.queue_enabled = True
+    mq.comments_by_pr[42] = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A)]
+    mq.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+    mq_state = tmp_path / "mq_moved.json"
+    lines1, failed1 = keeper.run(mq, mq_state, apply=True, ownership_path=own_path)
+    assert not failed1 and mutations(mq) == []
+    assert "#42 held: head-moved" in lines1
+    custody = own.keeper_custody_for(own_path, "unit/public", 42)
+    assert custody is not None and custody["keeper_state"] == "repair" and custody["observed_head"] == HEAD_B
+    outbox = json.loads(mq_state.read_text())["cto_outbox"]
+    assert len(outbox) == 1 and HEAD_A in outbox[0]["body"] and HEAD_B in outbox[0]["body"]
+    # Second tick sends no duplicate alert.
+    _lines2, failed2 = keeper.run(mq, mq_state, apply=True, ownership_path=own_path)
+    assert not failed2 and len(json.loads(mq_state.read_text())["cto_outbox"]) == 1
+
+    # Report mode (apply=False) with direct_config (no custody yet): prior approved HEAD_A moved
+    # to unreviewed HEAD_B raises ONE CTO alert on that tick with zero GitHub mutations.
+    rep = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_B)], repository=PRIVATE_REPO)
+    rep.comments_by_pr[42] = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A)]
+    rep.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+    rep_state = tmp_path / "report_moved.json"
+    rep_lines1, rep_failed1 = keeper.run(rep, rep_state, apply=False, direct_config=_direct_cfg())
+    assert not rep_failed1 and mutations(rep) == []
+    assert any("unreviewed head move alerted" in line for line in rep_lines1)
+    rep_outbox = json.loads(rep_state.read_text())["cto_outbox"]
+    assert len(rep_outbox) == 1 and HEAD_A in rep_outbox[0]["body"] and HEAD_B in rep_outbox[0]["body"]
+    # Second report tick does not duplicate the alert.
+    rep_lines2, rep_failed2 = keeper.run(rep, rep_state, apply=False, direct_config=_direct_cfg())
+    assert not rep_failed2 and mutations(rep) == []
+    assert not any("unreviewed head move alerted" in line for line in rep_lines2)
+    assert len(json.loads(rep_state.read_text())["cto_outbox"]) == 1
+
+    # Dormant mode (no direct_config, no ownership_path): report mode stays completely dormant.
+    dormant_state = tmp_path / "dormant_report.json"
+    _dl, df = keeper.run(rep, dormant_state, apply=False)
+    assert not df and not dormant_state.exists()
+
+    # F6 (fresh-read head move): active merge-queue custody at HEAD_A; initial snapshot sees HEAD_A,
+    # fresh read returns unreviewed HEAD_B -> alerts immediately on that tick and moves to repair custody.
+    fresh_own = tmp_path / "fresh_own.json"
+    own.acknowledge_keeper_transfer(
+        fresh_own,
+        repo="unit/public",
+        number=44,
+        pr={"state": "OPEN", "isDraft": False, "headRefOid": HEAD_A, "headRefName": "codex/x", "baseRefName": "main", "isCrossRepository": False},
+        worker_task="w1",
+        worker_nonce="n1",
+        records=[worker],
+        now=datetime(2026, 9, 23, 12, 0, tzinfo=UTC),
+        rerun="unspent",
+        repos=fleet,
+        verdict_receipt={"pr": 44, "head": HEAD_A, "task": "rev1", "verdict": "APPROVED", "status": "posted"},
+        live=lambda r: r is not None and r.get("status") == "running",
+    )
+    fresh_mq = DirectFakeGitHub([pr(number=44, headRefOid=HEAD_A)], repository="unit/public")
+    fresh_mq.queue_enabled = True
+    fresh_mq.fresh_by_pr[44] = {**fresh_mq.rows[0], "headRefOid": HEAD_B, "state": "OPEN", "labels": []}
+    fresh_mq.comments_by_pr[44] = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A)]
+    fresh_state = tmp_path / "fresh_moved.json"
+    fm_lines, fm_failed = keeper.run(fresh_mq, fresh_state, apply=True, ownership_path=fresh_own)
+    assert not fm_failed and "enqueue" not in mutations(fresh_mq) and "re-enqueue" not in mutations(fresh_mq)
+    assert "#44 held: head-moved" in fm_lines
+    fm_custody = own.keeper_custody_for(fresh_own, "unit/public", 44)
+    assert fm_custody is not None and fm_custody["keeper_state"] == "repair" and fm_custody["observed_head"] == HEAD_B
+    fm_outbox = json.loads(fresh_state.read_text())["cto_outbox"]
+    assert len(fm_outbox) == 1 and HEAD_A in fm_outbox[0]["body"] and HEAD_B in fm_outbox[0]["body"]
+
+    # F6 (report mode without prior verdict/custody): tick 1 observes unreviewed HEAD_A (no alert),
+    # tick 2 observes unreviewed HEAD_B (ONE alert), tick 3 stays silent.
+    unrev = DirectFakeGitHub([pr(number=45, headRefOid=HEAD_A)], repository=PRIVATE_REPO)
+    unrev.comments_by_pr[45] = []
+    unrev.checks_by_head[HEAD_A] = checks(HEAD_A, conclusion="", status="in_progress")
+    unrev_state = tmp_path / "unrev_report.json"
+    _u_lines1, u_failed1 = keeper.run(unrev, unrev_state, apply=False, direct_config=_direct_cfg())
+    assert not u_failed1 and mutations(unrev) == []
+    assert json.loads(unrev_state.read_text()).get("cto_outbox", []) == []
+    assert json.loads(unrev_state.read_text())["report_heads"]["45"] == HEAD_A
+    unrev.rows = [pr(number=45, headRefOid=HEAD_B)]
+    unrev.fresh_by_pr[45] = {**unrev.rows[0], "state": "OPEN", "labels": []}
+    unrev.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+    u_lines2, u_failed2 = keeper.run(unrev, unrev_state, apply=False, direct_config=_direct_cfg())
+    assert not u_failed2 and mutations(unrev) == []
+    assert any("unreviewed head move alerted" in line for line in u_lines2)
+    u_outbox = json.loads(unrev_state.read_text())["cto_outbox"]
+    assert len(u_outbox) == 1 and HEAD_A in u_outbox[0]["body"] and HEAD_B in u_outbox[0]["body"]
+    u_lines3, u_failed3 = keeper.run(unrev, unrev_state, apply=False, direct_config=_direct_cfg())
+    assert not u_failed3 and not any("unreviewed head move alerted" in line for line in u_lines3)
+    assert len(json.loads(unrev_state.read_text())["cto_outbox"]) == 1
+
+    # F1 (R1 + R2): interleaved apply write (repaired_reenqueues reservation + newer report_heads for PRs 46 and 47)
+    # during an activated report run is preserved without overwriting newer heads or pruning other PRs.
+    head_c = "c" * 40
+    race_state = tmp_path / "race_report.json"
+    race_lock = tmp_path / "race_report.lock"
+    race_state.write_text(json.dumps({"queued": {}, "report_heads": {"46": HEAD_A}}))
+
+    class InterleavedReportGitHub(DirectFakeGitHub):
+        def checks(self, head: str) -> list[dict[str, Any]]:
+            # Simulate an overlapping --apply tick advancing PR 46 and 47 to head_c and reserving a repair.
+            concurrent = json.loads(race_state.read_text())
+            concurrent["repaired_reenqueues"] = {"99": {"head": HEAD_A, "proof": "repair-verified", "at": "2026-09-23T12:00:00Z"}}
+            concurrent["report_heads"] = {"46": head_c, "47": head_c}
+            race_state.write_text(json.dumps(concurrent))
+            return super().checks(head)
+
+    interleaved = InterleavedReportGitHub([pr(number=46, headRefOid=HEAD_B)], repository=PRIVATE_REPO)
+    interleaved.comments_by_pr[46] = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A)]
+    interleaved.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+    ir_lines, ir_failed = keeper.run(
+        interleaved, race_state, apply=False, direct_config=_direct_cfg(), lock_path=race_lock,
+    )
+    assert not ir_failed and any("unreviewed head move alerted" in line for line in ir_lines)
+    merged_state = json.loads(race_state.read_text())
+    assert "99" in merged_state["repaired_reenqueues"]
+    assert merged_state["report_heads"] == {"46": head_c, "47": head_c}
+    assert len(merged_state["cto_outbox"]) == 1
+
+    # F6 (R2): CI check lookup failure does NOT discard a determined unreviewed verdict;
+    # and when comments/verdict lookup itself fails, report_heads retains the predecessor until evaluated.
+    class FlakyChecksReportGitHub(DirectFakeGitHub):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            super().__init__(*a, **kw)
+            self.fail_checks = False
+            self.fail_comments = False
+
+        def checks(self, head: str) -> list[dict[str, Any]]:
+            if self.fail_checks:
+                raise keeper.KeeperError("checks lookup unavailable")
+            return super().checks(head)
+
+        def comments(self, number: int) -> list[dict[str, Any]]:
+            if self.fail_comments:
+                raise keeper.KeeperError("comments lookup unavailable")
+            return super().comments(number)
+
+    flaky_ci = FlakyChecksReportGitHub([pr(number=48, headRefOid=HEAD_A)], repository=PRIVATE_REPO)
+    flaky_ci.comments_by_pr[48] = []
+    flaky_ci_state = tmp_path / "flaky_ci_report.json"
+    _fc1, fc_f1 = keeper.run(flaky_ci, flaky_ci_state, apply=False, direct_config=_direct_cfg())
+    assert not fc_f1 and json.loads(flaky_ci_state.read_text())["report_heads"]["48"] == HEAD_A
+    flaky_ci.rows = [pr(number=48, headRefOid=HEAD_B)]
+    flaky_ci.fresh_by_pr[48] = {**flaky_ci.rows[0], "state": "OPEN", "labels": []}
+    flaky_ci.fail_checks = True
+    fc_lines2, fc_f2 = keeper.run(flaky_ci, flaky_ci_state, apply=False, direct_config=_direct_cfg())
+    assert not fc_f2 and any("unreviewed head move alerted" in line for line in fc_lines2)
+    assert len(json.loads(flaky_ci_state.read_text())["cto_outbox"]) == 1
+
+    flaky_comm = FlakyChecksReportGitHub([pr(number=49, headRefOid=HEAD_A)], repository=PRIVATE_REPO)
+    flaky_comm.comments_by_pr[49] = []
+    flaky_comm_state = tmp_path / "flaky_comm_report.json"
+    _fm1, fmf1 = keeper.run(flaky_comm, flaky_comm_state, apply=False, direct_config=_direct_cfg())
+    assert not fmf1 and json.loads(flaky_comm_state.read_text())["report_heads"]["49"] == HEAD_A
+    flaky_comm.rows = [pr(number=49, headRefOid=HEAD_B)]
+    flaky_comm.fresh_by_pr[49] = {**flaky_comm.rows[0], "state": "OPEN", "labels": []}
+    flaky_comm.fail_comments = True
+    _fm2, fmf2 = keeper.run(flaky_comm, flaky_comm_state, apply=False, direct_config=_direct_cfg())
+    assert not fmf2 and json.loads(flaky_comm_state.read_text())["report_heads"]["49"] == HEAD_A
+    flaky_comm.fail_comments = False
+    fm_lines3, fmf3 = keeper.run(flaky_comm, flaky_comm_state, apply=False, direct_config=_direct_cfg())
+    assert not fmf3 and any("unreviewed head move alerted" in line for line in fm_lines3)
+    assert len(json.loads(flaky_comm_state.read_text())["cto_outbox"]) == 1
+
+    # F6 (R3): in merge-queue apply=True without custody, if a previously approved PR's fresh read sees
+    # head moved A->B while comments lookup fails, report_heads preserves HEAD_A so the next tick alerts A->B
+    # with an honest non-custody alert body (never claiming held repair custody).
+    class FlakyFreshMoveGitHub(DirectFakeGitHub):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            super().__init__(*a, **kw)
+            self.comment_calls = 0
+
+        def comments(self, number: int) -> list[dict[str, Any]]:
+            self.comment_calls += 1
+            if self.comment_calls == 2:
+                raise keeper.KeeperError("transient comments failure on fresh read")
+            return super().comments(number)
+
+    f6_mq = FlakyFreshMoveGitHub([pr(number=50, headRefOid=HEAD_A)], repository="unit/public")
+    f6_mq.queue_enabled = True
+    f6_mq.comments_by_pr[50] = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A)]
+    f6_mq.fresh_by_pr[50] = {**f6_mq.rows[0], "headRefOid": HEAD_B, "state": "OPEN", "labels": []}
+    f6_state = tmp_path / "f6_mq_fresh.json"
+    f6_cfg = _direct_cfg(repository="unit/public")
+    _f6_l1, f6_f1 = keeper.run(f6_mq, f6_state, apply=True, direct_config=f6_cfg)
+    assert not f6_f1
+    f6_saved1 = json.loads(f6_state.read_text())
+    assert f6_saved1["report_heads"]["50"] == HEAD_A
+    assert f6_saved1.get("cto_outbox", []) == []
+    # Next tick sees HEAD_B with readable comments -> alerts HEAD_A->HEAD_B once and advances report_heads.
+    f6_mq.rows = [pr(number=50, headRefOid=HEAD_B)]
+    f6_mq.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+    f6_l2, f6_f2 = keeper.run(f6_mq, f6_state, apply=True, direct_config=f6_cfg)
+    assert not f6_f2 and any("unreviewed head move alerted" in line for line in f6_l2)
+    f6_saved2 = json.loads(f6_state.read_text())
+    assert f6_saved2["report_heads"]["50"] == HEAD_B
+    assert len(f6_saved2["cto_outbox"]) == 1 and HEAD_A in f6_saved2["cto_outbox"][0]["body"] and HEAD_B in f6_saved2["cto_outbox"][0]["body"]
+    assert "No keeper repair custody is held" in f6_saved2["cto_outbox"][0]["body"]
+    assert "Keeper repair custody stays held" not in f6_saved2["cto_outbox"][0]["body"]
+
+    # F1 (R1 on PR #1234): in apply=True without custody/tracking/prior approval (including drafts),
+    # ordinary WIP pushes HEAD_A->HEAD_B MUST NOT raise head-moved-unreviewed CTO alerts; draft PRs
+    # in report mode also stay silent.
+    for draft_flag, mode_apply in ((False, True), (True, True), (True, False)):
+        wip = DirectFakeGitHub([pr(number=51, headRefOid=HEAD_A, isDraft=draft_flag)], repository=PRIVATE_REPO)
+        wip.comments_by_pr[51] = []
+        wip.checks_by_head[HEAD_A] = checks(HEAD_A, conclusion="", status="in_progress")
+        wip_state = tmp_path / f"wip_{draft_flag}_{mode_apply}.json"
+        _wl1, wf1 = keeper.run(wip, wip_state, apply=mode_apply, direct_config=_direct_cfg())
+        assert not wf1
+        wip.rows = [pr(number=51, headRefOid=HEAD_B, isDraft=draft_flag)]
+        wip.fresh_by_pr[51] = {**wip.rows[0], "state": "OPEN", "labels": []}
+        wip.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+        wl2, wf2 = keeper.run(wip, wip_state, apply=mode_apply, direct_config=_direct_cfg())
+        assert not wf2 and not any("unreviewed head move alerted" in line for line in wl2)
+        assert json.loads(wip_state.read_text()).get("cto_outbox", []) == []
+    assert "No keeper repair custody is held" in json.loads(rep_state.read_text())["cto_outbox"][0]["body"]
+
+    # F10 (R2): malformed non-string outbox key fails closed with KeeperError instead of TypeError.
+    bad_outbox = tmp_path / "bad_outbox.json"
+    bad_outbox.write_text(json.dumps({"queued": {}, "cto_outbox": [{"key": ["bad"], "kind": "x", "body": "y"}]}))
+    with pytest.raises(keeper.KeeperError, match="keeper state malformed"):
+        keeper.run(rep, bad_outbox, apply=False, direct_config=_direct_cfg())
+
+
+def test_required_verify_run_failure_blocks_landing_and_alerts(tmp_path: Path) -> None:
+    """Defect class: keeper enqueues or direct-merges a PR touching a verify_run area when verify_run fails."""
+    # Area mapping checks (verify/SKILL.md): api, sources, host, combined, tests/docs exclusions, and fail-closed code blobs.
+    assert keeper._verify_run_areas_for_files(
+        ["lu_machinery/api/state_router.py"], repository=PRIVATE_REPO, blob_reader=lambda _p, _r: "x = 1\n",
+    ) == ("api",)
+    assert keeper._verify_run_areas_for_files([".mcp/servers/sources/server.py"], repository=PRIVATE_REPO) == ("sources",)
+    assert keeper._verify_run_areas_for_files(["packaging/systemd/learn-ukrainian-sources.service"], repository=PRIVATE_REPO) == ("sources", "host")
+    assert keeper._verify_run_areas_for_files(["lu_machinery/packaging/systemd/learn-ukrainian-loopback.target"], repository=PRIVATE_REPO) == ("host",)
+    assert keeper._verify_run_areas_for_files(["tests/fixtures/foo.service", "docs/runbooks/foo.md", "CHANGELOG.md"], repository=PRIVATE_REPO) == ()
+    assert keeper._verify_run_areas_for_files(
+        ["scripts/example.py"], repository=PRIVATE_REPO, blob_reader=lambda _p, _r: "print('ok')\n",
+    ) == ()
+    # F2 (R1 on PR #1234): a clean rename's previous_filename is read ONLY at the diff base (removed=True),
+    # never at PR head (where it does not exist), so clean renames do not falsely require "sources".
+    rename_calls: list[tuple[str, bool]] = []
+
+    def rename_reader(path: str, removed: bool) -> str | None:
+        rename_calls.append((path, removed))
+        if path == "scripts/old_name.py" and not removed:
+            return None
+        return "VALUE = 1\n"
+
+    rename_rows = [{"filename": "scripts/new_name.py", "previous_filename": "scripts/old_name.py", "status": "renamed"}]
+    assert keeper._verify_run_areas_for_files(
+        keeper.pr_file_paths(rename_rows),
+        repository=PRIVATE_REPO,
+        file_rows=rename_rows,
+        blob_reader=rename_reader,
+    ) == ()
+    assert rename_calls == [("scripts/new_name.py", False), ("scripts/old_name.py", True)]
+    # Unreadable code blob (e.g. empty checkout with no remote) fails closed and requires Sources verification.
+    empty_dir = tmp_path / "empty_checkout"
+    empty_dir.mkdir()
+    assert keeper._verify_run_areas_for_files(
+        ["scripts/example.py"],
+        repository=PRIVATE_REPO,
+        file_rows=[{"filename": "scripts/example.py", "status": "modified", "patch": "@@ -1 +1 @@\n+x = 1\n"}],
+        repo_root=empty_dir,
+        head=HEAD_A,
+    ) == ("sources",)
+
+    # Direct-landing mode: PR touches api area -> failing verify_run refuses direct_merge and alerts CTO once.
+    seen_areas: list[tuple[str, ...]] = []
+
+    def fail_verify(areas: Any) -> dict[str, Any]:
+        seen_areas.append(tuple(areas))
+        return {"schema_version": "verify-run.v1", "ok": False, "areas": [{"area": a, "ok": False} for a in areas]}
+
+    def pass_verify(areas: Any) -> dict[str, Any]:
+        seen_areas.append(tuple(areas))
+        return {"schema_version": "verify-run.v1", "ok": True, "areas": [{"area": a, "ok": True} for a in areas]}
+
+    direct = DirectFakeGitHub([pr(number=42)], repository=PRIVATE_REPO)
+    direct.files_by_pr[42] = ["lu_machinery/api/state_router.py"]
+    direct_state = tmp_path / "verify_direct.json"
+    lines1, failed1 = keeper.run(
+        direct, direct_state, apply=True, direct_config=_direct_cfg(), verify_runner=fail_verify,
+    )
+    assert not failed1 and mutations(direct) == []
+    assert "#42 held: verify-run-failed:api" in lines1
+    assert seen_areas == [("api",)]
+    outbox = json.loads(direct_state.read_text())["cto_outbox"]
+    assert len(outbox) == 1 and "verify-run-failed:api" in outbox[0]["body"]
+
+    # Once verify_run passes, direct_merge succeeds.
+    lines2, failed2 = keeper.run(
+        direct, direct_state, apply=True, direct_config=_direct_cfg(),
+        verify_runner=pass_verify, closeout_runner=lambda num, repo, root: ("closed_out", ""),
+    )
+    assert not failed2 and mutations(direct) == ["direct-merge"]
+    assert "#42 direct-merged" in "\n".join(lines2)
+
+    # Merge-queue mode: PR touches host area -> failing verify_run blocks enqueue and alerts CTO once.
+    mq = DirectFakeGitHub([pr(number=43, headRefOid=HEAD_B)], repository="unit/public")
+    mq.queue_enabled = True
+    mq.files_by_pr[43] = ["lu_machinery/packaging/systemd/learn-ukrainian-loopback.target"]
+    mq_state = tmp_path / "verify_mq.json"
+    mq_cfg = _direct_cfg(repository="unit/public")
+    mq_lines1, mq_failed1 = keeper.run(mq, mq_state, apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+    assert not mq_failed1 and mutations(mq) == []
+    assert "#43 held: verify-run-failed:host" in mq_lines1
+    mq_outbox = json.loads(mq_state.read_text())["cto_outbox"]
+    assert len(mq_outbox) == 1 and "verify-run-failed:host" in mq_outbox[0]["body"]
+
+    # Once verify_run passes, enqueue succeeds.
+    mq_lines2, mq_failed2 = keeper.run(mq, mq_state, apply=True, direct_config=mq_cfg, verify_runner=pass_verify)
+    assert not mq_failed2 and mutations(mq) == ["enqueue"]
+    assert "#43 enqueued" in mq_lines2
+
+    # F4: verify_word callers outside server dirs (lu_machinery/ops/verify_run.py and patch-matched caller)
+    # require the Sources verification gate and block enqueue on failure.
+    assert keeper._verify_run_areas_for_files(["lu_machinery/ops/verify_run.py"], repository="unit/public") == ("sources",)
+    caller_mq = DirectFakeGitHub([pr(number=44, headRefOid=HEAD_A)], repository="unit/public")
+    caller_mq.queue_enabled = True
+    caller_mq.files_by_pr[44] = ["lu_machinery/ops/verify_run.py"]
+    caller_state = tmp_path / "verify_caller.json"
+    c_lines, c_failed = keeper.run(caller_mq, caller_state, apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+    assert not c_failed and mutations(caller_mq) == []
+    assert "#44 held: verify-run-failed:sources" in c_lines
+
+    patch_mq = DirectFakeGitHub([pr(number=45, headRefOid=HEAD_B)], repository="unit/public")
+    patch_mq.queue_enabled = True
+    patch_mq.file_rows_by_pr[45] = [{
+        "filename": "scripts/custom_checker.py",
+        "status": "modified",
+        "patch": "+result = client.verify_word(lemma)\n",
+    }]
+    patch_state = tmp_path / "verify_patch_caller.json"
+    p_lines, p_failed = keeper.run(patch_mq, patch_state, apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+    assert not p_failed and mutations(patch_mq) == []
+    assert "#45 held: verify-run-failed:sources" in p_lines
+
+    # F4 (R2): exact PR-head Git blob inspection (and diff-base inspection for removed callers)
+    # from a base-only keeper checkout where the file is absent locally and verify_word is outside the patch hunk.
+    import os
+    import subprocess
+
+    git_env = {
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+
+    def _git(repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_env,
+            timeout=30,
+        ).stdout.strip()
+
+    bare = tmp_path / "verify_origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True, env=git_env, timeout=30)
+    author = tmp_path / "verify_author"
+    subprocess.run(["git", "clone", str(bare), str(author)], check=True, capture_output=True, env=git_env, timeout=30)
+    (author / "scripts").mkdir()
+    (author / "scripts/removed_caller.py").write_text("def old():\n    return verify_word('x')\n")
+    (author / "scripts/plain.py").write_text("VALUE = 1\n")
+    _git(author, "add", ".")
+    _git(author, "commit", "-m", "base")
+    _git(bare, "fetch", str(author), "+HEAD:refs/heads/main")
+    keeper_repo = tmp_path / "verify_keeper"
+    subprocess.run(["git", "clone", str(bare), str(keeper_repo)], check=True, capture_output=True, env=git_env, timeout=30)
+
+    # PR 46: adds scripts/deep_caller.py with verify_word far from the patch hunk (not in keeper checkout).
+    _git(author, "checkout", "-b", "pr-46")
+    (author / "scripts/deep_caller.py").write_text("def call(c):\n    return c.verify_word('a')\n" + ("# pad\n" * 40) + "X = 2\n")
+    _git(author, "add", "scripts/deep_caller.py")
+    _git(author, "commit", "-m", "add deep caller")
+    pr46_sha = _git(author, "rev-parse", "HEAD")
+    _git(bare, "fetch", str(author), "+refs/heads/pr-46:refs/pull/46/head")
+
+    deep_mq = DirectFakeGitHub([pr(number=46, headRefOid=pr46_sha)], repository="unit/public")
+    deep_mq.root = keeper_repo
+    deep_mq.read_source_blob = None
+    deep_mq.queue_enabled = True
+    deep_mq.file_rows_by_pr[46] = [{"filename": "scripts/deep_caller.py", "status": "modified", "patch": "@@ -42 +42 @@\n+X = 2\n"}]
+    d_lines, d_failed = keeper.run(deep_mq, tmp_path / "verify_deep.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+    assert not d_failed and mutations(deep_mq) == []
+    assert "#46 held: verify-run-failed:sources" in d_lines
+
+    # PR 47: removes scripts/removed_caller.py (patch omits verify_word, proven diff base contains it).
+    _git(author, "checkout", "main")
+    _git(author, "checkout", "-b", "pr-47")
+    (author / "scripts/removed_caller.py").unlink()
+    _git(author, "add", "-A")
+    _git(author, "commit", "-m", "remove caller")
+    pr47_sha = _git(author, "rev-parse", "HEAD")
+    _git(bare, "fetch", str(author), "+refs/heads/pr-47:refs/pull/47/head")
+
+    rem_mq = DirectFakeGitHub([pr(number=47, headRefOid=pr47_sha)], repository="unit/public")
+    rem_mq.root = keeper_repo
+    rem_mq.read_source_blob = None
+    rem_mq.queue_enabled = True
+    rem_mq.file_rows_by_pr[47] = [{"filename": "scripts/removed_caller.py", "status": "removed", "patch": ""}]
+    r_lines, r_failed = keeper.run(rem_mq, tmp_path / "verify_rem.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+    assert not r_failed and mutations(rem_mq) == []
+    assert "#47 held: verify-run-failed:sources" in r_lines
+
+    # F4 (R3): remote main advances AFTER keeper_repo was cloned, adding verify_word to scripts/plain.py;
+    # PR 49 branches from the newer remote main and removes scripts/plain.py -> isolated store resolves
+    # merge-base against live remote main (not stale keeper_repo origin/main) and requires "sources".
+    _git(author, "checkout", "main")
+    (author / "scripts/plain.py").write_text("def late():\n    return verify_word('z')\n")
+    _git(author, "add", "scripts/plain.py")
+    _git(author, "commit", "-m", "advance main with verify_word caller")
+    _git(bare, "fetch", str(author), "+HEAD:refs/heads/main")
+    _git(author, "checkout", "-b", "pr-49")
+    (author / "scripts/plain.py").unlink()
+    _git(author, "add", "-A")
+    _git(author, "commit", "-m", "remove late caller")
+    pr49_sha = _git(author, "rev-parse", "HEAD")
+    _git(bare, "fetch", str(author), "+refs/heads/pr-49:refs/pull/49/head")
+
+    stale_rem_mq = DirectFakeGitHub([pr(number=49, headRefOid=pr49_sha)], repository="unit/public")
+    stale_rem_mq.root = keeper_repo
+    stale_rem_mq.read_source_blob = None
+    stale_rem_mq.queue_enabled = True
+    stale_rem_mq.file_rows_by_pr[49] = [{"filename": "scripts/plain.py", "status": "removed", "patch": ""}]
+    sr_lines, sr_failed = keeper.run(stale_rem_mq, tmp_path / "verify_stale_rem.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+    assert not sr_failed and mutations(stale_rem_mq) == []
+    assert "#49 held: verify-run-failed:sources" in sr_lines
+
+    # F4 (R3): orphan PR with no common ancestor with main cannot prove merge-base -> fails closed ("sources").
+    _git(author, "checkout", "--orphan", "pr-50-orphan")
+    _git(author, "rm", "-rf", ".")
+    (author / "scripts").mkdir()
+    (author / "scripts/other.py").write_text("A = 1\n")
+    _git(author, "add", ".")
+    _git(author, "commit", "-m", "orphan")
+    pr50_sha = _git(author, "rev-parse", "HEAD")
+    _git(bare, "fetch", str(author), "+refs/heads/pr-50-orphan:refs/pull/50/head")
+    assert keeper._verify_run_areas_for_files(
+        ["scripts/removed_caller.py"],
+        repository="unit/public",
+        file_rows=[{"filename": "scripts/removed_caller.py", "status": "removed", "patch": ""}],
+        repo_root=keeper_repo,
+        head=pr50_sha,
+        base_name="main",
+        number=50,
+    ) == ("sources",)
+
+    # F12 (R3): multi-file clean PR absent locally opens ONE isolated object store per pass,
+    # and short-circuits with ZERO store opens when "sources" is already matched or excluded.
+    _git(author, "checkout", "main")
+    _git(author, "checkout", "-b", "pr-48")
+    (author / "scripts/clean_a.py").write_text("VALUE_A = 1\n")
+    (author / "scripts/clean_b.py").write_text("VALUE_B = 2\n")
+    _git(author, "add", "scripts/clean_a.py", "scripts/clean_b.py")
+    _git(author, "commit", "-m", "add two clean files")
+    pr48_sha = _git(author, "rev-parse", "HEAD")
+    _git(bare, "fetch", str(author), "+refs/heads/pr-48:refs/pull/48/head")
+
+    from lu_machinery.review import record_cf_verdict
+
+    iso_opens = 0
+    real_iso = record_cf_verdict.isolated_object_store
+
+    def counting_iso(checkout: Path | None = None) -> Any:
+        nonlocal iso_opens
+        iso_opens += 1
+        return real_iso(checkout)
+
+    orig_iso = record_cf_verdict.isolated_object_store
+    record_cf_verdict.isolated_object_store = counting_iso  # type: ignore[assignment]
+    try:
+        plain_mq = DirectFakeGitHub([pr(number=48, headRefOid=pr48_sha)], repository="unit/public")
+        plain_mq.root = keeper_repo
+        plain_mq.read_source_blob = None
+        plain_mq.queue_enabled = True
+        plain_mq.file_rows_by_pr[48] = [
+            {"filename": "scripts/clean_a.py", "status": "added", "patch": "@@ -0,0 +1 @@\n+VALUE_A = 1\n"},
+            {"filename": "scripts/clean_b.py", "status": "added", "patch": "@@ -0,0 +1 @@\n+VALUE_B = 2\n"},
+        ]
+        pl_lines, pl_failed = keeper.run(plain_mq, tmp_path / "verify_plain.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+        assert not pl_failed and mutations(plain_mq) == ["enqueue"]
+        assert "#48 enqueued" in pl_lines
+        assert iso_opens == 1
+
+        # Already matched by path -> ZERO isolated store opens.
+        iso_opens = 0
+        assert keeper._verify_run_areas_for_files(
+            ["scripts/clean_a.py", ".mcp/servers/sources/server.py"],
+            repository="unit/public",
+            file_rows=[
+                {"filename": "scripts/clean_a.py", "status": "added", "patch": "+VALUE_A = 1\n"},
+                {"filename": ".mcp/servers/sources/server.py", "status": "modified", "patch": "+X = 1\n"},
+            ],
+            repo_root=keeper_repo,
+            head=pr48_sha,
+            base_name="main",
+            number=48,
+        ) == ("sources",)
+        assert iso_opens == 0
+
+        # Repository catalog excludes "sources" -> ZERO isolated store opens.
+        orig_cat = keeper.prepublish_catalog
+        keeper.prepublish_catalog = lambda: {"p": {"github": "unit/api-only", "verify_run_areas": ["api"]}}
+        try:
+            assert keeper._verify_run_areas_for_files(
+                ["scripts/clean_a.py", "lu_machinery/api/state_router.py"],
+                repository="unit/api-only",
+                repo_root=keeper_repo,
+                head=pr48_sha,
+                base_name="main",
+                number=48,
+            ) == ("api",)
+            assert iso_opens == 0
+        finally:
+            keeper.prepublish_catalog = orig_cat
+    finally:
+        record_cf_verdict.isolated_object_store = orig_iso  # type: ignore[assignment]
+
+
+def test_pr_ci_infra_failure_alerts_without_rerun(tmp_path: Path) -> None:
+    """Defect class: PR CI infrastructure failure triggers an automatic rerun or spams duplicate CTO alerts."""
+    cfg = _direct_cfg(allow_infra_reenqueue=True)
+    infra_check = {
+        "id": 701, "workflow_run_id": 8888, "name": "CI Gate", "head_sha": HEAD_A,
+        "status": "completed", "conclusion": "failure", "started_at": "2026-09-23T00:00:00Z",
+    }
+
+    # 1. Direct-landing mode (even with allow_infra_reenqueue=True): PR CI infra failure raises ONE
+    # claude-cto alert for that head, performs ZERO reruns or PR comments, and does not duplicate on
+    # later ticks even when another check on the same head also fails.
+    direct = DirectFakeGitHub([pr(number=42)], repository=PRIVATE_REPO)
+    direct.checks_by_head[HEAD_A] = [infra_check]
+    direct_state = tmp_path / "direct_infra_alert.json"
+    lines1, failed1 = keeper.run(direct, direct_state, apply=True, direct_config=cfg)
+    assert not failed1 and mutations(direct) == []
+    assert "#42 held: CI-red-CI Gate" in lines1
+    outbox1 = json.loads(direct_state.read_text())["cto_outbox"]
+    assert len(outbox1) == 1 and "8888" in outbox1[0]["body"] and HEAD_A in outbox1[0]["body"]
+
+    direct.checks_by_head[HEAD_A].append({
+        "id": 702, "workflow_run_id": 8889, "name": "lint", "head_sha": HEAD_A,
+        "status": "completed", "conclusion": "failure", "started_at": "2026-09-23T00:01:00Z",
+    })
+    _lines2, failed2 = keeper.run(direct, direct_state, apply=True, direct_config=cfg)
+    assert not failed2 and mutations(direct) == []
+    assert len(json.loads(direct_state.read_text())["cto_outbox"]) == 1
+
+    # 2. Merge-queue mode with activation flags: PR CI infra failure alerts claude-cto ONCE,
+    # performs ZERO reruns or enqueues, and does not duplicate on the next tick.
+    mq = DirectFakeGitHub([pr(number=43, headRefOid=HEAD_A)], repository="unit/public")
+    mq.queue_enabled = True
+    mq.checks_by_head[HEAD_A] = [infra_check]
+    mq_state = tmp_path / "mq_infra_alert.json"
+    mq_cfg = _direct_cfg(repository="unit/public", allow_infra_reenqueue=True)
+    mq_lines1, mq_failed1 = keeper.run(mq, mq_state, apply=True, direct_config=mq_cfg)
+    assert not mq_failed1 and "enqueue" not in mutations(mq) and "re-enqueue" not in mutations(mq)
+    assert "#43 held: CI-red-CI Gate" in mq_lines1
+    mq_outbox = json.loads(mq_state.read_text())["cto_outbox"]
+    assert len(mq_outbox) == 1 and "8888" in mq_outbox[0]["body"] and HEAD_A in mq_outbox[0]["body"]
+    _mq_lines2, mq_failed2 = keeper.run(mq, mq_state, apply=True, direct_config=mq_cfg)
+    assert not mq_failed2 and len(json.loads(mq_state.read_text())["cto_outbox"]) == 1
+
+    # 3. Dormant mode (no direct_config, no ownership_path): no CTO alert queued and no mutation.
+    dormant = DirectFakeGitHub([pr(number=44, headRefOid=HEAD_A)], repository="unit/public")
+    dormant.queue_enabled = True
+    dormant.checks_by_head[HEAD_A] = [infra_check]
+    dormant_state = tmp_path / "dormant_ci_fail.json"
+    _dl, df = keeper.run(dormant, dormant_state, apply=True)
+    assert not df and "enqueue" not in mutations(dormant)
+    assert json.loads(dormant_state.read_text()).get("cto_outbox", []) == []
+
+
+def test_ejected_repaired_head_reenqueues_once_only_with_repair_evidence(tmp_path: Path) -> None:
+    """Defect class: ejected PR's approved repaired head re-enqueues without repair evidence, fails to re-enqueue with it, or re-enqueues twice."""
+    head_c = "c" * 40
+    mq_cfg = _direct_cfg(repository="unit/public", allow_infra_reenqueue=True)
+
+    # 1. Without repair evidence (ordinary new approved head HEAD_B after ejection at HEAD_A): MUST NOT re-enqueue.
+    no_proof = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_B)], repository="unit/public")
+    no_proof.queue_enabled = True
+    no_proof.comments_by_pr[42] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A),
+        recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", HEAD_B),
+    ]
+    no_proof_state = tmp_path / "no_proof.json"
+    no_proof_state.write_text(json.dumps({"queued": {}, "ejections": {f"42:{HEAD_A}": [123]}}))
+    lines_np, failed_np = keeper.run(
+        no_proof, no_proof_state, apply=True, direct_config=mq_cfg, repair_prover=lambda *a, **kw: None,
+    )
+    assert not failed_np and "enqueue" not in mutations(no_proof) and "re-enqueue" not in mutations(no_proof)
+    assert "#42 held: queued-before" in lines_np
+
+    # 2. Real git repo for F5 (cryptographic binding of REPAIR_VERIFIED digest to ejected head)
+    # and F8 (isolated fetch clean-base-merge proof from base-only keeper checkout), with timeouts on all git calls.
+    import hashlib
+    import os
+    import subprocess
+
+    git_env = {
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+
+    def _git(repo: Path, *args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_env,
+            timeout=30,
+        )
+        return proc.stdout.strip()
+
+    origin_bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin_bare)], check=True, capture_output=True, env=git_env, timeout=30)
+    author_repo = tmp_path / "author_repo"
+    subprocess.run(["git", "clone", str(origin_bare), str(author_repo)], check=True, capture_output=True, env=git_env, timeout=30)
+    (author_repo / "base.txt").write_text("v1\n")
+    _git(author_repo, "add", "base.txt")
+    _git(author_repo, "commit", "-m", "base v1")
+    _git(origin_bare, "fetch", str(author_repo), "+HEAD:refs/heads/main")
+    # Keeper checkout is cloned BEFORE the PR branch or base advancement exists locally.
+    keeper_clone = tmp_path / "keeper_clone"
+    subprocess.run(["git", "clone", str(origin_bare), str(keeper_clone)], check=True, capture_output=True, env=git_env, timeout=30)
+    refs_before = _git(keeper_clone, "for-each-ref")
+
+    # Author creates ejected PR commit (ejected_sha), repaired commit (repaired_sha), and third commit (third_sha).
+    _git(author_repo, "checkout", "-b", "pr-42")
+    (author_repo / "feature.txt").write_text("feat v1\n")
+    _git(author_repo, "add", "feature.txt")
+    _git(author_repo, "commit", "-m", "pr feature v1")
+    ejected_sha = _git(author_repo, "rev-parse", "HEAD")
+
+    (author_repo / "feature.txt").write_text("feat v2\n")
+    _git(author_repo, "add", "feature.txt")
+    _git(author_repo, "commit", "-m", "pr repair v2")
+    repaired_sha = _git(author_repo, "rev-parse", "HEAD")
+    _git(origin_bare, "fetch", str(author_repo), "+refs/heads/pr-42:refs/pull/42/head")
+    ab_diff = subprocess.run(
+        ["git", "-C", str(author_repo), "diff", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-textconv", ejected_sha, repaired_sha],
+        check=True, capture_output=True, env=git_env, timeout=30,
+    ).stdout
+    ab_digest = hashlib.sha256(ab_diff).hexdigest()
+
+    # F5 (R2): an unrelated REPAIR_VERIFIED digest (e.g., digest of repaired_sha..third_sha, NOT ejected_sha..third_sha)
+    # MUST NOT satisfy the ejected-head repair gate!
+    (author_repo / "feature.txt").write_text("feat v3\n")
+    _git(author_repo, "add", "feature.txt")
+    _git(author_repo, "commit", "-m", "pr v3")
+    third_sha = _git(author_repo, "rev-parse", "HEAD")
+    _git(origin_bare, "fetch", str(author_repo), "+refs/heads/pr-42:refs/pull/46/head")
+    bc_diff = subprocess.run(
+        ["git", "-C", str(author_repo), "diff", "--binary", "--full-index", "--no-renames", "--no-ext-diff", "--no-textconv", repaired_sha, third_sha],
+        check=True, capture_output=True, env=git_env, timeout=30,
+    ).stdout
+    bc_digest = hashlib.sha256(bc_diff).hexdigest()
+
+    unrelated = DirectFakeGitHub([pr(number=46, headRefOid=third_sha)], repository="unit/public")
+    unrelated.root = keeper_clone
+    unrelated.queue_enabled = True
+    unrelated.comments_by_pr[46] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", ejected_sha),
+        recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", repaired_sha),
+        {
+            "body": build_comment(
+                sha=third_sha,
+                task_id="review-unrelated",
+                started="2026-09-23T12:20:00.000001+00:00",
+                verdict="APPROVED",
+                model="gpt-6.1-sol",
+                family="openai",
+                reply=f"VERDICT: APPROVE\nREPAIR_VERIFIED: {bc_digest}",
+            ),
+            "user": {"login": "driver"},
+            "author_association": "MEMBER",
+            "created_at": "2026-09-23T13:05:00Z",
+            "updated_at": "2026-09-23T13:05:00Z",
+        },
+    ]
+    unrelated.checks_by_head[third_sha] = checks(third_sha)
+    unrel_state = tmp_path / "unrelated_repair.json"
+    unrel_state.write_text(json.dumps({"queued": {}, "ejections": {f"46:{ejected_sha}": [123]}}))
+    unrel_lines, unrel_failed = keeper.run(unrelated, unrel_state, apply=True, direct_config=mq_cfg)
+    assert not unrel_failed and "enqueue" not in mutations(unrelated)
+    assert "#46 held: queued-before" in unrel_lines
+
+    # With REPAIR_VERIFIED bound to the exact delta ejected_sha..repaired_sha: re-enqueues ONCE.
+    repaired = DirectFakeGitHub([pr(number=42, headRefOid=repaired_sha)], repository="unit/public")
+    repaired.root = keeper_clone
+    repaired.queue_enabled = True
+    approved_b = {
+        "body": build_comment(
+            sha=repaired_sha,
+            task_id="review-repair",
+            started="2026-09-23T12:10:00.000001+00:00",
+            verdict="APPROVED",
+            model="gpt-6.1-sol",
+            family="openai",
+            reply=f"VERDICT: APPROVE\nREPAIR_VERIFIED: {ab_digest}",
+        ),
+        "user": {"login": "driver"},
+        "author_association": "MEMBER",
+        "created_at": "2026-09-23T13:00:00Z",
+        "updated_at": "2026-09-23T13:00:00Z",
+    }
+    repaired.comments_by_pr[42] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", ejected_sha),
+        approved_b,
+    ]
+    repaired.checks_by_head[repaired_sha] = checks(repaired_sha)
+    rep_state = tmp_path / "repaired.json"
+    rep_state.write_text(json.dumps({"queued": {}, "ejections": {f"42:{ejected_sha}": [123]}}))
+    lines_ok, failed_ok = keeper.run(repaired, rep_state, apply=True, direct_config=mq_cfg)
+    assert not failed_ok
+    assert [action for action in repaired.actions if action[0] == "enqueue"] == [("enqueue", (42, repaired_sha))]
+    assert "#42 re-enqueued (repaired:repair-verified)" in lines_ok
+    assert not any(name == "comment" for name, _ in repaired.actions)
+
+    # If repaired_sha is later ejected and a third head HEAD_C is pushed with repair evidence,
+    # the keeper MUST NOT re-enqueue a second time and alerts claude-cto once.
+    saved = json.loads(rep_state.read_text())
+    saved["queued"] = {}
+    saved["ejections"][f"42:{repaired_sha}"] = [124]
+    rep_state.write_text(json.dumps(saved))
+    repaired.rows = [pr(number=42, headRefOid=head_c)]
+    repaired.fresh_by_pr[42] = {**repaired.rows[0], "state": "OPEN", "labels": []}
+    repaired.comments_by_pr[42].append(recorded("APPROVED", "2026-09-23T12:20:00.000001+00:00", head_c))
+    repaired.checks_by_head[head_c] = checks(head_c)
+    lines_twice, failed_twice = keeper.run(
+        repaired, rep_state, apply=True, direct_config=mq_cfg, repair_prover=lambda *a, **kw: "repair-verified",
+    )
+    assert not failed_twice
+    assert [action for action in repaired.actions if action[0] == "enqueue"] == [("enqueue", (42, repaired_sha))]
+    assert "#42 held: repaired-reenqueue-exhausted" in lines_twice
+    outbox = json.loads(rep_state.read_text())["cto_outbox"]
+    assert len(outbox) == 1 and "repaired-reenqueue-exhausted" in outbox[0]["body"]
+
+    # 3. Clean base merge proof also re-enqueues once; dormant flag blocks it.
+    clean = DirectFakeGitHub([pr(number=43, headRefOid=HEAD_B)], repository="unit/public")
+    clean.queue_enabled = True
+    clean.comments_by_pr[43] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A),
+        recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", HEAD_B),
+    ]
+    dormant_state = tmp_path / "clean_dormant.json"
+    dormant_state.write_text(json.dumps({"queued": {}, "ejections": {f"43:{HEAD_A}": [200]}}))
+    _dl, df = keeper.run(
+        clean, dormant_state, apply=True, direct_config=_direct_cfg(repository="unit/public", allow_infra_reenqueue=False),
+        repair_prover=lambda *a, **kw: "clean-base-merge",
+    )
+    assert not df and "enqueue" not in mutations(clean) and "re-enqueue" not in mutations(clean)
+
+    clean_state = tmp_path / "clean_ok.json"
+    clean_state.write_text(json.dumps({"queued": {}, "ejections": {f"43:{HEAD_A}": [200]}}))
+    clean_lines, clean_failed = keeper.run(
+        clean, clean_state, apply=True, direct_config=mq_cfg, repair_prover=lambda *a, **kw: "clean-base-merge",
+    )
+    assert not clean_failed
+    assert [action for action in clean.actions if action[0] == "enqueue"] == [("enqueue", (43, HEAD_B))]
+    assert "#43 re-enqueued (repaired:clean-base-merge)" in clean_lines
+
+    # F5 (R1): a prior queue stay without a confirmed ejection (only keeper revocation
+    # in ejection_alerts, no ejections entry) MUST NOT re-enqueue even with REPAIR_VERIFIED.
+    not_ejected = DirectFakeGitHub([pr(number=44, headRefOid=repaired_sha)], repository="unit/public")
+    not_ejected.root = keeper_clone
+    not_ejected.queue_enabled = True
+    not_ejected.comments_by_pr[44] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", ejected_sha),
+        approved_b,
+    ]
+    not_ejected.checks_by_head[repaired_sha] = checks(repaired_sha)
+    not_ejected_state = tmp_path / "not_ejected.json"
+    not_ejected_state.write_text(json.dumps({
+        "queued": {},
+        "ejection_alerts": {f"44:{ejected_sha}": "2026-09-23T12:05:00Z"},
+    }))
+    ne_lines, ne_failed = keeper.run(not_ejected, not_ejected_state, apply=True, direct_config=mq_cfg)
+    assert not ne_failed and "enqueue" not in mutations(not_ejected) and "re-enqueue" not in mutations(not_ejected)
+    assert "#44 held: queued-before" in ne_lines
+
+    # F8: default clean-base-merge proof fetches missing PR/base objects into an isolated store
+    # from a base-only keeper checkout without mutating the keeper checkout's refs.
+    _git(author_repo, "checkout", "main")
+    (author_repo / "base.txt").write_text("v2\n")
+    _git(author_repo, "add", "base.txt")
+    _git(author_repo, "commit", "-m", "base v2")
+    new_base = _git(author_repo, "rev-parse", "HEAD")
+    _git(origin_bare, "fetch", str(author_repo), "+refs/heads/main:refs/heads/main")
+
+    _git(author_repo, "checkout", "-b", "pr-45", ejected_sha)
+    _git(author_repo, "merge", "--no-edit", "main")
+    merged_sha = _git(author_repo, "rev-parse", "HEAD")
+    _git(origin_bare, "fetch", str(author_repo), "+refs/heads/pr-45:refs/pull/45/head")
+
+    # Confirm keeper_clone does NOT have merged_sha locally before keeper.run().
+    assert subprocess.run(
+        ["git", "-C", str(keeper_clone), "cat-file", "-e", f"{merged_sha}^{{commit}}"],
+        capture_output=True,
+        timeout=30,
+    ).returncode != 0
+
+    real_clean = DirectFakeGitHub([pr(number=45, headRefOid=merged_sha)], repository="unit/public")
+    real_clean.root = keeper_clone
+    real_clean.queue_enabled = True
+    real_clean.base_heads["main"] = new_base
+    real_clean.comments_by_pr[45] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", ejected_sha),
+        recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", merged_sha),
+    ]
+    real_clean.checks_by_head[merged_sha] = checks(merged_sha)
+    real_clean_state = tmp_path / "real_clean.json"
+    real_clean_state.write_text(json.dumps({"queued": {}, "ejections": {f"45:{ejected_sha}": [300]}}))
+    rc_lines, rc_failed = keeper.run(real_clean, real_clean_state, apply=True, direct_config=mq_cfg)
+    assert not rc_failed
+    assert [action for action in real_clean.actions if action[0] == "enqueue"] == [("enqueue", (45, merged_sha))]
+    assert "#45 re-enqueued (repaired:clean-base-merge)" in rc_lines
+    assert _git(keeper_clone, "for-each-ref") == refs_before
