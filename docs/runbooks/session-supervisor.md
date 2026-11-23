@@ -283,10 +283,15 @@ Before running an attributed force release, verify quiescence in three steps:
 2. **Prove the turn scope and services are gone on the recorded host:** check
    `systemctl --user list-units 'lu-worker-<task-id>*'` and confirm no scope or listed
    task service remains active.
-3. **Reconcile child tasks:** check `child_tasks` and `orphaned_child_tasks` on the turn
-   record (and live tasks with `parent_stream == epic:<N>` via
-   `.venv/bin/python -m lu_machinery.dispatch list --status running`) and confirm every
-   child has settled or has an explicit CTO custody owner.
+3. **Prove full child quiescence:** inspect `child_tasks`, `orphaned_child_tasks`,
+   `unknown_child_tasks`, and `unreadable_child_records` on the turn record, and list
+   all task records linked to the exact turn (`parent_task_id == <task-id>` and
+   `parent_run_nonce == <run-nonce>`) via `.venv/bin/python -m lu_machinery.dispatch list --all`.
+   Confirm every child is terminal with its processes/scope and task services proven gone
+   (no `worktree_disposition_reason` of `provider_processes_alive` or
+   `provider_liveness_unknown`). If any child is `spawning`, `running`, `unknown`, or
+   unreadable, keep the stream held — custody reassignment alone does not satisfy
+   quiescence.
 
 Once all three checks pass, re-read Monitor to confirm the same holder is still current,
 then run the attributed operator release:

@@ -723,6 +723,63 @@ def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) ->
     return None
 
 
+def _terminal_child_unsettled_state(other: dict) -> str | None:
+    """Return ``'live'`` or ``'unknown'`` when a terminal child lacks proof that its processes and services stopped."""
+    from lu_machinery.orchestration import dispatch_isolation
+
+    never_started = other.get("never_started_reason")
+    if (isinstance(never_started, str) and never_started
+            and other.get("pid") is None and other.get("provider_pgid") is None
+            and other.get("launch_unit") is None):
+        return None
+    disp_reason = other.get("worktree_disposition_reason")
+    survivors = other.get("fallback_survivors")
+    if disp_reason == "provider_processes_alive" or (isinstance(survivors, dict) and bool(survivors)):
+        return "live"
+    if disp_reason in {"provider_liveness_unknown", "task_record_damaged"}:
+        return "unknown"
+    try:
+        listed_services = dispatch_isolation.listed_task_services(other)
+    except Exception:
+        return "unknown"
+    if listed_services is None:
+        return "unknown"
+    stops = other.get("task_service_stops")
+    if stops is not None and (not isinstance(stops, list) or any(
+        not isinstance(row, dict) or row.get("postcondition") != "true" for row in stops
+    )):
+        return "unknown"
+    if listed_services:
+        stopped_units = {
+            row.get("unit")
+            for row in (stops if isinstance(stops, list) else ())
+            if isinstance(row, dict) and row.get("postcondition") == "true" and isinstance(row.get("unit"), str)
+        }
+        if not set(listed_services).issubset(stopped_units):
+            return "unknown"
+    has_launch_evidence = (
+        other.get("launch_mode") in {"scope", "popen-fallback"}
+        or other.get("pid") is not None
+        or other.get("provider_pgid") is not None
+        or other.get("launch_unit") is not None
+        or other.get("launch_cgroup") is not None
+    )
+    if not has_launch_evidence:
+        return "unknown"
+    try:
+        alive = _provider_alive(other)
+    except Exception:
+        return "unknown"
+    if alive is True:
+        return "live"
+    if alive is None:
+        return "unknown"
+    if (other.get("mode") == "workspace-write" and other.get("worktree_path")
+            and other.get("worktree_disposition") is None):
+        return "unknown"
+    return None
+
+
 def _scan_turn_children(record: dict) -> dict:
     """Inspect every child task dispatched by this turn; fail closed on unreadable or unknown records.
 
@@ -773,6 +830,8 @@ def _scan_turn_children(record: dict) -> dict:
             live.append(child_id)
         elif nonce_malformed or not valid_nonce or not isinstance(child_status, str) or child_status not in store.TERMINAL:
             unknown.append(child_id)
+        elif unsettled := _terminal_child_unsettled_state(other):
+            (live if unsettled == "live" else unknown).append(child_id)
 
     seen_names: set[str] = set()
     try:
@@ -859,6 +918,13 @@ def _enforce_orchestrator(record: dict) -> None:
     record["owned_path_grants_used"] = []
     scan = _scan_turn_children(record)
     _record_turn_children(record, scan)
+    if (record["status"] == "failed" and not record.get("provider_terminal_failure")
+            and str(record.get("error") or "").startswith("agy_child_still_running:")):
+        cause = _child_state_refusal(scan) or (
+            f"orchestrator_orphaned_children: child state blocks completion ({record['error']})"
+        )
+        record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
+        return
     if record["status"] != "done":
         return
     cause: str | None
@@ -2593,10 +2659,9 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 try:
                     if cancel_requested:
                         if _check_scope_runtime_timeout():
-                            if record["status"] != "timeout":
-                                record.pop("no_deliverable_reason", None)
-                                record.update(status="timeout", error="scope RuntimeMaxSec exceeded",
-                                              kill_reason="scope_runtime_max_timeout")
+                            record.pop("no_deliverable_reason", None)
+                            record.update(status="timeout", error="scope RuntimeMaxSec exceeded",
+                                          kill_reason="scope_runtime_max_timeout")
                         elif record["status"] != "cancelled":
                             record.pop("no_deliverable_reason", None)
                             record.update(status="cancelled", error="cancelled by client")

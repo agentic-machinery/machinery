@@ -409,6 +409,7 @@ class AdmissionDecision:
     psi_shadow: dict[str, Any] | None = None
     meter: MeterCheck | None = None
     live_orchestrator_ids: tuple[str, ...] = ()
+    orchestrator_cap_refused: bool = False
 
     @property
     def live_write_workers(self) -> int:
@@ -536,6 +537,7 @@ class AdmissionDecision:
             "max_live_write_workers": limits.max_live_write_workers if limits else None,
             "live_orchestrators": len(self.live_orchestrator_ids),
             "max_live_orchestrators": limits.max_live_orchestrators if limits else None,
+            "orchestrator_cap_refused": self.orchestrator_cap_refused,
             "mem_available_gib": round(mem, 2) if mem is not None else None,
             "min_mem_available_gib": limits.min_mem_available_gib if limits else None,
             "load1": probe.load1 if probe else None,
@@ -2012,7 +2014,8 @@ def evaluate(
             f"live write workers {live}/{limits.max_live_write_workers} reached the cap "
             f"({ENV_MAX_LIVE_WRITE_WORKERS}={limits.max_live_write_workers})"
         )
-    if orchestrator and len(scan.live_orchestrator_ids) >= limits.max_live_orchestrators:
+    orchestrator_cap_refused = bool(orchestrator and len(scan.live_orchestrator_ids) >= limits.max_live_orchestrators)
+    if orchestrator_cap_refused:
         failures.append(
             f"live orchestrator turns {len(scan.live_orchestrator_ids)}/{limits.max_live_orchestrators} reached the cap "
             f"({ENV_MAX_LIVE_ORCHESTRATORS}={limits.max_live_orchestrators})"
@@ -2079,6 +2082,7 @@ def evaluate(
         disk=disk,
         meter=meter_check,
         live_orchestrator_ids=scan.live_orchestrator_ids,
+        orchestrator_cap_refused=orchestrator_cap_refused,
     )
     return replace(
         decision,
