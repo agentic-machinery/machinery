@@ -52,6 +52,7 @@ from lu_machinery.review.security_paths import git_changed_paths
 from lu_machinery.review.target_resolution import (
     ReviewTarget,
     TargetResolutionError,
+    _origin_github_repo,
     diff_against_base,
     repository_target_error,
     resolve_branch_target,
@@ -430,12 +431,18 @@ def _checkout_git(repo_root: Path, *args: str) -> str:
 
 
 def _checkout_repository(repo_root: Path) -> str:
-    """``owner/name`` of the checkout's GitHub origin, which task records must name."""
-    url = _checkout_git(repo_root, "config", "--get", "remote.origin.url")
-    match = re.search(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url)
-    if not match:
+    """``owner/name`` of the checkout's GitHub origin, which task records must name.
+
+    Parsed exactly as target resolution parses it: a case-insensitive, exact
+    ``github.com`` host, so a lookalike host is never read as a repository.
+    """
+    try:
+        origin = _origin_github_repo(repo_root)
+    except (OSError, subprocess.TimeoutExpired):
+        origin = None
+    if origin is None:
         raise CloseoutStateError("repository unknown: pass --repository owner/name")
-    return match.group(1)
+    return origin
 
 
 def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:

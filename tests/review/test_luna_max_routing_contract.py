@@ -1395,8 +1395,12 @@ def test_scripts_relocation_follows_the_reviewed_repository(repository, relocate
         (None, None, True),
         # Local-target preview: the checkout's origin decides when no repository is passed.
         ("https://github.com/kube-dojo/kube-dojo.github.io.git", None, False),
+        ("https://GITHUB.COM/kube-dojo/kube-dojo.github.io.git", None, False),
+        ("git@github.com:kube-dojo/kube-dojo.github.io.git", None, False),
         ("https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", None, True),
         ("https://example.invalid/not-github.git", None, True),
+        # A lookalike host is not GitHub, so the origin stays unknown.
+        ("https://example.invalid/github.com/kube-dojo/kube-dojo.github.io.git", None, True),
     ],
 )
 def test_reviewer_preview_without_branch_facts_judges_scripts_paths_by_repository(
