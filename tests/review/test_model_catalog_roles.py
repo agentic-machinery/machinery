@@ -32,6 +32,7 @@ from tests.review.test_model_catalog import (
     CURRENT_INPUTS as APPROVED_INPUTS,
 )
 from tests.review.test_model_catalog import (
+    CURRENT_CATALOG_REVIEW_DATE,
     FIXED_NOW,
     GROK_REVIEW_CANDIDATE,
     assert_frozen_surfaces,
@@ -460,5 +461,6 @@ def test_frozen_complete_reviewer_receipts(index, tmp_path, monkeypatch):
         assert res == approved_dispatcher_spelling(json.loads(encode(paired)))
         assert res["value"]["resolved_risk"] == "critical"
         assert res["value"]["selected"]["name"] == "gemini-4-neon-high"
-    expected = APPROVED_BASELINE["reviewer"][index]
+    expected = deepcopy(APPROVED_BASELINE["reviewer"][index])
+    expected["value"]["catalog_reviewed_on"] = CURRENT_CATALOG_REVIEW_DATE
     assert res == expected

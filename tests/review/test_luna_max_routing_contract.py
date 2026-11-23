@@ -566,7 +566,7 @@ def test_medium_risk_uses_sonnet_and_omits_retired_pool():
 def test_policy_receipt_exposes_catalog_version_date_and_risk():
     resolution = resolve_reviewer(ResolverInputs(author_model="codex", risk="high", claude_account=HOST_ACCOUNT))
     assert resolution.policy_version == "deterministic-formal-routing.v2"
-    assert resolution.catalog_reviewed_on == "2026-10-23"
+    assert resolution.catalog_reviewed_on == "2026-11-23"
     assert resolution.resolved_risk == "high"
 
 
