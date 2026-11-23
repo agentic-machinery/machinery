@@ -139,6 +139,8 @@ def fetch_open_prs(slug: str) -> list[dict]:
         )
     except (subprocess.SubprocessError, OSError) as exc:
         raise RuntimeError(f"cannot list open PRs of {slug}: {type(exc).__name__}") from exc
+    if (refusal := github_client.refusal_of(proc)) is not None:
+        raise refusal
     try:
         prs = json_depth.loads(proc.stdout, max_depth=512) if proc.returncode == 0 else None
     except ValueError:

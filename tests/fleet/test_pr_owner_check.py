@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from lu_machinery.common.github_client import GitHubRateLimited, Result
 from lu_machinery.fleet import pr_owner_check as check
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 
@@ -194,6 +195,16 @@ def test_fetch_open_prs_fails_closed_on_gh_error_and_truncation(monkeypatch):
     assert len(check.fetch_open_prs(PUBLIC)) == check._PR_LIMIT
     monkeypatch.setattr(check.github_client, "run", fake(json.dumps([pr(1, "a")])))
     assert check.fetch_open_prs(PUBLIC) == [pr(1, "a")]
+
+
+def test_open_pr_list_preserves_the_shared_clients_rate_limit_reset(monkeypatch):
+    refusal = Result(status=429, error="github_rate_limited", reset_at=1795424400, reason="retry_after")
+    monkeypatch.setattr(check.github_client, "run", lambda *a, **k: SimpleNamespace(
+        stdout="", stderr="", returncode=75, github_result=refusal,
+    ))
+    with pytest.raises(GitHubRateLimited) as caught:
+        check.fetch_open_prs(PUBLIC)
+    assert (caught.value.reset_at, caught.value.reason) == (1795424400, "retry_after")
 
 
 def test_fetch_open_prs_rejects_unusable_rows_and_transport_errors(monkeypatch):
