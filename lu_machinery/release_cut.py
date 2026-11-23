@@ -520,16 +520,27 @@ def _running_publisher_base() -> tuple[list[str | Path], Path | None]:
         raise CutError("cannot locate the running lu_machinery package for lu_machinery.publish")
     try:
         resolved_package = Path(package_file).resolve(strict=True)
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         raise CutError(f"cannot resolve running lu_machinery package {package_file!r}: {exc}") from exc
     if resolved_package.parent.name != "lu_machinery":
         raise CutError(f"unexpected lu_machinery package path: {resolved_package}")
     package_root = resolved_package.parents[1]
-    site_roots = [
-        Path(path).resolve()
-        for key in ("purelib", "platlib")
-        if (path := sysconfig.get_path(key))
-    ]
+    site_roots: list[Path] = []
+    for key in ("purelib", "platlib"):
+        raw = sysconfig.get_path(key)
+        if not raw:
+            continue
+        candidate = Path(raw)
+        try:
+            os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise CutError(f"cannot inspect running interpreter {key} path {raw!r}: {exc}") from exc
+        try:
+            site_roots.append(candidate.resolve(strict=True))
+        except (OSError, RuntimeError) as exc:
+            raise CutError(f"cannot resolve running interpreter {key} path {raw!r}: {exc}") from exc
     if package_root in site_roots:
         return [python, "-I", "-m", "lu_machinery.publish"], None
     root_text = str(package_root)
@@ -572,6 +583,7 @@ class Cut:
     product_milestone: str | None = None
     publisher_python: Path | None = None
     keep_collection_overlay: bool = False
+    _publisher_blocked_reason: str | None = field(default=None, init=False)
 
     # Plumbing
 
@@ -650,6 +662,8 @@ class Cut:
 
     def publisher_invocation(self, *args: str) -> tuple[list[str | Path], dict[str, str]]:
         """Command and environment for ``lu_machinery.publish`` using the release's own code."""
+        if self._publisher_blocked_reason is not None:
+            raise CutError(self._publisher_blocked_reason)
         if self.publisher_python is not None:
             return [self.publisher_python.absolute(), "-I", "-m", "lu_machinery.publish", *args], self.env()
         base, package_root = _running_publisher_base()
@@ -1129,8 +1143,8 @@ class Cut:
         site = self.run([python, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"]).stdout.strip()
         lines = "".join(f"import site; site.addsitedir({path!r})\n" for path in dict.fromkeys(paths))
         overlay = Path(site, "zz-release-cut-consumer.pth")
-        overlay.write_text(lines, encoding="utf-8")
         try:
+            overlay.write_text(lines, encoding="utf-8")
             shown = self.run([python, "-c", _SHOW_LU], cwd=product, env=self.scratch_env()).stdout.split()
             if shown[0] != self.built or not Path(shown[1]).resolve().is_relative_to(Path(site).resolve()):
                 raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
@@ -1145,7 +1159,13 @@ class Cut:
             return summary
         finally:
             if not self.keep_collection_overlay:
-                overlay.unlink(missing_ok=True)
+                try:
+                    overlay.unlink(missing_ok=True)
+                except OSError as exc:
+                    self._publisher_blocked_reason = (
+                        f"refusing publisher: failed to remove consumer overlay {overlay}: {exc}"
+                    )
+                    raise
 
     def contract_canary(self) -> subprocess.CompletedProcess[str]:
         """The candidate's canary orchestration and sealed candidate receipt gate."""
@@ -1246,9 +1266,10 @@ class Cut:
         if tagged is None or release is None:
             return f"remote state of {tag} unknown (tag {tagged}, release {release}); nothing withdrawn"
         if release == "released":
+            x_agent_flag = f" --x-agent {shlex.quote(self.x_agent)}" if self.x_agent else ""
             resume = (
-                f"{shlex.quote(str(self.publisher_python))} -I -m lu_machinery.release_cut post-release"
-                if self.publisher_python is not None else "release_cut post-release"
+                f"{shlex.quote(str(self.publisher_python))} -I -m lu_machinery.release_cut post-release{x_agent_flag}"
+                if self.publisher_python is not None else f"release_cut post-release{x_agent_flag}"
             )
             return (f"{tag} is a full release; nothing withdrawn. Remaining: mark the adopt PR "
                     f"{adopt if adopt is not None else 'unknown'} ready, then run {resume}")
@@ -1370,7 +1391,6 @@ def execute(cut: Cut) -> int:
     files = cut.build(built)
     consumer_lock = cut.wheelhouse(files, built)
     python = cut.install(consumer_lock, built)
-    cut.publisher_python = python
     product = cut.work / "product"
     ci = cut.ci
     pending = "Pre-release: acceptance is running. Adopt only after this release is no longer a pre-release.\n"
