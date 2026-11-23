@@ -19,7 +19,7 @@ from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
 from tests.dispatcher.conftest import await_file as await_file
 from tests.dispatcher.conftest import prior_worktree as prior_worktree
 from tests.dispatcher.conftest import run_git as run_git
-from tests.dispatcher.test_providers_b import _github_meta_path
+from tests.dispatcher.test_providers_b import _bwrap_usable, _github_meta_path
 from tests.dispatcher.test_site_deps_node import _write_fake_toolchain
 from tests.helpers.product_tree import configured_roots as configured_roots
 
@@ -652,11 +652,9 @@ def test_agy_sandbox_node_toolchain_reads_admits_bin_and_modules_and_refuses_uns
             agy_sandbox._node_toolchain_reads(forbidden, home=home, reject_root=primary, worktree=worktree)
 
 
+@pytest.mark.skipif(not _bwrap_usable(), reason="needs a usable unprivileged bubblewrap")
 def test_agy_sandbox_exposes_pinned_node_toolchain_read_only_and_refuses_missing_pin(tmp_path: Path):
     """Defect class: read-only AGY bubblewrap sandbox hiding /opt/lu-node or failing to put pinned Node on PATH."""
-    if agy_sandbox.unavailable() is not None:
-        pytest.skip(agy_sandbox.unavailable() or "bwrap unavailable")
-
     repo = tmp_path / "repo"
     repo.mkdir()
     run_git(repo, "init", "-q", "-b", "main")

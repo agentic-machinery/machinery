@@ -960,9 +960,12 @@ def _admit_toolchain_read_dir(path: Path, *, home: Path, reject_root: Path, work
 
 def _node_toolchain_reads(bin_dir: Path, *, home: Path, reject_root: Path, worktree: Path) -> list[Path]:
     """Read-only mounts for a worktree-pinned Node/npm toolchain: ``bin/`` and its sibling ``lib/node_modules``."""
-    resolved_home = home.resolve()
-    resolved_reject = reject_root.resolve()
-    resolved_worktree = worktree.resolve()
+    try:
+        resolved_home = home.resolve()
+        resolved_reject = reject_root.resolve()
+        resolved_worktree = worktree.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise Refused("node_toolchain_sandbox_refused: sandbox boundary root is unreadable") from exc
     reads = [_admit_toolchain_read_dir(bin_dir, home=resolved_home, reject_root=resolved_reject, worktree=resolved_worktree)]
     if reads[0].name == "bin":
         modules = reads[0].parent / "lib" / "node_modules"
@@ -1315,7 +1318,7 @@ class _Boundary:
         node_bin: Path | None = None
         node_reads: list[Path] = []
         try:
-            node_bin = site_deps.resolve_toolchain_dir(self.worktree, env=os.environ)
+            node_bin = site_deps.resolve_toolchain_dir(self.worktree)
         except site_deps.NodeToolchainError as exc:
             raise Refused(str(exc)) from exc
         if node_bin is not None:
@@ -1506,7 +1509,11 @@ class _Boundary:
         }
         env.update(AGY_APP_DATA_DIR=str(app), **{name: os.environ[name] for name in _AGY_AUTH if name in os.environ})
         try:
-            self.process = subprocess.Popen(argv, env=env, cwd=cwd, pass_fds=(report_write, go_read))
+            # argv comes from wrap_argv_with_sandbox and env["PATH"]'s node_bin is a canonical,
+            # validated toolchain bin dir (_admit_toolchain_read_dir + resolve_toolchain_dir).
+            self.process = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+                argv, env=env, cwd=cwd, pass_fds=(report_write, go_read),
+            )
         finally:
             os.close(report_write)
             os.close(go_read)
