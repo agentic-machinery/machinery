@@ -454,3 +454,28 @@ def test_post_response_pruning_commits_before_connection_close(tmp_path, monkeyp
     assert transactions and not any(transactions)
     with sqlite3.connect(tmp_path / "cache.sqlite3") as db:
         assert db.execute("SELECT count(*) FROM cache").fetchone() == (0,)
+
+
+def test_large_response_never_evicts_small_conditional_entry(tmp_path):
+    """Responses above the body limit must not replace or evict useful ETags."""
+    limit = gh.CACHE_MAX_BODY_BYTES
+    seen = []
+    bodies = [b'{"small":true}', b'"' + b'x' * (limit - 2) + b'"', b'"' + b'x' * (limit - 1) + b'"']
+
+    def transport(method, endpoint, headers, body, timeout):
+        seen.append((endpoint, headers.get("If-None-Match")))
+        if endpoint == "small" and len(seen) > 3:
+            return gh.Response(304, {}, b"")
+        return gh.Response(200, {"etag": endpoint}, bodies[len(seen) - 1])
+
+    client = gh.GitHubClient(cache_dir=tmp_path, env={}, clock=lambda: 1000,
+                             cache_max_bytes=limit + 1000, transport=transport)
+    assert client.request("GET", "small").value == {"small": True}
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as db:
+        db.execute("INSERT INTO cache VALUES(?,?,?,?,?)", (client.scope, "legacy", b"x" * (limit + 1), "{}", 999))
+    assert len(client.request("GET", "boundary").value) == limit - 2
+    assert len(client.request("GET", "large").value) == limit - 1
+    assert client.request("GET", "small").status == 304
+    assert seen[-1] == ("small", "small")
+    with sqlite3.connect(tmp_path / "cache.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM cache").fetchone() == (2,)

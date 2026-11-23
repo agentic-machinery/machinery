@@ -19,7 +19,7 @@ from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from lu_machinery.common import json_depth
+from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet.ignored_task_output import succession_streams
@@ -45,6 +45,57 @@ GRACE_SECONDS = 2 * 3600
 # A persistent scan error stays in the journal without a line on every keeper minute.
 _SUMMARY = timedelta(hours=1)
 _CHECKPOINT_KEYS = frozenset({"report", "route"})
+_CLOSED_PRS_QUERY = """query($owner:String!, $name:String!, $cursor:String) {
+  repository(owner:$owner, name:$name) {
+    nameWithOwner
+    pullRequests(first:100, after:$cursor, states:[CLOSED, MERGED],
+                 orderBy:{field:UPDATED_AT, direction:DESC}) {
+      nodes { number url updatedAt mergedAt headRefName headRefOid
+              headRepository { nameWithOwner } mergeCommit { oid } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+
+
+def closed_pull_pager(slug: str):
+    """Fetch only the fields the merged-head index uses, in its 100-record pages."""
+    owner, name = slug.split("/", 1)
+    client = github_client.GitHubClient()
+    cursor = None
+    finished = False
+
+    def page(_slug: str, number: int) -> list[dict[str, Any]]:
+        nonlocal cursor, finished
+        if finished:
+            return []
+        result = client.request(
+            "POST", "graphql", payload={"query": _CLOSED_PRS_QUERY,
+                                         "variables": {"owner": owner, "name": name, "cursor": cursor}},
+            fresh=True,
+        )
+        try:
+            target = result.require_fresh()["data"]["repository"]
+            connection = target["pullRequests"]
+            nodes, info = connection["nodes"], connection["pageInfo"]
+            more, next_cursor = info["hasNextPage"], info["endCursor"]
+            if (target["nameWithOwner"].casefold() != slug.casefold() or not isinstance(nodes, list)
+                    or len(nodes) > 100 or type(more) is not bool
+                    or (more and (len(nodes) != 100 or not isinstance(next_cursor, str) or next_cursor == cursor))):
+                raise ValueError("incomplete closed PR page")
+            rows = [
+                {"number": node["number"], "html_url": node["url"], "updated_at": node["updatedAt"],
+                 "merged_at": node["mergedAt"], "merge_commit_sha": (node["mergeCommit"] or {}).get("oid"),
+                 "head": {"ref": node["headRefName"], "sha": node["headRefOid"],
+                          "repo": {"full_name": (node["headRepository"] or {}).get("nameWithOwner")}}}
+                for node in nodes
+            ]
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError("malformed closed PR page") from exc
+        cursor, finished = next_cursor, not more
+        return rows
+
+    return page
 
 
 def owner_lanes() -> dict[str, str]:
@@ -255,7 +306,7 @@ def scan(
             merged = stale.build_pull_index(
                 slug,
                 oldest_start=min(c.task_start or since for c, _, since in pending_prs),
-                pager=stale.gh_pull_page,
+                pager=closed_pull_pager(slug),
                 max_pages=stale.DEFAULT_MAX_PR_PAGES,
             )
             if merged.error or merged.covered_since is not None:
