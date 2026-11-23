@@ -43,6 +43,7 @@ from lu_machinery.session_streams.store import (
     LifecycleError,
     NotFoundError,
     SessionStreamStore,
+    TurnLeaseUnclearedError,
     validate_entry_body,
 )
 
@@ -913,6 +914,18 @@ def remote_claim(
         response = _stream_response(store, stream_id, limit)
         response["outcome"] = outcome
         return JSONResponse(content=response, headers={"Cache-Control": "no-store"})
+    except TurnLeaseUnclearedError as exc:
+        # A verified occupancy conflict: the dispatcher reads only this detail prefix as "stream leased".
+        detail = str(exc)
+        try:
+            lease = _stream_response(store, stream_id, limit).get("lease")
+        except Exception:
+            lease = None
+        if isinstance(lease, dict):
+            current = lease.get("holder") or {}
+            detail += (f"; current holder={current.get('agent', '?')}/{current.get('harness', '?')} "
+                       f"instance_id={current.get('instance_id', '?')}; expires_at={lease.get('expires_at', '?')}")
+        return _error(409, detail)
     except LeaseConflictError:
         try:
             projection = _stream_response(store, stream_id, limit)

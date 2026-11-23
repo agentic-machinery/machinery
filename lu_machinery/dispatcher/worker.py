@@ -537,12 +537,15 @@ def _guard_launch_cleanup(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
                 "launch cleanup failed for %s: %s", spec.task_id, _launch_cleanup_text(again))
 
 
-def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, progress: dict | None = None) -> None:
+def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, progress: dict | None = None,
+          scope_limits: tuple[int, int] | None = None) -> None:
     """Publish the task record and spawn its supervisor.
 
     ``progress`` is the caller's launch progress: ``progress["record"]`` is set immediately before the record
     that names the prompt file can be published, and ``progress["started"]`` immediately before the first
     supervisor spawn attempt, so a failure before it (record, prompt or log setup) proves no supervisor ran.
+    ``scope_limits`` (an orchestrator turn's ``RuntimeMaxSec`` and ``TimeoutStopSec``) bounds a scope launch
+    and refuses the plain-process fallback.
     """
     from lu_machinery.orchestration.dispatch_admission import new_admission_hold
 
@@ -574,6 +577,7 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, p
                     env={**os.environ,
                          "LEARN_UKRAINIAN_DISPATCH_TASK_ID": spec.task_id,
                          "LEARN_UKRAINIAN_DISPATCH_AGENT": spec.agent},
+                    **({} if scope_limits is None else {"scope_limits": scope_limits}),
                 )
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, mask)
@@ -735,8 +739,8 @@ def _turn_tree_unproven(record: dict) -> bool:
     A turn is judged on its final tree, so nothing it started may still write it when the snapshot is taken.
     Only a scope launch can prove that: its cgroup holds every descendant, while a fallback launch records one
     process group, which a descendant can leave. No other task can write the tree: dispatch refuses a --cwd
-    attachment to it and a turn's task service (host_admission.turn_writer_refusal); any service stop is
-    still verified.
+    attachment to a turn's tree and from a turn's child (host_admission.turn_tree_refusal); a service an older
+    record lists is still stopped and verified.
     """
     if record.get("launch_mode") != "scope":
         return True
@@ -752,13 +756,14 @@ def _turn_tree_unproven(record: dict) -> bool:
 
 
 def _release_stream(record: dict, *, evidence_lost: bool) -> None:
-    """Free a settled orchestrator turn's stream once nothing of its run can write (DRIVERS-1122).
+    """Release a settled orchestrator turn's Monitor stream lease once nothing of its run can write (DRIVERS-1122).
 
     Only on proof: the published record is terminal and still this run's turn, its launch was a scope whose
     probe (``_provider_alive``) answers False, so every descendant has exited, and it lists no task service.
     ``evidence_lost`` (the record was found damaged, replaced or missing and had to be rebuilt) keeps the
-    reservation, as do a fallback launch, a probe error and anything unknown; so does a supervisor that dies
-    first. The reservation file is released only for this task id and nonce.
+    lease, as do a fallback launch, a probe error and anything unknown; so does a supervisor that dies
+    first. Only the exact lease this run claimed is released, at the Monitor that granted it; a Monitor
+    outage or a lost answer keeps it held until its exact holder or an operator releases it.
     """
     if evidence_lost:
         return
@@ -778,8 +783,9 @@ def _release_stream(record: dict, *, evidence_lost: bool) -> None:
             return
     except Exception:  # any unreadable state is not proof, and never ends this settlement
         return
-    if reason := host_admission.release_stream(stream, published["task_id"], published["run_nonce"]):
-        print(f"dispatcher: {stream} stays reserved: {reason}", file=sys.stderr)
+    if reason := host_admission.release_turn(published.get(host_admission.TURN_LEASE_KEY), stream=stream,
+                                             task_id=published["task_id"], run_nonce=published["run_nonce"]):
+        print(f"dispatcher: {stream} stays leased: {reason}", file=sys.stderr)
 
 
 def _enforce_delivery(record: dict) -> None:

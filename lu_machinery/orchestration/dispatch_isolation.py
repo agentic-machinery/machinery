@@ -15,10 +15,11 @@ If the process image is already the worker, that process is kept. If ``/proc``
 cannot show which image it is, or the start marker arrives only as the process
 is stopped, the dispatch fails instead of starting a second worker. Isolation
 is required inside a driver scope: plain-process fallback there is refused.
-A transient service a task starts (a review-candidate API, a background test)
-is created with ``BindsTo`` and ``PartOf`` on that task's scope, and settlement
-stops that service and checks it is gone. A failed or unreadable check does not
-retry and does not call ``reset-failed``.
+A caller may also refuse fallback outright and bound the scope's run time
+(``RuntimeMaxSec``, then ``TimeoutStopSec`` before the whole control group is
+killed), as an orchestrator turn does. Settlement still stops any transient
+service an older task record lists and checks it is gone. A failed or
+unreadable check does not retry and does not call ``reset-failed``.
 
 A worker that dispatches workers of its own (a builder that starts writers)
 runs under the sanitized agent environment, which has neither
@@ -198,11 +199,17 @@ def _unit_piece(value: str, limit: int) -> str:
     return piece or "x"
 
 
+def _whole_seconds(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
 def build_scope_argv(
     cmd: Sequence[str],
     *,
     unit: str,
     slice_unit: str = SLICE_UNIT,
+    runtime_max_s: int | None = None,
+    stop_timeout_s: int | None = None,
 ) -> list[str]:
     """``systemd-run`` argv. ``--scope`` execs ``cmd`` in place after ``--``.
 
@@ -210,7 +217,21 @@ def build_scope_argv(
     ``$NAME`` and ``${NAME}`` in these arguments before exec, so a ``--cwd``
     path that contains ``$`` would reach the worker changed. Plain ``Popen``
     does not expand them.
+
+    ``runtime_max_s`` and ``stop_timeout_s`` go together (positive whole seconds): the scope is stopped once it
+    has run ``RuntimeMaxSec`` (systemd.scope(5), 244+), every process in its control group gets SIGTERM, and
+    whatever is left ``TimeoutStopSec`` later gets SIGKILL (systemd.kill(5)).
     """
+    limits: list[str] = []
+    if runtime_max_s is not None or stop_timeout_s is not None:
+        if not (_whole_seconds(runtime_max_s) and _whole_seconds(stop_timeout_s)):
+            raise ValueError("scope limits need positive whole seconds for both the run and the stop")
+        limits = [
+            f"--property=RuntimeMaxSec={runtime_max_s}",
+            f"--property=TimeoutStopSec={stop_timeout_s}",
+            "--property=KillMode=control-group",
+            "--property=SendSIGKILL=yes",
+        ]
     return [
         "systemd-run",
         "--user",
@@ -220,6 +241,7 @@ def build_scope_argv(
         f"--unit={unit}",
         "--collect",
         "--quiet",
+        *limits,
         "--",
         *cmd,
     ]
@@ -232,11 +254,6 @@ _SERVICE_GONE = frozenset({"inactive", "failed", "unknown"})
 def _task_service_tag(task_id: str) -> str:
     """Identity of this exact task id. Truncating the id would make ``scratch-task`` and ``scratch-task-`` one unit."""
     return hashlib.sha256(task_id.encode()).hexdigest()
-
-
-def task_service_name(task_id: str) -> str:
-    """Stem of one transient service for ``task_id``. systemd appends ``.service``."""
-    return f"lu-task-{_task_service_tag(task_id)}-{secrets.token_hex(_UNIT_TOKEN_BYTES)}"
 
 
 def _service_stem(unit: str, *, task_id: str) -> str | None:
@@ -259,32 +276,6 @@ def _service_stem(unit: str, *, task_id: str) -> str | None:
     return None
 
 
-def task_service_matches(unit: str, *, task_id: str) -> bool:
-    """Whether ``unit`` is a stem :func:`task_service_name` gives this task, with or without ``.service``."""
-    return _service_stem(unit, task_id=task_id) is not None
-
-
-def build_task_service_argv(cmd: Sequence[str], *, unit: str, scope_unit: str) -> list[str]:
-    """``systemd-run`` argv for a service that ends with ``scope_unit``.
-
-    ``BindsTo`` and ``PartOf`` propagate stop from the scope to this service,
-    not the other way around. ``--collect`` unloads it once it is inactive or
-    failed, so the caller never uses ``reset-failed``.
-    """
-    scope = scope_unit if scope_unit.endswith(_SCOPE_SUFFIX) else f"{scope_unit}{_SCOPE_SUFFIX}"
-    return [
-        "systemd-run",
-        "--user",
-        "--collect",
-        f"--unit={unit}",
-        f"--property=BindsTo={scope}",
-        f"--property=After={scope}",
-        f"--property=PartOf={scope}",
-        "--",
-        *cmd,
-    ]
-
-
 def _service_list_path(task_id: object) -> Path | None:
     if not isinstance(task_id, str):
         return None
@@ -294,23 +285,6 @@ def _service_list_path(task_id: object) -> Path | None:
         return task_scratch_path(task_id) / "task-services.txt"
     except (ValueError, ImportError, OSError):
         return None
-
-
-def _remember_service(task_id: str, unit: str) -> None:
-    """Append ``unit`` to the task scratch list. A symlink or a failed write is skipped."""
-    path = _service_list_path(task_id)
-    if path is None:
-        return
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, flags, 0o600)
-    except OSError:
-        return
-    try:
-        os.write(fd, f"{unit}\n".encode())
-    finally:
-        os.close(fd)
 
 
 def _read_service_list(task_id: object) -> list[str] | None:
@@ -417,53 +391,6 @@ def _service_attempt(
     if state:
         row["state"] = state[:80]
     attempts.append(row)
-
-
-def start_task_service(
-    record: dict[str, Any],
-    cmd: Sequence[str],
-    *,
-    run: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
-) -> str:
-    """Start ``cmd`` as a transient user service bound to this task's scope.
-
-    The unit name is recorded on ``record`` and in the task scratch before the
-    start, so settlement can stop it if this process dies after systemd has
-    the service. Refuses a launch that is not this task's own scope, and an
-    orchestrator turn's service (DRIVERS-1122): the turn is judged on its tree
-    after its scope drains, which a service would outlive. That refusal comes
-    before any scratch or systemd side effect.
-    """
-    from lu_machinery.dispatcher import host_admission
-    from lu_machinery.dispatcher.ownership import TASK_ID_ENV
-
-    task_id, scope, nonce = record.get("task_id"), record.get("launch_unit"), record.get("run_nonce")
-    if record.get("launch_mode") != LAUNCH_SCOPE or not isinstance(task_id, str) or not isinstance(scope, str):
-        raise DispatchIsolationError("a task service requires this task's scope launch")
-    if not isinstance(nonce, str) or not scope_unit_matches(scope, task_id=task_id, run_nonce=nonce):
-        raise DispatchIsolationError("launch unit is not this task's scope")
-    # The reservation file attributes a turn, so a record copy without its orchestrator key is still one, as is
-    # any process that inherited the turn's task id.
-    if "orchestrator" in record:
-        raise DispatchIsolationError("orchestrator_turn_writer_refused: an orchestrator turn starts no task service")
-    inherited = os.environ.get(TASK_ID_ENV)
-    if refusal := host_admission.turn_writer_refusal(task_ids={task_id, *([inherited] if inherited else [])}):
-        raise DispatchIsolationError(refusal)
-    unit = task_service_name(task_id)
-    if not task_service_matches(unit, task_id=task_id):
-        raise DispatchIsolationError("refusing a unit name that is not this task's")
-    record["task_services"] = [*list(record.get("task_services") or []), unit]
-    _remember_service(task_id, unit)
-    argv = build_task_service_argv(cmd, unit=unit, scope_unit=scope)
-    try:
-        proc = (run or _systemctl)(argv)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise DispatchIsolationError(f"task service did not start: {type(exc).__name__}") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        tail = detail[-1][:200] if detail else f"exit {proc.returncode}"
-        raise DispatchIsolationError(f"task service did not start: {tail}")
-    return unit
 
 
 def stop_task_services(
@@ -637,6 +564,8 @@ def spawn_detached_worker(
     timeout_s: float = PROBE_TIMEOUT_S,
     cgroup_mount: Path = Path("/sys/fs/cgroup"),
     subtree_path: Path | None = None,
+    runtime_max_s: int | None = None,
+    stop_timeout_s: int | None = None,
 ) -> tuple[subprocess.Popen[Any], WorkerLaunch]:
     """Start ``cmd`` in the slice, or plain ``Popen`` when isolation is unavailable.
 
@@ -650,6 +579,8 @@ def spawn_detached_worker(
     of starting a second worker. A process that is already the worker is
     returned as-is. ``start_new_session=True`` matches the historical spawn.
     The launch records how the probe or ``systemd-run`` reached the user bus.
+    ``runtime_max_s`` and ``stop_timeout_s`` bound the scope (:func:`build_scope_argv`); a caller that passes
+    them also passes ``allow_fallback=False``, since a plain process has no such bound.
     """
     if not cmd:
         raise ValueError("worker command is empty")
@@ -688,6 +619,8 @@ def spawn_detached_worker(
         slice_unit=slice_unit,
         unit=unit,
         timeout_s=timeout_s,
+        runtime_max_s=runtime_max_s,
+        stop_timeout_s=stop_timeout_s,
     )
     if proc is not None:
         return proc, WorkerLaunch(mode=LAUNCH_SCOPE, unit=unit, user_bus=scope_bus.as_state())
@@ -810,6 +743,8 @@ def _try_scope(
     slice_unit: str,
     unit: str,
     timeout_s: float,
+    runtime_max_s: int | None = None,
+    stop_timeout_s: int | None = None,
 ) -> tuple[subprocess.Popen[Any] | None, str | None]:
     read_fd, write_fd = os.pipe()
     try:
@@ -818,7 +753,8 @@ def _try_scope(
         # wrapper removes what was added only for systemd-run (#9514).
         scope_env = scope_bus.env
         wrapped = [cmd[0], "-c", _MARKER_CODE, str(write_fd), ",".join(scope_bus.derived), *cmd]
-        argv = build_scope_argv(wrapped, unit=unit, slice_unit=slice_unit)
+        argv = build_scope_argv(wrapped, unit=unit, slice_unit=slice_unit, runtime_max_s=runtime_max_s,
+                                stop_timeout_s=stop_timeout_s)
         start = _file_size(stderr_log)
         try:
             proc = popen(

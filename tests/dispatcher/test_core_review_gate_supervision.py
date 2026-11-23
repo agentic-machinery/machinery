@@ -299,9 +299,9 @@ def test_settlement_stops_a_task_scoped_transient_service(monkeypatch, tmp_path)
     """Defect class: transient service still running after settlement.
 
     A review-candidate API started with systemd-run stayed up for about 30 hours
-    after its task ended, because nothing bound it to the task scope or stopped
-    it at settlement. A unit that is still active is not recorded as stopped,
-    and reset-failed is not used.
+    after its task ended, because nothing stopped it at settlement. A service an
+    older record lists is still stopped and checked; a unit that is still active
+    is not recorded as stopped, and reset-failed is not used.
     """
     from lu_machinery.orchestration import dispatch_isolation as iso
 
@@ -313,16 +313,11 @@ def test_settlement_stops_a_task_scoped_transient_service(monkeypatch, tmp_path)
     record = {
         "task_id": "scratch-task", "launch_mode": "scope", "launch_unit": scope, "run_nonce": nonce,
     }
-    started_argv: list[list[str]] = []
-
-    def started(argv):
-        started_argv.append(list(argv))
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    unit = iso.start_task_service(record, ["sleep", "30"], run=started)
-    assert f"--property=BindsTo={scope}.scope" in started_argv[0]
-    assert f"--property=PartOf={scope}.scope" in started_argv[0]
-    assert (base / "scratch-task" / "task-services.txt").read_text() == f"{unit}\n"
+    # What an older dispatcher's service start left: the unit on the record and in the task scratch.
+    unit = f"lu-task-{iso._task_service_tag('scratch-task')}-0123abcd"
+    record["task_services"] = [unit]
+    (base / "scratch-task").mkdir()
+    (base / "scratch-task" / "task-services.txt").write_text(f"{unit}\n")
 
     live_calls: list[list[str]] = []
 
@@ -340,7 +335,7 @@ def test_settlement_stops_a_task_scoped_transient_service(monkeypatch, tmp_path)
     assert foreign["task_service_stops"][-1]["result"] == "refused"
     assert not any("lu-worker-not-this-task" in part for call in live_calls for part in call)
     for other_id in ("scratch-task-", "scratch-task_", "scratch-task."):
-        assert iso.task_service_matches(unit, task_id=other_id) is False
+        assert iso._service_stem(unit, task_id=other_id) is None
         other = {"task_id": other_id, "task_services": [unit]}
         before = len(live_calls)
         iso.stop_task_services(other, run=still_active, alert=lambda *args: alerts.append(args))
@@ -509,7 +504,7 @@ def test_task_scratch_goes_once_the_provider_is_proven_gone_whatever_the_worktre
     # failed stop (is-active exit 3), keeps the scratch.
     from lu_machinery.orchestration import dispatch_isolation as iso
 
-    late = iso.task_service_name("scratch-task")
+    late = f"lu-task-{iso._task_service_tag('scratch-task')}-89abcdef"
     (base / "scratch-task" / "task-services.txt").write_text(f"{late}\n")
     alerts: list[tuple[str, ...]] = []
     monkeypatch.setattr(iso, "_publish_task_service_alert", lambda *args: alerts.append(args))

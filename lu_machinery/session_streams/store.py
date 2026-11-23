@@ -42,6 +42,11 @@ from .model import (
 
 MAX_ENTRY_BYTES = 65_536
 MAX_TTL_SECONDS = 86_400
+# The holder harness of every orchestrator turn's stream lease (DRIVERS-1122): the dispatcher claims with it, and
+# no claim or PID force close supersedes an active lease when either side names it.
+TURN_HOLDER_HARNESS = "dispatch-turn"
+# The stable prefix of a turn conflict, in the error and in the claim route's 409 detail.
+TURN_CONFLICT_PREFIX = "turn_lease_uncleared"
 SECRET_PATTERNS = (
     ("private-key", re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |PGP )?PRIVATE KEY-----")),
     ("credential-token", re.compile(r"(?:sk-|gh[pousr]_|AIza)[A-Za-z0-9_-]{16,}")),
@@ -218,6 +223,23 @@ class NotFoundError(SessionStreamError):
 
 class LeaseConflictError(SessionStreamError):
     """Raised when a mutation lacks the exact current valid lease."""
+
+
+class TurnLeaseUnclearedError(LeaseConflictError):
+    """An active lease a dispatch turn holds, or one a turn would supersede, whether or not its TTL has passed.
+
+    Expiry is no proof that a turn has stopped, so only the exact holder's release or an attributed force release
+    clears it (DRIVERS-1122).
+    """
+
+
+def _turn_conflict(predecessor_harness: str, candidate_harness: str) -> TurnLeaseUnclearedError | None:
+    if TURN_HOLDER_HARNESS not in (predecessor_harness, candidate_harness):
+        return None
+    return TurnLeaseUnclearedError(
+        f"{TURN_CONFLICT_PREFIX}: an active lease is never superseded when it or its successor is a dispatch turn; "
+        "only the exact holder's release or an attributed force release clears it"
+    )
 
 
 class LifecycleError(SessionStreamError):
@@ -657,6 +679,9 @@ class SessionStreamStore:
         The transaction deliberately treats an exact replay as authoritative
         even after its TTL elapsed.  That is what lets a late heartbeat revive
         the original lease until a successor has committed the recovery CAS.
+        An active lease whose holder or claimant is a dispatch turn is never
+        superseded, expired or not (``TurnLeaseUnclearedError``); TTL recovery
+        stays for legacy holders on both sides.
         """
         stream_id = validate_stream_id(stream_id)
         if not stream_id.startswith("epic:"):
@@ -687,6 +712,8 @@ class SessionStreamStore:
                 if same_identity and projection["state"] == "active":
                     return current, "replayed"
                 if projection["state"] == "active":
+                    if conflict := _turn_conflict(current.holder.harness, holder.harness):
+                        raise conflict
                     expires = parse_timestamp(str(projection["expires_at"]))
                     if current_time < expires:
                         raise LeaseConflictError("epic stream has a live holder")
@@ -1342,7 +1369,9 @@ class SessionStreamStore:
         TTL expiry is **not** required: a dead local process cannot renew the lease,
         and waiting for a multi-hour launcher TTL blocked relaunch after crash (#5630
         only covered expired+dead). A still-live holder process is never force-closed,
-        whether or not the wall-clock TTL has elapsed.
+        whether or not the wall-clock TTL has elapsed. A dispatch turn's lease, and a
+        turn as the candidate, are refused (``TurnLeaseUnclearedError``): a turn's
+        recorded process is the dispatcher that claimed it, which exits after launch.
         """
         stream_id = validate_stream_id(stream_id)
         candidate.validate()
@@ -1358,6 +1387,8 @@ class SessionStreamStore:
             ).fetchone()
             if row is None or row["state"] != "active":
                 raise LeaseConflictError("crashed session has no exact active lease to prove and close")
+            if conflict := _turn_conflict(str(row["holder_harness"]), candidate.harness):
+                raise conflict
             remote_claim = connection.execute(
                 "SELECT 1 FROM session_events WHERE stream_id = ? AND session_id = ? "
                 "AND json_extract(proof_json, '$.kind') = 'remote_epic_claim.v1' LIMIT 1",

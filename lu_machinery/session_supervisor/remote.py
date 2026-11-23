@@ -42,6 +42,17 @@ class RemoteLeaseLostError(RemoteSupervisorError):
     """The server fenced this client; renewal must stop."""
 
 
+class RemoteClaimConflictError(RemoteSupervisorError):
+    """Monitor refused a claim with 409; ``detail`` is the route's text ("" when it sent none readable).
+
+    A 409 alone is not occupancy: invariant failures share the status, so callers read the detail.
+    """
+
+    def __init__(self, message: str, *, detail: str) -> None:
+        super().__init__(message)
+        self.detail = detail
+
+
 def monitor_url(raw: str | None = None) -> str:
     """Validate the configured Monitor URL without exposing it in responses."""
     value = (raw if raw is not None else os.environ.get("LU_MONITOR_LOOPBACK", DEFAULT_MONITOR)).strip()
@@ -123,6 +134,10 @@ class RemoteEpicClient:
                 detail = "request refused"
             if exc.code == 409 and not path.endswith("/claim"):
                 raise RemoteLeaseLostError("LEASE LOST: Monitor fenced the exact lease") from None
+            if exc.code == 409:
+                raise RemoteClaimConflictError(
+                    f"Monitor API refused request (409): {detail}", detail=detail if isinstance(detail, str) else ""
+                ) from None
             if exc.code == 404:
                 raise RemoteSupervisorError(
                     f"Monitor API refused request (404): missing route {path}; "
@@ -145,6 +160,10 @@ class RemoteEpicClient:
                 detail = json_depth.loads(raw, max_depth=512).get("detail", "request refused")
             except (ValueError, json.JSONDecodeError, OSError):
                 detail = "request refused"
+            if status == 409:
+                raise RemoteClaimConflictError(
+                    f"Monitor API returned an error ({status}): {detail}", detail=detail if isinstance(detail, str) else ""
+                )
             raise RemoteSupervisorError(f"Monitor API returned an error ({status}): {detail}")
         try:
             data = json_depth.loads(raw, max_depth=512)

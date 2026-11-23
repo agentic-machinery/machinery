@@ -976,6 +976,45 @@ def test_worker_that_starts_and_exits_is_not_relaunched(tmp_path: Path):
     assert proc.wait(timeout=5) == 3
 
 
+@pytest.mark.parametrize(
+    ("runtime", "stop"),
+    [(1.5, 30), (True, 30), (0, 30), (-5, 30), (600, None), (None, 30), (600, 0.5), ("600", 30)],
+)
+def test_scope_limits_are_whole_positive_seconds_given_together(runtime, stop):
+    """Defect class T5: a fractional, boolean, zero, negative or half-given scope bound reaches systemd-run as an
+    unbounded or misread RuntimeMaxSec/TimeoutStopSec."""
+    with pytest.raises(ValueError, match="positive whole seconds"):
+        iso.build_scope_argv([_PY], unit="u", runtime_max_s=runtime, stop_timeout_s=stop)
+
+
+def test_a_bounded_scope_carries_its_limits_and_never_falls_back(tmp_path: Path):
+    """Defect class T5: a turn's scope starts without RuntimeMaxSec, TimeoutStopSec and a control-group kill, or a
+    turn whose host cannot isolate it runs as a plain process that nothing bounds."""
+    bindir = _install_fakes(tmp_path)
+    argv_log = tmp_path / "argv.txt"
+    env = _env(bindir, FAKE_SYSTEMD_RUN="exec", FAKE_ARGV_LOG=str(argv_log))
+    proc, launch = iso.spawn_detached_worker(
+        [_PY, "-c", "pass"], task_id="turn-1", run_nonce="abc123", env=env, probe_env=env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        subtree_path=_subtree(tmp_path), allow_fallback=False, runtime_max_s=7800, stop_timeout_s=30,
+    )
+    proc.wait(timeout=5)
+    assert launch.mode == iso.LAUNCH_SCOPE
+    recorded = argv_log.read_text(encoding="utf-8").splitlines()
+    limits = recorded[recorded.index("--quiet") + 1 : recorded.index("--")]
+    assert limits == ["--property=RuntimeMaxSec=7800", "--property=TimeoutStopSec=30",
+                      "--property=KillMode=control-group", "--property=SendSIGKILL=yes"]
+    assert "RuntimeMaxSec" not in " ".join(iso.build_scope_argv([_PY], unit="u"))  # unbounded unless asked
+
+    def popen(*_args, **_kwargs):
+        pytest.fail("a bounded launch fell back to a plain process")
+
+    with pytest.raises(iso.DispatchIsolationError, match="forced"):
+        iso.spawn_detached_worker([_PY, "-c", "pass"], task_id="turn-2", run_nonce="n", popen=popen,
+                                  probe_env={"LU_DISPATCH_ISOLATION": "fallback"}, allow_fallback=False,
+                                  runtime_max_s=7800, stop_timeout_s=30)
+
+
 def test_scope_unit_names_differ_for_the_same_task_and_nonce():
     first = iso.scope_unit_name("same-task", "reused-nonce")
     second = iso.scope_unit_name("same-task", "reused-nonce")

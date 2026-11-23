@@ -389,3 +389,104 @@ def test_remote_epic_status_has_no_per_request_connection_fan_out(tmp_path: Path
     assert response["lease"] is not None
     assert [entry["body"] for entry in response["digest"]["recent"]] == ["working"]
     assert opened == [True]
+
+
+def _turn(instance: str = "turn-run") -> LeaseHolder:
+    from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
+
+    return LeaseHolder("claude", TURN_HOLDER_HARNESS, instance, process_id=os.getpid(), task_id=f"turn-{instance}")
+
+
+def _claim(store: SessionStreamStore, holder: LeaseHolder, name: str, now, *, stream: str = "epic:7300", ttl: int = 30):
+    return store.claim_remote_session(
+        stream_id=stream, holder=holder, lineage_id=f"{name}-lineage", ttl_seconds=ttl,
+        session_id=f"{name}-session", lease_id=f"{name}-lease", now=now,
+    )
+
+
+@pytest.mark.parametrize("first_is_turn", [True, False])
+@pytest.mark.parametrize("after_ttl", [False, True])
+def test_a_turn_and_a_legacy_claim_exclude_each_other_in_both_orders(tmp_path: Path, first_is_turn, after_ttl) -> None:
+    """Defect class T1: a legacy launcher and a dispatch turn both hold one stream, in either order, before or after
+    the holder's TTL; or exclusion leaks into legacy-to-legacy TTL recovery."""
+    from lu_machinery.session_streams.store import TurnLeaseUnclearedError
+
+    store = _store(tmp_path)
+    now = utc_now()
+    turn, legacy = _turn(), _holder("codex", "legacy", "alpha")
+    first, second = (turn, legacy) if first_is_turn else (legacy, turn)
+    held, outcome = _claim(store, first, "first", now)
+    assert outcome == "claimed"
+    before = store.dump_stream(held.stream_id)
+    with pytest.raises(TurnLeaseUnclearedError, match=r"^turn_lease_uncleared: "):
+        _claim(store, second, "second", now + timedelta(seconds=31 if after_ttl else 5))
+    assert store.dump_stream(held.stream_id) == before
+    # Two legacy holders keep TTL recovery.
+    other, _ = _claim(store, legacy, "legacy-a", now, stream="epic:7301")
+    _successor, recovered = _claim(store, _holder("gemini", "legacy-b", "beta"), "legacy-b", now + timedelta(seconds=31),
+                                   stream="epic:7301")
+    assert recovered == "recovered" and other.generation == 1
+
+
+def test_exactly_one_of_many_concurrent_claims_wins(tmp_path: Path) -> None:
+    """Defect class T1: two claimants of one free stream, turns and legacy launchers at once, both win the CAS."""
+    import threading
+
+    store = _store(tmp_path)
+    store.claim_remote_session(  # creates the schema before the race
+        stream_id="epic:7399", holder=_holder("codex", "warm", "alpha"), lineage_id="warm", ttl_seconds=30,
+        session_id="warm-session", lease_id="warm-lease",
+    )
+    holders = [_turn(f"run-{n}") for n in range(4)] + [_holder("codex", f"legacy-{n}", "alpha") for n in range(4)]
+    gate, results = threading.Barrier(len(holders)), []
+
+    def claim(index: int, holder: LeaseHolder) -> None:
+        gate.wait(timeout=60)
+        try:
+            results.append(_claim(store, holder, f"c{index}", utc_now(), stream="epic:7302")[1])
+        except LeaseConflictError as exc:
+            results.append(type(exc).__name__)
+
+    threads = [threading.Thread(target=claim, args=pair) for pair in enumerate(holders)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert results.count("claimed") == 1 and len(results) == len(holders), results
+    assert all(result in {"claimed", "LeaseConflictError", "TurnLeaseUnclearedError"} for result in results), results
+
+
+def test_an_expired_turn_lease_stays_until_an_exact_or_attributed_release(tmp_path: Path) -> None:
+    """Defect class T2: a turn lease past its TTL, with no proof the turn stopped, is superseded by a claim or freed by
+    a dead-PID force close; or its exact holder, or an attributed operator, can no longer release it."""
+    from lu_machinery.session_streams.store import TurnLeaseUnclearedError
+
+    store = _store(tmp_path)
+    now = utc_now()
+    lease, _ = _claim(store, _turn(), "turn", now)
+    late = now + timedelta(days=2)
+    before = store.dump_stream(lease.stream_id)
+    for holder in (_holder("codex", "legacy", "alpha"), _turn("other-run")):
+        with pytest.raises(TurnLeaseUnclearedError):
+            _claim(store, holder, holder.instance_id, late)
+    store._process_probe = lambda pid: pid == 5678  # the turn's recorded process is dead; the candidate lives
+    candidate = LeaseHolder("codex", "cli", "local", process_id=5678)
+    with pytest.raises(TurnLeaseUnclearedError):
+        store.force_close_expired_session(stream_id=lease.stream_id, session_id=lease.session_id, candidate=candidate,
+                                          now=late)
+    assert store.dump_stream(lease.stream_id) == before
+    # A turn lease opened without Monitor's claim (no remote provenance) is refused the PID close all the same.
+    local = store.open_session(stream_id="epic:7303", holder=replace(_turn("local-run"), process_id=4321),
+                               lineage_id="local", ttl_seconds=30, now=now)
+    with pytest.raises(TurnLeaseUnclearedError):
+        store.force_close_expired_session(stream_id=local.stream_id, session_id=local.session_id, candidate=candidate,
+                                          now=late)
+    # The exact holder closes it after expiry, and the stream is free again.
+    assert store.release_remote_session(lease, now=late).value == "closed"
+    successor, outcome = _claim(store, _holder("codex", "legacy", "alpha"), "after-release", late)
+    assert outcome == "claimed" and successor.generation == lease.generation + 1
+    # An attributed operator force release clears an expired turn lease too.
+    turn, _ = _claim(store, _turn("third-run"), "third", now, stream="epic:7304")
+    store.force_release_remote_session(stream_id=turn.stream_id, actor_agent="claude-cto", actor_host_id="host-a",
+                                       reason="scope proven gone", now=late)
+    assert _claim(store, _turn("fourth-run"), "fourth", late, stream="epic:7304")[1] == "claimed"

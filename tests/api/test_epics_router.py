@@ -250,6 +250,32 @@ def test_router_live_claim_conflict_names_holder_and_expiry(tmp_path: Path, monk
     assert "expires_at=" in competing.text
 
 
+@pytest.mark.parametrize("turn_first", [True, False])
+def test_router_turn_conflict_has_its_stable_detail_prefix(tmp_path: Path, monkeypatch, turn_first: bool) -> None:
+    """Defect class T1: a turn/legacy conflict reaches the dispatcher as a bare 409 it cannot tell from an invariant
+    failure, so a held stream reads as unknown, or an invariant 409 reads as a held stream."""
+    from lu_machinery.session_streams.store import TURN_CONFLICT_PREFIX, TURN_HOLDER_HARNESS
+
+    client = _client(tmp_path, monkeypatch)
+    turn = {"harness": TURN_HOLDER_HARNESS, "instance_id": "a" * 32, "task_id": "turn-a"}
+    first, second = ({**turn}, {}) if turn_first else ({}, {**turn})
+    held = client.post("/api/epics/v1/epic:7178/claim", json={
+        "session_id": "first-session", "lease_id": "first-lease", "lineage_id": "first", "agent": "claude",
+        "harness": "codex-cli", "instance_id": "first-instance", "process_id": 1234, "ttl_seconds": 1, **first})
+    assert held.status_code == 200, held.text
+    later = epics_router.parse_timestamp("2099-01-01T00:00:00Z")  # long past the holder's TTL
+    monkeypatch.setattr(epics_router, "utc_now", lambda: later)
+    monkeypatch.setattr("lu_machinery.session_streams.store.utc_now", lambda: later)
+    competing = client.post("/api/epics/v1/epic:7178/claim", json={
+        "session_id": "other-session", "lease_id": "other-lease", "lineage_id": "other", "agent": "claude",
+        "harness": "codex-cli", "instance_id": "other-instance", "process_id": 5678, **second})
+    assert competing.status_code == 409
+    detail = competing.json()["detail"]
+    assert detail.startswith(f"{TURN_CONFLICT_PREFIX}: "), detail
+    holder = TURN_HOLDER_HARNESS if turn_first else "codex-cli"
+    assert f"current holder=claude/{holder}" in detail and "expires_at=" in detail
+
+
 def test_router_responses_have_no_paths_or_host_network_tokens(tmp_path: Path, monkeypatch) -> None:
     client = _client(tmp_path, monkeypatch)
     response = _claim(client)
@@ -297,6 +323,7 @@ def test_router_claim_invariant_failures_are_logged_and_not_store_unavailable(
 
     assert response.status_code == 409
     assert response.json()["detail"] == "epic claim rejected by a session-stream invariant"
+    assert not response.json()["detail"].startswith("turn_lease_uncleared")
     assert "store unavailable" not in response.text
     assert any(record.exc_info for record in caplog.records)
 
