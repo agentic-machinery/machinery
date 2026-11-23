@@ -38,6 +38,7 @@ from lu_machinery.session_streams.model import (
 )
 from lu_machinery.session_streams.receipts import register_manifest_inventory
 from lu_machinery.session_streams.store import (
+    TURN_CONFLICT_PREFIX,
     ContentRejectedError,
     LeaseConflictError,
     LifecycleError,
@@ -914,17 +915,23 @@ def remote_claim(
         response = _stream_response(store, stream_id, limit)
         response["outcome"] = outcome
         return JSONResponse(content=response, headers={"Cache-Control": "no-store"})
-    except TurnLeaseUnclearedError as exc:
+    except TurnLeaseUnclearedError:
         # A verified occupancy conflict: the dispatcher reads only this detail prefix as "stream leased".
-        detail = str(exc)
+        detail = (
+            f"{TURN_CONFLICT_PREFIX}: an active lease is never superseded when it or its successor is a dispatch "
+            "turn; only the exact holder's release or an attributed force release clears it"
+        )
         try:
             lease = _stream_response(store, stream_id, limit).get("lease")
         except Exception:
             lease = None
         if isinstance(lease, dict):
-            current = lease.get("holder") or {}
-            detail += (f"; current holder={current.get('agent', '?')}/{current.get('harness', '?')} "
-                       f"instance_id={current.get('instance_id', '?')}; expires_at={lease.get('expires_at', '?')}")
+            raw_holder = lease.get("holder")
+            current = raw_holder if isinstance(raw_holder, dict) else {}
+            detail += (
+                f"; current holder={current.get('agent', '?')}/{current.get('harness', '?')} "
+                f"instance_id={current.get('instance_id', '?')}; expires_at={lease.get('expires_at', '?')}"
+            )
         return _error(409, detail)
     except LeaseConflictError:
         try:
