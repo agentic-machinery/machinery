@@ -193,13 +193,39 @@ class SubjectExclusion:
     fail_closed_reason: str | None = None
 
 
-def normalize_owned_path(path: str) -> str:
-    """Normalize current and pre-extraction subject paths for all review callers."""
+# Fleet catalog rows whose ``scripts/`` tree is the machinery package's pre-extraction layout:
+# learn-ukrainian (row ``public``) and the machinery repository itself.
+_LEGACY_SCRIPTS_REPOS = frozenset({"public", "machinery"})
+
+
+def legacy_scripts_layout(repository: str | None) -> bool:
+    """Whether the reviewed repository's ``scripts/`` paths name machinery package paths.
+
+    ``repository`` is the reviewed repository's ``owner/name`` (or fleet key). Another
+    fleet repository's ``scripts/`` tree is its own. A missing identity, or one the fleet
+    catalog cannot resolve to one row, fails closed to the legacy relocation.
+    """
+    if repository is None:
+        return True
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, resolve_fleet_repo_by_slug
+
+    try:
+        return resolve_fleet_repo_by_slug(repository).key in _LEGACY_SCRIPTS_REPOS
+    except FleetRepoError:
+        return True
+
+
+def normalize_owned_path(path: str, *, repository: str | None = None) -> str:
+    """Normalize current and pre-extraction subject paths for all review callers.
+
+    The pre-extraction ``scripts/`` relocation applies only where
+    :func:`legacy_scripts_layout` holds for ``repository``.
+    """
     text = str(path).strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
     text = text.rstrip("/")
-    if text.startswith("scripts/"):
+    if text.startswith("scripts/") and legacy_scripts_layout(repository):
         relocated = f"{_MACHINERY}/{text.removeprefix('scripts/')}"
         if relocated in _BOUNDARY_SEATS or relocated.startswith((_ADAPTER_PREFIX, _PROVIDER_PREFIX)):
             return relocated
@@ -253,13 +279,13 @@ def adapter_subject_index() -> Mapping[str, frozenset[str]]:
     return {path: frozenset(seats) for path, seats in by_file.items()}
 
 
-def classify_owned_path(path: str) -> OwnedPathClassification:
-    """Classify one owned path as one seat, ambiguous, or unrelated.
+def classify_owned_path(path: str, *, repository: str | None = None) -> OwnedPathClassification:
+    """Classify one owned path of ``repository`` as one seat, ambiguous, or unrelated.
 
     Unrelated paths (a README, a generic timing hook) do not imply a subject
     seat. Ambiguous paths must not be turned into a guess.
     """
-    rel = normalize_owned_path(path)
+    rel = normalize_owned_path(path, repository=repository)
     boundary_seat = _BOUNDARY_SEATS.get(rel)
     if boundary_seat is not None:
         return OwnedPathClassification("seat", frozenset({boundary_seat}), boundary_seat)
@@ -307,8 +333,9 @@ def prepare_subject_exclusion(
     subject_seats: frozenset[str] = frozenset(),
     subject_families: frozenset[str] = frozenset(),
     owned_paths: tuple[str, ...] = (),
+    repository: str | None = None,
 ) -> SubjectExclusion:
-    """Resolve explicit seats/families plus unambiguous owned paths.
+    """Resolve explicit seats/families plus unambiguous owned paths of ``repository``.
 
     Missing or ambiguous subjects remain unknown. Known subjects and their
     evidence still apply; explicit malformed metadata remains an error.
@@ -321,8 +348,8 @@ def prepare_subject_exclusion(
 
     evidence: list[str] = []
     for raw_path in owned_paths:
-        classification = classify_owned_path(raw_path)
-        rel = normalize_owned_path(raw_path)
+        classification = classify_owned_path(raw_path, repository=repository)
+        rel = normalize_owned_path(raw_path, repository=repository)
         if classification.kind == "seat":
             seats.update(classification.seats)
             evidence.append(rel)

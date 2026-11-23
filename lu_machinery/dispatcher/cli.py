@@ -829,7 +829,7 @@ def _dispatch(args) -> int:
     if args.subject_seat or args.subject_family or (args.mode == "read-only" and args.owned_path):
         with admission.record_refusal(args, agent, StartRefusal.REVIEW_SETUP):
             exclusion = checks.check_review_subjects(agent, args.model, args.subject_seat, args.subject_family,
-                                                    args.owned_path, review=review)
+                                                    args.owned_path, review=review, repository=info["github"])
         args.subject_seat, args.subject_family = sorted(exclusion.seats), sorted(exclusion.families)
         if (exclusion.seats or exclusion.families) and (
             (args.review_profile or "").strip().casefold() == "ukrainian" or args.language_lane

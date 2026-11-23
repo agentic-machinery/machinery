@@ -1324,6 +1324,134 @@ def test_extracted_seat_boundary_paths_preserve_subject_exclusion(path, seat):
             )
 
 
+# Every reviewer seat's adapter, as a consumer repository's own dead fork lists them (kube-dojo PR 3904).
+_FORKED_ADAPTERS = tuple(f"scripts/agent_runtime/adapters/{name}.py" for name in ("agy", "claude", "codex", "deepseek", "gemini"))
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "repository,relocated",
+    [
+        # The machinery repository (both baked slugs) and learn-ukrainian keep the pre-extraction layout.
+        ("learn-ukrainian/machinery", True),
+        ("agentic-machinery/machinery", True),
+        ("Learn-Ukrainian/Machinery", True),
+        ("learn-ukrainian/learn-ukrainian.github.io", True),
+        ("machinery", True),
+        # A missing or unresolvable identity fails closed to the relocation.
+        (None, True),
+        ("", True),
+        ("someone/unknown-repo", True),
+        ("kube-dojo/kube-dojo.github.io/extra", True),
+        # A consumer repository's scripts/ tree is its own.
+        ("kube-dojo/kube-dojo.github.io", False),
+        (" KUBE-DOJO/kube-dojo.github.io ", False),
+        ("kube-dojo", False),
+    ],
+)
+def test_scripts_relocation_follows_the_reviewed_repository(repository, relocated):
+    """Defect class: a consumer repository's own scripts/ paths were read as machinery seat boundaries.
+
+    Deleting a consumer's forked adapters excluded every reviewer; the legacy relocation must stay
+    for the machinery and learn-ukrainian repositories and for any repository the catalog cannot resolve.
+    """
+    subject = prepare_subject_exclusion(owned_paths=_FORKED_ADAPTERS, repository=repository)
+    expected_seats = {"agy", "claude", "codex", "deepseek", "gemini"} if relocated else set()
+    assert subject.seats == expected_seats
+    assert subject.fail_closed_reason is None
+    result = resolve_reviewer(
+        ResolverInputs(
+            author_model="claude-opus-5-5",
+            domain="infra",
+            review_profile="infra",
+            risk="critical",
+            owned_paths=_FORKED_ADAPTERS,
+            repository=repository,
+            claude_account=HOST_ACCOUNT,
+        )
+    )
+    governed = [entry.name for entry in result.trace if "subject exclusion" in (entry.reason or "")]
+    if relocated:
+        assert result.selected is None
+        assert "openai_frontier" in governed and "gemini-4-neon-high" in governed
+    else:
+        assert result.selected is not None and result.selected.family != "anthropic"
+        assert governed == []
+    # The current package paths govern their seats whatever repository lists them.
+    current = prepare_subject_exclusion(
+        owned_paths=tuple(path.replace("scripts/", "lu_machinery/", 1) for path in _FORKED_ADAPTERS),
+        repository=repository,
+    )
+    assert current.seats == {"agy", "claude", "codex", "deepseek", "gemini"}
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "origin,flag,relocated",
+    [
+        # Owned-path-only preview: the explicit repository decides; none keeps the legacy relocation.
+        (None, "kube-dojo/kube-dojo.github.io", False),
+        (None, "learn-ukrainian/machinery", True),
+        (None, None, True),
+        # Local-target preview: the checkout's origin decides when no repository is passed.
+        ("https://github.com/kube-dojo/kube-dojo.github.io.git", None, False),
+        ("https://GITHUB.COM/kube-dojo/kube-dojo.github.io.git", None, False),
+        ("git@github.com:kube-dojo/kube-dojo.github.io.git", None, False),
+        ("https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", None, True),
+        ("https://example.invalid/not-github.git", None, True),
+        # A lookalike host is not GitHub, so the origin stays unknown.
+        ("https://example.invalid/github.com/kube-dojo/kube-dojo.github.io.git", None, True),
+    ],
+)
+def test_reviewer_preview_without_branch_facts_judges_scripts_paths_by_repository(
+    tmp_path, capsys, monkeypatch, origin, flag, relocated
+):
+    """Defect class: a resolve-reviewer preview without branch facts dropped the reviewed repository."""
+    import os
+    import subprocess
+
+    from lu_machinery.review import closeout_cli
+
+    state = tmp_path / "state.json"
+    if origin is not None:
+        for key in list(os.environ):
+            if key.startswith("GIT_"):
+                monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        for argv in (
+            ["init", "-q", "-b", "main"],
+            ["config", "user.email", "test@example.invalid"],
+            ["config", "user.name", "test"],
+            ["remote", "add", "origin", origin],
+            ["commit", "-q", "--allow-empty", "-m", "base"],
+        ):
+            subprocess.run(["git", "-C", str(checkout), *argv], check=True, timeout=60)
+        (checkout / "note.md").write_text("local change\n", encoding="utf-8")
+        assert closeout_cli.main(["--state-file", str(state), "target", "--mode", "local", "--repo-root", str(checkout)]) == 0
+        capsys.readouterr()
+    snapshot = tmp_path / "routing.json"
+    snapshot.write_text("{}", encoding="utf-8")
+    argv = ["--state-file", str(state), "resolve-reviewer", "--author-model", "claude-opus-5-5",
+            "--review-profile", "infra", "--domain", "infra", "--risk", "critical",
+            "--routing-snapshot-file", str(snapshot)]
+    for path in _FORKED_ADAPTERS:
+        argv += ["--owned-path", path]
+    if flag is not None:
+        argv += ["--repository", flag]
+    code = closeout_cli.main(argv)
+    payload = json.loads(capsys.readouterr().out)
+    governed = [entry["name"] for entry in payload["trace"] if "subject exclusion" in (entry.get("reason") or "")]
+    if relocated:
+        assert code == 1 and payload["selected"] is None
+        assert "openai_frontier" in governed
+    else:
+        assert code == 0 and payload["selected"]["family"] != "anthropic"
+        assert governed == []
+
+
 @pytest.mark.usefixtures('configured_roots')
 def test_resolve_reviewer_without_subject_information_matches_empty_subject_fields():
     """AC-02: explicit empty subject inputs do not change the trace."""

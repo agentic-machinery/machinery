@@ -52,6 +52,7 @@ from lu_machinery.review.security_paths import git_changed_paths
 from lu_machinery.review.target_resolution import (
     ReviewTarget,
     TargetResolutionError,
+    _origin_github_repo,
     diff_against_base,
     repository_target_error,
     resolve_branch_target,
@@ -430,12 +431,18 @@ def _checkout_git(repo_root: Path, *args: str) -> str:
 
 
 def _checkout_repository(repo_root: Path) -> str:
-    """``owner/name`` of the checkout's GitHub origin, which task records must name."""
-    url = _checkout_git(repo_root, "config", "--get", "remote.origin.url")
-    match = re.search(r"github\.com[:/]([\w.-]+/[\w.-]+?)(?:\.git)?/?$", url)
-    if not match:
+    """``owner/name`` of the checkout's GitHub origin, which task records must name.
+
+    Parsed exactly as target resolution parses it: a case-insensitive, exact
+    ``github.com`` host, so a lookalike host is never read as a repository.
+    """
+    try:
+        origin = _origin_github_repo(repo_root)
+    except (OSError, subprocess.TimeoutExpired):
+        origin = None
+    if origin is None:
         raise CloseoutStateError("repository unknown: pass --repository owner/name")
-    return match.group(1)
+    return origin
 
 
 def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
@@ -585,6 +592,14 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
     if facts is not None:
         inputs = facts.resolver_inputs(risk=args.risk, review_profile=args.review_profile, **common)
     else:
+        # A preview names its paths' repository like the committed facts do; an
+        # unknown origin leaves it None, which keeps the legacy scripts/ relocation.
+        repository = args.repository
+        if repository is None and target is not None:
+            try:
+                repository = _checkout_repository(repo_root)
+            except CloseoutStateError:
+                repository = None
         inputs = ResolverInputs(
             review_profile=args.review_profile,
             risk=args.risk,
@@ -592,6 +607,7 @@ def _cmd_resolve_reviewer(args: argparse.Namespace) -> int:
             subject_seats=frozenset(args.subject_seat or []),
             subject_families=frozenset(args.subject_family or []),
             owned_paths=tuple(args.owned_path or []),
+            repository=repository,
             **common,
         )
     resolution = resolve_reviewer(inputs, review_mode=args.review_mode)
@@ -1935,8 +1951,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--repository",
         default=None,
         help=(
-            "GitHub owner/name that author task records must name, for a committed target's "
-            "complete authorship. Default: the target checkout's origin. Example: owner/repo"
+            "GitHub owner/name of the reviewed repository: author task records must name it for a "
+            "committed target's complete authorship, and it decides whether scripts/ paths are the "
+            "machinery package's pre-extraction layout. Default: the target checkout's origin; "
+            "without either, scripts/ paths keep that layout. Example: owner/repo"
         ),
     )
     p_reviewer.add_argument(
