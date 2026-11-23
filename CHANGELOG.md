@@ -9,6 +9,19 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.58"></a>
+## [0.1.58] - 2026-11-23
+
+### Changed
+
+- One reader per PR state in pr-watch ([#1254](https://github.com/learn-ukrainian/machinery/pull/1254))
+- Keep large GitHub pages out of the shared cache ([#1257](https://github.com/learn-ukrainian/machinery/pull/1257))
+
+### Fixed
+
+- Back off failed PR ownership scans ([#1255](https://github.com/learn-ukrainian/machinery/pull/1255))
+- Use filtered conditional REST reads for worktree settlement ([#1258](https://github.com/learn-ukrainian/machinery/pull/1258))
+
 <a id="v0.1.57"></a>
 ## [0.1.57] - 2026-11-23
 
@@ -1444,7 +1457,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.57...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.58...HEAD
+[0.1.58]: https://github.com/learn-ukrainian/machinery/compare/v0.1.57...v0.1.58
 [0.1.57]: https://github.com/learn-ukrainian/machinery/compare/v0.1.56...v0.1.57
 [0.1.56]: https://github.com/learn-ukrainian/machinery/compare/v0.1.55...v0.1.56
 [0.1.55]: https://github.com/learn-ukrainian/machinery/compare/v0.1.54...v0.1.55
