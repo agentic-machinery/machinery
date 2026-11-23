@@ -1578,7 +1578,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     with pytest.raises(CutError, match="OPSEC: invalid publisher arguments"):
         cut.post_release(section)
     first_oid = subprocess.run(
-        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     assert len(push_commands) == 1
 
@@ -1588,7 +1588,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     assert cut.post_release(section) == 1277
     assert push_commands == []
     reused_oid = subprocess.run(
-        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     assert reused_oid == first_oid
 
@@ -1610,18 +1610,18 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     assert len(push_commands) == 1
     assert f"--force-with-lease=refs/heads/{branch}:{first_oid}" in push_commands[0]
     first_oid = subprocess.run(
-        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     cut.x_agent = "claude/claude-opus-5-5"
     push_commands.clear()
 
     def _raw_git(repo: Path, *args: str) -> None:
-        subprocess.run([git_module.GIT_BINARY, "-C", str(repo), *args], check=True, capture_output=True, text=True)
+        subprocess.run([git_module.GIT_BINARY, "-C", str(repo), *args], check=True, capture_output=True, text=True, timeout=30)
 
     # 4. When main advances, resuming verifies the existing remote bookkeeping commit and updates it with
     # --force-with-lease (never bare --force).
     helper = tmp_path / "helper"
-    subprocess.run([git_module.GIT_BINARY, "clone", "--quiet", str(bare), str(helper)], check=True, capture_output=True, text=True)
+    subprocess.run([git_module.GIT_BINARY, "clone", "--quiet", str(bare), str(helper)], check=True, capture_output=True, text=True, timeout=30)
     _raw_git(helper, "config", "user.name", "Release Cut")
     _raw_git(helper, "config", "user.email", "release-cut@example.invalid")
     (helper / "README.md").write_text("unrelated main advance\n", encoding="utf-8")
@@ -1629,7 +1629,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "docs: advance main")
     _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "origin", "main")
     new_main = subprocess.run(
-        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", "refs/heads/main"], check=True, capture_output=True, text=True,
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", "refs/heads/main"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
 
     assert cut.post_release(section) == 1277
@@ -1637,11 +1637,11 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     assert f"--force-with-lease=refs/heads/{branch}:{first_oid}" in push_commands[0]
     assert "--force" not in push_commands[0]
     updated_oid = subprocess.run(
-        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     assert updated_oid != first_oid
     updated_parent = subprocess.run(
-        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"{updated_oid}^"], check=True, capture_output=True, text=True,
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"{updated_oid}^"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     assert updated_parent == new_main
 
@@ -1666,7 +1666,7 @@ def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeyp
     with pytest.raises(CutError, match="exited 1"):
         cut.post_release(section)
     raced_oid = subprocess.run(
-        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True, timeout=30,
     ).stdout.strip()
     assert raced_oid != updated_oid
 
