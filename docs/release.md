@@ -385,9 +385,11 @@ does these steps in order:
      to the candidate, then runs
      `env -u PYTHONPATH LU_PRODUCT_ROOT="$WORK/product" "$P" -m pytest --collect-only -q tests`.
      A non-zero exit or any collection error stops the cut. During a release
-     cut, the `.pth` overlay is removed as soon as collection finishes so `$P`
-     stays machinery-only for promotion and post-release publishing (standalone
-     `release_cut consumer-collection` keeps it for CI's key-test step).
+     cut, the `.pth` overlay is written into a disposable offline install under
+     `$WORK/tmp/` rather than `$WORK/accept`, so `$WORK/accept` stays
+     machinery-only for promotion, post-release publishing, and failure
+     rollback (standalone `release_cut consumer-collection` writes the overlay
+     into the given `--python` venv for CI's key-test step).
 
      The same step already runs on every PR and merge group, so a change that
      breaks it fails before merge. The `Installed wheel` job of CI Gate runs
