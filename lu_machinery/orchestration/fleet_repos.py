@@ -18,9 +18,13 @@ restart long-running processes after a registry or selector flip.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import re
+import stat
 import sys
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
@@ -37,9 +41,35 @@ from lu_machinery.common.git_credentials import (
     repository_registry,
     verify_authenticated_repository,
 )
+from lu_machinery.common.repo_root import PRODUCT_MARKER, main_checkout_root, resolve_path
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
 _VALID_VISIBILITIES = frozenset({"public", "private"})
+_MAX_GIT_CONFIG_BYTES = 256 * 1024
+_GITHUB_ORIGIN_RE = re.compile(
+    r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9._-]{1,100}?)(?:\.git)?$"
+)
+_GIT_SECTION_RE = re.compile(r'^\[\s*([A-Za-z0-9-]+)(?:\s+"([^"]*)")?\s*\](?:\s*[#;].*)?$')
+
+
+def _validate_optional_repo_relpath(key: str, field: str, value: Any) -> str | None:
+    """Validate an optional canonical repo-relative POSIX file path from ``fleet_repos.yaml``."""
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or value.startswith("/")
+        or value.endswith("/")
+        or "\\" in value
+        or "\x00" in value
+        or any(unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise FleetRepoError(f"fleet_repos[{key!r}].{field} must be a canonical repo-relative file path")
+    return value
 
 
 @dataclass(frozen=True)
@@ -53,6 +83,8 @@ class FleetRepo:
     repository_id: int | None = None
     visibility: str | None = None
     alternate_github: str | None = None
+    sources_server: str | None = None
+    admission_policy: str | None = None
 
     @property
     def owner(self) -> str:
@@ -128,6 +160,8 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
         repository_id = body.get("repository_id")
         visibility = body.get("visibility")
         alternate_github = body.get("alternate_github")
+        sources_server = _validate_optional_repo_relpath(key, "sources_server", body.get("sources_server"))
+        admission_policy = _validate_optional_repo_relpath(key, "admission_policy", body.get("admission_policy"))
         if not isinstance(github, str) or "/" not in github:
             raise FleetRepoError(f"fleet_repos[{key!r}].github must be owner/name")
         if not isinstance(local_name, str) or not local_name.strip():
@@ -157,6 +191,8 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
             repository_id=repository_id,
             visibility=visibility,
             alternate_github=alternate_github,
+            sources_server=sources_server,
+            admission_policy=admission_policy,
         )
     if defaults != 1:
         raise FleetRepoError("fleet_repos must mark exactly one default repo")
@@ -517,6 +553,186 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
+def _marker_state(checkout: Path) -> str:
+    """Return ``'present'``, ``'absent'``, or ``'unreadable'`` for ``PRODUCT_MARKER`` in *checkout*."""
+    try:
+        os.lstat(checkout / PRODUCT_MARKER)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return "absent"
+        return "unreadable"
+    return "present"
+
+
+def _github_slug_from_origin(url: str) -> str | None:
+    """Extract ``owner/name`` from a supported GitHub remote URL, or ``None``."""
+    match = _GITHUB_ORIGIN_RE.fullmatch(url)
+    if match is None:
+        return None
+    slug = match.group(1)
+    if slug.split("/", 1)[1] in (".", ".."):
+        return None
+    return slug
+
+
+def _read_origin_urls(git_dir: Path) -> tuple[list[str], bool] | None:
+    """Read ``[remote "origin"]`` URLs from a primary ``.git/config`` without spawning git.
+
+    Returns ``(urls, has_includes)``, or ``None`` when the config cannot be safely read.
+    """
+    cfg = git_dir / "config"
+    try:
+        info = os.lstat(cfg)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return [], False
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_GIT_CONFIG_BYTES:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(cfg, flags)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read(_MAX_GIT_CONFIG_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > _MAX_GIT_CONFIG_BYTES:
+        return None
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return None
+
+    in_origin = False
+    has_includes = False
+    urls: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.startswith("["):
+            sec = _GIT_SECTION_RE.fullmatch(line)
+            if sec is None:
+                in_origin = False
+                continue
+            name = sec.group(1).lower()
+            subsection = sec.group(2)
+            if name in ("include", "includeif", "url"):
+                has_includes = True
+            in_origin = name == "remote" and subsection == "origin"
+            continue
+        if in_origin and "=" in line:
+            key, value = line.split("=", 1)
+            if key.strip().lower() == "url":
+                val = value.strip()
+                if val.startswith('"'):
+                    end_quote = val.find('"', 1)
+                    if end_quote != -1 and val[end_quote + 1 :].lstrip().startswith(("", "#", ";")):
+                        tail = val[end_quote + 1 :].strip()
+                        val = val[1:end_quote] if (not tail or tail.startswith(("#", ";"))) else val
+                else:
+                    for marker in ("#", ";"):
+                        if marker in val:
+                            val = val.split(marker, 1)[0].rstrip()
+                urls.append(val)
+    return urls, has_includes
+
+
+def consumer_repo_for_root(
+    root: Path,
+    *,
+    repos: Mapping[str, FleetRepo] | None = None,
+) -> FleetRepo | None:
+    """Resolve a product checkout ``root`` to its registered ``FleetRepo`` row, or ``None``.
+
+    Fail-closed rules:
+    - A symlinked ``root`` resolves to its real target first, and linked worktrees resolve to
+      their primary checkout via :func:`main_checkout_root`. Unresolvable or symlink-looping
+      paths return ``None``.
+    - Any checkout carrying ``PRODUCT_MARKER`` (on ``root`` or its primary) always resolves to
+      the default (``public``) Learn Ukrainian row and can never match a non-default consumer.
+    - When the primary has a ``.git`` entry, a real ``.git/config`` ``origin`` remote is
+      authoritative: a registered GitHub slug selects that row (even when the directory was
+      renamed), while an unregistered, ambiguous, included, or unreadable ``origin`` returns
+      ``None`` rather than falling back to directory basename. A symlinked or malformed
+      ``.git`` entry also returns ``None``.
+    - Only when no ``origin`` remote is present (e.g. a synthetic consumer directory in tests)
+      does the primary checkout's directory name match a unique ``local_name`` in the catalog.
+    - An unreadable or malformed ``fleet_repos.yaml`` raises :class:`FleetRepoError`.
+    """
+    catalog = repos if repos is not None else _bundled_catalog()
+    try:
+        resolved_root = resolve_path(root, strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not resolved_root.is_dir():
+        return None
+
+    # Refuse a symlinked .git entry on the checkout itself before trusting worktree metadata.
+    root_git = resolved_root / ".git"
+    try:
+        root_git_stat = os.lstat(root_git)
+        if stat.S_ISLNK(root_git_stat.st_mode):
+            return None
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            return None
+
+    try:
+        primary = resolve_path(main_checkout_root(resolved_root), strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+    # Learn Ukrainian marker always pins to the default (public) row, never a non-LU consumer.
+    for candidate in (resolved_root, primary):
+        marker = _marker_state(candidate)
+        if marker == "unreadable":
+            return None
+        if marker == "present":
+            defaults = [row for row in catalog.values() if row.default]
+            return defaults[0] if len(defaults) == 1 else None
+
+    primary_git = primary / ".git"
+    try:
+        primary_git_stat = os.lstat(primary_git)
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            return None
+        primary_git_stat = None
+
+    if primary_git_stat is not None:
+        if not stat.S_ISDIR(primary_git_stat.st_mode):
+            return None
+        parsed = _read_origin_urls(primary_git)
+        if parsed is None:
+            return None
+        urls, has_includes = parsed
+        if urls:
+            if len(urls) != 1:
+                return None
+            slug = _github_slug_from_origin(urls[0])
+            if slug is None:
+                return None
+            folded = slug.casefold()
+            matches = [row for row in catalog.values() if any(folded == s.casefold() for s in row.slugs)]
+            return matches[0] if len(matches) == 1 else None
+        if has_includes:
+            return None
+
+    name_matches = [row for row in catalog.values() if row.local_name == primary.name]
+    return name_matches[0] if len(name_matches) == 1 else None
+
+
 __all__ = [
     "SELECTOR_ENV",
     "ActiveFleetRepo",
@@ -528,6 +744,7 @@ __all__ = [
     "canonical_repo_key",
     "canonical_repository",
     "clear_repository_cache",
+    "consumer_repo_for_root",
     "default_repo_key",
     "load_fleet_repo_selector",
     "load_fleet_repos",

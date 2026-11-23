@@ -284,6 +284,37 @@ Write workers run directly in their dispatch worktrees with normal provider logi
 Native read-only reviews retain the OS boundary and GitHub read relays described in
 [read-only review boundary](write-worker-boundary.md); they cannot publish or record verdicts.
 
+#### Non-curriculum consumer repositories (Sources server and admission policy)
+
+Each registered row in `lu_machinery/config/fleet_repos.yaml` may declare two optional
+canonical repo-relative file paths:
+
+- `sources_server` (declared on `public` as `.mcp/servers/sources/server.py`): parsed
+  statically by `lu_machinery.agent_runtime.sources_read_only` for read-only Sources MCP
+  grants and writer denies. Registered consumers that omit `sources_server` (such as
+  `kube-dojo`, `kubedojo-labs`, and `machinery`) have no Sources server wired in read-only
+  adapter invocations (ordinary Claude reviewers receive `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`,
+  and explicit caller attempts to allow or wire `sources` fail closed). When `sources_server`
+  is declared—or when `LU_PRODUCT_ROOT` is unregistered or carries `curriculum/l2-uk-en/curriculum.yaml`—missing
+  or unreadable declarations fail closed.
+- `admission_policy` (declared on `public` as `scripts/curriculum/admission_policy.v1.json`):
+  loaded by `lu_machinery.orchestration.product_policy` and `dispatch_admission`. Registered
+  non-curriculum consumers that omit `admission_policy` receive the fail-closed machinery
+  default policy (`origin: "lu_machinery:default"`): empty `content_agent_types`, empty
+  `ukrainian_content_families` and `ukrainian_review_seats` (denying all Ukrainian content
+  and review seat queries), empty `learner_payload_paths`, and the conservative default
+  review-receipt floor `{"google", "openai"}`. `public`, any checkout carrying
+  `curriculum/l2-uk-en/curriculum.yaml` or a `learn-ukrainian/learn-ukrainian.github.io`
+  `origin`, and any unregistered `LU_PRODUCT_ROOT` still require the policy file and fail
+  closed (`ProductPolicyError`) when it is missing or invalid.
+
+Consumer checkout identification (`fleet_repos.consumer_repo_for_root`) resolves symlinks
+and linked worktrees to their primary checkout, pins any checkout carrying
+`curriculum/l2-uk-en/curriculum.yaml` to the default `public` row, treats a real
+`.git/config` `origin` GitHub URL as authoritative (refusing basename fallback when an
+unregistered or ambiguous `origin` is present), and matches `local_name` only when no
+`origin` remote exists.
+
 ### GPT-6 Codex role routing
 
 For bounded implementation or investigation, read the machine-readable

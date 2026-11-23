@@ -1253,3 +1253,112 @@ def test_healthy_test_host_never_reads_the_real_test_slot_pool(tmp_path, probe, 
     assert decision.admitted
     assert decision.slots is not None and decision.slots.skipped == "test host"
     assert "test-slot queue check skipped (test host)" in decision.summary()
+
+
+def test_consumer_without_admission_policy_uses_fail_closed_machinery_default(tmp_path, probe, monkeypatch):
+    """Defect class (F5): dispatch admission refuses a registered non-curriculum consumer lacking
+    scripts/curriculum/admission_policy.v1.json, or its default policy permits Ukrainian content."""
+    from lu_machinery.orchestration import product_policy
+
+    # Synthetic consumer identified by git origin (even when directory name differs) and by local_name.
+    consumer = tmp_path / "renamed-kd"
+    (consumer / ".git").mkdir(parents=True)
+    (consumer / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+
+    policy = adm.load_product_policy()
+    assert policy.origin == product_policy.MACHINERY_DEFAULT_ORIGIN
+    assert not adm.is_content_seat("curriculum-orchestrator")
+    for family in ("anthropic", "google", "openai"):
+        assert not adm.ukrainian_content_family_allowed(family)
+    assert not adm.is_ukrainian_review_seat("agy", "google")
+    assert not adm.is_ukrainian_review_seat("codex", "openai")
+    assert not adm.requires_ukrainian_review(["curriculum/l2-uk-en/a1/lesson.md", "src/index.ts"])
+    with pytest.raises(product_policy.ProductPolicyError) as bad_path:
+        adm.requires_ukrainian_review(["../escape"])
+    assert bad_path.value.code == "change_path_not_canonical"
+    assert adm.required_review_receipts(["google"]) == frozenset({"google", "openai"})
+
+    assert adm.precheck("workspace-write", thresholds=_LIMITS) is None
+    assert adm.evaluate("read-only", tmp_path / "tasks").admitted
+    write_decision = adm.evaluate("workspace-write", tmp_path / "tasks", thresholds=_LIMITS)
+    assert write_decision.admitted
+
+    # Linked worktree of the consumer resolves through its primary checkout.
+    wt_gitdir = consumer / ".git" / "worktrees" / "wt1"
+    wt_gitdir.mkdir(parents=True)
+    worktree = tmp_path / "wt1"
+    worktree.mkdir()
+    (worktree / ".git").write_text(f"gitdir: {wt_gitdir}\n", encoding="utf-8")
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(worktree))
+    assert adm.load_product_policy().origin == product_policy.MACHINERY_DEFAULT_ORIGIN
+
+    # Explicit path argument still fails closed even when LU_PRODUCT_ROOT is a consumer without policy.
+    with pytest.raises(product_policy.ProductPolicyError) as explicit_missing:
+        adm.load_product_policy(tmp_path / "missing.json")
+    assert explicit_missing.value.code == "policy_missing"
+
+
+@pytest.mark.parametrize(
+    ("dirname", "origin_url", "with_lu_marker"),
+    [
+        ("learn-ukrainian", None, False),
+        ("kube-dojo", None, True),
+        ("kube-dojo", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", False),
+        ("kube-dojo", "https://github.com/other-org/other-repo.git", False),
+        ("unregistered-root", None, False),
+    ],
+    ids=["public-dir", "lu-marker", "lu-origin", "unregistered-origin", "unregistered-dir"],
+)
+def test_missing_admission_policy_fails_closed_for_learn_ukrainian_and_unregistered_roots(
+    tmp_path, monkeypatch, dirname, origin_url, with_lu_marker
+):
+    """Defect class (F5 fail-closed): missing admission_policy.v1.json silently widens admission
+    for Learn Ukrainian or an unregistered product root."""
+    from lu_machinery.orchestration import product_policy
+
+    root = tmp_path / dirname
+    root.mkdir()
+    if origin_url is not None:
+        (root / ".git").mkdir()
+        (root / ".git" / "config").write_text(f'[remote "origin"]\n\turl = {origin_url}\n', encoding="utf-8")
+    if with_lu_marker:
+        marker = root / "curriculum" / "l2-uk-en" / "curriculum.yaml"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("levels: {}\n", encoding="utf-8")
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+
+    with pytest.raises(product_policy.ProductPolicyError) as exc_info:
+        adm.evaluate("read-only", tmp_path / "tasks")
+    assert exc_info.value.code == "policy_missing"
+
+
+def test_fleet_repos_rejects_invalid_consumer_relative_paths(tmp_path):
+    """Defect class (F1/F5 config validation): traversal or non-canonical sources_server /
+    admission_policy entries in fleet_repos.yaml are accepted instead of failing closed."""
+    import yaml
+
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+
+    for field in ("sources_server", "admission_policy"):
+        for bad_value in ("/etc/passwd", "../escape.json", "dir/sub/", "a\\b.json", "a\x00b", "", 123):
+            cfg = tmp_path / f"bad-{field}.yaml"
+            cfg.write_text(
+                yaml.safe_dump({
+                    "version": 1,
+                    "repos": {
+                        "public": {
+                            "github": "learn-ukrainian/learn-ukrainian.github.io",
+                            "local_name": "learn-ukrainian",
+                            "default": True,
+                            field: bad_value,
+                        }
+                    },
+                }),
+                encoding="utf-8",
+            )
+            with pytest.raises(FleetRepoError, match=field):
+                load_fleet_repos(cfg)

@@ -32,6 +32,21 @@
 # post-release PR in machinery). Omitting the key leaves release PRs without a
 # milestone; an invalid, closed, or ambiguous value refuses before publication.
 #
+# `sources_server` (optional, canonical repo-relative POSIX file path) names the
+# repository's Sources MCP server declaration file parsed statically for
+# read-only tool grants and denies (`lu_machinery.agent_runtime.sources_read_only`).
+# Omit when a consumer repository has no Sources server; read-only adapters then
+# skip Sources wiring. When declared, a missing or unreadable server fails closed.
+#
+# `admission_policy` (optional, canonical repo-relative POSIX file path) names
+# the repository's versioned product admission policy file
+# (`lu_machinery.orchestration.product_policy`). Omit on a non-curriculum
+# consumer repository to use the documented fail-closed machinery default policy
+# (empty Ukrainian content/review seats and learner payload paths, conservative
+# default review receipts). When declared, or when the product root is
+# unregistered or carries the Learn Ukrainian curriculum marker, a missing or
+# invalid policy fails closed.
+#
 # Dual-slug transfer bridge (PLAN NEW-ORG-1122 A01):
 # - `alternate_github` (optional, owner/name) names the one exact alternate slug
 #   for a repository being transferred. Both `github` and `alternate_github`
@@ -76,6 +91,8 @@ repos:
     role: public-monorepo
     verdict_recorder: true
     default: true
+    sources_server: .mcp/servers/sources/server.py
+    admission_policy: scripts/curriculum/admission_policy.v1.json
   infra-private:
     github: learn-ukrainian/learn-ukrainian-infra-private
     alternate_github: agentic-machinery/machinery-infra

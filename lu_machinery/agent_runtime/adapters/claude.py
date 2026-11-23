@@ -266,7 +266,7 @@ from ..env_sanitize import (
 from ..errors import AgentUnavailableError
 from ..jsonl import jsonl_lines
 from ..result import ParseResult
-from ..sources_read_only import sources_tool_sets
+from ..sources_read_only import SERVER_RELATIVE_PATH, sources_server_path, sources_tool_sets
 from ..tool_calls import normalize_tool_calls, parse_json_events
 from ._output_schema import json_value, load_output_schema, plan_output_schema, schema_metadata, structured_result
 from .base import InvocationPlan
@@ -615,7 +615,30 @@ def _reviewer_mcp_config() -> str:
     """
     from lu_machinery.agent_runtime.review_mcp import isolated_sources_mcp_config, sources_server_launch
 
-    return json.dumps(isolated_sources_mcp_config(*sources_server_launch()), separators=(",", ":"))
+    python_bin, default_server = sources_server_launch()
+    declared = sources_server_path()
+    if declared is None:
+        return '{"mcpServers":{}}'
+    server = default_server if declared == product_root() / SERVER_RELATIVE_PATH else declared
+    return json.dumps(isolated_sources_mcp_config(python_bin, server), separators=(",", ":"))
+
+
+def _refuse_undeclared_sources_in_readonly(tc: dict[str, Any], *, review_isolation: bool) -> None:
+    """Fail closed if a read-only caller wires ``sources`` when the consumer declares no Sources server."""
+    if review_isolation:
+        return
+    explicit_allowed = tc.get("allowed_tools")
+    if isinstance(explicit_allowed, str):
+        tokens = [token.strip() for token in explicit_allowed.split(",") if token.strip()]
+        if any(token.casefold().startswith(f"mcp__{SOURCES_MCP_SERVER}__") for token in tokens):
+            raise ValueError(
+                "ClaudeAdapter: read-only mode cannot allow mcp__sources__* when the consumer declares no sources_server"
+            )
+    explicit_mcp = tc.get("mcp_config_path")
+    if isinstance(explicit_mcp, str) and explicit_mcp and SOURCES_MCP_SERVER in _mcp_server_names(Path(explicit_mcp)):
+        raise ValueError(
+            "ClaudeAdapter: read-only mode cannot wire a sources MCP server when the consumer declares no sources_server"
+        )
 
 
 _DEPLOYED_HOOKS_PREFIX = "$CLAUDE_PROJECT_DIR/.claude/hooks/"
@@ -1072,6 +1095,8 @@ class ClaudeAdapter:
         # settings, whatever name the server is registered under. An unreadable server
         # declaration raises here rather than launching without the denies.
         sources_readers, sources_writers = sources_tool_sets() if mode == "read-only" else ((), ())
+        if mode == "read-only" and not sources_readers and not sources_writers:
+            _refuse_undeclared_sources_in_readonly(tc, review_isolation=review_isolation)
         if mode == "danger":
             cmd.append("--dangerously-skip-permissions")
         elif ordinary_reviewer:
@@ -1088,9 +1113,11 @@ class ClaudeAdapter:
                     "ClaudeAdapter: an ordinary reviewer's MCP config is built by the harness; "
                     "mcp_config_path is accepted only for a formal full-access review attempt"
                 )
-            else:
+            elif sources_readers:
                 cmd.extend(["--strict-mcp-config", "--mcp-config", _reviewer_mcp_config()])
                 granted.extend(_sources_rules(sources_readers))
+            else:
+                cmd.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
             cmd.extend(["--allowedTools", ",".join(dict.fromkeys(granted))])
             cmd.extend(["--disallowedTools", ",".join(denied)])
         elif mode == "read-only" and sources_writers:

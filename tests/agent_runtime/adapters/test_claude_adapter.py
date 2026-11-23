@@ -147,3 +147,168 @@ def test_missing_native_claude_on_fake_path_refuses_without_package_runner(
     assert "@latest" not in message
     assert "npm install" not in message
     assert not runner_marker.exists()
+
+
+def _install_fake_claude_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from lu_machinery.review.isolation import CLAUDE_MIN_SUPPORTED_CLI_VERSION
+
+    fake_bin = tmp_path / "fake-claude-bin"
+    fake_bin.mkdir(exist_ok=True)
+    binary = fake_bin / "claude"
+    version = ".".join(str(part) for part in CLAUDE_MIN_SUPPORTED_CLI_VERSION)
+    binary.write_text(f"#!/bin/sh\nprintf '%s\\n' '{version} (Claude Code)'\n", encoding="utf-8")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+
+def _make_consumer_root(
+    target: Path,
+    *,
+    origin_url: str | None = None,
+    with_lu_marker: bool = False,
+) -> Path:
+    """Create a synthetic consumer checkout with shared Claude settings but no Sources server or policy."""
+    fixture_settings = (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "product_tree"
+        / "agents_extensions"
+        / "shared"
+        / "settings.json"
+    )
+    settings_dst = target / "agents_extensions" / "shared" / "settings.json"
+    settings_dst.parent.mkdir(parents=True, exist_ok=True)
+    settings_dst.write_bytes(fixture_settings.read_bytes())
+    if origin_url is not None:
+        git_dir = target / ".git"
+        git_dir.mkdir(parents=True, exist_ok=True)
+        (git_dir / "config").write_text(f'[remote "origin"]\n\turl = {origin_url}\n', encoding="utf-8")
+    if with_lu_marker:
+        marker = target / "curriculum" / "l2-uk-en" / "curriculum.yaml"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("levels: {}\n", encoding="utf-8")
+    return target
+
+
+def test_read_only_claude_adapter_skips_sources_wiring_for_consumer_without_sources_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class (F1): read-only ClaudeAdapter crashes with FileNotFoundError or wires a missing
+    Sources server when running in a registered consumer repo whose fleet_repos row declares none."""
+    _install_fake_claude_cli(tmp_path, monkeypatch)
+    consumer = _make_consumer_root(
+        tmp_path / "renamed-consumer",
+        origin_url="https://github.com/kube-dojo/kube-dojo.github.io.git",
+    )
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+
+    plain = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=consumer,
+        model=None,
+        task_id="consumer-plain",
+        session_id=None,
+        tool_config=None,
+    )
+    assert "--disallowedTools" not in plain.cmd
+    assert "--mcp-config" not in plain.cmd
+
+    reviewer = ClaudeAdapter().build_invocation(
+        prompt="review",
+        mode="read-only",
+        cwd=consumer,
+        model=None,
+        task_id="consumer-reviewer",
+        session_id=None,
+        tool_config={"reviewer_tools": True},
+    )
+    assert "--strict-mcp-config" in reviewer.cmd
+    mcp_cfg = reviewer.cmd[reviewer.cmd.index("--mcp-config") + 1]
+    assert json.loads(mcp_cfg) == {"mcpServers": {}}
+    allowed = reviewer.cmd[reviewer.cmd.index("--allowedTools") + 1].split(",")
+    disallowed = reviewer.cmd[reviewer.cmd.index("--disallowedTools") + 1].split(",")
+    assert not any("mcp__sources__" in rule for rule in allowed)
+    assert not any("mcp__sources__" in rule for rule in disallowed)
+
+    # Explicit attempts to allow or wire a sources server in a consumer without one fail closed.
+    with pytest.raises(ValueError, match="declares no sources_server"):
+        ClaudeAdapter().build_invocation(
+            prompt="inspect",
+            mode="read-only",
+            cwd=consumer,
+            model=None,
+            task_id="consumer-explicit-allow",
+            session_id=None,
+            tool_config={"allowed_tools": "Read,mcp__sources__verify_word"},
+        )
+    sources_mcp = tmp_path / "extra.mcp.json"
+    sources_mcp.write_text('{"mcpServers":{"sources":{"command":"/bin/true"}}}', encoding="utf-8")
+    with pytest.raises(ValueError, match="declares no sources_server"):
+        ClaudeAdapter().build_invocation(
+            prompt="inspect",
+            mode="read-only",
+            cwd=consumer,
+            model=None,
+            task_id="consumer-explicit-mcp",
+            session_id=None,
+            tool_config={"mcp_config_path": str(sources_mcp)},
+        )
+
+
+@pytest.mark.parametrize(
+    ("dirname", "origin_url", "with_lu_marker"),
+    [
+        ("learn-ukrainian", None, False),
+        ("kube-dojo", None, True),
+        ("kube-dojo", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", False),
+        ("kube-dojo", "https://github.com/unregistered/repo.git", False),
+        ("unregistered-consumer", None, False),
+    ],
+    ids=["public-dir", "lu-marker-beats-name", "lu-origin-beats-name", "unknown-origin-no-fallback", "unregistered"],
+)
+def test_read_only_claude_adapter_fails_closed_when_sources_server_required_but_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dirname: str,
+    origin_url: str | None,
+    with_lu_marker: bool,
+) -> None:
+    """Defect class (F1 fail-closed): Learn Ukrainian, LU-origin, LU-marker, or unregistered roots
+    silently skip Sources denies when .mcp/servers/sources/server.py is missing."""
+    _install_fake_claude_cli(tmp_path, monkeypatch)
+    root = _make_consumer_root(tmp_path / dirname, origin_url=origin_url, with_lu_marker=with_lu_marker)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+
+    with pytest.raises(FileNotFoundError):
+        ClaudeAdapter().build_invocation(
+            prompt="inspect",
+            mode="read-only",
+            cwd=root,
+            model=None,
+            task_id="missing-sources",
+            session_id=None,
+            tool_config=None,
+        )
+
+
+def test_read_only_claude_adapter_refuses_symlink_impersonating_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class (F1 symlink spoof): a symlink named kube-dojo pointing at learn-ukrainian skips Sources."""
+    _install_fake_claude_cli(tmp_path, monkeypatch)
+    real_lu = _make_consumer_root(tmp_path / "learn-ukrainian")
+    spoof = tmp_path / "kube-dojo"
+    spoof.symlink_to(real_lu)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(spoof))
+
+    with pytest.raises(FileNotFoundError):
+        ClaudeAdapter().build_invocation(
+            prompt="inspect",
+            mode="read-only",
+            cwd=spoof,
+            model=None,
+            task_id="symlink-spoof",
+            session_id=None,
+            tool_config=None,
+        )

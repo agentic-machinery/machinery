@@ -80,10 +80,12 @@ from typing import Any
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError, product_root
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, consumer_repo_for_root
 
 SCHEMA = "learn-ukrainian.product-admission-policy"
 SCHEMA_VERSION = 1
 POLICY_REL = "scripts/curriculum/admission_policy.v1.json"
+MACHINERY_DEFAULT_ORIGIN = "lu_machinery:default"
 MAX_POLICY_BYTES = 64 * 1024
 DIGEST_FIELD = "content_sha256"
 
@@ -388,7 +390,12 @@ def _require_v1_envelope(
         )
 
 
-def parse_policy(document: Any, *, file_name: str | None = None) -> ProductPolicy:
+def parse_policy(
+    document: Any,
+    *,
+    file_name: str | None = None,
+    expected_origin: str = POLICY_REL,
+) -> ProductPolicy:
     """Validate a decoded policy document. ``file_name`` is the name the file was read under."""
     top = _fields(document, _TOP_FIELDS, "policy")
     if top["schema"] != SCHEMA:
@@ -398,10 +405,10 @@ def parse_policy(document: Any, *, file_name: str | None = None) -> ProductPolic
         raise ProductPolicyError(
             "policy_version_incompatible", f"schema_version {version!r} is not {SCHEMA_VERSION} (this loader reads v1 only)"
         )
-    if top["origin"] != POLICY_REL:
-        raise ProductPolicyError("policy_origin_mismatch", f"origin {top['origin']!r} is not {POLICY_REL!r}")
-    if file_name is not None and file_name != POLICY_REL.rsplit("/", 1)[-1]:
-        raise ProductPolicyError("policy_origin_mismatch", f"file name {file_name!r} does not match origin {POLICY_REL!r}")
+    if top["origin"] != expected_origin:
+        raise ProductPolicyError("policy_origin_mismatch", f"origin {top['origin']!r} is not {expected_origin!r}")
+    if file_name is not None and file_name != expected_origin.rsplit("/", 1)[-1]:
+        raise ProductPolicyError("policy_origin_mismatch", f"file name {file_name!r} does not match origin {expected_origin!r}")
     digest = top[DIGEST_FIELD]
     if not isinstance(digest, str) or not _SHA256_RE.match(digest):
         raise ProductPolicyError("policy_field_invalid", f"{DIGEST_FIELD} must be 64 lowercase hex digits")
@@ -474,6 +481,25 @@ def parse_policy(document: Any, *, file_name: str | None = None) -> ProductPolic
     )
 
 
+def machinery_default_policy() -> ProductPolicy:
+    """Fail-closed machinery default policy for registered non-curriculum consumers without ``admission_policy``.
+
+    Grants no Ukrainian content agent types, no Ukrainian content families, and no Ukrainian
+    review seats, declares no learner payload paths, and retains the conservative cross-family
+    default receipt floor. Never applied to Learn Ukrainian (``public``), to checkouts carrying
+    ``PRODUCT_MARKER`` or a Learn Ukrainian origin, or to unregistered ``LU_PRODUCT_ROOT`` values.
+    """
+    return ProductPolicy(
+        origin=MACHINERY_DEFAULT_ORIGIN,
+        content_agent_types=frozenset(),
+        ukrainian_content_families=frozenset(),
+        ukrainian_review_seats=frozenset(),
+        learner_payload_paths=(),
+        review_receipts_by_author_family=MappingProxyType({}),
+        review_receipts_default=_V1_RECEIPTS_DEFAULT_FLOOR,
+    )
+
+
 def default_policy_path() -> Path:
     """:data:`POLICY_REL` in the selected product checkout; refuse (``policy_missing``) without one."""
     try:
@@ -482,10 +508,52 @@ def default_policy_path() -> Path:
         raise ProductPolicyError("policy_missing", str(exc)) from None
 
 
+def resolve_policy_target(root: Path | None = None) -> tuple[Path, str] | None:
+    """Return ``(policy_path, expected_origin)`` for ``root`` (default ``product_root()``), or ``None``.
+
+    - When ``root`` matches a registered ``fleet_repos.yaml`` row with ``admission_policy``:
+      returns ``(root / row.admission_policy, row.admission_policy)``.
+    - When ``root`` matches a registered ``fleet_repos.yaml`` row omitting ``admission_policy``:
+      returns ``None`` (caller applies :func:`machinery_default_policy`).
+    - When ``root`` is unregistered (e.g. a Learn Ukrainian release snapshot or test fixture):
+      fails closed to ``(root / POLICY_REL, POLICY_REL)``.
+    """
+    try:
+        selected = product_root() if root is None else root
+    except ProductRootError as exc:
+        raise ProductPolicyError("policy_missing", str(exc)) from None
+    try:
+        repo = consumer_repo_for_root(selected)
+    except FleetRepoError as exc:
+        raise ProductPolicyError("policy_unreadable", str(exc)) from None
+    if repo is None:
+        return selected / POLICY_REL, POLICY_REL
+    if repo.admission_policy is None:
+        return None
+    return selected / repo.admission_policy, repo.admission_policy
+
+
 def load_policy(path: Path | None = None) -> ProductPolicy:
-    """Read and validate the product policy, or raise :class:`ProductPolicyError`."""
-    target = default_policy_path() if path is None else Path(path)
-    return parse_policy(_decode(_read_bytes(target), target), file_name=target.name)
+    """Read and validate the product policy, or raise :class:`ProductPolicyError`.
+
+    An explicit ``path`` always reads and validates that exact file (failing closed if missing
+    or invalid). When ``path`` is omitted, a registered consumer row in ``fleet_repos.yaml``
+    without ``admission_policy`` receives :func:`machinery_default_policy`; ``public``,
+    Learn Ukrainian checkouts, and unregistered roots still require the policy file and fail
+    closed when it is missing or invalid.
+    """
+    if path is not None:
+        target = Path(path)
+        return parse_policy(_decode(_read_bytes(target), target), file_name=target.name)
+    resolved = resolve_policy_target()
+    if resolved is None:
+        return machinery_default_policy()
+    target, expected_origin = resolved
+    return parse_policy(
+        _decode(_read_bytes(target), target),
+        file_name=target.name,
+        expected_origin=expected_origin,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -497,10 +565,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--digest", action="store_true", help="print the canonical content_sha256 without validating it")
     args = parser.parse_args(argv)
     try:
-        if args.path is None:
-            args.path = default_policy_path()
         if args.digest:
-            document = _decode(_read_bytes(args.path), args.path)
+            if args.path is None:
+                resolved = resolve_policy_target()
+                if resolved is None:
+                    raise ProductPolicyError("policy_missing", "consumer declares no admission_policy file to digest")
+                digest_path = resolved[0]
+            else:
+                digest_path = args.path
+            document = _decode(_read_bytes(digest_path), digest_path)
             if not isinstance(document, dict):
                 raise ProductPolicyError("policy_field_invalid", "policy must be an object")
             print(canonical_digest(document))
@@ -512,7 +585,10 @@ def main(argv: list[str] | None = None) -> int:
     except (TypeError, ValueError) as exc:
         print(f"product admission policy refused (policy_field_invalid): {exc}", file=sys.stderr)
         return 3
-    print(f"valid: {policy.origin} schema v{SCHEMA_VERSION}")
+    if policy.origin == MACHINERY_DEFAULT_ORIGIN:
+        print(f"valid: {policy.origin} (machinery default)")
+    else:
+        print(f"valid: {policy.origin} schema v{SCHEMA_VERSION}")
     return 0
 
 
@@ -521,6 +597,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "MACHINERY_DEFAULT_ORIGIN",
     "POLICY_REL",
     "SCHEMA",
     "SCHEMA_VERSION",
@@ -530,5 +607,7 @@ __all__ = [
     "canonical_digest",
     "default_policy_path",
     "load_policy",
+    "machinery_default_policy",
     "parse_policy",
+    "resolve_policy_target",
 ]
