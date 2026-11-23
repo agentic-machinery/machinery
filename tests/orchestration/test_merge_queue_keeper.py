@@ -536,6 +536,10 @@ class DirectFakeGitHub(FakeGitHub):
         }
         self.direct_merge_error: Exception | None = None
         self.auto_merge_marks_merged = True
+        self.runs_by_id: dict[int, dict[str, Any]] = {}
+        self.jobs_by_run: dict[int, list[dict[str, Any]]] = {}
+        self.logs_by_job: dict[int, str] = {}
+        self.run_rerun_error: Exception | None = None
 
     def branch_names(self) -> set[str]:
         return {row["baseRefName"] for row in self.rows} or {"main"}
@@ -571,6 +575,26 @@ class DirectFakeGitHub(FakeGitHub):
     def re_enqueue(self, number: int, head: str, recovery_run_id: int) -> bool:
         self.actions.append(("re-enqueue", (number, head, recovery_run_id)))
         return False
+
+    def run_detail(self, run_id: int) -> dict[str, Any]:
+        if run_id not in self.runs_by_id:
+            raise keeper.KeeperError(f"workflow run lookup incomplete for {run_id}")
+        return dict(self.runs_by_id[run_id])
+
+    def jobs(self, run_id: int) -> list[dict[str, Any]]:
+        if run_id not in self.jobs_by_run:
+            raise keeper.KeeperError(f"job page incomplete for {run_id}")
+        return list(self.jobs_by_run[run_id])
+
+    def job_log(self, job_id: int) -> str:
+        if job_id not in self.logs_by_job:
+            raise keeper.KeeperError(f"job log unavailable for {job_id}")
+        return self.logs_by_job[job_id]
+
+    def run_rerun(self, run_id: int) -> None:
+        self.actions.append(("run-rerun", run_id))
+        if self.run_rerun_error is not None:
+            raise self.run_rerun_error
 
     def branch_head(self, branch: str) -> str:
         if branch not in self.base_heads:
@@ -1190,3 +1214,293 @@ def test_recovery_concurrent_rerun_vs_reenqueue_and_keeper_sole_ownership(
     with pytest.raises(gate.PublishBlocked, match="RECOVERY_ALLOWANCE_SPENT"):
         pub.publish("run-rerun", number=123, repo="unit/public", cwd=tmp_path, env={}, runner=transport)
     assert len(writes) == 1
+
+
+def test_head_moved_to_unreviewed_head_alerts_once_in_custody_and_report_mode(tmp_path: Path) -> None:
+    """Defect class: PR in keeper custody (merge-queue) or report mode moved to unreviewed head misses immediate CTO alert."""
+    from datetime import UTC, datetime
+
+    from lu_machinery.orchestration import pr_ownership as own
+    from lu_machinery.orchestration.fleet_repos import FleetRepo
+
+    own_path = tmp_path / "pr_ownership.json"
+    fleet = {"public": FleetRepo("public", "unit/public", "unit-public", "public-monorepo", True)}
+    worker = {"task_id": "w1", "worktree_branch": "codex/x", "status": "running", "repository": "unit/public", "run_nonce": "n1"}
+    own.acknowledge_keeper_transfer(
+        own_path,
+        repo="unit/public",
+        number=42,
+        pr={"state": "OPEN", "isDraft": False, "headRefOid": HEAD_A, "headRefName": "codex/x", "baseRefName": "main", "isCrossRepository": False},
+        worker_task="w1",
+        worker_nonce="n1",
+        records=[worker],
+        now=datetime(2026, 9, 23, 12, 0, tzinfo=UTC),
+        rerun="unspent",
+        repos=fleet,
+        verdict_receipt={"pr": 42, "head": HEAD_A, "task": "rev1", "verdict": "APPROVED", "status": "posted"},
+        live=lambda r: r is not None and r.get("status") == "running",
+    )
+
+    # Merge-queue mode, apply=True: HEAD_B has NO recorded verdict and pending CI (not ready),
+    # yet keeper custody MUST alert claude-cto immediately on this tick and never duplicate.
+    mq = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_B)], repository="unit/public")
+    mq.queue_enabled = True
+    mq.comments_by_pr[42] = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A)]
+    mq.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+    mq_state = tmp_path / "mq_moved.json"
+    lines1, failed1 = keeper.run(mq, mq_state, apply=True, ownership_path=own_path)
+    assert not failed1 and mutations(mq) == []
+    assert "#42 held: head-moved" in lines1
+    custody = own.keeper_custody_for(own_path, "unit/public", 42)
+    assert custody is not None and custody["keeper_state"] == "repair" and custody["observed_head"] == HEAD_B
+    outbox = json.loads(mq_state.read_text())["cto_outbox"]
+    assert len(outbox) == 1 and HEAD_A in outbox[0]["body"] and HEAD_B in outbox[0]["body"]
+    # Second tick sends no duplicate alert.
+    _lines2, failed2 = keeper.run(mq, mq_state, apply=True, ownership_path=own_path)
+    assert not failed2 and len(json.loads(mq_state.read_text())["cto_outbox"]) == 1
+
+    # Report mode (apply=False) with direct_config (no custody yet): prior approved HEAD_A moved
+    # to unreviewed HEAD_B raises ONE CTO alert on that tick with zero GitHub mutations.
+    rep = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_B)], repository=PRIVATE_REPO)
+    rep.comments_by_pr[42] = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A)]
+    rep.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+    rep_state = tmp_path / "report_moved.json"
+    rep_lines1, rep_failed1 = keeper.run(rep, rep_state, apply=False, direct_config=_direct_cfg())
+    assert not rep_failed1 and mutations(rep) == []
+    assert any("unreviewed head move alerted" in line for line in rep_lines1)
+    rep_outbox = json.loads(rep_state.read_text())["cto_outbox"]
+    assert len(rep_outbox) == 1 and HEAD_A in rep_outbox[0]["body"] and HEAD_B in rep_outbox[0]["body"]
+    # Second report tick does not duplicate the alert.
+    rep_lines2, rep_failed2 = keeper.run(rep, rep_state, apply=False, direct_config=_direct_cfg())
+    assert not rep_failed2 and mutations(rep) == []
+    assert not any("unreviewed head move alerted" in line for line in rep_lines2)
+    assert len(json.loads(rep_state.read_text())["cto_outbox"]) == 1
+
+    # Dormant mode (no direct_config, no ownership_path): report mode stays completely dormant.
+    dormant_state = tmp_path / "dormant_report.json"
+    _dl, df = keeper.run(rep, dormant_state, apply=False)
+    assert not df and not dormant_state.exists()
+
+
+def test_required_verify_run_failure_blocks_landing_and_alerts(tmp_path: Path) -> None:
+    """Defect class: keeper enqueues or direct-merges a PR touching a verify_run area when verify_run fails."""
+    # Area mapping checks (verify/SKILL.md): api, sources, host, combined, and tests/docs exclusions.
+    assert keeper._verify_run_areas_for_files(["lu_machinery/api/state_router.py"], repository=PRIVATE_REPO) == ("api",)
+    assert keeper._verify_run_areas_for_files([".mcp/servers/sources/server.py"], repository=PRIVATE_REPO) == ("sources",)
+    assert keeper._verify_run_areas_for_files(["packaging/systemd/learn-ukrainian-sources.service"], repository=PRIVATE_REPO) == ("sources", "host")
+    assert keeper._verify_run_areas_for_files(["lu_machinery/packaging/systemd/learn-ukrainian-loopback.target"], repository=PRIVATE_REPO) == ("host",)
+    assert keeper._verify_run_areas_for_files(["tests/fixtures/foo.service", "docs/runbooks/foo.md", "scripts/example.py"], repository=PRIVATE_REPO) == ()
+
+    # Direct-landing mode: PR touches api area -> failing verify_run refuses direct_merge and alerts CTO once.
+    seen_areas: list[tuple[str, ...]] = []
+
+    def fail_verify(areas: Any) -> dict[str, Any]:
+        seen_areas.append(tuple(areas))
+        return {"schema_version": "verify-run.v1", "ok": False, "areas": [{"area": a, "ok": False} for a in areas]}
+
+    def pass_verify(areas: Any) -> dict[str, Any]:
+        seen_areas.append(tuple(areas))
+        return {"schema_version": "verify-run.v1", "ok": True, "areas": [{"area": a, "ok": True} for a in areas]}
+
+    direct = DirectFakeGitHub([pr(number=42)], repository=PRIVATE_REPO)
+    direct.files_by_pr[42] = ["lu_machinery/api/state_router.py"]
+    direct_state = tmp_path / "verify_direct.json"
+    lines1, failed1 = keeper.run(
+        direct, direct_state, apply=True, direct_config=_direct_cfg(), verify_runner=fail_verify,
+    )
+    assert not failed1 and mutations(direct) == []
+    assert "#42 held: verify-run-failed:api" in lines1
+    assert seen_areas == [("api",)]
+    outbox = json.loads(direct_state.read_text())["cto_outbox"]
+    assert len(outbox) == 1 and "verify-run-failed:api" in outbox[0]["body"]
+
+    # Once verify_run passes, direct_merge succeeds.
+    lines2, failed2 = keeper.run(
+        direct, direct_state, apply=True, direct_config=_direct_cfg(),
+        verify_runner=pass_verify, closeout_runner=lambda num, repo, root: ("closed_out", ""),
+    )
+    assert not failed2 and mutations(direct) == ["direct-merge"]
+    assert "#42 direct-merged" in "\n".join(lines2)
+
+    # Merge-queue mode: PR touches host area -> failing verify_run blocks enqueue and alerts CTO once.
+    mq = DirectFakeGitHub([pr(number=43, headRefOid=HEAD_B)], repository="unit/public")
+    mq.queue_enabled = True
+    mq.files_by_pr[43] = ["lu_machinery/packaging/systemd/learn-ukrainian-loopback.target"]
+    mq_state = tmp_path / "verify_mq.json"
+    mq_cfg = _direct_cfg(repository="unit/public")
+    mq_lines1, mq_failed1 = keeper.run(mq, mq_state, apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+    assert not mq_failed1 and mutations(mq) == []
+    assert "#43 held: verify-run-failed:host" in mq_lines1
+    mq_outbox = json.loads(mq_state.read_text())["cto_outbox"]
+    assert len(mq_outbox) == 1 and "verify-run-failed:host" in mq_outbox[0]["body"]
+
+    # Once verify_run passes, enqueue succeeds.
+    mq_lines2, mq_failed2 = keeper.run(mq, mq_state, apply=True, direct_config=mq_cfg, verify_runner=pass_verify)
+    assert not mq_failed2 and mutations(mq) == ["enqueue"]
+    assert "#43 enqueued" in mq_lines2
+
+
+def test_pr_ci_infra_failure_gets_exactly_one_rerun_and_second_alerts(tmp_path: Path) -> None:
+    """Defect class: PR CI infra failure skips rerun, reruns a failing test node, or reruns twice without alerting."""
+    cfg = _direct_cfg(allow_infra_reenqueue=True)
+
+    # 1. Infrastructure failure with no failing test node -> posts evidence comment + ONE rerun;
+    # second failure on the same head does NOT rerun and alerts claude-cto once.
+    fake = DirectFakeGitHub([pr(number=42)], repository=PRIVATE_REPO)
+    fake.checks_by_head[HEAD_A] = [{
+        "id": 701, "workflow_run_id": 8888, "name": "CI Gate", "head_sha": HEAD_A,
+        "status": "completed", "conclusion": "failure", "started_at": "2026-09-23T00:00:00Z",
+    }]
+    fake.runs_by_id[8888] = {
+        "id": 8888, "head_sha": HEAD_A, "status": "completed", "conclusion": "failure",
+        "event": "pull_request", "run_attempt": 1,
+    }
+    fake.jobs_by_run[8888] = [
+        {"id": 9901, "name": "validate", "conclusion": "failure"},
+        {"id": 9902, "name": "CI Gate", "conclusion": "failure"},
+    ]
+    fake.logs_by_job[9901] = "2026-11-23T00:00:00Z ##[error]The self-hosted runner: pilot-vps lost communication with the server."
+    state = tmp_path / "infra_rerun.json"
+
+    lines1, failed1 = keeper.run(fake, state, apply=True, direct_config=cfg)
+    assert not failed1
+    assert [action for action in fake.actions if action[0] == "run-rerun"] == [("run-rerun", 8888)]
+    comment_bodies = [payload for name, payload in fake.actions if name == "comment"]
+    assert len(comment_bodies) == 1 and "<!-- ci-recovery-evidence " in comment_bodies[0]
+    assert '"diagnosis":"infrastructure"' in comment_bodies[0] and '"failed_tests":[]' in comment_bodies[0]
+    assert "#42 infra-rerun run=8888" in "\n".join(lines1)
+    assert json.loads(state.read_text()).get("cto_outbox", []) == []
+
+    # Tick 2: rerun finishes and fails again on the SAME head -> NO second rerun, alerts claude-cto once.
+    fake.runs_by_id[8888]["run_attempt"] = 2
+    lines2, failed2 = keeper.run(fake, state, apply=True, direct_config=cfg)
+    assert not failed2
+    assert [action for action in fake.actions if action[0] == "run-rerun"] == [("run-rerun", 8888)]
+    assert any("infra-rerun-exhausted" in line for line in lines2)
+    outbox = json.loads(state.read_text())["cto_outbox"]
+    assert len(outbox) == 1 and "8888" in outbox[0]["body"]
+    # Tick 3: still no second rerun and no duplicate CTO alert.
+    _lines3, failed3 = keeper.run(fake, state, apply=True, direct_config=cfg)
+    assert not failed3 and len(json.loads(state.read_text())["cto_outbox"]) == 1
+
+    # 2. A failing test node is NEVER infrastructure -> zero reruns, immediate CTO alert.
+    test_fail = DirectFakeGitHub([pr(number=43, headRefOid=HEAD_B)], repository=PRIVATE_REPO)
+    test_fail.checks_by_head[HEAD_B] = [{
+        "id": 702, "workflow_run_id": 8889, "name": "CI Gate", "head_sha": HEAD_B,
+        "status": "completed", "conclusion": "failure", "started_at": "2026-09-23T00:00:00Z",
+    }]
+    test_fail.runs_by_id[8889] = {
+        "id": 8889, "head_sha": HEAD_B, "status": "completed", "conclusion": "failure",
+        "event": "pull_request", "run_attempt": 1,
+    }
+    test_fail.jobs_by_run[8889] = [{"id": 9903, "name": "boundary-and-python", "conclusion": "failure"}]
+    test_fail.logs_by_job[9903] = "FAILED tests/test_example.py::test_broken - AssertionError\nThe runner has received a shutdown signal"
+    tf_state = tmp_path / "test_fail.json"
+    tf_lines, tf_failed = keeper.run(test_fail, tf_state, apply=True, direct_config=cfg)
+    assert not tf_failed and mutations(test_fail) == []
+    assert any("test-failure" in line for line in tf_lines)
+    assert len(json.loads(tf_state.read_text())["cto_outbox"]) == 1
+
+    # 3. Dormant (allow_infra_reenqueue=False): never reruns even on infra failure.
+    dormant = DirectFakeGitHub([pr(number=42)], repository=PRIVATE_REPO)
+    dormant.checks_by_head[HEAD_A] = fake.checks_by_head[HEAD_A]
+    dormant.runs_by_id[8888] = {**fake.runs_by_id[8888], "run_attempt": 1}
+    dormant.jobs_by_run[8888] = fake.jobs_by_run[8888]
+    dormant.logs_by_job[9901] = fake.logs_by_job[9901]
+    _dl, df = keeper.run(dormant, tmp_path / "dormant_rerun.json", apply=True, direct_config=_direct_cfg(allow_infra_reenqueue=False))
+    assert not df and mutations(dormant) == []
+
+
+def test_ejected_repaired_head_reenqueues_once_only_with_repair_evidence(tmp_path: Path) -> None:
+    """Defect class: ejected PR's approved repaired head re-enqueues without repair evidence, fails to re-enqueue with it, or re-enqueues twice."""
+    head_c = "c" * 40
+    digest = "1" * 64
+    mq_cfg = _direct_cfg(repository="unit/public", allow_infra_reenqueue=True)
+
+    # 1. Without repair evidence (ordinary new approved head HEAD_B after ejection at HEAD_A): MUST NOT re-enqueue.
+    no_proof = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_B)], repository="unit/public")
+    no_proof.queue_enabled = True
+    no_proof.comments_by_pr[42] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A),
+        recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", HEAD_B),
+    ]
+    no_proof_state = tmp_path / "no_proof.json"
+    no_proof_state.write_text(json.dumps({"queued": {}, "ejections": {f"42:{HEAD_A}": [123]}}))
+    lines_np, failed_np = keeper.run(
+        no_proof, no_proof_state, apply=True, direct_config=mq_cfg, repair_prover=lambda *a, **kw: None,
+    )
+    assert not failed_np and "enqueue" not in mutations(no_proof) and "re-enqueue" not in mutations(no_proof)
+    assert "#42 held: queued-before" in lines_np
+
+    # 2. With REPAIR_VERIFIED in trusted exact-head APPROVED verdict comment: re-enqueues ONCE.
+    repaired = DirectFakeGitHub([pr(number=42, headRefOid=HEAD_B)], repository="unit/public")
+    repaired.queue_enabled = True
+    approved_b = {
+        "body": build_comment(
+            sha=HEAD_B,
+            task_id="review-repair",
+            started="2026-09-23T12:10:00.000001+00:00",
+            verdict="APPROVED",
+            model="gpt-6.1-sol",
+            family="openai",
+            reply=f"VERDICT: APPROVE\nREPAIR_VERIFIED: {digest}",
+        ),
+        "user": {"login": "driver"},
+        "author_association": "MEMBER",
+        "created_at": "2026-09-23T13:00:00Z",
+        "updated_at": "2026-09-23T13:00:00Z",
+    }
+    repaired.comments_by_pr[42] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A),
+        approved_b,
+    ]
+    rep_state = tmp_path / "repaired.json"
+    rep_state.write_text(json.dumps({"queued": {}, "ejections": {f"42:{HEAD_A}": [123]}}))
+    lines_ok, failed_ok = keeper.run(repaired, rep_state, apply=True, direct_config=mq_cfg)
+    assert not failed_ok
+    assert [action for action in repaired.actions if action[0] == "enqueue"] == [("enqueue", (42, HEAD_B))]
+    assert "#42 re-enqueued (repaired:repair-verified)" in lines_ok
+    assert not any(name == "comment" for name, _ in repaired.actions)
+
+    # If HEAD_B is later ejected and a third head HEAD_C is pushed with repair evidence,
+    # the keeper MUST NOT re-enqueue a second time and alerts claude-cto once.
+    saved = json.loads(rep_state.read_text())
+    saved["queued"] = {}
+    saved["ejections"][f"42:{HEAD_B}"] = [124]
+    rep_state.write_text(json.dumps(saved))
+    repaired.rows = [pr(number=42, headRefOid=head_c)]
+    repaired.fresh_by_pr[42] = {**repaired.rows[0], "state": "OPEN", "labels": []}
+    repaired.comments_by_pr[42].append(recorded("APPROVED", "2026-09-23T12:20:00.000001+00:00", head_c))
+    repaired.checks_by_head[head_c] = checks(head_c)
+    lines_twice, failed_twice = keeper.run(
+        repaired, rep_state, apply=True, direct_config=mq_cfg, repair_prover=lambda *a, **kw: "repair-verified",
+    )
+    assert not failed_twice
+    assert [action for action in repaired.actions if action[0] == "enqueue"] == [("enqueue", (42, HEAD_B))]
+    assert "#42 held: repaired-reenqueue-exhausted" in lines_twice
+    outbox = json.loads(rep_state.read_text())["cto_outbox"]
+    assert len(outbox) == 1 and "repaired-reenqueue-exhausted" in outbox[0]["body"]
+
+    # 3. Clean base merge proof also re-enqueues once; dormant flag blocks it.
+    clean = DirectFakeGitHub([pr(number=43, headRefOid=HEAD_B)], repository="unit/public")
+    clean.queue_enabled = True
+    clean.comments_by_pr[43] = [
+        recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A),
+        recorded("APPROVED", "2026-09-23T12:10:00.000001+00:00", HEAD_B),
+    ]
+    dormant_state = tmp_path / "clean_dormant.json"
+    dormant_state.write_text(json.dumps({"queued": {}, "ejections": {f"43:{HEAD_A}": [200]}}))
+    _dl, df = keeper.run(
+        clean, dormant_state, apply=True, direct_config=_direct_cfg(repository="unit/public", allow_infra_reenqueue=False),
+        repair_prover=lambda *a, **kw: "clean-base-merge",
+    )
+    assert not df and "enqueue" not in mutations(clean) and "re-enqueue" not in mutations(clean)
+
+    clean_state = tmp_path / "clean_ok.json"
+    clean_state.write_text(json.dumps({"queued": {}, "ejections": {f"43:{HEAD_A}": [200]}}))
+    clean_lines, clean_failed = keeper.run(
+        clean, clean_state, apply=True, direct_config=mq_cfg, repair_prover=lambda *a, **kw: "clean-base-merge",
+    )
+    assert not clean_failed
+    assert [action for action in clean.actions if action[0] == "enqueue"] == [("enqueue", (43, HEAD_B))]
+    assert "#43 re-enqueued (repaired:clean-base-merge)" in clean_lines
