@@ -1413,6 +1413,42 @@ def test_unidentified_checkout_keeps_the_learn_ukrainian_policy_requirement(tmp_
     assert exc_info.value.code == "policy_missing"
 
 
+def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monkeypatch):
+    """Defect class (F8 primary-only contract): an ordinary linked worktree of a registered
+    consumer configured as LU_PRODUCT_ROOT silently receives consumer defaults instead of failing
+    closed with policy_missing and requiring the Sources server."""
+    from lu_machinery.agent_runtime.sources_read_only import (
+        SERVER_RELATIVE_PATH,
+        sources_server_path,
+        sources_tool_sets,
+    )
+    from lu_machinery.orchestration import fleet_repos, product_policy
+
+    primary = _checkout(tmp_path / "kd-primary", _KUBE_DOJO_URL)
+    linked = tmp_path / "kd-linked"
+    _git(primary, "worktree", "add", "-q", "-b", "wt", str(linked))
+
+    # Positive control: the consumer's primary checkout resolves to kube-dojo.
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(primary))
+    identified = fleet_repos.fleet_repo_for_checkout(primary)
+    assert identified is not None and identified.key == "kube-dojo"
+    assert adm.load_product_policy().origin == product_policy.MACHINERY_DEFAULT_ORIGIN
+    assert sources_server_path() is None
+
+    # Linked worktree of that same primary fails closed on both policy and Sources server.
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(linked))
+    assert fleet_repos.fleet_repo_for_checkout(linked) is None
+    with pytest.raises(product_policy.ProductPolicyError) as load_exc:
+        adm.load_product_policy()
+    assert load_exc.value.code == "policy_missing"
+    with pytest.raises(product_policy.ProductPolicyError) as eval_exc:
+        adm.evaluate("read-only", tmp_path / "tasks")
+    assert eval_exc.value.code == "policy_missing"
+    assert sources_server_path() == linked / SERVER_RELATIVE_PATH
+    with pytest.raises(FileNotFoundError):
+        sources_tool_sets()
+
+
 def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
     """Defect class (F5 config validation): a malformed product file declaration, a declaration naming a
     location machinery does not read, or a Learn Ukrainian row without both declarations is accepted."""
