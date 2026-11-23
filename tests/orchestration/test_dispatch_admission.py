@@ -1266,7 +1266,7 @@ def _git(cwd: Path, *args: str) -> None:
 
     env = {**safe_git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid"}
     env |= {"GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
-    subprocess.run([GIT, "-C", str(cwd), *args], env=env, check=True, capture_output=True)
+    subprocess.run([GIT, "-C", str(cwd), *args], env=env, check=True, capture_output=True, timeout=60)
 
 
 def _checkout(path: Path, *origins: str) -> Path:

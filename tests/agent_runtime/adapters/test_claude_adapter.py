@@ -171,9 +171,9 @@ def _product_checkout(root: Path, origin: str | None) -> Path:
     settings = Path(__file__).resolve().parents[2] / "fixtures" / "product_tree" / "agents_extensions" / "shared"
     (root / "agents_extensions" / "shared").mkdir(parents=True)
     shutil.copyfile(settings / "settings.json", root / "agents_extensions" / "shared" / "settings.json")
-    subprocess.run([GIT, "-C", str(root), "init", "-q"], env=safe_git_env(), check=True)
+    subprocess.run([GIT, "-C", str(root), "init", "-q"], env=safe_git_env(), check=True, timeout=60)
     if origin is not None:
-        subprocess.run([GIT, "-C", str(root), "remote", "add", "origin", origin], env=safe_git_env(), check=True)
+        subprocess.run([GIT, "-C", str(root), "remote", "add", "origin", origin], env=safe_git_env(), check=True, timeout=60)
     return root
 
 
