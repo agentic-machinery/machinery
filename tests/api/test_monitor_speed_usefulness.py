@@ -363,7 +363,7 @@ def test_home_announces_panel_status_and_has_skip_purpose_and_sites_label():
     subs_page = (dashboards / "subscriptions.html").read_text()
     assert subs_page.count('aria-live="polite"') == 1
     assert "Which subscription is near its limit, when it resets, and whether anything is signed out." in subs_page
-    assert (dashboards / "fleet.html").read_text().count('aria-live="polite"') == 3
+    assert (dashboards / "fleet.html").read_text().count('aria-live="polite"') == 5
     assert (dashboards / "pull-requests.html").read_text().count('aria-live="polite"') == 1
     assert (dashboards / "milestones.html").read_text().count('aria-live="polite"') == 1
 
