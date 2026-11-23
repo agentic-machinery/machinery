@@ -61,20 +61,19 @@ every check passes. Read-only dispatches are exempt.
   (which agent types are content seats, which families may work on and
   review Ukrainian content, which changed paths are learner payloads, and
   whose review receipts a Ukrainian head needs) are product data in
-  ``scripts/curriculum/admission_policy.v1.json`` (declared by
-  ``admission_policy`` on the repository's row in
-  ``lu_machinery/config/fleet_repos.yaml``), read only through
-  :mod:`lu_machinery.orchestration.product_policy`. Every :func:`evaluate`, of
-  any mode, and every write-mode :func:`precheck` loads it first. A registered
-  non-curriculum consumer row that omits ``admission_policy`` receives the
-  documented fail-closed machinery default policy (empty Ukrainian content and
-  review seats, empty learner payload paths, conservative default review
-  receipts). When ``admission_policy`` is declared (including ``public``), or
-  when the product root is unregistered or carries the Learn Ukrainian
-  curriculum marker, a missing, renamed, truncated or incompatible policy
-  raises :class:`~lu_machinery.orchestration.product_policy.ProductPolicyError`,
-  a ``ValueError``, so callers refuse exactly as they do for an invalid
-  threshold and ``--force-admission`` cannot override it.
+  ``scripts/curriculum/admission_policy.v1.json``, read only through
+  :mod:`scripts.orchestration.product_policy`. Every :func:`evaluate`, of any
+  mode, and every write-mode :func:`precheck` loads it first; a missing,
+  renamed, truncated or incompatible policy raises
+  :class:`~scripts.orchestration.product_policy.ProductPolicyError`, a
+  ``ValueError``, so callers refuse exactly as they do for an invalid
+  threshold and ``--force-admission`` cannot override it. The policy is read
+  from the checkout this module runs from, so a dispatch that runs the
+  primary checkout's code reads the primary checkout's policy. A registered
+  non-curriculum repository whose ``fleet_repos.yaml`` row declares no
+  ``admission_policy`` gets the machinery default policy (no Ukrainian seats,
+  no learner payloads) instead; any checkout the catalog cannot identify
+  still needs the file.
 * **Slice use is reported, not enforced.** When ``lu-dispatch.slice`` is
   active, the admission line adds its current memory against ``MemoryMax``.
   An inactive or missing slice omits that clause. The floor and the caps

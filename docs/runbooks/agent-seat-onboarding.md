@@ -284,36 +284,21 @@ Write workers run directly in their dispatch worktrees with normal provider logi
 Native read-only reviews retain the OS boundary and GitHub read relays described in
 [read-only review boundary](write-worker-boundary.md); they cannot publish or record verdicts.
 
-#### Non-curriculum consumer repositories (Sources server and admission policy)
+#### Non-curriculum consumer repositories
 
-Each registered row in `lu_machinery/config/fleet_repos.yaml` may declare two optional
-canonical repo-relative file paths:
+A product checkout (`LU_PRODUCT_ROOT`) is matched to its `lu_machinery/config/fleet_repos.yaml`
+row by its Git `origin` URL, read by `git` itself (`fleet_repos.fleet_repo_for_checkout`).
+A row may omit `sources_server` and `admission_policy`:
 
-- `sources_server` (declared on `public` as `.mcp/servers/sources/server.py`): parsed
-  statically by `lu_machinery.agent_runtime.sources_read_only` for read-only Sources MCP
-  grants and writer denies. Registered consumers that omit `sources_server` (such as
-  `kube-dojo`, `kubedojo-labs`, and `machinery`) have no Sources server wired in read-only
-  adapter invocations (ordinary Claude reviewers receive `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`,
-  and explicit caller attempts to allow or wire `sources` fail closed). When `sources_server`
-  is declared—or when `LU_PRODUCT_ROOT` is unregistered or carries `curriculum/l2-uk-en/curriculum.yaml`—missing
-  or unreadable declarations fail closed.
-- `admission_policy` (declared on `public` as `scripts/curriculum/admission_policy.v1.json`):
-  loaded by `lu_machinery.orchestration.product_policy` and `dispatch_admission`. Registered
-  non-curriculum consumers that omit `admission_policy` receive the fail-closed machinery
-  default policy (`origin: "lu_machinery:default"`): empty `content_agent_types`, empty
-  `ukrainian_content_families` and `ukrainian_review_seats` (denying all Ukrainian content
-  and review seat queries), empty `learner_payload_paths`, and the conservative default
-  review-receipt floor `{"google", "openai"}`. `public`, any checkout carrying
-  `curriculum/l2-uk-en/curriculum.yaml` or a `learn-ukrainian/learn-ukrainian.github.io`
-  `origin`, and any unregistered `LU_PRODUCT_ROOT` still require the policy file and fail
-  closed (`ProductPolicyError`) when it is missing or invalid.
+- Without `sources_server`, a read-only Claude run loads no MCP server (`--strict-mcp-config`
+  with an empty config) and refuses a caller's `mcp_config_path`. Codex and AGY read-only runs
+  still require the Learn Ukrainian Sources server.
+- Without `admission_policy`, dispatch admission uses the machinery default policy: no
+  Ukrainian content or review seats and no learner payload paths.
 
-Consumer checkout identification (`fleet_repos.consumer_repo_for_root`) resolves symlinks
-and linked worktrees to their primary checkout, pins any checkout carrying
-`curriculum/l2-uk-en/curriculum.yaml` to the default `public` row, treats a real
-`.git/config` `origin` GitHub URL as authoritative (refusing basename fallback when an
-unregistered or ambiguous `origin` is present), and matches `local_name` only when no
-`origin` remote exists.
+A checkout that cannot be matched (no or several `origin` URLs, an include or URL rewrite in
+its config, a Git failure, not the top of its work tree) or that carries
+`curriculum/l2-uk-en/curriculum.yaml` keeps both Learn Ukrainian files and refuses without them.
 
 ### GPT-6 Codex role routing
 

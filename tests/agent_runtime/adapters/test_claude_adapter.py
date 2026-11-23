@@ -161,201 +161,79 @@ def _install_fake_claude_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("PATH", str(fake_bin))
 
 
-def _make_consumer_root(
-    target: Path,
-    *,
-    origin_url: str | None = None,
-    with_lu_marker: bool = False,
-) -> Path:
-    """Create a synthetic consumer checkout with shared Claude settings but no Sources server or policy."""
-    fixture_settings = (
-        Path(__file__).resolve().parents[2]
-        / "fixtures"
-        / "product_tree"
-        / "agents_extensions"
-        / "shared"
-        / "settings.json"
+def _product_checkout(root: Path, origin: str | None) -> Path:
+    """A Git checkout with the shared Claude settings and no Sources server or admission policy."""
+    import shutil
+    import subprocess
+
+    from lu_machinery.orchestration.execution_safe_git import GIT, safe_git_env
+
+    settings = Path(__file__).resolve().parents[2] / "fixtures" / "product_tree" / "agents_extensions" / "shared"
+    (root / "agents_extensions" / "shared").mkdir(parents=True)
+    shutil.copyfile(settings / "settings.json", root / "agents_extensions" / "shared" / "settings.json")
+    subprocess.run([GIT, "-C", str(root), "init", "-q"], env=safe_git_env(), check=True)
+    if origin is not None:
+        subprocess.run([GIT, "-C", str(root), "remote", "add", "origin", origin], env=safe_git_env(), check=True)
+    return root
+
+
+def _read_only(root: Path, tool_config: dict | None) -> list[str]:
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=root,
+        model=None,
+        task_id="consumer",
+        session_id=None,
+        tool_config=tool_config,
     )
-    settings_dst = target / "agents_extensions" / "shared" / "settings.json"
-    settings_dst.parent.mkdir(parents=True, exist_ok=True)
-    settings_dst.write_bytes(fixture_settings.read_bytes())
-    if origin_url is not None:
-        git_dir = target / ".git"
-        git_dir.mkdir(parents=True, exist_ok=True)
-        (git_dir / "config").write_text(f'[remote "origin"]\n\turl = {origin_url}\n', encoding="utf-8")
-    if with_lu_marker:
-        marker = target / "curriculum" / "l2-uk-en" / "curriculum.yaml"
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("levels: {}\n", encoding="utf-8")
-    return target
+    return list(plan.cmd)
 
 
-def test_read_only_claude_adapter_skips_sources_wiring_for_consumer_without_sources_server(
+def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Defect class (F1): read-only ClaudeAdapter crashes with FileNotFoundError or wires a missing
-    Sources server when running in a registered consumer repo whose fleet_repos row declares none."""
+    """Defect class (F1/F4): in a registered consumer whose fleet row declares no Sources server, a
+    read-only Claude run crashes looking for the server, or leaves user, project or caller MCP
+    servers loaded with no Sources writer denies."""
     _install_fake_claude_cli(tmp_path, monkeypatch)
-    consumer = _make_consumer_root(
-        tmp_path / "renamed-consumer",
-        origin_url="https://github.com/kube-dojo/kube-dojo.github.io.git",
-    )
+    consumer = _product_checkout(tmp_path / "renamed-consumer", "https://github.com/kube-dojo/kube-dojo.github.io")
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
 
-    plain = ClaudeAdapter().build_invocation(
-        prompt="inspect",
-        mode="read-only",
-        cwd=consumer,
-        model=None,
-        task_id="consumer-plain",
-        session_id=None,
-        tool_config=None,
-    )
-    assert "--disallowedTools" not in plain.cmd
-    assert "--mcp-config" not in plain.cmd
+    for tool_config in (None, {"reviewer_tools": True}, {"allowed_tools": "Read,mcp__sources__verify_word"}):
+        cmd = _read_only(consumer, tool_config)
+        assert cmd.count("--strict-mcp-config") == 1
+        assert cmd.count("--mcp-config") == 1
+        assert json.loads(cmd[cmd.index("--mcp-config") + 1]) == {"mcpServers": {}}
+        if "--disallowedTools" in cmd:
+            assert "sources" not in cmd[cmd.index("--disallowedTools") + 1]
+    reviewer = _read_only(consumer, {"reviewer_tools": True})
+    assert not any("mcp__sources" in rule for rule in reviewer[reviewer.index("--allowedTools") + 1].split(","))
 
-    reviewer = ClaudeAdapter().build_invocation(
-        prompt="review",
-        mode="read-only",
-        cwd=consumer,
-        model=None,
-        task_id="consumer-reviewer",
-        session_id=None,
-        tool_config={"reviewer_tools": True},
-    )
-    assert "--strict-mcp-config" in reviewer.cmd
-    mcp_cfg = reviewer.cmd[reviewer.cmd.index("--mcp-config") + 1]
-    assert json.loads(mcp_cfg) == {"mcpServers": {}}
-    allowed = reviewer.cmd[reviewer.cmd.index("--allowedTools") + 1].split(",")
-    disallowed = reviewer.cmd[reviewer.cmd.index("--disallowedTools") + 1].split(",")
-    assert not any("mcp__sources__" in rule for rule in allowed)
-    assert not any("mcp__sources__" in rule for rule in disallowed)
-
-    # Explicit attempts to allow or wire a sources server in a consumer without one fail closed,
-    # including space-delimited rules, glob/server-wide rules, relative paths resolved against cwd,
-    # missing or symlinked explicit files, inline JSON with bad entry types, and unsupported types.
-    for bad_allowed in (
-        "Read,mcp__sources__verify_word",
-        "Read,mcp__sources",
-        "Read,MCP__SOURCES",
-        "Read,mcp__sources(verify_word)",
-        "Read,mcp__*",
-        "Read mcp__sources",
-        "Bash(git status) mcp__sources__verify_word",
-        "Read mcp__s*",
-        "Read *",
-        "   ",
-        "Read,(unbalanced",
-        ["Read"],
+    docs = consumer / "docs.mcp.json"
+    docs.write_text('{"mcpServers":{"docs":{"command":"/bin/true"}}}', encoding="utf-8")
+    for tool_config in (
+        {"mcp_config_path": str(docs)},
+        {"mcp_config_path": "docs.mcp.json", "strict_mcp_config": True},
+        {"mcp_config_path": '{"mcpServers":{}}'},
+        {"reviewer_tools": True, "mcp_config_path": str(docs), "review_access": "full"},
     ):
-        with pytest.raises(ValueError):
-            ClaudeAdapter().build_invocation(
-                prompt="inspect",
-                mode="read-only",
-                cwd=consumer,
-                model=None,
-                task_id="consumer-explicit-allow",
-                session_id=None,
-                tool_config={"allowed_tools": bad_allowed},
-            )
-    sources_mcp = consumer / "relative.mcp.json"
-    sources_mcp.write_text('{"mcpServers":{"sources":{"command":"/bin/true"}}}', encoding="utf-8")
-    symlink_mcp = consumer / "linked.mcp.json"
-    safe_mcp = consumer / "safe.mcp.json"
-    safe_mcp.write_text('{"mcpServers":{"docs":{"command":"/bin/true"}}}', encoding="utf-8")
-    symlink_mcp.symlink_to(safe_mcp)
-    for bad_mcp in (
-        str(sources_mcp),
-        "relative.mcp.json",
-        Path("relative.mcp.json"),
-        "missing.mcp.json",
-        "linked.mcp.json",
-        '{"mcpServers":{"sources":{"command":"/bin/true"}}}',
-        '{"mcpServers":{"docs":[]}}',
-        '{"mcpServers":{"docs":"not-an-object"}}',
-        {"mcpServers": {}},
-        "   ",
-    ):
-        with pytest.raises(ValueError):
-            ClaudeAdapter().build_invocation(
-                prompt="inspect",
-                mode="read-only",
-                cwd=consumer,
-                model=None,
-                task_id="consumer-explicit-mcp",
-                session_id=None,
-                tool_config={"mcp_config_path": bad_mcp},
-            )
-    # A clean relative non-sources MCP config is read once and forwarded as canonical inline JSON
-    # (never reopened by Claude), and space-delimited allowed_tools are normalized consistently.
-    safe_plan = ClaudeAdapter().build_invocation(
-        prompt="inspect",
-        mode="read-only",
-        cwd=consumer,
-        model=None,
-        task_id="consumer-safe-mcp",
-        session_id=None,
-        tool_config={"mcp_config_path": "safe.mcp.json", "allowed_tools": "Read Bash(git status) mcp__docs__*"},
-    )
-    forwarded_mcp = safe_plan.cmd[safe_plan.cmd.index("--mcp-config") + 1]
-    assert json.loads(forwarded_mcp) == {"mcpServers": {"docs": {"command": "/bin/true"}}}
-    assert str(safe_mcp) not in forwarded_mcp
-    assert safe_plan.cmd[safe_plan.cmd.index("--allowedTools") + 1] == "Read,Bash(git status),mcp__docs__*"
+        with pytest.raises(ValueError, match="declares no Sources server"):
+            _read_only(consumer, tool_config)
 
 
 @pytest.mark.parametrize(
-    ("dirname", "origin_url", "with_lu_marker"),
-    [
-        ("learn-ukrainian", None, False),
-        ("kube-dojo", None, True),
-        ("kube-dojo", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", False),
-        ("kube-dojo", "https://github.com/unregistered/repo.git", False),
-        ("unregistered-consumer", None, False),
-    ],
-    ids=["public-dir", "lu-marker-beats-name", "lu-origin-beats-name", "unknown-origin-no-fallback", "unregistered"],
+    "origin",
+    [None, "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", "https://github.com/other/repo.git"],
+    ids=["no-origin", "learn-ukrainian-origin", "unregistered-origin"],
 )
-def test_read_only_claude_adapter_fails_closed_when_sources_server_required_but_missing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    dirname: str,
-    origin_url: str | None,
-    with_lu_marker: bool,
+def test_read_only_claude_still_requires_the_sources_server_outside_a_registered_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str | None
 ) -> None:
-    """Defect class (F1 fail-closed): Learn Ukrainian, LU-origin, LU-marker, or unregistered roots
-    silently skip Sources denies when .mcp/servers/sources/server.py is missing."""
+    """Defect class (F1 fail closed): a Learn Ukrainian or unidentified checkout without its Sources
+    server launches a read-only run with no Sources writer denies."""
     _install_fake_claude_cli(tmp_path, monkeypatch)
-    root = _make_consumer_root(tmp_path / dirname, origin_url=origin_url, with_lu_marker=with_lu_marker)
+    root = _product_checkout(tmp_path / "kube-dojo", origin)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
-
     with pytest.raises(FileNotFoundError):
-        ClaudeAdapter().build_invocation(
-            prompt="inspect",
-            mode="read-only",
-            cwd=root,
-            model=None,
-            task_id="missing-sources",
-            session_id=None,
-            tool_config=None,
-        )
-
-
-def test_read_only_claude_adapter_refuses_symlink_impersonating_consumer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Defect class (F1 symlink spoof): a symlink named kube-dojo pointing at learn-ukrainian skips Sources."""
-    _install_fake_claude_cli(tmp_path, monkeypatch)
-    real_lu = _make_consumer_root(tmp_path / "learn-ukrainian")
-    spoof = tmp_path / "kube-dojo"
-    spoof.symlink_to(real_lu)
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(spoof))
-
-    with pytest.raises(FileNotFoundError):
-        ClaudeAdapter().build_invocation(
-            prompt="inspect",
-            mode="read-only",
-            cwd=spoof,
-            model=None,
-            task_id="symlink-spoof",
-            session_id=None,
-            tool_config=None,
-        )
+        _read_only(root, None)

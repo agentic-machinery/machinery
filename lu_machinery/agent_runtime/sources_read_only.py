@@ -17,42 +17,33 @@ from lu_machinery.common.repo_root import product_root
 SERVER_RELATIVE_PATH = Path(".mcp/servers/sources/server.py")
 
 
-def sources_server_path(root: Path | None = None) -> Path | None:
-    """Return the configured Sources server path for ``root`` (default :func:`product_root`), or ``None``.
+def sources_server_path() -> Path | None:
+    """The configured product checkout's Sources server, or ``None`` when its fleet row declares none.
 
-    - When ``root`` matches a registered ``fleet_repos.yaml`` row: returns ``root / row.sources_server``
-      when declared, or ``None`` when the row omits ``sources_server`` (no Sources wiring attempted).
-    - When ``root`` is unregistered (such as a Learn Ukrainian release snapshot or test fixture):
-      fails closed to ``root / SERVER_RELATIVE_PATH``.
-    - An unselectable product root raises ``ProductRootError``; a malformed catalog raises ``FleetRepoError``.
+    The checkout is identified by :func:`~lu_machinery.orchestration.fleet_repos.fleet_repo_for_checkout`.
+    A registered row that omits ``sources_server`` gives ``None``; any other checkout keeps
+    :data:`SERVER_RELATIVE_PATH`, so a missing server still fails closed. A declared value must be
+    :data:`SERVER_RELATIVE_PATH`, the only location read. Only a caller that has disabled every other
+    MCP source may act on ``None``; :func:`sources_tool_sets` never does.
     """
-    from lu_machinery.orchestration.fleet_repos import consumer_repo_for_root
+    from lu_machinery.orchestration.fleet_repos import fleet_repo_for_checkout
 
-    selected = product_root() if root is None else root
-    repo = consumer_repo_for_root(selected)
-    if repo is None:
-        return selected / SERVER_RELATIVE_PATH
-    if repo.sources_server is None:
+    root = product_root()
+    repo = fleet_repo_for_checkout(root)
+    if repo is not None and repo.sources_server is None:
         return None
-    return selected / repo.sources_server
+    if repo is not None and repo.sources_server != SERVER_RELATIVE_PATH.as_posix():
+        raise ValueError(f"fleet_repos[{repo.key!r}].sources_server must be {SERVER_RELATIVE_PATH.as_posix()!r}")
+    return root / SERVER_RELATIVE_PATH
 
 
 def sources_tool_sets(server_path: Path | None = None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """The Sources tool partition of ``server_path``, or of the configured product checkout's server.
 
-    The default is resolved through :func:`sources_server_path` at the call, before the cache lookup,
-    so the cache is keyed by the selected server; an unselectable product root raises
-    ``ProductRootError``. When the configured product matches a registered consumer row in
-    ``fleet_repos.yaml`` that declares no ``sources_server``, returns ``((), ())`` without touching
-    the filesystem. When a server IS configured (or ``server_path`` is explicit, or the root is
-    unregistered), missing or unreadable declarations fail closed identically to today.
+    The default is resolved through :func:`product_root` at the call, before the cache lookup, so the
+    cache is keyed by the selected server; an unselectable product root raises ``ProductRootError``.
     """
-    if server_path is not None:
-        return _tool_sets(server_path)
-    resolved = sources_server_path()
-    if resolved is None:
-        return (), ()
-    return _tool_sets(resolved)
+    return _tool_sets(product_root() / SERVER_RELATIVE_PATH if server_path is None else server_path)
 
 
 @lru_cache(maxsize=1)

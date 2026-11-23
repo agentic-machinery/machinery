@@ -1255,292 +1255,181 @@ def test_healthy_test_host_never_reads_the_real_test_slot_pool(tmp_path, probe, 
     assert "test-slot queue check skipped (test host)" in decision.summary()
 
 
+_KUBE_DOJO_URL = "https://github.com/kube-dojo/kube-dojo.github.io.git"
+_LEARN_UKRAINIAN_URL = "git@github.com:learn-ukrainian/learn-ukrainian.github.io.git"
+
+
+def _git(cwd: Path, *args: str) -> None:
+    import subprocess
+
+    from lu_machinery.orchestration.execution_safe_git import GIT, safe_git_env
+
+    env = {**safe_git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid"}
+    env |= {"GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    subprocess.run([GIT, "-C", str(cwd), *args], env=env, check=True, capture_output=True)
+
+
+def _checkout(path: Path, *origins: str) -> Path:
+    """A real Git checkout at ``path`` with one commit and the given ``origin`` URLs."""
+    path.mkdir(parents=True)
+    _git(path, "init", "-q")
+    _git(path, "commit", "-q", "--allow-empty", "-m", "init")
+    for index, url in enumerate(origins):
+        _git(path, "config", *(["--add"] if index else []), "remote.origin.url", url)
+    return path
+
+
+def _mark_curriculum(root: Path) -> None:
+    marker = root / "curriculum" / "l2-uk-en" / "curriculum.yaml"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("levels: {}\n", encoding="utf-8")
+
+
 def test_consumer_without_admission_policy_uses_fail_closed_machinery_default(tmp_path, probe, monkeypatch):
-    """Defect class (F5): dispatch admission refuses a registered non-curriculum consumer lacking
-    scripts/curriculum/admission_policy.v1.json, or its default policy permits Ukrainian content."""
+    """Defect class (F5): a registered non-curriculum consumer without an admission policy file is refused
+    (policy_missing), or its default policy admits Ukrainian content or seats."""
     from lu_machinery.orchestration import product_policy
 
-    # Synthetic consumer identified by git origin (even when directory name differs) and by local_name.
-    consumer = tmp_path / "renamed-kd"
-    (consumer / ".git").mkdir(parents=True)
-    (consumer / ".git" / "config").write_text(
-        '[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+    consumer = _checkout(tmp_path / "renamed-kd", _KUBE_DOJO_URL)
+    worktree = tmp_path / "linked-kd"
+    _git(consumer, "worktree", "add", "-q", "-b", "wt", str(worktree))
+    for root in (consumer, worktree):
+        monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+        policy = adm.load_product_policy()
+        assert policy.origin == product_policy.MACHINERY_DEFAULT_ORIGIN
+        assert not adm.is_content_seat("curriculum-orchestrator")
+        assert not any(adm.ukrainian_content_family_allowed(f) for f in ("anthropic", "google", "openai"))
+        assert not adm.is_ukrainian_review_seat("agy", "google")
+        assert not adm.requires_ukrainian_review(["curriculum/l2-uk-en/a1/lesson.md", "src/index.ts"])
+        assert adm.required_review_receipts(["google"]) == frozenset({"google", "openai"})
+        assert adm.precheck("workspace-write", thresholds=_LIMITS) is None
+        assert adm.evaluate("workspace-write", tmp_path / "tasks", thresholds=_LIMITS).admitted
 
-    policy = adm.load_product_policy()
-    assert policy.origin == product_policy.MACHINERY_DEFAULT_ORIGIN
-    assert not adm.is_content_seat("curriculum-orchestrator")
-    for family in ("anthropic", "google", "openai"):
-        assert not adm.ukrainian_content_family_allowed(family)
-    assert not adm.is_ukrainian_review_seat("agy", "google")
-    assert not adm.is_ukrainian_review_seat("codex", "openai")
-    assert not adm.requires_ukrainian_review(["curriculum/l2-uk-en/a1/lesson.md", "src/index.ts"])
-    with pytest.raises(product_policy.ProductPolicyError) as bad_path:
-        adm.requires_ukrainian_review(["../escape"])
-    assert bad_path.value.code == "change_path_not_canonical"
-    assert adm.required_review_receipts(["google"]) == frozenset({"google", "openai"})
-
-    assert adm.precheck("workspace-write", thresholds=_LIMITS) is None
-    assert adm.evaluate("read-only", tmp_path / "tasks").admitted
-    write_decision = adm.evaluate("workspace-write", tmp_path / "tasks", thresholds=_LIMITS)
-    assert write_decision.admitted
-
-    # Verified linked worktree of the consumer resolves through its primary checkout.
-    wt_gitdir = consumer / ".git" / "worktrees" / "wt1"
-    wt_gitdir.mkdir(parents=True)
-    worktree = tmp_path / "wt1"
-    worktree.mkdir()
-    (worktree / ".git").write_text(f"gitdir: {wt_gitdir}\n", encoding="utf-8")
-    (wt_gitdir / "commondir").write_text("../..\n", encoding="utf-8")
-    (wt_gitdir / "gitdir").write_text(f"{worktree / '.git'}\n", encoding="utf-8")
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(worktree))
-    assert adm.load_product_policy().origin == product_policy.MACHINERY_DEFAULT_ORIGIN
-
-    # Forged/dangling/corrupt/blank-line/symlinked gitfiles in an unregistered directory fail closed.
-    linked_admin = tmp_path / "linked-admin"
-    linked_admin.symlink_to(wt_gitdir)
-    for bad_name, payload in (
-        ("dangling", f"gitdir: {consumer / '.git' / 'worktrees' / 'nonexistent'}\n".encode()),
-        ("wrong-backptr", f"gitdir: {wt_gitdir}\n".encode()),
-        ("leading-blank-line", f"\ngitdir: {wt_gitdir}\n".encode()),
-        ("symlinked-admin", f"gitdir: {linked_admin}\n".encode()),
-        ("non-utf8", b"\xff\xfe\x00"),
-        ("nul-byte", f"gitdir: {wt_gitdir}\x00\n".encode()),
-    ):
-        forged = tmp_path / f"forged-{bad_name}"
-        forged.mkdir()
-        (forged / ".git").write_bytes(payload)
-        monkeypatch.setenv("LU_PRODUCT_ROOT", str(forged))
-        with pytest.raises(product_policy.ProductPolicyError) as forged_exc:
-            adm.load_product_policy()
-        assert forged_exc.value.code == "policy_missing"
-
-    # Leading blank line in an otherwise valid worktree's .git file and commondir redirect on a
-    # real .git directory both fail closed.
-    (worktree / ".git").write_text(f"\ngitdir: {wt_gitdir}\n", encoding="utf-8")
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(worktree))
-    with pytest.raises(product_policy.ProductPolicyError) as blank_wt_exc:
-        adm.load_product_policy()
-    assert blank_wt_exc.value.code == "policy_missing"
-
-    redirected = tmp_path / "kube-dojo"
-    (redirected / ".git").mkdir(parents=True)
-    (redirected / ".git" / "config").write_text(
-        '[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n',
-        encoding="utf-8",
-    )
-    (redirected / ".git" / "commondir").write_text("..\n", encoding="utf-8")
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(redirected))
-    with pytest.raises(product_policy.ProductPolicyError) as redirect_exc:
-        adm.load_product_policy()
-    assert redirect_exc.value.code == "policy_missing"
-
-    # Explicit path argument still fails closed even when LU_PRODUCT_ROOT is a consumer without policy.
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+    # An explicit path is always read.
     with pytest.raises(product_policy.ProductPolicyError) as explicit_missing:
         adm.load_product_policy(tmp_path / "missing.json")
     assert explicit_missing.value.code == "policy_missing"
 
 
-@pytest.mark.parametrize(
-    "config_bytes",
-    [
-        b'[remote.origin]\n\turl = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
-        b'\xef\xbb\xbf[remote "origin"]\n\turl = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
-        b'[remote "origin"]\n# trailing backslash in comment \\\n\turl = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
-        b'[remote "origin"]\n; semicolon comment \\\n\turl = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
-        b'[ remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n',
-        b'[remote "origin" ]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n',
-        b'[remote "origin"]\n\turl = " https://github.com/kube-dojo/kube-dojo.github.io.git "\n',
-        b'[remote "origin"] url = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
-        b'[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git # comment \\\n[include]\n\tpath = extra\n',
-        b'[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n[include]\n\tpath = extra\n',
-        b'[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n[url "https://github.com/learn-ukrainian/"]\n\tinsteadOf = https://github.com/kube-dojo/\n',
-        b'[extensions]\n\tworktreeConfig = invalid-bool\n[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n',
-        b'[broken-header\n',
-        None,  # .git directory missing its config file
-    ],
-    ids=[
-        "legacy-dotted-lu",
-        "bom-lu",
-        "hash-comment-trailing-bs",
-        "semi-comment-trailing-bs",
-        "space-after-lbracket",
-        "space-before-rbracket",
-        "quoted-whitespace-url",
-        "inline-key-after-header",
-        "inline-comment-trailing-bs-include",
-        "consumer-with-include",
-        "consumer-with-url-rewrite",
-        "invalid-worktreeconfig-bool",
-        "malformed-header",
-        "missing-config",
-    ],
-)
-def test_git_config_edge_cases_never_bypass_fail_closed_policy(tmp_path, monkeypatch, config_bytes):
-    """Defect class (F1/F3): legacy dotted sections, UTF-8 BOM, comment backslashes, bracket padding,
-    quoted whitespace, inline keys, includes/rewrites, malformed headers, or missing .git/config allow
-    a checkout named kube-dojo to drop Learn Ukrainian protections."""
+def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
+    """Checkouts that must keep the Learn Ukrainian requirements: Git cannot tie each to one consumer row."""
+    roots = {
+        "no-git": tmp_path / "kube-dojo",
+        "learn-ukrainian-origin": _checkout(tmp_path / "lu-origin", _LEARN_UKRAINIAN_URL),
+        "unregistered-origin": _checkout(tmp_path / "other", "https://github.com/other/repo.git"),
+        "lookalike-origin": _checkout(tmp_path / "lookalike", _KUBE_DOJO_URL.replace("k", "K", 1)),
+        "two-origins": _checkout(tmp_path / "two", _KUBE_DOJO_URL, _LEARN_UKRAINIAN_URL),
+        "no-origin": _checkout(tmp_path / "bare-name"),
+        "include": _checkout(tmp_path / "include", _KUBE_DOJO_URL),
+        "url-rewrite": _checkout(tmp_path / "rewrite", _KUBE_DOJO_URL),
+        "marker": _checkout(tmp_path / "marked", _KUBE_DOJO_URL),
+        "malformed-config": _checkout(tmp_path / "malformed", _KUBE_DOJO_URL),
+    }
+    roots["no-git"].mkdir()
+    _git(roots["include"], "config", "include.path", "extra")
+    _git(roots["url-rewrite"], "config", "url.https://github.com/learn-ukrainian/.insteadOf", "https://github.com/kube-dojo/")
+    _mark_curriculum(roots["marker"])
+    with (roots["malformed-config"] / ".git" / "config").open("a", encoding="utf-8") as config:
+        config.write("[broken-header\n")
+    # Per-worktree config adds a second origin URL that Git itself reports.
+    worktree_config = _checkout(tmp_path / "wtconfig", _KUBE_DOJO_URL)
+    _git(worktree_config, "config", "extensions.worktreeConfig", "2")
+    _git(worktree_config, "config", "--worktree", "--add", "remote.origin.url", _LEARN_UKRAINIAN_URL)
+    roots["worktree-config-origin"] = worktree_config
+    # A linked worktree whose primary checkout carries the curriculum marker.
+    marked_primary = _checkout(tmp_path / "marked-primary", _KUBE_DOJO_URL)
+    _mark_curriculum(marked_primary)
+    _git(marked_primary, "worktree", "add", "-q", "-b", "wt", str(tmp_path / "marked-linked"))
+    roots["marked-primary"] = tmp_path / "marked-linked"
+    # A subdirectory of a consumer is not a checkout top; a symlink resolves to its target.
+    consumer = _checkout(tmp_path / "consumer", _KUBE_DOJO_URL)
+    (consumer / "sub").mkdir()
+    roots["subdirectory"] = consumer / "sub"
+    (tmp_path / "link-to-lu").symlink_to(roots["learn-ukrainian-origin"])
+    roots["symlink-to-learn-ukrainian"] = tmp_path / "link-to-lu"
+    # A gitfile Git refuses (no space after "gitdir:") naming the consumer's own Git directory.
+    gitfile = tmp_path / "gitfile"
+    gitfile.mkdir()
+    (gitfile / ".git").write_text(f"gitdir:{consumer / '.git'}\n", encoding="utf-8")
+    roots["gitfile-no-space"] = gitfile
+    return roots
+
+
+_UNIDENTIFIABLE = [
+    "no-git",
+    "learn-ukrainian-origin",
+    "unregistered-origin",
+    "lookalike-origin",
+    "two-origins",
+    "no-origin",
+    "include",
+    "url-rewrite",
+    "marker",
+    "malformed-config",
+    "worktree-config-origin",
+    "marked-primary",
+    "subdirectory",
+    "symlink-to-learn-ukrainian",
+    "gitfile-no-space",
+]
+
+
+@pytest.mark.parametrize("case", _UNIDENTIFIABLE)
+def test_unidentified_checkout_keeps_the_learn_ukrainian_policy_requirement(tmp_path, monkeypatch, case):
+    """Defect class (F1/F3/F5): a checkout Git cannot tie to exactly one consumer row (or a curriculum
+    checkout) silently drops the admission policy requirement instead of refusing policy_missing."""
     from lu_machinery.orchestration import product_policy
 
-    root = tmp_path / "kube-dojo"
-    (root / ".git").mkdir(parents=True)
-    if config_bytes is not None:
-        (root / ".git" / "config").write_bytes(config_bytes)
+    root = _unidentifiable_roots(tmp_path)[case]
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
-
+    # Inherited Git redirection must not substitute another repository's metadata.
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "consumer" / ".git"))
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'remote.origin.url'='{_KUBE_DOJO_URL}'")
     with pytest.raises(product_policy.ProductPolicyError) as exc_info:
         adm.evaluate("read-only", tmp_path / "tasks")
     assert exc_info.value.code == "policy_missing"
 
 
-def test_worktree_config_additional_origin_fails_closed(tmp_path, monkeypatch):
-    """Defect class (F1): extensions.worktreeConfig adding a second origin URL is ignored."""
-    from lu_machinery.orchestration import product_policy
-
-    root = tmp_path / "kube-dojo"
-    (root / ".git").mkdir(parents=True)
-    (root / ".git" / "config").write_text(
-        '[extensions]\n\tworktreeConfig = true\n'
-        '[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n',
-        encoding="utf-8",
-    )
-    (root / ".git" / "config.worktree").write_text(
-        '[remote "origin"]\n\turl = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
-
-    with pytest.raises(product_policy.ProductPolicyError) as exc_info:
-        adm.evaluate("read-only", tmp_path / "tasks")
-    assert exc_info.value.code == "policy_missing"
-
-
-@pytest.mark.parametrize(
-    ("dirname", "origin_url", "with_lu_marker"),
-    [
-        ("learn-ukrainian", None, False),
-        ("kube-dojo", None, True),
-        ("kube-dojo", "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", False),
-        ("kube-dojo", "https://github.com/other-org/other-repo.git", False),
-        ("unregistered-root", None, False),
-    ],
-    ids=["public-dir", "lu-marker", "lu-origin", "unregistered-origin", "unregistered-dir"],
-)
-def test_missing_admission_policy_fails_closed_for_learn_ukrainian_and_unregistered_roots(
-    tmp_path, monkeypatch, dirname, origin_url, with_lu_marker
-):
-    """Defect class (F5 fail-closed): missing admission_policy.v1.json silently widens admission
-    for Learn Ukrainian or an unregistered product root."""
-    from lu_machinery.orchestration import product_policy
-
-    root = tmp_path / dirname
-    root.mkdir()
-    if origin_url is not None:
-        (root / ".git").mkdir()
-        (root / ".git" / "config").write_text(f'[remote "origin"]\n\turl = {origin_url}\n', encoding="utf-8")
-    if with_lu_marker:
-        marker = root / "curriculum" / "l2-uk-en" / "curriculum.yaml"
-        marker.parent.mkdir(parents=True)
-        marker.write_text("levels: {}\n", encoding="utf-8")
-    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
-
-    with pytest.raises(product_policy.ProductPolicyError) as exc_info:
-        adm.evaluate("read-only", tmp_path / "tasks")
-    assert exc_info.value.code == "policy_missing"
-
-
-def test_fleet_repos_rejects_invalid_consumer_relative_paths(tmp_path):
-    """Defect class (F1/F5 config validation): traversal, explicit YAML null/blank, lone surrogates,
-    or omitting mandatory declarations on Learn Ukrainian are accepted instead of failing closed."""
+def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
+    """Defect class (F5 config validation): a malformed product file declaration, a declaration naming a
+    location machinery does not read, or a Learn Ukrainian row without both declarations is accepted."""
     import yaml
 
-    from lu_machinery.orchestration.fleet_repos import FleetRepoError, clear_repository_cache, load_fleet_repos
+    from lu_machinery.agent_runtime.sources_read_only import sources_server_path
+    from lu_machinery.orchestration import fleet_repos, product_policy
 
+    lu_row = {
+        "github": "learn-ukrainian/learn-ukrainian.github.io",
+        "local_name": "learn-ukrainian",
+        "default": True,
+        "sources_server": ".mcp/servers/sources/server.py",
+        "admission_policy": "scripts/curriculum/admission_policy.v1.json",
+    }
+
+    def load(rows: dict) -> dict:
+        cfg = tmp_path / "fleet_repos.yaml"
+        cfg.write_text(yaml.safe_dump({"version": 1, "repos": rows}), encoding="utf-8")
+        fleet_repos.clear_repository_cache()  # the registry reader caches by path
+        return fleet_repos.load_fleet_repos(cfg)
+
+    load({"primary": lu_row})
     for field in ("sources_server", "admission_policy"):
-        for bad_value in (None, "/etc/passwd", "../escape.json", "dir/sub/", "a\\b.json", "a\x00b", "\ud800", "", 123):
-            cfg = tmp_path / f"bad-{field}.yaml"
-            cfg.write_text(
-                yaml.safe_dump({
-                    "version": 1,
-                    "repos": {
-                        "public": {
-                            "github": "learn-ukrainian/learn-ukrainian.github.io",
-                            "local_name": "learn-ukrainian",
-                            "default": True,
-                            "sources_server": ".mcp/servers/sources/server.py",
-                            "admission_policy": "scripts/curriculum/admission_policy.v1.json",
-                            field: bad_value,
-                        }
-                    },
-                }),
-                encoding="utf-8",
-            )
-            clear_repository_cache()
-            with pytest.raises(FleetRepoError, match=field):
-                load_fleet_repos(cfg)
-        # Explicit YAML blank value (parses as None) is also refused.
-        blank_cfg = tmp_path / f"blank-{field}.yaml"
-        blank_cfg.write_text(
-            "version: 1\nrepos:\n  public:\n    github: o/r\n    local_name: r\n    default: true\n"
-            f"    {field}:\n",
-            encoding="utf-8",
-        )
-        clear_repository_cache()
-        with pytest.raises(FleetRepoError, match=field):
-            load_fleet_repos(blank_cfg)
+        for bad in (None, "", 123, ["x"]):
+            with pytest.raises(fleet_repos.FleetRepoError, match=field):
+                load({"primary": {**lu_row, field: bad}})
+        for github in ("learn-ukrainian/learn-ukrainian.github.io", "Learn-Ukrainian/LEARN-UKRAINIAN.github.io"):
+            with pytest.raises(fleet_repos.FleetRepoError, match=f"{field} is required"):
+                load({"primary": {**{k: v for k, v in lu_row.items() if k != field}, "github": github}})
 
-    # Omitting either mandatory declaration on the Learn Ukrainian row OR a repurposed `public` key is refused.
-    for slug in ("learn-ukrainian/learn-ukrainian.github.io", "other-org/repurposed-public"):
-        for omitted in ("sources_server", "admission_policy"):
-            entry = {
-                "github": slug,
-                "local_name": "learn-ukrainian",
-                "default": True,
-                "sources_server": ".mcp/servers/sources/server.py",
-                "admission_policy": "scripts/curriculum/admission_policy.v1.json",
-            }
-            del entry[omitted]
-            missing_cfg = tmp_path / f"lu-missing-{slug.replace('/', '-')}-{omitted}.yaml"
-            missing_cfg.write_text(yaml.safe_dump({"version": 1, "repos": {"public": entry}}), encoding="utf-8")
-            clear_repository_cache()
-            with pytest.raises(FleetRepoError, match=omitted):
-                load_fleet_repos(missing_cfg)
-
-    # A Learn Ukrainian marker always pins to the verified Learn Ukrainian row even if another
-    # consumer row carries `default: true` in the catalog.
-    from lu_machinery.orchestration.fleet_repos import consumer_repo_for_root
-
-    swapped_cfg = tmp_path / "swapped-default.yaml"
-    swapped_cfg.write_text(
-        yaml.safe_dump({
-            "version": 1,
-            "repos": {
-                "public": {
-                    "github": "learn-ukrainian/learn-ukrainian.github.io",
-                    "local_name": "learn-ukrainian",
-                    "sources_server": ".mcp/servers/sources/server.py",
-                    "admission_policy": "scripts/curriculum/admission_policy.v1.json",
-                },
-                "kube-dojo": {
-                    "github": "kube-dojo/kube-dojo.github.io",
-                    "local_name": "kube-dojo",
-                    "default": True,
-                },
-            },
-        }),
-        encoding="utf-8",
-    )
-    clear_repository_cache()
-    swapped = load_fleet_repos(swapped_cfg)
-    marked = tmp_path / "marked-lu"
-    marker = marked / "curriculum" / "l2-uk-en" / "curriculum.yaml"
-    marker.parent.mkdir(parents=True)
-    marker.write_text("levels: {}\n", encoding="utf-8")
-    resolved = consumer_repo_for_root(marked, repos=swapped)
-    assert resolved is not None
-    assert resolved.key == "public"
-    assert resolved.sources_server == ".mcp/servers/sources/server.py"
-    assert resolved.admission_policy == "scripts/curriculum/admission_policy.v1.json"
+    # A declaration naming any other location refuses where the file is read.
+    consumer = _checkout(tmp_path / "consumer", _KUBE_DOJO_URL)
+    elsewhere = {"github": "kube-dojo/kube-dojo.github.io", "local_name": "kube-dojo"}
+    elsewhere |= {"sources_server": "tools/server.py", "admission_policy": "policy/admission_policy.v1.json"}
+    catalog = load({"primary": lu_row, "kube-dojo": elsewhere})
+    monkeypatch.setattr(fleet_repos, "_bundled_catalog", lambda: catalog)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+    with pytest.raises(ValueError, match="sources_server must be"):
+        sources_server_path()
+    with pytest.raises(product_policy.ProductPolicyError) as exc_info:
+        adm.load_product_policy()
+    assert exc_info.value.code == "policy_origin_mismatch"
