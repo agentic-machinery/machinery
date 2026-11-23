@@ -247,13 +247,8 @@ jobs:
           npm_cache="$RUNNER_TEMP/acp-npm-cache"
           prefix="$(env -u PYTHONPATH "$runtime_python" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import prepare_node_dependencies; print(prepare_node_dependencies() or "")')"
           if [ -n "$prefix" ]; then
-            node_binary="$(env -u PYTHONPATH "$runtime_python" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[0])')"
-            npm_cli="$(env -u PYTHONPATH "$runtime_python" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[1])')"
-            if [[ "$node_binary" != "$(realpath "$(command -v node)")" || "$npm_cli" != "$(realpath "$(command -v npm)")" ]]; then
-              echo "::error::Release provisioning did not select the pinned CI Node and npm"
-              exit 1
-            fi
-            PATH="$(dirname "$node_binary"):$PATH" "$node_binary" "$npm_cli" ci --ignore-scripts --no-audit --no-fund --prefix="$prefix" --cache="$npm_cache"
+            # Use the Node and npm on PATH from the preceding CI toolchain check.
+            npm ci --ignore-scripts --no-audit --no-fund --prefix="$prefix" --cache="$npm_cache"
             env -u PYTHONPATH "$runtime_python" -I -c 'from pathlib import Path; import sys; from lu_machinery.agent_runtime.adapters.acpx import seal_node_dependencies; print(seal_node_dependencies(cache=Path(sys.argv[1])))' "$npm_cache"
           fi
 
@@ -837,14 +832,14 @@ jobs:
           rm -rf lu_machinery "$RUNNER_TEMP/installed-wheel/src"
           LU_TEST_WHEEL="$(find "$RUNNER_TEMP/installed-wheel/dist" -name '*.whl')"
           toolchain="$work/toolchain"
-          if [ ! -x "$toolchain/node" ]; then
+          if [ ! -x "$toolchain/node" ] || [ ! -x "$toolchain/npm" ]; then
             mkdir -p "$toolchain"
             for tool in node npm; do
               if ! found="$(command -v "$tool")"; then
                 echo "::error::${tool} is not on the runner PATH; the launcher fixture needs it"
                 exit 1
               fi
-              ln -s "$found" "$toolchain/$tool"
+              ln -sfn "$found" "$toolchain/$tool"
             done
           fi
           set +e
