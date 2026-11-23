@@ -1296,4 +1296,113 @@ def test_cto_safe_mode_refuses_the_cto_initiator_option(admission_dispatch, tmp_
     assert not admission_dispatch.spawned
 
 
+def test_provider_setup_refusal_records_typed_code_and_falls_back_safely(tmp_path, monkeypatch):
+    """Defect class: provider setup exceptions drop their typed .code (e.g. NodeToolchainError) or leak unsafe values."""
+    from enum import StrEnum
+
+    from lu_machinery.dispatcher import site_deps
+
+    class _TypedValueError(ValueError):
+        def __init__(self, message, code):
+            super().__init__(message)
+            self.code = code
+
+    class _TypedOSError(OSError):
+        def __init__(self, message, code):
+            super().__init__(message)
+            self.code = code
+
+    class _CodeEnum(StrEnum):
+        PIN = "node_pin_conflict"
+
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    (tasks / "logs").mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.setattr(worker.headroom, "check_plan", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker.headroom, "check_runtime", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker, "_reap_settled", lambda *_a, **_k: None)
+    monkeypatch.setattr(git, "pin_settlement_registry", lambda: None)
+    monkeypatch.setattr(git, "snapshot_delivery", lambda *_a, **_k: {})
+
+    def run_supervise(task_id, worktree):
+        prompt = tmp_path / f"{task_id}.prompt"
+        prompt.write_bytes(b"prompt")
+        spec = TaskSpec(task_id, "codex", CURRENT_SOL, None, "read-only", worktree, prompt, tasks / f"{task_id}.result")
+        record = store.new_record(spec, {"key": "public", "github": "example/repo"}, "main", "a" * 40,
+                                  {"research_owned_path": []})
+        record["prompt_file"] = str(tasks / f"{task_id}.prompt")
+        path = store.create(record, b"prompt")
+        worker.supervise(path, {}, 10)
+        return json.loads(path.read_text())
+
+    # Real NodeToolchainError path: worktree pins an unavailable Node version through _provider_env -> child_env.
+    real_tree = tmp_path / "real-tree"
+    real_tree.mkdir()
+    (real_tree / ".nvmrc").write_text("99.0.0\n", encoding="utf-8")
+    empty_roots = tmp_path / "empty-node-roots"
+    empty_roots.mkdir()
+    monkeypatch.setenv(site_deps.NODE_TOOLCHAIN_DIRS_ENV, str(empty_roots))
+    monkeypatch.setenv("PATH", str(empty_roots))
+    monkeypatch.setattr(site_deps, "DEFAULT_NODE_TOOLCHAIN_DIRS", ())
+    real_settled = run_supervise("real-node-unavailable", real_tree)
+    _assert_pre_start_refusal(real_settled, "setup_refusal")
+    assert real_settled["error"] == "provider_setup_refused: node_toolchain_unavailable (NodeToolchainError)"
+
+    # Runtime-context setup exceptions: typed codes stay visible; missing, non-string, or unsafe codes fall back.
+    cases = [
+        ("node-pin", site_deps.NodeToolchainError("bad /secret/path", code="node_pin_invalid"),
+         "provider_setup_refused: node_pin_invalid (NodeToolchainError)"),
+        ("typed-val", _TypedValueError("secret detail", "custom_setup_refusal"),
+         "provider_setup_refused: custom_setup_refusal (_TypedValueError)"),
+        ("enum-code", _TypedValueError("detail", _CodeEnum.PIN),
+         "provider_setup_refused: node_pin_conflict (_TypedValueError)"),
+        ("typed-os", _TypedOSError("detail", "os_setup.v1-denied"),
+         "provider_setup_refused: os_setup.v1-denied (_TypedOSError)"),
+        ("plain-val", ValueError("contains /home/secret"),
+         "provider_setup_refused: ValueError"),
+        ("plain-os", FileNotFoundError(2, "missing", "/etc/secret"),
+         "provider_setup_refused: FileNotFoundError"),
+        ("int-code", _TypedOSError("http-like", 404),
+         "provider_setup_refused: _TypedOSError"),
+        ("none-code", _TypedValueError("none", None),
+         "provider_setup_refused: _TypedValueError"),
+        ("empty-code", _TypedValueError("empty", ""),
+         "provider_setup_refused: _TypedValueError"),
+        ("space-code", _TypedValueError("spaces", "bad code /secret"),
+         "provider_setup_refused: _TypedValueError"),
+        ("newline-code", _TypedValueError("newline", "node_pin_invalid\n"),
+         "provider_setup_refused: _TypedValueError"),
+        ("traversal-code", _TypedValueError("dots", "a..b"),
+         "provider_setup_refused: _TypedValueError"),
+        ("colon-code", _TypedValueError("colon", "a:b"),
+         "provider_setup_refused: _TypedValueError"),
+        ("bidi-code", _TypedValueError("bidi", "ok\u202ecode"),
+         "provider_setup_refused: _TypedValueError"),
+        ("long-code", _TypedValueError("long", "a" * 65),
+         "provider_setup_refused: _TypedValueError"),
+    ]
+    for task_id, exc, expected_error in cases:
+        monkeypatch.setattr(worker.runtime_context, "build", lambda *_a, _exc=exc, **_k: (_ for _ in ()).throw(_exc))
+        settled = run_supervise(task_id, tmp_path)
+        _assert_pre_start_refusal(settled, "setup_refusal")
+        assert settled["error"] == expected_error, task_id
+
+    # Outer pre-launch OSError path (child is None when Popen fails with a typed OSError).
+    monkeypatch.setattr(
+        worker.runtime_context, "build",
+        lambda spec, env: Invocation([sys.executable, "-c", "pass"], b"", env, None),
+    )
+    monkeypatch.setattr(worker, "_in_boundary", lambda _spec: False)
+    monkeypatch.setattr(worker, "create_dispatch_lease", lambda *_a, **_k: None)
+    monkeypatch.setattr(worker, "_discard_read_only_scratch", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        worker.subprocess, "Popen",
+        lambda *_a, **_k: (_ for _ in ()).throw(_TypedOSError("exec refused", "exec_policy_refused")),
+    )
+    prelaunch = run_supervise("prelaunch-typed-os", tmp_path)
+    _assert_pre_start_refusal(prelaunch, "setup_refusal")
+    assert prelaunch["error"] == "provider_setup_refused: exec_policy_refused (_TypedOSError)"
+
+
 pytestmark = pytest.mark.usefixtures("sources_product_root")

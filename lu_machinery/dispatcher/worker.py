@@ -1787,6 +1787,21 @@ def _in_boundary(spec: TaskSpec) -> bool:
     return spec.mode == "read-only" and spec.agent not in {"agy", "muse"}
 
 
+# A typed setup refusal code is a single ASCII token (never a path, secret, or multiline message).
+_SETUP_REFUSAL_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+
+def _provider_setup_refused(exc: BaseException) -> str:
+    """Format a pre-start provider setup refusal, keeping a safe typed code alongside the class name."""
+    name = type(exc).__name__
+    code = getattr(exc, "code", None)
+    if isinstance(code, str):
+        token = str.__str__(code)
+        if _SETUP_REFUSAL_CODE.fullmatch(token) and ".." not in token:
+            return f"provider_setup_refused: {token} ({name})"
+    return f"provider_setup_refused: {name}"
+
+
 def _provider_env(spec: TaskSpec) -> dict[str, str]:
     """Mark the trusted Claude launch before build; supervise always wraps it before Popen."""
     env = child_env(spec)
@@ -1988,7 +2003,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             status, error, start_refusal = "failed", str(exc), StartRefusal.ACCOUNT
             return
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            status, error = "failed", f"provider_setup_refused: {type(exc).__name__}"
+            status, error = "failed", _provider_setup_refused(exc)
             start_refusal = StartRefusal.SETUP
             return
         record["runtime_input_sha256"] = hashlib.sha256(invocation.stdin or b"").hexdigest()
@@ -2284,7 +2299,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         status, error, record_damaged = "crashed", exc.code, True
     except OSError as exc:
         if child is None and not record.get("review_attempt"):
-            status, error, start_refusal = "failed", f"provider_setup_refused: {type(exc).__name__}", StartRefusal.SETUP
+            status, error, start_refusal = "failed", _provider_setup_refused(exc), StartRefusal.SETUP
         else:
             status, error = "crashed", f"supervisor or provider processing failed ({type(exc).__name__})"
     except Exception as exc:
