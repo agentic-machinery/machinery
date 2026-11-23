@@ -1511,9 +1511,8 @@ class _Boundary:
         try:
             # argv comes from wrap_argv_with_sandbox and env["PATH"]'s node_bin is a canonical,
             # validated toolchain bin dir (_admit_toolchain_read_dir + resolve_toolchain_dir).
-            self.process = subprocess.Popen(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
-                argv, env=env, cwd=cwd, pass_fds=(report_write, go_read),
-            )
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit, python.lang.security.audit.dangerous-subprocess-use-tainted-env-args
+            self.process = subprocess.Popen(argv, env=env, cwd=cwd, pass_fds=(report_write, go_read))
         finally:
             os.close(report_write)
             os.close(go_read)
