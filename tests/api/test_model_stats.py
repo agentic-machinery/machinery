@@ -668,7 +668,7 @@ def _git_fixture(tmp_path, monkeypatch) -> Path:
         monkeypatch.setenv(f"GIT_{role}_EMAIL", "fixture@example.invalid")
     repo = tmp_path / "repo"
     repo.mkdir()
-    _git(repo, "init", "-q", "--template=")
+    _git(repo, "init", "-q", "--initial-branch=main", "--template=")
     return repo
 
 
@@ -2039,7 +2039,8 @@ def test_author_results_split_by_risk_tier(tmp_path):
 
 def _merged_history(tmp_path, monkeypatch):
     repo = _git_fixture(tmp_path, monkeypatch)
-    fleet_repo = FleetRepo("machinery", "learn-ukrainian/machinery", "repo", "test")
+    fleet_repo = FleetRepo("machinery", "learn-ukrainian/machinery", "repo", "test",
+                           alternate_github="agentic-machinery/machinery")
     monkeypatch.setattr(stats, "load_fleet_repos", lambda: {"machinery": fleet_repo})
     monkeypatch.setattr(stats, "resolve_fleet_repo", lambda key, **_: (fleet_repo, repo))
 
@@ -2095,6 +2096,12 @@ def test_author_quality_stratifies_published_rounds_by_risk_and_landed_diff_size
         ("small", 1, 2.0, 0.0, 1.0, 2.0, True), ("medium", 2, 1.0, 1.0, 1.0, 0.0, True),
         ("large", 1, 1.0, 1.0, 1.0, 0.0, True), ("unknown", 1, 1.0, 0.0, 0.0, 1.0, True),
     ]
+    # The shallow boundary contains only PR 36. Its tree is large, but its parent and exact diff are missing.
+    shallow = tmp_path / "shallow"
+    _git(tmp_path, "clone", "-q", "--depth=1", (tmp_path / "repo").as_uri(), str(shallow))
+    monkeypatch.setattr(stats, "resolve_fleet_repo", lambda *args, **kwargs: (None, shallow))
+    (author,) = stats.collect(batch_state, tmp_path, NOW)["page_windows"]["7d"]["author_risks"]
+    assert author["by_risk"][0]["by_size"][0]["size"] == "unknown"
 
 
 def test_post_merge_rework_deduplicates_same_repo_fixes_in_a_complete_week(tmp_path, monkeypatch):
@@ -2110,7 +2117,11 @@ def test_post_merge_rework_deduplicates_same_repo_fixes_in_a_complete_week(tmp_p
         sha = merge(f"Feature (#{number})", day, body=f"X-Agent: codex/written-{number}")
         if number == 14:
             reverted_sha = sha
-    merge("fix: repair #11 (#21)", -9, body="Refs other/repo#12\n\n```\nExample #13\n```")
+    _record(tasks, "written-16", repo="machinery", model=terra, started_at=(NOW - timedelta(days=20)).isoformat())
+    merge("Feature (#16)", -10, body="X-Agent: codex/written-16")
+    merge("fix: repair agentic-machinery/machinery#16 (#20)", -10)
+    merge("fix: repair a prior change (#21)", -9,
+          body="Fixes https://github.com/agentic-machinery/machinery/pull/11\nRefs other/repo#12\n\n```\nExample #13\n```")
     merge("docs: cite #12 (#22)", -8, body="https://example.invalid/leaky-commit-body")
     merge("fix: repair #11 again (#23)", -6)
     merge("fix: late repair for #12 (#24)", -4)
@@ -2126,7 +2137,7 @@ def test_post_merge_rework_deduplicates_same_repo_fixes_in_a_complete_week(tmp_p
     assert response.status_code == 200 and "leaky-commit-body" not in response.text
     assert day["post_merge_rework_proxy"] == []
     assert [(r["model"], r["reworked"], r["rate"]) for r in response.json()["post_merge_rework_proxy"]] == [
-        (terra, 1, {"value": 0.5, "n": 2, "low_sample": True}), (sol, 1, {"value": 0.5, "n": 2, "low_sample": True}),
+        (terra, 2, {"value": 0.667, "n": 3, "low_sample": True}), (sol, 1, {"value": 0.5, "n": 2, "low_sample": True}),
     ]
 
 

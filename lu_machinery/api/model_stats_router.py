@@ -21,6 +21,12 @@ figures use reviews of record (reviews that name a PR and the author's model). O
 labels leave ``view=page``. The per-reason counts stay on every HTTP view. Up to 200 escaped characters of the
 first failing reply per model and reason leave only on ``view=full`` and ``view=samples``: never prompts, parsed
 bodies, paths, accounts or task ids, and never any sample on ``view=page`` or ``/metrics``.
+
+``author_risks[].by_risk`` groups published outcomes by the first review's risk. Its ``by_size`` groups use
+additions plus deletions at merge: 0–100, 101–1,000, over 1,000, or unknown without a measurable diff.
+``post_merge_rework_proxy`` counts attributed merges named by a fix or revert in the same repository over the
+next seven days of local history. A merge enters the selected window when its seven-day follow-up ends.
+``no_deliverable_causes`` counts each no-deliverable task once, using its recorded cause when available.
 """
 
 from __future__ import annotations
@@ -141,7 +147,10 @@ def _unfenced_lines(message: str) -> Iterator[str]:
 
 
 def trailer_task_ids(message: str) -> set[str]:
-    """Task IDs from whole-line attribution trailers outside code fences."""
+    """Task IDs from whole-line attribution trailers outside code fences.
+
+    An unclosed fence hides later trailers. A trailer-shaped line in a multi-line inline code span still counts.
+    """
     return {trailer.group(1) for line in _unfenced_lines(message) if (trailer := _TRAILER.fullmatch(line))}
 
 
@@ -168,7 +177,7 @@ class Landing:
                 "trailer_task_ids_by_repository": dict(sorted(self.by_repository.items()))}
 
 
-def _rework_references(title: str, body: str, slug: str) -> tuple[set[str], set[str]]:
+def _rework_references(title: str, body: str, slugs: frozenset[str]) -> tuple[set[str], set[str]]:
     prs, shas = set(), set()
     fix_title = bool(_REWORK_TITLE.match(title))
     for line in _unfenced_lines(f"{title}\n{body}"):
@@ -179,7 +188,7 @@ def _rework_references(title: str, body: str, slug: str) -> tuple[set[str], set[
         for ref in _PR_REFERENCE.finditer(line):
             url_slug, url_pr, named_slug, named_pr = ref.groups()
             target = url_slug or named_slug
-            if target and target.casefold() != slug.casefold():
+            if target and target.casefold() not in slugs:
                 continue
             prefix = line[:ref.start()]
             if fix_title or _REWORK_RELATION.search(prefix):
@@ -193,7 +202,7 @@ def _landed_sizes(checkout: Path, prs: list[_MergedPR], env: Mapping[str, str]) 
         return
     try:
         diff = subprocess.run(
-            ["git", "-C", str(checkout), "diff-tree", "--stdin", "--always", "--root", "--diff-merges=first-parent",
+            ["git", "-C", str(checkout), "diff-tree", "--stdin", "--always", "--diff-merges=first-parent",
              "--shortstat", "--no-ext-diff", "--no-textconv", "-r", "--find-renames"],
             input="".join(f"{pr.sha}\n" for pr in prs), capture_output=True, text=True,
             timeout=GIT_TIMEOUT_SECONDS, env=env, check=False,
@@ -229,6 +238,7 @@ def scan_landing(primary_root: Path, since: datetime, *,
         return landing
     env = {**sanitized_git_env(strip_config_injection=True), "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1",
            "GIT_NO_REPLACE_OBJECTS": "1", "LC_ALL": "C"}
+    reviewed_prs = reviewed_prs or set()
     for repo in repos:
         try:
             _, checkout = resolve_fleet_repo(repo.key, primary_root=primary_root, require_checkout=True)
@@ -250,6 +260,8 @@ def scan_landing(primary_root: Path, since: datetime, *,
         first_parent = None
         fields = iter(parts[:-1])
         repo_prs: dict[str, _MergedPR] = {}
+        measurable: list[_MergedPR] = []
+        slugs = frozenset(slug.casefold() for slug in repo.slugs)
         for sha, parents, merged_at, message in zip(fields, fields, fields, fields, strict=True):
             task_ids = trailer_task_ids(message)
             found |= task_ids
@@ -268,10 +280,11 @@ def scan_landing(primary_root: Path, since: datetime, *,
                 title, _, body = body.lstrip("\n").partition("\n")
                 number = number or merge[1]
             if number and number not in repo_prs:
-                refs, shas = _rework_references(title, body, repo.github)
-                repo_prs[number] = _MergedPR(sha, moment, task_ids, refs, shas)
-        _landed_sizes(checkout, [pr for number, pr in repo_prs.items() if (repo.key, number) in (reviewed_prs or ())],
-                      env)
+                refs, shas = _rework_references(title, body, slugs)
+                pr = repo_prs[number] = _MergedPR(sha, moment, task_ids, refs, shas)
+                if parents and (repo.key, number) in reviewed_prs:
+                    measurable.append(pr)
+        _landed_sizes(checkout, measurable, env)
         landing.prs.update({(repo.key, number): pr for number, pr in repo_prs.items()})
         landing.by_repository[repo.key] += len(found)
         landing.task_ids |= found
@@ -1067,13 +1080,16 @@ def _merge_outcomes(landing: Landing, rows: Iterable[_Row], record_prs: Iterable
     reviewed_authors = {pr["key"]: pr["author"] for pr in record_prs}
     by_sha = {(repo, pr.sha): number for (repo, number), pr in landing.prs.items()}
     reworked: set[tuple[str, str]] = set()
-    for (repo, _), followup in landing.prs.items():
+    earlier: dict[tuple[str, str], _MergedPR] = {}
+    # Mainline order distinguishes two merges with the same second-resolution timestamp.
+    for (repo, own_number), followup in reversed(landing.prs.items()):
         if followup.at >= until:
             continue
         reverted = {by_sha[repo, sha] for sha in followup.reverted_shas if (repo, sha) in by_sha}
         for number in followup.references | reverted:
-            if (pr := landing.prs.get((repo, number))) and timedelta(0) < followup.at - pr.at <= _REWORK_WINDOW:
+            if (pr := earlier.get((repo, number))) and timedelta(0) <= followup.at - pr.at <= _REWORK_WINDOW:
                 reworked.add((repo, number))
+        earlier[repo, own_number] = followup
     outcomes = []
     for (repo, number), pr in landing.prs.items():
         eligible_at = pr.at + _REWORK_WINDOW
