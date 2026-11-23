@@ -9,6 +9,7 @@ import logging
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from lu_machinery.dispatcher import providers, store
 from lu_machinery.dispatcher.types import StartRefusal
@@ -205,15 +206,21 @@ def claude_launch(spec, invocation):
 
 
 class LaunchRefused(ValueError):
-    """No supervisor was started, or its start was ambiguous and must not be retried."""
+    """No supervisor was started, or its start was ambiguous and must not be retried.
 
-    def __init__(self, message: str, fields: dict):
+    ``never_started`` is True only for a refusal the launch raised before any process of it was started
+    (``dispatch_isolation.LaunchNotStarted``).
+    """
+
+    def __init__(self, message: str, fields: dict, *, never_started: bool = False):
         super().__init__(message)
         self.fields = fields
+        self.never_started = never_started
 
 
 def spawn_supervisor(
     cmd: list[str], *, task_id: str, run_nonce: str, cwd: Path, stderr, stderr_log: Path, env: dict[str, str],
+    scope_limits: tuple[int, int, float] | None = None,
 ):
     """Start the supervisor in ``lu-dispatch.slice`` or, when isolation is unavailable, with plain ``Popen``.
 
@@ -221,8 +228,12 @@ def spawn_supervisor(
     returned pid is the supervisor in both cases, and the launch fields (``launch_mode``,
     ``launch_unit``, ``launch_fallback_reason``, ``launch_user_bus``) go into the record. A refused
     fallback (a caller inside a driver scope) or an ambiguous scoped start raises
-    :class:`LaunchRefused` with the legacy failure code; it is never relaunched.
+    :class:`LaunchRefused` with the legacy failure code; it is never relaunched. ``scope_limits``
+    (``RuntimeMaxSec``, ``TimeoutStopSec``, the latest POSIX time the scope may start) bound an orchestrator
+    turn's scope, which never falls back.
     """
+    bounded: dict[str, Any] = {} if scope_limits is None else dict(
+        allow_fallback=False, runtime_max_s=scope_limits[0], stop_timeout_s=scope_limits[1], start_by=scope_limits[2])
     try:
         process, launch = dispatch_isolation.spawn_detached_worker(
             cmd,
@@ -234,12 +245,14 @@ def spawn_supervisor(
             stdout=subprocess.DEVNULL,
             stderr=stderr,
             stderr_log=stderr_log,
+            **bounded,
         )
     except dispatch_isolation.DispatchIsolationError as exc:
         refused = str(exc).startswith("fallback-refused:")
         code = "dispatch_fallback_refused" if refused else "dispatch_isolation_failed"
         message = f"dispatch isolation: {exc}"[:500]
-        raise LaunchRefused(message, {"status": "failed", "error": f"{code}: {message}"}) from None
+        raise LaunchRefused(message, {"status": "failed", "error": f"{code}: {message}"},
+                            never_started=isinstance(exc, dispatch_isolation.LaunchNotStarted)) from None
     except (OSError, ValueError) as exc:
         # No supervisor process exists: fail like the legacy spawn instead of reporting a crash.
         message = f"Popen failed: {type(exc).__name__}: {exc}"[:500]

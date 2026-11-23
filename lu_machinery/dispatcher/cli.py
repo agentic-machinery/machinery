@@ -149,13 +149,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("read-only", "workspace-write", "orchestrator"),
         default="read-only",
         help="Mode; orchestrator is a CTO-started stream turn that dispatches workers and writes no product change "
-             "(needs --stream and --initiator claude-cto; default: read-only)",
+             "(needs --stream, --initiator claude-cto, a finite --hard-timeout and a --task-id starting turn-, "
+             "generated when omitted; default: read-only)",
     )
     # Absent unless given (SUPPRESS), so every other dispatch's advisory binding stays unchanged.
     dispatch.add_argument(
         "--stream", metavar="STREAM", default=argparse.SUPPRESS,
-        help="Canonical stream an orchestrator turn reserves, e.g. epic:1122; refused while another turn on it may "
-             "run or a live legacy driver lease holds it; needs --mode orchestrator (default: none)",
+        help="Canonical stream whose Monitor lease an orchestrator turn claims, e.g. epic:1122; refused while any "
+             "active lease (a turn's or a legacy driver's, expired or not) holds it; needs --mode orchestrator "
+             "(default: none)",
     )
     dispatch.add_argument(
         "--input", action="append", default=[], metavar="PATH",
@@ -397,7 +399,9 @@ def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
     """The record field of an orchestrator turn, ``{"stream": "epic:<N>"}``, or a typed refusal.
 
     Only the CTO seat enters the mode: ``--initiator claude-cto`` from a process that is no dispatched
-    task (so a turn never starts another turn), with a canonical epic stream.
+    task (so a turn never starts another turn), with a canonical epic stream. A turn's task id, and so its tree's
+    name, starts with ``host_admission.TURN_TASK_PREFIX`` (one is generated when omitted), and its tree is never
+    placed elsewhere (``--worktree PATH``).
     """
     from lu_machinery.orchestration import task_record_store
     from lu_machinery.session_streams.model import validate_stream_id
@@ -418,11 +422,22 @@ def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
                          "(--initiator claude-cto, from outside any dispatched task)")
     if agent == "opencode" and args.provider == SAVANT_PROVIDER:
         raise ValueError("orchestrator_entry_refused: a Savant run cannot be an orchestrator turn")
-    if refusal := host_admission.domain_refusal():
-        raise ValueError(f"orchestrator_entry_refused: {refusal}")
+    if args.task_id is None:
+        args.task_id = f"{host_admission.TURN_TASK_PREFIX}{uuid.uuid4().hex}"
+    elif not args.task_id.startswith(host_admission.TURN_TASK_PREFIX):
+        raise ValueError(f"orchestrator_entry_refused: a turn's --task-id starts with "
+                         f"{host_admission.TURN_TASK_PREFIX!r}, which marks its tree as a turn's")
+    if args.worktree:
+        raise ValueError("orchestrator_entry_refused: an orchestrator turn takes no --worktree path; its tree is "
+                         "the automatic one its task id names")
     # Every task-store scan (sweeps, child linkage) skips a file named like a dispatcher sidecar.
     if args.task_id is not None and task_record_store._is_dispatcher_sidecar(store.record_path(args.task_id)):
         raise ValueError("orchestrator_entry_refused: --task-id ends like a dispatcher sidecar file name")
+    # Monitor's claim route validates holder.task_id with the same public projection token rule (C-7010).
+    from lu_machinery.api.occupancy_sanitize import safe_field
+
+    if safe_field(args.task_id, role="task_id") != args.task_id:
+        raise ValueError("orchestrator_entry_refused: a turn's --task-id must be a Monitor-safe token")
     # Identity, not equality: --pr 0 is a given flag, though 0 == False.
     given = [name for name in _ORCHESTRATOR_REFUSED
              if (value := getattr(args, name, None)) is not None and value is not False and value != []]
@@ -476,11 +491,13 @@ def _dispatch(args) -> int:
     if orchestrator_requested:
         args.mode = "workspace-write"
     orchestrator = None
+    turn_runtime_s = turn_ttl_s = 0
     if orchestrator_requested or getattr(args, "stream", None) is not None:
         # First, so a flag the mode refuses gets the mode's own typed refusal.
         entry_agent = ALIASES.get(args.agent, args.agent)
         with admission.record_refusal(args, entry_agent, StartRefusal.ELIGIBILITY):
             orchestrator = _orchestrator_entry(args, entry_agent, requested=orchestrator_requested)
+            turn_runtime_s, turn_ttl_s = host_admission.turn_timing(args.hard_timeout)
     if binding := store.review_binding(vars(args)):
         # Bound attempts have their own accounting; PR selectors would also charge their records to a PR budget.
         if args.branch is not None or args.pr is not None:
@@ -582,6 +599,12 @@ def _dispatch(args) -> int:
         raise ValueError("task id already exists; choose a new task id")
     with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         linkage = _parent_linkage(task_id)
+        # A turn's child never borrows a tree, its turn's or any other: settlement judges the turn on its own. An
+        # inherited turn id counts even when the turn's record is gone or lost its orchestrator key.
+        parent = os.environ.get(ownership.TASK_ID_ENV) or ""
+        if args.cwd and (linkage.get("parent_stream") is not None or parent.startswith(host_admission.TURN_TASK_PREFIX)):
+            raise ValueError("orchestrator_turn_writer_refused: a task an orchestrator turn dispatches cannot borrow "
+                             "a tree (--cwd)")
     repo, info = git.resolve_repo(args.repo)
     # Absent unless given, so an omitted --read-path leaves every other route's advisory binding unchanged.
     read_paths = getattr(args, "read_path", [])
@@ -819,12 +842,16 @@ def _dispatch(args) -> int:
             spec=spec, orchestrator=orchestrator,
         )
     if orchestrator is not None:
-        # Monitor holds the legacy leases, so this probe runs outside the admission lock; the turn's own
-        # reservation is published atomically in reserve(). A dry run reads the reservation file, writing nothing.
+        # A turn never falls back to a plain process (its run is bounded only by its scope), so a host that
+        # cannot isolate it refuses before its stream's lease is claimed. reserve() claims that lease; a dry run
+        # only reads it, writing nothing.
+        from lu_machinery.orchestration import dispatch_isolation
+
         with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
-            if refusal := host_admission.legacy_lease_refusal(orchestrator["stream"]):
-                raise host_admission.Refused(f"❌ {refusal}", 3)
-            if args.dry_run and (busy := host_admission.stream_refusal(orchestrator["stream"])):
+            if not (probed := dispatch_isolation.probe_isolation()).ready:
+                raise host_admission.Refused(f"❌ orchestrator_isolation_unavailable: {probed.reason or 'unknown'}; "
+                                             "a turn runs only in its own bounded scope", 3)
+            if args.dry_run and (busy := host_admission.turn_lease_probe(orchestrator["stream"])):
                 raise host_admission.Refused(f"❌ {busy}", 3)
     if args.dry_run:
         # The real run re-checks child_env after worktree creation in worker.py.
@@ -862,12 +889,14 @@ def _dispatch(args) -> int:
                 stack.enter_context(git.worktree_lock(repo))
                 checks.check_review_budget(args, info, sha)
         launch = {"record": False, "started": False}  # worker.start marks each just before that step
+        # A turn's run nonce exists before its lease is claimed, which names it; the hold, record and scope keep it.
+        turn = {} if orchestrator is None else {"run_nonce": uuid.uuid4().hex, "turn_ttl_s": turn_ttl_s}
         with admission.record_refusal(args, agent, StartRefusal.CAPACITY, task_id=task_id):
             hold = stack.enter_context(host_admission.reserve(
                 task_id, args.mode, decision, agent=agent, force_reason=force_reason,
                 spec=spec,
                 disk_guard=lambda: not (args.worktree is not None and (worktree / ".git").exists()),
-                orchestrator=orchestrator, linkage=linkage, tree=str(worktree), launch=launch,
+                orchestrator=orchestrator, linkage=linkage, launch=launch, **turn,
             ))
         with admission.record_refusal(args, agent, StartRefusal.SETUP, task_id=task_id, hold=hold):
             if binding:
@@ -891,6 +920,7 @@ def _dispatch(args) -> int:
             record.update(linkage)
             if orchestrator is not None:
                 record["orchestrator"] = orchestrator
+                record[host_admission.TURN_LEASE_KEY] = hold[host_admission.TURN_LEASE_KEY]
             if review_contract is not None:
                 record["review_contract"] = review_contract
             if publish_remote is not None:
@@ -910,16 +940,24 @@ def _dispatch(args) -> int:
                     if args.cwd and not worktree.is_dir():
                         raise ValueError("cwd worktree was removed before the task started")
                     # An orchestrator turn's tree is judged unchanged at its settlement: no other task may write it.
-                    if args.cwd and (refusal := host_admission.turn_writer_refusal(tree=str(worktree))):
+                    if args.cwd and (refusal := host_admission.turn_tree_refusal(worktree)):
                         raise ValueError(refusal)
                     if args.cwd and args.mode == "workspace-write" and git.agent_deploy_enrolled(worktree, sha):
                         # Another task in a borrowed tree could commit, enroll or redeploy at any moment, so only a
                         # tree this dispatch creates gets, and keeps, the deployment its start commit composes.
                         raise ValueError("agent_deploy_attach_refused: a write task cannot borrow (--cwd) a tree "
                                          "enrolled in the agent deployment; dispatch it without --cwd")
-                # Only a turn's reservation reads the launch progress (host_admission.reserve).
-                worker.start(spec, record, prompt, args.hard_timeout,
-                             **({} if orchestrator is None else {"progress": launch}))
+                    # Last before the scope starts: the turn's lease must outlast its run and the scope's stop.
+                    if orchestrator is not None and (refusal := host_admission.turn_launch_refusal(
+                            record[host_admission.TURN_LEASE_KEY], turn_runtime_s)):
+                        raise ValueError(refusal)
+                # Only a turn's lease release reads the launch progress (host_admission.reserve).
+                if orchestrator is None:
+                    worker.start(spec, record, prompt, args.hard_timeout)
+                else:
+                    start_by = host_admission.turn_start_deadline(record[host_admission.TURN_LEASE_KEY], turn_runtime_s)
+                    worker.start(spec, record, prompt, args.hard_timeout, progress=launch, scope_limits=(
+                        turn_runtime_s, host_admission.TURN_STOP_TIMEOUT_S, start_by or 0.0))
         except admission.LaunchRefused as exc:
             # The record is terminal: preserve the account/placement port's no-relaunch refusal.
             print(f"dispatcher: failed to spawn worker for {task_id!r}: {exc}", file=sys.stderr)

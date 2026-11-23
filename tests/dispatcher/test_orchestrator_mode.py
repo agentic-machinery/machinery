@@ -1,7 +1,7 @@
 """Orchestrator dispatch mode: a CTO-started stream turn that writes no product change (DRIVERS-1122).
 
-The tests own their data: a private task store, a scripted Monitor (an in-process fake or a loopback stub
-server for the subprocess dispatcher) and the dispatcher sandbox's stub provider.
+The tests own their data: a private task store, a Monitor (an in-process fake, or the production epics router over
+a test-owned store on a loopback port) and the dispatcher sandbox's stub provider.
 """
 
 import contextlib
@@ -11,16 +11,18 @@ import os
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import UTC, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from lu_machinery.dispatcher import environment, git, host_admission, ownership, store, worker
-from lu_machinery.orchestration import dispatch_admission, task_record_store
+from lu_machinery.dispatcher import git, host_admission, ownership, store, worker
+from lu_machinery.orchestration import dispatch_admission
 from lu_machinery.session_supervisor import remote
 from tests.dispatcher.conftest import await_file, run_git
+from tests.epics_monitor_stub import isolated_monitor_state  # noqa: F401
 from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 STREAM = "epic:7"
@@ -33,9 +35,18 @@ _LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="scope", lau
                  provider_pgid=None)
 
 
-def _lease(state="active", session_state="open", expires_in=600):
-    expires = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
-    return {"state": state, "session_state": session_state, "expires_at": expires, "holder": {"agent": "claude"}}
+def _lease(state="active", session_state="open", expires_in=600, **fields):
+    """Monitor's projection of one lease on STREAM, as its stream route answers."""
+    ttl = fields.get("ttl_seconds", 900)
+    expires_dt = datetime.now(UTC) + timedelta(seconds=expires_in)
+    heartbeat_dt = expires_dt - timedelta(seconds=ttl if type(ttl) is int else 900)
+    expires = expires_dt.isoformat().replace("+00:00", "Z")
+    heartbeat = heartbeat_dt.isoformat().replace("+00:00", "Z")
+    return {"stream_id": STREAM, "session_id": "session-1", "lease_id": "lease-1", "generation": 2,
+            "fencing_token": 2, "state": state, "session_state": session_state, "heartbeat_at": heartbeat,
+            "expires_at": expires, "ttl_seconds": 900, "version": 1, "age_seconds": 0,
+            "holder": {"agent": "claude", "harness": "codex-cli", "instance_id": "legacy-1", "task_id": None,
+                       "process_id": 4321, "holder_kind": "process", "host_id": None}, **fields}
 
 
 @pytest.fixture
@@ -84,8 +95,14 @@ def _write(record):
         (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--pr", "0"], "takes no --pr"),
         (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--require-review-verdict"],
          "takes no --require-review-verdict"),
-        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn.sandbox"],
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn-1.sandbox"],
          "ends like a dispatcher sidecar"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn-review.next"],
+         "Monitor-safe token"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn-1.2.3.4"],
+         "Monitor-safe token"),
+        (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--task-id", "turn-vps"],
+         "Monitor-safe token"),
         (["--mode", "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", "--research-role", "advisory"],
          "--research-role is driver"),
     ],
@@ -97,12 +114,12 @@ def test_entry_refuses_anything_but_the_cto_seat_on_a_canonical_stream(task_stor
 
     for target, name in ((git, "create_worktree"), (worker, "start"), (host_admission, "reserve")):
         monkeypatch.setattr(target, name, lambda *_a, _name=name, **_k: pytest.fail(f"{_name} ran before refusal"))
-    task_id = [] if "--task-id" in flags else ["--task-id", "turn"]
+    task_id = [] if "--task-id" in flags else ["--task-id", "turn-1"]
     code = cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", *task_id,
                      "--prompt", "drive", *flags])
     assert code == 2
     assert reason in capsys.readouterr().err
-    assert not store.read("turn", missing_ok=True)
+    assert not store.read("turn-1", missing_ok=True)
 
 
 @pytest.mark.parametrize(("marker", "value"), [(TASK_ENV, "some-worker"), (TASK_ENV, ""),
@@ -114,10 +131,34 @@ def test_entry_refuses_a_caller_inside_a_dispatched_task(task_store, cto_seat, m
 
     monkeypatch.setenv(marker, value)
     monkeypatch.setattr(worker, "start", lambda *_a, **_k: pytest.fail("spawned"))
-    assert cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", "--task-id", "turn",
+    assert cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", "--task-id", "turn-1",
                      "--prompt", "drive", "--mode", "orchestrator", "--stream", STREAM,
                      "--initiator", "claude-cto"]) == 2
     assert "only the CTO seat" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("flags", "reason"),
+    [
+        (["--task-id", "worker-1"], "a turn's --task-id starts with 'turn-'"),  # T6: its tree would not read as a turn's
+        (["--task-id", "turn-1", "--worktree", "/trees/elsewhere"], "takes no --worktree path"),  # T6
+        (["--task-id", "turn-1", "--hard-timeout", "nan"], "orchestrator_timeout_refused"),  # T5
+        (["--task-id", "turn-1", "--hard-timeout", "inf"], "orchestrator_timeout_refused"),  # T5
+        (["--task-id", "turn-1", "--hard-timeout", "0"], "orchestrator_timeout_refused"),  # T5: 0 disables a deadline
+        (["--task-id", "turn-1", "--hard-timeout", "86400"], "orchestrator_timeout_refused"),  # T5
+    ],
+)
+def test_entry_refuses_a_turn_without_a_turn_id_its_own_tree_or_a_bounded_deadline(task_store, cto_seat, monkeypatch,
+                                                                                   capsys, flags, reason):
+    """Defect classes T5, T6: a turn starts under a task id or tree path that does not mark its tree as a turn's, or
+    with a deadline that leaves its scope unbounded or its lease beyond Monitor's limit."""
+    from lu_machinery.dispatcher import cli
+
+    for target, name in ((git, "create_worktree"), (worker, "start"), (host_admission, "reserve")):
+        monkeypatch.setattr(target, name, lambda *_a, _name=name, **_k: pytest.fail(f"{_name} ran before refusal"))
+    assert cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", "--prompt", "drive", "--mode",
+                     "orchestrator", "--stream", STREAM, "--initiator", "claude-cto", *flags]) == 2
+    assert reason in capsys.readouterr().err
 
 
 # --- admission -----------------------------------------------------------------------------------------------------
@@ -152,9 +193,54 @@ def test_a_turn_takes_no_write_slot_but_keeps_the_host_checks(task_store, monkey
     assert (scan.live_on_meter, scan.last_meter_launch_age_s is not None) == (0, True)
 
 
-# A dispatcher process that reserves a stream on "go", reports, and holds the reservation until "done" (stdin).
+# --- the stream lease: one Monitor claim per stream (DRIVERS-1122 PR 2) --------------------------------------------
+
+
+def _monitor_store(tmp_path):
+    from lu_machinery.session_streams.db import SessionStreamDatabase
+    from lu_machinery.session_streams.store import SessionStreamStore
+
+    return SessionStreamStore(SessionStreamDatabase(tmp_path / "monitor" / "epics.sqlite3"))
+
+
+@pytest.fixture
+def monitor(tmp_path, monkeypatch, request):
+    """A loopback Monitor serving the production epics router over a test-owned store."""
+    from tests.epics_monitor_stub import epics_monitor_stub
+
+    request.getfixturevalue("isolated_monitor_state")
+
+    (tmp_path / "monitor").mkdir()
+    store_ = _monitor_store(tmp_path)
+    with epics_monitor_stub(store_) as base:
+        monkeypatch.setenv("LU_MONITOR_LOOPBACK", base)
+        yield SimpleNamespace(base=base, store=store_, client=remote.RemoteEpicClient(base=base))
+
+
+def _legacy(name="legacy"):
+    from lu_machinery.session_streams.model import LeaseHolder
+
+    return LeaseHolder("codex", "codex-cli", name, process_id=os.getpid())
+
+
+def _legacy_claim(client, stream=STREAM, name="legacy", ttl=900):
+    return client.claim(stream_id=stream, holder=_legacy(name), lineage_id=f"{name}-lineage", ttl_seconds=ttl,
+                        session_id=f"{name}-session", lease_id=f"{name}-lease")
+
+
+def _reserve(task_id, stream=STREAM, *, launch=None, nonce=None, ttl=3600, force_reason=None):
+    """Reserve ``stream`` for turn ``task_id`` as dispatch does, then hand the record on as to a supervisor."""
+    decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+    with host_admission.reserve(task_id, "workspace-write", decision, agent="claude", disk_guard=lambda: False,
+                                force_reason=force_reason, orchestrator={"stream": stream},
+                                run_nonce=nonce or uuid.uuid4().hex, turn_ttl_s=ttl, launch=launch) as hold:
+        store.replace({**hold, "prompt_file": "/prompts/turn.md"}, store.record_path(task_id))
+    return hold
+
+
+# A dispatcher process that reserves a stream on "go", reports, and holds it until "done" (stdin).
 _CONTENDER = """
-import sys
+import sys, uuid
 from lu_machinery.dispatcher import host_admission
 task_id, stream = sys.argv[1:3]
 decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
@@ -162,7 +248,8 @@ print("ready", flush=True)
 sys.stdin.readline()
 try:
     with host_admission.reserve(task_id, "workspace-write", decision, agent="claude", disk_guard=lambda: False,
-                                orchestrator={"stream": stream}, tree="/trees/" + task_id, launch={"started": False}):
+                                orchestrator={"stream": stream}, run_nonce=uuid.uuid4().hex, turn_ttl_s=3600,
+                                launch={"started": False}):
         print("held", flush=True)
         sys.stdin.readline()
 except host_admission.Refused as exc:
@@ -170,24 +257,10 @@ except host_admission.Refused as exc:
 """
 
 
-def _reservation(stream=STREAM):
-    return host_admission.reservations_dir() / f"{stream}{host_admission.RESERVATION_SUFFIX}"
-
-
-def _reserve(task_id, stream=STREAM, *, force_reason=None, launch=None):
-    """Reserve ``stream`` for ``task_id`` as dispatch does, then hand the record on as to a supervisor."""
-    decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
-    with host_admission.reserve(task_id, "workspace-write", decision, agent="claude", disk_guard=lambda: False,
-                                force_reason=force_reason, orchestrator={"stream": stream},
-                                tree=f"/trees/{task_id}", launch=launch) as hold:
-        store.replace({**hold, "prompt_file": "/prompts/turn.md"}, store.record_path(task_id))
-    return hold
-
-
-def test_dispatch_processes_contending_for_one_stream_get_one_reservation(task_store):
-    """Defect class: two dispatcher processes both admit a turn on one stream (check-then-act across processes),
-    one stream's reservation blocks another stream, or a hold that ends unused keeps its stream."""
-    contenders = [(f"turn-{n}", STREAM) for n in range(4)] + [("other", "epic:8")]
+def test_dispatch_processes_and_a_legacy_launcher_contending_for_one_stream_get_one_lease(task_store, monitor):
+    """Defect class T1: two dispatcher processes both start a turn on one stream (check-then-act across processes), a
+    legacy launcher claims beside a turn or a turn beside a legacy lease, or one stream's lease blocks another."""
+    contenders = [(f"turn-{n}", STREAM) for n in range(4)] + [("turn-other", "epic:8")]
     procs = [subprocess.Popen([sys.executable, "-c", _CONTENDER, task_id, stream], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for task_id, stream in contenders]
     # Bounds every pipe read: a contender that hangs is killed, which ends its output.
@@ -196,19 +269,21 @@ def test_dispatch_processes_contending_for_one_stream_get_one_reservation(task_s
     try:
         for proc in procs:
             assert proc.stdout.readline() == "ready\n", proc.stderr.read()
-        for proc in procs:  # every process has its admission decision; now they all reserve at once
+        for proc in procs:  # every process has its admission decision; now they all claim at once
             proc.stdin.write("go\n")
             proc.stdin.flush()
         results = [proc.stdout.readline() for proc in procs]
         held = [task_id for (task_id, _stream), line in zip(contenders, results, strict=True) if line == "held\n"]
-        assert len(held) == 2 and "other" in held, results
-        [winner] = [task_id for task_id in held if task_id != "other"]
+        assert len(held) == 2 and "turn-other" in held, results
+        [winner] = [task_id for task_id in held if task_id != "turn-other"]
         refused = [line for line in results if line.startswith("refused")]
         assert len(refused) == 3
-        assert all(line.startswith(f"refused 3 ❌ orchestrator_stream_busy: {STREAM} is reserved by turn {winner} ")
+        assert all(line.startswith(f"refused 3 ❌ orchestrator_stream_leased: {STREAM} has an active lease")
                    for line in refused), refused
-        assert json.loads(_reservation().read_text())["task_id"] == winner
-        assert json.loads(_reservation("epic:8").read_text())["task_id"] == "other"
+        assert monitor.client.stream(STREAM)["lease"]["holder"]["task_id"] == winner
+        # A legacy launcher's claim is refused while the turn holds the stream, with the turn conflict's detail.
+        with pytest.raises(remote.RemoteClaimConflictError, match="turn_lease_uncleared"):
+            _legacy_claim(monitor.client)
     finally:
         for proc in procs:
             with contextlib.suppress(BrokenPipeError, ValueError):
@@ -216,36 +291,252 @@ def test_dispatch_processes_contending_for_one_stream_get_one_reservation(task_s
                 proc.stdin.close()
             proc.wait(timeout=60)
         watchdog.cancel()
-    # Each hold ended before any supervisor could start, so both streams are free again.
-    assert not _reservation().exists() and not _reservation("epic:8").exists()
-    assert _reserve("turn-next")["orchestrator"] == {"stream": STREAM}
+    # Each hold ended before any supervisor could start, so both leases were released exactly.
+    assert {monitor.client.stream(stream)["lease"]["state"] for stream in (STREAM, "epic:8")} == {"released"}
+    # The other order: a legacy lease holds the stream, and a turn is refused beside it.
+    _legacy_claim(monitor.client)
+    with pytest.raises(host_admission.Refused, match=f"orchestrator_stream_leased: {STREAM} has an active lease"):
+        _reserve("turn-next", force_reason="operator says go")
+    assert store.read("turn-next", missing_ok=True) is None  # refused before any hold
 
 
-def test_a_crash_between_the_reservation_and_the_hold_leaves_the_stream_held(task_store):
-    """Defect class: a dispatcher that dies after reserving and before publishing its hold frees the stream."""
-    crash = ("import os, sys\nfrom lu_machinery.dispatcher import host_admission, store\n"
-             "store._write = lambda *_a, **_k: os._exit(9)\n" + _CONTENDER.split("print(\"ready\"", 1)[0]
-             + "with host_admission.reserve(task_id, 'workspace-write', decision, agent='claude', disk_guard=lambda: False,"
-             " orchestrator={'stream': stream}, tree='/trees/' + task_id):\n    pass\n")
-    result = subprocess.run([sys.executable, "-c", crash, "turn", STREAM], capture_output=True, text=True, timeout=120)
-    assert result.returncode == 9, result.stderr
-    assert store.read("turn", missing_ok=True) is None  # no hold, no record
-    assert json.loads(_reservation().read_text())["task_id"] == "turn"
-    for task_id in ("turn", "turn-2"):  # neither the same task id nor another one gets the stream
-        with pytest.raises(host_admission.Refused, match="orchestrator_stream_busy: epic:7 is reserved by turn turn "):
-            _reserve(task_id)
-    assert host_admission.stream_refusal(STREAM).startswith("orchestrator_stream_busy")
+def _answer(nonce, ttl=3600, **changes):
+    """Monitor's claim answer for this turn's new lease, with ``changes`` applied (``lease.<field>`` for its lease)."""
+    from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
+
+    now = datetime.now(UTC)
+    heartbeat = now.isoformat().replace("+00:00", "Z")
+    expires = (now + timedelta(seconds=ttl)).isoformat().replace("+00:00", "Z")
+    lease = dict(stream_id=STREAM, session_id=f"turn-session-{nonce}", lease_id=f"turn-lease-{nonce}", generation=3,
+                 fencing_token=3, state="active", session_state="open", heartbeat_at=heartbeat, expires_at=expires,
+                 ttl_seconds=ttl, version=1, age_seconds=0,
+                 holder=dict(agent="claude", harness=TURN_HOLDER_HARNESS, instance_id=nonce, task_id="turn-1",
+                             process_id=os.getpid(), holder_kind="process", host_id=None))
+    answer = {"schema": "remote-epic-lifecycle.v1", "stream_id": STREAM, "session_state": "open", "outcome": "claimed",
+              "lease": lease}
+    for key, value in changes.items():
+        target, name = (lease, key.removeprefix("lease.")) if key.startswith("lease.") else (answer, key)
+        if name.startswith("holder."):
+            target = lease["holder"]
+            name = name.removeprefix("holder.")
+        if value is _MISSING:
+            target.pop(name)
+        else:
+            target[name] = value
+    return answer
 
 
-def test_release_needs_the_reserving_task_and_run(task_store):
-    """Defect class: a stale run (or another task) releases a stream that a newer turn reserved."""
-    hold = _reserve("turn")
-    for task_id, nonce in (("turn", "f" * 32), ("other", hold["run_nonce"]), ("turn", hold["run_nonce"].upper())):
-        assert host_admission.release_stream(STREAM, task_id, nonce).startswith("orchestrator_reservation_foreign")
-        assert _reservation().exists()
-    assert host_admission.release_stream(STREAM, "turn", hold["run_nonce"]) is None
-    assert not _reservation().exists()
-    assert host_admission.release_stream(STREAM, "turn", hold["run_nonce"]) == "orchestrator_reservation_missing"
+def _conflict(detail):
+    return remote.RemoteClaimConflictError(f"Monitor API refused request (409): {detail}", detail=detail)
+
+
+@pytest.mark.parametrize(
+    ("answer", "refused"),
+    [
+        ({}, None),
+        (_conflict("turn_lease_uncleared: an active lease ...; current holder=codex/codex-cli"),
+         "orchestrator_stream_leased"),
+        (_conflict("epic claim rejected by a session-stream invariant"), "orchestrator_lease_unknown"),
+        (_conflict("epic stream already has live session; current holder=codex/codex-cli"), "orchestrator_lease_unknown"),
+        (_conflict("turn_lease_unclearedX"), "orchestrator_lease_unknown"),
+        (remote.RemoteSupervisorError("Monitor API refused request (403): loopback mutation required"),
+         "orchestrator_lease_unknown"),
+        (remote.RemoteUnreachableError("Monitor API unreachable; no remote claim was made"), "orchestrator_lease_unknown"),
+        (TimeoutError("the answer was lost"), "orchestrator_lease_unknown"),
+        (AttributeError("'list' object has no attribute 'get'"), "orchestrator_lease_unknown"),
+        ({"schema": _MISSING}, "orchestrator_lease_unknown"),
+        ({"schema": "remote-epic-lifecycle.v2"}, "orchestrator_lease_unknown"),
+        ({"schema": True}, "orchestrator_lease_unknown"),
+        ({"outcome": "replayed"}, "orchestrator_lease_unknown"),
+        ({"outcome": "recovered"}, "orchestrator_lease_unknown"),
+        ({"outcome": _MISSING}, "orchestrator_lease_unknown"),
+        ({"stream_id": "epic:8"}, "orchestrator_lease_unknown"),
+        ({"lease": None}, "orchestrator_lease_unknown"),
+        ({"lease.stream_id": "epic:8"}, "orchestrator_lease_unknown"),
+        ({"lease.session_id": "session-other"}, "orchestrator_lease_unknown"),
+        ({"lease.lease_id": "lease-other"}, "orchestrator_lease_unknown"),
+        ({"lease.state": "expired"}, "orchestrator_lease_unknown"),
+        ({"lease.session_state": "rolling"}, "orchestrator_lease_unknown"),
+        ({"lease.holder.harness": "codex-cli"}, "orchestrator_lease_unknown"),
+        ({"lease.holder.instance_id": "f" * 32}, "orchestrator_lease_unknown"),
+        ({"lease.holder.task_id": "turn-2"}, "orchestrator_lease_unknown"),
+        ({"lease.holder.host_id": "elsewhere"}, "orchestrator_lease_unknown"),
+        ({"lease.holder.process_id": _MISSING}, "orchestrator_lease_unknown"),
+        ({"lease.holder.process_id": float(os.getpid())}, "orchestrator_lease_unknown"),  # equal, but not an integer
+        ({"lease.generation": True}, "orchestrator_lease_unknown"),
+        ({"lease.fencing_token": 0}, "orchestrator_lease_unknown"),
+        ({"ttl": 7200}, "orchestrator_lease_unknown"),  # valid 7200s projection, wrong TTL for this 3600s claim
+        ({"lease.ttl_seconds": True}, "orchestrator_lease_unknown"),
+        ({"lease.version": True}, "orchestrator_lease_unknown"),
+        ({"lease.version": 0}, "orchestrator_lease_unknown"),
+        ({"lease.age_seconds": -1}, "orchestrator_lease_unknown"),
+        ({"lease.age_seconds": True}, "orchestrator_lease_unknown"),
+        ({"lease.heartbeat_at": "soon"}, "orchestrator_lease_unknown"),
+        ({"lease.heartbeat_at": (datetime.now(UTC) + timedelta(seconds=7200)).isoformat().replace("+00:00", "Z")},
+         "orchestrator_lease_unknown"),  # heartbeat after expiry
+        ({"lease.heartbeat_at": (datetime.now(UTC) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")},
+         "orchestrator_lease_unknown"),  # expiry - heartbeat != ttl_seconds
+        ({"session_state": "closed"}, "orchestrator_lease_unknown"),  # top-level disagrees with nested open
+        ({"session_state": _MISSING}, "orchestrator_lease_unknown"),
+        ({"lease.expires_at": "soon"}, "orchestrator_lease_unknown"),
+        ({"lease.heartbeat_at": "2025-12-31T23:00:00Z", "lease.expires_at": "2026-01-01T00:00:00Z"},
+         "orchestrator_lease_unknown"),  # valid 3600s projection, already past
+        ({"lease.heartbeat_at": "2098-12-31T23:00:00Z", "lease.expires_at": "2099-01-01T00:00:00Z"},
+         "orchestrator_lease_unknown"),  # valid 3600s projection, beyond the TTL asked for
+    ],
+)
+def test_a_claim_answer_that_is_not_exactly_this_turns_new_lease_starts_nothing(task_store, monkeypatch, answer,
+                                                                                refused):
+    """Defect class T3: a replayed, recovered, malformed, foreign or lost claim answer, or a 409 that is not a turn
+    conflict, reads as this turn's lease (or as a held stream), or the dispatcher retries the claim."""
+    nonce = "a" * 32
+    calls = []
+
+    def claim(self, **kwargs):
+        calls.append(kwargs)
+        if isinstance(answer, BaseException):
+            raise answer
+        return None, _answer(nonce, **answer)
+
+    monkeypatch.setattr(remote.RemoteEpicClient, "claim", claim)
+    if refused is None:
+        envelope = host_admission.claim_turn(STREAM, "turn-1", nonce, agent="claude", ttl_s=3600)
+        assert envelope["lease"]["holder"]["instance_id"] == nonce and set(envelope) == {"monitor", "lease"}
+    else:
+        with pytest.raises(host_admission.Refused, match=f"^❌ {refused}: ") as error:
+            host_admission.claim_turn(STREAM, "turn-1", nonce, agent="claude", ttl_s=3600)
+        assert error.value.code == 3
+    assert len(calls) == 1  # never retried
+    assert calls[0]["holder"].instance_id == nonce and calls[0]["session_id"] == f"turn-session-{nonce}"
+
+
+def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_store, monitor, monkeypatch):
+    """Defect class T3: an outage before the claim reads as 'no lease', or a claim Monitor committed whose answer
+    was lost frees the stream, is retried, or starts the turn."""
+    real_request = remote.RemoteEpicClient._request
+    lost = {"claim": True}
+
+    def request(self, method, path, payload=None):
+        answer = real_request(self, method, path, payload)
+        if path.endswith("/claim") and lost["claim"]:
+            raise TimeoutError("the claim's answer was lost after Monitor committed it")
+        return answer
+
+    monkeypatch.setattr(remote.RemoteEpicClient, "_request", request)
+    with pytest.raises(host_admission.Refused, match="orchestrator_lease_unknown"):
+        _reserve("turn-1")
+    assert store.read("turn-1", missing_ok=True) is None  # nothing started
+    # The committed claim holds the stream: no turn and no legacy launcher passes it until an operator releases it.
+    lost["claim"] = False
+    with pytest.raises(host_admission.Refused, match="orchestrator_stream_leased"):
+        _reserve("turn-2")
+    with pytest.raises(remote.RemoteClaimConflictError, match="turn_lease_uncleared"):
+        _legacy_claim(monitor.client)
+    monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
+                           reason="the lost claim's turn never started")
+    assert _reserve("turn-3")["turn_lease"]["lease"]["holder"]["task_id"] == "turn-3"
+    # Before the commit: an unreachable Monitor claims nothing.
+    monkeypatch.setenv("LU_MONITOR_LOOPBACK", "http://127.0.0.1:9")
+    with pytest.raises(host_admission.Refused, match="orchestrator_lease_unknown"):
+        _reserve("turn-4", stream="epic:8")
+    monkeypatch.setenv("LU_MONITOR_LOOPBACK", monitor.base)
+    assert monitor.store.lease_projection("epic:8") is None
+
+
+def test_a_dry_run_reads_a_projection_whose_session_disagrees_with_its_lease_as_unknown(monkeypatch):
+    """Defect class T1: a dry run reports a stream free from a projection whose own session state contradicts its
+    lease (an open session beside a released lease, or beside no lease), or whose lifecycle schema is unsupported."""
+    for lease, session in ((_lease(state="released", session_state="closed"), "open"), (None, "open")):
+        monkeypatch.setattr(remote.RemoteEpicClient, "stream", lambda self, stream_id, digest_limit=20, lease=lease,
+                            session=session: {"schema": "remote-epic-lifecycle.v1", "stream_id": stream_id,
+                                              "session_state": session, "lease": lease})
+        assert host_admission.turn_lease_probe(STREAM).startswith("orchestrator_lease_unknown"), (lease, session)
+    for bad_schema in (_MISSING, "remote-epic-lifecycle.v2", True):
+        for lease, session in ((None, None), (_lease(state="released", session_state="closed"), "closed")):
+            payload = {"stream_id": STREAM, "session_state": session, "lease": lease}
+            if bad_schema is not _MISSING:
+                payload["schema"] = bad_schema
+            monkeypatch.setattr(remote.RemoteEpicClient, "stream",
+                                lambda self, stream_id, digest_limit=20, payload=payload: payload)
+            assert host_admission.turn_lease_probe(STREAM).startswith("orchestrator_lease_unknown"), (bad_schema, lease)
+
+
+@pytest.mark.parametrize(
+    ("lease", "refused"),
+    [
+        (None, None),
+        (_lease(), "orchestrator_stream_leased"),
+        (_lease(session_state="rolling"), "orchestrator_stream_leased"),
+        (_lease(state="expired", expires_in=-5), "orchestrator_stream_leased"),  # a turn never supersedes it
+        (_lease(state="released", session_state="closed"), None),
+        (_lease(state="released", session_state="open"), "orchestrator_lease_unknown"),  # the states disagree
+        (_lease(state="active", session_state="closed"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", stream_id="epic:8"), "orchestrator_lease_unknown"),
+        ({key: value for key, value in _lease(state="released", session_state="closed").items()
+          if key in {"state", "session_state", "expires_at"}}, "orchestrator_lease_unknown"),  # no identity
+        (_lease(holder=None), "orchestrator_lease_unknown"),
+        (_lease(holder={"agent": "claude"}), "orchestrator_lease_unknown"),
+        (_lease(generation=True), "orchestrator_lease_unknown"),
+        # A released lease decides "free" only with a well-formed identity, fence and holder.
+        (_lease(state="released", session_state="closed", session_id=""), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_id=""), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", fencing_token=0), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", generation=-1), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": "4321"}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": 0}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "robot"}),
+         "orchestrator_lease_unknown"),
+        (_lease(holder={**_lease()["holder"], "agent": ""}), "orchestrator_lease_unknown"),
+        # An app thread's holder carries a canonical UUID task id and no pid, as Monitor itself requires.
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
+                                                                  "process_id": None, "task_id": None}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
+                                                                  "process_id": None, "task_id": "turn-1"}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "app_thread",
+                                                                  "process_id": None,
+                                                                  "task_id": "0b9a3a9e-6a8e-4f53-9d0c-7d6f1e2a4b5c"}),
+         None),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": True}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", ttl_seconds=True), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", version=True), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", age_seconds=True), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", heartbeat_at="soon"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed",
+                heartbeat_at=(datetime.now(UTC) + timedelta(seconds=7200)).isoformat().replace("+00:00", "Z")),
+         "orchestrator_lease_unknown"),  # heartbeat after expiry
+        (_lease(state="released", session_state="closed",
+                heartbeat_at=(datetime.now(UTC) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")),
+         "orchestrator_lease_unknown"),  # expiry - heartbeat != ttl_seconds
+        (_lease(state="released", session_state="closed", session_id="bad.example"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", session_id="[redacted]"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_id="bad.example"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "host_id": "bad.host"}),
+         "orchestrator_lease_unknown"),
+        ({**_lease(), "expires_at": "soon"}, "orchestrator_lease_unknown"),
+        ("lease", "orchestrator_lease_unknown"),
+        (_MISSING, "orchestrator_lease_unknown"),  # no lease field is not the projection's explicit null
+        ({key: value for key, value in _lease().items() if key != "session_state"}, "orchestrator_lease_unknown"),
+        (_lease(state="held"), "orchestrator_lease_unknown"),
+        ({**_lease(state="released", session_state="closed"), "expires_at": None}, "orchestrator_lease_unknown"),
+    ],
+)
+def test_a_dry_run_reads_any_active_lease_as_busy(monkeypatch, lease, refused):
+    """Defect class T1: a dry run reports a stream free that a turn's claim would be refused on (an expired but
+    uncleared lease), or reads an unreadable lease as none."""
+    session = lease.get("session_state") if isinstance(lease, dict) else None
+    monkeypatch.setattr(remote.RemoteEpicClient, "stream", lambda self, stream_id, digest_limit=20: {
+        "schema": "remote-epic-lifecycle.v1", "stream_id": stream_id, "session_state": session,
+        **({} if lease is _MISSING else {"lease": lease})})
+    reason = host_admission.turn_lease_probe(STREAM)
+    if refused is None:
+        assert reason is None
+    else:
+        assert reason.startswith(refused), reason
 
 
 @pytest.mark.parametrize(("progress", "record", "released"), [
@@ -259,155 +550,96 @@ def test_release_needs_the_reserving_task_and_run(task_store):
     ({"started": None}, "kept", False),  # damaged progress is not proof
     (None, "kept", False),  # no progress given
 ])
-def test_a_pre_launch_abort_follows_the_dispatchers_own_launch_progress(task_store, progress, record, released):
-    """Defect class: a lost, replaced or stale hold record reads as 'never launched' and frees the stream while a
-    supervisor this dispatch started may still run."""
+def test_a_pre_launch_abort_releases_the_lease_only_on_the_dispatchers_own_progress(task_store, monkeypatch, progress,
+                                                                                     record, released):
+    """Defect class T4: a lost, replaced or stale hold record reads as 'never launched' and releases the stream's
+    lease while a supervisor this dispatch started may still run."""
+    envelope = {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM}}
+    releases = []
+    monkeypatch.setattr(host_admission, "claim_turn", lambda *_a, **_k: envelope)
+    monkeypatch.setattr(host_admission, "release_turn", lambda lease, **kwargs: releases.append((lease, kwargs)))
     decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
-    with host_admission.reserve("turn", "workspace-write", decision, agent="claude", disk_guard=lambda: False,
-                                orchestrator={"stream": STREAM}, tree="/trees/turn", launch=progress) as hold:
-        path = store.record_path("turn")
+    nonce = "b" * 32
+    with host_admission.reserve("turn-1", "workspace-write", decision, agent="claude", disk_guard=lambda: False,
+                                orchestrator={"stream": STREAM}, run_nonce=nonce, turn_ttl_s=3600,
+                                launch=progress) as hold:
+        assert (hold["run_nonce"], hold["turn_lease"]) == (nonce, envelope)
+        path = store.record_path("turn-1")
         if record == "deleted":
             path.unlink()
         elif record == "replaced":
             path.write_text(json.dumps({**hold, "run_nonce": "f" * 32}))
         elif record == "damaged":
             path.write_text("{")
-    assert _reservation().exists() is not released
+    expected = [(envelope, {"stream": STREAM, "task_id": "turn-1", "run_nonce": nonce})]
+    assert releases == (expected if released else [])
 
 
-@pytest.mark.parametrize("damage", ["deleted", "archived", "truncated", "key-lost", "foreign", "fifo"])
-def test_occupancy_is_the_reservation_alone_whatever_the_task_records_say(task_store, damage):
-    """Defect class: a deleted, archived, damaged or identity-less turn record (or a non-regular file in the store)
-    frees, or blocks, a stream; a force reason or a reused task id bypasses a reservation."""
-    _reserve("turn")
-    path = store.record_path("turn")
-    if damage == "deleted":
-        path.unlink()
-    elif damage == "archived":
-        archive = task_store / task_record_store.ARCHIVE_DIR_NAME
-        archive.mkdir()
-        path.rename(archive / path.name)
-    elif damage == "truncated":
-        path.write_text(path.read_text()[:20])
-    elif damage == "key-lost":
-        path.write_text(json.dumps({key: value for key, value in json.loads(path.read_text()).items()
-                                    if key != "orchestrator"}))
-    elif damage == "foreign":
-        path.write_text(json.dumps({"orchestrator": {"stream": STREAM}}))
-    else:
-        path.unlink()
-        os.mkfifo(path)
-    for task_id in ("turn", "turn-2"):
-        with pytest.raises(host_admission.Refused, match="orchestrator_stream_busy: epic:7 is reserved by turn turn "):
-            _reserve(task_id, force_reason="operator says go")
-    # Another stream is untouched by this one's records, damaged or not.
-    assert _reserve("turn-8", stream="epic:8")["orchestrator"] == {"stream": "epic:8"}
+def _refused_launch(task_store, monkeypatch, tmp_path, error, *, record_change=None):
+    """Run reserve() and worker.start as dispatch does, with the scope layer raising ``error``; the releases made."""
+    from lu_machinery.dispatcher import admission
+    from lu_machinery.dispatcher.types import TaskSpec
+    from lu_machinery.orchestration import dispatch_isolation
+
+    envelope = {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM, "generation": 3}}
+    releases = []
+    monkeypatch.setattr(host_admission, "claim_turn", lambda *_a, **_k: envelope)
+    monkeypatch.setattr(host_admission, "release_turn", lambda lease, **kwargs: releases.append(lease))
+
+    def spawn(*_args, **_kwargs):
+        raise error
+
+    real_cleanup = worker._guard_launch_cleanup
+
+    def cleanup(path, spec, record, exc):  # what another writer leaves in the record before its read-back
+        real_cleanup(path, spec, record, exc)
+        if record_change:
+            path.write_text(json.dumps({**json.loads(path.read_text()), **record_change}))
+
+    monkeypatch.setattr(dispatch_isolation, "spawn_detached_worker", spawn)
+    monkeypatch.setattr(worker, "_guard_launch_cleanup", cleanup)
+    decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+    launch = {"record": False, "started": False}
+    with pytest.raises(admission.LaunchRefused), host_admission.reserve(
+            "turn-1", "workspace-write", decision, agent="codex", disk_guard=lambda: False,
+            orchestrator={"stream": STREAM}, run_nonce="c" * 32, turn_ttl_s=3600, launch=launch) as hold:
+        path = store.record_path("turn-1")
+        spec = TaskSpec("turn-1", "codex", "m", None, "workspace-write", tmp_path, path.with_suffix(".prompt"),
+                        path.with_suffix(".result"))
+        record = {**hold, "status": "spawning", "pid": None, "prompt_file": str(spec.prompt_file)}
+        worker.start(spec, record, b"prompt", 60, progress=launch, scope_limits=(660, 30, 4e9))
+    return envelope, releases
 
 
-def _plant(kind, entry):
-    if kind == "symlink":
-        target = entry.with_name("elsewhere.json")
-        target.write_text("{}")
-        entry.symlink_to(target)
-    elif kind == "fifo":
-        os.mkfifo(entry)
-    elif kind == "directory":
-        entry.mkdir()
-    elif kind == "oversized":
-        entry.write_bytes(b" " * (64 * 1024))
-    elif kind == "empty":
-        entry.write_bytes(b"")
-    else:
-        hold = dict(schema=host_admission.RESERVATION_SCHEMA, stream=STREAM, task_id="turn", run_nonce="a" * 32,
-                    worktree_path="/trees/turn", reserved_at=store.now())
-        text = {
-            "not-json": "{",
-            "not-utf8": b"\xff\xfe".decode("latin-1"),
-            "a-list": "[]",
-            "duplicate-key": json.dumps(hold)[:-1] + ', "task_id": "other"}',
-            "extra-field": json.dumps({**hold, "expires_at": store.now()}),
-            "missing-field": json.dumps({key: value for key, value in hold.items() if key != "run_nonce"}),
-            "other-stream": json.dumps({**hold, "stream": "epic:8"}),
-            "bad-nonce": json.dumps({**hold, "run_nonce": "nonce"}),
-            "bad-task-id": json.dumps({**hold, "task_id": "../turn"}),
-            "relative-tree": json.dumps({**hold, "worktree_path": "trees/turn"}),
-            "nul-tree": json.dumps({**hold, "worktree_path": "/trees/turn\x00x"}),
-            "surrogate-tree": json.dumps({**hold, "worktree_path": "/trees/\ud800"}),
-            "bad-time": json.dumps({**hold, "reserved_at": "soon"}),
-            "other-schema": json.dumps({**hold, "schema": "v0"}),
-        }[kind]
-        entry.write_text(text, encoding="latin-1" if kind == "not-utf8" else "utf-8")
+@pytest.mark.parametrize(("after_popen", "record_change", "released"), [
+    (False, None, True),  # C-6991: the probe's fallback refusal or the start deadline, before any Popen
+    (True, None, False),  # systemd-run was started (even if it exited): a scope may hold it
+    (False, {"run_nonce": "f" * 32}, False),  # the record read back is another run's
+    (False, {"turn_lease": {"monitor": "http://127.0.0.1:9", "lease": {}}}, False),  # it holds another lease
+    (False, {"pid": 4242}, False),  # it names a process
+    (False, {"task_id": "turn-2"}, False),  # it is another task's
+    (False, {"orchestrator": None}, False),  # it is no longer a turn on this stream
+    (False, {"orchestrator": {"stream": "epic:8"}}, False),
+    (False, {"status": "running"}, False),
+    (False, {"returncode_reason": ["dispatch_isolation_failed"]}, False),  # malformed: never raises, never proof
+    (False, {"returncode_reason": "worker_spawn_failed"}, False),  # not a placement refusal
+    (False, {"turn_lease": {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM, "generation": 3.0}}},
+     False),  # equal, but not the same JSON value
+])
+def test_a_launch_refused_before_any_process_releases_only_its_own_lease(task_store, monkeypatch, tmp_path,
+                                                                          after_popen, record_change, released):
+    """Defect class T4: a launch the scope layer refused before any of its processes started keeps a lease no turn
+    holds, or a refusal after systemd-run started, or a record that is not this run's unstarted failure, releases a
+    lease a running scope may hold."""
+    from lu_machinery.orchestration import dispatch_isolation
 
-
-@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory", "oversized", "empty", "not-json", "not-utf8",
-                                  "a-list", "duplicate-key", "extra-field", "missing-field", "other-stream",
-                                  "bad-nonce", "bad-task-id", "relative-tree", "nul-tree", "surrogate-tree",
-                                  "bad-time", "other-schema"])
-def test_an_unsafe_or_malformed_reservation_holds_its_stream(task_store, kind):
-    """Defect class: a symlinked, non-regular (a FIFO must not block), oversized or malformed reservation file reads
-    as a free stream, or its damage frees or blocks another stream."""
-    directory = host_admission.reservations_dir()
-    directory.mkdir(mode=0o700)
-    _plant(kind, _reservation())
-    reason = host_admission.stream_refusal(STREAM)
-    assert reason is not None and reason.startswith("orchestrator_reservation_"), reason
-    with pytest.raises(host_admission.Refused, match="orchestrator_reservation_"):
-        _reserve("turn")
-    assert store.read("turn", missing_ok=True) is None  # refused before any hold
-    assert host_admission.release_stream(STREAM, "turn", "a" * 32) is not None  # never unlinked
-    assert os.path.lexists(_reservation())
-    assert _reserve("turn-8", stream="epic:8")["orchestrator"] == {"stream": "epic:8"}
-
-
-@pytest.mark.parametrize("kind", ["symlink", "file", "group-writable"])
-def test_an_unsafe_reservation_directory_holds_every_stream(task_store, tmp_path, kind):
-    """Defect class: a planted reservation directory (a symlink, a file, writable by others) is trusted or replaced."""
-    directory = host_admission.reservations_dir()
-    if kind == "symlink":
-        (tmp_path / "planted").mkdir()
-        directory.symlink_to(tmp_path / "planted")
-    elif kind == "file":
-        directory.write_text("")
-    else:
-        directory.mkdir()
-        directory.chmod(0o770)
-    for stream in (STREAM, "epic:8"):
-        assert host_admission.stream_refusal(stream).startswith("orchestrator_reservation_dir_unsafe")
-        with pytest.raises(host_admission.Refused, match="orchestrator_reservation_dir_unsafe"):
-            _reserve("turn", stream=stream)
-    assert host_admission.turn_writer_refusal(task_ids={"worker"}).startswith("orchestrator_reservation_dir_unsafe")
-    if kind == "symlink":
-        assert not list((tmp_path / "planted").iterdir())  # nothing was written through the link
-
-
-def test_a_sibling_task_store_cannot_reserve_in_a_shared_namespace(task_store, monkeypatch, cto_seat, capsys):
-    """Defect class: two task stores beside each other share one reservation directory under two admission locks,
-    so one domain's turn blocks, or races, the other's."""
-    from lu_machinery.dispatcher import cli
-
-    _reserve("turn")
-    sibling = task_store.with_name("tasks-other")
-    sibling.mkdir()
-    monkeypatch.setenv("LU_TASKS_DIR", str(sibling))
-    with pytest.raises(host_admission.Refused, match="orchestrator_domain_refused"):
-        _reserve("turn-2", stream="epic:8")
-    assert not _reservation("epic:8").exists()
-    monkeypatch.setattr(worker, "start", lambda *_a, **_k: pytest.fail("spawned"))
-    assert cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", "--task-id", "turn-3",
-                     "--prompt", "drive", "--mode", "orchestrator", "--stream", "epic:9",
-                     "--initiator", "claude-cto"]) == 2
-    assert "orchestrator_domain_refused" in capsys.readouterr().err
-    # A worker in the sibling store still sees the shared namespace's turns: its writer checks fail closed.
-    assert host_admission.turn_writer_refusal(task_ids={"turn"}).startswith("orchestrator_turn_writer_refused")
-
-
-def test_a_dry_run_reads_the_stream_without_writing(task_store):
-    """Defect class: a dry run creates the reservation directory or file, or misses a reserved stream."""
-    assert host_admission.stream_refusal(STREAM) is None
-    assert not host_admission.reservations_dir().exists()
-    _reserve("turn")
-    assert host_admission.stream_refusal(STREAM).startswith("orchestrator_stream_busy: epic:7 is reserved by turn turn ")
-    assert host_admission.stream_refusal("epic:8") is None
+    error = (dispatch_isolation.DispatchIsolationError if after_popen else dispatch_isolation.LaunchNotStarted)(
+        "refused")
+    envelope, releases = _refused_launch(task_store, monkeypatch, tmp_path, error, record_change=record_change)
+    assert releases == ([envelope] if released else [])
+    if record_change is None:  # this run's own record: the failed launch is recorded
+        state = store.read("turn-1")
+        assert (state["status"], state["pid"], state["returncode_reason"]) == ("failed", None, "dispatch_isolation_failed")
 
 
 @pytest.mark.parametrize(
@@ -427,17 +659,19 @@ def test_a_dry_run_reads_the_stream_without_writing(task_store):
         ({"orchestrator": {"stream": "epic:8"}}, False),  # the published record names another stream
         ({"orchestrator": None}, False),
         ({"run_nonce": "f" * 32}, False),  # the published record is another run's
+        ({"turn_lease": {"monitor": "http://127.0.0.1:9", "lease": {"stream_id": STREAM}}}, False),  # rewritten
     ],
 )
-def test_settlement_releases_the_stream_only_on_proof_the_run_is_gone(task_store, monkeypatch, change, released):
-    """Defect class: settlement frees a stream while a process or service of the turn may still write, or from a
-    record that is not this run's terminal one."""
-    hold = _reserve("turn")
-    record = _orchestrator_record("turn", **{**_LAUNCHED, "status": "done", "run_nonce": hold["run_nonce"],
-                                             "launch_unit": "lu-worker-turn"})
+def test_settlement_releases_the_lease_only_on_proof_the_run_is_gone(task_store, monkeypatch, change, released):
+    """Defect class T4: settlement releases a stream's lease while a process or service of the turn may still write,
+    or from a record that is not this run's terminal one."""
+    envelope = {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM}}
+    releases = []
+    monkeypatch.setattr(host_admission, "release_turn", lambda lease, **kwargs: releases.append((lease, kwargs)))
+    record = _orchestrator_record("turn-1", **{**_LAUNCHED, "status": "done", "launch_unit": "lu-worker-turn"},
+                                  turn_lease=envelope)
     published = {**record, **{key: value for key, value in change.items() if key != "probe"}}
-    path = store.record_path("turn")
-    path.write_text(json.dumps(published))  # raw: the store's writer refuses some of these states
+    store.record_path("turn-1").write_text(json.dumps(published))  # raw: the store's writer refuses some states
 
     def probe(seen):
         assert seen["run_nonce"] == published["run_nonce"]
@@ -447,59 +681,231 @@ def test_settlement_releases_the_stream_only_on_proof_the_run_is_gone(task_store
 
     monkeypatch.setattr(worker, "_provider_alive", probe)
     worker._release_stream(record, evidence_lost=True)  # the record had to be rebuilt at publication
-    assert _reservation().exists()
+    assert releases == []
     worker._release_stream(record, evidence_lost=False)
-    assert _reservation().exists() is not released
+    expected = [(envelope, {"stream": STREAM, "task_id": "turn-1", "run_nonce": record["run_nonce"]})]
+    assert releases == (expected if released else [])
 
 
-def test_a_turn_tree_takes_no_other_writer(task_store, tmp_path, monkeypatch):
-    """Defect class: a --cwd task or a task service is added to an orchestrator turn while it runs or drains, also
-    when the turn's record lost its orchestrator key, so its tree changes after it was judged."""
-    from lu_machinery.orchestration import dispatch_isolation as iso
+def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, monitor, monkeypatch):
+    """Defect class T4: a release reaches another Monitor, names another run's lease, retries or force-releases after
+    an outage, or a late release frees the successor that an operator's force release let in."""
+    hold = _reserve("turn-1", launch={"started": True})  # launched: only settlement releases it
+    envelope, nonce = hold["turn_lease"], hold["run_nonce"]
+    exact = dict(stream=STREAM, task_id="turn-1", run_nonce=nonce)
+    assert monitor.client.stream(STREAM)["lease"]["state"] == "active"
+    contacted = []
+    with monkeypatch.context() as patch:
+        patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, **k: contacted.append(self.base))
+        for wrong in (dict(exact, task_id="turn-2"), dict(exact, run_nonce="f" * 32), dict(exact, stream="epic:8")):
+            assert host_admission.release_turn(envelope, **wrong).startswith("orchestrator_lease_release_refused")
+        for monitor_spelling in (monitor.base.replace("127.0.0.1", "localhost"), "", "http://example.invalid:80", 7):
+            reason = host_admission.release_turn({**envelope, "monitor": monitor_spelling}, **exact)
+            assert reason.startswith("orchestrator_lease_release_refused"), (monitor_spelling, reason)
+        base_ack = {**envelope["lease"], "state": "released", "session_state": "closed",
+                    "heartbeat_at": "1970-01-01T00:00:00Z", "expires_at": "1970-01-01T00:00:00Z",
+                    "version": 1, "age_seconds": 0}
+        valid_ack = {"schema": "remote-epic-lifecycle.v1", "outcome": "released", "lease": base_ack}
+        patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, **k: valid_ack)
+        assert host_admission.release_turn(envelope, **exact) is None
+        for answer in ({"outcome": "released", "lease": base_ack},
+                       {**valid_ack, "schema": "remote-epic-lifecycle.v2"},
+                       {**valid_ack, "schema": True},
+                       {"schema": "remote-epic-lifecycle.v1", "outcome": "released"},
+                       {**valid_ack, "lease": {**base_ack, "session_state": "open"}},
+                       {**valid_ack, "lease": {**base_ack, "state": "active"}},
+                       {**valid_ack, "lease": {**base_ack, "ttl_seconds": True}},
+                       {**valid_ack, "lease": {**base_ack, "expires_at": "soon"}},
+                       {**valid_ack, "lease": {**base_ack, "heartbeat_at": "2099-01-01T00:00:00Z"}},
+                       {**valid_ack, "lease": {**base_ack, "version": True}},
+                       {**valid_ack, "session_state": "open"}):
+            patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, answer=answer, **k: answer)
+            assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
+    assert contacted == []
+    # A 409 whose detail is not Monitor's recognized LEASE LOST is unknown, never fenced (exercising _request).
+    import urllib.error
+    import urllib.request
 
-    tree = tmp_path / "turn-tree"
-    tree.mkdir()
-    decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
-    with host_admission.reserve("turn", "workspace-write", decision, agent="claude", disk_guard=lambda: False,
-                                orchestrator={"stream": STREAM}, tree=str(tree)) as hold:
-        store.replace({**hold, "prompt_file": "/prompts/turn.md"}, store.record_path("turn"))
-    # The record lost its orchestrator key: the reservation still attributes the turn and its tree.
-    store.record_path("turn").write_text(json.dumps({**hold, "prompt_file": "/prompts/turn.md", "orchestrator": None}))
-    refused = host_admission.turn_writer_refusal(tree=str(tree))
-    assert refused.startswith("orchestrator_turn_writer_refused: turn is the orchestrator turn on epic:7")
-    assert host_admission.turn_writer_refusal(tree=str(tmp_path)) is None  # any other tree
-    nonce = hold["run_nonce"]
-    scope = iso.scope_unit_name("turn", nonce)
-    base = tmp_path / "var-tmp"
-    base.mkdir()
-    monkeypatch.setattr(environment, "TASK_SCRATCH_BASE", base)
-    monkeypatch.setattr(environment, "TASK_SCRATCH_PATH_MAX", 4096)
-    record = {"task_id": "turn", "launch_mode": "scope", "launch_unit": scope, "run_nonce": nonce}
+    for mode in ("status", "http_error"):
+        reached = []
 
-    def systemd(_argv):
-        pytest.fail("systemd was asked to start a turn's service")
+        def unrelated_409(request, timeout=0, mode=mode, reached=reached):
+            reached.append(request.full_url)
+            if mode == "http_error":
+                raise urllib.error.HTTPError(request.full_url, 409, "Conflict", {},
+                                             io.BytesIO(b'{"detail":"request refused"}'))
+            return contextlib.nullcontext(SimpleNamespace(status=409, read=lambda: b'{"detail":"request refused"}'))
 
-    for copy, inherited in (({**record, "orchestrator": {"stream": STREAM}}, None), (record, None),
-                            # a child process of the turn passing another task's record copy
-                            ({**record, "task_id": "worker", "launch_unit": iso.scope_unit_name("worker", nonce)},
-                             "turn")):
-        if inherited:
-            monkeypatch.setenv(TASK_ENV, inherited)
-        with pytest.raises(iso.DispatchIsolationError, match="orchestrator_turn_writer_refused"):
-            iso.start_task_service(copy, ["sleep", "30"], run=systemd)
-        assert "task_services" not in copy
-    assert not list(base.iterdir())  # no scratch side effect
-    # An ordinary task still starts its service.
-    monkeypatch.delenv(TASK_ENV)
-    worker_record = {**record, "task_id": "worker", "launch_unit": iso.scope_unit_name("worker", nonce)}
-    started = iso.start_task_service(worker_record, ["sleep", "30"],
-                                     run=lambda argv: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""))
-    assert worker_record["task_services"] == [started]
-    # A reservation that cannot be read is anyone's: both refuse.
-    _plant("not-json", _reservation("epic:9"))
-    assert host_admission.turn_writer_refusal(tree=str(tmp_path)).startswith("orchestrator_reservation_malformed")
-    with pytest.raises(iso.DispatchIsolationError, match="orchestrator_reservation_malformed"):
-        iso.start_task_service(dict(worker_record), ["sleep", "30"], run=systemd)
+        with monkeypatch.context() as patch:
+            patch.setattr(urllib.request, "urlopen", unrelated_409)
+            reason = host_admission.release_turn(envelope, **exact)
+            assert reason.startswith("orchestrator_lease_release_unknown: (RemoteSupervisorError)"), (mode, reason)
+        assert len(reached) == 1, mode
+    calls = []
+
+    def unreachable(self, *args, **kwargs):
+        calls.append(kwargs)
+        raise remote.RemoteUnreachableError("Monitor API unreachable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(remote.RemoteEpicClient, "release", unreachable)
+        assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
+    assert len(calls) == 1 and "force" not in calls[0]
+    assert monitor.client.stream(STREAM)["lease"]["state"] == "active"  # the outage kept it
+    monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
+                           reason="the turn's scope is proven gone")
+    successor = _legacy_claim(monitor.client)[0]
+    before = monitor.store.dump_stream(STREAM)
+    assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_fenced")
+    assert monitor.store.dump_stream(STREAM) == before
+    monitor.client.release(successor)
+    assert _reserve("turn-2", launch={"started": False}) is not None  # pre-launch abort released it again
+    assert host_admission.release_turn(_reserve("turn-3", launch={"started": True})["turn_lease"], stream=STREAM,
+                                       task_id="turn-3", run_nonce=store.read("turn-3")["run_nonce"]) is None
+
+
+# --- the turn's bounds --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("hard_timeout", "timing"),
+    [
+        (7200, (7800, 8490)),
+        (1.5, (602, 1292)),  # fractions round up, never down
+        (85110, (85710, 86400)),  # the largest deadline whose lease fits Monitor's limit
+        (85110.5, None),
+        (86400, None),
+        (0, None),
+        (-1, None),
+        (float("nan"), None),
+        (float("inf"), None),
+        (True, None),
+        ("7200", None),
+    ],
+)
+def test_a_turn_needs_a_finite_deadline_its_lease_covers(hard_timeout, timing):
+    """Defect class T5: a zero, negative, non-finite, fractional or oversized --hard-timeout gives a turn an unbounded
+    scope or a lease TTL shorter than its run and stop, or one Monitor refuses."""
+    if timing is None:
+        with pytest.raises(ValueError, match=r"^orchestrator_timeout_refused: "):
+            host_admission.turn_timing(hard_timeout)
+    else:
+        assert host_admission.turn_timing(hard_timeout) == timing
+        runtime, ttl = timing
+        assert ttl - runtime == (host_admission.TURN_SETUP_BUDGET_S + host_admission.TURN_STOP_TIMEOUT_S
+                                 + host_admission.TURN_TTL_MARGIN_S)
+
+
+@pytest.mark.parametrize(("remaining", "refused"), [
+    (8490, None), (7891, None), (7889, "orchestrator_lease_budget_short"), (-60, "orchestrator_lease_budget_short"),
+    (None, "orchestrator_lease_budget_unknown")])
+def test_a_delayed_setup_never_starts_a_turn_its_lease_cannot_outlast(remaining, refused):
+    """Defect class T5: a setup that ran past its budget (a slow worktree) starts a turn whose lease expires before its
+    run and the scope's stop end."""
+    expires = None if remaining is None else (datetime.now(UTC) + timedelta(seconds=remaining)).isoformat()
+    reason = host_admission.turn_launch_refusal({"lease": {"expires_at": expires}}, 7800)
+    assert (reason or "").startswith(refused or ""), reason
+    assert (reason is None) is (refused is None)
+
+
+def test_a_turn_launch_passes_its_bounds_and_refuses_fallback(monkeypatch, tmp_path):
+    """Defect class T5: the turn's scope bounds never reach systemd-run, or a turn's supervisor starts as a plain
+    process when its scope cannot start."""
+    from lu_machinery.dispatcher import admission
+    from lu_machinery.orchestration import dispatch_isolation
+
+    seen = []
+
+    def spawn(cmd, **kwargs):
+        seen.append(kwargs)
+        raise dispatch_isolation.DispatchIsolationError("forced: no scope")
+
+    monkeypatch.setattr(dispatch_isolation, "spawn_detached_worker", spawn)
+    for limits in ((7800, 30, 1234.5), None):
+        with pytest.raises(admission.LaunchRefused) as refused:
+            admission.spawn_supervisor(["true"], task_id="turn-1", run_nonce="n", cwd=tmp_path, stderr=None,
+                                       stderr_log=tmp_path / "log", env={}, scope_limits=limits)
+        assert refused.value.never_started is False
+    bounded, ordinary = seen
+    assert (bounded["allow_fallback"], bounded["runtime_max_s"], bounded["stop_timeout_s"], bounded["start_by"]) == (
+        False, 7800, 30, 1234.5)
+    assert not {"allow_fallback", "runtime_max_s", "stop_timeout_s", "start_by"} & set(ordinary)  # others unchanged
+
+
+# --- writers ------------------------------------------------------------------------------------------------------
+
+
+def test_no_task_borrows_a_turn_tree(task_store, tmp_path, monkeypatch):
+    """Defect class T6: a --cwd task attaches to an orchestrator turn's tree because the turn's record is missing,
+    archived, damaged or lost its orchestrator key, so the turn's tree changes after it was judged."""
+    trees = tmp_path / "trees"
+    assert host_admission.turn_tree_refusal(trees / "turn-1").startswith("orchestrator_turn_writer_refused")  # no record
+    for alias in (trees / "turn-1" / "sub" / "..", trees / "turn-1" / "."):  # any spelling of the turn's tree
+        assert host_admission.turn_tree_refusal(alias).startswith("orchestrator_turn_writer_refused"), alias
+    _write(_orchestrator_record("turn-1"))
+    assert host_admission.turn_tree_refusal(trees / "turn-1").startswith("orchestrator_turn_writer_refused")
+    _write(_orchestrator_record("legacy-turn"))  # a turn from before the reserved prefix
+    assert "orchestrator turn on epic:7" in host_admission.turn_tree_refusal(trees / "legacy-turn")
+    store.record_path("damaged").write_text("{")
+    assert "cannot be read" in host_admission.turn_tree_refusal(trees / "damaged")
+    archive = task_store / "archive"
+    archive.mkdir()
+    store._write(archive / "archived-turn.json", _orchestrator_record("archived-turn"))
+    assert "orchestrator turn on epic:7" in host_admission.turn_tree_refusal(trees / "archived-turn")
+    real_lstat = os.lstat
+
+    def denied(path, *args, **kwargs):  # what an unreadable store directory answers (3.14 is_file() hides it)
+        if os.fspath(path).endswith("hidden-turn.json"):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", denied)
+        assert "cannot be read" in host_admission.turn_tree_refusal(trees / "hidden-turn")
+    ordinary = _orchestrator_record("masked")
+    ordinary.pop("orchestrator")
+    store._write(archive / "masked.json", ordinary)
+    store.record_path("masked").mkdir()  # a hot entry that is no record: the archived one never stands in
+    assert "cannot be read" in host_admission.turn_tree_refusal(trees / "masked")
+    store.record_path("mismatch").write_text(json.dumps({**ordinary, "task_id": "other"}))  # names another task
+    assert "cannot be read" in host_admission.turn_tree_refusal(trees / "mismatch")
+    store.record_path("invalid-schema").write_text(json.dumps({"task_id": "invalid-schema", "schema_version": True,
+                                                               "status": "running"}))  # damaged record fails closed
+    assert "cannot be read" in host_admission.turn_tree_refusal(trees / "invalid-schema")
+    # A record observed in the hot store that is gone when read never lets an older archived copy decide.
+    store._write(store.record_path("moving-turn"), _orchestrator_record("moving-turn"))
+    stale = _orchestrator_record("moving-turn")
+    stale.pop("orchestrator")
+    store._write(archive / "moving-turn.json", stale)
+    real_read_bytes = Path.read_bytes
+
+    def vanishing(path, *args, **kwargs):
+        if path == store.record_path("moving-turn"):
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real_read_bytes(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "read_bytes", vanishing)
+        assert "cannot be read" in host_admission.turn_tree_refusal(trees / "moving-turn")
+    # Archive and restore move records under the archive lock, which the lookup holds across both names.
+    from lu_machinery.orchestration import task_record_store
+
+    taken = []
+    real_lock = task_record_store.task_archive_lock
+
+    def lock(tasks_dir, **kwargs):
+        taken.append((tasks_dir, kwargs))
+        return real_lock(tasks_dir, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(task_record_store, "task_archive_lock", lock)
+        host_admission.turn_tree_refusal(trees / "worker-0")
+    assert taken == [(task_store, {})]
+    plain = _orchestrator_record("worker-1")
+    plain.pop("orchestrator")
+    _write(plain)
+    for ordinary in ("worker-1", "prior-round", "-not-a-task-id"):  # an ordinary task's, or a tree no record names
+        assert host_admission.turn_tree_refusal(trees / ordinary) is None
 
 
 @pytest.mark.skipif(not os.path.exists("/sys/fs/cgroup/cgroup.controllers"), reason="needs cgroup v2")
@@ -520,54 +926,6 @@ def test_the_scope_probe_proves_exit_only_for_a_leaf_scope(task_store, monkeypat
     launch = {"task_id": "turn", "run_nonce": nonce, "launch_mode": "scope", "launch_unit": unit,
               "launch_cgroup": iso.scope_cgroup(unit, uid=os.getuid())}
     assert worker._provider_alive(launch) is None
-
-
-# --- legacy lease --------------------------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("lease", "refused"),
-    [
-        (None, None),
-        (_lease(), "orchestrator_stream_leased"),
-        (_lease(session_state="rolling"), "orchestrator_stream_leased"),
-        (_lease(expires_in=-5), None),
-        (_lease(state="released"), None),
-        (_lease(session_state="closed"), None),
-        (_lease(state="expired"), None),
-        ({**_lease(), "expires_at": "soon"}, "orchestrator_lease_unknown"),
-        ("lease", "orchestrator_lease_unknown"),
-        (_MISSING, "orchestrator_lease_unknown"),  # no lease field is not the projection's explicit null
-        ({key: value for key, value in _lease().items() if key != "session_state"}, "orchestrator_lease_unknown"),
-        (_lease(state="held"), "orchestrator_lease_unknown"),
-        (_lease(session_state=["open"]), "orchestrator_lease_unknown"),
-        # Every part of a lease is checked, whatever its state decides.
-        ({**_lease(state="released"), "expires_at": "soon"}, "orchestrator_lease_unknown"),
-        ({**_lease(state="expired"), "expires_at": None}, "orchestrator_lease_unknown"),
-        ({**_lease(session_state="closed"), "expires_at": "2026-11-22T20:00:00\x00+00:00"}, "orchestrator_lease_unknown"),
-        ({**_lease(), "expires_at": "2026-11-22 20:00:00Z"}, "orchestrator_lease_unknown"),
-    ],
-)
-def test_a_live_legacy_lease_refuses_the_turn(monkeypatch, lease, refused):
-    """Defect class: a turn starts beside a live tmux driver lease, or an unreadable lease reads as none."""
-    monkeypatch.setattr(remote.RemoteEpicClient, "stream", lambda self, stream_id, digest_limit=20: {
-        "stream_id": stream_id, **({} if lease is _MISSING else {"lease": lease})})
-    reason = host_admission.legacy_lease_refusal(STREAM)
-    if refused is None:
-        assert reason is None
-    else:
-        assert reason.startswith(refused), reason
-
-
-def test_an_unreachable_monitor_refuses_the_turn(hermetic_monitor, monkeypatch):
-    """Defect class: a Monitor outage or a malformed error reply reads as 'no lease' or escapes as a crash."""
-    assert host_admission.legacy_lease_refusal(STREAM).startswith("orchestrator_lease_unknown")
-
-    def malformed_error_body(self, stream_id, digest_limit=20):
-        raise AttributeError("'list' object has no attribute 'get'")  # what a JSON array error body raised
-
-    monkeypatch.setattr(remote.RemoteEpicClient, "stream", malformed_error_body)
-    assert host_admission.legacy_lease_refusal(STREAM).startswith("orchestrator_lease_unknown")
 
 
 # --- handoff receipt -----------------------------------------------------------------------------------------------
@@ -745,73 +1103,103 @@ def test_a_turn_gets_no_path_grant(task_store, tmp_path, monkeypatch):
         store.grant_paths("turn", "nonce-turn", ["docs/x.md"], "reason", "approval")
 
 
-# --- the turn end to end: reservation, child linkage, receipt, settlement ------------------------------------------
+# --- the turn end to end: lease, child linkage, receipt, settlement -----------------------------------------------
 
 
-class _Monitor(BaseHTTPRequestHandler):
-    def do_GET(self):
-        stream = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
-        body = json.dumps({"stream_id": stream, "lease": None}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+# Loaded by the sandbox interpreter's site (a .pth import), so the dispatcher subprocess sees it: a turn's bounded
+# launch is recorded and started as a plain process that claims to be its scope (CI has no user manager). Every
+# other launch keeps the sandbox's forced fallback. The double cannot prove the turn's processes gone, which is the
+# point: settlement then keeps the lease.
+_SCOPE_DOUBLE = '''
+import json, os
+if os.environ.get("TURN_SCOPE_DOUBLE_LOG"):
+    from lu_machinery.orchestration import dispatch_isolation as iso
 
-    def log_message(self, *_args):
-        return
+    _real_spawn = iso.spawn_detached_worker
+    iso._probe_uncached = lambda *_a, **_k: iso.ProbeResult(ready=True)
+
+    def _spawn(cmd, *, task_id, run_nonce, popen, env=None, stdin=None, stdout=None, stderr=None, **kwargs):
+        if kwargs.get("runtime_max_s") is None:
+            return _real_spawn(cmd, task_id=task_id, run_nonce=run_nonce, popen=popen, env=env, stdin=stdin,
+                               stdout=stdout, stderr=stderr, probe_env={"LU_DISPATCH_ISOLATION": "fallback"}, **kwargs)
+        with open(os.environ["TURN_SCOPE_DOUBLE_LOG"], "a") as log:
+            log.write(json.dumps(dict(task_id=task_id, run_nonce=run_nonce, allow_fallback=kwargs["allow_fallback"],
+                                      argv=iso.build_scope_argv(["worker"], unit="u", runtime_max_s=kwargs["runtime_max_s"],
+                                                                stop_timeout_s=kwargs["stop_timeout_s"]))) + "\\n")
+        proc = popen(list(cmd), env=env, stdin=stdin, stdout=stdout, stderr=stderr, start_new_session=True,
+                     close_fds=True)
+        return proc, iso.WorkerLaunch(mode=iso.LAUNCH_SCOPE, unit=iso.scope_unit_name(task_id, run_nonce))
+
+    iso.spawn_detached_worker = _spawn
+'''
 
 
 @pytest.fixture
-def turn_box(sandbox):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Monitor)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+def turn_box(sandbox, monitor):
     for name in (TASK_ENV, "LU_WRITE_BOUNDARY_BROKER", "SESSION_SEAT", "SESSION_EPIC"):
         sandbox.env.pop(name, None)
-    sandbox.env["LU_MONITOR_LOOPBACK"] = f"http://127.0.0.1:{server.server_address[1]}"
+    sandbox.env["LU_MONITOR_LOOPBACK"] = monitor.base
     # A turn takes no write slot: no write worker could start at this cap.
     sandbox.env["DISPATCH_MAX_LIVE_WRITE_WORKERS"] = "0"
     # A turn's launch paces its meter, which would defer the duplicate turn before its stream is checked.
     sandbox.env["DISPATCH_MIN_METER_LAUNCH_INTERVAL_S"] = "0"
+    site = next(Path(sandbox.python).parent.parent.glob("lib/python*/site-packages"))
+    (site / "_turn_scope_double.py").write_text(_SCOPE_DOUBLE)
+    (site / "turn-scope-double.pth").write_text("import _turn_scope_double\n")
+    launches = sandbox.tasks.parent / "turn-launches.jsonl"
 
-    def run(*args, task_env=None, expected=0):
+    def run(*args, task_env=None, expected=0, isolated=False):
         env = {**sandbox.env, **({TASK_ENV: task_env} if task_env else {})}
+        if isolated:  # the turn's own dispatcher: a host that can isolate it, through the double
+            env.pop("LU_DISPATCH_ISOLATION", None)
+            env["TURN_SCOPE_DOUBLE_LOG"] = str(launches)
         result = subprocess.run([sandbox.python, "lu_machinery/dispatch.py", *args], cwd=sandbox.repo, env=env,
                                 text=True, capture_output=True, timeout=60)
         assert result.returncode == expected, (result.stdout, result.stderr)
         return result
 
-    def turn(task_id, expected=0, stream=STREAM):
+    def turn(task_id, expected=0, stream=STREAM, isolated=True):
         return run("dispatch", "--agent", "sol", "--model", "blocked", "--mode", "orchestrator", "--stream", stream,
                    "--initiator", "claude-cto", "--task-id", task_id, "--prompt", "drive one wave",
-                   expected=expected)
+                   "--hard-timeout", "600", expected=expected, isolated=isolated)
 
-    sandbox.run, sandbox.turn = run, turn
-    try:
-        yield sandbox
-    finally:
-        server.shutdown()
-        server.server_close()
+    sandbox.run, sandbox.turn, sandbox.monitor, sandbox.launches = run, turn, monitor, launches
+    return sandbox
 
 
-def _release(box, task_id):
-    (box.tasks / f"{task_id}.release").write_text("go")
-
-
-def test_a_turn_end_to_end_reserves_links_children_and_settles_on_its_receipt(turn_box):
-    """Defect class: duplicate turns, unlinked children, late children of a settled turn, done without a handoff,
-    and a fallback turn (unprovable process tree) judged done or freeing its stream."""
+def test_a_turn_end_to_end_holds_its_lease_links_children_and_never_shares_its_tree(turn_box):
+    """Defect classes T1, T4, T5, T6: a duplicate turn or a legacy launcher shares the stream, the scope runs unbounded
+    or as a fallback, a child or another task borrows the turn's tree, a late child of a settled turn starts, or a
+    turn whose processes are not proven gone frees its stream."""
     box = turn_box
+    # A host that cannot isolate a turn refuses it before its lease is claimed.
+    assert "orchestrator_isolation_unavailable" in box.turn("turn-0", expected=3, isolated=False).stderr
+    assert box.monitor.store.lease_projection(STREAM) is None
     task_id, nonce = box.turn("turn-1").stdout.splitlines()
     record = store.read("turn-1", tasks_root=box.tasks)
     assert record["orchestrator"] == {"stream": STREAM} and record["mode"] == "workspace-write"
     assert record["research_role"] == "driver"  # role policy sees a driving turn, not only authoring
-    assert "orchestrator_stream_busy: epic:7" in box.turn("turn-2", expected=3).stderr
+    lease = box.monitor.client.stream(STREAM)["lease"]
+    assert (lease["state"], lease["holder"]["harness"], lease["holder"]["instance_id"], lease["holder"]["task_id"]) == (
+        "active", "dispatch-turn", nonce, "turn-1")
+    assert record["turn_lease"]["lease"]["session_id"] == lease["session_id"]
+    [launch] = [json.loads(line) for line in box.launches.read_text().splitlines()]
+    assert (launch["task_id"], launch["run_nonce"], launch["allow_fallback"]) == ("turn-1", nonce, False)
+    assert {"--property=RuntimeMaxSec=1200", "--property=TimeoutStopSec=30",
+            "--property=KillMode=control-group"} <= set(launch["argv"])
+    assert "orchestrator_stream_leased: epic:7" in box.turn("turn-2", expected=3).stderr
+    with pytest.raises(remote.RemoteClaimConflictError, match="turn_lease_uncleared"):
+        _legacy_claim(box.monitor.client)
     await_file(box.tasks / "turn-1.started")  # the turn's provider runs, as when it dispatches
     attach = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "borrower", "--prompt", "edit",
                      "--cwd", record["worktree_path"], task_env="turn-1", expected=2)
-    assert "orchestrator_turn_writer_refused: turn-1 is the orchestrator turn on epic:7" in attach.stderr
+    assert "orchestrator_turn_writer_refused: a task an orchestrator turn dispatches cannot borrow" in attach.stderr
+    orphan = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "orphan", "--prompt", "edit",
+                     "--cwd", record["worktree_path"], task_env="turn-9", expected=2)  # turn-9 has no record
+    assert "orchestrator_turn_writer_refused: a task an orchestrator turn dispatches cannot borrow" in orphan.stderr
+    outsider = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "outsider", "--prompt", "edit",
+                       "--cwd", record["worktree_path"], expected=2)
+    assert "orchestrator_turn_writer_refused: turn-1 is an orchestrator turn's tree" in outsider.stderr
     child = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "child-1",
                     "--prompt", "map the flags", task_env="turn-1").stdout.splitlines()
     linked = json.loads(box.run("wait", *child[:1], "--run-nonce", child[1], "--timeout", "15").stdout)
@@ -820,22 +1208,25 @@ def test_a_turn_end_to_end_reserves_links_children_and_settles_on_its_receipt(tu
                                  "--handoff-ref", "note-41", task_env="turn-1").stdout)
     assert receipt["schema"] == store.HANDOFF_RECEIPT_SCHEMA and receipt["handoff_ref"] == "note-41"
     _release(box, "turn-1")
-    settled = box.settle((task_id, nonce), expected=1)
-    # The sandbox forces a fallback launch, which cannot prove its processes gone before its tree is judged.
+    settled = json.loads(box.run("wait", task_id, "--run-nonce", nonce, "--timeout", "60", expected=1).stdout)
+    # The double's processes are not in the scope it names, so they are never proven gone before the tree is judged.
     assert (settled["status"], settled["no_deliverable_reason"].split(":")[0]) == (
         "no_deliverable", "orchestrator_tree_unproven"), settled
     assert settled[store.HANDOFF_RECEIPT_KEY] == receipt
     late = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "child-late", "--prompt", "late",
                    task_env="turn-1", expected=2)
     assert "orchestrator_parent_not_running" in late.stderr
-    # Nor does it prove the process tree gone afterwards: the settled turn keeps its stream's reservation.
-    assert f"orchestrator_stream_busy: {STREAM} is reserved by turn turn-1 (run {nonce})" in box.turn(
-        "turn-3", expected=3).stderr
-    # A turn without a receipt settles no_deliverable.
-    second = box.turn("turn-4", stream="epic:8").stdout.splitlines()
+    # Nor afterwards: the settled turn keeps its stream's lease until an operator releases it.
+    assert box.monitor.client.stream(STREAM)["lease"]["state"] == "active"
+    assert "orchestrator_stream_leased" in box.turn("turn-3", expected=3).stderr
+    box.monitor.client.release(stream_id=STREAM, force=True, actor_agent="claude-cto", actor_host_id="host-a",
+                               reason="turn-1 scope proven gone")
+    assert box.turn("turn-4").stdout.splitlines()[0] == "turn-4"
     _release(box, "turn-4")
-    missed = box.settle(second, expected=1)
-    assert (missed["status"], missed["no_deliverable_reason"]) == ("no_deliverable", "orchestrator_handoff_receipt_missing")
+
+
+def _release(box, task_id):
+    (box.tasks / f"{task_id}.release").write_text("go")
 
 
 pytestmark = pytest.mark.usefixtures("sources_product_root")

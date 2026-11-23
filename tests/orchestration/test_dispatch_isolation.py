@@ -976,6 +976,83 @@ def test_worker_that_starts_and_exits_is_not_relaunched(tmp_path: Path):
     assert proc.wait(timeout=5) == 3
 
 
+@pytest.mark.parametrize(
+    ("runtime", "stop"),
+    [(1.5, 30), (True, 30), (0, 30), (-5, 30), (600, None), (None, 30), (600, 0.5), ("600", 30)],
+)
+def test_scope_limits_are_whole_positive_seconds_given_together(runtime, stop):
+    """Defect class T5: a fractional, boolean, zero, negative or half-given scope bound reaches systemd-run as an
+    unbounded or misread RuntimeMaxSec/TimeoutStopSec."""
+    with pytest.raises(ValueError, match="positive whole seconds"):
+        iso.build_scope_argv([_PY], unit="u", runtime_max_s=runtime, stop_timeout_s=stop)
+
+
+def test_a_bounded_scope_carries_its_limits_and_never_falls_back(tmp_path: Path):
+    """Defect class T5: a turn's scope starts without RuntimeMaxSec, TimeoutStopSec and a control-group kill, starts
+    after its lease can no longer cover run and stop, or a turn whose host cannot isolate it runs as a plain process
+    that nothing bounds."""
+    bindir = _install_fakes(tmp_path)
+    argv_log = tmp_path / "argv.txt"
+    env = _env(bindir, FAKE_SYSTEMD_RUN="exec", FAKE_ARGV_LOG=str(argv_log))
+    proc, launch = iso.spawn_detached_worker(
+        [_PY, "-c", "pass"], task_id="turn-1", run_nonce="abc123", env=env, probe_env=env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        subtree_path=_subtree(tmp_path), allow_fallback=False, runtime_max_s=7800, stop_timeout_s=30,
+    )
+    proc.wait(timeout=5)
+    assert launch.mode == iso.LAUNCH_SCOPE
+    recorded = argv_log.read_text(encoding="utf-8").splitlines()
+    limits = recorded[recorded.index("--quiet") + 1 : recorded.index("--")]
+    assert limits == ["--property=RuntimeMaxSec=7800", "--property=TimeoutStopSec=30",
+                      "--property=KillMode=control-group", "--property=SendSIGKILL=yes"]
+    assert "RuntimeMaxSec" not in " ".join(iso.build_scope_argv([_PY], unit="u"))  # unbounded unless asked
+
+    def popen(*_args, **_kwargs):
+        pytest.fail("a bounded launch fell back to a plain process")
+
+    # Past the start deadline (a slow setup), the scope is refused before systemd-run runs.
+    argv_log.unlink()
+    with pytest.raises(iso.LaunchNotStarted, match="orchestrator_lease_budget_short"):
+        iso.spawn_detached_worker(
+            [_PY, "-c", "pass"], task_id="turn-1", run_nonce="abc124", env=env, probe_env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            subtree_path=_subtree(tmp_path), allow_fallback=False, runtime_max_s=7800, stop_timeout_s=30,
+            start_by=time.time() - 1,
+        )
+    assert not argv_log.exists()
+
+    with pytest.raises(iso.LaunchNotStarted, match="forced"):
+        iso.spawn_detached_worker([_PY, "-c", "pass"], task_id="turn-2", run_nonce="n", popen=popen,
+                                  probe_env={"LU_DISPATCH_ISOLATION": "fallback"}, allow_fallback=False,
+                                  runtime_max_s=7800, stop_timeout_s=30)
+    # An unreadable caller cgroup never hides pre-launch proof when fallback is unconditionally refused.
+    def unavailable_cgroup():
+        raise iso.DispatchIsolationError("fallback-refused: caller-cgroup-unavailable")
+
+    real_detector = iso._caller_in_driver_scope
+    iso._caller_in_driver_scope = unavailable_cgroup
+    try:
+        with pytest.raises(iso.LaunchNotStarted, match="forced"):
+            iso.spawn_detached_worker([_PY, "-c", "pass"], task_id="turn-2b", run_nonce="n2", popen=popen,
+                                      probe_env={"LU_DISPATCH_ISOLATION": "fallback"}, allow_fallback=False,
+                                      runtime_max_s=7800, stop_timeout_s=30)
+    finally:
+        iso._caller_in_driver_scope = real_detector
+
+
+def test_a_refusal_after_systemd_run_started_is_never_a_launch_that_never_started(tmp_path: Path):
+    """Defect class T4: a bounded launch whose systemd-run was started, and exited before the worker, is reported as
+    never started, so its turn's lease is released while a scope of it may run."""
+    bindir = _install_fakes(tmp_path)
+    env = _env(bindir, FAKE_SYSTEMD_RUN="fail")
+    with pytest.raises(iso.DispatchIsolationError) as refused:
+        iso.spawn_detached_worker([_PY, "-c", "pass"], task_id="turn-3", run_nonce="n3", env=env, probe_env=env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  subtree_path=_subtree(tmp_path), timeout_s=2, allow_fallback=False,
+                                  runtime_max_s=7800, stop_timeout_s=30)
+    assert not isinstance(refused.value, iso.LaunchNotStarted), refused.value
+
+
 def test_scope_unit_names_differ_for_the_same_task_and_nonce():
     first = iso.scope_unit_name("same-task", "reused-nonce")
     second = iso.scope_unit_name("same-task", "reused-nonce")
