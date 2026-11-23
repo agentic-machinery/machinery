@@ -418,6 +418,8 @@ def _orchestrator_entry(args, agent: str, *, requested: bool) -> dict:
                          "(--initiator claude-cto, from outside any dispatched task)")
     if agent == "opencode" and args.provider == SAVANT_PROVIDER:
         raise ValueError("orchestrator_entry_refused: a Savant run cannot be an orchestrator turn")
+    if refusal := host_admission.domain_refusal():
+        raise ValueError(f"orchestrator_entry_refused: {refusal}")
     # Every task-store scan (sweeps, child linkage) skips a file named like a dispatcher sidecar.
     if args.task_id is not None and task_record_store._is_dispatcher_sidecar(store.record_path(args.task_id)):
         raise ValueError("orchestrator_entry_refused: --task-id ends like a dispatcher sidecar file name")

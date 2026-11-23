@@ -185,6 +185,19 @@ def reservations_dir() -> Path:
     return tasks_dir().parent / RESERVATIONS_DIR_NAME
 
 
+# Only a task store named ``tasks`` reserves, so <parent>/tasks and <parent>/streams are one admission domain:
+# two sibling stores (another LU_TASKS_DIR beside it) would share the namespace under two different locks.
+TASKS_DIR_NAME = "tasks"
+
+
+def domain_refusal() -> str | None:
+    """Why this task store cannot hold stream reservations, or None."""
+    if tasks_dir().name != TASKS_DIR_NAME:
+        return (f"orchestrator_domain_refused: the task store must be a directory named {TASKS_DIR_NAME!r}, so its "
+                "admission lock is the only one guarding its reservations")
+    return None
+
+
 def _reservations_fd(*, create: bool) -> int | None:
     """A descriptor of the verified reservation directory, or None when it does not exist (never with ``create``).
 
@@ -469,6 +482,8 @@ def _claim_stream(stream, task_id, run_nonce, tree):
     The caller holds the admission lock. Only a missing entry in the verified directory is free: a valid
     reservation, whatever task id or record it names, and an unsafe, unreadable or malformed one refuse.
     """
+    if refusal := domain_refusal():
+        return refusal
     try:
         fd = _reservations_fd(create=True)
         try:

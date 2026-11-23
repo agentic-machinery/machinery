@@ -380,6 +380,27 @@ def test_an_unsafe_reservation_directory_holds_every_stream(task_store, tmp_path
         assert not list((tmp_path / "planted").iterdir())  # nothing was written through the link
 
 
+def test_a_sibling_task_store_cannot_reserve_in_a_shared_namespace(task_store, monkeypatch, cto_seat, capsys):
+    """Defect class: two task stores beside each other share one reservation directory under two admission locks,
+    so one domain's turn blocks, or races, the other's."""
+    from lu_machinery.dispatcher import cli
+
+    _reserve("turn")
+    sibling = task_store.with_name("tasks-other")
+    sibling.mkdir()
+    monkeypatch.setenv("LU_TASKS_DIR", str(sibling))
+    with pytest.raises(host_admission.Refused, match="orchestrator_domain_refused"):
+        _reserve("turn-2", stream="epic:8")
+    assert not _reservation("epic:8").exists()
+    monkeypatch.setattr(worker, "start", lambda *_a, **_k: pytest.fail("spawned"))
+    assert cli.main(["dispatch", "--agent", "claude", "--model", "claude-sonnet-5-5", "--task-id", "turn-3",
+                     "--prompt", "drive", "--mode", "orchestrator", "--stream", "epic:9",
+                     "--initiator", "claude-cto"]) == 2
+    assert "orchestrator_domain_refused" in capsys.readouterr().err
+    # A worker in the sibling store still sees the shared namespace's turns: its writer checks fail closed.
+    assert host_admission.turn_writer_refusal(task_ids={"turn"}).startswith("orchestrator_turn_writer_refused")
+
+
 def test_a_dry_run_reads_the_stream_without_writing(task_store):
     """Defect class: a dry run creates the reservation directory or file, or misses a reserved stream."""
     assert host_admission.stream_refusal(STREAM) is None
