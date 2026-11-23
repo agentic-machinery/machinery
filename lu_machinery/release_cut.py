@@ -83,6 +83,33 @@ _NODE_SEAL = f"from pathlib import Path; import sys; {_ACPX}seal_node_dependenci
 _SITE_PATHS = "import sysconfig; print(sysconfig.get_path('purelib')); print(sysconfig.get_path('platlib'))"
 
 
+_GIT_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_POST_RELEASE_ALLOWED_PATHS = frozenset({"CHANGELOG.md", *VERSION_FILES, "uv.lock"})
+
+
+def _verify_uv_lock_version_bump(parent_text: str, remote_text: str, *, old: str, new: str) -> None:
+    """Confirm ``remote_text`` differs from ``parent_text`` only by bumping ``lu-machinery`` ``old`` -> ``new``."""
+    try:
+        parent_doc = tomllib.loads(parent_text)
+        remote_doc = tomllib.loads(remote_text)
+    except (tomllib.TOMLDecodeError, ValueError) as exc:
+        raise CutError(f"POST_RELEASE_BRANCH_REFUSED: cannot parse uv.lock on remote post-release branch ({exc})") from exc
+    packages = parent_doc.get("package")
+    if not isinstance(packages, list):
+        raise CutError("POST_RELEASE_BRANCH_REFUSED: uv.lock package table missing on remote post-release base")
+    matches = [
+        pkg for pkg in packages
+        if isinstance(pkg, dict) and pkg.get("name") == "lu-machinery" and pkg.get("version") == old
+    ]
+    if len(matches) != 1:
+        raise CutError(
+            f"POST_RELEASE_BRANCH_REFUSED: expected one lu-machinery=={old} package in base uv.lock, found {len(matches)}"
+        )
+    matches[0]["version"] = new
+    if parent_doc != remote_doc:
+        raise CutError("POST_RELEASE_BRANCH_REFUSED: remote post-release branch has non-bookkeeping changes in uv.lock")
+
+
 class CutError(Exception):
     """A refused precondition or a failed step; the message names the cause."""
 
@@ -1274,7 +1301,8 @@ class Cut:
             return f"remote state of {tag} unknown (tag {tagged}, release {release}); nothing withdrawn"
         if release == "released":
             root = shlex.quote(str(self.primary.absolute()))
-            env_prefix = f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={root} LU_PRODUCT_ROOT={root}"
+            host_py = shlex.quote(str(self.host_python.absolute()))
+            env_prefix = f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={root} LU_PRODUCT_ROOT={root} LU_PYTHON={host_py}"
             x_agent_flag = f" --x-agent {shlex.quote(self.x_agent)}" if self.x_agent else ""
             resume = (
                 f"{env_prefix} {shlex.quote(str(self.publisher_python.absolute()))} -I -m lu_machinery.release_cut "
@@ -1311,15 +1339,224 @@ class Cut:
             f"Withdrawn: release acceptance failed at {cause}.\n\n" + self.section, yanked=True))
         return f"{tag} {release}: " + "; ".join(done)
 
+    def _remote_branch_oid(self, clone: Path, branch: str) -> str | None:
+        """Exact commit OID of ``refs/heads/<branch>`` on ``machinery_remote``, or ``None`` if absent."""
+        expected_ref = f"refs/heads/{branch}"
+        listed = self.run(
+            ["git", "-C", clone, "ls-remote", "--heads", self.machinery_remote, expected_ref],
+            timeout=120,
+        ).stdout
+        matches: list[str] = []
+        for raw_line in listed.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            if len(parts) != 2 or not _GIT_OID.fullmatch(parts[0]):
+                raise CutError(f"POST_RELEASE_BRANCH_REFUSED: malformed ls-remote line for {branch}: {raw_line!r}")
+            oid, ref = parts
+            if ref == expected_ref:
+                matches.append(oid)
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise CutError(f"POST_RELEASE_BRANCH_REFUSED: ambiguous remote ref {expected_ref} ({len(matches)} matches)")
+        return matches[0]
+
+    def _refuse_open_post_release_pr(self, branch: str) -> None:
+        """Fail closed if an open PR already exists for ``branch`` or PR state cannot be read."""
+        listed = self.run(
+            ["gh", "pr", "list", "-R", self.machinery_repo, "--head", branch, "--state", "open", "--json", "number"],
+            check=False,
+            timeout=120,
+        )
+        if listed.returncode != 0:
+            detail = (listed.stderr or listed.stdout).strip().splitlines()[-1:] or ["no output"]
+            raise CutError(
+                f"POST_RELEASE_PR_STATE_UNKNOWN: could not list open PRs for {branch} "
+                f"(gh exited {listed.returncode}): {detail[0]}"
+            )
+        try:
+            rows = json_depth.loads(listed.stdout, max_depth=512)
+        except ValueError as exc:
+            raise CutError(f"POST_RELEASE_PR_STATE_UNKNOWN: malformed open PR list for {branch}") from exc
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or type(row.get("number")) is not int for row in rows
+        ):
+            raise CutError(f"POST_RELEASE_PR_STATE_UNKNOWN: malformed open PR list for {branch}")
+        if rows:
+            numbers = ", ".join(f"#{row['number']}" for row in rows)
+            raise CutError(f"POST_RELEASE_PR_EXISTS: post-release branch {branch} already has open PR {numbers}")
+
+    def _inspect_existing_post_release_branch(
+        self, clone: Path, *, branch: str, title: str, upcoming: str,
+    ) -> tuple[str, str, str, set[str]]:
+        """Fetch and verify structural identity of an existing remote post-release branch.
+
+        Returns ``(fetched_oid, remote_parent, remote_x_agent, changed_paths)``. Raises a typed
+        ``CutError`` if the branch has an open PR or holds anything other than a single generated
+        bookkeeping commit directly on top of an ancestor of ``origin/main``.
+        """
+        self._refuse_open_post_release_pr(branch)
+        remote_ref = f"refs/remotes/origin/{branch}"
+        self.run(
+            ["git", "-C", clone, "fetch", "--quiet", self.machinery_remote, f"+refs/heads/{branch}:{remote_ref}"],
+            timeout=300,
+        )
+        fetched_oid = self.git(clone, "rev-parse", f"{remote_ref}^{{commit}}")
+        ahead = self.git(clone, "rev-list", f"refs/remotes/origin/main..{fetched_oid}").splitlines()
+        if len(ahead) != 1 or ahead[0] != fetched_oid:
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has "
+                f"{len(ahead)} commit(s) ahead of main; expected only 1 generated bookkeeping commit"
+            )
+        parents = self.git(clone, "rev-list", "--parents", "-n", "1", fetched_oid).split()[1:]
+        if len(parents) != 1:
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has "
+                f"{len(parents)} parent(s); refusing merge or root commit"
+            )
+        remote_parent = parents[0]
+        msg_lines = self.run(["git", "-C", clone, "log", "-1", "--format=%B", fetched_oid]).stdout.rstrip("\n").split("\n")
+        if (
+            len(msg_lines) != 4
+            or msg_lines[0] != title
+            or msg_lines[1] != ""
+            or not re.fullmatch(rf"X-Agent: {_X_AGENT.pattern}", msg_lines[2])
+            or msg_lines[3] != _POST_RELEASE_VERIFIED
+        ):
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) commit message "
+                f"does not match the generated bookkeeping commit for {self.version} -> {upcoming}"
+            )
+        remote_x_agent = msg_lines[2].removeprefix("X-Agent: ")
+        raw_diff = self.run(
+            ["git", "-C", clone, "diff-tree", "--no-commit-id", "-r", "--raw", "--no-renames", "-z",
+             remote_parent, fetched_oid],
+        ).stdout
+        tokens = raw_diff.split("\0")
+        if tokens and tokens[-1] == "":
+            tokens.pop()
+        if not tokens or len(tokens) % 2 != 0:
+            raise CutError(
+                f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has an empty or malformed diff"
+            )
+        changed_paths: set[str] = set()
+        for index in range(0, len(tokens), 2):
+            meta, path = tokens[index], tokens[index + 1]
+            fields = meta.lstrip(":").split(" ")
+            if len(fields) != 5:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: malformed diff-tree metadata on {branch} ({fetched_oid[:12]})"
+                )
+            old_mode, new_mode, _old_oid, _new_oid, status = fields
+            if status != "M" or old_mode != new_mode or not old_mode.startswith("100"):
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) changes file mode or "
+                    f"status ({status} {old_mode}->{new_mode}) on {path}"
+                )
+            if path not in _POST_RELEASE_ALLOWED_PATHS:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) modifies unexpected path {path}"
+                )
+            changed_paths.add(path)
+        return fetched_oid, remote_parent, remote_x_agent, changed_paths
+
+    def _verify_remote_bookkeeping_contents(
+        self, clone: Path, *, branch: str, fetched_oid: str, remote_parent: str,
+        changed_paths: set[str], section: str, upcoming: str, yanked: bool,
+    ) -> None:
+        """Confirm every modified file on ``fetched_oid`` matches the deterministic bookkeeping replay."""
+        for name in VERSION_FILES:
+            try:
+                parent_text = self.run(["git", "-C", clone, "show", f"{remote_parent}:{name}"]).stdout
+                remote_text = self.run(["git", "-C", clone, "show", f"{fetched_oid}:{name}"]).stdout
+                expected_text = bump_version_file(name, parent_text, self.version, upcoming)
+            except CutError as exc:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) failed {name} replay: {exc}"
+                ) from exc
+            if remote_text != expected_text:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has non-bookkeeping changes in {name}"
+                )
+        if "CHANGELOG.md" in changed_paths:
+            try:
+                parent_cl = self.run(["git", "-C", clone, "show", f"{remote_parent}:CHANGELOG.md"]).stdout
+                remote_cl = self.run(["git", "-C", clone, "show", f"{fetched_oid}:CHANGELOG.md"]).stdout
+            except CutError as exc:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) lacks CHANGELOG.md: {exc}"
+                ) from exc
+            yanked_suffix = r" \[YANKED\]" if yanked else ""
+            heading_re = re.compile(
+                rf'^<a id="v{re.escape(self.version)}"></a>\n'
+                rf"## \[{re.escape(self.version)}\] - (\d{{4}}-\d{{2}}-\d{{2}}){yanked_suffix}$",
+                re.MULTILINE,
+            )
+            dates = heading_re.findall(remote_cl)
+            if len(dates) != 1:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) CHANGELOG.md "
+                    f"heading does not match {self.version} (yanked={yanked})"
+                )
+            try:
+                dt.date.fromisoformat(dates[0])
+            except ValueError as exc:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) CHANGELOG.md "
+                    f"has invalid date {dates[0]!r}"
+                ) from exc
+            try:
+                expected_cl = record_changelog(
+                    parent_cl, version=self.version, previous=self.previous, date=dates[0],
+                    notes=section, repo=self.machinery_repo, yanked=yanked, since=self.baseline,
+                )
+            except CutError as exc:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) failed CHANGELOG.md replay: {exc}"
+                ) from exc
+            if remote_cl != expected_cl:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) has non-bookkeeping changes in CHANGELOG.md"
+                )
+        else:
+            try:
+                parent_cl = self.run(["git", "-C", clone, "show", f"{remote_parent}:CHANGELOG.md"]).stdout
+            except CutError as exc:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) lacks CHANGELOG.md: {exc}"
+                ) from exc
+            if f"\n## [{self.version}]" not in parent_cl:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) did not update CHANGELOG.md"
+                )
+        if "uv.lock" in changed_paths:
+            try:
+                parent_lock = self.run(["git", "-C", clone, "show", f"{remote_parent}:uv.lock"]).stdout
+                remote_lock = self.run(["git", "-C", clone, "show", f"{fetched_oid}:uv.lock"]).stdout
+            except CutError as exc:
+                raise CutError(
+                    f"POST_RELEASE_BRANCH_REFUSED: remote branch {branch} ({fetched_oid[:12]}) lacks uv.lock: {exc}"
+                ) from exc
+            _verify_uv_lock_version_bump(parent_lock, remote_lock, old=self.version, new=upcoming)
+
     def post_release(self, section: str, *, yanked: bool = False) -> int:
         """One PR: record the released section in CHANGELOG.md and move main to the next version."""
         self.step = "post-release PR"
         clone = self.work / "machinery"
         upcoming = next_version(self.version)
         branch = f"release/start-{upcoming}"
+        title = BUMP_TITLE.format(released=self.version, next=upcoming)
         self.run(["git", "-C", clone, "fetch", "--quiet", self.machinery_remote,
                   "+refs/heads/main:refs/remotes/origin/main"], timeout=300)
-        self.git(clone, "switch", "--quiet", "-c", branch, "refs/remotes/origin/main")
+        main_oid = self.git(clone, "rev-parse", "refs/remotes/origin/main^{commit}")
+        existing_branch: tuple[str, str, str, set[str]] | None = None
+        if self._remote_branch_oid(clone, branch) is not None:
+            existing_branch = self._inspect_existing_post_release_branch(
+                clone, branch=branch, title=title, upcoming=upcoming,
+            )
+        self.git(clone, "switch", "--quiet", "-C", branch, "refs/remotes/origin/main")
         changelog = clone / "CHANGELOG.md"
         changelog.write_text(record_changelog(changelog.read_text(encoding="utf-8"), version=self.version,
                                               previous=self.previous, date=utc_date(), notes=section,
@@ -1337,11 +1574,30 @@ class Cut:
             self.run([uv, "lock", "--no-python-downloads", "--python", self.host_python], cwd=clone,
                      env=self.scratch_env())
             version_files.append("uv.lock")
-        title = BUMP_TITLE.format(released=self.version, next=upcoming)
         self.git(clone, "add", "CHANGELOG.md", *version_files)
         self.git(clone, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
                  f"{title}\n\nX-Agent: {self.x_agent}\n{_POST_RELEASE_VERIFIED}")
-        self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
+        if existing_branch is None:
+            self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
+        else:
+            fetched_oid, remote_parent, remote_x_agent, changed_paths = existing_branch
+            local_oid = self.git(clone, "rev-parse", "HEAD")
+            local_tree = self.git(clone, "rev-parse", "HEAD^{tree}")
+            remote_tree = self.git(clone, "rev-parse", f"{fetched_oid}^{{tree}}")
+            if remote_parent == main_oid and remote_tree == local_tree and remote_x_agent == self.x_agent:
+                self.say(f"reusing existing post-release branch {branch} ({fetched_oid[:12]})")
+            else:
+                if not (remote_parent == main_oid and remote_tree == local_tree):
+                    self._verify_remote_bookkeeping_contents(
+                        clone, branch=branch, fetched_oid=fetched_oid, remote_parent=remote_parent,
+                        changed_paths=changed_paths, section=section, upcoming=upcoming, yanked=yanked,
+                    )
+                self.run(
+                    ["git", "-C", clone, "push", f"--force-with-lease=refs/heads/{branch}:{fetched_oid}",
+                     self.machinery_remote, f"HEAD:refs/heads/{branch}"],
+                    timeout=300,
+                )
+                self.say(f"updated existing post-release branch {branch} ({fetched_oid[:12]} -> {local_oid[:12]})")
         body = self.work / "post-release-body.md"
         body.write_text(
             f"Records the {self.version} section of `CHANGELOG.md`, generated from the merged PR titles in "

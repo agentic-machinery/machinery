@@ -1167,6 +1167,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     _init_repo(sibling_machinery)
     host_log = tmp_path / "host-publish.log"
     accept_log = tmp_path / "accept-publish.log"
+    fail_pytest_marker = work / "fail-pytest"
 
     # Simulate the new release's verified clean-install interpreter: requires -I, primary env, and accepts --milestone.
     accept_script = (
@@ -1186,6 +1187,10 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         "fi\n"
         'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pytest" ]; then\n'
         '  [ -f "$venv_root/lib/python3.14/site-packages/zz-release-cut-consumer.pth" ]\n'
+        f'  if [ -e {shlex.quote(str(fail_pytest_marker))} ]; then\n'
+        '    printf "1 error during collection\\n"\n'
+        "    exit 1\n"
+        "  fi\n"
         '  printf "10 tests collected\\n"\n'
         "  exit 0\n"
         "fi\n"
@@ -1290,17 +1295,23 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     lines = accept_log.read_text(encoding="utf-8").splitlines()
     assert "--milestone" in lines[1] and "--milestone" in lines[4]
 
-    # Cleanup after full release emits a complete resume command with required roots and --x-agent.
+    # Cleanup after full release emits a complete resume command with required roots, LU_PYTHON, and --x-agent.
     monkeypatch.setattr(cut, "remote_state", lambda: (True, "released", [1275]))
     resume_msg = cut.clean_up("post-release PR")
     quoted_root = shlex.quote(str(primary.absolute()))
+    quoted_host_py = shlex.quote(str(host_python.absolute()))
     expected_resume = (
         f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root} LU_PRODUCT_ROOT={quoted_root} "
+        f"LU_PYTHON={quoted_host_py} "
         f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release --x-agent claude/claude-opus-5-5"
     )
     assert expected_resume in resume_msg
-    # Execute the emitted env-prefixed command in a fresh shell with no root env vars inherited, exercising
-    # real argument parsing, x_agent_value attribution, resolve_repo("machinery"), and release-cut.lock.
+    # Execute the emitted env-prefixed command in a fresh shell with no root/interpreter env vars inherited and
+    # no <primary>/.venv/bin/python, exercising real main -> _locked_run -> _run (project_interpreter, resolve_repo,
+    # milestone parsing, git identity, lock acquisition) and stubbing only the live open_post_release call.
+    assert not (primary / ".venv/bin/python").exists()
+    probe_home = tmp_path / "probe-home"
+    probe_home.mkdir()
     probe_runner = tmp_path / "resume-probe-python"
     pkg_parent = Path(lu_machinery.__file__).resolve().parents[1]
     probe_runner.write_text(
@@ -1309,14 +1320,13 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         f"sys.path.insert(0, {str(pkg_parent)!r})\n"
         "from pathlib import Path\n"
         "from lu_machinery import release_cut\n"
-        "from lu_machinery.common.repo_root import primary_root\n"
-        "from lu_machinery.dispatcher.git import resolve_repo\n"
-        "def stub_run(args):\n"
-        f"    assert primary_root().resolve() == Path({str(primary)!r}).resolve()\n"
-        f"    assert resolve_repo('machinery')[0].resolve() == Path({str(sibling_machinery)!r}).resolve()\n"
-        "    print('LOCKED_OK', args.command, args.x_agent)\n"
+        "def stub_open_post_release(probe_cut):\n"
+        f"    assert probe_cut.primary.resolve() == Path({str(primary)!r}).resolve()\n"
+        f"    assert probe_cut.host_python == Path({str(host_python.absolute())!r})\n"
+        "    assert probe_cut.x_agent == 'claude/claude-opus-5-5'\n"
+        "    print('RUN_OK', probe_cut.host_python, probe_cut.x_agent)\n"
         "    return 0\n"
-        "release_cut._run = stub_run\n"
+        "release_cut.open_post_release = stub_open_post_release\n"
         "raise SystemExit(release_cut.main(sys.argv[4:]))\n",
         encoding="utf-8",
     )
@@ -1324,24 +1334,46 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     emitted_for_probe = expected_resume.replace(shlex.quote(str(installed)), shlex.quote(str(probe_runner)), 1)
     clean_shell_env = {
         key: value for key, value in os.environ.items()
-        if key not in {"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT", "LU_TASKS_DIR"}
+        if key not in {
+            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT",
+            "LU_PYTHON", "LEARN_UKRAINIAN_PYTHON", "LU_TASKS_DIR",
+            "LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
+        }
     }
+    clean_shell_env["HOME"] = str(probe_home)
     probe_result = subprocess.run(
         ["/bin/sh", "-c", emitted_for_probe], cwd=tmp_path, env=clean_shell_env,
         capture_output=True, text=True, check=False, timeout=30,
     )
     assert probe_result.returncode == 0, f"emitted resume command failed: {probe_result.stderr}"
-    assert "LOCKED_OK post-release claude/claude-opus-5-5" in probe_result.stdout
+    assert f"RUN_OK {host_python.absolute()} claude/claude-opus-5-5" in probe_result.stdout
     assert (sibling_machinery / ".git/release-cut.lock").is_file()
+    # Negative control (PR1278-F2): omitting LU_PYTHON fails in real _run when primary has no default venv.
+    without_lu_python = emitted_for_probe.replace(f"LU_PYTHON={quoted_host_py} ", "", 1)
+    fail_probe = subprocess.run(
+        ["/bin/sh", "-c", without_lu_python], cwd=tmp_path, env=clean_shell_env,
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert fail_probe.returncode != 0
+    assert "project interpreter not found" in fail_probe.stderr
 
     # 2. Cut-time consumer_collection uses a disposable venv under work/tmp, keeping work/accept unmutated for
-    # promotion and failure rollback even when overlay write raises ENOSPC.
+    # promotion and failure rollback even when overlay write raises ENOSPC or pytest exits nonzero.
     assert cut.consumer_collection(installed, product) == "10 tests collected"
     accept_overlay = work / "accept/lib/python3.14/site-packages/zz-release-cut-consumer.pth"
     assert not accept_overlay.exists()
     collection_dirs = sorted((work / "tmp").glob("collection-*"))
     assert len(collection_dirs) == 1
     assert (collection_dirs[0] / "lib/python3.14/site-packages/zz-release-cut-consumer.pth").is_file()
+
+    # Nonzero pytest --collect-only exit raises CutError and leaves work/accept clean (PR1278-F6).
+    fail_pytest_marker.write_text("1", encoding="utf-8")
+    try:
+        with pytest.raises(CutError, match=r"product test collection failed \(exit 1\): 1 error during collection"):
+            cut.consumer_collection(installed, product)
+    finally:
+        fail_pytest_marker.unlink()
+    assert not accept_overlay.exists()
 
     real_write_text = Path.write_text
 
@@ -1459,3 +1491,268 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     monkeypatch.setattr(sys, "executable", "")
     with pytest.raises(CutError, match="cannot locate the running Python interpreter"):
         cut.publisher_invocation("pr-create")
+
+
+def test_post_release_resumes_only_verified_bookkeeping_branch(tmp_path, monkeypatch):
+    """Defect class: resuming post-release after a failed cut either fails non-fast-forward on its own pushed
+    bookkeeping branch or overwrites unknown commits or an open PR."""
+    seed = tmp_path / "machinery-seed"
+    _init_repo(seed)
+    (seed / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n"
+        "[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.61...HEAD\n",
+        encoding="utf-8",
+    )
+    (seed / "pyproject.toml").write_text('[project]\nname = "lu-machinery"\nversion = "0.1.62"\n', encoding="utf-8")
+    (seed / "package.json").write_text(
+        json.dumps({"name": "lu-machinery-acp", "version": "0.1.62"}, indent=2) + "\n", encoding="utf-8",
+    )
+    (seed / "package-lock.json").write_text(
+        json.dumps({"name": "lu-machinery-acp", "version": "0.1.62", "packages": {"": {"version": "0.1.62"}}}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (seed / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "lu-machinery"\nversion = "0.1.62"\n', encoding="utf-8",
+    )
+    _git(seed, "add", "CHANGELOG.md", "pyproject.toml", "package.json", "package-lock.json", "uv.lock")
+    _git(seed, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "version files")
+
+    bare = tmp_path / "machinery.git"
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "home").mkdir()
+    (work / "tmp").mkdir()
+    machinery = work / "machinery"
+    _bare_checkout(seed, bare, machinery)
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    uv = bin_dir / "uv"
+    uv.write_text(
+        "#!/bin/sh\nset -eu\n"
+        "sed 's/^version = \"0.1.62\"$/version = \"0.1.63\"/' uv.lock > next.lock\n"
+        "mv next.lock uv.lock\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    cut = Cut(
+        work=work, dry_run=False, machinery_remote=str(bare), product_remote="",
+        machinery_repo=REPO, product_repo="learn-ukrainian/learn-ukrainian.github.io",
+        host_python=Path(sys.executable), primary=tmp_path, alert=False,
+        x_agent="claude/claude-opus-5-5", version="0.1.62", previous="0.1.61", baseline="0.1.61",
+        git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"),
+    )
+
+    open_prs_response: dict[str, object] = {"returncode": 0, "stdout": "[]", "stderr": ""}
+    push_commands: list[list[str]] = []
+    race_callback: list[object] = []
+    original_run = cut.run
+
+    def run(argv, **kwargs):
+        command = [str(part) for part in argv]
+        if command[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(
+                command, int(open_prs_response["returncode"]),
+                str(open_prs_response["stdout"]), str(open_prs_response["stderr"]),
+            )
+        if command[:2] == ["git", "-C"] and "push" in command:
+            push_commands.append(command)
+            if race_callback:
+                cb = race_callback.pop()
+                cb()
+            # Use the real git binary for local tmp_path bare-repo pushes so the worker PATH shim does not intercept fixtures.
+            return original_run([git_module.GIT_BINARY, *command[1:]], **kwargs)
+        return original_run(argv, **kwargs)
+
+    cut.run = run
+    section = "### Fixed\n\n- Release fix ([#1270](https://github.com/learn-ukrainian/machinery/pull/1270))\n"
+    branch = "release/start-0.1.63"
+
+    # 1. Initial cut pushes release/start-0.1.63 to the remote, then fails at pr-create (0.1.62 14:49Z scenario).
+    def failing_publisher(*_args: str) -> str:
+        raise CutError("OPSEC: invalid publisher arguments")
+
+    cut.publisher = failing_publisher
+    with pytest.raises(CutError, match="OPSEC: invalid publisher arguments"):
+        cut.post_release(section)
+    first_oid = subprocess.run(
+        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert len(push_commands) == 1
+
+    # 2. Resuming with no open PR and unchanged main reuses the identical bookkeeping commit without pushing.
+    push_commands.clear()
+    cut.publisher = lambda *_args: f"https://github.com/{REPO}/pull/1277\n"
+    assert cut.post_release(section) == 1277
+    assert push_commands == []
+    reused_oid = subprocess.run(
+        ["git", "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert reused_oid == first_oid
+
+    # 3. Refuse when an open PR already exists or when gh pr list fails (fail closed before pushing).
+    open_prs_response.update(returncode=0, stdout=json.dumps([{"number": 1277}]), stderr="")
+    with pytest.raises(CutError, match=r"POST_RELEASE_PR_EXISTS.*#1277"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    open_prs_response.update(returncode=1, stdout="", stderr="network error\n")
+    with pytest.raises(CutError, match="POST_RELEASE_PR_STATE_UNKNOWN"):
+        cut.post_release(section)
+    assert push_commands == []
+    open_prs_response.update(returncode=0, stdout="[]", stderr="")
+
+    # 3b. Different valid X-Agent trailer on an otherwise identical bookkeeping commit updates via --force-with-lease.
+    cut.x_agent = "codex/gpt-6.2-sol"
+    assert cut.post_release(section) == 1277
+    assert len(push_commands) == 1
+    assert f"--force-with-lease=refs/heads/{branch}:{first_oid}" in push_commands[0]
+    first_oid = subprocess.run(
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    cut.x_agent = "claude/claude-opus-5-5"
+    push_commands.clear()
+
+    def _raw_git(repo: Path, *args: str) -> None:
+        subprocess.run([git_module.GIT_BINARY, "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+    # 4. When main advances, resuming verifies the existing remote bookkeeping commit and updates it with
+    # --force-with-lease (never bare --force).
+    helper = tmp_path / "helper"
+    subprocess.run([git_module.GIT_BINARY, "clone", "--quiet", str(bare), str(helper)], check=True, capture_output=True, text=True)
+    _raw_git(helper, "config", "user.name", "Release Cut")
+    _raw_git(helper, "config", "user.email", "release-cut@example.invalid")
+    (helper / "README.md").write_text("unrelated main advance\n", encoding="utf-8")
+    _raw_git(helper, "add", "README.md")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "docs: advance main")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "origin", "main")
+    new_main = subprocess.run(
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", "refs/heads/main"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert cut.post_release(section) == 1277
+    assert len(push_commands) == 1
+    assert f"--force-with-lease=refs/heads/{branch}:{first_oid}" in push_commands[0]
+    assert "--force" not in push_commands[0]
+    updated_oid = subprocess.run(
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert updated_oid != first_oid
+    updated_parent = subprocess.run(
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"{updated_oid}^"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert updated_parent == new_main
+
+    # 5. Concurrent push between inspection and --force-with-lease update is rejected atomically (TOCTOU safe).
+    push_commands.clear()
+    _raw_git(helper, "fetch", "--quiet", "origin", branch)
+    _raw_git(helper, "switch", "--quiet", "-C", branch, f"origin/{branch}")
+    (helper / "README.md").write_text("main advance 2\n", encoding="utf-8")
+    _raw_git(helper, "switch", "--quiet", "main")
+    _raw_git(helper, "add", "README.md")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "docs: advance main 2")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "origin", "main")
+
+    def simulate_concurrent_push() -> None:
+        _raw_git(helper, "switch", "--quiet", branch)
+        (helper / "extra.txt").write_text("concurrent work\n", encoding="utf-8")
+        _raw_git(helper, "add", "extra.txt")
+        _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "wip: concurrent commit")
+        _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "origin", branch)
+
+    race_callback.append(simulate_concurrent_push)
+    with pytest.raises(CutError, match="exited 1"):
+        cut.post_release(section)
+    raced_oid = subprocess.run(
+        [git_module.GIT_BINARY, "-C", str(bare), "rev-parse", f"refs/heads/{branch}"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert raced_oid != updated_oid
+
+    # 6. Refuse with typed POST_RELEASE_BRANCH_REFUSED on every non-bookkeeping remote branch state.
+    # 6a. Two commits ahead of main (from the concurrent commit above).
+    push_commands.clear()
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*2 commit\(s\) ahead"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    bookkeeping_msg = (
+        f"chore(release): record 0.1.62 and start 0.1.63\n\nX-Agent: claude/claude-opus-5-5\n"
+        f"{release_cut._POST_RELEASE_VERIFIED}"
+    )
+
+    # 6b. Single commit with bookkeeping message and allowed path, but hand-edited pyproject.toml content.
+    _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
+    (helper / "pyproject.toml").write_text('[project]\nname = "lu-machinery"\nversion = "0.1.63"\n# hand edit\n', encoding="utf-8")
+    _raw_git(helper, "add", "pyproject.toml")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", bookkeeping_msg)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*non-bookkeeping changes in pyproject\.toml"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    # 6c. Single commit with valid version bumps, but hand-edited CHANGELOG.md content.
+    _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
+    for name in release_cut.VERSION_FILES:
+        path = helper / name
+        path.write_text(release_cut.bump_version_file(name, path.read_text(encoding="utf-8"), "0.1.62", "0.1.63"), encoding="utf-8")
+    (helper / "CHANGELOG.md").write_text(
+        record_changelog((helper / "CHANGELOG.md").read_text(encoding="utf-8"), version="0.1.62", previous="0.1.61",
+                         date="2026-11-23", notes="### Fixed\n\n- Tampered line\n", repo=REPO, since="0.1.61"),
+        encoding="utf-8",
+    )
+    _raw_git(helper, "add", "CHANGELOG.md", *release_cut.VERSION_FILES)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", bookkeeping_msg)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*non-bookkeeping changes in CHANGELOG\.md"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    # 6d. Single commit with valid version bumps and changelog, but hand-edited uv.lock content.
+    _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
+    for name in release_cut.VERSION_FILES:
+        path = helper / name
+        path.write_text(release_cut.bump_version_file(name, path.read_text(encoding="utf-8"), "0.1.62", "0.1.63"), encoding="utf-8")
+    (helper / "CHANGELOG.md").write_text(
+        record_changelog((helper / "CHANGELOG.md").read_text(encoding="utf-8"), version="0.1.62", previous="0.1.61",
+                         date="2026-11-23", notes=section, repo=REPO, since="0.1.61"),
+        encoding="utf-8",
+    )
+    (helper / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "lu-machinery"\nversion = "0.1.63"\n\n[[package]]\nname = "extra"\nversion = "1.0.0"\n',
+        encoding="utf-8",
+    )
+    _raw_git(helper, "add", "CHANGELOG.md", *release_cut.VERSION_FILES, "uv.lock")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", bookkeeping_msg)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*non-bookkeeping changes in uv\.lock"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    # 6e. Single commit modifying an unexpected file.
+    _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
+    (helper / "README.md").write_text("tampered\n", encoding="utf-8")
+    _raw_git(helper, "add", "README.md")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", bookkeeping_msg)
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*unexpected path README\.md"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    # 6f. Single commit with a non-bookkeeping commit message.
+    _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
+    (helper / "pyproject.toml").write_text('[project]\nname = "lu-machinery"\nversion = "0.1.63"\n', encoding="utf-8")
+    _raw_git(helper, "add", "pyproject.toml")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "feat: hand-written change")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*commit message"):
+        cut.post_release(section)
+    assert push_commands == []
+
+    # 6g. Branch already pointing at main (0 commits ahead).
+    _raw_git(helper, "switch", "--quiet", "-C", branch, "origin/main")
+    _raw_git(helper, "-c", "core.hooksPath=/dev/null", "push", "--quiet", "--force", "origin", branch)
+    with pytest.raises(CutError, match=r"POST_RELEASE_BRANCH_REFUSED.*0 commit\(s\) ahead"):
+        cut.post_release(section)
+    assert push_commands == []
