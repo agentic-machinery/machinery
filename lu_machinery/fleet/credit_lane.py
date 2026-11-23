@@ -15,8 +15,12 @@ and ``credits_unverified`` for unreadable usage records all qualify), and under
 ``policy_error``, whether or not the router currently recommends the lane. It also
 refuses an off-allowlist model when the routing-budget snapshot cannot be read.
 :func:`reset_advice` says whether a free full reset is worth using now. The policy lives in
-``scripts/config/credit_lanes.yaml``. Everything here reads snapshots only:
+``lu_machinery/config/credit_lanes.yaml``. Everything here reads snapshots only:
 nothing consumes credits or resets.
+
+Operator decision 2026-11-23: coding is refused only below 1 percent remaining
+when admission evaluates a fresh meter's usable allowance. The dispatcher
+also honors confirmed exhaustion and recent rate limits.
 
 Fail closed: a missing, stale, non-numeric or non-positive balance, a balance
 fetch time that is not an explicit fresh UTC timestamp, unreadable runtime
@@ -98,6 +102,8 @@ STALE_ADVISORY_LABEL = "UNKNOWN — stale/advisory"
 # warm at <= 50% remaining when pace is unavailable, cool otherwise.
 SUBSCRIPTION_NEAR_CAP_USED_PCT = 99.0
 _NEAR_CAP_REMAINING_PCT = 100.0 - SUBSCRIPTION_NEAR_CAP_USED_PCT
+# Workspace-write admission uses a strict floor on the measured allowance.
+CODING_ADMISSION_MIN_REMAINING_PCT = 1.0
 # Separate Codex credit-policy trigger, also used when the policy is unreadable.
 _CREDIT_NEAR_CAP_REMAINING_PCT = 10.0
 _WARM_REMAINING_PCT = 50.0
