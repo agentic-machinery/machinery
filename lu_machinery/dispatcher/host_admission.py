@@ -137,12 +137,47 @@ def allows(decision, force_reason):
     )
 
 
+def _refusal_admission_record(
+    decision: legacy.AdmissionDecision | None,
+    *,
+    failure: str,
+) -> tuple[str, dict]:
+    """Meter status clause and unforced refusal admission record for non-decision exits."""
+    if decision is not None and not decision.exempt:
+        clause = decision.meter_status_clause()
+        record = decision.to_record(force_reason=None)
+        record["admitted"] = False
+        record["forced"] = False
+        if failure not in record["failures"]:
+            record["failures"] = [*record["failures"], failure]
+        return clause, record
+    clause = f"meter telemetry={legacy.METER_TELEMETRY_NOT_CHECKED}, effective cap=none"
+    return clause, {
+        "checked_at": datetime.now(UTC).isoformat(),
+        "admitted": False,
+        "forced": False,
+        "force_reason": None,
+        "failures": [failure],
+        "meter": None,
+        "meter_live_write_workers": None,
+        "meter_effective_cap": None,
+        "meter_normal_cap": None,
+        "meter_unknown_cap": None,
+        "meter_telemetry": legacy.METER_TELEMETRY_NOT_CHECKED,
+        "meter_defer": None,
+        "meter_refused": False,
+    }
+
+
 def report(decision, *, force_reason=None):
     """Legacy refusal/admit/override text and exits."""
     if decision.exempt:
         return
     if decision.admitted:
-        print(f"🚦 dispatch admission: admitted — {decision.summary()}", file=sys.stderr)
+        summary = decision.summary()
+        if decision.meter is None:
+            summary = f"{summary}, {decision.meter_status_clause()}"
+        print(f"🚦 dispatch admission: admitted — {summary}", file=sys.stderr)
     elif allows(decision, force_reason):
         print(
             f"⚠️  dispatch admission overridden by --force-admission ({force_reason!r}): "
@@ -163,7 +198,9 @@ def precheck(mode, *, force_reason=None):
     try:
         decision = legacy.precheck(mode)
     except ValueError as exc:
-        raise Refused(f"❌ invalid dispatch admission threshold: {exc}", 2) from exc
+        failure = f"invalid dispatch admission threshold: {exc}"
+        clause, record = _refusal_admission_record(None, failure=failure)
+        raise Refused(f"❌ {failure} ({clause})", 2, admission_record=record) from exc
     if decision is not None:
         report(decision)
 
@@ -177,7 +214,9 @@ def check(mode, *, dry_run, disk_guard, force_reason=None, spec=None, orchestrat
             orchestrator=orchestrator is not None,
         )
     except ValueError as exc:
-        raise Refused(f"❌ invalid dispatch admission threshold: {exc}", 2) from exc
+        failure = f"invalid dispatch admission threshold: {exc}"
+        clause, record = _refusal_admission_record(None, failure=failure)
+        raise Refused(f"❌ {failure} ({clause})", 2, admission_record=record) from exc
     report(decision, force_reason=force_reason)
     return decision
 
@@ -586,6 +625,7 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     try:
         refusal = None
         locked = None
+        locked_eval = None
         try:
             with legacy.admission_lock(tasks_dir()):
                 current = evaluate(
@@ -593,6 +633,7 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
                     meter=meter, budget=budget, budget_error=budget_error,
                     orchestrator=orchestrator is not None,
                 )
+                locked_eval = current
                 if allows(current, force_reason):
                     locked = current
                     nonce = uuid.uuid4().hex
@@ -622,16 +663,21 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
                         admission_record=current.to_record(force_reason=force_reason),
                     )
         except _StreamBusy as exc:
-            refusal = Refused(f"❌ {exc}", 3)
+            clause, record = _refusal_admission_record(locked_eval, failure=str(exc))
+            refusal = Refused(f"❌ {exc} ({clause})", 3, admission_record=record)
         except legacy.AdmissionLockTimeout as exc:
-            raise Refused(f"❌ dispatch admission lock unavailable: {exc}; retry the dispatch", 3) from exc
+            failure = f"dispatch admission lock unavailable: {exc}; retry the dispatch"
+            clause, record = _refusal_admission_record(None, failure=failure)
+            raise Refused(f"❌ {failure} ({clause})", 3, admission_record=record) from exc
         except (OSError, RuntimeError) as exc:
-            raise Refused(f"❌ could not publish the admission hold for {task_id!r}: {exc}", 1) from exc
+            failure = f"could not publish the admission hold for {task_id!r}: {exc}"
+            clause, record = _refusal_admission_record(locked_eval, failure=failure)
+            raise Refused(f"❌ {failure} ({clause})", 1, admission_record=record) from exc
         if refusal is not None:
             raise refusal
         if (locked is not None and not locked.exempt and decision is not None
-                and (locked.meter_telemetry, locked.meter_effective_cap)
-                != (decision.meter_telemetry, decision.meter_effective_cap)):
+                and (locked.admitted, locked.meter_telemetry, locked.meter_effective_cap)
+                != (decision.admitted, decision.meter_telemetry, decision.meter_effective_cap)):
             report(locked, force_reason=force_reason)
         yield hold
     finally:

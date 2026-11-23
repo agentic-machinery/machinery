@@ -250,7 +250,35 @@ def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, pro
     assert not agy_exhausted_cg.admitted and agy_exhausted_cg.meter is not None
     assert agy_exhausted_cg.meter.telemetry == "fresh" and agy_exhausted_cg.meter.defer == adm.MeterDefer.EXHAUSTED
 
-    # Grok+Cursor requires verified bindings for fresh cap; unverified bindings stay on reduced cap.
+    # AGY Monitor runtime vetoes require attributable single-group model membership within 300s (F5).
+    for agy_models, expected_cg, expected_gem in (
+        (["claude-opus-5-5"], adm.MeterDefer.RATE_LIMITED, None),
+        (["gemini-4-neon-high"], None, adm.MeterDefer.RATE_LIMITED),
+        (["claude-opus-5-5", "gemini-4-neon-high"], None, None),
+        ([], None, None),
+        ([None], None, None),
+    ):
+        agy_rl_budget = {
+            "generated_at": now.isoformat(),
+            "agents": {
+                "gemini": {
+                    "status": "cool", "freshness": "fresh", "age_s": 10, "remaining_pct": 70,
+                    "claude_gpt_windows": {"five_hour": {"remaining_pct": 80}, "weekly": {"remaining_pct": 80}},
+                    "runtime": {
+                        "rate_limited": 1, "headroom_blocked": True,
+                        "last_rate_limited_at": recent_rl, "models_rate_limited": agy_models,
+                    },
+                },
+            },
+        }
+        cg_res = adm.evaluate("workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                              meter="agy:claude_gpt", meter_budget=agy_rl_budget, now=now)
+        gem_res = adm.evaluate("workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+                               meter="agy:gemini", meter_budget=agy_rl_budget, now=now)
+        assert cg_res.meter is not None and cg_res.meter.defer == expected_cg
+        assert gem_res.meter is not None and gem_res.meter.defer == expected_gem
+
+    # Grok+Cursor requires verified bindings and BOTH components fresh with usable allowance (F3/F4).
     verified_gc = {
         "generated_at": now.isoformat(),
         "agents": {
@@ -276,6 +304,64 @@ def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, pro
     )
     assert gc_unverified.admitted and gc_unverified.meter is not None
     assert gc_unverified.meter.telemetry == "unavailable:binding_unverified" and gc_unverified.meter.cap == 2
+
+    # F3: fresh Grok + unavailable Cursor (even with status=near_cap) must not report fresh or trigger quota refusal.
+    gc_mixed_unavail = {
+        "generated_at": now.isoformat(),
+        "agents": {
+            "grok": {"status": "cool", "freshness": "fresh", "age_s": 10, "remaining_pct": 60},
+            "cursor": {"status": "near_cap", "freshness": "unavailable"},
+        },
+    }
+    gc_f3 = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=gc_mixed_unavail, now=now,
+    )
+    assert gc_f3.admitted and gc_f3.meter is not None
+    assert gc_f3.meter.telemetry == "unavailable:probe_unavailable" and gc_f3.meter.cap == 2
+
+    # F4: malformed non-scalar login_state or deeply nested metadata degrades safely without raising,
+    # and preserves independent local rate-limit vetoes.
+    nested: dict[str, object] = {}
+    cursor_node = nested
+    for _ in range(400):
+        nxt: dict[str, object] = {}
+        cursor_node["deep"] = nxt
+        cursor_node = nxt
+    gc_deep = {
+        "generated_at": now.isoformat(),
+        "agents": {
+            "grok": {"status": "cool", "freshness": "fresh", "age_s": 10, "remaining_pct": 50,
+                     "codexbar": {"freshness": "fresh", "age_s": 10, "extra": nested}},
+            "cursor": {"status": "cool", "freshness": "fresh", "age_s": 15, "remaining_pct": 60},
+        },
+    }
+    gc_deep_res = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=gc_deep, now=now,
+    )
+    assert gc_deep_res.admitted and gc_deep_res.meter is not None and gc_deep_res.meter.telemetry == "fresh"
+    gc_malformed = {
+        "generated_at": now.isoformat(),
+        "agents": {
+            "grok": {"status": "cool", "login_state": ["NEED_LOGIN"], "freshness": "fresh", "age_s": 10, "remaining_pct": 50},
+            "cursor": {"status": "cool", "freshness": "fresh", "age_s": 15, "remaining_pct": 60},
+        },
+    }
+    gc_bad_res = adm.evaluate(
+        "workspace-write", empty_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=gc_malformed, now=now,
+    )
+    assert gc_bad_res.admitted and gc_bad_res.meter is not None
+    assert gc_bad_res.meter.telemetry == "unavailable:invalid_budget" and gc_bad_res.meter.cap == 2
+    rl_tasks = tmp_path / "gc-rl-tasks"
+    _record(rl_tasks, "grok-rl", status="rate_limited", agent="grok", finished_at=now.isoformat())
+    gc_bad_rl = adm.evaluate(
+        "workspace-write", rl_tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=gc_malformed, now=now,
+    )
+    assert not gc_bad_rl.admitted and gc_bad_rl.meter is not None
+    assert gc_bad_rl.meter.telemetry == "unavailable:invalid_budget" and gc_bad_rl.meter.defer == adm.MeterDefer.RATE_LIMITED
 
     # Fresh reading with 8 live hits cap 8; aggregate stale flag does not lower a fresh meter's cap;
     # missing row drops to unknown cap 2.
@@ -375,6 +461,63 @@ def test_stale_lane_does_not_disable_another_meters_quota_deferral(tmp_path, pro
     assert gc.meter.telemetry == "stale:probe_stale"
     assert gc.meter.cap == 2
 
+    # F2: Monitor's serve-time aggregate staleness withdrawal (_aged_routing_budget + _public_routing_budget)
+    # must not turn two fresh, healthy Grok/Cursor rows into binding_unverified, while genuinely unhealthy
+    # or non-withdrawn ineligible rows stay unverified.
+    from lu_machinery.api import state_router
+
+    raw_withdrawn = {
+        "generated_at": (now - timedelta(seconds=10)).isoformat(),
+        "diagnostics": {"stale": True, "data_age_s": 1200.0, "stale_threshold_s": 900},
+        "recommendation": {"primary_agent_for_code": "codex", "warnings": []},
+        "ranked_by_headroom": [{"lane": "cursor", "status": "cool"}],
+        "agents": {
+            "grok": {"status": "cool", "eligible": True, "freshness": "fresh", "age_s": 10.0, "remaining_pct": 0.0,
+                     "health": {"healthy": True, "eligible": True}},
+            "cursor": {"status": "cool", "eligible": True, "freshness": "fresh", "age_s": 10.0, "remaining_pct": 0.0,
+                       "health": {"healthy": True, "eligible": True}},
+        },
+    }
+    projected = state_router._public_routing_budget(
+        state_router._aged_routing_budget(raw_withdrawn, 5.0, claude_fields={})
+    )
+    gc_withdrawn = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=projected, now=now,
+    )
+    assert not gc_withdrawn.admitted and gc_withdrawn.meter is not None
+    assert gc_withdrawn.meter.telemetry == "fresh" and gc_withdrawn.meter.defer == adm.MeterDefer.EXHAUSTED
+
+    # Genuine ineligibility (unhealthy under withdrawal, or explicit eligible=False without withdrawal) stays unverified.
+    unhealthy_withdrawn = json.loads(json.dumps(raw_withdrawn))
+    unhealthy_withdrawn["agents"]["cursor"]["health"] = {"healthy": False, "eligible": False}
+    projected_unhealthy = state_router._public_routing_budget(
+        state_router._aged_routing_budget(unhealthy_withdrawn, 5.0, claude_fields={})
+    )
+    gc_unhealthy = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=projected_unhealthy, now=now,
+    )
+    assert gc_unhealthy.admitted and gc_unhealthy.meter is not None
+    assert gc_unhealthy.meter.telemetry == "unavailable:binding_unverified" and gc_unhealthy.meter.cap == 2
+
+    non_withdrawn_inelig = {
+        "generated_at": now.isoformat(),
+        "diagnostics": {"stale": False, "data_age_s": 10.0, "stale_threshold_s": 900},
+        "agents": {
+            "grok": {"status": "cool", "eligible": True, "freshness": "fresh", "age_s": 10.0, "remaining_pct": 50.0,
+                     "health": {"healthy": True}},
+            "cursor": {"status": "cool", "eligible": False, "freshness": "fresh", "age_s": 10.0, "remaining_pct": 50.0,
+                       "health": {"healthy": True}},
+        },
+    }
+    gc_inelig = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True,
+        meter="grok+cursor", meter_budget=non_withdrawn_inelig, now=now,
+    )
+    assert gc_inelig.admitted and gc_inelig.meter is not None
+    assert gc_inelig.meter.telemetry == "unavailable:binding_unverified" and gc_inelig.meter.cap == 2
+
 
 def test_unknown_meter_admits_at_most_the_unknown_cap(tmp_path, probe):
     """Defect class: an unknown or stale meter admits up to the full 8-worker ceiling instead of the reduced unknown cap."""
@@ -429,7 +572,7 @@ def test_unknown_meter_admits_at_most_the_unknown_cap(tmp_path, probe):
     assert not refused_clamped.admitted and refused_clamped.meter is not None and refused_clamped.meter.cap == 2
 
 
-def test_admit_line_names_the_telemetry_state(tmp_path, probe):
+def test_admit_line_names_the_telemetry_state(tmp_path, probe, capsys):
     """Defect class: admission output or task record omits telemetry state or effective cap."""
     tasks = tmp_path / "tasks"
     now = datetime.now(UTC)
@@ -465,9 +608,11 @@ def test_admit_line_names_the_telemetry_state(tmp_path, probe):
     assert "effective cap 2, telemetry=unavailable:http_403" in unavailable.summary()
     assert unavailable.to_record()["meter_telemetry"] == "unavailable:http_403"
 
-    # Not checked (unmetered write + early host-only precheck)
+    # Not checked (unmetered write keeps host-only summary for capacity_pick while dispatch report names it)
     unmetered = adm.evaluate("workspace-write", tasks, thresholds=limits, pid_alive=lambda _pid: True, now=now)
-    assert "meter telemetry=not checked, effective cap=none" in unmetered.summary()
+    assert "meter telemetry=not checked" not in unmetered.summary()
+    host_admission.report(unmetered)
+    assert "meter telemetry=not checked, effective cap=none" in capsys.readouterr().err
     assert unmetered.to_record()["meter_telemetry"] == "not checked"
     assert unmetered.to_record()["meter_effective_cap"] is None
 

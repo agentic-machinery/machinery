@@ -420,10 +420,9 @@ class AdmissionDecision:
             return f"mode {self.mode} is exempt (read-only dispatches are not admission-checked)"
         limits = self.thresholds
         probe = self.probe
-        parts = [
-            f"live write workers {self.live_write_workers}/{limits.max_live_write_workers}",
-            self.meter_status_clause(),
-        ]
+        parts = [f"live write workers {self.live_write_workers}/{limits.max_live_write_workers}"]
+        if self.meter is not None:
+            parts.append(self.meter.clause())
         mem = probe.mem_available_gib
         parts.append(
             f"MemAvailable {mem:.1f} GiB (floor {limits.min_mem_available_gib:g} GiB)"
@@ -1244,6 +1243,133 @@ def _probe_telemetry(
     return "unavailable:age_missing" if raw_age is None else "unavailable:age_invalid"
 
 
+def _scalar_str(mapping: Mapping[str, Any], key: str) -> tuple[str | None, bool]:
+    if key not in mapping or mapping[key] is None:
+        return None, True
+    value = mapping[key]
+    return (value, True) if isinstance(value, str) else (None, False)
+
+
+def _scalar_bool(mapping: Mapping[str, Any], key: str) -> tuple[bool | None, bool]:
+    if key not in mapping or mapping[key] is None:
+        return None, True
+    value = mapping[key]
+    return (value, True) if isinstance(value, bool) else (None, False)
+
+
+def _project_route_record(raw: object) -> tuple[dict[str, Any] | None, bool]:
+    """Validate and project only bounded fields admission reads, without deep-copying untrusted subtrees."""
+    if raw is None:
+        return {}, True
+    if not isinstance(raw, Mapping):
+        return None, False
+    out: dict[str, Any] = {}
+    for key in ("status", "status_source", "freshness", "login_state", "probe_state"):
+        val, ok = _scalar_str(raw, key)
+        if not ok:
+            return None, False
+        if key in raw:
+            out[key] = val
+    for key in ("stale", "eligible"):
+        bval, ok = _scalar_bool(raw, key)
+        if not ok:
+            return None, False
+        if key in raw:
+            out[key] = bval
+    for key in ("age_s", "remaining_pct"):
+        if key in raw:
+            out[key] = raw[key]
+    if "health" in raw and raw["health"] is not None:
+        health = raw["health"]
+        if not isinstance(health, Mapping):
+            return None, False
+        healthy, ok = _scalar_bool(health, "healthy")
+        if not ok:
+            return None, False
+        if "healthy" in health:
+            out["health"] = {"healthy": healthy}
+    if "codexbar" in raw and raw["codexbar"] is not None:
+        cb = raw["codexbar"]
+        if not isinstance(cb, Mapping):
+            return None, False
+        cb_out: dict[str, Any] = {}
+        for key in ("freshness", "login_state", "probe_state"):
+            val, ok = _scalar_str(cb, key)
+            if not ok:
+                return None, False
+            if key in cb:
+                cb_out[key] = val
+        cb_stale, ok = _scalar_bool(cb, "stale")
+        if not ok:
+            return None, False
+        if "stale" in cb:
+            cb_out["stale"] = cb_stale
+        for key in ("age_s", "weekly_remaining_pct", "primary_remaining_pct", "secondary_remaining_pct"):
+            if key in cb:
+                cb_out[key] = cb[key]
+        if isinstance(cb.get("provider_windows"), Mapping) and isinstance(cb["provider_windows"].get("auto"), Mapping):
+            cb_out["provider_windows"] = {"auto": {"remaining_pct": cb["provider_windows"]["auto"].get("remaining_pct")}}
+        if isinstance(cb.get("claude_gpt_windows"), Mapping):
+            cg = cb["claude_gpt_windows"]
+            cb_out["claude_gpt_windows"] = {
+                win: {"remaining_pct": _mapping(cg.get(win)).get("remaining_pct")}
+                for win in ("five_hour", "weekly")
+                if isinstance(cg.get(win), Mapping)
+            }
+        out["codexbar"] = cb_out
+    if isinstance(raw.get("provider_windows"), Mapping) and isinstance(raw["provider_windows"].get("auto"), Mapping):
+        out["provider_windows"] = {"auto": {"remaining_pct": raw["provider_windows"]["auto"].get("remaining_pct")}}
+    if isinstance(raw.get("claude_gpt_windows"), Mapping):
+        cg = raw["claude_gpt_windows"]
+        out["claude_gpt_windows"] = {
+            win: {"remaining_pct": _mapping(cg.get(win)).get("remaining_pct")}
+            for win in ("five_hour", "weekly")
+            if isinstance(cg.get(win), Mapping)
+        }
+    if "runtime" in raw and raw["runtime"] is not None:
+        rt = raw["runtime"]
+        if not isinstance(rt, Mapping):
+            return None, False
+        rt_out: dict[str, Any] = {}
+        for key in ("headroom_blocked", "rate_limited", "last_rate_limited_at"):
+            if key in rt:
+                rt_out[key] = rt[key]
+        if "models_rate_limited" in rt:
+            models = rt["models_rate_limited"]
+            rt_out["models_rate_limited"] = list(models) if isinstance(models, list) else models
+        out["runtime"] = rt_out
+    return out, True
+
+
+def _snapshot_authorization_withdrawn(budget: Mapping[str, Any]) -> bool:
+    """True when Monitor's serve-time aggregate staleness withdrawal rewrote lane eligible/status fields."""
+    diagnostics = _mapping(budget.get("diagnostics"))
+    if diagnostics.get("stale") is not True:
+        return False
+    data_age = diagnostics.get("data_age_s")
+    if isinstance(data_age, bool) or not isinstance(data_age, (int, float)) or not math.isfinite(data_age):
+        return False
+    threshold = diagnostics.get("stale_threshold_s", 900.0)
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(threshold):
+        threshold = 900.0
+    if data_age <= threshold:
+        return False
+    rec = _mapping(budget.get("recommendation"))
+    if rec.get("primary_agent_for_code") is not None:
+        return False
+    ranked = budget.get("ranked_by_headroom")
+    return not (isinstance(ranked, list) and ranked)
+
+
+def _strip_withdrawn_eligible(record: Mapping[str, Any], *, withdrawn: bool) -> Mapping[str, Any]:
+    """Ignore an aggregate-withdrawn ``eligible=False`` only when the route's own health proves it was healthy."""
+    if not withdrawn or record.get("eligible") is not False:
+        return record
+    if _mapping(record.get("health")).get("healthy") is not True:
+        return record
+    return {k: v for k, v in record.items() if k != "eligible"}
+
+
 def _meter_observation(meter: str, budget: Mapping[str, Any]) -> tuple[Mapping[str, Any], tuple[Mapping[str, Any], ...]]:
     """Use account or group quota data. Runtime blocks remain attributed to their route."""
     agents = _mapping(budget.get("agents"))
@@ -1267,13 +1393,19 @@ def _meter_observation(meter: str, budget: Mapping[str, Any]) -> tuple[Mapping[s
     if meter == "grok+cursor":
         from lu_machinery.fleet import credit_lane
 
-        grok, cursor = _mapping(agents.get("grok")), _mapping(agents.get("cursor"))
+        grok_proj, grok_ok = _project_route_record(agents.get("grok"))
+        cursor_proj, cursor_ok = _project_route_record(agents.get("cursor"))
+        if not grok_ok or not cursor_ok or grok_proj is None or cursor_proj is None:
+            return {"_malformed": True}, (_mapping(agents.get("grok")), _mapping(agents.get("cursor")))
+        withdrawn = _snapshot_authorization_withdrawn(budget)
+        grok_check = _strip_withdrawn_eligible(grok_proj, withdrawn=withdrawn)
+        cursor_check = _strip_withdrawn_eligible(cursor_proj, withdrawn=withdrawn)
         record = (
-            credit_lane.merge_grok_cursor_record(grok, cursor)
-            if credit_lane.grok_cursor_bindings_verified(grok, cursor)
+            credit_lane.merge_grok_cursor_record(grok_check, cursor_check)
+            if credit_lane.grok_cursor_bindings_verified(grok_check, cursor_check)
             else {}
         )
-        return record, (grok, cursor)
+        return record, (grok_proj, cursor_proj)
     gemini = _mapping(agents.get("gemini"))
     if meter == "agy:claude_gpt":
         groups = _mapping(gemini.get("claude_gpt_windows")) or _mapping(
@@ -1310,12 +1442,14 @@ def _meter_rate_limited(record: Mapping[str, Any], meter: str, now: datetime) ->
     event_age = _age_s(runtime.get("last_rate_limited_at"), now)
     if event_age is None or not 0 <= event_age < LANE_RUNTIME_WINDOW_S:
         return False
-    models = runtime.get("models_rate_limited")
-    if not meter.startswith("agy:") or not isinstance(models, list) or not models:
+    if not meter.startswith("agy:"):
         return True
-    return any(
-        not isinstance(model, str) or subscription_meter("agy", model=model) == meter for model in models
-    )
+    # Monitor publishes one latest timestamp and one model set for the whole AGY window;
+    # veto an AGY group only when every rate-limited model in that summary belongs to it.
+    models = runtime.get("models_rate_limited")
+    if not isinstance(models, list) or not models or not all(isinstance(model, str) for model in models):
+        return False
+    return {subscription_meter("agy", model=model) for model in models} == {meter}
 
 
 def _meter_defer(
@@ -1336,6 +1470,8 @@ def _meter_defer(
     runtime_defer = (
         MeterDefer.RATE_LIMITED if any(_meter_rate_limited(route, meter, now) for route in routes) else None
     )
+    if record.get("_malformed"):
+        return "unavailable:invalid_budget", runtime_defer
 
     if meter.startswith("claude:"):
         row = routes[0]
@@ -1375,10 +1511,15 @@ def _meter_defer(
                 return "unavailable:meter_missing", runtime_defer
             if not record:
                 return "unavailable:binding_unverified", runtime_defer
-            for component in (grok, cursor):
-                comp_telemetry = _probe_telemetry(component, remaining_max_age)
+            comp_states = [_probe_telemetry(component, remaining_max_age) for component in (grok, cursor)]
+            for comp_telemetry in comp_states:
                 if comp_telemetry.startswith("stale:"):
                     return comp_telemetry, runtime_defer
+            for comp_telemetry in comp_states:
+                if comp_telemetry != "fresh":
+                    return comp_telemetry, runtime_defer
+            if any(_usable_remaining_pct(component) is None for component in (grok, cursor)):
+                return "unavailable:allowance_missing", runtime_defer
         elif meter == "agy:claude_gpt":
             if not routes[0]:
                 return "unavailable:meter_missing", runtime_defer
