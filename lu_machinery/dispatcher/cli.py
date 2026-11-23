@@ -594,8 +594,10 @@ def _dispatch(args) -> int:
         raise ValueError("task id already exists; choose a new task id")
     with admission.record_refusal(args, agent, StartRefusal.ELIGIBILITY):
         linkage = _parent_linkage(task_id)
-        # A turn's child never borrows a tree, its turn's or any other: settlement judges the turn on its own.
-        if args.cwd and linkage.get("parent_stream") is not None:
+        # A turn's child never borrows a tree, its turn's or any other: settlement judges the turn on its own. An
+        # inherited turn id counts even when the turn's record is gone or lost its orchestrator key.
+        parent = os.environ.get(ownership.TASK_ID_ENV) or ""
+        if args.cwd and (linkage.get("parent_stream") is not None or parent.startswith(host_admission.TURN_TASK_PREFIX)):
             raise ValueError("orchestrator_turn_writer_refused: a task an orchestrator turn dispatches cannot borrow "
                              "a tree (--cwd)")
     repo, info = git.resolve_repo(args.repo)
@@ -948,8 +950,9 @@ def _dispatch(args) -> int:
                 if orchestrator is None:
                     worker.start(spec, record, prompt, args.hard_timeout)
                 else:
-                    worker.start(spec, record, prompt, args.hard_timeout, progress=launch,
-                                 scope_limits=(turn_runtime_s, host_admission.TURN_STOP_TIMEOUT_S))
+                    start_by = host_admission.turn_start_deadline(record[host_admission.TURN_LEASE_KEY], turn_runtime_s)
+                    worker.start(spec, record, prompt, args.hard_timeout, progress=launch, scope_limits=(
+                        turn_runtime_s, host_admission.TURN_STOP_TIMEOUT_S, start_by or 0.0))
         except admission.LaunchRefused as exc:
             # The record is terminal: preserve the account/placement port's no-relaunch refusal.
             print(f"dispatcher: failed to spawn worker for {task_id!r}: {exc}", file=sys.stderr)

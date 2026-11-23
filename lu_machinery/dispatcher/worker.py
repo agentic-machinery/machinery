@@ -538,14 +538,15 @@ def _guard_launch_cleanup(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
 
 
 def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, progress: dict | None = None,
-          scope_limits: tuple[int, int] | None = None) -> None:
+          scope_limits: tuple[int, int, float] | None = None) -> None:
     """Publish the task record and spawn its supervisor.
 
     ``progress`` is the caller's launch progress: ``progress["record"]`` is set immediately before the record
     that names the prompt file can be published, and ``progress["started"]`` immediately before the first
     supervisor spawn attempt, so a failure before it (record, prompt or log setup) proves no supervisor ran.
-    ``scope_limits`` (an orchestrator turn's ``RuntimeMaxSec`` and ``TimeoutStopSec``) bounds a scope launch
-    and refuses the plain-process fallback.
+    ``scope_limits`` (an orchestrator turn's ``RuntimeMaxSec``, ``TimeoutStopSec`` and latest scope start)
+    bounds a scope launch and refuses the plain-process fallback. A launch refused before any of its processes
+    started (``LaunchRefused.never_started``) sets ``progress["refused_before_start"]`` once its failure is recorded.
     """
     from lu_machinery.orchestration.dispatch_admission import new_admission_hold
 
@@ -594,6 +595,8 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, p
         # overwrite another run, or a supervisor that has already settled.
         # Recording that failure is cleanup: its own error must not replace the launch error.
         _guard_launch_cleanup(path, spec, record, exc)
+        if progress is not None and isinstance(exc, admission.LaunchRefused) and exc.never_started:
+            progress["refused_before_start"] = True
         raise
 
 
@@ -779,6 +782,8 @@ def _release_stream(record: dict, *, evidence_lost: bool) -> None:
         if (stream is None or stream != orchestrator_stream(record) or not _finished(published)
                 or published.get("launch_mode") != "scope"
                 or dispatch_isolation.listed_task_services(published) != []
+                # The lease the dispatcher claimed and handed this supervisor, never one a rewritten record names.
+                or published.get(host_admission.TURN_LEASE_KEY) != record.get(host_admission.TURN_LEASE_KEY)
                 or _provider_alive(published) is not False):
             return
     except Exception:  # any unreadable state is not proof, and never ends this settlement

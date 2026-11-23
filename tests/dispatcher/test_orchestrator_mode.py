@@ -35,9 +35,12 @@ _LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="scope", lau
                  provider_pgid=None)
 
 
-def _lease(state="active", session_state="open", expires_in=600):
+def _lease(state="active", session_state="open", expires_in=600, **fields):
+    """Monitor's projection of one lease on STREAM, as its stream route answers."""
     expires = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
-    return {"state": state, "session_state": session_state, "expires_at": expires, "holder": {"agent": "claude"}}
+    return {"stream_id": STREAM, "session_id": "session-1", "lease_id": "lease-1", "generation": 2,
+            "fencing_token": 2, "state": state, "session_state": session_state, "expires_at": expires,
+            "holder": {"agent": "claude", "harness": "codex-cli", "instance_id": "legacy-1"}, **fields}
 
 
 @pytest.fixture
@@ -341,6 +344,7 @@ def _conflict(detail):
         ({"lease.holder.task_id": "turn-2"}, "orchestrator_lease_unknown"),
         ({"lease.holder.host_id": "elsewhere"}, "orchestrator_lease_unknown"),
         ({"lease.holder.process_id": _MISSING}, "orchestrator_lease_unknown"),
+        ({"lease.holder.process_id": float(os.getpid())}, "orchestrator_lease_unknown"),  # equal, but not an integer
         ({"lease.generation": True}, "orchestrator_lease_unknown"),
         ({"lease.fencing_token": 0}, "orchestrator_lease_unknown"),
         ({"lease.ttl_seconds": 7200}, "orchestrator_lease_unknown"),
@@ -414,13 +418,21 @@ def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_stor
         (_lease(), "orchestrator_stream_leased"),
         (_lease(session_state="rolling"), "orchestrator_stream_leased"),
         (_lease(state="expired", expires_in=-5), "orchestrator_stream_leased"),  # a turn never supersedes it
-        (_lease(state="released"), None),
+        (_lease(state="released", session_state="closed"), None),
+        (_lease(state="released", session_state="open"), "orchestrator_lease_unknown"),  # the states disagree
+        (_lease(state="active", session_state="closed"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", stream_id="epic:8"), "orchestrator_lease_unknown"),
+        ({key: value for key, value in _lease(state="released", session_state="closed").items()
+          if key in {"state", "session_state", "expires_at"}}, "orchestrator_lease_unknown"),  # no identity
+        (_lease(holder=None), "orchestrator_lease_unknown"),
+        (_lease(holder={"agent": "claude"}), "orchestrator_lease_unknown"),
+        (_lease(generation=True), "orchestrator_lease_unknown"),
         ({**_lease(), "expires_at": "soon"}, "orchestrator_lease_unknown"),
         ("lease", "orchestrator_lease_unknown"),
         (_MISSING, "orchestrator_lease_unknown"),  # no lease field is not the projection's explicit null
         ({key: value for key, value in _lease().items() if key != "session_state"}, "orchestrator_lease_unknown"),
         (_lease(state="held"), "orchestrator_lease_unknown"),
-        ({**_lease(state="released"), "expires_at": None}, "orchestrator_lease_unknown"),
+        ({**_lease(state="released", session_state="closed"), "expires_at": None}, "orchestrator_lease_unknown"),
     ],
 )
 def test_a_dry_run_reads_any_active_lease_as_busy(monkeypatch, lease, refused):
@@ -471,6 +483,60 @@ def test_a_pre_launch_abort_releases_the_lease_only_on_the_dispatchers_own_progr
     assert releases == (expected if released else [])
 
 
+def _refused_launch(task_store, monkeypatch, tmp_path, error, *, record_change=None):
+    """Run reserve() and worker.start as dispatch does, with the scope layer raising ``error``; the releases made."""
+    from lu_machinery.dispatcher import admission
+    from lu_machinery.dispatcher.types import TaskSpec
+    from lu_machinery.orchestration import dispatch_isolation
+
+    envelope = {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM}}
+    releases = []
+    monkeypatch.setattr(host_admission, "claim_turn", lambda *_a, **_k: envelope)
+    monkeypatch.setattr(host_admission, "release_turn", lambda lease, **kwargs: releases.append(lease))
+
+    def spawn(*_args, **_kwargs):
+        if record_change:  # what another writer leaves in the record between the failure and its read-back
+            path = store.record_path("turn-1")
+            path.write_text(json.dumps({**json.loads(path.read_text()), **record_change}))
+        raise error
+
+    monkeypatch.setattr(dispatch_isolation, "spawn_detached_worker", spawn)
+    decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+    launch = {"record": False, "started": False}
+    with pytest.raises(admission.LaunchRefused), host_admission.reserve(
+            "turn-1", "workspace-write", decision, agent="codex", disk_guard=lambda: False,
+            orchestrator={"stream": STREAM}, run_nonce="c" * 32, turn_ttl_s=3600, launch=launch) as hold:
+        path = store.record_path("turn-1")
+        spec = TaskSpec("turn-1", "codex", "m", None, "workspace-write", tmp_path, path.with_suffix(".prompt"),
+                        path.with_suffix(".result"))
+        record = {**hold, "status": "spawning", "pid": None, "prompt_file": str(spec.prompt_file)}
+        worker.start(spec, record, b"prompt", 60, progress=launch, scope_limits=(660, 30, 4e9))
+    return envelope, releases
+
+
+@pytest.mark.parametrize(("after_popen", "record_change", "released"), [
+    (False, None, True),  # C-6991: the probe's fallback refusal or the start deadline, before any Popen
+    (True, None, False),  # systemd-run was started (even if it exited): a scope may hold it
+    (False, {"run_nonce": "f" * 32}, False),  # the record read back is another run's
+    (False, {"turn_lease": {"monitor": "http://127.0.0.1:9", "lease": {}}}, False),  # it holds another lease
+    (False, {"pid": 4242}, False),  # it names a process
+])
+def test_a_launch_refused_before_any_process_releases_only_its_own_lease(task_store, monkeypatch, tmp_path,
+                                                                          after_popen, record_change, released):
+    """Defect class T4: a launch the scope layer refused before any of its processes started keeps a lease no turn
+    holds, or a refusal after systemd-run started, or a record that is not this run's unstarted failure, releases a
+    lease a running scope may hold."""
+    from lu_machinery.orchestration import dispatch_isolation
+
+    error = (dispatch_isolation.DispatchIsolationError if after_popen else dispatch_isolation.LaunchNotStarted)(
+        "refused")
+    envelope, releases = _refused_launch(task_store, monkeypatch, tmp_path, error, record_change=record_change)
+    assert releases == ([envelope] if released else [])
+    if record_change is None:  # this run's own record: the failed launch is recorded either way
+        state = store.read("turn-1")
+        assert (state["status"], state["pid"], state["returncode_reason"]) == ("failed", None, "dispatch_isolation_failed")
+
+
 @pytest.mark.parametrize(
     ("change", "released"),
     [
@@ -488,6 +554,7 @@ def test_a_pre_launch_abort_releases_the_lease_only_on_the_dispatchers_own_progr
         ({"orchestrator": {"stream": "epic:8"}}, False),  # the published record names another stream
         ({"orchestrator": None}, False),
         ({"run_nonce": "f" * 32}, False),  # the published record is another run's
+        ({"turn_lease": {"monitor": "http://127.0.0.1:9", "lease": {"stream_id": STREAM}}}, False),  # rewritten
     ],
 )
 def test_settlement_releases_the_lease_only_on_proof_the_run_is_gone(task_store, monkeypatch, change, released):
@@ -522,11 +589,17 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
     envelope, nonce = hold["turn_lease"], hold["run_nonce"]
     exact = dict(stream=STREAM, task_id="turn-1", run_nonce=nonce)
     assert monitor.client.stream(STREAM)["lease"]["state"] == "active"
-    for wrong in (dict(exact, task_id="turn-2"), dict(exact, run_nonce="f" * 32), dict(exact, stream="epic:8")):
-        assert host_admission.release_turn(envelope, **wrong).startswith("orchestrator_lease_release_refused")
-    for monitor_spelling in (monitor.base.replace("127.0.0.1", "localhost"), "http://127.0.0.1:9"):
-        reason = host_admission.release_turn({**envelope, "monitor": monitor_spelling}, **exact)
-        assert reason.startswith(("orchestrator_lease_release_refused", "orchestrator_lease_release_unknown")), reason
+    contacted = []
+    with monkeypatch.context() as patch:
+        patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, **k: contacted.append(self.base))
+        for wrong in (dict(exact, task_id="turn-2"), dict(exact, run_nonce="f" * 32), dict(exact, stream="epic:8")):
+            assert host_admission.release_turn(envelope, **wrong).startswith("orchestrator_lease_release_refused")
+        for monitor_spelling in (monitor.base.replace("127.0.0.1", "localhost"), "", "http://example.invalid:80", 7):
+            reason = host_admission.release_turn({**envelope, "monitor": monitor_spelling}, **exact)
+            assert reason.startswith("orchestrator_lease_release_refused"), (monitor_spelling, reason)
+        patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, **k: {"outcome": "released"})
+        assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
+    assert contacted == []
     calls = []
 
     def unreachable(self, *args, **kwargs):
@@ -607,19 +680,21 @@ def test_a_turn_launch_passes_its_bounds_and_refuses_fallback(monkeypatch, tmp_p
         raise dispatch_isolation.DispatchIsolationError("forced: no scope")
 
     monkeypatch.setattr(dispatch_isolation, "spawn_detached_worker", spawn)
-    for limits in ((7800, 30), None):
-        with pytest.raises(admission.LaunchRefused):
+    for limits in ((7800, 30, 1234.5), None):
+        with pytest.raises(admission.LaunchRefused) as refused:
             admission.spawn_supervisor(["true"], task_id="turn-1", run_nonce="n", cwd=tmp_path, stderr=None,
                                        stderr_log=tmp_path / "log", env={}, scope_limits=limits)
+        assert refused.value.never_started is False
     bounded, ordinary = seen
-    assert (bounded["allow_fallback"], bounded["runtime_max_s"], bounded["stop_timeout_s"]) == (False, 7800, 30)
-    assert not {"allow_fallback", "runtime_max_s", "stop_timeout_s"} & set(ordinary)  # every other task unchanged
+    assert (bounded["allow_fallback"], bounded["runtime_max_s"], bounded["stop_timeout_s"], bounded["start_by"]) == (
+        False, 7800, 30, 1234.5)
+    assert not {"allow_fallback", "runtime_max_s", "stop_timeout_s", "start_by"} & set(ordinary)  # others unchanged
 
 
 # --- writers ------------------------------------------------------------------------------------------------------
 
 
-def test_no_task_borrows_a_turn_tree(task_store, tmp_path):
+def test_no_task_borrows_a_turn_tree(task_store, tmp_path, monkeypatch):
     """Defect class T6: a --cwd task attaches to an orchestrator turn's tree because the turn's record is missing,
     archived, damaged or lost its orchestrator key, so the turn's tree changes after it was judged."""
     trees = tmp_path / "trees"
@@ -632,6 +707,20 @@ def test_no_task_borrows_a_turn_tree(task_store, tmp_path):
     assert "orchestrator turn on epic:7" in host_admission.turn_tree_refusal(trees / "legacy-turn")
     store.record_path("damaged").write_text("{")
     assert "cannot be read" in host_admission.turn_tree_refusal(trees / "damaged")
+    archive = task_store / "archive"
+    archive.mkdir()
+    store._write(archive / "archived-turn.json", _orchestrator_record("archived-turn"))
+    assert "orchestrator turn on epic:7" in host_admission.turn_tree_refusal(trees / "archived-turn")
+    real_lstat = os.lstat
+
+    def denied(path, *args, **kwargs):  # what an unreadable store directory answers (3.14 is_file() hides it)
+        if os.fspath(path).endswith("hidden-turn.json"):
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", denied)
+        assert "cannot be read" in host_admission.turn_tree_refusal(trees / "hidden-turn")
     plain = _orchestrator_record("worker-1")
     plain.pop("orchestrator")
     _write(plain)
@@ -925,6 +1014,9 @@ def test_a_turn_end_to_end_holds_its_lease_links_children_and_never_shares_its_t
     attach = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "borrower", "--prompt", "edit",
                      "--cwd", record["worktree_path"], task_env="turn-1", expected=2)
     assert "orchestrator_turn_writer_refused: a task an orchestrator turn dispatches cannot borrow" in attach.stderr
+    orphan = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "orphan", "--prompt", "edit",
+                     "--cwd", record["worktree_path"], task_env="turn-9", expected=2)  # turn-9 has no record
+    assert "orchestrator_turn_writer_refused: a task an orchestrator turn dispatches cannot borrow" in orphan.stderr
     outsider = box.run("dispatch", "--agent", "sol", "--model", "echo", "--task-id", "outsider", "--prompt", "edit",
                        "--cwd", record["worktree_path"], expected=2)
     assert "orchestrator_turn_writer_refused: turn-1 is an orchestrator turn's tree" in outsider.stderr

@@ -988,8 +988,9 @@ def test_scope_limits_are_whole_positive_seconds_given_together(runtime, stop):
 
 
 def test_a_bounded_scope_carries_its_limits_and_never_falls_back(tmp_path: Path):
-    """Defect class T5: a turn's scope starts without RuntimeMaxSec, TimeoutStopSec and a control-group kill, or a
-    turn whose host cannot isolate it runs as a plain process that nothing bounds."""
+    """Defect class T5: a turn's scope starts without RuntimeMaxSec, TimeoutStopSec and a control-group kill, starts
+    after its lease can no longer cover run and stop, or a turn whose host cannot isolate it runs as a plain process
+    that nothing bounds."""
     bindir = _install_fakes(tmp_path)
     argv_log = tmp_path / "argv.txt"
     env = _env(bindir, FAKE_SYSTEMD_RUN="exec", FAKE_ARGV_LOG=str(argv_log))
@@ -1009,10 +1010,34 @@ def test_a_bounded_scope_carries_its_limits_and_never_falls_back(tmp_path: Path)
     def popen(*_args, **_kwargs):
         pytest.fail("a bounded launch fell back to a plain process")
 
-    with pytest.raises(iso.DispatchIsolationError, match="forced"):
+    # Past the start deadline (a slow setup), the scope is refused before systemd-run runs.
+    argv_log.unlink()
+    with pytest.raises(iso.LaunchNotStarted, match="orchestrator_lease_budget_short"):
+        iso.spawn_detached_worker(
+            [_PY, "-c", "pass"], task_id="turn-1", run_nonce="abc124", env=env, probe_env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            subtree_path=_subtree(tmp_path), allow_fallback=False, runtime_max_s=7800, stop_timeout_s=30,
+            start_by=time.time() - 1,
+        )
+    assert not argv_log.exists()
+
+    with pytest.raises(iso.LaunchNotStarted, match="forced"):
         iso.spawn_detached_worker([_PY, "-c", "pass"], task_id="turn-2", run_nonce="n", popen=popen,
                                   probe_env={"LU_DISPATCH_ISOLATION": "fallback"}, allow_fallback=False,
                                   runtime_max_s=7800, stop_timeout_s=30)
+
+
+def test_a_refusal_after_systemd_run_started_is_never_a_launch_that_never_started(tmp_path: Path):
+    """Defect class T4: a bounded launch whose systemd-run was started, and exited before the worker, is reported as
+    never started, so its turn's lease is released while a scope of it may run."""
+    bindir = _install_fakes(tmp_path)
+    env = _env(bindir, FAKE_SYSTEMD_RUN="fail")
+    with pytest.raises(iso.DispatchIsolationError) as refused:
+        iso.spawn_detached_worker([_PY, "-c", "pass"], task_id="turn-3", run_nonce="n3", env=env, probe_env=env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  subtree_path=_subtree(tmp_path), timeout_s=2, allow_fallback=False,
+                                  runtime_max_s=7800, stop_timeout_s=30)
+    assert not isinstance(refused.value, iso.LaunchNotStarted), refused.value
 
 
 def test_scope_unit_names_differ_for_the_same_task_and_nonce():

@@ -116,6 +116,14 @@ class DispatchIsolationError(RuntimeError):
     """
 
 
+class LaunchNotStarted(DispatchIsolationError):
+    """A refusal raised before any process of the launch was started: no Popen ran for it, so nothing runs.
+
+    Only two refusals are: a refused fallback after a failed readiness probe, and a scope start past its
+    deadline. A refusal after ``systemd-run`` was started, even one that exited, is never this (C-6991).
+    """
+
+
 @dataclass(frozen=True)
 class ProbeResult:
     """Whether a scoped launch is safe to try, and the first failed check."""
@@ -566,6 +574,7 @@ def spawn_detached_worker(
     subtree_path: Path | None = None,
     runtime_max_s: int | None = None,
     stop_timeout_s: int | None = None,
+    start_by: float | None = None,
 ) -> tuple[subprocess.Popen[Any], WorkerLaunch]:
     """Start ``cmd`` in the slice, or plain ``Popen`` when isolation is unavailable.
 
@@ -580,7 +589,8 @@ def spawn_detached_worker(
     returned as-is. ``start_new_session=True`` matches the historical spawn.
     The launch records how the probe or ``systemd-run`` reached the user bus.
     ``runtime_max_s`` and ``stop_timeout_s`` bound the scope (:func:`build_scope_argv`); a caller that passes
-    them also passes ``allow_fallback=False``, since a plain process has no such bound.
+    them also passes ``allow_fallback=False``, since a plain process has no such bound. ``start_by`` (POSIX
+    seconds) is the latest time the scope may start: past it, the launch is refused before ``systemd-run`` runs.
     """
     if not cmd:
         raise ValueError("worker command is empty")
@@ -603,6 +613,7 @@ def spawn_detached_worker(
                 reason=probed.reason or "isolation probe failed",
                 allow_fallback=allow_fallback,
                 user_bus=resolve_user_bus(os.environ if probe_env is None else probe_env),
+                never_started=True,  # nothing of this launch has run yet
             )
 
     unit = scope_unit_name(task_id, run_nonce)
@@ -621,6 +632,7 @@ def spawn_detached_worker(
         timeout_s=timeout_s,
         runtime_max_s=runtime_max_s,
         stop_timeout_s=stop_timeout_s,
+        start_by=start_by,
     )
     if proc is not None:
         return proc, WorkerLaunch(mode=LAUNCH_SCOPE, unit=unit, user_bus=scope_bus.as_state())
@@ -720,11 +732,13 @@ def _fallback(
     reason: str,
     allow_fallback: bool,
     user_bus: UserBus,
+    never_started: bool = False,
 ) -> tuple[subprocess.Popen[Any], WorkerLaunch]:
+    refused = LaunchNotStarted if never_started else DispatchIsolationError
     if _caller_in_driver_scope():
-        raise DispatchIsolationError("fallback-refused: inside-driver-scope; " + reason)
+        raise refused("fallback-refused: inside-driver-scope; " + reason)
     if not allow_fallback:
-        raise DispatchIsolationError(reason)
+        raise refused(reason)
     _warn(reason)
     proc = popen(list(cmd), **_popen_kwargs(env=env, stdin=stdin, stdout=stdout, stderr=stderr))
     return proc, WorkerLaunch(mode=LAUNCH_FALLBACK, fallback_reason=reason, user_bus=user_bus.as_state())
@@ -745,6 +759,7 @@ def _try_scope(
     timeout_s: float,
     runtime_max_s: int | None = None,
     stop_timeout_s: int | None = None,
+    start_by: float | None = None,
 ) -> tuple[subprocess.Popen[Any] | None, str | None]:
     read_fd, write_fd = os.pipe()
     try:
@@ -756,6 +771,11 @@ def _try_scope(
         argv = build_scope_argv(wrapped, unit=unit, slice_unit=slice_unit, runtime_max_s=runtime_max_s,
                                 stop_timeout_s=stop_timeout_s)
         start = _file_size(stderr_log)
+        # Last before the scope starts, after every blocking step of the launch (probe, record, log).
+        if start_by is not None and (late := time.time() - start_by) > 0:
+            raise LaunchNotStarted(
+                f"orchestrator_lease_budget_short: the scope's start deadline passed {late:.0f} s ago; nothing started"
+            )
         try:
             proc = popen(
                 argv,

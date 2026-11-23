@@ -269,6 +269,14 @@ def _lease_refused(reason: str) -> Refused:
     return Refused(f"❌ {reason} ({clause})", 3, admission_record=record)
 
 
+def _same_typed(value, expected) -> bool:
+    """``value`` equals ``expected`` with the same JSON type at every level: 1.0 or True never stands in for 1."""
+    if isinstance(expected, dict):
+        return (isinstance(value, dict) and set(value) == set(expected)
+                and all(_same_typed(value[key], item) for key, item in expected.items()))
+    return type(value) is type(expected) and value == expected
+
+
 def _claimed_lease(response, stream: str, holder: dict, session_id: str, lease_id: str, ttl_s: int) -> dict | None:
     """The lease envelope part of a claim answer, when it is exactly the new lease this claim asked for."""
     lease = response.get("lease") if isinstance(response, dict) else None
@@ -279,7 +287,7 @@ def _claimed_lease(response, stream: str, holder: dict, session_id: str, lease_i
     remaining = None if expires is None else (expires - datetime.now(UTC)).total_seconds()
     if not (lease.get("stream_id") == stream and lease.get("session_id") == session_id
             and lease.get("lease_id") == lease_id and lease.get("state") == "active"
-            and lease.get("session_state") == "open" and lease.get("holder") == holder
+            and lease.get("session_state") == "open" and _same_typed(lease.get("holder"), holder)
             and all(type(lease.get(name)) is int and lease[name] > 0 for name in ("generation", "fencing_token"))
             and type(lease.get("ttl_seconds")) is int and lease["ttl_seconds"] == ttl_s
             and remaining is not None and 0 < remaining <= ttl_s + TURN_TTL_MARGIN_S):
@@ -320,17 +328,22 @@ def claim_turn(stream: str, task_id: str, run_nonce: str, *, agent: str, ttl_s: 
                              "started, and a claim Monitor committed holds the stream until an operator releases "
                              "it") from None
     lease = _claimed_lease(response, stream, holder, session_id, lease_id, ttl_s)
-    if lease is None:
+    envelope = None if lease is None else {"monitor": client.base, "lease": lease}
+    try:
+        if envelope is None:
+            raise ValueError("not this turn's new lease")
+        _turn_lease(envelope, stream=stream, task_id=task_id, run_nonce=run_nonce)  # exactly what release accepts
+    except (ValueError, TypeError):
         raise _lease_refused("orchestrator_lease_unknown: Monitor's claim answer is not exactly this turn's new "
-                             "lease; nothing started, and the stream stays held until an operator releases it")
-    return {"monitor": client.base, "lease": lease}
+                             "lease; nothing started, and the stream stays held until an operator releases it") from None
+    return envelope
 
 
 def _turn_lease(envelope, *, stream: str, task_id: str, run_nonce: str):
     """The Monitor base and Lease an envelope names, when it is exactly this turn's; ValueError otherwise."""
     from lu_machinery.session_streams.model import HolderKind, Lease, LeaseHolder
     from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
-    from lu_machinery.session_supervisor.remote import monitor_url
+    from lu_machinery.session_supervisor.remote import RemoteSupervisorError, monitor_url
 
     lease = envelope.get("lease") if isinstance(envelope, dict) else None
     holder = lease.get("holder") if isinstance(lease, dict) else None
@@ -344,7 +357,10 @@ def _turn_lease(envelope, *, stream: str, task_id: str, run_nonce: str):
             and all(type(value) is int for value in (lease["generation"], lease["fencing_token"],
                                                       lease["ttl_seconds"], holder["process_id"]))):
         raise ValueError("the turn's lease envelope is not this run's")
-    base = monitor_url(envelope["monitor"])
+    try:
+        base = monitor_url(envelope["monitor"])
+    except RemoteSupervisorError:
+        raise ValueError("the turn's lease names no loopback Monitor") from None
     if base != envelope["monitor"]:
         raise ValueError("the turn's lease names another Monitor spelling")
     return base, Lease(
@@ -376,22 +392,36 @@ def release_turn(envelope, *, stream: str, task_id: str, run_nonce: str) -> str 
     except Exception as exc:  # the lease authority's boundary: any failure is unknown, never "released"
         return (f"orchestrator_lease_release_unknown: ({type(exc).__name__}); the lease stays held until its exact "
                 "holder or an operator releases it")
-    if not (isinstance(response, dict) and response.get("outcome") == "released"):
-        return "orchestrator_lease_release_unknown: Monitor's answer is not a release"
+    acknowledged = response.get("lease") if isinstance(response, dict) else None
+    if not (isinstance(response, dict) and response.get("outcome") == "released" and isinstance(acknowledged, dict)
+            and acknowledged.get("state") == "released"
+            and all(_same_typed(acknowledged.get(name), envelope["lease"][name])
+                    for name in ("stream_id", "session_id", "lease_id", "generation", "fencing_token", "holder"))):
+        return "orchestrator_lease_release_unknown: Monitor's answer does not acknowledge this exact lease"
     return None
 
 
-def turn_launch_refusal(envelope, runtime_s: int) -> str | None:
-    """Why the turn's lease no longer covers its run and stop (checked right before its scope starts), or None."""
+def turn_start_deadline(envelope, runtime_s: int) -> float | None:
+    """The latest time (POSIX seconds) the turn's scope may start so its lease outlasts run, stop and margin.
+
+    None when the lease's expiry is unreadable. The scope launch itself enforces it again, right before it starts
+    the scope (``dispatch_isolation``), after every blocking step of the launch.
+    """
     lease = envelope.get("lease") if isinstance(envelope, dict) else None
     expires = store.parse_utc_timestamp(lease.get("expires_at")) if isinstance(lease, dict) else None
     if expires is None:
+        return None
+    return expires.timestamp() - (runtime_s + TURN_STOP_TIMEOUT_S + TURN_TTL_MARGIN_S)
+
+
+def turn_launch_refusal(envelope, runtime_s: int) -> str | None:
+    """Why the turn's lease no longer covers its run and stop (checked before its record is published), or None."""
+    deadline = turn_start_deadline(envelope, runtime_s)
+    if deadline is None:
         return "orchestrator_lease_budget_unknown: the turn's lease expiry is unreadable; nothing started"
-    remaining = (expires - datetime.now(UTC)).total_seconds()
-    needed = runtime_s + TURN_STOP_TIMEOUT_S + TURN_TTL_MARGIN_S
-    if remaining < needed:
-        return (f"orchestrator_lease_budget_short: {max(remaining, 0):.0f} s of the turn's lease remain and its run "
-                f"and stop need {needed} s; nothing started")
+    if (late := datetime.now(UTC).timestamp() - deadline) > 0:
+        return (f"orchestrator_lease_budget_short: the turn's lease no longer covers its run and stop "
+                f"({runtime_s + TURN_STOP_TIMEOUT_S + TURN_TTL_MARGIN_S} s) by {late:.0f} s; nothing started")
     return None
 
 
@@ -403,6 +433,7 @@ def turn_tree_refusal(tree) -> str | None:
     The name is the tree's real one, whatever spelling (``TREE/sub/..``) the caller used.
     """
     from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+    from lu_machinery.orchestration.task_record_store import archived_task_record_path
 
     try:
         name = Path(os.path.realpath(tree)).name
@@ -411,14 +442,28 @@ def turn_tree_refusal(tree) -> str | None:
     if name.startswith(TURN_TASK_PREFIX):
         return f"orchestrator_turn_writer_refused: {name:.128} is an orchestrator turn's tree, which no other task writes"
     try:
-        store.record_path(name)
+        hot = store.record_path(name)
     except ValueError:
         return None  # no task id names it
+    unreadable = f"orchestrator_turn_writer_refused: the record of {name:.128}, which may own this tree, cannot be read"
+    present = False
+    for candidate in (hot, archived_task_record_path(hot.parent, name)):
+        try:
+            os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):  # an inaccessible record is not an absent one
+            return unreadable
+        present = True
+    if not present:
+        return None  # no record names it, and every turn's tree carries the turn prefix
     try:
         record = store.read(name, missing_ok=True)
         stream = None if record is None else orchestrator_stream(record)
     except (OSError, ValueError, RecursionError):
-        return f"orchestrator_turn_writer_refused: the record of {name:.128}, which may own this tree, cannot be read"
+        return unreadable
+    if record is None:  # present, yet not a readable regular record
+        return unreadable
     if stream is not None:
         return f"orchestrator_turn_writer_refused: {name:.128} is the orchestrator turn on {stream}"
     return None
@@ -451,9 +496,16 @@ def turn_lease_probe(stream):
         return "orchestrator_lease_unknown: the Monitor lease or its session state is malformed"
     if store.parse_utc_timestamp(lease.get("expires_at")) is None:
         return "orchestrator_lease_unknown: the Monitor lease expiry is unreadable"
+    holder = lease.get("holder")
+    if not (lease.get("stream_id") == stream and isinstance(lease.get("session_id"), str)
+            and isinstance(lease.get("lease_id"), str)
+            and all(type(lease.get(name)) is int for name in ("generation", "fencing_token"))
+            and isinstance(holder, dict) and all(isinstance(holder.get(name), str) and holder[name]
+                                                 for name in ("agent", "harness", "instance_id"))
+            and (session in ("closed", "expired") if state == "released" else session in ("open", "rolling"))):
+        return "orchestrator_lease_unknown: the Monitor lease is incomplete or its states disagree"
     if state == "released":
         return None
-    holder = lease.get("holder") if isinstance(lease.get("holder"), dict) else {}
     return (f"orchestrator_stream_leased: {stream} has an active lease, which no turn supersedes "
             f"(holder {holder.get('agent')!s:.64}/{holder.get('harness')!s:.64}, {state}, "
             f"expires {lease['expires_at']!s:.40})")
@@ -493,8 +545,9 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     keeps the lease envelope (TURN_LEASE_KEY). ``launch`` is the caller's own launch progress: it sets
     ``launch["record"] = True`` before it can publish a record naming the prompt file and ``launch["started"] =
     True`` before it starts a supervisor. Only a dispatch that ends before a supervisor start, and either before
-    that record or with this run's unclaimed hold read back, releases the lease here; otherwise only the turn's
-    settlement does. ``linkage`` (the parent fields of a task dispatched from inside another run) is in the hold
+    that record or with this run's unclaimed hold read back, releases the lease here. So does one whose launch was
+    refused before any of its processes started (``launch["refused_before_start"]``) when this run's record reads
+    back as that failed, pid-less launch holding this lease (C-6991). Otherwise only the turn's settlement does. ``linkage`` (the parent fields of a task dispatched from inside another run) is in the hold
     before anything spawns.
     """
     if orchestrator is not None and not (isinstance(run_nonce, str) and isinstance(turn_ttl_s, int)):
@@ -558,6 +611,7 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     finally:
         # Read before anything else here can fail: missing progress means a supervisor may have started.
         launch_started = launch is None or launch.get("started") is not False
+        refused_unstarted = launch is not None and launch.get("refused_before_start") is True
         # Once the record may have been handed over (store.create), only reading it back as this run's unclaimed
         # hold proves that no record of the run names a prompt file or pid; a lost or damaged one is not proof.
         unclaimed = launch is not None and launch.get("record", False) is False
@@ -567,10 +621,33 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
         finally:
             # A known pre-launch abort: this dispatch never started a supervisor and no record of the run can
             # start one. The hold's cleanup is independent: whatever it finds or raises, this still runs.
-            if (turn_lease is not None and not launch_started and unclaimed
+            if (turn_lease is not None
+                    and ((not launch_started and unclaimed)
+                         or (refused_unstarted and _launch_failed_unstarted(task_id, run_nonce, turn_lease)))
                     and (reason := release_turn(turn_lease, stream=orchestrator["stream"], task_id=task_id,
                                                 run_nonce=run_nonce))):
                 print(f"dispatcher: {orchestrator['stream']} stays leased: {reason}", file=sys.stderr)
+
+
+# The failure codes worker._record_failed_launch writes for a placement refusal (admission.spawn_supervisor).
+_UNSTARTED_LAUNCH_REASONS = frozenset({"dispatch_fallback_refused", "dispatch_isolation_failed"})
+
+
+def _launch_failed_unstarted(task_id, run_nonce, envelope) -> bool:
+    """True when this run's record reads back as its own launch that failed before any process started (C-6991).
+
+    That record is terminal ``failed``, names no pid, holds exactly the claimed lease and a placement refusal's
+    failure code, so no supervisor runs for it or can start from it. Anything else, unreadable included, is False.
+    """
+    try:
+        with task_state_lock(store.record_path(task_id)):
+            current = store.read(task_id, missing_ok=True)
+    except (OSError, ValueError, RecursionError):
+        return False
+    return (isinstance(current, dict) and current.get("run_nonce") == run_nonce and current.get("status") == "failed"
+            and "pid" in current and current["pid"] is None and "orchestrator" in current
+            and current.get(TURN_LEASE_KEY) == envelope
+            and current.get("returncode_reason") in _UNSTARTED_LAUNCH_REASONS)
 
 
 def _discard_unused_hold(task_id, run_nonce):
