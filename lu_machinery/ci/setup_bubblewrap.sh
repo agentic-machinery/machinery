@@ -124,7 +124,10 @@ if [ "${#missing[@]}" -gt 0 ] || ! "$bwrap_ready"; then
 
   # Keep the runner's sources, lists and archives untouched. Each invocation
   # starts with empty indexes, so a failed update cannot reuse stale metadata.
-  apt_dir="$(mktemp -d -- "${RUNNER_TEMP%/}/apt-snapshot.XXXXXXXX")"
+  # GitHub's RUNNER_TEMP can be private to the runner user. Use /tmp so
+  # APT can read and download as its unprivileged _apt user.
+  apt_dir="$(mktemp -d /tmp/lu-ci-apt-snapshot.XXXXXXXX)"
+  trap 'sudo rm -rf -- "$apt_dir"' EXIT
   chmod 0755 "$apt_dir"
   mkdir -- "$apt_dir/lists" "$apt_dir/archives"
   cat > "$apt_dir/ubuntu.sources" <<EOF
@@ -146,6 +149,16 @@ EOF
     -o Acquire::Retries=1
     -o Acquire::https::Timeout=10
   )
+  for i in "${!missing[@]}"; do
+    case "${missing[i]}" in
+      libpq-dev|libpq-dev:*)
+        # The runner may retain PGDG's libpq5 when libpq-dev is absent.
+        # Ubuntu's libpq-dev needs the exact matching Noble library.
+        missing[i]+=/noble
+        apt_opts+=(--allow-downgrades)
+        ;;
+    esac
+  done
 
   if ! "$bwrap_ready"; then
     deb=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb

@@ -67,11 +67,8 @@ if [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]]
     "$canary/checkout/.github/workflows" "$canary/checkout/lu_machinery/ci"
 
   sha256sum "$setup" .github/workflows/pins.txt
-  RUNNER_TEMP="$canary/present" bash -- "$setup" postgresql-16 libpq-dev
-  if compgen -G "$canary/present/apt-snapshot.*" >/dev/null; then
-    echo "::error::The preinstalled package case opened an APT workspace" >&2
-    exit 1
-  fi
+  RUNNER_TEMP="$canary/present" bash -- "$setup" postgresql-16 libpq-dev | tee "$canary/present.log"
+  grep -Fxq 'Native CI packages are already ready' "$canary/present.log"
 
   sudo apt-get --yes --no-download remove -- postgresql-16 libpq-dev
   for extra in postgresql-16 libpq-dev; do
