@@ -9,6 +9,29 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.56"></a>
+## [0.1.56] - 2026-11-23
+
+### Added
+
+- One reservation file per stream; refuse a turn's foreign writers (DRIVERS-1122 PR 1) ([#1241](https://github.com/learn-ukrainian/machinery/pull/1241))
+- Per-meter freshness, unknown cap, and typed telemetry reporting ([#1244](https://github.com/learn-ukrainian/machinery/pull/1244))
+
+### Changed
+
+- Pin Linux filesystem parity container image ([#1240](https://github.com/learn-ukrainian/machinery/pull/1240))
+- Use the pinned Node and npm toolchain ([#1246](https://github.com/learn-ukrainian/machinery/pull/1246))
+
+### Fixed
+
+- Require provisioned native claude CLI without npx fallback ([#1238](https://github.com/learn-ukrainian/machinery/pull/1238))
+- Refresh the fleet model review ([#1243](https://github.com/learn-ukrainian/machinery/pull/1243))
+- Restore empty unreleased changelog ([#1247](https://github.com/learn-ukrainian/machinery/pull/1247))
+
+### Removed
+
+- Delete dead CLAUDE_NPX_PREFIX and CLAUDE_CMD and align guard hints ([#1242](https://github.com/learn-ukrainian/machinery/pull/1242))
+
 <a id="v0.1.55"></a>
 ## [0.1.55] - 2026-11-23
 
@@ -1408,7 +1431,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.55...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.56...HEAD
+[0.1.56]: https://github.com/learn-ukrainian/machinery/compare/v0.1.55...v0.1.56
 [0.1.55]: https://github.com/learn-ukrainian/machinery/compare/v0.1.54...v0.1.55
 [0.1.54]: https://github.com/learn-ukrainian/machinery/compare/v0.1.53...v0.1.54
 [0.1.53]: https://github.com/learn-ukrainian/machinery/compare/v0.1.52...v0.1.53
