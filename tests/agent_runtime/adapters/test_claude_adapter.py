@@ -207,8 +207,16 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         assert json.loads(cmd[cmd.index("--mcp-config") + 1]) == {"mcpServers": {}}
         if "--disallowedTools" in cmd:
             assert "sources" not in cmd[cmd.index("--disallowedTools") + 1]
-    reviewer = _read_only(consumer, {"reviewer_tools": True})
-    assert not any("mcp__sources" in rule for rule in reviewer[reviewer.index("--allowedTools") + 1].split(","))
+        if "--allowedTools" in cmd:
+            assert not any("mcp__" in rule.lower() for rule in cmd[cmd.index("--allowedTools") + 1].split(","))
+    explicit = _read_only(
+        consumer,
+        {"allowed_tools": "Read, Bash(git log --format=%H,%s), mcp__sources__*, mcp__*, mcp__other__tool, mcp*"},
+    )
+    assert explicit[explicit.index("--allowedTools") + 1] == "Read,Bash(git log --format=%H,%s)"
+    for bad_allowed in ("mcp__sources__verify_word", "mcp__*", "Read(foo,mcp__sources__verify_word"):
+        with pytest.raises(ValueError):
+            _read_only(consumer, {"allowed_tools": bad_allowed})
 
     docs = consumer / "docs.mcp.json"
     docs.write_text('{"mcpServers":{"docs":{"command":"/bin/true"}}}', encoding="utf-8")

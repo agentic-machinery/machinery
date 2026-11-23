@@ -239,6 +239,7 @@ Issue: #1184
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -607,6 +608,48 @@ def _sources_writer_denies(tools: tuple[str, ...]) -> list[str]:
 
 
 _EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
+
+
+def _is_mcp_allow_rule(tool_lower: str) -> bool:
+    return (
+        tool_lower.startswith("mcp__")
+        or fnmatch.fnmatchcase(f"mcp__{SOURCES_MCP_SERVER}__x", tool_lower)
+        or fnmatch.fnmatchcase(f"mcp__{SOURCES_MCP_SERVER}", tool_lower)
+    )
+
+
+def _strip_mcp_allow_rules(raw: str) -> str:
+    """Drop MCP/Sources allow rules when a read-only run loads no MCP servers."""
+    if not raw.strip():
+        return ""
+    rules: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in raw:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+            buf.append(ch)
+        elif depth == 0 and (ch == "," or ch.isspace()):
+            if buf:
+                rules.append("".join(buf))
+                buf.clear()
+        else:
+            buf.append(ch)
+    if depth != 0:
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    if buf:
+        rules.append("".join(buf))
+    kept = [rule for rule in rules if not _is_mcp_allow_rule(rule.split("(", 1)[0].strip().lower())]
+    if not kept:
+        raise ValueError(
+            "ClaudeAdapter: this repository declares no Sources server; allowed_tools contains no non-MCP tools"
+        )
+    return ",".join(kept)
 
 
 def _reviewer_mcp_config() -> str:
@@ -1076,7 +1119,8 @@ class ClaudeAdapter:
         # declaration raises here rather than launching without the denies.
         sources_server = sources_server_path() if mode == "read-only" else None
         sources_readers, sources_writers = sources_tool_sets() if sources_server is not None else ((), ())
-        if mode == "read-only" and sources_server is None and not review_isolation:
+        no_sources_readonly = mode == "read-only" and sources_server is None and not review_isolation
+        if no_sources_readonly:
             # The checkout's fleet row declares no Sources server, so no writer list exists to
             # deny. Load no MCP server at all: user, project and plugin servers stay off, and a
             # caller's config is refused rather than validated (any server could be Sources).
@@ -1121,7 +1165,10 @@ class ClaudeAdapter:
         elif mcp_config_path and not review_isolation:
             cmd.extend(["--mcp-config", str(mcp_config_path)])
         if explicit_allowed_tools and not review_isolation:
-            cmd.extend(["--allowedTools", str(tc["allowed_tools"])])
+            allowed = str(tc["allowed_tools"])
+            if no_sources_readonly:
+                allowed = _strip_mcp_allow_rules(allowed)
+            cmd.extend(["--allowedTools", allowed])
 
         # Cache-warmth optimization (CC 2.1.98+)
         if cli_version and cli_version >= _EFFORT_MIN_VERSION:

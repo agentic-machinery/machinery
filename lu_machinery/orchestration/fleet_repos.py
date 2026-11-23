@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -514,13 +515,15 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     (:func:`~lu_machinery.orchestration.execution_safe_git.safe_git_env`), so only the repository's
     own config, and its worktree config when Git enables that, is read. Callers treat ``None`` as an
     unregistered root that keeps every Learn Ukrainian requirement. Only a primary checkout is
-    identified: Git must report ``root`` as the top of its work tree and ``root/.git`` as its shared
-    Git directory. A linked worktree, a separate Git directory, a bare repository's worktree or a
-    submodule is never identified, because Git cannot name the checkout whose curriculum marker
-    would decide it. ``None`` is also returned when Git fails, times out or cannot run; ``root``
-    carries ``PRODUCT_MARKER`` or cannot be checked for it; the config has an include or a URL
-    rewrite; ``origin`` has no URL or several; or the URL is not exactly the HTTPS or SSH form of
-    one registered slug (ASCII, case-insensitive, optional ``.git``).
+    identified: Git must report ``root`` as the top of its work tree, ``root/.git`` as its shared
+    Git directory, and no superproject working tree. A linked worktree, a separate Git directory, a
+    bare repository's worktree or a submodule (including an embedded-Git submodule) is never
+    identified, because Git cannot name the checkout whose curriculum marker would decide it.
+    ``None`` is also returned when Git fails, times out or cannot run; ``root`` carries
+    ``PRODUCT_MARKER``, has a non-directory or symlink marker ancestor, or cannot be checked for it;
+    the config has an include or a URL rewrite; ``origin`` has no URL or several; the URL names
+    Learn Ukrainian; or the URL is not exactly the HTTPS or SSH form of one registered slug (ASCII,
+    case-insensitive, optional ``.git``).
     """
     # Lazy: execution_safe_git imports PyYAML, and this module is reached from dependency-free hooks.
     from lu_machinery.orchestration.execution_safe_git import GIT, safe_git_env
@@ -547,18 +550,26 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
             return None
         return done.stdout if done.returncode == 0 else None
 
-    layout = git("rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir")
+    layout = git(
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+        "--git-common-dir",
+        "--show-superproject-working-tree",
+    )
     lines = [] if layout is None else layout.split(b"\n")
     if len(lines) != 3 or lines[2] or [Path(os.fsdecode(line)) for line in lines[:2]] != [resolved, resolved / ".git"]:
         return None
-    try:
-        os.lstat(resolved / PRODUCT_MARKER)
-    except (FileNotFoundError, NotADirectoryError):
-        pass
-    except (OSError, ValueError):
-        return None
-    else:
-        return None
+    marker = Path(PRODUCT_MARKER)
+    for rel in (*reversed(marker.parents[:-1]), marker):
+        try:
+            st = os.lstat(resolved / rel)
+        except FileNotFoundError:
+            break
+        except (OSError, ValueError):
+            return None
+        if rel == marker or not stat.S_ISDIR(st.st_mode):
+            return None
     config = git("config", "--no-includes", "--null", "--get-regexp", _CHECKOUT_IDENTITY_KEYS)
     entries = [] if config is None else config.split(b"\0")[:-1]
     key = b"remote.origin.url\n"
@@ -575,7 +586,9 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
             for suffix in ("", ".git")
         )
     ]
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) != 1 or _LEARN_UKRAINIAN_SLUG in {slug.lower() for slug in matches[0].slugs}:
+        return None
+    return matches[0]
 
 
 def main(argv: list[str] | None = None) -> int:

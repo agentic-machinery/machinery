@@ -1369,6 +1369,19 @@ def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
     gitfile.mkdir()
     (gitfile / ".git").write_text(f"gitdir:{consumer / '.git'}\n", encoding="utf-8")
     roots["gitfile-no-space"] = gitfile
+    # An embedded-Git submodule tracked by a superproject (#1287 R1 F2).
+    superproject = _checkout(tmp_path / "superproject", _LEARN_UKRAINIAN_URL)
+    embedded_sub = _checkout(superproject / "sub-consumer", _KUBE_DOJO_URL)
+    _git(superproject, "add", "sub-consumer")
+    _git(superproject, "commit", "-q", "-m", "track embedded submodule")
+    roots["embedded-git-submodule"] = embedded_sub
+    # A non-directory or symlink ancestor along PRODUCT_MARKER fails closed (#1287 R1 F3).
+    non_dir_ancestor = _checkout(tmp_path / "non-dir-ancestor", _KUBE_DOJO_URL)
+    (non_dir_ancestor / "curriculum").write_text("not-a-dir\n", encoding="utf-8")
+    roots["non-directory-marker-ancestor"] = non_dir_ancestor
+    symlink_ancestor = _checkout(tmp_path / "symlink-ancestor", _KUBE_DOJO_URL)
+    (symlink_ancestor / "curriculum").symlink_to(tmp_path / "missing-target")
+    roots["symlink-marker-ancestor"] = symlink_ancestor
     return roots
 
 
@@ -1394,6 +1407,9 @@ _UNIDENTIFIABLE = [
     "separate-dot-git",
     "separate-dot-git-linked",
     "symlinked-git-dir",
+    "embedded-git-submodule",
+    "non-directory-marker-ancestor",
+    "symlink-marker-ancestor",
 ]
 
 
@@ -1401,13 +1417,14 @@ _UNIDENTIFIABLE = [
 def test_unidentified_checkout_keeps_the_learn_ukrainian_policy_requirement(tmp_path, monkeypatch, case):
     """Defect class (F1/F3/F5): a checkout Git cannot tie to exactly one consumer row (or a curriculum
     checkout) silently drops the admission policy requirement instead of refusing policy_missing."""
-    from lu_machinery.orchestration import product_policy
+    from lu_machinery.orchestration import fleet_repos, product_policy
 
     root = _unidentifiable_roots(tmp_path)[case]
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
     # Inherited Git redirection must not substitute another repository's metadata.
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "consumer" / ".git"))
     monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'remote.origin.url'='{_KUBE_DOJO_URL}'")
+    assert fleet_repos.fleet_repo_for_checkout(root) is None
     with pytest.raises(product_policy.ProductPolicyError) as exc_info:
         adm.evaluate("read-only", tmp_path / "tasks")
     assert exc_info.value.code == "policy_missing"
