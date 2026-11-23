@@ -2,21 +2,23 @@
 
 
 
-from dataclasses import replace
-import sys
-import pytest
-from lu_machinery.dispatcher import environment, worker, write_boundary
-from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
-from tests.helpers.product_tree import configured_roots as configured_roots
 import contextlib
 import json
 import signal
 import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
-from lu_machinery.dispatcher import agy_sandbox
-from lu_machinery.dispatcher import git
-from lu_machinery.dispatcher import store
-from tests.dispatcher.conftest import await_file as await_file, prior_worktree as prior_worktree, run_git as run_git
+
+import pytest
+
+from lu_machinery.common.git_credentials import SELECTOR_ENV
+from lu_machinery.dispatcher import agy_sandbox, environment, git, store, worker, write_boundary
+from lu_machinery.dispatcher.types import Invocation, ParsedResult, TaskSpec
+from tests.dispatcher.conftest import await_file as await_file
+from tests.dispatcher.conftest import prior_worktree as prior_worktree
+from tests.dispatcher.conftest import run_git as run_git
+from tests.helpers.product_tree import configured_roots as configured_roots
 
 PROOF_DIR = "LU_SENSE_PROOF_DIR"
 SENTINEL = "/fixture/sense-proofs"
@@ -88,6 +90,27 @@ def test_child_env_carries_sense_proof_dir_and_strips_logins(tmp_path, monkeypat
     # A missing anchor stays missing; worker Git metadata must never fill it in.
     monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
     assert "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT" not in environment.child_env(replace(spec, mode="workspace-write"))
+
+
+@pytest.mark.parametrize(("agent", "provider"), PROVIDERS)
+def test_child_env_forwards_fleet_repo_selector_when_set_and_omits_when_absent(tmp_path, monkeypatch, agent, provider):
+    """Defect class: dropped LU_FLEET_REPO_SELECTOR_FILE breaks active-slug resolution in dispatched workers."""
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    selector = "/fixture/fleet-repo-selector/selector.yaml"
+    spec = TaskSpec("fixture", agent, "stub", None, "workspace-write", tmp_path, tmp_path / "prompt", tmp_path / "final",
+                    provider=provider)
+
+    monkeypatch.setenv(SELECTOR_ENV, selector)
+    for mode in ("workspace-write", "read-only"):
+        mode_spec = replace(spec, mode=mode)
+        assert environment.child_env(mode_spec)[SELECTOR_ENV] == selector
+        assert environment.probe_env(mode_spec)[SELECTOR_ENV] == selector
+        assert worker._provider_env(mode_spec)[SELECTOR_ENV] == selector
+
+    monkeypatch.delenv(SELECTOR_ENV, raising=False)
+    for mode in ("workspace-write", "read-only"):
+        assert SELECTOR_ENV not in environment.child_env(replace(spec, mode=mode))
 
 
 @pytest.mark.usefixtures('configured_roots')
