@@ -991,6 +991,7 @@ class BranchReviewFacts:
             subject_seats=self.subject_seats,
             subject_families=self.subject_families,
             subject_evidence=self.subject_evidence,
+            repository=self.repository,
             **overrides,
         )
 
@@ -1227,6 +1228,7 @@ def collect_branch_review_facts(
         subject_seats=frozenset(subject_seats),
         subject_families=frozenset(subject_families),
         owned_paths=tuple(dict.fromkeys((*changed, *owned))),
+        repository=repository,
     )
     if prepared.fail_closed_reason:
         raise BranchFactsError(FACTS_SCOPE_UNKNOWN, prepared.fail_closed_reason)

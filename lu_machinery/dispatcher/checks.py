@@ -674,7 +674,7 @@ def check_review_budget(args, repository: dict, head_sha: str) -> None:
         raise ValueError(f"review dispatch refused: {exc}") from None
 
 
-def check_review_subjects(agent, model, seats, families, owned_paths, *, review=False):
+def check_review_subjects(agent, model, seats, families, owned_paths, *, review=False, repository=None):
     from types import SimpleNamespace
 
     from lu_machinery.review.subject_seat import (
@@ -685,10 +685,10 @@ def check_review_subjects(agent, model, seats, families, owned_paths, *, review=
 
     if review:
         for path in owned_paths:
-            if classify_owned_path(path).kind == "ambiguous":
+            if classify_owned_path(path, repository=repository).kind == "ambiguous":
                 raise ValueError(f"ambiguous review subject path: {path}")
     exclusion = prepare_subject_exclusion(subject_seats=frozenset(seats), subject_families=frozenset(families),
-                                          owned_paths=tuple(owned_paths))
+                                          owned_paths=tuple(owned_paths), repository=repository)
     if exclusion.fail_closed_reason:
         raise ValueError(exclusion.fail_closed_reason)
     if not exclusion.seats and not exclusion.families:

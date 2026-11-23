@@ -1324,6 +1324,67 @@ def test_extracted_seat_boundary_paths_preserve_subject_exclusion(path, seat):
             )
 
 
+# Every reviewer seat's adapter, as a consumer repository's own dead fork lists them (kube-dojo PR 3904).
+_FORKED_ADAPTERS = tuple(f"scripts/agent_runtime/adapters/{name}.py" for name in ("agy", "claude", "codex", "deepseek", "gemini"))
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize(
+    "repository,relocated",
+    [
+        # The machinery repository (both baked slugs) and learn-ukrainian keep the pre-extraction layout.
+        ("learn-ukrainian/machinery", True),
+        ("agentic-machinery/machinery", True),
+        ("Learn-Ukrainian/Machinery", True),
+        ("learn-ukrainian/learn-ukrainian.github.io", True),
+        ("machinery", True),
+        # A missing or unresolvable identity fails closed to the relocation.
+        (None, True),
+        ("", True),
+        ("someone/unknown-repo", True),
+        ("kube-dojo/kube-dojo.github.io/extra", True),
+        # A consumer repository's scripts/ tree is its own.
+        ("kube-dojo/kube-dojo.github.io", False),
+        (" KUBE-DOJO/kube-dojo.github.io ", False),
+        ("kube-dojo", False),
+    ],
+)
+def test_scripts_relocation_follows_the_reviewed_repository(repository, relocated):
+    """Defect class: a consumer repository's own scripts/ paths were read as machinery seat boundaries.
+
+    Deleting a consumer's forked adapters excluded every reviewer; the legacy relocation must stay
+    for the machinery and learn-ukrainian repositories and for any repository the catalog cannot resolve.
+    """
+    subject = prepare_subject_exclusion(owned_paths=_FORKED_ADAPTERS, repository=repository)
+    expected_seats = {"agy", "claude", "codex", "deepseek", "gemini"} if relocated else set()
+    assert subject.seats == expected_seats
+    assert subject.fail_closed_reason is None
+    result = resolve_reviewer(
+        ResolverInputs(
+            author_model="claude-opus-5-5",
+            domain="infra",
+            review_profile="infra",
+            risk="critical",
+            owned_paths=_FORKED_ADAPTERS,
+            repository=repository,
+            claude_account=HOST_ACCOUNT,
+        )
+    )
+    governed = [entry.name for entry in result.trace if "subject exclusion" in (entry.reason or "")]
+    if relocated:
+        assert result.selected is None
+        assert "openai_frontier" in governed and "gemini-4-neon-high" in governed
+    else:
+        assert result.selected is not None and result.selected.family != "anthropic"
+        assert governed == []
+    # The current package paths govern their seats whatever repository lists them.
+    current = prepare_subject_exclusion(
+        owned_paths=tuple(path.replace("scripts/", "lu_machinery/", 1) for path in _FORKED_ADAPTERS),
+        repository=repository,
+    )
+    assert current.seats == {"agy", "claude", "codex", "deepseek", "gemini"}
+
+
 @pytest.mark.usefixtures('configured_roots')
 def test_resolve_reviewer_without_subject_information_matches_empty_subject_fields():
     """AC-02: explicit empty subject inputs do not change the trace."""

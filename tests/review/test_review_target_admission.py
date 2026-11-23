@@ -500,6 +500,42 @@ def test_review_admission_uses_complete_branch_authorship_like_the_recorder(tmp_
         )
 
 
+@pytest.mark.parametrize(
+    "repository,seats",
+    [
+        ("learn-ukrainian/learn-ukrainian.github.io", {"codex"}),
+        ("learn-ukrainian/machinery", {"codex"}),
+        ("someone/unknown-repo", {"codex"}),
+        ("kube-dojo/kube-dojo.github.io", set()),
+    ],
+)
+def test_branch_facts_judge_scripts_paths_as_the_reviewed_repository_files(tmp_path, monkeypatch, repository, seats):
+    """Defect class: branch facts relocated a consumer's own scripts/ paths onto machinery seat boundaries.
+
+    The facts, and the resolver inputs the recorder and admission build from them, carry the reviewed
+    repository, so a consumer's forked adapter is its own file while the legacy layouts stay protected.
+    """
+    from lu_machinery.review import record_cf_verdict as recorder
+    from lu_machinery.review.reviewer_resolver import resolve_reviewer
+    from tests.agent_runtime.test_authoring_review_feasibility import OPUS, mini_repo
+
+    repo = mini_repo(tmp_path, monkeypatch)
+    repo.commit(OPUS, path="scripts/agent_runtime/adapters/codex.py", message="forked adapter")
+    facts = recorder.collect_branch_review_facts(
+        repository=repository,
+        repo_root=repo.root,
+        base_tip_sha=repo.sha("origin/main"),
+        head_sha=repo.sha("feature"),
+        task_root=tmp_path / "tasks",
+    )
+    assert facts.subject_seats == seats
+    inputs = facts.resolver_inputs(risk="medium", claude_account=HOST_ACCOUNT)
+    assert inputs.repository == repository
+    resolution = resolve_reviewer(inputs)
+    excluded = {entry.name for entry in resolution.trace if "subject seat codex" in (entry.reason or "")}
+    assert ("openai_frontier" in excluded) is bool(seats)
+
+
 @pytest.mark.parametrize("mode", ["invalid", "red_team"])
 def test_review_mode_requires_known_mode_and_complete_task_facts(mode):
     with pytest.raises(ReviewAdmissionRefused, match=r"unsupported review mode|requires branch author facts"):
