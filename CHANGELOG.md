@@ -9,6 +9,24 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.55"></a>
+## [0.1.55] - 2026-11-23
+
+### Added
+
+- A02 PR-1 per-repository issue admission via A01 resolver ([#1218](https://github.com/learn-ukrainian/machinery/pull/1218))
+- Add dormant keeper custody transfer and opt-in direct landing ([#1216](https://github.com/learn-ukrainian/machinery/pull/1216))
+- Serve read-only seats and delivery records ([#1227](https://github.com/learn-ukrainian/machinery/pull/1227))
+- Show waiting seats and keep the Messages heading visible ([#1231](https://github.com/learn-ukrainian/machinery/pull/1231))
+- Deliver D-DETACH-RESIDUALS (b), (c), and (d2) in merge_queue_keeper ([#1234](https://github.com/learn-ukrainian/machinery/pull/1234))
+
+### Fixed
+
+- Use active repositories for lifecycle init and audits ([#1223](https://github.com/learn-ukrainian/machinery/pull/1223))
+- Use locked build tools for product consumer smoke ([#1228](https://github.com/learn-ukrainian/machinery/pull/1228))
+- Forward LU_FLEET_REPO_SELECTOR_FILE to child environments ([#1233](https://github.com/learn-ukrainian/machinery/pull/1233))
+- Clarify publisher command and queue flag in raw-merge refusal ([#1237](https://github.com/learn-ukrainian/machinery/pull/1237))
+
 <a id="v0.1.54"></a>
 ## [0.1.54] - 2026-11-22
 
@@ -1390,7 +1408,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.54...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.55...HEAD
+[0.1.55]: https://github.com/learn-ukrainian/machinery/compare/v0.1.54...v0.1.55
 [0.1.54]: https://github.com/learn-ukrainian/machinery/compare/v0.1.53...v0.1.54
 [0.1.53]: https://github.com/learn-ukrainian/machinery/compare/v0.1.52...v0.1.53
 [0.1.52]: https://github.com/learn-ukrainian/machinery/compare/v0.1.51...v0.1.52
