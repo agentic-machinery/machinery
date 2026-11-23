@@ -1574,35 +1574,63 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
             mp.setattr(fleet_repos, "_read_mount_table", lambda: {42: "/"})
             mp.setattr(fleet_repos, "_read_fd_mount_id", fake_fd_mount)
             assert fleet_repos.fleet_repo_for_checkout(primary) is None
-    # Parser-level and end-to-end refusal on raw malformed /proc/self/mountinfo and /proc/self/fdinfo files.
-    valid_root_line = "42 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+    # Parser-level and end-to-end refusal on raw malformed /proc/self/mountinfo and /proc/self/fdinfo files
+    # (including oversized 5,000-digit / out-of-range kernel IDs, PR1297-F1), while preserving valid
+    # unrelated Linux mount entries containing non-UTF-8 bytes or literal carriage returns (PR1297-F3).
+    valid_root_line = b"42 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+    oversized_id = b"9" * 5000
     for idx, bad_mountinfo in enumerate(
         (
-            valid_root_line + "99 42 8:1\n",  # truncated record after valid root
-            valid_root_line + "99 42 8:1 / /mnt\n",  # invalid 5-field record missing '-'
-            valid_root_line + "42 1 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # duplicate mount id
-            valid_root_line.rstrip("\n"),  # missing trailing newline
-            "",
+            valid_root_line + b"99 42 8:1\n",  # truncated record after valid root
+            valid_root_line + b"99 42 8:1 / /mnt\n",  # invalid 5-field record missing '-'
+            valid_root_line + b"42 1 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # duplicate mount id
+            valid_root_line + oversized_id + b" 42 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # >4300-digit id
+            valid_root_line + b"2147483648 42 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # >int32 max id
+            valid_root_line + b"99 42 8:1 / /bad\\777 rw - ext4 /dev/sda1 rw\n",  # invalid octal escape
+            valid_root_line.rstrip(b"\n"),  # missing trailing newline
+            b"",
         )
     ):
         fake_mi = tmp_path / f"mountinfo-{idx}"
-        fake_mi.write_text(bad_mountinfo, encoding="utf-8")
+        fake_mi.write_bytes(bad_mountinfo)
         with monkeypatch.context() as mp:
             mp.setattr(task_scratch, "_MOUNTINFO_PATH", fake_mi)
             assert fleet_repos.fleet_repo_for_checkout(primary) is None
+            with pytest.raises(product_policy.ProductPolicyError) as bad_pol:
+                adm.load_product_policy()
+            assert bad_pol.value.code == "policy_missing"
+            assert sources_server_path() == primary / SERVER_RELATIVE_PATH
     with monkeypatch.context() as mp:
         mp.setattr(task_scratch, "_MOUNTINFO_PATH", tmp_path / "missing-mountinfo")
         assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    # Unrelated valid Linux mountinfo records with non-UTF-8 bytes or literal CR keep consumer eligible.
+    real_mi_bytes = task_scratch._MOUNTINFO_PATH.read_bytes()
+    unrelated_valid_mi = tmp_path / "mountinfo-nonutf8-cr"
+    unrelated_valid_mi.write_bytes(
+        real_mi_bytes
+        + b"999001 1 8:1 /src\xff /mnt/unrelated\xff rw - ext4 /dev/sda1 rw\n"
+        + b"999002 1 8:1 /src\rdir /mnt/unrelated\rdir rw - ext4 /dev/sda1 rw\n"
+    )
+    with monkeypatch.context() as mp:
+        mp.setattr(task_scratch, "_MOUNTINFO_PATH", unrelated_valid_mi)
+        parsed = fleet_repos._read_mount_table()
+        assert parsed is not None
+        assert parsed[999001] == os.fsdecode(b"/mnt/unrelated\xff")
+        assert parsed[999002] == "/mnt/unrelated\rdir"
+        identified_with_unrelated = fleet_repos.fleet_repo_for_checkout(primary)
+        assert identified_with_unrelated is not None and identified_with_unrelated.key == "kube-dojo"
     fake_fdinfo_dir = tmp_path / "fdinfo"
     fake_fdinfo_dir.mkdir()
     for fd_num, bad_fdinfo in (
-        (101, "pos:\t0\nflags:\t012200000\nmnt_id:\t42\nmnt_id:\t99\nino:\t2\n"),  # conflicting ids
-        (102, "pos:\t0\nmnt_id:\t42\nmnt_id:\t42\n"),  # duplicate id
-        (103, "pos:\t0\nmnt_id:\tbad\n"),  # non-integer id
-        (104, "pos:\t0\nino:\t2\n"),  # missing mnt_id
-        (105, "pos:\t0\nmnt_id:\t42"),  # missing trailing newline
+        (101, b"pos:\t0\nflags:\t012200000\nmnt_id:\t42\nmnt_id:\t99\nino:\t2\n"),  # conflicting ids
+        (102, b"pos:\t0\nmnt_id:\t42\nmnt_id:\t42\n"),  # duplicate id
+        (103, b"pos:\t0\nmnt_id:\tbad\n"),  # non-integer id
+        (104, b"pos:\t0\nino:\t2\n"),  # missing mnt_id
+        (105, b"pos:\t0\nmnt_id:\t42"),  # missing trailing newline
+        (106, b"pos:\t0\nmnt_id:\t" + oversized_id + b"\n"),  # >4300-digit id
+        (107, b"pos:\t0\nmnt_id:\t2147483648\n"),  # >int32 max id
     ):
-        (fake_fdinfo_dir / str(fd_num)).write_text(bad_fdinfo, encoding="ascii")
+        (fake_fdinfo_dir / str(fd_num)).write_bytes(bad_fdinfo)
         with monkeypatch.context() as mp:
             mp.setattr(fleet_repos, "_FDINFO_DIR", fake_fdinfo_dir)
             assert fleet_repos._read_fd_mount_id(fd_num) is None

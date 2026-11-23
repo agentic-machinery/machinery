@@ -515,9 +515,29 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
 
 
 _FDINFO_DIR = Path("/proc/self/fdinfo")
-_MOUNTINFO_INT_RE = re.compile(r"^[0-9]+$")
-_MOUNTINFO_DEV_RE = re.compile(r"^[0-9]+:[0-9]+$")
-_MOUNTINFO_PATH_RE = re.compile(r"^/(?:[^\\\x00]|\\[0-7]{3})*$")
+_KERNEL_UINT_RE = re.compile(rb"^(?:0|[1-9][0-9]{0,9})$")
+_MOUNTINFO_PATH_BYTES_RE = re.compile(rb"^/(?:[^\\\x00\t\n ]|\\[0-3][0-7]{2})*$")
+_MOUNTINFO_OCTAL_RE = re.compile(rb"\\([0-3][0-7]{2})")
+_KERNEL_INT32_MAX = 0x7FFFFFFF
+_KERNEL_UINT32_MAX = 0xFFFFFFFF
+
+
+def _parse_kernel_int(token: bytes, *, max_value: int) -> int | None:
+    """Parse a bounded non-negative decimal kernel integer without unbounded ``int()`` conversion."""
+    if not _KERNEL_UINT_RE.fullmatch(token):
+        return None
+    value = int(token)
+    return value if value <= max_value else None
+
+
+def _unescape_mountinfo_path(field: bytes) -> str | None:
+    """Validate and losslessly decode one kernel-escaped ``mountinfo`` path field."""
+    if not _MOUNTINFO_PATH_BYTES_RE.fullmatch(field):
+        return None
+    raw = _MOUNTINFO_OCTAL_RE.sub(lambda m: bytes([int(m.group(1), 8)]), field)
+    if b"\x00" in raw:
+        return None
+    return os.fsdecode(raw)
 
 
 def _read_mount_table() -> dict[int, str] | None:
@@ -526,38 +546,44 @@ def _read_mount_table() -> dict[int, str] | None:
 
     try:
         raw = task_scratch._MOUNTINFO_PATH.read_bytes()
-        text = raw.decode("utf-8")
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return None
-    if not text or not text.endswith("\n"):
+    if not raw or not raw.endswith(b"\n"):
         return None
     table: dict[int, str] = {}
-    for line in text[:-1].split("\n"):
-        if not line or "\r" in line:
+    for line in raw[:-1].split(b"\n"):
+        if not line:
             return None
-        fields = line.split(" ")
+        fields = line.split(b" ")
         try:
-            sep = fields.index("-")
+            sep = fields.index(b"-")
         except ValueError:
             return None
         if sep < 6 or len(fields) != sep + 4:
             return None
-        mount_id_s, parent_id_s, dev_s, root_s, mount_point_s, mount_opts = fields[:6]
+        mount_id_b, parent_id_b, dev_b, root_b, mount_point_b, mount_opts_b = fields[:6]
+        mount_id = _parse_kernel_int(mount_id_b, max_value=_KERNEL_INT32_MAX)
+        parent_id = _parse_kernel_int(parent_id_b, max_value=_KERNEL_INT32_MAX)
+        major_b, colon, minor_b = dev_b.partition(b":")
+        major = _parse_kernel_int(major_b, max_value=_KERNEL_UINT32_MAX) if colon else None
+        minor = _parse_kernel_int(minor_b, max_value=_KERNEL_UINT32_MAX) if colon else None
+        root_path = _unescape_mountinfo_path(root_b)
+        mount_point = _unescape_mountinfo_path(mount_point_b)
         if (
-            not _MOUNTINFO_INT_RE.fullmatch(mount_id_s)
-            or not _MOUNTINFO_INT_RE.fullmatch(parent_id_s)
-            or not _MOUNTINFO_DEV_RE.fullmatch(dev_s)
-            or not _MOUNTINFO_PATH_RE.fullmatch(root_s)
-            or not _MOUNTINFO_PATH_RE.fullmatch(mount_point_s)
-            or not mount_opts
-            or any(not opt for opt in fields[6:sep])
-            or any(not tail for tail in fields[sep + 1 :])
+            mount_id is None
+            or parent_id is None
+            or major is None
+            or minor is None
+            or root_path is None
+            or mount_point is None
+            or not mount_opts_b
+            or b"\x00" in mount_opts_b
+            or any(not opt or b"\x00" in opt for opt in fields[6:sep])
+            or any(not tail or b"\x00" in tail for tail in fields[sep + 1 :])
+            or mount_id in table
         ):
             return None
-        mount_id = int(mount_id_s)
-        if mount_id in table:
-            return None
-        table[mount_id] = task_scratch._unescape_mountinfo(mount_point_s)
+        table[mount_id] = mount_point
     return table if "/" in table.values() else None
 
 
@@ -565,25 +591,24 @@ def _read_fd_mount_id(fd: int) -> int | None:
     """Strictly read the single ``mnt_id`` from ``/proc/self/fdinfo/<fd>``, or ``None`` on any error."""
     try:
         raw = (_FDINFO_DIR / str(fd)).read_bytes()
-        text = raw.decode("ascii")
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return None
-    if not text or not text.endswith("\n"):
+    if not raw or not raw.endswith(b"\n") or not raw.isascii() or b"\x00" in raw:
         return None
     mount_ids: list[int] = []
-    for line in text[:-1].split("\n"):
-        if not line or "\r" in line:
+    for line in raw[:-1].split(b"\n"):
+        if not line or b"\r" in line:
             return None
-        key, sep, value = line.partition(":")
-        if not sep or not key.strip():
+        key, sep, value = line.partition(b":")
+        if not sep or not key.strip(b" \t"):
             return None
-        if key.strip().lower() == "mnt_id":
-            if key != "mnt_id":
+        if key.strip(b" \t").lower() == b"mnt_id":
+            if key != b"mnt_id":
                 return None
-            stripped = value.strip(" \t")
-            if not _MOUNTINFO_INT_RE.fullmatch(stripped):
+            mount_id = _parse_kernel_int(value.strip(b" \t"), max_value=_KERNEL_INT32_MAX)
+            if mount_id is None:
                 return None
-            mount_ids.append(int(stripped))
+            mount_ids.append(mount_id)
     return mount_ids[0] if len(mount_ids) == 1 else None
 
 

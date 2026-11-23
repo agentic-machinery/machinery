@@ -621,7 +621,7 @@ def _is_mcp_allow_rule(tool_lower: str) -> bool:
 
 def _validate_allow_rule(rule: str) -> str:
     """Validate one Claude allowlist rule (``Tool`` or ``Tool(qualifier)``) and return its lowercase tool name."""
-    if not rule or any(ord(ch) < 32 or ord(ch) == 127 for ch in rule):
+    if not rule:
         raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
     if "(" not in rule and ")" not in rule:
         if not _ALLOW_RULE_NAME_RE.fullmatch(rule):
@@ -641,14 +641,21 @@ def _validate_allow_rule(rule: str) -> str:
                 raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
     if depth != 0 or not rule[open_idx + 1 : -1].strip():
         raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
-    return name.lower()
+    name_lower = name.lower()
+    if _is_mcp_allow_rule(name_lower):
+        raise ValueError("ClaudeAdapter: MCP allowed_tools rules do not accept specifiers")
+    return name_lower
 
 
 def _strip_mcp_allow_rules(raw: object) -> str:
     """Drop MCP/Sources allow rules when a read-only run loads no MCP servers."""
+    import unicodedata
+
     if not isinstance(raw, str):
         raise ValueError("ClaudeAdapter: allowed_tools must be a string")
-    if not raw.strip():
+    if any(ord(ch) < 32 or ord(ch) == 127 or unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"} for ch in raw):
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    if not raw.strip(" "):
         raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
     rules: list[str] = []
     buf: list[str] = []
@@ -671,7 +678,7 @@ def _strip_mcp_allow_rules(raw: object) -> str:
                 rules.append("".join(buf))
                 buf.clear()
             expect_rule = True
-        elif depth == 0 and ch.isspace():
+        elif depth == 0 and ch == " ":
             if buf:
                 rules.append("".join(buf))
                 buf.clear()
