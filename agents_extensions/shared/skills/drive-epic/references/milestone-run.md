@@ -75,8 +75,10 @@ Do these in order. Dispatch and land nothing until step 7 passes.
    - A `supervisory-request` delivery needs `deliveries consume` (a driver generation, which a run
      lacks) before it can be acked: leave it unacked, record its ID, end `blocked`.
    - An empty receive does not prove the inbox is clear: a predecessor with another worker ID may still
-     hold a delivery lease. Check `deliveries pending --recipient <slot>`. A non-zero count with nothing
-     claimable means no dependent work until the lease expires: end `handoff`, naming it.
+     hold a delivery lease. Check `deliveries pending --recipient <slot>`. Continue only on exit 0 with
+     `probe: ok` and `count: 0`. A positive count with nothing claimable means no dependent work until
+     the lease expires: end `handoff`, naming it. Any other answer (exit 3, `probe: unknown`, a null
+     count) is `blocked`.
    - A message that widens the brief or changes the stop rule is recorded, not applied: stop new work on
      that scope and ask once in your report.
    - A delivery you already applied before a crash is not repeated: check its ID in the tracker first.
@@ -93,8 +95,10 @@ Do these in order. Dispatch and land nothing until step 7 passes.
 7. The brief must carry the CTO's reconciled child list for the previous run: every child ID and
    full nonce, or "none, checked". The note alone is not enough: a run killed after a dispatch and
    before its tracker item leaves a child the note lacks. No such list, or "unknown", is `blocked`.
-   Check each listed child with `dispatch status`. A child still live is not duplicated: wait for
-   it; it counts against the worker cap.
+   Check each listed child with `dispatch status`: every child needs a successful read with the same ID
+   and the same full nonce, or the run is `blocked` (an unreadable or mismatched child is unresolved,
+   never assumed finished). A child still live is not duplicated: wait for it; it counts against the
+   worker cap.
 
 ## 2. During the run
 
@@ -140,7 +144,10 @@ After each pass:
    mismatch leaves the child unresolved: it keeps counting against the cap and blocks "Ending".
 4. Several children: wait on one, then `status` the others each pass. Do not poll in a tight loop.
 5. Each pass uses `--timeout` of 300 or the seconds left before the stop-new-work time, whichever is
-   smaller. With no time left, do not start a pass: go to "Ending".
+   smaller, and sets the Bash call's own timeout to that value plus 15 seconds. `--timeout` is a
+   client limit only: `wait` can still block on a child that is settling. If the Bash call is cut
+   off, the child is unresolved: carry its ID and nonce into the note. With no time left, do not
+   start a pass: go to "Ending".
 
 The loop is the mitigation, not the proof: the practice canary must show that a healthy quiet child
 never trips the silence timeout.
@@ -151,13 +158,17 @@ Order matters, because the dispatcher checks only the receipt's shape today.
 
 1. **Every child terminal.** `dispatch status` on each recorded child ID and full nonce, review
    children included. Terminal means the same ID, the same nonce and a terminal status; a failed
-   command or an unreadable record is unresolved. Anything unresolved or running blocks the next step. **[after PR 3 lands]** a live child
-   also makes the run not done.
+   command or an unreadable record is unresolved. Anything unresolved or running blocks the next step.
+   **[after PR 3 lands]** a live child also makes the run not done.
 2. **Prove the checklist** for each acceptance criterion, from tool output this run: merged SHA
    (`gh pr view --json state,mergeCommit`), recorded exact-head verdict with reviewer model, green
    same-head `CI Gate`, the child's closeout receipt (`worktree_disposition: removed`, `returncode: 0`),
    and issue disposition. A dispatch, an open or reviewed PR, or green CI is not done.
-3. **Write exactly one `handoff_note`** (`lu-driver-state add --kind handoff_note`). First line:
+3. **Check the tree**: `git status --porcelain` prints nothing and `git rev-parse HEAD` equals the
+   start SHA you read at cold start. Anything else settles the task `no_deliverable`
+   (`orchestrator_product_write`): the outcome cannot be `done`. Write the note with outcome `blocked`
+   and the difference in it.
+4. **Write exactly one `handoff_note`** (`lu-driver-state add --kind handoff_note`). First line:
    `OUTCOME: done`, `blocked` or `handoff`.
    - `done`: the whole checklist is proven.
    - `blocked`: it cannot continue without a decision, grant, outage end or cap ruling.
@@ -168,19 +179,19 @@ Order matters, because the dispatcher checks only the receipt's shape today.
    IDs, residual with owner, resume condition, next actions, and the one question for the CTO if
    there is one. If the note is wrong afterwards, add to it with `lu-driver-state note <id>`; never
    write a second note.
-4. **Read it back**: `lu-driver-state show <id>`; check it is whole.
-5. **Check the tree**: `git status --porcelain` prints nothing and `git rev-parse HEAD` equals the
-   start SHA you read at cold start. Anything else settles the task `no_deliverable`
-   (`orchestrator_product_write`): do not report `done`; write the difference into the note and end
-   `blocked`.
+   Outcome correction: if recording the receipt fails after the note says `done`, add
+   `CORRECTION: OUTCOME blocked, <reason>` to the same note (`lu-driver-state note <id>`). The newest
+   `CORRECTION` line is the outcome the CTO and the successor must honor.
+
+5. **Read it back**: `lu-driver-state show <id>`; check it is whole.
 6. **Record the receipt with that exact ID** (the receipt cannot be taken back):
    `dispatch handoff-receipt "$LEARN_UKRAINIAN_DISPATCH_TASK_ID" --run-nonce <your nonce> --stream <epic:N> --handoff-ref <id>`.
    - For `done`: record it.
    - For `blocked` or `handoff`: **today skip the receipt**, so the task ends `no_deliverable` and is
      not read as done; the note ID goes in your report. **[after PR 3 lands]** record it with
      `--outcome blocked` or `--outcome handoff`; the dispatcher then settles it as not done.
-   - A refused receipt (exit 2) is not retried with another ID. Add the refusal to the note
-     (`lu-driver-state note <id>`) and report `blocked`.
+   - A refused receipt (exit 2) is not retried with another ID. Add a `CORRECTION` line with the
+     refusal to the note and report `blocked`.
 7. **Report once** to `claude-cto`, after the receipt, so the report states what was recorded:
 
    ```bash
