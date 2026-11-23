@@ -23,17 +23,13 @@ REPO_ROOT: Path
 # _PARENT_ENV: the narrow environment for detached children.
 _PARENT_ENV: dict[str, str]
 
-# Resolve CLI paths at import time (before detached children lose PATH)
-# Prefer the local native `claude` binary (#4875: the npm package became a
-# native-installer shim — `npx @latest` exits rc=1 with "Error: claude native
-# binary not installed" and empty stdout, killing every bridge Claude call at
-# spawn). npx stays as the fallback for machines without a native install.
-# Second probe: the default native install target ~/.local/bin/claude covers
-# callers whose PATH omits it (mirrors start-claude.sh:33; review-4881).
+# Resolve the provisioned native `claude` binary at import time (before detached
+# children lose PATH). Probe PATH first, then the default native install target
+# ~/.local/bin/claude; never fall back to npx/npm package-runner execution.
 _CLAUDE_BIN = shutil.which("claude") or (
     str(Path.home() / ".local/bin/claude") if (Path.home() / ".local/bin/claude").is_file() else None
 )
-CLAUDE_CMD = [_CLAUDE_BIN] if _CLAUDE_BIN else ["npx", "@anthropic-ai/claude-code@latest"]
+CLAUDE_CMD = [_CLAUDE_BIN] if _CLAUDE_BIN else ["claude"]
 AGY_CLI = shutil.which("agy") or str(Path.home() / ".local/bin/agy")
 
 

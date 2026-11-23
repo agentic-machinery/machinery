@@ -110,7 +110,6 @@ EXEC_PROGRAMS = frozenset(
         "tsc",  # site type check: docs/practice/K3-BUILD-SPEC.md
         "playwright",  # site e2e: .github/workflows/ui-policy-gate.yml, docs/practice/K3-BUILD-SPEC.md
         "markdownlint-cli2",  # docs lint: docs/prompts/orchestrators/shared/validation-checklist.md
-        "@anthropic-ai/claude-code",  # Claude adapter fallback: scripts/agent_runtime/adapters/claude.py
     }
 )
 

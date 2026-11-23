@@ -10,9 +10,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 from lu_machinery.agent_runtime.adapters.claude import (
     ClaudeAdapter,
+    ClaudeCliUnavailableError,
     _extract_stream_json_response,
     _mcp_server_names,
 )
+from lu_machinery.agent_runtime.errors import AgentUnavailableError
 
 
 def test_claude_stream_single_turn_byte_identical() -> None:
@@ -104,3 +106,44 @@ def test_mcp_config_too_deep_is_refused_as_invalid_json(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match=r"is invalid JSON: JSON nesting exceeds 512 levels") as refused:
         _mcp_server_names(config)
     assert isinstance(refused.value.__cause__, RecursionError)
+
+
+@pytest.mark.real_claude_cli_gate
+def test_missing_native_claude_on_fake_path_refuses_without_package_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: missing native claude binary silently falls back to unpinned package-runner execution."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    runner_marker = tmp_path / "package-runner-called"
+    for runner in ("npx", "npm"):
+        stub = fake_bin / runner
+        stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "{runner_marker}"\nexit 0\n', encoding="utf-8")
+        stub.chmod(0o755)
+
+    monkeypatch.setenv("PATH", str(fake_bin))
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    with pytest.raises(ClaudeCliUnavailableError) as refused:
+        ClaudeAdapter().build_invocation(
+            prompt="hello",
+            mode="read-only",
+            cwd=tmp_path,
+            model=None,
+            task_id=None,
+            session_id=None,
+            tool_config=None,
+        )
+
+    exc = refused.value
+    assert isinstance(exc, AgentUnavailableError)
+    assert isinstance(exc, RuntimeError)
+    assert exc.reason == "missing"
+    message = str(exc)
+    assert "`claude`" in message
+    assert "native installer" in message
+    assert "@latest" not in message
+    assert "npm install" not in message
+    assert not runner_marker.exists()

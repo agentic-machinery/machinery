@@ -1,4 +1,4 @@
-"""ClaudeAdapter — wraps the local ``claude`` CLI (npx fallback) for the runtime.
+"""ClaudeAdapter — wraps the provisioned native ``claude`` CLI for the runtime.
 
 Third production adapter. Phase 5 of #1184. Claude is the LAST adapter
 to land because it has the most special-case logic:
@@ -263,6 +263,7 @@ from ..env_sanitize import (
     claude_labelled_inputs_digest,
     claude_login_credential_fingerprint,
 )
+from ..errors import AgentUnavailableError
 from ..jsonl import jsonl_lines
 from ..result import ParseResult
 from ..sources_read_only import sources_tool_sets
@@ -790,27 +791,35 @@ def _probe_claude_cli_version(cmd_prefix: tuple[str, ...]) -> tuple[int, int, in
     return _parse_claude_semver(combined)
 
 
+class ClaudeCliUnavailableError(AgentUnavailableError, RuntimeError):
+    """The provisioned native ``claude`` CLI is missing or incompatible."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
 def _ensure_supported_claude_cli_version(cmd_prefix: tuple[str, ...]) -> tuple[int, int, int] | None:
     """Reject Claude CLI versions with the 2026-04-23 postmortem regressions."""
     from lu_machinery.review.isolation import CLAUDE_MIN_SUPPORTED_CLI_VERSION
 
     version = _probe_claude_cli_version(cmd_prefix)
     if version is not None and version < CLAUDE_MIN_SUPPORTED_CLI_VERSION:
-        raise RuntimeError(
-            "Claude CLI < 2.1.116 inherits known quality regressions fixed "
-            f"on 2026-04-23 (see {_POSTMORTEM_URL}). Upgrade with: "
-            "`claude update` (native install) or "
-            "`npm install -g @anthropic-ai/claude-code@latest`"
+        min_version = ".".join(str(part) for part in CLAUDE_MIN_SUPPORTED_CLI_VERSION)
+        observed = ".".join(str(part) for part in version)
+        raise ClaudeCliUnavailableError(
+            f"Claude CLI < {min_version} (found {observed}) inherits known quality regressions fixed "
+            f"on 2026-04-23 (see {_POSTMORTEM_URL}). Update the provisioned native `claude` CLI "
+            "with `claude update` or reinstall it via the native installer.",
+            reason="incompatible",
         )
     return version
 
 
 def _default_claude_bin() -> str | None:
-    """Resolve the native ``claude`` binary: PATH first, then the default
-    install target ``~/.local/bin/claude`` (present even when the caller's
-    PATH omits it — mirrors ai_agent_bridge._config and start-claude.sh:33).
-    Returns None when no native install exists. (deepseek review-4881
-    follow-up on #4875.)"""
+    """Resolve the provisioned native ``claude`` binary: PATH first, then the
+    default native install target ``~/.local/bin/claude`` (present even when
+    the caller's PATH omits it). Returns None when no native install exists."""
     found = shutil.which("claude")
     if found:
         return found
@@ -821,7 +830,7 @@ def _default_claude_bin() -> str | None:
 
 
 class ClaudeAdapter:
-    """Adapter for the ``claude`` CLI in print mode (local binary preferred)."""
+    """Adapter for the provisioned native ``claude`` CLI in print mode."""
 
     name: str = "claude"
     default_model: str = "claude-sonnet-5-5"
@@ -892,26 +901,10 @@ class ClaudeAdapter:
         if discussion_readonly and mode != "read-only":
             raise ValueError("AB_DISCUSS_READONLY requires mode='read-only'")
 
-        # Command prefix — prefer the local native ``claude`` binary; ``npx``
-        # is the fallback for machines without a native install (#4875).
-        #
-        # History (both flips were empirically diagnosed — check before
-        # flipping again):
-        # - Pre-#1684: local binary first. On 2026-05-05 that let dispatched
-        #   runs silently drift behind the npx-managed version (local 2.1.126
-        #   vs npx 2.1.128), so #1684 flipped to npx-first.
-        # - #4875 (2026-07-10): the ``@anthropic-ai/claude-code`` npm package
-        #   became a thin shim around a NATIVE installer — ``npx @latest``
-        #   now exits rc=1 in ~8s with "Error: claude native binary not
-        #   installed" (stdout empty, no stderr diagnostic). Every dispatched
-        #   claude run died at spawn; last successful lane dispatch was
-        #   2026-05-31. The native binary on PATH self-updates, so the
-        #   #1684 version-drift concern no longer applies; the
-        #   ``_ensure_supported_claude_cli_version`` gate below still rejects
-        #   stale binaries (< 2.1.116) loudly.
-        #
-        # Callers can still override by passing
-        # ``tool_config={"cmd_prefix": [...]}`` (preserved unchanged).
+        # Command prefix — require the provisioned native ``claude`` CLI for
+        # ordinary dispatch; never install or run via a package runner (#1144).
+        # Isolated review selects its trusted binary separately; callers may
+        # still pass an explicit ``tool_config={"cmd_prefix": [...]}``.
         cmd_prefix = tc.get("cmd_prefix")
         if review_isolation:
             trusted = tc.get("review_engine_binary")
@@ -922,17 +915,15 @@ class ClaudeAdapter:
             cmd = [cmd_prefix] if isinstance(cmd_prefix, str) else list(cmd_prefix)
         else:
             claude_bin = _default_claude_bin()
-            if claude_bin:
-                cmd = [claude_bin]
-            elif shutil.which("npx"):
-                cmd = ["npx", "@anthropic-ai/claude-code@latest"]
-            else:
-                raise RuntimeError(
-                    "Cannot dispatch Claude Code: neither a `claude` binary "
-                    "nor `npx` was found on PATH. Install the native Claude "
-                    "CLI (https://claude.com/claude-code) or Node.js "
-                    "(provides npx)."
+            if not claude_bin:
+                raise ClaudeCliUnavailableError(
+                    "Cannot dispatch Claude Code: the provisioned native `claude` CLI was not "
+                    "found on PATH or at ~/.local/bin/claude. Provision the native Claude Code "
+                    "CLI via its native installer before dispatching; automatic package-runner "
+                    "execution is not supported.",
+                    reason="missing",
                 )
+            cmd = [claude_bin]
 
         probe_prefix = tuple(cmd)
         # Review binaries are probed later, inside the verified OS sandbox.
@@ -1061,8 +1052,13 @@ class ClaudeAdapter:
         requested_agent = tc.get("agent")
         if requested_agent:
             if cli_version and cli_version < _AGENT_FLAG_MIN_VERSION:
-                raise RuntimeError(
-                    f"Claude CLI < 2.1.119 does not support --agent for print-mode subprocesses; got {cli_version!r}."
+                min_agent = ".".join(str(part) for part in _AGENT_FLAG_MIN_VERSION)
+                observed = ".".join(str(part) for part in cli_version)
+                raise ClaudeCliUnavailableError(
+                    f"Claude CLI < {min_agent} (found {observed}) does not support --agent for "
+                    "print-mode subprocesses. Update the provisioned native `claude` CLI with "
+                    "`claude update` or reinstall it via the native installer.",
+                    reason="incompatible",
                 )
             cmd.extend(["--agent", str(requested_agent)])
 
