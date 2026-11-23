@@ -1,6 +1,10 @@
 # Credit-period lane policy (#9518) — canonical source of truth.
-# Read by scripts/fleet/credit_lane.py for scripts/fleet/capacity_pick.py (router)
-# and legacy dispatch admission. Neither consumes credits or resets.
+# Read by lu_machinery/fleet/credit_lane.py for routing and dispatch admission.
+# Neither consumes credits or resets.
+#
+# Operator decision 2026-11-23: coding is refused only below 1 percent remaining
+# when the fresh meter's allowance controls admission. The same floor applies to
+# all subscription meters. Confirmed exhaustion and recent rate limits also defer.
 #
 # A configured lane reads `credit_balance_present` only while its plan allowance
 # is at or below `near_cap_remaining_pct`, the routing-budget record carries a
@@ -23,8 +27,7 @@
 schema_version: credit-lanes.v1
 
 # Plan remaining-% at or below which a credit balance is considered for configured
-# lanes. This Codex credit-policy trigger is separate from the subscription router
-# near_cap line (>= 99% used, or <= 1% remaining).
+# lanes. This Codex credit-policy trigger controls credit-period model eligibility.
 near_cap_remaining_pct: 10.0
 
 # Credit freshness bound; matches the plan-window freshness bound the router

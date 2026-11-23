@@ -1537,7 +1537,8 @@ def _meter_defer(
     status = record.get("status")
     if status in ("exhausted", "pool_exhausted") or remaining == 0:
         return "fresh", MeterDefer.EXHAUSTED
-    if status == "near_cap" or credit_lane.allowance_status(remaining) == "near_cap":
+    # The producer's near_cap label is advisory. Admission uses the measured allowance.
+    if remaining < credit_lane.CODING_ADMISSION_MIN_REMAINING_PCT:
         return "fresh", MeterDefer.NEAR_CAP
     return "fresh", None
 

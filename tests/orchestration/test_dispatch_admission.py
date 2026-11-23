@@ -142,7 +142,7 @@ def test_meter_exhaustion_defers_and_unknown_usage_keeps_fixed_cap(tmp_path, pro
     for row, reason in (
         ({"status": "rate_limited", "runtime": {"last_rate_limited_at": recent_rl}}, "rate_limited"),
         ({"status": "cool", "runtime": {"rate_limited": 1, "last_rate_limited_at": recent_rl}}, "rate_limited"),
-        ({"status": "near_cap", "freshness": "fresh", "age_s": 0, "remaining_pct": 1.0}, "near_cap"),
+        ({"status": "cool", "freshness": "fresh", "age_s": 0, "remaining_pct": 0.99}, "near_cap"),
         ({"status": "cool", "freshness": "fresh", "age_s": 0, "remaining_pct": 0}, "exhausted"),
     ):
         decision = decide(row)
@@ -439,7 +439,7 @@ def test_stale_lane_does_not_disable_another_meters_quota_deferral(tmp_path, pro
         **budget,
         "generated_at": (now - timedelta(seconds=30)).isoformat(),
         "codex_accounts": {
-            "codex:a": {"status": "near_cap", "freshness": "fresh", "stale": False, "age_s": 30, "remaining_pct": 1.0},
+            "codex:a": {"status": "near_cap", "freshness": "fresh", "stale": False, "age_s": 30, "remaining_pct": 0.99},
         },
     }
     codex_a = adm.evaluate(
@@ -450,6 +450,14 @@ def test_stale_lane_does_not_disable_another_meters_quota_deferral(tmp_path, pro
     assert codex_a.meter is not None
     assert codex_a.meter.telemetry == "fresh"
     assert codex_a.meter.defer == adm.MeterDefer.NEAR_CAP
+
+    # Exactly 1% remains eligible even when the producer labels it near_cap.
+    budget_fresh_snap["codex_accounts"]["codex:a"]["remaining_pct"] = 1.0
+    codex_a = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, meter="codex:a", meter_budget=budget_fresh_snap, now=now,
+    )
+    assert codex_a.admitted and codex_a.meter is not None
+    assert codex_a.meter.telemetry == "fresh" and codex_a.meter.defer is None
 
     # The stale grok+cursor meter itself does not apply quota denials and falls back to the unknown cap.
     gc = adm.evaluate(
@@ -487,6 +495,18 @@ def test_stale_lane_does_not_disable_another_meters_quota_deferral(tmp_path, pro
     )
     assert not gc_withdrawn.admitted and gc_withdrawn.meter is not None
     assert gc_withdrawn.meter.telemetry == "fresh" and gc_withdrawn.meter.defer == adm.MeterDefer.EXHAUSTED
+
+    # A fresh Cursor Auto label cannot veto the shared meter's numeric allowance.
+    raw_withdrawn["agents"]["grok"]["remaining_pct"] = 6.0
+    raw_withdrawn["agents"]["cursor"].update(status="near_cap", status_source="cursor_auto", remaining_pct=5.9)
+    projected = state_router._public_routing_budget(
+        state_router._aged_routing_budget(raw_withdrawn, 5.0, claude_fields={})
+    )
+    gc_with_allowance = adm.evaluate(
+        "workspace-write", tasks, thresholds=limits, meter="grok+cursor", meter_budget=projected, now=now,
+    )
+    assert gc_with_allowance.admitted and gc_with_allowance.meter is not None
+    assert gc_with_allowance.meter.telemetry == "fresh" and gc_with_allowance.meter.defer is None
 
     # Genuine ineligibility (unhealthy under withdrawal, or explicit eligible=False without withdrawal) stays unverified.
     unhealthy_withdrawn = json.loads(json.dumps(raw_withdrawn))
