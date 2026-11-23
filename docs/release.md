@@ -448,10 +448,19 @@ ends with the `--x-agent` trailer.
 `post-release` opens the post-release PR for the newest tag on `main`. It
 keeps a changelog section that already exists, which covers a release cut by
 hand. When resuming `post-release` after a cut whose adopt PR has not yet been
-installed on the host, run it with the failed cut's preserved
-`"$WORK/accept/bin/python" -I -m lu_machinery.release_cut post-release` (the
-command printed in the cleanup notice) or with
-`PYTHONPATH="$MACHINERY" ... -P` so `pr-create` uses the released publisher.
+installed on the host, run it with the failed cut's preserved clean-install
+interpreter (the command printed in the cleanup notice) or from the machinery
+checkout so `pr-create` uses the released publisher:
+
+```bash
+LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
+  "$WORK/accept/bin/python" -I -m lu_machinery.release_cut post-release \
+  --x-agent claude/claude-opus-5-5
+
+PYTHONPATH="$MACHINERY" LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
+  "$PRIMARY/.venv/bin/python" -P -m lu_machinery.release_cut post-release \
+  --x-agent claude/claude-opus-5-5
+```
 
 Installing the wheelhouse files on the host is a host operation, outside this
 repository.
