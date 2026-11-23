@@ -475,11 +475,15 @@ body at `$WORK/post-release-body.md`:
   the PR manually after verifying the already pushed commit and confirming no
   open PR exists.
 - From a source checkout, it omits a copy-paste command and prints the branch
-  name, the preserved body path, and these manual steps: verify the pushed
-  commit on `release/start-<next>`, confirm no open PR exists, and run
-  `lu_machinery.publish pr-create` from the released `$WORK/accept/bin/python -I`
-  interpreter against `main` using `--body-file <preserved post-release-body.md>`
-  (and `--milestone` when configured).
+  name, preserved body path, and manual arguments (`--repo`, `--title`,
+  `--body-file`, `--base main`, `--head`, and `--milestone` when configured).
+  Verify the pushed commit on `release/start-<next>`, confirm no open PR exists,
+  and run `lu_machinery.publish pr-create` with those arguments from an isolated
+  interpreter holding the verified released `lu-machinery` wheel: reuse the
+  prior cut's `$WORK/accept/bin/python -I` if present, or otherwise install the
+  verified released wheelhouse offline (`pip install --no-index --require-hashes`)
+  into a fresh temporary venv and run `<temp-venv>/bin/python -I -m lu_machinery.publish pr-create`
+  with `LEARN_UKRAINIAN_PRIMARY_REPO_ROOT` and `LU_PRODUCT_ROOT` set.
 
 Installing the wheelhouse files on the host is a host operation, outside this
 repository.

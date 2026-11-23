@@ -509,6 +509,8 @@ def _resolve_site_root(key: str, raw: str) -> Path | None:
     Fails closed with ``CutError`` on dangling symlinks (at the path or any ancestor), symlink loops,
     permission errors, or non-directory ancestors or leaves.
     """
+    if "\x00" in raw:
+        raise CutError(f"running interpreter {key} path contains NUL byte: {raw!r}")
     candidate = Path(raw)
     if not candidate.is_absolute():
         raise CutError(f"running interpreter {key} path must be absolute: {raw!r}")
@@ -1327,11 +1329,15 @@ class Cut:
         if release == "released":
             env_prefix = self._recovery_env_prefix()
             x_agent_flag = f" --x-agent {shlex.quote(self.x_agent)}" if self.x_agent else ""
+            no_alert_flag = "" if self.alert else " --no-alert"
+            default_remote = f"https://github.com/{self.machinery_repo}.git"
+            custom_remote = bool(self.machinery_remote) and self.machinery_remote != default_remote
+            remote_flag = " --machinery-remote <original-machinery-remote>" if custom_remote else ""
             resume = (
                 f"{env_prefix} {shlex.quote(str(self.publisher_python.absolute()))} -I -m lu_machinery.release_cut "
-                f"post-release{x_agent_flag}"
+                f"post-release{x_agent_flag}{no_alert_flag}{remote_flag}"
                 if self.publisher_python is not None
-                else f"{env_prefix} release_cut post-release{x_agent_flag}"
+                else f"{env_prefix} release_cut post-release{x_agent_flag}{no_alert_flag}{remote_flag}"
             )
             return (f"{tag} is a full release; nothing withdrawn. Remaining: mark the adopt PR "
                     f"{adopt if adopt is not None else 'unknown'} ready, then run {resume}")
@@ -1406,7 +1412,7 @@ class Cut:
             argv.extend(["--milestone", _validate_release_milestone(self.machinery_milestone, repo_label=self.machinery_repo)])
         try:
             self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
-        except CutError as exc:
+        except (CutError, subprocess.SubprocessError, OSError) as exc:
             manual = self._manual_post_release_command(argv)
             if manual is not None:
                 self.say(
@@ -1419,15 +1425,17 @@ class Cut:
                     f"verify its commit and open the PR with:\n  {manual}"
                 ) from exc
             milestone_step = (
-                f" (passing --milestone {shlex.quote(self.machinery_milestone)})"
+                f", --milestone {shlex.quote(self.machinery_milestone)}"
                 if self.machinery_milestone is not None
                 else ""
             )
             guidance = (
                 f"if {branch} is already pushed on {self.machinery_repo} with no open PR:\n"
                 f"  1. Verify the pushed commit on {branch} and confirm no open PR exists.\n"
-                f"  2. Follow docs/release.md to open the PR manually against main "
-                f"from {branch} using preserved body {body.absolute()}{milestone_step}."
+                f"  2. Follow docs/release.md to open the PR manually with "
+                f"--repo {shlex.quote(self.machinery_repo)}, --title {shlex.quote(title)}, "
+                f"--body-file {shlex.quote(str(body.absolute()))}, --base main, --head {shlex.quote(branch)}"
+                f"{milestone_step}."
             )
             self.say(f"post-release push failed; {guidance}")
             raise CutError(f"{exc}\nManual recovery: {guidance}") from exc
