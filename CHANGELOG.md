@@ -9,6 +9,17 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.61"></a>
+## [0.1.61] - 2026-11-23
+
+### Changed
+
+- Check a product-used node_modules sentinel ([#1264](https://github.com/learn-ukrainian/machinery/pull/1264))
+
+### Fixed
+
+- Restrict snapshot components to main and derive update timeout ([#1268](https://github.com/learn-ukrainian/machinery/pull/1268))
+
 <a id="v0.1.60"></a>
 ## [0.1.60] - 2026-11-23
 
@@ -1475,7 +1486,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.60...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.61...HEAD
+[0.1.61]: https://github.com/learn-ukrainian/machinery/compare/v0.1.60...v0.1.61
 [0.1.60]: https://github.com/learn-ukrainian/machinery/compare/v0.1.59...v0.1.60
 [0.1.59]: https://github.com/learn-ukrainian/machinery/compare/v0.1.58...v0.1.59
 [0.1.58]: https://github.com/learn-ukrainian/machinery/compare/v0.1.57...v0.1.58
