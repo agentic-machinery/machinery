@@ -1258,6 +1258,22 @@ class Cut:
                            lambda prs: [int(row["number"]) for row in json_depth.loads(prs.stdout, max_depth=512)] if prs.returncode == 0 else None)
         return tagged, release, adopt
 
+    def _recovery_env_prefix(self) -> str:
+        root = shlex.quote(str(self.primary.absolute()))
+        host_py = shlex.quote(str(self.host_python.absolute()))
+        return f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={root} LU_PRODUCT_ROOT={root} LU_PYTHON={host_py}"
+
+    def _manual_post_release_command(self, argv: Sequence[str]) -> str | None:
+        """Shell-quoted publisher command to open the post-release PR from an already pushed branch."""
+        try:
+            pub_argv, pub_env = self.publisher_invocation(*argv)
+        except CutError:
+            return None
+        prefix = self._recovery_env_prefix()
+        if "PYTHONPATH" in pub_env:
+            prefix += f" PYTHONPATH={shlex.quote(pub_env['PYTHONPATH'])}"
+        return f"{prefix} {shlex.join(str(part) for part in pub_argv)}"
+
     def clean_up(self, cause: str) -> str:
         """After a failure past the tag push: act only on confirmed remote state, each step on its own.
 
@@ -1273,8 +1289,7 @@ class Cut:
         if tagged is None or release is None:
             return f"remote state of {tag} unknown (tag {tagged}, release {release}); nothing withdrawn"
         if release == "released":
-            root = shlex.quote(str(self.primary.absolute()))
-            env_prefix = f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={root} LU_PRODUCT_ROOT={root}"
+            env_prefix = self._recovery_env_prefix()
             x_agent_flag = f" --x-agent {shlex.quote(self.x_agent)}" if self.x_agent else ""
             resume = (
                 f"{env_prefix} {shlex.quote(str(self.publisher_python.absolute()))} -I -m lu_machinery.release_cut "
@@ -1341,7 +1356,6 @@ class Cut:
         self.git(clone, "add", "CHANGELOG.md", *version_files)
         self.git(clone, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
                  f"{title}\n\nX-Agent: {self.x_agent}\n{_POST_RELEASE_VERIFIED}")
-        self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "post-release-body.md"
         body.write_text(
             f"Records the {self.version} section of `CHANGELOG.md`, generated from the merged PR titles in "
@@ -1351,9 +1365,24 @@ class Cut:
             encoding="utf-8",
         )
         argv = ["pr-create", "--repo", self.machinery_repo, "--title", title,
-                "--body-file", str(body), "--base", "main", "--head", branch]
+                "--body-file", str(body.absolute()), "--base", "main", "--head", branch]
         if self.machinery_milestone is not None:
             argv.extend(["--milestone", _validate_release_milestone(self.machinery_milestone, repo_label=self.machinery_repo)])
+        try:
+            self.run(["git", "-C", clone, "push", self.machinery_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
+        except CutError as exc:
+            manual = self._manual_post_release_command(argv)
+            if manual is not None:
+                self.say(
+                    f"post-release push failed; if {branch} is already pushed on {self.machinery_repo} "
+                    f"with no open PR, verify its commit and open the PR manually with:\n  {manual}"
+                )
+                raise CutError(
+                    f"{exc}\n"
+                    f"Manual recovery: if {branch} is already pushed on {self.machinery_repo} with no open PR, "
+                    f"verify its commit and open the PR with:\n  {manual}"
+                ) from exc
+            raise
         number = pr_number(self.publisher(*argv))
         self.say(f"opened post-release PR #{number}")
         return number

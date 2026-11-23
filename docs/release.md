@@ -378,18 +378,18 @@ does these steps in order:
      applies to a scratch consumer, and `--check` must verify it. Import alone
      is not acceptance.
    - **Consumer test collection** from a fresh shallow clone of product `main`.
-     The command adds one `.pth` file to the clean environment. It runs
-     `site.addsitedir` on the product environment's site-packages, so the
-     candidate's own packages come first and product-only packages come from
-     the product environment. The command checks that `lu-machinery` resolves
-     to the candidate, then runs
-     `env -u PYTHONPATH LU_PRODUCT_ROOT="$WORK/product" "$P" -m pytest --collect-only -q tests`.
-     A non-zero exit or any collection error stops the cut. During a release
-     cut, the `.pth` overlay is written into a disposable offline install under
-     `$WORK/tmp/` rather than `$WORK/accept`, so `$WORK/accept` stays
-     machinery-only for promotion, post-release publishing, and failure
+     During a release cut, the command installs the candidate wheelhouse into
+     a disposable environment under `$WORK/tmp/collection-*` (`$C` is its
+     interpreter) rather than mutating `$WORK/accept` (`$P`), so `$WORK/accept`
+     stays machinery-only for promotion, post-release publishing, and failure
      rollback (standalone `release_cut consumer-collection` writes the overlay
-     into the given `--python` venv for CI's key-test step).
+     into the given `--python` venv for CI's key-test step). It adds one `.pth`
+     file to `$C`'s site-packages that runs `site.addsitedir` on the product
+     environment's site-packages, so the candidate's own packages come first
+     and product-only packages come from the product environment. The command
+     checks that `lu-machinery` resolves to the candidate, then runs
+     `env -u PYTHONPATH LU_PRODUCT_ROOT="$WORK/product" LEARN_UKRAINIAN_PYTHON="$C" "$C" -m pytest --collect-only -q tests`.
+     A non-zero exit or any collection error stops the cut.
 
      The same step already runs on every PR and merge group, so a change that
      breaks it fails before merge. The `Installed wheel` job of CI Gate runs
@@ -451,11 +451,12 @@ ends with the `--x-agent` trailer.
 keeps a changelog section that already exists, which covers a release cut by
 hand. When resuming `post-release` after a cut whose adopt PR has not yet been
 installed on the host, run it with the failed cut's preserved clean-install
-interpreter (the command printed in the cleanup notice) or from the machinery
-checkout so `pr-create` uses the released publisher:
+interpreter (the command printed in the cleanup notice, which also carries
+`LU_PYTHON` for custom host interpreters) or from the machinery checkout so
+`pr-create` uses the released publisher:
 
 ```bash
-LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" \
+LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_ROOT="$PRIMARY" LU_PYTHON="$HOST_PYTHON" \
   "$WORK/accept/bin/python" -I -m lu_machinery.release_cut post-release \
   --x-agent claude/claude-opus-5-5
 
@@ -463,6 +464,13 @@ PYTHONPATH="$MACHINERY" LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$PRIMARY" LU_PRODUCT_
   "$PRIMARY/.venv/bin/python" -P -m lu_machinery.release_cut post-release \
   --x-agent claude/claude-opus-5-5
 ```
+
+If `post-release` fails on `git push` (for example, because an earlier failed
+cut already pushed `release/start-<next>` before `pr-create` failed), it fails
+closed without reusing or force-updating the remote branch and prints the exact
+`lu_machinery.publish pr-create` command to open the PR manually from the
+already pushed branch after verifying its commit and confirming no open PR
+exists.
 
 Installing the wheelhouse files on the host is a host operation, outside this
 repository.

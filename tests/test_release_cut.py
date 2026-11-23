@@ -1125,7 +1125,7 @@ def test_execute_skips_and_refuses_before_live_milestone_lookup(tmp_path, monkey
     assert called == []
 
 
-def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monkeypatch):
+def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monkeypatch, capsys):
     """Defect class: release_cut invokes the consumer's stale host_python publisher instead of the release's own
     publisher, failing with OPSEC: invalid publisher arguments when the release passes a new flag (0.1.62 skew)."""
     import lu_machinery
@@ -1167,6 +1167,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     _init_repo(sibling_machinery)
     host_log = tmp_path / "host-publish.log"
     accept_log = tmp_path / "accept-publish.log"
+    fail_pytest_marker = work / "fail-pytest"
 
     # Simulate the new release's verified clean-install interpreter: requires -I, primary env, and accepts --milestone.
     accept_script = (
@@ -1186,6 +1187,10 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         "fi\n"
         'if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pytest" ]; then\n'
         '  [ -f "$venv_root/lib/python3.14/site-packages/zz-release-cut-consumer.pth" ]\n'
+        f'  if [ -e {shlex.quote(str(fail_pytest_marker))} ]; then\n'
+        '    printf "1 error during collection\\n"\n'
+        "    exit 1\n"
+        "  fi\n"
         '  printf "10 tests collected\\n"\n'
         "  exit 0\n"
         "fi\n"
@@ -1290,17 +1295,23 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     lines = accept_log.read_text(encoding="utf-8").splitlines()
     assert "--milestone" in lines[1] and "--milestone" in lines[4]
 
-    # Cleanup after full release emits a complete resume command with required roots and --x-agent.
+    # Cleanup after full release emits a complete resume command with required roots, LU_PYTHON, and --x-agent.
     monkeypatch.setattr(cut, "remote_state", lambda: (True, "released", [1275]))
     resume_msg = cut.clean_up("post-release PR")
     quoted_root = shlex.quote(str(primary.absolute()))
+    quoted_host_py = shlex.quote(str(host_python.absolute()))
     expected_resume = (
         f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root} LU_PRODUCT_ROOT={quoted_root} "
+        f"LU_PYTHON={quoted_host_py} "
         f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release --x-agent claude/claude-opus-5-5"
     )
     assert expected_resume in resume_msg
-    # Execute the emitted env-prefixed command in a fresh shell with no root env vars inherited, exercising
-    # real argument parsing, x_agent_value attribution, resolve_repo("machinery"), and release-cut.lock.
+    # Execute the emitted env-prefixed command in a fresh shell with no root/interpreter env vars inherited and
+    # no <primary>/.venv/bin/python, exercising real main -> _locked_run -> _run (project_interpreter, resolve_repo,
+    # milestone parsing, git identity, lock acquisition) and stubbing only the live open_post_release call.
+    assert not (primary / ".venv/bin/python").exists()
+    probe_home = tmp_path / "probe-home"
+    probe_home.mkdir()
     probe_runner = tmp_path / "resume-probe-python"
     pkg_parent = Path(lu_machinery.__file__).resolve().parents[1]
     probe_runner.write_text(
@@ -1309,14 +1320,13 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         f"sys.path.insert(0, {str(pkg_parent)!r})\n"
         "from pathlib import Path\n"
         "from lu_machinery import release_cut\n"
-        "from lu_machinery.common.repo_root import primary_root\n"
-        "from lu_machinery.dispatcher.git import resolve_repo\n"
-        "def stub_run(args):\n"
-        f"    assert primary_root().resolve() == Path({str(primary)!r}).resolve()\n"
-        f"    assert resolve_repo('machinery')[0].resolve() == Path({str(sibling_machinery)!r}).resolve()\n"
-        "    print('LOCKED_OK', args.command, args.x_agent)\n"
+        "def stub_open_post_release(probe_cut):\n"
+        f"    assert probe_cut.primary.resolve() == Path({str(primary)!r}).resolve()\n"
+        f"    assert probe_cut.host_python == Path({str(host_python.absolute())!r})\n"
+        "    assert probe_cut.x_agent == 'claude/claude-opus-5-5'\n"
+        "    print('RUN_OK', probe_cut.host_python, probe_cut.x_agent)\n"
         "    return 0\n"
-        "release_cut._run = stub_run\n"
+        "release_cut.open_post_release = stub_open_post_release\n"
         "raise SystemExit(release_cut.main(sys.argv[4:]))\n",
         encoding="utf-8",
     )
@@ -1324,24 +1334,86 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     emitted_for_probe = expected_resume.replace(shlex.quote(str(installed)), shlex.quote(str(probe_runner)), 1)
     clean_shell_env = {
         key: value for key, value in os.environ.items()
-        if key not in {"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT", "LU_TASKS_DIR"}
+        if key not in {
+            "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT",
+            "LU_PYTHON", "LEARN_UKRAINIAN_PYTHON", "LU_TASKS_DIR",
+            "LU_STATE_ROOT", "LEARN_UKRAINIAN_STATE_ROOT", "LEARN_UKRAINIAN_DISPATCH_TASK_ID",
+        }
     }
+    clean_shell_env["HOME"] = str(probe_home)
     probe_result = subprocess.run(
         ["/bin/sh", "-c", emitted_for_probe], cwd=tmp_path, env=clean_shell_env,
         capture_output=True, text=True, check=False, timeout=30,
     )
     assert probe_result.returncode == 0, f"emitted resume command failed: {probe_result.stderr}"
-    assert "LOCKED_OK post-release claude/claude-opus-5-5" in probe_result.stdout
+    assert f"RUN_OK {host_python.absolute()} claude/claude-opus-5-5" in probe_result.stdout
     assert (sibling_machinery / ".git/release-cut.lock").is_file()
+    # Negative control (PR1278-F2): omitting LU_PYTHON fails in real _run when primary has no default venv.
+    without_lu_python = emitted_for_probe.replace(f"LU_PYTHON={quoted_host_py} ", "", 1)
+    fail_probe = subprocess.run(
+        ["/bin/sh", "-c", without_lu_python], cwd=tmp_path, env=clean_shell_env,
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert fail_probe.returncode != 0
+    assert "project interpreter not found" in fail_probe.stderr
+
+    # 1b. Failed post_release git push prints and raises the exact manual publisher pr-create command without
+    # reusing or force-updating remote branches; executing that command in a fresh shell opens the PR.
+    push_fail_enabled = True
+
+    def run_with_push_failure(argv, **kwargs):
+        command = [str(part) for part in argv]
+        if push_fail_enabled and command[:2] == ["git", "-C"] and "push" in command:
+            raise CutError("git -C machinery push exited 1: ! [rejected] HEAD -> release/start-0.1.63 (non-fast-forward)")
+        return run(argv, **kwargs)
+
+    cut.git(machinery, "switch", "--quiet", "main")
+    cut.git(machinery, "branch", "-D", "release/start-0.1.63")
+    accept_log.write_text("", encoding="utf-8")
+    capsys.readouterr()
+    with monkeypatch.context() as push_ctx:
+        push_ctx.setattr(cut, "run", run_with_push_failure)
+        with pytest.raises(CutError) as push_exc:
+            cut.post_release("### Fixed\n\n- Fix\n")
+    err_text = str(push_exc.value)
+    out_text = capsys.readouterr().out
+    assert "non-fast-forward" in err_text
+    assert "Manual recovery:" in err_text
+    assert "post-release push failed;" in out_text
+    manual_line = err_text.splitlines()[-1].strip()
+    assert manual_line in out_text
+    assert f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={quoted_root}" in manual_line
+    assert f"LU_PRODUCT_ROOT={quoted_root}" in manual_line
+    assert f"LU_PYTHON={quoted_host_py}" in manual_line
+    assert f"--body-file {shlex.quote(str((work / 'post-release-body.md').absolute()))}" in manual_line
+    assert (work / "post-release-body.md").is_file()
+    manual_result = subprocess.run(
+        ["/bin/sh", "-c", manual_line], cwd=tmp_path, env=clean_shell_env,
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert manual_result.returncode == 0, f"manual pr-create command failed: {manual_result.stderr}"
+    assert "/pull/1275" in manual_result.stdout
+    assert "--milestone" in accept_log.read_text(encoding="utf-8")
+    assert not host_log.exists()
+    push_fail_enabled = False
 
     # 2. Cut-time consumer_collection uses a disposable venv under work/tmp, keeping work/accept unmutated for
-    # promotion and failure rollback even when overlay write raises ENOSPC.
+    # promotion and failure rollback even when overlay write raises ENOSPC or pytest exits nonzero.
     assert cut.consumer_collection(installed, product) == "10 tests collected"
     accept_overlay = work / "accept/lib/python3.14/site-packages/zz-release-cut-consumer.pth"
     assert not accept_overlay.exists()
     collection_dirs = sorted((work / "tmp").glob("collection-*"))
     assert len(collection_dirs) == 1
     assert (collection_dirs[0] / "lib/python3.14/site-packages/zz-release-cut-consumer.pth").is_file()
+
+    # Nonzero pytest --collect-only exit raises CutError and leaves work/accept clean (PR1278-F6).
+    fail_pytest_marker.write_text("1", encoding="utf-8")
+    try:
+        with pytest.raises(CutError, match=r"product test collection failed \(exit 1\): 1 error during collection"):
+            cut.consumer_collection(installed, product)
+    finally:
+        fail_pytest_marker.unlink()
+    assert not accept_overlay.exists()
 
     real_write_text = Path.write_text
 
@@ -1407,9 +1479,13 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     with monkeypatch.context() as src_ctx:
         src_ctx.setattr(lu_machinery, "__file__", str(src_init))
         argv, env = cut.publisher_invocation("read", "run", "--repo", REPO, "--number", "7")
+        manual_src = cut._manual_post_release_command(["pr-create", "--repo", REPO, "--head", "release/start-0.1.63"])
     assert argv == [Path(sys.executable), "-P", "-s", "-m", "lu_machinery.publish", "read", "run", "--repo", REPO, "--number", "7"]
     assert env["PYTHONPATH"] == str(src_root.resolve())
     assert "PYTHONWARNINGS" not in env and "PYTHONUSERBASE" not in env
+    assert manual_src is not None
+    assert f"PYTHONPATH={shlex.quote(str(src_root.resolve()))}" in manual_src
+    assert "-P -s -m lu_machinery.publish pr-create" in manual_src
 
     # Installed venv invocation (e.g. resuming post-release with accept/bin/python -I) uses -I with no PYTHONPATH.
     fake_site = work / "accept/lib/python3.14/site-packages"
@@ -1459,3 +1535,5 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     monkeypatch.setattr(sys, "executable", "")
     with pytest.raises(CutError, match="cannot locate the running Python interpreter"):
         cut.publisher_invocation("pr-create")
+    # Manual command formatting fails soft (None) when publisher_invocation fails so original push errors are not masked.
+    assert cut._manual_post_release_command(["pr-create"]) is None
