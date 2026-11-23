@@ -933,6 +933,48 @@ def _venv_reads() -> list[Path]:
     raise ValueError("the project interpreter link chain is too long")
 
 
+_FORBIDDEN_TOOLCHAIN_ROOTS = frozenset({
+    Path("/"), Path("/home"), Path("/root"), Path("/opt"), Path("/usr"),
+    Path("/usr/local"), Path("/var"), Path("/tmp"), Path("/etc"), Path("/proc"), Path("/sys"),
+})
+
+
+def _admit_toolchain_read_dir(path: Path, *, home: Path, reject_root: Path, worktree: Path) -> Path:
+    """Validate one canonical directory before binding it read-only into the AGY sandbox."""
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise Refused("node_toolchain_sandbox_refused: resolved Node toolchain directory is unreadable") from exc
+    if not resolved.is_dir():
+        raise Refused("node_toolchain_sandbox_refused: resolved Node toolchain path is not a directory")
+    if (
+        resolved in _FORBIDDEN_TOOLCHAIN_ROOTS
+        or home.is_relative_to(resolved)
+        or _under_credential(resolved, home)
+        or resolved.is_relative_to(reject_root)
+        or resolved.is_relative_to(worktree)
+    ):
+        raise Refused("node_toolchain_sandbox_refused: resolved Node toolchain path is not eligible for read-only mount")
+    return resolved
+
+
+def _node_toolchain_reads(bin_dir: Path, *, home: Path, reject_root: Path, worktree: Path) -> list[Path]:
+    """Read-only mounts for a worktree-pinned Node/npm toolchain: ``bin/`` and its sibling ``lib/node_modules``."""
+    resolved_home = home.resolve()
+    resolved_reject = reject_root.resolve()
+    resolved_worktree = worktree.resolve()
+    reads = [_admit_toolchain_read_dir(bin_dir, home=resolved_home, reject_root=resolved_reject, worktree=resolved_worktree)]
+    if reads[0].name == "bin":
+        modules = reads[0].parent / "lib" / "node_modules"
+        if os.path.lexists(modules):
+            resolved_modules = _admit_toolchain_read_dir(
+                modules, home=resolved_home, reject_root=resolved_reject, worktree=resolved_worktree
+            )
+            if resolved_modules not in reads:
+                reads.append(resolved_modules)
+    return reads
+
+
 def _link_interpreter(worktree: Path) -> bool:
     """Expose the project venv as the worktree's ``.venv``; return whether this call created the link.
 
@@ -1268,6 +1310,16 @@ class _Boundary:
         if main_checkout_root(self.worktree).resolve(strict=True) != repository:
             raise Refused("store_primary_disagreement")
         self.common = common
+        from lu_machinery.dispatcher import site_deps
+
+        node_bin: Path | None = None
+        node_reads: list[Path] = []
+        try:
+            node_bin = site_deps.resolve_toolchain_dir(self.worktree, env=os.environ)
+        except site_deps.NodeToolchainError as exc:
+            raise Refused(str(exc)) from exc
+        if node_bin is not None:
+            node_reads = _node_toolchain_reads(node_bin, home=Path.home(), reject_root=repository, worktree=self.worktree)
 
         self.base.mkdir(mode=0o700)  # exclusive: an existing scratch is never reused or removed
         self.created = True
@@ -1377,6 +1429,11 @@ class _Boundary:
                 {"op": "stat", "path": absent, "expect": "ENOENT"},
                 {"op": "create", "path": absent, "expect": "EROFS"},
             ])
+        if node_bin is not None:
+            probes.extend([
+                {"op": "stat", "path": str(node_bin / "node"), "expect": "OK"},
+                {"op": "stat", "path": str(node_bin / "npm"), "expect": "OK"},
+            ])
         self.receipt["canary"] = {"targets": sorted({probe["path"] for probe in probes}), "passed": False}
 
         self.gh = _GhBroker(boundary / "gh.sock", self.worktree)
@@ -1390,8 +1447,8 @@ class _Boundary:
         self.relay = SourcesRelay(boundary / "sources.sock", frozenset(readers), env_keep)
         sandbox = prepare_host_sandbox(
             engine="agy", snapshot_root=self.worktree, write_root=runtime, reject_root=repository,
-            runtime_reads=[*runtime_files(agy), *_venv_reads(), *reads, *(target for _, target in databases), *sidecars,
-                           shared, boundary],
+            runtime_reads=[*runtime_files(agy), *_venv_reads(), *node_reads, *reads,
+                           *(target for _, target in databases), *sidecars, shared, boundary],
             network_allowed=False,
         )
         self.receipt["bwrap"] = str(sandbox.binary)
@@ -1433,8 +1490,12 @@ class _Boundary:
             "--remount-ro", "/",
         ]
         self.receipt["argv_sha256"] = hashlib.sha256(json.dumps(argv).encode()).hexdigest()
+        sandbox_path = [str(boundary / "bin")]
+        if node_bin is not None:
+            sandbox_path.append(str(node_bin))
+        sandbox_path.extend(["/usr/bin", "/bin", str(agy.parent)])
         env = {
-            "HOME": str(home), "TMPDIR": str(tmp), "PATH": f"{boundary / 'bin'}:/usr/bin:/bin:{agy.parent}",
+            "HOME": str(home), "TMPDIR": str(tmp), "PATH": os.pathsep.join(dict.fromkeys(sandbox_path)),
             "LANG": os.environ.get("LANG", "C.UTF-8"), "USER": "review", "LOGNAME": "review", "SHELL": "/bin/bash",
             "LU_TASKS_DIR": str(tasks),
             # The project's scratch root (scripts.common.scratch) defaults to a host path that is
