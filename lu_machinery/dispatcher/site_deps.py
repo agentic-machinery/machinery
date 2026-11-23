@@ -21,19 +21,25 @@ that differ in a native build share only the files that really are identical.
 ``python -m scripts.dispatcher.site_deps {ensure|status|prune|detach}``.
 """
 
+from __future__ import annotations
+
 import argparse
 import fcntl
 import hashlib
 import json
 import logging
 import os
+import re
 import runpy
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import unicodedata
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 # File-path and isolated callers use this release's helper, never an installed copy.
@@ -67,10 +73,511 @@ RUNTIME_CACHES = frozenset({".cache", ".vite", ".vite-temp", ".astro"})
 COPIED = frozenset({".package-lock.json"})
 STORE_ENV = "LEARN_UKRAINIAN_DEP_STORE"
 DISABLE_ENV = "LEARN_UKRAINIAN_SITE_DEPS"
+NODE_TOOLCHAIN_DIRS_ENV = "LU_NODE_TOOLCHAIN_DIRS"
+# Default toolchain directory layout; hosts override via NODE_TOOLCHAIN_DIRS_ENV.
+DEFAULT_NODE_TOOLCHAIN_DIRS = ("/opt/lu-node/{major}/bin",)
+_SHIM_TAILS = frozenset({("agent_runtime", "shims"), ("dispatcher", "npm_shims")})
+_NVMRC_MAX_BYTES = 1024
+_ENGINE_SPEC_MAX_CHARS = 256
+_MAX_MAJOR_EXPANSION = 16
+_NVMRC_RE = re.compile(r"^v?(0|[1-9]\d*)(?:\.(0|[1-9]\d*)(?:\.(0|[1-9]\d*))?)?$")
+_SEMVER_OP_SPACE_RE = re.compile(r"(>=|<=|>|<|=|\^|~)\s+")
+_SEMVER_TOKEN_RE = re.compile(
+    r"^(?P<op>>=|<=|>|<|=|\^|~)?v?"
+    r"(?P<major>0|[1-9]\d*)"
+    r"(?:\.(?P<minor>0|[1-9]\d*|x|X|\*)(?:\.(?P<patch>0|[1-9]\d*|x|X|\*))?)?$"
+)
+_VERSION_LINE_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:[-+][0-9A-Za-z.-]+)?$")
 
 
 class NotCacheable(Exception):
     """The installed tree cannot be shared without breaking worktree isolation."""
+
+
+class NodeToolchainError(ValueError):
+    """A worktree's pinned Node/npm toolchain is invalid, conflicting, or unavailable."""
+
+    def __init__(self, message: str, *, code: str = "node_toolchain_unavailable") -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+
+@dataclass(frozen=True)
+class _SemverInterval:
+    """Half-open version interval ``[low, high)`` over ``(major, minor, patch)`` triples."""
+
+    low: tuple[int, int, int]
+    high: tuple[int, int, int] | None
+
+    def matches(self, version: tuple[int, int, int]) -> bool:
+        return version >= self.low and (self.high is None or version < self.high)
+
+    def intersect(self, other: _SemverInterval) -> _SemverInterval | None:
+        low = max(self.low, other.low)
+        if self.high is None:
+            high = other.high
+        elif other.high is None:
+            high = self.high
+        else:
+            high = min(self.high, other.high)
+        if high is not None and low >= high:
+            return None
+        return _SemverInterval(low=low, high=high)
+
+
+@dataclass(frozen=True)
+class _SemverRange:
+    """Union of half-open semver intervals parsed from an engine spec or ``.nvmrc``."""
+
+    raw: str
+    intervals: tuple[_SemverInterval, ...]
+
+    def matches(self, version: tuple[int, int, int]) -> bool:
+        return any(interval.matches(version) for interval in self.intervals)
+
+    def intersect(self, other: _SemverRange) -> tuple[_SemverInterval, ...]:
+        combined: list[_SemverInterval] = []
+        for left in self.intervals:
+            for right in other.intervals:
+                overlap = left.intersect(right)
+                if overlap is not None:
+                    combined.append(overlap)
+        return tuple(combined)
+
+
+@dataclass(frozen=True)
+class _WorktreeNodePin:
+    """Effective Node and npm version constraints read from a worktree."""
+
+    node_intervals: tuple[_SemverInterval, ...] | None
+    npm_range: _SemverRange | None
+    majors: tuple[int, ...] | None
+    description: str
+
+    def matches_node(self, version: tuple[int, int, int]) -> bool:
+        if self.node_intervals is None:
+            return True
+        return any(interval.matches(version) for interval in self.node_intervals)
+
+    def matches_npm(self, version: tuple[int, int, int]) -> bool:
+        if self.npm_range is None:
+            return True
+        return self.npm_range.matches(version)
+
+
+def _has_unsafe_chars(text: str) -> bool:
+    return any(unicodedata.category(ch)[0] == "C" or ch in "\u2028\u2029" for ch in text)
+
+
+def _parse_comparator(token: str, *, field: str) -> _SemverInterval:
+    if token in {"*", "x", "X"}:
+        return _SemverInterval((0, 0, 0), None)
+    match = _SEMVER_TOKEN_RE.fullmatch(token)
+    if match is None:
+        raise NodeToolchainError(f"{field} has unsupported version specifier {token!r}", code="node_pin_invalid")
+    op = match.group("op") or "="
+    major = int(match.group("major"))
+    raw_minor = match.group("minor")
+    raw_patch = match.group("patch")
+    minor_wild = raw_minor in {"x", "X", "*"}
+    patch_wild = raw_patch in {"x", "X", "*"}
+    if minor_wild and raw_patch is not None and not patch_wild:
+        raise NodeToolchainError(f"{field} has invalid wildcard specifier {token!r}", code="node_pin_invalid")
+    minor = None if raw_minor is None or minor_wild else int(raw_minor)
+    patch = None if raw_patch is None or patch_wild else int(raw_patch)
+
+    if op == "=":
+        if minor is None:
+            return _SemverInterval((major, 0, 0), (major + 1, 0, 0))
+        if patch is None:
+            return _SemverInterval((major, minor, 0), (major, minor + 1, 0))
+        return _SemverInterval((major, minor, patch), (major, minor, patch + 1))
+    if op == "^":
+        if minor is None:
+            return _SemverInterval((major, 0, 0), (major + 1, 0, 0))
+        if patch is None:
+            high = (major + 1, 0, 0) if major > 0 else (0, minor + 1, 0)
+            return _SemverInterval((major, minor, 0), high)
+        if major > 0:
+            high = (major + 1, 0, 0)
+        elif minor > 0:
+            high = (0, minor + 1, 0)
+        else:
+            high = (0, 0, patch + 1)
+        return _SemverInterval((major, minor, patch), high)
+    if op == "~":
+        if minor is None:
+            return _SemverInterval((major, 0, 0), (major + 1, 0, 0))
+        return _SemverInterval((major, minor, patch or 0), (major, minor + 1, 0))
+    if op == ">=":
+        return _SemverInterval((major, minor or 0, patch or 0), None)
+    if op == ">":
+        if minor is None:
+            return _SemverInterval((major + 1, 0, 0), None)
+        if patch is None:
+            return _SemverInterval((major, minor + 1, 0), None)
+        return _SemverInterval((major, minor, patch + 1), None)
+    if op == "<":
+        return _SemverInterval((0, 0, 0), (major, minor or 0, patch or 0))
+    # op == "<="
+    if minor is None:
+        return _SemverInterval((0, 0, 0), (major + 1, 0, 0))
+    if patch is None:
+        return _SemverInterval((0, 0, 0), (major, minor + 1, 0))
+    return _SemverInterval((0, 0, 0), (major, minor, patch + 1))
+
+
+def _parse_semver_range(raw: object, *, field: str) -> _SemverRange:
+    if not isinstance(raw, str):
+        raise NodeToolchainError(f"{field} must be a non-empty string", code="node_pin_invalid")
+    if len(raw) > _ENGINE_SPEC_MAX_CHARS or _has_unsafe_chars(raw):
+        raise NodeToolchainError(f"{field} contains invalid or oversized characters", code="node_pin_invalid")
+    cleaned = raw.strip()
+    if not cleaned:
+        raise NodeToolchainError(f"{field} must not be empty", code="node_pin_invalid")
+    intervals: list[_SemverInterval] = []
+    for raw_clause in cleaned.split("||"):
+        clause = _SEMVER_OP_SPACE_RE.sub(r"\1", raw_clause.strip())
+        if not clause:
+            raise NodeToolchainError(f"{field} has an empty version clause in {raw!r}", code="node_pin_invalid")
+        current: _SemverInterval | None = _SemverInterval((0, 0, 0), None)
+        for token in clause.split():
+            assert current is not None
+            current = current.intersect(_parse_comparator(token, field=field))
+            if current is None:
+                break
+        if current is not None:
+            intervals.append(current)
+    if not intervals:
+        raise NodeToolchainError(f"{field} ({cleaned!r}) matches no version", code="node_pin_conflict")
+    return _SemverRange(raw=cleaned, intervals=tuple(intervals))
+
+
+def _read_nvmrc(path: Path, *, label: str) -> _SemverRange | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise NodeToolchainError(f"cannot inspect {label} ({path}): {exc}", code="node_pin_invalid") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise NodeToolchainError(f"{label} ({path}) must be a regular file, not a symlink or directory",
+                                 code="node_pin_invalid")
+    if info.st_size > _NVMRC_MAX_BYTES:
+        raise NodeToolchainError(f"{label} ({path}) exceeds {_NVMRC_MAX_BYTES} bytes", code="node_pin_invalid")
+    try:
+        data = path.read_bytes()
+        text = data.decode("ascii")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise NodeToolchainError(f"{label} ({path}) is not readable ASCII: {exc}", code="node_pin_invalid") from exc
+    cleaned = text.strip(" \t\r\n")
+    if not cleaned or "\n" in cleaned or "\r" in cleaned or _has_unsafe_chars(cleaned):
+        raise NodeToolchainError(f"{label} ({path}) must contain a single Node version line", code="node_pin_invalid")
+    match = _NVMRC_RE.fullmatch(cleaned)
+    if match is None:
+        raise NodeToolchainError(f"{label} ({path}) has unsupported Node pin {cleaned!r}", code="node_pin_invalid")
+    major = int(match.group(1))
+    minor = int(match.group(2)) if match.group(2) is not None else None
+    patch = int(match.group(3)) if match.group(3) is not None else None
+    if minor is None:
+        interval = _SemverInterval((major, 0, 0), (major + 1, 0, 0))
+    elif patch is None:
+        interval = _SemverInterval((major, minor, 0), (major, minor + 1, 0))
+    else:
+        interval = _SemverInterval((major, minor, patch), (major, minor, patch + 1))
+    return _SemverRange(raw=cleaned, intervals=(interval,))
+
+
+def _bounded_majors(intervals: tuple[_SemverInterval, ...]) -> tuple[int, ...] | None:
+    majors: set[int] = set()
+    for interval in intervals:
+        if interval.high is None:
+            return None
+        max_major = interval.high[0] if (interval.high[1] > 0 or interval.high[2] > 0) else interval.high[0] - 1
+        if max_major - interval.low[0] + 1 > _MAX_MAJOR_EXPANSION:
+            return None
+        majors.update(range(interval.low[0], max_major + 1))
+    return tuple(sorted(majors, reverse=True)) if majors else None
+
+
+def _read_worktree_pins(worktree: Path, site: Path) -> _WorktreeNodePin | None:
+    root_nvmrc = _read_nvmrc(worktree / ".nvmrc", label=".nvmrc")
+    site_nvmrc = _read_nvmrc(site / ".nvmrc", label=f"{SITE}/.nvmrc")
+    nvmrc: _SemverRange | None = root_nvmrc
+    if root_nvmrc is not None and site_nvmrc is not None:
+        overlap = root_nvmrc.intersect(site_nvmrc)
+        if not overlap:
+            raise NodeToolchainError(
+                f".nvmrc ({root_nvmrc.raw!r}) conflicts with {SITE}/.nvmrc ({site_nvmrc.raw!r})",
+                code="node_pin_conflict",
+            )
+        nvmrc = _SemverRange(raw=f"{root_nvmrc.raw} & {site_nvmrc.raw}", intervals=overlap)
+    elif site_nvmrc is not None:
+        nvmrc = site_nvmrc
+
+    package_path = site / "package.json"
+    try:
+        package = _json_loads(package_path.read_text(encoding="utf-8"), max_depth=512)
+    except (OSError, ValueError, RecursionError) as exc:
+        raise NodeToolchainError(f"cannot read {SITE}/package.json: {exc}", code="node_pin_invalid") from exc
+    if not isinstance(package, dict):
+        raise NodeToolchainError(f"{SITE}/package.json must be a JSON object", code="node_pin_invalid")
+    engines = package.get("engines")
+    node_engine: _SemverRange | None = None
+    npm_engine: _SemverRange | None = None
+    if engines is not None:
+        if not isinstance(engines, dict):
+            raise NodeToolchainError(f"{SITE}/package.json engines must be a JSON object", code="node_pin_invalid")
+        if "node" in engines:
+            node_engine = _parse_semver_range(engines["node"], field=f"{SITE}/package.json engines.node")
+        if "npm" in engines:
+            npm_engine = _parse_semver_range(engines["npm"], field=f"{SITE}/package.json engines.npm")
+
+    node_intervals: tuple[_SemverInterval, ...] | None = None
+    if nvmrc is not None and node_engine is not None:
+        overlap = nvmrc.intersect(node_engine)
+        if not overlap:
+            raise NodeToolchainError(
+                f"worktree .nvmrc ({nvmrc.raw!r}) conflicts with {SITE}/package.json engines.node ({node_engine.raw!r})",
+                code="node_pin_conflict",
+            )
+        node_intervals = overlap
+    elif nvmrc is not None:
+        node_intervals = nvmrc.intervals
+    elif node_engine is not None:
+        node_intervals = node_engine.intervals
+
+    if node_intervals is None and npm_engine is None:
+        return None
+
+    parts: list[str] = []
+    if nvmrc is not None:
+        parts.append(f".nvmrc={nvmrc.raw!r}")
+    if node_engine is not None:
+        parts.append(f"{SITE}/package.json engines.node={node_engine.raw!r}")
+    if npm_engine is not None:
+        parts.append(f"{SITE}/package.json engines.npm={npm_engine.raw!r}")
+    majors = _bounded_majors(node_intervals) if node_intervals is not None else None
+    return _WorktreeNodePin(
+        node_intervals=node_intervals,
+        npm_range=npm_engine,
+        majors=majors,
+        description=", ".join(parts),
+    )
+
+
+def _is_shim_dir(entry: str) -> bool:
+    path = Path(entry)
+    if path.parts[-2:] in _SHIM_TAILS or path.parts[-3:] in SHIM_DIRS:
+        return True
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return True
+    return resolved.parts[-2:] in _SHIM_TAILS or resolved.parts[-3:] in SHIM_DIRS
+
+
+def _configured_toolchain_templates(env: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    source = os.environ if env is None else env
+    if NODE_TOOLCHAIN_DIRS_ENV not in source:
+        return DEFAULT_NODE_TOOLCHAIN_DIRS
+    raw = source[NODE_TOOLCHAIN_DIRS_ENV]
+    if not raw.strip():
+        raise NodeToolchainError(
+            f"{NODE_TOOLCHAIN_DIRS_ENV} must not be empty when set",
+            code="node_toolchain_config_invalid",
+        )
+    templates: list[str] = []
+    for entry in raw.split(os.pathsep):
+        if not entry or _has_unsafe_chars(entry):
+            raise NodeToolchainError(
+                f"{NODE_TOOLCHAIN_DIRS_ENV} contains an empty or unsafe path entry {entry!r}",
+                code="node_toolchain_config_invalid",
+            )
+        substituted = entry.replace("{major}", "0")
+        if "{" in substituted or "}" in substituted:
+            raise NodeToolchainError(
+                f"{NODE_TOOLCHAIN_DIRS_ENV} entry {entry!r} may only use the '{{major}}' placeholder",
+                code="node_toolchain_config_invalid",
+            )
+        probe_path = Path(substituted)
+        if not probe_path.is_absolute() or ".." in probe_path.parts:
+            raise NodeToolchainError(
+                f"{NODE_TOOLCHAIN_DIRS_ENV} entry {entry!r} must be an absolute path without '..'",
+                code="node_toolchain_config_invalid",
+            )
+        templates.append(entry)
+    return tuple(templates)
+
+
+def _non_shim_path_dirs(env: Mapping[str, str] | None = None) -> list[Path]:
+    source = os.environ if env is None else env
+    search = source.get("AGENT_ORIGINAL_PATH") or source.get("PATH", os.defpath)
+    dirs: list[Path] = []
+    for entry in search.split(os.pathsep):
+        if not entry or not Path(entry).is_absolute() or _is_shim_dir(entry):
+            continue
+        dirs.append(Path(entry))
+    return dirs
+
+
+def _companion_npm(candidate_dir: Path, resolved_node: Path) -> tuple[Path, Path] | None:
+    """Locate an executable ``npm`` paired with ``resolved_node``, preferring the Node install's bin dir."""
+    for bin_dir in (resolved_node.parent, candidate_dir):
+        node_path = bin_dir / "node"
+        npm_path = bin_dir / "npm"
+        try:
+            if node_path.resolve(strict=True) != resolved_node:
+                continue
+            resolved_npm = npm_path.resolve(strict=True)
+            resolved_dir = bin_dir.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved_npm.is_file() and os.access(npm_path, os.X_OK):
+            return resolved_dir, npm_path
+    return None
+
+
+def _probe_version(binary: Path, *, env: Mapping[str, str]) -> tuple[int, int, int] | None:
+    try:
+        proc = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            [str(binary), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            env=dict(env),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    observed = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    if not observed:
+        return None
+    match = _VERSION_LINE_RE.fullmatch(observed.splitlines()[0].strip())
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def _probe_npm_semver(npm_bin: Path, bin_dir: Path) -> tuple[int, int, int] | None:
+    probe_env = {
+        "PATH": os.pathsep.join(dict.fromkeys([str(bin_dir), *SYSTEM_PATH])),
+        "LANG": "C.UTF-8",
+    }
+    return _probe_version(npm_bin, env=probe_env)
+
+
+def _resolve_node_binary(
+    *,
+    search_dirs: Sequence[Path],
+    matches_version: Callable[[tuple[int, int, int]], bool],
+    probe_env: Mapping[str, str],
+    candidate_filter: Callable[[Path, Path, tuple[int, int, int]], bool],
+) -> tuple[Path, Path, tuple[int, int, int]] | None:
+    """Select the highest matching-semver ``node`` across ``search_dirs`` (stdlib-only for file-path callers)."""
+    seen: set[tuple[str, str]] = set()
+    best: tuple[Path, Path, tuple[int, int, int]] | None = None
+    for directory in search_dirs:
+        candidate = directory / "node"
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError):
+            # Python 3.12 raises RuntimeError on symlink loops; 3.13+ uses OSError(ELOOP).
+            continue
+        key = (str(resolved), str(directory))
+        if key in seen:
+            continue
+        seen.add(key)
+        if not (resolved.is_file() and os.access(resolved, os.X_OK)):
+            continue
+        version = _probe_version(resolved, env=probe_env)
+        if version is None or not matches_version(version):
+            continue
+        if not candidate_filter(candidate, resolved, version):
+            continue
+        if best is None or version > best[2]:
+            best = (candidate, resolved, version)
+    return best
+
+
+def resolve_toolchain_dir(
+    worktree: Path,
+    site: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Resolve the pinned Node/npm bin directory for ``worktree``, or ``None`` when unpinned."""
+    pin = _read_worktree_pins(worktree, site)
+    if pin is None:
+        return None
+    templates = _configured_toolchain_templates(env)
+    search_dirs: list[Path] = []
+    seen_dirs: set[str] = set()
+    skipped_templates: list[str] = []
+    for template in templates:
+        if "{major}" in template:
+            if pin.majors is None:
+                skipped_templates.append(template)
+                continue
+            for major in pin.majors:
+                expanded = template.replace("{major}", str(major))
+                if expanded not in seen_dirs:
+                    seen_dirs.add(expanded)
+                    search_dirs.append(Path(expanded))
+        elif template not in seen_dirs:
+            seen_dirs.add(template)
+            search_dirs.append(Path(template))
+    for path_dir in _non_shim_path_dirs(env):
+        text = str(path_dir)
+        if text not in seen_dirs:
+            seen_dirs.add(text)
+            search_dirs.append(path_dir)
+
+    probe_env = {"PATH": os.pathsep.join(SYSTEM_PATH), "LANG": "C.UTF-8"}
+    matched_dirs: dict[tuple[Path, Path], Path] = {}
+    npm_rejections: list[str] = []
+
+    def _check_npm(candidate: Path, resolved_node: Path, node_version: tuple[int, int, int]) -> bool:
+        pair = _companion_npm(candidate.parent, resolved_node)
+        if pair is None:
+            npm_rejections.append(f"{candidate.parent} (node v{'.'.join(map(str, node_version))}, npm missing)")
+            return False
+        bin_dir, npm_bin = pair
+        npm_version = _probe_npm_semver(npm_bin, bin_dir)
+        if npm_version is None:
+            npm_rejections.append(f"{bin_dir} (node v{'.'.join(map(str, node_version))}, npm --version unreadable)")
+            return False
+        if not pin.matches_npm(npm_version):
+            npm_rejections.append(
+                f"{bin_dir} (node v{'.'.join(map(str, node_version))}, npm {'.'.join(map(str, npm_version))})"
+            )
+            return False
+        matched_dirs[(candidate, resolved_node)] = bin_dir
+        return True
+
+    found = _resolve_node_binary(
+        search_dirs=search_dirs,
+        matches_version=pin.matches_node,
+        probe_env=probe_env,
+        candidate_filter=_check_npm,
+    )
+    if found is None:
+        searched = ", ".join(str(directory) for directory in search_dirs) or "(none)"
+        skipped = (
+            f"; skipped templated dirs (pin does not bound Node majors): {', '.join(skipped_templates)}"
+            if skipped_templates
+            else ""
+        )
+        extra = f"; rejected matching-node candidates: {'; '.join(npm_rejections)}" if npm_rejections else ""
+        raise NodeToolchainError(
+            f"no matching Node/npm toolchain for pin [{pin.description}]; "
+            f"searched directories: {searched}{skipped}{extra}; "
+            f"install the pinned toolchain or set {NODE_TOOLCHAIN_DIRS_ENV}",
+            code="node_toolchain_unavailable",
+        )
+    return matched_dirs[(found[0], found[1])]
 
 
 def store_root(repo: Path) -> Path:
@@ -120,14 +627,15 @@ def _local_inputs(site: Path) -> dict[str, str]:
 def _tool_dirs() -> list[str]:
     """Directories of the real node and npm, never a dispatch shim directory."""
     search = os.environ.get("AGENT_ORIGINAL_PATH") or os.environ.get("PATH", os.defpath)
-    entries = [e for e in search.split(os.pathsep) if e and Path(e).resolve().parts[-3:] not in SHIM_DIRS]
+    entries = [e for e in search.split(os.pathsep) if e and not _is_shim_dir(e)]
     found = (shutil.which(tool, path=os.pathsep.join(entries)) for tool in ("node", "npm"))
     return [str(Path(binary).parent) for binary in found if binary]
 
 
-def _install_env() -> dict[str, str]:
+def _install_env(toolchain_dir: Path | None = None) -> dict[str, str]:
     """Build the allowlisted environment before assigning a scratch home."""
-    env = {"PATH": os.pathsep.join(dict.fromkeys([*_tool_dirs(), *SYSTEM_PATH])), "LANG": "C.UTF-8"}
+    tool_dirs = [str(toolchain_dir)] if toolchain_dir is not None else _tool_dirs()
+    env = {"PATH": os.pathsep.join(dict.fromkeys([*tool_dirs, *SYSTEM_PATH])), "LANG": "C.UTF-8"}
     env.update({name: os.environ[name] for name in sorted(os.environ)
                 if name in PASSED_ENV or (
                     name.lower().startswith(NPM_CONFIG_PREFIX) and name.lower() not in NPM_HOME_SETTINGS)})
@@ -358,6 +866,7 @@ def ensure(repo: Path, worktree: Path) -> dict:
         return {"state": "skipped"}
     if (site / "node_modules").exists() or (site / "node_modules").is_symlink():
         return {"state": "present"}
+    toolchain_dir = resolve_toolchain_dir(worktree, site)
     store = store_root(repo)
     cache = Path(os.environ.get("NPM_CACHE", store.absolute() / "npm-cache"))
     if not cache.is_absolute():
@@ -365,7 +874,7 @@ def ensure(repo: Path, worktree: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix="site-deps-home-") as home, _locked(store / "prune.lock", fcntl.LOCK_SH):
         # Keep npm's diagnostic logs in the scratch home even when sharing cached tarballs.
         env = {
-            **_install_env(),
+            **_install_env(toolchain_dir=toolchain_dir),
             "HOME": home,
             "npm_config_globalconfig": str(Path(home) / "etc/npmrc"),
             "npm_config_cache": str(cache),
