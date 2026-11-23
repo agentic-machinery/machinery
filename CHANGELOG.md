@@ -9,10 +9,6 @@ this file.
 
 ## [Unreleased]
 
-### Fixed
-
-- Re-verify the fleet model catalog so the product's wheel-based freshness check passes with the next release.
-
 <a id="v0.1.55"></a>
 ## [0.1.55] - 2026-11-23
 
