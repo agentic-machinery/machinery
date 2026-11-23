@@ -1,5 +1,5 @@
 schema_version: model-catalog.v1
-reviewed_on: 2026-10-23
+reviewed_on: 2026-11-23
 refresh_after_days: 30
 
 # This is the preferred/current fleet, not every legacy model exposed by a
@@ -42,8 +42,8 @@ policy:
       approved model (orchestrator_seats.cursor).
     - >-
       GPT-6 routes are native Codex only until Cursor exposes a verified GPT-6 slug.
-      Claude Opus 5.5 reviews and drives through native Claude only; no Claude model
-      reviews through Cursor (operator decision D-129, #10464).
+      No Claude model reviews through Cursor (operator decision D-129, #10464).
+      The catalog lists native Claude review routes and AGY fallbacks.
       Operator order C-5307 (2026-11-12) restores grok-4.7 for coding and
       review through the existing Cursor transport, on trial (C-5308).
       Native Grok remains available for coding. Older Grok models remain
@@ -53,7 +53,9 @@ policy:
       Kimi models are retired (OO-58, #11327, 2026-10-21; unused since
       2026-10-13, reconfirmed 2026-10-18 and 2026-10-21). Dispatch refuses
       every Kimi id. Historical workers used the native `kimi` CLI only;
-      OpenRouter was never a Kimi worker bus. Pool is not subscribed (operator 2026-10-23). Gemma is retained for hramatka through its own AIS/OpenRouter HTTP client (operator 2026-11-07, REMOVE-UNNEEDED-1107); it is not a fleet route.
+      OpenRouter was never a Kimi worker bus. Pool is not subscribed (operator 2026-10-23).
+      Gemma remains available through OpenCode for hramatka only (operator 2026-11-07,
+      REMOVE-UNNEEDED-1107).
     - >-
       Kimi seats are not a usable lane (OO-58, #11327). Historical limit, kept
       as record: web, UI and backend coding only, no Ukrainian-language content,
@@ -85,7 +87,7 @@ policy:
       strong root-cause / densest useful CI nits. AGY gemini-3.7-flash-high = fast
       scoped CF. Historical GLM-5.3 = ships-heavier; GLM is now retired, not subscribed. Codex/Sol = careful/small, thorough/heavy advisory — not a
       speed winner. Evidence: AGY #7137, Kimi #7143, Codex/Sol #7142, Grok #7133,
-      GLM #7144 (also addresses #7121 fetch refspecs). Pool and GLM are not subscribed (operator 2026-10-23). Gemma is retained for hramatka through its own AIS/OpenRouter HTTP client (operator 2026-11-07, REMOVE-UNNEEDED-1107); it is not a fleet route.
+      GLM #7144 (also addresses #7121 fetch refspecs). Pool and GLM are not subscribed (operator 2026-10-23).
       Gemini uses AGY, never OpenRouter.
       Kimi is retired and is not a seat.
 
@@ -321,7 +323,6 @@ advisory_roles:
 models:
   muse-wonder-full-1.0:
     family: meta
-    # Minimum admitted code-review tier; runtime qualification remains pending.
     tier: economical
     lifecycle: retired
     roles: [coding, standard_review, routine_review]
@@ -329,11 +330,8 @@ models:
     strengths: [explicit_native_worker]
     weaknesses: [worker_qualification_pending, review_qualification_pending, no_driver_authority]
     notes: >-
-      Explicit native coding and low/medium code-review seat under measurement.
-      Private inputs are allowed only with contributor mode off (operator order C-2401).
-      No driver, automatic fallback, Ukrainian or security-final authority.
-      Formal reviewer for low- and medium-risk code and infra reviews (operator decision 2026-11-01).
-      Catalog eligibility does not attest provider-origin identity or effective permissions.
+      Retired by MUSE-RETIRE-1112 (2026-11-12). Historical identity for native
+      coding and low- and medium-risk code and infra reviews.
     sources: [https://dev.meta.ai/docs/muse-code]
   muse-spark-1.3:
     family: meta
@@ -587,17 +585,16 @@ models:
     strengths: [highest_anthropic_capability, long_horizon_work, always_on_thinking]
     weaknesses: [stricter_refusal_surface, cursor_fallback_no_zdr]
     notes: >-
-      Operator decision 2026-10-03 (#9583): Fable 5.1 holds no advisory, approval,
-      review or critique role and is not a last resort for any of them; Opus 5.5 /
+      Fable 5.1 is parked for explicit pins only. No resolver, substitution or
+      ladder selects it (operator decision 2026-10-21). Fable 5.1 holds no
+      advisory, approval, review or critique role (#9583). Opus 5.5 /
       Sol 6.2 hold those roles. It succeeds claude-fable-5 as a launchable Claude
       model only. Thinking is always on (never send
       thinking: disabled). Effort decision topology (operator 2026-09-09): default
       high (API default; start here — do not port Opus/xhigh habits); medium/low
       for routine interactive work (low often beats prior-gen xhigh/max; medium
-      ≈ Fable 5 cheaper); xhigh for hard multi-file / long autonomous turns and for
-      curriculum/linguistic review skills that pin effort: xhigh (content-review,
-      plan-review, plan-review-seminar, batch-review, prompt-review — do not step
-      those down); max almost never. Long deliverables stay at high unless a
+      ≈ Fable 5 cheaper); xhigh for hard multi-file or long autonomous turns;
+      max almost never. Long deliverables stay at high unless a
       measured quality gain says otherwise; at xhigh/max leave output-budget room.
       Quirks: high+ on simple tasks over-gathers (lower effort, do not prompt
       around it); low searches less (bump for retrieval-heavy named products);
@@ -647,9 +644,10 @@ models:
     strengths: [agentic_coding_at_medium_effort, code_review_precision, grounded_analysis, visual_input_reading]
     weaknesses: [thinking_cannot_be_disabled, longer_turns_at_xhigh_max, broader_refusal_classifiers]
     notes: >-
-      Operator 2026-09-22: default Claude model and the Claude orchestrator seat.
-      Opus 5.5 executes architecture, hard coding, deep code review and
-      Ukrainian-specific linguistic work. start-claude-driver.sh pins claude-opus-5-5[1m] @ high.
+      Opus 5.5 is the Claude authority seat for architecture, hard coding, deep
+      code review and Ukrainian authoring. The Claude CTO launcher accepts
+      Opus 5.5 on the epics lane. The Claude stream-driver launcher defaults
+      to Sonnet 5.5 at high effort.
       Opus 5.5 / Sol 6.2 take review, critique and design input and hold
       designated approval: the non-author's approval when one of them authored the
       proposal, both for any other author (#9583, #9616). Effort: API default is medium (not high); medium on
@@ -834,8 +832,9 @@ models:
       Sol 6.2 (after Sol and Opus on critical, alongside the Opus seats on high,
       unchanged on medium and low). Neon is also a peer of Opus 5.5 and Sol 6.2
       for hard coding, security-sensitive code authoring and stream driving;
-      designated approval stays Opus 5.5 and Sol 6.2. Ukrainian review uses
-      Neon High with the Sources MCP and VESUM. ACP consultation pins Neon High.
+      designated approval stays Opus 5.5 and Sol 6.2. Neon High writes fresh-build
+      lessons (UK-WRITER-NEON-1121) and reviews Ukrainian with the Sources MCP
+      and VESUM. ACP consultation pins Neon High.
       Google's
       AA Index v5.0.1 chart shows Neon high
       around 60 at USD 3.7 per task, matching Carbon's highest score and
@@ -910,9 +909,9 @@ models:
       - no_published_ukrainian_quality_result
       - agy_selector_thinking_level_mapping_unverified
     notes: >-
-      Operator decision 2026-11-10: Gemini 4 Argon at medium is the second Gemini
-      work option over AGY, used after Gemini 4 Carbon at medium and never ahead
-      of it. Live `agy models` probes on 2026-11-10 (19:50Z and 20:03Z) list
+      Gemini 4 Argon remains an explicit work option over AGY. Hydrogen Medium
+      is the current work default. The 2026-11-10 decision placed Argon behind
+      the now-retired Carbon. Live `agy models` probes on 2026-11-10 (19:50Z and 20:03Z) list
       gemini-4-argon-high, gemini-4-argon-medium and gemini-4-argon-low.
       Dispatch: `python -m lu_machinery.dispatch dispatch --agent agy --model
       gemini-4-argon-medium`; -high and -low are explicit selections only.
@@ -946,8 +945,8 @@ models:
     weaknesses: [superseded_as_default_by_3_8_flash, not_default_critical_authority, deep_architecture_still_prefers_pro_or_sol]
     notes: >-
       Wave 1 SCORECARD 2026-08-23: CF #7137 pass, wall ~47s, low noise, concrete
-      finding. Historical fast scoped CF evidence; AGY now reviews Ukrainian only
-      (operator 2026-09-25). Native subscribed seat — never OpenRouter.
+      finding. Historical fast scoped CF evidence. Retired selector, retained
+      for historical receipts.
     sources:
       - https://ai.google.dev/gemini-api/docs/models
   gemini-3.6-flash-high:
@@ -1227,9 +1226,9 @@ models:
       - https://docs.subq.ai/using-the-api/models/
       - https://docs.subq.ai/endpoints/chat-completions-api/
       - https://docs.subq.ai/using-the-api/data-retention/
-  # Poolside Laguna family (exact vendor IDs — do not invent "laguna-s2" / "laguna-m1"):
+  # Historical Poolside Laguna IDs (retired, no subscription):
   #   Gen-1:  laguna-m.1   (prior; technical report M.1 / XS.2 era)
-  #   Gen-2:  laguna-s-2.1 (strongest current — pool formal/volume default)
+  #   Gen-2:  laguna-s-2.1 (former Pool formal/volume default)
   #           laguna-xs-2.1 (light/fast 2nd gen — rapid iteration / cheap volume)
   #   Not out: Laguna M 2.x
   # API (poolside inference): poolside/laguna-s-2.1 · poolside/laguna-xs-2.1
@@ -1372,8 +1371,8 @@ review_candidates:
 # Fleet-comms stream orchestrator seats (#5512 / #4707 / #5703). These lanes may own a
 # cold-start loop (prioritize → delegate → CF → merge-in-lane).
 # Native AGY reviews code and infra at every risk tier in an exact-head worktree; its ACP wrapper cannot consume the
-# parent-owned sealed MCP. Grok reviews through Cursor and holds no driver seat;
-# Kimi: web, UI and backend coding only, never review.
+# parent-owned sealed MCP. Grok reviews through Cursor and holds no driver seat.
+# Kimi is retired (OO-58).
 # Parallel escalate ladder (user 2026-07-22): practical default + authority deep.
 orchestrator_seats:
   claude:
@@ -1383,10 +1382,10 @@ orchestrator_seats:
     escalate_effort: high
     escalate_when: deep_single_shot_or_architecture
     note: >-
-      Operator 2026-09-22: Opus 5.5 is the Claude orchestrator seat and executes
-      advanced non-linguistic work (architecture, hard coding, deep code review).
-      start-claude-driver.sh pins claude-opus-5-5[1m] @ high unless --model /
-      --effort (or LAUNCHER_MODEL / LAUNCHER_EFFORT) override it. Opus 5.5 /
+      Opus 5.5 is the Claude authority seat and executes advanced
+      work in architecture, hard coding and deep code review. The Claude CTO
+      launcher accepts Opus 5.5 on the epics lane. The Claude stream-driver
+      launcher defaults to Sonnet 5.5 at high effort. Opus 5.5 /
       Sol 6.2 take review, critique, design input and Ukrainian work and hold
       designated approval: the non-author's approval when one of them authored the
       proposal, both for any other author (#9583, #9616). Orchestration alone does not

@@ -1044,6 +1044,7 @@ _V2_BASELINE = json.loads(gzip.decompress(_V2_BASELINE_PATH.read_bytes()))
 # (after Sol and Opus on critical, alongside the Opus seats on high, unchanged on medium and low).
 CURRENT_BASELINE = _V2_BASELINE["baseline"]
 CURRENT_INPUTS = _V2_BASELINE["inputs"]
+CURRENT_CATALOG_REVIEW_DATE = "2026-11-23"
 
 GROK_REVIEW_CANDIDATE = {
     "model_id": "grok-4.7", "route": "cursor", "transport": "cursor",
@@ -1125,6 +1126,32 @@ def assert_frozen_surfaces(actual, *, surfaces):
         expected = deepcopy(CURRENT_BASELINE[surface])
         if surface == "catalog":
             _pop_advisory_roles(value)
+            expected["reviewed_on"] = CURRENT_CATALOG_REVIEW_DATE
+            # Pin the prose corrected in the catalog review without recapturing routing data.
+            reviewed_prose = {
+                ("policy", "notes"): "2d58c3951163f3989f322c0519d34804cbae7eeafb6f1826db675bb7b465c683",
+                ("models", "muse-wonder-full-1.0", "notes"):
+                    "3304e52346e8fcc32a733bb072ead7e4e2a82a8ffbba58465dd01617e632b4c0",
+                ("models", "claude-fable-5-1", "notes"):
+                    "afae68b099de300603458b5b8839660f70ee0351aff45c8c7628320ddc80eac9",
+                ("models", "claude-opus-5-5", "notes"):
+                    "1990f56acf404aeef4bd1de031d3cc81fb2c285a202e0480e793aaf03d851844",
+                ("models", "gemini-4-neon", "notes"):
+                    "9e2c5a21ddb16105c35d55ed6f98b148ba4acf5031d290cfd76a1efb9f5e941a",
+                ("models", "gemini-4-argon", "notes"):
+                    "2660fee9b21105e8171f20addcf97a9fb558775e50cbd95565901405df99a8f6",
+                ("models", "gemini-3.7-flash-high", "notes"):
+                    "8932dc718d4178042a425266545359a6db462a425573f27e4dc29f384ded2a2f",
+                ("orchestrator_seats", "claude", "note"):
+                    "50cf41b49baba7c937546f3956d5e481d77f98bd1154516e8abb1de27b86a4ba",
+            }
+            for path, digest in reviewed_prose.items():
+                actual_row, expected_row = value, expected
+                for key in path[:-1]:
+                    actual_row, expected_row = actual_row[key], expected_row[key]
+                field = path[-1]
+                assert hashlib.sha256(encode(actual_row[field])).hexdigest() == digest, path
+                expected_row[field] = actual_row[field]
             # Keep the captured reviewer receipts and overlay only Flash's retirement fields.
             flash = expected["models"]["gemini-3.8-flash-high"]
             flash.update(
