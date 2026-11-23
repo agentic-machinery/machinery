@@ -19,41 +19,47 @@ not a designated approver and not the reviewer of record for work you drove.
 
 ## What is live
 
-Checked against `origin/main` 4371b697. A step marked **[after #1290]** or **[after PR 3 lands]**
-is not built yet: you follow it as an instruction, and no tool enforces it.
+PR #1290 made Monitor's stream lease the exclusion authority shared by dispatched turns and legacy
+lane drivers. The CTO starts a run with `dispatch dispatch --mode orchestrator --stream epic:<N>`.
+The dispatcher uses a `turn-` task ID and refuses the launch if it cannot establish its lease or
+isolate the run. An active lease blocks a competing launch even after the lease's expiry time.
+Report a held or unknown lease to the CTO.
 
-- Live: `dispatch --mode orchestrator --stream epic:<N>` (CTO only), the one `dispatch handoff-receipt`
-  (`<task> --run-nonce --stream --handoff-ref`), and `done` only for a clean tree at the start SHA
-  plus a receipt that matches a pattern and its own hash.
-- So task status `done` proves a receipt and a clean tree, **nothing more**. A blocked run that
-  records a receipt also settles `done`, and a run can die after writing `OUTCOME: done`. So a `done`
-  note is provisional. The CTO and the next run accept it only when the run's task ID and full nonce
-  show a settled `done` status, its receipt names that note, and the note's checklist holds on live
-  state. Missing or conflicting evidence leaves the outcome unresolved: treat it as `blocked`.
-- **Exclusion today is local.** The dispatcher probes Monitor once (it refuses when a legacy lease is
-  active or Monitor is unreachable), then takes a local reservation file. That stops a second
-  dispatched run on the stream. It does **not** stop a legacy lane launcher that claims the stream
-  after the probe, so the CTO starts a run only on a stream whose legacy lane is off (a brief field).
-  **[after #1290]** the Monitor stream lease is the one exclusion authority; `turn-` task IDs.
-- `done` also needs the run's scope launch and its processes proven gone; otherwise the task ends
-  `no_deliverable` (`orchestrator_tree_unproven`) and the reservation stays held. No command frees a
-  stuck reservation today: that is the CTO's side.
-- **[after PR 3 lands]** `--outcome` on the receipt; the dispatcher reads the note back; a live child
-  makes the run not done; the run's identity environment is set; an alert for a held stream.
+Today the dispatcher checks that the run's processes are gone, the tree is clean at its start SHA,
+and the task has a valid receipt. The receipt contains a note reference. Apply the reader check
+below before accepting the milestone outcome.
+
+**[after PR 3 lands]** The dispatcher checks the recorded outcome against the note, checks for live
+children at settlement, supplies the run's identity environment, and reports held streams. Check
+the deployed wait contract after PR 3 lands before relying on a hard wall-clock guarantee.
+
+### Accepting a done note
+
+An `OUTCOME: done` note or report is provisional while its run settles. The CTO and the next run
+must verify every item below before relying on it.
+
+1. The newest outcome in the note is `done`. Apply any later `CORRECTION: OUTCOME` entry first.
+2. A bounded `dispatch wait <run-id> --run-nonce <full-nonce> --timeout <seconds>` returns exit 0
+   and the note's exact run ID and full nonce with `status: done`. Its
+   `orchestrator_handoff_receipt` names the same run, stream and note ID (`handoff_ref`).
+3. The milestone checklist still holds on live state.
+
+If any check fails or the evidence is missing, the milestone remains unresolved. Report it as
+`blocked` even if the writer could not add a correction.
 
 ## Rules for every run
 
 - No lease claim or renewal, no `handoff-claim`, no wake-up or schedule, no tmux, no
-  `thread-rollover`. The dispatcher owns the stream reservation; you never touch it, and you never
-  claim the stream yourself if a legacy lane seems to hold it: report it.
+  `thread-rollover`. The dispatcher owns the Monitor lease.
 - Unknown is not ok: a failed, partial, mismatched or timed-out read of any state (`gh`, `dispatch`,
   `lu-driver-state`, Fleet Comms) leaves that fact unresolved and blocks every action that depends on it.
 - Never start another driver, open an issue (the CTO does), or approve your own work.
 - Never block waiting for the CTO or the operator. Ask once (see "Ending"), finish what you can,
   and end `blocked`.
-- Run identity: the dispatcher does not set `SESSION_HANDOFF_AGENT`, `LU_INBOX_WORKER` or
-  `SESSION_EPIC` for a run **[after PR 3 lands]**. Use the literals in your brief (lane key, inbox
-  slot, stream). Never use your own task ID as a reply address: mail to a settled task is refused.
+- Use the lane key, inbox slot, actor and stream from your brief. Pass the actor to
+  `lu-driver-state` with `--actor`. The turn identity variables are populated
+  **[after PR 3 lands]**. Use the inbox slot or the CTO as the reply address so replies can arrive
+  after the run settles.
 
 ## 1. Cold start
 
@@ -61,15 +67,17 @@ Do these in order. Dispatch and land nothing until step 7 passes.
 
 1. `date -u`. Read your own run nonce and start SHA from `dispatch status "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"`
    (the dispatcher does not export the nonce). Read the brief ([template](#brief-template)): milestone
-   issue, stream epic, previous note ID (or `none`), the previous run's reconciled child list, legacy lane off, lane key, inbox
-   slot, worker cap, stop rule, stop-new-work time, hard deadline. A missing field is `blocked`.
+   issue, stream epic, previous note and run identity (or approved first run), the previous run's
+   reconciled child list, lane key, inbox slot, actor, worker cap, stop rule, stop-new-work time and
+   hard deadline. A missing required field is `blocked`.
 2. Probe `lu-driver-state render --help`. If it fails, it is `blocked`: report the exact command and
    error, dispatch nothing, and do not edit tracker state by hand.
 3. Read the previous note: `lu-driver-state show <id>`. It must exist, be a `handoff_note`, name
    your lane and stream, and read in full. Then `lu-driver-state render --lane <lane>`: a newer
    `handoff_note` the brief does not name means two predecessors, so it is `blocked`.
-   `none` is allowed only when the brief says "first run approved by the CTO". If the note says
-   `OUTCOME: done`, apply the acceptance rule in "What is live" before you rely on it.
+   `none` is allowed only when the brief says "first run approved by the CTO". Match the note's
+   run identity to the brief. If the outcome is `done`, use the
+   [reader check](#accepting-a-done-note) before you rely on it.
 4. Drain the stream inbox with the brief's slot, one message at a time: read, apply, record the
    delivery ID in your tracker item, then ack. Commands: the SKILL.md inbox drain, with
    `--recipient <slot> --worker-id "$LEARN_UKRAINIAN_DISPATCH_TASK_ID"` (a task-ID worker identity on a
@@ -92,11 +100,14 @@ Do these in order. Dispatch and land nothing until step 7 passes.
    same-head `CI Gate`; queue status per [review-merge-cleanup](review-merge-cleanup.md)); every
    child in the brief's list by `dispatch status <id> --run-nonce <full nonce>` (a failed command
    leaves it unresolved); the board and next list in
-   [orient](orient.md). Use `dispatch status` only on your own ID and the IDs you or the brief recorded; never `dispatch list`.
+   [orient](orient.md). Query only your own run and exact task identities you recorded or received
+   in the brief.
 6. Compare the note with live state. If the note is missing, unreadable, from another stream, or
    disagrees with live state on a fact an action depends on (a PR merged or its head moved, a child
    you did not expect is running, an issue closed), stop. Write one `blocked` note that says what
-   differs, record nothing as done, report, exit. Live state wins; the CTO decides what to repair. A cold-start `blocked` run has no children: it goes to "Ending" step 3.
+   differs, record nothing as done, report, exit. Live state wins and the CTO decides what to repair.
+   Go to "Ending" step 3. Carry forward known predecessor child identities and flag incomplete
+   custody for the CTO.
 7. The brief must carry the CTO's reconciled child list for the previous run: every child ID and
    full nonce, or "none, checked". The note alone is not enough: a run killed after a dispatch and
    before its tracker item leaves a child the note lacks. No such list, or "unknown", is `blocked`.
@@ -113,8 +124,9 @@ Do these in order. Dispatch and land nothing until step 7 passes.
   owns its chain to `MERGED` (`full-send`); you never do its implementation or review. You may
   `dispatch grant-paths` to your own child only for paths the brief or an approved CTO message
   names; anything else goes in your report.
-- **Record each child at once**: task ID and the FULL run nonce in a tracker item, right after the
-  dispatch returns ([handoff](handoff.md)). A run killed mid-way leaves only what it recorded.
+- Record each child's task ID and full run nonce in a tracker item as soon as dispatch returns
+  ([handoff](handoff.md)). On restart, use the CTO's reconciled child list to cover a crash between
+  dispatch and the tracker write.
 - **Wait** in a bounded loop ([below](#the-wait-loop)). Never run one unbounded wait, and never a
   wait that can run past your stop-new-work time.
 - **Land** only PRs no brief owns, by `full-send` step 0 (the stream check) and steps 7 to 11,
@@ -130,31 +142,31 @@ Do these in order. Dispatch and land nothing until step 7 passes.
 
 ## The wait loop
 
-**[after PR 3 lands]** (the dispatcher's keepalive handling; the commands below exist today.) The
-dispatcher ends a run that is silent for 3600 s, and one long `dispatch wait` prints nothing. So wait
-in short passes, one literal command per Bash call:
+One long `dispatch wait` prints nothing while the driver's silence timer runs. Use short passes,
+one command per tool call. **[after PR 3 lands]** add `--keepalive-interval 60` to the wait command.
+
+Before **each** wait, status or inbox call in the loop, read the UTC clock and calculate whole
+seconds remaining to the stop-new-work time. If 30 seconds or less remain, go to "Ending" with
+any unconfirmed child IDs and full nonces. Use a caller tool that lets you cap the command timeout
+at the newly calculated time remaining. If it cannot, stop waiting and go to "Ending". The
+client timeout can expire while a settlement read is still blocked. Set `<seconds>` to the
+smaller of 300 and seconds remaining minus 15.
 
 ```bash
-/abs/path/.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <full-nonce> --timeout 300
+/abs/path/.venv/bin/python -m lu_machinery.dispatch wait <task-id> --run-nonce <full-nonce> --timeout <seconds>
 ```
 
 After each pass:
 
 1. Print one keepalive line: `keepalive <task-id> exit=<code> <date -u>`.
-2. Exit 124 means the child is still running: read `dispatch status <task-id> --run-nonce <nonce>`,
-   drain the inbox, check the clock against the stop-new-work time, wait again.
-3. Any other exit is not yet a result. Record a child as settled only when `dispatch status` shows
-   the same task ID, the same full nonce and a terminal status (`done`, `failed`, `timeout`,
-   `rate_limited`, `cancelled`, `crashed` or `no_deliverable`). Exit 2, a missing task or a nonce
-   mismatch leaves the child unresolved: it keeps counting against the cap and blocks "Ending".
-4. Several children: wait on one, then `status` the others each pass. Do not poll in a tight loop.
-5. Let `left` be the seconds before the stop-new-work time. Each pass uses `--timeout` of 300 or
-   `left` minus 15, whichever is smaller, and sets the Bash call's own timeout to `left`, so the
-   call is cut off at the cutoff itself. `--timeout` is a client limit only: `wait` can still block
-   on a child that is settling. Every follow-up read in this loop (`dispatch status`, the inbox)
-   is one call with a Bash timeout of at most `left`. A cut-off call leaves its child unresolved:
-   carry its ID and nonce into the note. With `left` of 30 or less, start no pass: go to
-   "Ending".
+2. Accept settlement only from `dispatch wait` exit 0 or 1 with a complete record matching the
+   task ID and full nonce and a terminal status (`done`, `failed`, `timeout`, `rate_limited`,
+   `cancelled`, `crashed` or `no_deliverable`). Exit 124 means the client wait expired. A caller
+   timeout, exit 2, an unreadable response or an identity mismatch leaves the child unresolved.
+3. Check the other children with `dispatch status` to decide which child to wait on next. A terminal
+   status can appear before cleanup finishes. Use `wait` for closeout evidence. Drain the inbox
+   within the same budget, recalculating it before each call. Unconfirmed children still count
+   against the cap. Use the next wait pass to check again.
 
 The loop is the mitigation, not the proof: the practice canary must show that a healthy quiet child
 never trips the silence timeout.
@@ -163,9 +175,10 @@ never trips the silence timeout.
 
 Order matters, because the dispatcher checks only the receipt's shape today.
 
-1. **Every child terminal.** `dispatch status` on each recorded child ID and full nonce, review
-   children included. Terminal means the same ID, the same nonce and a terminal status; a failed
-   command or an unreadable record is unresolved. Anything unresolved or running blocks the next step.
+1. **Every child terminal.** Use the matching settled records from the wait loop, including
+   recorded review children. At the cutoff, carry forward each unconfirmed ID and full nonce
+   without starting a new wait. A running or unresolved child prevents a `done` note. Continue to
+   the tree check and write the handoff.
    **[after PR 3 lands]** a live child also makes the run not done.
 2. **Prove the checklist** for each acceptance criterion, from tool output this run: merged SHA
    (`gh pr view --json state,mergeCommit`), recorded exact-head verdict with reviewer model, green
@@ -186,9 +199,9 @@ Order matters, because the dispatcher checks only the receipt's shape today.
    IDs, residual with owner, resume condition, next actions, and the one question for the CTO if
    there is one. If the note is wrong afterwards, add to it with `lu-driver-state note <id>`; never
    write a second note.
-   Outcome correction: if recording the receipt fails after the note says `done`, add
-   `CORRECTION: OUTCOME blocked, <reason>` to the same note (`lu-driver-state note <id>`). The newest
-   `CORRECTION` line is the outcome the CTO and the successor must honor.
+   If the read-back or receipt fails after the note says `done`, add
+   `CORRECTION: OUTCOME blocked, <reason>` to that note with `lu-driver-state note <id>` when you can
+   confirm the failure. Readers still apply [the done-note check](#accepting-a-done-note).
 
 5. **Read it back**: `lu-driver-state show <id>`; check it is whole.
 6. **Record the receipt with that exact ID** (the receipt cannot be taken back):
@@ -199,10 +212,11 @@ Order matters, because the dispatcher checks only the receipt's shape today.
      `--outcome blocked` or `--outcome handoff`; the dispatcher then settles it as not done.
    - A refused receipt (exit 2) is not retried with another ID. Add a `CORRECTION` line with the
      refusal to the note and report `blocked`.
-7. **Report once** to `claude-cto`, after the receipt, so the report states what was recorded:
+7. **Report once** to `claude-cto`. Include the receipt result. If the outcome is `done`, say it
+   is provisional pending settlement and include the run ID and full nonce.
 
    ```bash
-   printf '%s\n' "OUTCOME: <done|blocked|handoff>; note <id>; <checklist, children, residual and owner, the decision you need>" |
+   printf '%s\n' "<outcome and receipt result, note ID, run ID and full nonce, checklist, children, residual and owner, decision needed>" |
      /abs/path/.venv/bin/python -I -m lu_machinery.fleet_comms channel publish cto - \
        --sender "$LEARN_UKRAINIAN_DISPATCH_TASK_ID" --source cto --recipient claude-cto \
        --idempotency-key "run-$LEARN_UKRAINIAN_DISPATCH_TASK_ID-report"
@@ -212,9 +226,9 @@ Order matters, because the dispatcher checks only the receipt's shape today.
    report. Your last output repeats the same text; that is the task result, not a second report.
 8. **Exit**: no process of yours still runs. The dispatcher removes the worktree at settlement.
 
-If the stop-new-work time passes with children still running, write the note as `handoff`, list each
-running child with its ID and nonce, skip the receipt, report, and exit by hard deadline minus
-20 minutes. Those children keep running; the CTO is their owner.
+If the stop-new-work time passes with children still running and there is no blocker, use `handoff`.
+List each unconfirmed child with its ID and full nonce, follow the receipt rule in step 6, report,
+and exit by hard deadline minus 20 minutes. The CTO takes custody of the running children.
 
 ## 4. Unexpected situations
 
@@ -247,7 +261,7 @@ your note and do not try to fix them.
 
 **The CTO's side** (not run steps; **[after PR 3 lands]** unless noted): settlement flags a live child
 and the next run is held until custody is reconciled; the held-stream alert and recovery runbook;
-the CTO startup reads every `turn-*` task **[after #1290]**; the practice-stream mail check across
+the CTO startup reads every `turn-*` task; the practice-stream mail check across
 slots; per-stream and fleet caps on runs.
 
 ## Brief template
@@ -260,9 +274,8 @@ Mode: milestone run (drive-epic references/milestone-run.md). Not a lane driver.
 Stream epic: #<N> (--stream epic:<N>)      Lane key: <lane>      Inbox slot: <slot>
 Milestone issue: #<M>, acceptance-criteria ledger hash <sha256>
 Previous note ID: <id> | none (first run approved by the CTO)
-Previous run: task <id>, nonce <full>
+Previous run: task <id>, nonce <full> | none (first run approved by the CTO)
 Previous run children (CTO-reconciled): <every id and full nonce> | none, checked
-Legacy lane for this stream: off (CTO checked <UTC>)
 Worker cap: <n>      Stop rule: <e.g. blocked on any operator decision; one failed milestone twice stops>
 Stop new work at: <UTC, at least 30 minutes before the hard deadline>      Hard deadline: <UTC>      Hard timeout: <seconds>
 Write scope: literal owned paths per child only; the run owns no product path.
@@ -271,7 +284,12 @@ Done means: every criterion proven on the merged SHA, exact-head review, same-he
 End: one note (OUTCOME first line), then the receipt rule in "Ending", one report to claude-cto.
 ```
 
-The CTO dispatches with `dispatch dispatch --agent <driver agent> --model <driver model> --effort high
---mode orchestrator --stream epic:<N> --initiator claude-cto --prompt-file <brief> --worktree` and a
-finite `--hard-timeout`, and starts at most one run per
-stream.
+The CTO uses the live catalog to select the driver model. Pass `--worktree` without a path. The
+dispatcher creates the worktree and binds the run to the stream.
+
+```bash
+/abs/path/.venv/bin/python -m lu_machinery.dispatch dispatch \
+  --agent <driver-agent> --model <driver-model> --effort high \
+  --mode orchestrator --stream epic:<N> --initiator claude-cto \
+  --prompt-file <brief> --worktree --hard-timeout <seconds>
+```

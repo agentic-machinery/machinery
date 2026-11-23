@@ -8,9 +8,9 @@ effort: high
 
 **Two modes.** This file and its loop are the always-on **lane driver** (`SESSION_EPIC` set, a
 launcher holds your lease). If your brief says **milestone run** and your task is a CTO-started
-orchestrator turn, follow [milestone-run](references/milestone-run.md) instead: it has no lease,
-no wake-up and no context-guard handoff, and ends with one handoff note. The rest of this file
-applies to a run only where that reference names it.
+orchestrator turn, start with [milestone-run](references/milestone-run.md). The dispatcher holds
+the stream lease. The run ends with one handoff note. Use the sections below when that reference
+points to them.
 
 You drive **one epic or track lane** (`SESSION_EPIC` is set), not the whole fleet. You own the
 lane's judgment: what is wrong, what is next, which model and harness should do it, whether the
