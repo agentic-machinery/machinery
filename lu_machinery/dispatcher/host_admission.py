@@ -180,23 +180,35 @@ class ReservationUnsafe(Exception):
         self.reason = reason
 
 
-def _task_store() -> Path:
-    """The task store's canonical path: every symlink and ``..`` resolved, as the kernel resolves them.
+def _task_store(*, missing_ok: bool = False) -> Path | None:
+    """The task store's canonical path, once the kernel has looked up the configured spelling as a directory.
 
-    Its admission lock is a file opened inside the store through the same links, and its reservations are
-    derived from this path, so every spelling of one store is one admission domain. A path that cannot be
-    resolved raises ReservationUnsafe.
+    The kernel's own lookup (``os.stat``, as the admission lock's open inside the store) rejects a spelling it
+    cannot walk (a file before ``..``, a missing component, a loop, an overlong name); only then is every
+    symlink and ``..`` resolved, so every working spelling of one store is one admission domain. A missing
+    store is None with ``missing_ok``; any other failure raises ReservationUnsafe.
     """
+    configured = tasks_dir()
     try:
-        return Path(os.path.realpath(tasks_dir()))
+        info = os.stat(configured)
+        canonical = Path(os.path.realpath(configured))
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise ReservationUnsafe("orchestrator_reservation_unknown: the task store is missing") from None
     except (OSError, RuntimeError, ValueError) as exc:
-        raise ReservationUnsafe(f"orchestrator_reservation_unknown: the task store path cannot be resolved "
+        raise ReservationUnsafe(f"orchestrator_reservation_unknown: the task store path cannot be looked up "
                                 f"({type(exc).__name__})") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise ReservationUnsafe("orchestrator_reservation_unknown: the task store is not a directory")
+    return canonical
 
 
 def reservations_dir() -> Path:
     """``batch_state/streams``: beside the task store, whose admission lock guards every reservation write."""
-    return _task_store().parent / RESERVATIONS_DIR_NAME
+    store_path = _task_store()
+    assert store_path is not None  # without missing_ok a missing store raises
+    return store_path.parent / RESERVATIONS_DIR_NAME
 
 
 # Only a task store named ``tasks`` reserves, so <parent>/tasks and <parent>/streams are one admission domain:
@@ -205,11 +217,16 @@ TASKS_DIR_NAME = "tasks"
 
 
 def domain_refusal() -> str | None:
-    """Why this task store cannot hold stream reservations, or None. The name is the canonical path's."""
+    """Why this task store cannot hold stream reservations, or None. The name is the canonical path's.
+
+    A store not created yet is judged by its configured name; reservation (under the admission lock, which
+    creates the store) checks again.
+    """
     try:
-        name = _task_store().name
+        store_path = _task_store(missing_ok=True)
     except ReservationUnsafe as exc:
         return exc.reason
+    name = tasks_dir().name if store_path is None else store_path.name
     if name != TASKS_DIR_NAME:
         return (f"orchestrator_domain_refused: the task store must be a directory named {TASKS_DIR_NAME!r}, so its "
                 "admission lock is the only one guarding its reservations")
@@ -222,7 +239,10 @@ def _reservations_fd(*, create: bool) -> int | None:
     The directory is ``streams`` beside the task store's canonical path, opened without following a symlink;
     it must be a directory the current user owns that no group or other user can write.
     """
-    parent = _task_store().parent
+    store_path = _task_store(missing_ok=not create)
+    if store_path is None:
+        return None
+    parent = store_path.parent
     try:
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except FileNotFoundError:
@@ -408,11 +428,7 @@ def turn_writer_refusal(*, task_ids=(), tree=None) -> str | None:
         from lu_machinery.dispatcher.worker import _same_tree
 
     try:
-        try:
-            store_is_dir = stat.S_ISDIR(os.stat(_task_store()).st_mode)
-        except FileNotFoundError:
-            store_is_dir = False
-        if not store_is_dir:
+        if _task_store(missing_ok=True) is None:
             return "orchestrator_reservation_unknown: the task store is missing"
         fd = _reservations_fd(create=False)
         if fd is None:
