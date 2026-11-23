@@ -12,10 +12,6 @@ this file.
 <a id="v0.1.60"></a>
 ## [0.1.60] - 2026-11-23
 
-### Changed
-
-- Record the 0.1.59 release and start 0.1.60 ([#1263](https://github.com/learn-ukrainian/machinery/pull/1263))
-
 ### Fixed
 
 - Provision site deps with worktree-pinned Node and npm ([#1262](https://github.com/learn-ukrainian/machinery/pull/1262))
