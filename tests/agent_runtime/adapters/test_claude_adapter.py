@@ -191,15 +191,48 @@ def _read_only(root: Path, tool_config: dict | None) -> list[str]:
 
 
 def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
-    """Normalize a mount-boundary parent stop for ``root`` when pytest ``tmp_path`` sits on a separate mount."""
+    """Normalize scratch-mount boundaries above ``root`` when pytest ``tmp_path`` sits on a separate mount."""
+    import os
     import subprocess
 
+    from lu_machinery.common import task_scratch
     from lu_machinery.orchestration import execution_safe_git
 
     real_run_git = execution_safe_git.run_git
+    real_mount_points = task_scratch.mount_points
+    real_fd_mount_id = task_scratch.fd_mount_id
     parent = root.resolve().parent
+    scratch_ancestors = frozenset(str(p) for p in (parent, *parent.parents) if p.parent != p)
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    root_fd = os.open("/", flags)
+    try:
+        root_mount_id = real_fd_mount_id(root_fd)
+    finally:
+        os.close(root_fd)
+    parent_fd = os.open(parent, flags)
+    try:
+        parent_dev = os.fstat(parent_fd).st_dev
+        parent_mount_id = real_fd_mount_id(parent_fd)
+    finally:
+        os.close(parent_fd)
 
-    def wrapped(args: list[str], *, cwd: Path, **kwargs: object):
+    def wrapped_mount_points() -> frozenset[str] | None:
+        mounts = real_mount_points()
+        return None if mounts is None else mounts - scratch_ancestors
+
+    def wrapped_fd_mount_id(fd: int) -> int | None:
+        mount_id = real_fd_mount_id(fd)
+        if (
+            mount_id is not None
+            and parent_mount_id is not None
+            and root_mount_id is not None
+            and mount_id == parent_mount_id
+            and os.fstat(fd).st_dev == parent_dev
+        ):
+            return root_mount_id
+        return mount_id
+
+    def wrapped_run_git(args: list[str], *, cwd: Path, **kwargs: object):
         result = real_run_git(args, cwd=cwd, **kwargs)
         if (
             Path(cwd).resolve() == parent
@@ -216,7 +249,9 @@ def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path
             )
         return result
 
-    monkeypatch.setattr(execution_safe_git, "run_git", wrapped)
+    monkeypatch.setattr(task_scratch, "mount_points", wrapped_mount_points)
+    monkeypatch.setattr(task_scratch, "fd_mount_id", wrapped_fd_mount_id)
+    monkeypatch.setattr(execution_safe_git, "run_git", wrapped_run_git)
 
 
 def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(

@@ -514,6 +514,42 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
     return next(iter(canonical)) if canonical else scoped_repository
 
 
+def _crosses_mount_boundary(resolved: Path) -> bool:
+    """Whether *resolved* or any ancestor below ``/`` crosses a mount boundary, or mount data is unavailable."""
+    from lu_machinery.common import task_scratch
+
+    mounts = task_scratch.mount_points()
+    if mounts is None or "/" not in mounts:
+        return True
+    if any(str(ancestor) in mounts for ancestor in (resolved, *resolved.parents) if ancestor.parent != ancestor):
+        return True
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        root_fd = os.open("/", flags)
+    except (OSError, ValueError):
+        return True
+    try:
+        try:
+            checkout_fd = os.open(resolved, flags)
+        except (OSError, ValueError):
+            return True
+        try:
+            root_mount_id = task_scratch.fd_mount_id(root_fd)
+            checkout_mount_id = task_scratch.fd_mount_id(checkout_fd)
+            if root_mount_id is None or checkout_mount_id is None or checkout_mount_id != root_mount_id:
+                return True
+            try:
+                if os.fstat(checkout_fd).st_dev != os.lstat(resolved.parent).st_dev:
+                    return True
+            except (OSError, ValueError):
+                return True
+        finally:
+            os.close(checkout_fd)
+    finally:
+        os.close(root_fd)
+    return False
+
+
 def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None = None) -> FleetRepo | None:
     """The registered row whose GitHub ``origin`` the Git checkout at ``root`` declares, else ``None``.
 
@@ -523,10 +559,12 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     repository-configured hooks and filesystem monitors. Callers treat ``None`` as an
     unregistered root that keeps every Learn Ukrainian requirement. Only a standalone primary
     checkout is identified: Git must report ``root`` as the top of its work tree, ``root/.git``
-    as its shared Git directory, and an execution-safe ``rev-parse --show-toplevel`` on
-    ``root``'s parent must traverse all ancestors and fail with Git's exact
-    ``not a git repository (or any of the parent directories): .git`` diagnostic (failing closed
-    on filesystem mount boundaries and reading no parent index or tree). A linked worktree, a
+    as its shared Git directory, no mount boundary (cross-device or same-filesystem bind mount)
+    may lie at ``root`` or any ancestor below ``/`` (verified via ``task_scratch.mount_points()``
+    and ``task_scratch.fd_mount_id()``, failing closed on unreadable mount data), and an
+    execution-safe ``rev-parse --show-toplevel`` on ``root``'s parent must traverse all ancestors
+    and fail with Git's exact ``not a git repository (or any of the parent directories): .git``
+    diagnostic (reading no parent index or tree). A linked worktree, a
     separate Git directory, a bare repository's worktree, or any checkout nested inside another
     Git repository (including an embedded-Git submodule) is never identified, because Git cannot
     name the checkout whose curriculum marker would decide it. ``None`` is also returned when Git
@@ -568,12 +606,7 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     if len(lines) != 3 or lines[2] or [Path(os.fsdecode(line)) for line in lines[:2]] != [resolved, resolved / ".git"]:
         return None
     if resolved.parent != resolved:
-        try:
-            root_stat = os.lstat(resolved)
-            parent_stat = os.lstat(resolved.parent)
-        except (OSError, ValueError):
-            return None
-        if root_stat.st_dev != parent_stat.st_dev or root_stat.st_ino == parent_stat.st_ino:
+        if _crosses_mount_boundary(resolved):
             return None
         parent_top = git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=resolved.parent)
         if (

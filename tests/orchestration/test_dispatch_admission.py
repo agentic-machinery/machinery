@@ -1286,15 +1286,48 @@ def _mark_curriculum(root: Path) -> None:
 
 
 def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
-    """Normalize a mount-boundary parent stop for ``root`` when pytest ``tmp_path`` sits on a separate mount."""
+    """Normalize scratch-mount boundaries above ``root`` when pytest ``tmp_path`` sits on a separate mount."""
+    import os
     import subprocess
 
+    from lu_machinery.common import task_scratch
     from lu_machinery.orchestration import execution_safe_git
 
     real_run_git = execution_safe_git.run_git
+    real_mount_points = task_scratch.mount_points
+    real_fd_mount_id = task_scratch.fd_mount_id
     parent = root.resolve().parent
+    scratch_ancestors = frozenset(str(p) for p in (parent, *parent.parents) if p.parent != p)
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    root_fd = os.open("/", flags)
+    try:
+        root_mount_id = real_fd_mount_id(root_fd)
+    finally:
+        os.close(root_fd)
+    parent_fd = os.open(parent, flags)
+    try:
+        parent_dev = os.fstat(parent_fd).st_dev
+        parent_mount_id = real_fd_mount_id(parent_fd)
+    finally:
+        os.close(parent_fd)
 
-    def wrapped(args: list[str], *, cwd: Path, **kwargs: object):
+    def wrapped_mount_points() -> frozenset[str] | None:
+        mounts = real_mount_points()
+        return None if mounts is None else mounts - scratch_ancestors
+
+    def wrapped_fd_mount_id(fd: int) -> int | None:
+        mount_id = real_fd_mount_id(fd)
+        if (
+            mount_id is not None
+            and parent_mount_id is not None
+            and root_mount_id is not None
+            and mount_id == parent_mount_id
+            and os.fstat(fd).st_dev == parent_dev
+        ):
+            return root_mount_id
+        return mount_id
+
+    def wrapped_run_git(args: list[str], *, cwd: Path, **kwargs: object):
         result = real_run_git(args, cwd=cwd, **kwargs)
         if (
             Path(cwd).resolve() == parent
@@ -1311,7 +1344,9 @@ def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path
             )
         return result
 
-    monkeypatch.setattr(execution_safe_git, "run_git", wrapped)
+    monkeypatch.setattr(task_scratch, "mount_points", wrapped_mount_points)
+    monkeypatch.setattr(task_scratch, "fd_mount_id", wrapped_fd_mount_id)
+    monkeypatch.setattr(execution_safe_git, "run_git", wrapped_run_git)
 
 
 def test_consumer_without_admission_policy_uses_fail_closed_machinery_default(tmp_path, probe, monkeypatch):
@@ -1508,29 +1543,46 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
     assert adm.load_product_policy().origin == product_policy.MACHINERY_DEFAULT_ORIGIN
     assert sources_server_path() is None
 
-    # Mount boundaries fail closed both at the checkout root (different st_dev, same st_ino,
-    # or stat error) and during parent discovery (PR1294-F2).
+    # Mount boundaries fail closed at the checkout root, at any ancestor (including same-device
+    # bind mounts where st_dev matches and st_ino differs), on unreadable/malformed mount data,
+    # on cross-device parent stat mismatch/error, and during parent discovery (PR1294-F2).
     import os
     import subprocess
     from types import SimpleNamespace
 
+    from lu_machinery.common import task_scratch
     from lu_machinery.orchestration import execution_safe_git
 
     resolved_primary = primary.resolve()
+    root_st = os.lstat("/")
     real_lstat = os.lstat
     real_run_git = execution_safe_git.run_git
-    for mode in ("cross-dev", "same-ino", "lstat-error"):
+    for fake_mounts in (
+        frozenset({"/", str(resolved_primary)}),
+        frozenset({"/", str(resolved_primary.parent)}),
+        frozenset(),
+        None,
+    ):
         with monkeypatch.context() as mp:
-            def _fake_lstat(path, *, _mode=mode, _real=real_lstat, _root=resolved_primary):
-                st = _real(path)
-                if Path(path) == _root:
+            mp.setattr(task_scratch, "mount_points", lambda _m=fake_mounts: _m)
+            assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    for fake_fd_mount in (
+        lambda fd, _r=(root_st.st_dev, root_st.st_ino): 42 if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == _r else 99,
+        lambda _fd: None,
+    ):
+        with monkeypatch.context() as mp:
+            mp.setattr(task_scratch, "mount_points", lambda: frozenset({"/"}))
+            mp.setattr(task_scratch, "fd_mount_id", fake_fd_mount)
+            assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    for mode in ("cross-dev", "lstat-error"):
+        with monkeypatch.context() as mp:
+            def _fake_lstat(path, *, _mode=mode, _real=real_lstat, _parent=resolved_primary.parent):
+                if Path(path) == _parent:
                     if _mode == "lstat-error":
                         raise OSError("stat failed")
-                    if _mode == "cross-dev":
-                        return SimpleNamespace(st_mode=st.st_mode, st_dev=st.st_dev + 1, st_ino=st.st_ino)
-                    parent_st = _real(_root.parent)
-                    return SimpleNamespace(st_mode=st.st_mode, st_dev=parent_st.st_dev, st_ino=parent_st.st_ino)
-                return st
+                    st = _real(path)
+                    return SimpleNamespace(st_mode=st.st_mode, st_dev=st.st_dev + 1, st_ino=st.st_ino)
+                return _real(path)
 
             mp.setattr(os, "lstat", _fake_lstat)
             assert fleet_repos.fleet_repo_for_checkout(primary) is None
