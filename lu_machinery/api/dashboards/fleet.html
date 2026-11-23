@@ -499,6 +499,11 @@ function renderChips(latest) {
     const dead = latest.comms.failure_windows?.["24h"]?.dead_letters?.total;
     out.push(chip("#comms", dead ?? "?", "dead letters / 24 h", dead ? "warn" : ""));
   }
+  // A panel retry can update chips before the first full refresh finishes.
+  // Measure the header after the runner inserts the chips.
+  if (latest.seats && !revealedMessages && PANELS.every(panel => panel.ok !== undefined)) {
+    queueMicrotask(revealMessages);
+  }
   return out.join("");
 }
 
@@ -537,7 +542,7 @@ const PANELS = [
   {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs(), onTick: expireWorkerPrsIfStale, onError: () => { latestPrsReading = null; }},
   {id: "recent", label: "Recently finished", urls: ["/api/delegate/recent"], render: renderRecent},
   {id: "comms", label: "Fleet Comms", urls: ["/api/comms/v1/metrics"], render: renderComms},
-  {id: "seats", label: "Seats", urls: [SEATS_URL], render: renderSeats, onData: () => { fillSeatOptions(); revealMessages(); }},
+  {id: "seats", label: "Seats", urls: [SEATS_URL], render: renderSeats, onData: fillSeatOptions},
   {id: "messages", label: "Messages", urls: [deliveryUrl()], render: renderMessages},
 ];
 
