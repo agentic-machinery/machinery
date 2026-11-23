@@ -65,6 +65,12 @@ def test_hook_accepts_exactly_the_publisher_pr_merge_flags():
 
 
 _PUBLISHER_MERGE = "python -m lu_machinery.publish pr-merge"
+_EXPECTED_PIN_GUIDANCE = (
+    "Use `.venv/bin/python -m lu_machinery.publish pr-merge "
+    "--repo <owner/name> --number <N> --match-head <approved SHA> --expect-queue <true|false>`. "
+    "Use `true` for a base branch with a merge queue (the PR is enqueued) and `false` for one "
+    "without (direct landing); an unreadable queue state stops the landing."
+)
 
 
 def _pinned_merge(number: str | int = 5) -> str:
@@ -402,7 +408,7 @@ def test_issue_9461_redirect_matrix_uses_pr_state(monkeypatch, capsys, command, 
     stderr = capsys.readouterr().err
     assert "cannot be read" not in stderr
     if not pinned:
-        assert "--match-head <approved SHA> --expect-queue <verified true|false>" in stderr
+        assert _EXPECTED_PIN_GUIDANCE in stderr
 
 
 @pytest.mark.parametrize("command", _ISSUE_9461_MERGES)
@@ -641,7 +647,7 @@ def test_compound_merge_segments_are_refused_before_lookup(monkeypatch, capsys, 
     stderr = capsys.readouterr().err
     if expect_raw:
         assert "RAW_MERGE_REQUIRES_PUBLISHER" in stderr
-    assert "publish pr-merge --match-head <approved SHA> --expect-queue <verified true|false>" in stderr
+    assert _EXPECTED_PIN_GUIDANCE in stderr
 
 
 def test_compound_admin_merge_is_refused_before_readiness(monkeypatch, capsys):
@@ -1384,7 +1390,7 @@ def test_private_repo_merge_requires_both_pins(monkeypatch, capsys, command, rea
         assert _run(monkeypatch, variant, pr="689") == 2
         stderr = capsys.readouterr().err
         assert reason in stderr
-        assert "--match-head <approved SHA> --expect-queue <verified true|false>" in stderr
+        assert _EXPECTED_PIN_GUIDANCE in stderr
 
 
 # --- codex re-review round 4 (PR #5324): pflag shorthands + shell escaping ---

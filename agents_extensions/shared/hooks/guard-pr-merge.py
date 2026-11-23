@@ -1130,8 +1130,10 @@ _PUBLISHER_MERGE_FLAGS = frozenset({
     "--recovery-run-id",
 })
 _PIN_GUIDANCE = (
-    f"Use `python -m {_PUBLISHER} pr-merge "
-    "--match-head <approved SHA> --expect-queue <verified true|false> --number <N>`."
+    f"Use `.venv/bin/python -m {_PUBLISHER} pr-merge "
+    "--repo <owner/name> --number <N> --match-head <approved SHA> --expect-queue <true|false>`. "
+    "Use `true` for a base branch with a merge queue (the PR is enqueued) and `false` for one "
+    "without (direct landing); an unreadable queue state stops the landing."
 )
 
 
