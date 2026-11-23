@@ -366,6 +366,7 @@ def record_admission_refusal(
     *,
     hold: dict | None = None,
     detail: str | None = None,
+    admission: dict | None = None,
 ) -> None:
     """Record the refusal without consuming the requested id or losing an attributed worktree."""
     when = now()
@@ -381,6 +382,10 @@ def record_admission_refusal(
         review_profile=metadata.get("review_profile"), review_risk=metadata.get("risk"),
         review_author_model=metadata.get("review_author_model"),
     )
+    if admission is not None:
+        record["admission"] = admission
+    elif hold is not None and isinstance(hold.get("admission"), dict):
+        record["admission"] = hold["admission"]
     if hold is not None:
         task_id = hold["task_id"]
         path = record_path(task_id)

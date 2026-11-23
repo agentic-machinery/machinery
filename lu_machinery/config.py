@@ -22,6 +22,7 @@ DISPATCH_MAX_LIVE_WRITE_WORKERS = 2
 # Subscription meter limits (#1129). The interval is measured between reservations
 # on the same subscription meter.
 DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER = 8
+DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN = 2
 DISPATCH_MIN_METER_LAUNCH_INTERVAL_S = 30.0
 # /proc/meminfo MemAvailable floor, in GiB.
 DISPATCH_MIN_MEM_AVAILABLE_GIB = 8.5
