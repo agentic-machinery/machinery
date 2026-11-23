@@ -1481,7 +1481,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     src_pub_main.write_text(
         "import json, os, sys\n"
         "python_vars = sorted(k for k in os.environ if k.startswith('PYTHON'))\n"
-        "print(json.dumps({'argv': sys.argv[1:], 'python_vars': python_vars, "
+        "print(json.dumps({'source': 'CHECKOUT', 'argv': sys.argv[1:], 'python_vars': python_vars, "
+        "'pythonpath': os.environ.get('PYTHONPATH'), "
         "'primary': os.environ.get('LEARN_UKRAINIAN_PRIMARY_REPO_ROOT'), "
         "'product': os.environ.get('LU_PRODUCT_ROOT'), 'lu_python': os.environ.get('LU_PYTHON')}))\n",
         encoding="utf-8",
@@ -1494,7 +1495,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     assert env["PYTHONPATH"] == str(src_root.resolve())
     assert "PYTHONWARNINGS" not in env and "PYTHONUSERBASE" not in env
     assert manual_src is not None
-    assert "-I -c" in manual_src
+    assert "-I -S -c" in manual_src
     # Execute the emitted source-checkout manual command in a fresh shell with hostile PYTHON* settings
     # (including PYTHONHOME pointing at an empty directory) to prove full isolation matching publisher_invocation().
     empty_pyhome = tmp_path / "empty-pythonhome"
@@ -1513,12 +1514,47 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     assert manual_src_result.returncode == 0, f"source manual command failed: {manual_src_result.stderr}"
     manual_src_payload = json.loads(manual_src_result.stdout)
     assert manual_src_payload == {
+        "source": "CHECKOUT",
         "argv": ["pr-create", "--repo", REPO, "--head", "release/start-0.1.63"],
-        "python_vars": [],
+        "python_vars": ["PYTHONPATH"],
+        "pythonpath": str(src_root.resolve()),
         "primary": str(primary.absolute()),
         "product": str(primary.absolute()),
         "lu_python": str(host_python.absolute()),
     }
+    # Startup-preload regression (R2 F1): in a real consumer venv with a competing installed lu_machinery wheel
+    # preloaded via both a .pth file and sitecustomize.py, the copied command still runs CHECKOUT, never INSTALLED.
+    preload_venv = tmp_path / "preload-venv"
+    subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(preload_venv)], check=True, timeout=30)
+    preload_python = (preload_venv / "bin/python").absolute()
+    preload_site = Path(subprocess.run(
+        [str(preload_python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+        check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip())
+    (preload_site / "lu_machinery/publish").mkdir(parents=True)
+    (preload_site / "lu_machinery/__init__.py").write_text("", encoding="utf-8")
+    (preload_site / "lu_machinery/publish/__init__.py").write_text("", encoding="utf-8")
+    (preload_site / "lu_machinery/publish/__main__.py").write_text(
+        "import json; print(json.dumps({'source': 'INSTALLED'}))\n", encoding="utf-8",
+    )
+    (preload_site / "zz_preload_lu.pth").write_text("import lu_machinery\n", encoding="utf-8")
+    (preload_site / "sitecustomize.py").write_text("import lu_machinery\n", encoding="utf-8")
+    with monkeypatch.context() as preload_ctx:
+        preload_ctx.setattr(sys, "executable", str(preload_python))
+        preload_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        preload_ctx.setattr(
+            release_cut.sysconfig, "get_path",
+            lambda key: str(preload_site) if key in {"purelib", "platlib"} else None,
+        )
+        manual_preload = cut._manual_post_release_command(["pr-create", "--repo", REPO, "--head", "release/start-0.1.63"])
+    assert manual_preload is not None
+    preload_result = subprocess.run(
+        ["/bin/sh", "-c", manual_preload], cwd=tmp_path, env=hostile_shell_env,
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert preload_result.returncode == 0, f"preload manual command failed: {preload_result.stderr}"
+    preload_payload = json.loads(preload_result.stdout)
+    assert isinstance(preload_payload, dict) and preload_payload["source"] == "CHECKOUT"
 
     # Installed venv invocation (e.g. resuming post-release with accept/bin/python -I) uses -I with no PYTHONPATH.
     fake_site = work / "accept/lib/python3.14/site-packages"

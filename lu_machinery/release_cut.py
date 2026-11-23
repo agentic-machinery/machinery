@@ -82,10 +82,10 @@ _RELEASE_INVENTORY = ("from importlib.resources import files; "
 _NODE_SEAL = f"from pathlib import Path; import sys; {_ACPX}seal_node_dependencies as s; print(s(cache=Path(sys.argv[1])))"
 _SITE_PATHS = "import sysconfig; print(sysconfig.get_path('purelib')); print(sysconfig.get_path('platlib'))"
 _SOURCE_PUBLISHER_RUN = (
-    "import os, runpy, sys; "
-    "[os.environ.pop(k, None) for k in list(os.environ) if k.startswith('PYTHON')]; "
-    "sys.path.insert(0, sys.argv.pop(1)); "
-    "runpy.run_module('lu_machinery.publish', run_name='__main__', alter_sys=True)"
+    "import os, sys; "
+    "env = {k: v for k, v in os.environ.items() if not k.startswith('PYTHON')}; "
+    "env['PYTHONPATH'] = sys.argv[1]; "
+    "os.execve(sys.argv[2], sys.argv[2:], env)"
 )
 
 
@@ -1310,7 +1310,7 @@ class Cut:
         prefix = self._recovery_env_prefix()
         if "PYTHONPATH" in pub_env:
             manual_argv: list[str | Path] = [
-                pub_argv[0], "-I", "-c", _SOURCE_PUBLISHER_RUN, pub_env["PYTHONPATH"], *argv,
+                pub_argv[0], "-I", "-S", "-c", _SOURCE_PUBLISHER_RUN, pub_env["PYTHONPATH"], *pub_argv,
             ]
             return f"{prefix} {shlex.join(str(part) for part in manual_argv)}"
         return f"{prefix} {shlex.join(str(part) for part in pub_argv)}"
