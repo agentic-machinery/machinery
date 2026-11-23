@@ -179,3 +179,66 @@ def test_cache_lock_progress_does_not_mask_later_mirror_failure(tmp_path: Path) 
         capture_output=True, text=True, timeout=10, check=False,
     )
     assert result.returncode == 1, result.stdout + result.stderr
+
+
+def test_snapshot_sources_restrict_components_to_main_and_preserve_integrity() -> None:
+    """Defect class: pulling unneeded archive components or regressing snapshot integrity/retries."""
+    setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
+    sources_block = setup.split('cat > "$apt_dir/ubuntu.sources" <<EOF\n', 1)[1].split(
+        "\nEOF\n", 1
+    )[0]
+    sources = dict(line.split(": ", 1) for line in sources_block.splitlines())
+    assert sources["Components"] == "main"
+    assert sources["Suites"] == "noble noble-updates noble-security"
+    assert sources["Signed-By"] == "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+    assert sources["Snapshot"] == "no"
+    assert "-o Acquire::Retries=3" in setup
+    assert "-o Acquire::Retries=1" not in setup
+    assert "--error-on=any" in setup
+    assert 'echo "${digest}  $apt_dir/$deb" | sha256sum -c -' in setup
+
+
+def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() -> None:
+    """Defect class: hardcoded 60 s update cap, budget overrun past apt_deadline, or timeout 0."""
+    setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
+    assert "apt_deadline=$((SECONDS + 195))" in setup
+    assert 'apt_install 55 40 "${missing[@]}"' in setup
+    update_block = setup.split("apt_deadline=$((SECONDS + 195))\n", 1)[1].split(
+        '\n  install_log="$apt_dir/install.log"', 1
+    )[0]
+    assert 'timeout --kill-after=5 "$update_cap"' in update_block
+    assert "--error-on=any" in update_block
+
+    # Only the extracted arithmetic/guard block is evaluated with a shell-function
+    # `sudo` stub; the host-changing setup script and real apt never run.
+    def _eval_update_block(deadline_offset: int) -> subprocess.CompletedProcess[str]:
+        script = (
+            "set -euo pipefail\n"
+            "snapshot=20261122T000000Z\n"
+            "apt_opts=(-o Acquire::Retries=3)\n"
+            'sudo() { printf "SUDO:%s\\n" "$*"; return 0; }\n'
+            f"apt_deadline=$((SECONDS + {deadline_offset}))\n"
+            f"{update_block}\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    fresh = _eval_update_block(195)
+    assert fresh.returncode == 0, fresh.stdout + fresh.stderr
+    assert fresh.stdout.startswith("SUDO:timeout --kill-after=5 "), fresh.stdout
+    tokens = fresh.stdout.strip().split()
+    cap = int(tokens[2])
+    assert 129 <= cap <= 130, f"expected derived cap in 129..130, got {cap}"
+    # Update cap + 5 s kill grace + first apt_install (55 s + 5 s kill grace) <= 195 s.
+    assert cap + 5 + 55 + 5 <= 195
+
+    for exhausted_offset in (65, 10):
+        exhausted = _eval_update_block(exhausted_offset)
+        assert exhausted.returncode == 1, exhausted.stdout + exhausted.stderr
+        assert "SUDO:" not in exhausted.stdout
+        assert "::error::Could not update package indexes" in exhausted.stderr
