@@ -1341,6 +1341,16 @@ def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
     _mark_curriculum(marked_primary)
     _git(marked_primary, "worktree", "add", "-q", "-b", "wt", str(tmp_path / "marked-linked"))
     roots["marked-primary"] = tmp_path / "marked-linked"
+    # Git metadata kept apart from the primary checkout (--separate-git-dir): Git cannot confirm the
+    # primary, so neither that checkout nor its linked worktree is identified (#1285 R1 F6).
+    separate = tmp_path / "separate-primary"
+    _git(tmp_path, "init", "-q", f"--separate-git-dir={tmp_path / 'separate-meta'}", str(separate))
+    _git(separate, "commit", "-q", "--allow-empty", "-m", "init")
+    _git(separate, "config", "remote.origin.url", _KUBE_DOJO_URL)
+    _mark_curriculum(separate)
+    _git(separate, "worktree", "add", "-q", "-b", "wt", str(tmp_path / "separate-linked"))
+    roots["separate-git-dir"] = separate
+    roots["separate-git-dir-linked"] = tmp_path / "separate-linked"
     # A subdirectory of a consumer is not a checkout top; a symlink resolves to its target.
     consumer = _checkout(tmp_path / "consumer", _KUBE_DOJO_URL)
     (consumer / "sub").mkdir()
@@ -1371,6 +1381,8 @@ _UNIDENTIFIABLE = [
     "subdirectory",
     "symlink-to-learn-ukrainian",
     "gitfile-no-space",
+    "separate-git-dir",
+    "separate-git-dir-linked",
 ]
 
 
@@ -1414,7 +1426,7 @@ def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
 
     load({"primary": lu_row})
     for field in ("sources_server", "admission_policy"):
-        for bad in (None, "", 123, ["x"]):
+        for bad in (None, "", " ", "\t\n", 123, ["x"]):
             with pytest.raises(fleet_repos.FleetRepoError, match=field):
                 load({"primary": {**lu_row, field: bad}})
         for github in ("learn-ukrainian/learn-ukrainian.github.io", "Learn-Ukrainian/LEARN-UKRAINIAN.github.io"):

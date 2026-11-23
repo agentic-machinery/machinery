@@ -143,7 +143,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
         product_files = {field: body[field] for field in _PRODUCT_FILE_FIELDS if field in body}
         for field, value in product_files.items():
             # The reader of each file checks the value against the one location it reads.
-            if not isinstance(value, str) or not value:
+            if not isinstance(value, str) or not value.strip():
                 raise FleetRepoError(f"fleet_repos[{key!r}].{field} must be a repo-relative file path")
         if not isinstance(github, str) or "/" not in github:
             raise FleetRepoError(f"fleet_repos[{key!r}].github must be owner/name")
@@ -514,10 +514,12 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     (:func:`~lu_machinery.orchestration.execution_safe_git.safe_git_env`), so only the repository's
     own config, and its worktree config when Git enables that, is read. Callers treat ``None`` as an
     unregistered root that keeps every Learn Ukrainian requirement. It is returned when Git fails,
-    times out or cannot run; ``root`` is not the top of its work tree; ``root`` or its primary
-    checkout carries ``PRODUCT_MARKER`` or cannot be checked for it; the config has an include or a
-    URL rewrite; ``origin`` has no URL or several; or the URL is not exactly the HTTPS or SSH form
-    of one registered slug (ASCII, case-insensitive, optional ``.git``).
+    times out or cannot run; ``root`` is not the top of its work tree; Git cannot confirm the primary
+    checkout (the shared Git directory must be ``<primary>/.git`` and Git, asked from ``<primary>``,
+    must report that work tree and that directory, so separate-git-dir layouts stay unidentified);
+    ``root`` or the primary carries ``PRODUCT_MARKER`` or cannot be checked for it; the config has
+    an include or a URL rewrite; ``origin`` has no URL or several; or the URL is not exactly the
+    HTTPS or SSH form of one registered slug (ASCII, case-insensitive, optional ``.git``).
     """
     # Lazy: execution_safe_git imports PyYAML, and this module is reached from dependency-free hooks.
     from lu_machinery.orchestration.execution_safe_git import GIT, safe_git_env
@@ -525,11 +527,11 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     catalog = repos if repos is not None else _bundled_catalog()
     env = safe_git_env()
 
-    def git(*args: str) -> bytes | None:
+    def git(directory: Path, *args: str) -> bytes | None:
         try:
             # Absolute Git, fixed arguments in an argv list, scrubbed environment; no shell runs.
             done = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-                [GIT, "-C", str(root), *args],
+                [GIT, "-C", str(directory), *args],
                 env=env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -540,15 +542,26 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
             return None
         return done.stdout if done.returncode == 0 else None
 
+    def layout(directory: Path) -> tuple[Path, Path] | None:
+        """``(work-tree top, shared Git directory)`` as Git reports them from ``directory``."""
+        out = git(directory, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir")
+        lines = [] if out is None else out.split(b"\n")
+        if len(lines) != 3 or lines[2]:
+            return None
+        return Path(os.fsdecode(lines[0])), Path(os.fsdecode(lines[1]))
+
     try:
         resolved = root.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
-    layout = git("rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir")
-    lines = [] if layout is None else layout.split(b"\n")
-    if len(lines) != 3 or lines[2] or Path(os.fsdecode(lines[0])) != resolved:
+    found = layout(resolved)
+    if found is None or found[0] != resolved:
         return None
-    for checkout in (resolved, Path(os.fsdecode(lines[1])).parent):
+    common = found[1]
+    primary = common.parent
+    if common.name != ".git" or (primary != resolved and layout(primary) != (primary, common)):
+        return None
+    for checkout in (resolved, primary):
         try:
             os.lstat(checkout / PRODUCT_MARKER)
         except (FileNotFoundError, NotADirectoryError):
@@ -556,8 +569,8 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
         except (OSError, ValueError):
             return None
         return None
-    found = git("config", "--no-includes", "--null", "--get-regexp", _CHECKOUT_IDENTITY_KEYS)
-    entries = [] if found is None else found.split(b"\0")[:-1]
+    config = git(resolved, "config", "--no-includes", "--null", "--get-regexp", _CHECKOUT_IDENTITY_KEYS)
+    entries = [] if config is None else config.split(b"\0")[:-1]
     key = b"remote.origin.url\n"
     if len(entries) != 1 or not entries[0].startswith(key):
         return None
