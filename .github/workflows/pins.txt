@@ -5,6 +5,8 @@
 # (fleet-security.yml, machinery #1080). This file is the record.
 # tests.yml reads NODE_VERSION and NPM_VERSION directly.
 # lu_machinery/ci/setup_bubblewrap.sh reads CI_UBUNTU_SNAPSHOT directly.
+# lu_machinery/ci/linux_fs_parity.sh reads LINUX_FS_PARITY_IMAGE, UV_VERSION
+# and UV_LINUX_X86_64_SHA256 directly.
 # When a workflow or script carries a copy of a pin, update it together
 # with this file and record the new upstream evidence.
 # Never move to an older release to clear a finding.
