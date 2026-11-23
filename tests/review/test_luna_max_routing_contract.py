@@ -1424,7 +1424,7 @@ def test_reviewer_preview_without_branch_facts_judges_scripts_paths_by_repositor
             ["remote", "add", "origin", origin],
             ["commit", "-q", "--allow-empty", "-m", "base"],
         ):
-            subprocess.run(["git", "-C", str(checkout), *argv], check=True)
+            subprocess.run(["git", "-C", str(checkout), *argv], check=True, timeout=60)
         (checkout / "note.md").write_text("local change\n", encoding="utf-8")
         assert closeout_cli.main(["--state-file", str(state), "target", "--mode", "local", "--repo-root", str(checkout)]) == 0
         capsys.readouterr()
