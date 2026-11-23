@@ -40,7 +40,8 @@ def _lease(state="active", session_state="open", expires_in=600, **fields):
     expires = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
     return {"stream_id": STREAM, "session_id": "session-1", "lease_id": "lease-1", "generation": 2,
             "fencing_token": 2, "state": state, "session_state": session_state, "expires_at": expires,
-            "holder": {"agent": "claude", "harness": "codex-cli", "instance_id": "legacy-1"}, **fields}
+            "holder": {"agent": "claude", "harness": "codex-cli", "instance_id": "legacy-1", "task_id": None,
+                       "process_id": 4321, "holder_kind": "process", "host_id": None}, **fields}
 
 
 @pytest.fixture
@@ -427,6 +428,18 @@ def test_a_monitor_outage_before_or_after_the_claim_commits_is_unknown(task_stor
         (_lease(holder=None), "orchestrator_lease_unknown"),
         (_lease(holder={"agent": "claude"}), "orchestrator_lease_unknown"),
         (_lease(generation=True), "orchestrator_lease_unknown"),
+        # A released lease decides "free" only with a well-formed identity, fence and holder.
+        (_lease(state="released", session_state="closed", session_id=""), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", lease_id=""), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", fencing_token=0), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", generation=-1), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": "4321"}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "process_id": 0}),
+         "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed", holder={**_lease()["holder"], "holder_kind": "robot"}),
+         "orchestrator_lease_unknown"),
+        (_lease(holder={**_lease()["holder"], "agent": ""}), "orchestrator_lease_unknown"),
         ({**_lease(), "expires_at": "soon"}, "orchestrator_lease_unknown"),
         ("lease", "orchestrator_lease_unknown"),
         (_MISSING, "orchestrator_lease_unknown"),  # no lease field is not the projection's explicit null
@@ -489,18 +502,23 @@ def _refused_launch(task_store, monkeypatch, tmp_path, error, *, record_change=N
     from lu_machinery.dispatcher.types import TaskSpec
     from lu_machinery.orchestration import dispatch_isolation
 
-    envelope = {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM}}
+    envelope = {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM, "generation": 3}}
     releases = []
     monkeypatch.setattr(host_admission, "claim_turn", lambda *_a, **_k: envelope)
     monkeypatch.setattr(host_admission, "release_turn", lambda lease, **kwargs: releases.append(lease))
 
     def spawn(*_args, **_kwargs):
-        if record_change:  # what another writer leaves in the record between the failure and its read-back
-            path = store.record_path("turn-1")
-            path.write_text(json.dumps({**json.loads(path.read_text()), **record_change}))
         raise error
 
+    real_cleanup = worker._guard_launch_cleanup
+
+    def cleanup(path, spec, record, exc):  # what another writer leaves in the record before its read-back
+        real_cleanup(path, spec, record, exc)
+        if record_change:
+            path.write_text(json.dumps({**json.loads(path.read_text()), **record_change}))
+
     monkeypatch.setattr(dispatch_isolation, "spawn_detached_worker", spawn)
+    monkeypatch.setattr(worker, "_guard_launch_cleanup", cleanup)
     decision = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
     launch = {"record": False, "started": False}
     with pytest.raises(admission.LaunchRefused), host_admission.reserve(
@@ -520,6 +538,14 @@ def _refused_launch(task_store, monkeypatch, tmp_path, error, *, record_change=N
     (False, {"run_nonce": "f" * 32}, False),  # the record read back is another run's
     (False, {"turn_lease": {"monitor": "http://127.0.0.1:9", "lease": {}}}, False),  # it holds another lease
     (False, {"pid": 4242}, False),  # it names a process
+    (False, {"task_id": "turn-2"}, False),  # it is another task's
+    (False, {"orchestrator": None}, False),  # it is no longer a turn on this stream
+    (False, {"orchestrator": {"stream": "epic:8"}}, False),
+    (False, {"status": "running"}, False),
+    (False, {"returncode_reason": ["dispatch_isolation_failed"]}, False),  # malformed: never raises, never proof
+    (False, {"returncode_reason": "worker_spawn_failed"}, False),  # not a placement refusal
+    (False, {"turn_lease": {"monitor": "http://127.0.0.1:8765", "lease": {"stream_id": STREAM, "generation": 3.0}}},
+     False),  # equal, but not the same JSON value
 ])
 def test_a_launch_refused_before_any_process_releases_only_its_own_lease(task_store, monkeypatch, tmp_path,
                                                                           after_popen, record_change, released):
@@ -532,7 +558,7 @@ def test_a_launch_refused_before_any_process_releases_only_its_own_lease(task_st
         "refused")
     envelope, releases = _refused_launch(task_store, monkeypatch, tmp_path, error, record_change=record_change)
     assert releases == ([envelope] if released else [])
-    if record_change is None:  # this run's own record: the failed launch is recorded either way
+    if record_change is None:  # this run's own record: the failed launch is recorded
         state = store.read("turn-1")
         assert (state["status"], state["pid"], state["returncode_reason"]) == ("failed", None, "dispatch_isolation_failed")
 
@@ -597,8 +623,11 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
         for monitor_spelling in (monitor.base.replace("127.0.0.1", "localhost"), "", "http://example.invalid:80", 7):
             reason = host_admission.release_turn({**envelope, "monitor": monitor_spelling}, **exact)
             assert reason.startswith("orchestrator_lease_release_refused"), (monitor_spelling, reason)
-        patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, **k: {"outcome": "released"})
-        assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
+        for answer in ({"outcome": "released"},
+                       {"outcome": "released", "lease": {**envelope["lease"], "state": "released", "session_state": "open"}},
+                       {"outcome": "released", "lease": {**envelope["lease"], "state": "active", "session_state": "closed"}}):
+            patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, answer=answer, **k: answer)
+            assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
     assert contacted == []
     calls = []
 
@@ -721,6 +750,13 @@ def test_no_task_borrows_a_turn_tree(task_store, tmp_path, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(os, "lstat", denied)
         assert "cannot be read" in host_admission.turn_tree_refusal(trees / "hidden-turn")
+    ordinary = _orchestrator_record("masked")
+    ordinary.pop("orchestrator")
+    store._write(archive / "masked.json", ordinary)
+    store.record_path("masked").mkdir()  # a hot entry that is no record: the archived one never stands in
+    assert "cannot be read" in host_admission.turn_tree_refusal(trees / "masked")
+    store.record_path("mismatch").write_text(json.dumps({**ordinary, "task_id": "other"}))  # names another task
+    assert "cannot be read" in host_admission.turn_tree_refusal(trees / "mismatch")
     plain = _orchestrator_record("worker-1")
     plain.pop("orchestrator")
     _write(plain)

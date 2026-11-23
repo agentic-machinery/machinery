@@ -8,6 +8,7 @@ import contextlib
 import http.client
 import math
 import os
+import stat
 import subprocess
 import sys
 import urllib.error
@@ -16,6 +17,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
+from lu_machinery.common import json_depth
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import store
 from lu_machinery.orchestration import dispatch_admission as legacy
@@ -269,12 +271,39 @@ def _lease_refused(reason: str) -> Refused:
     return Refused(f"❌ {reason} ({clause})", 3, admission_record=record)
 
 
-def _same_typed(value, expected) -> bool:
+def same_typed(value, expected) -> bool:
     """``value`` equals ``expected`` with the same JSON type at every level: 1.0 or True never stands in for 1."""
     if isinstance(expected, dict):
         return (isinstance(value, dict) and set(value) == set(expected)
-                and all(_same_typed(value[key], item) for key, item in expected.items()))
+                and all(same_typed(value[key], item) for key, item in expected.items()))
     return type(value) is type(expected) and value == expected
+
+
+def _text(value) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _positive(value) -> bool:
+    return type(value) is int and value > 0
+
+
+def _valid_holder(holder) -> bool:
+    """A holder as Monitor's projection writes it (epics_router._lease_payload; LeaseHolder.validate)."""
+    if not (isinstance(holder, dict) and set(holder) == set(_HOLDER_FIELDS)
+            and all(_text(holder[name]) for name in ("agent", "harness", "instance_id"))
+            and all(holder[name] is None or _text(holder[name]) for name in ("task_id", "host_id"))):
+        return False
+    if holder["holder_kind"] == "process":
+        return _positive(holder["process_id"])
+    return holder["holder_kind"] == "app_thread" and holder["process_id"] is None
+
+
+def _valid_lease_identity(lease, stream: str) -> bool:
+    """A lease on ``stream`` whose identity, fence and holder are all well formed."""
+    return (isinstance(lease, dict) and lease.get("stream_id") == stream
+            and _text(lease.get("session_id")) and _text(lease.get("lease_id"))
+            and _positive(lease.get("generation")) and _positive(lease.get("fencing_token"))
+            and _valid_holder(lease.get("holder")))
 
 
 def _claimed_lease(response, stream: str, holder: dict, session_id: str, lease_id: str, ttl_s: int) -> dict | None:
@@ -287,7 +316,7 @@ def _claimed_lease(response, stream: str, holder: dict, session_id: str, lease_i
     remaining = None if expires is None else (expires - datetime.now(UTC)).total_seconds()
     if not (lease.get("stream_id") == stream and lease.get("session_id") == session_id
             and lease.get("lease_id") == lease_id and lease.get("state") == "active"
-            and lease.get("session_state") == "open" and _same_typed(lease.get("holder"), holder)
+            and lease.get("session_state") == "open" and same_typed(lease.get("holder"), holder)
             and all(type(lease.get(name)) is int and lease[name] > 0 for name in ("generation", "fencing_token"))
             and type(lease.get("ttl_seconds")) is int and lease["ttl_seconds"] == ttl_s
             and remaining is not None and 0 < remaining <= ttl_s + TURN_TTL_MARGIN_S):
@@ -349,13 +378,11 @@ def _turn_lease(envelope, *, stream: str, task_id: str, run_nonce: str):
     holder = lease.get("holder") if isinstance(lease, dict) else None
     if not (isinstance(envelope, dict) and set(envelope) == {"monitor", "lease"} and isinstance(lease, dict)
             and set(lease) == _TURN_LEASE_FIELDS and isinstance(holder, dict) and set(holder) == set(_HOLDER_FIELDS)
-            and lease["stream_id"] == stream and holder["harness"] == TURN_HOLDER_HARNESS
+            and _valid_lease_identity(lease, stream) and holder["harness"] == TURN_HOLDER_HARNESS
             and holder["instance_id"] == run_nonce and holder["task_id"] == task_id
             and holder["holder_kind"] == "process" and holder["host_id"] is None
-            and all(isinstance(lease[name], str) for name in ("session_id", "lease_id", "expires_at"))
-            and isinstance(holder["agent"], str) and isinstance(envelope["monitor"], str)
-            and all(type(value) is int for value in (lease["generation"], lease["fencing_token"],
-                                                      lease["ttl_seconds"], holder["process_id"]))):
+            and store.parse_utc_timestamp(lease["expires_at"]) is not None and _positive(lease["ttl_seconds"])
+            and isinstance(envelope["monitor"], str)):
         raise ValueError("the turn's lease envelope is not this run's")
     try:
         base = monitor_url(envelope["monitor"])
@@ -394,8 +421,8 @@ def release_turn(envelope, *, stream: str, task_id: str, run_nonce: str) -> str 
                 "holder or an operator releases it")
     acknowledged = response.get("lease") if isinstance(response, dict) else None
     if not (isinstance(response, dict) and response.get("outcome") == "released" and isinstance(acknowledged, dict)
-            and acknowledged.get("state") == "released"
-            and all(_same_typed(acknowledged.get(name), envelope["lease"][name])
+            and acknowledged.get("state") == "released" and acknowledged.get("session_state") == "closed"
+            and all(same_typed(acknowledged.get(name), envelope["lease"][name])
                     for name in ("stream_id", "session_id", "lease_id", "generation", "fencing_token", "holder"))):
         return "orchestrator_lease_release_unknown: Monitor's answer does not acknowledge this exact lease"
     return None
@@ -446,27 +473,24 @@ def turn_tree_refusal(tree) -> str | None:
     except ValueError:
         return None  # no task id names it
     unreadable = f"orchestrator_turn_writer_refused: the record of {name:.128}, which may own this tree, cannot be read"
-    present = False
+    # The hot record decides; the archive only once the hot entry is proven absent. Each entry is read itself, so
+    # an inaccessible, non-regular or inconsistent one is never skipped for another.
     for candidate in (hot, archived_task_record_path(hot.parent, name)):
         try:
-            os.lstat(candidate)
+            if not stat.S_ISREG(os.lstat(candidate).st_mode):
+                return unreadable
+            record = json_depth.loads(candidate.read_text(encoding="utf-8"), max_depth=store._JSON_MAX_DEPTH)
+            if not (isinstance(record, dict) and record.get("task_id") == name):
+                return unreadable
+            stream = orchestrator_stream(record)
         except FileNotFoundError:
             continue
-        except (OSError, ValueError):  # an inaccessible record is not an absent one
+        except (OSError, ValueError, RecursionError):  # inaccessible, damaged, or a turn with an unknown stream
             return unreadable
-        present = True
-    if not present:
-        return None  # no record names it, and every turn's tree carries the turn prefix
-    try:
-        record = store.read(name, missing_ok=True)
-        stream = None if record is None else orchestrator_stream(record)
-    except (OSError, ValueError, RecursionError):
-        return unreadable
-    if record is None:  # present, yet not a readable regular record
-        return unreadable
-    if stream is not None:
-        return f"orchestrator_turn_writer_refused: {name:.128} is the orchestrator turn on {stream}"
-    return None
+        if stream is not None:
+            return f"orchestrator_turn_writer_refused: {name:.128} is the orchestrator turn on {stream}"
+        return None
+    return None  # no record names it, and every turn's tree carries the turn prefix
 
 
 def turn_lease_probe(stream):
@@ -496,16 +520,12 @@ def turn_lease_probe(stream):
         return "orchestrator_lease_unknown: the Monitor lease or its session state is malformed"
     if store.parse_utc_timestamp(lease.get("expires_at")) is None:
         return "orchestrator_lease_unknown: the Monitor lease expiry is unreadable"
-    holder = lease.get("holder")
-    if not (lease.get("stream_id") == stream and isinstance(lease.get("session_id"), str)
-            and isinstance(lease.get("lease_id"), str)
-            and all(type(lease.get(name)) is int for name in ("generation", "fencing_token"))
-            and isinstance(holder, dict) and all(isinstance(holder.get(name), str) and holder[name]
-                                                 for name in ("agent", "harness", "instance_id"))
+    if not (_valid_lease_identity(lease, stream)
             and (session in ("closed", "expired") if state == "released" else session in ("open", "rolling"))):
         return "orchestrator_lease_unknown: the Monitor lease is incomplete or its states disagree"
     if state == "released":
         return None
+    holder = lease["holder"]
     return (f"orchestrator_stream_leased: {stream} has an active lease, which no turn supersedes "
             f"(holder {holder.get('agent')!s:.64}/{holder.get('harness')!s:.64}, {state}, "
             f"expires {lease['expires_at']!s:.40})")
@@ -623,7 +643,8 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
             # start one. The hold's cleanup is independent: whatever it finds or raises, this still runs.
             if (turn_lease is not None
                     and ((not launch_started and unclaimed)
-                         or (refused_unstarted and _launch_failed_unstarted(task_id, run_nonce, turn_lease)))
+                         or (refused_unstarted
+                             and _launch_failed_unstarted(task_id, run_nonce, orchestrator["stream"], turn_lease)))
                     and (reason := release_turn(turn_lease, stream=orchestrator["stream"], task_id=task_id,
                                                 run_nonce=run_nonce))):
                 print(f"dispatcher: {orchestrator['stream']} stays leased: {reason}", file=sys.stderr)
@@ -633,21 +654,26 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
 _UNSTARTED_LAUNCH_REASONS = frozenset({"dispatch_fallback_refused", "dispatch_isolation_failed"})
 
 
-def _launch_failed_unstarted(task_id, run_nonce, envelope) -> bool:
+def _launch_failed_unstarted(task_id, run_nonce, stream, envelope) -> bool:
     """True when this run's record reads back as its own launch that failed before any process started (C-6991).
 
-    That record is terminal ``failed``, names no pid, holds exactly the claimed lease and a placement refusal's
-    failure code, so no supervisor runs for it or can start from it. Anything else, unreadable included, is False.
+    That record is this task's and run's, a turn on ``stream``, terminal ``failed``, names no pid, holds exactly
+    the claimed lease (same JSON types) and a placement refusal's failure code, so no supervisor runs for it or can
+    start from it. Anything else, a malformed or unreadable record included, is False and never raises.
     """
+    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+
     try:
         with task_state_lock(store.record_path(task_id)):
             current = store.read(task_id, missing_ok=True)
-    except (OSError, ValueError, RecursionError):
+        return bool(isinstance(current, dict) and same_typed(current.get("task_id"), task_id)
+                    and same_typed(current.get("run_nonce"), run_nonce) and same_typed(current.get("status"), "failed")
+                    and "pid" in current and current["pid"] is None and orchestrator_stream(current) == stream
+                    and same_typed(current.get(TURN_LEASE_KEY), envelope)
+                    and isinstance(reason := current.get("returncode_reason"), str)
+                    and reason in _UNSTARTED_LAUNCH_REASONS)
+    except Exception:  # the proof's boundary: anything unreadable or unexpected is not proof
         return False
-    return (isinstance(current, dict) and current.get("run_nonce") == run_nonce and current.get("status") == "failed"
-            and "pid" in current and current["pid"] is None and "orchestrator" in current
-            and current.get(TURN_LEASE_KEY) == envelope
-            and current.get("returncode_reason") in _UNSTARTED_LAUNCH_REASONS)
 
 
 def _discard_unused_hold(task_id, run_nonce):

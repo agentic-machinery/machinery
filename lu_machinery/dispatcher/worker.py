@@ -783,7 +783,8 @@ def _release_stream(record: dict, *, evidence_lost: bool) -> None:
                 or published.get("launch_mode") != "scope"
                 or dispatch_isolation.listed_task_services(published) != []
                 # The lease the dispatcher claimed and handed this supervisor, never one a rewritten record names.
-                or published.get(host_admission.TURN_LEASE_KEY) != record.get(host_admission.TURN_LEASE_KEY)
+                or not host_admission.same_typed(published.get(host_admission.TURN_LEASE_KEY),
+                                                 record.get(host_admission.TURN_LEASE_KEY))
                 or _provider_alive(published) is not False):
             return
     except Exception:  # any unreadable state is not proof, and never ends this settlement
