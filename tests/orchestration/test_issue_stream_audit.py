@@ -2359,3 +2359,66 @@ def test_a02_per_repo_registry_empty_section_and_audit_repo_both_selector_states
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)
+
+
+def test_cache_max_age_rejects_invalid_values():
+    for value in (True, -1, float('nan'), float('inf'), 10**400, '3600', None):
+        with pytest.raises(ValueError, match='max_age_s'):
+            issue_stream_audit.read_cache(value)
+        with pytest.raises(ValueError, match='max_age_s'):
+            issue_stream_audit.schedule_refresh(max_age_s=value)
+
+
+def test_cache_rejects_future_and_malformed_warnings(tmp_path, monkeypatch):
+    monkeypatch.setattr(issue_stream_audit, 'state_root', lambda: tmp_path)
+    monkeypatch.setattr(issue_stream_audit.time, 'time', lambda: 10000)
+    cache = tmp_path / 'batch_state' / 'issue_stream_audit.json'
+    cache.parent.mkdir()
+    report = {'generated_at': 10000, 'ok': False, 'open_total': 0, 'streams': {},
+              'orphans': [], 'multi_homed': [], 'pending_native_link': [], 'closed_or_missing_epics': []}
+    for warning in ({'code': 'truncated_depth'}, {'code': 'traversal_incomplete'},
+                    {'code': 'unresolved_subissue'}, {'code': 'cross_repo_subissue'},
+                    {'code': 'closed_epic_reopened'}, {'code': 'milestone_row_marked'},
+                    {'code': 'milestone_closed_issue'}, {'code': 'milestone_issue_state_unavailable'},
+                    {'code': 'milestone_confirmed_at_stale'}, {'code': None}):
+        cache.write_text(json.dumps({**report, 'warnings': [warning]}))
+        assert issue_stream_audit.read_cache() is None
+    cache.write_text(json.dumps({**report, 'generated_at': 10301}))
+    assert issue_stream_audit.read_cache() is None
+    cache.write_text(json.dumps({**report, 'generated_at': 10300, 'warnings': [{'code': 'traversal_incomplete', 'issue': 1}]}))
+    assert issue_stream_audit.read_cache() is not None
+    emitted = issue_stream_audit.milestone_warnings(
+        [{'stream': '', 'marker': 'STALE', 'issue_numbers': {123}, 'confirmed_at': None}],
+        {123: 'CLOSED'},
+    )
+    valid = [
+        {'code': 'truncated_depth', 'depth': 8, 'frontier': [1]},
+        {'code': 'unresolved_subissue', 'issue': 1},
+        {'code': 'cross_repo_subissue', 'repository': 'owner/repo', 'issue': 1, 'parent': 2},
+        {'code': 'closed_epic_reopened', 'stream': 's', 'epic': 1},
+        {'code': 'milestone_issue_state_unavailable', 'stream': '', 'issue': 1},
+        {'code': 'milestone_confirmed_at_stale', 'stream': '', 'confirmed_at': '2026-01-01', 'age_days': 30, 'max_age_days': 14},
+    ]
+    cache.write_text(json.dumps({**report, 'warnings': emitted + valid}))
+    assert issue_stream_audit.read_cache() is not None
+
+
+def test_schedule_refresh_skips_fresh_cache_but_force_and_stale_spawn(tmp_path, monkeypatch):
+    _refresh_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(issue_stream_audit, 'state_root', lambda: tmp_path)
+    monkeypatch.setattr(issue_stream_audit.time, 'time', lambda: 10000)
+    spawned = []
+    monkeypatch.setattr(issue_stream_audit, '_spawn_worker', lambda run_id: spawned.append(run_id) or True)
+    cache = tmp_path / 'batch_state' / 'issue_stream_audit.json'
+    cache.parent.mkdir(exist_ok=True)
+    report = {'generated_at': 6400, 'ok': False, 'open_total': 0, 'streams': {},
+              'orphans': [], 'multi_homed': [], 'pending_native_link': [], 'closed_or_missing_epics': []}
+    cache.write_text(json.dumps(report))
+    assert issue_stream_audit.schedule_refresh()['phase'] == 'idle'
+    assert spawned == []
+    assert issue_stream_audit.schedule_refresh(force=True)['phase'] == 'scheduled'
+    assert len(spawned) == 1
+    issue_stream_audit._write_refresh_state_atomic(issue_stream_audit._default_refresh_state())
+    cache.write_text(json.dumps({**report, 'generated_at': 6399}))
+    assert issue_stream_audit.schedule_refresh()['phase'] == 'scheduled'
+    assert len(spawned) == 2

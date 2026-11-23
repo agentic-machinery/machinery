@@ -65,6 +65,7 @@ ISSUE_RANGE_RE = re.compile(r"#(\d{2,6})\s*[–-]\s*#(\d{2,6})\b")
 CONFIRMED_AT_RE = re.compile(r"\bconfirmed-at\s*:\s*(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE)
 MILESTONE_MARKER_RE = re.compile(r"\b(STALE|VACANT)\b", re.IGNORECASE)
 DEFAULT_MAX_CONFIRMED_AGE_DAYS = 14
+DEFAULT_CACHE_MAX_AGE_S = 3600
 MAX_MILESTONE_ISSUE_RANGE = 100
 
 # ADR-011 P4 — private keys added to the cache report for the strict adoption
@@ -482,7 +483,20 @@ def _classify_failure(exc: Exception) -> str:
     return "audit_failed"
 
 
-def schedule_refresh(*, force: bool = False) -> dict:
+def _validate_max_age(max_age_s: object) -> float:
+    """Validate a cache freshness bound in seconds; fail closed on invalid input."""
+    if isinstance(max_age_s, bool) or not isinstance(max_age_s, (int, float)):
+        raise ValueError("max_age_s must be a non-negative finite number")
+    try:
+        numeric = float(max_age_s)
+    except OverflowError:
+        raise ValueError("max_age_s must be a non-negative finite number") from None
+    if not math.isfinite(numeric) or numeric < 0:
+        raise ValueError("max_age_s must be a non-negative finite number")
+    return numeric
+
+
+def schedule_refresh(*, force: bool = False, max_age_s: float = DEFAULT_CACHE_MAX_AGE_S) -> dict:
     """Single-flight refresh scheduler for both stale-fallback and
     ``?fresh=true`` paths.
 
@@ -497,6 +511,7 @@ def schedule_refresh(*, force: bool = False) -> dict:
     active run). The caller builds the public view via
     :func:`public_refresh_view`.
     """
+    validated_max_age = _validate_max_age(max_age_s)
     now = time.time()
     fd = _try_lock_nb()
     if fd is None:
@@ -523,6 +538,9 @@ def schedule_refresh(*, force: bool = False) -> dict:
 
         # ``running`` can't survive free-lock reconciliation.
         assert reconciled["phase"] == "idle"
+
+        if not force and read_cache(validated_max_age) is not None:
+            return reconciled
 
         # Cooldown gate for automatic requests.
         cooldown = reconciled.get("cooldown_until")
@@ -1965,6 +1983,47 @@ def run_audit(
     return report
 
 
+def _is_nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _is_valid_warning(warning: object) -> bool:
+    if not isinstance(warning, dict):
+        return False
+    code = warning.get("code")
+    if not _is_nonempty_str(code):
+        return False
+    if code == "truncated_depth":
+        frontier = warning.get("frontier")
+        return (
+            _is_nonneg_int(warning.get("depth"))
+            and isinstance(frontier, list)
+            and all(_is_positive_int(n) for n in frontier)
+        )
+    if code in {"unresolved_subissue", "traversal_incomplete"}:
+        return _is_positive_int(warning.get("issue"))
+    if code == "cross_repo_subissue":
+        return (
+            _is_nonempty_str(warning.get("repository"))
+            and _is_positive_int(warning.get("issue"))
+            and _is_positive_int(warning.get("parent"))
+        )
+    if code == "closed_epic_reopened":
+        return _is_positive_int(warning.get("epic")) and isinstance(warning.get("stream"), str)
+    if code == "milestone_row_marked":
+        return isinstance(warning.get("stream"), str) and _is_nonempty_str(warning.get("marker"))
+    if code in {"milestone_closed_issue", "milestone_issue_state_unavailable"}:
+        return isinstance(warning.get("stream"), str) and _is_positive_int(warning.get("issue"))
+    if code == "milestone_confirmed_at_stale":
+        return (
+            isinstance(warning.get("stream"), str)
+            and _is_nonempty_str(warning.get("confirmed_at"))
+            and _is_nonneg_int(warning.get("age_days"))
+            and _is_positive_int(warning.get("max_age_days"))
+        )
+    return True
+
+
 def _is_valid_cached_report(report: object) -> bool:
     if not isinstance(report, dict):
         return False
@@ -2002,11 +2061,12 @@ def _is_valid_cached_report(report: object) -> bool:
     warnings = report.get("warnings")
     return warnings is None or (
         isinstance(warnings, list)
-        and all(isinstance(w, dict) and isinstance(w.get("code"), str) for w in warnings)
+        and all(_is_valid_warning(w) for w in warnings)
     )
 
 
-def read_cache(max_age_s: int) -> dict | None:
+def read_cache(max_age_s: float = DEFAULT_CACHE_MAX_AGE_S) -> dict | None:
+    validated_max_age = _validate_max_age(max_age_s)
     path = state_root() / "batch_state/issue_stream_audit.json"
     try:
         report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
@@ -2017,7 +2077,8 @@ def read_cache(max_age_s: int) -> dict | None:
     generated_at = _epoch_or_none(report.get("generated_at"))
     if generated_at is None:
         return None
-    if time.time() - generated_at > max_age_s:
+    age = time.time() - generated_at
+    if age > validated_max_age or age < -CACHE_FUTURE_SKEW_S:
         return None
     return report
 
@@ -2411,7 +2472,7 @@ def main(argv: list[str] | None = None) -> int:
         help="exit 1 on membership invariant failures; milestone warnings remain non-fatal",
     )
     parser.add_argument("--from-cache", action="store_true")
-    parser.add_argument("--max-age", type=int, default=3600)
+    parser.add_argument("--max-age", type=int, default=DEFAULT_CACHE_MAX_AGE_S)
     parser.add_argument(
         "--max-confirmed-age-days",
         type=int,
@@ -2423,6 +2484,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--migrate", action="store_true")
     parser.add_argument("--refresh-worker", metavar="RUN_ID", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    try:
+        _validate_max_age(args.max_age)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.refresh_worker:
         return _run_refresh_worker(args.refresh_worker)
