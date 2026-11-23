@@ -568,6 +568,13 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
     if len(lines) != 3 or lines[2] or [Path(os.fsdecode(line)) for line in lines[:2]] != [resolved, resolved / ".git"]:
         return None
     if resolved.parent != resolved:
+        try:
+            root_stat = os.lstat(resolved)
+            parent_stat = os.lstat(resolved.parent)
+        except (OSError, ValueError):
+            return None
+        if root_stat.st_dev != parent_stat.st_dev or root_stat.st_ino == parent_stat.st_ino:
+            return None
         parent_top = git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=resolved.parent)
         if (
             parent_top is None

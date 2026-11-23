@@ -190,6 +190,35 @@ def _read_only(root: Path, tool_config: dict | None) -> list[str]:
     return list(plan.cmd)
 
 
+def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Normalize a mount-boundary parent stop for ``root`` when pytest ``tmp_path`` sits on a separate mount."""
+    import subprocess
+
+    from lu_machinery.orchestration import execution_safe_git
+
+    real_run_git = execution_safe_git.run_git
+    parent = root.resolve().parent
+
+    def wrapped(args: list[str], *, cwd: Path, **kwargs: object):
+        result = real_run_git(args, cwd=cwd, **kwargs)
+        if (
+            Path(cwd).resolve() == parent
+            and "--show-toplevel" in args
+            and result.returncode == 128
+            and not result.stdout
+            and result.stderr.startswith(b"fatal: not a git repository (or any parent up to mount point ")
+        ):
+            return subprocess.CompletedProcess(
+                result.args,
+                128,
+                b"",
+                b"fatal: not a git repository (or any of the parent directories): .git\n",
+            )
+        return result
+
+    monkeypatch.setattr(execution_safe_git, "run_git", wrapped)
+
+
 def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -198,6 +227,7 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
     servers loaded with no Sources writer denies."""
     _install_fake_claude_cli(tmp_path, monkeypatch)
     consumer = _product_checkout(tmp_path / "renamed-consumer", "https://github.com/kube-dojo/kube-dojo.github.io")
+    _allow_eligible_parent_discovery(monkeypatch, consumer)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
 
     for tool_config in (None, {"reviewer_tools": True}, {"allowed_tools": "Read,mcp__sources__verify_word"}):

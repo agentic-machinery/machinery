@@ -1285,12 +1285,42 @@ def _mark_curriculum(root: Path) -> None:
     marker.write_text("levels: {}\n", encoding="utf-8")
 
 
+def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Normalize a mount-boundary parent stop for ``root`` when pytest ``tmp_path`` sits on a separate mount."""
+    import subprocess
+
+    from lu_machinery.orchestration import execution_safe_git
+
+    real_run_git = execution_safe_git.run_git
+    parent = root.resolve().parent
+
+    def wrapped(args: list[str], *, cwd: Path, **kwargs: object):
+        result = real_run_git(args, cwd=cwd, **kwargs)
+        if (
+            Path(cwd).resolve() == parent
+            and "--show-toplevel" in args
+            and result.returncode == 128
+            and not result.stdout
+            and result.stderr.startswith(b"fatal: not a git repository (or any parent up to mount point ")
+        ):
+            return subprocess.CompletedProcess(
+                result.args,
+                128,
+                b"",
+                b"fatal: not a git repository (or any of the parent directories): .git\n",
+            )
+        return result
+
+    monkeypatch.setattr(execution_safe_git, "run_git", wrapped)
+
+
 def test_consumer_without_admission_policy_uses_fail_closed_machinery_default(tmp_path, probe, monkeypatch):
     """Defect class (F5): a registered non-curriculum consumer without an admission policy file is refused
     (policy_missing), or its default policy admits Ukrainian content or seats."""
     from lu_machinery.orchestration import product_policy
 
     consumer = _checkout(tmp_path / "renamed-kd", _KUBE_DOJO_URL)
+    _allow_eligible_parent_discovery(monkeypatch, consumer)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
     policy = adm.load_product_policy()
     assert policy.origin == product_policy.MACHINERY_DEFAULT_ORIGIN
@@ -1471,11 +1501,53 @@ def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monke
     _git(primary, "worktree", "add", "-q", "-b", "wt", str(linked))
 
     # Positive control: the consumer's primary checkout resolves to kube-dojo.
+    _allow_eligible_parent_discovery(monkeypatch, primary)
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(primary))
     identified = fleet_repos.fleet_repo_for_checkout(primary)
     assert identified is not None and identified.key == "kube-dojo"
     assert adm.load_product_policy().origin == product_policy.MACHINERY_DEFAULT_ORIGIN
     assert sources_server_path() is None
+
+    # Mount boundaries fail closed both at the checkout root (different st_dev, same st_ino,
+    # or stat error) and during parent discovery (PR1294-F2).
+    import os
+    import subprocess
+    from types import SimpleNamespace
+
+    from lu_machinery.orchestration import execution_safe_git
+
+    resolved_primary = primary.resolve()
+    real_lstat = os.lstat
+    real_run_git = execution_safe_git.run_git
+    for mode in ("cross-dev", "same-ino", "lstat-error"):
+        with monkeypatch.context() as mp:
+            def _fake_lstat(path, *, _mode=mode, _real=real_lstat, _root=resolved_primary):
+                st = _real(path)
+                if Path(path) == _root:
+                    if _mode == "lstat-error":
+                        raise OSError("stat failed")
+                    if _mode == "cross-dev":
+                        return SimpleNamespace(st_mode=st.st_mode, st_dev=st.st_dev + 1, st_ino=st.st_ino)
+                    parent_st = _real(_root.parent)
+                    return SimpleNamespace(st_mode=st.st_mode, st_dev=parent_st.st_dev, st_ino=parent_st.st_ino)
+                return st
+
+            mp.setattr(os, "lstat", _fake_lstat)
+            assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    with monkeypatch.context() as mp:
+        def _fake_mount_stop(args, *, cwd, **kw):
+            if Path(cwd) == resolved_primary.parent and "--show-toplevel" in args:
+                return subprocess.CompletedProcess(
+                    args,
+                    128,
+                    b"",
+                    b"fatal: not a git repository (or any parent up to mount point /mnt)\n"
+                    b"Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+                )
+            return real_run_git(args, cwd=cwd, **kw)
+
+        mp.setattr(execution_safe_git, "run_git", _fake_mount_stop)
+        assert fleet_repos.fleet_repo_for_checkout(primary) is None
 
     # Linked worktree of that same primary fails closed on both policy and Sources server.
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(linked))
@@ -1540,6 +1612,7 @@ def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
 
     # Read-time defense in depth: a row constructed with a non-canonical location refuses where read.
     consumer = _checkout(tmp_path / "consumer", _KUBE_DOJO_URL)
+    _allow_eligible_parent_discovery(monkeypatch, consumer)
     catalog = {
         **load({"primary": lu_row}),
         "kube-dojo": fleet_repos.FleetRepo(
