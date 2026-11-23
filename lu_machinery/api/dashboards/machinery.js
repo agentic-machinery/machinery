@@ -8,26 +8,8 @@
   const THEME_KEY = "machinery-theme";
   const THEMES = ["auto", "light", "dark"];
 
-  // Single source of truth for the Monitor navigation, rendered into every machinery page.
-  // NAV_PAGES are the pages this release serves; PRODUCT_PAGES are the pages the product serves
-  // from the same Monitor, listed so no page is more than one click from any other.
-  // Planning (#584) joins NAV_PAGES when it lands.
-  const NAV_PAGES = [
-    {href: "/machinery", label: "Overview", matches: ["/", "/index", "/index.html", "/machinery", "/machinery/"]},
-    {href: "/subscriptions", label: "Subscriptions", matches: ["/subscriptions", "/subscriptions.html"]},
-    {href: "/fleet", label: "Fleet & comms", matches: ["/fleet", "/fleet.html"]},
-    {href: "/pull-requests", label: "Pull requests", matches: ["/pull-requests", "/pull-requests.html"]},
-    {href: "/milestones", label: "Milestones", matches: ["/milestones", "/milestones.html"]},
-    {href: "/model-stats", label: "Model statistics", matches: ["/model-stats", "/model-stats.html"]},
-  ];
-
-  // Machinery never renders these pages, so none of them is ever the current page here.
-  const PRODUCT_PAGES = [
-    {href: "/", label: "Learn Ukrainian", matches: []},
-    {href: "/curriculum-dashboard.html", label: "Curriculum", matches: []},
-    {href: "/artifacts/", label: "Artifacts", matches: []},
-  ];
-
+  // The page navigation is rendered by the server from the page contracts (main.py), so it is
+  // in the HTML before this script runs. Only external site links are built here.
   const SITE_LINKS = [
     {href: "http://localhost:8768/", label: "KubeDojo"},
   ];
@@ -42,28 +24,6 @@
   }
 
   // ---- Navigation & theme ----
-
-  function currentPathname(explicitPath) {
-    if (typeof explicitPath === "string" && explicitPath) return explicitPath;
-    return typeof location === "object" && location && typeof location.pathname === "string"
-      ? location.pathname : "/machinery";
-  }
-
-  function isActivePage(page, pathname) {
-    return page.matches.includes(pathname);
-  }
-
-  function renderNavHtml(pathname) {
-    const path = currentPathname(pathname);
-    const link = (page, className) => {
-      const current = isActivePage(page, path) ? ' aria-current="page"' : "";
-      const cls = className ? ` class="${className}"` : "";
-      return `<a href="${escapeHtml(page.href)}"${cls}${current}>${escapeHtml(page.label)}</a>`;
-    };
-    return NAV_PAGES.map(page => link(page, ""))
-      .concat(PRODUCT_PAGES.map((page, index) => link(page, index === 0 ? "product first" : "product")))
-      .join("");
-  }
 
   function renderSitesHtml() {
     return SITE_LINKS.map(site => `<a href="${escapeHtml(site.href)}">${escapeHtml(site.label)}</a>`).join("");
@@ -126,10 +86,8 @@
     header.innerHTML = renderVersion(header.dataset?.version, header.dataset?.repository);
   }
 
-  function initChrome(options = {}) {
+  function initChrome() {
     if (typeof document !== "object" || !document || !document.getElementById) return;
-    const nav = document.getElementById("machinery-nav");
-    if (nav) nav.innerHTML = renderNavHtml(options.pathname);
     const sites = document.getElementById("machinery-sites");
     if (sites) sites.innerHTML = renderSitesHtml();
     let mode = applyTheme(readStoredTheme());
@@ -751,14 +709,11 @@
     REFRESH_MS,
     OPTIONAL_WAIT_MS,
     RETRY_LIMIT,
-    NAV_PAGES,
-    PRODUCT_PAGES,
     SITE_LINKS,
     FRESHNESS_LABELS,
     DEFAULT_OPTIONAL,
     escapeHtml,
     safeHttpUrl,
-    renderNavHtml,
     renderSitesHtml,
     applyTheme,
     renderVersion,

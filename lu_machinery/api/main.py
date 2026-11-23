@@ -100,6 +100,7 @@ from .project_state_router import router as project_state_router
 from .repository_authority import build_repository_authority, cwd_role
 from .resilience import get_resilience_snapshot, resilience_middleware
 from .rollover_router import collect_rollover_orient_data
+from .route_contracts import PAGE_CONTRACTS, all_page_contracts
 from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
@@ -1740,25 +1741,67 @@ def _attach_cold_start_research(response: dict[str, Any], role: str | None) -> N
 # ==================== STATIC FILES (MUST BE LAST) ====================
 
 
-MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/", "index"})
+MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/"})
 _VERSION_PLACEHOLDER = "__MACHINERY_VERSION__"
 _MACHINERY_REPOSITORY_PLACEHOLDER = "__MACHINERY_REPOSITORY__"
+_NAV_PLACEHOLDER = "__MACHINERY_NAV__"
+# A same-site absolute path: browsers read "//host" and "/\\host" as another site, so neither is one.
+_NAV_PATH = re.compile(r"/(?![/\\])[^\s\\\x00-\x1f\x7f]*")
 
 
-def _machinery_home_response(index: Path) -> HTMLResponse:
-    """The machinery home page with the installed release filled in.
+def _machinery_nav_html(current_file: str | None, product: Any) -> str:
+    """The shared Monitor navigation, from the page contracts: machinery pages, then the product's.
+
+    The current page is the machinery page whose file is being served. A product page is
+    listed only because the product declares it, so no page is named here that the
+    installed product does not serve. A declared URL that is not a same-site absolute path is skipped.
+    """
+    machinery_urls = {page.url for page in PAGE_CONTRACTS}
+    links: list[str] = []
+    product_started = False
+    for page in all_page_contracts(product):
+        if not _NAV_PATH.fullmatch(page.url):
+            continue
+        classes: list[str] = []
+        if page.url not in machinery_urls:
+            classes.append("product")
+            if not product_started:
+                classes.append("first")
+                product_started = True
+        current = ' aria-current="page"' if page.url in machinery_urls and page.file == current_file else ""
+        cls = f' class="{" ".join(classes)}"' if classes else ""
+        links.append(
+            f'<a href="{html.escape(page.url, quote=True)}"{cls}{current}>{html.escape(page.nav_label)}</a>'
+        )
+    return "".join(links)
+
+
+def _machinery_page_response(page: Path, product: Any) -> HTMLResponse:
+    """A machinery page with the installed release, its repository and the shared navigation filled in.
 
     The page reads the version from the document, not from ``/api/health``, so a
     viewer behind the UI gateway (which does not admit that route) still sees it.
     With no distribution installed the value is empty and the header says unknown.
     """
-    version = html.escape(_machinery_version() or "", quote=True)
-    try:
-        repository = load_fleet_repos()["machinery"].github
-    except (FleetRepoError, KeyError):
-        repository = ""
-    page = index.read_text(encoding="utf-8").replace(_VERSION_PLACEHOLDER, version)
-    return HTMLResponse(page.replace(_MACHINERY_REPOSITORY_PLACEHOLDER, html.escape(repository, quote=True)))
+    text = page.read_text(encoding="utf-8")
+    if _VERSION_PLACEHOLDER in text or _MACHINERY_REPOSITORY_PLACEHOLDER in text:
+        version = html.escape(_machinery_version() or "", quote=True)
+        try:
+            repository = load_fleet_repos()["machinery"].github
+        except (FleetRepoError, KeyError):
+            repository = ""
+        text = text.replace(_VERSION_PLACEHOLDER, version)
+        text = text.replace(_MACHINERY_REPOSITORY_PLACEHOLDER, html.escape(repository, quote=True))
+    if _NAV_PLACEHOLDER in text:
+        text = text.replace(_NAV_PLACEHOLDER, _machinery_nav_html(page.name, product))
+    return HTMLResponse(text)
+
+
+def _dashboard_file_response(path: Path, product: Any) -> Response:
+    """A dashboard file: an HTML page is rendered with the shared chrome, any other file is sent as it is."""
+    if path.suffix == ".html":
+        return _machinery_page_response(path, product)
+    return FileResponse(path)
 
 
 def _safe_join(base: Path, *parts: str | Path) -> Path | None:
@@ -1783,12 +1826,12 @@ def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_
     if path in MACHINERY_HOME_PATHS:
         # The machinery home has its own address, so a product that owns ``/``
         # never hides it.
-        return _machinery_home_response(dashboards_dir / "index.html")
+        return _machinery_page_response(dashboards_dir / "index.html", product)
     if not path or path in {"/", "index.html"}:
         product_index = product_file(product, "index.html")
         if product_index is not None:
             return FileResponse(product_index)
-        return _machinery_home_response(dashboards_dir / "index.html")
+        return _machinery_page_response(dashboards_dir / "index.html", product)
     file_path = _safe_join(dashboards_dir, path)
     if file_path is None:
         raise HTTPException(status_code=403, detail="Path traversal not allowed")
@@ -1797,9 +1840,9 @@ def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_
     if not file_path.resolve().is_relative_to(dashboards_root):
         raise HTTPException(status_code=403, detail="Path traversal not allowed")
     if file_path.is_file():
-        return FileResponse(file_path)
+        return _dashboard_file_response(file_path, product)
     if file_path.is_dir() and (file_path / "index.html").is_file():
-        return FileResponse(file_path / "index.html")
+        return _dashboard_file_response(file_path / "index.html", product)
     if not file_path.suffix:
         html_candidate = _safe_join(dashboards_dir, f"{path}.html")
         if (
@@ -1807,7 +1850,7 @@ def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_
             and html_candidate.resolve().is_relative_to(dashboards_root)
             and html_candidate.is_file()
         ):
-            return FileResponse(html_candidate)
+            return _dashboard_file_response(html_candidate, product)
     declared = product_file(product, path)
     if declared is not None:
         return FileResponse(declared)

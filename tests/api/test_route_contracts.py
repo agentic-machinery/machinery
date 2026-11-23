@@ -75,10 +75,54 @@ def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, m
     for path in ("machinery", "machinery/"):
         assert main.serve_static(path, request, context).body == b"machinery home"
 
+    # A path the machinery dashboards do not hold still reaches the product's declared file.
+    empty_dashboards = tmp_path / "empty"
+    empty_dashboards.mkdir()
+    bare = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=empty_dashboards))
+    declared_product = ProductContribution(static_files={"index": product_index})
+    declared_request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=declared_product))})
+    assert main.serve_static("index", declared_request, bare).path == product_index
+
+
+def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path):
+    """Defect class: machinery pages name product pages the product does not declare, or mark one current."""
+    import html
+    import re
+
+    from lu_machinery.api import main, route_contracts
+    from lu_machinery.api.product_contribution import ProductContribution
+
+    (tmp_path / "index.html").write_text('<nav id="machinery-nav">__MACHINERY_NAV__</nav>')
+    base = replace(route_contracts.PAGE_CONTRACTS[0], label="")
+    product = ProductContribution(
+        page_contracts=(
+            replace(base, file="index.html", url="/"),
+            replace(base, file="curriculum-dashboard.html", url="/curriculum-dashboard.html"),
+            replace(base, file="labelled.html", url="/labelled", label='Q&A "x"'),
+            replace(base, file="elsewhere.html", url="//example.invalid/x"),
+            replace(base, file="relative.html", url="relative"),
+            replace(base, file="backslash.html", url="/\\example.invalid"),
+            replace(base, file="space.html", url="/a b"),
+        )
+    )
+    request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=product))})
+    context = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=tmp_path))
+    body = main.serve_static("machinery", request, context).body.decode("utf-8")
+    links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', body)
+    machinery = [(c.url, html.escape(c.nav_label)) for c in route_contracts.PAGE_CONTRACTS]
+    assert [(href, label) for href, _, label in links[: len(machinery)]] == machinery
+    # The product group follows, starts once, is never current, escapes its labels and skips non-path URLs.
+    assert links[len(machinery) :] == [
+        ("/", ' class="product first"', "Home"),
+        ("/curriculum-dashboard.html", ' class="product"', "Curriculum dashboard"),
+        ("/labelled", ' class="product"', "Q&amp;A &quot;x&quot;"),
+    ]
+    assert body.count('aria-current="page"') == 1
+    assert 'href="/machinery" aria-current="page"' in body
+
 
 def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
     """Defect class: a split dashboard page misses its contract, shared nav/assets, or fetches another area's API."""
-    import json
     import re
     import subprocess
 
@@ -103,19 +147,25 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
     for page in route_contracts.PAGE_CONTRACTS:
         slug = page.url.lstrip("/")
         response = main.serve_static(slug, request, context)
+        body = response.body.decode("utf-8")
+        assert "__MACHINERY_" not in body, page.file
         if page.file == "index.html":
-            assert b"__MACHINERY_VERSION__" not in response.body
-            assert b"/machinery.css" in response.body
-            assert b"/machinery.js" in response.body
+            assert "/machinery.css" in body
+            assert "/machinery.js" in body
             root_response = main.serve_static("", request, context)
             assert b"/machinery.css" in root_response.body
-            # /index is the same page, with the release and repository filled in like /machinery.
-            alias_response = main.serve_static("index", request, context)
-            assert alias_response.body == response.body
+            # /index is the same page with the same fill-ins.
+            assert main.serve_static("index", request, context).body == response.body
         else:
-            assert response.path == dashboards / page.file
-            html_response = main.serve_static(page.file, request, context)
-            assert html_response.path == dashboards / page.file
+            assert main.serve_static(page.file, request, context).body == response.body
+        # The shared navigation is in the served HTML (no script needed), lists every machinery page in
+        # contract order, and marks exactly the page being served.
+        nav = re.search(r'<nav class="pages" id="machinery-nav"[^>]*>(.*?)</nav>', body, re.S)
+        assert nav, page.file
+        links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', nav.group(1))
+        assert [href for href, _, _ in links] == [contract.url for contract in route_contracts.PAGE_CONTRACTS]
+        assert [href for href, attrs, _ in links if 'aria-current="page"' in attrs] == [page.url], page.file
+        assert not any("product" in attrs for _, attrs, _ in links)
 
     # Every page loads the shared stylesheet, script, landmarks, and only its own API endpoints.
     expected_apis = {
@@ -154,30 +204,10 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
         found_apis = set(re.findall(r"/api/[a-z0-9/_-]+", text))
         assert found_apis == allowed, (filename, found_apis, allowed)
 
-    # Shared navigation covers every contracted page, marks active page, handles storage errors, and rejects unsafe URLs.
-    urls = [page.url for page in route_contracts.PAGE_CONTRACTS]
+    # The shared script rejects unsafe URLs, and its panel and rendering regressions stay fixed.
     node_script = r"""
 const assert = require('node:assert/strict');
 const M = require(process.argv[1]);
-const urls = JSON.parse(process.argv[2]);
-assert.deepEqual(M.NAV_PAGES.map(p => p.href), urls);
-for (const path of ['/', '/index', '/index.html', '/machinery', '/machinery/']) {
-  const html = M.renderNavHtml(path);
-  assert.match(html, /href="\/machinery" aria-current="page">Overview</, path);
-  assert.equal((html.match(/aria-current="page"/g) || []).length, 1, path);
-}
-for (const url of urls.filter(u => u !== '/machinery')) {
-  const html = M.renderNavHtml(url);
-  assert.ok(html.includes(`href="${url}" aria-current="page"`), url);
-  assert.equal((html.match(/aria-current="page"/g) || []).length, 1, url);
-}
-// Product pages are one click away from every machinery page, and are never marked current.
-assert.deepEqual(M.PRODUCT_PAGES.map(p => p.href), ['/', '/curriculum-dashboard.html', '/artifacts/']);
-for (const url of [...urls, '/index']) {
-  const html = M.renderNavHtml(url);
-  for (const page of M.PRODUCT_PAGES) assert.ok(html.includes(`href="${page.href}"`), `${url} -> ${page.href}`);
-}
-assert.equal((M.renderNavHtml('/fleet').match(/class="product/g) || []).length, M.PRODUCT_PAGES.length);
 assert.equal(M.safeHttpUrl('https://github.com/learn-ukrainian/machinery/pull/1'), 'https://github.com/learn-ukrainian/machinery/pull/1');
 assert.equal(M.safeHttpUrl('javascript:alert(1)'), null);
 assert.equal(M.safeHttpUrl('data:text/html,x'), null);
@@ -691,7 +721,7 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
 })().catch(err => { console.error(err); process.exitCode = 1; });
 """
     ran = subprocess.run(
-        ["node", "-e", node_script, str(dashboards / "machinery.js"), json.dumps(urls)],
+        ["node", "-e", node_script, str(dashboards / "machinery.js")],
         check=False,
         capture_output=True,
         text=True,

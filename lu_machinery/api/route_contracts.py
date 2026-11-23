@@ -83,6 +83,16 @@ class PageContract:
     overlap: str
     stale_risk: str
     recommendation: str
+    label: str = ""
+
+    @property
+    def nav_label(self) -> str:
+        """The name the Monitor navigation shows: the declared label, else one derived from the file name."""
+        if self.label:
+            return self.label
+        if self.url == "/":
+            return "Home"
+        return Path(self.file).stem.replace("-", " ").replace("_", " ").capitalize()
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -700,7 +710,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "http",
         "Static dashboard file serving catch-all.",
         "lu_machinery/api/dashboards/ (the machinery home at /machinery, and at / when the product declares no home), then the files the product entry declares (scripts/project_api/static/).",
-        "Static FileResponse; dashboard freshness comes from client-side API calls.",
+        "Static files; machinery pages are served with the shared navigation rendered in; dashboard freshness comes from client-side API calls.",
         ("humans",),
         "Can hide missing page contracts unless dashboard files are scanned separately.",
         "medium",
@@ -720,6 +730,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "The machinery overview; area pages carry the full per-area tables and product pages belong to the product.",
         "medium if a stale reading is read as current",
         "keep as the machinery overview home",
+        label="Overview",
     ),
     PageContract(
         "subscriptions.html",
@@ -731,6 +742,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Full detail backing the Overview capacity summary.",
         "medium if a stale reading is read as current",
         "keep",
+        label="Subscriptions",
     ),
     PageContract(
         "fleet.html",
@@ -742,6 +754,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Combines live agent dispatch activity and Fleet Comms metrics on one area page.",
         "medium if a stale reading is read as current",
         "keep",
+        label="Fleet & comms",
     ),
     PageContract(
         "pull-requests.html",
@@ -753,6 +766,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Full per-repository tables backing the Overview merge queue summary.",
         "medium if a two-minute-old queue position is read as live",
         "keep",
+        label="Pull requests",
     ),
     PageContract(
         "milestones.html",
@@ -764,6 +778,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Dedicated area page for fleet milestones.",
         "medium if a stale or partial collection is mistaken for complete live progress",
         "keep",
+        label="Milestones",
     ),
     PageContract(
         "model-stats.html",
@@ -780,6 +795,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "shows live usage, not outcomes.",
         "medium if a low-sample rate is read as a verdict",
         "keep",
+        label="Model statistics",
     ),
 )
 
