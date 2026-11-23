@@ -126,6 +126,9 @@ DEFAULT_CACHE_MAX_AGE_S = 3600
 # Bounded wait when a foreground CLI audit joins an already-running refresh.
 _CLI_LOCK_WAIT_S = 180.0
 
+# Bounded wait when schedule_refresh contends with a brief non-refresh lock holder.
+_LOCK_CONTENTION_WAIT_S = 5.0
+
 # Grace for the spawn→acquire race: the scheduler writes ``scheduled``, spawns
 # the worker, and releases the lock. The worker subprocess then acquires it.
 # During that gap a concurrent ``read_refresh_state`` may briefly observe
@@ -358,6 +361,21 @@ def _apply_worker_lost(state: dict, *, failure_at: float) -> None:
     state["cooldown_until"] = fail_ts + FAILURE_COOLDOWN_S
 
 
+def _cache_published_since(started_at: float) -> int | None:
+    """Return the cache's integer ``generated_at`` when a valid cache was published at or after ``started_at``."""
+    try:
+        path = state_root() / "batch_state/issue_stream_audit.json"
+        report = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=512)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(report, dict) or not _is_valid_cached_report(report):
+        return None
+    generated_at = _epoch_or_none(report.get("generated_at"))
+    if generated_at is None or generated_at < started_at:
+        return None
+    return int(generated_at)
+
+
 def _reconcile_state(raw: dict, *, now: float, lock_is_free: bool) -> dict:
     """Compute the effective state.
 
@@ -377,7 +395,24 @@ def _reconcile_state(raw: dict, *, now: float, lock_is_free: bool) -> dict:
             _apply_worker_lost(state, failure_at=int(requested_at + SCHEDULED_GRACE_S))
 
     elif phase == "running" and lock_is_free:
-        _apply_worker_lost(state, failure_at=int(now))
+        started_at = _epoch_or_none(state.get("started_at"))
+        prev_outcome_at = _epoch_or_none(state.get("last_outcome_at"))
+        published_at = _cache_published_since(started_at) if started_at is not None else None
+        if (
+            published_at is not None
+            and published_at <= now + CACHE_FUTURE_SKEW_S
+            and (prev_outcome_at is None or published_at > prev_outcome_at)
+        ):
+            state["phase"] = "idle"
+            state["run_id"] = None
+            state["requested_at"] = None
+            state["started_at"] = None
+            state["last_outcome"] = "succeeded"
+            state["last_outcome_at"] = published_at
+            state["failure_code"] = None
+            state["cooldown_until"] = None
+        else:
+            _apply_worker_lost(state, failure_at=int(now))
 
     cooldown = state.get("cooldown_until")
     if _is_finite_epoch(cooldown) and now >= cooldown:
@@ -522,14 +557,20 @@ def schedule_refresh(*, force: bool = False, max_age_s: float = DEFAULT_CACHE_MA
     :func:`public_refresh_view`.
     """
     validated_max_age = _validate_max_age(max_age_s)
+    # Coalesce immediately only when an active refresh ("scheduled" or "running")
+    # is observed. If another caller briefly holds the lock while sidecar phase is
+    # "idle" (e.g. read_refresh_state or a fresh-cache check), wait briefly for it
+    # to release so forced or stale requests are not dropped.
+    wait_deadline = time.monotonic() + _LOCK_CONTENTION_WAIT_S
     fd = _try_lock_nb()
-    if fd is None:
-        # Lock held by a scheduler, detached worker, or foreground CLI audit —
-        # an active run is in progress.
+    while fd is None:
         raw = _validate_refresh_state(_read_refresh_state_raw())
         if raw is None:
             raw = _default_refresh_state()
-        return raw
+        if raw["phase"] in {"scheduled", "running"} or time.monotonic() >= wait_deadline:
+            return raw
+        time.sleep(0.01)
+        fd = _try_lock_nb()
 
     try:
         now = time.time()
@@ -595,62 +636,160 @@ def schedule_refresh(*, force: bool = False, max_age_s: float = DEFAULT_CACHE_MA
         _release_lock(fd)
 
 
+def _apply_confirmed_age_threshold(report: dict, max_confirmed_age_days: int) -> dict | None:
+    """Recompute local milestone confirmed-at staleness warnings for ``max_confirmed_age_days``.
+
+    Returns an adjusted shallow copy without hitting GitHub, or ``None`` when a
+    non-default threshold was requested and ``docs/WORKSTREAMS.md`` cannot be read.
+    """
+    try:
+        rows = load_milestone_rows(product_root() / "docs" / "WORKSTREAMS.md")
+    except (OSError, ValueError):
+        return report if max_confirmed_age_days == DEFAULT_MAX_CONFIRMED_AGE_DAYS else None
+    base_warnings = [w for w in (report.get("warnings") or []) if w.get("code") != "milestone_confirmed_at_stale"]
+    stale_warnings = [
+        w
+        for w in milestone_warnings(rows, {}, max_confirmed_age_days=max_confirmed_age_days)
+        if w.get("code") == "milestone_confirmed_at_stale"
+    ]
+    return {**report, "warnings": base_warnings + stale_warnings}
+
+
 def _run_default_audit_single_flight(
     *,
     max_age_s: float,
     max_confirmed_age_days: int,
     repo: str | None,
     force: bool,
+    allow_join: bool = True,
     wait_timeout_s: float = _CLI_LOCK_WAIT_S,
 ) -> dict:
     """Coordinate a foreground default-repo CLI audit with the host-wide lock.
 
-    If a refresh is already running, wait for it to finish and join the fresh
-    cache it published instead of duplicating a second live GitHub audit.
-    While running, hold the shared lock and record ``running`` in the sidecar
-    so concurrent ``schedule_refresh()`` callers join instead of spawning.
+    Honors any active ``scheduled`` or ``running`` refresh without cancelling its
+    reservation, joins a completed refresh's result (respecting ``--max-age 0``,
+    failure cooldown, and the caller's ``--max-confirmed-age-days`` threshold),
+    and holds the shared lock while running so concurrent callers cannot overlap
+    or overwrite the shared cache out of order.
     """
     validated_max_age = _validate_max_age(max_age_s)
-    waited = False
-    fd = _try_lock_nb()
-    if fd is None:
-        waited = True
-        fd = _acquire_lock_blocking(timeout_s=wait_timeout_s)
+    deadline = time.monotonic() + wait_timeout_s
+    joined_requested_at: float | None = None
+    pre_wait_outcome_at: float | None = None
+    observed_active_run = False
+
+    while True:
+        fd = _try_lock_nb()
         if fd is None:
-            raise RuntimeError("issue-stream audit refresh already in progress (lock wait timed out)")
+            raw = _validate_refresh_state(_read_refresh_state_raw())
+            if raw is None:
+                raw = _default_refresh_state()
+            if raw["phase"] in {"scheduled", "running"} and not observed_active_run:
+                observed_active_run = True
+                joined_requested_at = _epoch_or_none(raw.get("requested_at"))
+                pre_wait_outcome_at = _epoch_or_none(raw.get("last_outcome_at"))
+            if time.monotonic() >= deadline:
+                raise RuntimeError("issue-stream audit refresh already in progress (lock wait timed out)")
+            time.sleep(0.05)
+            continue
 
-    try:
-        cached = read_cache(validated_max_age)
-        if cached is not None and (not force or waited):
-            return cached
-
-        now = time.time()
-        raw = _validate_refresh_state(_read_refresh_state_raw())
-        if raw is None:
-            raw = _default_refresh_state()
-        reconciled = _reconcile_state(raw, now=now, lock_is_free=True)
-        run_id = secrets.token_hex(8)
-        ts = int(now)
-        _write_refresh_state_atomic(
-            {
-                "schema_version": 1,
-                "run_id": run_id,
-                "phase": "running",
-                "requested_at": ts,
-                "started_at": ts,
-                "last_outcome": reconciled.get("last_outcome", "none"),
-                "last_outcome_at": reconciled.get("last_outcome_at"),
-                "failure_code": reconciled.get("failure_code") if reconciled.get("last_outcome") == "failed" else None,
-                "cooldown_until": None,
-            }
-        )
         try:
-            report = run_audit(max_confirmed_age_days=max_confirmed_age_days, repo=repo)
-        except Exception as exc:
-            code = _classify_failure(exc)
-            fail_ts = int(time.time())
+            now = time.time()
+            raw = _validate_refresh_state(_read_refresh_state_raw())
+            if raw is None:
+                raw = _default_refresh_state()
+            reconciled = _reconcile_state(raw, now=now, lock_is_free=True)
+            if reconciled != raw:
+                with contextlib.suppress(OSError):
+                    _write_refresh_state_atomic(reconciled)
+
+            # Honor a valid scheduled worker reservation during the spawn-to-lock gap.
+            if reconciled["phase"] == "scheduled":
+                if not observed_active_run:
+                    observed_active_run = True
+                    joined_requested_at = _epoch_or_none(reconciled.get("requested_at"))
+                    pre_wait_outcome_at = _epoch_or_none(reconciled.get("last_outcome_at"))
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("issue-stream audit refresh already in progress (lock wait timed out)")
+                _release_lock(fd)
+                fd = None
+                time.sleep(0.05)
+                continue
+
+            assert reconciled["phase"] == "idle"
+
+            if observed_active_run:
+                outcome_at = _epoch_or_none(reconciled.get("last_outcome_at"))
+                completed_new_outcome = outcome_at is not None and (
+                    outcome_at != pre_wait_outcome_at
+                    or (joined_requested_at is not None and outcome_at >= joined_requested_at)
+                )
+                if allow_join and completed_new_outcome and reconciled.get("last_outcome") == "succeeded":
+                    join_window = max(validated_max_age, wait_timeout_s + DEFAULT_CACHE_MAX_AGE_S)
+                    joined_report = read_cache(join_window)
+                    if joined_report is not None:
+                        gen_at = _epoch_or_none(joined_report.get("generated_at"))
+                        if joined_requested_at is None or (gen_at is not None and gen_at >= joined_requested_at - 1):
+                            adjusted = _apply_confirmed_age_threshold(joined_report, max_confirmed_age_days)
+                            if adjusted is not None:
+                                return adjusted
+                if not force and completed_new_outcome and reconciled.get("last_outcome") == "failed":
+                    code = reconciled.get("failure_code") or "audit_failed"
+                    raise RuntimeError(f"issue-stream audit refresh failed ({code})")
+
+            if not force and allow_join:
+                cached = read_cache(validated_max_age)
+                if cached is not None:
+                    adjusted = _apply_confirmed_age_threshold(cached, max_confirmed_age_days)
+                    if adjusted is not None:
+                        return adjusted
+
+            cooldown = _epoch_or_none(reconciled.get("cooldown_until"))
+            if not force and cooldown is not None and now < cooldown:
+                code = reconciled.get("failure_code") or "audit_failed"
+                raise RuntimeError(f"issue-stream audit refresh in cooldown after {code}")
+
+            run_id = secrets.token_hex(8)
+            ts = int(now)
+            _write_refresh_state_atomic(
+                {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "phase": "running",
+                    "requested_at": ts,
+                    "started_at": ts,
+                    "last_outcome": reconciled.get("last_outcome", "none"),
+                    "last_outcome_at": reconciled.get("last_outcome_at"),
+                    "failure_code": reconciled.get("failure_code") if reconciled.get("last_outcome") == "failed" else None,
+                    "cooldown_until": None,
+                }
+            )
+            try:
+                report = run_audit(max_confirmed_age_days=max_confirmed_age_days, repo=repo)
+            except Exception as exc:
+                code = _classify_failure(exc)
+                fail_ts = int(time.time())
+                current = _validate_refresh_state(_read_refresh_state_raw())
+                if current is not None and current.get("run_id") == run_id:
+                    with contextlib.suppress(OSError):
+                        _write_refresh_state_atomic(
+                            {
+                                "schema_version": 1,
+                                "run_id": None,
+                                "phase": "idle",
+                                "requested_at": None,
+                                "started_at": None,
+                                "last_outcome": "failed",
+                                "last_outcome_at": fail_ts,
+                                "failure_code": code,
+                                "cooldown_until": fail_ts + FAILURE_COOLDOWN_S,
+                            }
+                        )
+                raise
+
             current = _validate_refresh_state(_read_refresh_state_raw())
             if current is not None and current.get("run_id") == run_id:
+                ok_ts = int(time.time())
                 with contextlib.suppress(OSError):
                     _write_refresh_state_atomic(
                         {
@@ -659,33 +798,16 @@ def _run_default_audit_single_flight(
                             "phase": "idle",
                             "requested_at": None,
                             "started_at": None,
-                            "last_outcome": "failed",
-                            "last_outcome_at": fail_ts,
-                            "failure_code": code,
-                            "cooldown_until": fail_ts + FAILURE_COOLDOWN_S,
+                            "last_outcome": "succeeded",
+                            "last_outcome_at": ok_ts,
+                            "failure_code": None,
+                            "cooldown_until": None,
                         }
                     )
-            raise
-
-        current = _validate_refresh_state(_read_refresh_state_raw())
-        if current is not None and current.get("run_id") == run_id:
-            ok_ts = int(time.time())
-            _write_refresh_state_atomic(
-                {
-                    "schema_version": 1,
-                    "run_id": None,
-                    "phase": "idle",
-                    "requested_at": None,
-                    "started_at": None,
-                    "last_outcome": "succeeded",
-                    "last_outcome_at": ok_ts,
-                    "failure_code": None,
-                    "cooldown_until": None,
-                }
-            )
-        return report
-    finally:
-        _release_lock(fd)
+            return report
+        finally:
+            if fd is not None:
+                _release_lock(fd)
 
 
 def _run_refresh_worker(run_id: str) -> int:
@@ -740,19 +862,20 @@ def _run_refresh_worker(run_id: str) -> int:
         if current is None or current.get("run_id") != run_id:
             return 0
         ok_ts = int(time.time())
-        _write_refresh_state_atomic(
-            {
-                "schema_version": 1,
-                "run_id": None,
-                "phase": "idle",
-                "requested_at": None,
-                "started_at": None,
-                "last_outcome": "succeeded",
-                "last_outcome_at": ok_ts,
-                "failure_code": None,
-                "cooldown_until": None,
-            }
-        )
+        with contextlib.suppress(OSError):
+            _write_refresh_state_atomic(
+                {
+                    "schema_version": 1,
+                    "run_id": None,
+                    "phase": "idle",
+                    "requested_at": None,
+                    "started_at": None,
+                    "last_outcome": "succeeded",
+                    "last_outcome_at": ok_ts,
+                    "failure_code": None,
+                    "cooldown_until": None,
+                }
+            )
         return 0
     finally:
         _release_lock(fd)
@@ -2089,6 +2212,47 @@ def run_audit(
     return report
 
 
+def _is_nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _is_valid_warning(warning: object) -> bool:
+    if not isinstance(warning, dict):
+        return False
+    code = warning.get("code")
+    if not _is_nonempty_str(code):
+        return False
+    if code == "truncated_depth":
+        frontier = warning.get("frontier")
+        return (
+            _is_nonneg_int(warning.get("depth"))
+            and isinstance(frontier, list)
+            and all(_is_positive_int(n) for n in frontier)
+        )
+    if code in {"unresolved_subissue", "traversal_incomplete"}:
+        return _is_positive_int(warning.get("issue"))
+    if code == "cross_repo_subissue":
+        return (
+            _is_nonempty_str(warning.get("repository"))
+            and _is_positive_int(warning.get("issue"))
+            and _is_positive_int(warning.get("parent"))
+        )
+    if code == "closed_epic_reopened":
+        return _is_positive_int(warning.get("epic")) and _is_nonempty_str(warning.get("stream"))
+    if code == "milestone_row_marked":
+        return _is_nonempty_str(warning.get("stream")) and _is_nonempty_str(warning.get("marker"))
+    if code in {"milestone_closed_issue", "milestone_issue_state_unavailable"}:
+        return _is_nonempty_str(warning.get("stream")) and _is_positive_int(warning.get("issue"))
+    if code == "milestone_confirmed_at_stale":
+        return (
+            _is_nonempty_str(warning.get("stream"))
+            and _is_nonempty_str(warning.get("confirmed_at"))
+            and _is_nonneg_int(warning.get("age_days"))
+            and _is_positive_int(warning.get("max_age_days"))
+        )
+    return True
+
+
 def _is_valid_cached_report(report: object) -> bool:
     if not isinstance(report, dict):
         return False
@@ -2124,10 +2288,7 @@ def _is_valid_cached_report(report: object) -> bool:
     if not isinstance(closed, list) or not all(_is_positive_int(n) for n in closed):
         return False
     warnings = report.get("warnings")
-    return warnings is None or (
-        isinstance(warnings, list)
-        and all(isinstance(w, dict) and isinstance(w.get("code"), str) for w in warnings)
-    )
+    return warnings is None or (isinstance(warnings, list) and all(_is_valid_warning(w) for w in warnings))
 
 
 def read_cache(max_age_s: float = DEFAULT_CACHE_MAX_AGE_S) -> dict | None:
@@ -2564,12 +2725,18 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--from-cache is only available for the default repository")
 
     report = read_cache(args.max_age) if args.from_cache else None
+    if report is not None and args.max_confirmed_age_days != DEFAULT_MAX_CONFIRMED_AGE_DAYS:
+        adjusted = _apply_confirmed_age_threshold(report, args.max_confirmed_age_days)
+        if adjusted is not None:
+            report = adjusted
+        elif not args.check:
+            report = None
     if report is None:
         if args.from_cache and args.check:
             # Hook path: never block a session start on the network.
             print("issue-stream audit: no fresh cache (run the auditor to refresh)")
             return 0
-        if is_default_repo and not args.migrate:
+        if is_default_repo:
             report = _run_default_audit_single_flight(
                 max_age_s=args.max_age,
                 max_confirmed_age_days=args.max_confirmed_age_days,
@@ -2582,7 +2749,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.migrate:
         created = migrate(report, repo=args.repo)
         print(f"created {created} native sub-issue link(s)")
-        report = run_audit(max_confirmed_age_days=args.max_confirmed_age_days, repo=args.repo)
+        if is_default_repo:
+            report = _run_default_audit_single_flight(
+                max_age_s=args.max_age,
+                max_confirmed_age_days=args.max_confirmed_age_days,
+                repo=args.repo,
+                force=True,
+                allow_join=False,
+            )
+        else:
+            report = run_audit(max_confirmed_age_days=args.max_confirmed_age_days, repo=args.repo)
 
     print(json.dumps(report, ensure_ascii=False, indent=1) if args.json else human_summary(report))
     return 0 if (report["ok"] or not args.check) else 1
