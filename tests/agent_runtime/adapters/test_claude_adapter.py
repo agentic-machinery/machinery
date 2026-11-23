@@ -207,7 +207,8 @@ def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
         assert json.loads(cmd[cmd.index("--mcp-config") + 1]) == {"mcpServers": {}}
         if "--disallowedTools" in cmd:
             assert "sources" not in cmd[cmd.index("--disallowedTools") + 1]
-        if "--allowedTools" in cmd:
+        if tool_config is not None:
+            assert "--allowedTools" in cmd
             assert not any("mcp__" in rule.lower() for rule in cmd[cmd.index("--allowedTools") + 1].split(","))
     explicit = _read_only(
         consumer,

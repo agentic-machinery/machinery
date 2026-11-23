@@ -510,36 +510,38 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
 def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None = None) -> FleetRepo | None:
     """The registered row whose GitHub ``origin`` the Git checkout at ``root`` declares, else ``None``.
 
-    Git reads the checkout's metadata, never Python: ``git rev-parse`` and ``git config`` run with
-    every inherited ``GIT_*`` variable removed and global and system config disabled
-    (:func:`~lu_machinery.orchestration.execution_safe_git.safe_git_env`), so only the repository's
-    own config, and its worktree config when Git enables that, is read. Callers treat ``None`` as an
+    Git reads the checkout's metadata, never Python: ``git rev-parse``, ``git ls-files`` and
+    ``git config`` run through :func:`~lu_machinery.orchestration.execution_safe_git.run_git`, which
+    strips every inherited ``GIT_*`` variable, disables global and system config, and turns off
+    repository-configured hooks and filesystem monitors. Callers treat ``None`` as an
     unregistered root that keeps every Learn Ukrainian requirement. Only a primary checkout is
     identified: Git must report ``root`` as the top of its work tree, ``root/.git`` as its shared
-    Git directory, and no superproject working tree. A linked worktree, a separate Git directory, a
-    bare repository's worktree or a submodule (including an embedded-Git submodule) is never
-    identified, because Git cannot name the checkout whose curriculum marker would decide it.
-    ``None`` is also returned when Git fails, times out or cannot run; ``root`` carries
-    ``PRODUCT_MARKER``, has a non-directory or symlink marker ancestor, or cannot be checked for it;
-    the config has an include or a URL rewrite; ``origin`` has no URL or several; the URL names
-    Learn Ukrainian; or the URL is not exactly the HTTPS or SSH form of one registered slug (ASCII,
-    case-insensitive, optional ``.git``).
+    Git directory, and an execution-safe parent lookup must confirm ``root`` is not tracked inside
+    an enclosing Git repository (failing closed if the parent metadata or index cannot be verified).
+    A linked worktree, a separate Git directory, a bare repository's worktree or a submodule
+    (including an embedded-Git submodule) is never identified, because Git cannot name the checkout
+    whose curriculum marker would decide it. ``None`` is also returned when Git fails, times out or
+    cannot run; ``root`` carries ``PRODUCT_MARKER``, has a non-directory or symlink marker ancestor,
+    or cannot be checked for it; the config has an include or a URL rewrite; ``origin`` has no URL
+    or several; the URL names Learn Ukrainian; or the URL is not exactly the HTTPS or SSH form of
+    one registered slug (ASCII, case-insensitive, optional ``.git``).
     """
     # Lazy: execution_safe_git imports PyYAML, and this module is reached from dependency-free hooks.
-    from lu_machinery.orchestration.execution_safe_git import GIT, safe_git_env
+    from lu_machinery.orchestration.execution_safe_git import run_git
 
     catalog = repos if repos is not None else _bundled_catalog()
-    env = safe_git_env()
+    # Pin C locale so Git's non-repository diagnostic is stable; run_git strips GIT_* and disables hooks.
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C", "LANGUAGE": ""}
     try:
         resolved = root.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         return None
 
-    def git(*args: str) -> bytes | None:
+    def git(*args: str, cwd: Path = resolved) -> subprocess.CompletedProcess[Any] | None:
         try:
-            # Absolute Git, fixed arguments in an argv list, scrubbed environment; no shell runs.
-            done = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-                [GIT, "-C", str(resolved), *args],
+            return run_git(
+                list(args),
+                cwd=cwd,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -548,30 +550,45 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
             )
         except (OSError, ValueError, subprocess.SubprocessError):
             return None
-        return done.stdout if done.returncode == 0 else None
 
-    layout = git(
-        "rev-parse",
-        "--path-format=absolute",
-        "--show-toplevel",
-        "--git-common-dir",
-        "--show-superproject-working-tree",
-    )
-    lines = [] if layout is None else layout.split(b"\n")
+    layout = git("rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir")
+    lines = [] if layout is None or layout.returncode != 0 else layout.stdout.split(b"\n")
     if len(lines) != 3 or lines[2] or [Path(os.fsdecode(line)) for line in lines[:2]] != [resolved, resolved / ".git"]:
         return None
+    if resolved.parent != resolved:
+        parent_top = git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=resolved.parent)
+        if parent_top is None:
+            return None
+        if parent_top.returncode == 0:
+            parent_lines = parent_top.stdout.split(b"\n")
+            if len(parent_lines) != 2 or parent_lines[1]:
+                return None
+            try:
+                super_top = Path(os.fsdecode(parent_lines[0])).resolve(strict=True)
+                rel = resolved.relative_to(super_top).as_posix()
+            except (OSError, RuntimeError, ValueError):
+                return None
+            if not rel or rel == ".":
+                return None
+            tracked = git("ls-files", "--stage", "-z", "--", f":(literal){rel}", cwd=super_top)
+            if tracked is None or tracked.returncode != 0 or tracked.stdout:
+                return None
+        elif parent_top.returncode != 128 or not parent_top.stderr.startswith(
+            b"fatal: not a git repository (or any "
+        ):
+            return None
     marker = Path(PRODUCT_MARKER)
-    for rel in (*reversed(marker.parents[:-1]), marker):
+    for rel_marker in (*reversed(marker.parents[:-1]), marker):
         try:
-            st = os.lstat(resolved / rel)
+            st = os.lstat(resolved / rel_marker)
         except FileNotFoundError:
             break
         except (OSError, ValueError):
             return None
-        if rel == marker or not stat.S_ISDIR(st.st_mode):
+        if rel_marker == marker or not stat.S_ISDIR(st.st_mode):
             return None
     config = git("config", "--no-includes", "--null", "--get-regexp", _CHECKOUT_IDENTITY_KEYS)
-    entries = [] if config is None else config.split(b"\0")[:-1]
+    entries = [] if config is None or config.returncode != 0 else config.stdout.split(b"\0")[:-1]
     key = b"remote.origin.url\n"
     if len(entries) != 1 or not entries[0].startswith(key):
         return None

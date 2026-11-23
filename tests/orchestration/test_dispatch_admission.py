@@ -1369,12 +1369,30 @@ def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
     gitfile.mkdir()
     (gitfile / ".git").write_text(f"gitdir:{consumer / '.git'}\n", encoding="utf-8")
     roots["gitfile-no-space"] = gitfile
-    # An embedded-Git submodule tracked by a superproject (#1287 R1 F2).
-    superproject = _checkout(tmp_path / "superproject", _LEARN_UKRAINIAN_URL)
-    embedded_sub = _checkout(superproject / "sub-consumer", _KUBE_DOJO_URL)
-    _git(superproject, "add", "sub-consumer")
-    _git(superproject, "commit", "-q", "-m", "track embedded submodule")
-    roots["embedded-git-submodule"] = embedded_sub
+    # An embedded-Git submodule tracked by a superproject (#1287 R1 F2, R2 F2/F5).
+    # Configure a hostile core.fsmonitor hook on the superprojects after commit; checkout
+    # identification must never execute it and must still fail closed if the parent index
+    # or config is corrupt.
+    hook_marker = tmp_path / "fsmonitor-hook-ran"
+    hook = tmp_path / "evil-fsmonitor.sh"
+    hook.write_text(f"#!/bin/sh\ntouch '{hook_marker}'\necho '1'\n", encoding="utf-8")
+    hook.chmod(0o755)
+    for name, corrupt in (
+        ("embedded-git-submodule", None),
+        ("embedded-git-submodule-corrupt-index", "index"),
+        ("embedded-git-submodule-corrupt-config", "config"),
+    ):
+        superproject = _checkout(tmp_path / f"super-{name}", _LEARN_UKRAINIAN_URL)
+        embedded_sub = _checkout(superproject / "sub-consumer", _KUBE_DOJO_URL)
+        _git(superproject, "add", "sub-consumer")
+        _git(superproject, "commit", "-q", "-m", "track embedded submodule")
+        _git(superproject, "config", "core.fsmonitor", str(hook))
+        if corrupt == "index":
+            (superproject / ".git" / "index").write_bytes(b"corrupt")
+        elif corrupt == "config":
+            with (superproject / ".git" / "config").open("a", encoding="utf-8") as cfg:
+                cfg.write("[broken-header\n")
+        roots[name] = embedded_sub
     # A non-directory or symlink ancestor along PRODUCT_MARKER fails closed (#1287 R1 F3).
     non_dir_ancestor = _checkout(tmp_path / "non-dir-ancestor", _KUBE_DOJO_URL)
     (non_dir_ancestor / "curriculum").write_text("not-a-dir\n", encoding="utf-8")
@@ -1408,6 +1426,8 @@ _UNIDENTIFIABLE = [
     "separate-dot-git-linked",
     "symlinked-git-dir",
     "embedded-git-submodule",
+    "embedded-git-submodule-corrupt-index",
+    "embedded-git-submodule-corrupt-config",
     "non-directory-marker-ancestor",
     "symlink-marker-ancestor",
 ]
@@ -1428,6 +1448,7 @@ def test_unidentified_checkout_keeps_the_learn_ukrainian_policy_requirement(tmp_
     with pytest.raises(product_policy.ProductPolicyError) as exc_info:
         adm.evaluate("read-only", tmp_path / "tasks")
     assert exc_info.value.code == "policy_missing"
+    assert not (tmp_path / "fsmonitor-hook-ran").exists()
 
 
 def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monkeypatch):
