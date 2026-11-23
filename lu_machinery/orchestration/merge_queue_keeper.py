@@ -934,7 +934,9 @@ def _verify_run_areas_for_files(
                     patches_by_path[cleaned_prev] = patch
 
     matched: set[str] = set()
+    previous_paths = set(previous_by_path.values())
     blob_candidates: list[tuple[str, bool]] = []
+    seen_candidates: set[tuple[str, bool]] = set()
     for raw_path in files:
         norm = _norm_pr_path(raw_path)
         if not norm or norm.startswith(("tests/", "docs/")):
@@ -963,8 +965,13 @@ def _verify_run_areas_for_files(
             ):
                 matched.add("sources")
             else:
+                # A path that appears only as a rename's previous_filename does not exist at PR head;
+                # inspect it at the proven diff base (removed=True), never at PR head.
+                is_removed = status_by_path.get(norm) == "removed" or (
+                    norm in previous_paths and norm not in status_by_path
+                )
                 for cand_path, cand_removed in (
-                    (norm, status_by_path.get(norm) == "removed"),
+                    (norm, is_removed),
                     *((previous_by_path[norm], True) for _ in (0,) if norm in previous_by_path),
                 ):
                     if not cand_path.casefold().endswith(_VERIFY_WORD_CODE_SUFFIXES):
@@ -973,7 +980,10 @@ def _verify_run_areas_for_files(
                     if isinstance(patch, str) and _VERIFY_WORD_RE.search(patch):
                         matched.add("sources")
                         break
-                    blob_candidates.append((cand_path, cand_removed))
+                    pair = (cand_path, cand_removed)
+                    if pair not in seen_candidates:
+                        seen_candidates.add(pair)
+                        blob_candidates.append(pair)
 
     if "sources" in allowed and "sources" not in matched and blob_candidates:
         with contextlib.ExitStack() as stack:
@@ -1967,18 +1977,26 @@ def _queue_hold_alert(
     run_ids: Sequence[int],
     observed: str,
     dedup_reason: str | None = None,
+    in_custody: bool = True,
 ) -> bool:
-    """Freeze one deduplicated CTO inbox alert for a held PR with old/current SHA and run IDs."""
+    """Freeze one deduplicated CTO inbox alert for a held or unreviewed-moved PR with SHAs and run IDs."""
     key_reason = dedup_reason if dedup_reason is not None else reason
     alert_key = f"merge-queue-keeper:{kind}:{repo}:{number}:{old_head}:{current_head}:{marker_value(key_reason)}"
     sent = previous.setdefault("hold_alerts", {})
     if alert_key in sent:
         return False
-    body = (
-        f"Merge queue keeper: {repo}#{number} held ({display_text(reason, DISPLAY_REASON_LIMIT)}). "
-        f"old_sha={old_head} current_sha={current_head} run_ids={_run_ids(run_ids)}. "
-        "Keeper repair custody stays held until a claude-cto successor accepts ownership."
-    )
+    if in_custody:
+        body = (
+            f"Merge queue keeper: {repo}#{number} held ({display_text(reason, DISPLAY_REASON_LIMIT)}). "
+            f"old_sha={old_head} current_sha={current_head} run_ids={_run_ids(run_ids)}. "
+            "Keeper repair custody stays held until a claude-cto successor accepts ownership."
+        )
+    else:
+        body = (
+            f"Merge queue keeper: {repo}#{number} alert ({display_text(reason, DISPLAY_REASON_LIMIT)}). "
+            f"old_sha={old_head} current_sha={current_head} run_ids={_run_ids(run_ids)}. "
+            "No keeper repair custody is held; inspect and dispatch as needed."
+        )
     _queue_cto_report(previous, kind, alert_key, body)
     sent[alert_key] = observed
     return True
@@ -2483,9 +2501,10 @@ def run(
     ) -> None:
         nonlocal failed
         safe_reason = _repair_reason(reason)
+        has_custody = False
         if ownership_path is not None and ownership_path.exists():
             try:
-                pr_ownership.record_keeper_repair(
+                recorded_handoff = pr_ownership.record_keeper_repair(
                     ownership_path,
                     repo=canonical_repo,
                     number=number,
@@ -2493,6 +2512,7 @@ def run(
                     head=current_head,
                     run_ids=list(run_ids),
                 )
+                has_custody = recorded_handoff is not None
             except (pr_ownership.OwnershipError, OSError) as exc:
                 failed = True
                 lines.append(f"#{number} FAILED: custody-unknown ({display_text(str(exc), DISPLAY_REASON_LIMIT)})")
@@ -2507,11 +2527,13 @@ def run(
             run_ids=run_ids,
             observed=observed,
             dedup_reason=dedup_reason,
+            in_custody=has_custody,
         )
 
     def observe_head_move(
         number: int,
         *,
+        pr_row: Mapping[str, Any],
         key: str,
         head: str,
         comments: Sequence[Mapping[str, Any]],
@@ -2532,6 +2554,7 @@ def run(
             elif prior_observed != head:
                 report_heads_delta[key] = (prior_observed, head)
                 report_state_dirty = True
+        eligible_non_custody = pr_row.get("isDraft") is False and _hold(pr_row) is False
         unreviewed_old = (
             _unreviewed_move_source(
                 comments,
@@ -2539,9 +2562,11 @@ def run(
                 verdict_login,
                 previous_approved=previous.get("approved", {}).get(key),
                 tracked_head=tracked_head,
-                previous_observed=prior_observed,
+                # Only report mode treats observed-only heads as a move source; apply mode requires
+                # keeper custody, tracking, or a prior recorded APPROVED so WIP pushes never spam CTO.
+                previous_observed=prior_observed if not apply else None,
             )
-            if comment_safe and verdict.state in MISSING_CF_STATES and not review_satisfied(tier, verdict.state)
+            if eligible_non_custody and comment_safe and verdict.state in MISSING_CF_STATES and not review_satisfied(tier, verdict.state)
             else None
         )
         repair_old = (
@@ -2570,6 +2595,7 @@ def run(
                     reason="head-moved",
                     run_ids=_failed_check_run_ids(check_rows, head),
                     observed=observed,
+                    in_custody=custody is not None,
                 ):
                     report_state_dirty = True
                     for entry in previous.get("cto_outbox", [])[prev_len:]:
@@ -2590,6 +2616,7 @@ def run(
                     reason="head-moved-unreviewed",
                     run_ids=(),
                     observed=observed,
+                    in_custody=repair_old is not None,
                 ):
                     report_state_dirty = True
                     for entry in previous.get("cto_outbox", [])[prev_len:]:
@@ -2765,6 +2792,7 @@ def run(
                 continue
             unreviewed_move_old, repair_unreviewed_old = observe_head_move(
                 number,
+                pr_row=pr,
                 key=key,
                 head=head,
                 comments=comments,
@@ -2813,6 +2841,7 @@ def run(
                         reason="head-moved-unreviewed",
                         run_ids=(),
                         observed=observed,
+                        in_custody=repair_unreviewed_old is not None,
                     ):
                         lines.append(
                             f"#{number} unreviewed head move alerted to the CTO: {alert_old[:12]}->{head[:12]}"
@@ -3089,6 +3118,7 @@ def run(
             tracked_mq_head = tracked_mq.get("head") if isinstance(tracked_mq, dict) else None
             mq_unreviewed_move_old, mq_repair_unreviewed_old = observe_head_move(
                 number,
+                pr_row=pr,
                 key=key,
                 head=head,
                 comments=comments,
@@ -3128,6 +3158,7 @@ def run(
                     reason="head-moved-unreviewed",
                     run_ids=(),
                     observed=observed,
+                    in_custody=mq_repair_unreviewed_old is not None,
                 ):
                     lines.append(
                         f"#{number} unreviewed head move alerted to the CTO: {alert_old[:12]}->{head[:12]}"
@@ -3197,7 +3228,10 @@ def run(
                             moved_tier = "high"
                         if moved_verdict.state != "unknown":
                             if (
-                                moved_verdict.state in MISSING_CF_STATES
+                                current.get("isDraft") is False
+                                and _hold(current) is False
+                                and (approved_before or tracked_mq_head == head or head in _prior_approved_heads(moved_comments, current_head, verdict_login))
+                                and moved_verdict.state in MISSING_CF_STATES
                                 and not review_satisfied(moved_tier, moved_verdict.state)
                                 and _queue_hold_alert(
                                     previous,
@@ -3209,6 +3243,7 @@ def run(
                                     reason="head-moved-unreviewed",
                                     run_ids=(),
                                     observed=observed,
+                                    in_custody=False,
                                 )
                             ):
                                 lines.append(

@@ -1400,8 +1400,9 @@ def test_head_moved_to_unreviewed_head_alerts_once_in_custody_and_report_mode(tm
     assert not fmf3 and any("unreviewed head move alerted" in line for line in fm_lines3)
     assert len(json.loads(flaky_comm_state.read_text())["cto_outbox"]) == 1
 
-    # F6 (R3): in merge-queue apply=True without custody, if fresh read sees head moved A->B
-    # while comments lookup fails, report_heads preserves HEAD_A so the next tick alerts A->B.
+    # F6 (R3): in merge-queue apply=True without custody, if a previously approved PR's fresh read sees
+    # head moved A->B while comments lookup fails, report_heads preserves HEAD_A so the next tick alerts A->B
+    # with an honest non-custody alert body (never claiming held repair custody).
     class FlakyFreshMoveGitHub(DirectFakeGitHub):
         def __init__(self, *a: Any, **kw: Any) -> None:
             super().__init__(*a, **kw)
@@ -1415,7 +1416,7 @@ def test_head_moved_to_unreviewed_head_alerts_once_in_custody_and_report_mode(tm
 
     f6_mq = FlakyFreshMoveGitHub([pr(number=50, headRefOid=HEAD_A)], repository="unit/public")
     f6_mq.queue_enabled = True
-    f6_mq.comments_by_pr[50] = []
+    f6_mq.comments_by_pr[50] = [recorded("APPROVED", "2026-09-23T12:00:00.000001+00:00", HEAD_A)]
     f6_mq.fresh_by_pr[50] = {**f6_mq.rows[0], "headRefOid": HEAD_B, "state": "OPEN", "labels": []}
     f6_state = tmp_path / "f6_mq_fresh.json"
     f6_cfg = _direct_cfg(repository="unit/public")
@@ -1432,6 +1433,26 @@ def test_head_moved_to_unreviewed_head_alerts_once_in_custody_and_report_mode(tm
     f6_saved2 = json.loads(f6_state.read_text())
     assert f6_saved2["report_heads"]["50"] == HEAD_B
     assert len(f6_saved2["cto_outbox"]) == 1 and HEAD_A in f6_saved2["cto_outbox"][0]["body"] and HEAD_B in f6_saved2["cto_outbox"][0]["body"]
+    assert "No keeper repair custody is held" in f6_saved2["cto_outbox"][0]["body"]
+    assert "Keeper repair custody stays held" not in f6_saved2["cto_outbox"][0]["body"]
+
+    # F1 (R1 on PR #1234): in apply=True without custody/tracking/prior approval (including drafts),
+    # ordinary WIP pushes HEAD_A->HEAD_B MUST NOT raise head-moved-unreviewed CTO alerts; draft PRs
+    # in report mode also stay silent.
+    for draft_flag, mode_apply in ((False, True), (True, True), (True, False)):
+        wip = DirectFakeGitHub([pr(number=51, headRefOid=HEAD_A, isDraft=draft_flag)], repository=PRIVATE_REPO)
+        wip.comments_by_pr[51] = []
+        wip.checks_by_head[HEAD_A] = checks(HEAD_A, conclusion="", status="in_progress")
+        wip_state = tmp_path / f"wip_{draft_flag}_{mode_apply}.json"
+        _wl1, wf1 = keeper.run(wip, wip_state, apply=mode_apply, direct_config=_direct_cfg())
+        assert not wf1
+        wip.rows = [pr(number=51, headRefOid=HEAD_B, isDraft=draft_flag)]
+        wip.fresh_by_pr[51] = {**wip.rows[0], "state": "OPEN", "labels": []}
+        wip.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+        wl2, wf2 = keeper.run(wip, wip_state, apply=mode_apply, direct_config=_direct_cfg())
+        assert not wf2 and not any("unreviewed head move alerted" in line for line in wl2)
+        assert json.loads(wip_state.read_text()).get("cto_outbox", []) == []
+    assert "No keeper repair custody is held" in json.loads(rep_state.read_text())["cto_outbox"][0]["body"]
 
     # F10 (R2): malformed non-string outbox key fails closed with KeeperError instead of TypeError.
     bad_outbox = tmp_path / "bad_outbox.json"
@@ -1453,6 +1474,24 @@ def test_required_verify_run_failure_blocks_landing_and_alerts(tmp_path: Path) -
     assert keeper._verify_run_areas_for_files(
         ["scripts/example.py"], repository=PRIVATE_REPO, blob_reader=lambda _p, _r: "print('ok')\n",
     ) == ()
+    # F2 (R1 on PR #1234): a clean rename's previous_filename is read ONLY at the diff base (removed=True),
+    # never at PR head (where it does not exist), so clean renames do not falsely require "sources".
+    rename_calls: list[tuple[str, bool]] = []
+
+    def rename_reader(path: str, removed: bool) -> str | None:
+        rename_calls.append((path, removed))
+        if path == "scripts/old_name.py" and not removed:
+            return None
+        return "VALUE = 1\n"
+
+    rename_rows = [{"filename": "scripts/new_name.py", "previous_filename": "scripts/old_name.py", "status": "renamed"}]
+    assert keeper._verify_run_areas_for_files(
+        keeper.pr_file_paths(rename_rows),
+        repository=PRIVATE_REPO,
+        file_rows=rename_rows,
+        blob_reader=rename_reader,
+    ) == ()
+    assert rename_calls == [("scripts/new_name.py", False), ("scripts/old_name.py", True)]
     # Unreadable code blob (e.g. empty checkout with no remote) fails closed and requires Sources verification.
     empty_dir = tmp_path / "empty_checkout"
     empty_dir.mkdir()
