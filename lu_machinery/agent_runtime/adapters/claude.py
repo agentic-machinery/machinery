@@ -623,22 +623,79 @@ def _reviewer_mcp_config() -> str:
     return json.dumps(isolated_sources_mcp_config(python_bin, server), separators=(",", ":"))
 
 
-def _refuse_undeclared_sources_in_readonly(tc: dict[str, Any], *, review_isolation: bool) -> None:
-    """Fail closed if a read-only caller wires ``sources`` when the consumer declares no Sources server."""
+def _rule_targets_sources_mcp(rule: str) -> bool:
+    """True when a Claude permission rule grants server-wide or tool-specific access to ``sources``."""
+    lowered = rule.strip().casefold()
+    server_rule = f"mcp__{SOURCES_MCP_SERVER}"
+    return (
+        lowered == server_rule
+        or lowered.startswith((f"{server_rule}__", f"{server_rule}("))
+        or lowered in {"mcp", "mcp__*"}
+        or lowered.startswith("mcp__*__")
+    )
+
+
+def _inline_mcp_server_names(raw_json: str) -> tuple[str, ...]:
+    """Return MCP server names from an inline ``--mcp-config`` JSON string; invalid shapes fail closed."""
+    try:
+        data = json_depth.loads(raw_json, max_depth=_JSON_MAX_DEPTH)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"ClaudeAdapter: inline MCP config is invalid JSON: {exc}") from exc
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        raise ValueError("ClaudeAdapter: inline MCP config must be a JSON object with an mcpServers object")
+    names: list[str] = []
+    for name in servers:
+        if not isinstance(name, str) or not _MCP_SERVER_NAME_RE.fullmatch(name):
+            raise ValueError(f"ClaudeAdapter: inline MCP server name {name!r} is invalid")
+        names.append(name)
+    return tuple(names)
+
+
+def _refuse_undeclared_sources_in_readonly(
+    tc: dict[str, Any], *, cwd: Path, review_isolation: bool
+) -> str | None:
+    """Fail closed if a read-only caller wires ``sources`` when the consumer declares no Sources server.
+
+    Returns the validated, normalized ``--mcp-config`` argument to forward (resolving relative paths
+    against ``cwd`` so the guard and Claude CLI inspect the exact same file), or ``None`` when no
+    explicit ``mcp_config_path`` was provided.
+    """
     if review_isolation:
-        return
+        return None
     explicit_allowed = tc.get("allowed_tools")
-    if isinstance(explicit_allowed, str):
+    if explicit_allowed is not None:
+        if not isinstance(explicit_allowed, str):
+            raise ValueError("ClaudeAdapter: allowed_tools must be a comma-separated string")
         tokens = [token.strip() for token in explicit_allowed.split(",") if token.strip()]
-        if any(token.casefold().startswith(f"mcp__{SOURCES_MCP_SERVER}__") for token in tokens):
+        if any(_rule_targets_sources_mcp(token) for token in tokens):
             raise ValueError(
-                "ClaudeAdapter: read-only mode cannot allow mcp__sources__* when the consumer declares no sources_server"
+                "ClaudeAdapter: read-only mode cannot allow mcp__sources when the consumer declares no sources_server"
             )
-    explicit_mcp = tc.get("mcp_config_path")
-    if isinstance(explicit_mcp, str) and explicit_mcp and SOURCES_MCP_SERVER in _mcp_server_names(Path(explicit_mcp)):
+    if "mcp_config_path" not in tc or tc["mcp_config_path"] is None or tc["mcp_config_path"] == "":
+        return None
+    explicit_mcp = tc["mcp_config_path"]
+    if not isinstance(explicit_mcp, (str, Path)):
+        raise ValueError("ClaudeAdapter: mcp_config_path must be a path or inline JSON string")
+    raw = os.fspath(explicit_mcp)
+    if not raw.strip() or "\x00" in raw:
+        raise ValueError("ClaudeAdapter: mcp_config_path is invalid")
+    if raw.lstrip().startswith("{"):
+        names = _inline_mcp_server_names(raw)
+        if any(name.casefold() == SOURCES_MCP_SERVER for name in names):
+            raise ValueError(
+                "ClaudeAdapter: read-only mode cannot wire a sources MCP server when the consumer declares no sources_server"
+            )
+        return raw
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = cwd / candidate
+    names = _mcp_server_names(candidate)
+    if any(name.casefold() == SOURCES_MCP_SERVER for name in names):
         raise ValueError(
             "ClaudeAdapter: read-only mode cannot wire a sources MCP server when the consumer declares no sources_server"
         )
+    return str(candidate)
 
 
 _DEPLOYED_HOOKS_PREFIX = "$CLAUDE_PROJECT_DIR/.claude/hooks/"
@@ -1095,8 +1152,11 @@ class ClaudeAdapter:
         # settings, whatever name the server is registered under. An unreadable server
         # declaration raises here rather than launching without the denies.
         sources_readers, sources_writers = sources_tool_sets() if mode == "read-only" else ((), ())
+        validated_mcp_config: str | None = None
         if mode == "read-only" and not sources_readers and not sources_writers:
-            _refuse_undeclared_sources_in_readonly(tc, review_isolation=review_isolation)
+            validated_mcp_config = _refuse_undeclared_sources_in_readonly(
+                tc, cwd=cwd, review_isolation=review_isolation
+            )
         if mode == "danger":
             cmd.append("--dangerously-skip-permissions")
         elif ordinary_reviewer:
@@ -1128,11 +1188,11 @@ class ClaudeAdapter:
                 cmd.extend(["--allowedTools", ",".join(_workspace_write_allows(tc))])
 
         # MCP tool restrictions (pipeline reviewers)
-        mcp_config_path = tc.get("mcp_config_path")
-        if tc.get("strict_mcp_config") and mcp_config_path and not review_isolation:
-            cmd.extend(["--strict-mcp-config", "--mcp-config", str(mcp_config_path)])
-        elif mcp_config_path and not review_isolation:
-            cmd.extend(["--mcp-config", str(mcp_config_path)])
+        mcp_config_arg = validated_mcp_config if validated_mcp_config is not None else tc.get("mcp_config_path")
+        if tc.get("strict_mcp_config") and mcp_config_arg and not review_isolation:
+            cmd.extend(["--strict-mcp-config", "--mcp-config", str(mcp_config_arg)])
+        elif mcp_config_arg and not review_isolation:
+            cmd.extend(["--mcp-config", str(mcp_config_arg)])
         if explicit_allowed_tools and not review_isolation:
             cmd.extend(["--allowedTools", str(tc["allowed_tools"])])
 

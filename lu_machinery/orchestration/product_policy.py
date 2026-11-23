@@ -80,7 +80,6 @@ from typing import Any
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import ProductRootError, product_root
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, consumer_repo_for_root
 
 SCHEMA = "learn-ukrainian.product-admission-policy"
 SCHEMA_VERSION = 1
@@ -522,6 +521,10 @@ def resolve_policy_target(root: Path | None = None) -> tuple[Path, str] | None:
         selected = product_root() if root is None else root
     except ProductRootError as exc:
         raise ProductPolicyError("policy_missing", str(exc)) from None
+    # Import lazily so dependency-free hook imports (delegate_ownership -> dispatch_admission ->
+    # product_policy) do not pull PyYAML via fleet_repos -> git_credentials.
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, consumer_repo_for_root
+
     try:
         repo = consumer_repo_for_root(selected)
     except FleetRepoError as exc:

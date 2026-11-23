@@ -12,7 +12,6 @@ from functools import lru_cache
 from pathlib import Path
 
 from lu_machinery.common.repo_root import product_root
-from lu_machinery.orchestration.fleet_repos import consumer_repo_for_root
 
 # The Sources server is product-owned (C-4843): its path is the configured product checkout's.
 SERVER_RELATIVE_PATH = Path(".mcp/servers/sources/server.py")
@@ -27,6 +26,8 @@ def sources_server_path(root: Path | None = None) -> Path | None:
       fails closed to ``root / SERVER_RELATIVE_PATH``.
     - An unselectable product root raises ``ProductRootError``; a malformed catalog raises ``FleetRepoError``.
     """
+    from lu_machinery.orchestration.fleet_repos import consumer_repo_for_root
+
     selected = product_root() if root is None else root
     repo = consumer_repo_for_root(selected)
     if repo is None:

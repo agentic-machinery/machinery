@@ -1287,19 +1287,87 @@ def test_consumer_without_admission_policy_uses_fail_closed_machinery_default(tm
     write_decision = adm.evaluate("workspace-write", tmp_path / "tasks", thresholds=_LIMITS)
     assert write_decision.admitted
 
-    # Linked worktree of the consumer resolves through its primary checkout.
+    # Verified linked worktree of the consumer resolves through its primary checkout.
     wt_gitdir = consumer / ".git" / "worktrees" / "wt1"
     wt_gitdir.mkdir(parents=True)
     worktree = tmp_path / "wt1"
     worktree.mkdir()
     (worktree / ".git").write_text(f"gitdir: {wt_gitdir}\n", encoding="utf-8")
+    (wt_gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    (wt_gitdir / "gitdir").write_text(f"{worktree / '.git'}\n", encoding="utf-8")
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(worktree))
     assert adm.load_product_policy().origin == product_policy.MACHINERY_DEFAULT_ORIGIN
 
+    # Forged/dangling/corrupt gitfiles in an unregistered directory fail closed with ProductPolicyError.
+    for bad_name, payload in (
+        ("dangling", f"gitdir: {consumer / '.git' / 'worktrees' / 'nonexistent'}\n".encode()),
+        ("wrong-backptr", f"gitdir: {wt_gitdir}\n".encode()),
+        ("non-utf8", b"\xff\xfe\x00"),
+        ("nul-byte", f"gitdir: {wt_gitdir}\x00\n".encode()),
+    ):
+        forged = tmp_path / f"forged-{bad_name}"
+        forged.mkdir()
+        (forged / ".git").write_bytes(payload)
+        monkeypatch.setenv("LU_PRODUCT_ROOT", str(forged))
+        with pytest.raises(product_policy.ProductPolicyError) as forged_exc:
+            adm.load_product_policy()
+        assert forged_exc.value.code == "policy_missing"
+
     # Explicit path argument still fails closed even when LU_PRODUCT_ROOT is a consumer without policy.
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
     with pytest.raises(product_policy.ProductPolicyError) as explicit_missing:
         adm.load_product_policy(tmp_path / "missing.json")
     assert explicit_missing.value.code == "policy_missing"
+
+
+@pytest.mark.parametrize(
+    "config_bytes",
+    [
+        b'[remote.origin]\n\turl = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
+        b'\xef\xbb\xbf[remote "origin"]\n\turl = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
+        b'[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n[include]\n\tpath = extra\n',
+        b'[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n[url "https://github.com/learn-ukrainian/"]\n\tinsteadOf = https://github.com/kube-dojo/\n',
+        b'[broken-header\n',
+        None,  # .git directory missing its config file
+    ],
+    ids=["legacy-dotted-lu", "bom-lu", "consumer-with-include", "consumer-with-url-rewrite", "malformed-header", "missing-config"],
+)
+def test_git_config_edge_cases_never_bypass_fail_closed_policy(tmp_path, monkeypatch, config_bytes):
+    """Defect class (F1/F3): legacy dotted sections, UTF-8 BOM, includes/rewrites, malformed headers,
+    or missing .git/config allow a checkout named kube-dojo to drop Learn Ukrainian protections."""
+    from lu_machinery.orchestration import product_policy
+
+    root = tmp_path / "kube-dojo"
+    (root / ".git").mkdir(parents=True)
+    if config_bytes is not None:
+        (root / ".git" / "config").write_bytes(config_bytes)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+
+    with pytest.raises(product_policy.ProductPolicyError) as exc_info:
+        adm.evaluate("read-only", tmp_path / "tasks")
+    assert exc_info.value.code == "policy_missing"
+
+
+def test_worktree_config_additional_origin_fails_closed(tmp_path, monkeypatch):
+    """Defect class (F1): extensions.worktreeConfig adding a second origin URL is ignored."""
+    from lu_machinery.orchestration import product_policy
+
+    root = tmp_path / "kube-dojo"
+    (root / ".git").mkdir(parents=True)
+    (root / ".git" / "config").write_text(
+        '[extensions]\n\tworktreeConfig = true\n'
+        '[remote "origin"]\n\turl = https://github.com/kube-dojo/kube-dojo.github.io.git\n',
+        encoding="utf-8",
+    )
+    (root / ".git" / "config.worktree").write_text(
+        '[remote "origin"]\n\turl = https://github.com/learn-ukrainian/learn-ukrainian.github.io.git\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+
+    with pytest.raises(product_policy.ProductPolicyError) as exc_info:
+        adm.evaluate("read-only", tmp_path / "tasks")
+    assert exc_info.value.code == "policy_missing"
 
 
 @pytest.mark.parametrize(
@@ -1337,14 +1405,14 @@ def test_missing_admission_policy_fails_closed_for_learn_ukrainian_and_unregiste
 
 
 def test_fleet_repos_rejects_invalid_consumer_relative_paths(tmp_path):
-    """Defect class (F1/F5 config validation): traversal or non-canonical sources_server /
-    admission_policy entries in fleet_repos.yaml are accepted instead of failing closed."""
+    """Defect class (F1/F5 config validation): traversal, explicit YAML null/blank, lone surrogates,
+    or omitting mandatory declarations on Learn Ukrainian are accepted instead of failing closed."""
     import yaml
 
-    from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, clear_repository_cache, load_fleet_repos
 
     for field in ("sources_server", "admission_policy"):
-        for bad_value in ("/etc/passwd", "../escape.json", "dir/sub/", "a\\b.json", "a\x00b", "", 123):
+        for bad_value in (None, "/etc/passwd", "../escape.json", "dir/sub/", "a\\b.json", "a\x00b", "\ud800", "", 123):
             cfg = tmp_path / f"bad-{field}.yaml"
             cfg.write_text(
                 yaml.safe_dump({
@@ -1354,11 +1422,40 @@ def test_fleet_repos_rejects_invalid_consumer_relative_paths(tmp_path):
                             "github": "learn-ukrainian/learn-ukrainian.github.io",
                             "local_name": "learn-ukrainian",
                             "default": True,
+                            "sources_server": ".mcp/servers/sources/server.py",
+                            "admission_policy": "scripts/curriculum/admission_policy.v1.json",
                             field: bad_value,
                         }
                     },
                 }),
                 encoding="utf-8",
             )
+            clear_repository_cache()
             with pytest.raises(FleetRepoError, match=field):
                 load_fleet_repos(cfg)
+        # Explicit YAML blank value (parses as None) is also refused.
+        blank_cfg = tmp_path / f"blank-{field}.yaml"
+        blank_cfg.write_text(
+            "version: 1\nrepos:\n  public:\n    github: o/r\n    local_name: r\n    default: true\n"
+            f"    {field}:\n",
+            encoding="utf-8",
+        )
+        clear_repository_cache()
+        with pytest.raises(FleetRepoError, match=field):
+            load_fleet_repos(blank_cfg)
+
+    # Omitting either mandatory declaration on the Learn Ukrainian public row is refused.
+    for omitted in ("sources_server", "admission_policy"):
+        entry = {
+            "github": "learn-ukrainian/learn-ukrainian.github.io",
+            "local_name": "learn-ukrainian",
+            "default": True,
+            "sources_server": ".mcp/servers/sources/server.py",
+            "admission_policy": "scripts/curriculum/admission_policy.v1.json",
+        }
+        del entry[omitted]
+        missing_cfg = tmp_path / f"lu-missing-{omitted}.yaml"
+        missing_cfg.write_text(yaml.safe_dump({"version": 1, "repos": {"public": entry}}), encoding="utf-8")
+        clear_repository_cache()
+        with pytest.raises(FleetRepoError, match=omitted):
+            load_fleet_repos(missing_cfg)

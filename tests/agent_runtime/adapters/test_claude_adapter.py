@@ -231,29 +231,59 @@ def test_read_only_claude_adapter_skips_sources_wiring_for_consumer_without_sour
     assert not any("mcp__sources__" in rule for rule in allowed)
     assert not any("mcp__sources__" in rule for rule in disallowed)
 
-    # Explicit attempts to allow or wire a sources server in a consumer without one fail closed.
-    with pytest.raises(ValueError, match="declares no sources_server"):
-        ClaudeAdapter().build_invocation(
-            prompt="inspect",
-            mode="read-only",
-            cwd=consumer,
-            model=None,
-            task_id="consumer-explicit-allow",
-            session_id=None,
-            tool_config={"allowed_tools": "Read,mcp__sources__verify_word"},
-        )
-    sources_mcp = tmp_path / "extra.mcp.json"
+    # Explicit attempts to allow or wire a sources server in a consumer without one fail closed,
+    # including bare server-wide rules, relative paths resolved against cwd, inline JSON, and bad types.
+    for bad_allowed in (
+        "Read,mcp__sources__verify_word",
+        "Read,mcp__sources",
+        "Read,MCP__SOURCES",
+        "Read,mcp__sources(verify_word)",
+        "Read,mcp__*",
+        ["Read"],
+    ):
+        with pytest.raises(ValueError):
+            ClaudeAdapter().build_invocation(
+                prompt="inspect",
+                mode="read-only",
+                cwd=consumer,
+                model=None,
+                task_id="consumer-explicit-allow",
+                session_id=None,
+                tool_config={"allowed_tools": bad_allowed},
+            )
+    sources_mcp = consumer / "relative.mcp.json"
     sources_mcp.write_text('{"mcpServers":{"sources":{"command":"/bin/true"}}}', encoding="utf-8")
-    with pytest.raises(ValueError, match="declares no sources_server"):
-        ClaudeAdapter().build_invocation(
-            prompt="inspect",
-            mode="read-only",
-            cwd=consumer,
-            model=None,
-            task_id="consumer-explicit-mcp",
-            session_id=None,
-            tool_config={"mcp_config_path": str(sources_mcp)},
-        )
+    for bad_mcp in (
+        str(sources_mcp),
+        "relative.mcp.json",
+        Path("relative.mcp.json"),
+        '{"mcpServers":{"sources":{"command":"/bin/true"}}}',
+        {"mcpServers": {}},
+        "   ",
+    ):
+        with pytest.raises(ValueError):
+            ClaudeAdapter().build_invocation(
+                prompt="inspect",
+                mode="read-only",
+                cwd=consumer,
+                model=None,
+                task_id="consumer-explicit-mcp",
+                session_id=None,
+                tool_config={"mcp_config_path": bad_mcp},
+            )
+    # A clean relative non-sources MCP config is resolved against cwd and forwarded consistently.
+    safe_mcp = consumer / "safe.mcp.json"
+    safe_mcp.write_text('{"mcpServers":{"docs":{"command":"/bin/true"}}}', encoding="utf-8")
+    safe_plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=consumer,
+        model=None,
+        task_id="consumer-safe-mcp",
+        session_id=None,
+        tool_config={"mcp_config_path": "safe.mcp.json"},
+    )
+    assert safe_plan.cmd[safe_plan.cmd.index("--mcp-config") + 1] == str(safe_mcp)
 
 
 @pytest.mark.parametrize(
