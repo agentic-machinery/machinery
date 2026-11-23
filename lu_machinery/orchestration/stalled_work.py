@@ -159,13 +159,16 @@ def load_records(tasks: Path, now: datetime) -> tuple[list[stale.Candidate], lis
                 continue
             if not isinstance(record, dict):
                 raise ValueError("not an object")
+            status = record.get("status")
+            if status is not None and not isinstance(status, str):
+                raise ValueError("malformed status")
             stat = path.stat()
         except (OSError, ValueError) as exc:
             errors.append(f"task record {path.name}: {type(exc).__name__}")
             continue
         age = stale._record_age_days(record, stat.st_mtime_ns, now)
         # Keep live claims of any age; they still suppress duplicate repair work.
-        if not abandoned(record) and (record.get("status") not in TERMINAL or 0 <= age < MAX_AGE_DAYS):
+        if not abandoned(record) and (status not in TERMINAL or 0 <= age < MAX_AGE_DAYS):
             records.append(stale.Candidate(path, stat.st_mtime_ns, record, age))
     return records, errors
 
@@ -257,7 +260,7 @@ def _held_turn_lease_rows(
                 since = expires_at or heartbeat_at
             else:
                 status = rec.get("status")
-                if status in TERMINAL:
+                if isinstance(status, str) and status in TERMINAL:
                     settled = finished(candidate)
                     if lease_expired or (now - settled).total_seconds() >= TURN_LEASE_SETTLE_GRACE_SECONDS:
                         reason = f"terminal_turn:{status}"

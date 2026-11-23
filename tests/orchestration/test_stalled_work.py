@@ -700,9 +700,13 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
             body = service.read_message_body(mid)
             assert "exact fenced lease envelope" in body and "never unfenced session_supervisor release --force" in body
 
-        # PR1299-F4: verified held_turn_lease alerts still route even when an unrelated corrupt task record
-        # produces a scan error (while ordinary stalled-work rows remain gated on error-free scans).
+        # PR1299-F4 & PR1304-F4: verified held_turn_lease alerts still route even when an unrelated corrupt task
+        # record or parseable v2 record with an unhashable status (status: []) produces a per-record scan error.
         (host.tasks / "truncated-unrelated.json").write_text("{", encoding="utf-8")
+        (host.tasks / "malformed-status-unrelated.json").write_text(
+            json.dumps({"schema_version": 2, "task_id": "malformed-status-unrelated", "status": []}),
+            encoding="utf-8",
+        )
         report_err = mod.scan(
             host.tasks,
             {SLUG: host.tmp_path},
@@ -711,9 +715,11 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
             adapter_factory=lambda path: mod.GitHubAdapter(path, runner=host.gh),
             stream_fetcher=lambda: streams_cycle2,
         )
-        assert report_err["errors"]
+        assert any("truncated-unrelated.json" in err for err in report_err["errors"]), report_err["errors"]
+        assert any("malformed-status-unrelated.json" in err for err in report_err["errors"]), report_err["errors"]
         assert mod.route(report_err, cycle=3, service=service) == cycle1
         (host.tasks / "truncated-unrelated.json").unlink()
+        (host.tasks / "malformed-status-unrelated.json").unlink()
 
     # diagnose_handoff and SessionSupervisor.recover_expired_driver (local and remote) never advise TTL takeover.
     local_store = SessionStreamStore(SessionStreamDatabase(tmp_path / "local-streams.db"))

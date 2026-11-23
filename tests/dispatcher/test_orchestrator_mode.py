@@ -1455,6 +1455,37 @@ def test_live_unknown_or_unreadable_child_blocks_turn_done_keeps_lease_and_recor
     assert "child-fifo.json" in scan_fifo["unreadable"]
     hot_fifo_link.unlink()
 
+    # PR1304-F3: archived and hot runs sharing a task_id with distinct run_nonces are both recorded in child_tasks,
+    # while an identical-nonce archive copy deduplicates cleanly.
+    reuse_turn = _orchestrator_record("turn-reuse-child", run_nonce="parent-nonce-reuse")
+    _write(reuse_turn)
+    _write(dict(schema_version=2, task_id="child-reused", agent="claude", mode="workspace-write",
+                status="done", run_nonce="nonce-hot-2", parent_task_id="turn-reuse-child",
+                parent_run_nonce="parent-nonce-reuse", parent_stream=STREAM,
+                launch_mode="scope", pid=_DEAD_PID, process_start="boot:1", worktree_disposition="removed"))
+    arch_dir = task_store / "archive"
+    arch_dir.mkdir(exist_ok=True)
+    (arch_dir / "child-reused.20261123T000000Z.archived.json").write_text(json.dumps(dict(
+        schema_version=2, task_id="child-reused", agent="claude", mode="workspace-write",
+        status="done", run_nonce="nonce-arch-1", parent_task_id="turn-reuse-child",
+        parent_run_nonce="parent-nonce-reuse", parent_stream=STREAM,
+        launch_mode="scope", pid=_DEAD_PID, process_start="boot:1", worktree_disposition="removed",
+    )), encoding="utf-8")
+    (arch_dir / "child-reused.20261123T000001Z.archived.json").write_text(json.dumps(dict(
+        schema_version=2, task_id="child-reused", agent="claude", mode="workspace-write",
+        status="done", run_nonce="nonce-hot-2", parent_task_id="turn-reuse-child",
+        parent_run_nonce="parent-nonce-reuse", parent_stream=STREAM,
+        launch_mode="scope", pid=_DEAD_PID, process_start="boot:1", worktree_disposition="removed",
+    )), encoding="utf-8")
+    reuse_scan = worker._scan_turn_children(reuse_turn)
+    assert [(c["task_id"], c["run_nonce"]) for c in reuse_scan["children"]] == [
+        ("child-reused", "nonce-arch-1"),
+        ("child-reused", "nonce-hot-2"),
+    ]
+    assert reuse_scan["live"] == [] and reuse_scan["unknown"] == [] and reuse_scan["unreadable"] == []
+    for p in arch_dir.glob("child-reused.*.json"):
+        p.unlink()
+
 
 def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_store, tmp_path, monkeypatch):
     """Item 2 defect class: syntax-only handoff receipt certifies missing, wrong-kind, wrong-lane, dropped or reused
@@ -1722,6 +1753,17 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     assert not refused.admitted and refused.orchestrator_cap_refused is True
     assert not host_admission.allows(refused, force_reason="operator override")  # F9: hard cap
     assert any("live orchestrator turns 2/2 reached the cap" in f for f in refused.failures), refused.failures
+
+    # PR1304-F2: truncating one of two live turn records keeps the live-turn cap closed (outside --force-admission).
+    cap2_path = store.record_path("turn-cap-2")
+    cap2_saved = cap2_path.read_text(encoding="utf-8")
+    cap2_path.write_text("{", encoding="utf-8")
+    corrupt_refused = host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
+    assert not corrupt_refused.admitted and corrupt_refused.orchestrator_cap_refused is True
+    assert not host_admission.allows(corrupt_refused, force_reason="operator override")
+    assert any("orchestrator_cap_unknown:" in f for f in corrupt_refused.failures), corrupt_refused.failures
+    cap2_path.write_text(cap2_saved, encoding="utf-8")
+
     monkeypatch.setenv("DISPATCH_MAX_LIVE_ORCHESTRATORS", "3")
     with pytest.raises(ValueError, match="DISPATCH_MAX_LIVE_ORCHESTRATORS"):
         host_admission.evaluate("workspace-write", sweep=False, orchestrator=True)
@@ -1737,7 +1779,8 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
         pass
 
     # Per-turn child cap: 3 non-refused children + 1 refused attempt (never_started_reason) is admitted (3 < 4),
-    # while a 4th non-refused child blocks the 5th (even read-only / --force-admission) and env cannot raise past 4.
+    # while a 4th non-refused run (including an archived run sharing a task_id with a hot run, PR1304-F3)
+    # blocks the 5th (even read-only / --force-admission) and env cannot raise past 4.
     parent_nonce = "nonce-turn-cap-1"
     linkage = {"parent_task_id": "turn-cap-1", "parent_run_nonce": parent_nonce, "parent_stream": STREAM}
     for i in range(3):
@@ -1746,6 +1789,26 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     _write(dict(schema_version=2, task_id="c-refused", agent="claude", mode="workspace-write",
                 status="failed", never_started_reason="admission_capacity", run_nonce="cn-refused", **linkage))
     host_admission.check_turn_child_cap(linkage)  # 3 < 4 admitted (refused attempt not counted)
+
+    # PR1304-F3: archived run sharing task_id "c-0" with a distinct run_nonce counts as a 4th child run,
+    # whereas an archived copy of the same run_nonce ("cn-0") deduplicates cleanly.
+    arch_dir = task_store / "archive"
+    arch_dir.mkdir(exist_ok=True)
+    same_run_copy = arch_dir / "c-0.20261123T000000Z.archived.json"
+    same_run_copy.write_text(json.dumps(dict(
+        schema_version=2, task_id="c-0", agent="claude", mode="workspace-write",
+        status="done", run_nonce="cn-0", **linkage,
+    )), encoding="utf-8")
+    host_admission.check_turn_child_cap(linkage)  # still 3 < 4 (same run_nonce deduplicated)
+    distinct_arch_run = arch_dir / "c-0.20261123T000001Z.archived.json"
+    distinct_arch_run.write_text(json.dumps(dict(
+        schema_version=2, task_id="c-0", agent="claude", mode="workspace-write",
+        status="done", run_nonce="cn-0-prior", **linkage,
+    )), encoding="utf-8")
+    with pytest.raises(host_admission.Refused, match=r"orchestrator_child_cap_reached:.*4/4"):
+        host_admission.check_turn_child_cap(linkage)
+    same_run_copy.unlink()
+    distinct_arch_run.unlink()
 
     # Unreadable hot record (dangling symlink or FIFO symlink) fails closed at child admission (PR1299-F2).
     dangling = task_store / "dangling-cap.json"
@@ -1790,16 +1853,30 @@ def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp
     monkeypatch.setattr(worker, "_reap_settled", lambda *_a, **_k: None)
     monkeypatch.setattr(worker, "_release_stream", lambda *_a, **_k: None)
     monkeypatch.setattr(worker, "_turn_tree_unproven", lambda *_a, **_k: False)
+    real_scope_runtime_max_expired = dispatch_isolation.scope_runtime_max_expired
     (task_store / "logs").mkdir(exist_ok=True)
     work = tmp_path / "work"
     work.mkdir()
 
-    def _run_with_sigterm(task_id: str, scope_result: str | None, *, scope_runtime_max_s: int = 1200):
+    def _run_with_sigterm(
+        task_id: str,
+        runtime_max_expired: bool,
+        *,
+        scope_runtime_max_s: int | None = 1200,
+        mark_client_cancel: bool = False,
+    ):
         def trigger_sigterm(*_args, **_kwargs):
+            if mark_client_cancel:
+                cur = store.read(task_id)
+                worker._mark_client_cancel(task_id, cur["run_nonce"])
             _signal.raise_signal(_signal.SIGTERM)
 
         monkeypatch.setattr(worker.headroom, "check_runtime", trigger_sigterm)
-        monkeypatch.setattr(dispatch_isolation, "scope_stop_result", lambda _unit: scope_result)
+        monkeypatch.setattr(
+            dispatch_isolation,
+            "scope_runtime_max_expired",
+            lambda _unit, *, runtime_max_s: runtime_max_expired and type(runtime_max_s) is int and runtime_max_s > 0,
+        )
         spec = worker.TaskSpec(
             task_id, "codex", "echo", None, "read-only", work,
             work / f"{task_id}.prompt", task_store / f"{task_id}.result",
@@ -1808,29 +1885,65 @@ def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp
         record = store.new_record(spec, {"key": "public", "github": "example/public"}, "main",
                                   "a" * 40, {"research_owned_path": []})
         record["prompt_file"] = str(task_store / f"{task_id}.prompt")
-        record.update(launch_mode="scope", launch_unit=f"lu-worker-{task_id}-abcd1234",
-                      scope_runtime_max_s=scope_runtime_max_s)
+        record.update(launch_mode="scope", launch_unit=f"lu-worker-{task_id}-abcd1234")
+        if scope_runtime_max_s is not None:
+            record["scope_runtime_max_s"] = scope_runtime_max_s
         path = store.create(record, b"prompt")
         worker.supervise(path, {}, 60)
         return json.loads(path.read_text(encoding="utf-8"))
 
-    timed_out = _run_with_sigterm("turn-rmax-timeout", "timeout")
+    timed_out = _run_with_sigterm("turn-rmax-timeout", True)
     assert timed_out["status"] == "timeout"
     assert timed_out["kill_reason"] == "scope_runtime_max_timeout"
     assert timed_out["error"] == "scope RuntimeMaxSec exceeded"
 
-    # Client SIGTERM near the deadline with Result=success or unavailable systemd stays cancelled (PR1299-F3).
-    client_cancel = _run_with_sigterm("turn-rmax-cancel", "success", scope_runtime_max_s=1)
+    # Client SIGTERM without RuntimeMaxSec confirmation stays cancelled (PR1299-F3).
+    client_cancel = _run_with_sigterm("turn-rmax-cancel", False, scope_runtime_max_s=1)
     assert (client_cancel["status"], client_cancel["error"]) == ("cancelled", "cancelled by client")
     assert client_cancel.get("kill_reason") != "scope_runtime_max_timeout"
-    unconfirmed_cancel = _run_with_sigterm("turn-rmax-unconfirmed", None, scope_runtime_max_s=1)
-    assert (unconfirmed_cancel["status"], unconfirmed_cancel["error"]) == ("cancelled", "cancelled by client")
-    assert unconfirmed_cancel.get("kill_reason") != "scope_runtime_max_timeout"
+
+    # PR1304-F5: ordinary worker scope without scope_runtime_max_s never labels RuntimeMaxSec, and an explicit
+    # per-run client cancel marker preserves status=cancelled even if systemd reports timeout.
+    ordinary_scope = _run_with_sigterm("worker-no-rmax", True, scope_runtime_max_s=None)
+    assert (ordinary_scope["status"], ordinary_scope["error"]) == ("cancelled", "cancelled by client")
+    assert ordinary_scope.get("kill_reason") != "scope_runtime_max_timeout"
+    explicit_cancel = _run_with_sigterm("turn-explicit-cancel", True, scope_runtime_max_s=1200, mark_client_cancel=True)
+    assert (explicit_cancel["status"], explicit_cancel["error"]) == ("cancelled", "cancelled by client")
+    assert explicit_cancel.get("kill_reason") != "scope_runtime_max_timeout"
+
+    # PR1304-F5: real scope_runtime_max_expired parser requires Result=timeout, finite RuntimeMaxUSec,
+    # SubState=stop-sigterm, and elapsed >= runtime_max_s (rejecting TimeoutStopSec stop-sigkill and short stops).
+    import subprocess as _subprocess
+
+    def _probe_show(stdout: str, *, runtime_max_s: int = 1200) -> bool:
+        monkeypatch.setattr(
+            dispatch_isolation,
+            "_run",
+            lambda *_a, **_k: _subprocess.CompletedProcess([], 0, stdout, ""),
+        )
+        return real_scope_runtime_max_expired("lu-worker-x-abcd1234", runtime_max_s=runtime_max_s)
+
+    assert _probe_show(
+        "Result=timeout\nRuntimeMaxUSec=20min\nSubState=stop-sigterm\n"
+        "ActiveEnterTimestampMonotonic=1000000000\nStateChangeTimestampMonotonic=2200000000\n"
+    ) is True
+    assert _probe_show(  # TimeoutStopSec escalation to stop-sigkill
+        "Result=timeout\nRuntimeMaxUSec=20min\nSubState=stop-sigkill\n"
+        "ActiveEnterTimestampMonotonic=1000000000\nStateChangeTimestampMonotonic=2200000000\n"
+    ) is False
+    assert _probe_show(  # Stopped before RuntimeMaxSec elapsed
+        "Result=timeout\nRuntimeMaxUSec=20min\nSubState=stop-sigterm\n"
+        "ActiveEnterTimestampMonotonic=1000000000\nStateChangeTimestampMonotonic=1500000000\n"
+    ) is False
+    assert _probe_show(  # No RuntimeMaxSec configured in systemd
+        "Result=timeout\nRuntimeMaxUSec=infinity\nSubState=stop-sigterm\n"
+        "ActiveEnterTimestampMonotonic=1000000000\nStateChangeTimestampMonotonic=2200000000\n"
+    ) is False
 
     # Confirmed scope timeout with an active child preserves exact timeout error while recording child diagnostics (PR1299-F3).
     _write(dict(schema_version=2, task_id="child-during-rmax", agent="claude", mode="workspace-write",
                 status="running", run_nonce="nonce-child-rmax", parent_task_id="turn-rmax-child"))
-    timed_out_child = _run_with_sigterm("turn-rmax-child", "timeout")
+    timed_out_child = _run_with_sigterm("turn-rmax-child", True)
     assert timed_out_child["status"] == "timeout"
     assert timed_out_child["kill_reason"] == "scope_runtime_max_timeout"
     assert timed_out_child["error"] == "scope RuntimeMaxSec exceeded"
@@ -1851,7 +1964,7 @@ def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp
     monkeypatch.setattr(worker.headroom, "check_runtime", lambda *_a, **_k: None)
     monkeypatch.setattr(worker, "communicate", raise_watchdog_timeout)
     monkeypatch.setattr(store, "begin_settlement", settle_with_late_sigterm)
-    monkeypatch.setattr(dispatch_isolation, "scope_stop_result", lambda _unit: "timeout")
+    monkeypatch.setattr(dispatch_isolation, "scope_runtime_max_expired", lambda _unit, *, runtime_max_s: True)
     spec = worker.TaskSpec(
         "turn-rmax-late", "codex", "echo", None, "read-only", work,
         work / "turn-rmax-late.prompt", task_store / "turn-rmax-late.result",

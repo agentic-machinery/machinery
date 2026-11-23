@@ -280,9 +280,80 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
    `instance_id` (run nonce), `session_id`, `lease_id`, `generation`, and `fencing_token`
    via `.venv/bin/python -m lu_machinery.dispatch status <task-id>` and
    `GET /api/epics/v1/epic:<N>`.
-2. **Prove the turn scope and services are gone on the recorded host:** check
-   `systemctl --user list-units 'lu-worker-<task-id>*'` and confirm no scope or listed
-   task service remains active.
+2. **Prove the turn scope and task services are gone on the recorded host:** do **not**
+   rely on a raw `'lu-worker-<task-id>*'` glob (which misses task IDs whose trailing
+   punctuation is stripped by `_unit_piece`, such as `turn-review.`, and misses task
+   services under the `lu-task-<sha256(task_id)>-` prefix). Run the dispatcher's own
+   unit-naming and service-list checks and confirm every matching scope and service is
+   stopped (keep the lease held if `systemctl` fails, the service list is unreadable, or
+   any unit is active, activating, or deactivating):
+
+   ```bash
+   .venv/bin/python -c '
+   import os, subprocess, sys
+   from lu_machinery.dispatcher import store
+   from lu_machinery.orchestration import dispatch_isolation as di
+
+   def refuse(msg, detail=None):
+       raise SystemExit(f"refused: {msg}: {detail!r}")
+
+   if len(sys.argv) != 3 or not sys.argv[1] or not sys.argv[2]:
+       refuse("usage: <task-id> <run-nonce>", sys.argv[1:])
+   tid, nonce = sys.argv[1], sys.argv[2]
+   try:
+       rec = store.read(tid, nonce, missing_ok=True)
+   except (OSError, ValueError, store.TaskRecordError) as exc:
+       refuse("turn record unreadable or nonce mismatch", f"{type(exc).__name__}: {exc}")
+   rec = rec if isinstance(rec, dict) else {"task_id": tid, "run_nonce": nonce}
+   env = di.user_manager_env(os.environ)
+   gone = {"inactive", "failed", "unknown"}
+
+   def check_unit_stopped(unit):
+       if not isinstance(unit, str) or not unit or unit.startswith("-") or "/" in unit:
+           refuse("malformed unit name", unit)
+       proc = subprocess.run(
+           ["systemctl", "--user", "is-active", "--", unit],
+           env=env, capture_output=True, text=True, timeout=15,
+       )
+       lines = (proc.stdout or "").strip().splitlines()
+       state = lines[-1] if lines else ""
+       if proc.returncode == 0 or state not in gone or (state == "unknown" and proc.returncode not in {3, 4}):
+           refuse("unit not proven stopped", {"unit": unit, "rc": proc.returncode, "state": state})
+
+   def list_units(pattern):
+       proc = subprocess.run(
+           ["systemctl", "--user", "list-units", "--all", "--no-legend", "--plain", "--", pattern],
+           env=env, capture_output=True, text=True, timeout=15,
+       )
+       if proc.returncode != 0:
+           refuse("systemctl list-units failed", {"pattern": pattern, "rc": proc.returncode, "stderr": proc.stderr})
+       return [line.split()[0] for line in (proc.stdout or "").splitlines() if line.strip()]
+
+   launch_unit = rec.get("launch_unit")
+   if launch_unit is not None:
+       if not isinstance(launch_unit, str) or not launch_unit or "/" in launch_unit or launch_unit.startswith("-"):
+           refuse("malformed launch_unit", launch_unit)
+       scope = launch_unit if launch_unit.endswith(".scope") else f"{launch_unit}.scope"
+       check_unit_stopped(scope)
+
+   for unit in list_units(f"{di._unit_prefix(tid, nonce)}*.scope"):
+       check_unit_stopped(unit)
+
+   services = di.listed_task_services(rec)
+   if services is None:
+       refuse("task service list unreadable", tid)
+   for name in services:
+       stem = di._service_stem(name, task_id=tid)
+       if stem is None:
+           refuse("invalid task service name", name)
+       check_unit_stopped(f"{stem}.service")
+
+   for unit in list_units(f"lu-task-{di._task_service_tag(tid)}-*.service"):
+       check_unit_stopped(unit)
+
+   print(f"quiescent scope+services task_id={tid} run_nonce={nonce}")
+   ' <task-id> <run-nonce>
+   ```
 3. **Prove full child quiescence with a strict inventory:** inspect `child_tasks`,
    `orphaned_child_tasks`, `unknown_child_tasks`, and `unreadable_child_records` on the
    turn record, then run a strict inventory over both hot and archived task records
@@ -336,6 +407,12 @@ def require(cond, msg, detail=None):
     if not cond:
         raise SystemExit(f"refused: {msg}: {detail!r}")
 
+def is_pos_int(value):
+    return type(value) is int and value > 0
+
+def is_nonempty_str(value):
+    return isinstance(value, str) and bool(value.strip())
+
 require(len(sys.argv) == 4, "usage: <stream-id> <lease-id> <generation>", sys.argv[1:])
 stream_id, expected_lease_id = sys.argv[1], sys.argv[2]
 try:
@@ -353,16 +430,33 @@ require(raw.get("state") == "expired", "lease is not expired", raw)
 require(
     raw.get("stream_id") == stream_id
     and raw.get("lease_id") == expected_lease_id
-    and type(raw.get("generation")) is int
+    and is_pos_int(raw.get("generation"))
     and raw["generation"] == expected_gen,
     "lease identity mismatch",
     raw,
 )
+for field in ("session_id", "heartbeat_at", "expires_at"):
+    require(is_nonempty_str(raw.get(field)), f"malformed lease {field}", raw)
+for field in ("fencing_token", "ttl_seconds", "version"):
+    require(is_pos_int(raw.get(field)), f"malformed lease {field}", raw)
 h = raw.get("holder")
 require(isinstance(h, dict), "malformed lease holder", raw)
 require(h.get("harness") == "dispatch-turn", "holder is not dispatch-turn", h)
-holder_kind_raw = h.get("holder_kind", "process")
-require(isinstance(holder_kind_raw, str), "malformed holder_kind", h)
+for field in ("agent", "instance_id"):
+    require(is_nonempty_str(h.get(field)), f"malformed holder {field}", h)
+holder_kind_raw = h.get("holder_kind")
+require(
+    isinstance(holder_kind_raw, str) and holder_kind_raw in {k.value for k in HolderKind},
+    "malformed holder_kind",
+    h,
+)
+holder_kind = HolderKind(holder_kind_raw)
+if holder_kind is HolderKind.PROCESS:
+    require(is_pos_int(h.get("process_id")), "malformed holder process_id", h)
+else:
+    require(h.get("process_id") is None, "app_thread holder process_id must be null", h)
+for field in ("task_id", "host_id"):
+    require(h.get(field) is None or is_nonempty_str(h.get(field)), f"malformed holder {field}", h)
 lease = Lease(
     stream_id=raw["stream_id"],
     session_id=raw["session_id"],
@@ -373,8 +467,8 @@ lease = Lease(
         agent=h["agent"],
         harness=h["harness"],
         instance_id=h["instance_id"],
-        process_id=h["process_id"],
-        holder_kind=HolderKind(holder_kind_raw),
+        process_id=h.get("process_id"),
+        holder_kind=holder_kind,
         task_id=h.get("task_id"),
         host_id=h.get("host_id"),
     ),
@@ -383,7 +477,10 @@ lease = Lease(
     ttl_seconds=raw["ttl_seconds"],
     version=raw["version"],
 )
-lease.holder.validate()
+try:
+    lease.holder.validate()
+except ValueError as exc:
+    raise SystemExit(f"refused: invalid lease holder: {exc}")
 res = client.release(lease)
 require(isinstance(res, dict), "malformed release response", res)
 rel = res.get("lease")
@@ -392,7 +489,7 @@ require(
     and isinstance(rel, dict)
     and rel.get("stream_id") == stream_id
     and rel.get("lease_id") == expected_lease_id
-    and type(rel.get("generation")) is int
+    and is_pos_int(rel.get("generation"))
     and rel["generation"] == expected_gen,
     "unexpected release acknowledgement",
     res,
@@ -406,7 +503,7 @@ require(
     and after.get("session_state") == "closed"
     and after.get("stream_id") == stream_id
     and after.get("lease_id") == expected_lease_id
-    and type(after.get("generation")) is int
+    and is_pos_int(after.get("generation"))
     and after["generation"] == expected_gen,
     "post-release state mismatch",
     after,

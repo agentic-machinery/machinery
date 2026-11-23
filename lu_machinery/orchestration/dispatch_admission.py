@@ -1731,17 +1731,82 @@ def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -
     return records
 
 
+_KNOWN_TERMINAL_STATUSES = frozenset({
+    "done",
+    "failed",
+    "timeout",
+    "timed_out",
+    "timed-out",
+    "rate_limited",
+    "cancelled",
+    "crashed",
+    "no_deliverable",
+    "terminal_abandon",
+    "needs_finalize",
+})
+
+
+def _verified_live_orchestrators(
+    tasks_dir: Path,
+    *,
+    pid_alive: Callable[[int], bool] | None,
+    record_liveness: Callable[[dict[str, Any]], bool | None] | None,
+    now: datetime,
+) -> tuple[str, ...]:
+    """Count live orchestrator turns from a strict hot-store inventory; fail closed on any unreadable/malformed record."""
+    try:
+        tasks_dir.lstat()
+    except FileNotFoundError:
+        return ()
+    alive = pid_alive or process_alive
+    records = strict_task_inventory_in(tasks_dir, include_archive=False)
+    live_ids: list[str] = []
+    for state in records:
+        task_id = state["task_id"]
+        status = state.get("status")
+        if not isinstance(status, str) or status not in (ACTIVE_STATUSES | _KNOWN_TERMINAL_STATUSES):
+            raise ValueError(f"malformed status on {task_id}")
+        # Validate orchestrator metadata without swallowing ValueError so a damaged field cannot conceal a live turn.
+        is_orchestrator = orchestrator_stream(state) is not None
+        if not is_orchestrator or status not in ACTIVE_STATUSES:
+            continue
+        pid = _parse_pid(state.get("pid"))
+        if pid is None:
+            if is_orphaned_pidless_record(state) or status != "spawning":
+                continue
+            owner = _dispatcher_owner(state)
+            owner_pid = _parse_pid(owner.get("owner_pid")) if owner is not None else None
+            if owner is not None and owner_pid is not None:
+                if "owner_identity" in owner:
+                    from lu_machinery.orchestration.dead_worker_state import worker_liveness
+
+                    owner_live = worker_liveness({"pid": owner_pid, "worker_identity": owner["owner_identity"]}) is not False
+                else:
+                    owner_live = alive(owner_pid)
+                if owner_live:
+                    live_ids.append(task_id)
+                continue
+            age = _age_s(state.get("started_at"), now)
+            if age is not None and -PIDLESS_CLOCK_SKEW_S <= age <= PIDLESS_SPAWNING_GRACE_S:
+                live_ids.append(task_id)
+            continue
+        worker_live = record_liveness(state) is not False if record_liveness is not None else alive(pid)
+        if worker_live:
+            live_ids.append(task_id)
+    return tuple(live_ids)
+
+
 def count_turn_children(
     tasks_dir: Path,
     parent_task_id: str,
     parent_run_nonce: str | None = None,
 ) -> int:
-    """Count non-refused child tasks dispatched by one orchestrator turn; fail closed on any unreadable record."""
+    """Count non-refused child runs dispatched by one orchestrator turn; fail closed on any unreadable record."""
     try:
         records = strict_task_inventory_in(tasks_dir, include_archive=True)
     except ValueError as exc:
         raise ValueError(f"{exc}: cannot verify turn child count") from None
-    seen_ids: set[str] = set()
+    seen_runs: set[tuple[str, str]] = set()
     for record in records:
         if record.get("parent_task_id") != parent_task_id:
             continue
@@ -1754,8 +1819,11 @@ def count_turn_children(
         if rec_parent_nonce is not None and (not isinstance(rec_parent_nonce, str) or not rec_parent_nonce):
             raise ValueError(f"malformed parent_run_nonce on {record['task_id']}: cannot verify turn child count")
         if parent_run_nonce is None or rec_parent_nonce in (None, parent_run_nonce):
-            seen_ids.add(record["task_id"])
-    return len(seen_ids)
+            rec_run_nonce = record.get("run_nonce")
+            if not isinstance(rec_run_nonce, str) or not rec_run_nonce:
+                raise ValueError(f"malformed run_nonce on {record['task_id']}: cannot verify turn child count")
+            seen_runs.add((record["task_id"], rec_run_nonce))
+    return len(seen_runs)
 
 
 def iter_active_records(
@@ -1848,7 +1916,7 @@ def scan_task_records(
                 continue
             owner = _dispatcher_owner(state)
             owner_pid = _parse_pid(owner.get("owner_pid")) if owner is not None else None
-            if owner_pid is not None:
+            if owner is not None and owner_pid is not None:
                 # Held while the dispatcher lives, however long its worktree
                 # add runs. A missing pid is proof it is gone even on a host
                 # without /proc, where only the pid can be checked.
@@ -2078,12 +2146,23 @@ def evaluate(
             f"live write workers {live}/{limits.max_live_write_workers} reached the cap "
             f"({ENV_MAX_LIVE_WRITE_WORKERS}={limits.max_live_write_workers})"
         )
-    orchestrator_cap_refused = bool(orchestrator and len(scan.live_orchestrator_ids) >= limits.max_live_orchestrators)
-    if orchestrator_cap_refused:
-        failures.append(
-            f"live orchestrator turns {len(scan.live_orchestrator_ids)}/{limits.max_live_orchestrators} reached the cap "
-            f"({ENV_MAX_LIVE_ORCHESTRATORS}={limits.max_live_orchestrators})"
-        )
+    orchestrator_cap_refused = False
+    if orchestrator:
+        try:
+            verified_orchestrators = _verified_live_orchestrators(
+                tasks_dir, pid_alive=pid_alive, record_liveness=record_liveness, now=clock,
+            )
+        except (OSError, ValueError) as exc:
+            orchestrator_cap_refused = True
+            failures.append(f"orchestrator_cap_unknown: {exc}: cannot verify live orchestrator turn count")
+        else:
+            live_orch_count = len(set(scan.live_orchestrator_ids) | set(verified_orchestrators))
+            if live_orch_count >= limits.max_live_orchestrators:
+                orchestrator_cap_refused = True
+                failures.append(
+                    f"live orchestrator turns {live_orch_count}/{limits.max_live_orchestrators} reached the cap "
+                    f"({ENV_MAX_LIVE_ORCHESTRATORS}={limits.max_live_orchestrators})"
+                )
     meter_check = None
     if meter is not None:
         telemetry, monitor_defer = _meter_defer(

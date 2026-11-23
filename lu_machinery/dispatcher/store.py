@@ -267,6 +267,9 @@ def _write(path: Path, record: dict, exclusive: bool = False, *, grant: dict | N
             if HANDOFF_RECEIPT_KEY in current:
                 # Written once by the turn itself (record_handoff_receipt); no stale copy drops it.
                 record[HANDOFF_RECEIPT_KEY] = current[HANDOFF_RECEIPT_KEY]
+            if CLIENT_CANCEL_NONCE_KEY in current:
+                # Written by worker.cancel() for this exact run_nonce before SIGTERM; no stale copy drops it.
+                record[CLIENT_CANCEL_NONCE_KEY] = current[CLIENT_CANCEL_NONCE_KEY]
             if current.get("settling_at"):
                 record["settling_at"] = current["settling_at"]
             # A hold or malformed hold outranks a stale supervisor copy. False is an
@@ -584,6 +587,11 @@ def begin_settlement(record: dict) -> None:
         record["owned_path_grants"] = current.get("owned_path_grants", [])
         if HANDOFF_RECEIPT_KEY in current:
             record[HANDOFF_RECEIPT_KEY] = current[HANDOFF_RECEIPT_KEY]
+        if CLIENT_CANCEL_NONCE_KEY in current:
+            record[CLIENT_CANCEL_NONCE_KEY] = current[CLIENT_CANCEL_NONCE_KEY]
+
+
+CLIENT_CANCEL_NONCE_KEY = "client_cancel_nonce"
 
 
 # One orchestrator turn's handoff receipt (DRIVERS-1122), a field of its own task record:

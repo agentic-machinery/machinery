@@ -833,7 +833,7 @@ def _scan_turn_children(record: dict) -> dict:
 
     own_id = record.get("task_id")
     own_nonce = record.get("run_nonce")
-    children: dict[str, dict] = {}
+    children: dict[tuple[str, str | None, str | None], dict] = {}
     live: list[str] = []
     unknown: list[str] = []
     unreadable: list[str] = []
@@ -842,7 +842,7 @@ def _scan_turn_children(record: dict) -> dict:
     except (OSError, ValueError):
         return {"children": [], "live": [], "unknown": [], "unreadable": ["tasks_dir_unavailable"]}
 
-    def classify(other: dict, fallback_name: str) -> None:
+    def classify(other: dict, fallback_name: str, fallback_key: str) -> None:
         tid = other.get("task_id")
         if tid == own_id:
             return
@@ -856,7 +856,8 @@ def _scan_turn_children(record: dict) -> dict:
         child_nonce = other.get("run_nonce")
         child_status = other.get("status")
         valid_nonce = isinstance(child_nonce, str) and bool(child_nonce)
-        children[child_id] = {
+        run_key = (child_id, child_nonce, None) if valid_nonce else (child_id, None, fallback_key)
+        children[run_key] = {
             "task_id": child_id,
             "run_nonce": child_nonce if valid_nonce else None,
             "status": child_status if isinstance(child_status, str) else None,
@@ -884,7 +885,7 @@ def _scan_turn_children(record: dict) -> dict:
                 if not isinstance(parsed, dict) or not isinstance(parsed.get("task_id"), str) or not parsed["task_id"]:
                     unreadable.append(listed.name)
                     continue
-                classify(parsed, listed.stem)
+                classify(parsed, listed.stem, f"hot:{listed.name}")
             archive_dir = root / ARCHIVE_DIR_NAME
             try:
                 archive_candidates = scan_record_candidates(archive_dir)
@@ -896,12 +897,17 @@ def _scan_turn_children(record: dict) -> dict:
                     parsed = parse_task_record(listed, raw)
                 except (TaskIdentityMismatch, OSError, ValueError, RecursionError):
                     continue
-                if isinstance(parsed, dict) and parsed.get("task_id") not in children:
-                    classify(parsed, listed.stem)
+                if not isinstance(parsed, dict):
+                    continue
+                tid = parsed.get("task_id")
+                c_nonce = parsed.get("run_nonce")
+                if isinstance(tid, str) and isinstance(c_nonce, str) and c_nonce and (tid, c_nonce, None) in children:
+                    continue
+                classify(parsed, listed.stem, f"archive:{listed.name}")
     except (OSError, ValueError):
         unreadable.append("task_store_unreadable")
     return {
-        "children": [children[tid] for tid in sorted(children)],
+        "children": [children[k] for k in sorted(children, key=lambda k: (k[0], k[1] or "", k[2] or ""))],
         "live": sorted(set(live)),
         "unknown": sorted(set(unknown)),
         "unreadable": sorted(set(unreadable)),
@@ -2173,18 +2179,38 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     scope_runtime_timeout: bool | None = None
     record_damaged = False  # a TaskRecordError was seen: a later cancel status never erases that for the release
 
+    def _client_cancel_marked() -> bool:
+        own_nonce = record.get("run_nonce")
+        if not isinstance(own_nonce, str) or not own_nonce:
+            return False
+        if record.get(store.CLIENT_CANCEL_NONCE_KEY) == own_nonce:
+            return True
+        try:
+            disk = store.read(spec.task_id, own_nonce, missing_ok=True)
+        except (OSError, ValueError, store.TaskRecordError):
+            return False
+        if isinstance(disk, dict) and disk.get(store.CLIENT_CANCEL_NONCE_KEY) == own_nonce:
+            record[store.CLIENT_CANCEL_NONCE_KEY] = own_nonce
+            return True
+        return False
+
     def _check_scope_runtime_timeout() -> bool:
         nonlocal scope_runtime_timeout
+        if _client_cancel_marked():
+            scope_runtime_timeout = False
+            return False
         if scope_runtime_timeout is not None:
             return scope_runtime_timeout
-        if cancel_signal != signal.SIGTERM or record.get("launch_mode") != "scope":
+        scope_max = record.get("scope_runtime_max_s")
+        if (cancel_signal != signal.SIGTERM or record.get("launch_mode") != "scope"
+                or type(scope_max) is not int or scope_max <= 0):
             scope_runtime_timeout = False
             return False
         unit = record.get("launch_unit")
         if isinstance(unit, str) and unit:
             from lu_machinery.orchestration import dispatch_isolation
 
-            if dispatch_isolation.scope_stop_result(unit) == "timeout":
+            if dispatch_isolation.scope_runtime_max_expired(unit, runtime_max_s=scope_max):
                 scope_runtime_timeout = True
                 return True
         scope_runtime_timeout = False
@@ -2908,6 +2934,16 @@ def wait(task_id: str, nonce: str | None = None, timeout: float = 0, poll_interv
         time.sleep(max(0.0, sleep_s))
 
 
+def _mark_client_cancel(task_id: str, run_nonce: str) -> None:
+    """Persist an explicit per-run client-cancellation marker before signalling SIGTERM."""
+    path = store.record_path(task_id)
+    with store.task_state_lock(path):
+        current = store.read(task_id, run_nonce, missing_ok=True)
+        if isinstance(current, dict) and current.get("status") in store.ACTIVE:
+            current[store.CLIENT_CANCEL_NONCE_KEY] = run_nonce
+            store.replace(current, path, require_existing=True)
+
+
 def cancel(task_id: str, nonce: str | None = None) -> dict:
     record = _observe(store.read(task_id, nonce))
     if record.get("schema_version") != 2:
@@ -2920,6 +2956,8 @@ def cancel(task_id: str, nonce: str | None = None) -> dict:
             try:
                 if _identity(record["pid"]) != record["process_start"]:
                     raise ValueError("supervisor identity changed; cancellation refused")
+                if isinstance(record.get("run_nonce"), str) and record["run_nonce"]:
+                    _mark_client_cancel(task_id, record["run_nonce"])
                 signal.pidfd_send_signal(pidfd, signal.SIGTERM)
             finally:
                 os.close(pidfd)

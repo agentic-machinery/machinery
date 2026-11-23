@@ -346,23 +346,58 @@ def _systemctl(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return _run(argv, user_manager_env(os.environ), 30)
 
 
-def scope_stop_result(unit: str, *, timeout_s: float = 2.0) -> str | None:
-    """Query systemd's ``Result`` property for ``<unit>.scope``, or None when unavailable."""
+def scope_runtime_max_expired(unit: str, *, runtime_max_s: int, timeout_s: float = 2.0) -> bool:
+    """Whether systemd properties affirmatively prove ``<unit>.scope`` stopped due to ``RuntimeMaxSec`` expiry.
+
+    Requires all of:
+    - ``runtime_max_s`` is a positive non-bool integer,
+    - ``Result=timeout``,
+    - ``RuntimeMaxUSec`` is configured and finite (not ``infinity``),
+    - ``SubState=stop-sigterm`` (excluding ``TimeoutStopSec`` escalation to ``stop-sigkill``),
+    - monotonic elapsed runtime ``StateChangeTimestampMonotonic - ActiveEnterTimestampMonotonic``
+      is at least ``runtime_max_s`` seconds.
+    """
+    if type(runtime_max_s) is not int or runtime_max_s <= 0:
+        return False
     if not isinstance(unit, str) or not unit or unit.startswith("-") or "/" in unit:
-        return None
+        return False
     scope = unit if unit.endswith(_SCOPE_SUFFIX) else f"{unit}{_SCOPE_SUFFIX}"
     try:
         completed = _run(
-            ["systemctl", "--user", "show", "-p", "Result", "--value", "--", scope],
+            [
+                "systemctl", "--user", "show",
+                "-p", "Result",
+                "-p", "RuntimeMaxUSec",
+                "-p", "SubState",
+                "-p", "ActiveEnterTimestampMonotonic",
+                "-p", "StateChangeTimestampMonotonic",
+                "--", scope,
+            ],
             user_manager_env(os.environ),
             timeout_s,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return False
     if completed.returncode != 0:
-        return None
-    value = (completed.stdout or "").strip()
-    return value or None
+        return False
+    props: dict[str, str] = {}
+    for line in (completed.stdout or "").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            props[key.strip()] = value.strip()
+    if props.get("Result") != "timeout":
+        return False
+    if props.get("SubState") != "stop-sigterm":
+        return False
+    runtime_max_usec = props.get("RuntimeMaxUSec", "")
+    if not runtime_max_usec or runtime_max_usec == "infinity":
+        return False
+    try:
+        active_enter_us = int(props["ActiveEnterTimestampMonotonic"])
+        state_change_us = int(props["StateChangeTimestampMonotonic"])
+    except (KeyError, ValueError):
+        return False
+    return active_enter_us > 0 and (state_change_us - active_enter_us) >= runtime_max_s * 1_000_000
 
 
 def _service_gone(proc: subprocess.CompletedProcess[str]) -> bool:
