@@ -9,6 +9,19 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.57"></a>
+## [0.1.57] - 2026-11-23
+
+### Changed
+
+- Enforce empty CHANGELOG.md Unreleased section in CI Gate ([#1250](https://github.com/learn-ukrainian/machinery/pull/1250))
+- Fix usage ledger writes on legacy caches ([#1251](https://github.com/learn-ukrainian/machinery/pull/1251))
+- List linux_fs_parity.sh as direct reader in pins.txt header ([#1252](https://github.com/learn-ukrainian/machinery/pull/1252))
+
+### Fixed
+
+- Pin native dependencies to a signed Ubuntu snapshot ([#1245](https://github.com/learn-ukrainian/machinery/pull/1245))
+
 <a id="v0.1.56"></a>
 ## [0.1.56] - 2026-11-23
 
@@ -1431,7 +1444,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.56...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.57...HEAD
+[0.1.57]: https://github.com/learn-ukrainian/machinery/compare/v0.1.56...v0.1.57
 [0.1.56]: https://github.com/learn-ukrainian/machinery/compare/v0.1.55...v0.1.56
 [0.1.55]: https://github.com/learn-ukrainian/machinery/compare/v0.1.54...v0.1.55
 [0.1.54]: https://github.com/learn-ukrainian/machinery/compare/v0.1.53...v0.1.54
