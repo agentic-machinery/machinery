@@ -1265,19 +1265,34 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     lines = accept_log.read_text(encoding="utf-8").splitlines()
     assert "--milestone" in lines[1] and "--milestone" in lines[4]
 
-    # Cleanup after full release points resume instructions at the verified accept interpreter.
+    # Cleanup after full release points resume instructions at the verified accept interpreter with --x-agent.
     monkeypatch.setattr(cut, "remote_state", lambda: (True, "released", [1275]))
     resume_msg = cut.clean_up("post-release PR")
-    assert f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release" in resume_msg
+    expected_resume = f"{shlex.quote(str(installed))} -I -m lu_machinery.release_cut post-release --x-agent claude/claude-opus-5-5"
+    assert expected_resume in resume_msg
+    # Confirm the emitted CLI args parse cleanly through main().
+    resume_argv = shlex.split(expected_resume)[4:]
+    parsed_resume: list[tuple[str, str]] = []
+    with monkeypatch.context() as cli_ctx:
+        cli_ctx.setattr(release_cut, "_locked_run", lambda args: parsed_resume.append((args.command, args.x_agent)) or 0)
+        cli_ctx.setattr(release_cut, "x_agent_value", lambda value, **_k: value)
+        assert main(resume_argv) == 0
+    assert parsed_resume == [("post-release", "claude/claude-opus-5-5")]
 
     # 2. Before install() / standalone post-release (publisher_python=None): never falls back to stale host_python.
     cut.publisher_python = None
     monkeypatch.setenv("PYTHONWARNINGS", "error")
     monkeypatch.setenv("PYTHONUSERBASE", str(tmp_path / "userbase"))
-    argv, env = cut.publisher_invocation("read", "run", "--repo", REPO, "--number", "7")
-    expected_root = Path(lu_machinery.__file__).resolve().parents[1]
+    # Explicit source-checkout fixture outside site-packages so behavior is identical in wheel-installed CI.
+    src_root = tmp_path / "source-checkout"
+    src_init = src_root / "lu_machinery/__init__.py"
+    src_init.parent.mkdir(parents=True)
+    src_init.write_text("", encoding="utf-8")
+    with monkeypatch.context() as src_ctx:
+        src_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        argv, env = cut.publisher_invocation("read", "run", "--repo", REPO, "--number", "7")
     assert argv == [Path(sys.executable), "-P", "-s", "-m", "lu_machinery.publish", "read", "run", "--repo", REPO, "--number", "7"]
-    assert env["PYTHONPATH"] == str(expected_root)
+    assert env["PYTHONPATH"] == str(src_root.resolve())
     assert "PYTHONWARNINGS" not in env and "PYTHONUSERBASE" not in env
 
     # Installed venv invocation (e.g. resuming post-release with accept/bin/python -I) uses -I with no PYTHONPATH.
@@ -1296,7 +1311,25 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     assert "/pull/1275" in out
     assert not host_log.exists()
 
-    # Fail-closed checks when running interpreter/package metadata is invalid or unsafe for PYTHONPATH.
+    # Fail-closed checks when running interpreter/package metadata is invalid, looping, or unsafe for PYTHONPATH.
+    loop_site = tmp_path / "loop-site"
+    loop_site.symlink_to(loop_site)
+    with monkeypatch.context() as loop_ctx:
+        loop_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        loop_ctx.setattr(release_cut.sysconfig, "get_path", lambda key: str(loop_site) if key == "purelib" else None)
+        with pytest.raises(CutError, match="cannot resolve running interpreter purelib path"):
+            cut.publisher_invocation("pr-create")
+    with monkeypatch.context() as loop_ctx:
+        loop_ctx.setattr(lu_machinery, "__file__", str(src_init))
+        loop_ctx.setattr(release_cut.sysconfig, "get_path", lambda key: str(loop_site / "site-packages") if key == "purelib" else None)
+        with pytest.raises(CutError, match="cannot inspect running interpreter purelib path"):
+            cut.publisher_invocation("pr-create")
+    loop_pkg = tmp_path / "loop-pkg"
+    loop_pkg.symlink_to(loop_pkg)
+    with monkeypatch.context() as loop_ctx:
+        loop_ctx.setattr(lu_machinery, "__file__", str(loop_pkg))
+        with pytest.raises(CutError, match="cannot resolve running lu_machinery package"):
+            cut.publisher_invocation("pr-create")
     unsafe_dir = tmp_path / f"bad{os.pathsep}root" / "lu_machinery"
     unsafe_dir.mkdir(parents=True)
     unsafe_init = unsafe_dir / "__init__.py"
@@ -1311,13 +1344,14 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     with pytest.raises(CutError, match="cannot locate the running Python interpreter"):
         cut.publisher_invocation("pr-create")
 
-    # 3. consumer_collection removes its .pth overlay when keep_collection_overlay=False (cut path), even on failure.
+    # 3. consumer_collection removes its .pth overlay when keep_collection_overlay=False (even on write/collection
+    # failure) and blocks publisher if removal itself fails; keep_collection_overlay=True retains it for CI.
     overlay_site = tmp_path / "overlay-site"
     overlay_site.mkdir()
     overlay_cut = Cut(
         work=tmp_path, dry_run=True, machinery_remote="", product_remote="", machinery_repo=REPO,
         product_repo="learn-ukrainian/learn-ukrainian", host_python=host_python, primary=primary,
-        alert=False, x_agent="claude/claude-opus-5-5", built="0.1.62",
+        alert=False, x_agent="claude/claude-opus-5-5", built="0.1.62", publisher_python=installed,
     )
 
     def overlay_run(cmd, **_kwargs):
@@ -1336,6 +1370,40 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     overlay_cut.run = overlay_run
     assert overlay_cut.consumer_collection(installed, product) == "10 tests collected"
     assert not (overlay_site / "zz-release-cut-consumer.pth").exists()
+
+    # Partial write failure (e.g. ENOSPC after creating the .pth) must still remove the overlay.
+    real_write_text = Path.write_text
+
+    def failing_write(self_path, data, *args, **kwargs):
+        if self_path == overlay_site / "zz-release-cut-consumer.pth":
+            real_write_text(self_path, data, *args, **kwargs)
+            raise OSError(28, "No space left on device")
+        return real_write_text(self_path, data, *args, **kwargs)
+
+    with monkeypatch.context() as write_ctx:
+        write_ctx.setattr(Path, "write_text", failing_write)
+        with pytest.raises(OSError, match="No space left on device"):
+            overlay_cut.consumer_collection(installed, product)
+    assert not (overlay_site / "zz-release-cut-consumer.pth").exists()
+
+    # Unlink failure must block publisher_invocation so rollback cannot use a contaminated accept venv.
+    real_unlink = Path.unlink
+
+    def failing_unlink(self_path, *args, **kwargs):
+        if self_path == overlay_site / "zz-release-cut-consumer.pth":
+            raise PermissionError("simulated unlink refusal")
+        return real_unlink(self_path, *args, **kwargs)
+
+    with monkeypatch.context() as unlink_ctx:
+        unlink_ctx.setattr(Path, "unlink", failing_unlink)
+        with pytest.raises(PermissionError, match="simulated unlink refusal"):
+            overlay_cut.consumer_collection(installed, product)
+    assert (overlay_site / "zz-release-cut-consumer.pth").is_file()
+    with pytest.raises(CutError, match="refusing publisher: failed to remove consumer overlay"):
+        overlay_cut.publisher_invocation("release-edit")
+    (overlay_site / "zz-release-cut-consumer.pth").unlink()
+    overlay_cut._publisher_blocked_reason = None
+
     overlay_cut.run = lambda cmd, **_k: (
         subprocess.CompletedProcess([str(p) for p in cmd], 1, "collection error\n", "")
         if "pytest" in [str(p) for p in cmd] else overlay_run(cmd, **_k)
