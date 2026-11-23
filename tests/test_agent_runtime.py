@@ -2607,6 +2607,7 @@ def test_claude_adapter_default_prefix_prefers_local_binary_over_npx(tmp_path, m
     assert "npx" not in plan.cmd
 
 
+@pytest.mark.real_claude_cli_gate
 def test_claude_adapter_default_prefix_refuses_npx_fallback_when_local_missing(tmp_path, monkeypatch):
     """When no provisioned native `claude` binary exists, ordinary dispatch must
     refuse with a typed error instead of falling back to `npx` (#1144)."""
@@ -2636,6 +2637,7 @@ def test_claude_adapter_default_prefix_refuses_npx_fallback_when_local_missing(t
     assert "npm install" not in str(refused.value)
 
 
+@pytest.mark.real_claude_cli_gate
 def test_claude_adapter_default_prefix_raises_when_neither_present(tmp_path, monkeypatch):
     """If no provisioned native `claude` binary is present, fail loudly with a
     typed error naming the CLI and native provisioning (#1144)."""

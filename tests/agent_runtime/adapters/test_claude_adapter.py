@@ -108,6 +108,7 @@ def test_mcp_config_too_deep_is_refused_as_invalid_json(tmp_path: Path) -> None:
     assert isinstance(refused.value.__cause__, RecursionError)
 
 
+@pytest.mark.real_claude_cli_gate
 def test_missing_native_claude_on_fake_path_refuses_without_package_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
