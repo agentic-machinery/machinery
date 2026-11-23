@@ -336,7 +336,9 @@ def record(db, *, endpoint, status, now=None):
                     "CREATE INDEX ", "CREATE INDEX IF NOT EXISTS "
                 )
             )
-        db.execute("INSERT INTO usage VALUES(?,?,?,?)", (now, caller(), _text(endpoint), status))
+        db.execute(
+            "INSERT INTO usage (at, caller, endpoint, status) VALUES(?,?,?,?)", (now, caller(), _text(endpoint), status)
+        )
         db.execute("DELETE FROM usage WHERE at<?", (now - RETENTION_SECONDS,))
     except (sqlite3.Error, ValueError) as error:
         if corrupt(error):
