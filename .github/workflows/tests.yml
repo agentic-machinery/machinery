@@ -60,8 +60,8 @@
 # - Read-only contents permission, no kept checkout token, no secrets. Tests
 #   run under `env -i` with a temporary HOME and TMPDIR, so no runner
 #   credential or user configuration reaches them, and with isolated
-#   interpreters (python -I -B). PATH is /usr/bin:/bin plus a directory that
-#   holds only node and npm symlinks, the launcher fixture's toolchain.
+#   interpreters (python -I -B). PATH puts the pinned node and npm symlinks
+#   ahead of /usr/bin:/bin for the launcher fixture's toolchain.
 # - Every shard starts its own runner PostgreSQL 16 cluster for the Postgres-marked tests
 #   (lu_machinery/ci/test_env.sh start postgres, then wait). Its DSN is passed
 #   through `env -i`; lu_machinery.ci.pg_skip_guard then fails the job when a
@@ -196,11 +196,47 @@ jobs:
             --no-index --find-links dist --no-deps --require-hashes --requirement wheel.lock
           "$RUNNER_TEMP/test-venv/bin/python" -I -m pip check --disable-pip-version-check
 
+      - name: Read exact Node and npm pins
+        id: node-pins
+        run: |
+          set -euo pipefail
+          pins=.github/workflows/pins.txt
+          if ! LC_ALL=C awk -F= '
+            $1 == "NODE_VERSION" || $1 == "NPM_VERSION" {
+              if (NF != 2 || $2 !~ /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ || $1 in versions)
+                invalid = 1
+              versions[$1] = $2
+            }
+            END {
+              if (invalid || !("NODE_VERSION" in versions) || !("NPM_VERSION" in versions))
+                exit 1
+              printf "node=%s\nnpm=%s\n", versions["NODE_VERSION"], versions["NPM_VERSION"]
+            }
+          ' "$pins" >> "$GITHUB_OUTPUT"; then
+            echo "::error::Expected exactly one Node and one npm patch version in ${pins}"
+            exit 1
+          fi
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version-file: .nvmrc
+          node-version: ${{ steps.node-pins.outputs.node }}
           check-latest: false
           package-manager-cache: false
+
+      - name: Verify the CI toolchain
+        env:
+          NODE_VERSION: ${{ steps.node-pins.outputs.node }}
+          NPM_VERSION: ${{ steps.node-pins.outputs.npm }}
+        run: |
+          set -euo pipefail
+          reported_node="$(node --version)"
+          reported_npm="$(npm --version)"
+          printf 'Node %s\nnpm %s\n' "$reported_node" "$reported_npm"
+          "$RUNNER_TEMP/test-venv/bin/python" --version
+          if [[ "$reported_node" != "v${NODE_VERSION}" || "$reported_npm" != "$NPM_VERSION" ]]; then
+            echo "::error::Expected Node v${NODE_VERSION} and npm ${NPM_VERSION}"
+            exit 1
+          fi
 
       - name: Provision and seal the release Node dependencies
         run: |
@@ -213,6 +249,10 @@ jobs:
           if [ -n "$prefix" ]; then
             node_binary="$(env -u PYTHONPATH "$runtime_python" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[0])')"
             npm_cli="$(env -u PYTHONPATH "$runtime_python" -I -c 'from lu_machinery.agent_runtime.adapters.acpx import node_toolchain; print(node_toolchain()[1])')"
+            if [[ "$node_binary" != "$(realpath "$(command -v node)")" || "$npm_cli" != "$(realpath "$(command -v npm)")" ]]; then
+              echo "::error::Release provisioning did not select the pinned CI Node and npm"
+              exit 1
+            fi
             PATH="$(dirname "$node_binary"):$PATH" "$node_binary" "$npm_cli" ci --ignore-scripts --no-audit --no-fund --prefix="$prefix" --cache="$npm_cache"
             env -u PYTHONPATH "$runtime_python" -I -c 'from pathlib import Path; import sys; from lu_machinery.agent_runtime.adapters.acpx import seal_node_dependencies; print(seal_node_dependencies(cache=Path(sys.argv[1])))' "$npm_cache"
           fi
@@ -698,8 +738,7 @@ jobs:
           sys.exit(code)
           PY
           # tests/launcher_sandbox.py declares node, npm and git as the launcher
-          # toolchain. git is in /usr/bin; the hosted image keeps Node in
-          # /usr/local/bin, so only node and npm join PATH, as symlinks.
+          # toolchain. Link the pinned node and npm. Git comes from /usr/bin.
           toolchain="$work/toolchain"
           mkdir -p "$toolchain"
           for tool in node npm; do
@@ -710,7 +749,7 @@ jobs:
             ln -s "$found" "$toolchain/$tool"
           done
           set +e
-          env -i PATH="/usr/bin:/bin:$toolchain:$RUNNER_TEMP/trufflehog" HOME="$work/home" TMPDIR="$work/tmp" LU_TEST_WHEEL="$LU_TEST_WHEEL" \
+          env -i PATH="$toolchain:/usr/bin:/bin:$RUNNER_TEMP/trufflehog" HOME="$work/home" TMPDIR="$work/tmp" LU_TEST_WHEEL="$LU_TEST_WHEEL" \
             MACHINERY_GATE_SEMGREP_VENV="$RUNNER_TEMP/semgrep-venv" MACHINERY_GATE_RULES_SOURCE="$RUNNER_TEMP/semgrep-rules" \
             LEARN_UKRAINIAN_CP_PG_DSN="$LEARN_UKRAINIAN_CP_PG_DSN" \
             LEARN_UKRAINIAN_PYTHON="$venv/bin/python" \
@@ -809,7 +848,7 @@ jobs:
             done
           fi
           set +e
-          env -i PATH="/usr/bin:/bin:$toolchain:$RUNNER_TEMP/trufflehog" HOME="$work/home" TMPDIR="$work/tmp" LU_TEST_WHEEL="$LU_TEST_WHEEL" \
+          env -i PATH="$toolchain:/usr/bin:/bin:$RUNNER_TEMP/trufflehog" HOME="$work/home" TMPDIR="$work/tmp" LU_TEST_WHEEL="$LU_TEST_WHEEL" \
             MACHINERY_GATE_SEMGREP_VENV="$RUNNER_TEMP/semgrep-venv" MACHINERY_GATE_RULES_SOURCE="$RUNNER_TEMP/semgrep-rules" \
             LEARN_UKRAINIAN_CP_PG_DSN="$LEARN_UKRAINIAN_CP_PG_DSN" \
             LEARN_UKRAINIAN_PYTHON="$venv/bin/python" \
