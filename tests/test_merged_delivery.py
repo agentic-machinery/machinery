@@ -68,19 +68,19 @@ def test_merged_task_survives_missing_branch_search_and_provider_error(
 
     def gh(args, **_):
         words = args[1:]
-        if words[0] == "api" and "pulls?state=closed" in words[1]:
-            out = "[]"
-        elif words[:2] == ["pr", "list"]:
-            out = "[]"  # Neither the recorded branch nor indexed SHA search discovers the replacement PR.
+        if words[0] == "api" and "/pulls?" in words[-1]:
+            assert "--slurp" in words and "pulls?state=closed" not in words[-1], words
+            out = "[[]]"  # Neither the recorded branch nor indexed SHA search discovers the replacement PR.
         elif words[:2] == ["pr", "view"]:
             out = json.dumps({"state": "MERGED", "baseRefName": "main", "mergedAt": "2026-11-11T18:55:00Z",
                               "headRefOid": head, "headRefName": record["worktree_branch"],
                               "mergeCommit": {"oid": merge}, "isCrossRepository": False})
-        elif f"commits/{head}/pulls" in words[2]:
+        elif words[0] == "api" and f"commits/{head}/pulls" in words[-1]:
             out = json.dumps([{"number": number, "head": {"sha": head, "repo": {"full_name": "org/repo"}},
                                "base": {"repo": {"full_name": "org/repo"}}}])
-        elif words[2].endswith("/commits"):
-            out = json.dumps(f"deliver\n\nX-Agent: {agent}/{task}\n")
+        elif words[0] == "api" and "/commits?" in words[-1]:
+            assert "--slurp" in words, words
+            out = json.dumps([[{"commit": {"message": f"deliver\n\nX-Agent: {agent}/{task}\n"}}]])
         else:
             raise AssertionError(words)
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
@@ -222,19 +222,19 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
 
     def gh(args, **kwargs):
         words = args[1:]
-        if words[0] == "api" and "pulls?state=closed" in words[1]:
-            out = "[]"
-        elif words[:2] == ["pr", "list"]:
-            if "--search" in words:
-                assert words[words.index("--search") + 1] == head
-                assert words[words.index("--state") + 1] == "merged"
-                out = json.dumps([{"number": 7, "isCrossRepository": False, "headRefOid": pr["headRefOid"]}])
-            else:
-                out = json.dumps([] if replacement else [
-                    {"number": 7, "isCrossRepository": False, "headRefName": branch}])
+        if words[0] == "api" and "/pulls?" in words[-1]:
+            assert "--slurp" in words and "pulls?state=closed" not in words[-1], words
+            out = "[[]]" if replacement else json.dumps([[{
+                "number": 7,
+                "state": "open" if pr["state"] == "OPEN" else "closed",
+                "merged_at": None if pr["state"] == "OPEN" else pr["mergedAt"],
+                "head": {"ref": branch, "sha": pr["headRefOid"],
+                         "repo": {"full_name": "other/repo" if pr["isCrossRepository"] else "org/repo"}},
+                "base": {"repo": {"full_name": "org/repo"}},
+            }]])
         elif words[:2] == ["pr", "view"]:
             out = json.dumps(pr)
-        elif words[2].endswith("/pulls"):
+        elif words[0] == "api" and words[-1].endswith("/pulls"):
             if case in {"merged-other-head", "unpublished-snapshot"}:
                 return SimpleNamespace(returncode=0, stdout="[]", stderr="")
             if case == "commit-unavailable":
@@ -242,8 +242,11 @@ def test_merged_pr_proves_delivery_after_branch_and_pull_ref_are_gone(
                                 **kwargs)
             out = json.dumps([{"number": 7, "head": {"sha": pr["headRefOid"], "repo": {"full_name": "org/repo"}},
                                "base": {"repo": {"full_name": "org/repo"}}}])
-        elif words[2].endswith("/commits"):
-            out = json.dumps("deliver\n\nX-Agent: " + ("claude/foreign" if "foreign-trailer" in case else trailer))
+        elif words[0] == "api" and "/commits?" in words[-1]:
+            assert "--slurp" in words, words
+            out = json.dumps([[{"commit": {
+                "message": "deliver\n\nX-Agent: " + ("claude/foreign" if "foreign-trailer" in case else trailer),
+            }}]])
         else:
             raise AssertionError(words)
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
@@ -392,18 +395,22 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
 
     def gh(args, **_kwargs):
         words = args[1:]
-        if words[0] == "api" and "pulls?state=closed" in words[1]:
-            out = "[]"
-        elif words[:2] == ["pr", "list"]:
-            out = json.dumps([{"number": 1250, "isCrossRepository": False, "headRefName": branch}])
+        if words[0] == "api" and "/pulls?" in words[-1]:
+            assert "--slurp" in words and "pulls?state=closed" not in words[-1], words
+            out = json.dumps([[{
+                "number": 1250, "state": "closed", "merged_at": "2026-11-16T08:18:10Z",
+                "head": {"ref": branch, "sha": head, "repo": {"full_name": "org/repo"}},
+                "base": {"repo": {"full_name": "org/repo"}},
+            }]])
         elif words[:2] == ["pr", "view"]:
             out = json.dumps({"state": "MERGED", "baseRefName": "main", "mergedAt": "2026-11-16T08:18:10Z",
                               "headRefOid": head, "headRefName": branch,
                               "mergeCommit": {"oid": merge}, "isCrossRepository": False})
-        elif words[2].endswith("/pulls"):
+        elif words[0] == "api" and words[-1].endswith("/pulls"):
             out = "[]"
-        elif words[2].endswith("/commits"):
-            out = json.dumps("deliver\n\nX-Agent: claude/rescue-stacked\n")
+        elif words[0] == "api" and "/commits?" in words[-1]:
+            assert "--slurp" in words, words
+            out = json.dumps([[{"commit": {"message": "deliver\n\nX-Agent: claude/rescue-stacked\n"}}]])
         else:
             raise AssertionError(words)
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
@@ -425,3 +432,147 @@ def test_stacked_pr_merged_to_default_branch_after_base_ref_deleted(tmp_path, mo
     assert (record["status"], record["error"], record.get("delivery_pr")) == ("done", None, "org/repo#1250")
     assert record["delivery_merge_sha"] == merge
     assert "merged_delivery_lookup" not in record
+
+
+def test_settlement_reads_use_filtered_conditional_rest_without_closed_pr_pagination(tmp_path, monkeypatch):
+    """Defect class: settlement paginated all closed PRs and hit native gh fallthrough on branch and commit reads.
+
+    Approved by claude-cto (D-SETTLE-FRESH, message_f4fb3df7f3034eb3b55e29d9049bb59c).
+    """
+    from urllib.parse import urlencode
+
+    real_run = github_client.run
+    requests: list[str] = []
+    branch = "agy/fix+a#b%20c"
+    head_sha = "a" * 40
+    expected_pulls = "repos/org/repo/pulls?" + urlencode({"head": f"org:{branch}", "state": "all", "per_page": 100})
+    expected_commits = "repos/org/repo/pulls/42/commits?per_page=100"
+
+    def transport(method, endpoint, headers, body, timeout):
+        assert method == "GET"
+        requests.append(endpoint)
+        if endpoint == expected_pulls:
+            payload = [
+                # Merged exact-branch same-repo PR: included by _delivery_prs, ignored by _refresh_at_settlement.
+                {"number": 42, "state": "closed", "merged_at": "2026-11-23T09:00:00Z",
+                 "head": {"ref": branch, "sha": "b" * 40, "repo": {"full_name": "org/repo"}},
+                 "base": {"repo": {"full_name": "org/repo"}}},
+                # Open exact-branch same-repo PR at current head: picked by _refresh_at_settlement, skipped by _delivery_prs.
+                {"number": 43, "state": "open", "merged_at": None,
+                 "head": {"ref": branch, "sha": head_sha, "repo": {"full_name": "org/repo"}},
+                 "base": {"repo": {"full_name": "org/repo"}}},
+                # Cross-repo PR and prefix-split branch must be ignored by both.
+                {"number": 44, "state": "closed", "merged_at": "2026-11-23T09:00:00Z",
+                 "head": {"ref": branch, "sha": head_sha, "repo": {"full_name": "fork/repo"}},
+                 "base": {"repo": {"full_name": "org/repo"}}},
+                {"number": 45, "state": "closed", "merged_at": "2026-11-23T09:00:00Z",
+                 "head": {"ref": branch + "-split", "sha": head_sha, "repo": {"full_name": "org/repo"}},
+                 "base": {"repo": {"full_name": "org/repo"}}},
+            ]
+            return github_client.Response(200, {"ETag": '"pulls-v1"'}, json.dumps(payload).encode())
+        if endpoint == expected_commits:
+            payload = [{"commit": {"message": "deliver\n\nX-Agent: agy/t1\n"}}]
+            return github_client.Response(200, {"ETag": '"commits-v1"'}, json.dumps(payload).encode())
+        raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+    client = github_client.GitHubClient(cache_dir=tmp_path / "gh-cache", transport=transport,
+                                        env={"GH_HOST": "github.com"})
+    native_forbidden = Mock(side_effect=AssertionError("native gh fallthrough"))
+    monkeypatch.setattr(github_client, "run", lambda args, **kw: real_run(
+        args, client=client, runner=native_forbidden, **kw))
+    monkeypatch.setattr(pr_ownership, "state_path", lambda: tmp_path / "ownership.json")
+
+    record = {
+        "task_id": "t1", "worktree_branch": branch, "publish_branch": None,
+        "worktree_remote_url": "https://github.com/org/repo.git", "worktree_base_ref": "origin/main",
+        "started_at": "2026-11-23T08:00:00+00:00",
+    }
+    assert git._delivery_prs(record, "org/repo") == [42]
+    assert git._commit_messages("org/repo", 42) == ["deliver\n\nX-Agent: agy/t1\n"]
+
+    recorded_pr: list[int | None] = []
+    monkeypatch.setattr(git, "resolve_repo", lambda _key=None: (tmp_path, {"worktree_registry": "reg.json"}))
+    monkeypatch.setattr(git, "registry_path", lambda _repo, _info: tmp_path / "reg.json")
+    monkeypatch.setattr(git, "refresh_worktree", lambda _reg, _tree, pr: (recorded_pr.append(pr), True)[1])
+    assert git._refresh_at_settlement(record, tmp_path / "tree", head_sha) == "refreshed"
+    assert recorded_pr == [43]
+    assert requests == [expected_pulls, expected_commits, expected_pulls]
+    assert not any("state=closed" in endpoint for endpoint in requests)
+
+
+def test_settlement_reads_reuse_etag_304_and_honour_landing_reserve(tmp_path, monkeypatch):
+    """Defect class: unchanged settlement reads burn REST quota instead of 304 and ignore the landing reserve.
+
+    Approved by claude-cto (D-SETTLE-FRESH, message_f4fb3df7f3034eb3b55e29d9049bb59c).
+    """
+    import time
+
+    from lu_machinery.common import github_usage
+
+    real_run = github_client.run
+    cache_dir = tmp_path / "gh-cache"
+    now = int(time.time())
+    calls: list[tuple[str, str | None]] = []
+    remaining = [4500]
+
+    def transport(method, endpoint, headers, body, timeout):
+        assert method == "GET"
+        inm = headers.get("If-None-Match")
+        calls.append((endpoint, inm))
+        rate_headers = {
+            "X-RateLimit-Resource": "core",
+            "X-RateLimit-Remaining": str(remaining[0]),
+            "X-RateLimit-Reset": str(now + 1800),
+        }
+        if endpoint.startswith("repos/org/repo/pulls?"):
+            if inm == '"branch-v1"':
+                return github_client.Response(304, {**rate_headers, "ETag": '"branch-v1"'}, b"")
+            body_bytes = json.dumps([
+                {"number": 9, "state": "closed", "merged_at": "2026-11-23T09:00:00Z",
+                 "head": {"ref": "agy/t2", "sha": "a" * 40, "repo": {"full_name": "org/repo"}},
+                 "base": {"repo": {"full_name": "org/repo"}}},
+            ]).encode()
+            return github_client.Response(200, {**rate_headers, "ETag": '"branch-v1"'}, body_bytes)
+        if endpoint == "repos/org/repo/pulls/9/commits?per_page=100":
+            if inm == '"commits-v1"':
+                return github_client.Response(304, {**rate_headers, "ETag": '"commits-v1"'}, b"")
+            body_bytes = json.dumps([{"commit": {"message": "ok\n\nX-Agent: agy/t2\n"}}]).encode()
+            return github_client.Response(200, {**rate_headers, "ETag": '"commits-v1"'}, body_bytes)
+        raise AssertionError(endpoint)
+
+    client = github_client.GitHubClient(cache_dir=cache_dir, transport=transport, env={"GH_HOST": "github.com"})
+    native_forbidden = Mock(side_effect=AssertionError("native gh fallthrough"))
+    monkeypatch.setattr(github_client, "run", lambda args, **kw: real_run(
+        args, client=client, runner=native_forbidden, **kw))
+    monkeypatch.setattr(pr_ownership, "state_path", lambda: tmp_path / "ownership.json")
+
+    record = {
+        "task_id": "t2", "worktree_branch": "agy/t2", "publish_branch": None,
+        "worktree_remote_url": "https://github.com/org/repo.git", "worktree_base_ref": "origin/main",
+        "started_at": "2026-11-23T08:00:00+00:00",
+    }
+    # Pass 1: cold cache -> 200 charged.
+    assert git._delivery_prs(record, "org/repo") == [9]
+    assert git._commit_messages("org/repo", 9) == ["ok\n\nX-Agent: agy/t2\n"]
+    after_first = {row["endpoint"]: (row["charged"], row["requests"]) for row in github_usage.top(cache_dir, hours=1)}
+    assert after_first == {
+        "GET repos/:repo/pulls": (1, 1),
+        "GET repos/:repo/pulls/:n/commits": (1, 1),
+    }
+
+    # Pass 2: unchanged -> If-None-Match sent -> 304 free (0 additional charged calls), then observe low budget.
+    assert git._delivery_prs(record, "org/repo") == [9]
+    remaining[0] = github_client.LANDING_RESERVE - 1
+    assert git._commit_messages("org/repo", 9) == ["ok\n\nX-Agent: agy/t2\n"]
+    assert calls[2][1] == '"branch-v1"' and calls[3][1] == '"commits-v1"'
+    after_second = {row["endpoint"]: (row["charged"], row["requests"]) for row in github_usage.top(cache_dir, hours=1)}
+    assert after_second == {
+        "GET repos/:repo/pulls": (1, 2),
+        "GET repos/:repo/pulls/:n/commits": (1, 2),
+    }
+
+    # Pass 3: core remaining below LANDING_RESERVE -> refused before any transport request is sent.
+    before_refusal = len(calls)
+    with pytest.raises(git.GitHubRefused):
+        git._delivery_prs(record, "org/repo")
+    assert len(calls) == before_refusal

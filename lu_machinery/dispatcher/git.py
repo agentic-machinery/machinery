@@ -17,6 +17,7 @@ from contextlib import contextmanager, suppress
 from datetime import datetime
 from functools import partial
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlencode
 
 # A checkout that tracks DESCRIPTOR is enrolled in the installed agent deployment; STATE is its ownership manifest.
 from lu_machinery.agent_deploy.plan import DESCRIPTOR as AGENT_DEPLOY_DESCRIPTOR
@@ -802,10 +803,17 @@ def _refresh_at_settlement(record: dict, tree: Path, head: str) -> str | None:
         with suppress(GitHubRefused, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError):
             slug, _ = _repo_and_base(record)
             branch = record["worktree_branch"]
-            listed = json_depth.loads(_gh("pr", "list", "--repo", slug, "--head", branch, "--state", "open",
-                                    "--json", "number,headRefOid,headRefName"), max_depth=512) if slug else []
-            matching = [item["number"] for item in listed if item["headRefName"] == branch and item["headRefOid"] == head]
-            pr = matching[0] if len(matching) == 1 else None
+            if slug:
+                matching = [
+                    item["number"] for item in _branch_pulls(slug, branch)
+                    if item.get("state") == "open"
+                    and isinstance(item.get("head"), dict)
+                    and item["head"].get("ref") == branch
+                    and item["head"].get("sha") == head
+                    and _same_repo_pr(item, slug)
+                    and type(item.get("number")) is int and item["number"] > 0
+                ]
+                pr = matching[0] if len(matching) == 1 else None
         return "refreshed" if refresh_worktree(registry, tree, pr) else "no_entry"
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         return f"failed: {type(exc).__name__}: {exc}"
@@ -1123,32 +1131,70 @@ def _accepted_prs(task_id: str, repo: str) -> list[int]:
     return sorted({int(key.rpartition("#")[2]) for key in keys if key.rpartition("#")[0] == repo.casefold()})
 
 
-def _delivery_prs(record: dict, repo: str) -> list[int]:
-    """Candidate PRs from acceptance, exact branches and the non-search closed-PR listing.
+def _same_repo_pr(pr: dict, repo: str) -> bool:
+    """Whether a REST pull-request object has both head and base strictly in ``repo``."""
+    head = pr.get("head")
+    base = pr.get("base")
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    base_repo = base.get("repo") if isinstance(base, dict) else None
+    head_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+    base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+    return (isinstance(head_name, str) and isinstance(base_name, str)
+            and head_name.casefold() == base_name.casefold() == repo.casefold())
 
-    The updated-time order bounds the family scan at task start: a PR merged during
-    the task must have been updated then. Branch names discover candidates, never attribution.
+
+def _branch_pulls(repo: str, branch: str) -> list[dict]:
+    """Pull requests for ``repo``'s exact ``branch`` via one conditional REST query."""
+    owner, sep, name = repo.partition("/")
+    if not sep or not owner or not name or "/" in name or not isinstance(branch, str) or not branch:
+        raise ValueError("branch pull-request lookup requires owner/repo and branch")
+    query = urlencode({"head": f"{owner}:{branch}", "state": "all", "per_page": 100})
+    raw = json_depth.loads(_gh("api", "--paginate", "--slurp", f"repos/{repo}/pulls?{query}"), max_depth=512)
+    if not isinstance(raw, list) or any(not isinstance(page, list) for page in raw):
+        raise ValueError("branch pull-request listing has unexpected shape")
+    rows = [pr for page in raw for pr in page]
+    if any(not isinstance(pr, dict) for pr in rows):
+        raise ValueError("branch pull-request row has unexpected shape")
+    return rows
+
+
+def _commit_messages(repo: str, number: int) -> list[str]:
+    """Commit messages on ``repo`` pull request ``number`` via conditional REST pagination."""
+    raw = json_depth.loads(
+        _gh("api", "--paginate", "--slurp", f"repos/{repo}/pulls/{number}/commits?per_page=100"),
+        max_depth=512,
+    )
+    if not isinstance(raw, list) or any(not isinstance(page, list) for page in raw):
+        raise ValueError("pull-request commit listing has unexpected shape")
+    messages: list[str] = []
+    for page in raw:
+        for entry in page:
+            commit = entry.get("commit") if isinstance(entry, dict) else None
+            message = commit.get("message") if isinstance(commit, dict) else None
+            if not isinstance(message, str):
+                raise ValueError("pull-request commit entry has unexpected shape")
+            messages.append(message)
+    return messages
+
+
+def _delivery_prs(record: dict, repo: str) -> list[int]:
+    """Candidate PRs from ``pr_ownership`` acceptance and exact recorded-branch REST lookups.
+
+    Each recorded branch is queried via ``GET repos/{repo}/pulls?head=<owner>:<branch>&state=all``
+    through ``github_client`` conditional reads (free 304 when unchanged). Branch names discover
+    candidates, never attribution; unrecorded split branches require ``pr_ownership accept``.
     """
     numbers = set(_accepted_prs(record["task_id"], repo))
     branches = sorted({record["worktree_branch"], record.get("publish_branch")} - {None})
     for branch in branches:
-        listed = json_depth.loads(_gh("pr", "list", "--repo", repo, "--head", branch, "--state", "merged",
-                                "--json", "number,isCrossRepository,headRefName"), max_depth=512)
-        numbers.update(pr["number"] for pr in listed if pr["headRefName"] == branch and not pr["isCrossRepository"])
-    started = datetime.fromisoformat(record["started_at"].replace("Z", "+00:00"))
-    page = 1
-    while True:
-        listed = json_depth.loads(_gh("api", f"repos/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}"), max_depth=512)
-        if not listed:
-            break
-        updated = [datetime.fromisoformat(pr["updated_at"].replace("Z", "+00:00")) for pr in listed]
-        numbers.update(pr["number"] for pr, at in zip(listed, updated, strict=True)
-                       if at >= started and pr["merged_at"] and any(
-                           pr["head"]["ref"] == branch or pr["head"]["ref"].startswith((branch + "-", branch + "/"))
-                           for branch in branches))
-        if len(listed) < 100 or min(updated) < started:
-            break
-        page += 1
+        for pr in _branch_pulls(repo, branch):
+            number = pr.get("number")
+            if type(number) is not int or number <= 0:
+                raise ValueError("branch pull-request row has invalid number")
+            head = pr.get("head")
+            ref = head.get("ref") if isinstance(head, dict) else None
+            if ref == branch and _same_repo_pr(pr, repo) and isinstance(pr.get("merged_at"), str) and pr["merged_at"]:
+                numbers.add(number)
     return sorted(numbers)
 
 
@@ -1162,15 +1208,20 @@ def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
     # A zero-commit snapshot cannot attribute a PR by head association alone: another task's
     # merged PR can share that starting head. Branch candidates still require a task trailer or acceptance.
     commits = record.get("commits_ahead")
-    if head and isinstance(commits, int) and commits > 0 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+    if head and type(commits) is int and commits > 0 and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
         listed = _gh("api", "--paginate", f"repos/{repo}/commits/{head}/pulls", missing_commit=True)
-        for pr in json_depth.loads(listed or "[]", max_depth=512):
-            head_repo = (pr["head"]["repo"] or {}).get("full_name")
-            base_repo = (pr["base"]["repo"] or {}).get("full_name")
-            if (pr["number"] not in seen and head_repo == base_repo
-                    and head_repo and head_repo.casefold() == repo.casefold()):
-                seen.add(pr["number"])
-                yield pr["number"]
+        parsed = json_depth.loads(listed or "[]", max_depth=512)
+        if not isinstance(parsed, list):
+            raise ValueError("commit pull-request listing has unexpected shape")
+        for pr in parsed:
+            if not isinstance(pr, dict):
+                raise ValueError("commit pull-request row has unexpected shape")
+            candidate = pr.get("number")
+            if type(candidate) is not int or candidate <= 0:
+                raise ValueError("commit pull-request row has invalid number")
+            if candidate not in seen and _same_repo_pr(pr, repo):
+                seen.add(candidate)
+                yield candidate
 
 
 _DEFAULT_BRANCH = re.compile(r"ref: refs/heads/(\S+)\s+HEAD")
@@ -1228,8 +1279,8 @@ def merged_delivery(record: dict) -> dict | None:
     """The merged pull request that carries this task's delivery, or None when none is proven.
 
     A task that ends with its work merged has nothing left on its own branch to inspect: the
-    PRs it accepted, or those opened from its branch family, carry the delivery, and a worker may have
-    reset or deleted the branch after the merge. A candidate counts only when GitHub reports
+    PRs it accepted, those opened from its recorded branch, or commit-associated PRs carry the
+    delivery, and a worker may have reset or deleted the branch after the merge. A candidate counts only when GitHub reports
     it MERGED after the task started into the task's recorded base branch or the remote's
     default branch (a stacked task's base is the parent branch, and the pull request is
     retargeted onto the default branch once that parent is gone), with a merge commit and a
@@ -1289,10 +1340,8 @@ def merged_delivery(record: dict) -> dict | None:
             exact_delivery = exact_snapshot and recorded_branch and (record.get("commits_ahead") or 0) > 0
             strong = number in accepted or recorded_branch or exact_snapshot
             if number not in accepted and not exact_delivery:
-                messages = _gh("api", "--paginate", f"repos/{repo}/pulls/{number}/commits", "--jq",
-                               ".[] | .commit.message | @json")
                 trailer = f"X-Agent: {record['agent']}/{record['task_id']}"
-                trailers = [line for message in messages.splitlines() for line in json_depth.loads(message, max_depth=512).splitlines()
+                trailers = [line for message in _commit_messages(repo, number) for line in message.splitlines()
                             if line.startswith("X-Agent:")]
                 if trailer not in trailers:
                     continue
