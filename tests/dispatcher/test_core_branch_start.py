@@ -3,17 +3,24 @@
 
 
 import json
-import subprocess
-from pathlib import Path
-from unittest.mock import Mock
-import pytest
-from lu_machinery.dispatcher import cli, git, worker
-from tests.dispatcher.conftest import MERGED as MERGED, await_file as await_file, prior_worktree as prior_worktree, run_git as run_git
-from tests.helpers.product_tree import configured_roots as configured_roots
 import os
 import signal
+import subprocess
 import time
-from tests.dispatcher.conftest import in_process_repo as in_process_repo, local_branches as local_branches
+from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
+
+from lu_machinery.dispatcher import cli, git, worker
+from tests.dispatcher.conftest import MERGED as MERGED
+from tests.dispatcher.conftest import await_file as await_file
+from tests.dispatcher.conftest import in_process_repo as in_process_repo
+from tests.dispatcher.conftest import local_branches as local_branches
+from tests.dispatcher.conftest import prior_worktree as prior_worktree
+from tests.dispatcher.conftest import run_git as run_git
+from tests.helpers.product_tree import configured_roots as configured_roots
+
 
 @pytest.mark.parametrize("unpublished_ancestor", [False, True], ids=["unchanged-start", "unpublished-ancestor"])
 def test_accepted_merged_pr_without_new_commits_is_delivered(merged_delivery_world, unpublished_ancestor):
@@ -130,32 +137,28 @@ def test_unpushed_change_without_a_provable_merged_delivery_is_still_refused(mer
         assert world.record["error"] == "work_not_pushed_or_unknown"
 
 
-@pytest.mark.parametrize(("commits", "closeout_code", "separator"), [(0, 0, "-"), (3, 0, "-"), (3, 0, "/"), (3, 1, "-")])
+@pytest.mark.parametrize(("commits", "closeout_code"), [(0, 0), (3, 0), (3, 1)])
 def test_additional_task_prs_recover_split_branch_delivery(
-    merged_delivery_world, monkeypatch, tmp_path, commits, closeout_code, separator,
+    merged_delivery_world, monkeypatch, tmp_path, commits, closeout_code,
 ):
-    """Defect class: merged split branches are invisible after the task resets onto the merged base (#522)."""
+    """Defect class: accepted split PRs must be recovered and closed out without paginating closed PRs.
+
+    Unrecorded prefix-split branches require ``pr_ownership accept`` (D-SETTLE-FRESH).
+    """
     world = merged_delivery_world
     world.record["commits_ahead"] = commits
     world.listed = [
-        {"number": 78, "isCrossRepository": False, "headRefName": f"claude/merge-probe{separator}layout",
-         "headRefOid": "d" * 40},
-        {"number": 79, "isCrossRepository": False, "headRefName": f"claude/merge-probe{separator}alerts",
-         "headRefOid": "e" * 40},
+        {"number": 78, "isCrossRepository": False, "headRefName": "claude/merge-probe-layout"},
+        {"number": 79, "isCrossRepository": False, "headRefName": "claude/merge-probe-alerts"},
     ]
     world.prs = {78: dict(MERGED), 79: {**MERGED, "headRefOid": "e" * 40,
                                      "mergeCommit": {"oid": world.record["head_sha"]}}}
     world.files = {78: ["docs/owned.md"], 79: ["docs/second.md"]}
     world.record["owned_paths"].append("docs/second.md")
-    world.search_listed = []
-    if separator == "/":
-        # The second page must still contribute both splits when the first page is full.
-        filler = {"number": 90, "head": {"ref": "other/task"}, "merged_at": None,
-                  "updated_at": "2026-10-29T09:00:00Z"}
-        world.closed_pages = {1: [filler] * 100, 2: [
-            {"number": pr["number"], "head": {"ref": pr["headRefName"]},
-             "merged_at": "2026-10-29T09:00:00Z", "updated_at": "2026-10-29T09:00:00Z"}
-            for pr in world.listed]}
+    if commits == 0:
+        # Unrecorded prefix-split branches are never discovered via closed-PR pagination.
+        assert git.merged_delivery(world.record) is None
+    world.accept(78, 79)
     worker._enforce_delivery(world.record)
     assert (world.record["status"], world.record["error"]) == ("done", None)
     assert world.record["delivery_prs"] == ["org/repo#78", "org/repo#79"]
@@ -185,9 +188,9 @@ def test_additional_task_prs_recover_split_branch_delivery(
     assert calls == [78, 79]
 
 
-@pytest.mark.parametrize("fault", ["outside-path", "reverted-outside-path", "foreign-trailer", "branch-collision", "invalid-family-page", "mixed-trailers", "own-exact-with-mixed-successor"])
+@pytest.mark.parametrize("fault", ["outside-path", "reverted-outside-path", "foreign-trailer", "branch-collision", "invalid-branch-page", "mixed-trailers", "own-exact-with-mixed-successor"])
 def test_split_delivery_checks_every_owned_path(merged_delivery_world, monkeypatch, fault):
-    """Defect class: accepting the first merged split hides an unowned path or credits another task's split."""
+    """Defect class: accepting the first merged PR hides an unowned path or credits another task's PR."""
     world = merged_delivery_world
     world.record["commits_ahead"] = 2
     world.listed = [
@@ -197,17 +200,20 @@ def test_split_delivery_checks_every_owned_path(merged_delivery_world, monkeypat
     world.prs = {78: dict(MERGED), 79: dict(MERGED)}
     world.files = {78: ["docs/owned.md"], 79: ["outside.txt"]}
     if fault in {"outside-path", "reverted-outside-path"}:
+        world.accept(78, 79)
         world.prs[79]["headRefOid"] = world.record["head_sha"]
     if fault == "reverted-outside-path":
         world.files[79] = ["docs/owned.md"]
         monkeypatch.setattr(worker.ownership, "delivered_paths", lambda *_args, **_kwargs: ["outside.txt"])
     elif fault == "foreign-trailer":
+        world.listed[0]["headRefOid"] = world.listed[1]["headRefOid"] = "d" * 40
         world.messages[78] = world.messages[79] = "X-Agent: claude/other-task"
     elif fault == "branch-collision":
         world.listed[0]["headRefName"] = world.listed[1]["headRefName"] = "claude/merge-probeother"
-    elif fault == "invalid-family-page":
-        world.closed_pages = {1: [{"updated_at": "not-a-timestamp"}]}
+    elif fault == "invalid-branch-page":
+        world.branch_pages = [{"number": "not-a-page"}]
     elif fault in {"mixed-trailers", "own-exact-with-mixed-successor"}:
+        world.listed[1]["headRefOid"] = "d" * 40
         world.files[79] = ["docs/owned.md"]
         world.messages[79] = "X-Agent: claude/merge-probe\nX-Agent: claude/successor-task"
         if fault == "own-exact-with-mixed-successor":
@@ -238,6 +244,7 @@ def test_split_delivery_rejects_unpublished_snapshot(merged_delivery_world, dirt
     world = merged_delivery_world
     world.record.update(commits_ahead=2, worktree_dirty_on_exit=dirty)
     world.published = (None, False)
+    world.accept(78)
     world.listed = [{"number": 78, "isCrossRepository": False, "headRefName": "claude/merge-probe-layout"}]
     world.prs[78], world.files[78] = dict(MERGED), ["docs/owned.md"]
     worker._enforce_delivery(world.record)
@@ -251,6 +258,7 @@ def test_split_delivery_preserves_provider_failure_evidence(merged_delivery_worl
     world = merged_delivery_world
     world.record.update(status="failed", error="provider exited unsuccessfully", provider_terminal_failure=True,
                         commits_ahead=2, returncode=17)
+    world.accept(78)
     world.listed = [{"number": 78, "isCrossRepository": False, "headRefName": "claude/merge-probe-layout"}]
     world.prs[78] = {**MERGED, "state": "MERGED" if merged else "OPEN", "headRefOid": world.record["head_sha"]}
     world.files[78] = ["docs/owned.md"]

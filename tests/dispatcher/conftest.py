@@ -13,11 +13,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+
 import pytest
 import yaml
+
+from lu_machinery.common.repo_root import machinery_root
 from lu_machinery.dispatcher import environment, git, ownership, worker
 from tests.dispatcher.worker_reap import Reaper, reap_root
-from lu_machinery.common.repo_root import machinery_root
 from tests.helpers import current_sol
 
 CURRENT_SOL = current_sol()
@@ -401,7 +403,7 @@ def merged_delivery_world(tmp_path, monkeypatch):
     from lu_machinery.orchestration import pr_ownership
 
     world = SimpleNamespace(
-        prs={}, files={}, messages={}, listed=[], search_listed=None, closed_pages=None, published=(None, True), lookup_error=None,
+        prs={}, files={}, messages={}, listed=[], search_listed=None, branch_pages=None, published=(None, True), lookup_error=None,
         record={
             "task_id": "merge-probe", "agent": "claude", "mode": "workspace-write", "status": "done", "error": None,
             "owned_paths": ["docs/owned.md"], "worktree_remote_url": "https://github.com/org/repo.git",
@@ -419,31 +421,53 @@ def merged_delivery_world(tmp_path, monkeypatch):
         if world.lookup_error:
             raise world.lookup_error
         words = args[1:]
-        if words[0] == "api" and "pulls?state=closed" in words[1]:
-            page = int(words[1].rsplit("page=", 1)[1])
-            listed = (world.closed_pages.get(page, []) if world.closed_pages is not None else [
-                {"number": pr["number"], "head": {"ref": pr["headRefName"]},
-                 "merged_at": world.prs[pr["number"]].get("mergedAt"),
-                 "updated_at": world.prs[pr["number"]].get("mergedAt", "2026-10-29T09:00:00Z")}
-                for pr in world.listed] if page == 1 else [])
-            out = json.dumps(listed)
+        endpoint = words[-1] if words and words[0] == "api" else ""
+        repo_name = "/".join(endpoint.split("/")[1:3]) if endpoint.startswith("repos/") else "org/repo"
+        if words[0] == "api" and "/pulls?" in endpoint:
+            assert "--slurp" in words and "pulls?state=closed" not in endpoint, words
+            if world.branch_pages is not None:
+                out = json.dumps(world.branch_pages)
+            else:
+                rows = [
+                    {
+                        "number": pr["number"],
+                        "state": "open" if world.prs.get(pr["number"], {}).get("state") == "OPEN" else "closed",
+                        "merged_at": (
+                            None if world.prs.get(pr["number"], {}).get("state") == "OPEN"
+                            else world.prs.get(pr["number"], {}).get("mergedAt", "2026-10-29T09:00:00Z")
+                        ),
+                        "head": {
+                            "ref": pr["headRefName"],
+                            "sha": pr.get("headRefOid", world.prs.get(pr["number"], {}).get("headRefOid")),
+                            "repo": {"full_name": "other/repo" if pr.get("isCrossRepository") else repo_name},
+                        },
+                        "base": {"repo": {"full_name": repo_name}},
+                    }
+                    for pr in world.listed
+                ]
+                out = json.dumps([rows])
         elif words[:2] == ["pr", "view"]:
             number = int(words[2])
             current_pr = number
             branch = next((pr["headRefName"] for pr in world.listed if pr["number"] == number),
                           world.record["worktree_branch"])
             out = json.dumps({"headRefName": branch, **world.prs[number]})
+        elif words[0] == "api" and endpoint.endswith("/pulls"):
+            out = json.dumps([
+                {
+                    "number": pr["number"],
+                    "head": {"sha": pr["headRefOid"], "repo": {"full_name": repo_name}},
+                    "base": {"repo": {"full_name": "other/repo" if pr.get("isCrossRepository") else repo_name}},
+                }
+                for pr in world.listed if "headRefOid" in pr
+            ])
+        elif words[0] == "api" and "/commits?" in endpoint:
+            assert "--slurp" in words, words
+            number = int(endpoint.split("/")[4])
+            msg = world.messages.get(number, "deliver\n\nX-Agent: claude/merge-probe")
+            out = json.dumps([[{"commit": {"message": msg}}]])
         else:
-            out = (json.dumps([{"number": pr["number"],
-                                "head": {"sha": pr["headRefOid"], "repo": {"full_name": "org/repo"}},
-                                "base": {"repo": {"full_name": "other/repo" if pr["isCrossRepository"] else "org/repo"}}}
-                               for pr in world.listed if "headRefOid" in pr])
-                   if words[0] == "api" and words[2].endswith("/pulls")
-                   else json.dumps(world.messages.get(int(words[2].split("/")[4]), "deliver\n\nX-Agent: claude/merge-probe"))
-                   if words[0] == "api" and words[2].endswith("/commits")
-                   else json.dumps(world.search_listed if "--search" in words and world.search_listed is not None
-                                   else world.listed) if words[:2] == ["pr", "list"]
-                   else "[]")
+            raise AssertionError(words)
         return SimpleNamespace(returncode=0, stdout=out, stderr="")
 
     state = tmp_path / "state.json"
