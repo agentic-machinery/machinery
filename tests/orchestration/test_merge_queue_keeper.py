@@ -522,7 +522,7 @@ class DirectFakeGitHub(FakeGitHub):
         self.files_by_pr: dict[int, list[str]] = {row["number"]: ["scripts/example.py"] for row in self.rows}
         self.file_rows_by_pr: dict[int, list[dict[str, Any]]] = {}
         self.blobs_by_ref: dict[tuple[str, str], str | None] = {}
-        self.use_git_blobs = False
+        self.read_source_blob: Any = self._fake_read_source_blob
         self.base_heads: dict[str, str] = {"main": BASE_SHA}
         self.base_runs_by_sha: dict[str, list[dict[str, Any]]] = {
             BASE_SHA: [{
@@ -539,10 +539,6 @@ class DirectFakeGitHub(FakeGitHub):
         }
         self.direct_merge_error: Exception | None = None
         self.auto_merge_marks_merged = True
-        self.runs_by_id: dict[int, dict[str, Any]] = {}
-        self.jobs_by_run: dict[int, list[dict[str, Any]]] = {}
-        self.logs_by_job: dict[int, str] = {}
-        self.run_rerun_error: Exception | None = None
 
     def branch_names(self) -> set[str]:
         return {row["baseRefName"] for row in self.rows} or {"main"}
@@ -563,7 +559,7 @@ class DirectFakeGitHub(FakeGitHub):
             return [dict(row) for row in self.file_rows_by_pr[number]]
         return [{"filename": path, "status": "modified"} for path in self.files_by_pr.get(number, ["scripts/example.py"])]
 
-    def read_source_blob(
+    def _fake_read_source_blob(
         self,
         number: int,
         head: str,
@@ -572,10 +568,6 @@ class DirectFakeGitHub(FakeGitHub):
         base_name: str | None = None,
         removed: bool = False,
     ) -> str | None:
-        if self.use_git_blobs:
-            return keeper._read_git_blob_for_verify(
-                self.root, number=number, head=head, base_name=base_name, path=path, removed=removed,
-            )
         if (head, path) in self.blobs_by_ref:
             return self.blobs_by_ref[(head, path)]
         return ""
@@ -597,26 +589,6 @@ class DirectFakeGitHub(FakeGitHub):
     def re_enqueue(self, number: int, head: str, recovery_run_id: int) -> bool:
         self.actions.append(("re-enqueue", (number, head, recovery_run_id)))
         return False
-
-    def run_detail(self, run_id: int) -> dict[str, Any]:
-        if run_id not in self.runs_by_id:
-            raise keeper.KeeperError(f"workflow run lookup incomplete for {run_id}")
-        return dict(self.runs_by_id[run_id])
-
-    def jobs(self, run_id: int) -> list[dict[str, Any]]:
-        if run_id not in self.jobs_by_run:
-            raise keeper.KeeperError(f"job page incomplete for {run_id}")
-        return list(self.jobs_by_run[run_id])
-
-    def job_log(self, job_id: int) -> str:
-        if job_id not in self.logs_by_job:
-            raise keeper.KeeperError(f"job log unavailable for {job_id}")
-        return self.logs_by_job[job_id]
-
-    def run_rerun(self, run_id: int) -> None:
-        self.actions.append(("run-rerun", run_id))
-        if self.run_rerun_error is not None:
-            raise self.run_rerun_error
 
     def branch_head(self, branch: str) -> str:
         if branch not in self.base_heads:
@@ -1428,6 +1400,39 @@ def test_head_moved_to_unreviewed_head_alerts_once_in_custody_and_report_mode(tm
     assert not fmf3 and any("unreviewed head move alerted" in line for line in fm_lines3)
     assert len(json.loads(flaky_comm_state.read_text())["cto_outbox"]) == 1
 
+    # F6 (R3): in merge-queue apply=True without custody, if fresh read sees head moved A->B
+    # while comments lookup fails, report_heads preserves HEAD_A so the next tick alerts A->B.
+    class FlakyFreshMoveGitHub(DirectFakeGitHub):
+        def __init__(self, *a: Any, **kw: Any) -> None:
+            super().__init__(*a, **kw)
+            self.comment_calls = 0
+
+        def comments(self, number: int) -> list[dict[str, Any]]:
+            self.comment_calls += 1
+            if self.comment_calls == 2:
+                raise keeper.KeeperError("transient comments failure on fresh read")
+            return super().comments(number)
+
+    f6_mq = FlakyFreshMoveGitHub([pr(number=50, headRefOid=HEAD_A)], repository="unit/public")
+    f6_mq.queue_enabled = True
+    f6_mq.comments_by_pr[50] = []
+    f6_mq.fresh_by_pr[50] = {**f6_mq.rows[0], "headRefOid": HEAD_B, "state": "OPEN", "labels": []}
+    f6_state = tmp_path / "f6_mq_fresh.json"
+    f6_cfg = _direct_cfg(repository="unit/public")
+    _f6_l1, f6_f1 = keeper.run(f6_mq, f6_state, apply=True, direct_config=f6_cfg)
+    assert not f6_f1
+    f6_saved1 = json.loads(f6_state.read_text())
+    assert f6_saved1["report_heads"]["50"] == HEAD_A
+    assert f6_saved1.get("cto_outbox", []) == []
+    # Next tick sees HEAD_B with readable comments -> alerts HEAD_A->HEAD_B once and advances report_heads.
+    f6_mq.rows = [pr(number=50, headRefOid=HEAD_B)]
+    f6_mq.checks_by_head[HEAD_B] = checks(HEAD_B, conclusion="", status="in_progress")
+    f6_l2, f6_f2 = keeper.run(f6_mq, f6_state, apply=True, direct_config=f6_cfg)
+    assert not f6_f2 and any("unreviewed head move alerted" in line for line in f6_l2)
+    f6_saved2 = json.loads(f6_state.read_text())
+    assert f6_saved2["report_heads"]["50"] == HEAD_B
+    assert len(f6_saved2["cto_outbox"]) == 1 and HEAD_A in f6_saved2["cto_outbox"][0]["body"] and HEAD_B in f6_saved2["cto_outbox"][0]["body"]
+
     # F10 (R2): malformed non-string outbox key fails closed with KeeperError instead of TypeError.
     bad_outbox = tmp_path / "bad_outbox.json"
     bad_outbox.write_text(json.dumps({"queued": {}, "cto_outbox": [{"key": ["bad"], "kind": "x", "body": "y"}]}))
@@ -1578,14 +1583,14 @@ def test_required_verify_run_failure_blocks_landing_and_alerts(tmp_path: Path) -
 
     deep_mq = DirectFakeGitHub([pr(number=46, headRefOid=pr46_sha)], repository="unit/public")
     deep_mq.root = keeper_repo
-    deep_mq.use_git_blobs = True
+    deep_mq.read_source_blob = None
     deep_mq.queue_enabled = True
     deep_mq.file_rows_by_pr[46] = [{"filename": "scripts/deep_caller.py", "status": "modified", "patch": "@@ -42 +42 @@\n+X = 2\n"}]
     d_lines, d_failed = keeper.run(deep_mq, tmp_path / "verify_deep.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
     assert not d_failed and mutations(deep_mq) == []
     assert "#46 held: verify-run-failed:sources" in d_lines
 
-    # PR 47: removes scripts/removed_caller.py (patch omits verify_word, diff base contains it).
+    # PR 47: removes scripts/removed_caller.py (patch omits verify_word, proven diff base contains it).
     _git(author, "checkout", "main")
     _git(author, "checkout", "-b", "pr-47")
     (author / "scripts/removed_caller.py").unlink()
@@ -1596,221 +1601,179 @@ def test_required_verify_run_failure_blocks_landing_and_alerts(tmp_path: Path) -
 
     rem_mq = DirectFakeGitHub([pr(number=47, headRefOid=pr47_sha)], repository="unit/public")
     rem_mq.root = keeper_repo
-    rem_mq.use_git_blobs = True
+    rem_mq.read_source_blob = None
     rem_mq.queue_enabled = True
     rem_mq.file_rows_by_pr[47] = [{"filename": "scripts/removed_caller.py", "status": "removed", "patch": ""}]
     r_lines, r_failed = keeper.run(rem_mq, tmp_path / "verify_rem.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
     assert not r_failed and mutations(rem_mq) == []
     assert "#47 held: verify-run-failed:sources" in r_lines
 
-    # PR 48: modifies scripts/plain.py (verified clean from exact PR head blob -> no Sources check required).
+    # F4 (R3): remote main advances AFTER keeper_repo was cloned, adding verify_word to scripts/plain.py;
+    # PR 49 branches from the newer remote main and removes scripts/plain.py -> isolated store resolves
+    # merge-base against live remote main (not stale keeper_repo origin/main) and requires "sources".
+    _git(author, "checkout", "main")
+    (author / "scripts/plain.py").write_text("def late():\n    return verify_word('z')\n")
+    _git(author, "add", "scripts/plain.py")
+    _git(author, "commit", "-m", "advance main with verify_word caller")
+    _git(bare, "fetch", str(author), "+HEAD:refs/heads/main")
+    _git(author, "checkout", "-b", "pr-49")
+    (author / "scripts/plain.py").unlink()
+    _git(author, "add", "-A")
+    _git(author, "commit", "-m", "remove late caller")
+    pr49_sha = _git(author, "rev-parse", "HEAD")
+    _git(bare, "fetch", str(author), "+refs/heads/pr-49:refs/pull/49/head")
+
+    stale_rem_mq = DirectFakeGitHub([pr(number=49, headRefOid=pr49_sha)], repository="unit/public")
+    stale_rem_mq.root = keeper_repo
+    stale_rem_mq.read_source_blob = None
+    stale_rem_mq.queue_enabled = True
+    stale_rem_mq.file_rows_by_pr[49] = [{"filename": "scripts/plain.py", "status": "removed", "patch": ""}]
+    sr_lines, sr_failed = keeper.run(stale_rem_mq, tmp_path / "verify_stale_rem.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+    assert not sr_failed and mutations(stale_rem_mq) == []
+    assert "#49 held: verify-run-failed:sources" in sr_lines
+
+    # F4 (R3): orphan PR with no common ancestor with main cannot prove merge-base -> fails closed ("sources").
+    _git(author, "checkout", "--orphan", "pr-50-orphan")
+    _git(author, "rm", "-rf", ".")
+    (author / "scripts").mkdir()
+    (author / "scripts/other.py").write_text("A = 1\n")
+    _git(author, "add", ".")
+    _git(author, "commit", "-m", "orphan")
+    pr50_sha = _git(author, "rev-parse", "HEAD")
+    _git(bare, "fetch", str(author), "+refs/heads/pr-50-orphan:refs/pull/50/head")
+    assert keeper._verify_run_areas_for_files(
+        ["scripts/removed_caller.py"],
+        repository="unit/public",
+        file_rows=[{"filename": "scripts/removed_caller.py", "status": "removed", "patch": ""}],
+        repo_root=keeper_repo,
+        head=pr50_sha,
+        base_name="main",
+        number=50,
+    ) == ("sources",)
+
+    # F12 (R3): multi-file clean PR absent locally opens ONE isolated object store per pass,
+    # and short-circuits with ZERO store opens when "sources" is already matched or excluded.
     _git(author, "checkout", "main")
     _git(author, "checkout", "-b", "pr-48")
-    (author / "scripts/plain.py").write_text("VALUE = 2\n")
-    _git(author, "add", "scripts/plain.py")
-    _git(author, "commit", "-m", "bump plain")
+    (author / "scripts/clean_a.py").write_text("VALUE_A = 1\n")
+    (author / "scripts/clean_b.py").write_text("VALUE_B = 2\n")
+    _git(author, "add", "scripts/clean_a.py", "scripts/clean_b.py")
+    _git(author, "commit", "-m", "add two clean files")
     pr48_sha = _git(author, "rev-parse", "HEAD")
     _git(bare, "fetch", str(author), "+refs/heads/pr-48:refs/pull/48/head")
 
-    plain_mq = DirectFakeGitHub([pr(number=48, headRefOid=pr48_sha)], repository="unit/public")
-    plain_mq.root = keeper_repo
-    plain_mq.use_git_blobs = True
-    plain_mq.queue_enabled = True
-    plain_mq.file_rows_by_pr[48] = [{"filename": "scripts/plain.py", "status": "modified", "patch": "@@ -1 +1 @@\n+VALUE = 2\n"}]
-    pl_lines, pl_failed = keeper.run(plain_mq, tmp_path / "verify_plain.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
-    assert not pl_failed and mutations(plain_mq) == ["enqueue"]
-    assert "#48 enqueued" in pl_lines
+    from lu_machinery.review import record_cf_verdict
+
+    iso_opens = 0
+    real_iso = record_cf_verdict.isolated_object_store
+
+    def counting_iso(checkout: Path | None = None) -> Any:
+        nonlocal iso_opens
+        iso_opens += 1
+        return real_iso(checkout)
+
+    orig_iso = record_cf_verdict.isolated_object_store
+    record_cf_verdict.isolated_object_store = counting_iso  # type: ignore[assignment]
+    try:
+        plain_mq = DirectFakeGitHub([pr(number=48, headRefOid=pr48_sha)], repository="unit/public")
+        plain_mq.root = keeper_repo
+        plain_mq.read_source_blob = None
+        plain_mq.queue_enabled = True
+        plain_mq.file_rows_by_pr[48] = [
+            {"filename": "scripts/clean_a.py", "status": "added", "patch": "@@ -0,0 +1 @@\n+VALUE_A = 1\n"},
+            {"filename": "scripts/clean_b.py", "status": "added", "patch": "@@ -0,0 +1 @@\n+VALUE_B = 2\n"},
+        ]
+        pl_lines, pl_failed = keeper.run(plain_mq, tmp_path / "verify_plain.json", apply=True, direct_config=mq_cfg, verify_runner=fail_verify)
+        assert not pl_failed and mutations(plain_mq) == ["enqueue"]
+        assert "#48 enqueued" in pl_lines
+        assert iso_opens == 1
+
+        # Already matched by path -> ZERO isolated store opens.
+        iso_opens = 0
+        assert keeper._verify_run_areas_for_files(
+            ["scripts/clean_a.py", ".mcp/servers/sources/server.py"],
+            repository="unit/public",
+            file_rows=[
+                {"filename": "scripts/clean_a.py", "status": "added", "patch": "+VALUE_A = 1\n"},
+                {"filename": ".mcp/servers/sources/server.py", "status": "modified", "patch": "+X = 1\n"},
+            ],
+            repo_root=keeper_repo,
+            head=pr48_sha,
+            base_name="main",
+            number=48,
+        ) == ("sources",)
+        assert iso_opens == 0
+
+        # Repository catalog excludes "sources" -> ZERO isolated store opens.
+        orig_cat = keeper.prepublish_catalog
+        keeper.prepublish_catalog = lambda: {"p": {"github": "unit/api-only", "verify_run_areas": ["api"]}}
+        try:
+            assert keeper._verify_run_areas_for_files(
+                ["scripts/clean_a.py", "lu_machinery/api/state_router.py"],
+                repository="unit/api-only",
+                repo_root=keeper_repo,
+                head=pr48_sha,
+                base_name="main",
+                number=48,
+            ) == ("api",)
+            assert iso_opens == 0
+        finally:
+            keeper.prepublish_catalog = orig_cat
+    finally:
+        record_cf_verdict.isolated_object_store = orig_iso  # type: ignore[assignment]
 
 
-def test_pr_ci_infra_failure_gets_exactly_one_rerun_and_second_alerts(tmp_path: Path) -> None:
-    """Defect class: PR CI infra failure skips rerun, reruns a failing test node, or reruns twice without alerting."""
+def test_pr_ci_infra_failure_alerts_without_rerun(tmp_path: Path) -> None:
+    """Defect class: PR CI infrastructure failure triggers an automatic rerun or spams duplicate CTO alerts."""
     cfg = _direct_cfg(allow_infra_reenqueue=True)
-
-    # 1. Platform-proven pre-execution infrastructure failure (zero executed steps) -> posts evidence comment + ONE rerun;
-    # waits while attempt 1 is still reported, while attempt 2 is active, and while stale red checks lag a green attempt 2;
-    # exhausts and alerts claude-cto once ONLY on a confirmed completed failure on attempt 2.
-    fake = DirectFakeGitHub([pr(number=42)], repository=PRIVATE_REPO)
-    fake.checks_by_head[HEAD_A] = [{
+    infra_check = {
         "id": 701, "workflow_run_id": 8888, "name": "CI Gate", "head_sha": HEAD_A,
         "status": "completed", "conclusion": "failure", "started_at": "2026-09-23T00:00:00Z",
-    }]
-    fake.runs_by_id[8888] = {
-        "id": 8888, "head_sha": HEAD_A, "status": "completed", "conclusion": "failure",
-        "event": "pull_request", "run_attempt": 1,
     }
-    fake.jobs_by_run[8888] = [
-        {"id": 9901, "name": "validate", "status": "completed", "conclusion": "failure", "steps": []},
-        {"id": 9902, "name": "CI Gate", "status": "completed", "conclusion": "failure", "steps": []},
-    ]
-    fake.logs_by_job[9901] = ""
-    state = tmp_path / "infra_rerun.json"
 
-    lines1, failed1 = keeper.run(fake, state, apply=True, direct_config=cfg)
-    assert not failed1
-    assert [action for action in fake.actions if action[0] == "run-rerun"] == [("run-rerun", 8888)]
-    comment_bodies = [payload for name, payload in fake.actions if name == "comment"]
-    assert len(comment_bodies) == 1 and "<!-- ci-recovery-evidence " in comment_bodies[0]
-    assert '"diagnosis":"infrastructure"' in comment_bodies[0] and '"failed_tests":[]' in comment_bodies[0]
-    assert "#42 infra-rerun run=8888" in "\n".join(lines1)
-    assert json.loads(state.read_text()).get("cto_outbox", []) == []
+    # 1. Direct-landing mode (even with allow_infra_reenqueue=True): PR CI infra failure raises ONE
+    # claude-cto alert for that head, performs ZERO reruns or PR comments, and does not duplicate on
+    # later ticks even when another check on the same head also fails.
+    direct = DirectFakeGitHub([pr(number=42)], repository=PRIVATE_REPO)
+    direct.checks_by_head[HEAD_A] = [infra_check]
+    direct_state = tmp_path / "direct_infra_alert.json"
+    lines1, failed1 = keeper.run(direct, direct_state, apply=True, direct_config=cfg)
+    assert not failed1 and mutations(direct) == []
+    assert "#42 held: CI-red-CI Gate" in lines1
+    outbox1 = json.loads(direct_state.read_text())["cto_outbox"]
+    assert len(outbox1) == 1 and "8888" in outbox1[0]["body"] and HEAD_A in outbox1[0]["body"]
 
-    # F3 (R1 + R2): while GitHub still reports attempt 1 red, OR attempt 2 in_progress, OR stale red checks
-    # lagging a completed successful attempt 2 -> keeper waits (infra-rerun-pending) without exhausting or alerting.
-    for pending_update in (
-        {"run_attempt": 1, "status": "completed", "conclusion": "failure"},
-        {"run_attempt": 2, "status": "in_progress", "conclusion": None},
-        {"run_attempt": 2, "status": "completed", "conclusion": "success"},
-    ):
-        fake.runs_by_id[8888].update(pending_update)
-        lines_pending, failed_pending = keeper.run(fake, state, apply=True, direct_config=cfg)
-        assert not failed_pending
-        assert [action for action in fake.actions if action[0] == "run-rerun"] == [("run-rerun", 8888)]
-        assert any("infra-rerun-pending" in line for line in lines_pending)
-        assert json.loads(state.read_text()).get("cto_outbox", []) == []
+    direct.checks_by_head[HEAD_A].append({
+        "id": 702, "workflow_run_id": 8889, "name": "lint", "head_sha": HEAD_A,
+        "status": "completed", "conclusion": "failure", "started_at": "2026-09-23T00:01:00Z",
+    })
+    _lines2, failed2 = keeper.run(direct, direct_state, apply=True, direct_config=cfg)
+    assert not failed2 and mutations(direct) == []
+    assert len(json.loads(direct_state.read_text())["cto_outbox"]) == 1
 
-    # Tick 2: rerun completes and fails again on the SAME head (attempt 2, failure) -> NO second rerun, alerts claude-cto once.
-    fake.runs_by_id[8888].update({"run_attempt": 2, "status": "completed", "conclusion": "failure"})
-    lines2, failed2 = keeper.run(fake, state, apply=True, direct_config=cfg)
-    assert not failed2
-    assert [action for action in fake.actions if action[0] == "run-rerun"] == [("run-rerun", 8888)]
-    assert any("infra-rerun-exhausted" in line for line in lines2)
-    outbox = json.loads(state.read_text())["cto_outbox"]
-    assert len(outbox) == 1 and "8888" in outbox[0]["body"]
-    # Tick 3: still no second rerun and no duplicate CTO alert.
-    _lines3, failed3 = keeper.run(fake, state, apply=True, direct_config=cfg)
-    assert not failed3 and len(json.loads(state.read_text())["cto_outbox"]) == 1
+    # 2. Merge-queue mode with activation flags: PR CI infra failure alerts claude-cto ONCE,
+    # performs ZERO reruns or enqueues, and does not duplicate on the next tick.
+    mq = DirectFakeGitHub([pr(number=43, headRefOid=HEAD_A)], repository="unit/public")
+    mq.queue_enabled = True
+    mq.checks_by_head[HEAD_A] = [infra_check]
+    mq_state = tmp_path / "mq_infra_alert.json"
+    mq_cfg = _direct_cfg(repository="unit/public", allow_infra_reenqueue=True)
+    mq_lines1, mq_failed1 = keeper.run(mq, mq_state, apply=True, direct_config=mq_cfg)
+    assert not mq_failed1 and "enqueue" not in mutations(mq) and "re-enqueue" not in mutations(mq)
+    assert "#43 held: CI-red-CI Gate" in mq_lines1
+    mq_outbox = json.loads(mq_state.read_text())["cto_outbox"]
+    assert len(mq_outbox) == 1 and "8888" in mq_outbox[0]["body"] and HEAD_A in mq_outbox[0]["body"]
+    _mq_lines2, mq_failed2 = keeper.run(mq, mq_state, apply=True, direct_config=mq_cfg)
+    assert not mq_failed2 and len(json.loads(mq_state.read_text())["cto_outbox"]) == 1
 
-    # 2. A failing test node is NEVER infrastructure -> zero reruns, immediate CTO alert.
-    test_fail = DirectFakeGitHub([pr(number=43, headRefOid=HEAD_B)], repository=PRIVATE_REPO)
-    test_fail.checks_by_head[HEAD_B] = [{
-        "id": 702, "workflow_run_id": 8889, "name": "CI Gate", "head_sha": HEAD_B,
-        "status": "completed", "conclusion": "failure", "started_at": "2026-09-23T00:00:00Z",
-    }]
-    test_fail.runs_by_id[8889] = {
-        "id": 8889, "head_sha": HEAD_B, "status": "completed", "conclusion": "failure",
-        "event": "pull_request", "run_attempt": 1,
-    }
-    test_fail.jobs_by_run[8889] = [{"id": 9903, "name": "boundary-and-python", "status": "completed", "conclusion": "failure", "steps": []}]
-    test_fail.logs_by_job[9903] = "FAILED tests/test_example.py::test_broken - AssertionError\nThe runner has received a shutdown signal"
-    tf_state = tmp_path / "test_fail.json"
-    tf_lines, tf_failed = keeper.run(test_fail, tf_state, apply=True, direct_config=cfg)
-    assert not tf_failed and mutations(test_fail) == []
-    assert any("test-failure" in line for line in tf_lines)
-    assert len(json.loads(tf_state.read_text())["cto_outbox"]) == 1
-
-    # F2 (R1 + R2): missing steps with shutdown phrase in log, spoofed step display names after Set up job,
-    # mid-test network errors, and bare cancellations MUST NOT rerun; only platform-proven Set up job failure
-    # (step #1 failed with zero workflow steps executed) or empty steps reruns.
-    missing_steps = DirectFakeGitHub([pr(number=44, headRefOid=HEAD_A)], repository=PRIVATE_REPO)
-    missing_steps.checks_by_head[HEAD_A] = fake.checks_by_head[HEAD_A]
-    missing_steps.runs_by_id[8888] = {**fake.runs_by_id[8888], "run_attempt": 1}
-    missing_steps.jobs_by_run[8888] = [{"id": 9910, "name": "validate", "status": "completed", "conclusion": "failure"}]
-    missing_steps.logs_by_job[9910] = "2026-11-23T00:00:00Z ##[error]The self-hosted runner: pilot-vps lost communication with the server."
-    ms_state = tmp_path / "missing_steps.json"
-    _ms_lines, ms_failed = keeper.run(missing_steps, ms_state, apply=True, direct_config=cfg)
-    assert not ms_failed and mutations(missing_steps) == []
-    assert len(json.loads(ms_state.read_text())["cto_outbox"]) == 1
-
-    spoofed_checkout = DirectFakeGitHub([pr(number=45, headRefOid=HEAD_A)], repository=PRIVATE_REPO)
-    spoofed_checkout.checks_by_head[HEAD_A] = fake.checks_by_head[HEAD_A]
-    spoofed_checkout.runs_by_id[8888] = {**fake.runs_by_id[8888], "run_attempt": 1}
-    spoofed_checkout.jobs_by_run[8888] = [{
-        "id": 9911, "name": "validate", "status": "completed", "conclusion": "failure",
-        "steps": [
-            {"name": "Set up job", "number": 1, "status": "completed", "conclusion": "success"},
-            {"name": "Run actions/checkout@v4", "number": 2, "status": "completed", "conclusion": "failure"},
-        ],
-    }]
-    spoofed_checkout.logs_by_job[9911] = "fatal: unable to access: connection reset by peer"
-    sc_state = tmp_path / "spoofed_checkout.json"
-    _sc_lines, sc_failed = keeper.run(spoofed_checkout, sc_state, apply=True, direct_config=cfg)
-    assert not sc_failed and mutations(spoofed_checkout) == []
-    assert len(json.loads(sc_state.read_text())["cto_outbox"]) == 1
-
-    setup_job_fail = DirectFakeGitHub([pr(number=46, headRefOid=HEAD_A)], repository=PRIVATE_REPO)
-    setup_job_fail.checks_by_head[HEAD_A] = fake.checks_by_head[HEAD_A]
-    setup_job_fail.runs_by_id[8888] = {**fake.runs_by_id[8888], "run_attempt": 1}
-    setup_job_fail.jobs_by_run[8888] = [{
-        "id": 9912, "name": "validate", "status": "completed", "conclusion": "failure",
-        "steps": [
-            {"name": "Set up job", "number": 1, "status": "completed", "conclusion": "failure"},
-            {"name": "Run pytest", "number": 2, "status": "completed", "conclusion": "skipped"},
-        ],
-    }]
-    setup_job_fail.logs_by_job[9912] = "Failed to download action."
-    sj_lines, sj_failed = keeper.run(setup_job_fail, tmp_path / "setup_job_fail.json", apply=True, direct_config=cfg)
-    assert not sj_failed and [a for a in setup_job_fail.actions if a[0] == "run-rerun"] == [("run-rerun", 8888)]
-    assert "#46 infra-rerun run=8888" in "\n".join(sj_lines)
-
-    # F7: malformed list-valued Actions conclusion holds cleanly without raising TypeError.
-    malformed = DirectFakeGitHub([pr(number=47, headRefOid=HEAD_A)], repository=PRIVATE_REPO)
-    malformed.checks_by_head[HEAD_A] = fake.checks_by_head[HEAD_A]
-    malformed.runs_by_id[8888] = {
-        "id": 8888, "head_sha": HEAD_A, "status": "completed", "conclusion": ["failure"],
-        "event": "pull_request", "run_attempt": 1,
-    }
-    mal_state = tmp_path / "malformed.json"
-    _mal_lines, mal_failed = keeper.run(malformed, mal_state, apply=True, direct_config=cfg)
-    assert not mal_failed and mutations(malformed) == []
-    assert len(json.loads(mal_state.read_text())["cto_outbox"]) == 1
-
-    # F9: direct-landing PR green at initial snapshot then red with lost runner on fresh read
-    # routes to run-rerun instead of jumping directly into repair custody.
-    from datetime import UTC, datetime
-
-    from lu_machinery.orchestration import pr_ownership as own
-    from lu_machinery.orchestration.fleet_repos import FleetRepo
-
-    fresh_own = tmp_path / "fresh_infra_own.json"
-    fleet = {"private": FleetRepo("private", PRIVATE_REPO, "private-infra", "private-infra")}
-    worker = {"task_id": "w1", "worktree_branch": "codex/x", "status": "running", "repository": PRIVATE_REPO, "run_nonce": "n1"}
-    own.acknowledge_keeper_transfer(
-        fresh_own,
-        repo=PRIVATE_REPO,
-        number=48,
-        pr={"state": "OPEN", "isDraft": False, "headRefOid": HEAD_A, "headRefName": "codex/x", "baseRefName": "main", "isCrossRepository": False},
-        worker_task="w1",
-        worker_nonce="n1",
-        records=[worker],
-        now=datetime(2026, 9, 23, 12, 0, tzinfo=UTC),
-        rerun="unspent",
-        repos=fleet,
-        verdict_receipt={"pr": 48, "head": HEAD_A, "task": "rev1", "verdict": "APPROVED", "status": "posted"},
-        live=lambda r: r is not None and r.get("status") == "running",
-    )
-
-    class FreshRedDirectGitHub(DirectFakeGitHub):
-        def __init__(self, *a: Any, **kw: Any) -> None:
-            super().__init__(*a, **kw)
-            self._check_reads = 0
-
-        def checks(self, head: str) -> list[dict[str, Any]]:
-            self._check_reads += 1
-            if self._check_reads == 1:
-                return checks(head)
-            return list(fake.checks_by_head[HEAD_A])
-
-    fresh_red = FreshRedDirectGitHub([pr(number=48, headRefOid=HEAD_A)], repository=PRIVATE_REPO)
-    fresh_red.runs_by_id[8888] = {**fake.runs_by_id[8888], "run_attempt": 1}
-    fresh_red.jobs_by_run[8888] = fake.jobs_by_run[8888]
-    fresh_red.logs_by_job[9901] = fake.logs_by_job[9901]
-    fr_lines, fr_failed = keeper.run(
-        fresh_red, tmp_path / "fresh_red.json", apply=True, direct_config=cfg, ownership_path=fresh_own,
-    )
-    assert not fr_failed
-    assert [a for a in fresh_red.actions if a[0] == "run-rerun"] == [("run-rerun", 8888)]
-    assert "#48 infra-rerun run=8888" in "\n".join(fr_lines)
-    fr_custody = own.keeper_custody_for(fresh_own, PRIVATE_REPO, 48)
-    assert fr_custody is not None and fr_custody["keeper_state"] == "active"
-
-    # 3. Dormant (allow_infra_reenqueue=False): never reruns even on infra failure.
-    dormant = DirectFakeGitHub([pr(number=42)], repository=PRIVATE_REPO)
-    dormant.checks_by_head[HEAD_A] = fake.checks_by_head[HEAD_A]
-    dormant.runs_by_id[8888] = {**fake.runs_by_id[8888], "run_attempt": 1}
-    dormant.jobs_by_run[8888] = fake.jobs_by_run[8888]
-    dormant.logs_by_job[9901] = fake.logs_by_job[9901]
-    _dl, df = keeper.run(dormant, tmp_path / "dormant_rerun.json", apply=True, direct_config=_direct_cfg(allow_infra_reenqueue=False))
-    assert not df and mutations(dormant) == []
+    # 3. Dormant mode (no direct_config, no ownership_path): no CTO alert queued and no mutation.
+    dormant = DirectFakeGitHub([pr(number=44, headRefOid=HEAD_A)], repository="unit/public")
+    dormant.queue_enabled = True
+    dormant.checks_by_head[HEAD_A] = [infra_check]
+    dormant_state = tmp_path / "dormant_ci_fail.json"
+    _dl, df = keeper.run(dormant, dormant_state, apply=True)
+    assert not df and "enqueue" not in mutations(dormant)
+    assert json.loads(dormant_state.read_text()).get("cto_outbox", []) == []
 
 
 def test_ejected_repaired_head_reenqueues_once_only_with_repair_evidence(tmp_path: Path) -> None:
