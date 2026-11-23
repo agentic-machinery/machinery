@@ -1621,13 +1621,6 @@ def _compute_dispatch_routing_budget(
     # Build warnings for any lane in deficit (authoritative or fallback)
     for lane in SUBSCRIPTION_LANES:
         if lane in agents:
-            ladder = agents[lane].get("status")
-            if lane == "cursor" and ladder in {"hot", "near_cap"} and credit_lane.cursor_auto_lasts(
-                agents[lane], snapshot_stale=is_stale, now=current_time
-            ):
-                # The Auto burn ladder reads used-percent only; the pool's own pace says it lasts.
-                agents[lane]["status"] = "cool"
-                warnings.append(f"lane cursor: Auto allowance lasts to its reset at current pace — cool, not {ladder}")
             deficit = credit_lane.pace_deficit_state(
                 lane,
                 agents[lane],
@@ -1729,6 +1722,27 @@ def _compute_dispatch_routing_budget(
     # One source of truth with the machinery page: a pool that runs out before its reset is never cool.
     pool_pace = _pool_pace(current_time)
     _apply_pool_pace(agents, pool_pace, warnings)
+    # The Cursor Auto burn ladder reads used-percent only. It yields when the pool's own pace says
+    # it lasts and nothing on the shared Grok+Cursor meter reports a run-out.
+    cursor_record = agents.get("cursor")
+    ladder = cursor_record.get("status") if isinstance(cursor_record, dict) else None
+    if (
+        isinstance(cursor_record, dict)
+        and ladder in {"hot", "near_cap"}
+        and credit_lane.cursor_auto_lasts(
+            cursor_record,
+            grok=agents.get("grok"),
+            snapshot_stale=is_stale,
+            serve_for_s=ROUTING_BUDGET_TTL_S,
+            now=current_time,
+        )
+    ):
+        pool = cursor_record.get("pool_pace")
+        pool_status = pool.get("status") if isinstance(pool, dict) else None
+        cursor_record["status"] = "unknown" if pool_status == "unknown" else "cool"
+        warnings.append(
+            f"lane cursor: Auto allowance lasts to its reset at current pace — {cursor_record['status']}, not {ladder}"
+        )
 
     # Map health information to all subscription lanes in the agents dict
     for lane in SUBSCRIPTION_LANES:

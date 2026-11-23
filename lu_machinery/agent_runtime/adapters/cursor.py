@@ -32,7 +32,7 @@ import subprocess
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -888,30 +888,59 @@ def _monthly_window_block(
 _MAX_BILLING_CYCLE_MINUTES = 31 * 24 * 60
 
 
-def _billing_cycle_minutes(start_ms: object, end_ms: object) -> int | None:
-    """Length in whole minutes of the billing cycle the usage payload reports, or ``None``.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
-    Both bounds must be non-negative integer milliseconds (an ``int`` or a digit
-    string, as the dashboard API sends them), the end after the start, the
-    length a whole number of minutes and at most :data:`_MAX_BILLING_CYCLE_MINUTES`.
-    Anything else is unknown, so no pace is computed from it.
+
+def _cycle_instant(raw: object) -> datetime | None:
+    """One cycle bound: integer epoch milliseconds (an ``int`` or a digit string) or explicit-UTC ISO text.
+
+    Milliseconds are added exactly (no float rounding). ISO text must carry a
+    zero UTC offset (``Z`` or ``+00:00``). Anything else is ``None``.
     """
-    bounds: list[int] = []
-    for raw in (start_ms, end_ms):
-        if isinstance(raw, bool):
-            return None
-        if isinstance(raw, int) and raw >= 0:
-            bounds.append(raw)
+    if isinstance(raw, bool):
+        return None
+    millis: int | None = None
+    if isinstance(raw, int):
+        millis = raw
+    elif not isinstance(raw, str) or not raw or len(raw) > 40 or not raw.isascii():
+        return None
+    elif raw.isdigit():
         # Epoch milliseconds have 13 digits; a longer string is not a timestamp (and
         # int() refuses strings past the interpreter's digit limit).
-        elif isinstance(raw, str) and 0 < len(raw) <= 16 and raw.isascii() and raw.isdigit():
-            bounds.append(int(raw))
-        else:
+        if len(raw) > 16:
             return None
-    length_ms = bounds[1] - bounds[0]
-    if length_ms <= 0 or length_ms % 60_000:
+        millis = int(raw)
+    if millis is not None:
+        if millis < 0:
+            return None
+        try:
+            return _EPOCH + timedelta(milliseconds=millis)
+        except OverflowError:  # past datetime's year 9999
+            return None
+    if not isinstance(raw, str):
         return None
-    minutes = length_ms // 60_000
+    try:
+        parsed = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return None
+    return parsed if parsed.utcoffset() == timedelta(0) else None
+
+
+def _cycle_minutes(start: object, end: object) -> int | None:
+    """Length in whole minutes of the usage cycle between two reported bounds, or ``None``.
+
+    Both bounds must parse (:func:`_cycle_instant`), the end must follow the
+    start, and the length must be a whole number of minutes and at most
+    :data:`_MAX_BILLING_CYCLE_MINUTES`. Anything else is unknown, so no pace
+    is computed from it.
+    """
+    first, last = _cycle_instant(start), _cycle_instant(end)
+    if first is None or last is None:
+        return None
+    length = last - first
+    if length <= timedelta(0) or length % timedelta(minutes=1):
+        return None
+    minutes = length // timedelta(minutes=1)
     return minutes if minutes <= _MAX_BILLING_CYCLE_MINUTES else None
 
 
@@ -972,6 +1001,10 @@ def _probe_cursor_grok_bot_window(*, token: str, timeout_s: float) -> dict[str, 
             resets_at = iso
             break
     block = _usage_window_block(used_pct, label="Grok Bot", window="weekly", resets_at=resets_at)
+    # Its own period length, so routing can tell whether it is the Auto cycle.
+    period_minutes = _cycle_minutes(payload.get("currentPeriodStart"), resets_at)
+    if period_minutes is not None:
+        block["window_minutes"] = period_minutes
     block["probe_state"] = "healthy" if used_pct is not None else "NEED_PROBE"
     block["included"] = True
     return block
@@ -1048,7 +1081,7 @@ def probe_cursor_provider_windows(*, timeout_s: float = 8.0) -> dict[str, Any]:
     total_pct = float(total_used) if isinstance(total_used, (int, float)) else None
     resets_at = _ms_to_iso_z(payload.get("billingCycleEnd"))
     # The cycle length lets the routing owner pace the Auto pool on its own window.
-    cycle_minutes = _billing_cycle_minutes(payload.get("billingCycleStart"), payload.get("billingCycleEnd"))
+    cycle_minutes = _cycle_minutes(payload.get("billingCycleStart"), payload.get("billingCycleEnd"))
 
     auto_block = _monthly_window_block(
         auto_pct, label="Cursor Models (Auto)", resets_at=resets_at, window_minutes=cycle_minutes

@@ -1172,7 +1172,9 @@ def pace_forecast(
 def cursor_auto_lasts(
     record: Mapping[str, Any] | None,
     *,
+    grok: Mapping[str, Any] | None = None,
     snapshot_stale: bool = False,
+    serve_for_s: float = 0.0,
     policy: CreditPolicy | None = None,
     now: datetime | None = None,
 ) -> bool:
@@ -1182,17 +1184,30 @@ def cursor_auto_lasts(
     >= 90% ``near_cap``). A pool that lasts to its reset is spent, not held, so
     that label yields only to positive evidence from the same reading:
     :func:`pace_forecast` on the Auto window itself (its billing-cycle length,
-    remaining and reset) is available, fresh and says ``will_last_to_reset``.
-    The Auto window must be the tightest reported window, and a tied window
-    must reset at the same instant (the same cycle). More than the used-up
-    line must be left, and the runtime record must say it is not
-    headroom-blocked. Anything else is ``False``: the ladder status stays.
+    remaining and reset) is available, fresh and says ``will_last_to_reset``,
+    and the reset is more than ``serve_for_s`` away (the time a computed
+    snapshot may still be served). Every other reported window must agree:
+    Auto is the tightest window; the Grok Bot allotment, unless the provider
+    says it is not included, reports its own reading over the identical cycle
+    (same reset, same length), so at no higher usage it lasts too; and no
+    attached pool verdict (``pool_pace``) reports a run-out. ``grok`` is the
+    Grok lane record on the same Grok+Cursor meter: it must not read ``hot``
+    or ``near_cap``, nor report less remaining than Auto. More than the
+    used-up line must be left, and the runtime summary must be readable, with
+    no unreadable evidence, and not headroom-blocked. Anything else is
+    ``False``: the ladder status stays.
     """
     data = record if isinstance(record, Mapping) else {}
     if data.get("status_source") != "cursor_auto":
         return False
     runtime = data.get("runtime")
-    if not isinstance(runtime, Mapping) or runtime.get("headroom_blocked") is not False:
+    if not isinstance(runtime, Mapping) or runtime.get("headroom_blocked") is not False or "summary_error" in runtime:
+        return False
+    unreadable = runtime.get("unreadable")
+    if not isinstance(unreadable, Mapping) or unreadable.get("total") != 0:
+        return False
+    verdict = data.get("pool_pace")
+    if isinstance(verdict, Mapping) and verdict.get("status") in {"hot", "near_cap"}:
         return False
     auto = _auto_window(data)
     auto_rem = _block_remaining(auto)
@@ -1202,15 +1217,39 @@ def cursor_auto_lasts(
         return False
     if auto_rem <= _NEAR_CAP_REMAINING_PCT or plan_remaining_pct(data) != auto_rem:
         return False
-    native = _sub_mapping(data, "codexbar")
-    weekly_rem = _number(native.get("weekly_remaining_pct"))
-    if weekly_rem is not None and weekly_rem <= auto_rem and _reset_time(native.get("weekly_resets_at")) != auto_reset:
+    if grok is not None:
+        if not isinstance(grok, Mapping) or grok.get("status") in {"hot", "near_cap"}:
+            return False
+        grok_rem = plan_remaining_pct(grok)
+        if grok_rem is not None and grok_rem < auto_rem:
+            return False
+    windows = data.get("provider_windows")
+    bot = windows.get("grok_bot") if isinstance(windows, Mapping) else None
+    if not isinstance(bot, Mapping):
         return False
+    if bot.get("included") is not False:
+        bot_rem = _block_remaining(bot)
+        bot_mins, bot_ok = _parse_window_minutes(bot)
+        if (
+            bot_rem is None
+            or bot_rem < auto_rem
+            or not bot_ok
+            or bot_mins != auto_mins
+            or _reset_time(_block_reset(bot)) != auto_reset
+        ):
+            return False
     rem, reset, mins, ok, error = _matched_pace_window(data)
     if error is not None or not ok or rem != auto_rem or _reset_time(reset) != auto_reset or mins != auto_mins:
         return False
     forecast = pace_forecast(data, snapshot_metadata={"stale": snapshot_stale}, policy=policy, now=now)
-    return forecast["available"] is True and forecast["source"] == "usage_pace" and forecast["will_last_to_reset"] is True
+    hours = forecast["hours_to_reset"]
+    return (
+        forecast["available"] is True
+        and forecast["source"] == "usage_pace"
+        and forecast["will_last_to_reset"] is True
+        and isinstance(hours, (int, float))
+        and hours * 3600.0 > serve_for_s
+    )
 
 
 _GROK_CURSOR_SEVERITY = {"idle": 0, "cool": 0, "warm": 1, "hot": 2, "near_cap": 3}

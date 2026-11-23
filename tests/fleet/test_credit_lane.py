@@ -1642,6 +1642,7 @@ def _cursor_budget(monkeypatch, tmp_path, *, hours_to_reset: float, cycle_start:
     if cycle_start:
         usage["billingCycleStart"] = str(end_ms - 7 * 24 * 3600 * 1000)
     sand = {"usagePercent": 90.8, "nextResetTimestampUtc": end.isoformat().replace("+00:00", "Z"),
+            "currentPeriodStart": (end - timedelta(days=7)).isoformat().replace("+00:00", "Z"),
             "hasNonZeroIncludedLimit": True}
 
     class _Response(io.BytesIO):
@@ -1660,6 +1661,10 @@ def _cursor_budget(monkeypatch, tmp_path, *, hours_to_reset: float, cycle_start:
     probe = {**cursor_mod.probe_cursor_provider_windows(timeout_s=3), "freshness": "fresh", "stale": False, "age_s": 60.0}
     budget_path = _configure_base(monkeypatch, tmp_path)
     monkeypatch.setattr(state_router, "get_cursor_lane_usage", lambda **kw: copy.deepcopy(probe))
+    runtime = {"source": "agent_runtime_jsonl", "window_s": 300, "ok": 0, "error": 0, "rate_limited": 0, "timeout": 0,
+               "other": 0, "total": 0, "headroom_blocked": False, "headroom_reason": "",
+               "unreadable": {"files": 0, "lines": 0, "records": 0, "total": 0}}
+    monkeypatch.setattr(state_router, "summarize_lane_runtime", lambda agent, **kw: dict(runtime))
     data = state_router.compute_routing_budget(
         NOW, budget_config_path=budget_path, tasks_dir=tmp_path / "tasks", project_root=tmp_path,
         curriculum_root=tmp_path, batch_state_dir=tmp_path,
