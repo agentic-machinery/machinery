@@ -21,6 +21,12 @@ figures use reviews of record (reviews that name a PR and the author's model). O
 labels leave ``view=page``. The per-reason counts stay on every HTTP view. Up to 200 escaped characters of the
 first failing reply per model and reason leave only on ``view=full`` and ``view=samples``: never prompts, parsed
 bodies, paths, accounts or task ids, and never any sample on ``view=page`` or ``/metrics``.
+
+``author_risks[].by_risk`` groups published outcomes by the first review's risk. Its ``by_size`` groups use
+additions plus deletions at merge: 0–100, 101–1,000, over 1,000, or unknown without a measurable diff.
+``post_merge_rework_proxy`` counts attributed merges named by a fix or revert in the same repository over the
+next seven days of local history. A merge enters the selected window when its seven-day follow-up ends.
+``no_deliverable_causes`` counts each no-deliverable task once, using its recorded cause when available.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ from lu_machinery.review.model_catalog import (
 from . import planning
 from .model_stats_rows import (
     NATIVE_ALIASES,
+    NO_DELIVERABLE_CAUSES,
     POOLS,
     UNKNOWN_EFFORT,
     UNPARSED_REASONS,
@@ -107,19 +114,25 @@ _TRAILER = re.compile(r"X-Agent: [A-Za-z0-9._-]+/([A-Za-z0-9._-]+)[ \t]*")
 # CommonMark: a backtick fence's info string has no backtick, so "```X-Agent``` ..." is inline code, not a fence.
 _FENCE_OPEN = re.compile(r" {0,3}(?:(`{3,})[^`]*|(~{3,}).*)")
 _FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
+_SQUASH_SUBJECT = re.compile(r"(.+) \(#([1-9][0-9]{0,9})\)$")
+_MERGE_SUBJECT = re.compile(r"Merge pull request #([1-9][0-9]{0,9}) from \S+")
+_REWORK_TITLE = re.compile(r"^(?:fix|bugfix|hotfix|revert)\b", re.I)
+_REWORK_RELATION = re.compile(r"\b(?:fix(?:es|ed)?|revert(?:s|ed)?|follow[- ]up (?:to|for))\s+(?:PR\s+)?$", re.I)
+_PR_REFERENCE = re.compile(
+    r"https://github\.com/([\w.-]+/[\w.-]+)/pull/([1-9][0-9]{0,9})(?!\w)"
+    r"|(?<![\w/.-])(?:([\w.-]+/[\w.-]+))?#([1-9][0-9]{0,9})(?!\w)", re.I,
+)
+_REVERT_SHA = re.compile(r"This reverts commit ([0-9a-f]{40}(?:[0-9a-f]{24})?)\.?")
+_SHORTSTAT = re.compile(r" [0-9]+ files? changed(?:, ([0-9]+) insertions?\(\+\))?(?:, ([0-9]+) deletions?\(-\))?")
+_REWORK_WINDOW = timedelta(days=7)
+_SIZE_LIMITS = ((100, "small"), (1000, "medium"))
+_SIZE_ORDER = ("small", "medium", "large", "unknown")
 
 router = APIRouter()
 
 
-def trailer_task_ids(message: str) -> set[str]:
-    """Task ids named by whole-line ``X-Agent: <harness>/<task>`` trailers in one commit message.
-
-    Lines inside a backtick or tilde code fence (CommonMark: closed by a run of the same character at least as long,
-    else open to the end) are examples, never attribution. This is a line scan, not a Markdown parser; its known
-    limits (docs/runbooks/model-stats.md) are that a trailer-shaped line inside an inline code span running across
-    lines still counts, and that an unclosed fence earlier in a message hides the trailers after it.
-    """
-    found: set[str] = set()
+def _unfenced_lines(message: str) -> Iterator[str]:
+    """Skip backtick and tilde code fences, including a fence left open to the end."""
     fence: str | None = None
     for line in message.splitlines():
         if fence is not None:
@@ -129,9 +142,26 @@ def trailer_task_ids(message: str) -> set[str]:
             continue
         if opened := _FENCE_OPEN.fullmatch(line):
             fence = opened.group(1) or opened.group(2)
-        elif trailer := _TRAILER.fullmatch(line):
-            found.add(trailer.group(1))
-    return found
+        else:
+            yield line
+
+
+def trailer_task_ids(message: str) -> set[str]:
+    """Task IDs from whole-line attribution trailers outside code fences.
+
+    An unclosed fence hides later trailers. A trailer-shaped line in a multi-line inline code span still counts.
+    """
+    return {trailer.group(1) for line in _unfenced_lines(message) if (trailer := _TRAILER.fullmatch(line))}
+
+
+@dataclass
+class _MergedPR:
+    sha: str
+    at: datetime
+    task_ids: set[str]
+    references: set[str]
+    reverted_shas: set[str]
+    size: str = "unknown"
 
 
 @dataclass
@@ -139,39 +169,123 @@ class Landing:
     task_ids: set[str] = field(default_factory=set)
     repositories: Counter[str] = field(default_factory=Counter)
     by_repository: Counter[str] = field(default_factory=Counter)
+    prs: dict[tuple[str, str], _MergedPR] = field(default_factory=dict)
+    observed_through: dict[str, datetime] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {"trailer_task_ids": len(self.task_ids), "repositories": dict(sorted(self.repositories.items())),
                 "trailer_task_ids_by_repository": dict(sorted(self.by_repository.items()))}
 
 
-def scan_landing(primary_root: Path, since: datetime) -> Landing:
-    """Read each registered repository's local ``origin/main`` since ``since``; never fetch."""
+def _rework_references(title: str, body: str, slugs: frozenset[str]) -> tuple[set[str], set[str]]:
+    prs, shas = set(), set()
+    fix_title = bool(_REWORK_TITLE.match(title))
+    for line in _unfenced_lines(f"{title}\n{body}"):
+        if line.lstrip().startswith(">"):
+            continue
+        if revert := _REVERT_SHA.fullmatch(line):
+            shas.add(revert[1])
+        for ref in _PR_REFERENCE.finditer(line):
+            url_slug, url_pr, named_slug, named_pr = ref.groups()
+            target = url_slug or named_slug
+            if target and target.casefold() not in slugs:
+                continue
+            prefix = line[:ref.start()]
+            if fix_title or _REWORK_RELATION.search(prefix):
+                prs.add(url_pr or named_pr)
+    return prs, shas
+
+
+def _landed_sizes(checkout: Path, prs: list[_MergedPR], env: Mapping[str, str]) -> None:
+    """One batched local first-parent diff. A missing blob or malformed block leaves its sizes unknown."""
+    if not prs:
+        return
+    try:
+        diff = subprocess.run(
+            ["git", "-C", str(checkout), "diff-tree", "--stdin", "--always", "--diff-merges=first-parent",
+             "--shortstat", "--no-ext-diff", "--no-textconv", "-r", "--find-renames"],
+            input="".join(f"{pr.sha}\n" for pr in prs), capture_output=True, text=True,
+            timeout=GIT_TIMEOUT_SECONDS, env=env, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    sizes: list[tuple[_MergedPR, int]] = []
+    lines = iter(line for line in diff.stdout.splitlines() if line)
+    line = next(lines, None)
+    for pr in prs:
+        if line != pr.sha:
+            break
+        line = next(lines, None)
+        stat = _SHORTSTAT.fullmatch(line) if line else None
+        if stat:
+            sizes.append((pr, sum(int(count or 0) for count in stat.groups())))
+            line = next(lines, None)
+        elif (line is not None and _SHA_HEX.fullmatch(line)) or (line is None and diff.returncode == 0):
+            sizes.append((pr, 0))
+    for pr, size in sizes:
+        pr.size = next((label for maximum, label in _SIZE_LIMITS if size <= maximum), "large")
+
+
+def scan_landing(primary_root: Path, since: datetime, *,
+                 delivery_numbers: Mapping[tuple[str, str], str] | None = None,
+                 reviewed_prs: set[tuple[str, str]] | None = None) -> Landing:
+    """Read local origin/main once per repository. Measure only the landed PRs with published reviews."""
     landing = Landing()
     try:
         repos = list(load_fleet_repos().values())
     except FleetRepoError:
         landing.repositories["registry_unavailable"] += 1
         return landing
-    env = {**sanitized_git_env(), "GIT_OPTIONAL_LOCKS": "0"}
+    env = {**sanitized_git_env(strip_config_injection=True), "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1",
+           "GIT_NO_REPLACE_OBJECTS": "1", "LC_ALL": "C"}
+    reviewed_prs = reviewed_prs or set()
     for repo in repos:
         try:
             _, checkout = resolve_fleet_repo(repo.key, primary_root=primary_root, require_checkout=True)
             completed = subprocess.run(
-                ["git", "-C", str(checkout), "log", "refs/remotes/origin/main", f"--since={since.isoformat()}",
-                 "--format=%x01%B"],
-                capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS, env=env, check=False,
+                ["git", "-C", str(checkout), "log", "--topo-order", "-z", "--encoding=UTF-8",
+                 "--format=%H%x00%P%x00%cI%x00%B", f"--since={since.isoformat()}", "refs/remotes/origin/main"],
+                capture_output=True, encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT_SECONDS, env=env,
+                check=False,
             )
         except (FleetRepoError, OSError, subprocess.SubprocessError):
             landing.repositories["unavailable"] += 1
             continue
-        if completed.returncode != 0:
+        parts = completed.stdout.split("\0")
+        if completed.returncode != 0 or parts[-1] or (len(parts) - 1) % 4:
             landing.repositories["unavailable"] += 1
             continue
         landing.repositories["read"] += 1
         found: set[str] = set()
-        for message in completed.stdout.split("\x01"):
-            found |= trailer_task_ids(message)
+        first_parent = None
+        fields = iter(parts[:-1])
+        repo_prs: dict[str, _MergedPR] = {}
+        measurable: list[_MergedPR] = []
+        slugs = frozenset(slug.casefold() for slug in repo.slugs)
+        for sha, parents, merged_at, message in zip(fields, fields, fields, fields, strict=True):
+            task_ids = trailer_task_ids(message)
+            found |= task_ids
+            if first_parent is not None and sha != first_parent:
+                continue
+            first_parent = parents.partition(" ")[0]
+            if (moment := timestamp(merged_at)) is None:
+                continue
+            landing.observed_through.setdefault(repo.key, moment)
+            title, _, body = message.partition("\n")
+            number = (delivery_numbers or {}).get((repo.key, sha))
+            if squash := _SQUASH_SUBJECT.fullmatch(title):
+                title, subject_number = squash.groups()
+                number = number or subject_number
+            elif merge := _MERGE_SUBJECT.fullmatch(title):
+                title, _, body = body.lstrip("\n").partition("\n")
+                number = number or merge[1]
+            if number and number not in repo_prs:
+                refs, shas = _rework_references(title, body, slugs)
+                pr = repo_prs[number] = _MergedPR(sha, moment, task_ids, refs, shas)
+                if parents and (repo.key, number) in reviewed_prs:
+                    measurable.append(pr)
+        _landed_sizes(checkout, measurable, env)
+        landing.prs.update({(repo.key, number): pr for number, pr in repo_prs.items()})
         landing.by_repository[repo.key] += len(found)
         landing.task_ids |= found
     return landing
@@ -476,6 +590,7 @@ class _Group:
         self.landed = 0
         self.verdicts: Counter[str] = Counter()
         self.never_started_reasons: Counter[str] = Counter()
+        self.no_deliverable_causes: Counter[str] = Counter()
         self.unparsed_reasons: Counter[str] = Counter()
         self.review_evidence_absent: Counter[str] = Counter()
         self.unparsed_samples: dict[str, tuple[tuple[datetime, str], str, str]] = {}
@@ -491,6 +606,8 @@ class _Group:
             reason = row.raw.get("never_started_reason")
             code = reason if isinstance(reason, str) and reason in START_REFUSAL_CODES else "unknown"
             self.never_started_reasons[code] += 1
+        if row.status == "no_deliverable":
+            self.no_deliverable_causes[row.raw.get("no_deliverable_cause") or "no_commits_or_unknown"] += 1
         if row.duration is not None:
             self.durations.append(row.duration)
         self.tokens = [a + b for a, b in zip(self.tokens, row.tokens, strict=True)]
@@ -529,6 +646,7 @@ class _Group:
         self.landed += other.landed
         self.verdicts.update(other.verdicts)
         self.never_started_reasons.update(other.never_started_reasons)
+        self.no_deliverable_causes.update(other.no_deliverable_causes)
         self.unparsed_reasons.update(other.unparsed_reasons)
         self.review_evidence_absent.update(other.review_evidence_absent)
         for reason, item in other.unparsed_samples.items():
@@ -554,6 +672,7 @@ class _Group:
             "never_started_reasons": dict(sorted(self.never_started_reasons.items())),
             "not_done": _rate(tasks - self.status["done"], tasks),
             "no_deliverable": _rate(self.status["no_deliverable"], tasks),
+            "no_deliverable_causes": {cause: self.no_deliverable_causes[cause] for cause in NO_DELIVERABLE_CAUSES},
             "wall_seconds": {"p25": _percentile(self.durations, 0.25), "median": _median(self.durations),
                              "p75": _percentile(self.durations, 0.75), "p90": _percentile(self.durations, 0.9),
                              "total_hours": round(hours, 2), "total_seconds": round(seconds, 1),
@@ -720,6 +839,27 @@ def _prs(rows: Iterable[_Row], *, of_record: bool = False) -> list[dict[str, Any
 AFTER_BLOCK = ("approved_on_new_head", "approved_on_same_head", "not_approved")
 
 
+def _count_author_result(counts: Counter[str], pr: Mapping[str, Any]) -> None:
+    counts["prs"] += 1
+    counts["rounds"] += pr["rounds"]
+    counts["approved"] += pr["approved"]
+    counts["first_round_approved"] += pr["first"] == "correct"
+    if pr["findings_known"]:
+        counts["findings_known"] += 1
+        counts["blocking"] += pr["blocking"]
+        counts["p0_p2"] += pr["p0_p2"]
+
+
+def _author_quality(counts: Counter[str]) -> dict[str, Any]:
+    prs, known = counts["prs"], counts["findings_known"]
+    return {"prs": prs, "low_sample": prs < LOW_SAMPLE,
+            "rounds_per_pr": _rate(counts["rounds"], prs, 2),
+            "approved_eventually": _rate(counts["approved"], prs),
+            "first_round_approved": _rate(counts["first_round_approved"], prs),
+            "blocking_per_pr": _rate(counts["blocking"], known, 2),
+            "p0_p2_per_pr": _rate(counts["p0_p2"], known, 2)}
+
+
 def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str) -> list[dict[str, Any]]:
     """Author-side review outcomes per author model (a PR with two author models is grouped under ``a+b``)."""
     by_author: dict[str, Counter[str]] = defaultdict(Counter)
@@ -728,25 +868,12 @@ def _authors(prs: Iterable[Mapping[str, Any]], name: Callable[[str], str] = str)
         author = name(pr["author"])
         counts = by_author[author]
         efforts[author].update(pr["review_efforts"])
-        counts["prs"] += 1
-        counts["rounds"] += pr["rounds"]
-        counts["approved"] += pr["approved"]
-        counts["first_round_approved"] += pr["first"] == "correct"
-        if pr["findings_known"]:
-            counts["findings_known"] += 1
-            counts["blocking"] += pr["blocking"]
-            counts["p0_p2"] += pr["p0_p2"]
+        _count_author_result(counts, pr)
         if pr["after_block"] is not None:
             counts["blocked"] += 1
             counts[pr["after_block"]] += 1
     return [
-        {"model": author, "identity": identity(author), "review_efforts": sorted(efforts[author]),
-         "prs": c["prs"], "low_sample": c["prs"] < LOW_SAMPLE,
-         "rounds_per_pr": _rate(c["rounds"], c["prs"], 2),
-         "approved_eventually": _rate(c["approved"], c["prs"]),
-         "first_round_approved": _rate(c["first_round_approved"], c["prs"]),
-         "blocking_per_pr": _rate(c["blocking"], c["findings_known"], 2),
-         "p0_p2_per_pr": _rate(c["p0_p2"], c["findings_known"], 2),
+        {"model": author, "identity": identity(author), "review_efforts": sorted(efforts[author]), **_author_quality(c),
          # After a first round that did not approve: did a later round approve a new head (the author changed the
          # code), the same head (approved without a change), or nothing yet in this window?
          "after_blocked_first_round": {"blocked": c["blocked"],
@@ -904,7 +1031,7 @@ def _risk(review_class: str) -> str:
 
 def _author_risks(record_prs: Iterable[Mapping[str, Any]], prs: Iterable[Mapping[str, Any]],
                   name: Callable[[str], str] = str) -> list[dict[str, Any]]:
-    """Per author of record: first-round approval and findings per PR split by the risk tier of the PR's first
+    """Per author of record: outcomes by landed diff size and the risk tier of the PR's first
     published review, all from published reviews (``_prs(of_record=True)``); and per author the PRs of the parsed
     cohort ``prs`` that ``record_prs`` lacks, which these tiers leave out (``prs_without_review_of_record``): in a
     window, a PR with no published review at all, or whose first published review came before the window."""
@@ -912,17 +1039,16 @@ def _author_risks(record_prs: Iterable[Mapping[str, Any]], prs: Iterable[Mapping
     recorded = {pr["key"] for pr in record_prs}
     cells: dict[str, dict[str, Counter[str]]] = defaultdict(lambda: defaultdict(Counter))
     efforts: dict[tuple[str, str], set[str]] = defaultdict(set)
+    sizes: dict[tuple[str, str, str], Counter[str]] = defaultdict(Counter)
+    size_efforts: dict[tuple[str, str, str], set[str]] = defaultdict(set)
     without_record: Counter[str] = Counter(name(pr["author"]) for pr in prs if pr["key"] not in recorded)
     for pr in record_prs:
         author, risk = name(pr["author"]), _risk(pr["class"])
-        cell = cells[author][risk]
+        key = author, risk, pr.get("diff_size", "unknown")
         efforts[(author, risk)].update(pr["review_efforts"])
-        cell["prs"] += 1
-        cell["first_round_approved"] += pr["first"] == "correct"
-        if pr["findings_known"]:
-            cell["findings_known"] += 1
-            cell["blocking"] += pr["blocking"]
-            cell["p0_p2"] += pr["p0_p2"]
+        size_efforts[key].update(pr["review_efforts"])
+        _count_author_result(cells[author][risk], pr)
+        _count_author_result(sizes[key], pr)
 
     def order(risk: str) -> tuple[int, str]:
         return (_RISK_ORDER.index(risk) if risk in _RISK_ORDER else len(_RISK_ORDER), risk)
@@ -931,13 +1057,63 @@ def _author_risks(record_prs: Iterable[Mapping[str, Any]], prs: Iterable[Mapping
         return sum(c["prs"] for c in cells.get(author, {}).values())
 
     return [{"model": author, "identity": identity(author), "prs_without_review_of_record": without_record[author],
-             "by_risk": [{"risk": risk, "prs": c["prs"], "low_sample": c["prs"] < LOW_SAMPLE,
-                          "review_efforts": sorted(efforts[(author, risk)]),
-                          "first_round_approved": _rate(c["first_round_approved"], c["prs"]),
-                          "blocking_per_pr": _rate(c["blocking"], c["findings_known"], 2),
-                          "p0_p2_per_pr": _rate(c["p0_p2"], c["findings_known"], 2)}
+             "by_risk": [{"risk": risk, "review_efforts": sorted(efforts[(author, risk)]), **_author_quality(c),
+                          "by_size": [{"size": size, "review_efforts": sorted(size_efforts[(author, risk, size)]),
+                                       **_author_quality(sizes[(author, risk, size)])}
+                                      for size in _SIZE_ORDER if (author, risk, size) in sizes]}
                          for risk, c in sorted(cells.get(author, {}).items(), key=lambda item: order(item[0]))]}
             for author in sorted(set(cells) | set(without_record), key=lambda a: (-total(a), a))]
+
+
+def _merge_outcomes(landing: Landing, rows: Iterable[_Row], record_prs: Iterable[Mapping[str, Any]],
+                    until: datetime) -> list[tuple[str, datetime, bool]]:
+    """One observation per attributed merge with a full seven days of local follow-up."""
+    writers = {}
+    deliveries: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in rows:
+        if row.role != "write":
+            continue
+        repo = row.raw.get("repo") or "public"
+        writers[repo, row.task_id] = row.model
+        if delivery := row.raw.get("landing"):
+            deliveries[repo, delivery["merge_sha"]].add(row.model)
+    reviewed_authors = {pr["key"]: pr["author"] for pr in record_prs}
+    by_sha = {(repo, pr.sha): number for (repo, number), pr in landing.prs.items()}
+    reworked: set[tuple[str, str]] = set()
+    earlier: dict[tuple[str, str], _MergedPR] = {}
+    # Mainline order distinguishes two merges with the same second-resolution timestamp.
+    for (repo, own_number), followup in reversed(landing.prs.items()):
+        if followup.at >= until:
+            continue
+        reverted = {by_sha[repo, sha] for sha in followup.reverted_shas if (repo, sha) in by_sha}
+        for number in followup.references | reverted:
+            if (pr := earlier.get((repo, number))) and timedelta(0) <= followup.at - pr.at <= _REWORK_WINDOW:
+                reworked.add((repo, number))
+        earlier[repo, own_number] = followup
+    outcomes = []
+    for (repo, number), pr in landing.prs.items():
+        eligible_at = pr.at + _REWORK_WINDOW
+        if eligible_at >= until or repo not in landing.observed_through or eligible_at > landing.observed_through[repo]:
+            continue
+        authors = {writers[repo, task] for task in pr.task_ids if (repo, task) in writers}
+        authors.update(deliveries.get((repo, pr.sha), ()))
+        author = "+".join(sorted(authors)) or reviewed_authors.get((repo, number))
+        if author:
+            outcomes.append((author, eligible_at, (repo, number) in reworked))
+    return outcomes
+
+
+def _post_merge_rework(outcomes: Iterable[tuple[str, datetime, bool]], since: datetime,
+                       name: Callable[[str], str] = str) -> list[dict[str, Any]]:
+    totals: Counter[str] = Counter()
+    reworked: Counter[str] = Counter()
+    for model, eligible_at, had_rework in outcomes:
+        if eligible_at >= since:
+            author = name(model)
+            totals[author] += 1
+            reworked[author] += had_rework
+    return [{"model": model, "identity": identity(model), "reworked": reworked[model],
+             "rate": _rate(reworked[model], n)} for model, n in sorted(totals.items(), key=lambda item: (-item[1], item[0]))]
 
 
 @dataclass(frozen=True)
@@ -1709,14 +1885,24 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     keys = repository_keys(catalog)
     moments = [m for m in map(_moment, raw_rows) if m]
     first = min(moments, default=until)
-    if landing is None:
-        landing = scan_landing(primary_root, first)
-    rows = [row for row in _rows(raw_rows, landing, alias_resolver(raw_rows), publications, keys)
+    rows = [row for row in _rows(raw_rows, landing or Landing(), alias_resolver(raw_rows), publications, keys)
             if row.moment < until]
     all_prs, all_record_prs = _prs(rows), _prs(rows, of_record=True)
+    if landing is None:
+        delivery_numbers = {(row.raw.get("repo") or "public", delivery["merge_sha"]): str(delivery["pr"])
+                            for row in rows if row.role == "write" and (delivery := row.raw.get("landing"))}
+        first_start = min((row.started for row in rows if row.started is not None), default=first)
+        landing = scan_landing(primary_root, min(first, first_start) - _REWORK_WINDOW, delivery_numbers=delivery_numbers,
+                               reviewed_prs={pr["key"] for pr in all_record_prs})
+        for row in rows:
+            row.trailer = row.task_id in landing.task_ids
+    for pr in all_record_prs:
+        if (merged := landing.prs.get(pr["key"])) and merged.at < until:
+            pr["diff_size"] = merged.size
     rows = [replace(row, author=None, review_author=None)
             if row.review_author and retired_subscription_model(row.review_author) else row
             for row in rows if not retired_subscription_model(row.model)]
+    merge_outcomes = _merge_outcomes(landing, rows, all_record_prs, until)
     pairs = head_pairs(rows)
     touched = scan_touched(primary_root, pairs, catalog)
     # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
@@ -1725,6 +1911,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     windows, metric_windows, page_windows, sample_windows = {}, {}, {}, {}
     for name, days in WINDOWS.items():
         since = first if days is None else until - timedelta(days=days)
+        rework_since = datetime.min.replace(tzinfo=UTC) if days is None else since
         selected = [row for row in rows if since <= row.moment]
         # A PR belongs to the window of its first review of record, and its rounds come from all of its history, so
         # a window that starts mid-PR never takes a later round for the first one.
@@ -1733,7 +1920,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         window = {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
                   "cohort": "finished_at, else started_at, in [since, until)"}
         windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows, touched=touched,
-                                                       record_prs=record_prs)}
+                                                       record_prs=record_prs),
+                         "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since)}
         # Bound each member of the author id after deriving PR outcomes: a joint author stays joint, never a known model.
         page_prs, page_record_prs = (
             [{**pr, "author": _page_author(pr["author"]), "reviewer": _page_model(pr["reviewer"]),
@@ -1743,7 +1931,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         page_summary = summarize(page_selected, prs=page_prs, record_prs=page_record_prs, history=page_rows,
                                  touched=touched, accuracy_rows=selected, reviewer_name=_page_model)
         sample_windows[name] = {"window": window, "models": _sample_models(page_summary["models"])}
-        page_windows[name] = {"window": window, **page_window(page_summary)}
+        page_windows[name] = {"window": window, **page_window(page_summary),
+                              "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since, _page_author)}
         # /metrics labels come from a finite set: a model outside the catalog's known values is "other".
         # 24h stays off this label set.
         if name in METRIC_WINDOWS:
