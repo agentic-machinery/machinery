@@ -1164,17 +1164,60 @@ def test_pr_create_postcreate_failures_report_pr_number_and_url_in_typed_detail(
     detail = json.loads(res.stderr)
     assert res.returncode == 1 and "pr_number" not in detail and detail["pr_url"] == pr_url
 
-    def invalid_url(method, endpoint, _payload):
-        if method == "GET":
-            return gh.Response(200, {}, open_ms)
-        if method == "POST":
-            return gh.Response(201, {}, json.dumps({"number": 77, "html_url": "https://github.com/o/r/pull/77\nevil"}).encode())
-        return gh.Response(500, {}, b"{}")
+    for idx, bad_url in enumerate(
+        (
+            "https://github.com/o/r/pull/77\nevil",
+            "https://[bad/pull/77",
+            "https://github.com]/pull/77",
+            "https://[::1]x/pull/77",
+            "https://github.com:99999/pull/77",
+            "https://github.com:abc/pull/77",
+            "https://:443/pull/77",
+            "https://user@/pull/77",
+        )
+    ):
+        def invalid_url(method, endpoint, _payload, _url=bad_url):
+            if method == "GET":
+                return gh.Response(200, {}, open_ms)
+            if method == "POST":
+                return gh.Response(201, {}, json.dumps({"number": 77, "html_url": _url}).encode())
+            return gh.Response(500, {}, b"{}")
 
-    store, _ = _milestone_client(tmp_path / "f1-bad-url", invalid_url)
-    res = gh.run(argv, client=store, capture_output=True, text=True)
-    detail = json.loads(res.stderr)
-    assert res.returncode == 1 and detail["pr_number"] == 77 and "pr_url" not in detail
+        store, calls = _milestone_client(tmp_path / f"f1-bad-url-{idx}", invalid_url)
+        res = gh.run(argv, client=store, capture_output=True, text=True)
+        detail = json.loads(res.stderr)
+        assert [m for m, _, _ in calls] == ["GET", "POST", "PATCH"], bad_url
+        assert res.returncode == 1 and res.github_result.error == "github_milestone_failed", bad_url
+        assert detail["pr_number"] == 77 and "pr_url" not in detail, bad_url
+
+    # Malformed bracket URL in exit-75 stderr must not raise in refusal_of(injected=True).
+    bad_url_rl = subprocess.CompletedProcess(
+        argv,
+        75,
+        "",
+        json.dumps({"error": "github_rate_limited", "reset_at": FUTURE, "reason": "retry_after", "pr_number": 77, "pr_url": "https://[x"}),
+    )
+    parsed_refusal = gh.refusal_of(bad_url_rl, injected=True)
+    assert parsed_refusal is not None and parsed_refusal.reason == "retry_after"
+    assert parsed_refusal.created_pr == {"pr_number": 77}
+
+    # Malformed bracket URL from gh pr create on a confirmed PATCH must not raise in publish("pr-create").
+    monkeypatch.setattr(gate, "check_texts", lambda *_a, **_kw: None)
+
+    def publish_bracket_url_ok(cmd, **_kwargs):
+        if cmd[:4] == ["gh", "api", "--method", "GET"] and "/milestones?" in cmd[4]:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps([[{"number": 13, "title": "v0.11.0", "state": "open"}]]), "")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return subprocess.CompletedProcess(cmd, 0, "https://[bad/pull/77\n", "")
+        if cmd[:4] == ["gh", "api", "--method", "PATCH"]:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps({"number": 77, "milestone": {"number": 13}}), "")
+        raise AssertionError(f"unexpected argv: {cmd!r}")
+
+    pub_ok = pub.publish(
+        "pr-create", repo="unit/public", title="feat: ok", body="Body", base="main", head="feat/ok",
+        milestone="v0.11.0", runner=publish_bracket_url_ok, cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert pub_ok.returncode == 0
 
     # 4. Pre-create failures (POST /pulls 422 whose body happens to include number/html_url) must NOT emit pr_number/pr_url.
     def post_422_with_number(method, endpoint, _payload):
@@ -1234,6 +1277,10 @@ def test_match_milestone_pages_ignores_unrelated_odd_rows_but_validates_matched_
     assert gh.match_milestone_pages(pages, "v0.11.0") == (13, "v0.11.0")
     assert gh.match_milestone_pages(pages, "13") == (13, "v0.11.0")
     assert gh.match_milestone_pages(pages, "1") == (1, "v0.1.0")
+    assert gh.match_milestone_pages(
+        [[{"number": 10**5000, "title": "huge-int", "state": "open"}, {"number": 13, "title": "v0.11.0", "state": "open"}]],
+        "13",
+    ) == (13, "v0.11.0")
     assert pub.match_milestone_pages(pages, "v0.11.0", repo="o/r") == (13, "v0.11.0")
 
     # End-to-end gh pr create --milestone succeeds when an unrelated milestone has a ZWJ emoji title.

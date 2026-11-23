@@ -187,7 +187,7 @@ class GitHubRateLimited(RuntimeError):
             last = _LAST_REFUSAL.get()
             reason = last[1] if last is not None and last[0] == reset_at else None
         self.reset_at, self.reason = reset_at, reason
-        self.created_pr = dict(created_pr) if created_pr else None
+        self.created_pr = dict(created_pr) if isinstance(created_pr, dict) and created_pr else None
         extra = ""
         if self.created_pr:
             if "pr_number" in self.created_pr:
@@ -2547,18 +2547,23 @@ class GitHubMilestoneError(ValueError):
 
 
 def _valid_pr_url(value: object) -> str | None:
-    """Return *value* if it is a clean single-line HTTP(S) URL with a host and no control/format/whitespace characters."""
+    """Return *value* if it is a clean single-line HTTP(S) URL with a valid host and no control/format/whitespace characters."""
     if (
-        isinstance(value, str)
-        and value.startswith(("https://", "http://"))
-        and not any(
+        not isinstance(value, str)
+        or not value.startswith(("https://", "http://"))
+        or any(
             char.isspace() or ord(char) < 32 or ord(char) == 127 or unicodedata.category(char).startswith("C")
             for char in value
         )
-        and urlsplit(value).netloc
     ):
-        return value
-    return None
+        return None
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        return None
+    return value if host else None
 
 
 def created_pr_detail(value: object) -> dict[str, Any]:
@@ -2594,7 +2599,11 @@ def match_milestone_pages(pages: object, raw_milestone: object, *, require_open:
         raise GitHubMilestoneError("invalid_milestone", "milestone must be a non-blank single-line value")
     if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
         raise GitHubMilestoneError("malformed_milestones", "repository milestones payload is malformed")
-    is_numeric = re.fullmatch(r"[1-9][0-9]*", raw_milestone) is not None
+    target_num = (
+        int(raw_milestone)
+        if re.fullmatch(r"[1-9][0-9]*", raw_milestone) is not None and len(raw_milestone) <= 4300
+        else None
+    )
     all_rows: list[dict[str, Any]] = []
     matched_rows: list[dict[str, Any]] = []
     for page in pages:
@@ -2605,7 +2614,7 @@ def match_milestone_pages(pages: object, raw_milestone: object, *, require_open:
             num = row.get("number")
             title = row.get("title")
             title_match = isinstance(title, str) and title == raw_milestone
-            number_match = is_numeric and type(num) is int and num > 0 and str(num) == raw_milestone
+            number_match = target_num is not None and type(num) is int and num == target_num
             if title_match or number_match:
                 matched_rows.append(row)
     if not matched_rows:
@@ -4747,7 +4756,7 @@ def _result_process(args, result, options, kwargs, *, api=True):
                 detail["status"] = result.status
         elif result.error in {"github_unsupported_command", "github_invalid_command"} and result.reason:
             detail["reason"] = result.reason
-        if result.created_pr:
+        if isinstance(result.created_pr, dict):
             for key in ("pr_number", "pr_url"):
                 if key in result.created_pr:
                     detail[key] = result.created_pr[key]
