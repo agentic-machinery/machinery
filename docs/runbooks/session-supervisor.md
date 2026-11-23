@@ -313,11 +313,18 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
    `running`, `unknown`, or unreadable, keep the stream held — custody reassignment alone
    does not satisfy quiescence.
 
-Once all three checks pass, close **only the exact checked lease** using Monitor's fenced
-exact-envelope release (`POST /api/epics/v1/epic:<N>/release` with `session_id`, `lease_id`,
-`generation`, `fencing_token`, and exact `holder`). Monitor verifies all fields atomically
-inside its transaction and refuses with `409 LEASE LOST` (`RemoteLeaseLostError`) if the
-original holder already closed and a successor claimed the stream:
+Once all three checks pass **and the lease is past `expires_at` (`state == "expired"`)**,
+close **only the exact checked lease** using Monitor's fenced exact-envelope release
+(`POST /api/epics/v1/epic:<N>/release` with `session_id`, `lease_id`, `generation`,
+`fencing_token`, and exact `holder`). Turn leases are not heartbeated
+(`host_admission.claim_turn`), so a terminal or stuck turn's lease reaches `state == "expired"`
+on its own within its TTL. Under rules core `r2-lease`, a remote lease remains live until
+`expires_at` and earlier release requires an attributed operator release through the
+supervisor flow; therefore, for an `active` (unexpired) lease, **keep the hold until
+`state == "expired"`** rather than closing it through the unattributed exact-envelope path.
+Monitor verifies all envelope fields atomically inside its transaction and refuses with
+`409 LEASE LOST` (`RemoteLeaseLostError`) if the original holder already closed and a
+successor claimed the stream:
 
 ```bash
 .venv/bin/python -c '
@@ -326,10 +333,11 @@ from lu_machinery.session_streams.model import HolderKind, Lease, LeaseHolder
 from lu_machinery.session_supervisor.remote import RemoteEpicClient
 stream_id, expected_lease_id, expected_gen = sys.argv[1], sys.argv[2], int(sys.argv[3])
 client = RemoteEpicClient()
-raw = client.stream(stream_id)["lease"]
-assert raw["state"] in ("active", "expired"), raw
+raw = client.stream(stream_id).get("lease")
+assert isinstance(raw, dict) and raw.get("state") == "expired", raw
 assert raw["lease_id"] == expected_lease_id and raw["generation"] == expected_gen, raw
 h = raw["holder"]
+assert h["harness"] == "dispatch-turn", h
 lease = Lease(
     stream_id=raw["stream_id"],
     session_id=raw["session_id"],
@@ -360,12 +368,14 @@ print(f"released {stream_id} lease_id={expected_lease_id} generation={expected_g
 ' epic:<N> <lease-id> <generation>
 ```
 
-Do **not** use `session_supervisor release --force` for `dispatch-turn` lease recovery:
-`release --force` is scoped only by `stream_id` and is not fenced to a specific `lease_id`
-and `generation`, so a concurrent successor claim between pre-check and release could be
-closed erroneously. Withhold unfenced `--force` unless Monitor is stopped or successor
-claims are excluded externally. If quiescence cannot be proven or Monitor returns
-`409 LEASE LOST`, keep the current hold in place and re-inspect before taking any action.
+Do **not** run the exact-envelope recipe on an `active` (unexpired) lease, and do **not**
+use `session_supervisor release --force` for `dispatch-turn` lease recovery while
+`release --force` is scoped only by `stream_id` and not fenced to a specific `lease_id`
+and `generation` (a concurrent successor claim between pre-check and release could be
+closed erroneously). Withhold unfenced `--force` unless Monitor is stopped or successor
+claims are excluded externally. If the lease is still `active`, quiescence cannot be proven,
+or Monitor returns `409 LEASE LOST`, keep the current hold in place and re-inspect before
+taking any action.
 
 Explicit `--local` mode can recover a local process lease before TTL expiry when
 the exact holder PID is absent and the distinct candidate process is live.

@@ -89,9 +89,9 @@ def remote_lease_reason(
                 horizon = f"expiry unreadable ({expires_at})"
         return (
             f"dispatch-turn lease held by {holder_agent or '?'}/{holder_harness} ({horizon}) — "
-            "TTL takeover and local PID recovery refused; close using the exact fenced lease "
-            "envelope after verifying the turn scope and children are gone "
-            "(see docs/runbooks/session-supervisor.md)"
+            "TTL takeover and local PID recovery refused; keep an active lease held until expired, "
+            "then close using the exact fenced lease envelope after verifying the turn scope and "
+            "children are gone (see docs/runbooks/session-supervisor.md)"
         )
     if not expires_at:
         return "remote lease expiry is unknown — inspect Monitor before claiming; local PID recovery refused"

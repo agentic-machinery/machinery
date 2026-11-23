@@ -51,8 +51,9 @@ TURN_LEASE_OVERDUE_GRACE_SECONDS = 900
 TURN_LEASE_RECORDLESS_GRACE_SECONDS = 120
 _TURN_LEASE_RECOVERY_ADVICE = (
     "Confirm the turn scope and child tasks are gone; never use TTL takeover for dispatch-turn leases. "
-    "Close using the exact fenced lease envelope (RemoteEpicClient.release / host_admission.release_turn; "
-    "see docs/runbooks/session-supervisor.md; never unfenced session_supervisor release --force)."
+    "Keep an active lease held until expired, then close using the exact fenced lease envelope "
+    "(RemoteEpicClient.release / host_admission.release_turn; see docs/runbooks/session-supervisor.md; "
+    "never unfenced session_supervisor release --force)."
 )
 # A persistent scan error stays in the journal without a line on every keeper minute.
 _SUMMARY = timedelta(hours=1)
