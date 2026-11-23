@@ -333,7 +333,16 @@ does these steps in order:
    env -u PYTHONPATH "$P" -I -c 'import importlib.metadata as m, lu_machinery; print(m.version("lu-machinery")); print(lu_machinery.__file__)'
    ```
 
-   The version must be `$V`, imported from that environment.
+   The version must be `$V`, imported from that environment. Once verified, every
+   subsequent `lu_machinery.publish` call in the cut (`release-create`, adopt
+   `pr-create`, `release-edit`, `pr-ready`, `pr-close`, and post-release
+   `pr-create`) runs `"$P" -I -m lu_machinery.publish` from this clean wheel
+   environment with full OPSEC scanning, never the consumer's installed
+   interpreter. Before clean install (preflight CI-receipt reads) and in
+   standalone `post-release`, `release_cut` runs the `lu_machinery.publish`
+   shipped alongside the running `release_cut` module (with `-I` when installed
+   in a venv, or `-P -s` and `PYTHONPATH` pinned to that package root when
+   invoked from a source checkout).
 6. **Tag and publish a pre-release.** The command pushes the annotated tag
    `v$V` on `$SHA`. Then it runs `lu_machinery.publish release-create --prerelease`
    with the wheel, the sdist and `SHA256SUMS` in one call. The notes are the
@@ -375,7 +384,10 @@ does these steps in order:
      the product environment. The command checks that `lu-machinery` resolves
      to the candidate, then runs
      `env -u PYTHONPATH LU_PRODUCT_ROOT="$WORK/product" "$P" -m pytest --collect-only -q tests`.
-     A non-zero exit or any collection error stops the cut.
+     A non-zero exit or any collection error stops the cut. During a release
+     cut, the `.pth` overlay is removed as soon as collection finishes so `$P`
+     stays machinery-only for promotion and post-release publishing (standalone
+     `release_cut consumer-collection` keeps it for CI's key-test step).
 
      The same step already runs on every PR and merge group, so a change that
      breaks it fails before merge. The `Installed wheel` job of CI Gate runs
@@ -435,7 +447,11 @@ ends with the `--x-agent` trailer.
 
 `post-release` opens the post-release PR for the newest tag on `main`. It
 keeps a changelog section that already exists, which covers a release cut by
-hand.
+hand. When resuming `post-release` after a cut whose adopt PR has not yet been
+installed on the host, run it with the failed cut's preserved
+`"$WORK/accept/bin/python" -I -m lu_machinery.release_cut post-release` (the
+command printed in the cleanup notice) or with
+`PYTHONPATH="$MACHINERY" ... -P` so `pr-create` uses the released publisher.
 
 Installing the wheelhouse files on the host is a host operation, outside this
 repository.
