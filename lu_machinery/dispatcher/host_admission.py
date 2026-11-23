@@ -14,8 +14,9 @@ import sys
 import urllib.error
 import uuid
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, TypeGuard
 
 from lu_machinery.common.task_store_paths import tasks_dir
 from lu_machinery.dispatcher import store
@@ -327,21 +328,31 @@ def _valid_lease_identity(lease, stream: str) -> bool:
             and _valid_holder(lease.get("holder")))
 
 
-def _valid_projection_lease(lease, stream: str) -> bool:
-    """A lease payload as Monitor's projection writes it (epics_router._lease_payload)."""
+def _valid_projection_lease(lease: object, stream: str, *, match_ttl: bool = True) -> TypeGuard[dict[str, Any]]:
+    """A lease payload as Monitor's projection writes it (epics_router._lease_payload).
+
+    For claim and stored stream projections (``match_ttl=True``), Monitor computes ``expires_at`` by adding
+    ``ttl_seconds`` to ``heartbeat_at``. Release acknowledgements echo default timestamps, so ``match_ttl=False``
+    checks only that ``expires_at`` does not precede ``heartbeat_at``.
+    """
     from lu_machinery.session_streams.store import MAX_TTL_SECONDS
 
-    if not _valid_lease_identity(lease, stream):
+    if not isinstance(lease, dict) or not _valid_lease_identity(lease, stream):
         return False
     state, session = lease.get("state"), lease.get("session_state")
-    return (isinstance(state, str) and state in _LEASE_STATES
+    heartbeat = store.parse_utc_timestamp(lease.get("heartbeat_at"))
+    expires = store.parse_utc_timestamp(lease.get("expires_at"))
+    if not (isinstance(state, str) and state in _LEASE_STATES
             and isinstance(session, str) and session in _SESSION_STATES
             and (session in ("closed", "expired") if state == "released" else session in ("open", "rolling"))
             and _positive(lease.get("version"))
             and _positive(lease.get("ttl_seconds")) and lease["ttl_seconds"] <= MAX_TTL_SECONDS
             and _non_negative(lease.get("age_seconds"))
-            and store.parse_utc_timestamp(lease.get("heartbeat_at")) is not None
-            and store.parse_utc_timestamp(lease.get("expires_at")) is not None)
+            and heartbeat is not None and expires is not None):
+        return False
+    if match_ttl:
+        return expires - heartbeat == timedelta(seconds=lease["ttl_seconds"])
+    return expires >= heartbeat
 
 
 def _claimed_lease(response, stream: str, holder: dict, session_id: str, lease_id: str, ttl_s: int) -> dict | None:
@@ -460,7 +471,7 @@ def release_turn(envelope, *, stream: str, task_id: str, run_nonce: str) -> str 
     if not (isinstance(response, dict) and response.get("outcome") == "released"
             and ("stream_id" not in response or response["stream_id"] == stream)
             and ("session_state" not in response or response["session_state"] == "closed")
-            and _valid_projection_lease(acknowledged, stream)
+            and _valid_projection_lease(acknowledged, stream, match_ttl=False)
             and acknowledged["state"] == "released" and acknowledged["session_state"] == "closed"
             and all(same_typed(acknowledged.get(name), envelope["lease"][name])
                     for name in ("stream_id", "session_id", "lease_id", "generation", "fencing_token", "holder"))):

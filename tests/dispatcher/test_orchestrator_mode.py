@@ -37,9 +37,13 @@ _LAUNCHED = dict(pid=_DEAD_PID, process_start="boot:1", launch_mode="scope", lau
 
 def _lease(state="active", session_state="open", expires_in=600, **fields):
     """Monitor's projection of one lease on STREAM, as its stream route answers."""
-    expires = (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
+    ttl = fields.get("ttl_seconds", 900)
+    expires_dt = datetime.now(UTC) + timedelta(seconds=expires_in)
+    heartbeat_dt = expires_dt - timedelta(seconds=ttl if type(ttl) is int else 900)
+    expires = expires_dt.isoformat().replace("+00:00", "Z")
+    heartbeat = heartbeat_dt.isoformat().replace("+00:00", "Z")
     return {"stream_id": STREAM, "session_id": "session-1", "lease_id": "lease-1", "generation": 2,
-            "fencing_token": 2, "state": state, "session_state": session_state, "heartbeat_at": store.now(),
+            "fencing_token": 2, "state": state, "session_state": session_state, "heartbeat_at": heartbeat,
             "expires_at": expires, "ttl_seconds": 900, "version": 1, "age_seconds": 0,
             "holder": {"agent": "claude", "harness": "codex-cli", "instance_id": "legacy-1", "task_id": None,
                        "process_id": 4321, "holder_kind": "process", "host_id": None}, **fields}
@@ -300,9 +304,11 @@ def _answer(nonce, ttl=3600, **changes):
     """Monitor's claim answer for this turn's new lease, with ``changes`` applied (``lease.<field>`` for its lease)."""
     from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
 
-    expires = (datetime.now(UTC) + timedelta(seconds=ttl)).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC)
+    heartbeat = now.isoformat().replace("+00:00", "Z")
+    expires = (now + timedelta(seconds=ttl)).isoformat().replace("+00:00", "Z")
     lease = dict(stream_id=STREAM, session_id=f"turn-session-{nonce}", lease_id=f"turn-lease-{nonce}", generation=3,
-                 fencing_token=3, state="active", session_state="open", heartbeat_at=store.now(), expires_at=expires,
+                 fencing_token=3, state="active", session_state="open", heartbeat_at=heartbeat, expires_at=expires,
                  ttl_seconds=ttl, version=1, age_seconds=0,
                  holder=dict(agent="claude", harness=TURN_HOLDER_HARNESS, instance_id=nonce, task_id="turn-1",
                              process_id=os.getpid(), holder_kind="process", host_id=None))
@@ -362,6 +368,10 @@ def _conflict(detail):
         ({"lease.age_seconds": -1}, "orchestrator_lease_unknown"),
         ({"lease.age_seconds": True}, "orchestrator_lease_unknown"),
         ({"lease.heartbeat_at": "soon"}, "orchestrator_lease_unknown"),
+        ({"lease.heartbeat_at": (datetime.now(UTC) + timedelta(seconds=7200)).isoformat().replace("+00:00", "Z")},
+         "orchestrator_lease_unknown"),  # heartbeat after expiry
+        ({"lease.heartbeat_at": (datetime.now(UTC) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")},
+         "orchestrator_lease_unknown"),  # expiry - heartbeat != ttl_seconds
         ({"session_state": "closed"}, "orchestrator_lease_unknown"),  # top-level disagrees with nested open
         ({"session_state": _MISSING}, "orchestrator_lease_unknown"),
         ({"lease.expires_at": "soon"}, "orchestrator_lease_unknown"),
@@ -481,6 +491,12 @@ def test_a_dry_run_reads_a_projection_whose_session_disagrees_with_its_lease_as_
         (_lease(state="released", session_state="closed", version=True), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", age_seconds=True), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", heartbeat_at="soon"), "orchestrator_lease_unknown"),
+        (_lease(state="released", session_state="closed",
+                heartbeat_at=(datetime.now(UTC) + timedelta(seconds=7200)).isoformat().replace("+00:00", "Z")),
+         "orchestrator_lease_unknown"),  # heartbeat after expiry
+        (_lease(state="released", session_state="closed",
+                heartbeat_at=(datetime.now(UTC) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")),
+         "orchestrator_lease_unknown"),  # expiry - heartbeat != ttl_seconds
         (_lease(state="released", session_state="closed", session_id="bad.example"), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", session_id="[redacted]"), "orchestrator_lease_unknown"),
         (_lease(state="released", session_state="closed", lease_id="bad.example"), "orchestrator_lease_unknown"),
@@ -671,24 +687,38 @@ def test_a_release_is_exact_one_shot_and_fenced_from_a_successor(task_store, mon
             reason = host_admission.release_turn({**envelope, "monitor": monitor_spelling}, **exact)
             assert reason.startswith("orchestrator_lease_release_refused"), (monitor_spelling, reason)
         base_ack = {**envelope["lease"], "state": "released", "session_state": "closed",
-                    "heartbeat_at": store.now(), "version": 1, "age_seconds": 0}
+                    "heartbeat_at": "1970-01-01T00:00:00Z", "expires_at": "1970-01-01T00:00:00Z",
+                    "version": 1, "age_seconds": 0}
         for answer in ({"outcome": "released"},
                        {"outcome": "released", "lease": {**base_ack, "session_state": "open"}},
                        {"outcome": "released", "lease": {**base_ack, "state": "active"}},
                        {"outcome": "released", "lease": {**base_ack, "ttl_seconds": True}},
                        {"outcome": "released", "lease": {**base_ack, "expires_at": "soon"}},
+                       {"outcome": "released", "lease": {**base_ack, "heartbeat_at": "2099-01-01T00:00:00Z"}},
                        {"outcome": "released", "lease": {**base_ack, "version": True}},
                        {"outcome": "released", "session_state": "open", "lease": base_ack}):
             patch.setattr(remote.RemoteEpicClient, "release", lambda self, *a, answer=answer, **k: answer)
             assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
-        # A 409 whose detail is not Monitor's recognized LEASE LOST is unknown, never fenced.
-        def unrelated_409(request, timeout=0):
+    assert contacted == []
+    # A 409 whose detail is not Monitor's recognized LEASE LOST is unknown, never fenced (exercising _request).
+    import urllib.error
+    import urllib.request
+
+    for mode in ("status", "http_error"):
+        reached = []
+
+        def unrelated_409(request, timeout=0, mode=mode, reached=reached):
+            reached.append(request.full_url)
+            if mode == "http_error":
+                raise urllib.error.HTTPError(request.full_url, 409, "Conflict", {},
+                                             io.BytesIO(b'{"detail":"request refused"}'))
             return SimpleNamespace(status=409, read=lambda: b'{"detail":"request refused"}',
                                    __enter__=lambda s: s, __exit__=lambda *_a: False)
-        patch.setattr(remote.RemoteEpicClient, "release",
-                      lambda self, lease: remote.RemoteEpicClient(base=self.base, opener=unrelated_409).release(lease))
-        assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
-    assert contacted == []
+
+        with monkeypatch.context() as patch:
+            patch.setattr(urllib.request, "urlopen", unrelated_409)
+            assert host_admission.release_turn(envelope, **exact).startswith("orchestrator_lease_release_unknown")
+        assert len(reached) == 1, mode
     calls = []
 
     def unreachable(self, *args, **kwargs):
