@@ -1691,7 +1691,7 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
 
 
 def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
-    """Defect class: release build reads the workflow heredoc or syncs the build group without --locked/--no-build/--only-group, leaks ambient env, or fails open on missing uv or lock mismatch."""
+    """Defect class: release build reads the workflow heredoc or installs the build group without --locked/--only-group/--require-hashes/--only-binary=:all:/--no-deps, leaks ambient env, or fails open on missing uv, lock mismatch, or missing wheel hash."""
     seed = tmp_path / "machinery-seed"
     _init_repo(seed)
     (seed / "pyproject.toml").write_text(
@@ -1710,8 +1710,41 @@ def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
         ["git", "clone", "--quiet", "--bare", str(seed), str(bare)], check=True, capture_output=True, text=True, timeout=30,
     )
 
+    build_log = tmp_path / "build-calls.log"
+    fail_uv_marker = tmp_path / "fail-uv-export"
+    fail_pip_marker = tmp_path / "fail-pip-hash"
+
     host_python = tmp_path / "host-python"
-    host_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    host_python.write_text(
+        "#!/bin/sh\nset -eu\n"
+        '[ -z "${GH_TOKEN+x}${ANTHROPIC_API_KEY+x}${UV_INDEX_URL+x}${UV_EXCLUDE_NEWER+x}${UV_NO_SYNC+x}" ]\n'
+        'if [ "$1 $2 $3" = "-I -m venv" ]; then\n'
+        '  mkdir -p "$4/bin"\n'
+        '  cp "$0" "$4/bin/python"\n'
+        '  chmod 755 "$4/bin/python"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1 $2 $3 $4" = "-I -m pip install" ]; then\n'
+        f'  if [ -e {shlex.quote(str(fail_pip_marker))} ]; then\n'
+        '    printf "ERROR: THESE PACKAGES DO NOT MATCH THE HASHES\\n" >&2\n'
+        "    exit 1\n"
+        "  fi\n"
+        '  [ "$#" -eq 12 ]\n'
+        '  [ "$5 $6 $7 $8 $9 ${10} ${11}" = "--no-cache-dir --disable-pip-version-check --no-input --require-hashes --only-binary=:all: --no-deps --requirement" ]\n'
+        '  grep -Fq "build==1.6.1 --hash=sha256:" "${12}"\n'
+        f'  printf "pip %s\\n" "${{12}}" >> {shlex.quote(str(build_log))}\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1 $2 $3" = "-I -m build" ]; then\n'
+        '  [ "$4 $5 $6 $7" = "--sdist --wheel --no-isolation --outdir" ]\n'
+        f'  printf "build %s %s\\n" "$8" "$9" >> {shlex.quote(str(build_log))}\n'
+        '  printf "wheel-bytes" > "$8/lu_machinery-0.1.68-py3-none-any.whl"\n'
+        '  printf "sdist-bytes" > "$8/lu_machinery-0.1.68.tar.gz"\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
     host_python.chmod(0o755)
 
     def make_cut(name: str) -> Cut:
@@ -1732,32 +1765,20 @@ def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    build_log = tmp_path / "build-calls.log"
-    fail_marker = tmp_path / "fail-uv-sync"
     fake_uv = bin_dir / "uv"
     fake_uv.write_text(
         "#!/bin/sh\nset -eu\n"
-        f'if [ -e {shlex.quote(str(fail_marker))} ]; then\n'
+        f'if [ -e {shlex.quote(str(fail_uv_marker))} ]; then\n'
         '  printf "error: lockfile mismatch or missing build group\\n" >&2\n'
         "  exit 2\n"
         "fi\n"
         '[ -f pyproject.toml ] && [ -f uv.lock ] && [ ! -e .github/workflows/ci-gate.yml ]\n'
         '[ -z "${GH_TOKEN+x}${ANTHROPIC_API_KEY+x}${UV_INDEX_URL+x}${UV_EXCLUDE_NEWER+x}${UV_NO_SYNC+x}" ]\n'
         '[ "$HOME" = "${PWD%/*}/home" ] && [ "$TMPDIR" = "${PWD%/*}/tmp" ]\n'
-        '[ "$UV_PROJECT_ENVIRONMENT" = "${PWD%/*}/build-venv" ]\n'
-        '[ "$#" -eq 8 ]\n'
-        '[ "$1 $2 $3 $4 $5 $6 $7" = "sync --locked --no-build --only-group build --no-python-downloads --python" ]\n'
-        f'[ "$8" = {shlex.quote(str(host_python))} ]\n'
-        'mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"\n'
-        'cat > "$UV_PROJECT_ENVIRONMENT/bin/python" <<\'PYEOF\'\n'
-        "#!/bin/sh\nset -eu\n"
-        '[ -z "${GH_TOKEN+x}${ANTHROPIC_API_KEY+x}${UV_PROJECT_ENVIRONMENT+x}" ]\n'
-        '[ "$1 $2 $3 $4 $5 $6 $7" = "-I -m build --sdist --wheel --no-isolation --outdir" ]\n'
-        f'printf "build %s %s\\n" "$8" "$9" >> {shlex.quote(str(build_log))}\n'
-        'printf "wheel-bytes" > "$8/lu_machinery-0.1.68-py3-none-any.whl"\n'
-        'printf "sdist-bytes" > "$8/lu_machinery-0.1.68.tar.gz"\n'
-        "PYEOF\n"
-        'chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/python"\n',
+        '[ "$#" -eq 11 ]\n'
+        '[ "$1 $2 $3 $4 $5 $6 $7 $8 $9 ${10}" = "export --locked --quiet --format requirements.txt --no-emit-project --only-group build --no-python-downloads --python" ]\n'
+        f'[ "${{11}}" = {shlex.quote(str(host_python))} ]\n'
+        'printf "build==1.6.1 --hash=sha256:%s\\n" "ecd351a4be9d35a9eaaba244a7687143c9c7d4aea6ac964e7e7ddab20cbcf4e7"\n',
         encoding="utf-8",
     )
     fake_uv.chmod(0o755)
@@ -1768,28 +1789,40 @@ def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
     monkeypatch.setenv("UV_EXCLUDE_NEWER", "2000-01-01")
     monkeypatch.setenv("UV_NO_SYNC", "1")
 
-    # 1. Happy path: syncs the locked build group from uv.lock with no ci-gate.yml heredoc and builds dist + SHA256SUMS.
+    # 1. Happy path: exports the locked build group from uv.lock (no ci-gate.yml), installs hash-checked wheels, builds dist.
     ok_cut = make_cut("work-ok")
     ok_cut.uv = fake_uv
     files = ok_cut.build("0.1.68")
     assert files["wheel"].read_bytes() == b"wheel-bytes"
     assert files["sdist"].read_bytes() == b"sdist-bytes"
     assert files["sums"].is_file()
-    assert not (ok_cut.work / "build-requirements.txt").exists()
-    assert build_log.read_text(encoding="utf-8").strip() == f"build {ok_cut.work / 'dist'} {ok_cut.work / 'src'}"
+    assert (ok_cut.work / "build-requirements.txt").is_file()
+    assert build_log.read_text(encoding="utf-8").splitlines() == [
+        f"pip {ok_cut.work / 'build-requirements.txt'}",
+        f"build {ok_cut.work / 'dist'} {ok_cut.work / 'src'}",
+    ]
 
-    # 2. Fail closed when uv sync rejects a missing/mismatched lock or build group: never invokes build.
+    # 2. Fail closed when uv export rejects a missing/mismatched lock or build group: never invokes pip or build.
     build_log.unlink()
-    fail_marker.write_text("1", encoding="utf-8")
+    fail_uv_marker.write_text("1", encoding="utf-8")
     bad_lock_cut = make_cut("work-bad-lock")
     bad_lock_cut.uv = fake_uv
     with pytest.raises(CutError, match=r"lockfile mismatch or missing build group"):
         bad_lock_cut.build("0.1.68")
     assert not build_log.exists()
-    fail_marker.unlink()
+    fail_uv_marker.unlink()
 
-    # 3. Fail closed when uv is unavailable on PATH.
+    # 3. Fail closed when pip --require-hashes rejects a missing or mismatched wheel hash: never invokes build.
+    fail_pip_marker.write_text("1", encoding="utf-8")
+    bad_hash_cut = make_cut("work-bad-hash")
+    bad_hash_cut.uv = fake_uv
+    with pytest.raises(CutError, match=r"DO NOT MATCH THE HASHES"):
+        bad_hash_cut.build("0.1.68")
+    assert not build_log.exists()
+    fail_pip_marker.unlink()
+
+    # 4. Fail closed when uv is unavailable on PATH.
     no_uv_cut = make_cut("work-no-uv")
     monkeypatch.setattr(release_cut.shutil, "which", lambda _name: None)
-    with pytest.raises(CutError, match=r"uv is not on PATH; the release build tools are synced from uv\.lock"):
+    with pytest.raises(CutError, match=r"uv is not on PATH; the release build tools are exported from uv\.lock"):
         no_uv_cut.build("0.1.68")

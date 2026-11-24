@@ -1218,7 +1218,6 @@ audit = [
 build = [
     { name = "build" },
     { name = "packaging" },
-    { name = "pip" },
     { name = "pyproject-hooks" },
     { name = "setuptools" },
 ]
@@ -1276,7 +1275,6 @@ audit = [{ name = "pip-audit", specifier = "==2.10.1" }]
 build = [
     { name = "build", specifier = "==1.6.1" },
     { name = "packaging", specifier = "==26.3" },
-    { name = "pip", specifier = "==26.3" },
     { name = "pyproject-hooks", specifier = "==1.2.0" },
     { name = "setuptools", specifier = "==84.1.0" },
 ]

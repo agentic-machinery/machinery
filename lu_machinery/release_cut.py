@@ -869,15 +869,20 @@ class Cut:
         self.run(["tar", "-x", "-f", self.work / "src.tar", "-C", src])
         uv = self.uv or shutil.which("uv")
         if uv is None:
-            raise CutError("uv is not on PATH; the release build tools are synced from uv.lock")
-        build_venv = (self.work / "build-venv").absolute()
-        self.run(
-            [uv, "sync", "--locked", "--no-build", "--only-group", "build",
+            raise CutError("uv is not on PATH; the release build tools are exported from uv.lock")
+        pins = self.work / "build-requirements.txt"
+        exported = self.run(
+            [uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
+             "--no-emit-project", "--only-group", "build",
              "--no-python-downloads", "--python", self.host_python],
             cwd=src,
-            env=self.scratch_env(UV_PROJECT_ENVIRONMENT=str(build_venv)),
-        )
-        build_python = build_venv / "bin/python"
+            env=self.scratch_env(),
+        ).stdout
+        pins.write_text(exported, encoding="utf-8")
+        build_python = self.venv(self.work / "build-venv")
+        self.run([build_python, "-I", "-m", "pip", "install", "--no-cache-dir",
+                  "--disable-pip-version-check", "--no-input", "--require-hashes", "--only-binary=:all:",
+                  "--no-deps", "--requirement", pins], env=self.scratch_env())
         self.run([build_python, "-I", "-m", "build", "--sdist", "--wheel", "--no-isolation",
                   "--outdir", dist, src], env=self.scratch_env())
         files = {"wheel": dist / f"lu_machinery-{built_version}-py3-none-any.whl",
@@ -905,7 +910,7 @@ class Cut:
                              "--no-python-downloads", "--python", self.host_python],
                             cwd=self.work / "src", env=self.scratch_env()).stdout
         lock.write_text(exported, encoding="utf-8")
-        # The build venv's pip (from the locked build group), as in CI: an ordinary uv venv has no pip of its own.
+        # The build venv's pip, as in CI: an interpreter from `uv sync` has no pip of its own.
         self.run([self.work / "build-venv/bin/python", "-I", "-m", "pip", "download", "--no-cache-dir",
                   "--disable-pip-version-check",
                   "--no-input", "--require-hashes", "--only-binary=:all:", "--no-deps", "--dest", house,
