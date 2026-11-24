@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 import httpx2 as httpx
 from fastapi import FastAPI
 
-from lu_machinery.api import state_helpers, state_router
+from lu_machinery.api import state_helpers, state_router, subscription_usage
 from lu_machinery.api.lane_health import LaneHealthScan
 from lu_machinery.api.monitor_context import fixture_context
 
@@ -192,6 +192,61 @@ def test_slow_compute_duration_counts_toward_served_age(monkeypatch, tmp_path):
             assert body["recommendation"]["primary_agent_for_code"] is None
             assert body["agents"]["codex"]["eligible"] is False
             assert body["ranked_by_headroom"] == []
+
+    asyncio.run(scenario())
+
+
+def test_warm_codex_accounts_show_probe_failure_recorded_after_compute(monkeypatch, tmp_path):
+    """Defect class: cached routing rows hide a newer account-local probe failure."""
+    monkeypatch.setattr(subscription_usage, "_last_good_data", {})
+    monkeypatch.setattr(subscription_usage, "_last_failure_data", {})
+    monkeypatch.setattr(state_helpers, "_ttl_clock", lambda: 1000.0)
+    healthy = {"weekly_used_pct": 21.0}
+    failure_at = "2026-11-24T06:00:00Z"
+    for key in ("codex:a", "codex:b"):
+        assert subscription_usage._record_probe_result(key, healthy)
+
+    builds = []
+
+    def compute(**kwargs):
+        builds.append(True)
+        kwargs["task_generation"].append(state_router._tasks_content_token(kwargs["tasks_dir"]))
+        rows = {
+            key: {"eligible": True, "codexbar": {"weekly_used_pct": 21.0}}
+            for key in ("codex:a", "codex:b")
+        }
+        return {"agents": {"codex": rows["codex:a"]}, "codex_accounts": rows}
+
+    app = _app(monkeypatch, tmp_path, compute)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            cold = await client.get("/api/state/routing-budget")
+            assert cold.status_code == 200, cold.text
+            assert cold.json()["codex_accounts"]["codex:b"]["codexbar"].get("last_failure_at") is None
+
+            assert not subscription_usage._record_probe_result("codex:b", {
+                "error_kind": "need_login", "fetched_at": failure_at,
+            })
+            warm = await client.get("/api/state/routing-budget")
+            assert warm.status_code == 200, warm.text
+            failed = warm.json()["codex_accounts"]["codex:b"]
+            assert failed["codexbar"] == {
+                "weekly_used_pct": 21.0, "last_failure_at": failure_at, "failure_kind": "need_login",
+            }
+            assert failed["eligible"] is False
+            assert warm.json()["codex_accounts"]["codex:a"] == cold.json()["codex_accounts"]["codex:a"]
+
+            assert subscription_usage._record_probe_result("codex:b", healthy)
+            assert not subscription_usage._record_probe_result("codex:a", {
+                "error_kind": "timeout", "fetched_at": failure_at,
+            })
+            recovered = (await client.get("/api/state/routing-budget")).json()
+            assert recovered["codex_accounts"]["codex:b"] == cold.json()["codex_accounts"]["codex:b"]
+            assert recovered["codex_accounts"]["codex:a"]["eligible"] is False
+            assert recovered["codex_accounts"]["codex:a"]["codexbar"] == recovered["agents"]["codex"]["codexbar"]
+            assert recovered["agents"]["codex"]["codexbar"]["failure_kind"] == "timeout"
+            assert len(builds) == 1
 
     asyncio.run(scenario())
 
