@@ -97,6 +97,9 @@ const {escapeHtml, utc, relative, span, pct, bar, table, td, text, chip, panelAg
 
 const PAGE_ROWS = 25;
 const STALE_AFTER_S = 90;
+// Pools now is a snapshot at most 15 s old (CTO ruling 2026-11-24); the page reads it again from 11 s.
+const NOW_STALE_AFTER_S = 15;
+const NOW_RELOAD_AT_S = 11;
 // data/reading: the last successful response. failedAt: the last failed refresh, until one succeeds.
 const state = {data: null, reading: null, failedAt: null, shown: PAGE_ROWS, painted: ""};
 
@@ -142,7 +145,7 @@ function nowState(data) {
   if (state.failedAt) return "failed";
   if (now.state === "pending") return "pending";
   const age = ageNow(now.age_s);
-  return age === null || age > STALE_AFTER_S ? "stale" : "ok";
+  return age === null || age > NOW_STALE_AFTER_S ? "stale" : "ok";
 }
 
 function nowUnknownText(data) {
@@ -264,7 +267,7 @@ function renderFlow(data) {
     + '<div class="flow-head"></div><div class="flow-head">1 · Who picks the model</div><div class="flow-head">2 · Which account pays</div>'
     + '<div class="flow-head">3 · Admission (writes only)</div><div class="flow-head">4 · What ran</div>'
     + laneRow("Writes and other work", "The brief (CTO or lead) names the model", counts.brief || {})
-    + laneRow("Reviews", "The dispatch names a reviewer from another family (the resolver's pick is not recorded on the task)", counts.resolver || {})
+    + laneRow("Reviews", "The dispatch names the reviewer (the resolver's pick is not recorded on the task)", counts.resolver || {})
     + "</div>";
   const windowNote = `<p class="muted">${recent.total ?? 0} decisions started since ${escapeHtml(utc(Date.parse(recent.as_of) - (recent.window_s || 86400) * 1000))}.</p>`;
   return recentNote(data) + flow + windowNote + resolverCallouts(data);
@@ -305,7 +308,8 @@ function slotsCell(meter, data) {
 function allowanceCell(allowance) {
   if (state.failedAt) return text(unknownSince(allowance?.read_at, "the last refresh failed"), "warn");
   if (!allowanceCurrent(allowance)) {
-    return text(unknownSince(allowance?.read_at, allowance?.state === "fresh" ? "reading expired" : allowance?.reason), "warn");
+    const expired = allowance?.state === "fresh" ? (allowance.until_reset ? "awaiting a reading for the new window" : "reading expired") : allowance?.reason;
+    return text(unknownSince(allowance?.read_at, expired), "warn");
   }
   return cell(`${bar(allowance.left_pct)}${escapeHtml(pct(allowance.left_pct))}`, allowance.left_pct <= 0 ? "bad" : "");
 }
@@ -488,7 +492,20 @@ function tick(updateChips) {
   if (paintKey(data) !== state.painted) {
     paintAll();
     if (!state.failedAt) document.getElementById("flow-content").innerHTML = renderFlow(data);
-    if (typeof updateChips === "function") updateChips();
+  }
+  // Chips follow every change, including one a scheduled retry brought.
+  const shown = chips({flow: data});
+  if (shown !== state.chips && typeof updateChips === "function") {
+    state.chips = shown;
+    updateChips();
+  }
+  // Read the snapshot again before it lapses, and once more if it has (one read per snapshot and phase).
+  const age = ageNow(data.now?.age_s);
+  const phase = age === null ? null : age > NOW_STALE_AFTER_S ? "stale" : age > NOW_RELOAD_AT_S ? "early" : null;
+  const reloadKey = phase && `${data.now?.evaluated_at}|${phase}`;
+  if (reloadKey && reloadKey !== state.reloaded && !state.failedAt) {
+    state.reloaded = reloadKey;
+    runner.loadPanel(PANELS[0]);
   }
   paintAges();
 }
@@ -502,8 +519,9 @@ function chips(latest) {
     const lanes = [counts.brief || {}, counts.resolver || {}];
     const held = lanes.reduce((n, lane) => n + (lane.admission?.deferred || 0) + (lane.admission?.refused || 0), 0);
     const substituted = lanes.reduce((n, lane) => n + (lane.substitutions || 0), 0);
-    out.push(chip("#decisions", held, "deferred or refused in 24 h", held ? "warn" : ""));
-    if (substituted) out.push(chip("#decisions", substituted, "substitutions", "warn"));
+    const low = recentState(data) === "partial" ? " (may be low)" : "";
+    out.push(chip("#decisions", held, `deferred or refused in 24 h${low}`, held || low ? "warn" : ""));
+    if (substituted) out.push(chip("#decisions", substituted, `substitutions${low}`, "warn"));
   }
   if (nowState(data) === "ok" && data.now.resolver?.state === "ok") {
     const empty = (data.now.resolver.first_choice || []).filter(choice => (choice.seats || []).some(seat => emptyPool(data, seat.pool)));
@@ -563,7 +581,8 @@ document.addEventListener("click", event => {
   }
 });
 
-createPanelRunner({panels: PANELS, renderChips: chips}).start();
+const runner = createPanelRunner({panels: PANELS, renderChips: chips});
+runner.start();
 </script>
 </body>
 </html>

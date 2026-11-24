@@ -569,8 +569,12 @@ ROUTING_FUTURE_SKEW_S = 300.0
 # Pools now is admission's report-only snapshot with its evaluation time, never older than the
 # routing budget's own TTL; every dispatch is evaluated again when it starts.
 ROUTING_NOW_TTL_S = 15.0
-# A read starts the next evaluation once the stored one is this old, so it is usually ready before the bound.
-ROUTING_NOW_REFRESH_S = 10.0
+# A read starts the next evaluation once the stored one is this old, so it is usually ready before the bound
+# (the page reads again from 11 s).
+ROUTING_NOW_REFRESH_S = 5.0
+# Raised for a context on every unusable budget or task-store fault: an evaluation started before it is
+# never served afterwards, even one still in flight when the source recovers.
+_ROUTING_NOW_EPOCH: dict[str, int] = {}
 # An evaluation takes about 3 s on a full store and a scan up to about 1 s: a read waits this long
 # (routes answer within 1 s) and otherwise answers "pending"; the page reads again after 3 s.
 ROUTING_NOW_WAIT_S = 0.5
@@ -593,7 +597,10 @@ _ROUTING_AUTHOR_FAMILIES = (("anthropic", "Claude"), ("openai", "GPT"), ("google
 # Closed public vocabularies: a value outside them is published as None ("not recorded"), never verbatim.
 _ROUTING_RISKS = frozenset({"low", "medium", "high", "critical"})
 _ROUTING_PROFILES = frozenset({"code", "infra", "ukrainian"})
-_ROUTING_STATUSES = dispatch_admission.ACTIVE_STATUSES | dispatch_admission._KNOWN_TERMINAL_STATUSES | {"zombie"}
+# Statuses dispatch records; any other value (a typo, trailing space, non-string) is an unreadable record.
+_ROUTING_STATUSES = dispatch_admission.ACTIVE_STATUSES | dispatch_admission._KNOWN_TERMINAL_STATUSES | {
+    "settling", "blocked", "dry-run", "dry_run",
+}
 _ROUTING_ROLES = frozenset({
     "implementation", "implementer", "review", "reviewer", "advisory", "advisor", "evaluation", "evaluator",
     "analyst", "quality", "test", "recon", "integrator", "verification", "investigation", "investigator", "design",
@@ -717,7 +724,7 @@ def _routing_admission_check(record: Mapping[str, Any]) -> dict[str, list[str]]:
     return {"failing": failing, "unmeasured": unmeasured}
 
 
-def _routing_account_by(record: Mapping[str, Any]) -> str | None:
+def _routing_account_by(record: Mapping[str, Any], pool: str | None) -> str | None:
     """Who chose the account: the dispatch's explicit account (the account helper), a default, or the only account."""
     agent = record.get("agent")
     if agent == "claude":
@@ -731,8 +738,7 @@ def _routing_account_by(record: Mapping[str, Any]) -> str | None:
         except CodexAccountRefused:
             return None
         return "not_recorded" if label == DEFAULT_CODEX_ACCOUNT else "helper"
-    # AGY and Grok+Cursor each have one subscription: nothing chooses an account there.
-    pool = _routing_meter(agent, record.get("model"), None, None)
+    # AGY and Grok+Cursor each have one subscription: nothing chooses an account there (if the pool is known).
     return "single_account" if pool is not None else None
 
 
@@ -787,12 +793,13 @@ def _routing_pool(record: Mapping[str, Any]) -> str | None:
         # its own account fields hold defaults, not evidence: the pool is unknown.
         return None
     agent = record.get("agent")
-    # Admission splits these agents' meters by model or account and defaults a missing one: unknown here.
-    split = {"agy": panel_values.model(record.get("model")), "claude": record.get("claude_account"),
-             "codex": record.get("codex_account")}
+    model = panel_values.model(record.get("model"))  # the catalog id, so admission's meter reads its canonical name
+    # Admission splits these agents' meters by model or account (``gemini`` is AGY's older route name) and
+    # defaults a missing one: here the pool is unknown instead.
+    split = {"agy": model, "gemini": model, "claude": record.get("claude_account"), "codex": record.get("codex_account")}
     if agent in split and not isinstance(split[agent], str):
         return None
-    return _routing_meter(agent, record.get("model"), record.get("claude_account"), record.get("codex_account"))
+    return _routing_meter(agent, model, record.get("claude_account"), record.get("codex_account"))
 
 
 def _routing_status(record: Mapping[str, Any]) -> tuple[str, bool]:
@@ -803,10 +810,19 @@ def _routing_status(record: Mapping[str, Any]) -> tuple[str, bool]:
     zombie, and one whose liveness cannot be proven is unreadable.
     """
     status = record.get("status")
-    if not isinstance(status, str) or not status:
-        raise _RoutingMalformed("status unreadable")
+    if not isinstance(status, str) or status not in _ROUTING_STATUSES:
+        raise _RoutingMalformed("status unreadable or unsupported")
+    if status == "spawning":
+        # Admission's slot rule: a pid-less reservation is live until its own orphan proof; a started one
+        # is live unless its worker is proven dead.
+        if dispatch_admission._parse_pid(record.get("pid")) is None:
+            return status, not dispatch_admission.is_orphaned_pidless_record(dict(record))
+        return status, worker_liveness(dict(record), pid_alive=dispatch_admission.process_alive) is not False
     if status != "running":
-        return (status if status in _ROUTING_STATUSES else "unknown"), status == "spawning"
+        return status, False
+    start = record.get("process_start")
+    if record.get("schema_version") == 2 and not (isinstance(start, str) and start):
+        raise _RoutingMalformed("worker identity not recorded")  # liveness would rest on the PID alone
     alive = worker_liveness(dict(record), pid_alive=dispatch_admission.process_alive)
     if alive is None:
         raise _RoutingMalformed("worker liveness unknown")
@@ -819,7 +835,9 @@ def _routing_decision(record: Mapping[str, Any], *, now: datetime) -> dict[str, 
     Rows carry ids, labels, model names and fixed words only, never paths, prompts or free text.
     """
     # A refused start is recorded under its own id; the id the dispatch asked for is the one people know.
-    raw_id = record.get("requested_task_id") or record.get("task_id")
+    # A refused start is recorded under its own id and names the asked-for id; any other record is its task id.
+    raw_id = (record.get("requested_task_id") or record.get("task_id")) if record.get("never_started_reason") is not None \
+        else record.get("task_id")
     started = _routing_started(record.get("started_at"))
     if not isinstance(raw_id, str) or not raw_id or started is None:
         raise _RoutingMalformed("task id or start time unreadable")
@@ -851,7 +869,7 @@ def _routing_decision(record: Mapping[str, Any], *, now: datetime) -> dict[str, 
         "pool_label": _ROUTING_POOL_LABELS.get(pool or ""),
         # The dispatch caller names the model; a review record does not prove the resolver picked it.
         "model_by": "not_recorded" if review else "brief",
-        "account_by": _routing_account_by(record),
+        "account_by": _routing_account_by(record, pool),
         "admission": _routing_admission(record, write=write),
         "status": status,
         "live": live,
@@ -1093,13 +1111,14 @@ def _routing_admission_now(tasks_dir: Path, budget: Mapping[str, Any]) -> dict[s
     return {"host": host, "pools": pools}
 
 
-def routing_now(ctx: MonitorContext, budget: Mapping[str, Any]) -> dict[str, Any]:
+def routing_now(ctx: MonitorContext, budget: Mapping[str, Any], epoch: int = 0) -> dict[str, Any]:
     """Pools now, evaluated against one usable routing budget: admission (with its write slots) and the resolver.
 
     A part that cannot be evaluated is ``unknown`` with its reason; it never falls back to a guess.
     """
     tasks_dir = delegate_api._tasks_dir(resolve_context(ctx))
-    now: dict[str, Any] = {"budget_generated_at": budget["generated_at"], "evaluated_at": _routing_iso_z(datetime.now(UTC))}
+    now: dict[str, Any] = {"budget_generated_at": budget["generated_at"], "evaluated_at": _routing_iso_z(datetime.now(UTC)),
+                           "epoch": epoch}
     try:
         now["admission"] = {"state": "ok", **_routing_admission_now(tasks_dir, budget)}
     except (OSError, ValueError, TypeError, OverflowError, RecursionError):
@@ -1125,19 +1144,30 @@ def _routing_allowance(account: Mapping[str, Any] | None, stale_after_s: float |
     if weekly.get("status") != "ok" or left is None:
         state = "unknown"
     read_at = _routing_started(reading.get("read_at"))
-    # The subscription reader's own rule: fresh until stale_after_s past the reading (the page expires it then).
-    fresh_until = (_routing_iso_z(read_at + timedelta(seconds=stale_after_s))
-                   if state == "fresh" and read_at is not None and stale_after_s is not None else None)
-    if fresh_until is None and state == "fresh":
-        state = "unknown"  # a reading with no freshness bound cannot be shown as current
-    fresh = fresh_until is not None
+    reset = _routing_started(weekly.get("resets_at"))
+    # The subscription reader's own rule (fresh until stale_after_s past the reading), and never past the
+    # weekly reset the reading belongs to: the page expires the figure at the earlier of the two.
+    deadline = (read_at + timedelta(seconds=stale_after_s)
+                if state == "fresh" and read_at is not None and stale_after_s is not None else None)
+    if deadline is not None and reset is not None and reset < deadline:
+        deadline = reset
+    reason = reading.get("reason_code")
+    if state == "fresh" and (deadline is None or deadline <= datetime.now(UTC)):
+        state = "unknown"  # no freshness bound, or the window it measured has already reset
+        if deadline is not None:
+            reason = "awaiting_new_window" if deadline == reset else "reading_expired"
+    fresh = state == "fresh" and deadline is not None
+    fresh_until = _routing_iso_z(deadline) if fresh and deadline is not None else None
+    window_reset = fresh and deadline is not None and deadline == reset
     return {
         "state": state,
-        "reason": reading.get("reason_code") if state != "fresh" else None,
+        "reason": reason if state != "fresh" else None,
         "read_at": reading.get("read_at"),
         "left_pct": left if fresh else None,
         "resets_at": weekly.get("resets_at") if fresh else None,
         "fresh_until": fresh_until,
+        # Whether fresh_until is the weekly reset (the page then awaits a reading for the new window).
+        "until_reset": window_reset,
     }
 
 
@@ -1821,7 +1851,9 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
     now_key = ctx_scoped_ttl_key(ctx, "runtime-routing-now")
     if budget is None or store_fault is not None:
         # An unusable budget or an unreadable store: never serve an earlier snapshot; the next one starts afresh.
+        _ROUTING_NOW_EPOCH[now_key] = _ROUTING_NOW_EPOCH.get(now_key, 0) + 1
         cache_invalidate(now_key)
+    epoch = _ROUTING_NOW_EPOCH.get(now_key, 0)
     if budget is None:
         (decisions, age, stored), allowance = await asyncio.gather(recent(), asyncio.to_thread(routing_allowances))
         evaluated: dict[str, Any] = {
@@ -1834,11 +1866,14 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
             recent(),
             asyncio.to_thread(
                 cache_get_or_refresh, now_key, ROUTING_NOW_REFRESH_S,
-                functools.partial(routing_now, ctx, budget), wait_s=ROUTING_NOW_WAIT_S,
+                functools.partial(routing_now, ctx, budget, epoch), wait_s=ROUTING_NOW_WAIT_S,
             ),
             asyncio.to_thread(routing_allowances),
         )
         now_value = cast(tuple[dict[str, Any], float], now_read)[0] if now_read is not None else {}
+        if now_value and now_value.get("epoch") != epoch:
+            cache_invalidate(now_key)  # started before a fault: retired; the next read evaluates afresh
+            now_value = {}
         # The snapshot's age counts from when its evaluation started, the time the page shows.
         started_eval = _routing_started(now_value.get("evaluated_at"))
         now_age = (datetime.now(UTC) - started_eval).total_seconds() if started_eval is not None else None
@@ -1848,7 +1883,8 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
             evaluated = {"state": "pending", "age_s": None, "budget_generated_at": None,
                          "admission": pending, "resolver": pending}
         else:
-            evaluated = {"state": "ok", "age_s": round(max(now_age, 0.0), 3), **now_value}
+            evaluated = {"state": "ok", "age_s": round(max(now_age, 0.0), 3),
+                         **{key: value for key, value in now_value.items() if key != "epoch"}}
     admission, status = evaluated["admission"], decisions.get("status")
     if admission.get("state") in {"ok", "pending"} and (store_fault is not None or status not in {"ok", "partial", "pending"}):
         # Admission counts write slots from this store: when it cannot be read, its verdicts are unknown,

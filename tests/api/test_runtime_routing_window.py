@@ -67,7 +67,7 @@ def test_window_boundary_keeps_the_last_day_and_never_leaks_older_starts(tmp_pat
     _write_record(tasks, "old-rewritten", _write_task("old-rewritten", started=old))
     _write_record(tasks, "old-untouched", _write_task("old-untouched", started=old), mtime=old)
     _write_record(tasks, "old-running", _write_task("old-running", started=old, mode="read-only", status="running",
-                                                    pid=os.getpid()), mtime=old)
+                                                    pid=os.getpid(), process_start="boot:1"), mtime=old)
     _write_record(tasks, "from-the-future", _write_task("from-the-future", started=_NOW + timedelta(hours=2)))
 
     result = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
@@ -153,10 +153,10 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
 
     evaluations = []
 
-    def evaluate(_ctx, budget):
+    def evaluate(_ctx, budget, epoch=0):
         evaluations.append(budget["generated_at"])
         verdict = {"note": None, "live_writes": 0, "cap": 8}
-        return {"budget_generated_at": budget["generated_at"], "evaluated_at": _iso(datetime.now(UTC)),
+        return {"budget_generated_at": budget["generated_at"], "evaluated_at": _iso(datetime.now(UTC)), "epoch": epoch,
                 "admission": {"state": "ok", "host": {"admitting": True, "failing": [], "unmeasured": []},
                               "pools": {"codex:a": {**verdict, "state": "admitted", "reason": None},
                                         "codex:b": {**verdict, "state": "deferred", "reason": "Codex b: cap"}}},
