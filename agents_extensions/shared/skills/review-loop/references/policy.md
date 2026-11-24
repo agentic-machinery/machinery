@@ -69,6 +69,10 @@ Critical and high risk take Sol, Opus or Gemini 4 Neon High (NEON-SOLTIER-1120).
 - One finding per bug class, listing every instance; never repeat a posted finding.
 - Every blocking finding is fixed, or dismissed with evidence the reviewer confirms.
 
+**Threat model.** Every code or infrastructure implementation brief and round-one review brief states the supported inputs and operating conditions, who can influence inputs or write relevant paths (including indirectly), and the controls that enforce any exclusions. The reviewer verifies material assumptions against the reviewed head and supported environments. Review covers supported operation, foreseeable operator errors, malformed or partial state, concurrency, and recovery. Use hostile-input assumptions for all High-tier or security-sensitive changes, including classifier changes and every path it identifies, and wherever the brief is missing or its assumptions lack evidence. Existing severity rules and the critical review floor apply. Unresolved security findings always block.
+
+Record a potentially blocking trigger as a non-blocking out-of-scope note with an owner only when the reviewer confirms evidence that it is unreachable under the supported contract and effective controls. An omission, mismatch, or uncertainty material to a potential P0–P2 blocks approval pending correction or evidence. Any material change to the model requires independent review on the applicable head before it can change a finding’s disposition.
+
 ## 4. Convergence
 
 At most 3 charged rounds; Low uses at most 2 (the red-team pass and one fix confirmation), and
