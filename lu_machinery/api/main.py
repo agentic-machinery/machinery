@@ -79,6 +79,7 @@ from .fleet_workers_router import router as fleet_workers_router
 from .git_hygiene_router import router as git_hygiene_router
 from .git_hygiene_router import warm_pull_requests
 from .issues_router import router as issues_router
+from .journal_router import router as journal_router
 from .knowledge_router import router as knowledge_router
 from .milestones_router import router as milestones_router
 from .model_stats_router import ModelStatsCollector
@@ -2206,6 +2207,7 @@ def create_app(
     factory_app.include_router(git_hygiene_router, prefix="/api/git", tags=["git"])
     factory_app.include_router(ops_router, prefix="/api/ops", tags=["ops"])
     factory_app.include_router(issues_router, prefix="/api/issues", tags=["issues"])
+    factory_app.include_router(journal_router, prefix="/api/journal", tags=["journal"])
     factory_app.include_router(knowledge_router, prefix="/api/knowledge", tags=["knowledge"])
     factory_app.include_router(rules_router, prefix="/api/rules", tags=["rules"])
     factory_app.include_router(runtime_router, prefix="/api/runtime")

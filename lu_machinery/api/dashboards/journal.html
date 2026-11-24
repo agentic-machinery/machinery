@@ -1,0 +1,579 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Journal — Machinery</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/machinery.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+<header>
+  <div class="header-top">
+    <div class="title">
+      <h1>Journal</h1>
+      <p class="purpose">Newest-first per-project log of what was decided, done, and why.</p>
+    </div>
+    <div class="header-utils">
+      <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
+      <button type="button" class="theme-toggle" id="theme-toggle">Theme: Auto</button>
+      <div class="refresh">
+        <span class="muted" id="last-refresh">Loading…</span>
+        <button type="button" class="retry" id="refresh-retry" hidden aria-label="Retry refresh">Retry</button>
+      </div>
+    </div>
+  </div>
+  <div class="header-nav">
+    <nav class="pages" id="machinery-nav" aria-label="Pages">__MACHINERY_NAV__</nav>
+    <div class="chips" id="chips"></div>
+  </div>
+</header>
+<main id="main" tabindex="-1">
+  <section class="wide" id="journal">
+    <h2>Project journal <span class="age" id="journal-age">Loading…</span></h2>
+    <form id="journal-filters" class="filters" method="get" action="/journal">
+      <label>Project
+        <select id="filter-project" name="project" autocomplete="off">
+          <option value="">All projects</option>
+        </select>
+      </label>
+      <label>Type
+        <select id="filter-type" name="type" autocomplete="off">
+          <option value="">All types</option>
+          <option value="decision">decision</option>
+          <option value="landed">landed</option>
+          <option value="applied">applied</option>
+          <option value="started">started</option>
+          <option value="stopped">stopped</option>
+          <option value="incident">incident</option>
+          <option value="escalation">escalation</option>
+          <option value="correction">correction</option>
+          <option value="note">note</option>
+        </select>
+      </label>
+      <label>Since
+        <select id="filter-since" name="since" autocomplete="off">
+          <option value="24h">Last 24 h</option>
+          <option value="7d" selected>Last 7 d</option>
+          <option value="30d">Last 30 d</option>
+          <option value="all">All</option>
+        </select>
+      </label>
+      <div class="journal-actions">
+        <button type="button" class="retry" data-clear-filters>Clear filters</button>
+        <button type="button" class="retry" id="mark-caught-up" hidden>Mark caught up</button>
+      </div>
+    </form>
+    <p id="journal-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="journal-content">Loading…</div>
+  </section>
+</main>
+<script src="/machinery.js"></script>
+<script>
+"use strict";
+const {escapeHtml, safeHttpUrl, utc, relative, chip, createPanelRunner} = Machinery;
+
+const JOURNAL_URL = "/api/journal";
+const LAST_SEEN_KEY = "machinery-journal-last-seen-id";
+const TYPE_TONE = {
+  decision: "info",
+  landed: "ok",
+  applied: "ok",
+  started: "muted",
+  stopped: "warn",
+  incident: "bad",
+  escalation: "bad",
+  correction: "warn",
+  note: "muted",
+};
+const UNAVAILABLE_MESSAGES = {
+  cli_unavailable: "Journal unavailable: the driver-state CLI is not configured or could not be run.",
+  db_unavailable: "Journal unavailable: the driver-state database could not be reached.",
+  invalid_payload: "Journal unavailable: the driver-state CLI returned an unreadable payload.",
+};
+
+function parsePositiveId(raw) {
+  if (typeof raw === "number") return Number.isSafeInteger(raw) && raw > 0 ? raw : null;
+  if (typeof raw !== "string" || !/^[1-9]\d*$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function readLastSeenId() {
+  try {
+    if (typeof localStorage !== "object" || !localStorage) return null;
+    return parsePositiveId(localStorage.getItem(LAST_SEEN_KEY));
+  } catch {
+    return null;
+  }
+}
+
+function writeLastSeenId(id) {
+  const valid = parsePositiveId(id);
+  if (valid === null) return null;
+  const current = readLastSeenId();
+  const next = current !== null && current > valid ? current : valid;
+  try {
+    if (typeof localStorage === "object" && localStorage) {
+      localStorage.setItem(LAST_SEEN_KEY, String(next));
+    }
+  } catch {
+    // Storage unavailable; keep current view without throwing.
+  }
+  return next;
+}
+
+function pageQuery() {
+  try {
+    const search = typeof location === "object" && location && typeof location.search === "string" ? location.search : "";
+    return new URLSearchParams(search);
+  } catch {
+    return new URLSearchParams();
+  }
+}
+
+function journalQuery() {
+  const query = new URLSearchParams();
+  const page = pageQuery();
+  for (const key of ["project", "type", "since", "after_id", "limit", "offset"]) {
+    const value = page.get(key);
+    if (value) query.set(key, value);
+  }
+  return query;
+}
+
+function journalUrl() {
+  const text = journalQuery().toString();
+  return text ? `${JOURNAL_URL}?${text}` : JOURNAL_URL;
+}
+
+function highestEntryId(payload) {
+  let highest = parsePositiveId(payload?.latest_id) || 0;
+  if (Array.isArray(payload?.entries)) {
+    for (const entry of payload.entries) {
+      const id = parsePositiveId(entry?.id);
+      if (id !== null && id > highest) highest = id;
+    }
+  }
+  return highest > 0 ? highest : null;
+}
+
+function countNewEntries(payload, lastSeenId = readLastSeenId()) {
+  if (lastSeenId === null || !payload || payload.availability !== "available" || !Array.isArray(payload.entries)) {
+    return 0;
+  }
+  let count = 0;
+  for (const entry of payload.entries) {
+    const id = parsePositiveId(entry?.id);
+    if (id !== null && id > lastSeenId) count += 1;
+  }
+  return count;
+}
+
+let applyingFilters = false;
+
+function selectable(id) {
+  const select = typeof document === "object" && document && document.getElementById ? document.getElementById(id) : null;
+  return select && typeof select.add === "function" ? select : null;
+}
+
+function setChoice(id, value) {
+  const select = selectable(id);
+  if (!select) return;
+  const next = typeof value === "string" ? value : "";
+  if (next && ![...select.options].some(option => option.value === next)) {
+    const option = document.createElement("option");
+    option.value = next;
+    option.textContent = next;
+    select.append(option);
+  }
+  applyingFilters = true;
+  try { select.value = next; }
+  finally { applyingFilters = false; }
+}
+
+function fillProjectOptions(projects, selected) {
+  const select = selectable("filter-project");
+  if (!select) return;
+  const list = Array.isArray(projects) ? projects : [];
+  const current = typeof selected === "string" ? selected : (pageQuery().get("project") || "");
+  const seen = new Set();
+  select.replaceChildren();
+  const all = document.createElement("option");
+  all.value = "";
+  all.textContent = "All projects";
+  select.append(all);
+  for (const item of list) {
+    if (!item || typeof item.key !== "string" || !item.key || seen.has(item.key)) continue;
+    seen.add(item.key);
+    const option = document.createElement("option");
+    option.value = item.key;
+    const label = typeof item.label === "string" && item.label ? item.label : item.key;
+    option.textContent = item.private ? `${label} (private)` : label;
+    select.append(option);
+  }
+  if (current && !seen.has(current)) {
+    const option = document.createElement("option");
+    option.value = current;
+    option.textContent = current;
+    select.append(option);
+  }
+  applyingFilters = true;
+  try { select.value = current; }
+  finally { applyingFilters = false; }
+}
+
+function syncFiltersFromPayload(payload) {
+  const filters = payload && typeof payload.filters === "object" ? payload.filters : null;
+  const project = typeof filters?.project === "string" ? filters.project : (pageQuery().get("project") || "");
+  if (Array.isArray(payload?.projects)) fillProjectOptions(payload.projects, project);
+  else setChoice("filter-project", project);
+  if (!filters) return;
+  setChoice("filter-type", typeof filters.type === "string" ? filters.type : "");
+  setChoice("filter-since", typeof filters.since === "string" && filters.since ? filters.since : "7d");
+}
+
+function updateCaughtUpButton(payload, lastSeenId = readLastSeenId()) {
+  const button = typeof document === "object" && document && document.getElementById
+    ? document.getElementById("mark-caught-up") : null;
+  if (!button) return;
+  const highest = payload && payload.availability === "available" ? highestEntryId(payload) : null;
+  if (highest === null) {
+    button.hidden = true;
+    button.disabled = true;
+    return;
+  }
+  button.hidden = false;
+  button.disabled = lastSeenId !== null && highest <= lastSeenId;
+  button.dataset.latestId = String(highest);
+}
+
+function journalNotice(sentence) {
+  return `<p class="error">${escapeHtml(sentence)}</p>`
+    + '<p><button type="button" class="retry" data-retry-panel="journal" aria-label="Retry Journal">Retry</button></p>';
+}
+
+function pageHref(offset) {
+  const params = journalQuery();
+  if (offset > 0) params.set("offset", String(offset));
+  else params.delete("offset");
+  const text = params.toString();
+  return text ? `?${text}` : "?";
+}
+
+function renderLinks(links) {
+  if (!Array.isArray(links) || !links.length) return "";
+  const items = [];
+  for (const link of links) {
+    if (!link || typeof link !== "object" || typeof link.label !== "string" || !link.label) continue;
+    const href = safeHttpUrl(link.url);
+    if (href) {
+      items.push(`<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${escapeHtml(link.label)}</a>`);
+    } else {
+      items.push(`<span class="muted">${escapeHtml(link.label)}</span>`);
+    }
+  }
+  return items.length ? `<div class="journal-links">${items.join("")}</div>` : "";
+}
+
+function renderEntry(entry, projectMap, isNew) {
+  const projectInfo = projectMap.get(entry.project);
+  const projectLabel = projectInfo?.label || entry.project;
+  const privateBadge = projectInfo?.private ? ' <span class="journal-tag muted">private</span>' : "";
+  const tone = TYPE_TONE[entry.type] || "muted";
+  const whenUtc = utc(entry.occurred_at);
+  const whenRel = relative(entry.occurred_at);
+  const whenText = whenRel ? `${whenUtc} (${whenRel})` : whenUtc;
+  const refs = [];
+  if (typeof entry.source_item_id === "string" && entry.source_item_id) {
+    refs.push(`<span class="muted">item ${escapeHtml(entry.source_item_id)}</span>`);
+  }
+  const corrects = parsePositiveId(entry.corrects_id);
+  if (corrects !== null) {
+    refs.push(`<span class="muted">corrects #${corrects}</span>`);
+  }
+  const newBadge = isNew ? '<span class="journal-tag info">new</span>' : "";
+  const bodyHtml = typeof entry.body === "string" && entry.body
+    ? `<p class="journal-body">${escapeHtml(entry.body)}</p>` : "";
+  return `<article class="journal-entry${isNew ? " is-new" : ""}" data-entry-id="${escapeHtml(entry.id)}">`
+    + '<div class="journal-meta">'
+    + `<time class="journal-time" datetime="${escapeHtml(entry.occurred_at)}">${escapeHtml(whenText)}</time>`
+    + `<span class="journal-tag">${escapeHtml(projectLabel)}</span>`
+    + privateBadge
+    + `<span class="journal-tag ${escapeHtml(tone)}">${escapeHtml(entry.type)}</span>`
+    + newBadge
+    + `<span class="journal-author">by ${escapeHtml(entry.author_seat)}</span>`
+    + refs.join("")
+    + "</div>"
+    + `<h3 class="journal-headline"><strong>${escapeHtml(entry.headline)}</strong></h3>`
+    + bodyHtml
+    + renderLinks(entry.links)
+    + "</article>";
+}
+
+function renderJournal(payload, lastSeenId = readLastSeenId()) {
+  syncFiltersFromPayload(payload);
+  updateCaughtUpButton(payload, lastSeenId);
+
+  if (!payload || typeof payload !== "object") {
+    return journalNotice("Journal unavailable.");
+  }
+  if (payload.availability !== "available") {
+    const message = UNAVAILABLE_MESSAGES[payload.availability] || "Journal unavailable.";
+    return journalNotice(message);
+  }
+  const entries = payload.entries;
+  if (!Array.isArray(entries) || typeof payload.total !== "number" || !Number.isInteger(payload.total) || payload.total < 0) {
+    return journalNotice("Journal unavailable.");
+  }
+  const projectMap = new Map();
+  if (Array.isArray(payload.projects)) {
+    for (const item of payload.projects) {
+      if (item && typeof item.key === "string" && item.key) projectMap.set(item.key, item);
+    }
+  }
+  const offset = Number.isInteger(payload.offset) && payload.offset >= 0 ? payload.offset : 0;
+  const limit = Number.isInteger(payload.limit) && payload.limit > 0 ? payload.limit : 50;
+  const end = offset + entries.length;
+  const prev = offset > 0 ? pageHref(Math.max(0, offset - limit)) : "";
+  const next = Number.isInteger(payload.next_offset) && payload.next_offset > offset ? pageHref(payload.next_offset) : "";
+  const pagerItems = [
+    entries.length && end <= payload.total ? `<span>${offset + 1}–${end} of ${payload.total}</span>` : "",
+    prev ? `<a href="${escapeHtml(prev)}" data-journal-page="${Math.max(0, offset - limit)}">Previous</a>` : "",
+    next ? `<a href="${escapeHtml(next)}" data-journal-page="${payload.next_offset}">Next</a>` : "",
+  ].filter(Boolean);
+  const pager = pagerItems.length ? `<p class="pager">${pagerItems.join(" ")}</p>` : "";
+
+  if (payload.total === 0) {
+    if (entries.length !== 0) return journalNotice("Journal unavailable.");
+    return '<p class="muted">No journal entries match the current filters. '
+      + '<button type="button" class="retry" data-clear-filters>Clear filters</button></p>';
+  }
+  if (!entries.length) {
+    return `<p class="muted">No entries on this page.</p>${pager}`;
+  }
+
+  const parts = ['<div class="journal-list">'];
+  let sawNew = false;
+  let dividerInserted = false;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object" || parsePositiveId(entry.id) === null
+      || typeof entry.headline !== "string" || typeof entry.occurred_at !== "string"
+      || typeof entry.project !== "string" || typeof entry.type !== "string"
+      || typeof entry.author_seat !== "string") {
+      return journalNotice("Journal unavailable.");
+    }
+    const isNew = lastSeenId !== null && entry.id > lastSeenId;
+    if (isNew) {
+      sawNew = true;
+    } else if (sawNew && !dividerInserted) {
+      parts.push('<div class="journal-divider" role="separator"><span>Earlier</span></div>');
+      dividerInserted = true;
+    }
+    parts.push(renderEntry(entry, projectMap, isNew));
+  }
+  parts.push("</div>");
+  return parts.join("") + pager;
+}
+
+function renderChips(latest, lastSeenId = readLastSeenId()) {
+  const payload = latest?.journal;
+  if (!payload || payload.availability !== "available") return "";
+  const out = [];
+  const newCount = countNewEntries(payload, lastSeenId);
+  if (newCount > 0) {
+    out.push(chip("#journal", newCount, "new", "info"));
+  }
+  if (typeof payload.total === "number" && Number.isInteger(payload.total) && payload.total >= 0) {
+    out.push(chip("#journal", payload.total, payload.total === 1 ? "entry" : "entries"));
+  }
+  return out.join("");
+}
+
+let activeController = null;
+let activeRequestUrl = null;
+
+async function fetchJournal() {
+  while (true) {
+    const targetUrl = journalUrl();
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    activeController = controller;
+    activeRequestUrl = targetUrl;
+    const timer = controller
+      ? setTimeout(() => { controller.abort(); }, Machinery.API_TIMEOUT_MS)
+      : null;
+    try {
+      const options = {headers: {Accept: "application/json"}};
+      if (controller) options.signal = controller.signal;
+      const response = await fetch(targetUrl, options);
+      if (targetUrl !== journalUrl()) continue;
+      if (!response.ok) throw new Error(`${targetUrl}: HTTP ${response.status}`);
+      const receivedAt = Date.now();
+      const receivedMono = Machinery.snapshotClockStamp();
+      const rawText = await response.text();
+      if (targetUrl !== journalUrl()) continue;
+      let data;
+      try { data = JSON.parse(rawText); } catch { throw new Error(`${targetUrl}: Invalid JSON`); }
+      if (data === null || typeof data !== "object" || Array.isArray(data)) {
+        throw new Error(`${targetUrl}: Invalid JSON shape`);
+      }
+      const headers = response.headers && typeof response.headers.get === "function" ? response.headers : null;
+      return {
+        data,
+        ageHeader: headers ? headers.get("X-Snapshot-Age-S") : null,
+        boundHeader: headers ? headers.get("X-Snapshot-Stale-After-S") : null,
+        state: headers ? headers.get("X-Snapshot-State") : null,
+        snapshot: true,
+        receivedAt,
+        ...(receivedMono === null ? {} : {receivedMono}),
+        url: targetUrl,
+      };
+    } catch (error) {
+      if (targetUrl !== journalUrl()) continue;
+      throw error;
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+      if (activeController === controller) {
+        activeController = null;
+        activeRequestUrl = null;
+      }
+    }
+  }
+}
+
+const PANELS = [
+  {
+    id: "journal",
+    label: "Journal",
+    urls: [journalUrl()],
+    render: payload => renderJournal(payload),
+    onError: () => updateCaughtUpButton(null),
+  },
+];
+
+const runner = createPanelRunner({
+  panels: PANELS,
+  renderChips: latest => renderChips(latest),
+  fetchJson: fetchJournal,
+});
+
+function reloadForCurrentUrl() {
+  const nextUrl = journalUrl();
+  PANELS[0].urls = [nextUrl];
+  if (activeController && !activeController.signal.aborted && activeRequestUrl !== nextUrl) {
+    activeController.abort();
+  }
+  runner.retryPanel("journal");
+}
+
+function repaintFromLatest() {
+  const payload = runner.latest.journal;
+  if (!payload) return;
+  const content = document.getElementById("journal-content");
+  if (content) content.innerHTML = renderJournal(payload);
+  const chips = document.getElementById("chips");
+  if (chips) chips.innerHTML = renderChips(runner.latest);
+}
+
+function currentPath() {
+  return typeof location === "object" && location && typeof location.pathname === "string" && location.pathname
+    ? location.pathname : "/journal";
+}
+
+function navigateSearch(search) {
+  const target = `${currentPath()}${search}`;
+  if (typeof history === "object" && history && typeof history.pushState === "function") {
+    history.pushState(null, "", target);
+    reloadForCurrentUrl();
+    return;
+  }
+  if (typeof location === "object" && location && typeof location.assign === "function") {
+    location.assign(target);
+  }
+}
+
+function filtersFromForm() {
+  const form = document.getElementById("journal-filters");
+  const params = new URLSearchParams();
+  if (!form || typeof FormData !== "function") return params;
+  const data = new FormData(form);
+  for (const key of ["project", "type", "since"]) {
+    const value = String(data.get(key) || "");
+    if (key === "since" && (!value || value === "7d")) continue;
+    if (value) params.set(key, value);
+  }
+  const limit = pageQuery().get("limit");
+  if (limit) params.set("limit", limit);
+  return params;
+}
+
+function bindJournalControls() {
+  if (typeof document !== "object" || !document || typeof document.addEventListener !== "function") return;
+  if (document._journalControlsBound) return;
+  document._journalControlsBound = true;
+
+  document.addEventListener("click", event => {
+    const target = event.target;
+    if (typeof target?.closest !== "function") return;
+    if (target.closest("[data-clear-filters]")) {
+      event.preventDefault();
+      navigateSearch("");
+      return;
+    }
+    const pagerLink = target.closest("a[data-journal-page]");
+    if (pagerLink && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey && event.button === 0) {
+      event.preventDefault();
+      const offset = Number(pagerLink.dataset.journalPage || "0");
+      const params = journalQuery();
+      if (offset > 0) params.set("offset", String(offset));
+      else params.delete("offset");
+      const qs = params.toString();
+      navigateSearch(qs ? `?${qs}` : "");
+    }
+  });
+
+  const caughtUp = document.getElementById("mark-caught-up");
+  if (caughtUp && !caughtUp.dataset?.bound && typeof caughtUp.addEventListener === "function") {
+    if (caughtUp.dataset) caughtUp.dataset.bound = "1";
+    caughtUp.addEventListener("click", () => {
+      const latest = highestEntryId(runner.latest.journal);
+      if (latest === null) return;
+      writeLastSeenId(latest);
+      repaintFromLatest();
+      const status = document.getElementById("journal-status");
+      if (status) status.textContent = "Marked caught up.";
+    });
+  }
+
+  const form = document.getElementById("journal-filters");
+  if (form && form.dataset && typeof form.addEventListener === "function" && !form.dataset.bound) {
+    form.dataset.bound = "1";
+    const params = pageQuery();
+    setChoice("filter-project", params.get("project") || "");
+    setChoice("filter-type", params.get("type") || "");
+    setChoice("filter-since", params.get("since") || "7d");
+    const apply = () => {
+      if (applyingFilters) return;
+      const qs = filtersFromForm().toString();
+      navigateSearch(qs ? `?${qs}` : "");
+    };
+    form.addEventListener("change", apply);
+    form.addEventListener("submit", event => {
+      event.preventDefault();
+      apply();
+    });
+  }
+
+  if (typeof window === "object" && window && typeof window.addEventListener === "function") {
+    window.addEventListener("popstate", () => {
+      reloadForCurrentUrl();
+    });
+  }
+}
+
+bindJournalControls();
+runner.start();
+</script>
+</body>
+</html>
