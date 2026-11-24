@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote
 
 import yaml
@@ -361,6 +362,14 @@ def _handle_private_input(spec: TaskSpec, message: str) -> None:
         raise ValueError(message)
 
 
+def _is_private_repo(entry: dict[str, Any]) -> bool:
+    return (
+        bool(entry.get("private"))
+        or entry.get("visibility") == "private"
+        or "private" in (entry.get("role") or "")
+    )
+
+
 def check_private_input(spec: TaskSpec, repo_key: str) -> None:
     if spec.agent not in {"muse", "opencode"}:
         return
@@ -375,13 +384,13 @@ def check_private_input(spec: TaskSpec, repo_key: str) -> None:
         private_payload = not savant_request_store(spec.options.get("data_class"))
         entry = repos.get(repo_key, {})
         role = entry.get("role") or ""
-        if not role.startswith(("public-", "private-")):
+        visibility = entry.get("visibility")
+        known_visibility = role.startswith(("public-", "private-")) or visibility in {"public", "private"}
+        if not known_visibility:
             raise ValueError("savant_repository_refused: the target must be a registered repository with a known visibility")
-        if not private_payload and (entry.get("private") or role.startswith("private-")):
+        if not private_payload and _is_private_repo(entry):
             raise ValueError("savant_repository_refused: private repositories require a private data class")
-    private = {
-        key: item for key, item in repos.items() if item.get("private", False) or "private" in (item.get("role") or "")
-    }
+    private = {key: item for key, item in repos.items() if _is_private_repo(item)}
     roots = [git.resolve_repo(key)[0] for key in private]
     if not private_payload:
         if git.resolve_repo(repo_key)[0] in roots:

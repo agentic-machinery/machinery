@@ -96,31 +96,45 @@ def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(val).astimezone(UTC)
 
 
+class SlotAssignmentsConfigError(ValueError):
+    """Raised when ``area_assignments.yaml`` is unreadable or structurally malformed."""
+
+
 def _find_area_for_slot(slot: str, assignments_path: Path) -> str | None:
-    """Look up slot in area_assignments.yaml to find its area ID."""
+    """Look up slot in area_assignments.yaml to find its area ID.
+
+    Returns ``None`` only when ``assignments_path`` does not exist or is valid
+    and contains no mapping for ``slot``. Raises :class:`SlotAssignmentsConfigError`
+    on malformed YAML or invalid assignment/slot shapes so callers never fall
+    through to suffix-based area inference on a corrupt registry.
+    """
+    if not assignments_path.exists():
+        return None
+    if not assignments_path.is_file():
+        raise SlotAssignmentsConfigError(f"{assignments_path} is not a regular file")
+    import yaml
+
     try:
-        if not assignments_path.is_file():
-            return None
-        text = assignments_path.read_text(encoding="utf-8")
-        import yaml
-        raw_data = yaml.safe_load(text)
-        if not isinstance(raw_data, dict):
-            return None
-        assignments = raw_data.get("assignments")
-        if not isinstance(assignments, dict):
-            return None
-        for area_id, area_data in assignments.items():
-            if isinstance(area_id, str) and isinstance(area_data, dict):
-                slots = area_data.get("slots", [])
-                if (
-                    isinstance(slots, (list, tuple))
-                    and all(isinstance(item, str) for item in slots)
-                    and slot in slots
-                ):
-                    return area_id
-    except Exception:
-        pass
-    return None
+        raw_data = yaml.safe_load(assignments_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise SlotAssignmentsConfigError(f"failed to parse {assignments_path}: {exc}") from exc
+    if not isinstance(raw_data, dict):
+        raise SlotAssignmentsConfigError(f"{assignments_path} root must be a mapping")
+    assignments = raw_data.get("assignments")
+    if not isinstance(assignments, dict):
+        raise SlotAssignmentsConfigError(f"{assignments_path} 'assignments' must be a mapping")
+    matched_area: str | None = None
+    for area_id, area_data in assignments.items():
+        if not isinstance(area_id, str) or not area_id.strip() or not isinstance(area_data, dict):
+            raise SlotAssignmentsConfigError(f"{assignments_path} entry {area_id!r} must be a mapping")
+        slots = area_data.get("slots", [])
+        if slots is None:
+            slots = []
+        if not isinstance(slots, (list, tuple)) or not all(isinstance(item, str) for item in slots):
+            raise SlotAssignmentsConfigError(f"{assignments_path}[{area_id!r}].slots must be a list of strings")
+        if matched_area is None and slot in slots:
+            matched_area = area_id
+    return matched_area
 
 
 def resolve_slot_holder(

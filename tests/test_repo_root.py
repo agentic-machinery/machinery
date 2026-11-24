@@ -1321,8 +1321,24 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
         _, complete = authority._load_roster()
         assert complete is False
 
-        # F4: non-string driver_agent_type fails closed instead of stringifying to "7".
-        assert driver_agent_type.resolve_driver_agent_type("beta-area") is None
+        # F3: non-string driver_agent_type raises DriverAgentConfigError and exits 2 in CLI.
+        with pytest.raises(driver_agent_type.DriverAgentConfigError, match="driver_agent_type"):
+            driver_agent_type.resolve_driver_agent_type("beta-area")
+        assert driver_agent_type.main(["--lane", "beta-area"]) == 2
+
+        # F7: mixed-type slots list raises SlotAssignmentsConfigError instead of falling back to suffix inference.
+        (profile_b.parent / "area_assignments.yaml").write_text(
+            "version: 1\nassignments:\n  beta-area:\n    slots: [claude-beta, 7]\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(slot_routing.SlotAssignmentsConfigError, match="slots"):
+            slot_routing._find_area_for_slot("claude-beta", profile_b.parent / "area_assignments.yaml")
+
+        # F4: explicit visibility: private with role: null classifies as private in dispatcher checks.
+        from lu_machinery.dispatcher import checks as dispatch_checks
+
+        assert dispatch_checks._is_private_repo({"visibility": "private", "role": None}) is True
+        assert dispatch_checks._is_private_repo({"visibility": "public", "role": None}) is False
 
         # F4: malformed assignments mapping raises ValueError in stalled_work.owner_lanes().
         from lu_machinery.orchestration import stalled_work

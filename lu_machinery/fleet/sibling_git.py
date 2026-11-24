@@ -137,6 +137,15 @@ def _registry_transport(key: str, *, registry_path: Path | None = None) -> str:
     return transport
 
 
+_DEFAULT_REGISTRY_TRANSPORT = _registry_transport
+
+
+def _resolve_transport(key: str, registry_path: Path) -> str:
+    if _registry_transport is _DEFAULT_REGISTRY_TRANSPORT:
+        return _registry_transport(key, registry_path=registry_path)
+    return _registry_transport(key)
+
+
 def _https_url(remote: str, github: str) -> None:
     if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*", github) or remote not in (
         f"https://github.com/{github}.git",
@@ -515,7 +524,7 @@ def resolve_repository(key: str, primary: Path, git: Git) -> Repository:
     if git_dir != common or not common.is_relative_to(checkout):
         raise Refusal("sibling must own independent metadata beneath its checkout")
     _metadata_safe(common, primary)
-    transport = _registry_transport(key, registry_path=registry_path)
+    transport = _resolve_transport(key, registry_path)
     _safe_config(git, checkout, https=transport == "https")
     actual = git.text(
         checkout,
