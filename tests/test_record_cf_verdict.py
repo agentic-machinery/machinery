@@ -398,14 +398,44 @@ def test_ci_fix_uses_the_repository_required_workflow(monkeypatch, tmp_path):
     monkeypatch.setattr(repair_round.prepublish, "catalog", lambda: {"a": row, "b": row})
     with pytest.raises(repair_round.RepairRefused, match=r"\[evidence\].*registered more than once"):
         repair_round.required_workflows(REPOSITORY)
-    # Every registered repository without the key keeps ci.yml; machinery names ci-gate.yml and kube-dojo its four.
-    monkeypatch.undo()
-    workflows = {key: repair_round.required_workflows(repo.github) for key, repo in recorder.load_fleet_repos().items()}
-    assert workflows.pop("machinery") == (gate,)
-    assert workflows.pop("kube-dojo") == tuple(
-        f".github/workflows/{name}.yml" for name in ("incident-dedup", "link-check", "build-check", "vitest-check")
-    )
-    assert set(workflows.values()) == {(repair_round.DEFAULT_REQUIRED_WORKFLOW,)}
+
+
+def test_every_registered_row_requires_exactly_its_repository_merge_gates():
+    """Defect classes: a fleet_repos.yaml row whose required workflows (the ci.yml default included) differ from
+    the workflows that gate that repository's merges, so a repair round refuses a real CI failure or accepts a
+    non-gating one; and a merge-queue row naming several workflows, which merge closeout refuses.
+
+    The gates come from a fixture read from GitHub: the workflows behind the branch's required checks, or, where
+    GitHub requires none, every workflow that runs on pull requests (the publisher refuses any failing check).
+    """
+    import yaml
+
+    document = yaml.safe_load((Path(__file__).parent / "review/fixtures/fleet_repo_workflows.yaml").read_text())
+    assert isinstance(document, dict) and isinstance(document.get("repos"), dict)
+    recorded = document["repos"]
+    registered = recorder.load_fleet_repos()
+    # A newly registered repository has no recorded gates until someone reads them from GitHub.
+    assert set(recorded) == set(registered)
+    wrong = {}
+    for key, repo in registered.items():
+        row = recorded[key]
+        lists = [row.get(name) if isinstance(row, dict) else None for name in ("checks", "pull_request")]
+        if not (
+            isinstance(row, dict)
+            and set(row) == {"merge_queue", "checks", "pull_request"}
+            and type(row["merge_queue"]) is bool
+            and all(isinstance(names, list) and all(isinstance(name, str) for name in names) for names in lists)
+            and all(len(set(names)) == len(names) for names in lists)
+            and set(lists[0]) <= set(lists[1])
+        ):
+            wrong[key] = f"malformed fixture row {row!r}"
+            continue
+        required = repair_round.required_workflows(repo.github)
+        if sorted(required) != sorted(row["checks"] or row["pull_request"]):
+            wrong[key] = sorted(required)
+        elif row["merge_queue"] and len(required) != 1:
+            wrong[key] = f"merge queue with {len(required)} workflows"
+    assert wrong == {}
 
 
 def _misnamed_copy(tasks, name, **updates):

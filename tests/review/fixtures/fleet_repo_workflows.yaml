@@ -1,0 +1,87 @@
+# The merge gates of each registered repository's main branch, read-only from the GitHub workflows,
+# contents, rules and branch-protection APIs on 2026-11-24, for
+# tests/test_record_cf_verdict.py::test_every_registered_row_requires_exactly_its_repository_merge_gates.
+#   merge_queue:  the branch has a GitHub merge queue (merge closeout then binds one merge-group run).
+#   checks:       the workflow files whose jobs produce the branch's GitHub-required status checks;
+#                 empty where GitHub requires none.
+#   pull_request: the workflow files whose `on:` includes pull_request or merge_group, the only
+#                 events repair_round accepts as CI evidence.
+# Re-record a repository when its workflows or required checks change, or when one is registered.
+version: 1
+observed: "2026-11-24"
+repos:
+  public:
+    merge_queue: true
+    checks:
+      - .github/workflows/ci.yml
+    pull_request:
+      - .github/workflows/actionlint.yml
+      - .github/workflows/atlas-grow.yml
+      - .github/workflows/cache-hygiene.yml
+      - .github/workflows/ci.yml
+      - .github/workflows/model-catalog-freshness.yml
+      - .github/workflows/pr-body-guard.yml
+      - .github/workflows/pr-publication-scan.yml
+      - .github/workflows/pr-size-warning.yml
+      - .github/workflows/rules-deployment-check.yml
+      - .github/workflows/security-audit.yml
+      - .github/workflows/validate-yaml.yml
+  infra-private:
+    merge_queue: false
+    checks: []
+    pull_request:
+      - .github/workflows/fleet-security-caller.yml
+      - .github/workflows/hramatka-cd.yml
+      - .github/workflows/private-boundary.yml
+      - .github/workflows/security-scan.yml
+  hramatka:
+    merge_queue: false
+    checks: []
+    pull_request:
+      - .github/workflows/ci.yml
+      - .github/workflows/codeql.yml
+      - .github/workflows/security.yml
+  kube-dojo:
+    merge_queue: false
+    checks:
+      - .github/workflows/build-check.yml
+      - .github/workflows/incident-dedup.yml
+      - .github/workflows/link-check.yml
+      - .github/workflows/vitest-check.yml
+    pull_request:
+      - .github/workflows/arxiv-citations.yml
+      - .github/workflows/build-check.yml
+      - .github/workflows/extensions-sync.yml
+      - .github/workflows/incident-dedup.yml
+      - .github/workflows/link-check.yml
+      - .github/workflows/security.yml
+      - .github/workflows/supply-chain.yml
+      - .github/workflows/uk-quality-checks.yml
+      - .github/workflows/vitest-check.yml
+      - .github/workflows/zizmor.yml
+  kubedojo-labs:
+    merge_queue: false
+    checks: []
+    pull_request:
+      - .github/workflows/codeql.yml
+      - .github/workflows/test-scenarios.yml
+  machinery:
+    merge_queue: true
+    checks:
+      - .github/workflows/ci-gate.yml
+    pull_request:
+      - .github/workflows/ci-gate.yml
+      - .github/workflows/codeql.yml
+      - .github/workflows/security.yml
+  ukrainian-llm-eval:
+    # Its ruleset also requires "Independent review", a commit status no workflow produces.
+    merge_queue: false
+    checks:
+      - .github/workflows/ci.yml
+    pull_request:
+      - .github/workflows/ci.yml
+  mnq-orb:
+    merge_queue: false
+    checks: []
+    pull_request:
+      - .github/workflows/ci.yml
