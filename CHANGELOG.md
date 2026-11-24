@@ -9,6 +9,18 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.67"></a>
+## [0.1.67] - 2026-11-24 [YANKED]
+
+Withdrawn: release acceptance failed at contract canary.
+
+### Fixed
+
+- Support read-only consumer asks without Sources ([#1323](https://github.com/learn-ukrainian/machinery/pull/1323))
+- Select affordable direct importers in the extra PR test budget ([#1321](https://github.com/learn-ukrainian/machinery/pull/1321))
+- Route driver notices through ordinary inboxes ([#1326](https://github.com/learn-ukrainian/machinery/pull/1326))
+- Prefer Codex account b only while it has allowance ([#1328](https://github.com/learn-ukrainian/machinery/pull/1328))
+
 <a id="v0.1.66"></a>
 ## [0.1.66] - 2026-11-24
 
@@ -1559,7 +1571,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.67...HEAD
+[0.1.67]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...v0.1.67
 [0.1.66]: https://github.com/learn-ukrainian/machinery/compare/v0.1.65...v0.1.66
 [0.1.65]: https://github.com/learn-ukrainian/machinery/compare/v0.1.64...v0.1.65
 [0.1.64]: https://github.com/learn-ukrainian/machinery/compare/v0.1.63...v0.1.64
