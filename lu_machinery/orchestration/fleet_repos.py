@@ -42,7 +42,7 @@ from lu_machinery.common.git_credentials import (
     repository_registry,
     verify_authenticated_repository,
 )
-from lu_machinery.common.repo_root import PRODUCT_MARKER
+from lu_machinery.common.repo_root import PRODUCT_MARKER, configured_repos_root
 from lu_machinery.orchestration.product_policy import POLICY_REL
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
@@ -400,7 +400,16 @@ def resolve_fleet_repo(
     resolved_key = default_repo_key(catalog) if key is None else canonical_repo_key(key, catalog)
     repo = catalog[resolved_key]
     primary = primary_root.resolve()
-    checkout = primary if repo.default else (primary.parent / repo.local_name).resolve()
+    configured_repos = configured_repos_root()
+    if repo.default:
+        checkout = (
+            (configured_repos / repo.local_name).resolve()
+            if configured_repos is not None and not (primary / ".git").exists()
+            else primary
+        )
+    else:
+        sibling_base = configured_repos if configured_repos is not None else primary.parent
+        checkout = (sibling_base / repo.local_name).resolve()
     if require_checkout and not (checkout / ".git").exists() and not checkout.is_dir():
         raise _missing_checkout_error(
             repo,

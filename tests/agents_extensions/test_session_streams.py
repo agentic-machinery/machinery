@@ -1402,3 +1402,48 @@ def test_parse_timestamp_refuses_out_of_range_utc_conversion():
     for value in ("9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59"):
         with pytest.raises(ValueError):
             parse_timestamp(value)
+
+
+def test_canonical_state_root_and_default_db_converge_for_non_git_state_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: session_streams DB path diverges between non-Git state root and checkout."""
+    import subprocess
+
+    from lu_machinery.session_streams.db import (
+        DEFAULT_RELATIVE_DATABASE,
+        SessionStreamDatabaseError,
+        canonical_state_root,
+        default_database_path,
+    )
+
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    checkout = tmp_path / "repos" / "learn-ukrainian"
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=30)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.email", "t@example.invalid"], check=True, timeout=30)
+    subprocess.run(["git", "-C", str(checkout), "config", "user.name", "T"], check=True, timeout=30)
+    subprocess.run(["git", "-C", str(checkout), "commit", "--allow-empty", "-qm", "init"], check=True, timeout=30)
+    worktree = checkout / ".worktrees" / "dispatch" / "agy" / "wt"
+    subprocess.run(["git", "-C", str(checkout), "worktree", "add", "-q", "-b", "wt", str(worktree)], check=True, timeout=30)
+    unconfigured_dir = tmp_path / "not-git"
+    unconfigured_dir.mkdir()
+
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv("LU_PRIMARY_REPO_ROOT", str(checkout))
+    monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", raising=False)
+
+    expected_db = state.resolve() / DEFAULT_RELATIVE_DATABASE
+    assert canonical_state_root() == state.resolve()
+    assert canonical_state_root(state) == state.resolve()
+    assert canonical_state_root(checkout) == state.resolve()
+    assert canonical_state_root(worktree) == state.resolve()
+    assert default_database_path() == expected_db
+    assert default_database_path(state) == expected_db
+    assert default_database_path(checkout) == expected_db
+    assert default_database_path(worktree) == expected_db
+
+    # An unconfigured non-Git directory is still refused by canonical_state_root.
+    with pytest.raises(SessionStreamDatabaseError):
+        canonical_state_root(unconfigured_dir)

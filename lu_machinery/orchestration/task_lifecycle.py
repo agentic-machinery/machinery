@@ -28,7 +28,12 @@ from typing import Any, TypeGuard
 from jsonschema import Draft202012Validator, FormatChecker
 
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common.repo_root import (
+    MachineryConfigError,
+    is_configured_state_root,
+    machinery_path,
+    state_root_for_checkout,
+)
 from lu_machinery.github_check_rollup import group_collapsed_by_name
 from lu_machinery.orchestration import fleet_repos, issue_stream_audit, task_identity
 from lu_machinery.review.review_contract import finding_supports_approval, unverified_follow_up_notes
@@ -1213,14 +1218,24 @@ def set_remaining_scope(
 
 
 def canonical_state_root(repo_root: Path) -> Path:
-    """Return the primary checkout shared by all linked worktrees."""
+    """Return the canonical durable state root for ``repo_root``."""
+    try:
+        configured = is_configured_state_root(repo_root)
+    except (MachineryConfigError, OSError, RuntimeError) as exc:
+        raise LifecycleError(f"cannot resolve canonical state root: {exc}") from exc
+    if configured is not None:
+        return configured
     completed = _run_git(repo_root, ["rev-parse", "--path-format=absolute", "--git-common-dir"])
     common = Path(completed.strip())
     if not common.is_absolute():
         common = (repo_root / common).resolve()
     if common.name != ".git":
         raise LifecycleError(f"cannot derive primary checkout from Git common directory: {common}")
-    return common.parent.resolve()
+    checkout_primary = common.parent.resolve()
+    try:
+        return state_root_for_checkout(checkout_primary)
+    except (MachineryConfigError, OSError, RuntimeError) as exc:
+        raise LifecycleError(f"cannot resolve canonical state root: {exc}") from exc
 
 
 def lifecycle_path(repo_root: Path, identity: Mapping[str, Any]) -> Path:

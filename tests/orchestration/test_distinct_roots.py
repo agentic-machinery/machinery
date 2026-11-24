@@ -602,3 +602,32 @@ def test_machinery_path_refuses_absolute_traversal_and_escaping_symlink_inputs(m
     ):
         with pytest.raises(ValueError):
             rr.machinery_path(value)
+
+
+def test_non_git_state_root_uses_lu_repos_root_for_siblings_and_worktree_locks(
+    clean_env, monkeypatch, tmp_path: Path
+) -> None:
+    """Defect class: detached non-Git state root breaking sibling resolution or worktree lock paths."""
+    from lu_machinery.dispatcher import git as dispatch_git
+    from lu_machinery.orchestration import fleet_repos
+
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    machinery_checkout = repos / "machinery"
+    public_checkout = repos / "learn-ukrainian"
+    for checkout in (machinery_checkout, public_checkout):
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=30)
+
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(state))
+    monkeypatch.setenv(rr.REPOS_ROOT_ENV, str(repos))
+
+    assert dispatch_git.resolve_repo("machinery")[0] == machinery_checkout.resolve()
+    assert fleet_repos.resolve_fleet_repo("machinery", primary_root=rr.state_root())[1] == machinery_checkout.resolve()
+    assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == public_checkout.resolve()
+    assert worktree_claims.control_plane_root(machinery_checkout) == state.resolve()
+    assert worktree_claims.control_plane_root(public_checkout) == state.resolve()
+    expected_locks = state.resolve() / "batch_state" / "locks" / worktree_claims.LOCK_DIR_NAME
+    assert worktree_claims.repository_lock_dir(worktree_claims.control_plane_root(machinery_checkout)) == expected_locks
+    assert worktree_claims.repository_lock_dir(rr.state_root()) == expected_locks

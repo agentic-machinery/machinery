@@ -23,6 +23,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
+from lu_machinery.common.repo_root import configured_state_root
 from lu_machinery.gh_merge_queue_status import extract_pr_number
 from lu_machinery.github_check_rollup import bind_workflow_runs, group_collapsed_by_name, project_check_runs
 from lu_machinery.ops import verify_run as ops_verify_run
@@ -4004,13 +4005,24 @@ def _direct_config_from_args(args: argparse.Namespace) -> DirectLandingConfig | 
     )
 
 
+def default_keeper_paths(repo_root: Path) -> tuple[Path, Path]:
+    """Resolve default keeper state and lock paths, converging on ``LU_STATE_ROOT`` when set."""
+    configured_state = configured_state_root()
+    state_base = configured_state.resolve() if configured_state is not None else repo_root.resolve()
+    return (
+        state_base / "batch_state/merge_queue_keeper.json",
+        state_base / "batch_state/locks/merge_queue_keeper.lock",
+    )
+
+
 @publication_cli(KeeperError)
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = args.repo_root.resolve()
     direct_config = _direct_config_from_args(args)
-    state_path = args.state_file.resolve() if args.state_file is not None else root / "batch_state/merge_queue_keeper.json"
-    lock_path = args.lock_file.resolve() if args.lock_file is not None else root / "batch_state/locks/merge_queue_keeper.lock"
+    default_state_path, default_lock_path = default_keeper_paths(root)
+    state_path = args.state_file.resolve() if args.state_file is not None else default_state_path
+    lock_path = args.lock_file.resolve() if args.lock_file is not None else default_lock_path
     run_kwargs: dict[str, Any] = {}
     if direct_config is not None:
         from lu_machinery.common.task_store_paths import tasks_dir

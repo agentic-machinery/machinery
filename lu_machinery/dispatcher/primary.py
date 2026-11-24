@@ -11,8 +11,9 @@ from lu_machinery.common.repo_root import (
     in_tree_source,
     machinery_path,
     main_checkout_root,
-    primary_root,
+    state_root,
 )
+from lu_machinery.common.repo_root import primary_root as primary_root
 
 ENTRY = Path(Path(__file__).absolute().parents[1].name, "dispatch.py")
 
@@ -46,8 +47,8 @@ def exec_primary(
         # Installed code stays installed; a product checkout cannot select its replacement.
         if not any(arg in {"-h", "--help"} for arg in argv):
             try:
-                primary_root()
-            except MachineryConfigError as exc:  # unset, relative, missing, linked or looping primary
+                state_root()
+            except MachineryConfigError as exc:  # unset, relative, missing, linked or looping root
                 refuse(str(exc))
         return
     root = machinery_path("dispatch.py").parent.parent

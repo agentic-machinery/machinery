@@ -709,4 +709,27 @@ def test_agy_sandbox_exposes_pinned_node_toolchain_read_only_and_refuses_missing
     assert str(missing_receipt.get("reason", "")).startswith("node_toolchain_unavailable:")
 
 
+def test_child_env_forwards_non_git_state_repos_and_profile_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Defect class: child_env dropping LU_STATE_ROOT, LU_REPOS_ROOT, or LU_PROFILE_PATH."""
+    state = tmp_path / "state"
+    repos = tmp_path / "repos"
+    state.mkdir()
+    repos.mkdir()
+    host_profile = tmp_path / "profile.v1.json"
+    host_profile.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", sys.executable)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv("LU_REPOS_ROOT", str(repos))
+    monkeypatch.setenv("LU_PROFILE_PATH", str(host_profile))
+
+    spec = TaskSpec("roots", "agy", "stub", None, "workspace-write", tmp_path, tmp_path / "p", tmp_path / "f")
+    for mode in ("workspace-write", "read-only"):
+        child = environment.child_env(replace(spec, mode=mode))
+        assert child["LU_STATE_ROOT"] == str(state)
+        assert child["LU_REPOS_ROOT"] == str(repos)
+        assert child["LU_PROFILE_PATH"] == str(host_profile)
+
+
 pytestmark = [pytest.mark.usefixtures('configured_roots')]

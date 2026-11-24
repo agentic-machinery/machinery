@@ -32,6 +32,7 @@ from lu_machinery.common.repo_root import (
     main_checkout_root,
     product_root,
     project_interpreter,
+    repos_root,
     state_root,
 )
 from lu_machinery.common.task_scratch import TaskScratchError, allocate
@@ -368,7 +369,7 @@ def resolve_repo(key: str | None = None) -> tuple[Path, dict]:
         return main_checkout_root(product_root()).resolve(), item
     if not item.get("local_name", "").strip():
         raise ValueError("repository registry entry requires a local name")
-    return (state_root().parent / item["local_name"]).resolve(), item
+    return (repos_root() / item["local_name"]).resolve(), item
 
 
 def publish_start(repo: Path, repository: dict, branch: str, task_id: str, *, label: str = "publish branch") -> tuple[str, str]:

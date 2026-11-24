@@ -366,3 +366,28 @@ def test_control_plane_changed_files_match_counted_repo_results(tmp_path, capsys
     assert capsys.readouterr() == selected
     path.write_text(line.replace("connection =", "new_connection =") + "\n")
     assert lint.main(["--repo", str(tmp_path), str(path)]) == 1
+
+
+def test_sqlite_path_converges_on_non_git_state_root_over_legacy_repo_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: legacy LEARN_UK_REPO_ROOT splitting control-plane stores from LU_STATE_ROOT."""
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    legacy_checkout = tmp_path / "legacy-checkout"
+    for part in ("objects", "refs"):
+        (legacy_checkout / ".git" / part).mkdir(parents=True)
+    (legacy_checkout / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_OWNERSHIP_LEDGER", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+    monkeypatch.delenv("LU_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(legacy_checkout))
+    monkeypatch.setenv("LEARN_UK_REPO_ROOT", str(legacy_checkout))
+
+    expected = state.resolve()
+    assert sqlite_path(StoreId.FLEET_COMMS) == expected / "batch_state" / "fleet-comms" / "v1" / "comms.sqlite3"
+    assert sqlite_path(StoreId.SESSION_STREAMS) == expected / ".agent" / "session-streams" / "v1" / "session-streams.sqlite3"
+    assert sqlite_path(StoreId.WRITE_OWNERSHIP) == expected / "batch_state" / "tasks" / "write-ownership.sqlite3"

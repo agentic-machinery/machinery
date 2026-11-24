@@ -31,7 +31,12 @@ from lu_machinery.agent_runtime.env_sanitize import CLAUDE_LAUNCH_GUARD_EXIT
 from lu_machinery.agent_runtime.read_only_tmp import create_dispatch_lease, discard_dispatch_lease, dispatch_lease
 from lu_machinery.ai_agent_bridge.routing_guard import SAVANT_PROVIDER
 from lu_machinery.common import json_depth, task_scratch
-from lu_machinery.common.repo_root import in_tree_source, machinery_path, primary_root, state_root
+from lu_machinery.common.repo_root import (
+    configured_primary_root,
+    in_tree_source,
+    machinery_path,
+    state_root,
+)
 from lu_machinery.common.scratch import ensure_scratch_root
 from lu_machinery.common.task_scratch import TaskScratchError
 from lu_machinery.dispatcher import (
@@ -436,7 +441,8 @@ def _dispatcher_code() -> dict:
         attested = None
     # Product Git metadata cannot attest the installed distribution.
     return attested or {
-        "root": str(root if in_tree_source() else primary_root()), "head": None, "clean": False, "read_only": False,
+        "root": str(root if in_tree_source() else (configured_primary_root() or state_root())),
+        "head": None, "clean": False, "read_only": False,
     }
 
 

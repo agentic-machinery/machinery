@@ -300,3 +300,52 @@ def test_fleet_plane_reads_state_root_not_the_product_checkout(roots, monkeypatc
     assert seen == [state.resolve()] * 2
 
     assert not (product / "batch_state").exists()
+
+
+def test_monitor_boots_without_product_root_on_non_git_state_root(tmp_path, monkeypatch):
+    """Defect class: Monitor raising ProductRootError when LU_PRODUCT_ROOT is unset on a non-Git state root."""
+    from fastapi.testclient import TestClient
+
+    from lu_machinery.common.repo_root import ProductRootError
+
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    for name in (
+        "LU_PRODUCT_ROOT",
+        "LU_PRIMARY_REPO_ROOT",
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT",
+        "LEARN_UKRAINIAN_STATE_ROOT",
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR",
+        "LEARN_UK_REPO_ROOT",
+        "BACKUP_DIR",
+        "FLEET_COMMS_ROOT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    for name in ("PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT", "DASHBOARDS_DIR", "BATCH_STATE_DIR"):
+        if name in vars(config):
+            monkeypatch.delitem(vars(config), name)
+    monitor_context.production_context.cache_clear()
+    try:
+        ctx = monitor_context.production_context()
+        assert ctx.roots.state_root == state
+        assert ctx.roots.project_root == state
+        assert ctx.roots.live_repo_root == state
+        assert ctx.roots.batch_state_dir == state / "batch_state"
+        assert ctx.roots.session_streams_db_path == state.resolve() / ".agent/session-streams/v1/session-streams.sqlite3"
+
+        main = _load_api("lu_machinery.api.main", monkeypatch)
+        app = main.create_app(ctx)
+        client = TestClient(app)
+        health = client.get("/api/health")
+        assert health.status_code == 200, health.text
+
+        # An explicitly configured invalid LU_PRODUCT_ROOT still fails closed.
+        monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path / "missing-product"))
+        monitor_context.production_context.cache_clear()
+        with pytest.raises(ProductRootError):
+            monitor_context.production_context()
+    finally:
+        monitor_context.production_context.cache_clear()
+        for name in ("PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT", "DASHBOARDS_DIR", "BATCH_STATE_DIR"):
+            vars(config).pop(name, None)

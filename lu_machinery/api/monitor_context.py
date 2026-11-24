@@ -15,7 +15,12 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import Request
 
-from lu_machinery.common.repo_root import state_root
+from lu_machinery.common.repo_root import (
+    configured_primary_root,
+    configured_product_root,
+    in_tree_source,
+    state_root,
+)
 
 from . import config
 from .resilience import connect_sqlite
@@ -387,6 +392,28 @@ def _cached_production_context(
     )
 
 
+def _production_product_roots(shared_root: Path) -> tuple[Path, Path, Path]:
+    """Resolve ``(project_root, live_repo_root, curriculum_root)`` for production.
+
+    When a product is configured (via ``LU_PRODUCT_ROOT``, an in-tree source checkout,
+    or an explicit override cached on :mod:`.config`), keep the exact ``config.*``
+    resolution so invalid product settings still fail closed. When no product is
+    configured, fall back to ``shared_root`` for project/curriculum paths and
+    ``LEARN_UK_REPO_ROOT`` (or ``configured_primary_root`` or ``shared_root``) for
+    ``live_repo_root`` so Monitor boots cleanly without ``LU_PRODUCT_ROOT``.
+    """
+    config_vars = vars(config)
+    has_cached_product = any(name in config_vars for name in ("PROJECT_ROOT", "PRODUCT_ROOT"))
+    if has_cached_product or configured_product_root() is not None or in_tree_source():
+        return Path(config.PROJECT_ROOT), Path(config.LIVE_REPO_ROOT), Path(config.CURRICULUM_ROOT)
+    live_repo_root = (
+        Path(config.LIVE_REPO_ROOT)
+        if os.environ.get("LEARN_UK_REPO_ROOT")
+        else (configured_primary_root() or shared_root)
+    )
+    return shared_root, live_repo_root, shared_root / "curriculum" / "l2-uk-en"
+
+
 def production_context() -> MonitorContext:
     """Build a cached context keyed by the current production configuration."""
     from lu_machinery.session_streams.db import (  # noqa: PLC0415  # lazy-ok: checkout-only session store
@@ -394,15 +421,14 @@ def production_context() -> MonitorContext:
     )
 
     shared_root = state_root()
-    project_root = Path(config.PROJECT_ROOT)
-    live_repo_root = Path(config.LIVE_REPO_ROOT)
+    project_root, live_repo_root, curriculum_root = _production_product_roots(shared_root)
     return _cached_production_context(
         shared_root,
         project_root,
         live_repo_root,
         Path(config.DASHBOARDS_DIR),
         Path(os.environ.get("LEARN_UKRAINIAN_BATCH_STATE_DIR", str(shared_root / "batch_state"))),
-        Path(config.CURRICULUM_ROOT),
+        curriculum_root,
         default_database_path(shared_root),
         Path(os.environ.get("BACKUP_DIR", str(shared_root / "data" / "backups"))),
     )

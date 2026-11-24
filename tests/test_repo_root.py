@@ -283,10 +283,12 @@ def test_the_installed_package_refuses_product_and_state_without_anchors(unconfi
     # Consumers that catch the resolver's ValueError keep refusing.
     with pytest.raises(worktree_claims.ControlPlaneError, match=rr.PRIMARY_ROOT_ENV):
         worktree_claims.public_primary_root()
-    # A state root alone does not stand in for the primary anchor.
-    monkeypatch.setenv(rr.STATE_ROOT_ENV, str(_primary_checkout(tmp_path / "primary")))
+    # A state root alone satisfies state_root(), but does not stand in for the primary Git checkout anchor.
+    primary_candidate = _primary_checkout(tmp_path / "primary")
+    monkeypatch.setenv(rr.STATE_ROOT_ENV, str(primary_candidate))
+    assert rr.state_root() == primary_candidate
     with pytest.raises(rr.StateRootError, match=rr.PRIMARY_ROOT_ENV):
-        rr.state_root()
+        rr.primary_root()
 
 
 def test_the_installed_package_resolves_its_configured_anchors(unconfigured, tmp_path, monkeypatch):
@@ -302,8 +304,13 @@ def test_the_installed_package_resolves_its_configured_anchors(unconfigured, tmp
     assert worktree_claims.public_primary_root() == primary
     monkeypatch.setenv(rr.STATE_ROOT_ENV, str(primary))
     assert rr.state_root() == primary
+    dedicated_state = tmp_path / "dedicated-state"
+    dedicated_state.mkdir()
+    monkeypatch.setenv(rr.STATE_ROOT_ENV, str(dedicated_state))
+    assert rr.state_root() == dedicated_state
+    assert rr.primary_root() == primary
     monkeypatch.setenv(rr.STATE_ROOT_ENV, str(tmp_path / "decoy"))
-    with pytest.raises(rr.MachineryConfigError, match="state cutover"):
+    with pytest.raises(rr.MachineryConfigError, match="not a real Git directory"):
         rr.state_root()
 
 
@@ -605,8 +612,10 @@ def test_lu_and_legacy_root_names_resolve_alike_and_a_conflict_refuses(unconfigu
             with pytest.raises(rr.MachineryConfigError, match=f"^{name} must be"):
                 resolve({**base, name: "relative"})
     for name in (rr.LU_STATE_ROOT_ENV, rr.STATE_ROOT_ENV):
-        with pytest.raises(rr.MachineryConfigError, match=f"^{name} .* must be the primary checkout"):
-            rr.state_root(env={**anchored, name: str(other)})
+        assert rr.state_root(env={**anchored, name: str(other)}) == other
+        missing_state = tmp_path / "missing-state"
+        with pytest.raises(rr.MachineryConfigError, match=f"^{name} .* must be an existing directory"):
+            rr.state_root(env={**anchored, name: str(missing_state)})
     for name in (rr.LU_PRIMARY_ROOT_ENV, rr.PRIMARY_ROOT_ENV):
         assert project_interpreter(env={name: str(primary)}) == venv_python
     with pytest.raises(rr.StateRootError, match=rr.LU_PRIMARY_ROOT_ENV):
@@ -843,3 +852,241 @@ def test_an_invalid_profile_refuses_and_never_falls_back(unconfigured, tmp_path,
             with pytest.raises(profile.ProfileError):
                 profile.config_path("fleet_repos", env=selected)
     assert _tree(tmp_path) == before
+
+
+def test_non_git_state_root_and_explicit_repos_root_contract(unconfigured, tmp_path):
+    """Defect class: separate non-Git LU_STATE_ROOT refused, or siblings resolving via state_root().parent."""
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    primary = _primary_checkout(repos / "learn-ukrainian")
+    linked = tmp_path / "linked-wt"
+    _link_worktree(primary, linked)
+    stray = tmp_path / "stray"
+    (stray / ".git").mkdir(parents=True)
+    plain_file = tmp_path / "plain-file"
+    plain_file.write_text("x", encoding="utf-8")
+    python = _executable(tmp_path / "runtime" / "bin" / "python")
+
+    detached_env = {
+        rr.LU_STATE_ROOT_ENV: str(state),
+        rr.REPOS_ROOT_ENV: str(repos),
+        rr.LU_INTERPRETER_ENV: str(python),
+    }
+    assert rr.configured_state_root(detached_env) == state
+    assert rr.state_root(env=detached_env) == state
+    assert rr.configured_repos_root(detached_env) == repos
+    assert rr.repos_root(env=detached_env) == repos
+    roots = rr.machinery_roots(detached_env)
+    assert (roots.state, roots.primary, roots.repos, roots.interpreter) == (state, None, repos, python)
+    with pytest.raises(rr.StateRootError, match=rr.LU_PRIMARY_ROOT_ENV):
+        rr.primary_root(env=detached_env)
+
+    # Without LU_REPOS_ROOT, repos_root falls back to primary_root().parent and never state_root().parent.
+    assert rr.repos_root(env={rr.LU_PRIMARY_ROOT_ENV: str(primary)}) == repos
+    with pytest.raises(rr.StateRootError, match=rr.REPOS_ROOT_ENV):
+        rr.repos_root(env={rr.LU_STATE_ROOT_ENV: str(state)})
+
+    # Real-Git and directory validation stay fail-closed for bad LU_STATE_ROOT and LU_REPOS_ROOT values.
+    for bad_state in (str(linked), str(stray), str(plain_file), str(tmp_path / "missing"), "relative"):
+        with pytest.raises(rr.MachineryConfigError):
+            rr.state_root(env={rr.LU_STATE_ROOT_ENV: bad_state})
+    for bad_repos in (str(primary), str(plain_file), str(tmp_path / "missing-repos"), "relative"):
+        with pytest.raises(rr.MachineryConfigError):
+            rr.repos_root(env={rr.REPOS_ROOT_ENV: bad_repos})
+
+
+def test_host_profile_outside_state_root_via_lu_profile_path(unconfigured, tmp_path):
+    """Defect class: host profile outside state_root ignored or falling back when missing/invalid."""
+    state = tmp_path / "state"
+    state.mkdir()
+    _write_profile(state, {**_PROFILE, "github_slug": "state-org/state-repo"})
+    host_dir = tmp_path / "etc-lu-machinery"
+    host_dir.mkdir()
+    (host_dir / "fleet_repos.yaml").write_text("version: 1\n", encoding="utf-8")
+    host_profile = host_dir / "profile.v1.json"
+    host_doc = {
+        **_PROFILE,
+        "profile_id": "host-plane",
+        "github_slug": "host-org/host-repo",
+        "config": {"fleet_repos": "fleet_repos.yaml"},
+    }
+    host_profile.write_bytes(json.dumps(host_doc).encode())
+
+    # Works even without state_root, and overrides any profile inside state_root.
+    for env in (
+        {rr.PROFILE_PATH_ENV: str(host_profile)},
+        {rr.LU_STATE_ROOT_ENV: str(state), rr.PROFILE_PATH_ENV: str(host_profile)},
+    ):
+        loaded = profile.load_profile(env=env)
+        assert loaded is not None
+        assert (loaded.path, loaded.owner_root, loaded.profile_id, loaded.github_slug) == (
+            host_profile,
+            host_dir,
+            "host-plane",
+            "host-org/host-repo",
+        )
+        assert rr.configured_github_slug(env) == rr.github_slug(env) == "host-org/host-repo"
+        assert profile.config_path("fleet_repos", env=env) == host_dir / "fleet_repos.yaml"
+        with pytest.raises(profile.ProfileError, match="the profile is the one authority"):
+            rr.github_slug({**env, rr.LU_GITHUB_SLUG_ENV: "other-org/other-repo"})
+
+    # Missing, relative, traversal, and symlinked LU_PROFILE_PATH fail closed without fallback.
+    link = tmp_path / "linked-profile.json"
+    link.symlink_to(host_profile)
+    for bad in (
+        str(tmp_path / "missing.json"),
+        "relative/profile.v1.json",
+        str(host_dir / ".." / host_dir.name / "profile.v1.json"),
+        str(link),
+    ):
+        for call in (
+            lambda e: profile.load_profile(env=e),
+            lambda e: profile.config_path("fleet_repos", env=e),
+            rr.github_slug,
+        ):
+            with pytest.raises(profile.ProfileError):
+                call({rr.LU_STATE_ROOT_ENV: str(state), rr.PROFILE_PATH_ENV: bad})
+
+
+@pytest.mark.parametrize("layout_kind", ["today-primary", "non-git-clean", "non-git-with-legacy"])
+def test_every_entry_point_converges_for_primary_and_non_git_state_root(
+    unconfigured, tmp_path, monkeypatch, layout_kind: str
+):
+    """Convergence test: Monitor, CLI, dispatcher, session supervisor, control plane and keeper-facing
+    resolvers all converge on the exact same DBs, task store, lock paths and sibling checkouts for
+    (a) today's layout (state_root == primary checkout) and (b) a dedicated non-Git state root
+    (both clean and with legacy env vars set).
+    """
+    from lu_machinery.api import config as api_config
+    from lu_machinery.api import monitor_context
+    from lu_machinery.common.task_store_paths import tasks_dir
+    from lu_machinery.control_plane import storage as cp_storage
+    from lu_machinery.dispatcher import git as dispatch_git
+    from lu_machinery.dispatcher import primary as dispatch_primary
+    from lu_machinery.fleet_comms.paths import DEFAULT_ROOT_REL, default_plane_root
+    from lu_machinery.orchestration import (
+        fleet_repos,
+        merge_queue_keeper,
+        pr_ownership,
+        task_lifecycle,
+        thread_handoff,
+    )
+    from lu_machinery.session_streams.db import (
+        DEFAULT_RELATIVE_DATABASE,
+        SessionStreamDatabase,
+        canonical_state_root,
+        default_database_path,
+    )
+
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    primary = repos / "learn-ukrainian"
+    sibling = repos / "machinery"
+    for checkout in (primary, sibling):
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=30)
+    worktree = primary / ".worktrees" / "dispatch" / "agy" / "conv"
+    subprocess.run(["git", "-C", str(primary), "config", "user.email", "t@example.invalid"], check=True, timeout=30)
+    subprocess.run(["git", "-C", str(primary), "config", "user.name", "T"], check=True, timeout=30)
+    subprocess.run(["git", "-C", str(primary), "commit", "--allow-empty", "-qm", "init"], check=True, timeout=30)
+    subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "-b", "conv", str(worktree)], check=True, timeout=30)
+    python = _executable(tmp_path / "runtime" / "bin" / "python")
+
+    for name in (
+        "FLEET_COMMS_ROOT",
+        "LU_TASKS_DIR",
+        "LEARN_UKRAINIAN_OWNERSHIP_LEDGER",
+        "LEARN_UKRAINIAN_BATCH_STATE_DIR",
+        "LEARN_UK_REPO_ROOT",
+        "BACKUP_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT", "DASHBOARDS_DIR", "BATCH_STATE_DIR"):
+        if name in vars(api_config):
+            monkeypatch.delitem(vars(api_config), name)
+    monitor_context.production_context.cache_clear()
+
+    if layout_kind == "today-primary":
+        expected_state = primary.resolve()
+        monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
+        monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, str(primary))
+        monkeypatch.setenv(rr.INTERPRETER_ENV, str(python))
+        expected_lock_dir = (primary / ".git" / worktree_claims.LOCK_DIR_NAME).resolve()
+    else:
+        dedicated = tmp_path / "var-lib-machinery"
+        dedicated.mkdir()
+        expected_state = dedicated.resolve()
+        monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(dedicated))
+        monkeypatch.setenv(rr.REPOS_ROOT_ENV, str(repos))
+        monkeypatch.setenv(rr.LU_INTERPRETER_ENV, str(python))
+        if layout_kind == "non-git-with-legacy":
+            monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
+            monkeypatch.setenv("LEARN_UK_REPO_ROOT", str(primary))
+        expected_lock_dir = (dedicated / "batch_state" / "locks" / worktree_claims.LOCK_DIR_NAME).resolve()
+
+    expected_fleet_db = (expected_state / DEFAULT_ROOT_REL / "comms.sqlite3").resolve()
+    expected_streams_db = (expected_state / DEFAULT_RELATIVE_DATABASE).resolve()
+    expected_tasks = (expected_state / "batch_state" / "tasks").resolve()
+    expected_ownership_db = expected_tasks / "write-ownership.sqlite3"
+
+    # Monitor entry point
+    ctx = monitor_context.production_context()
+    assert ctx.roots.state_root.resolve() == expected_state
+    assert ctx.roots.batch_state_dir.resolve() == expected_state / "batch_state"
+    assert ctx.roots.session_streams_db_path.resolve() == expected_streams_db
+    assert ctx.stores.session_streams_database is not None
+    assert ctx.stores.session_streams_database.path.resolve() == expected_streams_db
+
+    # Fleet Comms + Control Plane storage entry points
+    assert (default_plane_root() / "comms.sqlite3").resolve() == expected_fleet_db
+    assert (default_plane_root(repo_root=ctx.roots.state_root) / "comms.sqlite3").resolve() == expected_fleet_db
+    assert (default_plane_root(repo_root=primary) / "comms.sqlite3").resolve() == expected_fleet_db
+    assert cp_storage.sqlite_path(cp_storage.StoreId.FLEET_COMMS).resolve() == expected_fleet_db
+    assert cp_storage.sqlite_path(cp_storage.StoreId.SESSION_STREAMS).resolve() == expected_streams_db
+    assert cp_storage.sqlite_path(cp_storage.StoreId.WRITE_OWNERSHIP).resolve() == expected_ownership_db
+
+    # Session Streams CLI / DB entry points (none, state_root, primary checkout, linked worktree)
+    assert SessionStreamDatabase().path.resolve() == expected_streams_db
+    assert default_database_path().resolve() == expected_streams_db
+    assert default_database_path(expected_state).resolve() == expected_streams_db
+    assert default_database_path(primary).resolve() == expected_streams_db
+    assert default_database_path(worktree).resolve() == expected_streams_db
+    assert canonical_state_root(expected_state) == expected_state
+    assert canonical_state_root(primary) == expected_state
+    assert canonical_state_root(worktree) == expected_state
+
+    # Dispatcher entry points
+    dispatch_primary.exec_primary(["status"])
+    assert tasks_dir().resolve() == expected_tasks
+    assert dispatch_git.resolve_repo("machinery")[0] == sibling.resolve()
+
+    # Keeper-facing and orchestration resolvers
+    assert worktree_claims.public_primary_root().resolve() == expected_state
+    assert worktree_claims.control_plane_root(primary) == expected_state
+    assert worktree_claims.control_plane_root(sibling) == expected_state
+    assert worktree_claims.repository_lock_dir(worktree_claims.control_plane_root(primary)).resolve() == expected_lock_dir
+    assert worktree_claims.repository_lock_dir(worktree_claims.control_plane_root(sibling)).resolve() == expected_lock_dir
+    assert worktree_claims.repository_lock_dir(rr.state_root()).resolve() == expected_lock_dir
+    assert fleet_repos.resolve_fleet_repo("machinery", primary_root=rr.state_root())[1] == sibling.resolve()
+    keeper_state, keeper_lock = merge_queue_keeper.default_keeper_paths(primary)
+    assert keeper_state.resolve() == expected_state / "batch_state" / "merge_queue_keeper.json"
+    assert keeper_lock.resolve() == expected_state / "batch_state" / "locks" / "merge_queue_keeper.lock"
+    assert pr_ownership.state_path().resolve() == expected_state / "batch_state" / "pr_ownership" / "state.json"
+    assert task_lifecycle.canonical_state_root(expected_state) == expected_state
+    assert task_lifecycle.canonical_state_root(primary) == expected_state
+    assert task_lifecycle.canonical_state_root(worktree) == expected_state
+    assert thread_handoff.canonical_state_root(primary).resolve() == expected_state
+
+    # Session supervisor shell helper entry point
+    sup_script = f'source "{rr.machinery_path("lib/session_supervisor.sh")}"; _canonical_state_root "$1"'
+    sup_res = subprocess.run(
+        ["bash", "-c", sup_script, "bash", str(primary)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert sup_res.returncode == 0, sup_res.stderr
+    assert Path(sup_res.stdout.strip()).resolve() == expected_state
+    monitor_context.production_context.cache_clear()

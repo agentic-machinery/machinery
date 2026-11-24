@@ -40,7 +40,15 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import main_checkout_root, state_root
+from lu_machinery.common.repo_root import (
+    MachineryConfigError,
+    configured_primary_root,
+    configured_product_root,
+    configured_repos_root,
+    is_configured_state_root,
+    main_checkout_root,
+    state_root,
+)
 from lu_machinery.guardrails import worktree_containment
 from lu_machinery.orchestration.dead_worker_state import worker_liveness
 from lu_machinery.orchestration.execution_safe_git import SafeGitRunner
@@ -595,10 +603,17 @@ def _git_probe(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str
 
 
 def repository_lock_dir(repo_root: Path) -> Path:
-    """Return ``<git common dir>/<LOCK_DIR_NAME>`` for ``repo_root``'s repository.
+    """Return ``<git common dir>/<LOCK_DIR_NAME>`` for a Git checkout, or
+    ``<state_root>/batch_state/locks/<LOCK_DIR_NAME>`` for a configured non-Git state root.
 
-    Raises :class:`WorktreeLockError` when the common dir cannot be resolved.
+    Raises :class:`WorktreeLockError` when neither can be resolved.
     """
+    try:
+        configured_state = is_configured_state_root(repo_root)
+    except (MachineryConfigError, OSError, RuntimeError):
+        configured_state = None
+    if configured_state is not None and not os.path.lexists(configured_state / ".git"):
+        return configured_state / "batch_state" / "locks" / LOCK_DIR_NAME
     proc = _git_probe(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=repo_root)
     common_dir = (proc.stdout or "").strip() if proc is not None and proc.returncode == 0 else ""
     if not common_dir:
@@ -614,8 +629,8 @@ def public_primary_root() -> Path:
     """Return the public primary checkout that owns dispatch state.
 
     This is the machinery state root (:func:`scripts.common.repo_root.state_root`):
-    the configured primary checkout, required when installed. A configured value
-    that cannot be used raises :class:`ControlPlaneError`.
+    the configured durable state root or primary checkout, required when installed.
+    A configured value that cannot be used raises :class:`ControlPlaneError`.
 
     Test seam: tests monkeypatch this to lay out a public primary and sibling
     checkouts under a temporary directory.
@@ -635,36 +650,64 @@ def identity_cache_publication_allowed(worktree: Path, tasks_dir: Path) -> bool:
     """
     try:
         public = public_primary_root().resolve(strict=True)
-        return (
-            (public / ".git").is_dir()
-            and tasks_dir.resolve(strict=True) == public / "batch_state" / "tasks"
-            and main_checkout_root(worktree.resolve(strict=True)).resolve(strict=True) == public
-        )
+        if tasks_dir.resolve(strict=True) != public / "batch_state" / "tasks":
+            return False
+        owner = main_checkout_root(worktree.resolve(strict=True)).resolve(strict=True)
+        if (public / ".git").is_dir():
+            return owner == public
+        primary_cfg = configured_primary_root()
+        if primary_cfg is not None:
+            return owner == primary_cfg.resolve(strict=True)
+        product_cfg = configured_product_root()
+        if product_cfg is not None:
+            return owner == main_checkout_root(product_cfg).resolve(strict=True)
+        return False
     except (OSError, ValueError, RuntimeError):
         return False
 
 
 def control_plane_root(repo_root: Path) -> Path:
-    """Return the checkout whose ``batch_state/`` and lock dir govern ``repo_root``'s worktrees.
+    """Return the root whose ``batch_state/`` and lock dir govern ``repo_root``'s worktrees.
 
-    Dispatch keeps every task record and per-worktree lock on the public
-    primary, even for ``--repo infra-private|hramatka`` worktrees (#672 P2.1,
-    :mod:`scripts.orchestration.fleet_repos`). A worktree of an allowlisted
-    sibling checkout therefore resolves to the public primary, so a remover
-    acting on it reads the records and takes the lock dispatch wrote and holds
+    Dispatch keeps every task record and per-worktree lock on the configured durable
+    state root (or public primary in today's layout), even for ``--repo`` sibling
+    worktrees (#672 P2.1, :mod:`scripts.orchestration.fleet_repos`). A worktree of an
+    allowlisted checkout therefore resolves to that single control-plane root, so a
+    remover acting on it reads the records and takes the lock dispatch wrote and holds
     (#8624). Any other repository is its own control plane. Raises
-    :class:`ControlPlaneError` when the fleet catalog cannot be read: a caller
-    that mutates must then refuse, since it cannot tell whether the repository
+    :class:`ControlPlaneError` when the fleet catalog or repos root cannot be read: a
+    caller that mutates must then refuse, since it cannot tell whether the repository
     is a sibling.
     """
     public = public_primary_root().resolve()
     repo = main_checkout_root(repo_root).resolve()
+    if repo == public:
+        return public
     try:
         catalog = load_fleet_repos()
     except FleetRepoError as exc:
         raise ControlPlaneError(f"fleet repository catalog unreadable ({type(exc).__name__}: {exc})") from exc
+    try:
+        repos_base = configured_repos_root()
+    except MachineryConfigError as exc:
+        raise ControlPlaneError(f"machinery repos root unusable: {exc}") from exc
+    sibling_parent = repos_base.resolve() if repos_base is not None else public.parent
+    try:
+        primary_cfg = configured_primary_root()
+    except MachineryConfigError:
+        primary_cfg = None
+    if primary_cfg is not None and primary_cfg.resolve() == repo:
+        return public
+    try:
+        product_cfg = configured_product_root()
+    except MachineryConfigError:
+        product_cfg = None
+    if product_cfg is not None and main_checkout_root(product_cfg).resolve() == repo:
+        return public
     for fleet_repo in catalog.values():
-        if not fleet_repo.default and (public.parent / fleet_repo.local_name).resolve() == repo:
+        if (sibling_parent / fleet_repo.local_name).resolve() == repo and (
+            not fleet_repo.default or repos_base is not None or not (public / ".git").exists()
+        ):
             return public
     return repo
 

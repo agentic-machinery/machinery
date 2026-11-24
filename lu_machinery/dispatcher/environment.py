@@ -9,8 +9,13 @@ from lu_machinery.agent_runtime.read_only_tmp import dispatch_lease
 from lu_machinery.common.git_credentials import SELECTOR_ENV
 from lu_machinery.common.repo_root import (
     INTERPRETER_ENV,
+    LU_INTERPRETER_ENV,
+    LU_PRIMARY_ROOT_ENV,
+    LU_STATE_ROOT_ENV,
     PRIMARY_ROOT_ENV,
     PRODUCT_ROOT_ENV,
+    PROFILE_PATH_ENV,
+    REPOS_ROOT_ENV,
     STATE_ROOT_ENV,
     project_interpreter,
 )
@@ -273,14 +278,16 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
     if spec.mode == "read-only":
         # Restrict explicit URLs too; a worktree or ref snapshot cannot observe an arbitrary remote push.
         env["GIT_ALLOW_PROTOCOL"] = "file"
-    # Every worker's hooks take the interpreter only from the configured shared-state anchor and
-    # refuse without it (#100), so a configured anchor reaches every child, whatever its mode.
-    if os.environ.get(PRIMARY_ROOT_ENV, ""):
-        env[PRIMARY_ROOT_ENV] = os.environ[PRIMARY_ROOT_ENV]
+    # Every worker's hooks and machinery tools converge on the configured roots (#100), so
+    # explicit machinery root settings reach every child, whatever its mode.
+    for name in (PRIMARY_ROOT_ENV, LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV, REPOS_ROOT_ENV, PROFILE_PATH_ENV):
+        configured = os.environ.get(name, "")
+        if configured:
+            env[name] = configured
     # Write providers need these paths for Git hooks. No credential is added.
     # Read-only AGY, Claude and Muse launchers also need the configured interpreter and product.
     if spec.mode == "workspace-write" or (spec.mode == "read-only" and spec.agent in {"agy", "claude", "muse"}):
-        names = (INTERPRETER_ENV, PRODUCT_ROOT_ENV)
+        names = (INTERPRETER_ENV, LU_INTERPRETER_ENV, PRODUCT_ROOT_ENV)
         if spec.mode == "workspace-write":
             names += (STATE_ROOT_ENV,)
         for name in names:
