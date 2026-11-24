@@ -129,13 +129,15 @@ interpreter does not select the primary checkout's Python modules.
    does not bind that schema. Stdout is two lines: the task id, then the run nonce. Record both.
 
    **Supplemental review (measurement only).** Run none by default: the review of record is
-   the only review. Run one only when the brief carries the line
-   `MEASURE: <model id> until <n> samples`, an operator-ordered model measurement. The
-   dispatcher who wrote the line counts samples and removes it at `<n>`. Without that line, run no
-   supplemental review. With it, dispatch the named model read-only on the first
-   code or infra review head, using the model's routing in
-   [model-assignment](../../rules/model-assignment.md) (for Neon,
-   [its advisory routing](../../rules/model-assignment.md#gemini-4-neon-advisory-routing)).
+   the only review. This step is the only definition of the trigger; every other rule points
+   here. Run one only when the brief carries the complete line
+   `MEASURE: <model id> until <n> samples` (an operator-ordered model measurement), with a
+   model id and a sample count. A line missing either, or no line, means no supplemental
+   review. The dispatcher who wrote the line counts samples and removes it at `<n>`. With a
+   complete line, dispatch exactly the model id it names, read-only, on the first code or
+   infra review head, with that model's harness and flags from
+   [model-assignment](../../rules/model-assignment.md). Never let a selector (for Neon, the
+   High/Medium parity rule in its advisory routing) replace the named id.
    Use `--research-role advisory` and `--pinned-head "$HEAD_SHA"`. Put the PR number in the
    prompt. Omit `--pr` and formal review flags so the dispatch stays supplemental.
    Record an unavailable seat as such.
