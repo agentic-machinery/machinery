@@ -377,6 +377,7 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
         },
         "pull-requests.html": {"/api/git/pull-requests"},
         "milestones.html": {"/api/milestones"},
+        "routing.html": {"/api/runtime/routing"},
         "model-stats.html": {"/api/fleet/model-stats", "/api/fleet/model-stats/planning", "/api/state/routing-budget"},
     }
     assert set(expected_apis) == set(html_files)

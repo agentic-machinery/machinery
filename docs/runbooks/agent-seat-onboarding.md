@@ -150,33 +150,29 @@ reclaims or reroutes work. Product pages belong to the product.
 
 ### Read the routing overview correctly
 
-Query `GET /api/runtime/routing-assignments?limit=100` for the body-free
-authority projection. The four summary cards, lifecycle groups, filters, and
-route distribution describe only the assignments returned in that loaded
-recent window. They are not all-time fleet totals, configured routing weights,
-provider quotas, or evidence of caching.
+Open the Monitor's Routing page (`/routing`), or query `GET /api/runtime/routing`
+for the same body-free view. Its counts and rows cover only the task records of
+the last 24 hours. They are not all-time fleet totals, configured routing
+weights, provider quotas, or evidence of caching.
 
-Read each decision path from left to right:
+Read each decision row from left to right:
 
-1. **Initiator** identifies the orchestrator/caller responsible for the
-   request; author model/family describes the work being reviewed or routed.
-2. **Request** records the requested role, profile, risk, and whether selection
-   was `AUTOMATIC` or `EXPLICIT`. An explicit assignment may be intentionally
-   concentrated because the orchestrator pinned a reviewer.
-3. **Selected route/model** is the durable scheduler result, not proof that the
-   provider completed successfully.
-4. **Outcome** and **Failure record** show the terminal classification. Expand
-   **Decision evidence & operational details** for selection reasoning, quota
-   freshness, capacity facts, retry/failover/replay state, and chronological
-   authority events.
+1. **Asked for** is the work: a write or read-only role, or a review with its
+   profile, risk and author model.
+2. **Chosen** is the model and the pool that paid for it.
+3. **Chosen by** names who picked the model (the brief, or the reviewer
+   resolver for a review) and who picked the account (the account helper, a
+   saved default, or the pool's only account).
+4. **Admission and substitution** shows whether admission admitted, deferred or
+   refused a write (read-only work is not checked), and any recorded case where
+   another model ran.
 
-An active row with “No ledger update” is stale activity evidence only. It is
-not provider-liveness proof: it establishes neither that a provider process is
-alive nor dead and does not authorize early lease reclamation. Before
-diagnosing unfair routing or a bad orchestrator,
-filter by mode, initiator, route, and lifecycle; inspect the durable event and
-selection trace; then corroborate current headroom with CodexBar and authority
-job/reservation state. Never infer provider health from route counts alone.
+**Pools now** shows what admission would say about a new write on each pool
+and which review seats the resolver would seat there; it is current state, not
+the history of a past review. A source the page cannot read shows "unknown
+since" the time of its last reading, never zero. Before diagnosing unfair
+routing, filter by work kind and pool, then corroborate current headroom on the
+Subscriptions page. Never infer provider health from route counts alone.
 
 ### Discuss is not formal review
 

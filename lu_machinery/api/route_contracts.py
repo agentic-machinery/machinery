@@ -369,17 +369,29 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "keep",
     ),
     RouteContract(
-        "/api/runtime/routing-assignments",
+        "/api/runtime/routing",
         "exact",
         "http",
-        "Body-free recent routing decisions with initiator, requested target, selected route, outcome, and lifecycle evidence.",
-        "Fleet Comms routing-reservation decision ledger read through its read-only authority projection.",
-        "The list is served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S, per limit, refreshed after 15 s (as_of names the projection time); each projection reads at most ten times the requested event limit, then aggregated and capped to 1-100 recent assignments; quota fields are decision-time snapshots, not live provider health.",
-        ("agents", "orchestrators", "operators"),
-        "Complements /api/state/routing-budget and CodexBar health/quota signals; it does not expose all-time routing weights or choose a route.",
-        "medium if the bounded loaded window is treated as all-time distribution or stale activity as provider-liveness proof",
-        "keep as the canonical read-only routing-decision observer",
-        locality="cluster_authoritative",
+        "How work is routed, for the Routing page. now: each subscription pool's live workers, weekly allowance left and "
+        "reset, what admission says about a new write dispatch there and why (admission's own meter rule and host "
+        "checks), and the reviewer resolver's eligible or excluded seats and first choice per author family. recent: one "
+        "row per dispatch and review seat in the last 24 hours (what was asked, the model and pool chosen, who chose "
+        "each, the admission outcome, any recorded substitution) with per-lane counts.",
+        "Hot task records (batch_state/tasks), the routing budget dispatch admission reads (/api/state/routing-budget), "
+        f"{_rel('orchestration', 'dispatch_admission.py')} thresholds, meter rule and host probes, the subscription "
+        f"readings shared with /api/runtime/subscriptions, and {_rel('review', 'reviewer_resolver.py')} seat evaluation.",
+        "now is built per request from cached sources; recent is one scan of task records written in the last day, "
+        "served stale-while-revalidate (state_helpers.cache_read_swr): the last value at once with its true age in "
+        "X-Snapshot-Age-S, refreshed after 30 s, stale after 90 s. A source that cannot be read is typed unknown with "
+        "its reason and the time of its last reading, never zero.",
+        ("routing.html", "operators", "agents"),
+        "Replaces /api/runtime/routing-assignments, whose routing-reservation ledger lost its only writer when the "
+        "sealed formal review path was retired; reuses the routing budget, subscription and resolver projections "
+        "instead of keeping a second record.",
+        "medium if the resolver's first choice is read as the seat a past review ran on (the task record keeps the "
+        "seat that ran, not the resolver's pick), or a per-pool verdict as a promise that a dispatch will start",
+        "keep as the routing observer; routing stays with the brief, the account choice, admission and the resolver",
+        response_schema_version="routing.v1",
     ),
     RouteContract(
         "/api/runtime/subscriptions",
@@ -810,6 +822,22 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "medium if a stale or partial collection is mistaken for complete live progress",
         "keep",
         label="Milestones",
+    ),
+    PageContract(
+        "routing.html",
+        "/routing",
+        "Routing: a flow picture of the four routing stages (brief picks the model, account choice, admission, reviewer "
+        "resolver) with the last 24 hours' counts; each pool now with live workers, allowance left, reset time, whether "
+        "new writes are admitted or deferred and why, and its review seats; and one row per recent dispatch and review "
+        "seat with what was asked, what was chosen, by whom and why.",
+        "GET /api/runtime/routing.",
+        "HTTP reads every 30 seconds; recent decisions are at most 90 seconds old and their age is shown; a stale or "
+        "missing source reads unknown since the time of its last reading.",
+        ("humans", "operators"),
+        "Shows routing decisions; the Subscriptions page keeps the full per-account usage and Fleet the live worker list.",
+        "medium if the resolver's current first choice is read as history",
+        "keep",
+        label="Routing",
     ),
     PageContract(
         "model-stats.html",

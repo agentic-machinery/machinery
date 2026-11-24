@@ -115,12 +115,11 @@ cold-prompts; silent plane flips; “for now” cutovers.
 
 ### Routing observability contract
 
-Use the body-free `GET /api/runtime/routing-assignments?limit=100` projection
-to diagnose which
-orchestrator initiated a request, whether selection was automatic or explicit,
-which route/model was admitted, and how the reservation terminated. Summary
-cards, lifecycle groups, filters, and route distributions cover only the
-loaded recent window; they are not all-time totals, routing weights, provider
+Use the body-free `GET /api/runtime/routing` view (the Monitor's Routing page)
+to diagnose who picked a dispatch's model (the brief or the reviewer resolver),
+which pool and account paid, whether admission admitted or deferred it, and
+whether a substitution was recorded. Its counts cover only the last 24 hours
+of task records; they are not all-time totals, routing weights, provider
 quotas, or caching evidence.
 
 Inspect the chronological event and selection trace before attributing

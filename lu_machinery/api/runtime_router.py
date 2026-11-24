@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
+import functools
 import importlib.util
 import inspect
 import ipaddress
@@ -11,7 +11,8 @@ import json
 import os
 import re
 import sqlite3
-from collections import defaultdict
+from collections import Counter, defaultdict
+from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Lock
@@ -30,18 +31,29 @@ from lu_machinery.agent_runtime.failure_codes import RUNTIME_FAILURE_CODES
 from lu_machinery.agent_runtime.usage import _iter_usage_records as _iter_usage_file_records
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path
-from lu_machinery.control_plane import storage
+from lu_machinery.dispatcher.admission import review_typed
+from lu_machinery.dispatcher.types import StartRefusal
+from lu_machinery.fleet import claude_account_lane
 from lu_machinery.fleet_comms import message_plane
-from lu_machinery.fleet_comms.message_plane import read_plane_status
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, import_named_module, open_readonly
-from lu_machinery.orchestration import codex_transport_health
-from lu_machinery.review.model_catalog import load_model_catalog
+from lu_machinery.orchestration import codex_transport_health, dispatch_admission
+from lu_machinery.orchestration.task_record_store import iter_task_records
+from lu_machinery.review import bench_health
+from lu_machinery.review.model_catalog import canonical_model_id, load_model_catalog
+from lu_machinery.review.reviewer_resolver import (
+    REVIEW_CANDIDATES,
+    REVIEW_LADDERS,
+    ResolverInputs,
+    codex_account_key,
+    resolve_reviewer,
+)
 
 from . import account_logins, panel_values, subscriptions
+from . import delegate_router as delegate_api
 from .model_stats_rows import current_catalog_model_ids
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .monitor_context import production_context as production_context  # re-export: test monkeypatches
-from .state_helpers import swr_route
+from .state_helpers import cache_read_swr, ctx_scoped_ttl_key, swr_route
 
 router = APIRouter(tags=["runtime"])
 
@@ -521,415 +533,472 @@ def recent_runtime_records(*, limit: int = 50, ctx: MonitorContext | None = None
     return {"records": summaries[:record_limit], "unreadable": records.unreadable}
 
 
-def _routing_plane_status(ctx: MonitorContext | None = None) -> dict[str, Any]:
-    """Expose the actual plane posture without inferring authority from rows."""
-    resolved_ctx = resolve_context(ctx)
-    try:
-        raw = read_plane_status(repo_root=resolved_ctx.roots.state_root, recent_limit=0)
-    except Exception:
-        raw = {"mode": "unavailable", "enabled": False}
-    mode = str(raw.get("mode") or "unavailable")
-    authority_active = mode == "authority"
-    return {
-        "mode": mode,
-        "enabled": bool(raw.get("enabled")),
-        "authority": "fleet_comms_authoritative" if authority_active else "file_handoffs_authoritative",
-        "cutover": "authority_active" if authority_active else "pre_flip_operator_gated",
-    }
-
-
-def _routing_value(record: dict[str, Any], *keys: str) -> Any:
-    """Read an optional compatible ledger field without fabricating values."""
-    for key in keys:
-        value = record.get(key)
-        if value is not None:
-            return value
-    return None
-
-
-def _routing_first(*values: Any) -> Any:
-    """Return the first present field while preserving meaningful zero values."""
-    return next((value for value in values if value is not None), None)
-
-
-def _routing_trace_value(trace: dict[str, Any], *keys: str) -> Any:
-    """Read a trace field across policy-version-compatible names."""
-    return _routing_first(*(trace.get(key) for key in keys))
-
-
-def _routing_duration_s(record: dict[str, Any]) -> float | None:
-    direct = _routing_value(record, "duration_s", "duration_seconds")
-    if isinstance(direct, (int, float)) and not isinstance(direct, bool):
-        return float(direct)
-    lifecycle = record.get("lifecycle") if isinstance(record.get("lifecycle"), dict) else {}
-    started = _parse_iso_datetime(_routing_first(_routing_value(record, "started_at"), lifecycle.get("started_at")))
-    settled = _parse_iso_datetime(
-        _routing_first(_routing_value(record, "settled_at", "terminal_at"), lifecycle.get("settled_at"))
-    )
-    if started is None or settled is None:
-        return None
-    return max(0.0, round((settled - started).total_seconds(), 3))
-
-
-def _routing_quota_freshness_state(value: Any) -> str | None:
-    """Classify a recorded quota freshness value without treating a time as state."""
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip().lower()
-    if normalized == "fresh":
-        return "fresh"
-    if normalized in {"stale", "stale_last_good"}:
-        return "stale"
-    if normalized in {"unavailable", "unknown"}:
-        return normalized
-    return None
-
-
-def _routing_selection_reason(record: dict[str, Any]) -> Any:
-    """Read an explicitly recorded selection reason, never infer one from a route."""
-    evidence = record.get("evidence") if isinstance(record.get("evidence"), dict) else {}
-    resolved = record.get("resolved") if isinstance(record.get("resolved"), dict) else {}
-    trace = _routing_first(_routing_value(record, "selection_trace", "trace"), resolved.get("trace"))
-    trace_detail = trace if isinstance(trace, dict) else {}
-    direct_reason = _routing_first(
-        _routing_value(record, "selection_reason", "reason"),
-        trace_detail.get("selection_reason"),
-        trace_detail.get("substitution_note"),
-    )
-    if direct_reason is not None:
-        return direct_reason
-    # A terminal event's evidence describes execution, not selection.  Older
-    # flat projections have no event type, so retain that compatible fallback.
-    if _routing_value(record, "event_type") in {None, "reserved"}:
-        return evidence.get("reason")
-    return None
-
-
-def _routing_event_item(record: dict[str, Any]) -> dict[str, Any]:
-    """Return the body-free lifecycle facts suitable for an expandable timeline."""
-    return {
-        "decision_id": _routing_value(record, "decision_id"),
-        "event_type": _routing_value(record, "event_type"),
-        "state": _routing_value(record, "state"),
-        "timestamp": _routing_value(record, "created_at", "timestamp"),
-    }
-
-
-_ROUTING_EVENT_ORDER = {
-    # The authority ledger timestamps events to whole seconds.  A reservation
-    # and its immediate start (or a settlement and its circuit update) can
-    # therefore share a timestamp; UUID order is not lifecycle order.
-    "reserved": 0,
-    "authorized_substitution": 1,
-    "started": 2,
-    "settled": 3,
-    "recovered_expired": 3,
-    "circuit_recorded": 4,
-    "circuit_healed": 4,
-    "legacy_authorization_envelope_reconstructed": 5,
-}
-
-
-def _routing_event_sort_key(record: dict[str, Any]) -> tuple[datetime, int, str]:
-    """Sort same-second authority events in their recorded lifecycle order."""
-    timestamp = _parse_iso_datetime(_routing_value(record, "created_at", "timestamp"))
-    event_type = str(_routing_value(record, "event_type") or "")
-    return (
-        timestamp or datetime.min.replace(tzinfo=UTC),
-        _ROUTING_EVENT_ORDER.get(event_type, 50),
-        str(_routing_value(record, "decision_id") or ""),
-    )
-
-
-def _routing_capacity_evidence(records: list[dict[str, Any]], quota_snapshot: dict[str, Any]) -> dict[str, Any] | None:
-    """Project the finite capacity/load allowlist from routing authority evidence."""
-    scheduler = quota_snapshot.get("scheduler") if isinstance(quota_snapshot.get("scheduler"), dict) else {}
-    reservation_evidence: dict[str, Any] = {}
-    for record in records:
-        if _routing_value(record, "event_type") != "reserved":
-            continue
-        evidence = record.get("evidence")
-        if isinstance(evidence, dict):
-            reservation_evidence = evidence
-            break
-    fields = {
-        "active_credential_before": reservation_evidence.get("active_credential_before"),
-        "active_quota_before": reservation_evidence.get("active_quota_before"),
-        "credential_limit": reservation_evidence.get("credential_limit"),
-        "quota_limit": reservation_evidence.get("quota_limit"),
-        "completed_input_bytes": scheduler.get("completed_input_bytes"),
-        "active_reserved_input_bytes": scheduler.get("active_reserved_input_bytes"),
-        "inflight": scheduler.get("inflight"),
-        "failures": scheduler.get("failures"),
-        "circuit_open": scheduler.get("circuit_open"),
-        "capacity_exhausted": scheduler.get("capacity_exhausted"),
-        "quota_remaining_pct": scheduler.get("quota_remaining_pct"),
-        "quota_stale": scheduler.get("quota_stale"),
-    }
-    allowed = {
-        key: value
-        for key, value in fields.items()
-        if isinstance(value, (str, int, float, bool)) and not isinstance(value, bytes)
-    }
-    return allowed or None
-
-
-def _routing_assignment_item(record: dict[str, Any]) -> dict[str, Any]:
-    """Serialize an allowlisted, body-free routing decision for the Runtime UI."""
-    requested = record.get("requested") if isinstance(record.get("requested"), dict) else {}
-    resolved = record.get("resolved") if isinstance(record.get("resolved"), dict) else {}
-    quota_detail = record.get("quota") if isinstance(record.get("quota"), dict) else {}
-    quota_snapshot = _routing_first(
-        quota_detail.get("snapshot") if isinstance(quota_detail.get("snapshot"), dict) else None,
-        _routing_value(record, "quota_snapshot") if isinstance(_routing_value(record, "quota_snapshot"), dict) else None,
-    ) or {}
-    lifecycle = record.get("lifecycle") if isinstance(record.get("lifecycle"), dict) else {}
-    replay = record.get("replay") if isinstance(record.get("replay"), dict) else {}
-    retry = record.get("retry") if isinstance(record.get("retry"), dict) else {}
-    selection_trace = _routing_first(_routing_value(record, "selection_trace", "trace"), resolved.get("trace"))
-    trace = selection_trace if isinstance(selection_trace, dict) else {}
-    snapshot_codexbar = quota_snapshot.get("codexbar") if isinstance(quota_snapshot.get("codexbar"), dict) else {}
-    quota_freshness = _routing_first(
-        _routing_value(record, "quota_freshness"),
-        quota_detail.get("freshness"),
-        quota_snapshot.get("freshness"),
-        snapshot_codexbar.get("freshness"),
-    )
-    automatic = _routing_value(record, "automatic")
-    if not isinstance(automatic, bool):
-        automatic = _routing_value(record, "route_mode") == "auto" or requested.get("route_mode") == "auto"
-    return {
-        "decision_id": _routing_value(record, "decision_id"),
-        "decision_event": _routing_value(record, "event_type"),
-        "decision_state": _routing_value(record, "state"),
-        "source_authority_id": _routing_value(record, "source_authority_id", "reservation_id"),
-        "authority_key": _routing_value(record, "authority_key"),
-        "timestamp": _routing_value(record, "created_at", "timestamp"),
-        "initiator": _routing_first(_routing_value(record, "initiator"), requested.get("initiator")),
-        "author_model": _routing_first(_routing_value(record, "author_model"), requested.get("author_model")),
-        "author_family": _routing_first(_routing_value(record, "author_family"), requested.get("author_family")),
-        "requested_role": _routing_first(_routing_value(record, "requested_role"), requested.get("role")),
-        "requested_profile": _routing_first(_routing_value(record, "requested_profile"), requested.get("profile")),
-        "requested_risk": _routing_first(_routing_value(record, "requested_risk"), requested.get("risk")),
-        "requested_reviewer": _routing_first(
-            _routing_value(record, "requested_reviewer", "requested_route"), requested.get("requested_reviewer")
-        ),
-        # Kept as a compatibility alias for existing Runtime consumers.  The
-        # nested ledger's requested route is a reviewer pin, not route_mode.
-        "requested_route": _routing_first(
-            _routing_value(record, "requested_reviewer", "requested_route"), requested.get("requested_reviewer")
-        ),
-        "automatic": automatic,
-        "resolved_candidate": _routing_first(_routing_value(record, "resolved_candidate", "candidate"), resolved.get("candidate")),
-        "resolved_route": _routing_first(_routing_value(record, "resolved_route", "route"), resolved.get("route")),
-        "resolved_model": _routing_first(_routing_value(record, "resolved_model", "model"), resolved.get("model")),
-        "resolved_family": _routing_first(_routing_value(record, "resolved_family", "family"), resolved.get("family")),
-        "quota_bucket": _routing_first(_routing_value(record, "quota_bucket"), quota_detail.get("bucket")),
-        "policy_version": _routing_first(_routing_value(record, "policy_version"), resolved.get("policy_version")),
-        "selection_reason": _routing_selection_reason(record),
-        "selection_trace": selection_trace,
-        "selection_reasoning": {
-            # The order is deliberate: a candidate must first be eligible and
-            # task-suitable before quota, opportunity cost, capacity, or
-            # failure posture can distinguish otherwise suitable routes.
-            "hard_eligibility": _routing_trace_value(
-                trace,
-                "hard_eligibility", "eligibility", "capability_gates", "gates",
-            ),
-            "task_fit_quality": _routing_trace_value(
-                trace,
-                "task_fit", "capability_fit", "strength", "quality_rank", "suitability",
-            ),
-            "tie_breakers": _routing_trace_value(
-                trace,
-                "tie_breakers", "quota_cost_capacity", "quota", "opportunity_cost", "failure_posture",
-            ),
-            "cheaper_or_idle_not_selected": _routing_trace_value(
-                trace,
-                "cheaper_or_idle_not_selected", "rejected_alternatives", "not_selected",
-            ),
-        },
-        "quota_source": _routing_first(
-            _routing_value(record, "quota_source"), quota_detail.get("source"), quota_snapshot.get("source")
-        ),
-        "quota_freshness": quota_freshness,
-        "quota_freshness_state": _routing_quota_freshness_state(quota_freshness),
-        "quota_fresh_at": _routing_first(
-            _routing_value(record, "quota_fresh_at"), quota_detail.get("fresh_at"),
-            quota_snapshot.get("fresh_at"), quota_snapshot.get("fetched_at"), snapshot_codexbar.get("fetched_at"),
-        ),
-        "quota_headroom": _routing_first(_routing_value(record, "quota_headroom"), quota_snapshot.get("headroom")),
-        "quota_headroom_band": _routing_first(
-            _routing_value(record, "quota_headroom_band"), quota_detail.get("headroom_band")
-        ),
-        "credential_bucket": _routing_first(_routing_value(record, "credential_bucket"), quota_detail.get("credential_bucket")),
-        "estimated_input_bytes": _routing_first(_routing_value(record, "estimated_input_bytes"), requested.get("estimated_input_bytes")),
-        "actual_input_bytes": _routing_value(record, "actual_input_bytes"),
-        "actual_output_bytes": _routing_value(record, "actual_output_bytes"),
-        "actual_work_bytes": _routing_first(_routing_value(record, "actual_work_bytes"), lifecycle.get("actual_bytes")),
-        "actual_tokens": _routing_first(_routing_value(record, "actual_tokens"), lifecycle.get("actual_tokens")),
-        "reservation_state": _routing_first(_routing_value(record, "reservation_state", "status"), lifecycle.get("status")),
-        "terminal_status": _routing_first(_routing_value(record, "terminal_status", "status"), lifecycle.get("status")),
-        "created_at": _routing_first(_routing_value(record, "created_at"), lifecycle.get("created_at")),
-        "expires_at": _routing_first(_routing_value(record, "expires_at"), lifecycle.get("expires_at")),
-        "started_at": _routing_first(_routing_value(record, "started_at"), lifecycle.get("started_at")),
-        "settled_at": _routing_first(_routing_value(record, "settled_at", "terminal_at"), lifecycle.get("settled_at")),
-        "duration_s": _routing_duration_s(record),
-        "failure_classification": _routing_first(_routing_value(record, "failure_classification"), lifecycle.get("failure_classification")),
-        "retry_chain": _routing_first(_routing_value(record, "retry_chain", "retry"), retry),
-        "failover_chain": _routing_first(_routing_value(record, "failover_chain", "failover"), retry.get("fallback_from")),
-        "replay_status": _routing_first(_routing_value(record, "replay_status", "replay"), replay),
-        "cache_status": _routing_value(record, "cache_status", "cache"),
-    }
-
-
-_ROUTING_ACTIVE_STATES = frozenset({"reserved", "running"})
-# Served stale-while-revalidate: a read gets the last projection at once and
-# an older one queues a single refresh (``state_helpers.swr_route``).
-ROUTING_ASSIGNMENTS_TTL_S = 15.0
 ACP_CONVERSATIONS_TTL_S = 15.0
-# Matches the dashboard's STALE_ACTIVITY_MS (45 minutes) so the API and the
-# page agree on when a loaded window no longer counts as recent.
-_ROUTING_WINDOW_STALE_AFTER_S = 45 * 60
+
+
+# ---------------------------------------------------------------------
+# Routing page (/api/runtime/routing)
+# ---------------------------------------------------------------------
+#
+# Work is routed in four places: the brief names the worker's model, the dispatch
+# picks the account, dispatch admission admits or defers a write, and the reviewer
+# resolver seats each review. This view reads each stage's own evidence where it
+# already lives: task records, the routing budget admission reads, admission's own
+# meter rule, and the resolver's own candidate evaluation. It keeps no store.
+
+# The decisions snapshot (one scan of the last day's task records) is served
+# stale-while-revalidate; the page's freshness bound allows two refreshes.
+ROUTING_TTL_S = 30.0
+ROUTING_STALE_AFTER_S = 90.0
+ROUTING_WINDOW_S = 24 * 3600.0
+ROUTING_DECISION_LIMIT = 400
+# The review the "excluded" column and the resolver's first choice describe.
+ROUTING_REVIEW_PROFILE = "code"
+ROUTING_REVIEW_RISK = "medium"
+# Admission meters in page order, with the subscription account each one bills.
+ROUTING_POOLS: tuple[tuple[str, str], ...] = (
+    ("claude:a", "Claude a"),
+    ("claude:b", "Claude b"),
+    ("codex:a", "Codex a"),
+    ("codex:b", "Codex b"),
+    ("agy:gemini", "AGY Gemini"),
+    ("agy:claude_gpt", "AGY Claude/GPT"),
+    ("grok+cursor", "Grok+Cursor"),
+)
+_ROUTING_POOL_LABELS = dict(ROUTING_POOLS)
+# Author families the resolver's pick is shown for, with the page's name for each.
+_ROUTING_AUTHOR_FAMILIES = (("anthropic", "Claude"), ("openai", "GPT"), ("google", "Gemini"), ("xai", "Grok"))
+_ROUTING_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+\[\]-]{0,99}$")
+_ROUTING_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_ROUTING_WORD = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
+_ROUTING_RISKS = frozenset({"low", "medium", "high", "critical"})
+_ROUTING_ENV_CLAUSE = re.compile(r"\s*\([A-Z][A-Z0-9_]*=[^)]*\)")
+_ROUTING_ACTIVE = frozenset({"running", "spawning"})
+_ROUTING_START_REFUSALS = {
+    StartRefusal.CAPACITY.value: ("deferred", "admission deferred it: a host or pool limit was reached"),
+    StartRefusal.HEADROOM.value: ("refused", "refused: the pool had no allowance headroom"),
+    StartRefusal.ACCOUNT.value: ("refused", "refused: the account check failed"),
+    StartRefusal.ELIGIBILITY.value: ("refused", "refused: the route is not eligible"),
+    StartRefusal.MODEL_UNAVAILABLE.value: ("refused", "refused: the model is unavailable"),
+    StartRefusal.PLACEMENT.value: ("refused", "refused: no worker placement"),
+    StartRefusal.BOUNDARY.value: ("refused", "refused by the write boundary"),
+    StartRefusal.SETUP.value: ("refused", "refused during setup"),
+    StartRefusal.REVIEW_SETUP.value: ("refused", "refused during review setup (round budget or target)"),
+}
+_ROUTING_METER_DEFERS = {
+    "exhausted": "the pool's allowance is used up",
+    "near_cap": "the pool's allowance is nearly used up",
+    "rate_limited": "the pool was rate limited in the last few minutes",
+    "cap": "the pool's write-worker cap was reached",
+    "cadence": "another write had just started on this pool (launches are spaced out)",
+}
+_ROUTING_METER_DEFER_CLAUSE = re.compile(r"^meter (?P<meter>[a-z+:_]+): .*subscription_meter_defer=(?P<defer>[a-z_]+)")
+_ROUTING_CLAUDE_ACCOUNT_SOURCES = {"explicit": "helper", "default-file": "saved_default", "builtin": "builtin_default"}
 
 
 def _routing_iso_z(value: datetime) -> str:
     return value.isoformat().replace("+00:00", "Z")
 
 
-def _routing_zombie_expired(item: dict[str, Any], now: datetime) -> bool:
-    """Observer-side TTL check mirroring the ledger's ``_recover_expired_tx``.
-
-    The write-path expiry only runs when Fleet Comms opens a write
-    transaction; if no reservation activity has happened since a row went
-    overdue, its ``reserved``/``running`` status persists indefinitely.  The
-    read-only projection must never write, so it reports those zombies as
-    terminal ``expired`` rows instead of live routing (#7088).
-    """
-    state = str(item.get("current_state") or item.get("reservation_state") or "").lower()
-    if state not in _ROUTING_ACTIVE_STATES:
-        return False
-    expires_at = _parse_iso_datetime(item.get("expires_at"))
-    return expires_at is not None and expires_at <= now
+def _routing_text(value: object, pattern: re.Pattern[str]) -> str | None:
+    return value if isinstance(value, str) and pattern.fullmatch(value) else None
 
 
-def _routing_apply_observer_expiry(item: dict[str, Any], now: datetime) -> None:
-    if not _routing_zombie_expired(item, now):
-        return
-    item["reservation_state"] = "expired"
-    item["terminal_status"] = "expired"
-    item["current_state"] = "expired"
-    if not item.get("failure_classification"):
-        item["failure_classification"] = "ttl_expired_orphan"
-    item["zombie_expired"] = True
+def _routing_plain(text: str, limit: int = 200) -> str:
+    """Admission prose without its environment-variable clauses, paths redacted, bounded."""
+    plain = _ROUTING_ENV_CLAUSE.sub("", dispatch_admission.redact_paths(text)).strip()
+    return plain if len(plain) <= limit else plain[: limit - 1] + "…"
 
 
-def _routing_assignment_window(assignments: list[dict[str, Any]], now: datetime) -> dict[str, Any] | None:
-    timestamps = [
-        parsed
-        for parsed in (_parse_iso_datetime(item.get("timestamp")) for item in assignments)
-        if parsed is not None
-    ]
-    if not timestamps:
+def _routing_failure_text(failure: str) -> str:
+    """One admission failure clause in plain words; a meter clause names its pool and cause."""
+    meter_clause = _ROUTING_METER_DEFER_CLAUSE.match(failure)
+    if meter_clause and meter_clause["defer"] in _ROUTING_METER_DEFERS:
+        pool = _ROUTING_POOL_LABELS.get(meter_clause["meter"], meter_clause["meter"])
+        return f"{pool}: {_ROUTING_METER_DEFERS[meter_clause['defer']]}"
+    return _routing_plain(failure)
+
+
+def _routing_record_pool(record: Mapping[str, Any]) -> str | None:
+    meter = dispatch_admission.subscription_meter(
+        record.get("agent"), model=record.get("model"),
+        claude_account=record.get("claude_account"), codex_account=record.get("codex_account"),
+    )
+    return meter if meter in _ROUTING_POOL_LABELS else None
+
+
+def _routing_account_by(record: Mapping[str, Any]) -> str | None:
+    """Who chose the account: the dispatch's explicit account (the account helper) or a default."""
+    if record.get("agent") == "claude":
+        return _ROUTING_CLAUDE_ACCOUNT_SOURCES.get(str(record.get("claude_account_source") or ""))
+    if record.get("agent") == "codex":
+        options = record.get("options")
+        if not isinstance(options, Mapping):
+            return None
+        return "helper" if options.get("codex_account") else "saved_default"
+    # AGY and Grok+Cursor each have one subscription: nothing chooses an account there.
+    return "single_account" if _routing_record_pool(record) is not None else None
+
+
+def _routing_same_model(left: str, right: str) -> bool:
+    return (canonical_model_id(left) or left.casefold()) == (canonical_model_id(right) or right.casefold())
+
+
+def _routing_substitution(record: Mapping[str, Any], model: str | None) -> str | None:
+    """Plain text when the record shows the run used another model than the one asked for."""
+    substitution = record.get("substitution")
+    if isinstance(substitution, Mapping) and substitution.get("substituted") is True:
+        actual = _routing_text(substitution.get("actual_model"), _ROUTING_MODEL_ID)
+        requested = _routing_text(substitution.get("requested_model"), _ROUTING_MODEL_ID) or model
+        if actual and requested and not _routing_same_model(requested, actual):
+            return f"asked for {requested}; the runtime ran {actual}"
+    observed = recorded_model_accounting_fields(record).get("observed_model")
+    observed = _routing_text(observed, _ROUTING_MODEL_ID)
+    if observed and model and not _routing_same_model(model, observed):
+        return f"asked for {model}; the provider reported {observed}"
+    return None
+
+
+def _routing_admission(record: Mapping[str, Any], *, write: bool) -> dict[str, Any]:
+    never = record.get("never_started_reason")
+    if isinstance(never, str) and never:
+        state, reason = _ROUTING_START_REFUSALS.get(never, ("refused", "refused before start"))
+        admission = record.get("admission")
+        failures = admission.get("failures") if isinstance(admission, Mapping) else None
+        if isinstance(failures, list) and failures and isinstance(failures[0], str):
+            reason = f"{reason}: {_routing_failure_text(failures[0])}"
+        return {"state": state, "reason": reason}
+    if write:
+        return {"state": "admitted", "reason": None}
+    return {"state": "not_checked", "reason": "read-only work is not admission-checked"}
+
+
+def _routing_decision(record: Mapping[str, Any], *, status: str, alive: bool) -> dict[str, Any] | None:
+    """One allowlisted row: ids, labels and model names only, never paths, prompts or bodies."""
+    # A refused start is recorded under its own id; the id the dispatch asked for is the one people know.
+    task_id = _routing_text(record.get("requested_task_id"), _ROUTING_TASK_ID) or _routing_text(
+        record.get("task_id"), _ROUTING_TASK_ID,
+    )
+    if task_id is None:
         return None
-    newest = max(timestamps)
+    review = review_typed(dict(record))
+    write = record.get("mode") in dispatch_admission.WRITE_CAPABLE_MODES
+    model = _routing_text(record.get("model"), _ROUTING_MODEL_ID)
+    pool = _routing_record_pool(record)
+    risk = record.get("review_risk") if record.get("review_risk") in _ROUTING_RISKS else None
     return {
-        "oldest_at": _routing_iso_z(min(timestamps)),
-        "newest_at": _routing_iso_z(newest),
-        "stale": (now - newest).total_seconds() > _ROUTING_WINDOW_STALE_AFTER_S,
+        "task_id": task_id,
+        "started_at": record.get("started_at") if isinstance(record.get("started_at"), str) else None,
+        "kind": "review" if review else "write" if write else "read_only",
+        "role": _routing_text(record.get("research_role"), _ROUTING_WORD),
+        "profile": _routing_text(record.get("review_profile"), _ROUTING_WORD) if review else None,
+        "risk": risk if review else None,
+        "author_model": _routing_text(record.get("review_author_model"), _ROUTING_MODEL_ID) if review else None,
+        "model": model,
+        "effort": _routing_text(record.get("effort"), _ROUTING_WORD),
+        "pool": pool,
+        "pool_label": _ROUTING_POOL_LABELS.get(pool or ""),
+        "model_by": "resolver" if review else "brief",
+        "account_by": _routing_account_by(record),
+        "admission": _routing_admission(record, write=write),
+        "status": status if _ROUTING_WORD.fullmatch(status) else "unknown",
+        "live": status in _ROUTING_ACTIVE and (alive or status == "spawning"),
+        "substitution": _routing_substitution(record, model),
+        "parent_task_id": _routing_text(record.get("parent_task_id"), _ROUTING_TASK_ID),
     }
 
 
-def _routing_assignment_aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collapse decision events into one current reservation assignment."""
-    ordered = sorted(records, key=_routing_event_sort_key)
-    latest = ordered[-1]
-    item = _routing_assignment_item(latest)
-    item["event_history"] = [_routing_event_item(record) for record in ordered]
-    item["event_count"] = len(ordered)
-    item["latest_event"] = item["event_history"][-1]
-    item["timestamp"] = item["latest_event"]["timestamp"]
-    item["selection_reason"] = _routing_first(
-        *(_routing_selection_reason(record) for record in reversed(ordered)), item.get("selection_reason")
-    )
-    quota_snapshot = latest.get("quota", {}).get("snapshot") if isinstance(latest.get("quota"), dict) else {}
-    if not isinstance(quota_snapshot, dict):
-        quota_snapshot = {}
-    item["capacity_evidence"] = _routing_capacity_evidence(ordered, quota_snapshot)
-    item["current_state"] = _routing_first(item.get("reservation_state"), item.get("terminal_status"), item.get("decision_state"))
-    return item
+def _routing_lane_counts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    admission = Counter(row["admission"]["state"] for row in rows)
+    return {
+        "total": len(rows),
+        "by_model": dict(Counter(row["model"] or "unknown" for row in rows)),
+        "by_pool": dict(Counter(row["pool_label"] or "no subscription pool" for row in rows)),
+        "by_account_chooser": dict(Counter(row["account_by"] or "not_recorded" for row in rows if row["pool"])),
+        "admission": {state: admission.get(state, 0) for state in ("admitted", "deferred", "refused", "not_checked")},
+        "substitutions": sum(1 for row in rows if row["substitution"]),
+        "live": sum(1 for row in rows if row["live"]),
+    }
 
 
-def list_routing_assignments(*, limit: int = 100, ctx: MonitorContext | None = None) -> dict[str, Any]:
-    """Read persisted routing decisions through the optional authority ledger.
+def _routing_counts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The window's counts per lane (the brief picks the model; the resolver seats reviews), for the flow picture."""
+    return {
+        "brief": _routing_lane_counts([row for row in rows if row["kind"] != "review"]),
+        "resolver": _routing_lane_counts([row for row in rows if row["kind"] == "review"]),
+    }
 
-    The routing-reservation store is owned by Fleet Comms. Runtime only calls
-    its optional read-only projection and reports a distinct unavailable state
-    until that authority is installed; an absent table is never treated as an
-    empty history.
+
+def _routing_live(rows: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    live: dict[str, dict[str, int]] = {meter: {"all": 0, "write": 0} for meter, _ in ROUTING_POOLS}
+    for row in rows:
+        if row["live"] and row["pool"] in live:
+            live[row["pool"]]["all"] += 1
+            live[row["pool"]]["write"] += row["kind"] == "write"
+    return live
+
+
+def routing_decisions(ctx: MonitorContext | None = None) -> dict[str, Any]:
+    """The last day's dispatch and review decisions from the hot task records.
+
+    Records last written before the window are skipped by mtime before they are
+    read: a record is written when its task starts, so its mtime is never older
+    than its start. An unreadable record is counted, never dropped silently.
     """
-    record_limit = min(max(1, int(limit)), 100)
-    resolved_ctx = resolve_context(ctx)
-    plane = _routing_plane_status(resolved_ctx)
-    try:
-        ledger = importlib.import_module("lu_machinery.fleet_comms.routing_reservations")
-        reader = ledger.list_routing_decisions
-        # The authority projection returns one record per decision event.  Read
-        # a bounded event window wide enough to return up to ``limit`` distinct
-        # reservations after lifecycle aggregation.
-        rows = reader(
-            root=message_plane.default_plane_root(repo_root=resolved_ctx.roots.state_root),
-            limit=record_limit * 10,
-        )
-    except (ImportError, AttributeError):
-        return {
-            "availability": "unavailable",
-            "reason": "routing_decision_reader_unavailable",
-            "plane": plane,
-            "assignments": [],
-        }
-    except storage.ControlPlaneUnsupportedComponentError:
-        return {
-            "availability": "unavailable",
-            "reason": "routing_decision_reader_unsupported",
-            "plane": plane,
-            "assignments": [],
-        }
-    except (OSError, sqlite3.Error, TypeError, ValueError, storage.ControlPlaneError):
-        return {
-            "availability": "unavailable",
-            "reason": "routing_decision_reader_failed",
-            "plane": plane,
-            "assignments": [],
-        }
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        return {
-            "availability": "malformed",
-            "reason": "routing_decision_reader_malformed",
-            "plane": plane,
-            "assignments": [],
-        }
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for index, row in enumerate(rows):
-        reservation_id = _routing_value(row, "reservation_id", "source_authority_id")
-        grouping_key = str(reservation_id) if reservation_id is not None else f"unidentified:{index}"
-        grouped.setdefault(grouping_key, []).append(row)
-    assignments = [_routing_assignment_aggregate(records) for records in grouped.values()]
-    assignments.sort(
-        key=lambda item: _parse_iso_datetime(item.get("timestamp")) or datetime.min.replace(tzinfo=UTC),
-        reverse=True,
-    )
-    assignments = assignments[:record_limit]
     now = datetime.now(UTC)
-    for item in assignments:
-        _routing_apply_observer_expiry(item, now)
+    tasks_dir = delegate_api._tasks_dir(resolve_context(ctx))
+    if not tasks_dir.is_dir():
+        return {"status": "unknown", "reason": "task_records_missing", "as_of": _routing_iso_z(now)}
+    cutoff = now.timestamp() - ROUTING_WINDOW_S
+    rows: list[dict[str, Any]] = []
+    unreadable = 0
+    for path in iter_task_records(tasks_dir, include_archive=False):
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+            record = delegate_api._read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
+        except OSError:
+            unreadable += 1
+            continue
+        started = _parse_iso_datetime(record.get("started_at")) if record is not None else None
+        if record is None or started is None or (now - started).total_seconds() > ROUTING_WINDOW_S:
+            continue
+        status, alive = delegate_api._derived_task_status(record)
+        row = _routing_decision(record, status=status, alive=alive)
+        if row is not None:
+            rows.append(row)
+    rows.sort(key=lambda row: _parse_iso_datetime(row["started_at"]) or now, reverse=True)
     return {
-        "availability": "available" if assignments else "empty",
-        "plane": plane,
+        "status": "ok",
         "as_of": _routing_iso_z(now),
-        "window": _routing_assignment_window(assignments, now),
-        "assignments": assignments,
+        "window_s": ROUTING_WINDOW_S,
+        "total": len(rows),
+        "unreadable": unreadable,
+        "truncated": len(rows) > ROUTING_DECISION_LIMIT,
+        "counts": _routing_counts(rows),
+        "live": _routing_live(rows),
+        "decisions": rows[:ROUTING_DECISION_LIMIT],
     }
+
+
+def _routing_host(limits: Any, live_write_total: int) -> dict[str, Any]:
+    """Admission's host-wide checks, pass or fail, without raw host figures."""
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, failure: str | None, *, unknown: str | None = None) -> None:
+        state = "unknown" if unknown else "fail" if failure else "ok"
+        checks.append({"check": name, "state": state, "reason": _routing_plain(failure or unknown or "") or None})
+
+    cap = limits.max_live_write_workers
+    add("write workers on this host",
+        f"{live_write_total} of {cap} write workers already running" if live_write_total >= cap else None)
+    failures = dispatch_admission.host_failures(dispatch_admission.probe_host(), limits)
+    add("memory and CPU load", "; ".join(failures) or None)
+    disk, disk_failure = dispatch_admission.check_disk(limits)
+    add("disk", disk_failure, unknown=None if disk.probe.used_percent is not None else "disk not measured")
+    pool = dispatch_admission.probe_pool(limits.worker_mem_reserve_gib)
+    add("shared worker memory pool", None if pool.skipped or pool.fits else pool.failure(),
+        unknown="pool not measured" if pool.skipped else None)
+    slots = dispatch_admission.probe_test_slots()
+    add("test-slot queue",
+        f"{slots.depth} runs waiting for test slots" if slots.depth is not None
+        and slots.depth > limits.max_test_slot_queue else None,
+        unknown="test-slot queue not measured" if slots.depth is None else None)
+    blocking = [check for check in checks if check["state"] == "fail"]
+    return {"admitting": not blocking, "checks": checks}
+
+
+def _routing_candidate_pool(candidate: Any, claude_label: str | None) -> str | None:
+    if candidate.route == "codex":
+        return codex_account_key(candidate)
+    if candidate.route == "claude":
+        return f"claude:{claude_label}" if claude_label else None
+    meter = dispatch_admission.subscription_meter(candidate.route, model=candidate.concrete_model)
+    return meter if meter in _ROUTING_POOL_LABELS else None
+
+
+def _routing_resolver_pick(budget: Mapping[str, Any], family: str, account: Any) -> dict[str, Any]:
+    """The seat ``resolve_reviewer`` itself picks now for a review authored in ``family``."""
+    resolution = resolve_reviewer(ResolverInputs(
+        author_model=family, author_family=family, review_profile=ROUTING_REVIEW_PROFILE,
+        risk=ROUTING_REVIEW_RISK, data_egress_policy="local_interactive",
+        routing_snapshot=budget, claude_account=account,
+    ))
+    seats = [resolution.selected] if resolution.selected is not None else list(resolution.quorum)
+    picks = []
+    for seat in seats:
+        candidate = REVIEW_CANDIDATES.get(seat.name)
+        meter = _routing_candidate_pool(candidate, account.label) if candidate is not None else None
+        picks.append({"name": seat.name, "model": seat.concrete_model, "pool": meter,
+                      "pool_label": _ROUTING_POOL_LABELS.get(meter or "")})
+    return {"picks": picks, "reason": None if picks else resolution.fail_closed_reason or "no eligible reviewer"}
+
+
+def _routing_review_seats(budget: Mapping[str, Any]) -> dict[str, Any]:
+    """The resolver's own evaluation of each automatic seat on the medium code ladder, and its pick.
+
+    A seat is eligible when the resolver would admit it for at least one author
+    family; otherwise it is excluded with the resolver's reason for another family
+    (same-family exclusion is the cross-family rule, not a pool state). Among
+    eligible seats the resolver ranks by fit, tier and allowance, so the pick per
+    author family comes from ``resolve_reviewer`` itself, never from ladder order.
+    """
+    eligible, excluded = bench_health._bench_inventory(
+        budget, data_egress_policy="local_interactive",
+        review_profile=ROUTING_REVIEW_PROFILE, risk=ROUTING_REVIEW_RISK,
+    )
+    account = claude_account_lane.resolve_route_account(None, strict=False)
+    first_choice = []
+    picked_for: dict[str, list[str]] = {}
+    for family, name in _ROUTING_AUTHOR_FAMILIES:
+        pick = _routing_resolver_pick(budget, family, account)
+        first_choice.append({"author": name, "seats": [
+            {key: picked[key] for key in ("model", "pool", "pool_label")} for picked in pick["picks"]
+        ], "reason": pick["reason"]})
+        for picked in pick["picks"]:
+            picked_for.setdefault(picked["name"], []).append(name)
+    seats: dict[str, list[dict[str, Any]]] = {meter: [] for meter, _ in ROUTING_POOLS}
+    unpooled = []
+    for candidate in (candidate for rung in REVIEW_LADDERS[ROUTING_REVIEW_RISK] for candidate in rung):
+        families = [family for family in eligible if family != candidate.family]
+        seat: dict[str, Any] = {"model": candidate.concrete_model, "picked_for": picked_for.get(candidate.name, [])}
+        if any(candidate.name in eligible[family] for family in families):
+            seat.update(state="eligible", reason=None)
+        else:
+            reason = next((excluded[family].get(candidate.name) for family in families
+                           if excluded[family].get(candidate.name)), None)
+            seat.update(state="excluded", reason=reason or "not eligible")
+        meter = _routing_candidate_pool(candidate, account.label)
+        if meter in seats:
+            seats[meter].append(seat)
+        else:
+            unpooled.append(seat)
+    return {"by_pool": seats, "unpooled": unpooled, "first_choice": first_choice}
+
+
+def _routing_pool_admission(
+    meter: str, budget: Mapping[str, Any] | None, budget_reason: str | None, limits: Any,
+    live_write: int, host: Mapping[str, Any] | None, now: datetime,
+) -> dict[str, Any]:
+    """What admission says now about a new write dispatch on ``meter``, by admission's own meter rule."""
+    if limits is None:
+        return {"state": "unknown", "reason": "admission settings unreadable", "cap": None}
+    if budget is None:
+        return {"state": "unknown", "reason": f"routing budget unavailable ({budget_reason or 'unknown'})", "cap": None}
+    telemetry, defer = dispatch_admission._meter_defer(meter, budget, now)
+    fresh = telemetry == "fresh"
+    cap = limits.max_live_write_workers_per_meter if fresh else min(
+        limits.max_live_write_workers_per_meter, limits.max_live_write_workers_per_meter_unknown,
+    )
+    note = None if fresh else f"allowance reading {telemetry.replace('_', ' ').replace(':', ': ')}; cap lowered to {cap}"
+    if defer is not None:
+        return {"state": "deferred", "reason": _ROUTING_METER_DEFERS.get(defer, str(defer)), "cap": cap, "note": note}
+    if live_write >= cap:
+        reason = f"{live_write} of {cap} write workers already running on this pool"
+        return {"state": "deferred", "reason": reason, "cap": cap, "note": note}
+    if host is not None and not host["admitting"]:
+        failing = ", ".join(check["check"] for check in host["checks"] if check["state"] == "fail")
+        return {"state": "deferred", "reason": f"host limit: {failing}", "cap": cap, "note": note}
+    return {"state": "admitted", "reason": None, "cap": cap, "note": note}
+
+
+def _routing_allowance(account: Mapping[str, Any] | None) -> dict[str, Any]:
+    if account is None:
+        return {"state": "unknown", "reason": "no subscription reading for this pool", "read_at": None}
+    raw_reading, raw_weekly = account.get("reading"), account.get("weekly")
+    reading: Mapping[str, Any] = raw_reading if isinstance(raw_reading, Mapping) else {}
+    weekly: Mapping[str, Any] = raw_weekly if isinstance(raw_weekly, Mapping) else {}
+    left = panel_values.number(weekly.get("left_pct"))
+    state = reading.get("status") if reading.get("status") in {"fresh", "stale", "unknown"} else "unknown"
+    if weekly.get("status") != "ok" or left is None:
+        state = "unknown"
+    return {
+        "state": state,
+        "reason": reading.get("reason_code") if state != "fresh" else None,
+        "read_at": reading.get("read_at"),
+        "left_pct": left if state != "unknown" else None,
+        "resets_at": weekly.get("resets_at") if state != "unknown" else None,
+    }
+
+
+def routing_seats(budget: Mapping[str, Any] | None, budget_reason: str | None) -> dict[str, Any]:
+    """The resolver's seats and picks, or ``unknown`` with the reason they cannot be evaluated."""
+    if budget is None:
+        return {"state": "unknown", "reason": f"routing budget unavailable ({budget_reason or 'unknown'})"}
+    try:
+        return {"state": "ok", "reason": None, **_routing_review_seats(budget)}
+    except ValueError:
+        # The resolver refuses a malformed health reading; its seats are then unknown, never eligible.
+        return {"state": "unknown", "reason": "the resolver could not read the routing budget's health fields"}
+
+
+def routing_now(
+    budget: Mapping[str, Any] | None, budget_reason: str | None, decisions: Mapping[str, Any],
+    seats_reading: Mapping[str, Any], seats_age_s: float | None,
+) -> dict[str, Any]:
+    """Each pool now: live workers, allowance, reset, and the admission and resolver verdicts."""
+    now = datetime.now(UTC)
+    try:
+        limits = dispatch_admission.load_thresholds()
+    except ValueError:
+        limits = None
+    live = decisions.get("live") if decisions.get("status") == "ok" else None
+    live_write_total = sum(row["write"] for row in live.values()) if isinstance(live, Mapping) else None
+    host = _routing_host(limits, live_write_total) if limits is not None and live_write_total is not None else None
+    subs = _public_subscriptions(subscriptions.subscriptions_snapshot())
+    accounts = {row["account"]: row for provider in subs["providers"] for row in provider["accounts"]}
+    seats = seats_reading if seats_reading.get("state") == "ok" else None
+    pools = []
+    for meter, label in ROUTING_POOLS:
+        counts = live.get(meter) if isinstance(live, Mapping) else None
+        pools.append({
+            "pool": meter,
+            "label": label,
+            "live": counts,
+            "allowance": _routing_allowance(accounts.get(label)),
+            "admission": _routing_pool_admission(
+                meter, budget, budget_reason, limits, counts["write"] if counts else 0, host, now,
+            ) if counts is not None else {"state": "unknown", "reason": "live workers unknown", "cap": None},
+            "review_seats": seats["by_pool"][meter] if seats is not None else None,
+        })
+    diagnostics = budget.get("diagnostics") if isinstance(budget, Mapping) else None
+    return {
+        "as_of": _routing_iso_z(now),
+        "budget": {
+            "state": "ok" if budget is not None else "unknown",
+            "reason": budget_reason,
+            "generated_at": budget.get("generated_at") if budget is not None else None,
+            "age_s": panel_values.number(diagnostics.get("data_age_s")) if isinstance(diagnostics, Mapping) else None,
+        },
+        "host": host,
+        "pools": pools,
+        "resolver": {
+            "state": "unknown" if seats is None else "ok",
+            "reason": seats_reading.get("reason"),
+            "age_s": None if seats_age_s is None else round(seats_age_s, 3),
+            "profile": ROUTING_REVIEW_PROFILE,
+            "risk": ROUTING_REVIEW_RISK,
+            "first_choice": seats["first_choice"] if seats is not None else [],
+            "unpooled": seats["unpooled"] if seats is not None else [],
+        },
+    }
+
+
+async def _routing_budget(ctx: MonitorContext) -> tuple[dict[str, Any] | None, str | None]:
+    """The routing budget exactly as dispatch admission reads it (``GET /api/state/routing-budget``)."""
+    from . import state_router  # noqa: PLC0415  # lazy-ok: import cycle (state_router imports this module)
+
+    try:
+        response = await state_router.routing_budget(
+            fresh_codexbar=False, transport="dispatch", ctx=ctx, include_subscriptions=False,
+        )
+    except HTTPException as exc:
+        return None, "warming" if exc.status_code == 503 else f"http_{exc.status_code}"
+    try:
+        body = json_depth.loads(bytes(response.body), max_depth=512)
+    except (ValueError, RecursionError):
+        return None, "invalid_budget"
+    return (body, None) if isinstance(body, dict) else (None, "invalid_budget")
 
 
 def runtime_recent_outcomes_today(ctx: MonitorContext | None = None, *, unreadable: dict[str, int] | None = None) -> dict[str, int]:
@@ -1526,13 +1595,39 @@ async def runtime_acp_conversation_transcript(
 
 
 
-@router.get("/routing-assignments")
-@swr_route("runtime-routing-assignments", ROUTING_ASSIGNMENTS_TTL_S, vary=("limit",))
-def runtime_routing_assignments(
-    limit: int = Query(100, ge=1, le=100), ctx: MonitorContext = Depends(get_ctx)
-):
-    """Read-only routing authority decisions and their actual plane posture, with their true age."""
-    return list_routing_assignments(limit=limit, ctx=ctx)
+@router.get("/routing")
+async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
+    """How work is routed: each pool now, and the last day's dispatch and review decisions.
+
+    ``now`` is built per request from the routing budget dispatch admission reads,
+    admission's own meter rule, the subscription readings and the reviewer
+    resolver's own seat evaluation. ``recent`` is one scan of the last day's task
+    records, served stale-while-revalidate with its true age in
+    ``X-Snapshot-Age-S``. A source that cannot be read is typed ``unknown`` with
+    its reason, never shown as zero. Rows carry task ids, model and pool labels
+    only: no paths, prompts or credentials.
+    """
+    budget, budget_reason = await _routing_budget(ctx)
+    # Evaluating every seat and the resolver's pick per author family takes about two
+    # seconds, so it is cached like the decisions (a failed reading is never stored),
+    # and a cold read computes the two side by side.
+    (decisions, age, stored), (seats, seats_age, seats_stored) = await asyncio.gather(
+        cache_read_swr(
+            ctx_scoped_ttl_key(ctx, "runtime-routing-decisions"), ROUTING_TTL_S,
+            functools.partial(routing_decisions, ctx), storable=lambda value: value.get("status") == "ok",
+        ),
+        cache_read_swr(
+            ctx_scoped_ttl_key(ctx, "runtime-routing-seats"), ROUTING_TTL_S,
+            functools.partial(routing_seats, budget, budget_reason), storable=lambda value: value.get("state") == "ok",
+        ),
+    )
+    now_view = await asyncio.to_thread(
+        routing_now, budget, budget_reason, decisions, seats, seats_age if seats_stored else None,
+    )
+    payload = {"now": now_view, "recent": {**decisions, "age_s": round(age, 3) if stored else None}}
+    return JSONResponse(content=payload, headers=panel_values.snapshot_headers(
+        age if stored else None, ROUTING_STALE_AFTER_S, unavailable=not stored,
+    ))
 
 
 @router.get("/transport-health")
