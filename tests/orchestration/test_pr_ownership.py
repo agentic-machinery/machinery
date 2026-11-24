@@ -769,6 +769,13 @@ def test_documented_module_invocation_shows_help():
     assert own.QUEUE_CUSTODY_USAGE in accept_help.stdout
     assert own.RECORDED_CUSTODY_USAGE in accept_help.stdout
     assert "never a merge gate" in accept_help.stdout
+    run_prs_help = subprocess.run(
+        [sys.executable, "-m", "lu_machinery.orchestration.pr_ownership", "run-prs", "--help"],
+        capture_output=True, text=True, timeout=60, check=False, cwd=root,
+    )
+    assert run_prs_help.returncode == 0
+    assert "Outputs:" in run_prs_help.stdout and "Exit codes:" in run_prs_help.stdout
+    assert "--task" in run_prs_help.stdout and "--include-children" in run_prs_help.stdout
 
 
 # --- round-1 review regressions -----------------------------------------------------
@@ -1127,3 +1134,269 @@ def test_keeper_repair_custody_released_only_when_cto_successor_accepts():
     assert receipt["successor"] == "repair-1"
     assert not own.keeper_custody(data["handoffs"][KEY])
     assert any(item["event"] == "repair_custody_released" and item["successor"] == "repair-1" for item in data["history"])
+
+
+# --- run-prs strict inventory ------------------------------------------------------
+
+
+def _rest_pr(
+    slug: str,
+    number: int,
+    *,
+    branch: str,
+    head_sha: str,
+    state: str = "open",
+    merged_at: str | None = None,
+    updated_at: str = "2026-10-28T12:10:00+00:00",
+    head_repo: str | None = ...,  # type: ignore[assignment]
+) -> dict:
+    resolved_head_repo = slug if head_repo is ... else head_repo
+    return {
+        "number": number,
+        "state": state,
+        "merged_at": merged_at,
+        "updated_at": updated_at,
+        "base": {"repo": {"full_name": slug}},
+        "head": {
+            "ref": branch,
+            "sha": head_sha,
+            "repo": None if resolved_head_repo is None else {"full_name": resolved_head_repo},
+        },
+    }
+
+
+def _write_task_file(directory: Path, filename: str, payload: dict) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / filename
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def test_run_prs_lists_unrecorded_branch_pr_via_x_agent_trailer(tmp_path, monkeypatch, capsys):
+    """Defect class: PR pushed on an unrecorded branch carrying only the task's X-Agent trailer is missed."""
+    from lu_machinery.orchestration import fleet_repos
+
+    tasks_root = tmp_path / "tasks"
+    archive_dir = tasks_root / "archive"
+    state_file = tmp_path / "pr_ownership" / "state.json"
+
+    parent_rec = {
+        "schema_version": 2,
+        "task_id": "turn-parent",
+        "run_nonce": "nonce-parent",
+        "status": "running",
+        "started_at": at(0).isoformat(),
+        "repo": "machinery",
+        "repository": MACHINERY,
+        "repository_id": MACHINERY,
+        "worktree_branch": "codex/turn-parent",
+    }
+    live_child = {
+        "schema_version": 2,
+        "task_id": "child-live",
+        "run_nonce": "nonce-live",
+        "parent_task_id": "turn-parent",
+        "parent_run_nonce": "nonce-parent",
+        "status": "running",
+        "started_at": at(2).isoformat(),
+        "repo": "machinery",
+        "repository": MACHINERY,
+        "repository_id": MACHINERY,
+        "worktree_branch": "agy/child-live",
+    }
+    archived_child = {
+        "schema_version": 2,
+        "task_id": "child-archived",
+        "run_nonce": "nonce-arch",
+        "parent_task_id": "turn-parent",
+        "parent_run_nonce": "nonce-parent",
+        "status": "done",
+        "started_at": at(3).isoformat(),
+        "repo": "public",
+        "repository": REPO,
+        "repository_id": REPO,
+        "worktree_branch": "agy/child-archived",
+        "delivery_prs": [f"{REPO}#55"],
+    }
+    _write_task_file(tasks_root, "turn-parent.json", parent_rec)
+    _write_task_file(tasks_root, "child-live.json", live_child)
+    _write_task_file(archive_dir, "child-archived.20261028T121500Z.archived.json", archived_child)
+
+    # Recorded ownership handoff for PR #60 in MACHINERY.
+    ownership_data = own._empty()
+    ownership_data["handoffs"][own.pr_key(MACHINERY, 60)] = {
+        "successor": "child-live",
+        "predecessor": None,
+        "accepted_at": at(5).isoformat(),
+        "head": "c" * 40,
+        "custody": [],
+        "rerun_allowance": "unspent",
+    }
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(ownership_data), encoding="utf-8")
+
+    sha_branch = "1" * 40
+    sha_handoff = "c" * 40
+    sha_delivery = "2" * 40
+    sha_trailer_open = "3" * 40
+    sha_trailer_merged = "4" * 40
+    sha_fork = "5" * 40
+    sha_other = "6" * 40
+
+    pr_recorded = _rest_pr(MACHINERY, 50, branch="agy/child-live", head_sha=sha_branch, state="open")
+    pr_handoff = _rest_pr(MACHINERY, 60, branch="someone/else", head_sha=sha_handoff, state="open")
+    pr_delivery = _rest_pr(
+        REPO, 55, branch="agy/old-split", head_sha=sha_delivery, state="closed", merged_at=at(12).isoformat(),
+    )
+    # Unrecorded branches carrying ONLY X-Agent trailers (one open in machinery, one merged in public).
+    pr_trailer_open = _rest_pr(
+        MACHINERY, 77, branch="agy/unrecorded-split", head_sha=sha_trailer_open, state="open",
+        updated_at=at(10).isoformat(),
+    )
+    pr_trailer_merged = _rest_pr(
+        REPO, 88, branch="agy/unrecorded-cross-repo", head_sha=sha_trailer_merged, state="closed",
+        merged_at=at(11).isoformat(), updated_at=at(11).isoformat(),
+    )
+    pr_fork = _rest_pr(
+        REPO, 91, branch="ext/fork-branch", head_sha=sha_fork, state="open",
+        updated_at=at(10).isoformat(), head_repo="external/fork",
+    )
+    pr_unrelated = _rest_pr(
+        MACHINERY, 92, branch="codex/other-task", head_sha=sha_other, state="open",
+        updated_at=at(10).isoformat(),
+    )
+
+    def fake_gh(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if endpoint.startswith(f"repos/{MACHINERY}/pulls?head=learn-ukrainian%3Aagy%2Fchild-live"):
+            payload = [[pr_recorded]]
+        elif endpoint.startswith(f"repos/{MACHINERY}/pulls?head=") or endpoint.startswith(f"repos/{REPO}/pulls?head="):
+            payload = [[]]
+        elif endpoint == f"repos/{MACHINERY}/pulls/60":
+            payload = pr_handoff
+        elif endpoint == f"repos/{REPO}/pulls/55":
+            payload = pr_delivery
+        elif endpoint.startswith(f"repos/{MACHINERY}/pulls?state=all&sort=updated"):
+            payload = [pr_recorded, pr_handoff, pr_trailer_open, pr_unrelated]
+        elif endpoint.startswith(f"repos/{REPO}/pulls?state=all&sort=updated"):
+            payload = [pr_delivery, pr_trailer_merged, pr_fork]
+        elif endpoint.startswith(f"repos/{MACHINERY}/pulls/50/commits"):
+            payload = [[{"commit": {"message": "feat: recorded branch\n\nX-Agent: agy/child-live"}}]]
+        elif endpoint.startswith(f"repos/{MACHINERY}/pulls/60/commits"):
+            payload = [[{"commit": {"message": "feat: handoff\n\nX-Agent: codex/prev-owner"}}]]
+        elif endpoint.startswith(f"repos/{REPO}/pulls/55/commits"):
+            payload = [[{"commit": {"message": "feat: delivery\n\nX-Agent: agy/child-archived"}}]]
+        elif endpoint.startswith(f"repos/{MACHINERY}/pulls/77/commits"):
+            payload = [[{"commit": {"message": "feat: split fix\n\nX-Agent: agy/child-live"}}]]
+        elif endpoint.startswith(f"repos/{REPO}/pulls/88/commits"):
+            payload = [[{"commit": {"message": "fix: archived child work\n\nX-Agent: agy/child-archived"}}]]
+        elif endpoint.startswith(f"repos/{MACHINERY}/pulls/92/commits"):
+            payload = [[{"commit": {"message": "chore: unrelated\n\nX-Agent: codex/someone-else"}}]]
+        else:
+            raise AssertionError(f"unexpected GitHub call: {cmd}")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="", github_result=None)
+
+    monkeypatch.setattr(own, "tasks_dir", lambda: tasks_root)
+    monkeypatch.setattr(own, "state_path", lambda: state_file)
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: FLEET)
+    monkeypatch.setattr(own.github_client, "run", fake_gh)
+
+    rc = own.main(["run-prs", "--task", "turn-parent", "--include-children"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert f"excluded fork PR {REPO}#91" in captured.err
+    rows = json.loads(captured.out)
+    assert rows == [
+        {"repo": REPO, "number": 55, "state": "MERGED", "head": sha_delivery, "how_found": "delivery_pr"},
+        {"repo": REPO, "number": 88, "state": "MERGED", "head": sha_trailer_merged, "how_found": "x_agent_trailer"},
+        {"repo": MACHINERY, "number": 50, "state": "OPEN", "head": sha_branch, "how_found": "recorded_branch"},
+        {"repo": MACHINERY, "number": 60, "state": "OPEN", "head": sha_handoff, "how_found": "ownership_handoff"},
+        {"repo": MACHINERY, "number": 77, "state": "OPEN", "head": sha_trailer_open, "how_found": "x_agent_trailer"},
+    ]
+
+    # Without --include-children, only turn-parent itself is inventoried (children excluded).
+    rc_self = own.main(["run-prs", "--task", "turn-parent"])
+    captured_self = capsys.readouterr()
+    assert rc_self == 0
+    assert json.loads(captured_self.out) == []
+
+
+def test_run_prs_exits_2_on_unreadable_archived_child_record(tmp_path, monkeypatch, capsys):
+    """Defect class: unreadable archived child record skipped with exit 0 instead of failing closed with exit 2."""
+    from lu_machinery.orchestration import fleet_repos
+
+    tasks_root = tmp_path / "tasks"
+    archive_dir = tasks_root / "archive"
+    state_file = tmp_path / "pr_ownership" / "state.json"
+
+    parent_rec = {
+        "schema_version": 2,
+        "task_id": "turn-parent",
+        "run_nonce": "nonce-parent",
+        "status": "done",
+        "started_at": at(0).isoformat(),
+        "repo": "machinery",
+        "repository": MACHINERY,
+        "repository_id": MACHINERY,
+        "worktree_branch": "codex/turn-parent",
+    }
+    _write_task_file(tasks_root, "turn-parent.json", parent_rec)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    corrupt = archive_dir / "child-corrupt.json"
+    corrupt.write_text("{truncated", encoding="utf-8")
+
+    monkeypatch.setattr(own, "tasks_dir", lambda: tasks_root)
+    monkeypatch.setattr(own, "state_path", lambda: state_file)
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: FLEET)
+    monkeypatch.setattr(
+        own.github_client, "run", lambda *a, **k: pytest.fail("GitHub queried despite unreadable archived record")
+    )
+
+    rc = own.main(["run-prs", "--task", "turn-parent", "--include-children"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.out == ""
+    assert "child-corrupt.json" in captured.err
+
+    # Sibling: dangling symlink in archive also fails closed with exit 2.
+    corrupt.unlink()
+    dangling = archive_dir / "child-dangling.json"
+    dangling.symlink_to(tmp_path / "missing-target.json")
+    rc_dangling = own.main(["run-prs", "--task", "turn-parent", "--include-children"])
+    captured_dangling = capsys.readouterr()
+    assert rc_dangling == 2
+    assert captured_dangling.out == ""
+    assert "child-dangling.json" in captured_dangling.err
+    dangling.unlink()
+
+    # Sibling: child listed in settled parent's child_tasks but missing from store fails closed with exit 2.
+    parent_rec["child_tasks"] = [{"task_id": "child-deleted", "run_nonce": "nonce-del", "status": "done"}]
+    _write_task_file(tasks_root, "turn-parent.json", parent_rec)
+    rc_missing = own.main(["run-prs", "--task", "turn-parent", "--include-children"])
+    captured_missing = capsys.readouterr()
+    assert rc_missing == 2
+    assert captured_missing.out == ""
+    assert "child-deleted" in captured_missing.err
+
+    # Sibling: unreadable ownership state or failed GitHub read also exits 2 with nothing on stdout.
+    parent_rec.pop("child_tasks")
+    _write_task_file(tasks_root, "turn-parent.json", parent_rec)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text("{bad-json", encoding="utf-8")
+    rc_state = own.main(["run-prs", "--task", "turn-parent", "--include-children"])
+    captured_state = capsys.readouterr()
+    assert rc_state == 2
+    assert captured_state.out == ""
+    assert "ownership state unreadable" in captured_state.err
+
+    state_file.unlink()
+    monkeypatch.setattr(
+        own.github_client,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="HTTP 500", github_result=None),
+    )
+    rc_gh = own.main(["run-prs", "--task", "turn-parent", "--include-children"])
+    captured_gh = capsys.readouterr()
+    assert rc_gh == 2
+    assert captured_gh.out == ""
+    assert "GitHub read failed" in captured_gh.err
