@@ -315,6 +315,11 @@ _ROUTING_BUDGET_USAGE_SOURCE_KEYS = frozenset(
 def test_routing_budget_shape_lock(monkeypatch, tmp_path):
     """The routing page depends on this key set. Do not add or drop keys."""
     _configure(monkeypatch, tmp_path, [])
+    monkeypatch.setattr(subscription_usage_mod, "_last_good_data", {})
+    monkeypatch.setattr(subscription_usage_mod, "_last_failure_data", {})
+    assert subscription_usage_mod._record_probe_result("codex:b", {"weekly_used_pct": 21.0})
+    # A partial failure beside retained capacity cannot be treated as a successful read.
+    monkeypatch.setitem(subscription_usage_mod._last_failure_data, "codex:b", {"failure_code": 401})
     ctx = fixture_context(tmp_path)
     # An observable tasks directory publishes measured counts. A missing
     # directory stays null (unknown load), which the page treats as empty.
@@ -337,6 +342,11 @@ def test_routing_budget_shape_lock(monkeypatch, tmp_path):
     assert isinstance(data["ranked_by_headroom"], list)
     assert isinstance(data["in_flight"], dict)
     assert all(isinstance(count, int) for count in data["in_flight"].values())
+    assert set(data["codex_accounts"]) == {"codex:a", "codex:b"}
+    for row in data["codex_accounts"].values():
+        assert row["eligible"] is False
+        assert row["codexbar"]["last_failure_at"] is None
+        assert row["codexbar"]["failure_kind"] == "unavailable"
 
 
 def test_refresh_due_snapshot_within_source_age_threshold_stays_fresh():

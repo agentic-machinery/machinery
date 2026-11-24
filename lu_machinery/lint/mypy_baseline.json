@@ -6378,26 +6378,6 @@
       "message": "Need type annotation for \"root_results\""
     },
     {
-      "path": "lu_machinery/orchestration/job_host_exec.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/orchestration/job_host_exec.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/orchestration/job_host_exec.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
-      "path": "lu_machinery/orchestration/job_host_exec.py",
-      "code": "union-attr",
-      "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
-    },
-    {
       "path": "lu_machinery/orchestration/lifecycle_observation.py",
       "code": "arg-type",
       "message": "Argument 1 to \"deepcopy\" has incompatible type \"Mapping[str, Any]\"; expected \"dict[str, Any]\""

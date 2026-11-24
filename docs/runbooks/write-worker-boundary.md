@@ -110,6 +110,17 @@ across format corrections, regardless of the CLI caller's `--idempotency-key`. T
 the installed Fleet CLI while the Fleet store remains masked.
 
 The owning write worker records the finished review through `record_cf_verdict.py`. The reviewer supplies its structured result and cannot publish a verdict or act for a child task.
+
+`dispatch wait <review> --run-nonce <nonce> --reply` gives the running parent the sealed review reply
+when the review is on the parent's recorded publish or worktree branch in the same repository. For a
+replacement PR on another branch, the parent needs recorded accepted ownership of that repository and
+PR. The dispatcher verifies the PR branch and pinned commit when it admits the read-only review. A
+running task with recorded accepted ownership can also read the review of a settled parent if the review
+branch matches the running task's publish branch, or its worktree branch if it has no publish branch.
+Each path requires the running task's worktree HEAD to match the reviewed commit. A refused request
+returns `result_unavailable` in place of the reply. For example, a running parent without accepted
+ownership receives `review_not_of_parent_branch` for a review on an unrecorded branch.
+
 The boundary receipt includes the launch mode and GitHub read-relay outcomes. Setup or canary failure
 refuses the run, with no uncontained fallback.
 

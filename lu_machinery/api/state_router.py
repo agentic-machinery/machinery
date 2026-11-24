@@ -42,7 +42,7 @@ from lu_machinery.research.registry import research_manifest_component
 from lu_machinery.telemetry.cost_report import CostRecord, load_cost_records
 
 from . import delegate_router as delegate_api
-from . import panel_values, state_helpers, subscriptions
+from . import panel_values, state_helpers, subscription_usage, subscriptions
 from .claude_account_usage import ROW_REASON_CODES, revalidated_routing_budget_fields
 from .claude_account_usage import routing_budget_fields as claude_account_routing_fields
 from .codexbar_usage import (
@@ -1964,6 +1964,11 @@ _CODEXBAR_PUBLIC_FIELDS = (
     "source",
 )
 
+_ROUTING_FAILURE_KINDS = frozenset({
+    "account_unavailable", "fetch_error", "malformed_json", "need_login", "provider",
+    "rate_limit", "timeout", "token_rejected", "unavailable", "unparseable_schema", "unsupported",
+})
+
 
 # Ledger labels for Codex account b. An unlabelled row stays on account a.
 _CODEX_B_LEDGER = frozenset({"b-sub", "b", "codex:b"})
@@ -2283,6 +2288,51 @@ def compute_routing_budget(
     return budget
 
 
+def _with_live_codex_failures(payload: dict[str, Any]) -> dict[str, Any]:
+    """Recheck account eligibility against the Monitor's in-memory probe records."""
+    accounts = _as_mapping(payload.get("codex_accounts"))
+    if not accounts:
+        return payload
+
+    served_accounts = dict(accounts)
+    agents = _as_mapping(payload.get("agents"))
+    no_failure_record = object()
+    for key in subscription_usage.CODEX_ACCOUNT_USAGE_KEYS.values():
+        row = _as_mapping(accounts.get(key))
+        if not row:
+            continue
+        # Read the same key as the budget builder. Both account-a aliases
+        # share a producer. The canonical lane is the first one it updates.
+        provider = "codex" if key == "codex:a" else key
+        had_success = provider in subscription_usage._last_good_data
+        # Read one failure record. The usage projection fills missing fields
+        # with nulls, which would make a partial failure look like success.
+        latest_failure = subscription_usage._last_failure_data.get(provider, no_failure_record)
+        failure = _as_mapping(latest_failure)
+        failure_at = panel_values.timestamp(failure.get("last_failure_at"))
+        if failure_at is not None and "T" not in failure_at:
+            failure_at = None
+        kind = None
+        if latest_failure is not no_failure_record:
+            kind = panel_values.choice(
+                failure.get("failure_kind"), _ROUTING_FAILURE_KINDS, "provider" if failure_at else "unavailable",
+            )
+        elif not had_success:
+            kind = "unavailable"
+        fields = {"last_failure_at": failure_at, "failure_kind": kind}
+        served_row = {**row, "codexbar": {**_as_mapping(row.get("codexbar")), **fields}}
+        if kind is not None:
+            served_row["eligible"] = False
+        served_accounts[key] = served_row
+
+        if key == "codex:a" and (legacy := _as_mapping(agents.get("codex"))):
+            payload["agents"] = {
+                **agents, "codex": {**legacy, "codexbar": {**_as_mapping(legacy.get("codexbar")), **fields}},
+            }
+    payload["codex_accounts"] = served_accounts
+    return payload
+
+
 def _aged_routing_budget(
     payload: object,
     age_s: float,
@@ -2298,7 +2348,9 @@ def _aged_routing_budget(
     """
     if not isinstance(payload, dict):
         return payload
-    served = {**payload, **(claude_account_routing_fields() if claude_fields is None else claude_fields)}
+    served = _with_live_codex_failures(
+        {**payload, **(claude_account_routing_fields() if claude_fields is None else claude_fields)}
+    )
     diagnostics = payload.get("diagnostics")
     threshold = ROUTING_BUDGET_MAX_AGE_S
     reported_age = age_s
@@ -2507,6 +2559,7 @@ _ROUTING_ENUMS = {
     "status": {"cool", "warm", "hot", "near_cap", "unknown", "unavailable", "pre_launch", "need_login",
                "ok", "fresh", "stale", "blocked", "eligible", "expired", "pending", "avoid", "credit"},
     "freshness": {"fresh", "stale", "stale_last_good", "unavailable", "unknown"},
+    "failure_kind": _ROUTING_FAILURE_KINDS,
     "probe_state": {"healthy", "NEED_LOGIN", "NEED_KEY", "NEED_PROBE", "unknown", "unavailable", "error", "ok"},
     "login_state": {"authenticated", "NEED_LOGIN", "unknown", "unavailable"},
     "balance_probe_state": {"ok", "NEED_KEY", "NEED_PROBE", "unknown", "unavailable", "unsupported", "error", "fresh", "stale"},
