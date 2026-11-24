@@ -740,6 +740,25 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
         except (OSError, ValueError, subprocess.SubprocessError):
             return None
 
+    # Two lstat-only refusals come before any Git subprocess, so dispatch admission's cheap precheck
+    # spawns nothing for the curriculum product or a non-checkout product root. Neither changes a
+    # result: a curriculum marker always gives None, and Git can report ``root/.git`` as the common
+    # directory only when it is a real directory (it reports a symlinked ``.git`` by its realpath).
+    marker = Path(PRODUCT_MARKER)
+    for rel_marker in (*reversed(marker.parents[:-1]), marker):
+        try:
+            st = os.lstat(resolved / rel_marker)
+        except FileNotFoundError:
+            break
+        except (OSError, ValueError):
+            return None
+        if rel_marker == marker or not stat.S_ISDIR(st.st_mode):
+            return None
+    try:
+        if not stat.S_ISDIR(os.lstat(resolved / ".git").st_mode):
+            return None
+    except (OSError, ValueError):
+        return None
     layout = git("rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir")
     lines = [] if layout is None or layout.returncode != 0 else layout.stdout.split(b"\n")
     if len(lines) != 3 or lines[2] or [Path(os.fsdecode(line)) for line in lines[:2]] != [resolved, resolved / ".git"]:
@@ -754,16 +773,6 @@ def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None
         or parent_top.stderr != b"fatal: not a git repository (or any of the parent directories): .git\n"
     ):
         return None
-    marker = Path(PRODUCT_MARKER)
-    for rel_marker in (*reversed(marker.parents[:-1]), marker):
-        try:
-            st = os.lstat(resolved / rel_marker)
-        except FileNotFoundError:
-            break
-        except (OSError, ValueError):
-            return None
-        if rel_marker == marker or not stat.S_ISDIR(st.st_mode):
-            return None
     config = git("config", "--no-includes", "--null", "--get-regexp", _CHECKOUT_IDENTITY_KEYS)
     entries = [] if config is None or config.returncode != 0 else config.stdout.split(b"\0")[:-1]
     key = b"remote.origin.url\n"
