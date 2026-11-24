@@ -416,7 +416,10 @@ does these steps in order:
      candidate source on `PYTHONPATH`):
      `"$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"`.
      Every required route must pass, and the final receipt check, which uses
-     the sealed candidate's gate and catalog, must succeed. The installed gate
+     the sealed candidate's gate and catalog, must succeed. The Codex route
+     runs on Codex account a (`--codex-account sub`) and the Claude route on
+     subscription account b; an account without allowance fails its route,
+     which blocks the release. The installed gate
      originally matched the keeper's runtime when canaries gated PR admission.
      At cut time, the candidate gate validates the models and catalog that this
      release installs together. A failing route or an incomplete run
