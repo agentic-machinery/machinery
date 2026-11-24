@@ -349,10 +349,10 @@ canonical receipt using `contract_canary.record`:
 
 | Route | Model | Account |
 | --- | --- | --- |
-| Codex | `gpt-6.2-sol` | `b-sub` |
+| Codex | `gpt-6.2-sol` | Chosen per run by allowance: account b first, then a ([release guide](../release.md)) |
 | Claude | `claude-sonnet-5-5` | `b` |
 | Cursor | `grok-4.7-high` | Existing host binding |
-| AGY | `gemini-3.8-flash-high` | Existing host binding |
+| AGY | `gemini-4-neon-high` | Existing host binding |
 
 The per-route deadline defaults to 1200 seconds; change it with
 `--hard-timeout <positive-seconds>`. A changed catalog route set refuses the run

@@ -416,7 +416,36 @@ does these steps in order:
      candidate source on `PYTHONPATH`):
      `"$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"`.
      Every required route must pass, and the final receipt check, which uses
-     the sealed candidate's gate and catalog, must succeed. The installed gate
+     the sealed candidate's gate and catalog, must succeed. The Codex route
+     has no pinned account. Before anything is built, the canary reads the
+     Monitor routing budget once and runs Codex on an account with observed
+     allowance. This is the reviewer resolver's rule: a fresh reading above
+     the near-cap reserve, account b first among funded accounts. The reading
+     must be the account's own fresh provider sample. A ledger estimate, a
+     missing or stale probe, a sample fetched longer ago than the probe age
+     limit, a plan window outside 0–100%, a provider probe that failed after
+     the sample, a row for another account, or a route the resolver blocks
+     (unhealthy, logged out, circuit open) is not allowance.
+     When no Codex account is funded, or the budget is unreadable, the canary
+     refuses with `no-allowance` and lists each account's reading. A dry run
+     reads the same budget, prints the chosen accounts and refuses the same
+     way. Known residual (FU-ROUTING-BUDGET-FAILSTATE, owned by the Monitor
+     routing-budget owner): the canary reads the budget once per run, before
+     anything is created, and Monitor answers from its stored budget when it
+     has one. Once that budget is 15 seconds old, a request schedules a
+     rebuild beside it and is still answered from the stored budget. A
+     provider probe failure recorded after that build, such as a lost login,
+     is not in the budget the canary reads until a rebuild completes, so the
+     canary can choose that account.
+     The canary's own age check still applies: it counts a sample only while
+     its `fetched_at` is within the probe age limit (`credit_max_age_s`, 900
+     seconds as shipped) of now. For account b-sub, dispatch admission runs
+     `codex login status` in the bound home and refuses the route with
+     `codex_account_not_logged_in` when it exits non-zero. Account a (`sub`)
+     has no such admission check, and no admission check covers other kinds
+     of provider probe failure. If a run reports a retained mount and
+     environment, settle its tasks before unmounting, as that message says.
+     The Claude route runs on subscription account b. The installed gate
      originally matched the keeper's runtime when canaries gated PR admission.
      At cut time, the candidate gate validates the models and catalog that this
      release installs together. A failing route or an incomplete run
