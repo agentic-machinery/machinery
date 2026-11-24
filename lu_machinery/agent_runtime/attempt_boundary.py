@@ -1296,10 +1296,18 @@ class AttemptBoundary:
         if agent not in SUPPORTED_HARNESSES:
             raise ReviewIsolationError("attempt_harness_unsupported")
         access = "full" if self.full else "isolated"
+        self.sources_enabled = True
         if consumer_workspace is not None:
+            from lu_machinery.orchestration.fleet_repos import fleet_repo_for_checkout
+
             if agent != "agy" or tool_config:
                 raise ReviewIsolationError("agy_consumer_boundary_requires_default_config")
             root = _agy_consumer_checkout(consumer_workspace)
+            # Use the same fleet declaration as sources_server_path. The
+            # sandboxed checkout owns this choice even when the host has a
+            # different default product root.
+            repo = fleet_repo_for_checkout(root)
+            self.sources_enabled = repo is None or repo.sources_server is not None
             closure: dict[str, bytes] = {}
         else:
             config = Path(tool_config["mcp_config_path"])
@@ -1363,29 +1371,31 @@ class AttemptBoundary:
             self.env.update(USER="review", LOGNAME="review", SHELL="/bin/bash")
             self.env.pop("GIT_DIR", None)
             self.env.pop("GIT_WORK_TREE", None)
-            proxy = self.write_root / "stdio.py"
-            proxy.write_bytes(Path(__file__).with_name("attempt_proxy.py").read_bytes())
-            endpoint = self.write_root / "sources.sock"
-            self.endpoint = endpoint
-            if self.consumer:
-                from lu_machinery.dispatcher.agy_sandbox import SourcesRelay
-
-                from .review_mcp import REVIEWER_SOURCES_ENV, review_tools
-
-                self.connection = SourcesRelay(endpoint, review_tools(access), dict(REVIEWER_SOURCES_ENV))
-            else:
-                self.connection = SourcesConnection(endpoint, server)
             self.egress_endpoint = self.write_root / "egress.sock"
             self.egress = AttemptEgress(self.egress_endpoint)
             self.forwarder = self.write_root / "forwarder.py"
             self.forwarder.write_bytes(Path(__file__).with_name("attempt_forwarder.py").read_bytes())
-            # -I: the proxy directory and PYTHONPATH must not supply code. attempt_proxy flushes each write.
-            proxy_server = {
-                "command": str(Path(sys.executable).resolve(strict=True)),
-                "args": ["-I", str(proxy), str(endpoint)],
-            }
+            proxy_servers = {}
+            proxy_python = Path(sys.executable).resolve(strict=True)
+            if self.sources_enabled:
+                proxy = self.write_root / "stdio.py"
+                proxy.write_bytes(Path(__file__).with_name("attempt_proxy.py").read_bytes())
+                self.endpoint = self.write_root / "sources.sock"
+                if self.consumer:
+                    from lu_machinery.dispatcher.agy_sandbox import SourcesRelay
+
+                    from .review_mcp import REVIEWER_SOURCES_ENV, review_tools
+
+                    self.connection = SourcesRelay(self.endpoint, review_tools(access), dict(REVIEWER_SOURCES_ENV))
+                else:
+                    self.connection = SourcesConnection(self.endpoint, server)
+                # -I keeps the proxy directory and PYTHONPATH from supplying code.
+                proxy_servers["sources"] = {
+                    "command": str(proxy_python),
+                    "args": ["-I", str(proxy), str(self.endpoint)],
+                }
             proxy_config = self.write_root / ("consumer.mcp.json" if self.consumer else "mcp.json")
-            proxy_config.write_text(json.dumps({"mcpServers": {"sources": proxy_server}}))
+            proxy_config.write_text(json.dumps({"mcpServers": proxy_servers}))
             if self.consumer:
                 self.config_path = proxy_config
             self.tool_config = {
@@ -1399,10 +1409,10 @@ class AttemptBoundary:
                 from .review_mcp import _render_codex_review_config, _toml_string
 
                 # The renderer JSON-escapes the path. A raw replace misses quotes, backslashes and non-ASCII.
-                rendered = _render_codex_review_config(Path(proxy_server["command"]), proxy, {})
+                rendered = _render_codex_review_config(proxy_python, proxy, {})
                 needle = f"args = [{_toml_string('-I')}, {_toml_string(str(proxy))}]"
                 isolated = "args = [" + ", ".join(
-                    _toml_string(part) for part in ("-I", str(proxy), str(endpoint))
+                    _toml_string(part) for part in ("-I", str(proxy), str(self.endpoint))
                 ) + "]"
                 if rendered.count(needle) != 1:
                     raise ReviewIsolationError("attempt_codex_proxy_args_unisolated")
@@ -1440,7 +1450,11 @@ class AttemptBoundary:
                 settings = target.parent / "settings.json"
                 fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 with os.fdopen(fd, "w") as handle:
-                    handle.write(json.dumps(agy_review_settings(access, checkout_root=consumer_workspace or self.workspace)))
+                    handle.write(json.dumps(agy_review_settings(
+                        access,
+                        checkout_root=consumer_workspace or self.workspace,
+                        sources_enabled=self.sources_enabled,
+                    )))
                 self.tool_config["agy_home_override"] = str(home)
                 self.env["AGY_APP_DATA_DIR"] = str(target.parent)
             else:
@@ -1468,7 +1482,7 @@ class AttemptBoundary:
             snapshot_root=self.workspace,
             write_root=self.write_root,
             reject_root=reject,
-            runtime_reads=[*runtime, *full_reads, self.endpoint],
+            runtime_reads=[*runtime, *full_reads, *([self.endpoint] if self.sources_enabled else [])],
             network_allowed=False,
         )
         if self.egress is None or not self.egress.thread.is_alive():

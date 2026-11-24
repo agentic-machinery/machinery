@@ -339,11 +339,6 @@
     },
     {
       "path": "lu_machinery/agent_runtime/attempt_boundary.py",
-      "code": "arg-type",
-      "message": "Argument 1 to \"Path\" has incompatible type \"Sequence[str]\"; expected \"PathLike[str] | str\""
-    },
-    {
-      "path": "lu_machinery/agent_runtime/attempt_boundary.py",
       "code": "assignment",
       "message": "Incompatible types in assignment (expression has type \"None | str\", variable has type \"str\")"
     },

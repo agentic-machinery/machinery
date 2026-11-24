@@ -46,9 +46,9 @@ verifies the catalog via ``tool_config.ensure_agy_mcp_catalog`` before spawning.
 A scoped read-only invocation uses ``tool_config["agy_home_override"]`` to point
 at a private home. The invocation's env overrides
 set ``HOME`` to it and ``AGY_APP_DATA_DIR`` to ``<home>/.gemini/antigravity-cli``.
-The CLI then loads the scoped ``config/mcp_config.json`` (one stdio ``sources``
-server) and the transcript reader follows ``AGY_APP_DATA_DIR`` to the scoped app
-data. Without the key nothing changes.
+The CLI loads the scoped ``config/mcp_config.json`` and the transcript reader
+follows ``AGY_APP_DATA_DIR`` to the scoped app data. The config contains one stdio
+``sources`` server for reviews and is empty for a consumer that omits Sources.
 
 Threat model for background-task completion (#8502 r12): the completion gate
 defends against agy and its agents behaving honestly, and against accidental
@@ -1083,14 +1083,18 @@ class AgyAdapter:
                 "agy_isolated_review_unsupported: AGY cannot yet prove native "
                 "project-instruction, MCP, hook, and nested-reviewer suppression"
             )
-        if review_route:
-            validate_agy_read_only_paths(prompt, mode=mode, cwd=cwd, tool_config=tc)
-            _write_review_permissions(tc, mode=mode, session_id=session_id, cwd=cwd)
 
         from ..attempt_boundary import AttemptBoundary
 
         boundary = tc.get("review_attempt_boundary")
         consumer_route = isinstance(boundary, AttemptBoundary) and boundary.consumer
+        sources_enabled = not isinstance(boundary, AttemptBoundary) or boundary.sources_enabled
+        if review_route:
+            if not sources_enabled and "mcp__sources__" in prompt:
+                raise AgyReviewPermissionError("agy_sources_undeclared: mcp__sources__ tools are unavailable")
+            validate_agy_read_only_paths(prompt, mode=mode, cwd=cwd, tool_config=tc)
+            _write_review_permissions(tc, mode=mode, session_id=session_id, cwd=cwd, sources_enabled=sources_enabled)
+
         scoped_home = Path(str(tc["agy_home_override"])) if tc.get("agy_home_override") else None
         if consumer_route:
             # Only the scoped registration is loadable in the consumer sandbox.
@@ -1215,6 +1219,7 @@ class AgyAdapter:
                 "agy_app_data_path": str(app_data),
                 "agy_app_data_root": str(app_data_root),
                 "agy_mcp_config_path": str(mcp_config_path),
+                "agy_sources_enabled": sources_enabled,
                 "attempt_read_root": bool(tc.get("review_write_root")),
                 "log_read_root": str(log_read_root),
                 "agy_permission_profile_id": (
@@ -1620,7 +1625,9 @@ def _attempt_evidence(bound: _TranscriptSlice | None, result: ParseResult, plan:
         excused = set()
     from ..sources_read_only import sources_tool_sets
 
-    read_only_sources, persisting_sources = sources_tool_sets()
+    read_only_sources, persisting_sources = (
+        sources_tool_sets() if plan is None or plan.metadata.get("agy_sources_enabled", True) else ((), ())
+    )
     known_sources = set(read_only_sources) | set(persisting_sources)
     # Current AGY emits planner intents followed by GENERIC result slots in
     # FIFO order; a planner's step index is not its tool result's step index.
@@ -2246,7 +2253,9 @@ def _headless_permission_denial(stderr_text: str) -> AgyHeadlessPermissionDenial
     return AgyHeadlessPermissionDenial(kind, target)
 
 
-def _write_review_permissions(tc: Mapping[str, Any], *, mode: str, session_id: str | None, cwd: Path) -> None:
+def _write_review_permissions(
+    tc: Mapping[str, Any], *, mode: str, session_id: str | None, cwd: Path, sources_enabled: bool,
+) -> None:
     """Write a fresh scoped allow set; refuse requirements or config drift first.
 
     ``agy_required_permissions`` is a list of exact action(target) resources
@@ -2271,16 +2280,19 @@ def _write_review_permissions(tc: Mapping[str, Any], *, mode: str, session_id: s
         for key in ("review_access", "review_id", "attempt_id", "review_attempt_boundary", "review_isolation")
     )
     try:
-        expected = agy_review_settings(None if permission_only else access, checkout_root=cwd)
+        expected = agy_review_settings(
+            None if permission_only else access, checkout_root=cwd, sources_enabled=sources_enabled,
+        )
     except (OSError, ValueError, SyntaxError, StopIteration):
         raise AgyReviewPermissionError("agy_review_permissions_tool_inventory_unavailable") from None
     allow = set(expected["permissions"]["allow"])
     required = tc.get("agy_required_permissions", [])
+    mcp_names = ["sources"] if sources_enabled else []
     if (
         not isinstance(required, (list, tuple))
         or any(not isinstance(rule, str) or rule not in allow for rule in required)
         or tc.get("agy_skip_permissions")
-        or tc.get("mcp_server_names", ["sources"]) != ["sources"]
+        or tc.get("mcp_server_names", mcp_names) != mcp_names
     ):
         raise AgyReviewPermissionError("agy_review_permission_outside_allow_set: review forbids permission widening")
     if (tools := tc.get("allowed_tools")) and (
