@@ -71,7 +71,7 @@ from lu_machinery.opsec.prepublish import (
     publication_cli,
 )
 from lu_machinery.orchestration import integration_sweep
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_fleet_repo_by_slug
 from lu_machinery.orchestration.integration_sweep import (
     CHUNK_VOIDS,
     ITEM_ID_RE,
@@ -2075,28 +2075,43 @@ def _task(task_id: str, task_root: Path) -> tuple[dict[str, Any], str]:
     return task, reply
 
 
-def _load_linked_issue_labels(repository: str, pr: dict[str, Any]) -> None:
-    """Fill labels on closing issues the PR view named but did not label.
-
-    The same ``gh`` read the recorder already uses. A view that did not ask for
-    closing issues is left alone. A named issue whose labels cannot be read
-    refuses, so a security label is never treated as absent.
-    """
-    if "closingIssuesReferences" not in pr:
-        return
-    refs = pr.get("closingIssuesReferences")
+def _load_linked_issue_labels(pr: dict[str, Any]) -> None:
+    """Fill closing issue labels from the fleet repository named by each issue URL."""
+    refs = pr.get("closingIssuesReferences", [])
     if not isinstance(refs, list):
-        raise RecordError("linked issue labels unavailable")
+        raise RecordError("LINKED_ISSUE_LABELS_UNAVAILABLE: closing references are malformed")
+    if not refs:
+        return
+    try:
+        repos = load_fleet_repos()
+    except FleetRepoError:
+        raise RecordError("LINKED_ISSUE_LABELS_UNAVAILABLE: fleet repository registry is unreadable") from None
     for ref in refs:
-        if not isinstance(ref, dict) or isinstance(ref.get("labels"), list):
-            continue
-        number = ref.get("number")
+        number = ref.get("number") if isinstance(ref, dict) else None
         if type(number) is not int or number < 1:
-            raise RecordError("linked issue labels unavailable")
-        viewed = _run_json(["gh", "issue", "view", str(number), "--repo", repository, "--json", "labels"])
+            raise RecordError("LINKED_ISSUE_LABELS_UNAVAILABLE: closing reference lacks a valid issue number")
+        url = ref.get("url")
+        match = re.fullmatch(
+            r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)",
+            url if isinstance(url, str) else "",
+        )
+        if match is None or match[2] != str(number):
+            raise RecordError(f"LINKED_ISSUE_LABELS_UNAVAILABLE: closing issue #{number} has a missing or inconsistent URL")
+        repository = match[1]
+        issue = f"{repository}#{number}"
+        try:
+            resolve_fleet_repo_by_slug(repository, repos=repos)
+        except FleetRepoError:
+            raise RecordError(f"LINKED_ISSUE_LABELS_UNAVAILABLE: {issue} is outside the fleet registry") from None
+        if isinstance(ref.get("labels"), list):
+            continue
+        try:
+            viewed = _run_json(["gh", "issue", "view", str(number), "--repo", repository, "--json", "labels"])
+        except RecordError:
+            raise RecordError(f"LINKED_ISSUE_LABELS_UNAVAILABLE: {issue} is unreadable") from None
         labels = viewed.get("labels") if isinstance(viewed, dict) else None
         if not isinstance(labels, list):
-            raise RecordError("linked issue labels unavailable")
+            raise RecordError(f"LINKED_ISSUE_LABELS_UNAVAILABLE: {issue} returned malformed labels")
         ref["labels"] = labels
 
 
@@ -2136,7 +2151,7 @@ def _pr(repository: str, branch: str, number: int | None) -> dict[str, Any]:
     )
     if not isinstance(data, dict) or data.get("state") != "OPEN":
         raise RecordError("PR is not open")
-    _load_linked_issue_labels(repository, data)
+    _load_linked_issue_labels(data)
     # The view is checked. The return stays Any so this function's existing
     # no-any-return baseline row still matches; that baseline is not in scope.
     checked: Any = data

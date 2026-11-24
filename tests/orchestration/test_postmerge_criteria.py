@@ -174,8 +174,11 @@ def test_item_set_order_does_not_change_escalation(transport):
 
 def test_closing_references_and_body():
     pr = {"body": "Closes #7\nFixes other/repo#9\nMentions #10\n> Closes #11\n```\nCloses #12\n```",
-          "closingIssuesReferences": [{"url": "https://github.com/unit/public/issues/8"}]}
-    assert pc.closing_issues(pr, "unit/public") == [("other/repo", 9), ("unit/public", 7), ("unit/public", 8)]
+          "closingIssuesReferences": [{"url": "https://github.com/other/repo/issues/7"},
+                                      {"url": "https://github.com/unit/public/issues/8"}]}
+    assert pc.closing_issues(pr, "unit/public") == [
+        ("other/repo", 7), ("other/repo", 9), ("unit/public", 7), ("unit/public", 8),
+    ]
 
 
 @pytest.mark.parametrize("body,expected", [
