@@ -582,7 +582,7 @@ class _Termination:
         if self in _OWNER:
             _OWNER.remove(self)
 
-    def _interruptible(self) -> Generator[None, None, None]:
+    def _interruptible(self) -> Generator[None]:
         self.interruptible = True
         try:
             self.checkpoint()
@@ -591,11 +591,11 @@ class _Termination:
             self.interruptible = False
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
-    def pytest_collection(self) -> Generator[None, None, None]:
+    def pytest_collection(self) -> Generator[None]:
         return (yield from self._interruptible())
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
-    def pytest_runtestloop(self) -> Generator[None, None, None]:
+    def pytest_runtestloop(self) -> Generator[None]:
         return (yield from self._interruptible())
 
     @pytest.hookimpl(tryfirst=True)

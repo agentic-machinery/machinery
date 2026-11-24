@@ -128,13 +128,21 @@ interpreter does not select the primary checkout's Python modules.
    correction cannot change the verdict, the findings, or their meaning. A Ukrainian review
    does not bind that schema. Stdout is two lines: the task id, then the run nonce. Record both.
 
-   **Supplemental review.** On the first code or infra review head, offer
-   [Neon](../../rules/model-assignment.md#gemini-4-neon-advisory-routing) a parallel read-only review.
+   **Supplemental review (measurement only).** Run none by default: the review of record is
+   the only review. This step is the only definition of the trigger; every other rule points
+   here. Run one only when the brief carries the complete line
+   `MEASURE: <model id> until <n> samples` (an operator-ordered model measurement), with a
+   model id and a sample count. A line missing either, or no line, means no supplemental
+   review. The dispatcher who wrote the line counts samples and removes it at `<n>`. With a
+   complete line, dispatch exactly the model id it names, read-only, on the first code or
+   infra review head, with that model's harness and flags from
+   [model-assignment](../../rules/model-assignment.md). Never let a selector (for Neon, the
+   High/Medium parity rule in its advisory routing) replace the named id.
    Use `--research-role advisory` and `--pinned-head "$HEAD_SHA"`. Put the PR number in the
    prompt. Omit `--pr` and formal review flags so the dispatch stays supplemental.
    Record an unavailable seat as such.
 
-   Check Neon's findings against the pinned head and compare them with the review of
+   Check the measured model's findings against the pinned head and compare them with the review of
    record. Apply the [council score rubric](../drive-epic/references/decision-report.md#council-optional-independent-panel)
    to the confirmed findings. Record the model, effort, verdict, score and finding dispositions
    in the PR body. Model stats reads structured results from settled tasks and joins them to

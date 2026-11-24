@@ -374,6 +374,7 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
             "/api/git/pull-requests",
             "/api/fleet/seats",
             "/api/fleet/deliveries",
+            "/api/fleet/model-stats",
         },
         "pull-requests.html": {"/api/git/pull-requests"},
         "milestones.html": {"/api/milestones"},

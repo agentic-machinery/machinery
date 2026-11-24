@@ -722,14 +722,8 @@ def _may_fold_store(nodes: list[ast.AST], *, literals: set[str] | None = None) -
 
 
 def _dump_for_fingerprint(node: ast.AST) -> str:
-    """AST text whose bytes match CPython 3.12.
-
-    3.13+ omits empty lists unless ``show_empty`` is set. 3.12 always prints
-    them and rejects that keyword, so the flag is passed only when it exists.
-    """
-    if sys.version_info >= (3, 13):
-        return ast.dump(node, include_attributes=False, show_empty=True)
-    return ast.dump(node, include_attributes=False)
+    """AST text with empty lists retained so existing 3.12-keyed fingerprints stay stable."""
+    return ast.dump(node, include_attributes=False, show_empty=True)
 
 
 @dataclass(frozen=True)

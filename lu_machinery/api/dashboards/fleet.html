@@ -30,6 +30,10 @@
   </div>
 </header>
 <main id="main" tabindex="-1">
+  <div class="wide">
+    <div id="token-use-content"><a href="/model-stats#token-use">Tokens, last 7 days</a> · Loading…</div>
+    <small class="age" id="token-use-age"></small>
+  </div>
   <section class="wide stacked" id="seats">
     <h2>Seats <span class="age" id="seats-age">Loading…</span></h2>
     <p id="seats-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
@@ -539,12 +543,26 @@ function expireWorkerPrsIfStale(_panel, _latest, _updateChips, now = Date.now())
   }
 }
 
+function renderTokenUse(payload) {
+  const link = '<a href="/model-stats#token-use">Tokens, last 7 days</a>';
+  if (payload?.status === "pending") return `${link} · Collecting…`;
+  const totals = payload?.token_use?.totals;
+  const compact = new Intl.NumberFormat(undefined, {notation: "compact", maximumFractionDigits: 2});
+  const number = (value) => Number.isFinite(value) ? compact.format(value) : "unknown";
+  const share = payload?.token_use?.avoidable_share;
+  const waste = Number.isFinite(share)
+    ? share.toLocaleString(undefined, {style: "percent", maximumFractionDigits: 2}) : "unknown";
+  return `${link} · ${number(totals?.fresh_input)} fresh / ${number(totals?.cached_input)} cached / ${number(totals?.output)} out · Avoidable waste ${waste}`;
+}
+
 const PANELS = [
   {id: "workers", label: "Agent fleet", urls: ["/api/delegate/active"], render: renderWorkers, onData: () => enrichWorkerPrs(), onTick: expireWorkerPrsIfStale, onError: () => { latestPrsReading = null; }},
   {id: "recent", label: "Recently finished", urls: ["/api/delegate/recent"], render: renderRecent},
   {id: "comms", label: "Fleet Comms", urls: ["/api/comms/v1/metrics"], render: renderComms},
   {id: "seats", label: "Seats", urls: [SEATS_URL], render: renderSeats, onData: fillSeatOptions},
   {id: "messages", label: "Messages", urls: [deliveryUrl()], render: renderMessages},
+  {id: "token-use", label: "Token use", urls: ["/api/fleet/model-stats?window=7d&view=tokens"],
+    render: renderTokenUse, retry: (payload) => payload?.status === "pending"},
 ];
 
 const runner = createPanelRunner({panels: PANELS, renderChips});
