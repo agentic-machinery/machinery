@@ -2133,6 +2133,10 @@ def main(argv: list[str] | None = None) -> int:
         marker = workdir / ".lu-clean-machine-drill"
         if any(workdir.iterdir()) and not marker.exists():
             raise DrillError(f"{workdir} is not empty and not a drill workdir")
+        venv = workdir / "venv"
+        py = venv / "bin" / "python"
+        if args.reuse_venv and (py.exists() or py.is_symlink()):
+            base_py = resolve_interpreter(str(py))
         marker.write_text("lu-machinery clean-machine drill workdir\n")
         out = workdir / "out"
         if out.exists():
@@ -2147,15 +2151,11 @@ def main(argv: list[str] | None = None) -> int:
         previous_lock = obtain_consumer_lock(
             args.rollback_to, previous, wheels, offline
         )
-        venv = workdir / "venv"
         if venv.exists() and not args.reuse_venv:
             shutil.rmtree(venv)
         paths = build_world(workdir, base_py)
         home = paths["home"]
-        py = venv / "bin" / "python"
-        if py.exists():
-            resolve_interpreter(str(py))
-        else:
+        if not py.exists():
             log(f"setup: venv from {base_py}")
             py = create_venv(base_py, venv, home)
         log(f"setup: install v{args.version}")

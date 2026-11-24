@@ -18,8 +18,8 @@ No real secret and no private data is used anywhere.
 - Linux with CPython 3.14 or newer for the release venv (`python3 --version`, or
   `--python "$(uv python find 3.14)"`). The drill script itself runs on system CPython 3.12+
   (such as Ubuntu 24.04's 3.12 or Debian 13's 3.13) when `--python` selects CPython 3.14+;
-  if `python3` is older than 3.14, install 3.14 (`uv python install 3.14`) and pass
-  `--python "$(uv python find 3.14)"`.
+  if `python3` is older than 3.14, install `uv` and put it on `PATH`, run
+  `uv python install 3.14`, and pass `--python "$(uv python find 3.14)"`.
 - `git` and `bash`.
 - `strace`. Each row runs under it, and any machinery code loaded from outside the installed
   release fails the row. Install `strace` on the kit's fixed system `PATH` (`/usr/local/bin:/usr/bin:/bin`).
@@ -35,7 +35,9 @@ No real secret and no private data is used anywhere.
   pip ignores every pip configuration file on the machine and uses only pypi.org.
 - About 1 GB of free disk space while it runs, under 1 GB of memory, and 10 to 15 minutes.
 
-On Debian or Ubuntu: `sudo apt-get install -y python3 python3-venv git strace bubblewrap`.
+On Debian or Ubuntu: `sudo apt-get install -y python3 python3-venv git strace bubblewrap`. If the
+distro `python3` is older than 3.14, also install `uv` (https://docs.astral.sh/uv/getting-started/installation/)
+and put it on `PATH` before running `uv python install 3.14`.
 
 ## Steps
 
@@ -63,7 +65,8 @@ On Debian or Ubuntu: `sudo apt-get install -y python3 python3-venv git strace bu
      --python "$(uv python find 3.14)"
    ```
 
-   Omit `--python` when `python3` is already CPython 3.14 or newer. Replace the placeholders with
+   This requires `uv` on `PATH` and `uv python install 3.14` when `python3` is older than 3.14;
+   omit `--python` when `python3` is already CPython 3.14 or newer. Replace the placeholders with
    version numbers, without angle brackets.
 
    The kit downloads both wheels and `SHA256SUMS` from the GitHub release and checks the sums.
