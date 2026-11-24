@@ -13,7 +13,7 @@
   .flow .lane small { display: block; font-weight: normal; color: var(--muted); }
   .stage { position: relative; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; background: var(--bg); min-width: 0; }
   .stage + .stage::before { content: "→"; position: absolute; left: -18px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 16px; }
-  .stage.skip { border-style: dashed; background: transparent; }
+  .stage.unchecked { border-style: dashed; background: transparent; }
   .stage .who { font-size: 12px; color: var(--muted); }
   .stage .count { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .stage .split { font-size: 12px; overflow-wrap: anywhere; }
@@ -222,7 +222,7 @@ function laneRow(name, chooser, counts) {
     stage(chooser, counts.total ?? 0, topCounts(counts.by_model)),
     stage(`Account: ${chooserSplit}`, Object.values(counts.by_pool || {}).reduce((n, v) => n + v, 0), topCounts(counts.by_pool, 4)),
     stage("Admission: host and pool limits", `${adm.admitted ?? 0} <small class="ok">admitted</small>`, admissionSplit(adm),
-      checked ? "" : "skip"),
+      checked ? "" : "unchecked"),
     stage("Ran", `${counts.live ?? 0} <small>running or starting</small>`,
       counts.substitutions ? `<a class="warn" href="#decisions" data-outcome="substituted">${counts.substitutions} ran another model</a>` : "no substitutions recorded"),
   ].join("");
@@ -256,6 +256,17 @@ function renderFlow(data) {
     + "</div>";
   const windowNote = `<p class="muted">${recent.total ?? 0} decisions started since ${escapeHtml(utc(Date.parse(recent.as_of) - (recent.window_s || 86400) * 1000))}.</p>`;
   return recentNote(data) + flow + windowNote + resolverCallouts(data);
+}
+
+// Every live worker on the pool, any mode, from the task-record scan.
+function liveCell(meter, data) {
+  const st = recentState(data);
+  const count = data.recent?.live_by_pool?.[meter];
+  if (st === "missing" || st === "stale" || st === "failed" || typeof count !== "number") {
+    const why = st === "failed" ? "the last refresh failed" : st === "missing" ? data.recent?.reason : "the reading is out of date";
+    return text(unknownSince(st === "missing" ? data.recent?.as_of : timeOf(data.recent?.age_s), why), "warn");
+  }
+  return st === "partial" ? text(`${count}, may be low`, "warn") : text(String(count), count ? "" : "muted");
 }
 
 // Admission's own write-slot count for the pool (a slot held by a starting dispatch counts, as for dispatch).
@@ -319,6 +330,9 @@ function hostLine(data) {
   }
   const unmeasured = (host.unmeasured?.length ? ` Not measured: ${escapeHtml(host.unmeasured.join(", "))}.` : "")
     + (data.now.admission.incomplete ? ` ${escapeHtml(data.now.admission.incomplete)}.` : "");
+  if (host.admitting === null) {
+    return `<p class="callout warn">Host: unknown whether admission is letting new writes start: ${escapeHtml(data.now.admission.incomplete || "the reading is incomplete")}.</p>`;
+  }
   if (!host.admitting) {
     return `<p class="callout bad">Host: admission is deferring <b>every</b> new write: ${escapeHtml(host.failing.join("; "))}.${unmeasured}</p>`;
   }
@@ -334,16 +348,19 @@ function renderPools(data) {
     : `<p class="warn">Routing budget ${escapeHtml(unknownSince(null, budget.reason))}: admission and resolver verdicts are unknown.</p>`;
   const rows = (now.pools || []).map(({pool, label}) => [
     td(`<b>${escapeHtml(label)}</b>`),
+    liveCell(pool, data),
     slotsCell(pool, data),
     allowanceCell(now.allowance?.[pool]),
     resetCell(now.allowance?.[pool]),
     admissionCell(pool, data),
     seatsCell(pool, data),
   ]);
-  const unpooled = nowState(data) === "ok" && now.resolver?.unpooled?.length
-    ? `<p class="muted">Seats without a pool (the account they would run on is not resolved): ${now.resolver.unpooled.map(seat => `${escapeHtml(seat.model)} — ${escapeHtml(seat.reason || seat.state)}`).join("; ")}.</p>` : "";
+  const liveUnpooled = recentState(data) !== "missing" && data.recent?.live_unpooled
+    ? `<p class="muted">${Number(data.recent.live_unpooled)} more live workers have no recorded pool.</p>` : "";
+  const unpooled = liveUnpooled + (nowState(data) === "ok" && now.resolver?.unpooled?.length
+    ? `<p class="muted">Seats without a pool (the account they would run on is not resolved): ${now.resolver.unpooled.map(seat => `${escapeHtml(seat.model)} — ${escapeHtml(seat.reason || seat.state)}`).join("; ")}.</p>` : "");
   return hostLine(data) + budgetLine
-    + table(["Pool", "Write slots in use", "Allowance left", "Resets", "New write work", "Review seats"], rows, true) + unpooled;
+    + table(["Pool", "Live workers", "Write slots in use", "Allowance left", "Resets", "New write work", "Review seats"], rows, true) + unpooled;
 }
 
 function asked(row) {
@@ -465,7 +482,7 @@ function chips(latest) {
     const empty = (data.now.resolver.first_choice || []).filter(choice => (choice.seats || []).some(seat => emptyPool(data, seat.pool)));
     if (empty.length) out.push(chip("#flow", empty.length, "author families get a reviewer on a pool with 0% left", "bad"));
   }
-  if (nowState(data) === "ok" && data.now.admission?.host && !data.now.admission.host.admitting) {
+  if (nowState(data) === "ok" && data.now.admission?.host?.admitting === false) {
     out.push(chip("#pools", "!", "host is deferring writes", "bad"));
   }
   return out.join("");
