@@ -1279,19 +1279,23 @@ def test_run_prs_lists_unrecorded_branch_pr_via_x_agent_trailer(tmp_path, monkey
         elif endpoint.startswith(f"repos/{MACHINERY}/pulls?state=all&sort=updated"):
             payload = [pr_recorded, pr_handoff, pr_trailer_open, pr_unrelated]
         elif endpoint.startswith(f"repos/{REPO}/pulls?state=all&sort=updated"):
-            payload = [pr_delivery, pr_trailer_merged, pr_fork]
+            payload = [pr_trailer_merged, pr_delivery, pr_fork]
         elif endpoint.startswith(f"repos/{MACHINERY}/pulls/50/commits"):
-            payload = [[{"commit": {"message": "feat: recorded branch\n\nX-Agent: agy/child-live"}}]]
+            payload = [[{"sha": sha_branch, "commit": {"message": "feat: recorded branch\n\nX-Agent: agy/child-live"}}]]
         elif endpoint.startswith(f"repos/{MACHINERY}/pulls/60/commits"):
-            payload = [[{"commit": {"message": "feat: handoff\n\nX-Agent: codex/prev-owner"}}]]
+            payload = [[{"sha": sha_handoff, "commit": {"message": "feat: handoff\n\nX-Agent: codex/prev-owner"}}]]
         elif endpoint.startswith(f"repos/{REPO}/pulls/55/commits"):
-            payload = [[{"commit": {"message": "feat: delivery\n\nX-Agent: agy/child-archived"}}]]
+            payload = [[{"sha": sha_delivery, "commit": {"message": "feat: delivery\n\nX-Agent: agy/child-archived"}}]]
         elif endpoint.startswith(f"repos/{MACHINERY}/pulls/77/commits"):
-            payload = [[{"commit": {"message": "feat: split fix\n\nX-Agent: agy/child-live"}}]]
+            payload = [[{"sha": sha_trailer_open, "commit": {"message": "feat: split fix\n\nX-Agent: agy/child-live"}}]]
         elif endpoint.startswith(f"repos/{REPO}/pulls/88/commits"):
-            payload = [[{"commit": {"message": "fix: archived child work\n\nX-Agent: agy/child-archived"}}]]
+            payload = [[{"sha": sha_trailer_merged, "commit": {"message": "fix: archived child work\n\nX-Agent: agy/child-archived"}}]]
         elif endpoint.startswith(f"repos/{MACHINERY}/pulls/92/commits"):
-            payload = [[{"commit": {"message": "chore: unrelated\n\nX-Agent: codex/someone-else"}}]]
+            # F5: fenced example mentioning child-live must NOT attribute PR #92 to child-live.
+            payload = [[{
+                "sha": sha_other,
+                "commit": {"message": "docs: example\n\n```\nX-Agent: agy/child-live\n```\n\nX-Agent: codex/someone-else"},
+            }]]
         else:
             raise AssertionError(f"unexpected GitHub call: {cmd}")
         return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="", github_result=None)
@@ -1319,6 +1323,84 @@ def test_run_prs_lists_unrecorded_branch_pr_via_x_agent_trailer(tmp_path, monkey
     captured_self = capsys.readouterr()
     assert rc_self == 0
     assert json.loads(captured_self.out) == []
+
+    # F1: keeper history bound to run B's nonce is NOT returned when querying run A by --run-nonce.
+    run_a = {
+        "schema_version": 2,
+        "task_id": "reused-worker",
+        "run_nonce": "nonce-a",
+        "status": "done",
+        "started_at": at(0).isoformat(),
+        "repo": "machinery",
+        "repository": MACHINERY,
+        "repository_id": MACHINERY,
+        "worktree_branch": "agy/run-a-only",
+    }
+    run_b = {
+        "schema_version": 2,
+        "task_id": "reused-worker",
+        "run_nonce": "nonce-b",
+        "status": "running",
+        "started_at": at(5).isoformat(),
+        "repo": "machinery",
+        "repository": MACHINERY,
+        "repository_id": MACHINERY,
+        "worktree_branch": "agy/run-b-only",
+    }
+    _write_task_file(archive_dir, "reused-worker.20261028T120400Z.archived.json", run_a)
+    _write_task_file(tasks_root, "reused-worker.json", run_b)
+    ownership_data["history"].append({
+        "pr": own.pr_key(MACHINERY, 60),
+        "event": "keeper_transfer_acknowledged",
+        "at": at(6).isoformat(),
+        "worker_task": "reused-worker",
+        "worker_nonce": "nonce-b",
+        "head": sha_handoff,
+    })
+    state_file.write_text(json.dumps(ownership_data), encoding="utf-8")
+    rc_a = own.main(["run-prs", "--task", "reused-worker", "--run-nonce", "nonce-a"])
+    captured_a = capsys.readouterr()
+    assert rc_a == 0 and json.loads(captured_a.out) == []
+
+    # F3: transferred dual-slug repository queries the active slug and active owner.
+    active_slug = "agentic-machinery/machinery"
+    dual_repo = FleetRepo(
+        "machinery", MACHINERY, "machinery", "public-machinery", False, True, 1445647449, "public", active_slug,
+    )
+    dual_catalog = {"public": FLEET["public"], "machinery": dual_repo}
+    active_pr = _rest_pr(
+        active_slug, 105, branch="agy/run-a-only", head_sha="9" * 40, state="closed",
+        updated_at=at(-30).isoformat(),
+    )
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: dual_catalog)
+    monkeypatch.setattr(
+        fleet_repos,
+        "resolve_active_fleet_repo",
+        lambda ident, repos=None, **kw: fleet_repos.ActiveFleetRepo(
+            repo=dual_catalog[ident],
+            active_github=active_slug if ident == "machinery" else dual_catalog[ident].github,
+        ),
+    )
+
+    def fake_gh_dual(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if endpoint.startswith(f"repos/{active_slug}/pulls?head=agentic-machinery%3Aagy%2Frun-a-only"):
+            payload = [[active_pr]]
+        elif endpoint.startswith(
+            (f"repos/{active_slug}/pulls?state=all&sort=updated", f"repos/{REPO}/pulls?state=all&sort=updated")
+        ):
+            payload = []
+        else:
+            raise AssertionError(f"unexpected dual-slug GitHub call: {cmd}")
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", fake_gh_dual)
+    rc_dual = own.main(["run-prs", "--task", "reused-worker", "--run-nonce", "nonce-a"])
+    captured_dual = capsys.readouterr()
+    assert rc_dual == 0
+    assert json.loads(captured_dual.out) == [{
+        "repo": active_slug, "number": 105, "state": "CLOSED", "head": "9" * 40, "how_found": "recorded_branch",
+    }]
 
 
 def test_run_prs_exits_2_on_unreadable_archived_child_record(tmp_path, monkeypatch, capsys):
@@ -1400,3 +1482,131 @@ def test_run_prs_exits_2_on_unreadable_archived_child_record(tmp_path, monkeypat
     assert rc_gh == 2
     assert captured_gh.out == ""
     assert "GitHub read failed" in captured_gh.err
+
+    # F2: dangling symlink at ownership state path and partial accepted history entry exit 2.
+    state_file.symlink_to(tmp_path / "missing-state.json")
+    rc_link = own.main(["run-prs", "--task", "turn-parent"])
+    captured_link = capsys.readouterr()
+    assert rc_link == 2 and captured_link.out == "" and "ownership state unreadable" in captured_link.err
+    state_file.unlink()
+
+    partial_state = own._empty()
+    partial_state["history"].append({
+        "pr": own.pr_key(MACHINERY, 10), "event": "accepted", "at": at(1).isoformat(), "head": HEAD,
+    })
+    state_file.write_text(json.dumps(partial_state), encoding="utf-8")
+    rc_hist = own.main(["run-prs", "--task", "turn-parent"])
+    captured_hist = capsys.readouterr()
+    assert rc_hist == 2 and captured_hist.out == "" and "missing successor" in captured_hist.err
+    state_file.unlink()
+
+    # F1: shared branch across two runs of the same task fails closed when PR cannot be attributed.
+    other_run = {**parent_rec, "run_nonce": "nonce-other"}
+    _write_task_file(archive_dir, "turn-parent.20261028T115000Z.archived.json", other_run)
+    shared_pr = _rest_pr(MACHINERY, 70, branch="codex/turn-parent", head_sha="7" * 40, state="open")
+    monkeypatch.setattr(
+        own.github_client,
+        "run",
+        lambda cmd, **k: SimpleNamespace(returncode=0, stdout=json.dumps([[shared_pr]]), stderr="", github_result=None),
+    )
+    rc_shared = own.main(["run-prs", "--task", "turn-parent", "--run-nonce", "nonce-parent"])
+    captured_shared = capsys.readouterr()
+    assert rc_shared == 2 and captured_shared.out == "" and "shared branch" in captured_shared.err
+    (archive_dir / "turn-parent.20261028T115000Z.archived.json").unlink()
+
+    # F4: HTTP 422 on commits/{sha}/pulls, omitted head.repo, pagination drift, head drift, and 250-commit cap exit 2.
+    from lu_machinery.common.github_client import Result
+
+    parent_with_head = {**parent_rec, "head_sha": "8" * 40, "commits_ahead": 1}
+    _write_task_file(tasks_root, "turn-parent.json", parent_with_head)
+
+    def gh_422(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if "commits/" in endpoint:
+            return SimpleNamespace(returncode=1, stdout="", stderr="422", github_result=Result(status=422, error="http"))
+        return SimpleNamespace(returncode=0, stdout=json.dumps([[]]), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", gh_422)
+    rc_422 = own.main(["run-prs", "--task", "turn-parent"])
+    assert rc_422 == 2 and capsys.readouterr().out == ""
+
+    _write_task_file(tasks_root, "turn-parent.json", parent_rec)
+    missing_head_repo = _rest_pr(MACHINERY, 71, branch="x", head_sha="7" * 40, state="open")
+    missing_head_repo["head"].pop("repo")
+
+    def gh_missing_repo(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if "?head=" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([[]]), stderr="", github_result=None)
+        if MACHINERY in endpoint and "sort=updated" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([missing_head_repo]), stderr="", github_result=None)
+        return SimpleNamespace(returncode=0, stdout=json.dumps([]), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", gh_missing_repo)
+    rc_missing_repo = own.main(["run-prs", "--task", "turn-parent"])
+    assert rc_missing_repo == 2 and capsys.readouterr().out == ""
+
+    # Pagination drift: page 2 repeats a PR from page 1.
+    page1 = [
+        _rest_pr(MACHINERY, 200 + i, branch=f"b/{i}", head_sha=f"{i:040x}", updated_at=at(10).isoformat())
+        for i in range(own._RUN_PRS_PER_PAGE)
+    ]
+    page2 = [page1[-1]]
+
+    def gh_drift(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if "?head=" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([[]]), stderr="", github_result=None)
+        if MACHINERY in endpoint and "page=1" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(page1), stderr="", github_result=None)
+        if MACHINERY in endpoint and "page=2" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(page2), stderr="", github_result=None)
+        return SimpleNamespace(returncode=0, stdout=json.dumps([]), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", gh_drift)
+    rc_drift = own.main(["run-prs", "--task", "turn-parent"])
+    captured_drift = capsys.readouterr()
+    assert rc_drift == 2 and captured_drift.out == "" and "drifted" in captured_drift.err
+
+    # Commit head mismatch and 250-commit listing cap both exit 2.
+    probe_pr = _rest_pr(MACHINERY, 72, branch="other/b", head_sha="a" * 40, updated_at=at(10).isoformat())
+
+    def gh_head_mismatch(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if "?head=" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([[]]), stderr="", github_result=None)
+        if MACHINERY in endpoint and "sort=updated" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([probe_pr]), stderr="", github_result=None)
+        if "/pulls/72/commits" in endpoint:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([[{"sha": "b" * 40, "commit": {"message": "X-Agent: codex/turn-parent"}}]]),
+                stderr="",
+                github_result=None,
+            )
+        return SimpleNamespace(returncode=0, stdout=json.dumps([]), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", gh_head_mismatch)
+    rc_mismatch = own.main(["run-prs", "--task", "turn-parent"])
+    captured_mismatch = capsys.readouterr()
+    assert rc_mismatch == 2 and captured_mismatch.out == "" and "head changed" in captured_mismatch.err
+
+    capped_commits = [
+        {"sha": "a" * 40, "commit": {"message": "X-Agent: codex/turn-parent"}}
+        for _ in range(own._RUN_PRS_COMMIT_CAP)
+    ]
+
+    def gh_capped(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if "?head=" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([[]]), stderr="", github_result=None)
+        if MACHINERY in endpoint and "sort=updated" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([probe_pr]), stderr="", github_result=None)
+        if "/pulls/72/commits" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([capped_commits]), stderr="", github_result=None)
+        return SimpleNamespace(returncode=0, stdout=json.dumps([]), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", gh_capped)
+    rc_capped = own.main(["run-prs", "--task", "turn-parent"])
+    captured_capped = capsys.readouterr()
+    assert rc_capped == 2 and captured_capped.out == "" and "250-commit listing cap" in captured_capped.err

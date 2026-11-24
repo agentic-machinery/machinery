@@ -42,6 +42,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -334,8 +335,19 @@ def keeper_custody(handoff: Mapping[str, Any] | None) -> bool:
 
 
 def load(path: Path) -> dict[str, Any]:
-    if not path.exists():
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
         return _empty()
+    except OSError as exc:
+        raise OwnershipError(f"ownership state unreadable: {type(exc).__name__}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            st = path.stat()
+        except OSError as exc:
+            raise OwnershipError(f"ownership state unreadable: {type(exc).__name__}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise OwnershipError("ownership state unreadable: not a regular file")
     try:
         data = json_depth.loads(path.read_text(), max_depth=512)
     except (OSError, ValueError) as exc:
@@ -700,17 +712,6 @@ def _head_commit(pr: Mapping[str, Any]) -> Mapping[str, Any] | None:
     return rows[-1]
 
 
-def _message_task_ids(message: str) -> list[str]:
-    """Task ids from well-formed ``X-Agent`` trailers in a commit message."""
-    normalized = message.replace("\r\n", "\n").replace("\r", "\n")
-    return [
-        match.group("task")
-        for match in re.compile(
-            r"(?m)^X-Agent:[ \t]+(?P<agent>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)/(?P<task>[A-Za-z0-9._-]+)[ \t]*$"
-        ).finditer(normalized)
-    ]
-
-
 def _head_task_ids(pr: Mapping[str, Any]) -> list[str]:
     """Task ids from well-formed ``X-Agent`` trailers on the PR head commit."""
     commit = _head_commit(pr)
@@ -721,7 +722,21 @@ def _head_task_ids(pr: Mapping[str, Any]) -> list[str]:
         value = commit.get(name)
         if isinstance(value, str) and value:
             parts.append(value)
-    return _message_task_ids("\n".join(parts))
+    message = "\n".join(parts).replace("\r\n", "\n").replace("\r", "\n")
+    return [
+        match.group("task")
+        for match in re.compile(
+            r"(?m)^X-Agent:[ \t]+(?P<agent>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)/(?P<task>[A-Za-z0-9._-]+)[ \t]*$"
+        ).finditer(message)
+    ]
+
+
+def _declared_task_ids(message: str) -> list[str]:
+    """Task ids from validated ``X-Agent`` declaration paragraphs (never fenced or quoted examples)."""
+    from lu_machinery.ci.check_agent_attribution import extract_attribution
+
+    attribution = extract_attribution(message)
+    return [value.partition("/")[2] for value in attribution.values]
 
 
 def _with_head_commits(
@@ -1808,24 +1823,31 @@ def _valid_run_identity(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and bool(value) and all(ch.isprintable() and not ch.isspace() for ch in value)
 
 
+def _active_fleet_catalog(repos: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve every registered fleet repo to its ``ActiveFleetRepo`` (enforcing dual-slug selectors)."""
+    from lu_machinery.orchestration.fleet_repos import resolve_active_fleet_repo
+
+    return {key: resolve_active_fleet_repo(key, repos=repos) for key in repos}
+
+
 def _resolve_registered_repo(
-    identifier: object, repos: Mapping[str, Any], *, allow_key: bool = False, context: str,
+    identifier: object, active_repos: Mapping[str, Any], *, allow_key: bool = False, context: str,
 ) -> Any:
     if not isinstance(identifier, str) or not identifier.strip():
         raise OwnershipError(f"unregistered repository in {context}: {identifier!r}")
     spelling = identifier.strip().casefold()
     matches = [
-        repo for repo in repos.values()
-        if (allow_key and spelling == repo.key.casefold())
-        or any(spelling == slug.casefold() for slug in repo.slugs)
+        active for active in active_repos.values()
+        if (allow_key and spelling == active.repo.key.casefold())
+        or any(spelling == slug.casefold() for slug in active.repo.slugs)
     ]
-    unique = {repo.github.casefold(): repo for repo in matches}
+    unique = {active.active_github.casefold(): active for active in matches}
     if len(unique) != 1:
         raise OwnershipError(f"unregistered repository in {context}: {identifier!r}")
     return next(iter(unique.values()))
 
 
-def _task_fleet_repo(record: Mapping[str, Any], repos: Mapping[str, Any]) -> Any:
+def _task_fleet_repo(record: Mapping[str, Any], active_repos: Mapping[str, Any]) -> Any:
     """Resolve a task record's repository against registered fleet repos, including dual-slug rows."""
     selected: dict[str, Any] = {}
     task_id = record.get("task_id")
@@ -1837,11 +1859,11 @@ def _task_fleet_repo(record: Mapping[str, Any], repos: Mapping[str, Any]) -> Any
             raise OwnershipError(f"task_repository_unregistered on {task_id!r}")
         spelling = value.strip().casefold()
         matches = [
-            repo for key, repo in repos.items()
+            active for key, active in active_repos.items()
             if (field == "repo" and spelling == key.casefold())
-            or (field != "repo" and any(spelling == slug.casefold() for slug in repo.slugs))
+            or (field != "repo" and any(spelling == slug.casefold() for slug in active.repo.slugs))
         ]
-        unique = {repo.github.casefold(): repo for repo in matches}
+        unique = {active.active_github.casefold(): active for active in matches}
         if len(unique) != 1:
             raise OwnershipError(f"task_repository_unregistered on {task_id!r}: {value!r}")
         selected.update(unique)
@@ -1852,14 +1874,30 @@ def _task_fleet_repo(record: Mapping[str, Any], repos: Mapping[str, Any]) -> Any
     return next(iter(selected.values()))
 
 
-def _parse_pr_ref(value: object, repos: Mapping[str, Any], *, context: str) -> tuple[Any, int]:
+def _parse_pr_ref(value: object, active_repos: Mapping[str, Any], *, context: str) -> tuple[Any, int]:
     if not isinstance(value, str) or "#" not in value:
         raise OwnershipError(f"malformed PR reference in {context}: {value!r}")
     slug, _, num_text = value.rpartition("#")
     if not slug or not re.compile(r"[1-9][0-9]*").fullmatch(num_text):
         raise OwnershipError(f"malformed PR reference in {context}: {value!r}")
-    fleet_repo = _resolve_registered_repo(slug, repos, context=context)
-    return fleet_repo, int(num_text)
+    active_repo = _resolve_registered_repo(slug, active_repos, context=context)
+    return active_repo, int(num_text)
+
+
+def _reused_task_ids(records: list[dict[str, Any]]) -> set[str]:
+    """Task ids that have more than one distinct run in the strict hot+archive inventory."""
+    nonces_by_id: dict[str, set[str | None]] = {}
+    none_counts: dict[str, int] = {}
+    for rec in records:
+        tid = rec["task_id"]
+        nonce = rec.get("run_nonce")
+        nonces_by_id.setdefault(tid, set()).add(nonce)
+        if nonce is None:
+            none_counts[tid] = none_counts.get(tid, 0) + 1
+    return {
+        tid for tid, nonces in nonces_by_id.items()
+        if len(nonces) > 1 or none_counts.get(tid, 0) > 1
+    }
 
 
 def _select_covered_records(
@@ -1868,7 +1906,8 @@ def _select_covered_records(
     *,
     include_children: bool,
     run_nonce: str | None,
-) -> list[dict[str, Any]]:
+    reused_ids: set[str],
+) -> tuple[list[dict[str, Any]], set[int]]:
     """Select the target task record and (optionally) all transitive child records, failing closed."""
     if not _valid_run_identity(task_id):
         raise OwnershipError(f"invalid --task value: {task_id!r}")
@@ -1881,10 +1920,8 @@ def _select_covered_records(
     if not root_indices:
         detail = f" for run_nonce {run_nonce!r}" if run_nonce is not None else ""
         raise OwnershipError(f"task {task_id!r} not found{detail}")
-    if run_nonce is None:
-        distinct_nonces = {records[idx].get("run_nonce") for idx in root_indices}
-        if len(distinct_nonces) > 1:
-            raise OwnershipError(f"multiple runs found for task {task_id!r}; pass --run-nonce")
+    if run_nonce is None and task_id in reused_ids:
+        raise OwnershipError(f"multiple runs found for task {task_id!r}; pass --run-nonce")
     covered_indices: list[int] = list(root_indices)
     seen_indices: set[int] = set(root_indices)
     if include_children:
@@ -1899,13 +1936,25 @@ def _select_covered_records(
             parent_nonce = parent.get("run_nonce")
             if parent_nonce is not None and not _valid_run_identity(parent_nonce):
                 raise OwnershipError(f"malformed run_nonce on task {parent_id!r}")
+            parent_reused = parent_id in reused_ids
             for idx, other in enumerate(records):
                 if idx in seen_indices or other.get("parent_task_id") != parent_id:
                     continue
                 other_parent_nonce = other.get("parent_run_nonce")
                 if other_parent_nonce is not None and not _valid_run_identity(other_parent_nonce):
                     raise OwnershipError(f"malformed parent_run_nonce on task {other.get('task_id')!r}")
-                if parent_nonce is not None and other_parent_nonce is not None and other_parent_nonce != parent_nonce:
+                if other_parent_nonce is None:
+                    if parent_reused:
+                        raise OwnershipError(
+                            f"child task {other.get('task_id')!r} lacks parent_run_nonce while multiple runs share "
+                            f"parent task {parent_id!r}"
+                        )
+                elif parent_nonce is None:
+                    if parent_reused:
+                        raise OwnershipError(
+                            f"parent task {parent_id!r} lacks run_nonce while multiple runs share that id"
+                        )
+                elif other_parent_nonce != parent_nonce:
                     continue
                 seen_indices.add(idx)
                 covered_indices.append(idx)
@@ -1945,19 +1994,15 @@ def _select_covered_records(
                         raise OwnershipError(
                             f"unknown child task {uid!r} listed by {parent['task_id']!r} is missing from task store"
                         )
-    return [records[idx] for idx in covered_indices]
+    return [records[idx] for idx in covered_indices], seen_indices
 
 
-def _gh_api_json(endpoint: str, *, paginate: bool = False, allow_missing: bool = False) -> Any:
+def _gh_api_json(endpoint: str, *, paginate: bool = False) -> Any:
     cmd = ["gh", "api", *(("--paginate", "--slurp") if paginate else ()), endpoint]
     proc = github_client.run(cmd, capture_output=True, text=True, check=False, timeout=_RUN_PRS_TIMEOUT)
     if (refusal := github_client.refusal_of(proc)) is not None:
         raise refusal
     if proc.returncode != 0:
-        if allow_missing:
-            failure = getattr(proc, "github_result", None)
-            if isinstance(failure, github_client.Result) and failure.status in {404, 422}:
-                return None
         detail = (proc.stderr or "").strip()[:200]
         raise OwnershipError(f"GitHub read failed for {endpoint}: {detail or f'exit {proc.returncode}'}")
     try:
@@ -1971,47 +2016,50 @@ def _gh_api_json(endpoint: str, *, paginate: bool = False, allow_missing: bool =
     return parsed
 
 
-def _classify_rest_pr(pr: object, fleet_repo: Any) -> tuple[str, int, dict[str, Any] | None]:
-    """Validate one REST PR object against ``fleet_repo``; distinguish same-repo PRs from forks."""
+def _classify_rest_pr(pr: object, active_repo: Any) -> tuple[str, int, dict[str, Any] | None]:
+    """Validate one REST PR object against ``active_repo``; distinguish same-repo PRs from forks."""
+    slug = active_repo.active_github
     if not isinstance(pr, dict):
-        raise OwnershipError(f"malformed PR payload for {fleet_repo.github}")
+        raise OwnershipError(f"malformed PR payload for {slug}")
     number = pr.get("number")
     if type(number) is not int or number <= 0:
-        raise OwnershipError(f"malformed PR number for {fleet_repo.github}")
-    allowed_slugs = {slug.casefold() for slug in fleet_repo.slugs}
+        raise OwnershipError(f"malformed PR number for {slug}")
+    allowed_slugs = {s.casefold() for s in active_repo.repo.slugs}
     base = pr.get("base")
     base_repo = base.get("repo") if isinstance(base, dict) else None
     base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
     if not isinstance(base_name, str) or base_name.casefold() not in allowed_slugs:
-        raise OwnershipError(f"PR {fleet_repo.github}#{number} base repository mismatch: {base_name!r}")
+        raise OwnershipError(f"PR {slug}#{number} base repository mismatch: {base_name!r}")
     head = pr.get("head")
     if not isinstance(head, dict):
-        raise OwnershipError(f"PR {fleet_repo.github}#{number} head payload malformed")
-    head_repo = head.get("repo")
+        raise OwnershipError(f"PR {slug}#{number} head payload malformed")
+    if "repo" not in head:
+        raise OwnershipError(f"PR {slug}#{number} head repository field missing")
+    head_repo = head["repo"]
     if head_repo is None:
         return "fork", number, None
     if not isinstance(head_repo, dict) or not isinstance(head_repo.get("full_name"), str):
-        raise OwnershipError(f"PR {fleet_repo.github}#{number} head repository malformed")
+        raise OwnershipError(f"PR {slug}#{number} head repository malformed")
     if head_repo["full_name"].casefold() not in allowed_slugs:
         return "fork", number, None
     head_sha = head.get("sha")
     if not _git_head(head_sha):
-        raise OwnershipError(f"PR {fleet_repo.github}#{number} head SHA malformed")
+        raise OwnershipError(f"PR {slug}#{number} head SHA malformed")
     head_ref = head.get("ref")
     if not isinstance(head_ref, str) or not head_ref:
-        raise OwnershipError(f"PR {fleet_repo.github}#{number} head ref malformed")
+        raise OwnershipError(f"PR {slug}#{number} head ref malformed")
     merged_at = pr.get("merged_at")
     raw_state = pr.get("state")
     if isinstance(merged_at, str) and merged_at:
         state = "MERGED"
     elif merged_at is not None:
-        raise OwnershipError(f"PR {fleet_repo.github}#{number} merged_at malformed")
+        raise OwnershipError(f"PR {slug}#{number} merged_at malformed")
     elif isinstance(raw_state, str) and raw_state.upper() in {"OPEN", "CLOSED"}:
         state = raw_state.upper()
     else:
-        raise OwnershipError(f"PR {fleet_repo.github}#{number} state malformed: {raw_state!r}")
+        raise OwnershipError(f"PR {slug}#{number} state malformed: {raw_state!r}")
     return "pr", number, {
-        "repo": fleet_repo.github,
+        "repo": slug,
         "number": number,
         "state": state,
         "head": head_sha,
@@ -2020,48 +2068,50 @@ def _classify_rest_pr(pr: object, fleet_repo: Any) -> tuple[str, int, dict[str, 
     }
 
 
-def _pr_has_covered_trailer(slug: str, number: int, head_sha: str, covered_ids: set[str]) -> bool:
-    """Whether any commit on ``slug#number`` carries an ``X-Agent`` trailer for ``covered_ids``.
-
-    Fails closed when GitHub's 250-commit listing cap is reached without a match in either
-    the returned commits or the head commit itself.
-    """
-    messages = _pr_commit_messages(slug, number)
-    if any(tid in covered_ids for msg in messages for tid in _message_task_ids(msg)):
-        return True
-    if len(messages) >= _RUN_PRS_COMMIT_CAP:
-        head_msg = _commit_message(slug, head_sha)
-        if any(tid in covered_ids for tid in _message_task_ids(head_msg)):
-            return True
-        raise OwnershipError(
-            f"{slug}#{number} has at least {_RUN_PRS_COMMIT_CAP} commits; X-Agent trailer scan may be truncated"
-        )
-    return False
-
-
-def _pr_commit_messages(slug: str, number: int) -> list[str]:
+def _pr_commit_messages(slug: str, number: int, expected_head: str) -> list[str]:
+    """Return every commit message of ``slug#number``, verifying completeness and ``expected_head``."""
     rows = _gh_api_json(f"repos/{slug}/pulls/{number}/commits?per_page={_RUN_PRS_PER_PAGE}", paginate=True)
+    if len(rows) >= _RUN_PRS_COMMIT_CAP:
+        raise OwnershipError(
+            f"{slug}#{number} reached GitHub's {_RUN_PRS_COMMIT_CAP}-commit listing cap; "
+            "commit evidence is incomplete"
+        )
+    if not rows:
+        raise OwnershipError(f"PR {slug}#{number} commit listing is empty")
     messages: list[str] = []
+    last_sha: str | None = None
     for entry in rows:
+        sha = entry.get("sha") if isinstance(entry, dict) else None
         commit = entry.get("commit") if isinstance(entry, dict) else None
         message = commit.get("message") if isinstance(commit, dict) else None
-        if not isinstance(message, str):
+        if not _git_head(sha) or not isinstance(message, str):
             raise OwnershipError(f"PR {slug}#{number} commit listing malformed")
+        last_sha = sha
         messages.append(message)
+    if last_sha != expected_head:
+        raise OwnershipError(
+            f"PR {slug}#{number} head changed during inspection (expected {expected_head}, got {last_sha})"
+        )
     return messages
 
 
-def _commit_message(slug: str, sha: str) -> str:
-    payload = _gh_api_json(f"repos/{slug}/git/commits/{sha}")
-    message = payload.get("message") if isinstance(payload, dict) else None
-    if not isinstance(message, str):
-        raise OwnershipError(f"commit {slug}@{sha} message unreadable")
-    return message
+def _pr_matched_declared_ids(slug: str, number: int, expected_head: str, covered_ids: set[str]) -> list[str]:
+    """Covered task ids declared in validated ``X-Agent`` paragraphs of ``slug#number``."""
+    messages = _pr_commit_messages(slug, number, expected_head)
+    matched: list[str] = []
+    for msg in messages:
+        for tid in _declared_task_ids(msg):
+            if tid in covered_ids and tid not in matched:
+                matched.append(tid)
+    return matched
 
 
-def _repo_pulls_since(fleet_repo: Any, cutoff: datetime) -> list[dict[str, Any]]:
-    """Every PR in ``fleet_repo`` updated at or after ``cutoff`` (open, merged, or closed)."""
+def _repo_pulls_since(active_repo: Any, cutoff: datetime) -> list[dict[str, Any]]:
+    """Every PR in ``active_repo`` updated at or after ``cutoff``; fails closed on pagination drift."""
+    slug = active_repo.active_github
     collected: list[dict[str, Any]] = []
+    seen_numbers: set[int] = set()
+    prev_page_min_updated: datetime | None = None
     for page in range(1, _RUN_PRS_MAX_PAGES + 1):
         query = urlencode({
             "state": "all",
@@ -2070,68 +2120,181 @@ def _repo_pulls_since(fleet_repo: Any, cutoff: datetime) -> list[dict[str, Any]]
             "per_page": _RUN_PRS_PER_PAGE,
             "page": page,
         })
-        page_rows = _gh_api_json(f"repos/{fleet_repo.github}/pulls?{query}")
+        page_rows = _gh_api_json(f"repos/{slug}/pulls?{query}")
         if not isinstance(page_rows, list):
-            raise OwnershipError(f"PR listing malformed for {fleet_repo.github}")
+            raise OwnershipError(f"PR listing malformed for {slug}")
         if not page_rows:
             return collected
         reached_cutoff = False
+        prev_in_page: datetime | None = None
         for pr in page_rows:
             if not isinstance(pr, dict):
-                raise OwnershipError(f"PR row malformed for {fleet_repo.github}")
+                raise OwnershipError(f"PR row malformed for {slug}")
+            number = pr.get("number")
+            if type(number) is not int or number <= 0:
+                raise OwnershipError(f"PR number malformed in {slug}")
+            if number in seen_numbers:
+                raise OwnershipError(f"PR pagination drifted while scanning {slug} (duplicate #{number})")
             raw_updated = pr.get("updated_at")
             if not isinstance(raw_updated, str):
-                raise OwnershipError(f"PR updated_at missing in {fleet_repo.github}")
+                raise OwnershipError(f"PR updated_at missing in {slug}")
             try:
                 updated_at = _at(raw_updated)
             except ValueError as exc:
-                raise OwnershipError(f"PR updated_at malformed in {fleet_repo.github}: {raw_updated!r}") from exc
+                raise OwnershipError(f"PR updated_at malformed in {slug}: {raw_updated!r}") from exc
+            if prev_page_min_updated is not None and updated_at > prev_page_min_updated:
+                raise OwnershipError(f"PR pagination drifted while scanning {slug} (non-monotonic updated_at)")
+            if prev_in_page is not None and updated_at > prev_in_page:
+                raise OwnershipError(f"PR listing out of updated_at order in {slug}")
+            prev_in_page = updated_at
+            seen_numbers.add(number)
             if updated_at < cutoff:
                 reached_cutoff = True
                 break
             collected.append(pr)
+        prev_page_min_updated = prev_in_page
         if reached_cutoff or len(page_rows) < _RUN_PRS_PER_PAGE:
             return collected
     raise OwnershipError(
-        f"{fleet_repo.github} PR scan exceeded {_RUN_PRS_MAX_PAGES} pages before reaching {cutoff.isoformat()}"
+        f"{slug} PR scan exceeded {_RUN_PRS_MAX_PAGES} pages before reaching {cutoff.isoformat()}"
     )
 
 
+def _validate_history_entry(entry: object, active_repos: Mapping[str, Any]) -> tuple[Any, int, str]:
+    """Validate one ownership history row unconditionally before task matching."""
+    if not isinstance(entry, dict):
+        raise OwnershipError("ownership history entry malformed")
+    active_repo, number = _parse_pr_ref(entry.get("pr"), active_repos, context="ownership history")
+    raw_at = entry.get("at")
+    if not isinstance(raw_at, str):
+        raise OwnershipError(f"ownership history entry for {entry.get('pr')!r} missing timestamp")
+    try:
+        _at(raw_at)
+    except ValueError as exc:
+        raise OwnershipError(f"ownership history timestamp malformed: {raw_at!r}") from exc
+    event = entry.get("event")
+    if not isinstance(event, str):
+        raise OwnershipError(f"ownership history entry for {entry.get('pr')!r} missing event")
+    if event == "accepted":
+        if not _single_line(entry.get("successor")) or not _single_line(entry.get("head")):
+            raise OwnershipError(f"ownership history accepted entry for {entry['pr']} missing successor or head")
+        if entry.get("predecessor") is not None and not _single_line(entry.get("predecessor")):
+            raise OwnershipError(f"ownership history accepted entry for {entry['pr']} has invalid predecessor")
+        if any(name in entry for name in ("reason", "decision_owner", "pr_state")) and not decision_custody(entry):
+            raise OwnershipError(f"ownership history accepted decision custody entry for {entry['pr']} malformed")
+    elif event == "cleared":
+        if not _single_line(entry.get("successor")):
+            raise OwnershipError(f"ownership history cleared entry for {entry['pr']} missing successor")
+    elif event == "closed":
+        pass
+    elif event == "alerted":
+        if not isinstance(entry.get("reason"), str) or not entry["reason"]:
+            raise OwnershipError(f"ownership history alerted entry for {entry['pr']} missing reason")
+    elif event == "custody_released":
+        if not isinstance(entry.get("how"), str) or not entry["how"]:
+            raise OwnershipError(f"ownership history custody_released entry for {entry['pr']} missing how")
+    elif event == "keeper_transfer_acknowledged":
+        if (
+            not _valid_run_identity(entry.get("worker_task"))
+            or not _valid_run_identity(entry.get("worker_nonce"))
+            or not _git_head(entry.get("head"))
+        ):
+            raise OwnershipError(f"ownership history keeper_transfer_acknowledged entry for {entry['pr']} malformed")
+    elif event == "keeper_custody_released":
+        if not _valid_run_identity(entry.get("worker_task")) or not isinstance(entry.get("how"), str) or not entry["how"]:
+            raise OwnershipError(f"ownership history keeper_custody_released entry for {entry['pr']} malformed")
+    elif event == "keeper_repair_held":
+        if not _single_line(entry.get("reason")) or not _git_head(entry.get("head")):
+            raise OwnershipError(f"ownership history keeper_repair_held entry for {entry['pr']} malformed")
+    elif event == "repair_custody_released":
+        if (
+            not _valid_run_identity(entry.get("successor"))
+            or not _valid_run_identity(entry.get("previous_worker_task"))
+        ):
+            raise OwnershipError(f"ownership history repair_custody_released entry for {entry['pr']} malformed")
+    else:
+        raise OwnershipError(f"ownership history unknown event {event!r} for {entry['pr']}")
+    return active_repo, number, event
+
+
 def _ownership_pr_refs(
-    data: Mapping[str, Any], covered_ids: set[str], repos: Mapping[str, Any],
-) -> dict[tuple[str, int], Any]:
-    """PRs linked to any covered task in active ``handoffs`` or ``history``."""
+    data: Mapping[str, Any],
+    covered_nonces: Mapping[str, set[str | None]],
+    reused_ids: set[str],
+    active_repos: Mapping[str, Any],
+) -> tuple[dict[tuple[str, int], Any], set[tuple[str, int]], set[tuple[str, int]]]:
+    """Validate ownership handoffs/history and return ``(matched_refs, covered_nonce_bound, other_nonce_bound)``."""
     refs: dict[tuple[str, int], Any] = {}
+    covered_bound: set[tuple[str, int]] = set()
+    other_bound: set[tuple[str, int]] = set()
+
     for key, handoff in data["handoffs"].items():
-        matched = (
-            handoff.get("predecessor") in covered_ids
-            or handoff.get("worker_task") in covered_ids
-            or (
-                not decision_custody(handoff)
-                and not keeper_custody(handoff)
-                and handoff.get("successor") in covered_ids
-            )
-        )
-        if matched:
-            fleet_repo, number = _parse_pr_ref(key, repos, context="ownership handoff")
-            refs[(fleet_repo.github.casefold(), number)] = fleet_repo
+        active_repo, number = _parse_pr_ref(key, active_repos, context="ownership handoff")
+        pr_id = (active_repo.active_github.casefold(), number)
+        if keeper_custody(handoff):
+            worker = handoff["worker_task"]
+            nonce = handoff["worker_nonce"]
+            if worker in covered_nonces:
+                if nonce in covered_nonces[worker]:
+                    refs[pr_id] = active_repo
+                    covered_bound.add(pr_id)
+                else:
+                    other_bound.add(pr_id)
+            continue
+        named: list[str] = []
+        predecessor = handoff.get("predecessor")
+        if predecessor is not None and not _single_line(predecessor):
+            raise OwnershipError(f"ownership handoff for {key} has invalid predecessor")
+        if isinstance(predecessor, str) and predecessor:
+            named.append(predecessor)
+        if not decision_custody(handoff):
+            named.append(handoff["successor"])
+        for tid in named:
+            if tid not in covered_nonces:
+                continue
+            if tid in reused_ids:
+                raise OwnershipError(
+                    f"ownership handoff for {key} names reused task {tid!r} without a distinguishing run nonce"
+                )
+            refs[pr_id] = active_repo
+
     for entry in data["history"]:
-        if not isinstance(entry, dict):
-            raise OwnershipError("ownership history entry malformed")
-        matched = (
-            entry.get("predecessor") in covered_ids
-            or entry.get("worker_task") in covered_ids
-            or entry.get("previous_worker_task") in covered_ids
-            or (
-                not decision_custody(entry)
-                and entry.get("successor") != SENDER
-                and entry.get("successor") in covered_ids
-            )
-        )
-        if matched:
-            fleet_repo, number = _parse_pr_ref(entry.get("pr"), repos, context="ownership history")
-            refs[(fleet_repo.github.casefold(), number)] = fleet_repo
-    return refs
+        active_repo, number, event = _validate_history_entry(entry, active_repos)
+        pr_id = (active_repo.active_github.casefold(), number)
+        if event == "keeper_transfer_acknowledged":
+            worker = entry["worker_task"]
+            nonce = entry["worker_nonce"]
+            if worker in covered_nonces:
+                if nonce in covered_nonces[worker]:
+                    refs[pr_id] = active_repo
+                    covered_bound.add(pr_id)
+                else:
+                    other_bound.add(pr_id)
+            continue
+        named = []
+        if event == "accepted":
+            if isinstance(entry.get("predecessor"), str) and entry["predecessor"]:
+                named.append(entry["predecessor"])
+            if not decision_custody(entry):
+                named.append(entry["successor"])
+        elif event == "cleared":
+            if entry["successor"] != SENDER:
+                named.append(entry["successor"])
+        elif event == "keeper_custody_released":
+            named.append(entry["worker_task"])
+        elif event == "repair_custody_released":
+            named.extend([entry["successor"], entry["previous_worker_task"]])
+        for tid in named:
+            if tid not in covered_nonces:
+                continue
+            if tid in reused_ids:
+                raise OwnershipError(
+                    f"ownership history {event} for {entry['pr']} names reused task {tid!r} "
+                    "without a distinguishing run nonce"
+                )
+            refs[pr_id] = active_repo
+
+    return refs, covered_bound, other_bound
 
 
 def run_prs(
@@ -2146,8 +2309,9 @@ def run_prs(
     """List every PR touched by ``task_id`` (and optionally its child tasks) across fleet repos.
 
     Read-only and fail-closed: any unreadable hot or archived task record, malformed ownership
-    state, unregistered repository, or failed/truncated GitHub read raises ``OwnershipError`` or
-    ``GitHubRateLimited``. Fork PRs are excluded with a note on stderr rather than attributed.
+    state, unregistered repository, ambiguous reused-task attribution, or failed/drifted/capped
+    GitHub read raises ``OwnershipError``, ``FleetRepoError`` or ``GitHubRateLimited``. Fork PRs
+    are excluded with a note on stderr rather than attributed.
     Returns ``(rows, notes)`` where each row is ``{repo, number, state, head, how_found}``.
     """
     from lu_machinery.orchestration.dispatch_admission import (
@@ -2157,16 +2321,27 @@ def run_prs(
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
     catalog = repos if repos is not None else load_fleet_repos()
+    active_repos = _active_fleet_catalog(catalog)
     root_dir = tasks_root if tasks_root is not None else tasks_dir()
     records = strict_task_inventory_in(root_dir, include_archive=True)
-    covered = _select_covered_records(records, task_id, include_children=include_children, run_nonce=run_nonce)
-    covered_ids = {rec["task_id"] for rec in covered}
+    reused_ids = _reused_task_ids(records)
+    covered, covered_idx_set = _select_covered_records(
+        records, task_id, include_children=include_children, run_nonce=run_nonce, reused_ids=reused_ids,
+    )
+    covered_nonces: dict[str, set[str | None]] = {}
+    for rec in covered:
+        covered_nonces.setdefault(rec["task_id"], set()).add(rec.get("run_nonce"))
+    covered_ids = set(covered_nonces)
+
     ownership_data = load(ownership_path or state_path())
-    handoff_refs = _ownership_pr_refs(ownership_data, covered_ids, catalog)
+    handoff_refs, covered_nonce_bound, other_nonce_bound = _ownership_pr_refs(
+        ownership_data, covered_nonces, reused_ids, active_repos,
+    )
 
     branch_queries: dict[tuple[str, str], Any] = {}
     delivery_refs: dict[tuple[str, int], Any] = {}
     commit_queries: dict[tuple[str, str], Any] = {}
+    covered_head_shas: set[tuple[str, str]] = set()
     started_times: list[datetime] = []
 
     for rec in covered:
@@ -2175,7 +2350,8 @@ def run_prs(
             raise OwnershipError(contradiction)
         if is_pre_launch:
             continue
-        fleet_repo = _task_fleet_repo(rec, catalog)
+        active_repo = _task_fleet_repo(rec, active_repos)
+        repo_fold = active_repo.active_github.casefold()
         raw_started = rec.get("started_at")
         if not isinstance(raw_started, str):
             raise OwnershipError(f"missing started_at on task {rec['task_id']!r}")
@@ -2189,22 +2365,72 @@ def run_prs(
                 continue
             if not isinstance(branch, str) or not branch:
                 raise OwnershipError(f"malformed {field} on task {rec['task_id']!r}")
-            branch_queries[(fleet_repo.github.casefold(), branch)] = (fleet_repo, branch)
+            branch_queries[(repo_fold, branch)] = (active_repo, branch)
         raw_delivery_prs = rec.get("delivery_prs")
         if raw_delivery_prs is not None:
             if not isinstance(raw_delivery_prs, list):
                 raise OwnershipError(f"malformed delivery_prs on task {rec['task_id']!r}")
             for ref in raw_delivery_prs:
-                d_repo, d_num = _parse_pr_ref(ref, catalog, context=f"delivery_prs on {rec['task_id']!r}")
-                delivery_refs[(d_repo.github.casefold(), d_num)] = d_repo
+                d_repo, d_num = _parse_pr_ref(ref, active_repos, context=f"delivery_prs on {rec['task_id']!r}")
+                delivery_refs[(d_repo.active_github.casefold(), d_num)] = d_repo
         raw_delivery_pr = rec.get("delivery_pr")
         if raw_delivery_pr is not None:
-            d_repo, d_num = _parse_pr_ref(raw_delivery_pr, catalog, context=f"delivery_pr on {rec['task_id']!r}")
-            delivery_refs[(d_repo.github.casefold(), d_num)] = d_repo
+            d_repo, d_num = _parse_pr_ref(raw_delivery_pr, active_repos, context=f"delivery_pr on {rec['task_id']!r}")
+            delivery_refs[(d_repo.active_github.casefold(), d_num)] = d_repo
         head_sha = rec.get("head_sha")
         commits_ahead = rec.get("commits_ahead")
         if head_sha is not None and type(commits_ahead) is int and commits_ahead > 0 and _git_head(head_sha):
-            commit_queries[(fleet_repo.github.casefold(), head_sha)] = (fleet_repo, head_sha)
+            commit_queries[(repo_fold, head_sha)] = (active_repo, head_sha)
+            covered_head_shas.add((repo_fold, head_sha))
+
+    # Track branches, deliveries, and exact exit heads of uncovered runs so shared branches or
+    # reused task ids never misattribute another run's PR.
+    shared_branches: set[tuple[str, str]] = set()
+    uncovered_delivery_prs: set[tuple[str, int]] = set()
+    uncovered_head_shas: set[tuple[str, str]] = set()
+    for idx, other in enumerate(records):
+        if idx in covered_idx_set:
+            continue
+        is_pre_launch, _ = classify_never_started_refusal(other)
+        if is_pre_launch:
+            continue
+        same_task = other["task_id"] in covered_ids
+        try:
+            other_repo = _task_fleet_repo(other, active_repos)
+        except OwnershipError:
+            if same_task:
+                raise
+            other_repo = None
+        other_fold = other_repo.active_github.casefold() if other_repo is not None else None
+        for field in ("worktree_branch", "publish_branch"):
+            branch = other.get(field)
+            if isinstance(branch, str) and branch:
+                if other_fold is not None and (other_fold, branch) in branch_queries:
+                    shared_branches.add((other_fold, branch))
+                elif other_fold is None:
+                    for branch_key in branch_queries:
+                        if branch_key[1] == branch:
+                            shared_branches.add(branch_key)
+        if same_task:
+            raw_dps = other.get("delivery_prs")
+            if isinstance(raw_dps, list):
+                for ref in raw_dps:
+                    d_repo, d_num = _parse_pr_ref(ref, active_repos, context=f"delivery_prs on {other['task_id']!r}")
+                    uncovered_delivery_prs.add((d_repo.active_github.casefold(), d_num))
+            raw_dp = other.get("delivery_pr")
+            if raw_dp is not None:
+                d_repo, d_num = _parse_pr_ref(raw_dp, active_repos, context=f"delivery_pr on {other['task_id']!r}")
+                uncovered_delivery_prs.add((d_repo.active_github.casefold(), d_num))
+        if other_fold is not None:
+            other_head = other.get("head_sha")
+            other_ahead = other.get("commits_ahead")
+            if other_head is not None and type(other_ahead) is int and other_ahead > 0 and _git_head(other_head):
+                uncovered_head_shas.add((other_fold, other_head))
+
+    covered_unique_heads = covered_head_shas - uncovered_head_shas
+    uncovered_unique_heads = uncovered_head_shas - covered_head_shas
+    covered_corroborated_prs = set(delivery_refs) | covered_nonce_bound
+    uncovered_corroborated_prs = uncovered_delivery_prs | other_nonce_bound
 
     found: dict[tuple[str, int], dict[str, Any]] = {}
     fork_notes: set[str] = set()
@@ -2223,79 +2449,118 @@ def run_prs(
     def note_fork(slug: str, number: int) -> None:
         fork_notes.add(f"excluded fork PR {slug}#{number} (cross-repository)")
 
+    def is_covered_corroborated(key: tuple[str, int], head_sha: str) -> bool:
+        return key in covered_corroborated_prs or (key[0], head_sha) in covered_unique_heads
+
+    def is_uncovered_only(key: tuple[str, int], head_sha: str) -> bool:
+        return (
+            not is_covered_corroborated(key, head_sha)
+            and (key in uncovered_corroborated_prs or (key[0], head_sha) in uncovered_unique_heads)
+        )
+
     # 1. Recorded worktree/publish branches (state=all).
-    for _, (fleet_repo, branch) in sorted(branch_queries.items()):
-        query = urlencode({"head": f"{fleet_repo.owner}:{branch}", "state": "all", "per_page": _RUN_PRS_PER_PAGE})
-        for pr in _gh_api_json(f"repos/{fleet_repo.github}/pulls?{query}", paginate=True):
-            kind, number, info = _classify_rest_pr(pr, fleet_repo)
+    for (repo_fold, branch), (active_repo, _) in sorted(branch_queries.items()):
+        query = urlencode({"head": f"{active_repo.owner}:{branch}", "state": "all", "per_page": _RUN_PRS_PER_PAGE})
+        for pr in _gh_api_json(f"repos/{active_repo.active_github}/pulls?{query}", paginate=True):
+            kind, number, info = _classify_rest_pr(pr, active_repo)
             if kind == "fork":
-                note_fork(fleet_repo.github, number)
+                note_fork(active_repo.active_github, number)
                 continue
             assert info is not None
-            if info["head_ref"] == branch:
+            if info["head_ref"] != branch:
+                continue
+            key = (repo_fold, number)
+            if (repo_fold, branch) in shared_branches:
+                if is_covered_corroborated(key, info["head"]) and key not in uncovered_corroborated_prs:
+                    record_pr(info, "recorded_branch")
+                elif is_uncovered_only(key, info["head"]):
+                    continue
+                else:
+                    raise OwnershipError(
+                        f"PR {active_repo.active_github}#{number} on shared branch {branch!r} "
+                        "cannot be attributed unambiguously to the selected run"
+                    )
+            else:
                 record_pr(info, "recorded_branch")
 
     # 2. Recorded ownership handoffs and history.
-    for (repo_fold, number), fleet_repo in sorted(handoff_refs.items()):
+    for (repo_fold, number), active_repo in sorted(handoff_refs.items()):
         if (repo_fold, number) in found:
             continue
-        pr = _gh_api_json(f"repos/{fleet_repo.github}/pulls/{number}")
-        kind, pr_num, info = _classify_rest_pr(pr, fleet_repo)
+        pr = _gh_api_json(f"repos/{active_repo.active_github}/pulls/{number}")
+        kind, pr_num, info = _classify_rest_pr(pr, active_repo)
         if kind == "fork":
-            note_fork(fleet_repo.github, pr_num)
+            note_fork(active_repo.active_github, pr_num)
             continue
         assert info is not None
         record_pr(info, "ownership_handoff")
 
     # 3. Settled delivery_pr / delivery_prs references on covered records.
-    for (repo_fold, number), fleet_repo in sorted(delivery_refs.items()):
+    for (repo_fold, number), active_repo in sorted(delivery_refs.items()):
         if (repo_fold, number) in found:
             continue
-        pr = _gh_api_json(f"repos/{fleet_repo.github}/pulls/{number}")
-        kind, pr_num, info = _classify_rest_pr(pr, fleet_repo)
+        pr = _gh_api_json(f"repos/{active_repo.active_github}/pulls/{number}")
+        kind, pr_num, info = _classify_rest_pr(pr, active_repo)
         if kind == "fork":
-            note_fork(fleet_repo.github, pr_num)
+            note_fork(active_repo.active_github, pr_num)
             continue
         assert info is not None
         record_pr(info, "delivery_pr")
 
     # 4. Exact-head commit association for settled tasks with commits_ahead > 0.
-    for _, (fleet_repo, head_sha) in sorted(commit_queries.items()):
-        rows = _gh_api_json(
-            f"repos/{fleet_repo.github}/commits/{head_sha}/pulls", paginate=True, allow_missing=True,
-        )
-        if rows is None:
-            continue
+    for (repo_fold, head_sha), (active_repo, _) in sorted(commit_queries.items()):
+        rows = _gh_api_json(f"repos/{active_repo.active_github}/commits/{head_sha}/pulls", paginate=True)
         for pr in rows:
-            kind, number, info = _classify_rest_pr(pr, fleet_repo)
+            kind, number, info = _classify_rest_pr(pr, active_repo)
             if kind == "fork":
-                note_fork(fleet_repo.github, number)
+                note_fork(active_repo.active_github, number)
                 continue
             assert info is not None
-            key = (fleet_repo.github.casefold(), number)
+            key = (repo_fold, number)
             if key in found:
                 continue
-            if info["head"] == head_sha or _pr_has_covered_trailer(
-                fleet_repo.github, number, info["head"], covered_ids
-            ):
+            if info["head"] == head_sha and (repo_fold, head_sha) in covered_unique_heads:
                 record_pr(info, "commit_association")
+                continue
+            matched = _pr_matched_declared_ids(active_repo.active_github, number, info["head"], covered_ids)
+            if not matched:
+                continue
+            if any(tid not in reused_ids for tid in matched) or is_covered_corroborated(key, info["head"]):
+                record_pr(info, "commit_association")
+            elif is_uncovered_only(key, info["head"]):
+                continue
+            else:
+                raise OwnershipError(
+                    f"PR {active_repo.active_github}#{number} matches bare X-Agent declaration for reused task "
+                    f"{matched[0]!r}; cannot distinguish runs"
+                )
 
-    # 5. Unrecorded-branch PRs carrying a covered task's X-Agent trailer across all fleet repos.
+    # 5. Unrecorded-branch PRs carrying a covered task's validated X-Agent declaration across all fleet repos.
     if started_times:
         cutoff = min(started_times) - _RUN_PRS_CLOCK_SKEW
-        unique_repos = {repo.github.casefold(): repo for repo in catalog.values()}
-        for _, fleet_repo in sorted(unique_repos.items()):
-            for pr in _repo_pulls_since(fleet_repo, cutoff):
-                kind, number, info = _classify_rest_pr(pr, fleet_repo)
+        unique_repos: dict[str, Any] = {active.active_github.casefold(): active for active in active_repos.values()}
+        for repo_fold, active_repo in sorted(unique_repos.items()):
+            for pr in _repo_pulls_since(active_repo, cutoff):
+                kind, number, info = _classify_rest_pr(pr, active_repo)
                 if kind == "fork":
-                    note_fork(fleet_repo.github, number)
+                    note_fork(active_repo.active_github, number)
                     continue
                 assert info is not None
-                key = (fleet_repo.github.casefold(), number)
+                key = (repo_fold, number)
                 if key in found:
                     continue
-                if _pr_has_covered_trailer(fleet_repo.github, number, info["head"], covered_ids):
+                matched = _pr_matched_declared_ids(active_repo.active_github, number, info["head"], covered_ids)
+                if not matched:
+                    continue
+                if any(tid not in reused_ids for tid in matched) or is_covered_corroborated(key, info["head"]):
                     record_pr(info, "x_agent_trailer")
+                elif is_uncovered_only(key, info["head"]):
+                    continue
+                else:
+                    raise OwnershipError(
+                        f"PR {active_repo.active_github}#{number} matches bare X-Agent declaration for reused task "
+                        f"{matched[0]!r}; cannot distinguish runs"
+                    )
 
     ordered = [found[key] for key in sorted(found)]
     return ordered, sorted(fork_notes)
