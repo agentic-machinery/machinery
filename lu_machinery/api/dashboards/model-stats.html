@@ -155,7 +155,7 @@
     <div id="tokens-body">Loading…</div>
     <details><summary>How providers report tokens</summary>
       <p class="note">Codex fresh input is input minus cache reads. Claude, Cursor and OpenCode add cache writes to fresh input. AGY reports fresh input directly. Cached input counts cache reads. Add the separate thinking or reasoning counter to output for AGY, Cursor and OpenCode. Codex and Claude output already include it.</p>
-      <p class="note">Rates divide recorded tokens for all work that settled in the window by PRs seen merging in the same window in local origin/main history. Cache hit is cached input divided by fresh plus cached input. Token volume does not measure price.</p>
+      <p class="note">Rates divide recorded tokens for work that settled in the window by PRs observed merging in the same window. Rates need readable local origin/main history for every registered repository. Cache hit is cached input divided by fresh plus cached input. Token volume does not measure price.</p>
     </details>
   </section>
   <section class="wide" id="jobs"><h2>Best model per job <span class="meta" id="jobs-meta"></span></h2>

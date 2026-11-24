@@ -467,6 +467,15 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert registry.get_sample_value("lu_tokens_waste", {
         "window": "7d", "model": "gpt-6.1-sol", "waste_class": "capped_and_replaced",
     }) is None
+    landing.repositories["unavailable"] = 1
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=landing)
+    partial = snapshot["page_windows"]["7d"]["token_use"]
+    assert partial["totals"] == token_use["totals"]
+    assert partial["merged_prs"] is partial["per_merged_pr"] is None
+    assert partial["by_work"]["implementation"]["per_merged_pr"] is None
+    labels = {"window": "7d", "model": "gpt-6.1-sol", "work_type": "implementation"}
+    assert registry.get_sample_value("lu_tokens_per_merged_pr", labels) is None
+    assert registry.get_sample_value("lu_tokens_fresh_input", labels) == 600
 
     review = _row(payload, "claude-opus-5-5", "review")
     assert review["tasks"] == 3 and "landed" not in review

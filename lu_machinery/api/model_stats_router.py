@@ -2005,6 +2005,8 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     token_rows = rows
     token_work = _token_work(token_rows)
     merge_times = [pr.at for pr in landing.prs.values() if pr.at < until]
+    read_repositories = landing.repositories["read"]
+    complete_landing = read_repositories > 0 and read_repositories == landing.repositories.total()
     rows = [replace(row, author=None, review_author=None)
             if row.review_author and retired_subscription_model(row.review_author) else row
             for row in rows if not retired_subscription_model(row.model)]
@@ -2025,7 +2027,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         record_prs = [pr for pr in all_record_prs if since <= pr["first_at"]]
         window = {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
                   "cohort": "finished_at, else started_at, in [since, until)"}
-        merged_prs = sum(since <= at for at in merge_times) if landing.repositories["read"] else None
+        merged_prs = sum(since <= at for at in merge_times) if complete_landing else None
         token_use, token_metrics = _token_use([row for row in token_rows if since <= row.moment], token_work,
                                              merged_prs, include_metrics=name in TOKEN_METRIC_WINDOWS)
         if name in TOKEN_METRIC_WINDOWS:

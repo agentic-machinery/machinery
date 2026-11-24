@@ -539,6 +539,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "include token use and waste. view=tokens returns just that report and its window, without reply text or "
         "task ids. The report has normalized token totals, usage coverage, tokens per observed merged PR, work "
         "and waste breakdowns, cache hit ratios and five highest-volume runs. Unsupported attributions are null. "
+        "The per-merge denominator needs readable mainline history for every registered repository. "
         "/metrics exports "
         "selected gauges from the same cached snapshot for 7d, 30d, 90d, all and ISO weeks (omitting 24h, observed "
         "wall hours and chart series). Token gauges cover 24h and 7d: lu_tokens_fresh_input, lu_tokens_cached_input, "
