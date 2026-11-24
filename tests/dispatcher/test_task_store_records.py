@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from lu_machinery.dispatcher import ownership, store, worker
+from lu_machinery.dispatcher import cli, ownership, store, worker
 from lu_machinery.dispatcher.types import ReviewAttempt, TaskSpec
 from lu_machinery.orchestration.task_record_store import read_task_record
 from lu_machinery.review import record_cf_verdict as recorder
@@ -320,7 +320,7 @@ def test_failed_record_recovery_types_os_errors_and_keeps_a_removed_tree(tmp_pat
 REPLY = '{"verdict": "REQUEST_CHANGES", "findings": [{"id": "F1"}]}\n'
 
 
-def _review_of_takeover(tmp_path, monkeypatch, *, review_branch="codex/inherited"):
+def _review_of_takeover(tmp_path, monkeypatch, *, review_branch="codex/inherited", review_pr=None):
     """A running takeover author (publish branch unlike its worktree branch) and its done review at its head."""
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path / "tasks"))
     monkeypatch.delenv(worker.write_boundary.BROKER_ENV, raising=False)
@@ -337,7 +337,7 @@ def _review_of_takeover(tmp_path, monkeypatch, *, review_branch="codex/inherited
         "stranger": dict(status="running", run_nonce="s1", worktree_branch="codex/inherited",
                          worktree_path=str(tree)),
         "author-review": dict(status="done", run_nonce="r1", parent_task_id="author", mode="read-only",
-                              review_branch=review_branch, pinned_head=head,
+                              review_branch=review_branch, pinned_head=head, pr=review_pr,
                               result_file=str(tmp_path / "tasks/author-review.result"),
                               result_sha256=hashlib.sha256(REPLY.encode()).hexdigest()),
     }.items():
@@ -409,6 +409,29 @@ def _write_ownership_state(tmp_path: Path, handoffs: dict[str, dict]) -> Path:
         "heal_attempts": {},
     }))
     return state_file
+
+
+def test_running_parent_reads_replacement_pr_reply_with_accepted_ownership(tmp_path, monkeypatch, capsys):
+    """Defect class: PR branch replacement denies the running owner's sealed review reply."""
+    tree = _review_of_takeover(tmp_path, monkeypatch, review_branch="codex/replacement", review_pr=1277)
+    monkeypatch.setenv(ownership.TASK_ID_ENV, "author")
+    argv = ["wait", "author-review", "--run-nonce", "r1", "--reply"]
+
+    assert cli.main(argv) == 0
+    refused = json.loads(capsys.readouterr().out)
+    assert ("result" in refused, refused["result_unavailable"]) == (False, "review_not_of_parent_branch")
+
+    _write_ownership_state(tmp_path, {"org/repo#1277": {
+        "successor": "author",
+        "predecessor": None,
+        "accepted_at": "2026-11-23T15:00:00+00:00",
+        "head": run_git(tree, "rev-parse", "HEAD"),
+        "custody": [],
+        "rerun_allowance": "unspent",
+    }})
+    assert cli.main(argv) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert (record.get("result"), record.get("result_unavailable")) == (REPLY, None)
 
 
 def _review_with_pr_successor(

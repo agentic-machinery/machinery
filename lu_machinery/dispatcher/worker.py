@@ -2846,13 +2846,28 @@ def _worktree_head(tree: object) -> str | None:
         return None
 
 
+def _review_pr_ownership_refusal(record: dict, repo_id: str, caller: str, *, not_owner: str) -> str | None:
+    """Require recorded task acceptance of the review's exact repository and PR."""
+    pr_number = record.get("pr")
+    if type(pr_number) is not int or pr_number <= 0:
+        return not_owner
+    from lu_machinery.orchestration import pr_ownership
+
+    try:
+        owner = pr_ownership.accepted_handoffs().get((repo_id.casefold(), pr_number))
+    except (pr_ownership.OwnershipError, OSError, ValueError, RecursionError):
+        return "ownership_state_unavailable"
+    return None if owner == caller else not_owner
+
+
 def _own_review_reply(record: dict, nonce: str | None) -> dict:
     """A done review's sealed reply, for its running parent or a settled parent's accepted PR successor (#1075).
 
     Write workers run outside the write boundary (#619), whose broker no longer hands an author its review's reply,
     and their launch context forbids reading another task's records. So ``wait --reply`` returns the reply (its
     digest checked by the recorder) to:
-    - the review's running parent task on its publish branch or worktree branch at the reviewed head, or
+    - the review's running parent task at the reviewed head, either on a recorded publish or worktree branch
+      or with accepted ownership of the PR whose branch and head were verified at review admission, or
     - when the review's parent task has settled (known terminal status), a running caller that holds the recorded
       accepted PR ownership for that review's PR and repository, on that PR's head branch at the reviewed head.
     Both paths require ``--run-nonce``. Anyone else gets a typed reason, no reply. Opt-in, so plain ``wait``
@@ -2877,22 +2892,26 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
             branch for branch in (holder.get("publish_branch"), holder.get("worktree_branch"))
             if isinstance(branch, str) and branch
         }
-        if holder.get("repository_id") != record.get("repository_id") or review_branch not in branches:
+        if holder.get("repository_id") != record.get("repository_id"):
             return {"result_unavailable": "review_not_of_parent_branch"}
+        if review_branch not in branches:
+            # Read-only --pr admission binds the repository, PR number, branch and pinned commit before
+            # the dispatcher writes the v2 record. The holder's local HEAD must still match that commit.
+            repo_id = _record_repo_id(record)
+            if (record.get("schema_version") != 2 or record.get("mode") != "read-only"
+                    or not repo_id or _record_repo_id(holder) != repo_id):
+                return {"result_unavailable": "review_not_of_parent_branch"}
+            refusal = _review_pr_ownership_refusal(record, repo_id, caller, not_owner="review_not_of_parent_branch")
+            if refusal is not None:
+                return {"result_unavailable": refusal}
         head_unavailable = "parent_head_unavailable"
     else:
-        pr_number = record.get("pr")
         repo_id = _record_repo_id(record)
-        if type(pr_number) is not int or pr_number <= 0 or not repo_id:
+        if not repo_id:
             return {"result_unavailable": "caller_not_parent"}
-        from lu_machinery.orchestration import pr_ownership
-
-        try:
-            owner = pr_ownership.accepted_handoffs().get((repo_id.casefold(), pr_number))
-        except (pr_ownership.OwnershipError, OSError, ValueError, RecursionError):
-            return {"result_unavailable": "ownership_state_unavailable"}
-        if owner != caller:
-            return {"result_unavailable": "caller_not_parent"}
+        refusal = _review_pr_ownership_refusal(record, repo_id, caller, not_owner="caller_not_parent")
+        if refusal is not None:
+            return {"result_unavailable": refusal}
         if nonce is None:
             return {"result_unavailable": "run_nonce_required"}
         parent = _read_status_record(parent_id)
