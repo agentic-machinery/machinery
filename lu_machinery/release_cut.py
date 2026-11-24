@@ -66,9 +66,9 @@ VERSION_FILES = ("pyproject.toml", "package.json", "package-lock.json")
 ALERT_RECIPIENT = "claude-cto"
 _PROXY_VARIABLES = frozenset({"http_proxy", "https_proxy", "no_proxy", "all_proxy"})
 CI_WORKFLOW = "CI Gate"
-# tempfile.mkdtemp appends exactly eight letters, digits or underscores. Prune deletes only that shape.
+# tempfile.mkdtemp appends exactly eight lowercase letters, digits or underscores.
 _WORK_PREFIX = ".lu-release-cut-"
-_WORK_SUFFIX = r"[A-Za-z0-9_]{8}"
+_WORK_SUFFIX = r"[a-z0-9_]{8}"
 _WORK_NAME = re.compile(re.escape(_WORK_PREFIX) + _WORK_SUFFIX + r"\Z")
 _STATE_DIR_NAME = "lu-release-cut"
 _PRUNE_DEFAULT_HOURS = 24.0
@@ -625,6 +625,8 @@ class Cut:
     machinery_milestone: str | None = None
     product_milestone: str | None = None
     publisher_python: Path | None = None
+    # Device and inode of a directory this command created. Deletion requires this same directory.
+    work_identity: tuple[int, int] | None = None
     _consumer_lock: Path | None = field(default=None, init=False)
 
     # Plumbing
@@ -1620,65 +1622,81 @@ def _positive_hours(value: str) -> float:
     return hours
 
 
-def _preserve_cut_log(work: Path, *, version: str, head: str) -> Path | None:
+def _preserve_cut_log(work: Path, *, version: str, head: str, expected: tuple[int, int]) -> Path | None:
     """Copy a regular ``cut.log`` into the state directory. A missing log copies nothing.
 
-    A symlink ``cut.log`` is refused: preserving it would read another file and then allow the
-    work directory to be removed.
+    The work directory must still be the one created for this run. ``cut.log`` is opened through
+    that directory's descriptor, so a replacement at the same path is not read and not archived.
+    The state directory is opened without following a symlink and its mode is set on that descriptor.
     """
-    source = work / "cut.log"
-    try:
-        info = source.lstat()
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISREG(info.st_mode):
-        raise OSError(f"cut.log is not a regular file: {source}")
-    state = _release_state_dir()
-    state.mkdir(parents=True, exist_ok=True)
-    state_info = state.lstat()
-    if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(state_info.st_mode):
-        raise OSError(f"release-cut state directory is not a real directory: {state}")
-    os.chmod(state, 0o700)
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
-    stem = f"{_filename_token(version or 'noversion')}-{_filename_token((head or 'nohead')[:12])}-{stamp}"
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    src_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+    parent = os.open(work.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        if not stat.S_ISREG(os.fstat(src_fd).st_mode):
-            raise OSError(f"cut.log is not a regular file: {source}")
-        for suffix in ("", "-2", "-3", "-4", "-5", "-6", "-7", "-8"):
-            dest = state / f"{stem}{suffix}-cut.log"
-            try:
-                out_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow, 0o600)
-            except FileExistsError:
-                continue
-            try:
-                os.fchmod(out_fd, 0o600)
-                while chunk := os.read(src_fd, 1024 * 1024):
-                    view = memoryview(chunk)
-                    while view:
-                        written = os.write(out_fd, view)
-                        if written <= 0:
-                            raise OSError(f"short write preserving {dest}")
-                        view = view[written:]
-                os.fsync(out_fd)
-            except OSError:
-                os.close(out_fd)
-                out_fd = -1
-                with contextlib.suppress(OSError):
-                    os.unlink(dest)
-                raise
-            finally:
-                if out_fd >= 0:
-                    os.close(out_fd)
-            dir_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-            return dest
+        info = os.lstat(work.name, dir_fd=parent)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"refusing to archive {work}: not the created directory")
+        if (info.st_dev, info.st_ino) != expected:
+            raise OSError(f"refusing to archive {work}: directory was replaced")
+        work_fd = os.open(work.name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow, dir_fd=parent)
     finally:
-        os.close(src_fd)
+        os.close(parent)
+    try:
+        held = os.fstat(work_fd)
+        if (held.st_dev, held.st_ino) != expected:
+            raise OSError(f"refusing to archive {work}: directory was replaced")
+        try:
+            src_fd = os.open("cut.log", os.O_RDONLY | os.O_CLOEXEC | nofollow, dir_fd=work_fd)
+        except FileNotFoundError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(src_fd).st_mode):
+                raise OSError(f"cut.log is not a regular file: {work / 'cut.log'}")
+            state = _release_state_dir()
+            state.mkdir(parents=True, exist_ok=True)
+            state_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow)
+            try:
+                state_info = os.fstat(state_fd)
+                if not stat.S_ISDIR(state_info.st_mode) or state_info.st_uid != os.geteuid():
+                    raise OSError(f"release-cut state directory is not a directory we own: {state}")
+                os.fchmod(state_fd, 0o700)
+                stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+                stem = f"{_filename_token(version or 'noversion')}-{_filename_token((head or 'nohead')[:12])}-{stamp}"
+                for suffix in ("", "-2", "-3", "-4", "-5", "-6", "-7", "-8"):
+                    name = f"{stem}{suffix}-cut.log"
+                    try:
+                        out_fd = os.open(
+                            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow, 0o600,
+                            dir_fd=state_fd,
+                        )
+                    except FileExistsError:
+                        continue
+                    try:
+                        os.fchmod(out_fd, 0o600)
+                        while chunk := os.read(src_fd, 1024 * 1024):
+                            view = memoryview(chunk)
+                            while view:
+                                written = os.write(out_fd, view)
+                                if written <= 0:
+                                    raise OSError(f"short write preserving {state / name}")
+                                view = view[written:]
+                        os.fsync(out_fd)
+                    except OSError:
+                        os.close(out_fd)
+                        out_fd = -1
+                        with contextlib.suppress(OSError):
+                            os.unlink(name, dir_fd=state_fd)
+                        raise
+                    finally:
+                        if out_fd >= 0:
+                            os.close(out_fd)
+                    os.fsync(state_fd)
+                    return state / name
+            finally:
+                os.close(state_fd)
+        finally:
+            os.close(src_fd)
+    finally:
+        os.close(work_fd)
     raise OSError(f"could not allocate a cut.log name in {state}")
 
 
@@ -1724,8 +1742,12 @@ def _retire_tool_work_directory(cut: Cut) -> None:
     The release has already succeeded; this does not change the exit code.
     """
     work = cut.work
+    expected = cut.work_identity
+    if expected is None:
+        cut.say(f"kept work directory {work}: directory identity was not recorded")
+        return
     try:
-        dest = _preserve_cut_log(work, version=cut.version, head=cut.head)
+        dest = _preserve_cut_log(work, version=cut.version, head=cut.head, expected=expected)
     except OSError as exc:
         cut.say(f"kept work directory {work}: could not preserve cut.log ({exc})")
         return
@@ -1734,7 +1756,7 @@ def _retire_tool_work_directory(cut: Cut) -> None:
     else:
         cut.say(f"no cut.log in {work}")
     try:
-        _unlink_tool_work_directory(work, _operator_home())
+        _unlink_tool_work_directory(work, _operator_home(), expected=expected)
     except OSError as exc:
         cut.say(f"kept work directory {work}: {exc}")
         return
@@ -1836,6 +1858,22 @@ def _path_is_held(directory: Path, referenced: set[str]) -> bool:
             if held == form or held.startswith(form + "/"):
                 return True
     return False
+
+
+def _mount_block(candidate: Path) -> str | None:
+    """Why ``candidate`` must not be listed or deleted, or None when no mount blocks it.
+
+    Unavailable mount information refuses the directory. A mount at or inside it, including a
+    bind mount of the same filesystem, is refused before the dry run calls it reclaimable.
+    """
+    mounts = task_scratch.mount_points()
+    if mounts is None:
+        return "mount information unavailable"
+    logical = os.path.abspath(candidate).rstrip("/")
+    prefix = logical + "/"
+    if any(point.rstrip("/") == logical or point.startswith(prefix) for point in mounts):
+        return "mount point inside the directory"
+    return None
 
 
 def _directory_size(path: Path) -> int:
@@ -1947,6 +1985,10 @@ def prune_stale_work_directories(
             continue
         if _path_is_held(candidate, referenced):
             print(f"prune: keep {candidate} (in use by a live process)")
+            continue
+        blocked = _mount_block(candidate)
+        if blocked is not None:
+            print(f"prune: refuse {candidate} ({blocked})")
             continue
         try:
             size = _directory_size(candidate)
@@ -2092,7 +2134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Remove old tool-created release work directories from the home directory.\n"
         "Use it after a cut to reclaim directories a failed or interrupted run left behind. "
         "It removes only a direct child of the home directory whose name is .lu-release-cut- plus the "
-        "eight characters mkdtemp appends. A different suffix is left alone. A --work directory is not "
+        "eight lowercase characters mkdtemp appends. A different suffix is left alone. A --work directory is not "
         "removed by cut; do not give --work that exact home-directory name if prune should keep it."
     )
     prune = sub.add_parser(
@@ -2204,8 +2246,15 @@ def _run(args: argparse.Namespace) -> int:
             print(f"release cut refused: {exc}", file=sys.stderr)
             return 1
         work = Path(tempfile.mkdtemp(prefix=_WORK_PREFIX, dir=home)).absolute()
+        created = os.open(work, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            identity = os.fstat(created)
+        finally:
+            os.close(created)
+        work_identity = (identity.st_dev, identity.st_ino)
     else:
         work = Path(args.work).absolute()
+        work_identity = None
     work.mkdir(parents=True, exist_ok=True)
     if any(path.name != "home" for path in work.iterdir()):
         print(f"--work {work} must be empty", file=sys.stderr)
@@ -2217,7 +2266,8 @@ def _run(args: argparse.Namespace) -> int:
               product_remote=args.product_remote or f"https://github.com/{product_repo}.git",
               machinery_repo=machinery_repo, product_repo=product_repo, host_python=project_interpreter(),
               primary=primary_root(), alert=not args.no_alert, x_agent=args.x_agent,
-              machinery_milestone=machinery_milestone, product_milestone=product_milestone)
+              machinery_milestone=machinery_milestone, product_milestone=product_milestone,
+              work_identity=work_identity)
     name, email = (cut.git(machinery_checkout, "config", "--get", key, check=False) for key in ("user.name", "user.email"))
     if name and email:
         cut.git_identity = ("-c", f"user.name={name}", "-c", f"user.email={email}")

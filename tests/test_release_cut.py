@@ -1765,6 +1765,24 @@ def test_successful_default_work_dir_cut_removes_the_directory_and_preserves_cut
     assert sorted((state / "lu-release-cut").glob("*-cut.log")) == logs
     assert {path.name for path in home.iterdir() if path.name.startswith(".lu-release-cut-")} == {failed.name}
 
+    held: dict[str, Path] = {}
+
+    def replaced(cut):
+        (cut.work / "cut.log").write_text("original-log\n", encoding="utf-8")
+        aside = cut.work.with_name("kept-aside")
+        cut.work.rename(aside)
+        cut.work.mkdir()
+        (cut.work / "foreign").write_text("foreign", encoding="utf-8")
+        held["aside"] = aside
+        held["replaced"] = cut.work
+        return 0
+
+    monkeypatch.setattr(release_cut, "execute", replaced)
+    assert main(["cut", "--no-alert", "--x-agent", "claude/claude-opus-5-5"]) == 0
+    assert (held["replaced"] / "foreign").read_text(encoding="utf-8") == "foreign"
+    assert (held["aside"] / "cut.log").read_text(encoding="utf-8") == "original-log\n"
+    assert sorted((state / "lu-release-cut").glob("*-cut.log")) == logs
+
 
 def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(monkeypatch, tmp_path, capsys):
     """Defect class: prune follows a symlink, deletes a non-prefix name, or removes a directory a live process is using."""
@@ -1788,6 +1806,10 @@ def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(mo
     handmade.mkdir()
     (handmade / "keep").write_text("handmade", encoding="utf-8")
     _backdate(handmade, 48)
+    upper = home / ".lu-release-cut-BACKUP01"
+    upper.mkdir()
+    (upper / "keep").write_text("upper", encoding="utf-8")
+    _backdate(upper, 48)
     other = home / "scratch-notes"
     other.mkdir()
     (other / "notes").write_text("keep", encoding="utf-8")
@@ -1845,6 +1867,7 @@ def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(mo
         assert str(bare) not in tokens
         assert str(nested) not in tokens
         assert str(handmade) not in tokens
+        assert str(upper) not in tokens
         assert stale.is_dir()
         assert (outside / "keep").read_text(encoding="utf-8") == "safe"
 
@@ -1891,6 +1914,7 @@ def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(mo
         assert nested.is_dir() and (nested / "payload").read_text(encoding="utf-8") == "keep"
         assert fresh.is_dir()
         assert handmade.is_dir() and (handmade / "keep").read_text(encoding="utf-8") == "handmade"
+        assert upper.is_dir() and (upper / "keep").read_text(encoding="utf-8") == "upper"
         assert (outside / "keep").read_text(encoding="utf-8") == "safe"
 
         swap = home / ".lu-release-cut-swap0001"
@@ -1943,6 +1967,11 @@ def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(mo
         monkeypatch.setattr(
             release_cut.task_scratch, "mount_points", lambda: frozenset({str(mounted / "bind")}),
         )
+        assert main(["prune"]) == 0
+        listed = capsys.readouterr().out
+        only_fixture(listed)
+        assert "mount point" in listed
+        assert not any(line.startswith("prune: would remove /") and str(mounted) in line for line in listed.splitlines())
         assert main(["prune", "--apply"]) == 0
         bound = capsys.readouterr().out
         only_fixture(bound)

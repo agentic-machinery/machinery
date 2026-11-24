@@ -293,12 +293,12 @@ remove and the space, and it deletes nothing unless `--apply` is set:
 
 `prune` only considers direct children of the home directory whose names are
 the tool's own `.lu-release-cut-` prefix plus the eight characters `mkdtemp`
-appends (letters, digits and underscore). A different suffix, including a
-hand-made name, is left alone. It refuses symlinks, other names, files, a
+appends (lowercase letters, digits and underscore). A different suffix,
+including uppercase letters or a hand-made name, is left alone. It refuses symlinks, other names, files, a
 directory a live process is using (including `prune`'s own current directory),
 and a directory that was replaced or touched after it was chosen. It does not
-follow symlinks, and it refuses to delete a directory that contains a mount,
-including a bind mount of the same filesystem. While a cut holds
+follow symlinks, and it refuses, including on a dry run, to list a directory
+that contains a mount, including a bind mount of the same filesystem. While a cut holds
 `release-cut.lock`, or another `cut` or `post-release` process is running,
 `prune` removes nothing. A directory passed with `--work` is not removed by
 the cut; do not pass a home-directory child of this exact shape as `--work`
