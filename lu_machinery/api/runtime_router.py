@@ -50,7 +50,7 @@ from . import delegate_router as delegate_api
 from .model_stats_rows import current_catalog_model_ids
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .monitor_context import production_context as production_context  # re-export: test monkeypatches
-from .state_helpers import cache_get_stored, cache_read_swr, ctx_scoped_ttl_key, swr_route
+from .state_helpers import cache_get_stored, cache_read_swr, ctx_cache_scope, swr_route
 
 router = APIRouter(tags=["runtime"])
 
@@ -1562,23 +1562,24 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
 
     ``recent`` is one scan of the task records, served stale-while-revalidate.
     The store is listed on every request, and a listing fault makes ``recent``
-    unknown even when a scan is cached. Resolving the store, listing it and the
-    scan share one deadline (routes answer within 1 s): past it, ``recent`` is
-    ``pending`` and that work runs on to store its scan. A result that is not a reading (unknown or pending) carries no
-    counts, and its ``as_of`` is the time of the last stored reading (None when
-    there is none). A reading's ``age_s`` and ``X-Snapshot-Age-S`` count from the
+    unknown even when a scan is cached. Before the deadline the request does no
+    I/O: the store's path and the cache key come from the context alone. Listing
+    the store and the scan run in one task under one deadline (routes answer
+    within 1 s): past it, ``recent`` is ``pending`` and that task runs on, so a
+    late listing still stores its scan. A result that is not a reading (unknown
+    or pending) carries no counts, and its ``as_of`` is the time of the last
+    stored reading (None when there is none). A reading's ``age_s`` and ``X-Snapshot-Age-S`` count from the
     scan's own ``as_of``. Rows carry task references, catalog models, pool labels
     and fixed words only: no paths, prompts or credentials.
     """
-    keys: list[str] = []
+    # Path arithmetic only (no resolve): the deadline bounds every filesystem step, and a pending
+    # answer can always find the last stored reading.
+    tasks_dir = delegate_api._tasks_dir(ctx)
+    key = f"runtime-routing-decisions{ctx_cache_scope(ctx)}"
 
     async def read() -> tuple[dict[str, Any], bool]:
-        # Every filesystem step (paths, the listing, the scan) runs in this one task. Past the deadline it
-        # runs on: a listing that finishes late still starts the shared scan, which stores its value.
-        tasks_dir, key = await asyncio.to_thread(
-            lambda: (delegate_api._tasks_dir(resolve_context(ctx)), ctx_scoped_ttl_key(ctx, "runtime-routing-decisions")),
-        )
-        keys.append(key)
+        # The listing and the scan run in this one task. Past the deadline it runs on: a listing
+        # that finishes late still starts the shared scan, which stores its value.
         _, store_fault = await asyncio.to_thread(_routing_listing, tasks_dir)
         if store_fault is not None:
             return {"status": "unknown", "reason": store_fault}, False
@@ -1596,7 +1597,7 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
         decisions, stored = {"status": "pending", "reason": "task_records_being_read"}, False
     if not stored:
         # Not a reading: "unknown since" the last stored reading, never since this attempt.
-        last = cache_get_stored(keys[0]) if keys else None
+        last = cache_get_stored(key)
         last_as_of = last[0].get("as_of") if last is not None and isinstance(last[0], dict) else None
         decisions = {"status": decisions.get("status"), "reason": decisions.get("reason"), "as_of": last_as_of}
     scanned = _routing_started(decisions.get("as_of")) if stored else None
