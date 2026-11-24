@@ -297,7 +297,7 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
    def refuse(msg, detail=None):
        raise SystemExit(f"refused: {msg}: {detail!r}")
 
-   if len(sys.argv) != 3 or not sys.argv[1] or not sys.argv[2]:
+   if len(sys.argv) != 3 or not sys.argv[1].strip() or not sys.argv[2].strip() or any(c.isspace() for c in sys.argv[2]):
        refuse("usage: <task-id> <run-nonce>", sys.argv[1:])
    tid, nonce = sys.argv[1], sys.argv[2]
    try:
@@ -305,15 +305,18 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
        records = store.strict_task_inventory(include_archive=True)
    except (OSError, ValueError) as exc:
        refuse("task store or turn record unreadable", f"{type(exc).__name__}: {exc}")
-   if any(r.get("task_id") == tid and (not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce")) for r in records):
+   for_tid = [r for r in records if r.get("task_id") == tid]
+   if any(not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce").strip() for r in for_tid):
        refuse("malformed run_nonce on turn record", tid)
-   matches = [r for r in records if r.get("task_id") == tid and r.get("run_nonce") == nonce]
+   matches = [r for r in for_tid if r.get("run_nonce") == nonce]
+   if for_tid and not matches:
+       refuse("run nonce mismatch", {"task_id": tid, "run_nonce": nonce})
    recs = matches or [{"task_id": tid, "run_nonce": nonce}]
    env = di.user_manager_env(os.environ)
    gone = {"inactive", "failed", "unknown"}
 
    def check_unit_stopped(unit):
-       if not isinstance(unit, str) or not unit or unit.startswith("-") or "/" in unit:
+       if not isinstance(unit, str) or not unit or any(c.isspace() for c in unit) or unit.startswith("-") or "/" in unit:
            refuse("malformed unit name", unit)
        try:
            proc = subprocess.run(
@@ -342,7 +345,7 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
    for rec in recs:
        launch_unit = rec.get("launch_unit")
        if launch_unit is not None:
-           if not isinstance(launch_unit, str) or not launch_unit or "/" in launch_unit or launch_unit.startswith("-"):
+           if not isinstance(launch_unit, str) or not launch_unit or any(c.isspace() for c in launch_unit) or "/" in launch_unit or launch_unit.startswith("-"):
                refuse("malformed launch_unit", launch_unit)
            scope = launch_unit if launch_unit.endswith(".scope") else f"{launch_unit}.scope"
            check_unit_stopped(scope)
@@ -373,12 +376,28 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
    .venv/bin/python -c '
    import json, sys
    from lu_machinery.dispatcher import store
+
+   def refuse(msg, detail=None):
+       raise SystemExit(f"refused: {msg}: {detail!r}")
+
+   if len(sys.argv) != 3 or not sys.argv[1].strip() or not sys.argv[2].strip() or any(c.isspace() for c in sys.argv[2]):
+       refuse("usage: <task-id> <run-nonce>", sys.argv[1:])
    tid, nonce = sys.argv[1], sys.argv[2]
+   try:
+       store.record_path(tid)
+       records = store.strict_task_inventory(include_archive=True)
+   except (OSError, ValueError) as exc:
+       refuse("task store or turn record unreadable", f"{type(exc).__name__}: {exc}")
+   for_tid = [r for r in records if r.get("task_id") == tid]
+   if any(not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce").strip() for r in for_tid):
+       refuse("malformed run_nonce on turn record", tid)
+   if for_tid and not any(r.get("run_nonce") == nonce for r in for_tid):
+       refuse("run nonce mismatch", {"task_id": tid, "run_nonce": nonce})
    rows = [
        {k: r.get(k) for k in ("task_id", "run_nonce", "parent_run_nonce", "status", "worktree_disposition_reason")}
-       for r in store.strict_task_inventory(include_archive=True)
+       for r in records
        if r.get("parent_task_id") == tid
-       and (not isinstance(r.get("parent_run_nonce"), str) or not r.get("parent_run_nonce") or r.get("parent_run_nonce") == nonce)
+       and (not isinstance(r.get("parent_run_nonce"), str) or not r.get("parent_run_nonce").strip() or r.get("parent_run_nonce") == nonce)
    ]
    print(json.dumps(rows, indent=2))
    ' <task-id> <run-nonce>
@@ -427,6 +446,11 @@ def is_nonempty_str(value):
 
 require(len(sys.argv) == 4, "usage: <stream-id> <lease-id> <generation>", sys.argv[1:])
 stream_id, expected_lease_id = sys.argv[1], sys.argv[2]
+require(
+    is_nonempty_str(stream_id) and is_nonempty_str(expected_lease_id),
+    "usage: <stream-id> <lease-id> <generation>",
+    sys.argv[1:],
+)
 try:
     expected_gen = int(sys.argv[3])
 except ValueError:
