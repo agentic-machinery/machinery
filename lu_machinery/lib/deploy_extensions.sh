@@ -56,15 +56,7 @@ deploy_agent_extensions() {
     local exit_code=0
     (cd "$project_dir" && npm run --silent --usage=false --if-present=false --script-shell=/bin/sh --workspaces=false "$npm_script" >"$log_file" 2>&1) || exit_code=$?
 
-    # Durable status breadcrumb. Printing the banner to the terminal is NOT
-    # enough: the launcher hands the terminal to the agent CLI, which clears
-    # it on start, so the operator never sees the banner and the agent boots
-    # with no idea its own config is stale. Persist the verdict where
-    # session-setup.sh can read it back into the session capsule.
-    # .agent is concurrent agent-owned state. The helper opens it with
-    # O_NOFOLLOW|O_DIRECTORY and updates leaves by dir_fd; plain shell
-    # redirection/cp/rm here would reintroduce deploy's path-swap escape.
-    local status_python status_rc=0
+    local status_python
 
     # The interpreter belongs to the checkout being deployed (its primary's
     # .venv, or the configured LEARN_UKRAINIAN_PYTHON), never to this helper's
@@ -74,6 +66,25 @@ deploy_agent_extensions() {
     # exits 1 only when it refuses the .agent root (its stderr says why); any
     # other non-zero exit is a crash or usage error.
     status_python="$(project_interpreter_resolve "$project_dir")" || status_python=""
+    deploy_agent_report "$project_dir" "npm run $npm_script" "$npm_script" "$exit_code" "$log_file" "$status_python"
+}
+
+# deploy_agent_report <project_dir> <reproduce> <label> <exit_code> <log_file> <status_python>
+# Reports one finished deploy: prints the success line or the failure banner and
+# records the verdict under <project_dir>/.agent with <status_python> (empty when
+# no interpreter resolved). Removes <log_file>. Returns the deploy's exit code, or
+# 1 when a successful deploy's breadcrumb cannot be cleared.
+deploy_agent_report() {
+    local project_dir="$1" reproduce="$2" label="$3" exit_code="$4" log_file="$5" status_python="$6"
+    # Durable status breadcrumb. Printing the banner to the terminal is NOT
+    # enough: the launcher hands the terminal to the agent CLI, which clears
+    # it on start, so the operator never sees the banner and the agent boots
+    # with no idea its own config is stale. Persist the verdict where
+    # session-setup.sh can read it back into the session capsule.
+    # .agent is concurrent agent-owned state. The helper opens it with
+    # O_NOFOLLOW|O_DIRECTORY and updates leaves by dir_fd; plain shell
+    # redirection/cp/rm here would reintroduce deploy's path-swap escape.
+    local status_rc=0
 
     if [ "$exit_code" -eq 0 ]; then
         if [ -z "$status_python" ]; then
@@ -91,21 +102,21 @@ deploy_agent_extensions() {
             rm -f "$log_file"
             return 1
         fi
-        echo "Agent extensions deployed ($npm_script)"
+        echo "Agent extensions deployed ($label)"
     else
         echo ""
-        echo "⚠️⚠️  AGENT-EXTENSIONS DEPLOY FAILED (npm run $npm_script, exit $exit_code)  ⚠️⚠️"
+        echo "⚠️⚠️  AGENT-EXTENSIONS DEPLOY FAILED ($reproduce, exit $exit_code)  ⚠️⚠️"
         echo "⚠️   Deploy targets (.claude/.codex/.agents/...) may be STALE."
         echo "──── last 15 lines of deploy output ────"
         tail -15 "$log_file"
         echo "────────────────────────────────────────"
-        echo "Reproduce with: npm run $npm_script"
+        echo "Reproduce with: $reproduce"
         if [ -z "$status_python" ]; then
             echo "Error: deploy-status update skipped (project interpreter missing)." >&2
         else
             project_python_run "$status_python" -m "$PROJECT_PACKAGE.agent_deploy.update_agent_deploy_status" record-failure \
                 --agent-root "$project_dir/.agent" \
-                --script "$npm_script" \
+                --script "$label" \
                 --exit-code "$exit_code" \
                 --failure-log "$log_file" || status_rc=$?
             if [ "$status_rc" -eq 1 ]; then
@@ -117,4 +128,26 @@ deploy_agent_extensions() {
     fi
     rm -f "$log_file"
     return "$exit_code"
+}
+
+# deploy_agent_workspace <workspace> <python>
+# The CTO workspace deploy: the installed release's agent_deploy in workspace
+# target mode (a non-Git directory outside every checkout; no npm, no product
+# descriptor script). <python> is the launch's resolved project interpreter and
+# also writes the breadcrumb: nothing here resolves one from the workspace, which
+# has no Git metadata and would resolve to itself.
+deploy_agent_workspace() {
+    local workspace="$1" python="$2" log_file exit_code=0
+    if [ -z "$python" ]; then
+        echo "Error: no project interpreter; cannot deploy the workspace agent extensions." >&2
+        return 1
+    fi
+    log_file="$(mktemp "${TMPDIR:-/tmp}/agents-deploy.XXXXXX")" || {
+        echo "Error: mktemp failed; cannot capture the workspace agent-extensions deploy output." >&2
+        return 1
+    }
+    project_python_run "$python" -m "$PROJECT_PACKAGE.agent_deploy" --workspace --project-root "$workspace" \
+        >"$log_file" 2>&1 || exit_code=$?
+    deploy_agent_report "$workspace" "python -I -m $PROJECT_PACKAGE.agent_deploy --workspace --project-root $workspace" \
+        "agent_deploy --workspace" "$exit_code" "$log_file" "$python"
 }

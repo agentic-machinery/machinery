@@ -29,11 +29,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/context-rollover-lib.sh" \
 # run_bounded, whose interpreter is chosen from the result.
 _HOOK_TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
 git_common_dir() {
+  local dir="${1:-$PROJECT_DIR}"
   if [ -n "$_HOOK_TIMEOUT_BIN" ]; then
-    "$_HOOK_TIMEOUT_BIN" -s KILL 2 git -C "$PROJECT_DIR" rev-parse --path-format=absolute \
+    "$_HOOK_TIMEOUT_BIN" -s KILL 2 git -C "$dir" rev-parse --path-format=absolute \
       --git-common-dir 2>/dev/null
   else
-    git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+    git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
   fi
 }
 # One interpreter (R66) and code root (machinery #100 R51, R62, R69): the release the
@@ -51,8 +52,11 @@ post_compact_bootstrap() {
   fi
   if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
     CANONICAL_ROOT="$CODEX_CANONICAL_REPO_ROOT"
+  elif [ -n "$PRIMARY_ROOT" ]; then
+    CANONICAL_ROOT="$PRIMARY_ROOT"
   else
-    CANONICAL_ROOT="${PRIMARY_ROOT:-$PROJECT_DIR}"
+    # Outside every checkout (the CTO workspace): the configured state root.
+    CANONICAL_ROOT=$(context_state_root "$PROJECT_DIR") || exit 1
   fi
   BOUNDED_PYTHON="$CONTEXT_PROJECT_PYTHON"
   BOUNDED_RUNNER="${SESSION_BOUNDED_RUNNER:-$MACHINERY_DIR/lu_machinery/agent_runtime/bounded_command.py}"
@@ -219,12 +223,23 @@ else
     --repo-root "$CANONICAL_ROOT" detect --agent "$HANDOFF_AGENT" 2>&1) || true
 fi
 
-# 3. Key reminders. Claude keys its per-project directory by the checkout
-# path with every character outside [A-Za-z0-9-] replaced by '-'. The memory
-# directory belongs to the primary checkout, resolved exactly as
-# session-setup.sh resolves it (CANONICAL_ROOT, above), so a worktree session
-# names the same directory.
-CLAUDE_PROJECT_KEY=$(printf '%s' "$CANONICAL_ROOT" | sed 's/[^A-Za-z0-9-]/-/g')
+# 3. Key reminders. Claude keys its per-project directory by its project
+# directory's Git root (one for a checkout and its worktrees), or by the
+# directory itself outside every checkout (the CTO workspace), with every
+# character outside [A-Za-z0-9-] replaced by '-', under its configuration
+# directory (CLAUDE_CONFIG_DIR, one per account, else ~/.claude); resolved
+# exactly as session-setup.sh resolves it.
+MEMORY_PROJECT="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}"
+MEMORY_GIT_COMMON=$(git_common_dir "$MEMORY_PROJECT") || MEMORY_GIT_COMMON=""
+if [ -n "$MEMORY_GIT_COMMON" ] && [ "$(basename "$MEMORY_GIT_COMMON")" = ".git" ]; then
+  MEMORY_PROJECT=$(dirname "$MEMORY_GIT_COMMON")
+fi
+CLAUDE_PROJECT_KEY=$(printf '%s' "$MEMORY_PROJECT" | sed 's/[^A-Za-z0-9-]/-/g')
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  MEMORY_BASE="$CLAUDE_CONFIG_DIR"
+else
+  MEMORY_BASE='$HOME/.claude'
+fi
 NOTE_LANE="$(context_handoff_note_lane)"
 if [ -n "$NOTE_LANE" ]; then
   CONTEXT="$CONTEXT
@@ -242,6 +257,6 @@ KEY REMINDERS:
   - Project interpreter only: $BOUNDED_PYTHON
   - Pre-commit: ruff + /simplify + cross-family code review (non-Gemini seat)
   - Read audit/ and review/ files before fixing modules
-  - MEMORY: \$HOME/.claude/projects/$CLAUDE_PROJECT_KEY/memory/MEMORY.md"
+  - MEMORY: $MEMORY_BASE/projects/$CLAUDE_PROJECT_KEY/memory/MEMORY.md"
 emit_context "CONTEXT RESTORED AFTER COMPACTION:$CONTEXT"
 exit 0

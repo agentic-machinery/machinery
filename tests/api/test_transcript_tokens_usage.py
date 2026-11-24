@@ -131,3 +131,23 @@ def test_parse_transcript_tokens_follows_rule_for_tokens_and_prev(tmp_path: Path
     assert telemetry.tokens == 589549
     assert telemetry.prev_tokens == 77346
     assert telemetry.turn == 2
+
+
+def test_transcript_fallback_reads_the_account_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect class: a dual-account transcript miss. With CLAUDE_CONFIG_DIR set (one directory per
+    account), the session fallback reads that account's projects directory, never ~/.claude."""
+    from lu_machinery.api.telemetry import transcript_tokens as tt
+
+    project = tmp_path / "cto-workspace"
+    project.mkdir()
+    flat = str(project.resolve()).replace("/", "-")
+    home, account = tmp_path / "home", tmp_path / "account-b"
+    for base in (home / ".claude", account):
+        (base / "projects" / flat).mkdir(parents=True)
+        _write_transcript(base / "projects" / flat / "s1.jsonl", [_incident_usage()])
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(tt, "read_session_record", lambda *_args: None)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(account))
+    assert tt.resolve_transcript_paths(project, session="s1") == [account / "projects" / flat / "s1.jsonl"]
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR")
+    assert tt.resolve_transcript_paths(project, session="s1") == [home / ".claude" / "projects" / flat / "s1.jsonl"]

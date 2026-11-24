@@ -57,11 +57,25 @@ class SupervisorError(ValueError):
     """A launch request violates the common supervisor contract."""
 
 
+# The two admitted ``lu-start-cto`` templates, by the SHA-256 of their normalized
+# statements. The checkout template runs the product checkout's start-claude-cto.sh
+# from REPO, the product checkout. The workspace template (DETACH step 4b) exports
+# LC_WORKSPACE_ROOT=$REPO and runs the installed package's start-claude-cto.sh, named
+# by its LAUNCHER policy line, from REPO, the CTO workspace. Each binds its own mode:
+# neither template's successor is admitted from a launch of the other mode.
+_CTO_CHECKOUT_TEMPLATE = "44dedafd91b354e31b9fcd8a4948518b57dc9f41cce9f34fd02e5cae36157280"
+_CTO_WORKSPACE_TEMPLATE = "82e0e67a345c35b4f304afbc2d1f41409826253ef60e6d9b86b566bbdcaca513"
+_CTO_PACKAGE_WRAPPER = Path(__file__).resolve().parents[1] / "start-claude-cto.sh"
+
+
 def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: list[str]) -> str:
     """Bind the supported wrapper template and its expanded launch intent, without executing it.
 
     Only literal source policy inputs vary. Account selection and authentication
     remain the wrapper's responsibility; neither account store is read here.
+    The launch mode comes from the environment the launcher validated: a set
+    ``LC_WORKSPACE_ROOT`` admits only the workspace template, for that workspace;
+    unset, only the checkout template.
     """
     try:
         source = wrapper.read_bytes()
@@ -79,7 +93,7 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
             line = line.strip(" \t")
             if not line or line.startswith("#"):
                 continue
-            match = re.fullmatch(r"(REPO|CFG|MODEL|EFFORT|KICK)=(.*)", line)
+            match = re.fullmatch(r"(REPO|CFG|LAUNCHER|MODEL|EFFORT|KICK)=(.*)", line)
             if match:
                 key, value = match.groups()
                 lexer = shlex.shlex(value, posix=True, punctuation_chars=";&|<>()")
@@ -105,16 +119,24 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
         # This binds executable statements, quoting, order and the existing
         # a|b/--here grammar. It admits no custom wrapper code or passthrough.
         template = hashlib.sha256("\n".join(normalized).encode()).hexdigest()
-        if template != "44dedafd91b354e31b9fcd8a4948518b57dc9f41cce9f34fd02e5cae36157280":
+        workspace = os.environ.get("LC_WORKSPACE_ROOT", "")
+        if template != (_CTO_WORKSPACE_TEMPLATE if workspace else _CTO_CHECKOUT_TEMPLATE):
             raise ValueError("unsupported wrapper template")
         repository = Path(policy["REPO"])
         config = Path(policy["CFG"])
+        if workspace:
+            launcher = Path(policy["LAUNCHER"])
+            expected_entry = launcher.resolve() if launcher.is_absolute() else None
+            if expected_entry != _CTO_PACKAGE_WRAPPER or Path(workspace).resolve() != repository.resolve():
+                raise ValueError("unsupported workspace intent")
+        else:
+            expected_entry = (repository / "start-claude-cto.sh").resolve()
         if (
             not repository.is_absolute()
             or not config.is_absolute()
             or repository.resolve() != root.resolve()
             or Path.cwd().resolve() != repository.resolve()
-            or entrypoint.resolve() != (repository / "start-claude-cto.sh").resolve()
+            or entrypoint.resolve() != expected_entry
         ):
             raise ValueError("unsupported repository intent")
         # Match shell command substitution, including removal of every trailing

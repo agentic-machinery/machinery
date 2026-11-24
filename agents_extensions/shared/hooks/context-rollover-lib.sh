@@ -222,7 +222,9 @@ context_live_usage() {
 
 # Canonical checkout that owns runtime state (.agent/): CODEX_CANONICAL_REPO_ROOT
 # when set, else the git common dir's checkout, so linked worktrees share the
-# primary checkout's session records and rollover leases.
+# primary checkout's session records and rollover leases. A project directory
+# outside every checkout (the CTO workspace) owns no runtime state: the
+# configured state root does (context_state_root).
 context_canonical_root() {
   local project_dir="$1" git_common_dir
   if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
@@ -233,8 +235,27 @@ context_canonical_root() {
   if [ -n "$git_common_dir" ] && [ "$(basename "$git_common_dir")" = ".git" ]; then
     dirname "$git_common_dir"
   else
-    printf '%s\n' "$project_dir"
+    context_state_root "$project_dir"
   fi
+}
+
+# The runtime-state root for a project directory outside every checkout: the
+# configured state root by the one Python rule (common/repo_root.py state_root:
+# LU_STATE_ROOT, else the configured primary), run by the hook's resolved
+# interpreter. It never answers the directory itself, whose .agent no other
+# reader would find; when the rule does not resolve it says why and returns 1.
+context_state_root() {
+  local project_dir="$1" state
+  if [ -z "${CONTEXT_PROJECT_PYTHON:-}" ]; then
+    context_machinery_bootstrap "$project_dir" >/dev/null || return 1
+  fi
+  if ! state="$(project_python_run "$CONTEXT_PROJECT_PYTHON" -c \
+      'from lu_machinery.common.repo_root import state_root; print(state_root())' 2>/dev/null)" \
+      || [[ "$state" != /* ]]; then
+    echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: no runtime-state root for $project_dir (set LU_STATE_ROOT or LU_PRIMARY_REPO_ROOT)" >&2
+    return 1
+  fi
+  printf '%s\n' "$state"
 }
 
 # Canonical session record path: an explicit existing override, else
@@ -245,7 +266,9 @@ context_session_record_file() {
     printf '%s\n' "$LEARN_UKRAINIAN_SESSION_RECORD"
     return 0
   fi
-  printf '%s\n' "$(context_canonical_root "$project_dir")/.agent/sessions/$session_id.json"
+  local root
+  root="$(context_canonical_root "$project_dir")" || return 1
+  printf '%s\n' "$root/.agent/sessions/$session_id.json"
 }
 
 # Effective rollover mode for this session. operator_restart applies only when

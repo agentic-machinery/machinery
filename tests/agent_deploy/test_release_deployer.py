@@ -135,6 +135,44 @@ def test_wrong_project_selection_never_falls_back(consumer, tmp_path, monkeypatc
     assert invoke(monkeypatch) == 2
 
 
+def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer, tmp_path, monkeypatch, capsys):
+    """Defect class: the deployer writing provider trees into a directory nested in a checkout (whose
+    ancestor project instructions Claude Code would load), or accepting a non-Git target without the
+    explicit workspace mode. A workspace renders its own sources, agents included, and checks clean."""
+    workspace = tmp_path / "cto-workspace"
+    shutil.copytree(consumer / "agents_extensions", workspace / "agents_extensions")
+    write(workspace, "agents_extensions/shared/agents/cto.md", "---\nname: cto\ndescription: CTO\n---\nDrive.\n")
+
+    def run(*options):
+        monkeypatch.setattr(sys, "argv", ["agent_deploy", *options])
+        return main()
+
+    assert run("--project-root", str(workspace)) == 2
+    assert "Git checkout root" in capsys.readouterr().err
+    assert not (workspace / ".claude").exists()
+    assert run("--workspace", "--project-root", str(workspace)) == 0
+    assert run("--workspace", "--project-root", str(workspace), "--check") == 0
+    assert (workspace / ".claude/agents/cto.md").read_text() == "---\nname: cto\ndescription: CTO\n---\nDrive.\n"
+    assert (workspace / ".claude/skills/fleet/SKILL.md").read_bytes() == SKILL
+    assert not (workspace / ".git").exists()
+    capsys.readouterr()
+
+    nested = consumer / "tools" / "cto-workspace"
+    shutil.copytree(consumer / "agents_extensions", nested / "agents_extensions")
+    for target in (consumer, nested):
+        before = snapshot(consumer)
+        assert run("--workspace", "--project-root", str(target)) == 2
+        assert "outside every Git checkout" in capsys.readouterr().err
+        assert snapshot(consumer) == before
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(workspace))
+    with pytest.raises(SystemExit) as refused:
+        run("--workspace")
+    assert refused.value.code == 2
+    with pytest.raises(SystemExit) as refused:
+        run("--workspace", "--project-root", str(workspace), "--inputs-commit", "0" * 40)
+    assert refused.value.code == 2
+
+
 def test_non_curriculum_consumer_lints_its_own_sources(consumer, monkeypatch):
     """A consumer with no curriculum marker must lint and deploy its own skills."""
     path = consumer / "agents_extensions/shared/skills/product/SKILL.md"

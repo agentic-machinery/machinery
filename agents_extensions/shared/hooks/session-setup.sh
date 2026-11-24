@@ -151,7 +151,8 @@ else
   if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
     CANONICAL_ROOT=$(dirname "$GIT_COMMON_DIR")
   else
-    CANONICAL_ROOT="$PROJECT_DIR"
+    # Outside every checkout (the CTO workspace): the configured state root.
+    CANONICAL_ROOT=$(context_state_root "$PROJECT_DIR") || exit 1
   fi
 fi
 
@@ -404,10 +405,19 @@ fi
 unset ROOT_GUARD_RC ROOT_GUARD_JSON
 
 # 6. Check MEMORY.md line count (truncated at 200 lines by system)
-# Claude keys its per-project directory by the checkout path with every
-# character outside [A-Za-z0-9-] replaced by '-'.
-CLAUDE_PROJECT_KEY=$(printf '%s' "$CANONICAL_ROOT" | sed 's/[^A-Za-z0-9-]/-/g')
-MEMORY_DIR="$HOME/.claude/projects/$CLAUDE_PROJECT_KEY/memory"
+# Claude keys its per-project directory by its project directory's Git root (one
+# for a checkout and its worktrees), or by the directory itself outside every
+# checkout (the CTO workspace), with every character outside [A-Za-z0-9-]
+# replaced by '-', under its configuration directory (CLAUDE_CONFIG_DIR, one per
+# account, else ~/.claude).
+MEMORY_PROJECT="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}"
+MEMORY_GIT_COMMON=$(_hook_deadline 2 git -C "$MEMORY_PROJECT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+if [ -n "$MEMORY_GIT_COMMON" ] && [ "$(basename "$MEMORY_GIT_COMMON")" = ".git" ]; then
+  MEMORY_PROJECT=$(dirname "$MEMORY_GIT_COMMON")
+fi
+CLAUDE_PROJECT_KEY=$(printf '%s' "$MEMORY_PROJECT" | sed 's/[^A-Za-z0-9-]/-/g')
+MEMORY_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$CLAUDE_PROJECT_KEY/memory"
+unset MEMORY_PROJECT MEMORY_GIT_COMMON
 MEMORY_FILE="$MEMORY_DIR/MEMORY.md"
 if [ "$IS_CODEX_SESSION" = "0" ] && [ -f "$MEMORY_FILE" ]; then
   MEMORY_LINES=$(wc -l < "$MEMORY_FILE" | tr -d ' ')

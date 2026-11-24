@@ -936,12 +936,22 @@ def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
     library = machinery_path("lib/project_interpreter.sh")
     env = {name: os.environ[name] for name in _HOOK_ROOTS_ENV if name in os.environ}
     # The shell rule reads the compatibility names only: hand it the value of whichever name is set
-    # (a conflict between the two refuses here, before the rule runs).
+    # (a conflict between the two refuses here, before the rule runs). The rule's state-root check
+    # is the checkout layout's: a state root that is a checkout must be the hook anchor. A dedicated
+    # non-Git LU_STATE_ROOT (the detached layout) is not a checkout and not an anchor, so it is not
+    # handed over; ``configure_native_hook_roots`` still validates it through :func:`state_root`.
+    # An alias set in the environment is copied above unchanged: the generated hook command sees it
+    # too, and the rule refuses it there and here alike.
     try:
         for name in (LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV):
             setting = _setting(name, None)
-            if setting is not None:
-                env[ENV_ALIASES[name]] = setting[1]
+            if setting is None:
+                continue
+            if name == LU_STATE_ROOT_ENV:
+                configured = configured_state_root()
+                if configured is not None and not os.path.lexists(configured / ".git"):
+                    continue
+            env[ENV_ALIASES[name]] = setting[1]
     except MachineryConfigError as exc:
         raise ProductRootError(f"no hook context resolves from {invocation_dir}: {exc}") from None
     try:

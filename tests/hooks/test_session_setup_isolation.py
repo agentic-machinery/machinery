@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -366,3 +367,34 @@ def test_launcher_library_python_children_never_import_from_the_cwd(tmp_path: Pa
         children = child_log.read_text(encoding="utf-8").splitlines()
         assert children, f"the site started no Python child: {result.stdout}{result.stderr}"
         assert set(children) == {"-I"}, children
+
+
+def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_state_root(tmp_path: Path) -> None:
+    """Defect class: hooks reading another account's or another root's memory or state. From a
+    non-Git project directory (the CTO workspace) the memory check reads the workspace's directory
+    under CLAUDE_CONFIG_DIR, and session state goes to the configured state root, never the workspace."""
+    primary = _scratch_project(tmp_path)
+    workspace, state, home, account = (tmp_path / name for name in ("cto-workspace", "state", "home", "account-b"))
+    for path in (workspace, state, home):
+        path.mkdir()
+    key = re.sub(r"[^A-Za-z0-9-]", "-", str(workspace))
+    memory = account / "projects" / key / "memory" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("note\n" * 160)
+    stray = home / ".claude" / "projects" / key / "memory" / "MEMORY.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("note\n")
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home), "CLAUDE_CONFIG_DIR": str(account),
+        "SESSION_START_BUDGET_SECONDS": "60", "LEARN_UKRAINIAN_PYTHON": sys.executable,
+        "LEARN_UKRAINIAN_CLAUDEX_RUN_ID": "isolation-probe-run", "LEARN_UKRAINIAN_CLAUDEX_LAUNCH_GENERATION": "1",
+        "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "1", "CLAUDE_PROJECT_DIR": str(workspace),
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary), "LU_STATE_ROOT": str(state),
+    }
+    result = subprocess.run(["bash", str(_HOOK)], cwd=workspace, env=env, input=_STDIN, capture_output=True,
+                            text=True, timeout=120, check=False)
+    assert result.returncode == 0, result.stderr
+    context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "MEMORY.md is 160 lines" in context, context
+    assert (state / ".agent" / "sessions" / "isolation-probe.json").is_file()
+    assert not (workspace / ".agent").exists() and not (primary / ".agent").exists()

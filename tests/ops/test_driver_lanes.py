@@ -240,3 +240,20 @@ def test_pane_command_runs_launcher_words_without_shell_parsing(tmp_path: Path) 
     assert result.stdout == "|".join(words[2:]) + f"|\n{dl.EXIT_MARKER}0\n"
     assert not marker.exists() and not (tmp_path / "out").exists()
     assert plan.command == shlex.join(words)  # display only
+
+
+def test_lane_cwd_override_needs_a_wrapper_and_an_absolute_existing_directory(tmp_path: Path) -> None:
+    """Defect class: a keeper starting a lane in the wrong working directory. A lane whose session runs
+    outside the checkout (the CTO workspace) starts there only with a wrapper; anything else refuses."""
+    workspace = tmp_path / "cto-workspace"
+    workspace.mkdir()
+    cto = dl.load_registry().by_session("cto")
+    overrides = dl.load_local_config(write_local(tmp_path, {"cto": {"wrapper": "lu-start-cto", "cwd": str(workspace)}}))
+    assert dl.launch_plan(cto, repo_root=tmp_path / "checkout", local=overrides).cwd == str(workspace)
+    assert dl.launch_plan(cto, repo_root=tmp_path / "checkout", local={}).cwd == str(tmp_path / "checkout")
+    for entry in ({"cwd": str(workspace)}, {"wrapper": "lu-start-cto", "cwd": "cto-workspace"},
+                  {"wrapper": "lu-start-cto", "cwd": str(tmp_path / "absent")},
+                  {"wrapper": "lu-start-cto", "cwd": f"{workspace}; touch x"}):
+        refused = dl.load_local_config(write_local(tmp_path, {"cto": entry}))
+        with pytest.raises(dl.LaneConfigError, match="local lane config: cto: "):
+            dl.launch_plan(cto, repo_root=tmp_path, local=refused)

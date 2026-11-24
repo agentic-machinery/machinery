@@ -364,8 +364,24 @@ class CommitInputs:
         return {key: (blob, mode) for (key, _, mode), blob in zip(items, contents, strict=True)}
 
 
+def _has_git_entry(directory: int) -> bool:
+    """``.git`` exists (any type, a dangling symlink included) in the open ``directory``."""
+    try:
+        os.stat(".git", dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 @contextlib.contextmanager
-def selected_tree(selected: str | None, check: bool) -> Iterator[Tree]:
+def selected_tree(selected: str | None, check: bool, *, workspace: bool = False) -> Iterator[Tree]:
+    """Hold the selected target's directory and its per-target lock.
+
+    A consumer target (the default) must be its Git checkout's root. A workspace target
+    (``workspace=True``, the CTO workspace) is the opposite: a generated directory that is
+    neither a checkout nor inside one, so no ancestor ``.git`` can make Claude Code load a
+    checkout's project instructions, and a checkout can never be selected by accident.
+    """
     if selected is None:
         raise Invalid("--project-root or LU_PRODUCT_ROOT is required")
     if selected != "/":
@@ -374,21 +390,31 @@ def selected_tree(selected: str | None, check: bool) -> Iterator[Tree]:
     if not path.is_absolute():
         raise Invalid("project root must be absolute")
     relative(str(path)[1:])
+    if workspace and path == Path("/"):
+        raise Invalid("a workspace target cannot be the filesystem root")
     # Open each component: resolve() would silently accept symlink targets.
     base = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
+        if workspace and _has_git_entry(base):
+            raise Invalid("a workspace target must be outside every Git checkout: / has a .git entry")
+        walked = ""
         for component in path.parts[1:]:
             child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=base)
             os.close(base)
             base = child
+            walked += "/" + component
+            # Checked on the held descriptors, so no path swap can hide a checkout.
+            if workspace and _has_git_entry(base):
+                raise Invalid(f"a workspace target must be outside every Git checkout: {walked} has a .git entry")
         tree = Tree(base)
-        result = subprocess.run(
-            ["git", "-C", f"/proc/self/fd/{base}", "rev-parse", "--show-toplevel"],
-            pass_fds=(base,), capture_output=True, text=True, check=False,
-            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-        )
-        if result.returncode or result.stdout.strip() != str(path):
-            raise Invalid("project root must be the Git checkout root")
+        if not workspace:
+            result = subprocess.run(
+                ["git", "-C", f"/proc/self/fd/{base}", "rev-parse", "--show-toplevel"],
+                pass_fds=(base,), capture_output=True, text=True, check=False,
+                env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+            )
+            if result.returncode or result.stdout.strip() != str(path):
+                raise Invalid("project root must be the Git checkout root")
         # flock on the checkout inode needs no lockfile and writes nothing in check mode.
         fcntl.flock(base, (fcntl.LOCK_SH if check else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         yield tree

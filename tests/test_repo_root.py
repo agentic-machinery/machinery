@@ -522,6 +522,33 @@ def test_a_configured_product_cannot_hide_a_bad_invocation_git(unconfigured, tmp
     hooks.require_hook_config(good, home)
 
 
+def test_native_hook_roots_admit_a_dedicated_non_git_state_root_beside_the_git_anchor(unconfigured, tmp_path, monkeypatch):
+    """Defect class: the hook boundary refusing the detached layout (a dedicated non-Git LU_STATE_ROOT
+    beside a Git primary anchor) or admitting a malformed state root. Every Python hook re-runs this
+    rule, so a refusal here refused every driver-state and audit hook from the CTO workspace."""
+    primary = _primary_checkout(tmp_path / "primary")
+    workspace, state = tmp_path / "cto-workspace", tmp_path / "state"
+    workspace.mkdir()
+    state.mkdir()
+    monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(workspace))
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(state))
+    assert rr.native_hook_roots(workspace) == (workspace, primary.resolve())
+    # A state root that is a checkout must still be the anchor; a stray .git still refuses.
+    other = _primary_checkout(tmp_path / "other")
+    stray = tmp_path / "stray"
+    (stray / ".git").mkdir(parents=True)
+    for refused in (other, stray):
+        monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(refused))
+        with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
+            rr.native_hook_roots(workspace)
+    # The alias is the generated hook command's checkout state root: named non-Git, it refuses there and here.
+    monkeypatch.delenv(rr.LU_STATE_ROOT_ENV)
+    monkeypatch.setenv(rr.STATE_ROOT_ENV, str(state))
+    with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
+        rr.native_hook_roots(workspace)
+
+
 def test_the_native_hook_contract_bytes_match_the_product_contract():
     """Defect class: the installed hook resolver block or tail drifting from the product's coordinated contract.
 

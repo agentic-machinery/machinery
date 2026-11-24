@@ -29,7 +29,7 @@ driver_scope_entrypoint() {
     start-codex.sh) row='codex interactive codex' ;;
     start-gemini.sh) row='gemini interactive gemini' ;;
     "$DS_PACKAGE/start-bio-driver.sh") row='claude interactive bio' ;;
-    start-claude-driver.sh|start-claude-cto.sh|"$DS_PACKAGE/start-kube-dojo-driver.sh") row='claude driver -' ;;
+    start-claude-driver.sh|start-claude-cto.sh|"$DS_PACKAGE/start-claude-cto.sh"|"$DS_PACKAGE/start-kube-dojo-driver.sh") row='claude driver -' ;;
     start-codex-driver.sh|start-codex-cto.sh) row='codex driver -' ;;
     start-gemini-driver.sh) row='gemini driver -' ;;
     start-muse-driver.sh) row='muse driver -' ;;
@@ -45,10 +45,13 @@ driver_scope_invoked_entry() {
   # a lane wrapper lives in the machinery package directory that holds this
   # file: the product's own package in a checkout, site-packages for an
   # installed release. A copy or alias anywhere else is not an entry point.
+  # A workspace launch (LC_WORKSPACE_ROOT) has LC_ROOT on the CTO workspace,
+  # which holds no wrapper: only the package wrapper is its entry point.
   local dir root package
   dir="$(CDPATH='' cd -P -- "$(dirname -- "$0")" 2>/dev/null && pwd)" || return 1
   root="$(CDPATH='' cd -P -- "${LC_ROOT:-}" 2>/dev/null && pwd)" || return 1
   package="$(CDPATH='' cd -P -- "${DS_LIB_DIR%/*}" 2>/dev/null && pwd)" || return 1
+  if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then root=""; fi
   case "$dir" in
     "$root") DS_ENTRY_PATH="${0##*/}" DS_ENTRY_FILE="$LC_ROOT/${0##*/}" ;;
     "$package") DS_ENTRY_PATH="$DS_PACKAGE/${0##*/}" DS_ENTRY_FILE="${DS_LIB_DIR%/*}/${0##*/}" ;;

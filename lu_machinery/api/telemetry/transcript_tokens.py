@@ -112,12 +112,19 @@ def read_session_record(project_root: Path, session: str) -> dict[str, Any] | No
     return read_record(session, state_root=canonical_state_root(project_root))
 
 
+def _claude_projects_dir() -> Path:
+    """Claude's per-project directory root: under ``CLAUDE_CONFIG_DIR`` (one per account), else ``~/.claude``."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    return (Path(configured) if configured else Path.home() / ".claude") / "projects"
+
+
 def resolve_transcript_paths(project_root: Path, *, session: str | None = None) -> list[Path]:
     """Resolve candidate Claude transcript paths for this checkout.
 
     When ``session`` is given, resolve from the SessionStart runtime record first.
     Otherwise fall back to resolving EXACTLY
-    ``~/.claude/projects/<flat-root>/<session>.jsonl`` with no fallback
+    ``<Claude projects dir>/<flat-root>/<session>.jsonl`` (``CLAUDE_CONFIG_DIR/projects``
+    when set, else ``~/.claude/projects``) with no fallback
     globs and no cross-checkout scan.
 
     When ``session`` is omitted, honour ``LEARN_UKRAINIAN_TRANSCRIPT_PATH`` /
@@ -132,7 +139,7 @@ def resolve_transcript_paths(project_root: Path, *, session: str | None = None) 
             path = Path(rec["transcript_path"])
             return [path] if path.is_file() else []
 
-        exact = Path.home() / ".claude" / "projects" / _claude_project_dir_name(project_root) / f"{session}.jsonl"
+        exact = _claude_projects_dir() / _claude_project_dir_name(project_root) / f"{session}.jsonl"
         return [exact] if exact.is_file() else []
 
     explicit = os.environ.get("LEARN_UKRAINIAN_TRANSCRIPT_PATH") or os.environ.get("CLAUDE_TRANSCRIPT_PATH")
@@ -140,7 +147,7 @@ def resolve_transcript_paths(project_root: Path, *, session: str | None = None) 
         path = Path(explicit).expanduser()
         return [path] if path.is_file() else []
 
-    projects_dir = Path.home() / ".claude" / "projects"
+    projects_dir = _claude_projects_dir()
     candidates: list[Path] = []
     exact_dir = projects_dir / _claude_project_dir_name(project_root)
     if exact_dir.is_dir():
