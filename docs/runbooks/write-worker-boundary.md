@@ -304,6 +304,19 @@ These apply to the read-only review dispatches the boundary still contains.
 - A Unix socket that a host service first creates after launch, outside `/tmp`, `/run` and `/dev/shm`,
   is not masked. No such service is known on the fleet host.
 
+## Operator-only repository verbs
+
+No protected executor holds a GitHub principal whose credential write workers cannot read: a write
+worker runs as the dispatching user with that user's `gh` login (above), and the broker relays only
+`github-read` and `fleet-publish`. The publisher's `repo-create` and `repo-transfer` verbs
+(decision GH-ADMIN-VERBS-1124) therefore run only from an operator-run script. They refuse a process
+carrying `LEARN_UKRAINIAN_DISPATCH_TASK_ID` or `LU_WRITE_BOUNDARY_BROKER`, refuse every caller
+credential override (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`,
+`GH_CONFIG_DIR`, `XDG_CONFIG_HOME`), and verify the `--principal` the operator names with `GET /user`
+through the same `gh` credential before and after the mutation. The marker refusal stops accidents; it
+is not authentication, because a worker can drop its own markers. Run `--help` on either verb for the
+checks, receipts and exit codes.
+
 ## Review contract canary
 
 Once per release cut, run the supported host command at the exact release
