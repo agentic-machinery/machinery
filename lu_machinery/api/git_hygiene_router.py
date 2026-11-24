@@ -23,7 +23,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from packaging.requirements import InvalidRequirement, Requirement
-from packaging.utils import canonicalize_name
+from packaging.utils import InvalidName, canonicalize_name
 from pydantic import AfterValidator, BaseModel
 
 from lu_machinery.common import github_client, json_depth
@@ -731,27 +731,40 @@ def _unknown_pull_requests(
     return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
 
 
+def _valid_name(name: object) -> str | None:
+    """The normalized form of a valid PEP 508 name (ASCII letters and digits, ``.``, ``_``, ``-``
+    inside), else ``None``. The ASCII gate matters: packaging accepts the Kelvin sign as ``k``.
+    """
+    if not isinstance(name, str) or not name.isascii():
+        return None
+    try:
+        return canonicalize_name(name, validate=True)
+    except InvalidName:
+        return None
+
+
 def _group_requirements(groups: dict[str, Any]) -> list[Any] | None:
     """The requirement strings of every PEP 735 dependency group, or ``None`` for an invalid table.
 
-    Invalid: a group that is not an array, two names equal after normalization, an entry that is
-    neither a string nor an ``{include-group = "<name>"}`` table, an include naming no group, or an
-    include cycle. Every group is read, so an include adds no requirement that is not already listed.
+    Invalid: a name that is not a valid PEP 508 name, a group that is not an array, two names equal
+    after normalization, an entry that is neither a string nor an ``{include-group = "<name>"}``
+    table, an include naming no group, or an include cycle. Every group is read, so an include adds no requirement that is not already listed.
     """
     entries: dict[str, list[Any]] = {}
     for name, items in groups.items():
-        if not isinstance(items, list) or canonicalize_name(name) in entries:
+        normalized = _valid_name(name)
+        if normalized is None or not isinstance(items, list) or normalized in entries:
             return None
-        entries[canonicalize_name(name)] = items
+        entries[normalized] = items
     requirements: list[Any] = []
     includes: dict[str, set[str]] = {name: set() for name in entries}
     for name, items in entries.items():
         for item in items:
             if isinstance(item, dict):
-                target = item.get("include-group") if set(item) == {"include-group"} else None
-                if not isinstance(target, str) or canonicalize_name(target) not in entries:
+                target = _valid_name(item.get("include-group")) if set(item) == {"include-group"} else None
+                if target is None or target not in entries:
                     return None
-                includes[name].add(canonicalize_name(target))
+                includes[name].add(target)
             else:
                 requirements.append(item)
     # An include cycle leaves groups that never reach in-degree zero (Kahn's algorithm).
@@ -772,7 +785,8 @@ def _group_requirements(groups: dict[str, Any]) -> list[Any] | None:
 
 def _requirement_lists(manifest: dict[str, Any]) -> list[list[Any]] | None:
     """Every dependency array of a manifest; ``None`` when any has a shape the format does not allow,
-    two extras share a normalized name, or the dependencies are dynamic (declared outside the file).
+    an extra's name is invalid or shared after normalization, ``dynamic`` holds anything but strings,
+    or the dependencies are dynamic (declared outside the file).
     """
     project, groups = manifest.get("project", {}), manifest.get("dependency-groups", {})
     if not isinstance(project, dict) or not isinstance(groups, dict):
@@ -780,8 +794,11 @@ def _requirement_lists(manifest: dict[str, Any]) -> list[list[Any]] | None:
     optional, dynamic = project.get("optional-dependencies", {}), project.get("dynamic", [])
     grouped = _group_requirements(groups)
     if (not isinstance(optional, dict) or not isinstance(dynamic, list) or grouped is None
-            or {"dependencies", "optional-dependencies"} & {item for item in dynamic if isinstance(item, str)}
-            or len({canonicalize_name(extra) for extra in optional}) != len(optional)):
+            or not all(isinstance(item, str) for item in dynamic)
+            or {"dependencies", "optional-dependencies"} & set(dynamic)):
+        return None
+    extras = {_valid_name(extra) for extra in optional}
+    if None in extras or len(extras) != len(optional):
         return None
     lists = [project.get("dependencies", []), *optional.values(), grouped]
     return lists if all(isinstance(items, list) for items in lists) else None
@@ -872,7 +889,7 @@ def _errored_fields(document: object, aliases: set[str]) -> dict[str, set[str]] 
     found: dict[str, set[str]] = {}
     for item in errors or []:
         path = item.get("path") if isinstance(item, dict) else None
-        if not isinstance(path, list) or not path or path[0] not in aliases:
+        if not isinstance(path, list) or not path or not isinstance(path[0], str) or path[0] not in aliases:
             return None
         field = path[1] if len(path) > 1 else ""
         found.setdefault(path[0], set()).add(field if isinstance(field, str) else "")
@@ -960,7 +977,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         else:
             document = json_depth.loads(proc.stdout or "", max_depth=512)
         data = document["data"]
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, RecursionError):  # json_depth raises RecursionError past its bound
         return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
     if not isinstance(data, dict):
         return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")

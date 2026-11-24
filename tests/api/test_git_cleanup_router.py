@@ -446,7 +446,12 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
                       '[dependency-groups]\na-b = ["lu-machinery==1.2.3"]\na_b = []\n',
                       '[project]\noptional-dependencies = {X = ["lu-machinery==1.2.3"], x = []}\n',
                       # Dependencies declared outside the file may pin it there.
-                      '[project]\ndynamic = ["dependencies"]\n', '[project]\ndynamic = "dependencies"\n'):
+                      '[project]\ndynamic = ["dependencies"]\n', '[project]\ndynamic = "dependencies"\n',
+                      '[project]\ndependencies = ["lu-machinery==1.2.3"]\ndynamic = [123]\n',
+                      # Names must be valid PEP 508 names, ASCII only (packaging accepts the Kelvin sign as "k").
+                      '[dependency-groups]\n"bad group" = ["lu-machinery==1.2.3"]\nall = [{include-group = "bad group"}]\n',
+                      '[dependency-groups]\n"\u212a" = ["lu-machinery==1.2.3"]\n',
+                      '[project]\noptional-dependencies = {"bad extra" = ["lu-machinery==1.2.3"]}\n'):
         assert pin_of(manifest(malformed))["state"] == "unknown", malformed
     # A PEP 735 include table is allowed in a dependency group, and a pin beside it still reads.
     included = '[dependency-groups]\nbase = ["lu-machinery==3.4.5"]\nall = [{include-group = "base"}]\n'
@@ -602,6 +607,8 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     assert (limited["status"], limited["reason"]) == ("unknown", "github_unavailable")
     _graphql_result(monkeypatch, 0, "not json")
     assert git_hygiene_router.compute_pull_requests(tmp_path)["reason"] == "github_invalid_response"
+    _graphql_result(monkeypatch, 0, "[" * 600 + "]" * 600)  # past the JSON depth bound
+    assert git_hygiene_router.compute_pull_requests(tmp_path)["reason"] == "github_invalid_response"
     # GitHub's nullable commit nodes and contexts read as "no CI yet", never an exception.
     node = {**_open_pr("codex/one", 1), "commits": {"nodes": [None]}}
     nulls = {**_open_pr("codex/two", 2), "commits": {"nodes": [{"commit": {"statusCheckRollup": None, "status": None}}]}}
@@ -670,7 +677,8 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     assert (queue_failed["status"], queue_failed["pull_requests"], queue_failed["unknown_since"] is not None) == (
         "unknown", [], True)
     assert (pin_failed["status"], pin_failed["pin"]["state"], third["status"]) == ("ok", "unknown", "ok")
-    for stray in ({"message": "no path"}, {"path": ["elsewhere"], "message": "x"}, {"path": [], "message": "x"}):
+    for stray in ({"message": "no path"}, {"path": ["elsewhere"], "message": "x"}, {"path": [], "message": "x"},
+                  {"path": [[]], "message": "x"}, {"path": [{}], "message": "x"}, "not an object"):
         _graphql_result(monkeypatch, 1, json.dumps({"data": repos, "errors": [stray]}))
         assert git_hygiene_router.compute_pull_requests(tmp_path)["status"] == "unknown", stray
 
