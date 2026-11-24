@@ -20,6 +20,7 @@ Readers remain stdlib-only; writers load cause and dispatcher support lazily.
 
 from __future__ import annotations
 
+import atexit
 import fcntl
 import json
 import logging
@@ -47,8 +48,31 @@ _REDISPATCH_ARCHIVED_STEM_RE = re.compile(r"^(?P<base>.+)\.(?P<tag>\d{8}T\d{6}\d
 _V2_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _LOG = logging.getLogger(__name__)
 # Foreign-file fingerprints this process has already reported; scans repeat, the warning does not.
-_REPORTED_FOREIGN: set[tuple[str, int, int]] = set()
+_ForeignFingerprint = tuple[str, int, int]
+_REPORTED_FOREIGN: set[_ForeignFingerprint] = set()
 _REPORTED_FOREIGN_LIMIT = 65536
+# Paths buffered until the directory scan that read them finishes, then one warning.
+# Each path keeps every fingerprint seen before that warning, and is counted once.
+_PendingForeign = tuple[bool, list[_ForeignFingerprint]]
+_PENDING_FOREIGN: dict[str, _PendingForeign] = {}
+_FOREIGN_LOCK = threading.Lock()
+# How many iter_task_records scans are open. Zero means a single-file read, which warns immediately.
+_SCAN_DEPTH = 0
+# Example names in the one summary line. Names outside the families below are chosen first.
+_FOREIGN_EXAMPLE_LIMIT = 3
+# A known routing or closeout-state name is that word, then .json, or one
+# hyphen and an ASCII word, then .json. A longer, dotted or continued suffix
+# is a different kind and stays in the sample.
+_FOREIGN_HYPHEN_TAIL = r"(?:-[A-Za-z0-9]+)?\.json\Z"
+# Families short-lived readers already find beside task records (review-loop and closeout state).
+# A name that matches none of these is unexpected: the summary names it ahead of the families.
+_ROUTINE_FOREIGN_KINDS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("review-state", re.compile(r".*\.review-state\.json\Z")),
+    ("resolver", re.compile(r".*\.resolver\.json\Z")),
+    ("routing", re.compile(r".*\.routing" + _FOREIGN_HYPHEN_TAIL)),
+    ("ac-policy", re.compile(r".*\.ac-policy\.json\Z")),
+    ("closeout-state", re.compile(r".*\.closeout-state" + _FOREIGN_HYPHEN_TAIL)),
+)
 # Literal suffixes of files and directories the dispatcher writes beside ``<task_id>.json``.
 # Each string is the suffix that writer passes to ``Path.with_suffix`` or appends to the task id,
 # not a pattern. A record name ``<task_id>.json`` matches one only when the id itself ends in
@@ -77,20 +101,129 @@ def _is_dispatcher_sidecar(path: Path) -> bool:
     return path.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES)
 
 
-def _report_foreign(path: Path, raw: bytes) -> None:
-    """Warn once per process for each foreign file's path and content; a rewritten file is reported again.
+def _routine_kind(name: str) -> str | None:
+    """The known sidecar family of ``name``, or None when the name is a different kind."""
+    for kind, pattern in _ROUTINE_FOREIGN_KINDS:
+        if pattern.fullmatch(name):
+            return kind
+    return None
 
-    Dispatcher sidecars are not foreign. A file whose name is not one of those suffixes still warns.
+
+def _foreign_kind(path: str) -> str:
+    """Group example names so one family cannot fill every slot.
+
+    Dotted suffixes use their last word, so ``AC-01.test-evidence`` and
+    ``AC-02.test-evidence`` are one kind. A name with no dot uses the known
+    family token when it ends in one (``*-ac-policy``), otherwise its last
+    hyphen word. A different suffix still gets a slot.
+    """
+    name = Path(path).name
+    routine = _routine_kind(name)
+    if routine is not None:
+        return routine
+    if not name.endswith(".json"):
+        return name
+    stem = name[:-5]
+    dot = stem.find(".")
+    if dot == -1:
+        for kind in sorted((item[0] for item in _ROUTINE_FOREIGN_KINDS), key=len, reverse=True):
+            if stem == kind or stem.endswith("-" + kind):
+                return kind
+        return _foreign_stem_kind(stem, last_hyphen_word=True)
+    tail = stem[dot + 1:]
+    if "." in tail:
+        tail = tail.rsplit(".", 1)[-1]
+    return _foreign_stem_kind(tail, last_hyphen_word=False)
+
+
+def _foreign_stem_kind(stem: str, *, last_hyphen_word: bool) -> str:
+    """Drop a trailing number so ``loose-0`` and ``loose-1`` share one sample slot.
+
+    A dotted suffix keeps the rest of its last word (``custom-tail``). A name
+    with no dot still groups by its last hyphen word, as before.
+    """
+    while "-" in stem:
+        head, _, word = stem.rpartition("-")
+        if not word.isdigit() or not head:
+            break
+        stem = head
+    if last_hyphen_word:
+        return stem.rsplit("-", 1)[-1]
+    return stem
+
+
+def _foreign_summary(items: list[tuple[str, _PendingForeign]]) -> str:
+    """One line: how many foreign files, how many are an unexpected kind, and a few names."""
+    unexpected_n = sum(1 for _, (unexpected, _) in items if unexpected)
+    ranked = sorted(
+        ((not unexpected, _foreign_kind(path), path) for path, (unexpected, _) in items),
+    )
+    chosen: list[str] = []
+    seen: set[str] = set()
+    for _, kind, path in ranked:
+        if kind in seen:
+            continue
+        seen.add(kind)
+        chosen.append(path)
+        if len(chosen) == _FOREIGN_EXAMPLE_LIMIT:
+            break
+    count = len(items)
+    noun = "file" if count == 1 else "files"
+    clause = f", {unexpected_n} unexpected" if unexpected_n else ""
+    shown = ", ".join(repr(path) for path in chosen)
+    return f"{count} non-record {noun}{clause}; examples: {shown}"
+
+
+def _flush_foreign_reports(*, force: bool = False) -> None:
+    """Emit at most one summary for foreign files buffered since the previous summary.
+
+    A directory scan holds the buffer until it finishes, so one scan is one line.
+    ``force`` is the process-exit backstop: a scan that is still open must not drop its line.
+    """
+    with _FOREIGN_LOCK:
+        if not _PENDING_FOREIGN or (_SCAN_DEPTH != 0 and not force):
+            return
+        items = list(_PENDING_FOREIGN.items())
+        _PENDING_FOREIGN.clear()
+        for _, (_, fingerprints) in items:
+            for fingerprint in fingerprints:
+                if len(_REPORTED_FOREIGN) >= _REPORTED_FOREIGN_LIMIT:
+                    _REPORTED_FOREIGN.clear()
+                _REPORTED_FOREIGN.add(fingerprint)
+        summary = _foreign_summary(items)
+    # The summary is one logging argument, so a name cannot be read as a format string.
+    _LOG.warning("NON_RECORD_FILE: %s", summary)
+
+
+def _report_foreign(path: Path, raw: bytes) -> None:
+    """Buffer one foreign file. A directory scan emits one summary when it finishes.
+
+    Dispatcher sidecars are not foreign. A rewritten file is reported again. Every
+    version of a path seen before the summary is remembered, so bytes the summary
+    already covered do not warn a second time. Names that match no known sidecar
+    family are unexpected and are listed first, so a new kind stays in the sample.
+    Reads outside a scan are included in the next summary, or in the one line
+    emitted at process exit.
     """
     if _is_dispatcher_sidecar(path):
         return
     fingerprint = (str(path), len(raw), hash(raw))
-    if fingerprint in _REPORTED_FOREIGN:
-        return
-    if len(_REPORTED_FOREIGN) >= _REPORTED_FOREIGN_LIMIT:
-        _REPORTED_FOREIGN.clear()
-    _REPORTED_FOREIGN.add(fingerprint)
-    _LOG.warning("NON_RECORD_FILE: %r", str(path))
+    with _FOREIGN_LOCK:
+        if fingerprint in _REPORTED_FOREIGN:
+            return
+        current = _PENDING_FOREIGN.get(fingerprint[0])
+        if current is None:
+            _PENDING_FOREIGN[fingerprint[0]] = (_routine_kind(path.name) is None, [fingerprint])
+            return
+        if fingerprint in current[1]:
+            return
+        current[1].append(fingerprint)
+    # A directory scan flushes when it ends. A read outside a scan stays buffered
+    # until the next scan ends or the process exits, so a loop of single-file
+    # reads is one line, not one line per file.
+
+
+atexit.register(_flush_foreign_reports, force=True)
 
 
 def _has_v2_record_name(path: Path) -> bool:
@@ -310,25 +443,34 @@ def iter_task_records(tasks_dir: Path, *, include_archive: bool) -> Iterator[Pat
     directory that is missing or unreadable yields nothing. Readers classify at
     their own read, after their mtime, status-byte or fingerprint prefilters.
     Dispatcher sidecars that end in ``.json`` (boundary and sandbox receipts, and saved
-    tool results) are not candidates.
+    tool results) are not candidates. Closing the scan emits one summary for the foreign
+    files its caller reported while this scan was open.
     """
-    directories = [tasks_dir, tasks_dir / ARCHIVE_DIR_NAME] if include_archive else [tasks_dir]
-    for directory in directories:
-        try:
-            with os.scandir(directory) as entries:
-                names = []
-                for entry in entries:
-                    if not entry.name.endswith(".json") or entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES):
-                        continue
-                    try:
-                        if entry.is_file():
-                            names.append(entry.name)
-                    except OSError:
-                        continue  # one broken entry must not hide the other records
-                names.sort()
-        except OSError:
-            continue
-        yield from (directory / name for name in names)
+    global _SCAN_DEPTH
+    with _FOREIGN_LOCK:
+        _SCAN_DEPTH += 1
+    try:
+        directories = [tasks_dir, tasks_dir / ARCHIVE_DIR_NAME] if include_archive else [tasks_dir]
+        for directory in directories:
+            try:
+                with os.scandir(directory) as entries:
+                    names = []
+                    for entry in entries:
+                        if not entry.name.endswith(".json") or entry.name.endswith(_DISPATCHER_SIDECAR_SUFFIXES):
+                            continue
+                        try:
+                            if entry.is_file():
+                                names.append(entry.name)
+                        except OSError:
+                            continue  # one broken entry must not hide the other records
+                    names.sort()
+            except OSError:
+                continue
+            yield from (directory / name for name in names)
+    finally:
+        with _FOREIGN_LOCK:
+            _SCAN_DEPTH -= 1
+        _flush_foreign_reports()
 
 
 def relocated_result_file(record_path: Path, result_file: str | None) -> str | None:
