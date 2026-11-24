@@ -520,6 +520,95 @@ def test_created_commit_message_declares_x_agent_and_x_verified(tmp_path, monkey
         cut.update_adopt_inputs(lock, product)
 
 
+def test_adopt_pr_commits_candidate_snapshot(tmp_path, monkeypatch):
+    """Defect class: the adoption commit updates the wheel pin and leaves a stale generated snapshot."""
+    product = tmp_path / "product"
+    _init_repo(product)
+    release_base = f"https://github.com/{REPO}/releases/download"
+    old_url = f"{release_base}/v0.1.22/lu_machinery-0.1.22-py3-none-any.whl"
+    wheel_name = "lu_machinery-0.1.23-py3-none-any.whl"
+    new_url = f"{release_base}/v0.1.23/{wheel_name}"
+    (product / "pyproject.toml").write_text(
+        '[project]\nname = "example-product"\nversion = "0.1.0"\n'
+        'dependencies = ["lu-machinery==0.1.22"]\n'
+        f'[tool.uv.sources]\nlu-machinery = {{ url = "{old_url}" }}\n'
+        '[tool.lu-machinery.adoption-snapshot]\nmodule = "route_snapshot"\noutput = "snapshot.json"\n',
+        encoding="utf-8",
+    )
+    (product / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    old_snapshot = '{"routes": ["GET /before"]}\n'
+    (product / "snapshot.json").write_text(old_snapshot, encoding="utf-8")
+    (product / "route_snapshot.py").write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "from lu_machinery import ROUTES\n"
+        "assert 'GH_TOKEN' not in os.environ\n"
+        "assert os.environ['LU_PRODUCT_ROOT'] == str(Path.cwd())\n"
+        "print(json.dumps({'routes': ROUTES}))\n",
+        encoding="utf-8",
+    )
+    _git(product, "add", ".")
+    _git(product, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "product snapshot at old pin")
+
+    published = tmp_path / "published"
+    published.mkdir()
+    (published / wheel_name).write_bytes(b"candidate release fixture")
+    wheel_digest = hashlib.sha256(b"candidate release fixture").hexdigest()
+    lock = tmp_path / "consumer.lock"
+    lock.write_text("lu-machinery==0.1.23\n", encoding="utf-8")
+    host_python = Path(sys.executable)
+    cut = Cut(
+        work=tmp_path, dry_run=False, machinery_remote="", product_remote="", machinery_repo=REPO,
+        product_repo="example/product", host_python=host_python, primary=tmp_path,
+        alert=False, x_agent="claude/claude-cto", version="0.1.23", built="0.1.23",
+        git_identity=("-c", "user.name=Release Cut", "-c", "user.email=release-cut@example.invalid"),
+        publisher_python=host_python,
+    )
+    cut.uv = tmp_path / "uv"
+    monkeypatch.setenv("GH_TOKEN", "fixture-token")
+
+    def install_candidate(venv, consumer_lock, version):
+        assert (consumer_lock, version) == (lock, "0.1.23")
+        cut.run([host_python, "-I", "-m", "venv", "--without-pip", venv])
+        candidate = venv / "bin/python"
+        site = Path(cut.run([candidate, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"]).stdout.strip())
+        (site / "lu_machinery").mkdir()
+        (site / "lu_machinery/__init__.py").write_text("ROUTES = ['GET /before', 'GET /after']\n", encoding="utf-8")
+        metadata = site / "lu_machinery-0.1.23.dist-info"
+        metadata.mkdir()
+        (metadata / "METADATA").write_text("Name: lu-machinery\nVersion: 0.1.23\n", encoding="utf-8")
+        return candidate
+
+    run = cut.run
+    pushed: list[str] = []
+
+    def run_adoption(argv, **kwargs):
+        if argv[0] == cut.uv:
+            (product / "uv.lock").write_text(
+                'version = 1\n[[package]]\nname = "lu-machinery"\nversion = "0.1.23"\n'
+                f'source = {{ url = "{new_url}" }}\nwheels = [{{ url = "{new_url}", hash = "sha256:{wheel_digest}" }}]\n',
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["git", "-C", product] and argv[3] == "push":
+            pushed.append(cut.git(product, "rev-parse", "HEAD"))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return run(argv, **kwargs)
+
+    cut.run = run_adoption
+    cut._install_venv = install_candidate
+    cut.publisher = lambda *args: "https://github.com/example/product/pull/701\n"
+    cut.open_adopt_pr(lock, product)
+
+    assert cut.adopt_pr == 701
+    assert len(pushed) == 1
+    assert cut.git(product, "show", f"{pushed[0]}^:snapshot.json") == old_snapshot.strip()
+    assert json.loads(cut.git(product, "show", f"{pushed[0]}:snapshot.json")) == {"routes": ["GET /before", "GET /after"]}
+    assert cut.git(product, "diff-tree", "--no-commit-id", "--name-only", "-r", pushed[0]).splitlines() == [
+        "pyproject.toml", "snapshot.json", "uv.lock",
+    ]
+
+
 def test_annotated_tag_uses_the_checkout_identity_when_the_host_has_none(tmp_path, monkeypatch):
     """Defect class: the annotated tag ignores the checkout identity and fails after the wheel build."""
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")

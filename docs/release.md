@@ -365,9 +365,26 @@ does these steps in order:
    section (`SHA256SUMS` and the consumer lock) and a pending Acceptance
    section. The command downloads the published assets and compares them with
    `SHA256SUMS` and with the built files.
-7. **Draft adopt PR** in the product. It replaces `requirements-machinery.lock`
-   with the consumer lock and changes nothing else. Product CI runs on drafts,
-   and the merge-queue keeper refuses them.
+7. **Draft adopt PR** in the product. The cut changes the wheel pin in
+   `pyproject.toml` and `uv.lock`, or replaces `requirements-machinery.lock`
+   for a legacy consumer. Product CI runs on drafts. The merge-queue keeper
+   refuses drafts.
+
+   To include a generated JSON snapshot in the adoption commit, add this
+   table to the product's `pyproject.toml` and track both files in product main.
+
+   ```toml
+   [tool.lu-machinery.adoption-snapshot]
+   module = "checks.route_snapshot"
+   output = "checks/route_snapshot.json"
+   ```
+
+   The cut runs the module from the scratch product checkout with the verified
+   candidate wheel first and the product's dependencies after it. The module
+   prints one JSON object to stdout and leaves the checkout untouched. The cut
+   writes that stdout to the tracked output and stages it with the pin. A
+   failure stops the cut before it pushes an adoption commit. A dry run also
+   generates the snapshot in the scratch checkout.
 8. **Acceptance.** The review-contract canary runs alongside these checks:
    - **Node dependencies:** the install-and-seal block below, then admission
      of the sealed prefix.

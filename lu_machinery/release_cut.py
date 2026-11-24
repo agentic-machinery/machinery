@@ -81,6 +81,24 @@ _RELEASE_INVENTORY = ("from importlib.resources import files; "
                       "print(files('lu_machinery').joinpath('agent_deploy/release.v1.json').read_text())")
 _NODE_SEAL = f"from pathlib import Path; import sys; {_ACPX}seal_node_dependencies as s; print(s(cache=Path(sys.argv[1])))"
 _SITE_PATHS = "import sysconfig; print(sysconfig.get_path('purelib')); print(sysconfig.get_path('platlib'))"
+_ADOPTION_MODULE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", re.ASCII)
+_ADOPTION_OUTPUT = re.compile(r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.json")
+_RUN_ADOPTION_SNAPSHOT = textwrap.dedent("""\
+    import importlib.util
+    import os
+    import runpy
+    import sys
+
+    import lu_machinery
+
+    sys.path.insert(0, os.getcwd())
+    name = sys.argv[1]
+    path = os.path.join(os.getcwd(), *name.split(".")) + ".py"
+    spec = importlib.util.find_spec(name)
+    if spec is None or spec.origin != path:
+        raise SystemExit("ADOPTION_SNAPSHOT_MODULE: expected a module from the product checkout")
+    runpy.run_module(name, run_name="__main__", alter_sys=True)
+    """)
 
 
 class CutError(Exception):
@@ -971,6 +989,60 @@ class Cut:
                 raise CutError(f"published {path.name} differs from the built file")
         self.say(f"published pre-release {tag}; downloaded assets match SHA256SUMS")
 
+    def refresh_adopt_snapshot(self, product: Path) -> str | None:
+        """Refresh the optional product snapshot with the verified candidate wheel."""
+        manifest = product / "pyproject.toml"
+        if not manifest.exists():
+            return None
+        try:
+            manifest_data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (ValueError, RecursionError) as exc:
+            raise CutError("ADOPTION_SNAPSHOT_CONFIG: could not parse product pyproject.toml") from exc
+        tool = _manifest_table(manifest_data, "tool")
+        settings = _manifest_table(tool, "lu-machinery")
+        if "adoption-snapshot" not in settings:
+            return None
+        self.step = "adopt snapshot"
+        config = _manifest_table(settings, "adoption-snapshot")
+        module, output = config.get("module"), config.get("output")
+        if (set(config) != {"module", "output"}
+                or not isinstance(module, str) or _ADOPTION_MODULE.fullmatch(module) is None
+                or not isinstance(output, str) or _ADOPTION_OUTPUT.fullmatch(output) is None
+                or {".", "..", ".git"}.intersection(output.split("/"))):
+            raise CutError("ADOPTION_SNAPSHOT_CONFIG: expected a dotted Python module and relative .json output")
+        module_file = module.replace(".", "/") + ".py"
+        for relative in (module_file, output):
+            path = product / relative
+            path_error = f"ADOPTION_SNAPSHOT_PATH: expected a regular file in the product checkout: {relative}"
+            try:
+                if path.resolve(strict=True) != product.resolve(strict=True) / relative or not path.is_file():
+                    raise CutError(path_error)
+            except (OSError, RuntimeError) as exc:
+                raise CutError(path_error) from exc
+            try:
+                self.git(product, "ls-files", "--error-unmatch", "--", relative)
+            except CutError as exc:
+                raise CutError(f"ADOPTION_SNAPSHOT_PATH: file is not tracked: {relative}") from exc
+        if self.publisher_python is None:
+            raise CutError("ADOPTION_SNAPSHOT_WHEEL: the verified candidate environment is missing")
+        python = self._consumer_interpreter(self.publisher_python, product)
+        rendered = self.run(
+            [python, "-I", "-B", "-c", _RUN_ADOPTION_SNAPSHOT, module], cwd=product, timeout=120,
+            env=self.scratch_env(LU_PRODUCT_ROOT=str(product), LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=str(product),
+                                 LEARN_UKRAINIAN_PYTHON=str(python)),
+        ).stdout
+        if self.git(product, "status", "--porcelain", "--untracked-files=all"):
+            raise CutError("ADOPTION_SNAPSHOT_DIRTY: the snapshot module must write only to stdout")
+        try:
+            snapshot = json_depth.loads(rendered, max_depth=32)
+        except (ValueError, RecursionError) as exc:
+            raise CutError("ADOPTION_SNAPSHOT_JSON: the module must print one JSON object") from exc
+        if not isinstance(snapshot, dict):
+            raise CutError("ADOPTION_SNAPSHOT_JSON: the module must print one JSON object")
+        (product / output).write_text(rendered, encoding="utf-8")
+        self.say(f"measured adoption snapshot with lu-machinery {self.built}: {output}")
+        return output
+
     def update_adopt_inputs(self, consumer_lock: Path, product: Path) -> tuple[str, ...]:
         """Update the current product pin and return the exact paths the adopt PR will stage."""
         lock = product / "uv.lock"
@@ -998,13 +1070,19 @@ class Cut:
 
     def open_adopt_pr(self, consumer_lock: Path, product: Path) -> None:
         """Draft PR adopting the verified release into the product's active lock format."""
+        snapshot = self.refresh_adopt_snapshot(product)
         self.step = "adopt PR"
         branch = f"release/lu-machinery-{self.version}"
         self.git(product, "switch", "--quiet", "-c", branch)
         paths = self.update_adopt_inputs(consumer_lock, product)
-        self.git(product, "add", *paths)
+        verified = _ADOPT_VERIFIED
+        files = paths
+        if snapshot is not None:
+            files = (*paths, snapshot)
+            verified += ", candidate adoption snapshot"
+        self.git(product, "add", "--", *files)
         self.git(product, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
-                 f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: {self.x_agent}\n{_ADOPT_VERIFIED}")
+                 f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: {self.x_agent}\n{verified}")
         self.run(["git", "-C", product, "push", self.product_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "adopt-body.md"
         pin_summary = (
@@ -1012,6 +1090,8 @@ class Cut:
             if paths == ("pyproject.toml", "uv.lock") else
             "`requirements-machinery.lock` becomes the release's wheel-only consumer lock."
         )
+        if snapshot is not None:
+            pin_summary += f" The release cut measured `{snapshot}` from the candidate wheel."
         body.write_text(
             f"Adopts [lu-machinery {self.version}](https://github.com/{self.machinery_repo}/releases/tag/"
             f"v{self.version}). {pin_summary}\n\n"
@@ -1181,9 +1261,8 @@ class Cut:
         self.run([*deploy, "--check"], env=self.scratch_env())
         self.say("every module imports from the installed wheel; deployer apply and check pass on a scratch consumer")
 
-    def consumer_collection(self, python: Path, product: Path) -> str:
-        """Collect the product's tests with the candidate first and the product venv's packages after it (R5)."""
-        self.step = "consumer test collection"
+    def _consumer_interpreter(self, python: Path, product: Path) -> Path:
+        """Give product commands the verified candidate first and product-only dependencies after it."""
         # During a release cut, keep the verified publisher venv (work/accept) completely unmutated so
         # promotion and rollback always run a pure machinery-only environment; attach the consumer .pth
         # overlay to a disposable offline install under work/tmp instead.
@@ -1207,6 +1286,12 @@ class Cut:
         shown = self.run([python, "-c", _SHOW_LU], cwd=product, env=self.scratch_env()).stdout.split()
         if shown[0] != self.built or not Path(shown[1]).resolve().is_relative_to(Path(site).resolve()):
             raise CutError(f"overlay resolved lu-machinery {shown}, not the candidate")
+        return python
+
+    def consumer_collection(self, python: Path, product: Path) -> str:
+        """Collect the product's tests with the candidate first and the product venv's packages after it (R5)."""
+        self.step = "consumer test collection"
+        python = self._consumer_interpreter(python, product)
         # The product's project_interpreter() reads LEARN_UKRAINIAN_PYTHON; the candidate names itself rather
         # than inheriting the caller's value or none.
         result = self.run([python, "-m", "pytest", "--collect-only", "-q", "tests"], cwd=product, timeout=1800,
@@ -1499,7 +1584,9 @@ def execute(cut: Cut) -> int:
     product = cut.work / "product"
     ci = cut.ci
     pending = "Pre-release: acceptance is running. Adopt only after this release is no longer a pre-release.\n"
-    if not cut.dry_run:
+    if cut.dry_run:
+        cut.refresh_adopt_snapshot(product)
+    else:
         cut.publish(files, release_body(cut, section, files, consumer_lock, ci, pending))
         cut.open_adopt_pr(consumer_lock, product)
     canary: dict[str, subprocess.CompletedProcess[str] | BaseException] = {}
