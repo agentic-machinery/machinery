@@ -195,7 +195,12 @@ def test_snapshot_sources_restrict_components_to_main_and_preserve_integrity() -
     assert "-o Acquire::Retries=3" in setup
     assert "-o Acquire::Retries=1" not in setup
     assert "--error-on=any" in setup
-    assert 'echo "${digest}  $apt_dir/$deb" | sha256sum -c -' in setup
+    download = setup.split("if ! timeout ", 1)[1].split("; then", 1)[0]
+    assert download.startswith("--kill-after=1 29 ")
+    assert "--max-time 15" in download
+    assert "--retry 3" in download
+    checksum = 'echo "${digest}  $apt_dir/$deb" | sha256sum -c -'
+    assert setup.index(download) < setup.index(checksum) < setup.index('missing+=("$apt_dir/$deb")')
 
 
 def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() -> None:

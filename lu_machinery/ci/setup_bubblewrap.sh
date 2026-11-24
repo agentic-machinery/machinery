@@ -154,7 +154,9 @@ EOF
   if ! "$bwrap_ready"; then
     deb=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
     digest=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
-    if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 15 \
+    # Bound the whole download, including waits requested by Retry-After.
+    if ! timeout --kill-after=1 29 \
+      curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 15 --retry 3 \
       -o "$apt_dir/$deb" "${snapshot_url}/pool/main/b/bubblewrap/${deb}"; then
       echo "::error::Could not fetch ${deb} from Ubuntu snapshot ${snapshot}" >&2
       exit 1
