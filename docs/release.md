@@ -420,11 +420,11 @@ does these steps in order:
      with observed allowance. This is the reviewer resolver's rule: a fresh
      reading above the near-cap reserve, account b first among funded accounts.
      The reading must be the account's own fresh provider sample. A ledger
-     estimate, a missing or stale probe, or a row for another account is not
-     allowance. Claude considers only the subscription logins. When a route has no funded
+     estimate, a missing or stale probe, a row for another account, or a route
+     the resolver blocks (unhealthy, logged out, circuit open) is not allowance. Claude considers only the subscription logins. When a route has no funded
      account, or the budget is unreadable, the canary refuses with
-     `no-allowance` and lists each account's reading. The run plan prints the
-     chosen accounts. The installed gate
+     `no-allowance` and lists each account's reading. A dry run reads the same
+     budget, prints the chosen accounts and refuses the same way. The installed gate
      originally matched the keeper's runtime when canaries gated PR admission.
      At cut time, the candidate gate validates the models and catalog that this
      release installs together. A failing route or an incomplete run
