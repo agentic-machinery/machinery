@@ -481,3 +481,75 @@ def test_request_executor_failed_on_nonzero_empty(tmp_path: Path) -> None:
         done = ex.execute_capture(req.request_id, adapter="claude", stdout="", returncode=2)
         assert done.state == "failed"
         assert done.completion_state == CompletionState.FAILED.value
+
+
+def test_non_git_live_store_enforces_installed_release_guard_including_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: detached non-Git LU_STATE_ROOT bypassing or breaking the installed-release write guard."""
+    import sysconfig
+
+    from lu_machinery.fleet_comms import paths
+
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    venv = tmp_path / "opt-venv"
+    py = venv / "bin" / "python"
+    py.parent.mkdir(parents=True)
+    py.write_text("#!/bin/sh\n", encoding="utf-8")
+    py.chmod(0o755)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    site = Path(sysconfig.get_path("purelib", scheme="venv", vars={"base": str(venv), "platbase": str(venv)}))
+    installed_pkg = site / "lu_machinery" / "fleet_comms" / "artifacts.py"
+    installed_pkg.parent.mkdir(parents=True)
+    installed_pkg.write_text("# installed\n", encoding="utf-8")
+
+    monkeypatch.delenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.delenv("LU_PRIMARY_REPO_ROOT", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_PYTHON", raising=False)
+    monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv("LU_PYTHON", str(py))
+
+    live = state / paths.DEFAULT_ROOT_REL
+    live.mkdir(parents=True)
+    db = live / "comms.sqlite3"
+    db.write_bytes(b"")
+    alias_dir = tmp_path / "live-dir-alias"
+    alias_dir.symlink_to(live, target_is_directory=True)
+    alias_db_dir = tmp_path / "live-db-alias"
+    alias_db_dir.mkdir()
+    (alias_db_dir / "comms.sqlite3").symlink_to(db)
+    hardlink_dir = tmp_path / "live-db-hardlink"
+    hardlink_dir.mkdir()
+    (hardlink_dir / "comms.sqlite3").hardlink_to(db)
+
+    # Installed release package inside the configured venv is allowed.
+    for target in (db, alias_dir / "comms.sqlite3", alias_db_dir / "comms.sqlite3", hardlink_dir / "comms.sqlite3"):
+        paths.assert_store_write_allowed(target, package_file=str(installed_pkg))
+
+    # Source worktree code is refused for the live store and every alias.
+    for selection in ({}, {"root": live}, {"root": alias_dir}, {"root": alias_db_dir}, {"root": hardlink_dir}, {"repo_root": state}):
+        with pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release"):
+            ArtifactStore(**selection)
+
+    # Without any configured venv or primary, writes to the non-Git live store fail closed.
+    monkeypatch.delenv("LU_PYTHON")
+    with pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release"):
+        paths.assert_store_write_allowed(db, package_file=str(installed_pkg))
+
+    # For a primary Git checkout (today's layout), an external LEARN_UKRAINIAN_PYTHON venv
+    # (such as a test runner venv) must never authorize writes against primary's live store.
+    primary = tmp_path / "primary-checkout"
+    for part in ("objects", "refs"):
+        (primary / ".git" / part).mkdir(parents=True)
+    (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    primary_db = primary / paths.DEFAULT_ROOT_REL / "comms.sqlite3"
+    primary_db.parent.mkdir(parents=True)
+    primary_db.write_bytes(b"")
+    monkeypatch.delenv("LU_STATE_ROOT")
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", str(py))
+    with pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release"):
+        paths.assert_store_write_allowed(primary_db, package_file=str(installed_pkg))

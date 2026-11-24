@@ -742,3 +742,84 @@ def test_launcher_wake_survives_signal_between_check_and_wait(tmp_path: Path) ->
     assert result.returncode == 0, result.stderr
     assert events == ["stopped", "close", "successor"]
     assert elapsed < 5, f"Supervisory wake took {elapsed:.3f}s"
+
+
+def test_canonical_state_root_and_claim_accept_non_git_state_root_without_git(tmp_path: Path) -> None:
+    """Defect class: lib/session_supervisor.sh requiring .git on an explicit non-Git LU_STATE_ROOT."""
+    project, _capture = _build_fake_project(tmp_path)
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    assert not (state / ".git").exists()
+
+    env = _clean_environ()
+    env.pop("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", None)
+    env.pop("LU_PRIMARY_REPO_ROOT", None)
+    env.pop("LEARN_UKRAINIAN_STATE_ROOT", None)
+    env["LU_STATE_ROOT"] = str(state)
+    env["LU_PYTHON"] = str(project / ".venv" / "bin" / "python")
+
+    script = f"""
+set -euo pipefail
+source "{project}/lu_machinery/lib/session_supervisor.sh"
+printf 'STATE=%s\\n' "$(_canonical_state_root "{project}")"
+claim_session_supervisor_env "epic:9999" "test-agent" "test-harness" "test-task" "test-instance" "{project}" "test-launcher.sh" "hramatka"
+printf 'CAPSULE=%s\\n' "$SESSION_SUPERVISOR_CAPSULE_PATH"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+    lines = {k: v for k, v in (line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)}
+    assert Path(lines["STATE"]).resolve() == state.resolve()
+    capsule = Path(lines["CAPSULE"]).resolve()
+    assert capsule.is_file()
+    assert capsule.is_relative_to(state.resolve() / ".agent" / "session-capsules")
+
+    # Conflicting aliases, relative state root, and stray .git on state root still fail closed.
+    stray = tmp_path / "stray-state"
+    (stray / ".git").mkdir(parents=True)
+    for bad_env in (
+        {**env, "LEARN_UKRAINIAN_STATE_ROOT": str(project)},
+        {**env, "LU_STATE_ROOT": "relative/state"},
+        {**env, "LU_STATE_ROOT": str(stray)},
+    ):
+        refused = subprocess.run(
+            ["bash", "-c", f'source "{project}/lu_machinery/lib/session_supervisor.sh"; _canonical_state_root "{project}"'],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=bad_env,
+        )
+        assert refused.returncode == 1, refused.stdout + refused.stderr
+
+    # Non-Git state root with neither configured interpreter nor configured primary must
+    # fail closed rather than falling back to the caller's project_dir/.venv.
+    no_runtime_env = {k: v for k, v in env.items() if k not in {"LU_PYTHON", "LEARN_UKRAINIAN_PYTHON"}}
+    refused_claim = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env=no_runtime_env,
+    )
+    assert refused_claim.returncode == 1, refused_claim.stdout + refused_claim.stderr
+    assert "non-Git state root requires" in refused_claim.stderr
+
+    # With a configured primary (and no LU_PYTHON), the supervisor uses that primary's .venv.
+    primary_fallback_env = {**no_runtime_env, "LU_PRIMARY_REPO_ROOT": str(project)}
+    ok_primary = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env=primary_fallback_env,
+    )
+    assert ok_primary.returncode == 0, ok_primary.stderr + ok_primary.stdout

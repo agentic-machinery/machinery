@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from fastapi import APIRouter
 
 from lu_machinery.common import json_depth
+from lu_machinery.common.repo_root import configured_product_root, in_tree_source
 from lu_machinery.ops.product_entry import ConfiguredModuleError, load_configured_module
 
 from . import config
@@ -169,8 +170,25 @@ def product_module_name(product_root: Path) -> str:
 
 
 def load_product(context: MonitorContext, *, product_root: Path | None = None) -> ProductContribution:
-    """Import the configured product entry and return its contribution for ``context``."""
-    root = config.PRODUCT_ROOT if product_root is None else product_root
+    """Import the configured product entry and return its contribution for ``context``.
+
+    When ``product_root`` is omitted and no product is configured (``LU_PRODUCT_ROOT``
+    unset, no cached ``config.PRODUCT_ROOT``/``PROJECT_ROOT``, and not in-tree source),
+    returns :data:`EMPTY` so Monitor boots product-free. An invalid or incomplete
+    configured product still fails closed.
+    """
+    if product_root is None:
+        config_vars = vars(config)
+        if (
+            "PRODUCT_ROOT" not in config_vars
+            and "PROJECT_ROOT" not in config_vars
+            and configured_product_root() is None
+            and not in_tree_source()
+        ):
+            return EMPTY
+        root = config.PRODUCT_ROOT
+    else:
+        root = product_root
     name = product_module_name(root)
     try:
         entry = load_configured_module(name, product_root=root)
@@ -350,10 +368,11 @@ class _RegistryOnlyAtlas:
 
 @functools.cache
 def _registry_only_atlas() -> AtlasProvider | None:
-    path = config.PRODUCT_ROOT / ATLAS_REGISTRY_DATA
     try:
+        root = config.PRODUCT_ROOT
+        path = root / ATLAS_REGISTRY_DATA
         name = json_depth.loads(path.read_text(encoding="utf-8"), max_depth=_JSON_MAX_DEPTH)["module"]
-        jobs = load_configured_module(name, product_root=config.PRODUCT_ROOT)
+        jobs = load_configured_module(name, product_root=root)
     except (OSError, ValueError, KeyError, TypeError, ImportError):
         return None
     return _RegistryOnlyAtlas(jobs)

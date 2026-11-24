@@ -342,3 +342,41 @@ def test_gemini_opens_as_agy_on_plane(tmp_path: Path) -> None:
         assert req is not None
         assert req.requested_recipient == "gemini"
         assert req.resolved_recipient == "agy"
+
+
+def test_default_plane_root_accepts_explicit_non_git_state_root_and_refuses_unconfigured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: explicit non-Git LU_STATE_ROOT refused with PlaneRootAnchorError, or #6863 weakened."""
+    from lu_machinery.fleet_comms.paths import RETIRED_LOCAL_MARKER, local_plane_is_retired
+
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    primary = tmp_path / "primary"
+    for part in ("objects", "refs"):
+        (primary / ".git" / part).mkdir(parents=True)
+    (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    stray = tmp_path / "unconfigured-non-git"
+    stray.mkdir()
+
+    monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
+    monkeypatch.delenv("FLEET_COMMS_ALLOW_LOCAL_SHADOW", raising=False)
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.setenv(PRIMARY_ROOT_ENV, str(primary))
+
+    expected = (state / "batch_state" / "fleet-comms" / "v1").resolve()
+    assert default_plane_root() == expected
+    assert default_plane_root(repo_root=state) == expected
+    assert default_plane_root(repo_root=primary) == expected
+
+    # Unconfigured non-Git directory still fails closed (#6863).
+    with pytest.raises(PlaneRootAnchorError):
+        default_plane_root(repo_root=stray)
+
+    # Retired-local marker is honored on the non-Git state root too.
+    expected.mkdir(parents=True)
+    (expected / RETIRED_LOCAL_MARKER).write_text("retired\n", encoding="utf-8")
+    assert local_plane_is_retired(repo_root=state) is True
+    with pytest.raises(PlaneRootAnchorError, match="retired"):
+        default_plane_root(repo_root=state)

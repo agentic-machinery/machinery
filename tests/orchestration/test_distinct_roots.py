@@ -602,3 +602,79 @@ def test_machinery_path_refuses_absolute_traversal_and_escaping_symlink_inputs(m
     ):
         with pytest.raises(ValueError):
             rr.machinery_path(value)
+
+
+def test_non_git_state_root_uses_lu_repos_root_for_siblings_and_worktree_locks(
+    clean_env, monkeypatch, tmp_path: Path
+) -> None:
+    """Defect class: detached non-Git state root breaking sibling resolution or worktree lock paths."""
+    from lu_machinery.dispatcher import git as dispatch_git
+    from lu_machinery.orchestration import fleet_repos, merge_queue_keeper
+
+    state = tmp_path / "var-lib-machinery"
+    state.mkdir()
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    machinery_checkout = repos / "machinery"
+    public_checkout = repos / "learn-ukrainian"
+    custom_primary = repos / "custom-primary"
+    for checkout in (machinery_checkout, public_checkout, custom_primary):
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=30)
+
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(state))
+    monkeypatch.setenv(rr.REPOS_ROOT_ENV, str(repos))
+
+    assert dispatch_git.resolve_repo("machinery")[0] == machinery_checkout.resolve()
+    assert fleet_repos.resolve_fleet_repo("machinery", primary_root=rr.state_root())[1] == machinery_checkout.resolve()
+    assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == public_checkout.resolve()
+    assert worktree_claims.control_plane_root(machinery_checkout) == state.resolve()
+    assert worktree_claims.control_plane_root(public_checkout) == state.resolve()
+    expected_locks = state.resolve() / "batch_state" / "locks" / worktree_claims.LOCK_DIR_NAME
+    assert worktree_claims.repository_lock_dir(worktree_claims.control_plane_root(machinery_checkout)) == expected_locks
+    assert worktree_claims.repository_lock_dir(rr.state_root()) == expected_locks
+
+    # Non-default keeper repos get distinct per-repo state/lock files under non-Git LU_STATE_ROOT,
+    # and keep <repo-root>/batch_state when LU_STATE_ROOT is a primary Git checkout.
+    default_state, default_lock = merge_queue_keeper.default_keeper_paths(public_checkout)
+    mach_state, mach_lock = merge_queue_keeper.default_keeper_paths(machinery_checkout, "learn-ukrainian/machinery")
+    assert default_state == state.resolve() / "batch_state/merge_queue_keeper.json"
+    assert mach_state == state.resolve() / "batch_state/merge_queue_keeper/learn-ukrainian__machinery.json"
+    assert mach_lock == state.resolve() / "batch_state/locks/merge_queue_keeper.learn-ukrainian__machinery.lock"
+    assert default_state != mach_state and default_lock != mach_lock
+
+    # With LU_PRIMARY_REPO_ROOT set (custom basename) and LU_REPOS_ROOT unset, every resolver
+    # still converges on primary.parent for siblings and primary itself for default repo.
+    monkeypatch.delenv(rr.REPOS_ROOT_ENV)
+    monkeypatch.setenv(rr.LU_PRIMARY_ROOT_ENV, str(custom_primary))
+    assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == custom_primary.resolve()
+    assert dispatch_git.resolve_repo("machinery")[0] == machinery_checkout.resolve()
+    assert fleet_repos.resolve_fleet_repo("machinery", primary_root=rr.state_root())[1] == machinery_checkout.resolve()
+    assert worktree_claims.control_plane_root(custom_primary) == state.resolve()
+    assert worktree_claims.control_plane_root(machinery_checkout) == state.resolve()
+    with monkeypatch.context() as mp:
+        mp.setenv(rr.PRODUCT_ROOT_ENV, str(custom_primary))
+        assert dispatch_git.resolve_repo("public")[0] == custom_primary.resolve()
+        assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == custom_primary.resolve()
+
+    # With LU_REPOS_ROOT also set, default repo still honors configured LU_PRIMARY_REPO_ROOT.
+    monkeypatch.setenv(rr.REPOS_ROOT_ENV, str(repos))
+    assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == custom_primary.resolve()
+
+    # With non-Git LU_STATE_ROOT and neither LU_REPOS_ROOT nor LU_PRIMARY_REPO_ROOT, sibling
+    # resolution fails closed instead of falling back to state_root().parent.
+    monkeypatch.delenv(rr.REPOS_ROOT_ENV)
+    monkeypatch.delenv(rr.LU_PRIMARY_ROOT_ENV)
+    with pytest.raises(fleet_repos.FleetRepoError):
+        fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())
+    with pytest.raises(fleet_repos.FleetRepoError):
+        fleet_repos.resolve_fleet_repo("machinery", primary_root=rr.state_root())
+    with pytest.raises(worktree_claims.ControlPlaneError):
+        worktree_claims.control_plane_root(machinery_checkout)
+
+    # In today's layout with explicit LU_STATE_ROOT == primary, non-default keeper keeps <repo-root>.
+    monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(public_checkout))
+    today_mach_state, today_mach_lock = merge_queue_keeper.default_keeper_paths(
+        machinery_checkout, "learn-ukrainian/machinery"
+    )
+    assert today_mach_state == machinery_checkout.resolve() / "batch_state/merge_queue_keeper.json"
+    assert today_mach_lock == machinery_checkout.resolve() / "batch_state/locks/merge_queue_keeper.lock"

@@ -51,7 +51,7 @@ Related:
         type=Path,
         default=None,
         help=(
-            "SQLite database path. Default: canonical primary-checkout "
+            "SQLite database path. Default: canonical durable state root "
             ".agent/session-streams/v1/session-streams.sqlite3."
         ),
     )

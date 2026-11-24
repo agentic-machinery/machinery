@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from lu_machinery.common.repo_root import state_root
+from lu_machinery.common.repo_root import (
+    MachineryConfigError,
+    is_configured_state_root,
+    state_root,
+    state_root_for_checkout,
+)
 from lu_machinery.control_plane.storage import StoreId, assert_component_supported
 from lu_machinery.control_plane.storage import connect as cp_connect
 
@@ -44,9 +49,15 @@ class Migration:
 
 
 def canonical_state_root(repo_root: Path | None = None) -> Path:
-    """Resolve the primary checkout shared by every linked worktree."""
+    """Resolve the canonical durable state root for session streams."""
     if repo_root is None:
-        return state_root()
+        return state_root().resolve()
+    try:
+        configured = is_configured_state_root(repo_root)
+    except (MachineryConfigError, OSError, RuntimeError) as exc:
+        raise SessionStreamDatabaseError(f"cannot resolve canonical state root: {exc}") from exc
+    if configured is not None:
+        return configured
     active_root = repo_root.resolve()
     result = subprocess.run(
         ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -65,7 +76,11 @@ def canonical_state_root(repo_root: Path | None = None) -> Path:
         raise SessionStreamDatabaseError(
             f"cannot derive primary checkout from Git common directory: {common_dir_text!r}"
         )
-    return common_dir.parent.resolve()
+    checkout_primary = common_dir.parent.resolve()
+    try:
+        return state_root_for_checkout(checkout_primary)
+    except (MachineryConfigError, OSError, RuntimeError) as exc:
+        raise SessionStreamDatabaseError(f"cannot resolve canonical state root: {exc}") from exc
 
 
 def default_database_path(repo_root: Path | None = None) -> Path:

@@ -142,6 +142,8 @@ LU_PRIMARY_ROOT_ENV = "LU_PRIMARY_REPO_ROOT"
 LU_GITHUB_SLUG_ENV = "LU_GITHUB_SLUG"
 LU_STATE_ROOT_ENV = "LU_STATE_ROOT"
 LU_INTERPRETER_ENV = "LU_PYTHON"
+REPOS_ROOT_ENV = "LU_REPOS_ROOT"
+PROFILE_PATH_ENV = "LU_PROFILE_PATH"
 PRIMARY_ROOT_ENV = "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
 GITHUB_SLUG_ENV = "LEARN_UKRAINIAN_GITHUB_SLUG"
 STATE_ROOT_ENV = "LEARN_UKRAINIAN_STATE_ROOT"
@@ -158,6 +160,8 @@ MACHINERY_ENV_VARS = (
     GITHUB_SLUG_ENV,
     STATE_ROOT_ENV,
     INTERPRETER_ENV,
+    REPOS_ROOT_ENV,
+    PROFILE_PATH_ENV,
     *ENV_ALIASES,
 )
 DEFAULT_GITHUB_SLUG = "learn-ukrainian/learn-ukrainian.github.io"
@@ -247,6 +251,27 @@ def _configured_path(primary: str, env: Mapping[str, str] | None) -> tuple[str, 
     if "\x00" in value or not os.path.isabs(value):
         raise MachineryConfigError(f"{name} must be an absolute path, got {value!r}")
     return name, Path(value)
+
+
+def _configured_single_path(name: str, env: Mapping[str, str] | None) -> tuple[str, Path] | None:
+    """``(name, path)`` of a single-name absolute path setting; refuse relative or NUL-bearing values."""
+    value = _env(env).get(name, "")
+    if not value:
+        return None
+    if "\x00" in value or not os.path.isabs(value):
+        raise MachineryConfigError(f"{name} must be an absolute path, got {value!r}")
+    return name, Path(value)
+
+
+def _validate_existing_directory(name: str, path: Path) -> Path:
+    """Verify ``path`` is resolvable (no symlink loop) and an existing directory."""
+    try:
+        resolve_path(path)
+    except (OSError, RuntimeError) as exc:
+        raise MachineryConfigError(f"{name} ({path}) cannot be resolved: {exc}") from None
+    if not os.path.isdir(path):
+        raise MachineryConfigError(f"{name} ({path}) must be an existing directory")
+    return path
 
 
 def configured_primary_root(env: Mapping[str, str] | None = None) -> Path | None:
@@ -378,10 +403,12 @@ def _profile_reader():
 
 
 def _may_hold_profile(env: Mapping[str, str] | None) -> bool:
-    """False only when the plane owner provably has no profile: no owner is configured, or it has no ``.lu-machinery``.
+    """False only when no host profile is configured and the plane owner provably has no profile.
 
     Anything else, an unreadable owner included, goes to the profile reader, which decides or refuses.
     """
+    if _env(env).get(PROFILE_PATH_ENV, ""):
+        return True
     try:
         owner = state_root(env=env)
     except StateRootError:
@@ -421,28 +448,127 @@ def github_slug(env: Mapping[str, str] | None = None) -> str:
     return configured_github_slug(env) or DEFAULT_GITHUB_SLUG
 
 
-def state_root(start: Path | None = None, env: Mapping[str, str] | None = None) -> Path:
-    """The checkout whose ``batch_state/`` holds dispatch state: the primary checkout.
+def configured_state_root(env: Mapping[str, str] | None = None) -> Path | None:
+    """The explicitly configured durable state root (``LU_STATE_ROOT`` or its alias), else ``None``.
 
-    A configured state root must be that same directory (compared after ``realpath``);
-    any other value would point state at a new store, which only the operator's state
-    cutover may do, so it is refused. The installed package anchors only on a configured
-    ``LU_PRIMARY_REPO_ROOT`` or its alias (see :func:`primary_root`): a configured state
-    root alone does not stand in for it.
+    Accepts either a dedicated non-Git existing directory (for example ``/var/lib/machinery``)
+    or a real primary Git checkout. Refuses relative paths, alias conflicts, missing or
+    non-directory paths, symlink loops, linked worktrees, and stray/broken ``.git`` entries.
     """
-    # The state setting is validated first (alias conflict, relative path), so a missing primary
-    # anchor can never hide an invalid one.
     setting = _configured_path(LU_STATE_ROOT_ENV, env)
-    primary = primary_root(start, env)
     if setting is None:
-        return primary
+        return None
     name, configured = setting
-    if _realpath(configured) != _realpath(primary):
+    _validate_existing_directory(name, configured)
+    if os.path.lexists(configured / ".git") and not _is_primary_git_layout(configured, env):
         raise MachineryConfigError(
-            f"{name} ({configured}) must be the primary checkout ({primary}); "
-            "moving dispatch state to another store is the operator's state cutover"
+            f"{name} must name a dedicated non-Git directory or a primary checkout, "
+            f"not a linked worktree or a stray .git: {configured}/.git is not a real Git directory of its own"
         )
     return configured
+
+
+def state_root(start: Path | None = None, env: Mapping[str, str] | None = None) -> Path:
+    """The durable state root holding ``batch_state/`` and ``.agent/``.
+
+    When ``LU_STATE_ROOT`` (or its alias ``LEARN_UKRAINIAN_STATE_ROOT``) is set, it names the
+    durable state root directly—either a dedicated non-Git directory or a primary checkout.
+    Any configured ``LU_PRIMARY_REPO_ROOT`` is still validated so an invalid primary setting
+    never slips past. When ``LU_STATE_ROOT`` is unset, today's layout stands: the primary
+    checkout (:func:`primary_root`).
+    """
+    # Validate state setting first (alias conflict, relative path, non-dir, broken .git),
+    # then validate any configured primary checkout so neither invalid root is hidden.
+    configured = configured_state_root(env)
+    primary = configured_primary_root(env)
+    if configured is not None:
+        return configured
+    if primary is not None:
+        return primary
+    _require_in_tree_default(
+        StateRootError,
+        "shared-state anchor",
+        f"set {LU_STATE_ROOT_ENV} or {LU_PRIMARY_ROOT_ENV} (or its alias {PRIMARY_ROOT_ENV}) "
+        "to the durable state directory or primary checkout that holds batch_state/",
+    )
+    return main_checkout_root(RUNTIME_ROOT if start is None else start)
+
+
+def configured_repos_root(env: Mapping[str, str] | None = None) -> Path | None:
+    """The explicitly configured repository checkouts root (``LU_REPOS_ROOT``), else ``None``.
+
+    Must name an existing non-Git directory holding sibling repository checkouts.
+    """
+    setting = _configured_single_path(REPOS_ROOT_ENV, env)
+    if setting is None:
+        return None
+    name, configured = setting
+    _validate_existing_directory(name, configured)
+    if os.path.lexists(configured / ".git"):
+        raise MachineryConfigError(
+            f"{name} ({configured}) must name the parent directory holding repository checkouts, "
+            "not a Git checkout itself"
+        )
+    return configured
+
+
+def repos_root(start: Path | None = None, env: Mapping[str, str] | None = None) -> Path:
+    """Directory holding fleet repository checkouts: ``LU_REPOS_ROOT``, else ``primary_root().parent``."""
+    configured = configured_repos_root(env)
+    if configured is not None:
+        return configured
+    try:
+        return primary_root(start, env).parent
+    except StateRootError as exc:
+        raise StateRootError(
+            f"no repository checkouts root is configured: set {REPOS_ROOT_ENV} "
+            f"(or {LU_PRIMARY_ROOT_ENV} / {PRIMARY_ROOT_ENV}): {exc}"
+        ) from None
+
+
+def configured_product_root(env: Mapping[str, str] | None = None) -> Path | None:
+    """Validated ``LU_PRODUCT_ROOT`` when set, else ``None`` (never raises when unset)."""
+    if not _env(env).get(PRODUCT_ROOT_ENV, ""):
+        return None
+    return product_root(env=env)
+
+
+def is_configured_state_root(path: Path, env: Mapping[str, str] | None = None) -> Path | None:
+    """Resolved configured state root when ``path`` names it, else ``None``."""
+    configured = configured_state_root(env)
+    if configured is None:
+        return None
+    resolved_configured = resolve_path(configured)
+    if resolve_path(path) == resolved_configured:
+        return resolved_configured
+    return None
+
+
+def state_root_for_checkout(checkout_primary: Path, env: Mapping[str, str] | None = None) -> Path:
+    """Converge a fleet checkout's primary root onto the configured durable ``state_root``.
+
+    When ``LU_STATE_ROOT`` is configured separately from repository checkouts, any checkout
+    belonging to this control plane (the configured primary, configured product, or a direct
+    child of ``LU_REPOS_ROOT``) resolves to that single state root. Isolated checkouts
+    outside the configured plane keep ``checkout_primary`` unchanged.
+    """
+    configured = configured_state_root(env)
+    if configured is None:
+        return checkout_primary
+    resolved_state = resolve_path(configured)
+    resolved_checkout = resolve_path(checkout_primary)
+    if resolved_checkout == resolved_state:
+        return resolved_state
+    primary = configured_primary_root(env)
+    if primary is not None and resolve_path(primary) == resolved_checkout:
+        return resolved_state
+    product = configured_product_root(env)
+    if product is not None and resolve_path(main_checkout_root(product)) == resolved_checkout:
+        return resolved_state
+    repos = configured_repos_root(env)
+    if repos is not None and resolved_checkout.parent == resolve_path(repos):
+        return resolved_state
+    return checkout_primary
 
 
 def rules_dir() -> Path:
@@ -458,14 +584,15 @@ def configured_interpreter(env: Mapping[str, str] | None = None) -> Path | None:
 
 @dataclass(frozen=True)
 class MachineryRoots:
-    """The five distinct roots and the GitHub slug, as one resolved view."""
+    """The distinct roots and the GitHub slug, as one resolved view."""
 
     runtime: Path
-    primary: Path
+    primary: Path | None
     github_slug: str
     state: Path
     rules_dir: Path
     interpreter: Path
+    repos: Path | None = None
 
 
 def machinery_roots(env: Mapping[str, str] | None = None) -> MachineryRoots:
@@ -475,13 +602,21 @@ def machinery_roots(env: Mapping[str, str] | None = None) -> MachineryRoots:
     state anchor, :class:`StateRootError` being the missing case, and ``FileNotFoundError``
     when no interpreter can be resolved.
     """
+    state = state_root(env=env)
+    primary = configured_primary_root(env)
+    if primary is None and in_tree_source():
+        primary = primary_root(env=env)
+    repos = configured_repos_root(env)
+    if repos is None and primary is not None:
+        repos = primary.parent
     return MachineryRoots(
         runtime=RUNTIME_ROOT,
-        primary=primary_root(env=env),
+        primary=primary,
         github_slug=github_slug(env),
-        state=state_root(env=env),
+        state=state,
         rules_dir=rules_dir(),
         interpreter=project_interpreter(env=env),
+        repos=repos,
     )
 
 

@@ -60,6 +60,7 @@ from .safe_open import UnsafeEntryError, safe_open_below
 PROFILE_DIR = repo_root.CONSUMER_PROFILE_DIR
 PROFILE_NAME = "profile.v1.json"
 PROFILE_REL = f"{PROFILE_DIR}/{PROFILE_NAME}"
+PROFILE_PATH_ENV = repo_root.PROFILE_PATH_ENV
 PROFILE_SCHEMA = "lu-machinery.profile"
 PROFILE_VERSION = 1
 MAX_PROFILE_BYTES = 64 * 1024
@@ -99,13 +100,36 @@ class Profile:
     config: Mapping[str, str]
 
 
-def load_profile(*, env: Mapping[str, str] | None = None) -> Profile | None:
-    """The plane owner's validated profile, or ``None`` when it has none.
+def _configured_profile_path(env: Mapping[str, str] | None) -> Path | None:
+    """Validated explicit host profile path from ``LU_PROFILE_PATH``, else ``None``."""
+    raw = (os.environ if env is None else env).get(PROFILE_PATH_ENV, "")
+    if not raw:
+        return None
+    if (
+        "\x00" in raw
+        or "\\" in raw
+        or raw.endswith("/")
+        or any(unicodedata.category(c).startswith("C") or c in "\u2028\u2029" for c in raw)
+        or not os.path.isabs(raw)
+    ):
+        raise ProfileError(f"{PROFILE_PATH_ENV} must be a clean absolute file path, got {raw!r}")
+    path = Path(raw)
+    if ".." in path.parts or not path.name or path.parent == path:
+        raise ProfileError(f"{PROFILE_PATH_ENV} must name a profile file without parent traversal, got {raw!r}")
+    return path
 
-    ``None`` too when no plane owner is configured (the installed package without
-    ``LU_PRIMARY_REPO_ROOT``), which is the behaviour before profiles existed. Any other unusable
-    plane owner setting, and any present but invalid profile, raises.
+
+def load_profile(*, env: Mapping[str, str] | None = None) -> Profile | None:
+    """The configured host profile (``LU_PROFILE_PATH``) or the plane owner's validated profile.
+
+    When ``LU_PROFILE_PATH`` is set, that file is the sole candidate and a missing or invalid
+    file fails closed (:class:`ProfileError`). Otherwise reads
+    ``<state_root>/.lu-machinery/profile.v1.json``, returning ``None`` when absent or when no
+    plane owner is configured.
     """
+    explicit = _configured_profile_path(env)
+    if explicit is not None:
+        return _load_explicit(explicit, env)
     try:
         owner = repo_root.state_root(env=env)
     except repo_root.StateRootError:
@@ -114,9 +138,10 @@ def load_profile(*, env: Mapping[str, str] | None = None) -> Profile | None:
 
 
 def config_path(name: str, *, env: Mapping[str, str] | None = None) -> Path:
-    """The consumer config file ``name`` as the plane owner's profile names it.
+    """The consumer config file ``name`` as the active profile names it.
 
-    The returned path is below the plane owner root and was, when checked, a regular file owned by
+    The returned path is below the profile's ``owner_root`` (``LU_PROFILE_PATH.parent`` for a
+    host profile, else ``state_root()``) and was, when checked, a regular file owned by
     the current user reached without a symlink. Raises :class:`ProfileError` naming ``name`` when it
     is not a consumer config name, no plane owner or profile exists, the profile has no entry for
     it, or the entry is missing, a symlink or not a regular file.
@@ -125,12 +150,18 @@ def config_path(name: str, *, env: Mapping[str, str] | None = None) -> Path:
         raise ProfileError(
             f"{name!r} is not a consumer config name; machinery's own configuration is read through machinery_path"
         )
-    try:
-        owner = repo_root.state_root(env=env)
-    except repo_root.StateRootError as exc:
-        raise ProfileError(f"consumer config {name!r} needs a consumer profile, and no plane owner is configured: {exc}") from None
-    profile = _load(owner, env)
-    where = owner / PROFILE_REL
+    explicit = _configured_profile_path(env)
+    if explicit is not None:
+        profile: Profile | None = _load_explicit(explicit, env)
+        owner = explicit.parent
+        where = explicit
+    else:
+        try:
+            owner = repo_root.state_root(env=env)
+        except repo_root.StateRootError as exc:
+            raise ProfileError(f"consumer config {name!r} needs a consumer profile, and no plane owner is configured: {exc}") from None
+        profile = _load(owner, env)
+        where = owner / PROFILE_REL
     if profile is None:
         raise ProfileError(f"consumer config {name!r} needs a consumer profile, and the plane owner has none at {where}")
     relative = profile.config.get(name)
@@ -140,20 +171,54 @@ def config_path(name: str, *, env: Mapping[str, str] | None = None) -> Path:
     return owner.joinpath(*relative.split("/"))
 
 
+def _check_slug_agreement(profile: Profile, env: Mapping[str, str] | None) -> Profile:
+    configured = repo_root.env_github_slug(env)
+    if configured is not None and configured != profile.github_slug:
+        raise ProfileError(
+            f"the consumer profile {profile.path} names GitHub slug {profile.github_slug!r}, but "
+            f"{repo_root.LU_GITHUB_SLUG_ENV} (or its alias {repo_root.GITHUB_SLUG_ENV}) names {configured!r}; "
+            "the profile is the one authority: unset the variable or make it agree"
+        )
+    return profile
+
+
 def _load(owner: Path, env: Mapping[str, str] | None) -> Profile | None:
     path = owner / PROFILE_REL
     blob = _read(owner, path)
     if blob is None:
         return None
-    profile = _parse(blob, path, owner)
-    configured = repo_root.env_github_slug(env)
-    if configured is not None and configured != profile.github_slug:
-        raise ProfileError(
-            f"the consumer profile {path} names GitHub slug {profile.github_slug!r}, but "
-            f"{repo_root.LU_GITHUB_SLUG_ENV} (or its alias {repo_root.GITHUB_SLUG_ENV}) names {configured!r}; "
-            "the profile is the one authority: unset the variable or make it agree"
-        )
-    return profile
+    return _check_slug_agreement(_parse(blob, path, owner), env)
+
+
+def _load_explicit(path: Path, env: Mapping[str, str] | None) -> Profile:
+    owner = path.parent
+    blob = _read_explicit(owner, path)
+    return _check_slug_agreement(_parse(blob, path, owner), env)
+
+
+def _read_explicit(owner: Path, path: Path) -> bytes:
+    """Read an explicitly configured host profile file; missing or unsafe fails closed."""
+    owner_fd = _open_owner(owner)
+    try:
+        try:
+            fd = safe_open_below(owner_fd, path.name, os.O_RDONLY)
+        except FileNotFoundError:
+            raise ProfileError(f"the configured consumer profile {path} does not exist") from None
+        except UnsafeEntryError:
+            raise ProfileError(
+                f"the consumer profile {path} is a symlink, not a regular file, or not owned by the current user"
+            ) from None
+        except OSError as exc:
+            raise ProfileError(f"the consumer profile {path} cannot be read: {exc.strerror}") from None
+        with os.fdopen(fd, "rb") as handle:
+            if os.fstat(handle.fileno()).st_size > MAX_PROFILE_BYTES:
+                raise ProfileError(f"the consumer profile {path} is larger than {MAX_PROFILE_BYTES} bytes")
+            blob = handle.read(MAX_PROFILE_BYTES + 1)
+        if len(blob) > MAX_PROFILE_BYTES:
+            raise ProfileError(f"the consumer profile {path} is larger than {MAX_PROFILE_BYTES} bytes")
+        return blob
+    finally:
+        os.close(owner_fd)
 
 
 def _open_directory(name: str, dir_fd: int, what: str) -> int | None:
