@@ -521,6 +521,9 @@ def _charges_round(run: ReviewRun) -> bool:
         no_saved_result = "result_sha256" in run.record and run.record["result_sha256"] is None
         never_started = "provider_pgid" in run.record and _provider_never_ran(run.record)
         return status == "done" or not (no_saved_result or never_started)
+    if status == "done":
+        # A completed review can contain findings even when its verdict cannot be parsed.
+        return bool(run.reply.strip())
     try:
         return bool(recognized_verdicts(run.reply))
     except (ValueError, RecursionError):

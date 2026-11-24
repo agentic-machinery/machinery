@@ -409,19 +409,20 @@ def test_no_verdict_leaves_room_at_the_next_head(crash_budget, outcome):
 
 
 @pytest.mark.parametrize(
-    "reply", ["VERDICT: APPROVE", "VERDICT: REQUEST_CHANGES", "VERDICT: BLOCKED", blocked_reply()],
-    ids=["approve", "request-changes", "blocked", "structured-blocked"],
+    "reply", ["VERDICT: APPROVE", "VERDICT: REQUEST_CHANGES", "VERDICT: BLOCKED", blocked_reply(),
+              "The implementation admits a fourth review head."],
+    ids=["approve", "request-changes", "blocked", "structured-blocked", "completed-without-readable-verdict"],
 )
 def test_unpublished_verdict_exhausts_the_budget(crash_budget, reply):
-    """Defect class: dropping an unpublished verdict lets a fourth head into a three-round budget."""
+    """Defect class: dropping an unpublished verdict or unreadable completed review admits a fourth head."""
     crash_budget.attempt(3, H3, reply=reply, status="done", returncode=0,
                          provider_terminal_failure=False, provider_terminal_status=None)
-    next_run = crash_budget.attempt(4, NEXT, reply="VERDICT: APPROVE", status="done", returncode=0,
-                                    provider_terminal_failure=False, provider_terminal_status=None)
-
     for check in (crash_budget.check, crash_budget.admit):
         with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
-            check("5" * 40)
+            check(NEXT)
+
+    next_run = crash_budget.attempt(4, NEXT, reply="VERDICT: APPROVE", status="done", returncode=0,
+                                    provider_terminal_failure=False, provider_terminal_status=None)
     with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
         crash_budget.record(NEXT, next_run)
 
