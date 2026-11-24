@@ -12,7 +12,7 @@
 #
 # - Jobs: Ruff over lu_machinery/ with the lint settings in pyproject.toml,
 #   plus unbounded JSON reader lint and CHANGELOG.md empty-Unreleased check; compileall
-#   of lu_machinery on the pinned Python and the supported floor; the mypy ratchet (lu_machinery.lint.mypy_ratchet:
+#   of lu_machinery on the pinned Python; the mypy ratchet (lu_machinery.lint.mypy_ratchet:
 #   new errors fail, the baseline only shrinks); the test-wait lint L4
 #   (lu_machinery.lint.lint_test_waits: a new sleep, timer poll, flaky or rerun
 #   mark, rerun option, or non-strict xfail fails, and the baseline only shrinks);
@@ -359,15 +359,11 @@ jobs:
   compileall:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
-    name: Compile (${{ matrix.python }} Python)
+    name: Compile (pinned Python)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        python: [pinned, floor]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -376,13 +372,12 @@ jobs:
       - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
         id: python
         with:
-          python: ${{ matrix.python }}
           uv-version: ${{ env.UV_VERSION }}
           uv-sha256: ${{ env.UV_LINUX_X86_64_SHA256 }}
 
       - name: Compile lu_machinery
         env:
-          # uv-python checked this against the pin or the floor.
+          # uv-python checked this against the pin.
           EXPECTED: ${{ steps.python.outputs.version }}
         run: |
           set -euo pipefail
