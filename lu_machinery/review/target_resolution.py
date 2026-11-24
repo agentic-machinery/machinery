@@ -29,6 +29,7 @@ from lu_machinery.orchestration.fleet_repos import (
     MissingFleetCheckout,
     canonical_repo_key,
     load_fleet_repos,
+    resolve_active_fleet_repo,
     resolve_fleet_repo,
 )
 
@@ -152,6 +153,8 @@ def resolve_review_repository(
 ) -> Path:
     """Select the catalog checkout, keeping a root whose origin already matches.
 
+    An origin matches only at the row's active slug: a transferred repository's inactive slug is
+    another origin, and a dual-slug row without a trusted selector refuses.
     A linked worktree of the catalog repository is that repository: ``HEAD``
     and ``--mode local`` stay there. A missing, unparsable, or different
     origin is not that checkout. Symbolic refs and local mode are refused;
@@ -167,12 +170,15 @@ def resolve_review_repository(
         raise repository_target_error(repo_key, exc) from exc
     if not _directory_root(repo_root):
         raise repository_target_error(canonical, OSError(REVIEW_ROOT_UNAVAILABLE)) from None
-    fleet_repo = catalog[canonical]
+    try:
+        active = resolve_active_fleet_repo(canonical, repos=catalog).active_github
+    except FleetRepoError as exc:
+        raise repository_target_error(canonical, exc) from exc
     try:
         origin = _origin_github_repo(repo_root)
     except OSError as exc:
         raise repository_target_error(canonical, exc) from None
-    if origin is not None and origin.casefold() == fleet_repo.github.casefold():
+    if origin is not None and origin.casefold() == active.casefold():
         return repo_root
     refs = _review_refs(mode, commit=commit, branch=branch, base=base)
     if mode == "local" or any(_is_symbolic_review_ref(ref) for ref in refs):
@@ -185,9 +191,9 @@ def resolve_review_repository(
         catalog_origin = _origin_github_repo(checkout)
     except OSError as exc:
         raise repository_target_error(canonical, exc) from None
-    if catalog_origin is None or catalog_origin.casefold() != resolved.github.casefold():
+    if catalog_origin is None or catalog_origin.casefold() != active.casefold():
         raise TargetResolutionError(
-            f"--repo {resolved.key} checkout origin does not match catalog repository {resolved.github}"
+            f"--repo {resolved.key} checkout origin does not match catalog repository {active}"
         )
     return checkout
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from lu_machinery.common import git_credentials
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.repo_root import main_checkout_root
 from lu_machinery.orchestration import fleet_repos
@@ -32,6 +33,13 @@ REVIEW_ROOT_MISMATCH = getattr(
 )
 repository_target_error = getattr(target_resolution, "repository_target_error", None)
 MissingReviewCommit = getattr(target_resolution, "MissingReviewCommit", None)
+
+
+@pytest.fixture(autouse=True)
+def _pre_transfer_selector(monkeypatch):
+    """The registry's infra-private row is dual-slug: review targets bind its active slug, chosen by the host selector."""
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_k: git_credentials.SelectorState(
+        {"machinery": "learn-ukrainian/machinery", "infra-private": "learn-ukrainian/learn-ukrainian-infra-private"}, "0" * 64))
 
 
 def _git(repo, *args, check=True):

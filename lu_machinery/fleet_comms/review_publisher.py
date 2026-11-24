@@ -24,7 +24,7 @@ import re
 import sqlite3
 import subprocess
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,7 @@ from lu_machinery.fleet_comms.review_publication import (
 )
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection
 from lu_machinery.opsec.prepublish import publication_boundary
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, resolve_payload_fleet_repo, same_repository
 from lu_machinery.publish.github import Request, request_run
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -64,15 +65,20 @@ class PublicationResult:
     comment_url: str | None
     status_posted: bool
     summary: str
+    # The dual-slug selector value and sha256 the repository was resolved with; None for a single-slug row.
+    fleet_repo_selector: dict[str, str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "plan": self.plan.to_dict(),
             "publication_id": self.publication_id,
             "comment_url": self.comment_url,
             "status_posted": self.status_posted,
             "summary": self.summary,
         }
+        if self.fleet_repo_selector is not None:
+            result["fleet_repo_selector"] = self.fleet_repo_selector
+        return result
 
 
 def _utc_now() -> str:
@@ -476,11 +482,16 @@ def publish_sealed_verdict(
         )
     except ReviewPublicationError as exc:
         raise ReviewPublisherError(str(exc)) from exc
+    # The sealed payload names its repository by either baked slug; GitHub is read and written at the active one.
+    try:
+        target = resolve_payload_fleet_repo(sealed.repository)
+    except FleetRepoError as exc:
+        raise ReviewPublisherError(f"repository_unresolved: {exc}") from exc
 
     head = current_head_sha
     if head is None:
         head = fetch_pr_head_sha(
-            repository=sealed.repository,
+            repository=target.active_github,
             pr_number=sealed.pr_number,
             runner=runner,
         )
@@ -493,12 +504,15 @@ def publish_sealed_verdict(
             conn, sealed, status_context=status_context
         )
 
-    plan = plan_publication(
-        sealed,
-        current_head_sha=head,
-        already_published_key=already_key,
-        mutate=mutate,
-        status_context=status_context,
+    plan = replace(
+        plan_publication(
+            sealed,
+            current_head_sha=head,
+            already_published_key=already_key,
+            mutate=mutate,
+            status_context=status_context,
+        ),
+        repository=target.active_github,
     )
     # Materialize FK parent only when we are about to post (not on stale/skip/dry-run).
     if (
@@ -507,12 +521,13 @@ def publish_sealed_verdict(
         and plan.mutate
     ):
         ensure_job_row_for_receipt(store, sealed)
-    return execute_publication(
+    result = execute_publication(
         plan,
         runner=runner,
         conn=conn,
         require_receipt=require_receipt,
     )
+    return replace(result, fleet_repo_selector=target.selector_receipt())
 
 
 def load_sealed_payload_file(path: Path) -> SealedVerdict:
@@ -541,7 +556,7 @@ def sealed_matches_job(
         raise ReviewPublisherError(
             f"sealed_job_mismatch: review_id sealed={sealed.review_id!r} job={review_id!r}"
         )
-    if sealed.repository != repository:
+    if not same_repository(sealed.repository, repository):
         raise ReviewPublisherError(
             f"sealed_job_mismatch: repository sealed={sealed.repository!r} job={repository!r}"
         )
