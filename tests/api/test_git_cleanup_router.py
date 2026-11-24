@@ -356,6 +356,19 @@ def _graphql_result(monkeypatch, returncode: int, stdout: str) -> None:
     )
 
 
+def _three_repo_registry(monkeypatch) -> dict:
+    """The test's own three-project registry and an empty unknown-since memory."""
+    catalog = {
+        "machinery": FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery", default=True),
+        "public": FleetRepo("public", "old-owner/product.pages", "product", "public-monorepo"),
+        "infra-private": FleetRepo("infra-private", "other-owner/private-infra", "private-infra", "private-infra",
+                                   repository_id=1, visibility="private", alternate_github="alt-owner/Private-Infra"),
+    }
+    monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: catalog)
+    monkeypatch.setattr(git_hygiene_router, "_UNKNOWN_SINCE", {})
+    return catalog
+
+
 def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch, tmp_path: Path) -> None:
     """Defect class: a private repository's PR titles or branch names leak through the Monitor."""
 
@@ -364,15 +377,13 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
             "mergeQueueEntry": {"position": 1, "state": "QUEUED"},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"},
                                               "status": {"context": {"state": "SUCCESS"}}}}]}}
-    repos = {"r0": {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [node]}},
-             "r1": {"isPrivate": True, "pullRequests": {"totalCount": 1, "nodes": [node]}},
-             "r2": {"pullRequests": {"totalCount": 1, "nodes": [node]}}}
-    catalog = {
-        "machinery": FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery"),
-        "public": FleetRepo("public", "old-owner/product.pages", "product", "public-monorepo", default=True),
-        "infra-private": FleetRepo("infra-private", "other-owner/private-infra", "private-infra", "private-infra"),
-    }
-    monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: catalog)
+    pinned = {"isTruncated": False, "text": 'dependencies = ["lu-machinery[api,pytest]==0.1.68"]'}
+    tip = {"target": {"statusCheckRollup": {"state": "FAILURE"}}}
+    extra = {"defaultBranchRef": tip, "pin": pinned}
+    repos = {"r0": {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [node]}, **extra},
+             "r1": {"isPrivate": True, "pullRequests": {"totalCount": 1, "nodes": [node]}, **extra},
+             "r2": {"pullRequests": {"totalCount": 1, "nodes": [node]}, **extra}}
+    _three_repo_registry(monkeypatch)
 
     def github_run(args, **_kwargs):
         assert 'r0: repository(owner: "new-owner", name: "machinery")' in args[-1]
@@ -390,7 +401,12 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     assert public["pull_requests"][0]["task_reference"] is None
     assert "secret-branch" not in json.dumps(public["pull_requests"])
     assert public["pull_requests"][0]["queue"] == {"position": 1, "state": "queued"}
+    assert public["default_branch"] == {"ci": "failure"}
+    assert public["pin"] == {"state": "pinned", "version": "0.1.68"}
     for repo in (private, unstated):
+        assert repo["default_branch"] == {"ci": "failure"}
+        # A private project shows counts and states only: its pin is withheld.
+        assert repo["pin"] == {"state": "withheld", "version": None}
         assert repo["private"] is True
         assert "title" not in repo["pull_requests"][0]
         assert repo["pull_requests"][0]["task_reference"] is None
@@ -410,14 +426,16 @@ def _heading_payload(*loaded: bool) -> dict:
 def test_pull_request_heading_uses_loaded_repositories(monkeypatch, tmp_path: Path) -> None:
     """Defect class: one unreadable repository marks the pull-request heading unavailable and drops the age of repositories that loaded."""
     state_helpers.cache_invalidate()
+    _three_repo_registry(monkeypatch)
     app = FastAPI()
     app.state.ctx = fixture_context(tmp_path)
     app.include_router(git_hygiene_router.router, prefix="/api/git")
     payload: dict = {}
-    call = {"code": 0}
+    call = {"code": 0, "stdout": None}
 
     def fake_run(*_args, **_kwargs):
-        return SimpleNamespace(returncode=call["code"], stdout=json.dumps({"data": payload}), stderr="")
+        stdout = call["stdout"] or json.dumps({"data": payload})
+        return SimpleNamespace(returncode=call["code"], stdout=stdout, stderr="")
 
     monkeypatch.setattr(git_hygiene_router.github_client, "run", fake_run)
     client = TestClient(app)
@@ -442,28 +460,66 @@ def test_pull_request_heading_uses_loaded_repositories(monkeypatch, tmp_path: Pa
     assert float(headers["X-Snapshot-Age-S"]) >= 0
     assert [repo["status"] for repo in body["repositories"]] == ["ok", "unknown", "ok"]
     assert body["repositories"][1]["reason"] == "not_readable"
+    # The unreadable project says since when, and the live-worker count is unknown (no snapshot), never zero.
+    assert body["repositories"][1]["unknown_since"] == body["observed_at"]
+    assert body["repositories"][0]["unknown_since"] is None
+    assert [repo["live_workers"] for repo in body["repositories"]] == [None, None, None]
+    # Live workers count over every slug of a registry row, ignore letter case, and the ones no row
+    # names (or with no claim) are reported apart, never dropped. A snapshot past its bound is unknown.
+    counts = {"new-owner/machinery": 2, "alt-owner/private-infra": 1, "other-owner/private-infra": 1,
+              "": 1, "gone/elsewhere": 1}
+    snapshot = {"age": 1.0}
+    real_snapshot = git_hygiene_router.active_snapshot
+    monkeypatch.setattr(git_hygiene_router, "active_snapshot",
+                        lambda _ctx: SimpleNamespace(read=lambda: ({"live_by_repository": counts}, snapshot["age"])))
+    state_helpers.cache_invalidate()
+    counted = client.get("/api/git/pull-requests").json()
+    assert [repo["live_workers"] for repo in counted["repositories"]] == [2, 0, 2]
+    assert counted["live_workers_unattributed"] == 2
+    snapshot["age"] = git_hygiene_router.LIVE_WORKERS_MAX_AGE_S + 1
+    state_helpers.cache_invalidate()
+    aged = client.get("/api/git/pull-requests").json()
+    assert [repo["live_workers"] for repo in aged["repositories"]] == [None, None, None]
+    monkeypatch.setattr(git_hygiene_router, "active_snapshot", real_snapshot)
+    # gh exits 1 when any one repository cannot be resolved; the others still read.
+    call["code"] = 1
+    payload.clear()
+    payload.update({**_heading_payload(True, False, True), "r1": None})
+    state_helpers.cache_invalidate()
+    partial = client.get("/api/git/pull-requests").json()
+    call["code"] = 0
+    assert [repo["status"] for repo in partial["repositories"]] == ["ok", "unknown", "ok"]
+    # The first failure's time survives the next failed reading of the same project.
+    assert partial["repositories"][1]["unknown_since"] == body["repositories"][1]["unknown_since"]
 
     headers, body = heading((False, False, False))
     assert (headers["X-Snapshot-State"], headers["X-Snapshot-Age-S"]) == ("unavailable", "unknown")
     assert [repo["status"] for repo in body["repositories"]] == ["unknown", "unknown", "unknown"]
 
     call["code"] = 1
+    call["stdout"] = '{"error": "github_rate_limited"}'
     state_helpers.cache_invalidate()
     failed = client.get("/api/git/pull-requests")
     assert failed.status_code == 200
     assert (failed.headers["X-Snapshot-State"], failed.headers["X-Snapshot-Age-S"]) == ("unavailable", "unknown")
     assert failed.json()["status"] == "unknown"
-    assert failed.json()["repositories"] == []
+    # A failed whole read still lists every registered project, each unknown, never an empty list.
+    assert [(repo["name"], repo["status"], repo["reason"]) for repo in failed.json()["repositories"]] == [
+        ("machinery", "unknown", "github_unavailable"), ("product", "unknown", "github_unavailable"),
+        ("private-infra", "unknown", "github_unavailable")]
+    assert all(repo["unknown_since"] for repo in failed.json()["repositories"])
     state_helpers.cache_invalidate()
 
 
 def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_path: Path) -> None:
     """Defect class: a failed or malformed GitHub read renders as "no open PRs" or crashes the route."""
+    _three_repo_registry(monkeypatch)
     _graphql_result(monkeypatch, 1, '{"error": "github_rate_limited"}')
     payload = git_hygiene_router.compute_pull_requests(tmp_path)
     assert payload["status"] == "unknown"
     assert payload["reason"] == "github_unavailable"
-    assert payload["repositories"] == []
+    assert [(repo["key"], repo["status"], repo["unknown_since"]) for repo in payload["repositories"]] == [
+        (key, "unknown", payload["observed_at"]) for key in ("machinery", "public", "infra-private")]
     _graphql_result(monkeypatch, 0, "not json")
     assert git_hygiene_router.compute_pull_requests(tmp_path)["reason"] == "github_invalid_response"
     # GitHub's nullable commit nodes and contexts read as "no CI yet", never an exception.

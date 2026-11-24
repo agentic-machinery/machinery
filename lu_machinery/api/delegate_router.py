@@ -631,6 +631,9 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     tasks_dir = _tasks_dir(ctx)
     rows = []
     claims: list[tuple[str | None, list[str]]] = []
+    # Live workers by claimed repository (read-only reviewers included). "" counts a record
+    # with no usable claim, so the Projects line can say how many are not attributed.
+    live_by_repository: dict[str, int] = {}
     for path in iter_task_records(tasks_dir, include_archive=False):
         try:
             file_stat = path.stat()
@@ -656,10 +659,13 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
                 summary = _task_summary(path, task)
         except OSError:
             claims.append((None, []))
+            live_by_repository[""] = live_by_repository.get("", 0) + 1
             continue
         except ValueError:
             continue
         rows.append(_task_summary_row(summary, status, alive, file_stat.st_mtime))
+        claimed = (_authoritative_task_repository(task) if task else None) or ""
+        live_by_repository[claimed] = live_by_repository.get(claimed, 0) + 1
         if task is None or task.get("mode") != "read-only":
             paths = []
             if task and isinstance(task.get("owned_paths"), list):
@@ -667,7 +673,10 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
                     paths = effective_scope(task)
             claims.append((_authoritative_task_repository(task) if task else None, paths))
     # The HTTP /active projection omits these internal claims, including grants.
-    return {"total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims}
+    return {
+        "total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims,
+        "live_by_repository": live_by_repository,
+    }
 
 
 def _delegate_task_rows_locked(

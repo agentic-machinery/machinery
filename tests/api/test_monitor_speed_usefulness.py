@@ -381,7 +381,7 @@ def test_home_announces_panel_status_and_has_skip_purpose_and_sites_label():
         assert 'class="skip" href="#main"' in page, name
         assert '<main id="main" tabindex="-1">' in page, name
         assert 'aria-label="Sites"' in page, name
-    assert (dashboards / "index.html").read_text().count('aria-live="polite"') == 3
+    assert (dashboards / "index.html").read_text().count('aria-live="polite"') == 4
     subs_page = (dashboards / "subscriptions.html").read_text()
     assert subs_page.count('aria-live="polite"') == 1
     assert "Which subscription is near its limit, when it resets, and whether anything is signed out." in subs_page

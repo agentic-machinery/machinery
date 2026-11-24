@@ -153,7 +153,7 @@ def test_panel_response_never_echoes_unvetted_provider_values(panel_client, monk
         assert data["subscriptions"]["ends"]["claude_b"] == {"ended": False, "ends_on": "2030-02-01"}
     elif route.endswith("pull-requests"):
         assert data["repositories"][0]["pull_requests"][0]["number"] == 7
-        assert data["repositories"][0]["pull_requests"][0]["url"] == "https://github.com/learn-ukrainian/machinery/pull/7"
+        assert data["repositories"][0]["pull_requests"][0]["url"] == "https://github.com/learn-ukrainian/learn-ukrainian.github.io/pull/7"
     elif route.endswith("alerts"):
         assert data["status"] == "ok" and len(data["alerts"]) == 1
         assert data["alerts"][0]["alertname"] == "UnrecognizedAlert"

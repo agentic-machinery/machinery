@@ -40,13 +40,20 @@
 <script>
 "use strict";
 const {
-  escapeHtml, safeHttpUrl, ageSpan, table, td, text, unknown,
+  escapeHtml, safeHttpUrl, ageSpan, toDate, utc, table, td, text, unknown,
   ciLabel, reviewLabel, prChips, prSnapshotState, createPanelRunner,
 } = Machinery;
 
+// A repository GitHub could not be read for says since when, never a zero.
+function unreadable(repo, reason) {
+  const since = repo && toDate(repo.unknown_since) ? ` since ${utc(repo.unknown_since)} (first failed reading; starts again when the Monitor restarts)` : "";
+  return `<p class="muted">Unknown${escapeHtml(since)}: ${escapeHtml(String(reason || "no reason given").replaceAll("_", " "))}.</p>`;
+}
+
 function renderPrs(prs, prState = null) {
-  if (prs.status !== "ok") return unknown(prs.reason);
   const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
+  // A failed whole read still lists every registered project, each unknown since its first failure.
+  if (prs.status !== "ok" && !repos.length) return unknown(prs.reason);
   const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
   const unavailable = prState === "unavailable" || allUnknown;
   const ageUnknown = !unavailable && prState === "unknown";
@@ -64,12 +71,12 @@ function renderPrs(prs, prState = null) {
   if (unavailable) {
     return stateNote + repos.map(repo => {
       const reason = repo && repo.status !== "ok" ? repo.reason : "snapshot unavailable";
-      return `<h3>${escapeHtml(repo && repo.name || "")}</h3>` + unknown(reason);
+      return `<h3>${escapeHtml(repo && repo.name || "")}</h3>` + unreadable(repo, reason);
     }).join("");
   }
   return stateNote + repos.map(repo => {
     const title = `<h3>${escapeHtml(repo.name)}${typeof repo.open_total === "number" ? ` · ${repo.open_total} open` : ""}</h3>`;
-    if (repo.status !== "ok") return title + unknown(repo.reason);
+    if (repo.status !== "ok") return title + unreadable(repo, repo.reason);
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
     const truncatedNote = typeof repo.open_total !== "number" || !Number.isFinite(repo.open_total)
       ? `<p class="warn">Total open PR count is unknown; showing ${list.length} returned PR${list.length === 1 ? "" : "s"}.</p>`

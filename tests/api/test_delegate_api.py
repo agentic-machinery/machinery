@@ -794,6 +794,9 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
         assert expected["total"] == 1
         expected_http = running.get("/api/delegate/active").json()
         assert expected_http["total"] == 1
+        # The internal per-repository worker counts reach the Projects line, never the public panel.
+        assert sum(expected["live_by_repository"].values()) == 1
+        assert "live_by_repository" not in expected_http
         def forbidden(*args, **kwargs):
             raise AssertionError("request collected task history")
         monkeypatch.setattr(delegate_router, "_active_snapshot_tasks", forbidden)
