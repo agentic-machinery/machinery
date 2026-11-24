@@ -159,21 +159,20 @@ def verification_origin(path: Path) -> str:
 def _complete_since_task_base(run, shallow: Path, task_base: str) -> bool:
     """Whether the fetched graph is enough to walk the delivery above the task start.
 
-    Callers walk from the delivery tip, excluding the task start and each merge base
-    with the base tip. Single-parent commits are diffed against their parent and
+    Callers walk from the delivery tip, excluding the task start and the upstream
+    tip. Single-parent commits are diffed against their parent and
     merges are re-run, which recomputes the merge bases of their parents.
 
     Every commit the walk inspects needs its real parents. A bounded fetch records
     each shallow boundary commit without parents, so no boundary may lie on a
     tip's path above the task start. A boundary parent is itself present with its
-    tree, so a single-parent diff against it is exact, and a merge base found in
-    the bounded graph is a real common ancestor of the delivery and the base tip.
+    tree, so a single-parent diff against it is exact.
 
     A merge in the inspected range needs the complete ancestry of its parents to
     be recomputed. A graph with shallow boundaries does not provide it, so a
     delivery with any merge above the task start requires non-shallow history.
     """
-    tips = ("refs/heads/delivery", "refs/heads/base")
+    tips = ("refs/heads/delivery", "refs/heads/upstream")
     return (task_base in run("rev-list", *tips).split()
             and set(shallow.read_text().split()).isdisjoint(run("rev-list", *tips, "--not", task_base).split())
             and not run("rev-list", "--min-parents=2", "refs/heads/delivery", "--not", task_base))
@@ -221,8 +220,9 @@ def ownership_git(record: dict, head: str | None = None):
 
     Fetch the exact exit snapshot, or the attributed merged pull request's final
     ``head``, by commit ID. The caller establishes publication independently.
-    Fetch the base branch once and deepen by its fetched ID. A merged walk uses
-    the recorded start as its initial base, since a stacked base ref can be gone.
+    Pin the recorded base and start and the remote default HEAD for a branch walk.
+    A merged pull request instead uses its verified pre-merge parent so its own
+    commits cannot disappear from the walk when they reach the default branch.
 
     A command-line include.path override is not a local-config sandbox. A fresh
     bare Git directory excludes both worker config and config.worktree,
@@ -239,13 +239,13 @@ def ownership_git(record: dict, head: str | None = None):
     The explicit fetches get VERIFICATION_FETCH_TIMEOUT. Lazy blob transfers run
     inside the caller's commands and share those commands' 30-second timeout.
     """
+    from lu_machinery.dispatcher import ownership
+
     remote = record["worktree_remote_url"]
     if verification_origin(Path(record["worktree_path"])) != remote:
         raise ValueError("origin URL changed since dispatch")
     base = verifiable_origin_base(record["worktree_base_ref"])
-    task_base = record.get("worktree_start_sha", record["worktree_base_sha"])
-    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", task_base):
-        raise ValueError("task base must be a full object name")
+    base_sha, start_sha = ownership.task_base_and_start(record)
     delivery_ref = f"refs/heads/{record['worktree_branch']}"
     allowed_refs = {delivery_ref}
     if record.get("publish_branch") is not None:
@@ -254,38 +254,55 @@ def ownership_git(record: dict, head: str | None = None):
     if record.get("remote_ref") in allowed_refs:
         delivery_ref = record["remote_ref"]
     base_ref = f"refs/heads/{base.removeprefix('origin/')}"
-    if head is None and delivery_ref == base_ref:
-        raise ValueError("delivery ref must differ from base ref")
     delivery_sha = record["head_sha"] if head is None else head
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", delivery_sha):
         raise ValueError("delivery head must be a full object name")
     if head is None and record.get("remote_ref") and record.get("remote_head_sha") != delivery_sha:
         raise ValueError("remote delivery tip does not match snapshot")
-    base_source = base_ref if head is None else task_base
-    delivery_objects = (f"+{delivery_sha}:refs/heads/delivery", f"+{task_base}:refs/heads/start")
+    pinned_objects: tuple[str, ...] = (f"+{delivery_sha}:refs/heads/delivery", f"+{start_sha}:refs/ownership/start")
+    if base_sha != start_sha:
+        pinned_objects += (f"+{base_sha}:refs/ownership/base",)
     with _private_remote_git(record["task_id"], remote) as (run, git_dir):
-        _ownership_fetch(run, record, "--depth=1", "--", "origin", f"+{base_source}:refs/heads/base",
-                         *delivery_objects, phase="initial")
-        base_sha = run("rev-parse", "--verify", "refs/heads/base^{commit}")
-        refspecs = (f"+{base_sha}:refs/heads/base", *delivery_objects)
-        since = int(run("show", "-s", "--format=%ct", task_base)) - HISTORY_SLACK_SECONDS
+        run("check-ref-format", base_ref)
+        upstream_sha = start_sha
+        if head is None:
+            default_branch, upstream_sha = _advertised_default(run)
+            if delivery_ref in {base_ref, f"refs/heads/{default_branch}"}:
+                raise ValueError("delivery ref must differ from base ref")
+        refspecs = (f"+{upstream_sha}:refs/heads/upstream", *pinned_objects)
+        try:
+            _ownership_fetch(run, record, "--depth=1", "--", "origin", *refspecs, phase="initial")
+        except VerificationFetchError as exc:
+            if exc.reason in {"remote ref missing", "remote object missing"}:
+                # A bundled fetch cannot identify which requested object was absent.
+                try:
+                    _ownership_fetch(run, record, "--depth=1", "--", "origin",
+                                     base_sha, phase="recorded-base")
+                except VerificationFetchError as base_exc:
+                    if base_exc.reason in {"remote ref missing", "remote object missing"}:
+                        raise ownership.TaskBaseError("WORKTREE_BASE_SHA_NOT_COMMIT") from None
+                    raise
+            raise
+        ownership.verify_task_commits(run, base_sha, start_sha)
+        since = int(run("show", "-s", "--format=%ct", start_sha)) - HISTORY_SLACK_SECONDS
         # Git selects no history below a tip dated before the cutoff and aborts the
         # bounded fetch; its message does not reach HTTPS clients, so decide by date.
-        bounded = min(map(int, run("show", "-s", "--format=%ct", "refs/heads/base",
+        bounded = min(map(int, run("show", "-s", "--format=%ct", "refs/heads/upstream",
                                    "refs/heads/delivery").split())) >= since
         if bounded:
             _ownership_fetch(run, record, f"--shallow-since=@{since}", "--", "origin", *refspecs,
                              phase="bounded-history")
         if run("rev-parse", "--is-shallow-repository") == "true" and (
-            not bounded or not _complete_since_task_base(run, git_dir / "shallow", task_base)
+            not bounded or base_sha != start_sha or not _complete_since_task_base(run, git_dir / "shallow", start_sha)
         ):
             # A takeover can rewrite the original tip. Fetch its history explicitly so
             # excluding the recorded start still excludes its inherited ancestors.
             _ownership_fetch(run, record, "--unshallow", "--", "origin", *refspecs, phase="full-history")
             if run("rev-parse", "--is-shallow-repository") != "false":
                 raise ValueError("full history could not be fetched")
-        if run("rev-parse", "--verify", "refs/heads/start^{commit}") != task_base:
-            raise ValueError("fetched task start does not match recorded start")
+        ownership.verify_base_ancestry(run, base_sha, start_sha)
+        if run("rev-parse", "--verify", "refs/heads/upstream^{commit}") != upstream_sha:
+            raise ValueError("remote upstream tip does not match fetched commit")
         if run("rev-parse", "--verify", "refs/heads/delivery^{commit}") != delivery_sha:
             raise ValueError("remote delivery tip does not match snapshot")
         yield run
@@ -1012,18 +1029,28 @@ def _batch_blobs(local, oids: list[str]) -> list[bytes]:
 
 
 def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
+    from lu_machinery.dispatcher import ownership
+
     delivery = dict(
         head_sha=None, remote_head_sha=None, remote_ref=None, publish_branch=record.get("publish_branch"),
         push_state="unknown", push_state_reason="observation_failed", commits_ahead=None,
         worktree_dirty_on_exit=None, worktree_untracked_only_on_exit=None,
     )
     try:
-        start_sha = record.get("worktree_start_sha", record["worktree_base_sha"])
+        scoped = spec.mode == "workspace-write" and bool(record.get("owned_paths"))
+        if scoped:
+            base_sha, start_sha = ownership.task_base_and_start(record)
+        else:
+            start_sha = record.get("worktree_start_sha", record["worktree_base_sha"])
         local = partial(execution_safe_git, cwd=spec.worktree, capture_output=True, text=True, check=True, timeout=30)
-        delivery.update(
-            head_sha=local(["rev-parse", "HEAD"]).stdout.strip(),
-            commits_ahead=int(local(["rev-list", "--count", f"{start_sha}..HEAD"]).stdout),
-        )
+        head = local(["rev-parse", "HEAD"]).stdout.strip()
+        try:
+            ahead = int(local(["rev-list", "--count", f"{start_sha}..HEAD"]).stdout)
+        except subprocess.CalledProcessError:
+            if scoped:
+                ownership.verify_task_commits(partial(_verification_git, spec.worktree), base_sha, start_sha)
+            raise
+        delivery.update(head_sha=head, commits_ahead=ahead)
         # --ignore-submodules=none overrides submodule.<name>.ignore and diff.ignoreSubmodules, so a submodule
         # edit or new submodule commit is reported whatever the tree configures. stat_integrity forces
         # core.trustctime and core.checkStat to their defaults, so a worker's stat settings cannot hide an edit,
@@ -1058,6 +1085,8 @@ def snapshot_delivery(spec: TaskSpec, record: dict) -> dict:
             delivery["push_state_reason"] = (
                 "remote_head_matches" if matched else "remote_head_differs" if heads else "remote_branch_missing"
             )
+    except ownership.TaskBaseError as exc:
+        delivery["push_state_reason"] = str(exc)
     # RecursionError: submodules nested past the interpreter's limit leave the tree unknown, never clean.
     except (OSError, ValueError, RecursionError, subprocess.SubprocessError, TaskScratchError):
         pass
@@ -1107,10 +1136,10 @@ def _gh(*args: str, missing_commit: bool = False) -> str:
 
 
 def _repo_and_base(record: dict) -> tuple[str | None, str]:
-    """The GitHub repository of the remote recorded at dispatch (None when it names none) and the task's base branch."""
+    """The recorded GitHub repository and the base branch name for PR attribution."""
     match = _REMOTE_SLUG.fullmatch(record["worktree_remote_url"])
     return (match.group(1) if match else None,
-            record["worktree_base_ref"].removeprefix("refs/remotes/").removeprefix("origin/"))
+            verifiable_origin_base(record["worktree_base_ref"]).removeprefix("origin/"))
 
 
 def _accepted_prs(task_id: str, repo: str) -> list[int]:
@@ -1229,16 +1258,21 @@ def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
 _DEFAULT_BRANCH = re.compile(r"ref: refs/heads/(\S+)\s+HEAD")
 
 
+def _advertised_default(run: Callable[..., str]) -> tuple[str, str]:
+    """Read origin's default branch and its tip in one ref advertisement."""
+    lines = run("ls-remote", "--symref", "--", "origin", "HEAD").splitlines()
+    names = [match[1] for line in lines if (match := _DEFAULT_BRANCH.fullmatch(line))]
+    tips = [match[1] for line in lines if (match := re.fullmatch(r"([0-9a-f]{40}|[0-9a-f]{64})\s+HEAD", line))]
+    if len(names) != 1 or len(tips) != 1:
+        raise ValueError("remote default branch is not advertised")
+    return names[0], tips[0]
+
+
 def _remote_default_branch(record: dict) -> str:
     """The recorded remote's default branch, from ``HEAD``'s symref, not from a configured name."""
     remote = record["worktree_remote_url"]
     with _private_remote_git(record["task_id"] + "-default-branch", remote) as (run, _):
-        advertised = run("ls-remote", "--symref", "--", "origin", "HEAD")
-    for line in advertised.splitlines():
-        match = _DEFAULT_BRANCH.match(line)
-        if match:
-            return match.group(1)
-    raise ValueError("remote default branch is not advertised")
+        return _advertised_default(run)[0]
 
 
 def _fetch_merged_parent(run: Callable[..., str], merge: str, record: dict) -> str:
@@ -1254,27 +1288,22 @@ def _fetch_merged_parent(run: Callable[..., str], merge: str, record: dict) -> s
     return run("rev-parse", "--verify", merge + "^1")
 
 
-def _supplemental_paths(record: dict, snapshot: str, start: str, branches: tuple[str, ...],
+def _supplemental_paths(record: dict, snapshot: str, start: str,
                         covered_commits: set[str]) -> list[str]:
     """Paths from an independently published snapshot beyond trusted or already verified history."""
     from lu_machinery.dispatcher import ownership
 
-    refs = tuple(f"refs/heads/{branch}" for branch in dict.fromkeys(branches))
     with _private_remote_git(record["task_id"], record["worktree_remote_url"]) as (run, _):
-        advertised = {ref: sha for sha, ref in
-                      (line.split() for line in run("ls-remote", "--heads", "--", "origin", *refs).splitlines())}
-        upstream = [advertised[ref] for ref in refs if ref in advertised]
-        if not upstream:
-            raise ValueError("no canonical upstream tip for supplemental ownership")
-        base, *other_bases = dict.fromkeys((*upstream, *sorted(covered_commits)))
-        objects = tuple(dict.fromkeys((snapshot, start, base, *other_bases)))
+        _, upstream = _advertised_default(run)
+        other_bases = sorted(covered_commits)
+        objects = tuple(dict.fromkeys((snapshot, start, upstream, *other_bases)))
         if any(not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) for sha in objects):
             raise ValueError("supplemental ownership requires full object names")
         _ownership_fetch(run, record, "--", "origin", *objects, phase="supplemental-history")
         if run("rev-parse", "--is-shallow-repository") != "false":
             raise ValueError("supplemental ownership requires complete history")
         # A reset onto upstream has no additional paths. The merged history was already checked.
-        return ownership.delivered_paths(run, snapshot, base, start, other_bases=other_bases)
+        return ownership.delivered_paths(run, snapshot, upstream, start, other_bases=other_bases)
 
 
 def merged_delivery(record: dict) -> dict | None:
@@ -1381,8 +1410,7 @@ def merged_delivery(record: dict) -> dict | None:
                 if not (merged or tip == snapshot):
                     return None  # merged splits cannot conceal further unpublished work
                 if record.get("owned_paths"):
-                    default = accepted_default or _remote_default_branch(record)
-                    paths.update(_supplemental_paths(record, snapshot, start, (base, default), covered_commits))
+                    paths.update(_supplemental_paths(record, snapshot, start, covered_commits))
             record.pop("merged_delivery_lookup", None)
             return {**(primary or deliveries[0]), "pull_requests": deliveries, "paths": sorted(paths - {""})}
     except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError, subprocess.SubprocessError) as exc:

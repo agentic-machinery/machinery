@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from lu_machinery.dispatcher import cli, git, worker
+from lu_machinery.dispatcher import cli, git, ownership, worker
 from lu_machinery.dispatcher.types import TaskSpec
 from tests.dispatcher.conftest import MERGED, run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -140,6 +140,38 @@ def test_unsuccessful_settle_preserves_cause_with_outside_commit(delivery_settle
     assert "no_deliverable_reason" not in result
 
 
+def test_delivered_paths_exclude_commits_reachable_from_default_branch(sandbox, delivery_settle):
+    """Merging origin's default branch into a stack cannot charge its paths to the task."""
+    record, settle = delivery_settle
+    tree = Path(record["cwd"])
+    (tree / "delivered.txt").write_text("owned delivery\n")
+    run_git(tree, "add", "delivered.txt")
+    run_git(tree, "commit", "-m", "owned delivery")
+
+    (sandbox.repo / "upstream.txt").write_text("upstream delivery\n")
+    run_git(sandbox.repo, "add", "upstream.txt")
+    run_git(sandbox.repo, "commit", "-m", "default branch change")
+    run_git(sandbox.repo, "push", "origin", "main")
+    run_git(tree, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    run_git(tree, "merge", "--no-edit", "origin/main")
+    run_git(tree, "push", "origin", "HEAD")
+
+    result = settle()
+    assert result["error"] is None
+    assert result["status"] == "done"
+    ref = result["remote_ref"]
+    updates = f"{ref} {result['head_sha']} {ref} {'0' * len(result['head_sha'])}\n"
+    paths = ownership._pushed_paths(ownership._local_git(tree), record, updates)
+    assert set(paths) - {""} == {"delivered.txt"}
+
+    (tree / "upstream.txt").write_text("worker edit\n")
+    run_git(tree, "add", "upstream.txt")
+    run_git(tree, "commit", "-m", "worker outside scope")
+    run_git(tree, "push", "origin", "HEAD")
+    result = settle()
+    assert (result["status"], result["error"]) == ("no_deliverable", "outside_owned_paths: upstream.txt")
+
+
 @pytest.mark.parametrize("history", ["merged", "restored", "rename-in", "rename-out", "deleted"])
 def test_scope_checks_each_own_commit(sandbox, delivery_settle, history, monkeypatch):
     record, settle = delivery_settle
@@ -151,7 +183,7 @@ def test_scope_checks_each_own_commit(sandbox, delivery_settle, history, monkeyp
         (sandbox.repo / source).write_text("upstream\n")
         run_git(sandbox.repo, "add", source)
         run_git(sandbox.repo, "commit", "-m", "upstream")
-        run_git(sandbox.repo, "push", "origin", "main:release")
+        run_git(sandbox.repo, "push", "origin", "main")
         run_git(tree, "merge", "--no-edit", "main")
     if history.startswith("rename"):
         run_git(tree, "mv", source, "delivered.txt" if history == "rename-in" else "outside.txt")

@@ -834,14 +834,23 @@ def _enforce_delivery(record: dict) -> None:
     # An unmatched branch cannot prove delivery. A merged PR can supply separate proof below.
     # A dirty snapshot can still have a matching remote ref whose commits need checking.
     branch_observed = record.get("push_state") == "pushed" or record.get("remote_ref") is not None
-    if owned and branch_observed and (record.get("commits_ahead") or 0) > 0:
+    if owned:
         try:
-            with git.ownership_git(record) as run:
-                base_sha = run("rev-parse", "--verify", "refs/heads/base^{commit}")
-                start_sha = record.get("worktree_start_sha", record["worktree_base_sha"])
-                paths = ownership.delivered_paths(run, record["head_sha"], base_sha, start_sha,
-                                                  commits_expected=True)
-            cause = _outside_cause(paths, owned)
+            _, start_sha = ownership.task_base_and_start(record)
+            if record.get("push_state_reason") in {"WORKTREE_BASE_SHA_NOT_COMMIT", "WORKTREE_START_SHA_NOT_COMMIT"}:
+                raise ownership.TaskBaseError(record["push_state_reason"])
+            if branch_observed and (record.get("commits_ahead") or 0) > 0:
+                with git.ownership_git(record) as run:
+                    upstream_sha = run("rev-parse", "--verify", "refs/heads/upstream^{commit}")
+                    paths = ownership.delivered_paths(run, record["head_sha"], upstream_sha, start_sha,
+                                                      commits_expected=True)
+                cause = _outside_cause(paths, owned)
+        except ownership.TaskBaseError as exc:
+            record["owned_path_grants_used"] = []
+            if not provider_failed:
+                cause = _verification_cause(exc)
+                record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
+            return
         except (OSError, ValueError, TypeError, IndexError, KeyError, TaskScratchError, subprocess.SubprocessError) as exc:
             cause = _verification_cause(exc)
     if cause is None:
