@@ -29,6 +29,7 @@ def test_probe_special_path_counts_one_unread_and_is_readonly(tmp_path, monkeypa
     target = recipient
     with closing(sqlite3.connect(db)) as conn:
         conn.execute("CREATE TABLE authority_deliveries (delivery_id TEXT, message_id TEXT, recipient TEXT, state TEXT, deadline_at TEXT)")
+        conn.execute("CREATE TABLE comms_messages (message_id TEXT, kind TEXT)")
         conn.execute("CREATE TABLE authority_idempotency (namespace TEXT)")
         conn.execute("CREATE TABLE authority_wake_receipts (delivery_id TEXT, state TEXT)")
         conn.executemany(
@@ -36,6 +37,7 @@ def test_probe_special_path_counts_one_unread_and_is_readonly(tmp_path, monkeypa
             [(str(i), "message_" + str(i) * 32, seat, state) for i, seat, state in
              [(1, target, "queued"), (2, target, "acknowledged"), (3, target, "failed"), (4, "claude", "queued")]],
         )
+        conn.executemany("INSERT INTO comms_messages VALUES (?, 'request')", [("message_" + str(i) * 32,) for i in range(1, 5)])
         conn.commit()
     before = db.read_bytes()
     connect = sqlite3.connect
@@ -71,6 +73,7 @@ def test_probe_empty_and_error_results(tmp_path, monkeypatch, capsys, state):
         with closing(sqlite3.connect(db)) as conn:
             if state == "empty":
                 conn.execute("CREATE TABLE authority_deliveries (delivery_id TEXT, message_id TEXT, recipient TEXT, state TEXT, deadline_at TEXT)")
+                conn.execute("CREATE TABLE comms_messages (message_id TEXT, kind TEXT)")
                 conn.execute("CREATE TABLE authority_idempotency (namespace TEXT)")
                 conn.execute("CREATE TABLE authority_wake_receipts (delivery_id TEXT, state TEXT)")
             else:

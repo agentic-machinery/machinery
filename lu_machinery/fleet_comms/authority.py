@@ -215,6 +215,7 @@ _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # The supervisory wake watcher's inbox (``ai_agent_bridge._inbox_watch.supervisory_recipient``).
 _SUPERVISORY_RECIPIENT_RE = re.compile(r"supervisor:epic:[1-9][0-9]*")
 _SUPERVISORY_REQUEST_KIND = "supervisory-request"
+_SUPERVISORY_CLAIM_PREDICATE = "(? OR m.kind <> ?)"
 RecipientStanding = Literal["registered", "live_task", "settled_task", "not_registered", "unknown"]
 _ROSTER_CACHE: dict[tuple[object, ...], tuple[frozenset[str], bool]] = {}
 # Dispatch v2 terminal statuses; only these prove a task has settled. Any other
@@ -566,16 +567,17 @@ def pending_delivery_snapshot(recipient: str, *, root: Path | None = None, limit
         with contextlib.closing(open_readonly(path, timeout=1.0)) as conn:
             conn.execute("BEGIN")
             conn.execute("SELECT delivery_id, state FROM authority_wake_receipts LIMIT 0")
-            where = """recipient = ? AND state IN ('queued', 'running')
-                AND (deadline_at IS NULL OR deadline_at > ?)
+            where = """d.recipient = ? AND d.state IN ('queued', 'running')
+                AND (d.deadline_at IS NULL OR d.deadline_at > ?)
                 AND NOT EXISTS (SELECT 1 FROM authority_idempotency i
-                    WHERE i.namespace = 'supervisory-consumption:' || d.delivery_id)"""
-            params = (recipient, _iso())
+                    WHERE i.namespace = 'supervisory-consumption:' || d.delivery_id)
+                AND """ + _SUPERVISORY_CLAIM_PREDICATE
+            params = (recipient, _iso(), bool(_SUPERVISORY_RECIPIENT_RE.fullmatch(recipient)), _SUPERVISORY_REQUEST_KIND)
             count = conn.execute(
-                f"SELECT COUNT(*) FROM authority_deliveries d WHERE {where}", params,
+                f"SELECT COUNT(*) FROM authority_deliveries d JOIN comms_messages m USING (message_id) WHERE {where}", params,
             ).fetchone()[0]
             ids = [row[0] for row in conn.execute(
-                f"SELECT message_id FROM authority_deliveries d WHERE {where} ORDER BY message_id LIMIT ?",
+                f"SELECT d.message_id FROM authority_deliveries d JOIN comms_messages m USING (message_id) WHERE {where} ORDER BY d.message_id LIMIT ?",
                 (*params, limit),
             )]
             if any(not isinstance(mid, str) or not AUTHORITY_MESSAGE_ID_RE.fullmatch(mid) for mid in ids):
@@ -1586,9 +1588,9 @@ class AuthorityService:
             self._reclaim_expired_deliveries_tx(now_value, max_attempts=max_attempts)
             if resume_owned:
                 held = self._conn.execute(
-                    """SELECT d.* FROM authority_deliveries d JOIN comms_messages m USING (message_id)
+                    f"""SELECT d.* FROM authority_deliveries d JOIN comms_messages m USING (message_id)
                        WHERE d.recipient = ? AND d.state = 'running' AND d.lease_owner = ?
-                         AND (? OR m.kind <> ?)
+                         AND {_SUPERVISORY_CLAIM_PREDICATE}
                        ORDER BY d.created_at ASC, d.delivery_id ASC""",
                     (recipient_name, worker, supervisory_inbox, _SUPERVISORY_REQUEST_KIND),
                 ).fetchall()
@@ -1601,11 +1603,11 @@ class AuthorityService:
                             content_sha256=message.content_sha256,
                         )
             candidates = self._conn.execute(
-                """SELECT d.* FROM authority_deliveries d JOIN comms_messages m USING (message_id)
+                f"""SELECT d.* FROM authority_deliveries d JOIN comms_messages m USING (message_id)
                    WHERE d.recipient = ? AND d.state = 'queued'
                      AND d.attempt_count < ?
                      AND (d.deadline_at IS NULL OR d.deadline_at > ?)
-                     AND (? OR m.kind <> ?)
+                     AND {_SUPERVISORY_CLAIM_PREDICATE}
                    ORDER BY d.created_at ASC, d.delivery_id ASC""",
                 (recipient_name, max_attempts, now_value, supervisory_inbox, _SUPERVISORY_REQUEST_KIND),
             )
