@@ -429,7 +429,15 @@ does these steps in order:
      When no Codex account is funded, or the budget is unreadable, the canary
      refuses with `no-allowance` and lists each account's reading. A dry run
      reads the same budget, prints the chosen accounts and refuses the same
-     way. The Claude route runs on subscription account b. The installed gate
+     way. Known residual (FU-ROUTING-BUDGET-FAILSTATE, owned by the Monitor
+     routing-budget owner): Monitor serves its cached budget until it is
+     rebuilt (a 15-second TTL, at most the 900-second stale threshold). A
+     probe failure recorded after the cache was built, such as a lost login,
+     therefore stays invisible until that rebuild. In that window the canary
+     can choose the failed account. Dispatch admission then refuses it
+     (`codex_account_not_logged_in`), the route fails closed, and a rerun
+     selects the funded account. The Claude route runs on subscription
+     account b. The installed gate
      originally matched the keeper's runtime when canaries gated PR admission.
      At cut time, the candidate gate validates the models and catalog that this
      release installs together. A failing route or an incomplete run
