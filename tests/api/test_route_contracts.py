@@ -126,6 +126,12 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monke
             replace(base, file="reports.html", url="/a/%2e/%2E%2e/reports"),
             replace(base, file="notes.html", url="/notes?folder=a\\b#s one"),
             replace(base, file="again-notes.html", url="/x/../notes"),
+            # The page is parsed as HTML first: a NUL in the attribute becomes U+FFFD.
+            replace(base, file="nul.html", url="/fleet\x00"),
+            replace(base, file="lead-nul.html", url="\x00/reports"),
+            # One link per browser destination: path, query and fragment.
+            replace(base, file="tab.html", url="/reports?tab=second"),
+            replace(base, file="dup-notes.html", url="/y/../notes?folder=a\\b#s one"),
             # F4: a file name or URL with nothing visible falls back to the next visible name.
             replace(base, file="----.html", url="/dashes"),
             replace(base, file="\u2067\u3164.html", url="/--"),
@@ -152,6 +158,9 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monke
                 ("/machinery.html", ' class="product"', "Machinery"),
                 ("/a/%2e/%2E%2e/reports", ' class="product"', "Reports"),
                 ("/notes?folder=a\\b#s one", ' class="product"', "Notes"),
+                ("/x/../notes", ' class="product"', "Again notes"),
+                ("/fleet\x00", ' class="product"', "Nul"),
+                ("/reports?tab=second", ' class="product"', "Tab"),
                 ("/dashes", ' class="product"', "Dashes"),
                 ("/--", ' class="product"', "/--"),
             ], path

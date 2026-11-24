@@ -1785,23 +1785,27 @@ def _dashboard_file(dashboards_dir: Path, path: str, product: Any) -> Path | Non
     return None
 
 
-def _request_path(url: str) -> str | None:
-    """The path the static route receives when a browser follows a link to ``url``, or ``None``.
+def _browser_destination(url: str) -> tuple[str, str | None, str | None] | None:
+    """Where a browser goes when it follows a navigation link to ``url``, or ``None``.
 
-    The browser side follows the URL Standard for a link on a same-site page: C0 control and
-    space characters are trimmed from both ends and tab and newline removed; the fragment
-    and query are dropped; a backslash is a slash; ``.`` and ``..`` segments, plain or
-    percent-encoded, are resolved. The server then percent-decodes the path, as uvicorn
-    does. ``None`` means the link does not name a fixed path on this site: it names another
-    host (``//host``) or a scheme, is relative to the current page, or is not text a page
-    can carry.
+    The result is the path the static route receives, then the query and the fragment
+    (``None`` when absent or empty, as the browser's URL API reports them). The browser first parses the rendered ``href`` attribute (HTML
+    Standard: a NUL becomes U+FFFD; the rest is escaped by ``html.escape``), then the URL
+    (URL Standard, for a link on a same-site page): C0 control and space characters are
+    trimmed from both ends and tab and newline removed; the fragment and query are split
+    off; a backslash is a slash; ``.`` and ``..`` segments, plain or percent-encoded, are
+    resolved. The server then percent-decodes the path, as uvicorn does. ``None`` means
+    the link does not name a fixed path on this site: it names another host (``//host``)
+    or a scheme, is relative to the current page, or is not text a page can carry.
     """
     try:
         url.encode("utf-8")
     except UnicodeEncodeError:
         return None
-    url = url.strip(_URL_TRIM).translate({0x09: None, 0x0A: None, 0x0D: None})
-    url = url.split("#", 1)[0].split("?", 1)[0].replace("\\", "/")
+    url = url.replace("\x00", "\ufffd").strip(_URL_TRIM).translate({0x09: None, 0x0A: None, 0x0D: None})
+    url, _, fragment = url.partition("#")
+    url, _, query = url.partition("?")
+    url = url.replace("\\", "/")
     if not url.startswith("/") or url.startswith("//"):
         return None
     segments: list[str] = []
@@ -1818,23 +1822,23 @@ def _request_path(url: str) -> str | None:
                 segments.append("")
         else:
             segments.append(segment)
-    return unquote("/".join(segments))
+    return unquote("/".join(segments)), query or None, fragment or None
 
 
-def _product_link_path(url: str, dashboards_dir: Path, product: Any) -> str | None:
-    """The request path of a declared product ``url`` when the static route leaves it to the product.
+def _product_destination(url: str, dashboards_dir: Path, product: Any) -> tuple[str, str | None, str | None] | None:
+    """The browser destination of a declared product ``url`` when the static route leaves its path to the product.
 
-    ``None`` when the link does not name a fixed path on this site (``_request_path``),
-    or the route's own lookup answers it with a machinery dashboard file or refuses it, or
-    the lookup fails on the filesystem (on Python 3.12 a symlink loop raises
+    ``None`` when the link does not name a fixed path on this site (``_browser_destination``),
+    or the route's own lookup answers its path with a machinery dashboard file or refuses
+    it, or the lookup fails on the filesystem (on Python 3.12 a symlink loop raises
     ``RuntimeError``; an overlong name raises ``OSError``). The failure then drops this one
     link, never the page.
     """
-    path = _request_path(url)
-    if path is None:
+    destination = _browser_destination(url)
+    if destination is None:
         return None
     try:
-        return path if _dashboard_file(dashboards_dir, path, product) is None else None
+        return destination if _dashboard_file(dashboards_dir, destination[0], product) is None else None
     except (HTTPException, OSError, RuntimeError, ValueError):
         return None
 
@@ -1845,24 +1849,24 @@ def _machinery_nav_html(current_file: str | None, dashboards_dir: Path, product:
     The current page is the machinery page whose file is being served. A product page is
     listed only because the product declares it, so no page is named here that the
     installed product does not serve. A declared URL is skipped when the static route does
-    not leave it to the product (``_product_link_path``), or when it opens the same request
-    path as a link already listed: a product contract that reuses a machinery URL replaces
-    the contract, never the page.
+    not leave its path to the product (``_product_destination``): a product contract that
+    reuses a machinery URL replaces the contract, never the page. It is also skipped when
+    it has the same path, query and fragment as a link already listed.
     """
 
     def link(page: PageContract, attrs: str) -> str:
         return f'<a href="{html.escape(page.url, quote=True)}"{attrs}>{html.escape(page.nav_label)}</a>'
 
     links = [link(page, ' aria-current="page"' if page.file == current_file else "") for page in PAGE_CONTRACTS]
-    listed: set[str] = set()
+    listed: set[tuple[str, str | None, str | None]] = set()
     first_product = True
     for page in all_page_contracts(product):
         if page in PAGE_CONTRACTS:
             continue
-        path = _product_link_path(page.url, dashboards_dir, product)
-        if path is None or path in listed:
+        destination = _product_destination(page.url, dashboards_dir, product)
+        if destination is None or destination in listed:
             continue
-        listed.add(path)
+        listed.add(destination)
         links.append(link(page, ' class="product first"' if first_product else ' class="product"'))
         first_product = False
     return "".join(links)
