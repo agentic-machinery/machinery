@@ -63,19 +63,24 @@ const ALERT_HEAD = ["Alert", "What it means", "What happens next", "Since"];
 const INFO_HEAD = ["Information", "What it means", "What happens next", "Since"];
 
 function alertLabel(group) {
-  if (!group.title) {
-    const raw = group.alertname && group.alertname !== "UnrecognizedAlert" ? `: ${group.alertname}` : "";
-    return `Unknown alert (name not listed)${raw}`;
-  }
-  return group.subject ? `${group.title}: ${group.subject}` : String(group.title);
+  // The API sentinel (a name outside the table) has no name to show; a listed name that arrives
+  // without text shows its raw name, and any subject still shows.
+  const raw = group.alertname && group.alertname !== "UnrecognizedAlert" ? `: ${group.alertname}` : "";
+  const head = group.title ? String(group.title) : `Unknown alert (name not listed)${raw}`;
+  return group.subject ? `${head}: ${group.subject}` : head;
 }
+
+// One group per alert and subject. Severity varies per instance (it is a label), so it is not
+// part of the key: the group keeps the highest severity and the earliest start of its instances.
+const SEVERITY_RANK = {critical: 3, warning: 2};
 
 function alertGroups(items) {
   const groups = new Map();
   for (const alert of items) {
-    const key = `${alert.alertname}|${alert.subject || ""}|${alert.severity}`;
+    const key = `${alert.alertname}|${alert.subject || ""}`;
     const group = groups.get(key) || {...alert, count: 0, oldest: alert.starts_at};
     group.count += 1;
+    if ((SEVERITY_RANK[alert.severity] || 1) > (SEVERITY_RANK[group.severity] || 1)) group.severity = alert.severity;
     if (toDate(alert.starts_at) && (!toDate(group.oldest) || toDate(alert.starts_at) < toDate(group.oldest))) group.oldest = alert.starts_at;
     groups.set(key, group);
   }

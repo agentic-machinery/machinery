@@ -223,6 +223,10 @@ const named = renderAlerts({status: 'ok', heartbeat: true, alerts: [
   {alertname: 'SubscriptionPoolRunsOutBeforeReset', severity: 'warning', subject: 'AGY Claude/GPT', ...pool},
   {alertname: 'SubscriptionPoolRunsOutBeforeReset', severity: 'warning', subject: 'AGY Claude/GPT', ...pool},
   {alertname: 'CliHealthBehind', severity: 'warning', starts_at: '2026-11-02T00:00:00Z'},
+  {alertname: 'CliHealthCheckFailed', severity: 'warning', subject: 'Claude', starts_at: '2026-11-06T00:00:00Z'},
+  {alertname: 'CliHealthCheckFailed', severity: 'critical', subject: 'Claude', starts_at: '2026-11-05T00:00:00Z'},
+  {alertname: 'CliHealthCheckFailed', severity: 'unknown', subject: 'Claude', starts_at: '2026-11-07T00:00:00Z'},
+  {alertname: 'SubscriptionPoolRunsOutBeforeReset', severity: 'warning', subject: 'Claude b', starts_at: '2026-11-08T00:00:00Z'},
   {alertname: 'SomeFutureAlert', severity: 'critical', starts_at: '2026-11-03T00:00:00Z', title: null},
   {alertname: 'UsagePoolRestored', severity: 'info', subject: 'Grok+Cursor', starts_at: '2026-11-04T00:00:00Z',
    title: 'Pool allowance is back', meaning: 'Recovered.', next_step: 'No action needed.'}]});
@@ -232,6 +236,12 @@ assert.match(problems, /Unknown alert \(name not listed\): CliHealthBehind/);
 assert.match(problems, /Critical: Unknown alert \(name not listed\): SomeFutureAlert/);
 assert.doesNotMatch(named, /UnrecognizedAlert/);
 assert.match(problems, /Approved change not merged \(2 firing\)/);
+// Severity is per instance: one alert and subject is one row, at its highest severity and earliest start.
+assert.equal((problems.match(/CliHealthCheckFailed|Unknown alert \(name not listed\): CliHealthCheckFailed/g) || []).length, 1);
+assert.match(problems, /Critical: Unknown alert \(name not listed\): CliHealthCheckFailed: Claude \(3 firing\)/);
+assert.match(problems, /2026-11-05 00:00Z/);
+// A listed name without text keeps its subject.
+assert.match(problems, /Unknown alert \(name not listed\): SubscriptionPoolRunsOutBeforeReset: Claude b/);
 assert.match(problems, /Subscription pool will run out early: Codex b</);
 assert.match(problems, /Subscription pool will run out early: AGY Claude\/GPT \(2 firing\)/);
 assert.equal((problems.match(/Approved change not merged/g) || []).length, 1);

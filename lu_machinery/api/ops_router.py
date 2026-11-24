@@ -325,7 +325,7 @@ _ALERT_TEXT: dict[str, tuple[str, str, str, str | None]] = {
         "New work is routed to other pools until it recovers.", "pool"),
     "UsagePoolReadingStale": (
         "Pool reading is stale", "A pool's usage reading has not been refreshed recently.",
-        "The infrastructure lane restarts the usage reader.", None),
+        "The infrastructure lane restarts the usage reader.", "pool"),
     "UsagePoolRestored": (
         "Pool allowance is back", "This pool had run low and has recovered.",
         "Informational: no action needed; it is available for work again.", "pool"),
@@ -343,6 +343,17 @@ _CLI_LABELS = {
     "agy": "AGY", "claude": "Claude", "codex": "Codex", "codexbar": "CodexBar",
     "cursor-agent": "Cursor agent", "grok": "Grok", "opencode": "OpenCode",
 }
+
+
+def _start_key(starts_at: str | None) -> datetime:
+    """Chronological sort key for a normalised start time; a missing one sorts last.
+
+    The serialised form drops the fraction for whole seconds, so comparing the strings
+    would put ``…:00.5Z`` before ``…:00Z``.
+    """
+    if starts_at is None:
+        return datetime.max.replace(tzinfo=UTC)
+    return datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
 
 
 def _alerts_reading() -> dict:
@@ -409,7 +420,7 @@ def _alerts_reading() -> dict:
         }
         alerts.append(row)
     # Problems first (critical, then the rest), then information; oldest first within each.
-    alerts.sort(key=lambda row: (row["severity"] == "info", row["severity"] != "critical", row.get("starts_at") or ""))
+    alerts.sort(key=lambda row: (row["severity"] == "info", row["severity"] != "critical", _start_key(row["starts_at"])))
     return {"status": "ok", "reason_code": None, "observed_at": observed_at, "heartbeat": heartbeat, "alerts": alerts}
 
 

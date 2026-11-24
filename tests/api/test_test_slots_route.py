@@ -88,6 +88,13 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
          "startsAt": "2030-01-04T00:00:00Z", "status": {"state": "active"}},
         {"labels": {"alertname": "UsagePoolRestored", "severity": "info", "pool": ["leak-pool"]}, "annotations": {},
          "startsAt": "2030-01-04T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "UsagePoolReadingStale", "severity": "warning", "pool": "codex-a"}, "annotations": {},
+         "startsAt": "2030-01-06T00:00:00Z", "status": {"state": "active"}},
+        # Whole-second start times drop the fraction, so a string sort puts .5 before the whole second.
+        {"labels": {"alertname": "CertExpirySoon", "severity": "warning"}, "annotations": {},
+         "startsAt": "2030-01-06T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "DiskAlmostFull", "severity": "warning"}, "annotations": {},
+         "startsAt": "2030-01-06T00:00:00.5Z", "status": {"state": "active"}},
         {"labels": {"alertname": "MonitorApiSlowRoute", "severity": "warning", "route": "/api/orient"}, "annotations": {},
          "startsAt": "2030-01-05T00:00:00Z", "status": {"state": "active"}},
         {"labels": {"alertname": "ForeignAlert", "severity": "warning"}, "annotations": {},
@@ -126,7 +133,7 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
     assert [row["alertname"] for row in body["alerts"]] == [
         "UnrecognizedAlert", "ApprovedNotLanded30m", "PROpenOver60m",
         "SubscriptionPoolRunsOutBeforeReset", "SubscriptionPoolRunsOutBeforeReset", "CliHealthBehind",
-        "MonitorApiSlowRoute", "UsagePoolRestored",
+        "MonitorApiSlowRoute", "UsagePoolReadingStale", "CertExpirySoon", "DiskAlmostFull", "UsagePoolRestored",
     ]
     assert all(set(row) == {"alertname", "title", "meaning", "next_step", "subject", "severity", "starts_at"}
                for row in body["alerts"])
@@ -139,6 +146,7 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
     assert [row["subject"] for row in by_name["SubscriptionPoolRunsOutBeforeReset"]] == ["Claude b", None]
     assert by_name["CliHealthBehind"][0]["subject"] == "AGY"
     assert by_name["UsagePoolRestored"][0]["subject"] is None
+    assert by_name["UsagePoolReadingStale"][0]["subject"] == "Codex a"
     assert by_name["PROpenOver60m"][0]["title"] and by_name["PROpenOver60m"][0]["next_step"]
     assert body["stale_after_s"] == 60.0
     assert "leak" not in response.text and "ForeignAlert" not in response.text
