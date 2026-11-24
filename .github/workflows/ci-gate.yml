@@ -130,13 +130,13 @@ jobs:
     name: Reuse verified merge-group tree
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 3
     # An unavailable reuse optimization falls back to the full required checks.
     # History checks independently refuse a missing history-base output.
     continue-on-error: true
     permissions:
       contents: read
-      actions: read
+      actions: write
     outputs:
       reuse: ${{ steps.proof.outputs.reuse }}
       source: ${{ steps.proof.outputs.source }}
@@ -234,9 +234,9 @@ jobs:
           fi
 
       # These are the only main-scope outputs of the full check jobs. Queue-ref
-      # caches cannot seed main, so retain just their existing verified saves.
+      # caches cannot seed main, so retain just their existing verified saves
+      # and keep the main-scope bubblewrap package cache verified and warm.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.match.outputs.run_id != ''
         with:
           persist-credentials: false
 
@@ -289,46 +289,8 @@ jobs:
           token: ${{ github.token }}
           member: zizmor
 
-      - name: Restore cached bubblewrap package
-        id: cache-bubblewrap
-        if: steps.match.outputs.run_id != ''
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
-          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-bubblewrap-${{ env.BUBBLEWRAP_DEB_SHA256 }}
-
-      - name: Fetch and verify bubblewrap package on cache miss
-        if: steps.match.outputs.run_id != '' && steps.cache-bubblewrap.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          snapshot="$(awk -F= '$1 == "CI_UBUNTU_SNAPSHOT" { count++; value = substr($0, index($0, "=") + 1) } END { if (count != 1) exit 1; print value }' .github/workflows/pins.txt)"
-          if ! [[ "$snapshot" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
-            echo "::error::Expected one CI_UBUNTU_SNAPSHOT in UTC (YYYYMMDDTHHMMSSZ) in .github/workflows/pins.txt" >&2
-            exit 1
-          fi
-          dest="$RUNNER_TEMP/release-cache/bubblewrap/$BUBBLEWRAP_DEB"
-          mkdir -p "$(dirname "$dest")"
-          url="https://snapshot.ubuntu.com/ubuntu/${snapshot}/pool/main/b/bubblewrap/${BUBBLEWRAP_DEB}"
-          if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 30 \
-            --connect-timeout 4 --max-time 15 \
-            -o "$dest" "$url"; then
-            rm -f -- "$dest"
-            echo "::error::Could not fetch ${BUBBLEWRAP_DEB} from Ubuntu snapshot ${snapshot}" >&2
-            exit 1
-          fi
-          if ! printf '%s  %s\n' "$BUBBLEWRAP_DEB_SHA256" "$dest" | sha256sum --check --strict -; then
-            rm -f -- "$dest"
-            exit 1
-          fi
-
-      - name: Save verified bubblewrap package
-        if: steps.match.outputs.run_id != '' && steps.cache-bubblewrap.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
-          key: ${{ steps.cache-bubblewrap.outputs.cache-primary-key }}
-
+      # Record verified merge-group reuse before optional bubblewrap cache
+      # priming so a snapshot outage never suppresses valid merge-group proof.
       - name: Record reused CI Gate proof
         id: proof
         if: steps.match.outputs.run_id != ''
@@ -341,6 +303,67 @@ jobs:
           printf 'Reused merge-group CI Gate run [%s](https://github.com/%s/actions/runs/%s), tree %s. Main-scope tool archives preserved; push history scans and trailers still required.\n' \
             "$RUN_ID" "$GITHUB_REPOSITORY" "$RUN_ID" "$TREE" >> "$GITHUB_STEP_SUMMARY"
           printf 'source=%s\nreuse=true\n' "$SOURCE" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached bubblewrap package
+        id: cache-bubblewrap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-bubblewrap-${{ env.BUBBLEWRAP_DEB_SHA256 }}
+
+      - name: Verify or prime cached bubblewrap package
+        id: prime-bubblewrap
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CACHE_HIT: ${{ steps.cache-bubblewrap.outputs.cache-hit }}
+          CACHE_KEY: ${{ steps.cache-bubblewrap.outputs.cache-primary-key }}
+        run: |
+          set -euo pipefail
+          deb="$RUNNER_TEMP/release-cache/bubblewrap/$BUBBLEWRAP_DEB"
+          if [ "$CACHE_HIT" = 'true' ] && [ -f "$deb" ] && [ ! -L "$deb" ] &&
+            printf '%s  %s\n' "$BUBBLEWRAP_DEB_SHA256" "$deb" | sha256sum --check --strict -; then
+            echo "Verified restored main bubblewrap cache entry."
+            echo 'save=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          corrupt_hit=false
+          if [ "$CACHE_HIT" = 'true' ]; then
+            corrupt_hit=true
+            echo "::warning::Restored main bubblewrap cache entry failed SHA-256 verification; refetching verified replacement." >&2
+          fi
+          if ! bash lu_machinery/ci/setup_bubblewrap.sh --prime-cache; then
+            echo "::warning::Skipping main bubblewrap cache prime after snapshot fetch failure; verified merge-group reuse is preserved." >&2
+            echo 'save=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ ! -f "$deb" ] || [ -L "$deb" ] ||
+            ! printf '%s  %s\n' "$BUBBLEWRAP_DEB_SHA256" "$deb" | sha256sum --check --strict -; then
+            echo "::warning::Primed bubblewrap package failed final SHA-256 verification; skipping cache save." >&2
+            rm -f -- "$deb"
+            echo 'save=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # GitHub Actions cache keys are immutable: evict a corrupt main-scoped
+          # entry only after verified replacement bytes are ready on disk.
+          if [ "$corrupt_hit" = 'true' ] && [[ "$CACHE_KEY" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            cache_ids="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/caches" \
+              -f "key=$CACHE_KEY" -f ref=refs/heads/main -F per_page=100 \
+              | jq -r --arg key "$CACHE_KEY" '.actions_caches[] | select(.key == $key and .ref == "refs/heads/main") | .id')" || cache_ids=""
+            for cache_id in $cache_ids; do
+              if [[ "$cache_id" =~ ^[0-9]+$ ]]; then
+                gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$cache_id" || true
+              fi
+            done
+          fi
+          echo 'save=true' >> "$GITHUB_OUTPUT"
+
+      - name: Save verified bubblewrap package
+        if: steps.prime-bubblewrap.outputs.save == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
+          key: ${{ steps.cache-bubblewrap.outputs.cache-primary-key }}
 
   ruff:
     needs: [main-proof]

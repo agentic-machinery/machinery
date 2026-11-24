@@ -81,7 +81,7 @@ apt_reports_interrupted_dpkg() {
 }
 
 offline_apt_install() {
-  local deb_path="$1" log="$2" lock_wait="${3:-25}" rc=0
+  local cap="$1" lock_wait="$2" deb_path="$3" log="$4" rc=0
   local -a offline_opts=(
     -o Dir::Etc::sourcelist=/dev/null
     -o Dir::Etc::sourceparts=/dev/null
@@ -95,11 +95,30 @@ offline_apt_install() {
   # download can occur while still allowing APT's local .deb acquire path (APT's
   # --no-download fails on local .deb arguments with a non-absolute pathname error).
   # shellcheck disable=SC2024
-  sudo timeout --kill-after=5 35 env -u APT_CONFIG LC_ALL=C apt-get "${offline_opts[@]}" \
+  sudo timeout --kill-after=5 "$cap" env -u APT_CONFIG LC_ALL=C apt-get "${offline_opts[@]}" \
     -o "DPkg::Lock::Timeout=$lock_wait" install -y --no-install-recommends --no-remove -- "$deb_path" \
     >"$log" 2>&1 || rc=$?
   cat "$log" || return "$?"
   return "$rc"
+}
+
+read_ubuntu_snapshot() {
+  local code_root pins snapshot
+  code_root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+  pins="$code_root/.github/workflows/pins.txt"
+  case "$code_root" in
+    */lib/python*/site-packages|*/lib64/python*/site-packages)
+      pins="${code_root%/*/*/*}/share/lu-machinery/ci/pins.txt"
+      ;;
+  esac
+  if ! snapshot="$(awk -F= '
+    $1 == "CI_UBUNTU_SNAPSHOT" { count++; value = substr($0, index($0, "=") + 1) }
+    END { if (count != 1) exit 1; print value }
+  ' "$pins")" || ! [[ "$snapshot" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+    echo "::error::Expected one CI_UBUNTU_SNAPSHOT in UTC (YYYYMMDDTHHMMSSZ) in ${pins}" >&2
+    return 1
+  fi
+  printf '%s\n' "$snapshot"
 }
 
 # Obtain the pinned bubblewrap .deb, always verifying SHA-256 against the pin
@@ -192,6 +211,26 @@ fetch_verified_bubblewrap_deb() {
   return 1
 }
 
+BUBBLEWRAP_DEB=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
+BUBBLEWRAP_DEB_SHA256=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
+
+# Cache-only mode used by CI workflows to verify or prime the pinned .deb under
+# RUNNER_TEMP/release-cache without running sudo, apt-get, dpkg, or AppArmor.
+if [ "$#" -eq 1 ] && [ "$1" = "--prime-cache" ]; then
+  snapshot="$(read_ubuntu_snapshot)"
+  snapshot_url="https://snapshot.ubuntu.com/ubuntu/${snapshot}"
+  prime_dir="$(mktemp -d "${RUNNER_TEMP}/lu-ci-bwrap-prime.XXXXXXXX")"
+  trap 'rm -rf -- "$prime_dir"' EXIT
+  fetch_verified_bubblewrap_deb "$BUBBLEWRAP_DEB" "$BUBBLEWRAP_DEB_SHA256" "$snapshot" "$snapshot_url" "$prime_dir"
+  cached_deb="$RUNNER_TEMP/release-cache/bubblewrap/$BUBBLEWRAP_DEB"
+  if [ ! -f "$cached_deb" ] || [ -L "$cached_deb" ] ||
+    ! echo "${BUBBLEWRAP_DEB_SHA256}  $cached_deb" | sha256sum -c -; then
+    echo "::error::Primed cache file ${cached_deb} is missing or failed verification" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
 missing=()
 for pkg in "$@" apparmor; do
   if ! [[ "$pkg" =~ ^[a-z0-9][a-z0-9+.-]+(:[a-z0-9][a-z0-9-]*)?$ ]]; then
@@ -218,20 +257,7 @@ if has_overlay_src; then
 fi
 
 if [ "${#missing[@]}" -gt 0 ] || ! "$bwrap_ready"; then
-  code_root="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-  pins="$code_root/.github/workflows/pins.txt"
-  case "$code_root" in
-    */lib/python*/site-packages|*/lib64/python*/site-packages)
-      pins="${code_root%/*/*/*}/share/lu-machinery/ci/pins.txt"
-      ;;
-  esac
-  if ! snapshot="$(awk -F= '
-    $1 == "CI_UBUNTU_SNAPSHOT" { count++; value = substr($0, index($0, "=") + 1) }
-    END { if (count != 1) exit 1; print value }
-  ' "$pins")" || ! [[ "$snapshot" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
-    echo "::error::Expected one CI_UBUNTU_SNAPSHOT in UTC (YYYYMMDDTHHMMSSZ) in ${pins}" >&2
-    exit 1
-  fi
+  snapshot="$(read_ubuntu_snapshot)"
   snapshot_url="https://snapshot.ubuntu.com/ubuntu/${snapshot}"
 
   # Keep the runner's sources, lists and archives untouched. Each invocation
@@ -266,19 +292,25 @@ EOF
 
   offline_installed=false
   if ! "$bwrap_ready"; then
-    deb=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
-    digest=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
+    deb="$BUBBLEWRAP_DEB"
+    digest="$BUBBLEWRAP_DEB_SHA256"
     fetch_verified_bubblewrap_deb "$deb" "$digest" "$snapshot" "$snapshot_url" "$apt_dir"
     if [ "${#missing[@]}" -eq 0 ]; then
       echo "Installing verified ${deb} offline (all other requested packages are already installed)"
       offline_log="$apt_dir/offline-install.log"
       offline_rc=0
-      offline_apt_install "$apt_dir/$deb" "$offline_log" 25 || offline_rc=$?
+      offline_apt_install 35 25 "$apt_dir/$deb" "$offline_log" || offline_rc=$?
+      if [ "$offline_rc" -ne 0 ] && ! grep -Fq 'E: dpkg was interrupted' "$offline_log" &&
+        apt_failure_is_dpkg_lock "$offline_rc" "$offline_log"; then
+        echo 'Retrying offline bubblewrap install after dpkg lock contention'
+        offline_rc=0
+        offline_apt_install 45 35 "$apt_dir/$deb" "$offline_log" || offline_rc=$?
+      fi
       if [ "$offline_rc" -ne 0 ] && grep -Fq 'E: dpkg was interrupted' "$offline_log"; then
         echo 'Repairing the interrupted dpkg transaction before retrying offline bubblewrap install'
         dpkg_with_lock_wait 15 --configure -a
         offline_rc=0
-        offline_apt_install "$apt_dir/$deb" "$offline_log" 20 || offline_rc=$?
+        offline_apt_install 35 20 "$apt_dir/$deb" "$offline_log" || offline_rc=$?
       fi
       if [ "$offline_rc" -eq 0 ]; then
         offline_installed=true

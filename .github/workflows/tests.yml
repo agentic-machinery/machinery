@@ -132,6 +132,20 @@ jobs:
           path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
           key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-bubblewrap-${{ env.BUBBLEWRAP_DEB_SHA256 }}
 
+      - name: Verify restored bubblewrap package
+        id: cache-bubblewrap-valid
+        if: steps.cache-bubblewrap.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          deb="$RUNNER_TEMP/release-cache/bubblewrap/$BUBBLEWRAP_DEB"
+          if [ -f "$deb" ] && [ ! -L "$deb" ] &&
+            printf '%s  %s\n' "$BUBBLEWRAP_DEB_SHA256" "$deb" | sha256sum --check --strict -; then
+            echo 'valid=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Restored bubblewrap cache entry failed SHA-256 verification; setup will refetch." >&2
+            echo 'valid=false' >> "$GITHUB_OUTPUT"
+          fi
+
       # PostgreSQL 16 and bubblewrap start in the background during the Python
       # installs below; `wait` blocks until the server answers on the DSN.
       - run: bash lu_machinery/ci/test_env.sh start postgres
@@ -352,11 +366,12 @@ jobs:
 
       - run: bash lu_machinery/ci/test_env.sh wait
 
-      # Save only verified bytes after setup_bubblewrap.sh finishes. Fork PRs
-      # can restore base caches but cannot write through this step.
+      # Save only verified bytes after setup_bubblewrap.sh finishes when the
+      # restore missed or failed verification. Fork PRs can restore base caches
+      # but cannot write through this step.
       - name: Verify bubblewrap package before cache save
         id: bubblewrap-cache-file
-        if: steps.cache-bubblewrap.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: steps.cache-bubblewrap-valid.outputs.valid != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           set -euo pipefail
           deb="$RUNNER_TEMP/release-cache/bubblewrap/$BUBBLEWRAP_DEB"
