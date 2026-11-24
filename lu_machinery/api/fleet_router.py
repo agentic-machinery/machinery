@@ -1333,6 +1333,8 @@ def _fleet_seat_roster() -> tuple[list[_FleetSeat], str, str]:
         )
         seats.append(_FleetSeat(lane.name, "cto" if cto else "driver", lane.epic, recipients))
 
+    external: tuple[str, ...]
+    external_roster: str
     try:
         assignments_path = agent_identity.default_assignments_path()
     except (OSError, ValueError, RuntimeError):
