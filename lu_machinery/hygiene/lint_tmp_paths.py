@@ -773,11 +773,6 @@ ALLOWLIST: tuple[tuple[str, str, str], ...] = (
         "8640cf7f0d0116eec5bc28feaf76e1e70769ffd900775c0ba583c1b91735f6d3:1",
     ),
     (
-        _mp("orchestration/job_host_exec.py"),
-        "Remote context; existing exit/signal cleanup traps own these files. Expanded checks retain exact legacy fingerprints (#9702).",
-        "1c57c0f6ac43dd4fc0b4f4baba7647ce4221086b52f0e6b4700ff406bee6dcb6:1 27aa61ac8f66a6b34cfed0dd8cf8e12e93aeb31cdea4813f6f09c6062576c8fa:1 3569f08b00e9114418242100f1b22462198be378022613efeef593b3ff6fd02e:1",
-    ),
-    (
         _mp("orchestration/red_ci_known_failures.py"),
         "Existing literal or temp producer exposed by expanded lint; migration tracked in #9702.",
         "6fc1251070848cb64ab73fce1f4d6fbe71bda1e8ace49bd1d5c2d933895f9f64:1",
@@ -1674,11 +1669,6 @@ ALLOWLIST: tuple[tuple[str, str, str], ...] = (
         "tests/maintenance/test_claude_session_scratch.py",
         "Existing test literal; migration outside this bounded packet (#9702).",
         "a73144ec31e1e70a566534e56044cba6207bf4b5c171e2daf7ce655e7dca111a:1",
-    ),
-    (
-        "tests/orchestration/test_job_host_exec.py",
-        "Existing test literal; migration outside this bounded packet (#9702).",
-        "169d4511743538b9be608c16cfd4a86ccd75de5d018d4cffc3f6bca40b8eda67:1 35eef957e7ac6dfb323982b5acdb0d4c5ac6bc3e41dba5a3f06a0d4ed8ad76c5:1 3cac3970d6434c27592340c8750dfe8c885f88ad6d33a46e20e461d810482bb5:1 6d0a3a07137da113db85eadf897776f58b8104244fa38a91b62e2d6e12fb9290:1 78a2828693382f4e53c60d70ea534f892706f2cdc6a74b1e3ff1f4a888c3f0af:1 9668994dd3e78910e686248664fb372b4ceb8c3b3c73f7394d646d27ca2e5199:3",
     ),
     (
         "tests/orchestration/test_scheduled_worktree_cleanup.py",

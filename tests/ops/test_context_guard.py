@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parents[2]
 START = dt.datetime(2026, 10, 16, 12, 0, tzinfo=dt.UTC)
 ECHO = (
     "> HANDOFF NOW (CTO automated, 2026-10-16T12:00:00Z): your context is 70% (hand off at 70%). "
-    "Finish the current step only, write the top of .claude/infra-epic/DRIVER-STATE.md "
+    "Finish the current step only, record a DB handoff_note for lane infra "
     "(in-flight workers with task ids, waits with nonces, PRs, holds, orders and their status, next actions), "
     "stop every background task you started (background Bash tasks and Monitor streams), "
     "post 'HANDOFF-DONE infra .claude/infra-epic/DRIVER-STATE.md' to Fleet Comms recipient claude-cto, then stop. "
@@ -313,6 +313,9 @@ def test_claude_lanes_share_the_70_percent_threshold(tmp_path: Path) -> None:
     h.tick()
     typed = {s: h.fake.typed(s) for s in ("infra-muse", "devops-muse", "cto")}
     assert all(len(v) == 1 and v[0].startswith("HANDOFF NOW") for v in typed.values()), typed
+    for session, db_lane in (("infra-muse", "infra"), ("devops-muse", "devops"), ("cto", "cto")):
+        assert f"record a DB handoff_note for lane {db_lane} (" in typed[session][0], (session, typed[session][0])
+    assert "for lane epics" not in typed["cto"][0]
     assert {h.state[s]["phase"] for s in typed} == {"handoff"}
     assert len(h.sent) == 3
 
