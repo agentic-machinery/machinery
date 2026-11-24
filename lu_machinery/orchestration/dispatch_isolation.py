@@ -767,6 +767,8 @@ def _caller_in_driver_scope() -> bool:
         cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
     except OSError as exc:
         raise DispatchIsolationError("fallback-refused: caller-cgroup-unavailable") from exc
+    except UnicodeError as exc:
+        raise DispatchIsolationError("fallback-refused: caller-cgroup-unverifiable") from exc
     # Read the caller, not worker env: sandboxes remove launcher variables.
     # No harness currently has a validated bounded fallback exemption.
     paths = [line[3:] for line in cgroup.splitlines() if line.startswith("0::")]
@@ -791,7 +793,13 @@ def _fallback(
     refused = LaunchNotStarted if never_started else DispatchIsolationError
     if not allow_fallback:
         raise refused(reason)
-    if _caller_in_driver_scope():
+    try:
+        in_driver_scope = _caller_in_driver_scope()
+    except DispatchIsolationError as exc:
+        if type(exc) is refused:
+            raise
+        raise refused(str(exc)) from exc
+    if in_driver_scope:
         raise refused("fallback-refused: inside-driver-scope; " + reason)
     _warn(reason)
     proc = popen(list(cmd), **_popen_kwargs(env=env, stdin=stdin, stdout=stdout, stderr=stderr))
@@ -1047,10 +1055,17 @@ def _kill_if_alive(proc: subprocess.Popen[Any]) -> None:
 
 
 def _warn(reason: str) -> None:
-    print(
-        f"⚠️  dispatch isolation: {reason}; launching the worker with plain Popen",
-        file=sys.stderr,
-    )
+    stream = sys.stderr
+    if stream is None:
+        return
+    message = f"⚠️  dispatch isolation: {reason}; launching the worker with plain Popen"
+    try:
+        print(message, file=stream)
+    except UnicodeEncodeError:
+        with contextlib.suppress(OSError, ValueError):
+            print(message.encode("ascii", "replace").decode("ascii"), file=stream)
+    except (OSError, ValueError):
+        return
 
 
 def _forced_fallback(env: Mapping[str, str]) -> ProbeResult | None:

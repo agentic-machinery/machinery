@@ -2058,6 +2058,120 @@ def test_turn_children_count_contradictory_never_started_reason(
         assert worker._terminal_child_unsettled_state(unstarted) is None
 
 
+def test_unreadable_cgroup_in_fallback_is_never_started(task_store, tmp_path, monkeypatch, driver_scope_detection):
+    """PR1310-F2 defect class: pre-launch fallback refusals in _fallback(..., never_started=True) escape as plain
+    DispatchIsolationError (or raw UnicodeDecodeError / stderr write error), stamping launch_mode='scope' and
+    burning a per-turn child cap slot on a launch that never started."""
+    from lu_machinery.dispatcher import admission
+    from lu_machinery.dispatcher.types import TaskSpec
+    from lu_machinery.orchestration import dispatch_isolation
+
+    parent_nonce = "nonce-pr1310-f2"
+    linkage = {"parent_task_id": "turn-f2", "parent_run_nonce": parent_nonce, "parent_stream": STREAM}
+    for idx in range(3):
+        _write(dict(schema_version=2, task_id=f"c-ok-{idx}", agent="claude", mode="workspace-write",
+                    status="done", run_nonce=f"cn-ok-{idx}", **linkage))
+
+    monkeypatch.setattr(
+        dispatch_isolation,
+        "probe_isolation",
+        lambda *_a, **_k: dispatch_isolation.ProbeResult(False, "bus unavailable"),
+    )
+    original_read_text = Path.read_text
+
+    def _run_child(task_id: str) -> tuple[admission.LaunchRefused, dict, dict]:
+        path = store.record_path(task_id)
+        spec = TaskSpec(task_id, "claude", "claude-sonnet-5-5", "high", "workspace-write",
+                        tmp_path, path.with_suffix(".prompt"), path.with_suffix(".result"))
+        record = dict(
+            schema_version=2, task_id=task_id, agent="claude", model="claude-sonnet-5-5",
+            mode="workspace-write", status="spawning", pid=None, run_nonce=f"cn-{task_id}",
+            prompt_file=str(spec.prompt_file), result_file=str(spec.final_file), **linkage,
+        )
+        progress = {"record": False, "started": False}
+        with pytest.raises(admission.LaunchRefused) as raised:
+            worker.start(spec, record, b"prompt", 60, progress=progress)
+        return raised.value, progress, store.read(task_id)
+
+    # 1-3: unreadable, empty, and non-UTF-8 /proc/self/cgroup through the real detector.
+    monkeypatch.setattr(dispatch_isolation, "_caller_in_driver_scope", driver_scope_detection)
+    for task_id, outcome, expected_fragment in (
+        ("c-cg-perm", PermissionError("unavailable"), "caller-cgroup-unavailable"),
+        ("c-cg-empty", "", "caller-cgroup-unverifiable"),
+        ("c-cg-utf8", UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "caller-cgroup-unverifiable"),
+    ):
+        def _fake_read(self: Path, *args, _outcome=outcome, **kwargs):
+            if str(self) == "/proc/self/cgroup":
+                if isinstance(_outcome, BaseException):
+                    raise _outcome
+                return _outcome
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _fake_read)
+        exc, progress, saved = _run_child(task_id)
+        assert exc.never_started is True, (task_id, exc)
+        assert progress.get("refused_before_start") is True, (task_id, progress)
+        assert saved["status"] == "failed" and saved["pid"] is None
+        assert saved["returncode_reason"] == "dispatch_fallback_refused"
+        assert saved["never_started_reason"] == "worker_placement"
+        assert expected_fragment in saved["error"]
+        assert saved.get("launch_mode") is None, saved
+        assert dispatch_admission.classify_never_started_refusal(saved) == (True, None)
+        assert dispatch_admission.count_turn_children(task_store, "turn-f2", parent_nonce) == 3
+        host_admission.check_turn_child_cap(linkage)
+        assert worker._terminal_child_unsettled_state(saved) is None
+    monkeypatch.setattr(Path, "read_text", original_read_text)
+
+    # 4: replaced _caller_in_driver_scope seam raising plain DispatchIsolationError.
+    def _seam_raises() -> bool:
+        raise dispatch_isolation.DispatchIsolationError("fallback-refused: custom-seam")
+
+    monkeypatch.setattr(dispatch_isolation, "_caller_in_driver_scope", _seam_raises)
+    exc, progress, saved = _run_child("c-cg-seam")
+    assert exc.never_started is True and progress.get("refused_before_start") is True
+    assert saved["returncode_reason"] == "dispatch_fallback_refused"
+    assert "custom-seam" in saved["error"]
+    assert saved.get("launch_mode") is None
+    assert dispatch_admission.count_turn_children(task_store, "turn-f2", parent_nonce) == 3
+    host_admission.check_turn_child_cap(linkage)
+    assert worker._terminal_child_unsettled_state(saved) is None
+
+    # 5: post-start _fallback(..., never_started=False) never upgrades to LaunchNotStarted (C-6991).
+    for exc_cls in (dispatch_isolation.DispatchIsolationError, dispatch_isolation.LaunchNotStarted):
+        def _post_start_seam(_cls=exc_cls) -> bool:
+            raise _cls("fallback-refused: custom-seam")
+
+        monkeypatch.setattr(dispatch_isolation, "_caller_in_driver_scope", _post_start_seam)
+        with pytest.raises(dispatch_isolation.DispatchIsolationError, match="custom-seam") as post_start:
+            dispatch_isolation._fallback(
+                [sys.executable, "-c", "pass"],
+                popen=lambda *_a, **_k: pytest.fail("popen must not run when fallback is refused"),
+                env={}, stdin=None, stdout=None, stderr=None, reason="systemd-run exited 1",
+                allow_fallback=True, user_bus=dispatch_isolation.UserBus(env={}), never_started=False,
+            )
+        assert not isinstance(post_start.value, dispatch_isolation.LaunchNotStarted)
+
+    # 6: _warn failing on non-UTF-8 / broken sys.stderr never aborts a permitted fallback before popen.
+    monkeypatch.setattr(dispatch_isolation, "_caller_in_driver_scope", lambda: False)
+
+    class _BrokenStderr:
+        def write(self, text: str) -> int:
+            if not text.isascii():
+                raise UnicodeEncodeError("ascii", text, 0, 1, "ordinal not in range(128)")
+            raise BrokenPipeError("closed")
+
+    monkeypatch.setattr(sys, "stderr", _BrokenStderr())
+    seen: list[list[str]] = []
+    fake_proc = SimpleNamespace(pid=42, stdin=None)
+    proc, launch = dispatch_isolation._fallback(
+        [sys.executable, "-c", "pass"],
+        popen=lambda argv, **_k: (seen.append(list(argv)), fake_proc)[1],
+        env={}, stdin=None, stdout=None, stderr=None, reason="bus unavailable",
+        allow_fallback=True, user_bus=dispatch_isolation.UserBus(env={}), never_started=True,
+    )
+    assert proc is fake_proc and launch.mode == dispatch_isolation.LAUNCH_FALLBACK and len(seen) == 1
+
+
 def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp_path, monkeypatch):
     """Item 7 defect class: systemd RuntimeMaxSec SIGTERM on a turn scope is mislabelled as status=cancelled
     'cancelled by client' instead of status=timeout."""
