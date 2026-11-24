@@ -113,6 +113,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -181,6 +182,8 @@ DEFAULT_LOCK_TIMEOUT_S = 60.0
 PROC_ROOT = Path("/proc")
 
 ENV_MAX_LIVE_WRITE_WORKERS = "DISPATCH_MAX_LIVE_WRITE_WORKERS"
+ENV_MAX_LIVE_ORCHESTRATORS = "DISPATCH_MAX_LIVE_ORCHESTRATORS"
+ENV_MAX_CHILDREN_PER_TURN = "DISPATCH_MAX_CHILDREN_PER_TURN"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER"
 ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN = "DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN"
 ENV_MIN_METER_LAUNCH_INTERVAL_S = "DISPATCH_MIN_METER_LAUNCH_INTERVAL_S"
@@ -220,6 +223,8 @@ ENV_ADMISSION_FILE = "DISPATCH_ADMISSION_ENV_FILE"
 ADMISSION_ENV_FILE_NAME = "dispatch-admission.env"
 _THRESHOLD_ENV_NAMES = (
     ENV_MAX_LIVE_WRITE_WORKERS,
+    ENV_MAX_LIVE_ORCHESTRATORS,
+    ENV_MAX_CHILDREN_PER_TURN,
     ENV_MAX_LIVE_WRITE_WORKERS_PER_METER,
     ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN,
     ENV_MIN_METER_LAUNCH_INTERVAL_S,
@@ -265,6 +270,8 @@ class Thresholds:
     max_live_write_workers_per_meter: int = config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER
     max_live_write_workers_per_meter_unknown: int = config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN
     min_meter_launch_interval_s: float = config.DISPATCH_MIN_METER_LAUNCH_INTERVAL_S
+    max_live_orchestrators: int = config.DISPATCH_MAX_LIVE_ORCHESTRATORS
+    max_children_per_turn: int = config.DISPATCH_MAX_CHILDREN_PER_TURN
 
     def __post_init__(self) -> None:
         unknown_cap = self.max_live_write_workers_per_meter_unknown
@@ -272,6 +279,12 @@ class Thresholds:
             raise ValueError(
                 f"{ENV_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN}={unknown_cap!r} must be a positive whole number"
             )
+        for env_name, cap, ceiling in (
+            (ENV_MAX_LIVE_ORCHESTRATORS, self.max_live_orchestrators, config.DISPATCH_MAX_LIVE_ORCHESTRATORS),
+            (ENV_MAX_CHILDREN_PER_TURN, self.max_children_per_turn, config.DISPATCH_MAX_CHILDREN_PER_TURN),
+        ):
+            if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0 or cap > ceiling:
+                raise ValueError(f"{env_name}={cap!r} must be a whole number between 0 and {ceiling}")
 
 
 class MeterDefer(StrEnum):
@@ -401,6 +414,8 @@ class AdmissionDecision:
     disk: DiskCheck | None = None
     psi_shadow: dict[str, Any] | None = None
     meter: MeterCheck | None = None
+    live_orchestrator_ids: tuple[str, ...] = ()
+    orchestrator_cap_refused: bool = False
 
     @property
     def live_write_workers(self) -> int:
@@ -491,6 +506,11 @@ class AdmissionDecision:
                 f"dispatch admission deferred for a {self.mode} worker: {details}. "
                 "Retry when the subscription meter has room. --force-admission cannot override meter limits."
             )
+        if self.orchestrator_cap_refused:
+            return (
+                f"dispatch admission refused for a {self.mode} worker: {details}. "
+                "Wait for a live orchestrator turn to finish; --force-admission cannot override the orchestrator cap."
+            )
         return (
             f"dispatch admission refused for a {self.mode} worker: {details}. "
             "Wait for a worker to finish or for the host to recover, raise the threshold through the named "
@@ -521,11 +541,18 @@ class AdmissionDecision:
         return {
             "checked_at": datetime.now(UTC).isoformat(),
             "admitted": self.admitted,
-            "forced": force_reason is not None and not self.admitted and not (self.disk_refused or self.meter_refused),
+            "forced": (
+                force_reason is not None
+                and not self.admitted
+                and not (self.disk_refused or self.meter_refused or self.orchestrator_cap_refused)
+            ),
             "force_reason": force_reason,
             "failures": list(self.failures),
             "live_write_workers": self.live_write_workers,
             "max_live_write_workers": limits.max_live_write_workers if limits else None,
+            "live_orchestrators": len(self.live_orchestrator_ids),
+            "max_live_orchestrators": limits.max_live_orchestrators if limits else None,
+            "orchestrator_cap_refused": self.orchestrator_cap_refused,
             "mem_available_gib": round(mem, 2) if mem is not None else None,
             "min_mem_available_gib": limits.min_mem_available_gib if limits else None,
             "load1": probe.load1 if probe else None,
@@ -609,6 +636,8 @@ def config_defaults() -> Thresholds:
         max_live_write_workers_per_meter=int(config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER),
         max_live_write_workers_per_meter_unknown=int(config.DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER_UNKNOWN),
         min_meter_launch_interval_s=float(config.DISPATCH_MIN_METER_LAUNCH_INTERVAL_S),
+        max_live_orchestrators=int(config.DISPATCH_MAX_LIVE_ORCHESTRATORS),
+        max_children_per_turn=int(config.DISPATCH_MAX_CHILDREN_PER_TURN),
     )
 
 
@@ -732,6 +761,12 @@ def load_thresholds(environ: Mapping[str, str] | None = None) -> Thresholds:
         ),
         max_live_write_workers_per_meter_unknown=unknown_meter_cap,
         min_meter_launch_interval_s=interval,
+        max_live_orchestrators=int(
+            _env_number(env, ENV_MAX_LIVE_ORCHESTRATORS, defaults.max_live_orchestrators, integer=True)
+        ),
+        max_children_per_turn=int(
+            _env_number(env, ENV_MAX_CHILDREN_PER_TURN, defaults.max_children_per_turn, integer=True)
+        ),
     )
     validate_disk_watermarks(limits)
     return limits
@@ -1612,6 +1647,243 @@ class WorkerScan:
     live_on_meter: int = 0
     last_meter_launch_age_s: float | None = None
     meter_recently_rate_limited: bool = False
+    live_orchestrator_ids: tuple[str, ...] = ()
+
+
+def _is_orchestrator_turn(state: Mapping[str, Any]) -> bool:
+    try:
+        return orchestrator_stream(state) is not None
+    except ValueError:
+        return False
+
+
+def read_regular_task_record_bytes(path: Path) -> bytes:
+    """Read ``path`` only after proving it is a regular file without blocking on FIFOs or devices."""
+    st = os.stat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"non-regular task record {path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(path, flags)
+    try:
+        fst = os.fstat(fd)
+        if not stat.S_ISREG(fst.st_mode):
+            raise ValueError(f"non-regular task record {path.name}")
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def is_safe_identical_copy(exc: task_record_store.TaskIdentityMismatch) -> bool:
+    """Whether ``exc`` is an exact copy of its named regular-file sibling, read without blocking."""
+    named = task_record_store.task_record_path(exc.path.parent, exc.record["task_id"])
+    if named == exc.path:
+        return False
+    try:
+        raw = read_regular_task_record_bytes(named)
+        other = task_record_store.parse_task_record(named, raw)
+    except (OSError, ValueError, RecursionError):
+        return False
+    return isinstance(other, dict) and json.dumps(other, sort_keys=True) == json.dumps(exc.record, sort_keys=True)
+
+
+def scan_record_candidates(directory: Path) -> list[Path]:
+    """Enumerate every non-sidecar ``.json`` entry in ``directory`` without filtering out dangling or non-regular files."""
+    with os.scandir(directory) as entries:
+        names = [
+            entry.name
+            for entry in entries
+            if entry.name.endswith(".json") and not entry.name.endswith(task_record_store._DISPATCHER_SIDECAR_SUFFIXES)
+        ]
+    names.sort()
+    return [directory / name for name in names]
+
+
+def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -> list[dict[str, Any]]:
+    """Return every verified task record under ``tasks_dir`` (and archive) while holding ``task_archive_lock``.
+
+    Fails closed on any directory traversal error, unreachable existing archive entry, dangling
+    symlink, non-regular ``.json`` candidate (FIFO, socket, device, directory), corrupt or
+    non-object record, or misnamed record that is not an exact copy of its named sibling.
+    """
+    records: list[dict[str, Any]] = []
+    with task_record_store.task_archive_lock(tasks_dir):
+        candidates = scan_record_candidates(tasks_dir)
+        if include_archive:
+            archive_dir = tasks_dir / task_record_store.ARCHIVE_DIR_NAME
+            try:
+                archive_dir.lstat()
+            except FileNotFoundError:
+                archive_present = False
+            else:
+                archive_present = True
+            if archive_present:
+                candidates.extend(scan_record_candidates(archive_dir))
+        for listed in candidates:
+            try:
+                raw = read_regular_task_record_bytes(listed)
+                parsed = task_record_store.parse_task_record(listed, raw)
+            except task_record_store.TaskIdentityMismatch as exc:
+                if is_safe_identical_copy(exc):
+                    continue
+                raise ValueError(f"unreadable task record {listed.name}") from None
+            except (OSError, ValueError, RecursionError):
+                raise ValueError(f"unreadable task record {listed.name}") from None
+            if not isinstance(parsed, dict) or not _is_valid_run_identity(parsed.get("task_id")):
+                raise ValueError(f"unreadable task record {listed.name}")
+            records.append(parsed)
+    return records
+
+
+def _is_valid_run_identity(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and all(ch.isprintable() and not ch.isspace() for ch in value)
+
+
+NEVER_STARTED_REFUSAL_STATUSES = frozenset({"failed", "rate_limited"})
+NEVER_STARTED_LAUNCH_FIELDS = (
+    "pid",
+    "process_start",
+    "provider_pgid",
+    "launch_unit",
+    "launch_cgroup",
+    "launch_mode",
+)
+
+
+def classify_never_started_refusal(record: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Classify whether ``record`` is a verified pre-launch refusal with no launch evidence.
+
+    Returns ``(is_pre_launch_refusal, contradiction_reason)``:
+    - ``(False, None)`` when ``never_started_reason`` is absent, or when ``status`` is a refusal
+      status (``failed``/``rate_limited``) with a valid ``never_started_reason`` and launch
+      evidence present (the supervisor launched before refusing, so it counts toward the cap and
+      must still pass process/service/worktree settlement checks).
+    - ``(True, None)`` only when ``status`` is in :data:`NEVER_STARTED_REFUSAL_STATUSES`,
+      ``never_started_reason`` is a valid run identity, and every field in
+      :data:`NEVER_STARTED_LAUNCH_FIELDS` is ``None``.
+    - ``(False, reason)`` when ``never_started_reason`` is malformed, or ``status`` is not a
+      refusal status (``spawning``, ``running``, non-refusal terminal, or invalid/unknown).
+    """
+    never_started = record.get("never_started_reason")
+    if never_started is None:
+        return False, None
+    task_id = record.get("task_id")
+    if not _is_valid_run_identity(never_started):
+        return False, f"malformed never_started_reason on {task_id}"
+    status = record.get("status")
+    if not isinstance(status, str) or status not in NEVER_STARTED_REFUSAL_STATUSES:
+        return False, f"contradictory never_started_reason on {task_id} with status={status!r}"
+    if any(record.get(k) is not None for k in NEVER_STARTED_LAUNCH_FIELDS):
+        return False, None
+    return True, None
+
+
+_KNOWN_TERMINAL_STATUSES = frozenset({
+    "done",
+    "failed",
+    "timeout",
+    "timed_out",
+    "timed-out",
+    "rate_limited",
+    "cancelled",
+    "crashed",
+    "no_deliverable",
+    "terminal_abandon",
+    "needs_finalize",
+})
+
+
+def _verified_live_orchestrators(
+    tasks_dir: Path,
+    *,
+    pid_alive: Callable[[int], bool] | None,
+    record_liveness: Callable[[dict[str, Any]], bool | None] | None,
+    now: datetime,
+) -> tuple[str, ...]:
+    """Count live orchestrator turns from a strict hot-store inventory; fail closed on any unreadable/malformed record."""
+    try:
+        tasks_dir.lstat()
+    except FileNotFoundError:
+        return ()
+    alive = pid_alive or process_alive
+    records = strict_task_inventory_in(tasks_dir, include_archive=False)
+    live_ids: list[str] = []
+    for state in records:
+        task_id = state["task_id"]
+        status = state.get("status")
+        if not isinstance(status, str) or status not in (ACTIVE_STATUSES | _KNOWN_TERMINAL_STATUSES):
+            raise ValueError(f"malformed status on {task_id}")
+        # Validate orchestrator metadata without swallowing ValueError so a damaged field cannot conceal a live turn.
+        is_orchestrator = orchestrator_stream(state) is not None
+        if not is_orchestrator or status not in ACTIVE_STATUSES:
+            continue
+        raw_pid = state.get("pid")
+        pid = _parse_pid(raw_pid)
+        if raw_pid is not None and pid is None:
+            raise ValueError(f"malformed pid on {task_id}")
+        if pid is None:
+            if status != "spawning":
+                raise ValueError(f"missing pid on running orchestrator turn {task_id}")
+            if is_orphaned_pidless_record(state):
+                continue
+            owner = _dispatcher_owner(state)
+            if owner is not None:
+                raw_owner_pid = owner.get("owner_pid")
+                owner_pid = _parse_pid(raw_owner_pid)
+                if raw_owner_pid is not None and owner_pid is None:
+                    raise ValueError(f"malformed owner_pid on spawning orchestrator turn {task_id}")
+                if owner_pid is not None:
+                    if "owner_identity" in owner:
+                        from lu_machinery.orchestration.dead_worker_state import worker_liveness
+
+                        owner_live = worker_liveness({"pid": owner_pid, "worker_identity": owner["owner_identity"]}) is not False
+                    else:
+                        owner_live = alive(owner_pid)
+                    if owner_live:
+                        live_ids.append(task_id)
+                    continue
+            age = _age_s(state.get("started_at"), now)
+            if age is None:
+                raise ValueError(f"unverifiable spawning orchestrator turn {task_id}")
+            if -PIDLESS_CLOCK_SKEW_S <= age <= PIDLESS_SPAWNING_GRACE_S:
+                live_ids.append(task_id)
+            continue
+        worker_live = record_liveness(state) is not False if record_liveness is not None else alive(pid)
+        if worker_live:
+            live_ids.append(task_id)
+    return tuple(live_ids)
+
+
+def count_turn_children(
+    tasks_dir: Path,
+    parent_task_id: str,
+    parent_run_nonce: str | None = None,
+) -> int:
+    """Count non-refused child runs dispatched by one orchestrator turn; fail closed on any unreadable record."""
+    try:
+        records = strict_task_inventory_in(tasks_dir, include_archive=True)
+    except ValueError as exc:
+        raise ValueError(f"{exc}: cannot verify turn child count") from None
+    seen_runs: set[tuple[str, str]] = set()
+    for record in records:
+        if record.get("parent_task_id") != parent_task_id:
+            continue
+        rec_parent_nonce = record.get("parent_run_nonce")
+        if rec_parent_nonce is not None and not _is_valid_run_identity(rec_parent_nonce):
+            raise ValueError(f"malformed parent_run_nonce on {record['task_id']}: cannot verify turn child count")
+        if parent_run_nonce is not None and rec_parent_nonce not in (None, parent_run_nonce):
+            continue
+        rec_run_nonce = record.get("run_nonce")
+        if not isinstance(rec_run_nonce, str) or not _is_valid_run_identity(rec_run_nonce):
+            raise ValueError(f"malformed run_nonce on {record['task_id']}: cannot verify turn child count")
+        is_pre_launch_refusal, contradiction = classify_never_started_refusal(record)
+        if contradiction is not None:
+            raise ValueError(f"{contradiction}: cannot verify turn child count")
+        if is_pre_launch_refusal:
+            continue
+        seen_runs.add((record["task_id"], rec_run_nonce))
+    return len(seen_runs)
 
 
 def iter_active_records(
@@ -1662,6 +1934,7 @@ def scan_task_records(
     alive = pid_alive or process_alive
     clock = now or datetime.now(UTC)
     live: list[str] = []
+    live_orchestrators: list[str] = []
     dead: list[tuple[Path, dict[str, Any]]] = []
     live_on_meter = 0
     last_meter_launch_age_s: float | None = None
@@ -1677,6 +1950,7 @@ def scan_task_records(
         task_id = str(state.get("task_id") or path.stem)
         mode = state.get("mode")
         launches_writer = isinstance(mode, str) and mode in WRITE_CAPABLE_MODES
+        is_orchestrator = _is_orchestrator_turn(state)
         write_capable = _holds_write_slot(state, launches_writer)
         matches_meter = meter is not None and _meter_record(state) == meter
         on_meter = matches_meter and write_capable
@@ -1698,11 +1972,11 @@ def scan_task_records(
             if is_orphaned_pidless_record(state):
                 dead.append((path, state))
                 continue
-            if not write_capable or state.get("status") != "spawning":
+            if (not write_capable and not is_orchestrator) or state.get("status") != "spawning":
                 continue
             owner = _dispatcher_owner(state)
             owner_pid = _parse_pid(owner.get("owner_pid")) if owner is not None else None
-            if owner_pid is not None:
+            if owner is not None and owner_pid is not None:
                 # Held while the dispatcher lives, however long its worktree
                 # add runs. A missing pid is proof it is gone even on a host
                 # without /proc, where only the pid can be checked.
@@ -1713,8 +1987,11 @@ def scan_task_records(
                 else:
                     owner_live = alive(owner_pid)
                 if owner_live:
-                    live.append(task_id)
-                    live_on_meter += on_meter
+                    if write_capable:
+                        live.append(task_id)
+                        live_on_meter += on_meter
+                    if is_orchestrator:
+                        live_orchestrators.append(task_id)
                 continue
             age = _age_s(state.get("started_at"), clock)
             if age is not None and age < -PIDLESS_CLOCK_SKEW_S:
@@ -1724,17 +2001,29 @@ def scan_task_records(
                     -age,
                 )
             elif age is not None and age <= PIDLESS_SPAWNING_GRACE_S:
-                live.append(task_id)
-                live_on_meter += on_meter
+                if write_capable:
+                    live.append(task_id)
+                    live_on_meter += on_meter
+                if is_orchestrator:
+                    live_orchestrators.append(task_id)
             continue
         worker_live = record_liveness(state) is not False if record_liveness is not None else alive(pid)
         if worker_live:
             if write_capable:
                 live.append(task_id)
                 live_on_meter += on_meter
+            if is_orchestrator:
+                live_orchestrators.append(task_id)
         else:
             dead.append((path, state))
-    return WorkerScan(tuple(live), tuple(dead), live_on_meter, last_meter_launch_age_s, meter_recently_rate_limited)
+    return WorkerScan(
+        tuple(live),
+        tuple(dead),
+        live_on_meter,
+        last_meter_launch_age_s,
+        meter_recently_rate_limited,
+        tuple(live_orchestrators),
+    )
 
 
 def host_failures(probe: HostProbe, limits: Thresholds) -> list[str]:
@@ -1921,6 +2210,23 @@ def evaluate(
             f"live write workers {live}/{limits.max_live_write_workers} reached the cap "
             f"({ENV_MAX_LIVE_WRITE_WORKERS}={limits.max_live_write_workers})"
         )
+    orchestrator_cap_refused = False
+    if orchestrator:
+        try:
+            verified_orchestrators = _verified_live_orchestrators(
+                tasks_dir, pid_alive=pid_alive, record_liveness=record_liveness, now=clock,
+            )
+        except (OSError, ValueError) as exc:
+            orchestrator_cap_refused = True
+            failures.append(f"orchestrator_cap_unknown: {exc}: cannot verify live orchestrator turn count")
+        else:
+            live_orch_count = len(set(scan.live_orchestrator_ids) | set(verified_orchestrators))
+            if live_orch_count >= limits.max_live_orchestrators:
+                orchestrator_cap_refused = True
+                failures.append(
+                    f"live orchestrator turns {live_orch_count}/{limits.max_live_orchestrators} reached the cap "
+                    f"({ENV_MAX_LIVE_ORCHESTRATORS}={limits.max_live_orchestrators})"
+                )
     meter_check = None
     if meter is not None:
         telemetry, monitor_defer = _meter_defer(
@@ -1982,6 +2288,8 @@ def evaluate(
         slots=slots,
         disk=disk,
         meter=meter_check,
+        live_orchestrator_ids=scan.live_orchestrator_ids,
+        orchestrator_cap_refused=orchestrator_cap_refused,
     )
     return replace(
         decision,

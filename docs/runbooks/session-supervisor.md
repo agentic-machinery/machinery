@@ -260,6 +260,313 @@ once that successor claim commits. Remote unavailability fails closed.
 Clean exits release only their exact lease envelope. Attributed `release --force`
 is an exceptional, separately authorized operator action, never automatic recovery.
 
+### Dispatch-turn lease recovery (DRIVERS-1122)
+
+Orchestrator turns claim a Monitor stream lease with holder harness `dispatch-turn`.
+Unlike legacy launcher leases, a `dispatch-turn` lease is **never** auto-superseded by
+TTL/CAS or local PID force-close (`409 turn_lease_uncleared`): expiry only signals that
+an operator should investigate, because TTL expiry alone does not prove the turn's
+systemd scope or child tasks have stopped.
+
+When a turn crashes, loses a claim or release response, settles with live/unknown/unreadable
+children, or survives a host reboot, the stream remains held. `stalled_work` surfaces any
+held `dispatch-turn` lease whose turn record is terminal or overdue as a `held_turn_lease`
+row and sends one deduplicated alert to `claude-cto`. `diagnose_handoff` and
+`recover_expired_driver` refuse TTL takeover and direct recovery here.
+
+Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
+
+1. **Inspect the turn record and Monitor projection:** confirm the holder `task_id`,
+   `instance_id` (run nonce), `session_id`, `lease_id`, `generation`, and `fencing_token`
+   via `.venv/bin/python -m lu_machinery.dispatch status <task-id>` and
+   `GET /api/epics/v1/epic:<N>`.
+2. **Prove the turn scope and task services are gone on the recorded host:** do **not**
+   rely on a raw `'lu-worker-<task-id>*'` glob (which misses task IDs whose trailing
+   punctuation is stripped by `_unit_piece`, such as `turn-review.`, and misses task
+   services under the `lu-task-<sha256(task_id)>-` prefix). Run the dispatcher's own
+   unit-naming and service-list checks and confirm every matching scope and service is
+   stopped (keep the lease held if `systemctl` fails, the service list is unreadable, or
+   any unit is active, activating, or deactivating):
+
+   ```bash
+   .venv/bin/python -c '
+   import os, subprocess, sys
+   from lu_machinery.dispatcher import store
+   from lu_machinery.orchestration import dispatch_isolation as di
+
+   def refuse(msg, detail=None):
+       raise SystemExit(f"refused: {msg}: {detail!r}")
+
+   if len(sys.argv) != 3 or not sys.argv[1].strip() or not sys.argv[2].strip() or any(c.isspace() for c in sys.argv[2]):
+       refuse("usage: <task-id> <run-nonce>", sys.argv[1:])
+   tid, nonce = sys.argv[1], sys.argv[2]
+   try:
+       store.record_path(tid)
+       records = store.strict_task_inventory(include_archive=True)
+   except (OSError, ValueError) as exc:
+       refuse("task store or turn record unreadable", f"{type(exc).__name__}: {exc}")
+   for_tid = [r for r in records if r.get("task_id") == tid]
+   if any(not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce") or any(c.isspace() for c in r.get("run_nonce")) for r in for_tid):
+       refuse("malformed run_nonce on turn record", tid)
+   matches = [r for r in for_tid if r.get("run_nonce") == nonce]
+   if for_tid and not matches:
+       refuse("run nonce mismatch", {"task_id": tid, "run_nonce": nonce})
+   recs = matches or [{"task_id": tid, "run_nonce": nonce}]
+   env = di.user_manager_env(os.environ)
+   gone = {"inactive", "failed", "unknown"}
+
+   def check_unit_stopped(unit):
+       if not isinstance(unit, str) or not unit or any(c.isspace() for c in unit) or unit.startswith("-") or "/" in unit:
+           refuse("malformed unit name", unit)
+       try:
+           proc = subprocess.run(
+               ["systemctl", "--user", "is-active", "--", unit],
+               env=env, capture_output=True, text=True, timeout=15,
+           )
+       except (OSError, subprocess.TimeoutExpired) as exc:
+           refuse("systemctl is-active failed", f"{type(exc).__name__}: {exc}")
+       lines = (proc.stdout or "").strip().splitlines()
+       state = lines[-1] if lines else ""
+       if proc.returncode == 0 or state not in gone or (state == "unknown" and proc.returncode not in {3, 4}):
+           refuse("unit not proven stopped", {"unit": unit, "rc": proc.returncode, "state": state})
+
+   def list_units(pattern):
+       try:
+           proc = subprocess.run(
+               ["systemctl", "--user", "list-units", "--all", "--no-legend", "--plain", "--", pattern],
+               env=env, capture_output=True, text=True, timeout=15,
+           )
+       except (OSError, subprocess.TimeoutExpired) as exc:
+           refuse("systemctl list-units failed", f"{type(exc).__name__}: {exc}")
+       if proc.returncode != 0:
+           refuse("systemctl list-units failed", {"pattern": pattern, "rc": proc.returncode, "stderr": proc.stderr})
+       return [line.split()[0] for line in (proc.stdout or "").splitlines() if line.strip()]
+
+   for rec in recs:
+       launch_unit = rec.get("launch_unit")
+       if launch_unit is not None:
+           if not isinstance(launch_unit, str) or not launch_unit or any(c.isspace() for c in launch_unit) or "/" in launch_unit or launch_unit.startswith("-"):
+               refuse("malformed launch_unit", launch_unit)
+           scope = launch_unit if launch_unit.endswith(".scope") else f"{launch_unit}.scope"
+           check_unit_stopped(scope)
+       services = di.listed_task_services(rec)
+       if services is None:
+           refuse("task service list unreadable", tid)
+       for name in services:
+           stem = di._service_stem(name, task_id=tid)
+           if stem is None:
+               refuse("invalid task service name", name)
+           check_unit_stopped(f"{stem}.service")
+
+   for unit in list_units(f"{di._unit_prefix(tid, nonce)}*.scope"):
+       check_unit_stopped(unit)
+
+   for unit in list_units(f"lu-task-{di._task_service_tag(tid)}-*.service"):
+       check_unit_stopped(unit)
+
+   print(f"quiescent scope+services task_id={tid} run_nonce={nonce}")
+   ' <task-id> <run-nonce>
+   ```
+3. **Prove full child quiescence with a strict inventory:** inspect `child_tasks`,
+   `orphaned_child_tasks`, `unknown_child_tasks`, and `unreadable_child_records` on the
+   turn record, then run a strict inventory over both hot and archived task records
+   (never `dispatch list --all`, which skips unreadable records):
+
+   ```bash
+   .venv/bin/python -c '
+   import json, sys
+   from lu_machinery.dispatcher import store
+
+   def refuse(msg, detail=None):
+       raise SystemExit(f"refused: {msg}: {detail!r}")
+
+   if len(sys.argv) != 3 or not sys.argv[1].strip() or not sys.argv[2].strip() or any(c.isspace() for c in sys.argv[2]):
+       refuse("usage: <task-id> <run-nonce>", sys.argv[1:])
+   tid, nonce = sys.argv[1], sys.argv[2]
+   try:
+       store.record_path(tid)
+       records = store.strict_task_inventory(include_archive=True)
+   except (OSError, ValueError) as exc:
+       refuse("task store or turn record unreadable", f"{type(exc).__name__}: {exc}")
+   for_tid = [r for r in records if r.get("task_id") == tid]
+   if any(not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce") or any(c.isspace() for c in r.get("run_nonce")) for r in for_tid):
+       refuse("malformed run_nonce on turn record", tid)
+   if for_tid and not any(r.get("run_nonce") == nonce for r in for_tid):
+       refuse("run nonce mismatch", {"task_id": tid, "run_nonce": nonce})
+   rows = [
+       {k: r.get(k) for k in ("task_id", "run_nonce", "parent_run_nonce", "status", "worktree_disposition_reason")}
+       for r in records
+       if r.get("parent_task_id") == tid
+       and (
+           not isinstance(r.get("parent_run_nonce"), str)
+           or not r.get("parent_run_nonce")
+           or any(c.isspace() for c in r.get("parent_run_nonce"))
+           or r.get("parent_run_nonce") == nonce
+       )
+   ]
+   print(json.dumps(rows, indent=2))
+   ' <task-id> <run-nonce>
+   ```
+
+   `store.strict_task_inventory(include_archive=True)` holds `task_archive_lock` across both
+   enumeration and reads of the hot and archived stores and raises on any dangling symlink,
+   non-regular candidate (FIFO, socket, device, directory), corrupt or non-object JSON record,
+   unreadable directory, or misnamed record. Confirm the inventory exits 0 and that every
+   linked child is terminal with its processes/scope and task services proven gone (no
+   `worktree_disposition_reason` of `provider_processes_alive` or
+   `provider_liveness_unknown`). If the strict inventory fails, or any child is `spawning`,
+   `running`, `unknown`, or unreadable, keep the stream held — custody reassignment alone
+   does not satisfy quiescence.
+
+Once all three checks pass **and the lease is past `expires_at` (`state == "expired"`)**,
+close **only the exact checked lease** using Monitor's fenced exact-envelope release
+(`POST /api/epics/v1/epic:<N>/release` with `session_id`, `lease_id`, `generation`,
+`fencing_token`, and exact `holder`). Turn leases are not heartbeated
+(`host_admission.claim_turn`), so a terminal or stuck turn's lease reaches `state == "expired"`
+on its own within its TTL. Under rules core `r2-lease`, a remote lease remains live until
+`expires_at` and earlier release requires an attributed operator release through the
+supervisor flow; therefore, for an `active` (unexpired) lease, **keep the hold until
+`state == "expired"`** rather than closing it through the unattributed exact-envelope path.
+Monitor verifies all envelope fields atomically inside its transaction and refuses with
+`409 LEASE LOST` (`RemoteLeaseLostError`) if the original holder already closed and a
+successor claimed the stream:
+
+```bash
+.venv/bin/python -c '
+import sys
+from datetime import UTC, datetime
+from lu_machinery.dispatcher.store import parse_utc_timestamp
+from lu_machinery.session_streams.model import HolderKind, Lease, LeaseHolder
+from lu_machinery.session_supervisor.remote import RemoteEpicClient
+
+def require(cond, msg, detail=None):
+    if not cond:
+        raise SystemExit(f"refused: {msg}: {detail!r}")
+
+def is_pos_int(value):
+    return type(value) is int and value > 0
+
+def is_nonempty_str(value):
+    return isinstance(value, str) and bool(value.strip())
+
+require(len(sys.argv) == 4, "usage: <stream-id> <lease-id> <generation>", sys.argv[1:])
+stream_id, expected_lease_id = sys.argv[1], sys.argv[2]
+require(
+    is_nonempty_str(stream_id) and is_nonempty_str(expected_lease_id),
+    "usage: <stream-id> <lease-id> <generation>",
+    sys.argv[1:],
+)
+try:
+    expected_gen = int(sys.argv[3])
+except ValueError:
+    raise SystemExit(f"refused: generation must be an integer: {sys.argv[3]!r}")
+require(expected_gen > 0, "generation must be positive", expected_gen)
+
+client = RemoteEpicClient()
+proj = client.stream(stream_id)
+require(isinstance(proj, dict), "malformed stream projection", proj)
+raw = proj.get("lease")
+require(isinstance(raw, dict), "malformed lease projection", raw)
+require(raw.get("state") == "expired", "lease is not expired", raw)
+require(
+    raw.get("stream_id") == stream_id
+    and raw.get("lease_id") == expected_lease_id
+    and is_pos_int(raw.get("generation"))
+    and raw["generation"] == expected_gen,
+    "lease identity mismatch",
+    raw,
+)
+require(is_nonempty_str(raw.get("session_id")), "malformed lease session_id", raw)
+hb_dt = parse_utc_timestamp(raw.get("heartbeat_at"))
+require(hb_dt is not None, "malformed lease heartbeat_at", raw)
+exp_dt = parse_utc_timestamp(raw.get("expires_at"))
+require(exp_dt is not None, "malformed lease expires_at", raw)
+require(hb_dt <= exp_dt, "lease heartbeat_at is after expires_at", raw)
+require(exp_dt <= datetime.now(UTC), "lease expires_at is not in the past", raw)
+for field in ("fencing_token", "ttl_seconds", "version"):
+    require(is_pos_int(raw.get(field)), f"malformed lease {field}", raw)
+h = raw.get("holder")
+require(isinstance(h, dict), "malformed lease holder", raw)
+require(h.get("harness") == "dispatch-turn", "holder is not dispatch-turn", h)
+for field in ("agent", "instance_id"):
+    require(is_nonempty_str(h.get(field)), f"malformed holder {field}", h)
+holder_kind_raw = h.get("holder_kind")
+require(
+    isinstance(holder_kind_raw, str) and holder_kind_raw in {k.value for k in HolderKind},
+    "malformed holder_kind",
+    h,
+)
+holder_kind = HolderKind(holder_kind_raw)
+if holder_kind is HolderKind.PROCESS:
+    require(is_pos_int(h.get("process_id")), "malformed holder process_id", h)
+else:
+    require(h.get("process_id") is None, "app_thread holder process_id must be null", h)
+for field in ("task_id", "host_id"):
+    require(h.get(field) is None or is_nonempty_str(h.get(field)), f"malformed holder {field}", h)
+lease = Lease(
+    stream_id=raw["stream_id"],
+    session_id=raw["session_id"],
+    lease_id=raw["lease_id"],
+    generation=raw["generation"],
+    fencing_token=raw["fencing_token"],
+    holder=LeaseHolder(
+        agent=h["agent"],
+        harness=h["harness"],
+        instance_id=h["instance_id"],
+        process_id=h.get("process_id"),
+        holder_kind=holder_kind,
+        task_id=h.get("task_id"),
+        host_id=h.get("host_id"),
+    ),
+    heartbeat_at=raw["heartbeat_at"],
+    expires_at=raw["expires_at"],
+    ttl_seconds=raw["ttl_seconds"],
+    version=raw["version"],
+)
+try:
+    lease.holder.validate()
+except ValueError as exc:
+    raise SystemExit(f"refused: invalid lease holder: {exc}")
+res = client.release(lease)
+require(isinstance(res, dict), "malformed release response", res)
+rel = res.get("lease")
+require(
+    res.get("outcome") == "released"
+    and isinstance(rel, dict)
+    and rel.get("stream_id") == stream_id
+    and rel.get("lease_id") == expected_lease_id
+    and is_pos_int(rel.get("generation"))
+    and rel["generation"] == expected_gen,
+    "unexpected release acknowledgement",
+    res,
+)
+after_proj = client.stream(stream_id)
+require(isinstance(after_proj, dict), "malformed post-release projection", after_proj)
+after = after_proj.get("lease")
+require(
+    isinstance(after, dict)
+    and after.get("state") == "released"
+    and after.get("session_state") == "closed"
+    and after.get("stream_id") == stream_id
+    and after.get("lease_id") == expected_lease_id
+    and is_pos_int(after.get("generation"))
+    and after["generation"] == expected_gen,
+    "post-release state mismatch",
+    after,
+)
+print(f"released {stream_id} lease_id={expected_lease_id} generation={expected_gen}")
+' epic:<N> <lease-id> <generation>
+```
+
+Do **not** run the exact-envelope recipe on an `active` (unexpired) lease, and do **not**
+use `session_supervisor release --force` for `dispatch-turn` lease recovery while
+`release --force` is scoped only by `stream_id` and not fenced to a specific `lease_id`
+and `generation` (a concurrent successor claim between pre-check and release could be
+closed erroneously). Withhold unfenced `--force` unless Monitor is stopped or successor
+claims are excluded externally. If the lease is still `active`, quiescence cannot be proven,
+or Monitor returns `409 LEASE LOST`, keep the current hold in place and re-inspect before
+taking any action.
+
 Explicit `--local` mode can recover a local process lease before TTL expiry when
 the exact holder PID is absent and the distinct candidate process is live.
 It cannot use local PID evidence to close a lease acquired through Monitor,

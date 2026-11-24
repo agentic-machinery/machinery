@@ -19,6 +19,10 @@ and live in ``scripts/curriculum/pedagogy_config.py`` (#12680).
 # admission snapshots carry memory, load, and CPU steal counters for measurement.
 # Live write workers (spawning/running, pid alive) at which a new one is refused.
 DISPATCH_MAX_LIVE_WRITE_WORKERS = 2
+# Orchestrator turn caps (DRIVERS-1122): live orchestrator turns fleet-wide and
+# child tasks dispatched by a single orchestrator turn.
+DISPATCH_MAX_LIVE_ORCHESTRATORS = 2
+DISPATCH_MAX_CHILDREN_PER_TURN = 4
 # Subscription meter limits (#1129). The interval is measured between reservations
 # on the same subscription meter.
 DISPATCH_MAX_LIVE_WRITE_WORKERS_PER_METER = 8

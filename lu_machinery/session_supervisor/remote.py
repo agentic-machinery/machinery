@@ -338,6 +338,10 @@ class RemoteEpicClient:
         query = urlencode({"limit": digest_limit})
         return self._request("GET", f"/api/epics/v1/{stream_id}?{query}")
 
+    def streams(self) -> dict[str, Any]:
+        """List all epic stream lease projections from Monitor."""
+        return self._request("GET", "/api/epics/v1")
+
     @staticmethod
     def digest_from_response(response: Mapping[str, Any]) -> StreamDigest:
         digest = response.get("digest")

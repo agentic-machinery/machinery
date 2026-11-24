@@ -506,7 +506,7 @@ def _record_failed_launch(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
         if (current is None or current.get("run_nonce") != record["run_nonce"]
                 or current.get("status") not in store.ACTIVE):
             return
-        fields = (exc.fields if isinstance(exc, admission.LaunchRefused) else
+        fields = (dict(exc.fields) if isinstance(exc, admission.LaunchRefused) else
                   dict(status="failed" if current.get("pid") is None else "crashed",
                        error="supervisor launch failed"))
         reason = (fields["error"].split(":", 1)[0] if isinstance(exc, admission.LaunchRefused) else
@@ -517,6 +517,11 @@ def _record_failed_launch(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
             # start() sends the launch payload only after placement returns and the PID is recorded.
             fields.update(usage=None, never_started_reason=(
                 StartRefusal.SETUP if reason == "spawn_setup_failed" else StartRefusal.PLACEMENT))
+        if (isinstance(exc, admission.LaunchRefused) and not exc.never_started
+                and reason in {"dispatch_isolation_failed", "dispatch_fallback_refused"}):
+            # A scope launch ran or ended ambiguously: record launch evidence so per-turn child cap
+            # and settlement never exclude this record as a verified pre-launch refusal.
+            fields["launch_mode"] = "scope"
         if cleanup_error is not None:
             fields["launch_cleanup_error"] = _launch_cleanup_text(cleanup_error)
         current.update(fields, finished_at=store.now(), returncode_reason=reason)
@@ -586,6 +591,9 @@ def start(spec: TaskSpec, record: dict, prompt: bytes, hard_timeout: float, *, p
         if record.get("launch_mode") == "scope":
             # Crash recovery reads the scope's members to prove the whole task tree has exited.
             record["launch_cgroup"] = _cgroup(process.pid)
+        if scope_limits is not None:
+            record["scope_runtime_max_s"] = scope_limits[0]
+            record["scope_stop_timeout_s"] = scope_limits[1]
         store.replace(record, path)
         payload = json.dumps({"options": spec.options, "hard_timeout": hard_timeout}).encode()
         process.stdin.write(payload)
@@ -605,6 +613,12 @@ class _Cancelled(Exception):
 
 
 def _spec(record: dict, options: dict) -> TaskSpec:
+    merged_options = {**record.get("options", {}), **options}
+    orchestrator = record.get("orchestrator")
+    if isinstance(orchestrator, dict) and isinstance(orchestrator.get("stream"), str):
+        merged_options.setdefault("orchestrator_stream", orchestrator["stream"])
+    if isinstance(record.get("run_nonce"), str) and "orchestrator" in record:
+        merged_options.setdefault("orchestrator_run_nonce", record["run_nonce"])
     return TaskSpec(
         record["task_id"],
         record["agent"],
@@ -616,7 +630,7 @@ def _spec(record: dict, options: dict) -> TaskSpec:
         Path(record["result_file"]),
         record["claude_account"],
         record["provider"],
-        {**record.get("options", {}), **options},
+        merged_options,
         codex_account=record.get("codex_account"),
     )
 
@@ -714,14 +728,259 @@ def _keep_savant_patch(record: dict, task_file: Path, descriptor: int | None) ->
     return None
 
 
-def _enforce_orchestrator(record: dict) -> None:
-    """An orchestrator turn delivers its handoff receipt, never a product change (DRIVERS-1122).
+_PRE_LAUNCH_TERMINAL_REASONS = frozenset({
+    "spawn_process_missing",
+    "dispatch_died_after_admission",
+    "spawn_setup_failed",
+})
 
-    It settles ``done`` only when its worktree is clean and still at its start commit, and its record
-    holds the one valid receipt for its stream, task and run; anything else, unknown state included,
-    is ``no_deliverable``. A merged pull request never stands in. A provider failure keeps its status.
+
+def _terminal_child_unsettled_state(other: dict) -> str | None:
+    """Return ``'live'`` or ``'unknown'`` when a terminal child lacks proof that its processes and services stopped."""
+    from lu_machinery.orchestration import dispatch_isolation
+    from lu_machinery.orchestration.dispatch_admission import (
+        NEVER_STARTED_LAUNCH_FIELDS,
+        classify_never_started_refusal,
+    )
+
+    is_pre_launch_refusal, refusal_contradiction = classify_never_started_refusal(other)
+    if refusal_contradiction is not None:
+        return "unknown"
+    disp_reason = other.get("worktree_disposition_reason")
+    if disp_reason is not None and not isinstance(disp_reason, str):
+        return "unknown"
+    survivors = other.get("fallback_survivors")
+    if survivors is not None and not isinstance(survivors, dict):
+        return "unknown"
+    launch_mode = other.get("launch_mode")
+    if launch_mode is not None and not isinstance(launch_mode, str):
+        return "unknown"
+    rc_reason = other.get("returncode_reason")
+    if rc_reason is not None and not isinstance(rc_reason, str):
+        return "unknown"
+
+    if disp_reason == "provider_processes_alive" or (isinstance(survivors, dict) and bool(survivors)):
+        return "live"
+    if disp_reason in {"provider_liveness_unknown", "task_record_damaged"}:
+        return "unknown"
+    try:
+        listed_services = dispatch_isolation.listed_task_services(other)
+    except Exception:
+        return "unknown"
+    if listed_services is None:
+        return "unknown"
+    stops = other.get("task_service_stops")
+    if stops is not None and (not isinstance(stops, list) or any(
+        not isinstance(row, dict) or row.get("postcondition") != "true" for row in stops
+    )):
+        return "unknown"
+    if listed_services:
+        stopped_units = {
+            row.get("unit")
+            for row in (stops if isinstance(stops, list) else ())
+            if isinstance(row, dict) and row.get("postcondition") == "true" and isinstance(row.get("unit"), str)
+        }
+        if not set(listed_services).issubset(stopped_units):
+            return "unknown"
+    pre_launch_terminated = is_pre_launch_refusal or (
+        isinstance(rc_reason, str)
+        and rc_reason in _PRE_LAUNCH_TERMINAL_REASONS
+        and all(other.get(k) is None for k in NEVER_STARTED_LAUNCH_FIELDS)
+    )
+    if not pre_launch_terminated:
+        has_launch_evidence = (
+            launch_mode in {"scope", "popen-fallback"}
+            or other.get("pid") is not None
+            or other.get("provider_pgid") is not None
+            or other.get("launch_unit") is not None
+            or other.get("launch_cgroup") is not None
+        )
+        if not has_launch_evidence:
+            return "unknown"
+        try:
+            alive = _provider_alive(other)
+        except Exception:
+            return "unknown"
+        if alive is True:
+            return "live"
+        if alive is None:
+            return "unknown"
+    if (other.get("mode") == "workspace-write" and other.get("worktree_path")
+            and other.get("worktree_disposition") is None):
+        return "unknown"
+    return None
+
+
+def _scan_turn_children(record: dict) -> dict:
+    """Inspect every child task dispatched by this turn; fail closed on unreadable or unknown records.
+
+    Both hot and archived stores are scanned strictly under ``task_archive_lock`` so a damaged,
+    misnamed, or unreadable file in either store cannot hide a live or unsettled child. An absent
+    archive directory is ignored, while an existing archive that cannot be enumerated fails closed.
     """
+    from lu_machinery.orchestration.dispatch_admission import (
+        _is_valid_run_identity,
+        is_safe_identical_copy,
+        read_regular_task_record_bytes,
+        scan_record_candidates,
+    )
+    from lu_machinery.orchestration.task_record_store import (
+        ARCHIVE_DIR_NAME,
+        TaskIdentityMismatch,
+        parse_task_record,
+        task_archive_lock,
+    )
+
+    own_id = record.get("task_id")
+    own_nonce = record.get("run_nonce")
+    children: dict[tuple[str, str | None, str | None], dict] = {}
+    live: list[str] = []
+    unknown: list[str] = []
+    unreadable: list[str] = []
+    try:
+        root = store.tasks_dir()
+    except (OSError, ValueError):
+        return {"children": [], "live": [], "unknown": [], "unreadable": ["tasks_dir_unavailable"]}
+
+    def classify(other: dict, fallback_name: str, fallback_key: str) -> None:
+        tid = other.get("task_id")
+        if tid == own_id:
+            return
+        if other.get("parent_task_id") != own_id:
+            return
+        parent_nonce = other.get("parent_run_nonce")
+        nonce_malformed = parent_nonce is not None and not _is_valid_run_identity(parent_nonce)
+        if not nonce_malformed and parent_nonce is not None and _is_valid_run_identity(own_nonce) and parent_nonce != own_nonce:
+            return
+        child_id = tid if isinstance(tid, str) and _is_valid_run_identity(tid) else fallback_name
+        child_nonce = other.get("run_nonce")
+        child_status = other.get("status")
+        valid_nonce = isinstance(child_nonce, str) and _is_valid_run_identity(child_nonce)
+        run_key = (child_id, child_nonce, None) if valid_nonce else (child_id, None, fallback_key)
+        children.setdefault(
+            run_key,
+            {
+                "task_id": child_id,
+                "run_nonce": child_nonce if valid_nonce else None,
+                "status": child_status if isinstance(child_status, str) else None,
+            },
+        )
+        if isinstance(child_status, str) and child_status in store.ACTIVE:
+            live.append(child_id)
+        elif nonce_malformed or not valid_nonce or not isinstance(child_status, str) or child_status not in store.TERMINAL:
+            unknown.append(child_id)
+        elif unsettled := _terminal_child_unsettled_state(other):
+            (live if unsettled == "live" else unknown).append(child_id)
+
+    try:
+        with task_archive_lock(root):
+            for listed in scan_record_candidates(root):
+                try:
+                    raw = read_regular_task_record_bytes(listed)
+                    parsed = parse_task_record(listed, raw)
+                except TaskIdentityMismatch as exc:
+                    if not is_safe_identical_copy(exc):
+                        unreadable.append(listed.name)
+                    continue
+                except (OSError, ValueError, RecursionError):
+                    unreadable.append(listed.name)
+                    continue
+                if not isinstance(parsed, dict) or not _is_valid_run_identity(parsed.get("task_id")):
+                    unreadable.append(listed.name)
+                    continue
+                classify(parsed, listed.stem, f"hot:{listed.name}")
+            archive_dir = root / ARCHIVE_DIR_NAME
+            try:
+                archive_dir.lstat()
+            except FileNotFoundError:
+                archive_present = False
+            except OSError:
+                archive_present = False
+                unreadable.append(ARCHIVE_DIR_NAME)
+            else:
+                archive_present = True
+            if archive_present:
+                try:
+                    archive_candidates = scan_record_candidates(archive_dir)
+                except OSError:
+                    unreadable.append(ARCHIVE_DIR_NAME)
+                    archive_candidates = []
+                for listed in archive_candidates:
+                    try:
+                        raw = read_regular_task_record_bytes(listed)
+                        parsed = parse_task_record(listed, raw)
+                    except TaskIdentityMismatch as exc:
+                        if not is_safe_identical_copy(exc):
+                            unreadable.append(f"{ARCHIVE_DIR_NAME}/{listed.name}")
+                        continue
+                    except (OSError, ValueError, RecursionError):
+                        unreadable.append(f"{ARCHIVE_DIR_NAME}/{listed.name}")
+                        continue
+                    if not isinstance(parsed, dict) or not _is_valid_run_identity(parsed.get("task_id")):
+                        unreadable.append(f"{ARCHIVE_DIR_NAME}/{listed.name}")
+                        continue
+                    classify(parsed, listed.stem, f"archive:{listed.name}")
+    except (OSError, ValueError):
+        unreadable.append("task_store_unreadable")
+    return {
+        "children": [children[k] for k in sorted(children, key=lambda k: (k[0], k[1] or "", k[2] or ""))],
+        "live": sorted(set(live)),
+        "unknown": sorted(set(unknown)),
+        "unreadable": sorted(set(unreadable)),
+    }
+
+
+def _child_state_refusal(scan: dict) -> str | None:
+    parts: list[str] = []
+    if scan["live"]:
+        parts.append(f"live={', '.join(scan['live'])}")
+    if scan["unknown"]:
+        parts.append(f"unknown={', '.join(scan['unknown'])}")
+    if scan["unreadable"]:
+        parts.append(f"unreadable={', '.join(scan['unreadable'])}")
+    if not parts:
+        return None
+    return f"orchestrator_orphaned_children: child state blocks completion ({'; '.join(parts)})"
+
+
+def _record_turn_children(record: dict, scan: dict) -> None:
+    record["child_tasks"] = scan["children"]
+    if scan["live"]:
+        record["orphaned_child_tasks"] = scan["live"]
+    else:
+        record.pop("orphaned_child_tasks", None)
+    if scan["unknown"]:
+        record["unknown_child_tasks"] = scan["unknown"]
+    else:
+        record.pop("unknown_child_tasks", None)
+    if scan["unreadable"]:
+        record["unreadable_child_records"] = scan["unreadable"]
+    else:
+        record.pop("unreadable_child_records", None)
+
+
+def _enforce_orchestrator(record: dict) -> None:
+    """An orchestrator turn delivers its verified handoff receipt, never a product change (DRIVERS-1122).
+
+    It settles ``done`` only when its worktree is clean and still at its start commit, every child task
+    is proven terminal (no live, unknown or unreadable child), its record holds the one valid receipt
+    for its stream, task and run with ``outcome == "done"``, and ``lu-driver-state show`` verifies that
+    the referenced handoff_note exists, has kind ``handoff_note``, belongs to the stream's lane and was
+    created after the turn started. ``blocked`` and ``handoff`` outcomes settle ``no_deliverable`` with
+    typed reasons. A merged pull request never stands in. A provider failure keeps its status.
+    """
+    from lu_machinery.orchestration.dispatch_admission import orchestrator_stream
+
     record["owned_path_grants_used"] = []
+    scan = _scan_turn_children(record)
+    _record_turn_children(record, scan)
+    if (record["status"] == "failed" and not record.get("provider_terminal_failure")
+            and str(record.get("error") or "").startswith("agy_child_still_running:")):
+        agy_cause = _child_state_refusal(scan) or (
+            f"orchestrator_orphaned_children: child state blocks completion ({record['error']})"
+        )
+        record.update(status="no_deliverable", error=agy_cause, no_deliverable_reason=agy_cause)
+        return
     if record["status"] != "done":
         return
     cause: str | None
@@ -730,8 +989,24 @@ def _enforce_orchestrator(record: dict) -> None:
             or not isinstance(start, str) or record.get("head_sha") != start):
         cause = ("orchestrator_product_write: the turn's worktree left its start commit, has changes, or its "
                  "state is unknown")
+    elif child_cause := _child_state_refusal(scan):
+        cause = child_cause
     else:
         cause = store.handoff_receipt_refusal(record)
+        if cause is None:
+            receipt = record[store.HANDOFF_RECEIPT_KEY]
+            try:
+                stream = orchestrator_stream(record)
+            except ValueError:
+                stream = None
+            if stream is None:
+                cause = "orchestrator_handoff_receipt_invalid"
+            elif note_cause := store.verify_handoff_note(record, stream, receipt["handoff_ref"]):
+                cause = note_cause
+            elif receipt["outcome"] == "blocked":
+                cause = f"orchestrator_blocked: turn ended blocked (handoff_ref={receipt['handoff_ref']})"
+            elif receipt["outcome"] == "handoff":
+                cause = f"orchestrator_handoff: turn handed off (handoff_ref={receipt['handoff_ref']})"
     if cause:
         record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
 
@@ -786,6 +1061,13 @@ def _release_stream(record: dict, *, evidence_lost: bool) -> None:
                 or not host_admission.same_typed(published.get(host_admission.TURN_LEASE_KEY),
                                                  record.get(host_admission.TURN_LEASE_KEY))
                 or _provider_alive(published) is not False):
+            return
+        # A live, unknown or unreadable child keeps the stream held until reconciled.
+        if (published.get("orphaned_child_tasks") or published.get("unknown_child_tasks")
+                or published.get("unreadable_child_records")):
+            return
+        child_scan = _scan_turn_children(published)
+        if child_scan["live"] or child_scan["unknown"] or child_scan["unreadable"]:
             return
     except Exception:  # any unreadable state is not proof, and never ends this settlement
         return
@@ -1017,9 +1299,12 @@ def _running_children(record: dict) -> list[str]:
 
     A child whose status is not a string is not running: no record may stop this settlement.
     """
+    own_nonce = record.get("run_nonce")
     with contextlib.suppress(OSError, ValueError):
         return sorted(other["task_id"] for other in store.list_tasks()
                       if other.get("parent_task_id") == record["task_id"]
+                      and (other.get("parent_run_nonce") is None or own_nonce is None
+                           or other.get("parent_run_nonce") == own_nonce)
                       and isinstance(other.get("status"), str) and other["status"] in store.ACTIVE)
     return []
 
@@ -1043,7 +1328,7 @@ def _children_at(record: dict, deadline: float, checkpoint) -> list[str]:
 
 
 def _agy_follow_up(spec: TaskSpec, record: dict, parsed: ParsedResult, started: float,
-                   hard_timeout: float, resumes: int, checkpoint) -> tuple[str | None, ParsedResult]:
+                   hard_timeout: float, resumes: int, checkpoint, *, exit_code: int = 0) -> tuple[str | None, ParsedResult]:
     """Resume an AGY workspace-write turn that closed while its work was still open.
 
     Returns ``(conversation id, parsed)`` to launch again, or ``(None, parsed)``
@@ -1055,9 +1340,15 @@ def _agy_follow_up(spec: TaskSpec, record: dict, parsed: ParsedResult, started: 
 
     if spec.agent != "agy" or spec.mode != "workspace-write":
         return None, parsed
-    incomplete = parsed.error == "agy: incomplete run"
-    # An orchestrator turn dispatches its wave and exits; its children outlive it by design (DRIVERS-1122).
-    children = [] if "orchestrator" in record else _running_children(record)
+    incomplete = parsed.incomplete or parsed.error == "agy: incomplete run"
+    if "orchestrator" in record and (
+        parsed.rate_limited
+        or parsed.start_refusal is not None
+        or (not incomplete and (exit_code != 0 or parsed.error is not None))
+    ):
+        # Preserve genuine terminal AGY provider failures; settlement still scans children and holds the lease.
+        return None, parsed
+    children = _running_children(record)
     if not incomplete and not children:
         return None, parsed
     deadline = started + hard_timeout if hard_timeout > 0 else time.monotonic()
@@ -1900,15 +2191,56 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
     resolved_model = sources_calls = source = transport_warning = None
     started = time.monotonic()
     cancel_requested = interruptible = False
+    cancel_signal: int | None = None
+    scope_runtime_timeout: bool | None = None
     record_damaged = False  # a TaskRecordError was seen: a later cancel status never erases that for the release
 
-    def cancelled(_signum, _frame):
+    def _client_cancel_marked() -> bool:
+        own_nonce = record.get("run_nonce")
+        if not isinstance(own_nonce, str) or not own_nonce:
+            return False
+        if record.get(store.CLIENT_CANCEL_NONCE_KEY) == own_nonce:
+            return True
+        try:
+            disk = store.read(spec.task_id, own_nonce, missing_ok=True)
+        except (OSError, ValueError, store.TaskRecordError):
+            return False
+        if isinstance(disk, dict) and disk.get(store.CLIENT_CANCEL_NONCE_KEY) == own_nonce:
+            record[store.CLIENT_CANCEL_NONCE_KEY] = own_nonce
+            return True
+        return False
+
+    def _check_scope_runtime_timeout() -> bool:
+        nonlocal scope_runtime_timeout
+        if _client_cancel_marked():
+            scope_runtime_timeout = False
+            return False
+        if scope_runtime_timeout is not None:
+            return scope_runtime_timeout
+        scope_max = record.get("scope_runtime_max_s")
+        if (cancel_signal != signal.SIGTERM or record.get("launch_mode") != "scope"
+                or type(scope_max) is not int or scope_max <= 0):
+            scope_runtime_timeout = False
+            return False
+        unit = record.get("launch_unit")
+        if isinstance(unit, str) and unit:
+            from lu_machinery.orchestration import dispatch_isolation
+
+            if dispatch_isolation.scope_runtime_max_expired(unit, runtime_max_s=scope_max):
+                scope_runtime_timeout = True
+                return True
+        scope_runtime_timeout = False
+        return False
+
+    def cancelled(signum, _frame):
         # A handler's exception lands at an arbitrary bytecode, where Python can drop it (a weakref
         # callback) or a caller can convert it (#11994). Record the request; checkpoint() raises it,
         # settlement honours it, and only a wait marked interruptible, built to unwind there, is
         # stopped in place.
-        nonlocal cancel_requested, interruptible
+        nonlocal cancel_requested, cancel_signal, interruptible
         cancel_requested = True
+        if cancel_signal is None:
+            cancel_signal = signum
         if interruptible:
             interruptible = False  # one raise per run: a later signal cannot interrupt cleanup
             raise _Cancelled()
@@ -1917,7 +2249,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         if cancel_requested:
             raise _Cancelled()
 
-    def terminate():
+    def terminate(grace_s: float = TERMINAL_EXIT_GRACE_S):
         # Only an unreaped leader still pins its group id; a reaped one's id may name another group.
         if child and child.returncode is None and (
             spec.mode == "workspace-write" or spec.mode == "read-only"
@@ -1926,7 +2258,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             with contextlib.suppress(ProcessLookupError):
                 child.send_signal(signal.SIGTERM)
             with contextlib.suppress(subprocess.TimeoutExpired):
-                child.wait(timeout=TERMINAL_EXIT_GRACE_S)
+                child.wait(timeout=grace_s)
         if child and child.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(child.pid, signal.SIGKILL)
@@ -2154,7 +2486,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
             # Once parsed, the whole stream decides the model, whatever settlement follows (not the running value).
             resolved_model = parsed.resolved_model
             conversation, parsed = _agy_follow_up(
-                spec, record, parsed, started, hard_timeout, continuations, checkpoint)
+                spec, record, parsed, started, hard_timeout, continuations, checkpoint, exit_code=exit_code)
             if conversation is not None:
                 pending_conversation = conversation
                 continuations += 1
@@ -2301,7 +2633,13 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     status, error = "failed", refusal
                 record["provider_terminal_failure"] = False
     except _Cancelled:
-        status, error = "cancelled", "cancelled by client"
+        if _check_scope_runtime_timeout():
+            status, error = "timeout", "scope RuntimeMaxSec exceeded"
+            record["kill_reason"] = "scope_runtime_max_timeout"
+        else:
+            if record.get("kill_reason") == "scope_runtime_max_timeout":
+                record.pop("kill_reason", None)
+            status, error = "cancelled", "cancelled by client"
     except DeadlineExpired as exc:
         status, error = "timeout", exc.diagnostic
         record.update(kill_reason=exc.kind, stderr_excerpt=exc.diagnostic)
@@ -2319,11 +2657,17 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
         status, error = "crashed", f"supervisor or provider processing failed ({type(exc).__name__})"
     finally:
         if cancel_requested:
-            # A cancel requested before settlement decides the run, whatever exit the work took after it.
-            status, error = "cancelled", "cancelled by client"
+            # A cancel or scope RuntimeMaxSec stop requested before settlement decides the run.
+            if _check_scope_runtime_timeout():
+                status, error = "timeout", "scope RuntimeMaxSec exceeded"
+                record["kill_reason"] = "scope_runtime_max_timeout"
+            else:
+                if record.get("kill_reason") == "scope_runtime_max_timeout":
+                    record.pop("kill_reason", None)
+                status, error = "cancelled", "cancelled by client"
         try:
             if child and (child.returncode is None or status in {"cancelled", "timeout", "crashed"}):
-                terminate()
+                terminate(grace_s=min(TERMINAL_EXIT_GRACE_S, 5) if scope_runtime_timeout else TERMINAL_EXIT_GRACE_S)
                 returncode = child.returncode
             if not record.get("settling_at"):
                 try:
@@ -2380,7 +2724,7 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                     cause = ("orchestrator_tree_unproven: the turn's processes were not proven gone before its tree "
                              "was checked")
                     record.update(status="no_deliverable", error=cause, no_deliverable_reason=cause)
-            if children := _running_children(record):
+            if "orchestrator" not in record and (children := _running_children(record)):
                 # A run that ends while a task it dispatched still runs left that result unconsumed (#12156).
                 record["orphaned_child_tasks"] = children
             if source:
@@ -2395,16 +2739,26 @@ def supervise(path: Path, options: dict | None = None, hard_timeout: float | Non
                 # thread's; the supervisor runs no other).
                 mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
                 try:
-                    if cancel_requested and record["status"] != "cancelled":
-                        record.pop("no_deliverable_reason", None)
-                        record.update(status="cancelled", error="cancelled by client")
+                    if cancel_requested:
+                        if _check_scope_runtime_timeout():
+                            record.pop("no_deliverable_reason", None)
+                            record.update(status="timeout", error="scope RuntimeMaxSec exceeded",
+                                          kill_reason="scope_runtime_max_timeout")
+                        else:
+                            if record.get("kill_reason") == "scope_runtime_max_timeout":
+                                record.pop("kill_reason", None)
+                            if record["status"] != "cancelled":
+                                record.pop("no_deliverable_reason", None)
+                                record.update(status="cancelled", error="cancelled by client")
                     # The status is final here: a Savant write run's patch is named only when it settles done.
                     _settle_savant_patch(record, path, draft_fd)
                     if start_refusal is not None and record["status"] in {"failed", "rate_limited"}:
                         record["never_started_reason"] = start_refusal
                     if transport_warning and record["status"] == "done":
                         record["transport_warning"] = transport_warning
-                    if (children := record.get("orphaned_child_tasks")) and record["status"] != "done":
+                    if ((children := record.get("orphaned_child_tasks")) and record["status"] != "done"
+                            and record.get("kill_reason") != "scope_runtime_max_timeout"
+                            and not str(record.get("error") or "").startswith("orchestrator_orphaned_children:")):
                         record["error"] = f"orphaned_child_tasks: {', '.join(children)}; {record['error']}"
                     try:
                         store.replace(record, path, require_existing=True)
@@ -2563,8 +2917,10 @@ def _own_review_reply(record: dict, nonce: str | None) -> dict:
 
 
 def wait(task_id: str, nonce: str | None = None, timeout: float = 0, poll_interval: float = 1, *,
-         reply: bool = False) -> tuple[dict, int]:
-    deadline = time.monotonic() + timeout if timeout else None
+         reply: bool = False, keepalive_interval: float = 0) -> tuple[dict, int]:
+    started = time.monotonic()
+    deadline = started + timeout if timeout else None
+    next_keepalive = started + keepalive_interval if keepalive_interval > 0 else None
     # Inside a write boundary (#423) the task store is read-only and host processes are in another PID namespace,
     # so a waiter there only reads: settling a crashed supervisor stays with the host's own observers.
     inside = bool(os.environ.get(write_boundary.BROKER_ENV))
@@ -2584,10 +2940,31 @@ def wait(task_id: str, nonce: str | None = None, timeout: float = 0, poll_interv
                 record.update({"result_unavailable": "inside_write_boundary"} if inside
                               else _own_review_reply(record, nonce))
             return record, 0 if record["status"] == "done" else 1
-        remaining = deadline - time.monotonic() if deadline else None
+        now_mono = time.monotonic()
+        remaining = deadline - now_mono if deadline is not None else None
         if remaining is not None and remaining <= 0:
             return record, 124
-        time.sleep(min(poll_interval, remaining) if remaining is not None else poll_interval)
+        if next_keepalive is not None and now_mono >= next_keepalive:
+            elapsed = int(now_mono - started)
+            print(f"wait keepalive: {task_id} status={record['status']} elapsed={elapsed}s",
+                  file=sys.stderr, flush=True)
+            next_keepalive = now_mono + keepalive_interval
+        sleep_s = poll_interval
+        if remaining is not None:
+            sleep_s = min(sleep_s, remaining)
+        if next_keepalive is not None:
+            sleep_s = min(sleep_s, max(0.0, next_keepalive - now_mono))
+        time.sleep(max(0.0, sleep_s))
+
+
+def _mark_client_cancel(task_id: str, run_nonce: str) -> None:
+    """Persist an explicit per-run client-cancellation marker before signalling SIGTERM."""
+    path = store.record_path(task_id)
+    with store.task_state_lock(path):
+        current = store.read(task_id, run_nonce, missing_ok=True)
+        if isinstance(current, dict) and current.get("status") in store.ACTIVE:
+            current[store.CLIENT_CANCEL_NONCE_KEY] = run_nonce
+            store.replace(current, path, require_existing=True)
 
 
 def cancel(task_id: str, nonce: str | None = None) -> dict:
@@ -2602,6 +2979,8 @@ def cancel(task_id: str, nonce: str | None = None) -> dict:
             try:
                 if _identity(record["pid"]) != record["process_start"]:
                     raise ValueError("supervisor identity changed; cancellation refused")
+                if isinstance(record.get("run_nonce"), str) and record["run_nonce"]:
+                    _mark_client_cancel(task_id, record["run_nonce"])
                 signal.pidfd_send_signal(pidfd, signal.SIGTERM)
             finally:
                 os.close(pidfd)

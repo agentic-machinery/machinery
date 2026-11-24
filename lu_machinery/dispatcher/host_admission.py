@@ -130,9 +130,11 @@ def evaluate(mode, *, sweep, thresholds=None, disk_guard=True, meter=None, budge
 
 
 def allows(decision, force_reason):
-    """Force may override host checks, except the disk and subscription meter."""
+    """Force may override host checks, except the disk, subscription meter, and fleet orchestrator cap."""
     return decision.exempt or decision.admitted or (
-        force_reason is not None and not (decision.disk_refused or decision.meter_refused)
+        force_reason is not None and not (
+            decision.disk_refused or decision.meter_refused or decision.orchestrator_cap_refused
+        )
     )
 
 
@@ -621,6 +623,31 @@ def check_credit(agent, model, codex_account=None):
         raise Refused(f"❌ dispatch refused: {refusal}", 2)
 
 
+def check_turn_child_cap(linkage: Mapping | None, *, thresholds=None) -> None:
+    """Refuse a child dispatch when its orchestrator turn already reached its per-turn child cap."""
+    if not linkage or linkage.get("parent_stream") is None:
+        return
+    parent_id = linkage.get("parent_task_id")
+    parent_nonce = linkage.get("parent_run_nonce")
+    if not isinstance(parent_id, str) or not parent_id:
+        return
+    try:
+        limits = thresholds or legacy.load_thresholds()
+        count = legacy.count_turn_children(tasks_dir(), parent_id, parent_nonce if isinstance(parent_nonce, str) else None)
+    except (OSError, ValueError) as exc:
+        failure = f"orchestrator_child_cap_unknown: {exc}"
+        clause, record = _refusal_admission_record(None, failure=failure)
+        raise Refused(f"❌ {failure} ({clause})", 3, admission_record=record) from None
+    cap = limits.max_children_per_turn
+    if count >= cap:
+        failure = (
+            f"orchestrator_child_cap_reached: turn {parent_id} already dispatched {count}/{cap} children "
+            f"({legacy.ENV_MAX_CHILDREN_PER_TURN}={cap})"
+        )
+        clause, record = _refusal_admission_record(None, failure=failure)
+        raise Refused(f"❌ {failure} ({clause})", 3, admission_record=record)
+
+
 @contextlib.contextmanager
 def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, spec=None, orchestrator=None,
             linkage=None, launch=None, run_nonce=None, turn_ttl_s=None):
@@ -638,6 +665,10 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
     back as that failed, pid-less launch holding this lease (C-6991). Otherwise only the turn's settlement does. ``linkage`` (the parent fields of a task dispatched from inside another run) is in the hold
     before anything spawns.
     """
+    from lu_machinery.orchestration import task_record_store
+
+    if task_record_store._is_dispatcher_sidecar(store.record_path(task_id)):
+        raise ValueError("task_id_refused: task_id ends like a dispatcher sidecar file name")
     if orchestrator is not None and not (isinstance(run_nonce, str) and isinstance(turn_ttl_s, int)):
         raise ValueError("an orchestrator turn's hold needs its run nonce and lease TTL")
     hold = turn_lease = None
@@ -650,6 +681,7 @@ def reserve(task_id, mode, decision, *, agent, disk_guard, force_reason=None, sp
         locked_eval = None
         try:
             with legacy.admission_lock(tasks_dir()):
+                check_turn_child_cap(linkage, thresholds=decision.thresholds if decision is not None else None)
                 current = evaluate(
                     mode, sweep=True, thresholds=decision.thresholds, disk_guard=disk_guard(),
                     meter=meter, budget=budget, budget_error=budget_error,
