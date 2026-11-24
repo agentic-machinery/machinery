@@ -1932,6 +1932,85 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     monkeypatch.delenv("DISPATCH_MAX_CHILDREN_PER_TURN")
 
 
+@pytest.mark.parametrize(
+    "case_name,record_overrides,expected_cap_error",
+    [
+        ("spawning", {"status": "spawning"}, "orchestrator_child_cap_unknown:"),
+        ("active", {"status": "running"}, "orchestrator_child_cap_unknown:"),
+        ("invalid_status", {"status": "bogus"}, "orchestrator_child_cap_unknown:"),
+        ("terminal_non_refusal", {"status": "done"}, "orchestrator_child_cap_unknown:"),
+        ("launch_fields_present", {"status": "failed", "launch_mode": "scope"}, r"orchestrator_child_cap_reached:.*4/4"),
+    ],
+)
+def test_turn_children_count_contradictory_never_started_reason(
+    task_store, monkeypatch, case_name, record_overrides, expected_cap_error,
+):
+    """PR1306-F5 defect class: count_turn_children or _terminal_child_unsettled_state excludes a child
+    with never_started_reason despite a non-refusal/invalid status or launch evidence present."""
+    parent_nonce = f"nonce-f5-{case_name}"
+    linkage = {"parent_task_id": "turn-f5", "parent_run_nonce": parent_nonce, "parent_stream": STREAM}
+    for i in range(3):
+        _write(dict(schema_version=2, task_id=f"c-ok-{i}", agent="claude", mode="workspace-write",
+                    status="done", run_nonce=f"cn-ok-{i}", **linkage))
+    child = dict(
+        schema_version=2, task_id="c-contra", agent="claude", mode="workspace-write",
+        run_nonce="cn-contra", never_started_reason="admission_capacity", **linkage,
+        **record_overrides,
+    )
+    _write(child)
+
+    with pytest.raises(host_admission.Refused, match=expected_cap_error):
+        host_admission.check_turn_child_cap(linkage)
+    assert worker._terminal_child_unsettled_state(child) == "unknown"
+
+    if case_name == "invalid_status":
+        for non_str_status in (None, 123, True):
+            bad = {**child, "status": non_str_status}
+            _write(bad)
+            with pytest.raises(host_admission.Refused, match="orchestrator_child_cap_unknown:"):
+                host_admission.check_turn_child_cap(linkage)
+            assert worker._terminal_child_unsettled_state(bad) == "unknown"
+    elif case_name == "terminal_non_refusal":
+        turn = _orchestrator_record("turn-f5", run_nonce=parent_nonce)
+        scan = worker._scan_turn_children(turn)
+        assert "c-contra" in scan["unknown"]
+    elif case_name == "launch_fields_present":
+        for field, value in (
+            ("pid", _DEAD_PID),
+            ("process_start", "boot:1"),
+            ("provider_pgid", _DEAD_PID),
+            ("launch_unit", "lu-worker-c-contra"),
+            ("launch_cgroup", "/user.slice/lu-worker-c-contra.scope"),
+        ):
+            other = dict(
+                schema_version=2, task_id="c-contra", agent="claude", mode="workspace-write",
+                status="rate_limited", run_nonce="cn-contra", never_started_reason="headroom",
+                **linkage, **{field: value},
+            )
+            _write(other)
+            assert dispatch_admission.count_turn_children(task_store, "turn-f5", parent_nonce) == 4
+            with pytest.raises(host_admission.Refused, match=r"orchestrator_child_cap_reached:.*4/4"):
+                host_admission.check_turn_child_cap(linkage)
+        settled_headroom = dict(
+            schema_version=2, task_id="c-contra", agent="claude", mode="workspace-write",
+            status="rate_limited", run_nonce="cn-contra", never_started_reason="headroom",
+            pid=_DEAD_PID, process_start="boot:1", launch_mode="scope",
+            launch_unit="lu-worker-c-contra", worktree_disposition="removed", **linkage,
+        )
+        monkeypatch.setattr(worker, "_provider_alive", lambda _rec: False)
+        assert worker._terminal_child_unsettled_state(settled_headroom) is None
+        for refusal_status in ("failed", "rate_limited"):
+            valid_refusal = dict(
+                schema_version=2, task_id="c-contra", agent="claude", mode="workspace-write",
+                status=refusal_status, run_nonce="cn-contra", never_started_reason="admission_capacity",
+                **linkage,
+            )
+            _write(valid_refusal)
+            assert dispatch_admission.count_turn_children(task_store, "turn-f5", parent_nonce) == 3
+            host_admission.check_turn_child_cap(linkage)
+            assert worker._terminal_child_unsettled_state(valid_refusal) is None
+
+
 def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp_path, monkeypatch):
     """Item 7 defect class: systemd RuntimeMaxSec SIGTERM on a turn scope is mislabelled as status=cancelled
     'cancelled by client' instead of status=timeout."""

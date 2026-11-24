@@ -731,16 +731,16 @@ _PRE_LAUNCH_TERMINAL_REASONS = frozenset({
 })
 
 
-def _is_valid_run_identity(value: object) -> bool:
-    return isinstance(value, str) and bool(value) and not any(ch.isspace() for ch in value)
-
-
 def _terminal_child_unsettled_state(other: dict) -> str | None:
     """Return ``'live'`` or ``'unknown'`` when a terminal child lacks proof that its processes and services stopped."""
     from lu_machinery.orchestration import dispatch_isolation
+    from lu_machinery.orchestration.dispatch_admission import (
+        NEVER_STARTED_LAUNCH_FIELDS,
+        classify_never_started_refusal,
+    )
 
-    never_started = other.get("never_started_reason")
-    if never_started is not None and not _is_valid_run_identity(never_started):
+    is_pre_launch_refusal, refusal_contradiction = classify_never_started_refusal(other)
+    if refusal_contradiction is not None:
         return "unknown"
     disp_reason = other.get("worktree_disposition_reason")
     if disp_reason is not None and not isinstance(disp_reason, str):
@@ -755,11 +755,6 @@ def _terminal_child_unsettled_state(other: dict) -> str | None:
     if rc_reason is not None and not isinstance(rc_reason, str):
         return "unknown"
 
-    if (_is_valid_run_identity(never_started)
-            and other.get("pid") is None and other.get("process_start") is None
-            and other.get("provider_pgid") is None and other.get("launch_unit") is None
-            and other.get("launch_cgroup") is None):
-        return None
     if disp_reason == "provider_processes_alive" or (isinstance(survivors, dict) and bool(survivors)):
         return "live"
     if disp_reason in {"provider_liveness_unknown", "task_record_damaged"}:
@@ -783,14 +778,10 @@ def _terminal_child_unsettled_state(other: dict) -> str | None:
         }
         if not set(listed_services).issubset(stopped_units):
             return "unknown"
-    pre_launch_terminated = (
+    pre_launch_terminated = is_pre_launch_refusal or (
         isinstance(rc_reason, str)
         and rc_reason in _PRE_LAUNCH_TERMINAL_REASONS
-        and other.get("pid") is None
-        and other.get("process_start") is None
-        and other.get("provider_pgid") is None
-        and other.get("launch_unit") is None
-        and other.get("launch_cgroup") is None
+        and all(other.get(k) is None for k in NEVER_STARTED_LAUNCH_FIELDS)
     )
     if not pre_launch_terminated:
         has_launch_evidence = (
@@ -824,6 +815,7 @@ def _scan_turn_children(record: dict) -> dict:
     archive directory is ignored, while an existing archive that cannot be enumerated fails closed.
     """
     from lu_machinery.orchestration.dispatch_admission import (
+        _is_valid_run_identity,
         is_safe_identical_copy,
         read_regular_task_record_bytes,
         scan_record_candidates,

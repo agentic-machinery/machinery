@@ -1732,7 +1732,46 @@ def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -
 
 
 def _is_valid_run_identity(value: object) -> bool:
-    return isinstance(value, str) and bool(value) and not any(ch.isspace() for ch in value)
+    return isinstance(value, str) and bool(value) and all(ch.isprintable() and not ch.isspace() for ch in value)
+
+
+NEVER_STARTED_REFUSAL_STATUSES = frozenset({"failed", "rate_limited"})
+NEVER_STARTED_LAUNCH_FIELDS = (
+    "pid",
+    "process_start",
+    "provider_pgid",
+    "launch_unit",
+    "launch_cgroup",
+    "launch_mode",
+)
+
+
+def classify_never_started_refusal(record: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """Classify whether ``record`` is a verified pre-launch refusal with no launch evidence.
+
+    Returns ``(is_pre_launch_refusal, contradiction_reason)``:
+    - ``(False, None)`` when ``never_started_reason`` is absent, or when ``status`` is a refusal
+      status (``failed``/``rate_limited``) with a valid ``never_started_reason`` and launch
+      evidence present (the supervisor launched before refusing, so it counts toward the cap and
+      must still pass process/service/worktree settlement checks).
+    - ``(True, None)`` only when ``status`` is in :data:`NEVER_STARTED_REFUSAL_STATUSES`,
+      ``never_started_reason`` is a valid run identity, and every field in
+      :data:`NEVER_STARTED_LAUNCH_FIELDS` is ``None``.
+    - ``(False, reason)`` when ``never_started_reason`` is malformed, or ``status`` is not a
+      refusal status (``spawning``, ``running``, non-refusal terminal, or invalid/unknown).
+    """
+    never_started = record.get("never_started_reason")
+    if never_started is None:
+        return False, None
+    task_id = record.get("task_id")
+    if not _is_valid_run_identity(never_started):
+        return False, f"malformed never_started_reason on {task_id}"
+    status = record.get("status")
+    if not isinstance(status, str) or status not in NEVER_STARTED_REFUSAL_STATUSES:
+        return False, f"contradictory never_started_reason on {task_id} with status={status!r}"
+    if any(record.get(k) is not None for k in NEVER_STARTED_LAUNCH_FIELDS):
+        return False, None
+    return True, None
 
 
 _KNOWN_TERMINAL_STATUSES = frozenset({
@@ -1833,12 +1872,11 @@ def count_turn_children(
         rec_run_nonce = record.get("run_nonce")
         if not isinstance(rec_run_nonce, str) or not _is_valid_run_identity(rec_run_nonce):
             raise ValueError(f"malformed run_nonce on {record['task_id']}: cannot verify turn child count")
-        never_started = record.get("never_started_reason")
-        if never_started is not None:
-            if not _is_valid_run_identity(never_started):
-                raise ValueError(f"malformed never_started_reason on {record['task_id']}: cannot verify turn child count")
-            if all(record.get(k) is None for k in ("pid", "process_start", "provider_pgid", "launch_unit", "launch_cgroup")):
-                continue
+        is_pre_launch_refusal, contradiction = classify_never_started_refusal(record)
+        if contradiction is not None:
+            raise ValueError(f"{contradiction}: cannot verify turn child count")
+        if is_pre_launch_refusal:
+            continue
         seen_runs.add((record["task_id"], rec_run_nonce))
     return len(seen_runs)
 
