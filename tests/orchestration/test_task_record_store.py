@@ -205,6 +205,8 @@ def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
         before = len(caplog.records)
         path = tmp_path / f"foreign{fragment}FORGED entry.json"
         assert store.parse_task_record(path, b"[]") is None
+        assert not [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+        store._flush_foreign_reports()
         assert len(caplog.records) == before + 1
         message = caplog.records[-1].getMessage()
         assert message == f"NON_RECORD_FILE: 1 non-record file, 1 unexpected; examples: {str(path)!r}"
@@ -241,8 +243,20 @@ def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
         assert len(caplog.records) == before
     before = len(caplog.records)
     assert store.parse_task_record(tmp_path / "receipt.json", payload) is None
+    assert not [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    store._flush_foreign_reports()
     assert len(caplog.records) == before + 1
     assert "receipt.json" in caplog.records[-1].getMessage()
+
+    # A loop of reads outside a scan stays quiet until one flush, then one line.
+    before = len(caplog.records)
+    for index in range(4):
+        assert store.parse_task_record(tmp_path / f"loose-{index}.json", b"[]") is None
+    assert not [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    store._flush_foreign_reports()
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    assert notes[0].getMessage().startswith("NON_RECORD_FILE: 4 non-record files, 4 unexpected; examples: ")
 
     # One directory scan is one line. Unexpected kinds are named; a routine family cannot fill the sample.
     tasks = tmp_path / "scan"
@@ -370,4 +384,6 @@ def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
     assert "1 non-record file" in notes[0].getMessage()
     before = len(caplog.records)
     assert store.parse_task_record(tmp_path / "after-break.json", b"[]") is None
+    # Depth is back at zero, so the exit flush can see this read. A stuck scan would drop it.
+    store._flush_foreign_reports()
     assert len(caplog.records) == before + 1

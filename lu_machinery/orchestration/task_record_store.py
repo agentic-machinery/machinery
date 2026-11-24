@@ -175,9 +175,10 @@ def _flush_foreign_reports(*, force: bool = False) -> None:
 def _report_foreign(path: Path, raw: bytes) -> None:
     """Buffer one foreign file. A directory scan emits one summary when it finishes.
 
-    Dispatcher sidecars are not foreign. A rewritten file is reported again. Outside a scan,
-    the single file is its own summary. Names that match no known sidecar family are unexpected
-    and are listed first, so a new kind stays in the sample.
+    Dispatcher sidecars are not foreign. A rewritten file is reported again. Names that
+    match no known sidecar family are unexpected and are listed first, so a new kind stays
+    in the sample. Reads outside a scan are included in the next summary, or in the one
+    line emitted at process exit.
     """
     if _is_dispatcher_sidecar(path):
         return
@@ -189,9 +190,9 @@ def _report_foreign(path: Path, raw: bytes) -> None:
         if current is not None and current[0] == fingerprint:
             return
         _PENDING_FOREIGN[fingerprint[0]] = (fingerprint, _routine_kind(path.name) is None)
-        idle = _SCAN_DEPTH == 0
-    if idle:
-        _flush_foreign_reports()
+    # A directory scan flushes when it ends. A read outside a scan stays buffered
+    # until the next scan ends or the process exits, so a loop of single-file
+    # reads is one line, not one line per file.
 
 
 atexit.register(lambda: _flush_foreign_reports(force=True))
