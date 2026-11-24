@@ -213,29 +213,41 @@ assert.match(lastGood, /Last good reading, 1m old/);
 assert.match(lastGood, /needs an API key/);
 assert.doesNotMatch(lastGood, /STALE_LAST_GOOD|NEED_KEY/);
 assert.match(lastGood, /class="warn">Last good reading/);
+const known = {title: 'Approved change not merged', meaning: 'Held over 30 minutes.', next_step: 'The owner lands it.'};
+const pool = {title: 'Subscription pool will run out early', meaning: 'Ends before reset.', next_step: 'Work goes elsewhere.'};
 const named = renderAlerts({status: 'ok', heartbeat: true, alerts: [
-  {alertname: 'UnrecognizedAlert', severity: 'warning', starts_at: '2026-11-01T00:00:00Z', fingerprint: 'abc'},
-  {alertname: 'ApprovedNotLanded30m', severity: 'warning', starts_at: '2026-11-12T00:00:00Z'},
-  {alertname: 'ApprovedNotLanded30m', severity: 'warning', starts_at: '2026-11-11T00:00:00Z'},
-  {alertname: 'UnrecognizedAlert', severity: 'warning', fingerprint: 'alpha'},
-  {alertname: 'UnrecognizedAlert', severity: 'warning', fingerprint: 'beta'},
-  {alertname: 'UnrecognizedAlert', severity: 'warning', alert_id: 17},
-  {alertname: 'UnrecognizedAlert', severity: 'warning', fingerprint: 'alpha'}]});
-assert.match(named, /Unrecognised alert \(fingerprint abc\)/);
-assert.match(named, /ApprovedNotLanded30m/);
+  {alertname: 'UnrecognizedAlert', severity: 'warning', starts_at: '2026-11-01T00:00:00Z'},
+  {alertname: 'ApprovedNotLanded30m', severity: 'warning', starts_at: '2026-11-12T00:00:00Z', ...known},
+  {alertname: 'ApprovedNotLanded30m', severity: 'warning', starts_at: '2026-11-11T00:00:00Z', ...known},
+  {alertname: 'SubscriptionPoolRunsOutBeforeReset', severity: 'warning', subject: 'Codex b', ...pool},
+  {alertname: 'SubscriptionPoolRunsOutBeforeReset', severity: 'warning', subject: 'AGY Claude/GPT', ...pool},
+  {alertname: 'SubscriptionPoolRunsOutBeforeReset', severity: 'warning', subject: 'AGY Claude/GPT', ...pool},
+  {alertname: 'CliHealthBehind', severity: 'warning', starts_at: '2026-11-02T00:00:00Z'},
+  {alertname: 'SomeFutureAlert', severity: 'critical', starts_at: '2026-11-03T00:00:00Z', title: null},
+  {alertname: 'UsagePoolRestored', severity: 'info', subject: 'Grok+Cursor', starts_at: '2026-11-04T00:00:00Z',
+   title: 'Pool allowance is back', meaning: 'Recovered.', next_step: 'No action needed.'}]});
+const [problems, information] = named.split('<h3>Recent information</h3>');
+assert.match(problems, /Unknown alert \(name not listed\)/);
+assert.match(problems, /Unknown alert \(name not listed\): CliHealthBehind/);
+assert.match(problems, /Critical: Unknown alert \(name not listed\): SomeFutureAlert/);
 assert.doesNotMatch(named, /UnrecognizedAlert/);
-const rowFor = marker => {
-  const row = named.split("<tr>").find(part => part.includes(marker));
-  assert.ok(row, marker);
-  return row;
-};
-const countOf = row => row.match(/<td class="num">([^<]*)<\/td>/g).at(-1);
-assert.equal((named.match(/fingerprint alpha/g) || []).length, 1);
-assert.equal(countOf(rowFor('fingerprint alpha')), '<td class="num">2</td>');
-assert.equal(countOf(rowFor('fingerprint beta')), '<td class="num">1</td>');
-assert.equal(countOf(rowFor('alert id 17')), '<td class="num">1</td>');
-assert.equal((named.match(/ApprovedNotLanded30m/g) || []).length, 1);
-assert.equal(countOf(rowFor('ApprovedNotLanded30m')), '<td class="num">2</td>');
+assert.match(problems, /Approved change not merged \(2 firing\)/);
+assert.match(problems, /Subscription pool will run out early: Codex b</);
+assert.match(problems, /Subscription pool will run out early: AGY Claude\/GPT \(2 firing\)/);
+assert.equal((problems.match(/Approved change not merged/g) || []).length, 1);
+assert.equal((problems.match(/Subscription pool will run out early/g) || []).length, 2);
+assert.match(problems, /2026-11-11 00:00Z \(/);
+assert.match(problems, /What happens next/);
+// Good news is shown apart, never as a problem.
+assert.ok(information, 'information block');
+assert.match(information, /Pool allowance is back: Grok\+Cursor/);
+assert.doesNotMatch(problems, /Pool allowance is back/);
+assert.match(renderAlerts({status: 'ok', heartbeat: true, alerts: []}), /Nothing firing\./);
+const chipFor = alerts => renderChips({alerts: {status: 'ok', alerts}});
+assert.match(chipFor([{alertname: 'UsagePoolRestored', severity: 'info'}]), /<b>0<\/b> alerts firing/);
+assert.match(chipFor([{alertname: 'A', severity: 'info'}, {alertname: 'B', severity: 'critical'}]), /<b>1<\/b> alerts firing/);
+assert.match(renderAlerts({status: 'ok', heartbeat: true, alerts: [
+  {alertname: 'UsagePoolRestored', severity: 'info', title: 'Pool allowance is back'}]}), /No problems firing\./);
 """)
 
 
