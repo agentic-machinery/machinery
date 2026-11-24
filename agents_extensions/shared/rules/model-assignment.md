@@ -427,9 +427,9 @@ code and infra profiles, regardless of case.
   * **Top advisors**: Opus 5.5 / Sol 6.2 for advice, critiques and design input; they hold
     designated approval by agreeing; when one authored the proposal, the other's approval
     completes it, and any other author needs both (#9583, #9616).
-  * **Other advisors**: Gemini 4 Neon and SubQ Savant provide supplemental review and
-    hard-problem advice under their [Neon](#gemini-4-neon-advisory-routing) and
-    [Savant](#subq-savant-test-routing) routing rules. Grok 4.7 handles coding and
+  * **Other advisors**: Gemini 4 Neon and SubQ Savant provide hard-problem advice under their
+    [Neon](#gemini-4-neon-advisory-routing) and [Savant](#subq-savant-test-routing) routing
+    rules, and supplemental review only under a `MEASURE:` brief line (`review-loop`). Grok 4.7 handles coding and
     code/infra review only (C-5307). Kimi is retired (OO-58).
   * Legacy Terra review qualification does not authorize GPT-6.1 Terra review
     or advisory work; its current admission is routine coding only.
@@ -911,7 +911,7 @@ seats rotate — operator wording; the catalog-refresh contract §above owns nam
 | Ukrainian language & pedagogy | Opus · Sol (sanctioned language seats ONLY). Gemini joins only as task-level content reviewer under a fixed brief, never for planning or advice on new design (operator decision 2026-10-03, #9584) | LANGUAGE-LANES RULE binds |
 | Architecture & process design | Sol (designer) · Opus (counter-reader); designated approval needs the non-author's approval when Opus or Sol authored the proposal, both otherwise | fleet topology §above |
 | Code & infrastructure review | Opus 5.5 · GPT-6.2 Sol | Historical Terra review arcs on #5896/#5925/#5926/#5931 (defect-finding record) |
-| Security-sensitive changes | Sol · Opus · Neon and Savant for supplemental review | #5931 review evidence for the authority seats. Measure both trial seats against real reviews. |
+| Security-sensitive changes | Sol · Opus · Neon and Savant for supplemental review only under a `MEASURE:` brief line | #5931 review evidence for the authority seats. Measure both trial seats against real reviews. |
 | Debugging & forensics | Sol · Opus · Neon and Savant for hard-problem advice | Historical: retired Grok found the #5932 root cause (#5950 workaround); GLM: operator statement, #5933 comment 2026-07-28 |
 | Long-context sweeps & harness infra | Gemini for sweeps and recon · Neon and Savant for hard-problem advice | [Neon](#gemini-4-neon-advisory-routing) and [Savant](#subq-savant-test-routing) routing |
 
@@ -1029,7 +1029,7 @@ high, unchanged on medium and low). Neon High handles Ukrainian review with Sour
 | Model | AGY selector | Tier | Use |
 | --- | --- | --- | --- |
 | Gemini 4 Hydrogen (Medium) | `gemini-4-hydrogen-medium` | `frontier_practical` | Default AGY work dispatch, interactive launcher, and certified `start-gemini-driver.sh` pin |
-| Gemini 4 Neon | `gemini-4-neon-high`, `gemini-4-neon-medium` | `frontier_practical` | High for hard/security coding, stream driving, formal code/infra review at every risk tier (peer of Opus 5.5 and Sol 6.2, NEON-SOLTIER-1120), Ukrainian review with Sources MCP, fresh-build lesson writing (UK-WRITER-NEON-1121), and ACP consultation. High or Medium for [supplemental review](#gemini-4-neon-advisory-routing). |
+| Gemini 4 Neon | `gemini-4-neon-high`, `gemini-4-neon-medium` | `frontier_practical` | High for hard/security coding, stream driving, formal code/infra review at every risk tier (peer of Opus 5.5 and Sol 6.2, NEON-SOLTIER-1120), Ukrainian review with Sources MCP, fresh-build lesson writing (UK-WRITER-NEON-1121), and ACP consultation. High or Medium for [supplemental review](#gemini-4-neon-advisory-routing) under a `MEASURE:` brief line only. |
 | Gemini 4 Carbon | `gemini-4-carbon-medium` | `frontier_practical` | Retired. Existing receipts retain their Carbon model IDs. |
 | Gemini 3.8 Flash (High) | `gemini-3.8-flash-high` | `frontier_practical` | Explicit pin only until Google retires it. Existing receipts retain the original ID. |
 | Gemini 3.7 Flash (High) | `gemini-3.7-flash-high` | `frontier_practical` | Retired |
@@ -1040,9 +1040,11 @@ high, unchanged on medium and low). Neon High handles Ukrainian review with Sour
 ### Gemini 4 Neon advisory routing
 
 NEON-REPLACES-CARBON-1118 (2026-11-18) retires Carbon and moves its advisory work to Neon.
-Use Neon through native read-only AGY for supplemental review, supplemental security review,
-hard-problem advice and the independent answer in a non-Ukrainian council. The formal
-review ladders and designated approval rules still apply.
+Use Neon through native read-only AGY for hard-problem advice and the independent answer in a
+non-Ukrainian council. Run a supplemental (shadow) review with Neon only under a brief line
+`MEASURE: <model id> until <n> samples` (an operator-ordered model measurement, see
+`review-loop`); there is no default shadow review. The formal review ladders and designated
+approval rules still apply.
 
 Set `pr_number` to the PR number, when applicable, and `task_id` to the stable dispatch or
 discussion ID when you have one. Select the wire ID as follows.
@@ -1071,7 +1073,7 @@ reported by AGY in the settled dispatch. Compare review outcomes by selector.
 ### SubQ Savant test routing
 
 Use `subq-savant-1.4` through native OpenCode as a trial alongside Neon for
-supplemental PR review, hard-problem advice and the independent round of
+hard-problem advice and the independent round of
 non-Ukrainian councils. Keep the existing reviewer of record and designated
 approval seats. For public coding jobs, give Savant the relevant source and
 acceptance criteria and ask for a proposed patch. The authorized worker applies
