@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -1752,13 +1753,37 @@ _SINGLE_DOT_SEGMENTS = frozenset({".", "%2e"})
 _DOUBLE_DOT_SEGMENTS = frozenset({"..", ".%2e", "%2e.", "%2e%2e"})
 
 
-def _dashboard_file(dashboards_dir: Path, path: str, product: ProductContribution | None) -> Path | None:
+def _present(path: Path, kind: Callable[[int], bool]) -> bool:
+    """Whether ``path`` exists with a file type ``kind`` accepts; only plain absence is ``False``.
+
+    Any other lookup failure (a symlink loop, an overlong name, a denied directory, a NUL)
+    raises, where ``Path.is_file`` and ``Path.is_dir`` on Python 3.13+ answer ``False``.
+    """
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return kind(mode)
+
+
+def _dashboard_file(
+    dashboards_dir: Path, path: str, product: ProductContribution | None, *, strict: bool = False
+) -> Path | None:
     """The machinery dashboard file the static route serves at ``path``, or ``None`` when it serves none.
 
     ``None`` leaves the path to the product's declared files. This is the one lookup: the
     route serves what it returns, and the navigation uses it to tell machinery pages from
     product pages. Raises ``HTTPException(403)`` for a path that escapes the dashboards.
+    ``strict`` (the navigation) runs the same branches but raises on any lookup failure
+    other than absence (``_present``), so a failed lookup is never read as a missing file.
     """
+    is_file: Callable[[Path], bool]
+    is_dir: Callable[[Path], bool]
+    if strict:
+        is_file = functools.partial(_present, kind=stat.S_ISREG)
+        is_dir = functools.partial(_present, kind=stat.S_ISDIR)
+    else:
+        is_file, is_dir = Path.is_file, Path.is_dir
     if path in MACHINERY_HOME_PATHS:
         # The machinery home has its own address, so a product that owns ``/`` never hides it.
         return dashboards_dir / "index.html"
@@ -1771,16 +1796,16 @@ def _dashboard_file(dashboards_dir: Path, path: str, product: ProductContributio
     # Keep explicit traversal guard if relative path join bypassed via symlink tricks.
     if not file_path.resolve().is_relative_to(dashboards_root):
         raise HTTPException(status_code=403, detail="Path traversal not allowed")
-    if file_path.is_file():
+    if is_file(file_path):
         return file_path
-    if file_path.is_dir() and (file_path / "index.html").is_file():
+    if is_dir(file_path) and is_file(file_path / "index.html"):
         return file_path / "index.html"
     if not file_path.suffix:
         html_candidate = _safe_join(dashboards_dir, f"{path}.html")
         if (
             html_candidate is not None
             and html_candidate.resolve().is_relative_to(dashboards_root)
-            and html_candidate.is_file()
+            and is_file(html_candidate)
         ):
             return html_candidate
     return None
@@ -1830,26 +1855,16 @@ def _leaves_to_product(url: str, dashboards_dir: Path, product: ProductContribut
     False when the link does not name a fixed path on this site (``_request_path``), or the
     route's own lookup answers the path with a machinery dashboard file or refuses it, or
     the lookup fails on the filesystem (a symlink loop, an overlong name, a denied
-    directory, a NUL). On Python 3.13+ the route's path predicates answer such a failure
-    as "no file" where 3.12 raises, so each name the route looks up is also stat'ed here
-    and only plain absence counts: the failure drops this one link on every interpreter,
-    never the page. The product's own declared files were checked when it was loaded
-    (``checked_product``), and a path it declares no file for is still its own, since a
-    product router may serve it.
+    directory, a NUL). The lookup runs strict (``_dashboard_file``), so such a failure
+    drops this one link on every interpreter, never the page. The product's own declared
+    files were checked when it was loaded (``checked_product``), and a path it declares no
+    file for is still its own, since a product router may serve it.
     """
     path = _request_path(url)
     if path is None:
         return False
     try:
-        if _dashboard_file(dashboards_dir, path, product) is not None:
-            return False
-        base = dashboards_dir / path
-        for name in (base, base / "index.html", dashboards_dir / f"{path}.html"):
-            try:
-                name.stat()
-            except (FileNotFoundError, NotADirectoryError):
-                continue
-        return True
+        return _dashboard_file(dashboards_dir, path, product, strict=True) is None
     except (HTTPException, OSError, RuntimeError, ValueError):
         return False
 
