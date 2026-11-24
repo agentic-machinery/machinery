@@ -43,6 +43,8 @@ class _Lazy:
         return self._value
 
     def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
         return getattr(self._get(), name)
 
 

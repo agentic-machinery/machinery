@@ -1005,105 +1005,110 @@ def test_every_entry_point_converges_for_primary_and_non_git_state_root(
         "BACKUP_DIR",
     ):
         monkeypatch.delenv(name, raising=False)
-    for name in ("PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT", "DASHBOARDS_DIR", "BATCH_STATE_DIR"):
+    api_config_caches = ("PROJECT_ROOT", "PRODUCT_ROOT", "LIVE_REPO_ROOT", "CURRICULUM_ROOT", "DASHBOARDS_DIR", "BATCH_STATE_DIR")
+    for name in api_config_caches:
         if name in vars(api_config):
             monkeypatch.delitem(vars(api_config), name)
     monitor_context.production_context.cache_clear()
 
-    if layout_kind == "today-primary":
-        expected_state = primary.resolve()
-        monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
-        monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, str(primary))
-        monkeypatch.setenv(rr.INTERPRETER_ENV, str(python))
-        expected_lock_dir = (primary / ".git" / worktree_claims.LOCK_DIR_NAME).resolve()
-    else:
-        dedicated = tmp_path / "var-lib-machinery"
-        dedicated.mkdir()
-        expected_state = dedicated.resolve()
-        monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(dedicated))
-        monkeypatch.setenv(rr.LU_INTERPRETER_ENV, str(python))
-        if layout_kind != "non-git-without-repos-root":
-            monkeypatch.setenv(rr.REPOS_ROOT_ENV, str(repos))
-        if layout_kind == "non-git-with-legacy":
+    try:
+        if layout_kind == "today-primary":
+            expected_state = primary.resolve()
             monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
-            monkeypatch.setenv("LEARN_UK_REPO_ROOT", str(primary))
-        elif layout_kind == "non-git-without-repos-root":
-            monkeypatch.setenv(rr.LU_PRIMARY_ROOT_ENV, str(primary))
-        expected_lock_dir = (dedicated / "batch_state" / "locks" / worktree_claims.LOCK_DIR_NAME).resolve()
+            monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, str(primary))
+            monkeypatch.setenv(rr.INTERPRETER_ENV, str(python))
+            expected_lock_dir = (primary / ".git" / worktree_claims.LOCK_DIR_NAME).resolve()
+        else:
+            dedicated = tmp_path / "var-lib-machinery"
+            dedicated.mkdir()
+            expected_state = dedicated.resolve()
+            monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(dedicated))
+            monkeypatch.setenv(rr.LU_INTERPRETER_ENV, str(python))
+            if layout_kind != "non-git-without-repos-root":
+                monkeypatch.setenv(rr.REPOS_ROOT_ENV, str(repos))
+            if layout_kind == "non-git-with-legacy":
+                monkeypatch.setenv(rr.PRIMARY_ROOT_ENV, str(primary))
+                monkeypatch.setenv("LEARN_UK_REPO_ROOT", str(primary))
+            elif layout_kind == "non-git-without-repos-root":
+                monkeypatch.setenv(rr.LU_PRIMARY_ROOT_ENV, str(primary))
+            expected_lock_dir = (dedicated / "batch_state" / "locks" / worktree_claims.LOCK_DIR_NAME).resolve()
 
-    expected_fleet_db = (expected_state / DEFAULT_ROOT_REL / "comms.sqlite3").resolve()
-    expected_streams_db = (expected_state / DEFAULT_RELATIVE_DATABASE).resolve()
-    expected_tasks = (expected_state / "batch_state" / "tasks").resolve()
-    expected_ownership_db = expected_tasks / "write-ownership.sqlite3"
+        expected_fleet_db = (expected_state / DEFAULT_ROOT_REL / "comms.sqlite3").resolve()
+        expected_streams_db = (expected_state / DEFAULT_RELATIVE_DATABASE).resolve()
+        expected_tasks = (expected_state / "batch_state" / "tasks").resolve()
+        expected_ownership_db = expected_tasks / "write-ownership.sqlite3"
 
-    # Monitor entry point
-    ctx = monitor_context.production_context()
-    assert ctx.roots.state_root.resolve() == expected_state
-    assert ctx.roots.batch_state_dir.resolve() == expected_state / "batch_state"
-    assert ctx.roots.session_streams_db_path.resolve() == expected_streams_db
-    assert ctx.stores.session_streams_database is not None
-    assert ctx.stores.session_streams_database.path.resolve() == expected_streams_db
+        # Monitor entry point
+        ctx = monitor_context.production_context()
+        assert ctx.roots.state_root.resolve() == expected_state
+        assert ctx.roots.batch_state_dir.resolve() == expected_state / "batch_state"
+        assert ctx.roots.session_streams_db_path.resolve() == expected_streams_db
+        assert ctx.stores.session_streams_database is not None
+        assert ctx.stores.session_streams_database.path.resolve() == expected_streams_db
 
-    # Fleet Comms + Control Plane storage entry points
-    assert (default_plane_root() / "comms.sqlite3").resolve() == expected_fleet_db
-    assert (default_plane_root(repo_root=ctx.roots.state_root) / "comms.sqlite3").resolve() == expected_fleet_db
-    assert (default_plane_root(repo_root=primary) / "comms.sqlite3").resolve() == expected_fleet_db
-    assert cp_storage.sqlite_path(cp_storage.StoreId.FLEET_COMMS).resolve() == expected_fleet_db
-    assert cp_storage.sqlite_path(cp_storage.StoreId.SESSION_STREAMS).resolve() == expected_streams_db
-    assert cp_storage.sqlite_path(cp_storage.StoreId.WRITE_OWNERSHIP).resolve() == expected_ownership_db
+        # Fleet Comms + Control Plane storage entry points
+        assert (default_plane_root() / "comms.sqlite3").resolve() == expected_fleet_db
+        assert (default_plane_root(repo_root=ctx.roots.state_root) / "comms.sqlite3").resolve() == expected_fleet_db
+        assert (default_plane_root(repo_root=primary) / "comms.sqlite3").resolve() == expected_fleet_db
+        assert cp_storage.sqlite_path(cp_storage.StoreId.FLEET_COMMS).resolve() == expected_fleet_db
+        assert cp_storage.sqlite_path(cp_storage.StoreId.SESSION_STREAMS).resolve() == expected_streams_db
+        assert cp_storage.sqlite_path(cp_storage.StoreId.WRITE_OWNERSHIP).resolve() == expected_ownership_db
 
-    # Session Streams CLI / DB entry points (none, state_root, primary checkout, linked worktree)
-    assert SessionStreamDatabase().path.resolve() == expected_streams_db
-    assert default_database_path().resolve() == expected_streams_db
-    assert default_database_path(expected_state).resolve() == expected_streams_db
-    assert default_database_path(primary).resolve() == expected_streams_db
-    assert default_database_path(worktree).resolve() == expected_streams_db
-    assert canonical_state_root(expected_state) == expected_state
-    assert canonical_state_root(primary) == expected_state
-    assert canonical_state_root(worktree) == expected_state
+        # Session Streams CLI / DB entry points (none, state_root, primary checkout, linked worktree)
+        assert SessionStreamDatabase().path.resolve() == expected_streams_db
+        assert default_database_path().resolve() == expected_streams_db
+        assert default_database_path(expected_state).resolve() == expected_streams_db
+        assert default_database_path(primary).resolve() == expected_streams_db
+        assert default_database_path(worktree).resolve() == expected_streams_db
+        assert canonical_state_root(expected_state) == expected_state
+        assert canonical_state_root(primary) == expected_state
+        assert canonical_state_root(worktree) == expected_state
 
-    # Dispatcher entry points
-    dispatch_primary.exec_primary(["status"])
-    assert tasks_dir().resolve() == expected_tasks
-    assert dispatch_git.resolve_repo("machinery")[0] == sibling.resolve()
+        # Dispatcher entry points
+        dispatch_primary.exec_primary(["status"])
+        assert tasks_dir().resolve() == expected_tasks
+        assert dispatch_git.resolve_repo("machinery")[0] == sibling.resolve()
 
-    # Keeper-facing and orchestration resolvers
-    assert worktree_claims.public_primary_root().resolve() == expected_state
-    assert worktree_claims.control_plane_root(primary) == expected_state
-    assert worktree_claims.control_plane_root(sibling) == expected_state
-    assert worktree_claims.repository_lock_dir(worktree_claims.control_plane_root(primary)).resolve() == expected_lock_dir
-    assert worktree_claims.repository_lock_dir(worktree_claims.control_plane_root(sibling)).resolve() == expected_lock_dir
-    assert worktree_claims.repository_lock_dir(rr.state_root()).resolve() == expected_lock_dir
-    assert fleet_repos.resolve_fleet_repo("machinery", primary_root=rr.state_root())[1] == sibling.resolve()
-    assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == primary.resolve()
-    if layout_kind == "today-primary":
-        assert dispatch_git.resolve_repo("public")[0] == primary.resolve()
-    else:
-        with monkeypatch.context() as mp:
-            mp.setenv(rr.PRODUCT_ROOT_ENV, str(primary))
+        # Keeper-facing and orchestration resolvers
+        assert worktree_claims.public_primary_root().resolve() == expected_state
+        assert worktree_claims.control_plane_root(primary) == expected_state
+        assert worktree_claims.control_plane_root(sibling) == expected_state
+        assert worktree_claims.repository_lock_dir(worktree_claims.control_plane_root(primary)).resolve() == expected_lock_dir
+        assert worktree_claims.repository_lock_dir(worktree_claims.control_plane_root(sibling)).resolve() == expected_lock_dir
+        assert worktree_claims.repository_lock_dir(rr.state_root()).resolve() == expected_lock_dir
+        assert fleet_repos.resolve_fleet_repo("machinery", primary_root=rr.state_root())[1] == sibling.resolve()
+        assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == primary.resolve()
+        if layout_kind == "today-primary":
             assert dispatch_git.resolve_repo("public")[0] == primary.resolve()
-            assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == primary.resolve()
-    keeper_state, keeper_lock = merge_queue_keeper.default_keeper_paths(primary)
-    assert keeper_state.resolve() == expected_state / "batch_state" / "merge_queue_keeper.json"
-    assert keeper_lock.resolve() == expected_state / "batch_state" / "locks" / "merge_queue_keeper.lock"
-    sib_keeper_state, sib_keeper_lock = merge_queue_keeper.default_keeper_paths(sibling, "learn-ukrainian/machinery")
-    assert sib_keeper_state.resolve() != keeper_state.resolve()
-    assert sib_keeper_lock.resolve() != keeper_lock.resolve()
-    assert pr_ownership.state_path().resolve() == expected_state / "batch_state" / "pr_ownership" / "state.json"
-    assert task_lifecycle.canonical_state_root(expected_state) == expected_state
-    assert task_lifecycle.canonical_state_root(primary) == expected_state
-    assert task_lifecycle.canonical_state_root(worktree) == expected_state
-    assert thread_handoff.canonical_state_root(primary).resolve() == expected_state
+        else:
+            with monkeypatch.context() as mp:
+                mp.setenv(rr.PRODUCT_ROOT_ENV, str(primary))
+                assert dispatch_git.resolve_repo("public")[0] == primary.resolve()
+                assert fleet_repos.resolve_fleet_repo("public", primary_root=rr.state_root())[1] == primary.resolve()
+        keeper_state, keeper_lock = merge_queue_keeper.default_keeper_paths(primary)
+        assert keeper_state.resolve() == expected_state / "batch_state" / "merge_queue_keeper.json"
+        assert keeper_lock.resolve() == expected_state / "batch_state" / "locks" / "merge_queue_keeper.lock"
+        sib_keeper_state, sib_keeper_lock = merge_queue_keeper.default_keeper_paths(sibling, "learn-ukrainian/machinery")
+        assert sib_keeper_state.resolve() != keeper_state.resolve()
+        assert sib_keeper_lock.resolve() != keeper_lock.resolve()
+        assert pr_ownership.state_path().resolve() == expected_state / "batch_state" / "pr_ownership" / "state.json"
+        assert task_lifecycle.canonical_state_root(expected_state) == expected_state
+        assert task_lifecycle.canonical_state_root(primary) == expected_state
+        assert task_lifecycle.canonical_state_root(worktree) == expected_state
+        assert thread_handoff.canonical_state_root(primary).resolve() == expected_state
 
-    # Session supervisor shell helper entry point
-    sup_script = f'source "{rr.machinery_path("lib/session_supervisor.sh")}"; _canonical_state_root "$1"'
-    sup_res = subprocess.run(
-        ["bash", "-c", sup_script, "bash", str(primary)],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    assert sup_res.returncode == 0, sup_res.stderr
-    assert Path(sup_res.stdout.strip()).resolve() == expected_state
-    monitor_context.production_context.cache_clear()
+        # Session supervisor shell helper entry point
+        sup_script = f'source "{rr.machinery_path("lib/session_supervisor.sh")}"; _canonical_state_root "$1"'
+        sup_res = subprocess.run(
+            ["bash", "-c", sup_script, "bash", str(primary)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert sup_res.returncode == 0, sup_res.stderr
+        assert Path(sup_res.stdout.strip()).resolve() == expected_state
+    finally:
+        monitor_context.production_context.cache_clear()
+        for name in api_config_caches:
+            vars(api_config).pop(name, None)
