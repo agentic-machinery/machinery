@@ -257,7 +257,9 @@ launcher_drop_unneeded_secrets() {
   LC_CHILD_ENV_COMMAND=(/usr/bin/env)
   while IFS= read -r -d '' variable; do
     case "$variable" in
-      LAUNCHER_*=*) LC_CHILD_ENV_COMMAND+=(-u "${variable%%=*}") ;;
+      # LC_WORKSPACE_ROOT selects the workspace launch for this launcher only; the
+      # provider and everything it starts (workers, other launchers) never inherit it.
+      LAUNCHER_*=*|LC_WORKSPACE_ROOT=*) LC_CHILD_ENV_COMMAND+=(-u "${variable%%=*}") ;;
     esac
   done < <(/usr/bin/env -0)
   py="$(launcher_project_python)" || return 1

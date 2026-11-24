@@ -408,11 +408,14 @@ def selected_tree(selected: str | None, check: bool, *, workspace: bool = False)
                 raise Invalid(f"a workspace target must be outside every Git checkout: {walked} has a .git entry")
         tree = Tree(base)
         if not workspace:
-            result = subprocess.run(
-                ["git", "-C", f"/proc/self/fd/{base}", "rev-parse", "--show-toplevel"],
-                pass_fds=(base,), capture_output=True, text=True, check=False,
-                env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
-            )
+            try:
+                result = subprocess.run(
+                    ["git", "-C", f"/proc/self/fd/{base}", "rev-parse", "--show-toplevel"],
+                    pass_fds=(base,), capture_output=True, text=True, check=False, timeout=30,
+                    env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise Invalid("project root check timed out") from exc
             if result.returncode or result.stdout.strip() != str(path):
                 raise Invalid("project root must be the Git checkout root")
         # flock on the checkout inode needs no lockfile and writes nothing in check mode.
