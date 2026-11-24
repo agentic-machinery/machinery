@@ -27,7 +27,7 @@ import logging
 import os
 import re
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -434,13 +434,19 @@ def task_archive_lock(tasks_dir: Path, *, moving: bool = False) -> Iterator[None
         os.close(fd)
 
 
-def iter_task_records(tasks_dir: Path, *, include_archive: bool) -> Iterator[Path]:
+def iter_task_records(
+    tasks_dir: Path, *, include_archive: bool, on_error: Callable[[Path, OSError], None] | None = None,
+) -> Iterator[Path]:
     """Yield candidate JSON paths: the hot directory sorted by name, then the archive.
 
     ``include_archive=False`` is the hot directory alone, the view every active
     reader needs. A task id re-dispatched after its old record was archived has
     one record in each place; both are yielded because they are two runs. A
-    directory that is missing or unreadable yields nothing. Readers classify at
+    directory that is missing or unreadable yields nothing, and an entry whose type
+    cannot be read is skipped; ``on_error`` receives the path and the error for each,
+    so a reader that publishes counts can say they are unknown. Only a missing hot
+    directory is reported as missing: the first archive run creates the archive, and
+    an entry removed during the scan is no record. Readers classify at
     their own read, after their mtime, status-byte or fingerprint prefilters.
     Dispatcher sidecars that end in ``.json`` (boundary and sandbox receipts, and saved
     tool results) are not candidates. Closing the scan emits one summary for the foreign
@@ -461,10 +467,14 @@ def iter_task_records(tasks_dir: Path, *, include_archive: bool) -> Iterator[Pat
                         try:
                             if entry.is_file():
                                 names.append(entry.name)
-                        except OSError:
+                        except OSError as exc:
+                            if on_error is not None and not isinstance(exc, FileNotFoundError):
+                                on_error(directory / entry.name, exc)
                             continue  # one broken entry must not hide the other records
                     names.sort()
-            except OSError:
+            except OSError as exc:
+                if on_error is not None and not (directory != tasks_dir and isinstance(exc, FileNotFoundError)):
+                    on_error(directory, exc)
                 continue
             yield from (directory / name for name in names)
     finally:

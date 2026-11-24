@@ -69,6 +69,13 @@ RESULT_BYTES_LIMIT = 64 * 1024
 TASK_READ_RETRIES = 2
 TASK_READ_RETRY_SECONDS = 0.01
 ACTIVE_TASK_STATUSES = {"running", "spawning"}
+# Every status a task record carries, as the delegate panel shows them ("zombie" is derived from a
+# running record whose process is gone). A record with any other status is not known to be settled.
+TASK_STATUSES = frozenset({
+    "running", "spawning", "done", "failed", "timeout", "rate_limited", "cancelled", "crashed",
+    "no_deliverable", "needs_finalize", "settling", "zombie", "dry_run", "blocked",
+})
+_SETTLED_TASK_STATUSES = TASK_STATUSES - ACTIVE_TASK_STATUSES
 # Short enough that a dead pid drops off the active list quickly, long enough
 # that a burst of dashboard polls shares one directory scan.
 DELEGATE_LIST_TTL_S = 2.0
@@ -151,14 +158,18 @@ def _read_task_state(
     path: str, ctx: MonitorContext | None = None, *, tasks_dir: Path | None = None,
     raise_read_errors: bool = False,
 ) -> dict[str, Any] | None:
-    """Read contained task JSON; scans can distinguish retryable I/O from invalid content."""
+    """Read contained task JSON; ``None`` for a file that is no task record.
+
+    With ``raise_read_errors`` the last I/O error (OSError) or damaged record claim (ValueError)
+    is raised, so scans can tell them from a foreign file.
+    """
     root = tasks_dir if tasks_dir is not None else _tasks_dir(ctx)
     for attempt in range(TASK_READ_RETRIES):
         try:
             data = read_cached_task_record(Path(path), tasks_dir=root, display_unknown_schema=True)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
             if attempt + 1 == TASK_READ_RETRIES:
-                if raise_read_errors and isinstance(exc, OSError):
+                if raise_read_errors:
                     raise
                 return None
             time.sleep(TASK_READ_RETRY_SECONDS)
@@ -631,43 +642,65 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     tasks_dir = _tasks_dir(ctx)
     rows = []
     claims: list[tuple[str | None, list[str]]] = []
-    for path in iter_task_records(tasks_dir, include_archive=False):
+    # Live workers by claimed repository (read-only reviewers included). "" counts a confirmed live
+    # record with no usable claim, so the Projects line can say how many are not attributed. A task
+    # store that cannot be read and searched (one without search permission lists names but not their
+    # records) or listed, or a record that cannot be statted, read or parsed (damaged), or whose status
+    # is missing, empty or not a string (a newer schema's record is shown without its fields), gives no
+    # counts: it may be a live worker. Only running and spawning are live; any other string status is a
+    # writer-declared non-live state, not unknown. A foreign file is no record.
+    live_by_repository: dict[str, int] = {}
+    listing_failures: list[Exception] = []
+    store_readable = os.access(tasks_dir, os.R_OK | os.X_OK)
+    for path in iter_task_records(
+        tasks_dir, include_archive=False, on_error=lambda _path, exc: listing_failures.append(exc),
+    ):
         try:
             file_stat = path.stat()
             entry = _TASK_STATE_CACHE.get(str(path))
-            if entry is not None and entry[0] == _task_file_fingerprint(path.name, file_stat):
-                # Cache entries are replaced as a unit. Recheck live PIDs even
-                # when the record is unchanged.
-                _, summary, status, alive, _, pid = entry
-                if summary is None or status not in ACTIVE_TASK_STATUSES:
-                    continue
-                if status == "running" and pid:
-                    alive = _pid_alive(pid)
-                    if not alive:
-                        continue
-                task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
-            else:
-                task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
-                if task is None or str(task.get("status") or "") not in ACTIVE_TASK_STATUSES:
-                    continue
-                status, alive = _derived_task_status(task)
-                if status not in ACTIVE_TASK_STATUSES:
-                    continue
-                summary = _task_summary(path, task)
-        except OSError:
+            # The history scan's cache skips only an unchanged record it parsed (it has a summary)
+            # with a settled status. Foreign files and damaged records are both cached without a
+            # summary, and every other record is read again (served per file version by the record
+            # cache), so each one counted or skipped below is checked on its current content.
+            if (entry is not None and entry[1] is not None and entry[2] in _SETTLED_TASK_STATUSES
+                    and entry[0] == _task_file_fingerprint(path.name, file_stat)):
+                continue
+            task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
+            if task is None:  # a foreign file
+                continue
+            recorded = task.get("status")
+            if not isinstance(recorded, str) or not recorded:
+                raise ValueError(f"task record {path} has no status")
+            if recorded not in ACTIVE_TASK_STATUSES:
+                continue
+            status, alive = _derived_task_status(task)
+            if status not in ACTIVE_TASK_STATUSES:
+                continue
+            summary = _task_summary(path, task)
+        except OSError as exc:
             claims.append((None, []))
+            if not isinstance(exc, FileNotFoundError):  # a record removed during the scan is no worker
+                listing_failures.append(exc)
             continue
-        except ValueError:
+        except (ValueError, TypeError) as exc:  # a damaged or uninterpretable record: it may be a live worker
+            listing_failures.append(exc)
             continue
         rows.append(_task_summary_row(summary, status, alive, file_stat.st_mtime))
+        claimed = (_authoritative_task_repository(task) if task else None) or ""
+        live_by_repository[claimed] = live_by_repository.get(claimed, 0) + 1
         if task is None or task.get("mode") != "read-only":
             paths = []
             if task and isinstance(task.get("owned_paths"), list):
                 with suppress(TypeError, ValueError):
                     paths = effective_scope(task)
             claims.append((_authoritative_task_repository(task) if task else None, paths))
+    # Checked again after the scan: a store that stopped being searchable during it read only part.
+    store_readable = store_readable and os.access(tasks_dir, os.R_OK | os.X_OK)
     # The HTTP /active projection omits these internal claims, including grants.
-    return {"total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims}
+    return {
+        "total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims,
+        "live_by_repository": live_by_repository if store_readable and not listing_failures else None,
+    }
 
 
 def _delegate_task_rows_locked(
@@ -764,6 +797,8 @@ def _delegate_task_rows_locked(
                 # not publish a generation that omits the unread record.
                 generation = None
                 continue
+            except ValueError:  # a damaged record claim, cached as a miss below
+                task = None
             if task is None:
                 # Foreign or damaged records are misses too. Otherwise every
                 # projection repeats their reads, parsing and retry sleeps while
@@ -1034,10 +1069,7 @@ def _panel_task(raw: object) -> dict[str, Any]:
         "agent": panel_values.choice(row.get("agent"), panel_values.AGENTS, "unknown"),
         "model": panel_values.model(row.get("model")),
         "observed_model": panel_values.model(row.get("observed_model")),
-        "status": panel_values.choice(row.get("status"), {
-            "running", "spawning", "done", "failed", "timeout", "rate_limited", "cancelled", "crashed",
-            "no_deliverable", "needs_finalize", "settling", "zombie", "dry_run", "blocked",
-        }, "unknown"),
+        "status": panel_values.choice(row.get("status"), TASK_STATUSES, "unknown"),
         "push_state": panel_values.choice(row.get("push_state"), {"pushed", "unpushed", "unknown"}, "unknown"),
         "claude_account": panel_values.choice(row.get("claude_account"), {"a", "b"}),
         "codex_account": panel_values.choice(account, CODEX_ACCOUNT_LABELS),

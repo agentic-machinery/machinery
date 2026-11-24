@@ -14,12 +14,13 @@ import os
 import re
 import subprocess
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, TypeGuard
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator, BaseModel
 
@@ -34,6 +35,7 @@ from lu_machinery.orchestration.task_record_store import (
 )
 
 from . import panel_values
+from .delegate_router import _authoritative_task_repository, active_snapshot
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .state_helpers import (
     cache_get_or_compute_async,
@@ -601,18 +603,26 @@ def compute_git_cleanup(project_root: Path | None = None) -> CleanupReport:
 
 
 
-# Open pull requests and merge-queue state for the repositories the fleet lands in.
-# (registry key, display name). The display order also sets the query aliases.
-PULL_REQUEST_REPOSITORIES = (
-    ("machinery", "machinery"),
-    ("public", "learn-ukrainian"),
-    ("infra-private", "infra-private"),
-)
+# Open pull requests, default-branch CI and the lu-machinery pin for every project in the fleet
+# registry (lu_machinery/config/fleet_repos.yaml), in registry order, which also sets the query
+# aliases. The display name is the registry's local_name.
 _REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}")
 PULL_REQUESTS_TTL_S = 120.0
 PULL_REQUESTS_TIMEOUT_S = 20.0
 PULL_REQUESTS_PER_REPOSITORY = 50
 REVIEW_STATUS_CONTEXT = "fleet/cross-family-review"
+# The one file a project's lu-machinery version is read from, at its default branch head.
+PIN_FILE = "uv.lock"
+# The registry key of the machinery repository itself: its pin column says "self" and its lock
+# is not fetched.
+SELF_KEY = "machinery"
+_CI_STATES = {"success", "failure", "error", "pending", "expected"}
+_QUEUE_STATES = {"queued", "awaiting_checks", "locked", "mergeable", "unmergeable"}
+# A reading older than the delegate panel's own bound is not a live count.
+LIVE_WORKERS_MAX_AGE_S = 60.0
+# Since when each repository has been unreadable: the first of its consecutive failed readings in
+# this process. The first good reading clears it, and a Monitor restart starts it again.
+_UNKNOWN_SINCE: dict[str, str] = {}
 _PR_FIELDS = (
     "number isDraft createdAt headRefName mergeStateStatus"
     " mergeQueueEntry { position state }"
@@ -621,14 +631,20 @@ _PR_FIELDS = (
 )
 
 
-def _pull_requests_query(repositories: list[tuple[str, str, str]]) -> str:
+def _pull_requests_query(repositories: list[tuple[str, str, bool] | None]) -> str:
     pulls = (
         f"pullRequests(states: OPEN, first: {PULL_REQUESTS_PER_REPOSITORY}, orderBy: {{field: CREATED_AT, direction: DESC}})"
     )
     blocks = []
-    for index, (owner, name, _display) in enumerate(repositories):
+    for index, entry in enumerate(repositories):
+        if entry is None:  # an invalid slug stays out of the query; its row says so
+            continue
+        owner, name, own = entry
         header = f'r{index}: repository(owner: "{owner}", name: "{name}")'
-        blocks.append(f"{header} {{ isPrivate {pulls} {{ totalCount nodes {{ {_PR_FIELDS} }} }} }}")
+        tip = "defaultBranchRef { target { ... on Commit { statusCheckRollup { state } } } }"
+        # The machinery repository's own lock is never fetched: its pin reads "self".
+        pin = "" if own else f'pin: object(expression: "HEAD:{PIN_FILE}") {{ ... on Blob {{ isTruncated text }} }}'
+        blocks.append(f"{header} {{ isPrivate {tip} {pin} {pulls} {{ totalCount nodes {{ {_PR_FIELDS} }} }} }}")
     return "query { " + " ".join(blocks) + " }"
 
 
@@ -648,11 +664,13 @@ def _last_commit(node: dict[str, Any]) -> dict[str, Any]:
     return _mapping(_mapping(last).get("commit"))
 
 
-def _recorded_task_reference(tasks_dir: Path, candidate: object) -> str | None:
-    """Return a branch suffix only when a dispatcher record stores that same id.
+def _recorded_task_reference(tasks_dir: Path, candidate: object, slugs: frozenset[str]) -> str | None:
+    """Return a branch suffix only when a dispatcher record stores that same id for this repository.
 
     The suffix is contributor-controlled text. A matching character class is not
-    enough: the value is withheld unless the record's own task id equals it.
+    enough: the value is withheld unless the record's own task id equals it and the
+    record's authoritative repository is one of this project's registry slugs
+    (casefolded), so a PR in another project never takes a worker's reference.
     """
     token = panel_values.task_reference(candidate)
     if token is None:
@@ -666,12 +684,14 @@ def _recorded_task_reference(tasks_dir: Path, candidate: object) -> str | None:
         return None
     if not isinstance(record, dict) or record.get("task_id") != token:
         return None
+    if (_authoritative_task_repository(record) or "").casefold() not in slugs:
+        return None
     recorded = record["task_id"]
     return recorded if isinstance(recorded, str) else None
 
 
 def _pull_request_row(
-    node: dict[str, Any], *, private: bool, repository: str, tasks_dir: Path,
+    node: dict[str, Any], *, private: bool, repository: str, slugs: frozenset[str], tasks_dir: Path,
 ) -> dict[str, Any]:
     commit = _last_commit(node)
     rollup = _mapping(commit.get("statusCheckRollup"))
@@ -681,46 +701,209 @@ def _pull_request_row(
     number = raw_number if type(raw_number) is int and 0 < raw_number < 1_000_000_000 else None
     branch = node.get("headRefName")
     task_id = branch.rsplit("/", 1)[-1] if isinstance(branch, str) and len(branch) <= 512 else None
+    # A private project shows counts and states only: no PR number, link or creation time.
     return {
-        "number": number,
-        "url": f"https://github.com/{repository}/pull/{number}" if number is not None else None,
-        "task_reference": None if private else _recorded_task_reference(tasks_dir, task_id),
+        "number": None if private else number,
+        "url": f"https://github.com/{repository}/pull/{number}" if number is not None and not private else None,
+        "task_reference": None if private else _recorded_task_reference(tasks_dir, task_id, slugs),
         "draft": node.get("isDraft") is True,
-        "created_at": panel_values.timestamp(node.get("createdAt")),
+        "created_at": None if private else panel_values.timestamp(node.get("createdAt")),
         "merge_state": panel_values.choice(_lower(node.get("mergeStateStatus")), {
             "behind", "blocked", "clean", "dirty", "draft", "has_hooks", "unknown", "unstable",
         }, "unknown"),
-        "ci": panel_values.choice(_lower(rollup.get("state")), {"success", "failure", "error", "pending", "expected"}),
-        "review": panel_values.choice(_lower(review.get("state")), {"success", "failure", "error", "pending", "expected"}),
+        "ci": panel_values.choice(_lower(rollup.get("state")), _CI_STATES),
+        "review": panel_values.choice(_lower(review.get("state")), _CI_STATES),
         "queue": {
             "position": panel_values.number(queue.get("position")),
-            "state": panel_values.choice(_lower(queue.get("state")), {
-                "queued", "awaiting_checks", "locked", "mergeable", "unmergeable",
-            }, "unknown"),
+            "state": panel_values.choice(_lower(queue.get("state")), _QUEUE_STATES, "unknown"),
         } if queue else None,
     }
 
 
-def _unknown_pull_requests(reason: str, observed_at: str) -> dict[str, Any]:
-    return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": []}
+def _unreadable_row(entry: dict[str, Any], reason: str, observed_at: str, *, private: bool | None = None) -> dict[str, Any]:
+    """A project that could not be read: unknown with the time it first failed, never a zero."""
+    since = _UNKNOWN_SINCE.setdefault(entry["repository"], observed_at)
+    return {**entry, "status": "unknown", "reason": reason, "private": private, "open_total": None,
+            "pull_requests": [], "default_branch": None, "pin": None, "unknown_since": since}
+
+
+def _unknown_pull_requests(
+    reason: str, observed_at: str, targets: list[tuple[str, str, str, str]] | None = None,
+) -> dict[str, Any]:
+    """A whole failed read still lists every registered project, each unknown since its first failure."""
+    rows = [_unreadable_row({"repository": f"{owner}/{name}", "name": display, "key": key}, reason, observed_at)
+            for key, owner, name, display in targets or []]
+    return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
+
+
+def _locked_version(text: str) -> str | None:
+    """The version of the one ``[[package]]`` entry named exactly ``lu-machinery`` in a uv.lock.
+
+    ``None`` when tomllib refuses the text, ``package`` is not an array of tables, there are zero
+    or several such entries, or the entry has no non-empty string version.
+    """
+    try:
+        lock = tomllib.loads(text)
+    # TOMLDecodeError is a ValueError; so is an integer past the interpreter's digit limit. Deep
+    # nesting raises RecursionError.
+    except (ValueError, RecursionError):
+        return None
+    packages = lock.get("package")
+    if not isinstance(packages, list) or not all(isinstance(entry, dict) for entry in packages):
+        return None
+    entries = [entry for entry in packages if entry.get("name") == "lu-machinery"]
+    version = entries[0].get("version") if len(entries) == 1 else None
+    return version if isinstance(version, str) and version else None
+
+
+def _pin(repo: dict[str, Any], *, private: bool, errored: bool, own: bool) -> dict[str, Any]:
+    """The lu-machinery version a project locks, from the uv.lock at its default branch head.
+
+    ``withheld`` for a private project (counts and states only), ``self`` for the machinery
+    repository itself. ``unknown`` when the field is missing or errored, the file is absent, not a
+    file, cut short or not text, or it locks no single lu-machinery version. pyproject.toml is not read.
+    """
+    if private:
+        return {"state": "withheld", "version": None}
+    if own:
+        return {"state": "self", "version": None}
+    blob = _mapping(repo.get("pin")) if not errored else {}
+    body = blob.get("text")
+    version = _locked_version(body) if isinstance(body, str) and blob.get("isTruncated") is False else None
+    return {"state": "pinned", "version": version} if version else {"state": "unknown", "version": None}
+
+
+def _default_branch_ci(repo: dict[str, Any], *, errored: bool) -> dict[str, Any] | None:
+    """The check rollup of the default branch's latest commit: ``{"ci": None}`` ("none reported")
+    only when GitHub says there is no default branch or no rollup, never success.
+
+    The whole entry is ``None`` (unknown) when GitHub errored on the field, or any part of it is
+    missing, of the wrong type, or a state outside GitHub's set.
+    """
+    if errored or "defaultBranchRef" not in repo:
+        return None
+    branch = repo["defaultBranchRef"]
+    if branch is None:  # a repository with no default branch has no CI on it
+        return {"ci": None}
+    tip = branch.get("target") if isinstance(branch, dict) else None
+    if not isinstance(tip, dict) or "statusCheckRollup" not in tip:
+        return None
+    rollup = tip["statusCheckRollup"]
+    if rollup is None:
+        return {"ci": None}
+    state = rollup.get("state") if isinstance(rollup, dict) else None
+    return {"ci": state.lower()} if _enum(state, _CI_ENUM) else None
+
+
+def _errored_fields(document: object, aliases: set[str]) -> dict[str, set[str]] | None:
+    """Fields GitHub reported an error for, by repository alias: ``{"r0": {"pin"}}``.
+
+    An error on a repository itself is ``""``. ``None`` when an error names no repository of this
+    query (no path, a malformed one, or another root), since then no reading can be trusted.
+    """
+    errors = document.get("errors") if isinstance(document, dict) else None
+    if errors is not None and not isinstance(errors, list):
+        return None
+    found: dict[str, set[str]] = {}
+    for item in errors or []:
+        path = item.get("path") if isinstance(item, dict) else None
+        if not isinstance(path, list) or not path or not isinstance(path[0], str) or path[0] not in aliases:
+            return None
+        # Every later segment is a field name or a list index; anything else names no field.
+        if not all(isinstance(part, str) or (type(part) is int and part >= 0) for part in path[1:]):
+            return None
+        field = path[1] if len(path) > 1 else ""
+        found.setdefault(path[0], set()).add(field if isinstance(field, str) else "")
+    return found
+
+
+# GitHub's response types for the fields the query reads: enum values are the exact upper-case names
+# (compared as whole strings, so no case folding admits another spelling), Int is a 32-bit signed
+# integer and never a bool, and DateTime is ISO 8601 in UTC as GitHub writes it.
+_CI_ENUM = frozenset(state.upper() for state in _CI_STATES)
+_QUEUE_ENUM = frozenset(state.upper() for state in _QUEUE_STATES)
+_MERGE_STATE_ENUM = frozenset({"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"})
+_GRAPHQL_INT_MAX = 2**31 - 1
+_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+
+def _graphql_int(value: object, low: int) -> bool:
+    return type(value) is int and low <= value <= _GRAPHQL_INT_MAX
+
+
+def _enum(value: object, names: frozenset[str]) -> TypeGuard[str]:
+    # The type check comes first: an unhashable value would raise on set membership.
+    return isinstance(value, str) and value in names
+
+
+# Keys every PR node, its commit and its queue entry carry when GitHub answers the query as asked.
+_PR_NODE_KEYS = {"number", "isDraft", "createdAt", "headRefName", "mergeStateStatus", "mergeQueueEntry", "commits"}
+
+
+def _complete_pull_request(node: object) -> bool:
+    """Whether a PR node has every field the query asked for, each null where GitHub allows it or
+    else a value of GitHub's own type (see the enums, Int and DateTime above).
+
+    A field GitHub left out or sent malformed must not read as "not queued", "no CI yet" or "none".
+    """
+    if not isinstance(node, dict) or not node.keys() >= _PR_NODE_KEYS:
+        return False
+    # A malformed number would read as a private PR, and a non-boolean draft flag as ready.
+    created = node["createdAt"]
+    if (not _graphql_int(node["number"], 1) or node["number"] >= 1_000_000_000 or type(node["isDraft"]) is not bool
+            or not isinstance(node["headRefName"], str) or not _enum(node["mergeStateStatus"], _MERGE_STATE_ENUM)
+            or not isinstance(created, str) or not _DATETIME.fullmatch(created) or panel_values.timestamp(created) is None):
+        return False
+    queue, commits = node["mergeQueueEntry"], node["commits"]
+    # A queue entry, rollup or review context that is present carries a value of GitHub's own type
+    # and set; a malformed one must not read as "not queued", "no CI yet" or "none".
+    if queue is not None and not (isinstance(queue, dict) and _enum(queue.get("state"), _QUEUE_ENUM)
+                                  and _graphql_int(queue.get("position"), 0)):
+        return False
+    nodes = commits.get("nodes") if isinstance(commits, dict) else None
+    if not isinstance(nodes, list) or not all(item is None or isinstance(item, dict) for item in nodes):
+        return False
+    if not nodes or nodes[-1] is None:
+        return True
+    commit = nodes[-1].get("commit")
+    if not isinstance(commit, dict) or not commit.keys() >= {"statusCheckRollup", "status"}:
+        return False
+    rollup, status = commit["statusCheckRollup"], commit["status"]
+    if rollup is not None and not (isinstance(rollup, dict) and _enum(rollup.get("state"), _CI_ENUM)):
+        return False
+    if status is None:
+        return True
+    if not isinstance(status, dict) or "context" not in status:
+        return False
+    context = status["context"]
+    return context is None or (isinstance(context, dict) and _enum(context.get("state"), _CI_ENUM))
 
 
 def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) -> dict[str, Any]:
-    """Read open PRs for every fleet repository in one GraphQL call; never raises.
+    """Read every registered project in one GraphQL call; never raises.
 
     ``tasks_dir`` is the dispatcher task store. The HTTP route passes the
     monitor context's store, which is not always ``project_root / batch_state``.
+    A repository GitHub cannot resolve stays listed as unknown; the rest of the reading survives it.
     """
     records = tasks_dir if tasks_dir is not None else project_root / "batch_state" / "tasks"
     observed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     try:
-        catalog = load_fleet_repos()
-        targets = [(catalog[key], display) for key, display in PULL_REQUEST_REPOSITORIES]
-    except (FleetRepoError, KeyError):
+        catalog = list(load_fleet_repos().values())
+    except FleetRepoError:
         return _unknown_pull_requests("registry_unavailable", observed_at)
-    if any(not _REPOSITORY_SLUG.fullmatch(repo.github) or repo.name in {".", ".."} for repo, _ in targets):
-        return _unknown_pull_requests("invalid_repository", observed_at)
-    repositories = [(repo.owner, repo.name, display) for repo, display in targets]
+    targets = [(repo.key, repo.owner, repo.name, repo.local_name) for repo in catalog]
+    # One invalid slug is that project's unknown row, never a failed read for the others.
+    valid = [bool(_REPOSITORY_SLUG.fullmatch(repo.github)) and repo.name not in {".", ".."} for repo in catalog]
+    repositories: list[tuple[str, str, bool] | None] = [
+        (owner, name, key == SELF_KEY) if ok else None for ok, (key, owner, name, _display) in zip(valid, targets, strict=True)
+    ]
+    if not any(valid):
+        return _unknown_pull_requests("invalid_repository", observed_at, targets)
+
+    def unknown(reason: str) -> dict[str, Any]:
+        return _unknown_pull_requests(reason, observed_at, targets)
+
     try:
         proc = github_client.run(
             ["gh", "api", "graphql", "-f", f"query={_pull_requests_query(repositories)}"],
@@ -731,46 +914,118 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return _unknown_pull_requests("github_timeout", observed_at)
+        return unknown("github_timeout")
     except OSError:
-        return _unknown_pull_requests("github_unavailable", observed_at)
-    if proc.returncode != 0:
-        return _unknown_pull_requests("github_unavailable", observed_at)
+        return unknown("github_unavailable")
+    # With GraphQL errors (one repository unresolvable) the shared client refuses the response and
+    # carries the whole document on its typed result; native gh prints it on stdout and exits 1.
+    # Read it per repository; no data at all is a failed read.
     try:
-        data = json_depth.loads(proc.stdout or "", max_depth=512)["data"]
-    except (ValueError, KeyError, TypeError):
-        return _unknown_pull_requests("github_invalid_response", observed_at)
+        result = getattr(proc, "github_result", None)
+        if result is not None and (result.error, result.reason) == ("github_graphql_error", "graphql_errors"):
+            document = result.value
+        else:
+            document = json_depth.loads(proc.stdout or "", max_depth=512)
+        data = document["data"]
+    except (ValueError, KeyError, TypeError, RecursionError):  # json_depth raises RecursionError past its bound
+        return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
     if not isinstance(data, dict):
-        return _unknown_pull_requests("github_invalid_response", observed_at)
+        return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
+    errored = _errored_fields(document, {f"r{index}" for index, ok in enumerate(valid) if ok})
+    if errored is None:
+        return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
     rows = []
-    for index, (owner, name, display) in enumerate(repositories):
+    for index, (key, owner, name, display) in enumerate(targets):
         repo = data.get(f"r{index}")
-        entry: dict[str, Any] = {"repository": f"{owner}/{name}", "name": display}
-        if not isinstance(repo, dict) or not isinstance(repo.get("pullRequests"), dict):
-            rows.append({**entry, "status": "unknown", "reason": "not_readable", "private": None,
-                                 "open_total": None, "pull_requests": []})
+        entry: dict[str, Any] = {"repository": f"{owner}/{name}", "name": display, "key": key}
+        if not valid[index]:
+            rows.append(_unreadable_row(entry, "invalid_repository", observed_at))
             continue
-        # Fail closed: anything but an explicit public repository is treated as private.
-        private = repo.get("isPrivate") is not False
+        failed = errored.get(f"r{index}", set())
+        # An error on the repository or anywhere in its PRs leaves them unread (GitHub nulls the
+        # failed field and keeps its parent), never an empty queue or a PR with no CI.
+        if (not isinstance(repo, dict) or not isinstance(repo.get("pullRequests"), dict)
+                or failed - {"isPrivate", "defaultBranchRef", "pin"}):
+            rows.append(_unreadable_row(entry, "not_readable", observed_at))
+            continue
+        # Fail closed: anything but an explicit public repository, or a registry role that is not
+        # public, is private.
+        # An error on isPrivate makes it private too: GitHub nulls a failed field, so a value beside
+        # the error is no reading.
+        private = (repo.get("isPrivate") is not False or "isPrivate" in failed
+                   or not catalog[index].role.startswith("public-"))
         nodes = repo["pullRequests"].get("nodes")
         total = repo["pullRequests"].get("totalCount")
-        # A missing or null PR node would silently read as fewer open PRs.
-        if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes):
-            rows.append({**entry, "status": "unknown", "reason": "github_invalid_response", "private": private,
-                                 "open_total": None, "pull_requests": []})
+        # A missing or null PR node would silently read as fewer open PRs, and a count that is not an
+        # integer at least the number of PRs listed is no reading of the open PRs at all.
+        if (not isinstance(nodes, list) or not all(_complete_pull_request(node) for node in nodes)
+                or not _graphql_int(total, len(nodes))):
+            rows.append(_unreadable_row(entry, "github_invalid_response", observed_at, private=private))
             continue
+        _UNKNOWN_SINCE.pop(entry["repository"], None)
         rows.append({
             **entry,
             "status": "ok",
             "reason": None,
             "private": private,
-            "open_total": total if isinstance(total, int) else None,
+            "open_total": total,
+            "default_branch": _default_branch_ci(repo, errored="defaultBranchRef" in failed),
+            "pin": _pin(repo, private=private, errored="pin" in failed, own=key == SELF_KEY),
+            "unknown_since": None,
             "pull_requests": [
-                _pull_request_row(node, private=private, repository=f"{owner}/{name}", tasks_dir=records)
+                _pull_request_row(node, private=private, repository=f"{owner}/{name}",
+                                  slugs=frozenset(slug.casefold() for slug in catalog[index].slugs), tasks_dir=records)
                 for node in nodes[:PULL_REQUESTS_PER_REPOSITORY]
             ],
         })
+    if proc.returncode != 0 and not any(row["status"] == "ok" for row in rows):
+        # gh failed (rate limit, auth) and no repository came back: a failed read, not "all unreadable".
+        return unknown("github_unavailable")
     return {"status": "ok", "reason": None, "observed_at": observed_at, "repositories": rows}
+
+
+def _live_workers(ctx: MonitorContext) -> dict[str, int] | None:
+    """Live workers by claimed repository from the delegate panel's snapshot, or None when it is not live."""
+    try:
+        payload, age = active_snapshot(ctx).read()
+    except HTTPException:  # snapshot not ready
+        return None
+    counts = payload.get("live_by_repository") if isinstance(payload, dict) else None
+    if age > LIVE_WORKERS_MAX_AGE_S or not isinstance(counts, dict):
+        return None
+    merged: dict[str, int] = {}
+    for claimed, n in counts.items():
+        if type(n) is int:  # claims that differ only in case are one repository
+            merged[str(claimed).casefold()] = merged.get(str(claimed).casefold(), 0) + n
+    return merged
+
+
+def _with_live_workers(payload: dict[str, Any], counts: dict[str, int] | None) -> dict[str, Any]:
+    """Add each project's live workers, counted over every slug its registry row carries.
+
+    Workers on a repository no row names, or with no usable claim, are counted apart rather than
+    dropped. ``None`` is unknown, never zero.
+    """
+    rows = payload.get("repositories")
+    if not isinstance(rows, list):
+        return payload
+    try:
+        catalog = load_fleet_repos()
+    except FleetRepoError:
+        catalog = {}
+    seen = 0
+    out = []
+    for row in rows:
+        key = row.get("key") if isinstance(row, dict) else None
+        repo = catalog.get(key) if isinstance(key, str) else None
+        if counts is None or repo is None:
+            out.append({**row, "live_workers": None} if isinstance(row, dict) else row)
+            continue
+        live = sum(counts.get(slug, 0) for slug in {slug.casefold() for slug in repo.slugs})
+        seen += live
+        out.append({**row, "live_workers": live})
+    return {**payload, "repositories": out,
+            "live_workers_unattributed": None if counts is None else max(0, sum(counts.values()) - seen)}
 
 
 def _pull_requests_cache_key(ctx: MonitorContext) -> str:
@@ -815,6 +1070,8 @@ async def pull_requests(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
             schedule_cache_refresh(key, PULL_REQUESTS_TTL_S, compute)
     # A loaded repository is a row the panel can show. An unknown row is a gap
     # in that reading, not an empty panel, so it must not discard the other age.
+    counts = await asyncio.to_thread(_live_workers, ctx)
+    payload = _with_live_workers(payload, counts)
     raw_repositories = payload.get("repositories")
     rows = raw_repositories if isinstance(raw_repositories, list) else []
     usable = [repo for repo in rows if isinstance(repo, dict) and repo.get("status") == "ok"]

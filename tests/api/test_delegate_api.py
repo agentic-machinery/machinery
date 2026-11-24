@@ -794,6 +794,56 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
         assert expected["total"] == 1
         expected_http = running.get("/api/delegate/active").json()
         assert expected_http["total"] == 1
+        # The internal per-repository worker counts reach the Projects line, never the public panel.
+        assert sum(expected["live_by_repository"].values()) == 1
+        assert "live_by_repository" not in expected_http
+        # A task store that cannot be read gives no counts (unknown), never a fleet of zeroes.
+        with monkeypatch.context() as local:
+            local.setattr(delegate_router, "_tasks_dir", lambda _ctx: tmp_path / "absent")
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+            # A regular file that is readable and executable is no task store either, and neither is a listing that fails.
+            plain = tmp_path / "plain-file"
+            plain.write_text("x")
+            plain.chmod(0o755)
+            local.setattr(delegate_router, "_tasks_dir", lambda _ctx: plain)
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+            local.setattr(delegate_router, "_tasks_dir", lambda _ctx: tasks)
+            # A directory that cannot be read and searched lists names but not their types: no counts either.
+            local.setattr(delegate_router.os, "access", lambda *_args: False)
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+            local.undo()
+            local.setattr(delegate_router, "_tasks_dir", lambda _ctx: tasks)
+
+            def failing_listing(_path):
+                raise OSError(5, "input/output error")
+
+            local.setattr(delegate_router.os, "scandir", failing_listing)
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+        # A listed record that cannot be read may be a live worker: no counts either, until it reads again.
+        (tasks / "live.json").chmod(0o000)
+        try:
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+        finally:
+            (tasks / "live.json").chmod(0o644)
+        assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1
+        # So may a damaged record (cut short, not UTF-8), one of a newer schema, or one whose status is
+        # missing, empty or not a string, before and after the history scan has cached it; a foreign
+        # file is no record, and any other string status is a writer-declared non-live state, so both
+        # leave the counts known.
+        damaged = tasks / "other.json"
+        v2 = {"schema_version": 2, "task_id": "other"}
+        for body in (b'{"schema_version": 2, "task_id": "oth', b'{"task_id": "other\xff"}',
+                     json.dumps({**v2, "schema_version": 3, "status": "running"}).encode(), json.dumps(v2).encode(),
+                     *(json.dumps({**v2, "status": status}).encode() for status in (None, {}, ""))):
+            damaged.write_bytes(body)
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None, body
+            delegate_router.list_delegate_tasks(ctx=ctx)  # the history scan caches the record
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None, body
+        for body in (b"[1, 2]", *(json.dumps({**v2, "status": status}).encode() for status in ("done", "paused", "dry-run"))):
+            damaged.write_bytes(body)
+            delegate_router.list_delegate_tasks(ctx=ctx)
+            assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1, body
+        damaged.unlink()
         def forbidden(*args, **kwargs):
             raise AssertionError("request collected task history")
         monkeypatch.setattr(delegate_router, "_active_snapshot_tasks", forbidden)

@@ -14,7 +14,7 @@
     <div class="title">
       <h1>Machinery</h1>
       <span class="muted" id="machinery-version" data-version="__MACHINERY_VERSION__" data-repository="__MACHINERY_REPOSITORY__"></span>
-      <p class="purpose">What needs attention now: firing alerts, subscription capacity, and merge queue status.</p>
+      <p class="purpose">What needs attention now: firing alerts, subscription capacity, every project under machinery control, and merge queue status.</p>
     </div>
     <div class="header-utils">
       <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
@@ -40,6 +40,11 @@
     <h2>Capacity summary <span class="age" id="usage-age">Loading…</span> <a class="more" href="/subscriptions">Full subscriptions →</a></h2>
     <p id="usage-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div id="usage-content">Loading…</div>
+  </section>
+  <section class="wide stacked" id="projects">
+    <h2>Projects <span class="age" id="projects-age">Loading…</span> <a class="more" href="/pull-requests">All pull requests →</a></h2>
+    <p id="projects-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <div id="projects-content">Loading…</div>
   </section>
   <section id="queue">
     <h2>Merge queue status <span class="age" id="prs-age">Loading…</span> <a class="more" href="/pull-requests">All pull requests →</a></h2>
@@ -166,10 +171,11 @@ function renderCapacitySummary(subs, logins) {
 }
 
 function renderQueueSummary(prs, prState = null) {
-  if (prs.status !== "ok") return unknown(prs.reason);
   const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
+  // A whole failed read still lists every project with since when it is unknown; show those rows.
+  if (prs.status !== "ok" && !repos.length) return unknown(prs.reason);
   const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
-  const unavailable = prState === "unavailable" || allUnknown;
+  const unavailable = prs.status !== "ok" || prState === "unavailable" || allUnknown;
   const ageUnknown = !unavailable && prState === "unknown";
   const unbounded = !unavailable && prState === "unbounded";
   const expired = !unavailable && !ageUnknown && !unbounded && (prState === "expired" || prState === true);
@@ -182,7 +188,8 @@ function renderQueueSummary(prs, prState = null) {
       const reason = repo.status !== "ok"
         ? (repo.reason ? String(repo.reason).replaceAll("_", " ") : "unknown")
         : "snapshot unavailable";
-      repoRows.push([text(repo.name), text("?"), text("?"), text("?"), text(reason, "warn")]);
+      const since = repo.status !== "ok" && toDate(repo.unknown_since) ? ` since ${utc(repo.unknown_since)}` : "";
+      repoRows.push([text(repo.name), text("?"), text("?"), text("?"), text(reason + since, "warn")]);
       continue;
     }
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];
@@ -206,7 +213,7 @@ function renderQueueSummary(prs, prState = null) {
       const [ci, ciClass] = ciLabel(pr.ci);
       const [review, reviewClass] = reviewLabel(pr.review);
       queuedRows.push([
-        td(prLink(repo.name, pr)),
+        td(pr.number === null ? escapeHtml(`${repo.name} (private)`) : prLink(repo.name, pr)),
         text(ci, ciClass),
         text(review, reviewClass),
         text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}${expired ? " (cached)" : ""}`, expired ? "warn" : "ok"),
@@ -264,6 +271,58 @@ function renderQueueSummary(prs, prState = null) {
     + table(["Repository", "Open", "Queued", "CI red", "Status"], repoRows);
 }
 
+// One line per project the registry lists. GitHub data that could not be read is never a zero:
+// the line says since when it has been unknown. Worker counts come from the local task store, so
+// they stay known when GitHub is not.
+// The pin is the lu-machinery version in the project's uv.lock; anything else it cannot name is "?".
+const PIN_STATES = {self: "self", withheld: "private"};
+
+function pinCell(pin) {
+  if (pin && pin.state === "pinned" && pin.version) return text(`v${pin.version}`);
+  const label = pin && PIN_STATES[pin.state];
+  return text(label || "?", label ? "muted" : "warn");
+}
+
+// The status column also carries the snapshot's freshness: a GitHub value past its bound is a cached
+// observation, and one that is unavailable or has no measured age is not confirmed as current.
+const PROJECT_FRESHNESS = {expired: "cached (expired)", unknown: "age unknown", unbounded: "freshness unknown"};
+
+function projectRow(repo, prState) {
+  const unavailable = prState === "unavailable";
+  const readable = repo.status === "ok" && !unavailable;
+  const open = readable && typeof repo.open_total === "number" && Number.isFinite(repo.open_total) && repo.open_total >= 0 ? repo.open_total : null;
+  const branch = readable ? repo.default_branch : null;
+  const ciState = branch ? branch.ci : null;
+  const [ci, ciClass] = ciLabel(ciState);
+  const workers = typeof repo.live_workers === "number" && Number.isFinite(repo.live_workers) && repo.live_workers >= 0 ? repo.live_workers : null;
+  const since = toDate(repo.unknown_since) ? `unknown since ${utc(repo.unknown_since)}` : "unknown";
+  const caveat = PROJECT_FRESHNESS[prState];
+  return [
+    text(repo.name),
+    text(open ?? "?", open === null ? "num warn" : "num"),
+    readable ? pinCell(repo.pin) : text("?", "warn"),
+    branch ? text(ciState ? ci.replace(/^CI /, "") : "none reported", ciClass) : text("?", "warn"),
+    text(workers ?? "?", workers === null ? "num warn" : workers ? "num ok" : "num"),
+    readable ? (caveat ? text(caveat, "warn") : text("ok", "ok"))
+      : text(toDate(repo.unknown_since) ? since : unavailable ? "snapshot unavailable" : "unknown", "warn"),
+  ];
+}
+
+function renderProjects(prs, prState = null) {
+  const repos = Array.isArray(prs.repositories) ? prs.repositories.filter(repo => repo && typeof repo === "object") : [];
+  if (!repos.length) return unknown(prs.reason);
+  const notes = [];
+  if (repos.some(repo => repo.status !== "ok")) {
+    notes.push("Unknown since: the first failed reading of that project; it starts again when the Monitor restarts.");
+  }
+  const unattributed = prs.live_workers_unattributed;
+  if (typeof unattributed === "number" && unattributed > 0) {
+    notes.push(`${unattributed} live worker${unattributed === 1 ? "" : "s"} not counted above: no repository, or one outside the registry.`);
+  }
+  return table(["Project", "Open PRs", "lu-machinery pin", "Default-branch CI", "Live workers", "Status"], repos.map(repo => projectRow(repo, prState)), true)
+    + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("");
+}
+
 function renderChips(latest) {
   const out = [];
   if (latest.alerts?.status === "ok") {
@@ -307,6 +366,25 @@ const PANELS = [
       const box = document.getElementById("prs-content");
       if (box && reading && reading.data) box.innerHTML = renderQueueSummary(reading.data, next.status);
       updateChips();
+    },
+  },
+  {
+    id: "projects",
+    label: "Projects",
+    urls: ["/api/git/pull-requests"],
+    withReadings: true,
+    render: (prs, readings, now) => renderProjects(prs, prSnapshotState(readings?.[0], now).status),
+    onData: (_data, latest, readings, now) => { latest.projectsStatus = prSnapshotState(readings?.[0], now).status; },
+    onError: latest => { latest.projectsStatus = null; },
+    // The reading can cross its bound between polls: draw it again as cached when it does.
+    onTick: (panel, latest, _updateChips, now) => {
+      if (!panel.ok) return;
+      const reading = panel.readings?.[0];
+      const next = prSnapshotState(reading, now);
+      if (next.status === latest.projectsStatus) return;
+      latest.projectsStatus = next.status;
+      const box = document.getElementById("projects-content");
+      if (box && reading && reading.data) box.innerHTML = renderProjects(reading.data, next.status);
     },
   },
 ];

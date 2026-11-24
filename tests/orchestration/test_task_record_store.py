@@ -13,7 +13,7 @@ import pytest
 from lu_machinery.orchestration import task_record_store as store
 
 
-def test_iter_task_records_yields_hot_then_archive(tmp_path):
+def test_iter_task_records_yields_hot_then_archive(tmp_path, monkeypatch):
     tasks = tmp_path / "tasks"
     (tasks / "archive").mkdir(parents=True)
     for path in (tasks / "b.json", tasks / "a.json", tasks / "archive" / "a.json", tasks / "archive" / "c.json"):
@@ -31,6 +31,43 @@ def test_iter_task_records_yields_hot_then_archive(tmp_path):
     hot = [path.name for path in store.iter_task_records(tasks, include_archive=False)]
     assert hot == ["a.json", "b.json", "receipt.json"]
     assert list(store.iter_task_records(tmp_path / "missing", include_archive=True)) == []
+    # A reader that publishes counts learns of a listing it could not make; a missing archive is no failure.
+    errors = []
+    record_error = lambda path, exc: errors.append((path, type(exc)))  # noqa: E731
+    (tasks / "archive").rename(tmp_path / "archive-moved")
+    assert [path.name for path in store.iter_task_records(tasks, include_archive=True, on_error=record_error)] == hot
+    assert errors == []
+    assert list(store.iter_task_records(tmp_path / "missing", include_archive=True, on_error=record_error)) == []
+    assert errors == [(tmp_path / "missing", FileNotFoundError)]
+    errors.clear()
+    (tmp_path / "plain").write_text("x", encoding="utf-8")
+    assert list(store.iter_task_records(tmp_path / "plain", include_archive=False, on_error=record_error)) == []
+    assert errors == [(tmp_path / "plain", NotADirectoryError)]
+    errors.clear()
+
+    class Entry:
+        def __init__(self, name, error=None):
+            self.name, self.error = name, error
+
+        def is_file(self):
+            if self.error is not None:
+                raise self.error
+            return True
+
+    class Listing(list):
+        def __enter__(self):
+            return iter(self)
+
+        def __exit__(self, *_exc):
+            return False
+
+    # One entry whose type cannot be read hides no other record and is reported; one removed mid-scan is not.
+    listing = Listing([Entry("a.json"), Entry("b.json", PermissionError(13, "denied")), Entry("c.json", FileNotFoundError())])
+    monkeypatch.setattr(store.os, "scandir", lambda _path: listing)
+    assert [path.name for path in store.iter_task_records(tasks, include_archive=False, on_error=record_error)] == [
+        "a.json"
+    ]
+    assert errors == [(tasks / "b.json", PermissionError)]
 
 
 def test_inventory_enumeration_does_not_read_payloads(tmp_path, monkeypatch):
