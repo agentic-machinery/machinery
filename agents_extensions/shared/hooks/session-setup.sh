@@ -428,18 +428,31 @@ if [ "$IS_CODEX_SESSION" = "0" ] && [ -f "$MEMORY_FILE" ]; then
   fi
 fi
 
+# The deployment this session runs from: the project directory Claude started in
+# when that directory is outside every checkout (the CTO workspace, whose product
+# root may be configured separately), else the product checkout, as before.
+DEPLOY_TARGET="$PROJECT_DIR"
+DEPLOY_CHECK_MODE=()
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ] \
+  && [ -z "$(_hook_deadline 2 git -C "$CLAUDE_PROJECT_DIR" rev-parse --git-common-dir 2>/dev/null || true)" ]; then
+  DEPLOY_TARGET="$CLAUDE_PROJECT_DIR"
+  DEPLOY_CHECK_MODE=(--workspace)
+fi
+
 # 7a. Report the LAUNCH-TIME predeploy verdict. The launcher prints a failure
 # banner, but the agent CLI clears the terminal on start, so that banner never
 # reaches the operator or the session. scripts/lib/deploy_extensions.sh leaves
 # a durable breadcrumb; surface it here or the session boots against a stale
 # .claude/ believing it is current (incident 2026-07-26).
-PREDEPLOY_STATUS="$PROJECT_DIR/.agent/last-deploy-status"
+PREDEPLOY_STATUS="$DEPLOY_TARGET/.agent/last-deploy-status"
 if [ -f "$PREDEPLOY_STATUS" ] && head -1 "$PREDEPLOY_STATUS" 2>/dev/null | grep -q '^FAILED'; then
   PD_EXIT=$(grep '^exit_code=' "$PREDEPLOY_STATUS" 2>/dev/null | cut -d= -f2)
   PD_SCRIPT=$(grep '^script=' "$PREDEPLOY_STATUS" 2>/dev/null | cut -d= -f2)
-  PD_REASON=$(grep -m1 -E '^(❌|  ⚠️)' "$PROJECT_DIR/.agent/last-deploy-failure.log" 2>/dev/null | sed 's/^[[:space:]]*//')
+  PD_REASON=$(grep -m1 -E '^(❌|  ⚠️)' "$DEPLOY_TARGET/.agent/last-deploy-failure.log" 2>/dev/null | sed 's/^[[:space:]]*//')
   [ -z "$PD_REASON" ] && PD_REASON="see .agent/last-deploy-failure.log"
-  ISSUES+=("PREDEPLOY FAILED at launch (npm run ${PD_SCRIPT:-agents:deploy}, exit ${PD_EXIT:-?}) — deploy targets are STALE, this session may be running outdated hooks/skills/settings. Reason: $PD_REASON")
+  PD_COMMAND="npm run ${PD_SCRIPT:-agents:deploy}"
+  [ "${#DEPLOY_CHECK_MODE[@]}" -eq 0 ] || PD_COMMAND="${PD_SCRIPT:-agent_deploy --workspace}"
+  ISSUES+=("PREDEPLOY FAILED at launch ($PD_COMMAND, exit ${PD_EXIT:-?}) — deploy targets are STALE, this session may be running outdated hooks/skills/settings. Reason: $PD_REASON")
 fi
 
 # 7. Deployment drift. The installed release's deployer recomposes the release
@@ -452,8 +465,8 @@ fi
 # neither, and a product's linked worktree has the tracked descriptor but no
 # deployment of its own.
 if [ "$IS_CODEX_SESSION" = "0" ] \
-  && [ -f "$PROJECT_DIR/agents_extensions/deployment.v1.json" ] \
-  && [ -f "$PROJECT_DIR/.deploy-state/agent-deploy.v1.json" ]; then
+  && [ -f "$DEPLOY_TARGET/agents_extensions/deployment.v1.json" ] \
+  && [ -f "$DEPLOY_TARGET/.deploy-state/agent-deploy.v1.json" ]; then
   DEPLOY_CHECK_RC=0
   DEPLOY_CHECK_ERR=""
   # The deployer accepts only the physical checkout root; PROJECT_DIR keeps the
@@ -461,7 +474,7 @@ if [ "$IS_CODEX_SESSION" = "0" ] \
   # sentinel keeps newlines that end the directory name, which command
   # substitution would strip, so the deployer sees that root and refuses it
   # instead of checking a sibling checkout.
-  if DEPLOY_CHECK_ROOT="$(cd -P -- "$PROJECT_DIR" 2>/dev/null && pwd -P && printf x)"; then
+  if DEPLOY_CHECK_ROOT="$(cd -P -- "$DEPLOY_TARGET" 2>/dev/null && pwd -P && printf x)"; then
     DEPLOY_CHECK_ROOT="${DEPLOY_CHECK_ROOT%x}"
     DEPLOY_CHECK_ROOT="${DEPLOY_CHECK_ROOT%$'\n'}"
     # Exit 0 verified, 1 drift, 2 invalid or unsafe input. Drift is the last
@@ -469,13 +482,8 @@ if [ "$IS_CODEX_SESSION" = "0" ] \
     # interpreter warnings. Only the problem count is shown, because the
     # problems name checkout paths. A held deployment lock is exit 1 too, but
     # it means "not checked", never drift.
-    # A project directory outside every checkout (the CTO workspace, GIT_COMMON_DIR
-    # empty above) holds a workspace deployment: check it in workspace mode, where the
-    # deployer refuses any .git at or above it.
-    DEPLOY_CHECK_MODE=()
-    if [ -z "${GIT_COMMON_DIR:-}" ] && [ -z "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
-      DEPLOY_CHECK_MODE=(--workspace)
-    fi
+    # A workspace deployment (DEPLOY_CHECK_MODE above) is checked in workspace mode,
+    # where the deployer refuses any .git at or above it.
     DEPLOY_CHECK_ERR=$(run_bounded 3 "${PROJECT_PYTHON_COMMAND[@]}" \
       -m lu_machinery.agent_deploy ${DEPLOY_CHECK_MODE[@]+"${DEPLOY_CHECK_MODE[@]}"} --project-root "$DEPLOY_CHECK_ROOT" --check 2>&1 >/dev/null) || DEPLOY_CHECK_RC=$?
     DEPLOY_CHECK_ERR="${DEPLOY_CHECK_ERR##*$'\n'}"
@@ -498,7 +506,7 @@ if [ "$IS_CODEX_SESSION" = "0" ] \
   elif [ "$DEPLOY_CHECK_RC" -ne 0 ]; then
     ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m lu_machinery.agent_deploy ${DEPLOY_CHECK_MODE[*]+${DEPLOY_CHECK_MODE[*]} }--project-root <checkout root> --check")
   fi
-  unset DEPLOY_CHECK_RC DEPLOY_CHECK_ERR DEPLOY_CHECK_ROOT DEPLOY_CHECK_MODE DRIFT_COUNT
+  unset DEPLOY_CHECK_RC DEPLOY_CHECK_ERR DEPLOY_CHECK_ROOT DRIFT_COUNT
 fi
 
 if [ "$CODEX_NORMAL_TASK" = "0" ]; then

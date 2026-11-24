@@ -1092,7 +1092,7 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
     args = ["--epic", "epics", "--model", "claude-opus-5-5", "--effort", "high", "kick", "--",
             "--dangerously-skip-permissions", "--append-system-prompt", "role"]
 
-    def template(launcher: Path, repo: Path = workspace) -> Path:
+    def template(launcher: Path | str, repo: Path = workspace) -> Path:
         source = _WORKSPACE_TEMPLATE
         for key, value in {"REPO": str(repo), "CFG": str(config), "LAUNCHER": str(launcher),
                            "MODEL": "claude-opus-5-5", "EFFORT": "high", "KICK": "kick",
@@ -1119,6 +1119,9 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
         (template(package_wrapper, other), other, package_wrapper),  # REPO is not LC_WORKSPACE_ROOT
         (template(package_wrapper, alias), workspace, package_wrapper),  # REPO spelled through a symlink
         (template(renamed), workspace, package_wrapper),  # LAUNCHER resolves there under another name
+        (template(f"{package_wrapper}/"), workspace, package_wrapper),  # exec of this spelling fails
+        (template(f"{package_wrapper.parent}//{package_wrapper.name}"), workspace, package_wrapper),
+        (template(f"{package_wrapper.parent}/./{package_wrapper.name}"), workspace, package_wrapper),
     ):
         with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
             cto_wrapper_signature(wrapper, root, entry, args)

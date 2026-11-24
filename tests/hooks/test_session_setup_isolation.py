@@ -398,3 +398,36 @@ def test_workspace_session_reads_its_account_memory_and_writes_state_to_the_stat
     assert "MEMORY.md is 160 lines" in context, context
     assert (state / ".agent" / "sessions" / "isolation-probe.json").is_file()
     assert not (workspace / ".agent").exists() and not (primary / ".agent").exists()
+
+    # The drift check verifies the workspace's own deployment, in workspace mode, also with a
+    # product root configured and an inherited Codex canonical root.
+    inventory = json.loads(machinery_root().joinpath("agent_deploy", "release.v1.json").read_text())
+    settings: dict = {}
+    for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
+        node = settings
+        for key in requirement["path"][:-1]:
+            node = node.setdefault(key, {})
+        node.setdefault(requirement["path"][-1], []).append({**requirement["group"], "hooks": requirement["hooks"]})
+    source = workspace / "agents_extensions"
+    (source / "claude").mkdir(parents=True)
+    (source / "claude" / "settings.json").write_text(json.dumps(settings))
+    (source / "deployment.v1.json").write_text(json.dumps(
+        {"providers": ["claude"], "sources": {"claude": {"path": "agents_extensions/claude", "required": True}},
+         "preserve": []}))
+    subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--workspace", "--project-root",
+                    str(workspace)], check=True, capture_output=True, timeout=120)
+    drift_env = {**env, "LU_PRODUCT_ROOT": str(primary), "CODEX_CANONICAL_REPO_ROOT": str(primary)}
+
+    def deploy_issues() -> list[str]:
+        ran = subprocess.run(["bash", str(_HOOK)], cwd=workspace, env=drift_env, input=_STDIN, capture_output=True,
+                             text=True, timeout=120, check=False)
+        assert ran.returncode == 0, ran.stderr
+        lines = json.loads(ran.stdout)["hookSpecificOutput"]["additionalContext"].splitlines()
+        return [line.strip() for line in lines if "DEPLOY" in line]
+
+    assert deploy_issues() == []
+    (workspace / ".claude" / "rules" / "stray.md").write_text("stray\n")
+    assert deploy_issues() == [
+        "- DEPLOY DRIFT: 1 file(s) differ in this workspace's deployment. Run: "
+        '"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>'
+    ]
