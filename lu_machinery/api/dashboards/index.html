@@ -187,7 +187,8 @@ function renderQueueSummary(prs, prState = null) {
       const reason = repo.status !== "ok"
         ? (repo.reason ? String(repo.reason).replaceAll("_", " ") : "unknown")
         : "snapshot unavailable";
-      repoRows.push([text(repo.name), text("?"), text("?"), text("?"), text(reason, "warn")]);
+      const since = repo.status !== "ok" && toDate(repo.unknown_since) ? ` since ${utc(repo.unknown_since)}` : "";
+      repoRows.push([text(repo.name), text("?"), text("?"), text("?"), text(reason + since, "warn")]);
       continue;
     }
     const list = Array.isArray(repo.pull_requests) ? repo.pull_requests : [];

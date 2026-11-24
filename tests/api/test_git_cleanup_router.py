@@ -591,8 +591,13 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
                 "errors": [{"type": "NOT_FOUND", "path": ["r1"], "message": "gone"}]}
 
     def adapter_run(*_args, **_kwargs):
-        proc = SimpleNamespace(returncode=1, stdout=json.dumps({"error": "github_graphql_error"}), stderr="")
-        proc.github_result = SimpleNamespace(error="github_graphql_error", reason="graphql_errors", value=document)
+        # The response goes through the shared client's own classifier and process builder.
+        client = git_hygiene_router.github_client
+        response = client.Response(status=200, headers={"content-type": "application/json"},
+                                   body=json.dumps(document).encode())
+        result = client._classify_graphql_response(response, response.headers, raw_response=False, reset_at=None, now=0)
+        proc = client._result_process(["gh", "api", "graphql"], result, {}, {"capture_output": True, "text": True})
+        assert proc.returncode == 1 and "r0" not in proc.stdout  # stdout is only the error diagnostic
         return proc
 
     monkeypatch.setattr(git_hygiene_router.github_client, "run", adapter_run)
