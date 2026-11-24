@@ -91,10 +91,12 @@ offline_apt_install() {
     -o Dir::Cache::srcpkgcache=
     -o Acquire::Languages=none
   )
-  # The runner owns the log under /tmp.
+  # The runner owns the log under /tmp. Empty sources/lists guarantee no network
+  # download can occur while still allowing APT's local .deb acquire path (APT's
+  # --no-download fails on local .deb arguments with a non-absolute pathname error).
   # shellcheck disable=SC2024
   sudo timeout --kill-after=5 35 env -u APT_CONFIG LC_ALL=C apt-get "${offline_opts[@]}" \
-    -o "DPkg::Lock::Timeout=$lock_wait" install -y --no-download --no-install-recommends --no-remove -- "$deb_path" \
+    -o "DPkg::Lock::Timeout=$lock_wait" install -y --no-install-recommends --no-remove -- "$deb_path" \
     >"$log" 2>&1 || rc=$?
   cat "$log" || return "$?"
   return "$rc"

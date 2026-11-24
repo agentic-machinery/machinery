@@ -196,7 +196,7 @@ def test_snapshot_sources_restrict_components_to_main_and_preserve_integrity() -
     assert "-o Acquire::Retries=3" in setup
     assert "-o Acquire::Retries=1" not in setup
     assert "-o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false" in setup
-    assert "--no-download" in setup
+    assert "-o Dir::Etc::sourcelist=/dev/null" in setup
     assert "--error-on=any" in setup
     assert 'echo "${digest}  $apt_dir/$deb" | sha256sum -c -' in setup
 
