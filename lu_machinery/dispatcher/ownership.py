@@ -230,9 +230,15 @@ def _pushed_paths(run: Callable[..., str], record: dict, updates: str) -> list[s
         base_ref = ("refs/remotes/" if base_ref.startswith("origin/") else "refs/heads/") + base_ref
     run("check-ref-format", base_ref)
     default_ref = "refs/remotes/origin/HEAD"
+    advertised_tip = None
+    if record.get("worktree_remote_url"):
+        from lu_machinery.dispatcher import git
+
+        default_branch, advertised_tip = git.remote_default(record)
+        default_ref = f"refs/remotes/origin/{default_branch}"
     refs = {ref: (sha, symref) for ref, sha, symref in (
         row.split("\t") for row in run("for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)",
-                                        base_ref, default_ref, strip=False).splitlines()
+                                        base_ref, default_ref, strip=False).split("\n") if row
     ) if ref in {base_ref, default_ref}}
     if base_ref in refs:
         # A surviving tracking ref must still name a commit. Its tip never expands the exclusion.
@@ -240,12 +246,24 @@ def _pushed_paths(run: Callable[..., str], record: dict, updates: str) -> list[s
     upstream_sha = base_sha
     if default_ref in refs:
         sha, target = refs[default_ref]
-        if not target.startswith("refs/remotes/origin/") or target == default_ref:
+        if advertised_tip is None and (not target.startswith("refs/remotes/origin/") or target == default_ref):
             raise ValueError("origin HEAD does not name an origin tracking branch")
         upstream_sha = run("rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}")
+    if advertised_tip is not None:
+        # A concurrent advance can leave the advertised object unfetched. The
+        # tracking ref for the advertised branch still identifies fetched upstream.
+        try:
+            resolved = run("rev-parse", "--verify", "--quiet", "--end-of-options", f"{advertised_tip}^{{commit}}")
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode != 1:
+                raise
+        else:
+            if resolved != advertised_tip:
+                raise ValueError("origin default tip does not name a commit")
+            upstream_sha = advertised_tip
     paths: list[str] = []
-    for line in updates.splitlines():
-        fields = line.split()
+    for line in updates.split("\n"):
+        fields = line.split(" ")
         if len(fields) != 4 or not fields[2].startswith("refs/heads/") or set(fields[1]) <= _ZERO:
             continue
         if not _OBJECT_NAME.fullmatch(fields[1]):

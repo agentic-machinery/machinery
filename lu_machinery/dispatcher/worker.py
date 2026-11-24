@@ -836,10 +836,14 @@ def _enforce_delivery(record: dict) -> None:
     branch_observed = record.get("push_state") == "pushed" or record.get("remote_ref") is not None
     if owned:
         try:
-            _, start_sha = ownership.task_base_and_start(record)
-            if record.get("push_state_reason") in {"WORKTREE_BASE_SHA_NOT_COMMIT", "WORKTREE_START_SHA_NOT_COMMIT"}:
-                raise ownership.TaskBaseError(record["push_state_reason"])
+            base_refusal = record.get("push_state_reason")
+            if base_refusal in (
+                "WORKTREE_BASE_SHA_MISSING", "WORKTREE_BASE_SHA_INVALID", "WORKTREE_BASE_SHA_NOT_COMMIT",
+                "WORKTREE_START_SHA_INVALID", "WORKTREE_START_SHA_NOT_COMMIT",
+            ):
+                raise ownership.TaskBaseError(base_refusal)
             if branch_observed and (record.get("commits_ahead") or 0) > 0:
+                _, start_sha = ownership.task_base_and_start(record)
                 with git.ownership_git(record) as run:
                     upstream_sha = run("rev-parse", "--verify", "refs/heads/upstream^{commit}")
                     paths = ownership.delivered_paths(run, record["head_sha"], upstream_sha, start_sha,

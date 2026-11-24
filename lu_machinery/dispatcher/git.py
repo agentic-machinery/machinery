@@ -1255,24 +1255,24 @@ def _merged_delivery_candidates(record: dict, repo: str) -> Iterator[int]:
                 yield candidate
 
 
-_DEFAULT_BRANCH = re.compile(r"ref: refs/heads/(\S+)\s+HEAD")
+_DEFAULT_BRANCH = re.compile(r"ref: refs/heads/([^\r\n\t ]+)\tHEAD")
 
 
 def _advertised_default(run: Callable[..., str]) -> tuple[str, str]:
     """Read origin's default branch and its tip in one ref advertisement."""
-    lines = run("ls-remote", "--symref", "--", "origin", "HEAD").splitlines()
+    lines = run("ls-remote", "--symref", "--", "origin", "HEAD").split("\n")
     names = [match[1] for line in lines if (match := _DEFAULT_BRANCH.fullmatch(line))]
-    tips = [match[1] for line in lines if (match := re.fullmatch(r"([0-9a-f]{40}|[0-9a-f]{64})\s+HEAD", line))]
+    tips = [match[1] for line in lines if (match := re.fullmatch(r"([0-9a-f]{40}|[0-9a-f]{64})\tHEAD", line))]
     if len(names) != 1 or len(tips) != 1:
         raise ValueError("remote default branch is not advertised")
     return names[0], tips[0]
 
 
-def _remote_default_branch(record: dict) -> str:
-    """The recorded remote's default branch, from ``HEAD``'s symref, not from a configured name."""
+def remote_default(record: dict) -> tuple[str, str]:
+    """The recorded remote's default branch and tip, fetched together from its advertisement."""
     remote = record["worktree_remote_url"]
     with _private_remote_git(record["task_id"] + "-default-branch", remote) as (run, _):
-        return _advertised_default(run)[0]
+        return _advertised_default(run)
 
 
 def _fetch_merged_parent(run: Callable[..., str], merge: str, record: dict) -> str:
@@ -1352,7 +1352,7 @@ def merged_delivery(record: dict) -> dict | None:
             # One symref read per settlement. A stacked task's recorded base is the parent
             # branch; GitHub merges the pull request into the default branch after that parent is gone.
             if accepted_default is None:
-                accepted_default = _remote_default_branch(record)
+                accepted_default, _ = remote_default(record)
             return name == accepted_default
 
         for number in _merged_delivery_candidates(record, repo):

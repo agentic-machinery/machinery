@@ -152,7 +152,7 @@ def test_delivered_paths_exclude_commits_reachable_from_default_branch(sandbox, 
     run_git(sandbox.repo, "add", "upstream.txt")
     run_git(sandbox.repo, "commit", "-m", "default branch change")
     run_git(sandbox.repo, "push", "origin", "main")
-    run_git(tree, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    run_git(tree, "remote", "set-head", "origin", "-d")
     run_git(tree, "merge", "--no-edit", "origin/main")
     run_git(tree, "push", "origin", "HEAD")
 
