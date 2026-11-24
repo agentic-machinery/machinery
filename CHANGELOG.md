@@ -9,6 +9,14 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.66"></a>
+## [0.1.66] - 2026-11-24
+
+### Fixed
+
+- One identical-copy warning per lineage scan ([#1316](https://github.com/learn-ukrainian/machinery/pull/1316))
+- Keep ownership checks valid after the base branch moves ([#1318](https://github.com/learn-ukrainian/machinery/pull/1318))
+
 <a id="v0.1.65"></a>
 ## [0.1.65] - 2026-11-24
 
@@ -1551,7 +1559,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.65...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...HEAD
+[0.1.66]: https://github.com/learn-ukrainian/machinery/compare/v0.1.65...v0.1.66
 [0.1.65]: https://github.com/learn-ukrainian/machinery/compare/v0.1.64...v0.1.65
 [0.1.64]: https://github.com/learn-ukrainian/machinery/compare/v0.1.63...v0.1.64
 [0.1.63]: https://github.com/learn-ukrainian/machinery/compare/v0.1.62...v0.1.63
