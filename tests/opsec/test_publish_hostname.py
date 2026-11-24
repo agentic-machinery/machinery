@@ -713,6 +713,80 @@ def test_issue_create_epic_admits_only_an_explicit_cto_root(monkeypatch, capsys)
 
 
 @pytest.mark.usefixtures("configured_roots", "synthetic_opsec")
+def test_issue_create_links_sibling_to_default_registry_epic(tmp_path, monkeypatch, capsys):
+    """Catch publisher rejection of valid parents when a fleet repository has no local stream roots."""
+    from lu_machinery.orchestration import issue_stream_audit
+
+    registry = tmp_path / "issue_streams.yaml"
+    registry.write_text(
+        "streams:\n  epics:\n    epics: [42, 43]\n    closed_epics: [43]\n"
+        "repos:\n  bootstrap:\n    streams:\n      epics:\n        epics: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", registry)
+    monkeypatch.setattr(gate, "catalog", lambda: {
+        **CATALOG,
+        "sibling": {"github": "unit/sibling", "role": "public-content"},
+        "bootstrap": {"github": "unit/bootstrap", "role": "public-content"},
+        "other-owner": {"github": "other/sibling", "role": "public-content"},
+    })
+    monkeypatch.delenv("GH_HOST", raising=False)
+    monkeypatch.delenv(pub.BROKER_ENV, raising=False)
+
+    calls = []
+
+    def send(argv, **_kwargs):
+        if argv[1:4] == ["api", "--method", "GET"]:
+            path = argv[4].split("?", 1)[0]
+            assert path in {f"repos/unit/{name}/issues/42" for name in ("public", "sibling", "bootstrap")}
+            issue_repo = path.removeprefix("repos/").removesuffix("/issues/42")
+            calls.append(("read", issue_repo))
+            body = {
+                "number": 42,
+                "state": "open",
+                "node_id": f"NODE_{issue_repo.replace('/', '_')}",
+                "html_url": f"https://github.com/{issue_repo}/issues/42",
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        if argv[1:3] == ["issue", "create"]:
+            child_repo = argv[argv.index("--repo") + 1]
+            calls.append(("create", child_repo))
+            return subprocess.CompletedProcess(argv, 0, f"https://github.com/{child_repo}/issues/42\n", "")
+        assert argv[1:5] == ["api", "--method", "POST", "graphql"]
+        payload = json.loads(Path(argv[argv.index("--input") + 1]).read_text())
+        assert "addSubIssue" in payload["query"]
+        calls.append(("link", payload["variables"]))
+        return subprocess.CompletedProcess(argv, 0, '{"data":{"addSubIssue":{"issue":{"number":42}}}}', "")
+
+    for repo in ("unit/sibling", "unit/bootstrap"):
+        calls.clear()
+        args = ["issue-create", "--repo", repo, "--title", "Task", "--body", "Body"]
+        for refused in ("43", "99"):
+            assert pub.main([*args, "--parent", refused], runner=send) == 2
+            assert "PARENT_REFUSED" in (diagnostic := capsys.readouterr().err)
+            assert "unit/public" in diagnostic
+        assert calls == []
+
+        assert pub.main([*args, "--parent", "42"], runner=send) == 0
+        assert capsys.readouterr().out.strip() == f"https://github.com/{repo}/issues/42"
+        assert calls == [
+            ("read", "unit/public"),
+            ("create", repo),
+            ("read", repo),
+            ("link", {"p": "NODE_unit_public", "c": f"NODE_{repo.replace('/', '_')}"}),
+        ]
+
+    for ineligible in ("other/sibling", "unit/private"):
+        calls.clear()
+        assert pub.main(
+            ["issue-create", "--repo", ineligible, "--title", "Task", "--body", "Body", "--parent", "42"],
+            runner=send,
+        ) == 2
+        assert "PARENT_REFUSED" in capsys.readouterr().err
+        assert calls == []
+
+
+@pytest.mark.usefixtures("configured_roots", "synthetic_opsec")
 @pytest.mark.parametrize(
     ("active_slug", "inactive_slug"),
     [
@@ -761,8 +835,7 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
         monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
         monkeypatch.setenv(fleet_repos.SELECTOR_ENV, str(sel_file))
 
-        # Pre-bootstrap (MUST-FIX 4): machinery declared with empty epics allows CTO --epic
-        # and refuses ordinary issues without a registered local root.
+        # A declared, empty section permits CTO --epic and still requires --parent on ordinary issues.
         empty_streams = tmp_path / "issue_streams_empty.yaml"
         empty_streams.write_text(
             "schema_version: 1\n"
@@ -780,16 +853,22 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
         )
         monkeypatch.setattr(issue_stream_audit, "REGISTRY_PATH", empty_streams)
 
-        assert pub._issue_create_parent_policy(active_slug) == "stream"
-        assert pub._issue_create_parent_policy("learn-ukrainian/hramatka") == "none"
-        with pytest.raises(gate.PublishBlocked, match="REPO_REFUSED"):
-            pub._issue_create_parent_policy(inactive_slug)
-
         writes = []
 
         def send_bootstrap(argv, **_kwargs):
             writes.append(argv)
             return subprocess.CompletedProcess(argv, 0, f"https://github.com/{active_slug}/issues/1216\n", "")
+
+        assert pub.main(
+            ["issue-create", "--repo", active_slug, "--title", "Task", "--body", "Body"],
+            runner=send_bootstrap,
+        ) == 2
+        diagnostic = capsys.readouterr().err
+        assert "PARENT_" in diagnostic
+        if active_slug.split("/", 1)[0] == public_slug.split("/", 1)[0]:
+            assert "PARENT_REQUIRED" in diagnostic
+            assert public_slug in diagnostic
+        assert writes == []
 
         assert (
             pub.main(
@@ -947,7 +1026,11 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
                 "",
             )
 
-        assert pub._parent_epic_node(transfer_window_read, active_slug, 10, tmp_path, None) == "M_ROOT_10_ALT"
+        repos = pub._catalog_fleet_repos()
+        active = pub._fleet_catalog_row(active_slug, repos=repos)
+        assert pub._parent_epic_node(transfer_window_read, active, repos, 10, tmp_path, None) == (
+            active_slug, "M_ROOT_10_ALT",
+        )
 
         def foreign_repo_read(argv, **_kwargs):
             return subprocess.CompletedProcess(
@@ -966,7 +1049,7 @@ def test_a02_issue_create_policy_and_parent_both_selector_states_and_same_issue_
             )
 
         with pytest.raises(gate.PublishBlocked, match="PARENT_REFUSED"):
-            pub._parent_epic_node(foreign_repo_read, active_slug, 10, tmp_path, None)
+            pub._parent_epic_node(foreign_repo_read, active, repos, 10, tmp_path, None)
         assert (
             pub.main(
                 ["issue-create", "--repo", public_slug, "--parent", "20", "--title", "Task", "--body", "Body"],
