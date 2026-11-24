@@ -252,13 +252,22 @@ loads the version that exports the candidate's `uv.lock`.
 
 Exit 0 means released, or skipped as unchanged. Exit 1 means refused or failed:
 the command stops at that step and sends a Fleet alert to `claude-cto` that
-names the step. The alert is published from `$PRIMARY`, so it reaches the
-primary checkout's Fleet plane. After a successful cut, its work directory
-(`~/.lu-release-cut-*`) keeps `cut.log`, `dist/`, `wheelhouse/`, the release-note
-and PR-body files, `markers.log` and `published/`. As its last step, the cut removes
-only `accept`, `product`, `npm-cache`, `build-venv`, `agent-consumer`, `src`,
-`src.tar`, `home` and `tmp`; other entries remain. Failed, interrupted and dry-run
-cuts keep the entire work directory for diagnosis. The command adds
+names the step and the work directory. The alert is published from `$PRIMARY`,
+so it reaches the primary checkout's Fleet plane. When the command creates the
+work directory itself (no `--work`), a successful `cut` or `post-release`,
+including a successful dry run, copies `cut.log` to
+`$XDG_STATE_HOME/lu-release-cut/<version>-<head>-<UTC time>-cut.log`
+(`~/.local/state/lu-release-cut/` when `XDG_STATE_HOME` is unset, empty or
+relative) and then removes the work directory. A relative `XDG_STATE_HOME` is
+ignored, as the XDG base-directory spec requires. The log name uses the
+version, the first 12 characters of the machinery HEAD, and a UTC timestamp
+such as `0.1.66-6b51fa6d435f-20261124T031228Z-cut.log`. A directory passed with
+`--work` is never removed. On a successful real cut that keeps a `--work`
+directory, the last step still removes only the rebuildable scratch (`accept`,
+`product`, `npm-cache`, `build-venv`, `agent-consumer`, `src`, `src.tar`,
+`home` and `tmp`) and leaves `cut.log`, `dist/`, `wheelhouse/`, the release-note
+and PR-body files, `markers.log` and `published/`. A failed or interrupted
+command keeps the entire work directory for diagnosis. The command adds
 022 to the caller's umask for the whole run, so nothing it creates is group- or
 other-writable and Node admission accepts the prefix it provisions. `cut` and
 `post-release` require `--x-agent <agent>/<task-or-seat>`. The value is the
@@ -266,6 +275,25 @@ other-writable and Node admission accepts the prefix it provisions. `cut` and
 recorder must resolve its author family to verify reviewer independence. The
 CLI checks the trailer against each destination repository during argument
 parsing.
+
+## Remove old work directories
+
+A failed or interrupted cut leaves its `~/.lu-release-cut-*` directory in the
+home directory. `prune` removes those tool-created directories once they are
+older than 24 hours and no live process is using them. It prints what it would
+remove and the space, and it deletes nothing unless `--apply` is set:
+
+```bash
+"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut prune
+"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut prune --apply
+"$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut prune --older-than 48 --apply
+```
+
+`prune` only considers direct children of the home directory whose names are
+the tool's own `.lu-release-cut-` prefix plus the random suffix `mkdtemp`
+adds. It refuses symlinks, other names, files, and directories a live process
+is using, and it does not follow symlinks. While a cut holds `release-cut.lock`,
+or another `cut` or `post-release` process is running, `prune` removes nothing.
 
 ```bash
 "$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut --dry-run --x-agent claude/claude-opus-5-5

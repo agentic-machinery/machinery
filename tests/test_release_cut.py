@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -863,7 +867,11 @@ def test_failure_alert_is_published_from_the_primary_checkout(monkeypatch, tmp_p
 
 
 def test_success_reaps_only_rebuildable_scratch_and_failure_preserves_it(monkeypatch, tmp_path):
-    """Defect class: finished cuts accumulate scratch, or failed cuts lose diagnostic files."""
+    """Defect class: finished cuts accumulate scratch, or failed cuts lose diagnostic files.
+
+    This pins scratch removal inside a work directory that is still there. ``_run`` removes a
+    directory it created itself after success; a caller-supplied ``--work`` directory stays.
+    """
     removed = {"accept", "product", "npm-cache", "build-venv", "agent-consumer", "src", "src.tar", "home", "tmp"}
     kept = {"cut.log", "dist", "wheelhouse", "notes-prerelease.md", "notes-release.md",
             "adopt-body.md", "post-release-body.md", "markers.log", "published"}
@@ -1660,3 +1668,211 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         cut.publisher_invocation("pr-create")
     # Manual command formatting fails soft (None) when publisher_invocation fails so original push errors are not masked.
     assert cut._manual_post_release_command(["pr-create"]) is None
+
+
+def _backdate(path: Path, hours: float) -> None:
+    stamp = time.time() - hours * 3600
+    os.utime(path, (stamp, stamp), follow_symlinks=False)
+
+
+def _lock_is_held(path: Path) -> bool:
+    probe = path.open("a")
+    try:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        probe.close()
+
+
+def test_successful_default_work_dir_cut_removes_the_directory_and_preserves_cut_log(monkeypatch, tmp_path):
+    """Defect class: a successful cut, dry run or post-release leaves its tool-created work directory behind."""
+    home = tmp_path / "home"
+    home.mkdir()
+    state = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    monkeypatch.delenv("LEARN_UKRAINIAN_DISPATCH_TASK_ID", raising=False)
+    monkeypatch.setattr(release_cut, "_operator_home", lambda: home)
+    interpreter = tmp_path / "bin" / "python"
+    interpreter.parent.mkdir()
+    interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    interpreter.chmod(0o755)
+    _host(monkeypatch, tmp_path, interpreter)
+    created: list[Path] = []
+
+    def succeed(cut):
+        if cut.work.name.startswith(".lu-release-cut-") and cut.work.parent != home:
+            shutil.rmtree(cut.work)
+            raise CutError("work directory is not under the fixture home")
+        created.append(cut.work)
+        cut.version = "0.1.66"
+        cut.head = "a" * 40
+        (cut.work / "cut.log").write_text("preserved-line\n", encoding="utf-8")
+        payload = cut.work / "wheelhouse"
+        payload.mkdir()
+        (payload / "blob").write_bytes(b"x" * 4096)
+        return 0
+
+    def fail(cut):
+        if cut.work.name.startswith(".lu-release-cut-") and cut.work.parent != home:
+            shutil.rmtree(cut.work)
+            raise CutError("work directory is not under the fixture home")
+        created.append(cut.work)
+        (cut.work / "cut.log").write_text("failed-line\n", encoding="utf-8")
+        raise CutError("fixture failure")
+
+    monkeypatch.setattr(release_cut, "execute", succeed)
+    assert main(["cut", "--dry-run", "--no-alert", "--x-agent", "claude/claude-opus-5-5"]) == 0
+    assert main(["cut", "--no-alert", "--x-agent", "claude/claude-opus-5-5"]) == 0
+    monkeypatch.setattr(release_cut, "open_post_release", succeed)
+    assert main(["post-release", "--no-alert", "--x-agent", "claude/claude-opus-5-5"]) == 0
+    assert len(created) == 3
+    for work in created:
+        assert not work.exists()
+        assert work.parent == home
+        assert work.name.startswith(".lu-release-cut-")
+    logs = sorted((state / "lu-release-cut").glob("*-cut.log"))
+    assert len(logs) == 3
+    for log in logs:
+        assert log.read_text(encoding="utf-8") == "preserved-line\n"
+        assert log.parent == state / "lu-release-cut"
+        assert "0.1.66-" in log.name
+        assert "a" * 12 in log.name
+        assert re.fullmatch(r"0\.1\.66-a{12}-\d{8}T\d{6}Z(?:-\d+)?-cut\.log", log.name)
+
+    monkeypatch.setattr(release_cut, "execute", fail)
+    assert main(["cut", "--dry-run", "--no-alert", "--x-agent", "claude/claude-opus-5-5"]) == 1
+    failed = created[-1]
+    assert failed.is_dir()
+    assert (failed / "cut.log").read_text(encoding="utf-8") == "failed-line\n"
+    assert not failed.is_symlink()
+    assert sorted((state / "lu-release-cut").glob("*-cut.log")) == logs
+
+    supplied = tmp_path / "supplied"
+    supplied.mkdir()
+    monkeypatch.setattr(release_cut, "execute", succeed)
+    assert main(["cut", "--dry-run", "--no-alert", "--work", str(supplied), "--x-agent", "claude/claude-opus-5-5"]) == 0
+    assert supplied.is_dir()
+    assert (supplied / "cut.log").read_text(encoding="utf-8") == "preserved-line\n"
+    assert (supplied / "wheelhouse" / "blob").read_bytes() == b"x" * 4096
+    assert sorted((state / "lu-release-cut").glob("*-cut.log")) == logs
+    assert {path.name for path in home.iterdir() if path.name.startswith(".lu-release-cut-")} == {failed.name}
+
+
+def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(monkeypatch, tmp_path, capsys):
+    """Defect class: prune follows a symlink, deletes a non-prefix name, or removes a directory a live process is using."""
+    home = tmp_path / "home"
+    home.mkdir()
+    lock = tmp_path / "release-cut.lock"
+    monkeypatch.setattr(release_cut, "_operator_home", lambda: home)
+    monkeypatch.setattr(release_cut, "_release_lock_path", lambda: lock)
+    assert release_cut._operator_home() == home
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("safe", encoding="utf-8")
+    link = home / ".lu-release-cut-link"
+    link.symlink_to(outside, target_is_directory=True)
+    _backdate(link, 48)
+    other = home / "scratch-notes"
+    other.mkdir()
+    (other / "notes").write_text("keep", encoding="utf-8")
+    _backdate(other, 48)
+    bare = home / ".lu-release-cut"
+    bare.mkdir()
+    _backdate(bare, 48)
+    nested = home / "nested" / ".lu-release-cut-nested"
+    nested.parent.mkdir()
+    nested.mkdir()
+    (nested / "payload").write_text("keep", encoding="utf-8")
+    _backdate(nested, 48)
+    fresh = home / ".lu-release-cut-fresh"
+    fresh.mkdir()
+    (fresh / "new").write_text("new", encoding="utf-8")
+    stale = home / ".lu-release-cut-stale"
+    stale.mkdir()
+    (stale / "blob").write_bytes(b"x" * 2048)
+    (stale / "jump").symlink_to(outside, target_is_directory=True)
+    _backdate(stale, 48)
+    live = home / ".lu-release-cut-live"
+    live.mkdir()
+    (live / "blob").write_bytes(b"y" * 100)
+    _backdate(live, 48)
+
+    def only_fixture(text: str) -> None:
+        for line in text.splitlines():
+            if ".lu-release-cut-" in line and str(home) not in line:
+                raise AssertionError("prune mentioned a directory outside the fixture home")
+
+    proc = subprocess.Popen(["sleep", "120"], cwd=live)
+    holder = None
+    try:
+        with pytest.raises(SystemExit) as caught:
+            main(["prune", "--help"])
+        assert caught.value.code == 0
+        help_text = capsys.readouterr().out
+        assert "Examples:" in help_text
+        assert "--apply" in help_text
+        assert "--older-than" in help_text
+        assert "lu_machinery.release_cut prune" in help_text
+
+        assert main(["prune"]) == 0
+        dry = capsys.readouterr().out
+        only_fixture(dry)
+        would = [line for line in dry.splitlines() if line.startswith("prune: would remove /")]
+        assert len(would) == 1 and str(stale) in would[0]
+        size = re.search(r"\((\d+) bytes", would[0])
+        assert size is not None and int(size.group(1)) >= 2048
+        assert f"prune: refuse {link} (symlink)" in dry
+        assert f"prune: keep {live} (in use by a live process)" in dry
+        assert f"prune: keep {fresh} (newer than 24 h)" in dry
+        tokens = [token.rstrip(",") for line in dry.splitlines() for token in line.replace("(", " ").replace(")", " ").split()]
+        assert str(other) not in tokens
+        assert str(bare) not in tokens
+        assert str(nested) not in tokens
+        assert stale.is_dir()
+        assert (outside / "keep").read_text(encoding="utf-8") == "safe"
+
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl, sys, time; "
+             "handle = open(sys.argv[1], 'a'); fcntl.flock(handle, fcntl.LOCK_EX); time.sleep(120)",
+             str(lock)],
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not _lock_is_held(lock):
+            time.sleep(0.02)
+        assert _lock_is_held(lock)
+        assert main(["prune", "--apply"]) == 0
+        held_out = capsys.readouterr().out
+        only_fixture(held_out)
+        assert "release-cut lock is held" in held_out
+        assert stale.is_dir()
+        assert (outside / "keep").read_text(encoding="utf-8") == "safe"
+        holder.kill()
+        holder.wait(timeout=5)
+        holder = None
+
+        assert main(["prune", "--apply"]) == 0
+        applied = capsys.readouterr().out
+        only_fixture(applied)
+        assert "removed 1 directory" in applied
+        assert not stale.exists()
+        assert live.is_dir()
+        assert (live / "blob").read_bytes() == b"y" * 100
+        assert link.is_symlink()
+        assert other.is_dir() and (other / "notes").read_text(encoding="utf-8") == "keep"
+        assert bare.is_dir()
+        assert nested.is_dir() and (nested / "payload").read_text(encoding="utf-8") == "keep"
+        assert fresh.is_dir()
+        assert (outside / "keep").read_text(encoding="utf-8") == "safe"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if holder is not None and holder.poll() is None:
+            holder.kill()
+            holder.wait(timeout=5)

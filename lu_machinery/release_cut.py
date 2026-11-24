@@ -13,10 +13,12 @@ version replaces it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -64,6 +66,12 @@ VERSION_FILES = ("pyproject.toml", "package.json", "package-lock.json")
 ALERT_RECIPIENT = "claude-cto"
 _PROXY_VARIABLES = frozenset({"http_proxy", "https_proxy", "no_proxy", "all_proxy"})
 CI_WORKFLOW = "CI Gate"
+# tempfile.mkdtemp appends letters, digits and underscores. Prune deletes only that shape.
+_WORK_PREFIX = ".lu-release-cut-"
+_WORK_NAME = re.compile(re.escape(_WORK_PREFIX) + r"[A-Za-z0-9_]+\Z")
+_STATE_DIR_NAME = "lu-release-cut"
+_PRUNE_DEFAULT_HOURS = 24.0
+_RELEASE_COMMANDS = frozenset({"cut", "post-release"})
 # Node lazy require sites that docs/release.md names; each must resolve inside the prefix.
 _LAZY_CJS = (
     "require('debug')('release-cut')('lazy colours');"
@@ -1553,16 +1561,414 @@ def execute(cut: Cut) -> int:
     return 0
 
 
-def _locked_run(args: argparse.Namespace) -> int:
+def _operator_home() -> Path:
+    """The home directory where a default work directory is created. Tests replace this."""
+    return Path.home()
+
+
+def _release_lock_path() -> Path:
+    """``release-cut.lock`` in the machinery checkout's git common directory."""
     from lu_machinery.dispatcher.git import resolve_repo
 
+    checkout, _ = resolve_repo("machinery")
+    common = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        check=True, capture_output=True, text=True, env=sanitized_git_env(),
+    ).stdout.strip()
+    return Path(common) / "release-cut.lock"
+
+
+def _release_state_dir() -> Path:
+    """``$XDG_STATE_HOME/lu-release-cut``, or ``~/.local/state/lu-release-cut``.
+
+    A relative or empty ``XDG_STATE_HOME`` is ignored, as the XDG base-directory spec requires.
+    """
+    configured = os.environ.get("XDG_STATE_HOME", "")
+    base = Path(configured) if configured and Path(configured).is_absolute() else _operator_home() / ".local" / "state"
+    return base / _STATE_DIR_NAME
+
+
+def _filename_token(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "", value)
+    return cleaned or "unknown"
+
+
+def _positive_hours(value: str) -> float:
+    """argparse type: a finite number of hours greater than zero."""
     try:
-        checkout, _ = resolve_repo("machinery")
-        common = subprocess.run(
-            ["git", "-C", str(checkout), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-            check=True, capture_output=True, text=True, env=sanitized_git_env(),
-        ).stdout.strip()
-        lock_path = Path(common) / "release-cut.lock"
+        hours = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("--older-than must be a positive number of hours") from exc
+    if not math.isfinite(hours) or hours <= 0:
+        raise argparse.ArgumentTypeError("--older-than must be a positive number of hours")
+    return hours
+
+
+def _preserve_cut_log(work: Path, *, version: str, head: str) -> Path | None:
+    """Copy a regular ``cut.log`` into the state directory. A missing log copies nothing.
+
+    A symlink ``cut.log`` is refused: preserving it would read another file and then allow the
+    work directory to be removed.
+    """
+    source = work / "cut.log"
+    try:
+        info = source.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(f"cut.log is not a regular file: {source}")
+    state = _release_state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    if state.is_symlink() or not state.is_dir():
+        raise OSError(f"release-cut state directory is not a real directory: {state}")
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    stem = f"{_filename_token(version or 'noversion')}-{_filename_token((head or 'nohead')[:12])}-{stamp}"
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    src_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+    try:
+        if not stat.S_ISREG(os.fstat(src_fd).st_mode):
+            raise OSError(f"cut.log is not a regular file: {source}")
+        for suffix in ("", "-2", "-3", "-4", "-5", "-6", "-7", "-8"):
+            dest = state / f"{stem}{suffix}-cut.log"
+            try:
+                out_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow, 0o644)
+            except FileExistsError:
+                continue
+            try:
+                while chunk := os.read(src_fd, 1024 * 1024):
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(out_fd, view)
+                        if written <= 0:
+                            raise OSError(f"short write preserving {dest}")
+                        view = view[written:]
+                os.fsync(out_fd)
+            except OSError:
+                os.close(out_fd)
+                out_fd = -1
+                with contextlib.suppress(OSError):
+                    os.unlink(dest)
+                raise
+            finally:
+                if out_fd >= 0:
+                    os.close(out_fd)
+            dir_fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            return dest
+    finally:
+        os.close(src_fd)
+    raise OSError(f"could not allocate a cut.log name in {state}")
+
+
+def _unlink_tool_work_directory(work: Path, home: Path) -> None:
+    """Remove ``work`` only when it is a real direct child of ``home`` with this tool's prefix.
+
+    Opens ``home`` and deletes the child by directory file descriptor, so a symlink that replaced
+    the child is refused instead of followed.
+    """
+    name = work.name
+    if _WORK_NAME.fullmatch(name) is None:
+        raise OSError(f"refusing to remove {work}: name does not match {_WORK_PREFIX!r}")
+    home_abs = Path(os.path.abspath(home))
+    work_abs = Path(os.path.abspath(work))
+    if work_abs.parent != home_abs:
+        raise OSError(f"refusing to remove {work}: not a direct child of {home_abs}")
+    if os.path.realpath(work_abs) != os.path.realpath(home_abs / name):
+        raise OSError(f"refusing to remove {work}: path escapes the home directory")
+    directory = os.open(home_abs, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        info = os.lstat(name, dir_fd=directory)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError(f"refusing to remove {home_abs / name}: not a real directory")
+        shutil.rmtree(name, dir_fd=directory)
+    finally:
+        os.close(directory)
+
+
+def _retire_tool_work_directory(cut: Cut) -> None:
+    """After a successful tool-created run, keep ``cut.log`` in the state directory and remove the work directory.
+
+    A failure to copy the log or to prove the directory is ours leaves the work directory in place.
+    The release has already succeeded; this does not change the exit code.
+    """
+    work = cut.work
+    try:
+        dest = _preserve_cut_log(work, version=cut.version, head=cut.head)
+    except OSError as exc:
+        cut.say(f"kept work directory {work}: could not preserve cut.log ({exc})")
+        return
+    if dest is not None:
+        cut.say(f"preserved cut.log at {dest}")
+    else:
+        cut.say(f"no cut.log in {work}")
+    try:
+        _unlink_tool_work_directory(work, _operator_home())
+    except OSError as exc:
+        cut.say(f"kept work directory {work}: {exc}")
+        return
+    cut.say(f"removed work directory {work}")
+
+
+def _proc_state(entry: Path) -> str | None:
+    try:
+        blob = (entry / "stat").read_bytes()
+    except OSError:
+        return None
+    _, _, tail = blob.rpartition(b")")
+    fields = tail.split()
+    return fields[0].decode("ascii", errors="replace") if fields else None
+
+
+def _argv_of(entry: Path) -> list[str] | None:
+    try:
+        raw = (entry / "cmdline").read_bytes()
+    except OSError:
+        return None
+    return [part for part in raw.decode("utf-8", errors="surrogateescape").split("\0") if part]
+
+
+def _is_live_release_cut(argv: list[str]) -> bool:
+    """True for ``cut`` or ``post-release``. ``prune`` and ``check-changelog`` own no work directory."""
+    if not any(part == "lu_machinery.release_cut" or part == "release_cut.py" or part.endswith("/release_cut.py")
+               for part in argv):
+        return False
+    return any(part in _RELEASE_COMMANDS for part in argv)
+
+
+def _live_release_cut_pids(proc_root: Path) -> list[int]:
+    me = os.getpid()
+    found: list[int] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        argv = _argv_of(entry)
+        if argv and _is_live_release_cut(argv):
+            found.append(int(entry.name))
+    return found
+
+
+def _collect_process_paths(entry: Path, found: set[str]) -> None:
+    """Record cwd, open files and mapped files we are allowed to read.
+
+    An unreadable process is skipped. Treating every unreadable ``/proc`` entry as a holder makes
+    prune a no-op on a shared host, so finished cuts could never be reclaimed. A live release cut
+    holds ``release-cut.lock`` and runs as this user, so its command line and work directory are
+    readable. A process we can read that is inside a candidate directory still keeps that directory.
+    """
+    if _proc_state(entry) in {"Z", "X"}:
+        return
+    with contextlib.suppress(OSError):
+        found.add(os.readlink(entry / "cwd"))
+    try:
+        descriptors = list((entry / "fd").iterdir())
+    except OSError:
+        descriptors = []
+    for descriptor in descriptors:
+        try:
+            found.add(os.readlink(descriptor))
+        except OSError:
+            continue
+    try:
+        maps = (entry / "maps").read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return
+    for line in maps.splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and fields[5].startswith("/"):
+            found.add(fields[5].removesuffix(" (deleted)"))
+
+
+def _referenced_paths(proc_root: Path) -> set[str]:
+    if not proc_root.is_dir():
+        raise OSError(f"{proc_root} is not a directory")
+    found: set[str] = set()
+    me = os.getpid()
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        _collect_process_paths(entry, found)
+    return found
+
+
+def _path_is_held(directory: Path, referenced: set[str]) -> bool:
+    forms = {os.path.abspath(directory).rstrip("/"), os.path.realpath(directory).rstrip("/")}
+    for raw in referenced:
+        held = raw.removesuffix(" (deleted)").rstrip("/")
+        if not held.startswith("/"):
+            continue
+        for form in forms:
+            if held == form or held.startswith(form + "/"):
+                return True
+    return False
+
+
+def _directory_size(path: Path) -> int:
+    """Bytes of files, directories and symlinks under ``path``, without following any symlink."""
+    total = 0
+    for dirpath, dirnames, filenames, dirfd in os.fwalk(path, follow_symlinks=False):
+        del dirpath
+        for name in (*dirnames, *filenames):
+            try:
+                total += os.lstat(name, dir_fd=dirfd).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _format_bytes(size: int) -> str:
+    return f"{size} bytes ({size / 1024 ** 3:.2f} GiB)"
+
+
+def _release_cut_lock_held(lock_path: Path) -> bool | None:
+    """True when another process holds the lock, False when this probe could take it, None if it cannot be opened.
+
+    The probe releases the lock before returning. A cut creates a new work directory, so removing an
+    already-chosen old directory does not need to block that cut for the whole deletion.
+    """
+    try:
+        lock = lock_path.open("a")
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        return False
+    finally:
+        lock.close()
+
+
+def prune_stale_work_directories(
+    home: Path, *, apply: bool, older_than_hours: float, lock_path: Path, proc_root: Path = Path("/proc"),
+    now: float | None = None,
+) -> int:
+    """Print, and with ``apply`` remove, idle ``.lu-release-cut-*`` children of ``home`` older than the threshold.
+
+    Refuses a symlink, a non-prefix name, anything that is not a direct child, and a directory a live
+    process is using. Does not follow symlinks. Removes nothing while ``release-cut.lock`` is held or
+    another ``cut`` / ``post-release`` process is running.
+    """
+    home_abs = Path(os.path.abspath(home))
+    try:
+        home_info = home_abs.lstat()
+    except OSError as exc:
+        print(f"prune: cannot inspect the home directory {home_abs}: {exc}", file=sys.stderr)
+        return 1
+    if stat.S_ISLNK(home_info.st_mode) or not stat.S_ISDIR(home_info.st_mode):
+        print(f"prune: home directory is not a real directory: {home_abs}", file=sys.stderr)
+        return 1
+    held = _release_cut_lock_held(lock_path)
+    if held is None:
+        print(f"prune: cannot open the release-cut lock {lock_path}", file=sys.stderr)
+        return 1
+    if held:
+        print(f"prune: release-cut lock is held ({lock_path}); removed nothing")
+        return 0
+    try:
+        live = _live_release_cut_pids(proc_root)
+    except OSError as exc:
+        print(f"prune: cannot inspect processes ({exc}); removed nothing", file=sys.stderr)
+        return 1
+    if live:
+        print(f"prune: release-cut is running (pid {live[0]}); removed nothing")
+        return 0
+    try:
+        referenced = _referenced_paths(proc_root)
+    except OSError as exc:
+        print(f"prune: cannot inspect processes ({exc}); removed nothing", file=sys.stderr)
+        return 1
+    moment = time.time() if now is None else now
+    threshold = older_than_hours * 3600
+    try:
+        names = sorted(entry.name for entry in home_abs.iterdir())
+    except OSError as exc:
+        print(f"prune: cannot list {home_abs}: {exc}", file=sys.stderr)
+        return 1
+    chosen: list[tuple[str, int]] = []
+    for name in names:
+        if _WORK_NAME.fullmatch(name) is None:
+            continue
+        candidate = home_abs / name
+        if candidate.parent != home_abs:
+            print(f"prune: refuse {candidate} (not a direct child of the home directory)")
+            continue
+        try:
+            info = candidate.lstat()
+        except OSError as exc:
+            print(f"prune: refuse {candidate} ({exc})")
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            print(f"prune: refuse {candidate} (symlink)")
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            print(f"prune: refuse {candidate} (not a directory)")
+            continue
+        age = moment - info.st_mtime
+        if age < threshold:
+            print(f"prune: keep {candidate} (newer than {older_than_hours:g} h)")
+            continue
+        if _path_is_held(candidate, referenced):
+            print(f"prune: keep {candidate} (in use by a live process)")
+            continue
+        try:
+            size = _directory_size(candidate)
+        except OSError as exc:
+            print(f"prune: refuse {candidate} (size unknown: {exc})")
+            continue
+        chosen.append((name, size))
+        action = "remove" if apply else "would remove"
+        print(f"prune: {action} {candidate} ({_format_bytes(size)}, age {age / 3600:.1f} h)")
+    total = sum(size for _, size in chosen)
+    if apply:
+        removed = 0
+        removed_bytes = 0
+        for name, size in chosen:
+            candidate = home_abs / name
+            held_now = _release_cut_lock_held(lock_path)
+            if held_now is None:
+                print(f"prune: cannot open the release-cut lock {lock_path}; left {candidate}", file=sys.stderr)
+                continue
+            if held_now:
+                print(f"prune: release-cut lock is held ({lock_path}); left {candidate}")
+                continue
+            try:
+                if _live_release_cut_pids(proc_root) or _path_is_held(candidate, _referenced_paths(proc_root)):
+                    print(f"prune: keep {candidate} (in use by a live process)")
+                    continue
+                _unlink_tool_work_directory(candidate, home_abs)
+            except OSError as exc:
+                print(f"prune: refuse {candidate} ({exc})", file=sys.stderr)
+                continue
+            removed += 1
+            removed_bytes += size
+        noun = "directory" if removed == 1 else "directories"
+        print(f"prune: removed {removed} {noun}, {_format_bytes(removed_bytes)}")
+    else:
+        count = len(chosen)
+        noun = "directory" if count == 1 else "directories"
+        print(f"prune: would remove {count} {noun}, {_format_bytes(total)}")
+    return 0
+
+
+def _prune_cli(args: argparse.Namespace) -> int:
+    try:
+        lock_path = _release_lock_path()
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"prune: cannot locate release-cut.lock: {exc}", file=sys.stderr)
+        return 1
+    return prune_stale_work_directories(
+        _operator_home(), apply=args.apply, older_than_hours=args.older_than, lock_path=lock_path,
+    )
+
+
+def _locked_run(args: argparse.Namespace) -> int:
+    try:
+        lock_path = _release_lock_path()
         lock = lock_path.open("a")
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"release cut refused: cannot acquire release-cut.lock: {exc}", file=sys.stderr)
@@ -1588,10 +1994,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "  accept/bin/python -I -m lu_machinery.release_cut consumer-collection --python accept/bin/python \\\n"
         "      --product product --product-python product-venv/bin/python --version 0.1.24\n"
         "  .venv/bin/python -m lu_machinery.release_cut check-changelog\n"
-        "Outputs: step lines on stdout; successful cuts keep cut.log, dist, wheelhouse and release evidence;\n"
-        "failed or interrupted cuts keep the entire work directory.\n"
-        "Exit codes: 0 released, skipped as unchanged, dry run passed, consumer collection passed or changelog\n"
-        "check passed; 1 refused or failed (cut and post-release alert claude-cto); 2 invalid input.\n"
+        "  .venv/bin/python -I -m lu_machinery.release_cut prune\n"
+        "  .venv/bin/python -I -m lu_machinery.release_cut prune --apply\n"
+        "Outputs: step lines on stdout. A successful cut or post-release that created its own work directory\n"
+        "keeps cut.log under $XDG_STATE_HOME/lu-release-cut (or ~/.local/state/lu-release-cut) and removes that\n"
+        "directory. A --work directory is never removed. Failed or interrupted cuts keep the work directory.\n"
+        "prune prints each directory it would remove and the space; --apply removes those directories.\n"
+        "Exit codes: 0 released, skipped as unchanged, dry run passed, consumer collection passed, changelog\n"
+        "check passed, or prune finished; 1 refused or failed (cut and post-release alert claude-cto);\n"
+        "2 invalid input.\n"
         "Related: docs/release.md#cut-a-release.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1601,7 +2012,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         command.add_argument("--x-agent", required=True, type=partial(x_agent_value, command=name),
                              help=f"Required <agent>/<task-or-seat> trailer. The review recorder must resolve its "
                                   f"author family. Example: {_X_AGENT_EXAMPLE}")
-        command.add_argument("--work", type=Path, help="Empty work directory (default: a new ~/.lu-release-cut-*)")
+        command.add_argument(
+            "--work", type=Path,
+            help="Empty work directory you own (default: a new ~/.lu-release-cut-* that is removed after success, "
+                 "after cut.log is kept in the XDG state directory). A directory you pass is never removed. "
+                 "Example: /tmp/release-cut",
+        )
         command.add_argument("--machinery-remote", help="Machinery Git remote (default: its GitHub URL)")
         command.add_argument("--product-remote", help="Product Git remote or local path (default: its GitHub URL)")
         command.add_argument("--no-alert", action="store_true", help="Print instead of alerting claude-cto (default: alert)")
@@ -1621,9 +2037,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     check_changelog = sub.add_parser("check-changelog", help=check_text, description=check_text)
     check_changelog.add_argument("--path", type=Path, default=Path("CHANGELOG.md"),
                                  help="Changelog file to check (default: CHANGELOG.md)")
+    prune_text = (
+        "Remove old tool-created release work directories from the home directory.\n"
+        "Use it after a cut to reclaim directories a failed or interrupted run left behind. "
+        "Do not use it to delete a directory you passed as --work, or any path that is not a direct "
+        "child of the home directory named with this tool's .lu-release-cut- prefix."
+    )
+    prune = sub.add_parser(
+        "prune", help="Remove old ~/.lu-release-cut-* directories left in the home directory",
+        description=prune_text, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n"
+        "  .venv/bin/python -I -m lu_machinery.release_cut prune\n"
+        "  .venv/bin/python -I -m lu_machinery.release_cut prune --apply\n"
+        "  .venv/bin/python -I -m lu_machinery.release_cut prune --older-than 48 --apply\n"
+        "Outputs: one line per considered directory and the space a removal would free. Nothing is deleted\n"
+        "unless --apply is set. Symlinks are refused and not followed.\n"
+        "Exit codes: 0 the scan finished (a held lock or a live cut keeps every directory); 1 the home\n"
+        "directory or release-cut.lock could not be inspected; 2 invalid input.\n"
+        "Related: docs/release.md#remove-old-work-directories.",
+    )
+    prune.add_argument("--apply", action="store_true",
+                       help="Delete the directories the dry run would remove (default: print only, delete nothing)")
+    prune.add_argument("--older-than", type=_positive_hours, default=_PRUNE_DEFAULT_HOURS,
+                       help="Keep directories newer than this many hours (default: 24). Example: 48")
     args = parser.parse_args(argv)
     if args.command == "check-changelog":
         return _check_changelog(args)
+    if args.command == "prune":
+        return _prune_cli(args)
     # Runtime admission refuses group- or other-writable Node and agent artifacts, and every path the cut
     # writes (venvs, pip and npm installs, the prepared Node prefix) is made by this process or a child that
     # inherits its umask. Add 022 to the caller's mask for the whole run; a stricter mask is kept.
@@ -1697,18 +2138,23 @@ def _run(args: argparse.Namespace) -> int:
     except CutError as exc:
         print(f"release cut refused: {exc}", file=sys.stderr)
         return 1
-    work = (args.work or Path(tempfile.mkdtemp(prefix=".lu-release-cut-", dir=Path.home()))).absolute()
+    dry_run = getattr(args, "dry_run", False)
+    if not dry_run and os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID"):
+        print("cut and post-release run on the host, outside a dispatched worker; use cut --dry-run here",
+              file=sys.stderr)
+        return 2
+    # Only a directory this command created is removed, and only after success. A failure keeps it.
+    tool_created = args.work is None
+    if tool_created:
+        work = Path(tempfile.mkdtemp(prefix=_WORK_PREFIX, dir=_operator_home())).absolute()
+    else:
+        work = Path(args.work).absolute()
     work.mkdir(parents=True, exist_ok=True)
     if any(path.name != "home" for path in work.iterdir()):
         print(f"--work {work} must be empty", file=sys.stderr)
         return 2
     for name in ("home", "tmp"):
         (work / name).mkdir(exist_ok=True)
-    dry_run = getattr(args, "dry_run", False)
-    if not dry_run and os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID"):
-        print("cut and post-release run on the host, outside a dispatched worker; use cut --dry-run here",
-              file=sys.stderr)
-        return 2
     cut = Cut(work=work, dry_run=dry_run,
               machinery_remote=args.machinery_remote or f"https://github.com/{machinery_repo}.git",
               product_remote=args.product_remote or f"https://github.com/{product_repo}.git",
@@ -1720,9 +2166,7 @@ def _run(args: argparse.Namespace) -> int:
         cut.git_identity = ("-c", f"user.name={name}", "-c", f"user.email={email}")
     cut.say(f"work directory {work}")
     try:
-        if args.command == "post-release":
-            return open_post_release(cut)
-        return execute(cut)
+        code = open_post_release(cut) if args.command == "post-release" else execute(cut)
     except (CutError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
         failed_step = cut.step
         cause = f"{failed_step}: {exc}"
@@ -1741,6 +2185,9 @@ def _run(args: argparse.Namespace) -> int:
         except (CutError, OSError, subprocess.SubprocessError) as exc:
             print(f"alert to {ALERT_RECIPIENT} failed: {exc}", file=sys.stderr)
         return 1
+    if code == 0 and tool_created:
+        _retire_tool_work_directory(cut)
+    return code
 
 
 def open_post_release(cut: Cut) -> int:
