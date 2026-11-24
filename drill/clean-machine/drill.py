@@ -1760,7 +1760,12 @@ def bwrap_prefix(workdir: Path, roots: list[str]) -> list[str]:
 MIN_VENV_PYTHON = (3, 14)
 
 
-def resolve_interpreter(choice: str | None) -> str:
+def resolve_interpreter(
+    choice: str | None,
+    *,
+    label: str = "--python",
+    expected_prefix: Path | None = None,
+) -> str:
     """The real path of the base interpreter for the venv: this one, or ``--python`` found on PATH.
 
     A bare name is looked up on PATH, never against the current directory, and the interpreter
@@ -1778,33 +1783,86 @@ def resolve_interpreter(choice: str | None) -> str:
     found = choice if os.sep in choice else shutil.which(choice)
     if not found or not os.path.isfile(found):
         raise DrillError(
-            f"--python {choice!r} is not an interpreter on PATH or an existing file"
+            f"{label} {choice!r} is not an interpreter on PATH or an existing file"
         )
+    if not os.access(found, os.X_OK):
+        raise DrillError(f"{label} {choice!r} is not executable")
     script = (
-        "import json, os, sys; print(json.dumps([os.path.realpath(getattr(sys, '_base_executable', None) "
-        f"or sys.executable), sys.version_info[:2] >= {MIN_VENV_PYTHON!r}]))"
+        "import json, os, sys; print(json.dumps(["
+        "os.path.realpath(getattr(sys, '_base_executable', None) or sys.executable), "
+        f"sys.version_info[:2] >= {MIN_VENV_PYTHON!r}, "
+        "os.path.realpath(sys.prefix), "
+        "os.path.realpath(sys.base_prefix)]))"
     )
-    result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
-        [os.path.abspath(found), "-I", "-c", script],
-        check=False,
-        capture_output=True,
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise DrillError(f"--python {choice!r} exited {result.returncode}")
     try:
-        path, new_enough = json.loads(result.stdout.decode("utf-8"))
+        result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
+            [os.path.abspath(found), "-I", "-c", script],
+            check=False,
+            capture_output=True,
+            timeout=60,
+        )
+    except OSError as exc:
+        raise DrillError(f"{label} {choice!r} could not be executed: {exc}") from None
+    if result.returncode != 0:
+        raise DrillError(f"{label} {choice!r} exited {result.returncode}")
+    try:
+        path, new_enough, prefix, base_prefix = json.loads(
+            result.stdout.decode("utf-8")
+        )
         if (
             not isinstance(path, str)
             or not os.path.isabs(path)
             or not isinstance(new_enough, bool)
+            or not isinstance(prefix, str)
+            or not os.path.isabs(prefix)
+            or not isinstance(base_prefix, str)
+            or not os.path.isabs(base_prefix)
         ):
             raise ValueError("unexpected report")
     except (UnicodeDecodeError, ValueError, TypeError):
-        raise DrillError(f"--python {choice!r} gave an unreadable report") from None
+        raise DrillError(f"{label} {choice!r} gave an unreadable report") from None
     if not new_enough:
-        raise DrillError(f"--python {choice!r} is older than Python {min_label}")
+        raise DrillError(f"{label} {choice!r} is older than Python {min_label}")
+    if expected_prefix is not None:
+        want_prefix = os.path.realpath(expected_prefix)
+        if prefix != want_prefix or prefix == base_prefix:
+            raise DrillError(
+                f"{label} {choice!r} is not an active virtual environment rooted at {expected_prefix}"
+            )
     return path
+
+
+def validate_reused_venv(venv: Path) -> str | None:
+    """Validate an existing workdir venv before modifying the workdir.
+
+    Returns the real base interpreter path when ``venv`` is a valid CPython 3.14+
+    virtual environment rooted at ``venv``, or ``None`` when ``venv`` is absent
+    (allowing fresh creation). Refuses every damaged or incompatible state with
+    ``DrillError`` before the marker or ``out/`` is touched.
+    """
+    if not os.path.lexists(venv):
+        return None
+    if venv.is_symlink():
+        raise DrillError(f"--reuse-venv: {venv} must be a directory, not a symlink")
+    if not venv.is_dir():
+        raise DrillError(f"--reuse-venv: {venv} is not a directory")
+    venv_bin = venv / "bin"
+    if not os.path.lexists(venv_bin):
+        raise DrillError(f"--reuse-venv: {venv} is missing bin/")
+    if venv_bin.is_symlink():
+        raise DrillError(f"--reuse-venv: {venv_bin} must be a directory, not a symlink")
+    if not venv_bin.is_dir():
+        raise DrillError(f"--reuse-venv: {venv_bin} is not a directory")
+    py = venv_bin / "python"
+    if not os.path.lexists(py):
+        raise DrillError(f"--reuse-venv: {py} does not exist")
+    if py.is_symlink() and not py.exists():
+        raise DrillError(f"--reuse-venv: {py} is a dangling symlink")
+    if not py.is_file():
+        raise DrillError(f"--reuse-venv: {py} is not a regular file")
+    if not os.access(py, os.X_OK):
+        raise DrillError(f"--reuse-venv: {py} is not executable")
+    return resolve_interpreter(str(py), label="--reuse-venv", expected_prefix=venv)
 
 
 def base_interpreter() -> str:
@@ -2135,8 +2193,10 @@ def main(argv: list[str] | None = None) -> int:
             raise DrillError(f"{workdir} is not empty and not a drill workdir")
         venv = workdir / "venv"
         py = venv / "bin" / "python"
-        if args.reuse_venv and (py.exists() or py.is_symlink()):
-            base_py = resolve_interpreter(str(py))
+        if args.reuse_venv:
+            reused_base_py = validate_reused_venv(venv)
+            if reused_base_py is not None:
+                base_py = reused_base_py
         marker.write_text("lu-machinery clean-machine drill workdir\n")
         out = workdir / "out"
         if out.exists():
