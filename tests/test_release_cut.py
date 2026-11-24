@@ -379,6 +379,16 @@ def _assert_declared(message: str, agent: str) -> None:
     assert attribution.verification_findings(message, "0" * 40, None) == []
 
 
+def _stub_adopt_input_refresh(cut, monkeypatch):
+    """Supply files to stage when the test exercises PR publication independently of uv."""
+
+    def refresh(product):
+        (product / "pyproject.toml").write_text('[project]\nname = "product"\nversion = "1.0.0"\n', encoding="utf-8")
+        (product / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(cut, "update_adopt_inputs", refresh)
+
+
 def test_created_commit_message_declares_x_agent_and_x_verified(tmp_path, monkeypatch):
     """Defect classes: missing attribution or MISSING_VERIFICATION on release PRs, stale locks and credentials in uv subprocesses."""
     machinery_seed = tmp_path / "machinery-seed"
@@ -456,16 +466,7 @@ def test_created_commit_message_declares_x_agent_and_x_verified(tmp_path, monkey
     _assert_declared(post, "claude/claude-cto")
     assert cut.git(machinery, "show", "HEAD:uv.lock") == uv_lock.replace("0.1.22", "0.1.23").strip()
 
-    lock = tmp_path / "consumer.lock"
-    lock.write_text("lu-machinery==0.1.22\n", encoding="utf-8")
     cut.publisher = lambda *_args: "https://github.com/learn-ukrainian/learn-ukrainian/pull/1\n"
-    cut.open_adopt_pr(lock, product)
-    adopt = subprocess.run(
-        ["git", "-C", str(product), "log", "-1", "--format=%B"], check=True, capture_output=True, text=True,
-    ).stdout
-    _assert_declared(adopt, "claude/claude-cto")
-    assert cut.git(product, "show", "HEAD:requirements-machinery.lock") == "lu-machinery==0.1.22"
-
     cut.version = "0.1.23"
     base_url = "https://github.com/learn-ukrainian/machinery/releases/download"
     old_url = f"{base_url}/v0.1.22/lu_machinery-0.1.22-py3-none-any.whl"
@@ -506,7 +507,7 @@ def test_created_commit_message_declares_x_agent_and_x_verified(tmp_path, monkey
         return run(argv, **kwargs)
 
     cut.run = run_uv_adoption
-    cut.open_adopt_pr(lock, product)
+    cut.open_adopt_pr(product)
     assert cut.git(product, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines() == [
         "pyproject.toml", "uv.lock",
     ]
@@ -517,7 +518,7 @@ def test_created_commit_message_declares_x_agent_and_x_verified(tmp_path, monkey
         release_cut.wheel_only_requirements("", product / "uv.lock")
     manifest.write_text("tool = []\n", encoding="utf-8")
     with pytest.raises(CutError, match="pyproject.toml tool must be a table"):
-        cut.update_adopt_inputs(lock, product)
+        cut.update_adopt_inputs(product)
 
 
 def test_adopt_pr_commits_candidate_snapshot(tmp_path, monkeypatch):
@@ -598,7 +599,7 @@ def test_adopt_pr_commits_candidate_snapshot(tmp_path, monkeypatch):
     cut.run = run_adoption
     cut._install_venv = install_candidate
     cut.publisher = lambda *args: "https://github.com/example/product/pull/701\n"
-    cut.open_adopt_pr(lock, product)
+    cut.open_adopt_pr(product)
 
     assert cut.adopt_pr == 701
     assert len(pushed) == 1
@@ -703,7 +704,8 @@ def _released_history(tmp_path, monkeypatch, commits, releases, *, machinery_uv=
     product = tmp_path / "product seed"
     _init_repo(product)
     (product / "pyproject.toml").write_text(f'[tool.uv]\nrequired-version = "{product_uv}"\n', encoding="utf-8")
-    _git(product, "add", "pyproject.toml")
+    (product / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    _git(product, "add", "pyproject.toml", "uv.lock")
     _git(product, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "Set required uv version")
     bin_dir = tmp_path / "tool bin"
     bin_dir.mkdir()
@@ -765,23 +767,32 @@ def _released_history(tmp_path, monkeypatch, commits, releases, *, machinery_uv=
     ("==0.13.9", "==0.13.8", "product"),
 ])
 def test_cut_checks_both_uv_requirements_before_build(tmp_path, monkeypatch, machinery_uv, product_uv, mismatched_side):
-    """Defect class: an incompatible uv reaches build or tagging before the cut checks both projects."""
+    """Defect class: missing or incompatible uv inputs allow a cut to reach build or tagging."""
     cut = _released_history(tmp_path, monkeypatch, [
         ("seed versions", "0.1.21", "v0.1.21"),
         ("fix(release): check uv in preflight", "0.1.22", None),
     ], releases={"v0.1.21": False}, machinery_uv=machinery_uv, product_uv=product_uv)
+
+    def unexpected_step(*_):
+        pytest.fail("preflight allowed build or publication without the required uv inputs")
+
+    monkeypatch.setattr(cut, "build", unexpected_step)
+    monkeypatch.setattr(cut, "publish", unexpected_step)
     if mismatched_side is None:
         decision, _, _ = cut.preflight()
         assert decision.action == "cut"
         assert (cut.work / "product" / "pyproject.toml").is_file()
+
+        product_seed = Path(cut.product_remote)
+        _git(product_seed, "rm", "uv.lock")
+        _git(product_seed, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "Remove the lock")
+        cut.work = tmp_path / "missing-lock-cut"
+        cut.work.mkdir()
+        with pytest.raises(release_cut.UvPreflightError, match=r"uv preflight \(product\): uv.lock is required"):
+            release_cut.execute(cut)
+        assert cut.step == "preflight"
     else:
         cut.dry_run = mismatched_side == "product"
-
-        def unexpected_step(*_):
-            pytest.fail("preflight allowed build or publication with an incompatible uv")
-
-        monkeypatch.setattr(cut, "build", unexpected_step)
-        monkeypatch.setattr(cut, "publish", unexpected_step)
         with pytest.raises(CutError, match=rf"uv preflight \({mismatched_side}\): uv on PATH could not satisfy") as exc:
             release_cut.execute(cut)
         assert isinstance(exc.value, release_cut.UvPreflightError)
@@ -1172,9 +1183,8 @@ def test_release_prs_pass_configured_milestones_and_dry_run_reports_them(tmp_pat
     assert "--milestone" in published_calls[-1]
     assert published_calls[-1][published_calls[-1].index("--milestone") + 1] == "v0.11.0 - CI and GitHub budget reliability"
 
-    lock = tmp_path / "consumer.lock"
-    lock.write_text("lu-machinery==0.1.22\n", encoding="utf-8")
-    cut.open_adopt_pr(lock, product)
+    _stub_adopt_input_refresh(cut, monkeypatch)
+    cut.open_adopt_pr(product)
     assert "--milestone" in published_calls[-1]
     assert published_calls[-1][published_calls[-1].index("--milestone") + 1] == "Machinery simplification (product side)"
 
@@ -1402,7 +1412,8 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
     assert pub_argv == [installed, "-I", "-m", "lu_machinery.publish", "pr-create", "--milestone", "v0.11.0"]
     assert "PYTHONPATH" not in pub_env
     cut.publish(files, "notes\n")
-    cut.open_adopt_pr(lock, product)
+    _stub_adopt_input_refresh(cut, monkeypatch)
+    cut.open_adopt_pr(product)
     cut.promote("final notes\n")
     assert cut.post_release("### Fixed\n\n- Fix\n") == 1275
 

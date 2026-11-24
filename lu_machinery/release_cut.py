@@ -797,6 +797,8 @@ class Cut:
         except (CutError, OSError, subprocess.SubprocessError, UnicodeError) as exc:
             raise UvPreflightError("product", "could not read pyproject.toml at product main") from exc
         self.check_uv_requirement(uv, manifest, side="product")
+        if not (product / "uv.lock").is_file():
+            raise UvPreflightError("product", "uv.lock is required on product main")
         self.uv = uv
 
     def preflight(self) -> tuple[Decision, list[str], str]:
@@ -1043,12 +1045,9 @@ class Cut:
         self.say(f"measured adoption snapshot with lu-machinery {self.built}: {output}")
         return output
 
-    def update_adopt_inputs(self, consumer_lock: Path, product: Path) -> tuple[str, ...]:
-        """Update the current product pin and return the exact paths the adopt PR will stage."""
+    def update_adopt_inputs(self, product: Path) -> None:
+        """Update the product's uv pin and verify it resolves to the published wheel."""
         lock = product / "uv.lock"
-        if not os.path.lexists(lock):
-            shutil.copyfile(consumer_lock, product / "requirements-machinery.lock")
-            return ("requirements-machinery.lock",)
         uv = self.uv or shutil.which("uv")
         if uv is None:
             raise CutError("uv is not on PATH; cannot refresh the product's uv.lock")
@@ -1066,30 +1065,25 @@ class Cut:
                 or [(row.get("url"), row.get("hash")) for row in selected[0].get("wheels", [])]
                 != [(url, expected_hash)]):
             raise CutError("product uv.lock does not pin the verified published lu-machinery wheel")
-        return ("pyproject.toml", "uv.lock")
 
-    def open_adopt_pr(self, consumer_lock: Path, product: Path) -> None:
-        """Draft PR adopting the verified release into the product's active lock format."""
+    def open_adopt_pr(self, product: Path) -> None:
+        """Draft a PR adopting the verified release into the product's uv lock."""
         snapshot = self.refresh_adopt_snapshot(product)
         self.step = "adopt PR"
         branch = f"release/lu-machinery-{self.version}"
         self.git(product, "switch", "--quiet", "-c", branch)
-        paths = self.update_adopt_inputs(consumer_lock, product)
+        self.update_adopt_inputs(product)
         verified = _ADOPT_VERIFIED
-        files = paths
+        files: tuple[str, ...] = ("pyproject.toml", "uv.lock")
         if snapshot is not None:
-            files = (*paths, snapshot)
+            files = (*files, snapshot)
             verified += ", candidate adoption snapshot"
         self.git(product, "add", "--", *files)
         self.git(product, *self.committer(), "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m",
                  f"chore(deps): adopt lu-machinery {self.version}\n\nX-Agent: {self.x_agent}\n{verified}")
         self.run(["git", "-C", product, "push", self.product_remote, f"HEAD:refs/heads/{branch}"], timeout=300)
         body = self.work / "adopt-body.md"
-        pin_summary = (
-            "`pyproject.toml` points to the release wheel and `uv.lock` pins its verified SHA-256."
-            if paths == ("pyproject.toml", "uv.lock") else
-            "`requirements-machinery.lock` becomes the release's wheel-only consumer lock."
-        )
+        pin_summary = "`pyproject.toml` points to the release wheel and `uv.lock` pins its verified SHA-256."
         if snapshot is not None:
             pin_summary += f" The release cut measured `{snapshot}` from the candidate wheel."
         body.write_text(
@@ -1588,7 +1582,7 @@ def execute(cut: Cut) -> int:
         cut.refresh_adopt_snapshot(product)
     else:
         cut.publish(files, release_body(cut, section, files, consumer_lock, ci, pending))
-        cut.open_adopt_pr(consumer_lock, product)
+        cut.open_adopt_pr(product)
     canary: dict[str, subprocess.CompletedProcess[str] | BaseException] = {}
 
     def run_canary() -> None:
