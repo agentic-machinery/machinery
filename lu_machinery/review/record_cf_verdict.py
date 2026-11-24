@@ -72,8 +72,8 @@ from lu_machinery.opsec.prepublish import (
 )
 from lu_machinery.orchestration import integration_sweep
 from lu_machinery.orchestration.fleet_repos import (
+    FleetRepo,
     FleetRepoError,
-    canonical_repository,
     load_fleet_repos,
     resolve_fleet_repo_by_slug,
     resolve_payload_fleet_repo,
@@ -415,7 +415,7 @@ def live_app_bot_login(repository: str, sha: str) -> str | None:
     authorship unknown and refused.
     """
     try:
-        commit = _run_json(Request("read-commit", repo=repository, sha=sha))
+        commit = _run_json(Request("read-commit", repo=_review_github(repository).active, sha=sha))
     except RecordError:
         return None
     return verified_app_bot_login(commit, sha, repository)
@@ -818,14 +818,15 @@ def author_families(repository: str, pr_number: int, task_root: Path) -> set[str
     uses :func:`pr_review_facts`, which also binds the listing to the local
     ``git rev-list`` enumeration.
     """
-    commits = _pages(Request("read-commits", repo=repository, number=pr_number))
+    remote = _review_github(repository).active
+    commits = _pages(Request("read-commits", repo=remote, number=pr_number))
     if not commits:
         raise RecordError("PR commit set unavailable")
     base: list[str] = []
 
     def base_sha() -> str:
         if not base:
-            pr = _run_json(["gh", "pr", "view", str(pr_number), "--repo", repository, "--json", "baseRefOid"])
+            pr = _run_json(["gh", "pr", "view", str(pr_number), "--repo", remote, "--json", "baseRefOid"])
             value = pr.get("baseRefOid") if isinstance(pr, dict) else None
             if not isinstance(value, str) or not SHA.fullmatch(value):
                 raise RecordError("PR base SHA unavailable; cannot prove clean base merge")
@@ -1466,8 +1467,12 @@ def pr_review_facts(
     unknown_history: Iterable[str] = (),
     fetch: bool = True,
     current_head: bool = True,
+    github_repository: str | None = None,
 ) -> BranchReviewFacts:
     """Facts for an open PR's frozen head, bound to GitHub's listing of its commits (A1).
+
+    ``repository`` names the records the facts are matched against; GitHub is read at
+    ``github_repository`` (a dual-slug row's active slug), else at ``repository``.
 
     The head comes from GitHub; the range is the fetched default branch to
     that head (:func:`default_branch_review_base`), never the PR's base, which
@@ -1477,11 +1482,12 @@ def pr_review_facts(
     With ``current_head=False`` the facts are those of an earlier head the PR
     still contains: every commit of its range must be in GitHub's listing.
     """
-    pr = _run_json(["gh", "pr", "view", str(pr_number), "--repo", repository, "--json", "headRefOid"])
+    remote = github_repository or repository
+    pr = _run_json(["gh", "pr", "view", str(pr_number), "--repo", remote, "--json", "headRefOid"])
     head = pr.get("headRefOid") if isinstance(pr, dict) else None
     if current_head and head != head_sha:
         raise RecordError("PR head moved since review; re-run exact-head review")
-    listed = _pages(Request("read-commits", repo=repository, number=pr_number))
+    listed = _pages(Request("read-commits", repo=remote, number=pr_number))
     if not listed:
         raise RecordError("PR commit set unavailable")
     github_shas = [entry.get("sha") for entry in listed]
@@ -2242,7 +2248,7 @@ class _UniqueKeyLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep=deep)
 
 
-def _review_budget_policy(policy: Path) -> dict[str, int]:
+def _review_budget_policy(policy: Path, repos: Mapping[str, FleetRepo]) -> dict[str, int]:
     """Every declared budget in ``policy``, keyed by normalized repository; any defect in the file refuses.
 
     The whole file is validated, whichever repository is asked about: an integer ``version`` of 1,
@@ -2259,7 +2265,7 @@ def _review_budget_policy(policy: Path) -> dict[str, int]:
         raise RecordError("review budget unavailable: the review budget policy is malformed")
     budgets: dict[str, int] = {}
     for name, row in listed.items():
-        key = _budget_key(name) if isinstance(name, str) else "unknown"
+        key = _budget_key(name, repos) if isinstance(name, str) else "unknown"
         rounds = row.get("review_rounds") if isinstance(row, Mapping) else None
         if key == "unknown" or key in budgets or type(rounds) is not int or not 1 <= rounds <= MAX_DECLARED_REVIEW_ROUNDS:
             raise RecordError(
@@ -2270,12 +2276,14 @@ def _review_budget_policy(policy: Path) -> dict[str, int]:
     return budgets
 
 
-def _budget_key(repository: str) -> str:
+def _budget_key(repository: str, repos: Mapping[str, FleetRepo]) -> str:
     """The budget policy key of *repository*: either baked slug of a registered row is that row's one key."""
     try:
-        return normalize_repository(canonical_repository(repository))
+        if "/" in repository:
+            repository = resolve_fleet_repo_by_slug(repository, repos=repos).github
     except FleetRepoError:
-        return normalize_repository(repository)
+        pass  # an unregistered owner/name keys its own budget
+    return normalize_repository(repository)
 
 
 def repository_review_rounds(
@@ -2286,8 +2294,12 @@ def repository_review_rounds(
     An unknown PR tier uses the smallest cap. A branch without a PR uses the
     standard default. An unreadable or malformed policy file refuses.
     """
-    budgets = _review_budget_policy(REVIEW_BUDGET_POLICY if policy is None else policy)
-    return budgets.get(_budget_key(repository), 2 if tier in {None, "low"} else DEFAULT_REVIEW_ROUNDS)
+    try:
+        repos = load_fleet_repos()
+    except FleetRepoError:
+        raise RecordError("review budget unavailable: the fleet repository registry is unreadable") from None
+    budgets = _review_budget_policy(REVIEW_BUDGET_POLICY if policy is None else policy, repos)
+    return budgets.get(_budget_key(repository, repos), 2 if tier in {None, "low"} else DEFAULT_REVIEW_ROUNDS)
 
 
 def _pr_files_and_tier(
@@ -3408,8 +3420,9 @@ def record(
     ukrainian, sources_count, started = review.ukrainian, review.sources_count, review.started
     if ukrainian and verdict == "APPROVED":
         _require_ukrainian_claim_support(task, reply, task_id, task_root)
-    # Stored identity (``repository``) binds the records; GitHub is read and written at the active slug.
+    # Local records, locks and lineage use the registry slug; GitHub is read and written at the active slug.
     github = _review_github(repository)
+    repository = github.stored
     pr = _pr(github.active, branch, pr_number)
     if pr.get("headRefName") != branch:
         raise RecordError("review branch does not match PR head ref")
@@ -3441,6 +3454,7 @@ def record(
         subject_seats=_task_flag_values(task, "review_subject_seats"),
         subject_families=_task_flag_values(task, "review_subject_families"),
         unknown_history=unknown_history,
+        github_repository=github.active,
     )
     if facts.unknown_history:
         frozen = task.get("review_branch_facts")
@@ -3715,7 +3729,10 @@ def budget_check(
     from lu_machinery.common.task_store_paths import tasks_dir
 
     task_root = task_root or tasks_dir()
-    pr = _run_json(["gh", "pr", "view", str(number), "--repo", repository, "--json", "headRefOid,headRefName,state"])
+    # Local records and lineage use the registry slug; GitHub is read at the active slug.
+    github = _review_github(repository)
+    repository = github.stored
+    pr = _run_json(["gh", "pr", "view", str(number), "--repo", github.active, "--json", "headRefOid,headRefName,state"])
     if not isinstance(pr, dict) or pr.get("state") != "OPEN":
         raise RecordError(f"PR #{number} is not open")
     sha, branch = pr.get("headRefOid"), pr.get("headRefName")
@@ -3725,13 +3742,14 @@ def budget_check(
         raise RecordError(f"PR #{number} head is {sha[:12]}, not the review head {head[:12]}")
     review_root = _review_repository_root(repository, root)
     adapter = GitHubAdapter(review_root)
-    _, tier = _pr_files_and_tier(adapter, repository, number)
+    _, tier = _pr_files_and_tier(adapter, github.active, number)
     # Verify the head again after reading the PR files. A stale or missing default ref refuses.
-    pr_review_facts(repository, number, head_sha=sha, task_root=task_root, repo_root=review_root, fetch=False)
+    pr_review_facts(repository, number, head_sha=sha, task_root=task_root, repo_root=review_root, fetch=False,
+                    github_repository=github.active)
     budget = repository_review_rounds(repository, tier=tier)
     login = adapter.identity()
     try:
-        comments = adapter.comments(repository, number)
+        comments = adapter.comments(github.active, number)
     except SweepError as exc:
         raise RecordError(f"comment lookup failed: {exc}") from exc
     charging = cache(
@@ -3833,9 +3851,9 @@ def dispatch_budget_check(
             # policy can declare (1 at least) and nothing here depends on it. The verdict still reads it first.
             return None
         if number is None and branch is not None:
-            number = _open_pr_number(repository, branch)
+            number = _open_pr_number(_review_github(repository).active, branch)
         elif number is not None and branch is None:
-            branch = _pr(repository, "", number)["headRefName"]
+            branch = _pr(_review_github(repository).active, "", number)["headRefName"]
         runs = lineage_runs(task_root, repository=repository, number=number, branch=branch, records=records)
     # The full check must see a recovery even when the head is unchanged or the normal budget has room.
     if number is not None and provider_crash_recovery(runs, (), "") is not None:
@@ -3912,13 +3930,15 @@ def republish_withheld(
         raise RecordError("republication requires the review task's sealed reply digest")
     review = _task_verdict(task, reply)
     review_mode = task.get("review_mode", "cross_family")
+    # Local records, locks and lineage use the registry slug; GitHub is read and written at the active slug.
     github = _review_github(review.repository)
+    repository = github.stored
     pr = _pr(github.active, review.branch, pr_number)
     if pr.get("headRefName") != review.branch:
         raise RecordError("review branch does not match PR head ref")
-    review_root = _review_repository_root(review.repository, root or _repo_root())
+    review_root = _review_repository_root(repository, root or _repo_root())
     facts = pr_review_facts(
-        review.repository,
+        repository,
         pr_number,
         head_sha=review.sha,
         task_root=task_root,
@@ -3927,7 +3947,7 @@ def republish_withheld(
         subject_families=_task_flag_values(task, "review_subject_families"),
         unknown_history=(
             admitted_unknown_history(
-                repository=review.repository,
+                repository=repository,
                 branch=review.branch,
                 head_sha=review.sha,
                 task_root=task_root,
@@ -3937,6 +3957,7 @@ def republish_withheld(
             else ()
         ),
         current_head=False,
+        github_repository=github.active,
     )
     reply = repository_relative_reply(reply, task=task, primary_root=review_root)
 
@@ -3993,7 +4014,7 @@ def republish_withheld(
     if github.selector is not None:
         result["fleet_repo_selector"] = github.selector
     # The PR lock keeps a verdict at another head from landing between the order check and the post.
-    with pr_lock(review.repository, pr_number, lock_root):
+    with pr_lock(repository, pr_number, lock_root):
         try:
             comments = adapter.comments(github.active, pr_number)
         except SweepError as exc:

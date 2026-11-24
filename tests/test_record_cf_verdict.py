@@ -3090,8 +3090,12 @@ def test_recorded_verdict_posts_at_the_active_slug_and_names_the_selector(monkey
     monkeypatch.setattr(recorder, "post_commit_status", lambda **fields: written.append(fields["repository"]))
     post = recorder._post_verdict
     monkeypatch.setattr(recorder, "_post_verdict", lambda repository, *args: (written.append(repository), post(repository, *args))[1])
+    facts, reads = recorder.pr_review_facts, []
+    monkeypatch.setattr(recorder, "pr_review_facts", lambda repository, number, **kwargs: (
+        reads.append((repository, kwargs.get("github_repository"))), facts(repository, number, **kwargs))[1])
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert result["comment"] == "posted" and calls["posts"] == 1
     assert written == [active, active]
+    assert reads == [("org/repo", active)]  # records matched at the registry slug, GitHub read at the active one
     assert result["fleet_repo_selector"] == {"selector_value": active, "selector_sha256": "d" * 64}
     assert [entry["repository"] for entry in _ledger(tmp_path)] == ["org/repo"]

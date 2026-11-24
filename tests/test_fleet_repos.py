@@ -535,17 +535,21 @@ def test_opsec_private_exemption_follows_only_the_active_slug(monkeypatch: pytes
     assert not prepublish.is_private("evil/repo")
 
 
+@pytest.mark.parametrize("configured", [False, True])
 @pytest.mark.parametrize("visibility", ["public", "private"])
 @pytest.mark.parametrize("active", BOTH)
-def test_sandbox_repository_scope_follows_only_the_active_slug(monkeypatch: pytest.MonkeyPatch, active: str, visibility: str):
+def test_sandbox_repository_scope_follows_only_the_active_slug(
+    monkeypatch: pytest.MonkeyPatch, active: str, visibility: str, configured: bool,
+):
     """Defect class: the AGY sandbox and write boundary scope a repository by the registry's first slug, so after a
-    transfer the active slug loses its public or private scope and the inactive slug keeps it."""
+    transfer the active slug loses its public or private scope and the inactive slug keeps it, including through the
+    default repository's configured GitHub name when that name spells the inactive slug."""
     from lu_machinery.common import repo_root
     from lu_machinery.dispatcher import agy_sandbox
 
     _selected(monkeypatch, active, visibility=visibility)
-    monkeypatch.setattr(repo_root, "configured_github_slug", lambda *_a, **_k: None)
     inactive = next(slug for slug in BOTH if slug != active)
+    monkeypatch.setattr(repo_root, "configured_github_slug", lambda *_a, **_k: inactive if configured else None)
     assert agy_sandbox.public_repository(active) is (visibility == "public")
     assert agy_sandbox.private_repository(active) is (visibility == "private")
     for refused in (inactive, "evil/repo"):

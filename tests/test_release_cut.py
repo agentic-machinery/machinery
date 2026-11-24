@@ -1955,8 +1955,9 @@ def _transferred(monkeypatch, active):
             "repository_id": 4242, "visibility": "public", "local_name": "machinery"}
 
 
+@pytest.mark.parametrize("remote", [None, "active", "inactive"])
 @pytest.mark.parametrize("active", [*_BAKED, "evil/repo"])
-def test_release_cut_runs_at_the_active_slug_and_logs_the_selector(monkeypatch, tmp_path, capsys, active):
+def test_release_cut_runs_at_the_active_slug_and_logs_the_selector(monkeypatch, tmp_path, capsys, active, remote):
     """Defect class: the release cut clones, tags and publishes at the registry's first slug after a transfer, and
     its log never names the selector; a selector choosing a slug the row does not bake must refuse the cut."""
     _host(monkeypatch, tmp_path, sys.executable)
@@ -1971,17 +1972,24 @@ def test_release_cut_runs_at_the_active_slug_and_logs_the_selector(monkeypatch, 
 
     monkeypatch.setattr(release_cut, "execute", execute)
     argv = ["cut", "--dry-run", "--no-alert", "--work", str(tmp_path / "w"), "--x-agent", "claude/claude-opus-5-5"]
+    named = {"active": active, "inactive": next(slug for slug in _BAKED if slug != active)}.get(remote)
+    if named is not None:
+        argv += ["--machinery-remote", f"https://github.com/{named}.git"]
     if active == "evil/repo":
         assert main(argv) == 1
         assert "release cut refused: fleet repository selector" in capsys.readouterr().err and not seen
         return
+    if remote == "inactive":
+        assert main(argv) == 1
+        assert "--machinery-remote is not the active GitHub slug" in capsys.readouterr().err and not seen
+        return
     assert main(argv) == 0
     assert (seen["repo"], seen["remote"]) == (active, f"https://github.com/{active}.git")
-    assert f'fleet repository selector: {{"selector_sha256": "{"d" * 64}", "selector_value": "{active}"}}' in seen["log"]
+    assert f'fleet_repo_selector: {{"selector_sha256": "{"d" * 64}", "selector_value": "{active}"}}' in seen["log"]
 
 
 @pytest.mark.parametrize("active", _BAKED)
-@pytest.mark.parametrize("pinned", [*_BAKED, "evil/repo"])
+@pytest.mark.parametrize("pinned", [*_BAKED, "Org/Repo", "NewOrg/Repo", "evil/repo"])
 def test_adoption_replaces_a_pin_under_either_baked_slug_with_the_active_slug(monkeypatch, tmp_path, active, pinned):
     """Defect class: after a transfer the product's wheel pin still names the old release slug, so the adoption
     refuses it as another repository's; a pin under a slug the row does not bake must still refuse."""

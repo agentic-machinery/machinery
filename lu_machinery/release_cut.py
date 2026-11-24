@@ -486,6 +486,17 @@ def _adopt_cooldown_exemption(text: str, uv: dict) -> str:
     return text
 
 
+_GITHUB_RELEASE_BASE = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/releases/download")
+
+
+def _release_base_pattern(base: str) -> str:
+    """A regex for *base*: a GitHub release base matches its owner/name in any case (GitHub slugs ignore case)."""
+    match = _GITHUB_RELEASE_BASE.fullmatch(base)
+    if match is None:
+        return re.escape(base)
+    return rf"https://github\.com/(?i:{re.escape(match[1])})/releases/download"
+
+
 def adopt_manifest(
     text: str, release_base: str, version: str, *, previous_bases: Iterable[str] = ()
 ) -> tuple[str, str]:
@@ -502,7 +513,7 @@ def adopt_manifest(
     source = _manifest_table(uv, "sources").get("lu-machinery")
     if not isinstance(source, dict) or not isinstance(old_url := source.get("url"), str):
         raise CutError("pyproject.toml must declare one lu-machinery wheel URL")
-    bases = "|".join(re.escape(base) for base in (release_base, *previous_bases))
+    bases = "|".join(_release_base_pattern(base) for base in (release_base, *previous_bases))
     old = re.fullmatch(rf"(?:{bases})/v(\d+\.\d+\.\d+)/lu_machinery-\1-py3-none-any\.whl", old_url)
     if old is None or text.count(old_url) != 1:
         raise CutError("pyproject.toml must declare one lu-machinery wheel URL from this release repository")
@@ -1791,8 +1802,11 @@ def _consumer_collection(args: argparse.Namespace) -> int:
     return 0
 
 
+_GITHUB_REMOTE_PREFIXES = ("https://github.com/", "http://github.com/", "git@github.com:", "ssh://git@github.com/")
+
+
 def _run(args: argparse.Namespace) -> int:
-    from lu_machinery.common.git_credentials import SelectorError, active_slug
+    from lu_machinery.common.git_credentials import SelectorError, active_slug, canonical_origins
     from lu_machinery.common.repo_root import primary_root, project_interpreter
     from lu_machinery.dispatcher.git import resolve_repo
 
@@ -1802,6 +1816,14 @@ def _run(args: argparse.Namespace) -> int:
         # Each row is cut, cloned and published at its active slug; a dual-slug row needs the host selector.
         machinery_repo, selector = active_slug(machinery, key=machinery.get("key"))
         product_repo, _ = active_slug(product, key=product.get("key"))
+        # A GitHub remote override is a live destination: it must be the row's active slug, never another one.
+        for flag, remote, row in (("--machinery-remote", args.machinery_remote, machinery),
+                                  ("--product-remote", args.product_remote, product)):
+            if remote and remote.casefold().startswith(_GITHUB_REMOTE_PREFIXES) and remote not in canonical_origins(
+                row, key=row.get("key")
+            ):
+                print(f"release cut refused: {flag} is not the active GitHub slug of its repository", file=sys.stderr)
+                return 1
     except (SelectorError, ValueError, OSError) as exc:
         print(f"release cut refused: fleet repository selector: {exc}", file=sys.stderr)
         return 1
@@ -1835,7 +1857,7 @@ def _run(args: argparse.Namespace) -> int:
     cut.say(f"work directory {work}")
     if selector is not None:
         # The release receipt: the step line and the archived cut.log both name the selector the cut relied on.
-        line = "fleet repository selector: " + json.dumps(selector.receipt(machinery.get("key")), sort_keys=True)
+        line = "fleet_repo_selector: " + json.dumps(selector.receipt(machinery.get("key")), sort_keys=True)
         cut.say(line)
         with (work / "cut.log").open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
