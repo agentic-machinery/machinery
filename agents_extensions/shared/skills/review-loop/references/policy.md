@@ -77,9 +77,12 @@ Record a potentially blocking trigger as a non-blocking out-of-scope note with a
 ## 4. Convergence
 
 At most 3 charged rounds; Low uses at most 2 (the red-team pass and one fix confirmation), and
-Trivial none. A round is charged when a review is dispatched at a new head, whether
-or not its verdict is recorded. The clean base merge, the repair round and the capability
-failure under [Recording the verdict](#recording-the-verdict) do not count against the 3.
+Trivial none. A dispatch reserves a round at its head. A recognized verdict charges that head
+before publication. A completed review with a nonempty reply also charges its head, including
+when its verdict cannot be parsed. A settled attempt releases its reservation when the record
+shows it yielded no verdict or completed review. Active attempts and unverifiable results keep
+their reservation. The clean base merge, the repair round and the capability failure under
+[Recording the verdict](#recording-the-verdict) do not count against the 3.
 Round 1 is the full review. Rounds 2-3 review only the diff since the last reviewed head.
 When the cap prevents the next required round, stop and send the findings ledger and exact PR
 head to `claude-cto`. The CTO records one current disposition per work item on its parent
@@ -140,8 +143,8 @@ The recorder implements the rounds above. Resolve `PRIMARY_REPO` and `PY` as in 
   findings whose only reason is a named check still pending on the reviewed head is never
   recorded: a recorded `BLOCKED` could not be cleared at that head. Wait for those checks to
   finish on the head (`gh pr checks`), then use the one same-head rerun below, with the finished
-  CI evidence inlined in the brief. The dispatcher still counts the dispatched review against
-  the round budget. A second such reply escalates to the CTO.
+  CI evidence inlined in the brief. The `BLOCKED` verdict still counts against the round budget.
+  A second such reply escalates to the CTO.
 - **A failed execution** (timeout, error, malformed reply, `BLOCKED`) is never approval. Rerun
   it once at the same head; a second failure escalates to the CTO. When a `BLOCKED` reply has
   zero findings and only a missing capability caused it, the CTO may record a capability
