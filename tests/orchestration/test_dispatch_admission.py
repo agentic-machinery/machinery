@@ -1372,6 +1372,30 @@ def test_consumer_without_admission_policy_uses_fail_closed_machinery_default(tm
     assert explicit_missing.value.code == "policy_missing"
 
 
+def test_precheck_refuses_overloaded_markerless_git_checkout_without_git(tmp_path, probe, monkeypatch, configured_roots):
+    """Defect class (PR1305-F4): precheck spawns Git subprocesses (checkout identification for the
+    policy path) before it refuses an overloaded host, so its refusal-only path is no longer cheap."""
+    import subprocess
+
+    from lu_machinery.orchestration import product_policy
+
+    root = _checkout(tmp_path / "lu-origin", _LEARN_UKRAINIAN_URL)
+    policy = root / product_policy.POLICY_REL
+    policy.parent.mkdir(parents=True)
+    policy.write_bytes((configured_roots.product / product_policy.POLICY_REL).read_bytes())
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+    probe["probe"] = adm.HostProbe(mem_available_bytes=1 * _GIB, load1=40.0, cpu_count=8, proc_available=True)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("precheck spawned a subprocess before refusing an overloaded host")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    refused = adm.precheck("workspace-write", thresholds=_LIMITS)
+    assert refused is not None and not refused.admitted
+    assert refused.failures == tuple(adm.host_failures(probe["probe"], _LIMITS))
+
+
 def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
     """Checkouts that must keep the Learn Ukrainian requirements: Git cannot tie each to one consumer row."""
     roots = {
