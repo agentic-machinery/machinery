@@ -57,9 +57,11 @@ the cycle retryable. Fleet deduplicates messages already accepted on retry.
 | `LU_STALLED_WORK_ROUTE_ENABLED` | `0` | `1` enables routing from `--tick` |
 
 Report-only is the default. Direct `--route` explicitly sends requests.
-Routing emits one supervisory message per owning lane and a separate CTO
-summary through `AuthorityService(root=None)` when rows exist. Empty reports
-send no messages. Keys include cycle, lane and
+Routing sends ordinary Fleet Comms `request` mail to each owning lane and a
+separate summary to the CTO inbox. The CTO can act on that summary when no
+lane driver is running. Verified held dispatch-turn leases go directly to the
+CTO inbox as `request` mail, even if an unrelated scan error prevents ordinary
+packets from being sent. An empty report sends no mail. Packet keys include cycle, lane and
 the digest of the sorted row set, excluding changing age values. Retries in
 one cycle deduplicate; the next cycle repeats unresolved work. No tmux input,
 push, rebase, deletion or task-record write occurs. Missing Git or GitHub
@@ -70,6 +72,11 @@ PR verdict instead produces a `verdict_unknown` row for `claude-cto`, with the
 reason and unknown age, while other rows continue routing. The keeper's
 post-step ignores the observer's exit status so a scan failure does not mark
 the keeper itself as failed.
+
+Existing misrouted supervisory deliveries expire at their original deadlines.
+If a retry produces the same packet as an older misroute, Fleet Comms issues
+it as ordinary mail with the same idempotency key and correlation ID. Further
+retries deduplicate against that mail.
 
 After merge, the host configuration owner must deploy the updated keeper
 service or add the entry point to its existing private lane-wake service,

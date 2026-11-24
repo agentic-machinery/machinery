@@ -59,38 +59,33 @@ def test_authority_delivery_states(stores, state, consumed, wake, expected):
 
 
 def test_h26_wake_observation_is_not_supervisory_consumption(stores, roster):
+    recipient = "supervisor:epic:9999"
     with AuthorityService(root=stores[0].parent) as service:
         message = service.enqueue_supervisory_request(
             sender="supervisor",
-            recipient="gemini-infra",
+            recipient=recipient,
             body=BODY_MARKER,
             correlation_id="h26",
             idempotency_key="h26",
         )
         delivery_id = message.delivery_ids[0]
-        lease = service.claim_next_delivery("gemini-infra", "h26-worker")
+        lease = service.claim_next_delivery(recipient, "h26-worker")
         assert lease is not None
         service.record_wake_receipt(delivery_id, fence_token=lease.fence_token, state="consumed")
         expected_metadata = {
             "count": 1,
             "ids": [message.message_id],
             "truncated": False,
-            "stores": {"authority": 1},
             "probe": "ok",
+            "content_included": False,
         }
-        expected_notice = {
-            "injectSteps": [
-                {
-                    "ephemeralMessage": f"PENDING ORDERS: 1 (ids {message.message_id}); authority: .venv/bin/python -m lu_machinery.fleet_comms deliveries --help"
-                }
-            ]
-        }
+        expected_notice = {}
         print(
             "H26 frozen expectations:",
             json.dumps({"status": "delivered", "metadata": expected_metadata, "hook": expected_notice}),
         )
         before = snapshot(stores)
-        metadata = run_cli("gemini-infra")
+        metadata = pending_delivery_snapshot(recipient)
         hook_proc = subprocess.run(
             ["bash", str(machinery_path("agy_hooks/pending_orders_inject.sh"))],
             input="{}",
@@ -122,13 +117,13 @@ def test_h26_wake_observation_is_not_supervisory_consumption(stores, roster):
         status = service.supervisory_delivery_status(delivery_id)
         assert status == "live_driver_consumed"
         before = snapshot(stores)
-        metadata = run_cli("gemini-infra")
+        metadata = pending_delivery_snapshot(recipient)
         assert metadata == {
             "count": 0,
             "ids": [],
             "truncated": False,
-            "stores": {"authority": 0},
             "probe": "ok",
+            "content_included": False,
         }
         hook_proc = subprocess.run(
             ["bash", str(machinery_path("agy_hooks/pending_orders_inject.sh"))],

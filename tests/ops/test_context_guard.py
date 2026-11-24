@@ -182,7 +182,7 @@ class Harness:
         self.guard.tmux.proc_root = self.proc_root
 
     def send(self, recipient: str, body: str, key: str, kind: str) -> None:
-        # Only the handoff request to a lane's own seat is supervisory; every alert is ordinary (#12837).
+        # The lane and CTO drains both process ordinary request mail.
         lane_seats = {lane.sender for lane in self.guard.registry.lanes}
         assert kind == (cg.HANDOFF_REQUEST if recipient in lane_seats else cg.ALERT), (recipient, kind, key)
         self.kinds.append((recipient, key, kind))
@@ -1183,12 +1183,6 @@ def test_fleet_sender_uses_the_data_file_identity_and_never_raises(monkeypatch: 
         def __init__(self, root=None) -> None:
             pass
 
-        def enqueue_supervisory_request(self, **kwargs):
-            calls.append(kwargs)
-            if kwargs["recipient"] == "down":
-                raise RuntimeError("store unavailable")
-            return type("Msg", (), {"message_id": "m-1"})()
-
         def publish_message(self, **kwargs):
             calls.append(kwargs)
             if kwargs["recipients"] == ("down",):
@@ -1206,7 +1200,7 @@ def test_fleet_sender_uses_the_data_file_identity_and_never_raises(monkeypatch: 
     assert all(call["sender"] == load_registry().guard_sender for call in calls)
     assert [call["idempotency_key"] for call in calls] == ["key-1", "key-2", "key-3", "key-4"]
     assert logs == [
-        "send claude-infra ok m-1",
+        "send claude-infra ok m-2",
         "send down failed RuntimeError: store unavailable",
         "send claude-cto ok m-2",
         "send down failed RuntimeError: store unavailable",
@@ -1235,8 +1229,8 @@ def guard_sends(root: Path) -> dict[str, str]:
     return {key: line.split()[3] for key, line in zip(keys, logs, strict=True)}
 
 
-def test_fleet_sender_stores_the_handoff_as_supervisory_and_alerts_as_ordinary_messages(temp_plane: Path) -> None:
-    """Defect class (#12837): an alert stored as a supervisory request, which no agent seat may acknowledge."""
+def test_fleet_sender_stores_the_handoff_and_alerts_as_ordinary_requests(temp_plane: Path) -> None:
+    """A guard request addressed to a lane or the CTO must be ordinary mail."""
     from lu_machinery.fleet_comms.authority import AuthorityService
 
     sent = guard_sends(temp_plane)
@@ -1253,7 +1247,7 @@ def test_fleet_sender_stores_the_handoff_as_supervisory_and_alerts_as_ordinary_m
             ).fetchall()
         )
     assert {key: message.kind for key, message in stored.items()} == {
-        "claude-handoff-infra-1": "supervisory-request",
+        "claude-handoff-infra-1": "request",
         "relaunch-held-infra-1": "request",
         "handoff-alert-infra-1": "request",
     }
@@ -1270,7 +1264,7 @@ def test_an_alert_delivery_is_claimed_and_acked_by_an_agent_seat(
     temp_plane: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Defect class (#12837): the CTO's ack of a guard alert refused with supervisory_consumption_required."""
-    from lu_machinery.fleet_comms.cli import EXIT_ERROR, EXIT_OK, main
+    from lu_machinery.fleet_comms.cli import EXIT_OK, main
 
     sent = guard_sends(temp_plane)
     capsys.readouterr()
@@ -1291,9 +1285,9 @@ def test_an_alert_delivery_is_claimed_and_acked_by_an_agent_seat(
         sent["relaunch-held-infra-1"], sent["handoff-alert-infra-1"],
     }
     assert all(ack["state"] == "acknowledged" for _message_id, ack in cto_claims)
-    handoff_id, refused = claim_and_ack("claude-infra", EXIT_ERROR)
+    handoff_id, acknowledged = claim_and_ack("claude-infra", EXIT_OK)
     assert handoff_id == sent["claude-handoff-infra-1"]
-    assert refused["error"] == "supervisory_consumption_required"
+    assert acknowledged["state"] == "acknowledged"
 
 
 def test_stuck_handoff_alerts_the_cto_once_without_killing(tmp_path: Path) -> None:

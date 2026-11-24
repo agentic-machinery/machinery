@@ -146,8 +146,8 @@ def run_postmerge_criteria(pr_number: int, *, apply: bool = False) -> dict:
         if unassigned:
             key = _item_set_key(repository, number, unassigned)
             with AuthorityService(root=None) as authority:
-                authority.enqueue_supervisory_request(
-                    sender="codex-devops", recipient="claude-cto",
+                authority.publish_message(
+                    sender="codex-devops", recipients=("claude-cto",), kind="request",
                     body=f"Issue {repository}#{number} has outstanding criteria missing a recognized owner or valid due date:\n"
                     + "\n".join(f"- {item['id']}: {item['text']}" for item in sorted(unassigned, key=lambda item: item["id"])),
                     correlation_id=f"postmerge-criteria:{repository}#{number}",
@@ -181,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
         f"  .venv/bin/python -m {_MODULE} --pr 123\n"
         f"  .venv/bin/python -m {_MODULE} --pr 123 --apply\n"
         "Outputs: JSON report; apply reopens unfinished issues, comments once per item set,\n"
-        "and sends idempotent supervisory requests to claude-cto for missing assignments.\n"
+        "and sends idempotent requests to the CTO inbox for missing assignments.\n"
         "Exit codes: 0 = no outstanding items; 1 = outstanding items; 2 = read/write or state error.\n"
         "Related: docs/best-practices/task-quality.md; #11213.",
     )

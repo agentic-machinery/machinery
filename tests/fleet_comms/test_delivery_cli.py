@@ -15,6 +15,7 @@ from lu_machinery.fleet_comms.authority import AuthorityService, AuthorityServic
 from lu_machinery.fleet_comms.cli import EXIT_ERROR, EXIT_NOT_FOUND, EXIT_OK, main
 
 pytestmark = pytest.mark.usefixtures("placeholder_seats_registered")
+SUPERVISORY_INBOX = "supervisor:epic:9999"
 
 
 @pytest.fixture
@@ -26,10 +27,10 @@ def plane(tmp_path, monkeypatch):
     return root
 
 
-def publish(root, *, kind="message"):
+def publish(root, *, kind="message", recipient="codex"):
     with AuthorityService(root=root) as service:
         return service.publish_message(
-            sender="operator", body="private body sentinel", recipients=("codex",),
+            sender="operator", body="private body sentinel", recipients=(recipient,),
             kind=kind, idempotency_key="delivery-cli-test",
         )
 
@@ -185,8 +186,10 @@ def test_delivery_stale_fence_after_reclaim(plane, capsys):
 
 
 def test_supervisory_delivery_requires_current_consumption(plane, capsys):
-    publish(plane, kind="supervisory-request")
-    delivery = claim(capsys)
+    with pytest.raises(AuthorityServiceError, match="supervisory_recipient_required"):
+        publish(plane, kind="supervisory-request")
+    publish(plane, kind="supervisory-request", recipient=SUPERVISORY_INBOX)
+    delivery = claim(capsys, recipient=SUPERVISORY_INBOX)
     result = invoke(capsys, *fenced("ack", delivery), expected=EXIT_ERROR)
     assert result["error"] == "supervisory_consumption_required"
     for overrides in ({"worker": "other"}, {"token": 0}):
@@ -208,14 +211,14 @@ def test_supervisory_delivery_requires_current_consumption(plane, capsys):
 
 
 def test_supervisory_delivery_successor_must_reconcile_and_consume(plane, capsys):
-    publish(plane, kind="supervisory-request")
+    publish(plane, kind="supervisory-request", recipient=SUPERVISORY_INBOX)
     with AuthorityService(root=plane) as service:
-        old = service.claim_next_delivery("codex", "old-seat", now="2000-01-01T00:00:00Z")
+        old = service.claim_next_delivery(SUPERVISORY_INBOX, "old-seat", now="2000-01-01T00:00:00Z")
         service.record_supervisory_consumption(
             old.delivery.delivery_id, worker_id="old-seat", fence_token=old.fence_token,
             driver_generation="old-gen", now="2000-01-01T00:00:01Z",
         )
-    current = claim(capsys)
+    current = claim(capsys, recipient=SUPERVISORY_INBOX)
     result = invoke(capsys, *fenced("ack", current), expected=EXIT_ERROR)
     assert result["error"] == "supervisory_consumption_required"
     receipt = invoke(capsys, *fenced("consume", current), "--driver-generation", "new-gen")

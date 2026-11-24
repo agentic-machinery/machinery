@@ -469,7 +469,7 @@ def test_empty_scan_sends_no_lane_request_or_cto_summary(host):
     def enqueue(**kwargs):
         pytest.fail("empty scan must not enqueue any message")
 
-    service = SimpleNamespace(enqueue_supervisory_request=enqueue)
+    service = SimpleNamespace(publish_message=enqueue)
     assert mod.route(report, cycle=1, service=service) == []
     (machinery / ".git").rmdir()
     assert mod.run(args, now=NOW)["errors"] == [f"{MACHINERY}: missing_fleet_checkout"]
@@ -492,6 +492,45 @@ def test_route_is_idempotent_per_lane_and_cycle_with_real_authority(host):
         assert set(again).isdisjoint(first)
         messages = [service.get_message(mid) for mid in first]
         assert [message.recipient for message in messages] == ["claude-infra", "codex-devops", "claude-cto"]
+
+
+def test_stalled_cycle_sends_mail_to_lane_and_cto(host, capsys):
+    """Defect class: a stalled-work cycle enqueues a supervisory request to a recipient without a supervisory consumer."""
+    from lu_machinery.fleet_comms.cli import EXIT_OK, main
+
+    host.record()
+    host.facts.local_branches["codex/fix"] = LOCAL
+    report = host.scan()
+    report["rows"].append({
+        "kind": "held_turn_lease",
+        "lane": "claude-cto",
+        "stream_id": "epic:9999",
+        "lease_id": "fixture-lease",
+        "generation": 1,
+        "task_id": "fixture-turn",
+    })
+    plane = host.tmp_path / "fleet"
+    host.monkeypatch.setenv("FLEET_COMMS_ROOT", str(plane))
+    with AuthorityService(root=plane) as service:
+        lane_id, summary_id, alert_id = mod.route(report, cycle=42, service=service)
+
+    for recipient, expected_ids in (
+        ("codex-devops", {lane_id}),
+        ("claude-cto", {summary_id, alert_id}),
+    ):
+        received = set()
+        for _ in expected_ids:
+            worker = ["--worker-id", recipient]
+            assert main(["deliveries", "receive", "--recipient", recipient, *worker]) == EXIT_OK
+            delivery = json.loads(capsys.readouterr().out)["delivery"]
+            received.add(delivery["message_id"])
+            assert delivery["kind"] == "request"
+            assert main([
+                "deliveries", "ack", delivery["delivery_id"], *worker,
+                "--fence-token", str(delivery["fence_token"]),
+            ]) == EXIT_OK
+            assert json.loads(capsys.readouterr().out)["state"] == "acknowledged"
+        assert received == expected_ids
 
 
 def test_tick_cadence_and_retry(host):

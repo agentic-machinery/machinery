@@ -562,9 +562,10 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
             payload = json.dumps(rows, sort_keys=True, separators=(",", ":"))
             digest = hashlib.sha256(payload.encode()).hexdigest()
             key = f"stalled:{cycle}:{kind}:{lane}:{digest}"
-            message = service.enqueue_supervisory_request(
+            message = service.publish_message(
                 sender="claude-cto",
-                recipient=lane,
+                recipients=(lane,),
+                kind="request",
                 body=f"Stalled work {kind}. Return each row to its owning lane until landed or explicitly abandoned.\n{payload}",
                 correlation_id=f"stalled:{cycle}",
                 idempotency_key=key,
@@ -587,9 +588,10 @@ def route(report: dict[str, Any], *, cycle: int, service: AuthorityService) -> l
         lease_key = str(row.get("lease_id") or row.get("task_id") or hashlib.sha256(payload.encode()).hexdigest()[:16])
         gen_key = str(row["generation"]) if row.get("generation") is not None else "unknown"
         key = f"stalled:held-turn-lease:{stream_key}:{lease_key}:{gen_key}"
-        message = service.enqueue_supervisory_request(
+        message = service.publish_message(
             sender="claude-cto",
-            recipient="claude-cto",
+            recipients=("claude-cto",),
+            kind="request",
             body=(
                 f"Held dispatch-turn lease on {stream_key} (lease_id={lease_key}, generation={gen_key}). "
                 f"{_TURN_LEASE_RECOVERY_ADVICE}\n{payload}"
