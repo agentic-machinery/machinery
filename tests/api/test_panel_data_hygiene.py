@@ -19,6 +19,7 @@ from lu_machinery.api import (
     state_router,
 )
 from lu_machinery.api.monitor_context import fixture_context
+from lu_machinery.orchestration.fleet_repos import FleetRepo
 from tests.opsec_fixtures import TOKEN
 
 STAMP = "2030-01-01T00:00:00Z"
@@ -101,8 +102,12 @@ def _inputs(monkeypatch, ctx, dirty):
 
     monkeypatch.setattr(state_router, "compute_routing_budget", budget)
     monkeypatch.setattr(state_router, "scan_lane_health", lambda *_args, **_kwargs: {})
+    # The test's own registry: the PR row's link follows its first project, not the bundled catalog.
+    catalog = {key: FleetRepo(key, f"example-owner/{key}", key, "public-monorepo") for key in ("first", "second", "third")}
+    monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: catalog)
+    monkeypatch.setattr(git_hygiene_router, "_UNKNOWN_SINCE", {})
     node = {"number": 7, "title": dirty, "headRefName": "codex/unvetted " + dirty, "url": "https://github.com/" + dirty,
-            "createdAt": dirty, "mergeStateStatus": dirty, "mergeQueueEntry": {"state": dirty, "position": 1},
+            "isDraft": False, "createdAt": dirty, "mergeStateStatus": dirty, "mergeQueueEntry": {"state": dirty, "position": 1},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": dirty},
                                               "status": {"context": {"state": dirty}}}}]}}
     monkeypatch.setattr(git_hygiene_router.github_client, "run", lambda *_args, **_kwargs: SimpleNamespace(
@@ -153,7 +158,7 @@ def test_panel_response_never_echoes_unvetted_provider_values(panel_client, monk
         assert data["subscriptions"]["ends"]["claude_b"] == {"ended": False, "ends_on": "2030-02-01"}
     elif route.endswith("pull-requests"):
         assert data["repositories"][0]["pull_requests"][0]["number"] == 7
-        assert data["repositories"][0]["pull_requests"][0]["url"] == "https://github.com/learn-ukrainian/learn-ukrainian.github.io/pull/7"
+        assert data["repositories"][0]["pull_requests"][0]["url"] == "https://github.com/example-owner/first/pull/7"
     elif route.endswith("alerts"):
         assert data["status"] == "ok" and len(data["alerts"]) == 1
         assert data["alerts"][0]["alertname"] == "UnrecognizedAlert"

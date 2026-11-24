@@ -171,10 +171,11 @@ function renderCapacitySummary(subs, logins) {
 }
 
 function renderQueueSummary(prs, prState = null) {
-  if (prs.status !== "ok") return unknown(prs.reason);
   const repos = Array.isArray(prs.repositories) ? prs.repositories : [];
+  // A whole failed read still lists every project with since when it is unknown; show those rows.
+  if (prs.status !== "ok" && !repos.length) return unknown(prs.reason);
   const allUnknown = repos.length > 0 && !repos.some(repo => repo && repo.status === "ok");
-  const unavailable = prState === "unavailable" || allUnknown;
+  const unavailable = prs.status !== "ok" || prState === "unavailable" || allUnknown;
   const ageUnknown = !unavailable && prState === "unknown";
   const unbounded = !unavailable && prState === "unbounded";
   const expired = !unavailable && !ageUnknown && !unbounded && (prState === "expired" || prState === true);

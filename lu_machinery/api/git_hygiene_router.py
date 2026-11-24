@@ -731,20 +731,60 @@ def _unknown_pull_requests(
     return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
 
 
-def _requirement_lists(manifest: dict[str, Any]) -> list[tuple[list[Any], bool]] | None:
-    """Every dependency array of a manifest, each with whether it may hold PEP 735 include tables.
+def _group_requirements(groups: dict[str, Any]) -> list[Any] | None:
+    """The requirement strings of every PEP 735 dependency group, or ``None`` for an invalid table.
 
-    ``None`` when any of them has a shape the manifest format does not allow.
+    Invalid: a group that is not an array, two names equal after normalization, an entry that is
+    neither a string nor an ``{include-group = "<name>"}`` table, an include naming no group, or an
+    include cycle. Every group is read, so an include adds no requirement that is not already listed.
+    """
+    entries: dict[str, list[Any]] = {}
+    for name, items in groups.items():
+        if not isinstance(items, list) or canonicalize_name(name) in entries:
+            return None
+        entries[canonicalize_name(name)] = items
+    requirements: list[Any] = []
+    includes: dict[str, set[str]] = {name: set() for name in entries}
+    for name, items in entries.items():
+        for item in items:
+            if isinstance(item, dict):
+                target = item.get("include-group") if set(item) == {"include-group"} else None
+                if not isinstance(target, str) or canonicalize_name(target) not in entries:
+                    return None
+                includes[name].add(canonicalize_name(target))
+            else:
+                requirements.append(item)
+    # An include cycle leaves groups that never reach in-degree zero (Kahn's algorithm).
+    indegree = dict.fromkeys(entries, 0)
+    for targets in includes.values():
+        for target in targets:
+            indegree[target] += 1
+    ready = [name for name, count in indegree.items() if count == 0]
+    resolved = 0
+    while ready:
+        resolved += 1
+        for target in includes[ready.pop()]:
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                ready.append(target)
+    return requirements if resolved == len(entries) else None
+
+
+def _requirement_lists(manifest: dict[str, Any]) -> list[list[Any]] | None:
+    """Every dependency array of a manifest; ``None`` when any has a shape the format does not allow,
+    two extras share a normalized name, or the dependencies are dynamic (declared outside the file).
     """
     project, groups = manifest.get("project", {}), manifest.get("dependency-groups", {})
     if not isinstance(project, dict) or not isinstance(groups, dict):
         return None
-    optional = project.get("optional-dependencies", {})
-    if not isinstance(optional, dict):
+    optional, dynamic = project.get("optional-dependencies", {}), project.get("dynamic", [])
+    grouped = _group_requirements(groups)
+    if (not isinstance(optional, dict) or not isinstance(dynamic, list) or grouped is None
+            or {"dependencies", "optional-dependencies"} & {item for item in dynamic if isinstance(item, str)}
+            or len({canonicalize_name(extra) for extra in optional}) != len(optional)):
         return None
-    lists = [(project.get("dependencies", []), False), *((value, False) for value in optional.values()),
-             *((value, True) for value in groups.values())]
-    return lists if all(isinstance(items, list) for items, _ in lists) else None
+    lists = [project.get("dependencies", []), *optional.values(), grouped]
+    return lists if all(isinstance(items, list) for items in lists) else None
 
 
 def _exact_pins(text: str) -> set[str] | None:
@@ -758,11 +798,8 @@ def _exact_pins(text: str) -> set[str] | None:
         if lists is None:
             return None
         versions: set[str] = set()
-        for items, includes in lists:
+        for items in lists:
             for item in items:
-                # A PEP 735 include table has the one key include-group, naming a group.
-                if includes and isinstance(item, dict) and set(item) == {"include-group"} and isinstance(item["include-group"], str):
-                    continue
                 if not isinstance(item, str):
                     return None
                 req = Requirement(item)
@@ -802,25 +839,77 @@ def _pin(repo: dict[str, Any], *, private: bool, errored: bool) -> dict[str, Any
 
 
 def _default_branch_ci(repo: dict[str, Any], *, errored: bool) -> dict[str, Any] | None:
-    """The check rollup of the default branch's latest commit; no rollup is ``None``, never success.
+    """The check rollup of the default branch's latest commit: ``{"ci": None}`` ("none reported")
+    only when GitHub says there is no default branch or no rollup, never success.
 
-    The whole entry is ``None`` (unknown) when the field is missing or GitHub errored on it.
+    The whole entry is ``None`` (unknown) when GitHub errored on the field, or any part of it is
+    missing, of the wrong type, or a state outside GitHub's set.
     """
     if errored or "defaultBranchRef" not in repo:
         return None
-    tip = _mapping(_mapping(repo["defaultBranchRef"]).get("target"))
-    return {"ci": panel_values.choice(_lower(_mapping(tip.get("statusCheckRollup")).get("state")), _CI_STATES)}
+    branch = repo["defaultBranchRef"]
+    if branch is None:  # a repository with no default branch has no CI on it
+        return {"ci": None}
+    tip = branch.get("target") if isinstance(branch, dict) else None
+    if not isinstance(tip, dict) or "statusCheckRollup" not in tip:
+        return None
+    rollup = tip["statusCheckRollup"]
+    if rollup is None:
+        return {"ci": None}
+    state = _lower(rollup.get("state")) if isinstance(rollup, dict) else None
+    return {"ci": state} if state in _CI_STATES else None
 
 
-def _errored_fields(document: object) -> dict[str, set[str]]:
-    """Fields GitHub reported an error for, by repository alias: ``{"r0": {"pin"}}``."""
+def _errored_fields(document: object, aliases: set[str]) -> dict[str, set[str]] | None:
+    """Fields GitHub reported an error for, by repository alias: ``{"r0": {"pin"}}``.
+
+    An error on a repository itself is ``""``. ``None`` when an error names no repository of this
+    query (no path, a malformed one, or another root), since then no reading can be trusted.
+    """
     errors = document.get("errors") if isinstance(document, dict) else None
+    if errors is not None and not isinstance(errors, list):
+        return None
     found: dict[str, set[str]] = {}
-    for item in errors if isinstance(errors, list) else []:
+    for item in errors or []:
         path = item.get("path") if isinstance(item, dict) else None
-        if isinstance(path, list) and len(path) >= 2 and isinstance(path[0], str) and isinstance(path[1], str):
-            found.setdefault(path[0], set()).add(path[1])
+        if not isinstance(path, list) or not path or path[0] not in aliases:
+            return None
+        field = path[1] if len(path) > 1 else ""
+        found.setdefault(path[0], set()).add(field if isinstance(field, str) else "")
     return found
+
+
+# Keys every PR node, its commit and its queue entry carry when GitHub answers the query as asked.
+_PR_NODE_KEYS = {"number", "isDraft", "createdAt", "headRefName", "mergeStateStatus", "mergeQueueEntry", "commits"}
+
+
+def _complete_pull_request(node: object) -> bool:
+    """Whether a PR node has every field the query asked for, each null or of its own type.
+
+    A field GitHub left out or sent malformed must not read as "not queued", "no CI yet" or "none".
+    """
+    if not isinstance(node, dict) or not node.keys() >= _PR_NODE_KEYS:
+        return False
+    queue, commits = node["mergeQueueEntry"], node["commits"]
+    if queue is not None and not (isinstance(queue, dict) and queue.keys() >= {"position", "state"}):
+        return False
+    nodes = commits.get("nodes") if isinstance(commits, dict) else None
+    if not isinstance(nodes, list) or not all(item is None or isinstance(item, dict) for item in nodes):
+        return False
+    if not nodes or nodes[-1] is None:
+        return True
+    commit = nodes[-1].get("commit")
+    if not isinstance(commit, dict) or not commit.keys() >= {"statusCheckRollup", "status"}:
+        return False
+    rollup, status = commit["statusCheckRollup"], commit["status"]
+    if rollup is not None and not (isinstance(rollup, dict) and "state" in rollup):
+        return False
+    if status is None:
+        return True
+    if not isinstance(status, dict) or "context" not in status:
+        return False
+    context = status["context"]
+    return context is None or (isinstance(context, dict) and "state" in context)
 
 
 def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) -> dict[str, Any]:
@@ -875,7 +964,9 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
     if not isinstance(data, dict):
         return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
-    errored = _errored_fields(document)
+    errored = _errored_fields(document, {f"r{index}" for index, ok in enumerate(valid) if ok})
+    if errored is None:
+        return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
     rows = []
     for index, (key, owner, name, display) in enumerate(targets):
         repo = data.get(f"r{index}")
@@ -883,7 +974,11 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         if not valid[index]:
             rows.append(_unreadable_row(entry, "invalid_repository", observed_at))
             continue
-        if not isinstance(repo, dict) or not isinstance(repo.get("pullRequests"), dict):
+        failed = errored.get(f"r{index}", set())
+        # An error on the repository or anywhere in its PRs leaves them unread (GitHub nulls the
+        # failed field and keeps its parent), never an empty queue or a PR with no CI.
+        if (not isinstance(repo, dict) or not isinstance(repo.get("pullRequests"), dict)
+                or failed - {"isPrivate", "defaultBranchRef", "pin"}):
             rows.append(_unreadable_row(entry, "not_readable", observed_at))
             continue
         # Fail closed: anything but an explicit public repository, or a registry role that is not
@@ -893,7 +988,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         total = repo["pullRequests"].get("totalCount")
         # A missing or null PR node would silently read as fewer open PRs, and a count that is not a
         # non-negative integer is no reading of the open PRs at all.
-        if (not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes)
+        if (not isinstance(nodes, list) or not all(_complete_pull_request(node) for node in nodes)
                 or type(total) is not int or total < 0):
             rows.append(_unreadable_row(entry, "github_invalid_response", observed_at, private=private))
             continue
@@ -904,8 +999,8 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
             "reason": None,
             "private": private,
             "open_total": total,
-            "default_branch": _default_branch_ci(repo, errored="defaultBranchRef" in errored.get(f"r{index}", ())),
-            "pin": _pin(repo, private=private, errored="pin" in errored.get(f"r{index}", ())),
+            "default_branch": _default_branch_ci(repo, errored="defaultBranchRef" in failed),
+            "pin": _pin(repo, private=private, errored="pin" in failed),
             "unknown_since": None,
             "pull_requests": [
                 _pull_request_row(node, private=private, repository=f"{owner}/{name}", tasks_dir=records)

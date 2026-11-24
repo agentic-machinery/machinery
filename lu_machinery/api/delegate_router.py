@@ -632,9 +632,10 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     rows = []
     claims: list[tuple[str | None, list[str]]] = []
     # Live workers by claimed repository (read-only reviewers included). "" counts a confirmed live
-    # record with no usable claim, so the Projects line can say how many are not attributed. A record
-    # that cannot be read is no confirmed worker. A task store that cannot be read and searched (one
-    # without search permission lists names but not their records) or listed gives no counts.
+    # record with no usable claim, so the Projects line can say how many are not attributed. A task
+    # store that cannot be read and searched (one without search permission lists names but not their
+    # records) or listed, or a record that cannot be statted or read, gives no counts: the missing
+    # record may be a live worker.
     live_by_repository: dict[str, int] = {}
     listing_failures: list[OSError] = []
     store_readable = os.access(tasks_dir, os.R_OK | os.X_OK)
@@ -663,8 +664,10 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
                 if status not in ACTIVE_TASK_STATUSES:
                     continue
                 summary = _task_summary(path, task)
-        except OSError:
+        except OSError as exc:
             claims.append((None, []))
+            if not isinstance(exc, FileNotFoundError):  # a record removed during the scan is no worker
+                listing_failures.append(exc)
             continue
         except ValueError:
             continue

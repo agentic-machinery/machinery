@@ -819,6 +819,13 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
 
             local.setattr(delegate_router.os, "scandir", failing_listing)
             assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+        # A listed record that cannot be read may be a live worker: no counts either, until it reads again.
+        (tasks / "live.json").chmod(0o000)
+        try:
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+        finally:
+            (tasks / "live.json").chmod(0o644)
+        assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1
         def forbidden(*args, **kwargs):
             raise AssertionError("request collected task history")
         monkeypatch.setattr(delegate_router, "_active_snapshot_tasks", forbidden)

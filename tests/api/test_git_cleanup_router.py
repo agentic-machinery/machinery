@@ -438,11 +438,22 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
                       '[project]\ndependencies = ["lu-machinery==1.2.*"]\n',
                       '[dependency-groups]\ng = [0]\n', '[dependency-groups]\ng = [{include-group = 123}]\n',
                       '[dependency-groups]\ng = [{other = "x"}]\n',
-                      '[dependency-groups]\nb = ["lu-machinery==1.0"]\ng = [{include-group = "b", extra = 1}]\n'):
+                      '[dependency-groups]\nb = ["lu-machinery==1.0"]\ng = [{include-group = "b", extra = 1}]\n',
+                      # PEP 735: an include must name a group, includes must not cycle, names must not collide.
+                      '[dependency-groups]\na = [{include-group = "missing"}]\n',
+                      '[dependency-groups]\na = ["lu-machinery==1.2.3", {include-group = "b"}]\nb = [{include-group = "a"}]\n',
+                      '[dependency-groups]\na = ["lu-machinery==1.2.3", {include-group = "a"}]\n',
+                      '[dependency-groups]\na-b = ["lu-machinery==1.2.3"]\na_b = []\n',
+                      '[project]\noptional-dependencies = {X = ["lu-machinery==1.2.3"], x = []}\n',
+                      # Dependencies declared outside the file may pin it there.
+                      '[project]\ndynamic = ["dependencies"]\n', '[project]\ndynamic = "dependencies"\n'):
         assert pin_of(manifest(malformed))["state"] == "unknown", malformed
     # A PEP 735 include table is allowed in a dependency group, and a pin beside it still reads.
     included = '[dependency-groups]\nbase = ["lu-machinery==3.4.5"]\nall = [{include-group = "base"}]\n'
     assert pin_of(manifest(included)) == {"state": "pinned", "version": "3.4.5"}
+    # Names compare normalized, so an include may spell its target another way.
+    respelled = '[dependency-groups]\nBase_Set = ["lu-machinery==3.4.5"]\nall = [{include-group = "base-set"}]\n'
+    assert pin_of(manifest(respelled)) == {"state": "pinned", "version": "3.4.5"}
     for unknown in (
         {}, manifest("not = [toml"), manifest('[project]\ndependencies = ["lu-machinery>=1"]\n'),
         manifest('[project]\ndependencies = ["lu-machinery==1.0"]\n[project.optional-dependencies]\nx = ["lu-machinery==2.0"]\n'),
@@ -451,6 +462,17 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
         assert pin_of(unknown) == {"state": "unknown", "version": None}
     assert git_hygiene_router._pin(manifest(dependency), private=False, errored=True)["state"] == "unknown"
     assert git_hygiene_router._default_branch_ci({}, errored=False) is None
+    # Default-branch CI: "none reported" only when GitHub says there is no branch or no rollup;
+    # a missing or malformed part, or a state outside GitHub's set, is unknown.
+    def ci_of(branch: object) -> dict | None:
+        return git_hygiene_router._default_branch_ci({"defaultBranchRef": branch}, errored=False)
+
+    assert ci_of(None) == {"ci": None}
+    assert ci_of({"target": {"statusCheckRollup": None}}) == {"ci": None}
+    assert ci_of({"target": {"statusCheckRollup": {"state": "SUCCESS"}}}) == {"ci": "success"}
+    for malformed in ({}, {"target": None}, {"target": {}}, {"target": {"statusCheckRollup": "x"}},
+                      {"target": {"statusCheckRollup": {}}}, {"target": {"statusCheckRollup": {"state": "GREEN"}}}, "x"):
+        assert ci_of(malformed) is None, malformed
 
 
 def _heading_repo(*, loaded: bool) -> dict:
@@ -581,8 +603,8 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     _graphql_result(monkeypatch, 0, "not json")
     assert git_hygiene_router.compute_pull_requests(tmp_path)["reason"] == "github_invalid_response"
     # GitHub's nullable commit nodes and contexts read as "no CI yet", never an exception.
-    node = {"number": 1, "commits": {"nodes": [None]}}
-    nulls = {"number": 2, "commits": {"nodes": [{"commit": {"statusCheckRollup": None, "status": None}}]}}
+    node = {**_open_pr("codex/one", 1), "commits": {"nodes": [None]}}
+    nulls = {**_open_pr("codex/two", 2), "commits": {"nodes": [{"commit": {"statusCheckRollup": None, "status": None}}]}}
     repos = {f"r{i}": {"isPrivate": False, "pullRequests": {"totalCount": 2, "nodes": [node, nulls]}} for i in range(3)}
     _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
     rows = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][0]["pull_requests"]
@@ -629,6 +651,28 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     _ok, null_node, no_list = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]
     for repo in (null_node, no_list):
         assert (repo["status"], repo["reason"], repo["pull_requests"]) == ("unknown", "github_invalid_response", [])
+    # A PR node that lacks a field the query asked for is no reading of that PR either.
+    for field in ("mergeQueueEntry", "commits", "isDraft"):
+        partial = {key: value for key, value in _open_pr("codex/x", 3).items() if key != field}
+        repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [partial]}}
+        _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
+        assert git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][1]["status"] == "unknown", field
+    # GitHub nulls a failed field and keeps its parent: an error anywhere in a repository's PRs leaves
+    # that repository unknown (never "not queued" or "no CI yet"); one on its pin or CI leaves only that
+    # field unknown; an error naming no repository of the query is no reading at all.
+    repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [_open_pr("codex/x", 3)]}}
+    repos["r2"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [_open_pr("codex/y", 4)]}}
+    repos["r0"] = {**repos["r0"], "pin": None}  # the failed field, nulled
+    errors = [{"path": ["r1", "pullRequests", "nodes", 0, "mergeQueueEntry"], "message": "failed"},
+              {"path": ["r0", "pin"], "message": "failed"}]
+    _graphql_result(monkeypatch, 1, json.dumps({"data": repos, "errors": errors}))
+    pin_failed, queue_failed, third = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]
+    assert (queue_failed["status"], queue_failed["pull_requests"], queue_failed["unknown_since"] is not None) == (
+        "unknown", [], True)
+    assert (pin_failed["status"], pin_failed["pin"]["state"], third["status"]) == ("ok", "unknown", "ok")
+    for stray in ({"message": "no path"}, {"path": ["elsewhere"], "message": "x"}, {"path": [], "message": "x"}):
+        _graphql_result(monkeypatch, 1, json.dumps({"data": repos, "errors": [stray]}))
+        assert git_hygiene_router.compute_pull_requests(tmp_path)["status"] == "unknown", stray
 
 
 # Untrusted identifier text. These strings are filename-safe under the old check.
@@ -649,7 +693,7 @@ _KEPT_ARCHIVED = "kept-archived"
 def _open_pr(branch: str, number: int) -> dict:
     return {
         "number": number, "isDraft": False, "createdAt": "2030-01-01T00:00:00Z",
-        "headRefName": branch, "mergeStateStatus": "CLEAN",
+        "headRefName": branch, "mergeStateStatus": "CLEAN", "mergeQueueEntry": None,
         "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"},
                                           "status": {"context": {"state": "SUCCESS"}}}}]},
     }
