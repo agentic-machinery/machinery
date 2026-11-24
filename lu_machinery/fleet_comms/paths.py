@@ -10,7 +10,6 @@ from lu_machinery.common.repo_root import (
     MachineryConfigError,
     configured_interpreter,
     configured_primary_root,
-    in_tree_source,
     is_configured_state_root,
     resolve_path,
     state_root,
@@ -51,12 +50,17 @@ class LiveStoreReleaseError(PlaneRootAnchorError):
 def _installed_release_venv(state: Path) -> Path | None:
     """Resolve the operator-configured virtual environment authorized to write the live store.
 
-    A configured ``LU_PYTHON`` / ``LEARN_UKRAINIAN_PYTHON`` inside a real PEP 405 virtual
-    environment (regular non-symlink ``pyvenv.cfg``) identifies the installed runtime even
-    when ``state_root`` is a dedicated non-Git directory without a ``.venv``. Otherwise
-    falls back to the configured primary checkout's ``.venv`` (today's layout). Never
-    trusts ``sys.prefix`` or a worktree-local environment.
+    In today's layout (``state`` is a primary Git checkout), the authorized release is
+    always ``state / ".venv"`` so an ambient ``LEARN_UKRAINIAN_PYTHON`` (such as a test
+    environment) can never authorize writes against a primary checkout's live store. When
+    ``state`` is a dedicated non-Git ``LU_STATE_ROOT`` without a ``.venv``, an explicit
+    ``LU_PYTHON`` / ``LEARN_UKRAINIAN_PYTHON`` inside a real PEP 405 virtual environment
+    (regular non-symlink ``pyvenv.cfg``) identifies the installed runtime, falling back to
+    the configured primary checkout's ``.venv``. Never trusts ``sys.prefix`` or a
+    worktree-local environment.
     """
+    if (state / ".git").is_dir():
+        return state / ".venv"
     interpreter = configured_interpreter()
     if (
         interpreter is not None
@@ -71,8 +75,6 @@ def _installed_release_venv(state: Path) -> Path | None:
     primary = configured_primary_root()
     if primary is not None:
         return resolve_path(primary, strict=True) / ".venv"
-    if (state / ".git").is_dir() or in_tree_source():
-        return state / ".venv"
     return None
 
 

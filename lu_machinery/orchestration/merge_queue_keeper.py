@@ -23,7 +23,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lu_machinery.common import json_depth
 from lu_machinery.common.github_client import GitHubRateLimited
-from lu_machinery.common.repo_root import configured_state_root
+from lu_machinery.common.repo_root import MachineryConfigError, configured_github_slug, configured_state_root
 from lu_machinery.gh_merge_queue_status import extract_pr_number
 from lu_machinery.github_check_rollup import bind_workflow_runs, group_collapsed_by_name, project_check_runs
 from lu_machinery.ops import verify_run as ops_verify_run
@@ -3924,7 +3924,7 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--apply", action="store_true", help="Enqueue, revoke, comment, and persist state.")
     parser.add_argument(
         "--repo",
-        default="learn-ukrainian/learn-ukrainian.github.io",
+        default=_DEFAULT_REPO,
         help="GitHub owner/repository (default: project repository).",
     )
     parser.add_argument(
@@ -3934,13 +3934,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--state-file",
         type=Path,
         default=None,
-        help="Keeper state JSON path (default: <repo-root>/batch_state/merge_queue_keeper.json).",
+        help=(
+            "Keeper state JSON path (default: under LU_STATE_ROOT when configured—"
+            "per-repo slug for non-default repos on a non-Git state root—"
+            "else <repo-root>/batch_state/merge_queue_keeper.json)."
+        ),
     )
     parser.add_argument(
         "--lock-file",
         type=Path,
         default=None,
-        help="Keeper lock file path (default: <repo-root>/batch_state/locks/merge_queue_keeper.lock).",
+        help=(
+            "Keeper lock file path (default: under LU_STATE_ROOT/batch_state/locks when configured—"
+            "per-repo slug for non-default repos on a non-Git state root—"
+            "else <repo-root>/batch_state/locks/merge_queue_keeper.lock)."
+        ),
     )
     parser.add_argument(
         "--direct-land-repo",
@@ -4005,13 +4013,58 @@ def _direct_config_from_args(args: argparse.Namespace) -> DirectLandingConfig | 
     )
 
 
-def default_keeper_paths(repo_root: Path) -> tuple[Path, Path]:
-    """Resolve default keeper state and lock paths, converging on ``LU_STATE_ROOT`` when set."""
+_DEFAULT_REPO = "learn-ukrainian/learn-ukrainian.github.io"
+_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+
+def _is_default_repo(repo: str) -> bool:
+    norm = normalize_repository(repo)
+    if norm == normalize_repository(_DEFAULT_REPO):
+        return True
+    try:
+        configured_slug = configured_github_slug()
+    except MachineryConfigError:
+        return False
+    return configured_slug is not None and norm == normalize_repository(configured_slug)
+
+
+def default_keeper_paths(repo_root: Path, repo: str = _DEFAULT_REPO) -> tuple[Path, Path]:
+    """Resolve default keeper state and lock paths without mixing repositories.
+
+    In today's layout (no ``LU_STATE_ROOT`` or a Git checkout state root), non-default
+    repositories keep their own ``<repo-root>/batch_state`` state and lock files, while
+    the default product repository converges on ``LU_STATE_ROOT`` when set. Under a
+    dedicated non-Git ``LU_STATE_ROOT``, the default repository uses
+    ``batch_state/merge_queue_keeper.json`` and non-default repositories get distinct
+    per-repository slugged files under ``LU_STATE_ROOT/batch_state/``.
+    """
     configured_state = configured_state_root()
-    state_base = configured_state.resolve() if configured_state is not None else repo_root.resolve()
+    if configured_state is None:
+        state_base = repo_root.resolve()
+        return (
+            state_base / "batch_state/merge_queue_keeper.json",
+            state_base / "batch_state/locks/merge_queue_keeper.lock",
+        )
+    resolved_state = configured_state.resolve()
+    if _is_default_repo(repo):
+        return (
+            resolved_state / "batch_state/merge_queue_keeper.json",
+            resolved_state / "batch_state/locks/merge_queue_keeper.lock",
+        )
+    if (resolved_state / ".git").is_dir():
+        state_base = repo_root.resolve()
+        return (
+            state_base / "batch_state/merge_queue_keeper.json",
+            state_base / "batch_state/locks/merge_queue_keeper.lock",
+        )
+    norm = normalize_repository(repo)
+    repo_part = norm.removeprefix("github.com/")
+    if not _REPO_SLUG_RE.fullmatch(repo_part) or ".." in repo_part.split("/"):
+        raise KeeperError(f"invalid repository slug for default keeper state path: {repo!r}")
+    slug = repo_part.replace("/", "__")
     return (
-        state_base / "batch_state/merge_queue_keeper.json",
-        state_base / "batch_state/locks/merge_queue_keeper.lock",
+        resolved_state / "batch_state/merge_queue_keeper" / f"{slug}.json",
+        resolved_state / "batch_state/locks" / f"merge_queue_keeper.{slug}.lock",
     )
 
 
@@ -4020,7 +4073,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     root = args.repo_root.resolve()
     direct_config = _direct_config_from_args(args)
-    default_state_path, default_lock_path = default_keeper_paths(root)
+    default_state_path, default_lock_path = default_keeper_paths(root, args.repo)
     state_path = args.state_file.resolve() if args.state_file is not None else default_state_path
     lock_path = args.lock_file.resolve() if args.lock_file is not None else default_lock_path
     run_kwargs: dict[str, Any] = {}

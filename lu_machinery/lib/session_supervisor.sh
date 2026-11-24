@@ -157,18 +157,24 @@ claim_session_supervisor_env() {
 
   local state_root
   state_root="$(_canonical_state_root "$project_dir")" || return 1
-  local python_bin interp_root="$state_root"
+  local python_bin configured_python configured_primary
   if [ -n "${LU_PYTHON:-}" ] && [ -n "${LEARN_UKRAINIAN_PYTHON:-}" ] && [ "$LU_PYTHON" != "$LEARN_UKRAINIAN_PYTHON" ]; then
     echo "Error: LU_PYTHON and LEARN_UKRAINIAN_PYTHON are set to different values" >&2
     return 1
   fi
-  if [ ! -x "$state_root/.venv/bin/python" ] && [ -d "$project_dir" ]; then
-    interp_root="$project_dir"
-  fi
-  if [ -n "${LU_PYTHON:-}" ] && [ -z "${LEARN_UKRAINIAN_PYTHON:-}" ]; then
-    python_bin="$(LEARN_UKRAINIAN_PYTHON="$LU_PYTHON" project_interpreter_resolve "$interp_root")" || return 1
+  configured_python="${LU_PYTHON:-${LEARN_UKRAINIAN_PYTHON:-}}"
+  if [ -n "$configured_python" ]; then
+    python_bin="$(LEARN_UKRAINIAN_PYTHON="$configured_python" project_interpreter_resolve "$state_root")" || return 1
+  elif [ -d "$state_root/.git" ]; then
+    python_bin="$(project_interpreter_resolve "$state_root")" || return 1
   else
-    python_bin="$(project_interpreter_resolve "$interp_root")" || return 1
+    configured_primary="${LU_PRIMARY_REPO_ROOT:-${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}}"
+    if [ -n "$configured_primary" ]; then
+      python_bin="$(project_interpreter_resolve "$configured_primary")" || return 1
+    else
+      echo "Error: non-Git state root requires LU_PYTHON, LEARN_UKRAINIAN_PYTHON, or LU_PRIMARY_REPO_ROOT" >&2
+      return 1
+    fi
   fi
 
   local supervisor_tmp release_tmp

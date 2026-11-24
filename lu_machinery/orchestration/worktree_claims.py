@@ -47,6 +47,7 @@ from lu_machinery.common.repo_root import (
     configured_repos_root,
     is_configured_state_root,
     main_checkout_root,
+    repos_root,
     state_root,
 )
 from lu_machinery.guardrails import worktree_containment
@@ -691,7 +692,6 @@ def control_plane_root(repo_root: Path) -> Path:
         repos_base = configured_repos_root()
     except MachineryConfigError as exc:
         raise ControlPlaneError(f"machinery repos root unusable: {exc}") from exc
-    sibling_parent = repos_base.resolve() if repos_base is not None else public.parent
     try:
         primary_cfg = configured_primary_root()
     except MachineryConfigError:
@@ -704,9 +704,19 @@ def control_plane_root(repo_root: Path) -> Path:
         product_cfg = None
     if product_cfg is not None and main_checkout_root(product_cfg).resolve() == repo:
         return public
+    if repos_base is not None:
+        sibling_parent = repos_base.resolve()
+    elif (public / ".git").is_dir():
+        sibling_parent = public.parent
+    else:
+        try:
+            sibling_parent = repos_root().resolve()
+        except MachineryConfigError as exc:
+            raise ControlPlaneError(f"machinery repos root unusable: {exc}") from exc
     for fleet_repo in catalog.values():
         if (sibling_parent / fleet_repo.local_name).resolve() == repo and (
-            not fleet_repo.default or repos_base is not None or not (public / ".git").exists()
+            not fleet_repo.default
+            or (not (public / ".git").exists() and primary_cfg is None and product_cfg is None)
         ):
             return public
     return repo

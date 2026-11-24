@@ -538,3 +538,18 @@ def test_non_git_live_store_enforces_installed_release_guard_including_aliases(
     monkeypatch.delenv("LU_PYTHON")
     with pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release"):
         paths.assert_store_write_allowed(db, package_file=str(installed_pkg))
+
+    # For a primary Git checkout (today's layout), an external LEARN_UKRAINIAN_PYTHON venv
+    # (such as a test runner venv) must never authorize writes against primary's live store.
+    primary = tmp_path / "primary-checkout"
+    for part in ("objects", "refs"):
+        (primary / ".git" / part).mkdir(parents=True)
+    (primary / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    primary_db = primary / paths.DEFAULT_ROOT_REL / "comms.sqlite3"
+    primary_db.parent.mkdir(parents=True)
+    primary_db.write_bytes(b"")
+    monkeypatch.delenv("LU_STATE_ROOT")
+    monkeypatch.setenv("LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", str(primary))
+    monkeypatch.setenv("LEARN_UKRAINIAN_PYTHON", str(py))
+    with pytest.raises(PlaneRootAnchorError, match="live_store_requires_installed_release"):
+        paths.assert_store_write_allowed(primary_db, package_file=str(installed_pkg))

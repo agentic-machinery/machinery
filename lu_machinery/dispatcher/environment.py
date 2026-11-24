@@ -279,18 +279,15 @@ def child_env(spec: TaskSpec) -> dict[str, str]:
         # Restrict explicit URLs too; a worktree or ref snapshot cannot observe an arbitrary remote push.
         env["GIT_ALLOW_PROTOCOL"] = "file"
     # Every worker's hooks and machinery tools converge on the configured roots (#100), so
-    # explicit machinery root settings reach every child, whatever its mode.
-    for name in (PRIMARY_ROOT_ENV, LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV, REPOS_ROOT_ENV, PROFILE_PATH_ENV):
+    # explicit machinery root settings (including legacy aliases) reach every child, whatever its mode.
+    for name in (PRIMARY_ROOT_ENV, LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV, STATE_ROOT_ENV, REPOS_ROOT_ENV, PROFILE_PATH_ENV):
         configured = os.environ.get(name, "")
         if configured:
             env[name] = configured
     # Write providers need these paths for Git hooks. No credential is added.
     # Read-only AGY, Claude and Muse launchers also need the configured interpreter and product.
     if spec.mode == "workspace-write" or (spec.mode == "read-only" and spec.agent in {"agy", "claude", "muse"}):
-        names = (INTERPRETER_ENV, LU_INTERPRETER_ENV, PRODUCT_ROOT_ENV)
-        if spec.mode == "workspace-write":
-            names += (STATE_ROOT_ENV,)
-        for name in names:
+        for name in (INTERPRETER_ENV, LU_INTERPRETER_ENV, PRODUCT_ROOT_ENV):
             configured = os.environ.get(name, "")
             if configured:
                 env[name] = configured

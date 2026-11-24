@@ -42,7 +42,16 @@ from lu_machinery.common.git_credentials import (
     repository_registry,
     verify_authenticated_repository,
 )
-from lu_machinery.common.repo_root import PRODUCT_MARKER, configured_repos_root
+from lu_machinery.common.repo_root import (
+    PRODUCT_MARKER,
+    StateRootError,
+    configured_primary_root,
+    configured_product_root,
+    configured_repos_root,
+    is_configured_state_root,
+    main_checkout_root,
+    repos_root,
+)
 from lu_machinery.orchestration.product_policy import POLICY_REL
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
@@ -400,15 +409,38 @@ def resolve_fleet_repo(
     resolved_key = default_repo_key(catalog) if key is None else canonical_repo_key(key, catalog)
     repo = catalog[resolved_key]
     primary = primary_root.resolve()
+    is_detached_state = not (primary / ".git").exists() and is_configured_state_root(primary) is not None
     configured_repos = configured_repos_root()
     if repo.default:
-        checkout = (
-            (configured_repos / repo.local_name).resolve()
-            if configured_repos is not None and not (primary / ".git").exists()
-            else primary
-        )
+        if not is_detached_state:
+            checkout = primary
+        else:
+            product = configured_product_root()
+            primary_cfg = configured_primary_root()
+            if product is not None:
+                checkout = main_checkout_root(product).resolve()
+            elif primary_cfg is not None:
+                checkout = primary_cfg.resolve()
+            elif configured_repos is not None:
+                checkout = (configured_repos / repo.local_name).resolve()
+            else:
+                raise FleetRepoError(
+                    f"--repo {repo.key} cannot resolve default checkout from non-Git state root {primary}; "
+                    "set LU_PRODUCT_ROOT, LU_PRIMARY_REPO_ROOT, or LU_REPOS_ROOT"
+                )
     else:
-        sibling_base = configured_repos if configured_repos is not None else primary.parent
+        if configured_repos is not None:
+            sibling_base = configured_repos
+        elif not is_detached_state:
+            sibling_base = primary.parent
+        else:
+            try:
+                sibling_base = repos_root()
+            except StateRootError as exc:
+                raise FleetRepoError(
+                    f"--repo {repo.key} cannot resolve sibling checkout from non-Git state root {primary}; "
+                    f"set LU_REPOS_ROOT or LU_PRIMARY_REPO_ROOT ({exc})"
+                ) from exc
         checkout = (sibling_base / repo.local_name).resolve()
     if require_checkout and not (checkout / ".git").exists() and not checkout.is_dir():
         raise _missing_checkout_error(

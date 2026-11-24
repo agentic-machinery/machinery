@@ -797,3 +797,29 @@ printf 'CAPSULE=%s\\n' "$SESSION_SUPERVISOR_CAPSULE_PATH"
             env=bad_env,
         )
         assert refused.returncode == 1, refused.stdout + refused.stderr
+
+    # Non-Git state root with neither configured interpreter nor configured primary must
+    # fail closed rather than falling back to the caller's project_dir/.venv.
+    no_runtime_env = {k: v for k, v in env.items() if k not in {"LU_PYTHON", "LEARN_UKRAINIAN_PYTHON"}}
+    refused_claim = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env=no_runtime_env,
+    )
+    assert refused_claim.returncode == 1, refused_claim.stdout + refused_claim.stderr
+    assert "non-Git state root requires" in refused_claim.stderr
+
+    # With a configured primary (and no LU_PYTHON), the supervisor uses that primary's .venv.
+    primary_fallback_env = {**no_runtime_env, "LU_PRIMARY_REPO_ROOT": str(project)}
+    ok_primary = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+        env=primary_fallback_env,
+    )
+    assert ok_primary.returncode == 0, ok_primary.stderr + ok_primary.stdout
