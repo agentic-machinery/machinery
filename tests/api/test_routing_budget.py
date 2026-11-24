@@ -89,6 +89,7 @@ def _configure_base(monkeypatch, tmp_path: Path) -> Path:
             "headroom_reason": "",
         },
     )
+    return budget_path
 
 
 def test_cursor_logout_surfaces_need_login_without_substitution(monkeypatch, tmp_path):
@@ -284,10 +285,16 @@ def test_capacity_pick_marks_logout_cursor_avoid(monkeypatch):
 
 
 def test_b_sub_spend_and_in_flight_stay_off_account_a(monkeypatch, tmp_path: Path) -> None:
-    """A b-sub task's dollars and in-flight count land on account b and leave account a unchanged."""
+    """Spend, in-flight counts and probe failures stay on their own Codex account."""
     budget_path = _configure_base(monkeypatch, tmp_path)
     monkeypatch.setattr(state_router, "load_cost_records", cost_report.load_cost_records)
     now = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    failure_at = "2026-08-26T11:59:59Z"
+    probes = {
+        "codex": {"failure_kind": None},
+        "codex:b": {"failure_kind": "token_rejected", "last_failure_at": failure_at},
+    }
+    monkeypatch.setattr(state_router, "get_provider_usage_data", probes.get)
     dispatch = tmp_path / "a1" / "orchestration" / "probe" / "dispatch"
     dispatch.mkdir(parents=True)
     for name, account, tokens in (("a-meta.json", "sub", 1000), ("b-meta.json", "b-sub", 4000)):
@@ -342,6 +349,11 @@ def test_b_sub_spend_and_in_flight_stay_off_account_a(monkeypatch, tmp_path: Pat
     assert data["codex_accounts"]["codex:b"]["codex_account"] == "b-sub"
     assert data["in_flight"]["codex"] == 1
     assert data["in_flight"]["codex:b"] == 1
+    public_accounts = state_router._public_routing_budget(data)["codex_accounts"]
+    assert public_accounts["codex:a"]["codexbar"]["last_failure_at"] is None
+    assert public_accounts["codex:a"]["codexbar"]["failure_kind"] is None
+    assert public_accounts["codex:b"]["codexbar"]["last_failure_at"] == failure_at
+    assert public_accounts["codex:b"]["codexbar"]["failure_kind"] == "token_rejected"
 
 
 def test_in_flight_excludes_zombie_running_tasks(tmp_path: Path, monkeypatch) -> None:
