@@ -578,7 +578,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "One GitHub GraphQL read through the shared GitHub client over every registry repository, and the local live-worker snapshot for the worker counts.",
         "Startup warmup and a shared 120-second cache with one background refresh of expired snapshots. The 210-second display bound allows two 30-second page cycles plus collection/HTTP margin without extra GitHub reads. Age, bound and state are exposed in snapshot headers. A failed read is unknown, never an empty list: an unreadable project stays listed with status unknown, a reason and unknown_since (the first consecutive failed reading since this Monitor started), and one unreadable project never hides the others.",
         ("index.html", "pull-requests.html", "fleet.html", "operators"),
-        "A private repository returns counts and states only: titles, branch names and the lu-machinery pin are withheld.",
+        "A private repository returns counts and states only: PR numbers, links and creation times, titles, branch names and the lu-machinery pin are withheld.",
         "medium if a two-minute-old queue position is read as live",
         "keep as the pull-requests and overview merge-queue reading",
     ),

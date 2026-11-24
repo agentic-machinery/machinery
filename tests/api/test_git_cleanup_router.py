@@ -397,7 +397,7 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     payload = git_hygiene_router.compute_pull_requests(tmp_path)
     public, private, unstated = payload["repositories"]
     assert public["pull_requests"][0]["url"] == "https://github.com/new-owner/machinery/pull/7"
-    assert unstated["pull_requests"][0]["url"] == "https://github.com/other-owner/private-infra/pull/7"
+    assert public["pull_requests"][0]["number"] == 7 and public["pull_requests"][0]["created_at"]
     assert "title" not in public["pull_requests"][0]
     # An unrecorded branch suffix is withheld on a public repository too.
     assert public["pull_requests"][0]["task_reference"] is None
@@ -410,6 +410,9 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
         # A private project shows counts and states only: its pin is withheld.
         assert repo["pin"] == {"state": "withheld", "version": None}
         assert repo["private"] is True
+        # A private project's PRs are states only: no number, link or creation time.
+        assert [repo["pull_requests"][0][key] for key in ("number", "url", "created_at")] == [None, None, None]
+        assert repo["pull_requests"][0]["queue"] is not None and repo["pull_requests"][0]["ci"] == "success"
         assert "title" not in repo["pull_requests"][0]
         assert repo["pull_requests"][0]["task_reference"] is None
         assert "secret" not in json.dumps(repo)
@@ -431,6 +434,13 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     assert pin_of(manifest(dependency)) == {"state": "pinned", "version": "1.2.3"}
     assert pin_of(manifest('[project]\ndependencies = []\n# "lu-machinery==9.9.9"\n'))["state"] == "none"
     assert pin_of({"pin": None})["state"] == "none"
+    for malformed in ('[project]\ndependencies = [0]\n', '[project]\noptional-dependencies = "x"\n',
+                      '[project]\ndependencies = ["lu-machinery==1.2.*"]\n',
+                      '[dependency-groups]\ng = [0]\n'):
+        assert pin_of(manifest(malformed))["state"] == "unknown", malformed
+    # A PEP 735 include table is allowed in a dependency group, and a pin beside it still reads.
+    included = '[dependency-groups]\nbase = ["lu-machinery==3.4.5"]\nall = [{include-group = "base"}]\n'
+    assert pin_of(manifest(included)) == {"state": "pinned", "version": "3.4.5"}
     for unknown in (
         {}, manifest("not = [toml"), manifest('[project]\ndependencies = ["lu-machinery>=1"]\n'),
         manifest('[project]\ndependencies = ["lu-machinery==1.0"]\n[project.optional-dependencies]\nx = ["lu-machinery==2.0"]\n'),
@@ -575,6 +585,20 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
     rows = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][0]["pull_requests"]
     assert [(row["number"], row["ci"], row["review"]) for row in rows] == [(1, None, None), (2, None, None)]
+    # The shared GitHub client refuses a response that carries errors and holds the whole document on its
+    # typed result; its stdout is only the error diagnostic. The partial data must still be read.
+    document = {"data": {"r0": repos["r0"], "r1": None, "r2": repos["r2"]},
+                "errors": [{"type": "NOT_FOUND", "path": ["r1"], "message": "gone"}]}
+
+    def adapter_run(*_args, **_kwargs):
+        proc = SimpleNamespace(returncode=1, stdout=json.dumps({"error": "github_graphql_error"}), stderr="")
+        proc.github_result = SimpleNamespace(error="github_graphql_error", reason="graphql_errors", value=document)
+        return proc
+
+    monkeypatch.setattr(git_hygiene_router.github_client, "run", adapter_run)
+    typed = git_hygiene_router.compute_pull_requests(tmp_path)
+    assert typed["status"] == "ok"
+    assert [row["status"] for row in typed["repositories"]] == ["ok", "unknown", "ok"]
     # One invalid slug is that project's unknown row; the others are still read in the same call.
     catalog = _three_repo_registry(monkeypatch)
     catalog["public"] = FleetRepo("public", "fixture/invalid!", "product", "public-monorepo")

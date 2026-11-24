@@ -89,7 +89,7 @@ function renderPrs(prs, prState = null) {
       const name = text(pr.draft ? "draft" : "ready for review");
       const safe = safeHttpUrl(pr.url);
       return [
-        td(safe ? `<a href="${escapeHtml(safe)}">#${escapeHtml(pr.number)}</a>` : `#${escapeHtml(pr.number)}`),
+        td(pr.number === null ? "private PR" : safe ? `<a href="${escapeHtml(safe)}">#${escapeHtml(pr.number)}</a>` : `#${escapeHtml(pr.number)}`),
         name,
         text(ci, ciClass),
         text(review, reviewClass),

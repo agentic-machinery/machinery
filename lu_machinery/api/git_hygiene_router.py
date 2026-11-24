@@ -694,12 +694,13 @@ def _pull_request_row(
     number = raw_number if type(raw_number) is int and 0 < raw_number < 1_000_000_000 else None
     branch = node.get("headRefName")
     task_id = branch.rsplit("/", 1)[-1] if isinstance(branch, str) and len(branch) <= 512 else None
+    # A private project shows counts and states only: no PR number, link or creation time.
     return {
-        "number": number,
-        "url": f"https://github.com/{repository}/pull/{number}" if number is not None else None,
+        "number": None if private else number,
+        "url": f"https://github.com/{repository}/pull/{number}" if number is not None and not private else None,
         "task_reference": None if private else _recorded_task_reference(tasks_dir, task_id),
         "draft": node.get("isDraft") is True,
-        "created_at": panel_values.timestamp(node.get("createdAt")),
+        "created_at": None if private else panel_values.timestamp(node.get("createdAt")),
         "merge_state": panel_values.choice(_lower(node.get("mergeStateStatus")), {
             "behind", "blocked", "clean", "dirty", "draft", "has_hooks", "unknown", "unstable",
         }, "unknown"),
@@ -730,26 +731,44 @@ def _unknown_pull_requests(
     return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
 
 
+def _requirement_lists(manifest: dict[str, Any]) -> list[tuple[list[Any], bool]] | None:
+    """Every dependency array of a manifest, each with whether it may hold PEP 735 include tables.
+
+    ``None`` when any of them has a shape the manifest format does not allow.
+    """
+    project, groups = manifest.get("project", {}), manifest.get("dependency-groups", {})
+    if not isinstance(project, dict) or not isinstance(groups, dict):
+        return None
+    optional = project.get("optional-dependencies", {})
+    if not isinstance(optional, dict):
+        return None
+    lists = [(project.get("dependencies", []), False), *((value, False) for value in optional.values()),
+             *((value, True) for value in groups.values())]
+    return lists if all(isinstance(items, list) for items, _ in lists) else None
+
+
 def _exact_pins(text: str) -> set[str] | None:
     """Versions of lu-machinery that a manifest pins exactly, in any dependency group.
 
-    ``None`` when the manifest cannot be read, or names lu-machinery without one exact version.
+    ``None`` when the manifest cannot be read or has a malformed dependency table, or names
+    lu-machinery without one concrete version (a range or a wildcard).
     """
     try:
-        manifest = tomllib.loads(text)
-        project = _mapping(manifest.get("project"))
-        groups = [project.get("dependencies", []), *_mapping(project.get("optional-dependencies")).values(),
-                  *_mapping(manifest.get("dependency-groups")).values()]
+        lists = _requirement_lists(tomllib.loads(text))
+        if lists is None:
+            return None
         versions: set[str] = set()
-        for group in groups:
-            if not isinstance(group, list):
-                return None
-            for spec in (item for item in group if isinstance(item, str)):  # PEP 735 includes are tables
-                req = Requirement(spec)
+        for items, includes in lists:
+            for item in items:
+                if includes and isinstance(item, dict):  # a PEP 735 include table
+                    continue
+                if not isinstance(item, str):
+                    return None
+                req = Requirement(item)
                 if canonicalize_name(req.name) != "lu-machinery":
                     continue
                 exact = list(req.specifier)
-                if len(exact) != 1 or exact[0].operator != "==":
+                if len(exact) != 1 or exact[0].operator != "==" or exact[0].version.endswith(".*"):
                     return None
                 versions.add(exact[0].version)
     except (tomllib.TOMLDecodeError, InvalidRequirement, RecursionError, ValueError):
@@ -841,10 +860,15 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         return unknown("github_timeout")
     except OSError:
         return unknown("github_unavailable")
-    # gh exits 1 when any one repository is unresolvable, and still prints the rest under "data".
+    # With GraphQL errors (one repository unresolvable) the shared client refuses the response and
+    # carries the whole document on its typed result; native gh prints it on stdout and exits 1.
     # Read it per repository; no data at all is a failed read.
     try:
-        document = json_depth.loads(proc.stdout or "", max_depth=512)
+        result = getattr(proc, "github_result", None)
+        if result is not None and (result.error, result.reason) == ("github_graphql_error", "graphql_errors"):
+            document = result.value
+        else:
+            document = json_depth.loads(proc.stdout or "", max_depth=512)
         data = document["data"]
     except (ValueError, KeyError, TypeError):
         return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")

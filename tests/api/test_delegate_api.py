@@ -801,6 +801,19 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
         with monkeypatch.context() as local:
             local.setattr(delegate_router, "_tasks_dir", lambda _ctx: tmp_path / "absent")
             assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+            # A regular file that is readable and executable is no task store either, and neither is a listing that fails.
+            plain = tmp_path / "plain-file"
+            plain.write_text("x")
+            plain.chmod(0o755)
+            local.setattr(delegate_router, "_tasks_dir", lambda _ctx: plain)
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+            local.setattr(delegate_router, "_tasks_dir", lambda _ctx: tasks)
+
+            def failing_listing(_path):
+                raise OSError(5, "input/output error")
+
+            local.setattr(delegate_router.os, "scandir", failing_listing)
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
         def forbidden(*args, **kwargs):
             raise AssertionError("request collected task history")
         monkeypatch.setattr(delegate_router, "_active_snapshot_tasks", forbidden)

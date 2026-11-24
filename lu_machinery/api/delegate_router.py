@@ -626,6 +626,16 @@ def _sort_public_task_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [_public_task_metadata(row) for row in rows]
 
 
+def _task_store_readable(tasks_dir: Path) -> bool:
+    """Whether the task directory lists; the record scan treats a store it cannot list as empty."""
+    try:
+        with os.scandir(tasks_dir) as entries:
+            next(entries, None)
+    except OSError:
+        return False
+    return True
+
+
 def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     """Read hot records without waiting for the history scan or writing its cache."""
     tasks_dir = _tasks_dir(ctx)
@@ -635,6 +645,7 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     # record with no usable claim, so the Projects line can say how many are not attributed. A record
     # that cannot be read is no confirmed worker, and a task store that cannot be read gives no counts.
     live_by_repository: dict[str, int] = {}
+    store_readable = _task_store_readable(tasks_dir)
     for path in iter_task_records(tasks_dir, include_archive=False):
         try:
             file_stat = path.stat()
@@ -675,7 +686,7 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     # The HTTP /active projection omits these internal claims, including grants.
     return {
         "total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims,
-        "live_by_repository": live_by_repository if os.access(tasks_dir, os.R_OK | os.X_OK) else None,
+        "live_by_repository": live_by_repository if store_readable else None,
     }
 
 

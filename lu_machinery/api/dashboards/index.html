@@ -211,7 +211,7 @@ function renderQueueSummary(prs, prState = null) {
       const [ci, ciClass] = ciLabel(pr.ci);
       const [review, reviewClass] = reviewLabel(pr.review);
       queuedRows.push([
-        td(prLink(repo.name, pr)),
+        td(pr.number === null ? escapeHtml(`${repo.name} (private)`) : prLink(repo.name, pr)),
         text(ci, ciClass),
         text(review, reviewClass),
         text(`position ${pr.queue.position ?? "?"}${pr.queue.state ? ` · ${pr.queue.state.replaceAll("_", " ")}` : ""}${expired ? " (cached)" : ""}`, expired ? "warn" : "ok"),
@@ -300,7 +300,8 @@ function projectRow(repo, prState) {
     readable ? pinCell(repo.pin) : text("?", "warn"),
     branch ? text(ciState ? ci.replace(/^CI /, "") : "none reported", ciClass) : text("?", "warn"),
     text(workers ?? "?", workers === null ? "num warn" : workers ? "num ok" : "num"),
-    readable ? (caveat ? text(caveat, "warn") : text("ok", "ok")) : text(unavailable ? "snapshot unavailable" : since, "warn"),
+    readable ? (caveat ? text(caveat, "warn") : text("ok", "ok"))
+      : text(toDate(repo.unknown_since) ? since : unavailable ? "snapshot unavailable" : "unknown", "warn"),
   ];
 }
 
