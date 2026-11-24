@@ -575,3 +575,38 @@ def test_dispatch_receipt_names_the_selector_a_dual_slug_row_was_resolved_with(t
     assert record["repository"] == "org/repo"
     single = store.new_record(spec, {"key": "home", "github": "home/repo"}, "codex/task", "a" * 40, {"research_owned_path": []})
     assert "fleet_repo_selector" not in single
+
+
+@pytest.mark.parametrize("active", ["org/kit", "neworg/kit"])
+def test_review_checkout_origin_must_be_the_active_ascii_slug(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active: str):
+    """Defect class: review target resolution keeps a checkout whose origin is a transferred repository's inactive slug
+    (a PR target inferred without --repo) or a non-ASCII look-alike that casefolds onto the active slug."""
+    import subprocess
+
+    from lu_machinery.review import target_resolution
+
+    row = FleetRepo(key="case", github="org/kit", local_name="kit", role="public-labs", default=True,
+                    repository_id=4242, visibility="public", alternate_github="neworg/kit")
+    for module in (fleet_repos, target_resolution):
+        monkeypatch.setattr(module, "load_fleet_repos", lambda path=None: {"case": row})
+    monkeypatch.setattr(
+        git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState({"case": active}, "d" * 64),
+    )
+    inactive = next(slug for slug in ("org/kit", "neworg/kit") if slug != active)
+
+    def checkout(name: str, origin: str) -> Path:
+        root = tmp_path / name
+        subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True, timeout=30)
+        subprocess.run(["git", "-C", str(root), "remote", "add", "origin", f"https://github.com/{origin}.git"],
+                       check=True, capture_output=True, timeout=30)
+        return root
+
+    good, stale = checkout("good", active), checkout("stale", inactive)
+    look_alike = checkout("look-alike", active.replace("k", "\u212a"))
+    assert target_resolution.resolve_review_repository(good, None, mode="pr") == good
+    assert target_resolution.resolve_review_repository(good, "case", mode="pr") == good
+    with pytest.raises(target_resolution.TargetResolutionError, match="not its repository's active slug"):
+        target_resolution.resolve_review_repository(stale, None, mode="pr")
+    for root in (stale, look_alike):
+        with pytest.raises(target_resolution.TargetResolutionError):
+            target_resolution.resolve_review_repository(root, "case", mode="pr", commit="a" * 40)

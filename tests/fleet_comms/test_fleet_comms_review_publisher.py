@@ -387,3 +387,27 @@ def test_sealed_verdict_across_a_transfer_publishes_at_the_active_slug(
     assert result.plan.action == "publish" and result.plan.repository == active
     assert calls and all(active in " ".join(argv) for argv in calls)
     assert result.to_dict()["fleet_repo_selector"] == {"selector_value": active, "selector_sha256": "d" * 64}
+
+
+@pytest.mark.parametrize("active", ["org/repo", "neworg/repo"])
+def test_sealed_verdict_under_the_other_baked_slug_cannot_open_a_second_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active: str) -> None:
+    """Defect class: a sealed verdict spelled with the other baked slug of a transferred repository opens a second job,
+    receipt and status for the same PR head and gate instead of refusing the conflicting review id."""
+    from lu_machinery.fleet_comms.formal_review_jobs import FormalReviewJobService
+    from lu_machinery.fleet_comms.review_publication import parse_sealed_verdict_payload
+
+    _transferred(monkeypatch, active)
+    calls: list[list[str]] = []
+
+    def gh(argv, **_kwargs):
+        calls.append([str(part) for part in argv])
+        return subprocess.CompletedProcess(argv, 0, _SHA_A + "\n", "")
+
+    with ArtifactStore(root=tmp_path / "plane") as store:
+        FormalReviewJobService(store=store).create_job(
+            "org/repo", 5512, _SHA_A, "cross-family-review", review_id="review_first", state="complete",
+        )
+        sealed = parse_sealed_verdict_payload(json.dumps(_sealed(repository="neworg/repo", review_evidence=_approved_evidence())))
+        with pytest.raises(ReviewPublisherError, match="formal_job_review_id_mismatch"):
+            publish_sealed_verdict(sealed, runner=gh, store=store, mutate=True)
+    assert calls == []

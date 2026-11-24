@@ -29,8 +29,10 @@ from lu_machinery.orchestration.fleet_repos import (
     MissingFleetCheckout,
     canonical_repo_key,
     load_fleet_repos,
+    require_active_slug,
     resolve_active_fleet_repo,
     resolve_fleet_repo,
+    resolve_fleet_repo_by_slug,
 )
 
 TEST_DIR_MARKERS = ("tests/", "__tests__/", "test/")
@@ -153,8 +155,10 @@ def resolve_review_repository(
 ) -> Path:
     """Select the catalog checkout, keeping a root whose origin already matches.
 
-    An origin matches only at the row's active slug: a transferred repository's inactive slug is
-    another origin, and a dual-slug row without a trusted selector refuses.
+    An origin matches only at the row's active slug (ASCII, owner/name in any case): a transferred
+    repository's inactive slug is another origin, and a dual-slug row without a trusted selector
+    refuses. Without *repo_key*, a PR target whose checkout origin is a registered row's baked slug
+    must be that row's active slug before anything reads GitHub at it.
     A linked worktree of the catalog repository is that repository: ``HEAD``
     and ``--mode local`` stay there. A missing, unparsable, or different
     origin is not that checkout. Symbolic refs and local mode are refused;
@@ -162,6 +166,21 @@ def resolve_review_repository(
     checkout found from ``repo_root``.
     """
     if repo_key is None:
+        if mode == "pr" and _directory_root(repo_root):
+            try:
+                inferred = _origin_github_repo(repo_root)
+                registry = load_fleet_repos()
+            except (OSError, FleetRepoError) as exc:
+                raise repository_target_error(None, exc) from None
+            try:
+                registered = inferred is not None and bool(resolve_fleet_repo_by_slug(inferred, repos=registry))
+            except FleetRepoError:
+                registered = False  # an unregistered origin keeps its existing handling
+            if registered:
+                try:
+                    require_active_slug(inferred, repos=registry)
+                except FleetRepoError as exc:
+                    raise TargetResolutionError(f"checkout origin is not its repository's active slug: {exc}") from None
         return repo_root
     try:
         catalog = load_fleet_repos()
@@ -178,7 +197,7 @@ def resolve_review_repository(
         origin = _origin_github_repo(repo_root)
     except OSError as exc:
         raise repository_target_error(canonical, exc) from None
-    if origin is not None and origin.casefold() == active.casefold():
+    if origin is not None and origin.isascii() and origin.casefold() == active.casefold():
         return repo_root
     refs = _review_refs(mode, commit=commit, branch=branch, base=base)
     if mode == "local" or any(_is_symbolic_review_ref(ref) for ref in refs):
@@ -191,7 +210,7 @@ def resolve_review_repository(
         catalog_origin = _origin_github_repo(checkout)
     except OSError as exc:
         raise repository_target_error(canonical, exc) from None
-    if catalog_origin is None or catalog_origin.casefold() != active.casefold():
+    if catalog_origin is None or not catalog_origin.isascii() or catalog_origin.casefold() != active.casefold():
         raise TargetResolutionError(
             f"--repo {resolved.key} checkout origin does not match catalog repository {active}"
         )

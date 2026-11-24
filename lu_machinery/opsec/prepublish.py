@@ -177,11 +177,11 @@ def is_private(destination: str) -> bool:
         slug = row["github"]
         if row.get("alternate_github") is not None:
             try:
-                # Imported here: git_credentials imports this module.
-                from lu_machinery.common.git_credentials import SelectorError, active_slug
+                # Imported here: git_credentials imports this module. SelectorError is a ValueError.
+                from lu_machinery.common.git_credentials import active_slug
 
                 slug, _ = active_slug(row, key=key)
-            except (ImportError, SelectorError, ValueError, OSError):
+            except (ImportError, ValueError, OSError):
                 continue
         if normalize_repository(slug) == destination:
             return True

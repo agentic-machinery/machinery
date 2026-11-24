@@ -455,6 +455,20 @@ def ensure_job_row_for_receipt(
     )
 
 
+def _refuse_conflicting_job(store: ArtifactStore, sealed: SealedVerdict, slugs: tuple[str, ...]) -> None:
+    """Refuse when a job for this PR head and gate exists, under either baked slug, with another review id."""
+    from lu_machinery.fleet_comms.formal_review_jobs import FormalReviewJobService
+
+    # Do not close the service: it shares the caller's ArtifactStore connection.
+    service = FormalReviewJobService(store=store)
+    for slug in slugs:
+        existing = service.find_job(slug, sealed.pr_number, sealed.head_sha, sealed.gate_kind, include_attempts=False)
+        if existing is not None and existing.review_id != sealed.review_id:
+            raise ReviewPublisherError(
+                f"formal_job_review_id_mismatch: job={existing.review_id!r} sealed={sealed.review_id!r}"
+            )
+
+
 def publish_sealed_verdict(
     sealed: SealedVerdict | Mapping[str, Any] | str | bytes | Path,
     *,
@@ -482,11 +496,15 @@ def publish_sealed_verdict(
         )
     except ReviewPublicationError as exc:
         raise ReviewPublisherError(str(exc)) from exc
-    # The sealed payload names its repository by either baked slug; GitHub is read and written at the active one.
+    # The sealed payload names its repository by either baked slug. Job rows, receipts and the publication key use
+    # the registry slug, so both spellings are one gate; GitHub is read and written at the active slug.
     try:
         target = resolve_payload_fleet_repo(sealed.repository)
     except FleetRepoError as exc:
         raise ReviewPublisherError(f"repository_unresolved: {exc}") from exc
+    sealed = replace(sealed, repository=target.repo.github)
+    if store is not None:
+        _refuse_conflicting_job(store, sealed, target.repo.slugs)
 
     head = current_head_sha
     if head is None:
