@@ -52,20 +52,26 @@ _ForeignFingerprint = tuple[str, int, int]
 _REPORTED_FOREIGN: set[_ForeignFingerprint] = set()
 _REPORTED_FOREIGN_LIMIT = 65536
 # Paths buffered until the directory scan that read them finishes, then one warning.
-_PENDING_FOREIGN: dict[str, tuple[_ForeignFingerprint, bool]] = {}
+# Each path keeps every fingerprint seen before that warning, and is counted once.
+_PendingForeign = tuple[bool, list[_ForeignFingerprint]]
+_PENDING_FOREIGN: dict[str, _PendingForeign] = {}
 _FOREIGN_LOCK = threading.Lock()
 # How many iter_task_records scans are open. Zero means a single-file read, which warns immediately.
 _SCAN_DEPTH = 0
 # Example names in the one summary line. Names outside the families below are chosen first.
 _FOREIGN_EXAMPLE_LIMIT = 3
+# After a family token, the next character must not continue the token. Otherwise
+# routingbackup, closeout-stateful and a non-ASCII continuation are treated as
+# the known family and can fall out of the three-name sample.
+_FOREIGN_TOKEN_TAIL = r"(?!\w).*\.json\Z"
 # Families short-lived readers already find beside task records (review-loop and closeout state).
 # A name that matches none of these is unexpected: the summary names it ahead of the families.
 _ROUTINE_FOREIGN_KINDS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("review-state", re.compile(r".*\.review-state\.json\Z")),
     ("resolver", re.compile(r".*\.resolver\.json\Z")),
-    ("routing", re.compile(r".*\.routing.*\.json\Z")),
+    ("routing", re.compile(r".*\.routing" + _FOREIGN_TOKEN_TAIL)),
     ("ac-policy", re.compile(r".*\.ac-policy\.json\Z")),
-    ("closeout-state", re.compile(r".*\.closeout-state.*\.json\Z")),
+    ("closeout-state", re.compile(r".*\.closeout-state" + _FOREIGN_TOKEN_TAIL)),
 )
 # Literal suffixes of files and directories the dispatcher writes beside ``<task_id>.json``.
 # Each string is the suffix that writer passes to ``Path.with_suffix`` or appends to the task id,
@@ -130,11 +136,11 @@ def _foreign_kind(path: str) -> str:
     return tail
 
 
-def _foreign_summary(items: list[tuple[str, tuple[_ForeignFingerprint, bool]]]) -> str:
+def _foreign_summary(items: list[tuple[str, _PendingForeign]]) -> str:
     """One line: how many foreign files, how many are an unexpected kind, and a few names."""
-    unexpected_n = sum(1 for _, (_, unexpected) in items if unexpected)
+    unexpected_n = sum(1 for _, (unexpected, _) in items if unexpected)
     ranked = sorted(
-        ((not unexpected, _foreign_kind(path), path) for path, (_, unexpected) in items),
+        ((not unexpected, _foreign_kind(path), path) for path, (unexpected, _) in items),
     )
     chosen: list[str] = []
     seen: set[str] = set()
@@ -163,10 +169,11 @@ def _flush_foreign_reports(*, force: bool = False) -> None:
             return
         items = list(_PENDING_FOREIGN.items())
         _PENDING_FOREIGN.clear()
-        for _, (fingerprint, _) in items:
-            if len(_REPORTED_FOREIGN) >= _REPORTED_FOREIGN_LIMIT:
-                _REPORTED_FOREIGN.clear()
-            _REPORTED_FOREIGN.add(fingerprint)
+        for _, (_, fingerprints) in items:
+            for fingerprint in fingerprints:
+                if len(_REPORTED_FOREIGN) >= _REPORTED_FOREIGN_LIMIT:
+                    _REPORTED_FOREIGN.clear()
+                _REPORTED_FOREIGN.add(fingerprint)
         summary = _foreign_summary(items)
     # The summary is one logging argument, so a name cannot be read as a format string.
     _LOG.warning("NON_RECORD_FILE: %s", summary)
@@ -175,10 +182,12 @@ def _flush_foreign_reports(*, force: bool = False) -> None:
 def _report_foreign(path: Path, raw: bytes) -> None:
     """Buffer one foreign file. A directory scan emits one summary when it finishes.
 
-    Dispatcher sidecars are not foreign. A rewritten file is reported again. Names that
-    match no known sidecar family are unexpected and are listed first, so a new kind stays
-    in the sample. Reads outside a scan are included in the next summary, or in the one
-    line emitted at process exit.
+    Dispatcher sidecars are not foreign. A rewritten file is reported again. Every
+    version of a path seen before the summary is remembered, so bytes the summary
+    already covered do not warn a second time. Names that match no known sidecar
+    family are unexpected and are listed first, so a new kind stays in the sample.
+    Reads outside a scan are included in the next summary, or in the one line
+    emitted at process exit.
     """
     if _is_dispatcher_sidecar(path):
         return
@@ -187,15 +196,18 @@ def _report_foreign(path: Path, raw: bytes) -> None:
         if fingerprint in _REPORTED_FOREIGN:
             return
         current = _PENDING_FOREIGN.get(fingerprint[0])
-        if current is not None and current[0] == fingerprint:
+        if current is None:
+            _PENDING_FOREIGN[fingerprint[0]] = (_routine_kind(path.name) is None, [fingerprint])
             return
-        _PENDING_FOREIGN[fingerprint[0]] = (fingerprint, _routine_kind(path.name) is None)
+        if fingerprint in current[1]:
+            return
+        current[1].append(fingerprint)
     # A directory scan flushes when it ends. A read outside a scan stays buffered
     # until the next scan ends or the process exits, so a loop of single-file
     # reads is one line, not one line per file.
 
 
-atexit.register(lambda: _flush_foreign_reports(force=True))
+atexit.register(_flush_foreign_reports, force=True)
 
 
 def _has_v2_record_name(path: Path) -> bool:

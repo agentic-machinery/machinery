@@ -335,6 +335,40 @@ def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
     assert message.startswith("NON_RECORD_FILE: 4 non-record files, 2 unexpected; examples: ")
     assert "not-review-state" in message and "notrouting" in message
 
+    # The family token must end. A word that continues (routingbackup, closeout-stateful)
+    # is a different kind and stays in the sample when routine names would otherwise fill it.
+    wide = tmp_path / "wide"
+    wide.mkdir()
+    for name in (
+        "a.ac-policy.json", "a.resolver.json", "a.closeout-state-2.json",
+        "a.routing.json", "a.routing-note.json", "a.routing.extra.json",
+        "z.routingbackup.json", "z.routing_backup.json", "z.closeout-stateful.json",
+    ):
+        (wide / name).write_bytes(b"[]")
+    before = len(caplog.records)
+    for path in store.iter_task_records(wide, include_archive=False):
+        assert store.parse_task_record(path, path.read_bytes()) is None
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    message = notes[0].getMessage()
+    assert message.startswith("NON_RECORD_FILE: 9 non-record files, 3 unexpected; examples: ")
+    assert "routingbackup" in message and "routing_backup" in message and "closeout-stateful" in message
+    assert "ac-policy" not in message and "resolver" not in message
+
+    # A non-ASCII letter also continues the token, so it stays unexpected beside routine names.
+    uni = tmp_path / "uni"
+    uni.mkdir()
+    for name in ("a.routing.json", "a.resolver.json", "a.ac-policy.json", "z.routing\u043a\u0438.json"):
+        (uni / name).write_bytes(b"[]")
+    before = len(caplog.records)
+    for path in store.iter_task_records(uni, include_archive=False):
+        assert store.parse_task_record(path, path.read_bytes()) is None
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    message = notes[0].getMessage()
+    assert message.startswith("NON_RECORD_FILE: 4 non-record files, 1 unexpected; examples: ")
+    assert "routing\u043a\u0438" in message
+
     # A varying token in front of one suffix must not use up every example slot.
     varied = tmp_path / "varied"
     varied.mkdir()
@@ -387,3 +421,23 @@ def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
     # Depth is back at zero, so the exit flush can see this read. A stuck scan would drop it.
     store._flush_foreign_reports()
     assert len(caplog.records) == before + 1
+
+    # Bytes already covered by a summary stay quiet, including a version overwritten
+    # before that summary. A later, different payload is one new line.
+    repeat = tmp_path / "repeat.json"
+    assert store.parse_task_record(repeat, b"[]") is None
+    assert store.parse_task_record(repeat, b"{}") is None
+    before = len(caplog.records)
+    store._flush_foreign_reports()
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    assert notes[0].getMessage().startswith("NON_RECORD_FILE: 1 non-record file, 1 unexpected; examples: ")
+    before = len(caplog.records)
+    assert store.parse_task_record(repeat, b"[]") is None
+    store._flush_foreign_reports()
+    assert not [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert store.parse_task_record(repeat, b'{"changed": true}') is None
+    store._flush_foreign_reports()
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    assert notes[0].getMessage().startswith("NON_RECORD_FILE: 1 non-record file, 1 unexpected; examples: ")
