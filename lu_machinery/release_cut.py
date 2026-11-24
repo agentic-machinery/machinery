@@ -1573,7 +1573,7 @@ def _release_lock_path() -> Path:
     checkout, _ = resolve_repo("machinery")
     common = subprocess.run(
         ["git", "-C", str(checkout), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        check=True, capture_output=True, text=True, env=sanitized_git_env(),
+        check=True, capture_output=True, text=True, env=sanitized_git_env(), timeout=30,
     ).stdout.strip()
     return Path(common) / "release-cut.lock"
 
