@@ -93,15 +93,14 @@ def test_consumer_read_only_agy_skips_sources_with_foreign_scripts_package(tmp_p
     """A registered consumer's imports must not prevent a bounded AGY ask."""
     from lu_machinery.agent_runtime import review_mcp, runner
     from lu_machinery.agent_runtime.adapters.agy import AgyAdapter
+    from lu_machinery.orchestration import fleet_repos
 
     checkout = tmp_path / "consumer"
     scripts_dir = checkout / "scripts"
     scripts_dir.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=10)
-    subprocess.run(
-        ["git", "-C", str(checkout), "remote", "add", "origin", "https://github.com/kube-dojo/kube-dojo.github.io"],
-        check=True, timeout=10,
-    )
+    consumer = fleet_repos.load_fleet_repos()["kube-dojo"]
+    monkeypatch.setattr(fleet_repos, "fleet_repo_for_checkout", lambda root: consumer if root == checkout else None)
     scripts = ModuleType("scripts")
     scripts.__path__ = [str(scripts_dir)]
     monkeypatch.setitem(sys.modules, "scripts", scripts)
