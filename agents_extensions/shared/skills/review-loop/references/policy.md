@@ -44,7 +44,8 @@ policy calls learner content, is never Trivial.
 
 **Low is one quick red-team pass.** The reviewer tries to break the change and reports only
 break-it findings, each a P0-P2 reproducible failure (command, input, wrong output), never style
-or "consider". If the reviewer finds no break-it failure, the reviewer gives APPROVE. Landing
+or "consider". If the reviewer finds no break-it failure and no uncertainty material to a
+potential P0-P2 under the [threat model](#3-findings), the reviewer gives APPROVE. Landing
 requires a recorded APPROVE and the other merge gates. The author fixes a break-it finding,
 and the same reviewer confirms the fix in one delta round. That is the whole Low budget.
 
