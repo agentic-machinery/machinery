@@ -9,6 +9,19 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.70"></a>
+## [0.1.70] - 2026-11-24
+
+### Added
+
+- Add run-force-cancel verb for stuck cancelled runs ([#1371](https://github.com/learn-ukrainian/machinery/pull/1371))
+
+### Fixed
+
+- Declare each repository's real required CI workflows ([#1367](https://github.com/learn-ukrainian/machinery/pull/1367))
+- Refresh product snapshots in the adoption commit ([#1369](https://github.com/learn-ukrainian/machinery/pull/1369))
+- Require the product uv lock for adoption ([#1370](https://github.com/learn-ukrainian/machinery/pull/1370))
+
 <a id="v0.1.69"></a>
 ## [0.1.69] - 2026-11-24
 
@@ -1621,7 +1634,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.69...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.70...HEAD
+[0.1.70]: https://github.com/learn-ukrainian/machinery/compare/v0.1.69...v0.1.70
 [0.1.69]: https://github.com/learn-ukrainian/machinery/compare/v0.1.68...v0.1.69
 [0.1.68]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...v0.1.68
 [0.1.67]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...v0.1.67
