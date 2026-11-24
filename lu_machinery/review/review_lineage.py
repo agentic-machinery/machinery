@@ -509,13 +509,32 @@ def capability_exemption(
     return candidates[0] if candidates else None
 
 
+def _charges_round(run: ReviewRun) -> bool:
+    """Reserve unfinished or unverifiable attempts and charge any visible verdict."""
+    if run.record.get("mode") == "workspace-write":
+        return False
+    status = run.record.get("status")
+    if not isinstance(status, str) or status not in TERMINAL_TASK_STATUSES:
+        return True
+    if run.reply is None:
+        # Admission refusals can attest that no provider ran without writing a digest field.
+        no_saved_result = "result_sha256" in run.record and run.record["result_sha256"] is None
+        never_started = "provider_pgid" in run.record and _provider_never_ran(run.record)
+        return status == "done" or not (no_saved_result or never_started)
+    try:
+        return bool(recognized_verdicts(run.reply))
+    except (ValueError, RecursionError):
+        return True
+
+
 def capability_candidates_only(runs: Sequence[ReviewRun], head: str) -> bool:
     """Whether every review run at ``head`` is a finished zero-finding BLOCKED, which an exemption may uncharge.
 
-    The dispatcher reads no PR comments, so such a head may be uncharged; any other run makes it a charged round.
+    The dispatcher reads no PR comments, so such a head may be uncharged. Runs that do not
+    charge or reserve a round cannot change that decision.
     """
     at_head = [run for run in runs if run.record.get("worktree_base_sha") == head
-               and run.record.get("mode") != "workspace-write"]
+               and _charges_round(run)]
     return bool(at_head) and all(
         (evidence := _finished_verdict(run)) is not None and evidence[1:3] == ("BLOCKED", 0) for run in at_head
     )
@@ -528,13 +547,11 @@ def dispatched_rounds(
     login: str,
     exclude_head: str | None = None,
 ) -> dict[str, list[str]]:
-    """Each head a review run on record was dispatched at, with its runs' task ids, recorded or not (#12098).
+    """Each head charged or reserved by a review run, with the task ids that make it count.
 
-    A round is one reviewer dispatch at one exact head (review-loop policy), so a run counts from its
-    dispatch, whatever its status and whether its verdict was ever published. A writing task is not
-    a reviewer dispatch, and the lineage's one uncharged capability failure (:func:`capability_exemption`)
-    opens no round. ``exclude_head`` drops the round
-    being decided.
+    A verdict counts before publication. An attempt reserves its head until its record proves
+    there was no verdict. The lineage's one uncharged capability failure opens no round.
+    ``exclude_head`` drops the round being decided.
     """
     exempt = capability_exemption(runs=runs, comments=comments, login=login)
     rounds: dict[str, list[str]] = {}
@@ -542,9 +559,7 @@ def dispatched_rounds(
         head = run.record.get("worktree_base_sha")
         if not isinstance(head, str) or not SHA.fullmatch(head) or head == exclude_head:
             continue
-        if run.record.get("mode") == "workspace-write":
-            continue
-        if (run.task_id, _started(run.record)) != exempt:
+        if (run.task_id, _started(run.record)) != exempt and _charges_round(run):
             rounds.setdefault(head, []).append(run.task_id)
     return rounds
 
