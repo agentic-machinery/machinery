@@ -826,6 +826,18 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
         finally:
             (tasks / "live.json").chmod(0o644)
         assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1
+        # So may a damaged record (cut short, not UTF-8) or one of a newer schema, even when the history
+        # scan has cached it as a miss; a foreign file is no record and leaves the counts known.
+        damaged = tasks / "other.json"
+        for body in (b'{"schema_version": 2, "task_id": "oth', b'{"task_id": "other\xff"}',
+                     json.dumps({"schema_version": 3, "task_id": "other", "status": "running"}).encode()):
+            damaged.write_bytes(body)
+            delegate_router._TASK_STATE_CACHE[str(damaged)] = (
+                delegate_router._task_file_fingerprint(damaged.name, damaged.stat()), None, "", False, None, None)
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None, body
+        damaged.write_text("[1, 2]")
+        assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1
+        damaged.unlink()
         def forbidden(*args, **kwargs):
             raise AssertionError("request collected task history")
         monkeypatch.setattr(delegate_router, "_active_snapshot_tasks", forbidden)

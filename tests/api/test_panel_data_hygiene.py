@@ -106,10 +106,12 @@ def _inputs(monkeypatch, ctx, dirty):
     catalog = {key: FleetRepo(key, f"example-owner/{key}", key, "public-monorepo") for key in ("first", "second", "third")}
     monkeypatch.setattr(git_hygiene_router, "load_fleet_repos", lambda: catalog)
     monkeypatch.setattr(git_hygiene_router, "_UNKNOWN_SINCE", {})
+    # Queue, CI and review states outside GitHub's sets make the repository unknown (tested with the PR
+    # route), so the unvetted values ride in the fields a listed PR row still renders.
     node = {"number": 7, "title": dirty, "headRefName": "codex/unvetted " + dirty, "url": "https://github.com/" + dirty,
-            "isDraft": False, "createdAt": dirty, "mergeStateStatus": dirty, "mergeQueueEntry": {"state": dirty, "position": 1},
-            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": dirty},
-                                              "status": {"context": {"state": dirty}}}}]}}
+            "isDraft": False, "createdAt": dirty, "mergeStateStatus": dirty, "mergeQueueEntry": {"state": "QUEUED", "position": 1},
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"},
+                                              "status": {"context": {"state": "SUCCESS"}}}}]}}
     monkeypatch.setattr(git_hygiene_router.github_client, "run", lambda *_args, **_kwargs: SimpleNamespace(
         returncode=0, stdout=json.dumps({"data": {f"r{i}": {"isPrivate": False,
                    "pullRequests": {"totalCount": 1, "nodes": [node]}} for i in range(3)}})))

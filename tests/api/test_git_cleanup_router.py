@@ -442,7 +442,9 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
                       '[[package]]\nname = "other"\nversion = "1"\n# name = "lu-machinery"\n',
                       '[[package]]\nname = "lu_machinery"\nversion = "1.2.3"\n',
                       '[[package]]\nname = "lu-machinery"\n', '[[package]]\nname = "lu-machinery"\nversion = 1\n',
-                      '[[package]]\nname = "lu-machinery"\nversion = ""\n', locked + locked.split("\n\n")[1]):
+                      '[[package]]\nname = "lu-machinery"\nversion = ""\n', locked + locked.split("\n\n")[1],
+                      # tomllib raises ValueError past the integer digit limit and RecursionError when nested deep.
+                      locked + "n = " + "1" * 5000 + "\n", locked + "d = " + "[" * 5000 + "]" * 5000 + "\n"):
         assert pin_of(lock(malformed)) == {"state": "unknown", "version": None}, malformed
     # A missing, unreadable (non-text) or cut-short lock is unknown, never "does not pin".
     for unread in ({}, {"pin": None}, {"pin": {}}, {"pin": {"isTruncated": False, "text": None}},
@@ -647,8 +649,17 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
         repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [partial]}}
         _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
         assert git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][1]["status"] == "unknown", field
-    # Nor is one whose number or draft flag is malformed, or a count below the PRs listed.
-    for malformed, total in (({"number": "3"}, 1), ({"number": 0}, 1), ({"isDraft": None}, 1), ({}, 0)):
+    # Nor is one whose number, draft flag, queue entry, CI or review state is malformed, or a count below
+    # the PRs listed.
+    def commit(rollup: object, context: object) -> dict:
+        return {"commits": {"nodes": [{"commit": {"statusCheckRollup": rollup, "status": {"context": context}}}]}}
+
+    for malformed, total in (({"number": "3"}, 1), ({"number": 0}, 1), ({"isDraft": None}, 1), ({}, 0),
+                             ({"mergeQueueEntry": {"position": -2.5, "state": "QUEUED"}}, 1),
+                             ({"mergeQueueEntry": {"position": True, "state": "QUEUED"}}, 1),
+                             ({"mergeQueueEntry": {"position": 1, "state": "PARKED"}}, 1),
+                             (commit({"state": {}}, {"state": "SUCCESS"}), 1),
+                             (commit({"state": "SUCCESS"}, {"state": True}), 1)):
         repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": total, "nodes": [{**_open_pr("codex/x", 3), **malformed}]}}
         _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
         assert git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][1]["status"] == "unknown", malformed
@@ -717,9 +728,11 @@ def _graphql_repos(*repo_nodes: list[dict]) -> str:
     return json.dumps({"data": repos})
 
 
-def _write_task_record(tasks: Path, task_id: str, *, recorded: str | None = None) -> None:
+def _write_task_record(tasks: Path, task_id: str, *, recorded: str | None = None,
+                       repository: str = "new-owner/machinery") -> None:
     tasks.mkdir(parents=True, exist_ok=True)
-    body = {"schema_version": 2, "task_id": task_id if recorded is None else recorded, "status": "running"}
+    body = {"schema_version": 2, "task_id": task_id if recorded is None else recorded, "status": "running",
+            "repository": repository}
     (tasks / f"{task_id}.json").write_text(json.dumps(body), encoding="utf-8")
 
 
@@ -788,7 +801,7 @@ def test_identifier_routes_keep_a_recorded_task_id(tmp_path, monkeypatch):
         "r2": {"isPrivate": False, "pullRequests": {"totalCount": 0, "nodes": []}},
     }
     client, tasks = _identifier_client(tmp_path, monkeypatch, json.dumps({"data": repos}), payload)
-    _write_task_record(tasks, _KEPT)
+    _write_task_record(tasks, _KEPT, repository="New-Owner/MACHINERY")  # slugs compare casefolded
     _write_task_record(tasks, _KEPT_LONG)
     _write_task_record(tasks / "archive", _KEPT_ARCHIVED)
 
@@ -800,6 +813,13 @@ def test_identifier_routes_keep_a_recorded_task_id(tmp_path, monkeypatch):
     assert empty["pull_requests"] == []
     assert "cursor/" not in pulls.text
     assert _KEPT not in json.dumps(hidden)
+    # A record of another project's task never gives this project's PR its reference.
+    _write_task_record(tasks, _KEPT, repository="old-owner/product.pages")
+    state_helpers.cache_invalidate()
+    moved = client.get("/api/git/pull-requests").json()["repositories"][0]["pull_requests"]
+    assert [row["task_reference"] for row in moved] == [None, _KEPT_LONG, _KEPT_ARCHIVED]
+    _write_task_record(tasks, _KEPT)
+    state_helpers.cache_invalidate()
     # The route reads the context task store, not the empty project default.
     missed = git_hygiene_router.compute_pull_requests(tmp_path)
     assert missed["repositories"][0]["pull_requests"][0]["task_reference"] is None

@@ -35,7 +35,7 @@ from lu_machinery.orchestration.task_record_store import (
 )
 
 from . import panel_values
-from .delegate_router import active_snapshot
+from .delegate_router import _authoritative_task_repository, active_snapshot
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .state_helpers import (
     cache_get_or_compute_async,
@@ -617,6 +617,7 @@ PIN_FILE = "uv.lock"
 # is not fetched.
 SELF_KEY = "machinery"
 _CI_STATES = {"success", "failure", "error", "pending", "expected"}
+_QUEUE_STATES = {"queued", "awaiting_checks", "locked", "mergeable", "unmergeable"}
 # A reading older than the delegate panel's own bound is not a live count.
 LIVE_WORKERS_MAX_AGE_S = 60.0
 # Since when each repository has been unreadable: the first of its consecutive failed readings in
@@ -663,11 +664,13 @@ def _last_commit(node: dict[str, Any]) -> dict[str, Any]:
     return _mapping(_mapping(last).get("commit"))
 
 
-def _recorded_task_reference(tasks_dir: Path, candidate: object) -> str | None:
-    """Return a branch suffix only when a dispatcher record stores that same id.
+def _recorded_task_reference(tasks_dir: Path, candidate: object, slugs: frozenset[str]) -> str | None:
+    """Return a branch suffix only when a dispatcher record stores that same id for this repository.
 
     The suffix is contributor-controlled text. A matching character class is not
-    enough: the value is withheld unless the record's own task id equals it.
+    enough: the value is withheld unless the record's own task id equals it and the
+    record's authoritative repository is one of this project's registry slugs
+    (casefolded), so a PR in another project never takes a worker's reference.
     """
     token = panel_values.task_reference(candidate)
     if token is None:
@@ -681,12 +684,14 @@ def _recorded_task_reference(tasks_dir: Path, candidate: object) -> str | None:
         return None
     if not isinstance(record, dict) or record.get("task_id") != token:
         return None
+    if (_authoritative_task_repository(record) or "").casefold() not in slugs:
+        return None
     recorded = record["task_id"]
     return recorded if isinstance(recorded, str) else None
 
 
 def _pull_request_row(
-    node: dict[str, Any], *, private: bool, repository: str, tasks_dir: Path,
+    node: dict[str, Any], *, private: bool, repository: str, slugs: frozenset[str], tasks_dir: Path,
 ) -> dict[str, Any]:
     commit = _last_commit(node)
     rollup = _mapping(commit.get("statusCheckRollup"))
@@ -700,19 +705,17 @@ def _pull_request_row(
     return {
         "number": None if private else number,
         "url": f"https://github.com/{repository}/pull/{number}" if number is not None and not private else None,
-        "task_reference": None if private else _recorded_task_reference(tasks_dir, task_id),
+        "task_reference": None if private else _recorded_task_reference(tasks_dir, task_id, slugs),
         "draft": node.get("isDraft") is True,
         "created_at": None if private else panel_values.timestamp(node.get("createdAt")),
         "merge_state": panel_values.choice(_lower(node.get("mergeStateStatus")), {
             "behind", "blocked", "clean", "dirty", "draft", "has_hooks", "unknown", "unstable",
         }, "unknown"),
-        "ci": panel_values.choice(_lower(rollup.get("state")), {"success", "failure", "error", "pending", "expected"}),
-        "review": panel_values.choice(_lower(review.get("state")), {"success", "failure", "error", "pending", "expected"}),
+        "ci": panel_values.choice(_lower(rollup.get("state")), _CI_STATES),
+        "review": panel_values.choice(_lower(review.get("state")), _CI_STATES),
         "queue": {
             "position": panel_values.number(queue.get("position")),
-            "state": panel_values.choice(_lower(queue.get("state")), {
-                "queued", "awaiting_checks", "locked", "mergeable", "unmergeable",
-            }, "unknown"),
+            "state": panel_values.choice(_lower(queue.get("state")), _QUEUE_STATES, "unknown"),
         } if queue else None,
     }
 
@@ -736,12 +739,14 @@ def _unknown_pull_requests(
 def _locked_version(text: str) -> str | None:
     """The version of the one ``[[package]]`` entry named exactly ``lu-machinery`` in a uv.lock.
 
-    ``None`` when the text is not valid TOML, ``package`` is not an array of tables, there are zero
+    ``None`` when tomllib refuses the text, ``package`` is not an array of tables, there are zero
     or several such entries, or the entry has no non-empty string version.
     """
     try:
         lock = tomllib.loads(text)
-    except (tomllib.TOMLDecodeError, RecursionError):
+    # TOMLDecodeError is a ValueError; so is an integer past the interpreter's digit limit. Deep
+    # nesting raises RecursionError.
+    except (ValueError, RecursionError):
         return None
     packages = lock.get("package")
     if not isinstance(packages, list) or not all(isinstance(entry, dict) for entry in packages):
@@ -812,6 +817,10 @@ def _errored_fields(document: object, aliases: set[str]) -> dict[str, set[str]] 
     return found
 
 
+def _state_in(value: object, states: set[str]) -> bool:
+    return isinstance(value, str) and value.lower() in states
+
+
 # Keys every PR node, its commit and its queue entry carry when GitHub answers the query as asked.
 _PR_NODE_KEYS = {"number", "isDraft", "createdAt", "headRefName", "mergeStateStatus", "mergeQueueEntry", "commits"}
 
@@ -829,7 +838,10 @@ def _complete_pull_request(node: object) -> bool:
     if type(number) is not int or not 0 < number < 1_000_000_000 or type(node["isDraft"]) is not bool:
         return False
     queue, commits = node["mergeQueueEntry"], node["commits"]
-    if queue is not None and not (isinstance(queue, dict) and queue.keys() >= {"position", "state"}):
+    # A queue entry, rollup or review context that is present carries a value of GitHub's own type
+    # and set; a malformed one must not read as "not queued", "no CI yet" or "none".
+    if queue is not None and not (isinstance(queue, dict) and _state_in(queue.get("state"), _QUEUE_STATES)
+                                  and type(queue.get("position")) is int and queue["position"] >= 0):
         return False
     nodes = commits.get("nodes") if isinstance(commits, dict) else None
     if not isinstance(nodes, list) or not all(item is None or isinstance(item, dict) for item in nodes):
@@ -840,14 +852,14 @@ def _complete_pull_request(node: object) -> bool:
     if not isinstance(commit, dict) or not commit.keys() >= {"statusCheckRollup", "status"}:
         return False
     rollup, status = commit["statusCheckRollup"], commit["status"]
-    if rollup is not None and not (isinstance(rollup, dict) and "state" in rollup):
+    if rollup is not None and not (isinstance(rollup, dict) and _state_in(rollup.get("state"), _CI_STATES)):
         return False
     if status is None:
         return True
     if not isinstance(status, dict) or "context" not in status:
         return False
     context = status["context"]
-    return context is None or (isinstance(context, dict) and "state" in context)
+    return context is None or (isinstance(context, dict) and _state_in(context.get("state"), _CI_STATES))
 
 
 def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) -> dict[str, Any]:
@@ -944,7 +956,8 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
             "pin": _pin(repo, private=private, errored="pin" in failed, own=key == SELF_KEY),
             "unknown_since": None,
             "pull_requests": [
-                _pull_request_row(node, private=private, repository=f"{owner}/{name}", tasks_dir=records)
+                _pull_request_row(node, private=private, repository=f"{owner}/{name}",
+                                  slugs=frozenset(slug.casefold() for slug in catalog[index].slugs), tasks_dir=records)
                 for node in nodes[:PULL_REQUESTS_PER_REPOSITORY]
             ],
         })

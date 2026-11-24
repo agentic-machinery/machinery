@@ -151,14 +151,18 @@ def _read_task_state(
     path: str, ctx: MonitorContext | None = None, *, tasks_dir: Path | None = None,
     raise_read_errors: bool = False,
 ) -> dict[str, Any] | None:
-    """Read contained task JSON; scans can distinguish retryable I/O from invalid content."""
+    """Read contained task JSON; ``None`` for a file that is no task record.
+
+    With ``raise_read_errors`` the last I/O error (OSError) or damaged record claim (ValueError)
+    is raised, so scans can tell them from a foreign file.
+    """
     root = tasks_dir if tasks_dir is not None else _tasks_dir(ctx)
     for attempt in range(TASK_READ_RETRIES):
         try:
             data = read_cached_task_record(Path(path), tasks_dir=root, display_unknown_schema=True)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
             if attempt + 1 == TASK_READ_RETRIES:
-                if raise_read_errors and isinstance(exc, OSError):
+                if raise_read_errors:
                     raise
                 return None
             time.sleep(TASK_READ_RETRY_SECONDS)
@@ -634,10 +638,10 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     # Live workers by claimed repository (read-only reviewers included). "" counts a confirmed live
     # record with no usable claim, so the Projects line can say how many are not attributed. A task
     # store that cannot be read and searched (one without search permission lists names but not their
-    # records) or listed, or a record that cannot be statted or read, gives no counts: the missing
-    # record may be a live worker.
+    # records) or listed, or a record that cannot be statted, read or parsed (damaged, or of a newer
+    # schema), gives no counts: the missing record may be a live worker. A foreign file is no record.
     live_by_repository: dict[str, int] = {}
-    listing_failures: list[OSError] = []
+    listing_failures: list[Exception] = []
     store_readable = os.access(tasks_dir, os.R_OK | os.X_OK)
     for path in iter_task_records(
         tasks_dir, include_archive=False, on_error=lambda _path, exc: listing_failures.append(exc),
@@ -645,7 +649,9 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
         try:
             file_stat = path.stat()
             entry = _TASK_STATE_CACHE.get(str(path))
-            if entry is not None and entry[0] == _task_file_fingerprint(path.name, file_stat):
+            # The history scan caches foreign files and damaged records alike as misses (no summary),
+            # so only a fresh parse, served from the record cache, tells them apart.
+            if entry is not None and entry[1] is not None and entry[0] == _task_file_fingerprint(path.name, file_stat):
                 # Cache entries are replaced as a unit. Recheck live PIDs even
                 # when the record is unchanged.
                 _, summary, status, alive, _, pid = entry
@@ -658,6 +664,9 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
                 task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
             else:
                 task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
+                if task is not None and set(task) == {"schema_version"}:
+                    # A newer schema's record is shown without its fields; it may be a live worker.
+                    raise ValueError(f"task record {path} has a newer schema")
                 if task is None or str(task.get("status") or "") not in ACTIVE_TASK_STATUSES:
                     continue
                 status, alive = _derived_task_status(task)
@@ -669,7 +678,8 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
             if not isinstance(exc, FileNotFoundError):  # a record removed during the scan is no worker
                 listing_failures.append(exc)
             continue
-        except ValueError:
+        except ValueError as exc:  # a damaged record claim: it may be a live worker
+            listing_failures.append(exc)
             continue
         rows.append(_task_summary_row(summary, status, alive, file_stat.st_mtime))
         claimed = (_authoritative_task_repository(task) if task else None) or ""
@@ -783,6 +793,8 @@ def _delegate_task_rows_locked(
                 # not publish a generation that omits the unread record.
                 generation = None
                 continue
+            except ValueError:  # a damaged record claim, cached as a miss below
+                task = None
             if task is None:
                 # Foreign or damaged records are misses too. Otherwise every
                 # projection repeats their reads, parsing and retry sleeps while
