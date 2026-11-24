@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Sequence
@@ -24,6 +25,49 @@ from pathlib import Path
 
 TASK_ID_ENV = "LEARN_UKRAINIAN_DISPATCH_TASK_ID"
 _ZERO = frozenset("0")
+_OBJECT_NAME = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+class TaskBaseError(ValueError):
+    """A safe, typed refusal for an unverifiable recorded base or start commit."""
+
+
+def task_base_and_start(record: dict) -> tuple[str, str]:
+    """Read pinned object names, including records before the separate start field."""
+    base = record.get("worktree_base_sha")
+    if base is None:
+        raise TaskBaseError("WORKTREE_BASE_SHA_MISSING")
+    if not isinstance(base, str) or not _OBJECT_NAME.fullmatch(base):
+        raise TaskBaseError("WORKTREE_BASE_SHA_INVALID")
+    start = record.get("worktree_start_sha", base)
+    if not isinstance(start, str) or not _OBJECT_NAME.fullmatch(start):
+        raise TaskBaseError("WORKTREE_START_SHA_INVALID")
+    return base, start
+
+
+def verify_task_commits(run: Callable[..., str], base: str, start: str) -> None:
+    """Require the stored IDs themselves to be commits, without peeling tags."""
+    commits = ((base, "BASE"),) if base == start else ((base, "BASE"), (start, "START"))
+    for sha, field in commits:
+        try:
+            resolved = run("rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}")
+        except subprocess.CalledProcessError:
+            raise TaskBaseError(f"WORKTREE_{field}_SHA_NOT_COMMIT") from None
+        if resolved != sha:
+            raise TaskBaseError(f"WORKTREE_{field}_SHA_NOT_COMMIT")
+
+
+def verify_base_ancestry(run: Callable[..., str], base: str, start: str) -> None:
+    """Prove the dispatch base belongs to the recorded start's history."""
+    if base != start:
+        try:
+            run("merge-base", "--is-ancestor", base, start)
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode != 1:
+                raise
+            raise TaskBaseError("WORKTREE_BASE_NOT_ANCESTOR_OF_START") from None
+
+
 def _load_record(task_id: str) -> dict:
     """Read ownership from the task store; write workers run as the dispatching seat."""
     from lu_machinery.dispatcher import store
@@ -70,16 +114,15 @@ def outside_owned(paths: Iterable[str], owned: Sequence[str]) -> list[str]:
     return sorted(path for path in set(paths) if path and not path_is_owned(path, owned))
 
 
-def delivered_paths(run: Callable[..., str], head_sha: str, base_sha: str, start_sha: str, *,
+def delivered_paths(run: Callable[..., str], head_sha: str, upstream_sha: str, start_sha: str, *,
                     commits_expected: bool = False, other_bases: Sequence[str] = ()) -> list[str]:
     """Every path the task's own commits touch, as settlement reads them.
 
-    The range excludes the task's start and the merge bases with trusted upstream and checked
-    commits. Git treats multiple bases as the parents of a hypothetical merge. Remerge diffs
-    isolate resolution edits. Older Git and octopus merges cannot prove those edits absent.
+    Exclude every ancestor of the task start, trusted upstream and already checked commits.
+    Remerge diffs isolate resolution edits. Older Git and octopus merges cannot prove those
+    edits absent.
     """
-    merge_bases = run("merge-base", "--all", head_sha, base_sha, *other_bases).splitlines()
-    revision_range = (head_sha, "--not", *merge_bases, start_sha)
+    revision_range = (head_sha, "--not", upstream_sha, start_sha, *other_bases)
     if commits_expected and not run("rev-list", "--max-count=1", *revision_range):
         raise ValueError("empty ownership range with recorded commits ahead")
     version = tuple(int(part) for part in run("version").split()[2].split(".")[:2])
@@ -106,10 +149,15 @@ def failure_detail(exc: Exception) -> str:
     return type(exc).__name__
 
 
-def _local_git(root: Path) -> Callable[..., str]:
+def _local_git(root: Path, *, push: bool = False) -> Callable[..., str]:
+    # The push walk needs no caller Git environment. Staged checks need Git's
+    # index context for partial commits.
+    env = {key: value for key, value in os.environ.items() if not push or not key.startswith("GIT_")}
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+
     def run(*args: str, strip: bool = True) -> str:
         output = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True,
-                                check=True, timeout=30).stdout
+                                env=env, check=True, timeout=30).stdout
         return output.strip() if strip else output
 
     return run
@@ -174,14 +222,53 @@ def _staged_paths(run: Callable[..., str]) -> list[str]:
 
 
 def _pushed_paths(run: Callable[..., str], record: dict, updates: str) -> list[str]:
-    base_sha = run("rev-parse", "--verify", f"{record['worktree_base_ref']}^{{commit}}")
-    start_sha = record.get("worktree_start_sha", record["worktree_base_sha"])
+    base_sha, start_sha = task_base_and_start(record)
+    verify_task_commits(run, base_sha, start_sha)
+    verify_base_ancestry(run, base_sha, start_sha)
+    base_ref = record["worktree_base_ref"]
+    if not base_ref.startswith("refs/"):
+        base_ref = ("refs/remotes/" if base_ref.startswith("origin/") else "refs/heads/") + base_ref
+    run("check-ref-format", base_ref)
+    default_ref = "refs/remotes/origin/HEAD"
+    advertised_tip = None
+    if record.get("worktree_remote_url"):
+        from lu_machinery.dispatcher import git
+
+        default_branch, advertised_tip = git.remote_default(record)
+        default_ref = f"refs/remotes/origin/{default_branch}"
+    refs = {ref: (sha, symref) for ref, sha, symref in (
+        row.split("\t") for row in run("for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)",
+                                        base_ref, default_ref, strip=False).split("\n") if row
+    ) if ref in {base_ref, default_ref}}
+    if base_ref in refs:
+        # A surviving tracking ref must still name a commit. Its tip never expands the exclusion.
+        run("rev-parse", "--verify", "--end-of-options", f"{refs[base_ref][0]}^{{commit}}")
+    upstream_sha = base_sha
+    if default_ref in refs:
+        sha, target = refs[default_ref]
+        if advertised_tip is None and (not target.startswith("refs/remotes/origin/") or target == default_ref):
+            raise ValueError("origin HEAD does not name an origin tracking branch")
+        upstream_sha = run("rev-parse", "--verify", "--end-of-options", f"{sha}^{{commit}}")
+    if advertised_tip is not None:
+        # A concurrent advance can leave the advertised object unfetched. The
+        # tracking ref for the advertised branch still identifies fetched upstream.
+        try:
+            resolved = run("rev-parse", "--verify", "--quiet", "--end-of-options", f"{advertised_tip}^{{commit}}")
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode != 1:
+                raise
+        else:
+            if resolved != advertised_tip:
+                raise ValueError("origin default tip does not name a commit")
+            upstream_sha = advertised_tip
     paths: list[str] = []
-    for line in updates.splitlines():
-        fields = line.split()
+    for line in updates.split("\n"):
+        fields = line.split(" ")
         if len(fields) != 4 or not fields[2].startswith("refs/heads/") or set(fields[1]) <= _ZERO:
             continue
-        paths += delivered_paths(run, fields[1], base_sha, start_sha)
+        if not _OBJECT_NAME.fullmatch(fields[1]):
+            raise ValueError("pushed head must be a full object name")
+        paths += delivered_paths(run, fields[1], upstream_sha, start_sha)
     return paths
 
 
@@ -230,12 +317,15 @@ def main(argv: list[str] | None = None) -> int:
                   f"task {sanitize_for_display(record['task_id'])}: an orchestrator turn writes no product change. "
                   "Dispatch a worker with owned paths for it.", file=sys.stderr)
             return 1
-        run = _local_git(args.worktree)
+        run = _local_git(args.worktree, push=args.stage == "push")
         paths = (_staged_paths(run) if args.stage == "staged" else
                  _pushed_paths(run, record, sys.stdin.read()))
         outside = outside_owned(paths, effective_scope(record))
         if outside:
             print(_refusal(args.stage, record, outside), file=sys.stderr)
+    except TaskBaseError as exc:
+        print(f"owned-path check could not run ({exc}); refusing", file=sys.stderr)
+        return 1
     except Exception as exc:
         # Exception messages may contain record contents, paths or Git output. Keep this
         # boundary diagnostic fixed and single-line, including for unexpected failures.
