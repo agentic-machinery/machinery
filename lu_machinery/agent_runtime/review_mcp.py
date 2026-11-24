@@ -552,7 +552,7 @@ class CodexReviewMcpGateError(ValueError):
 
 
 class AgyReviewMcpGateError(ValueError):
-    """The effective AGY MCP server set for a review attempt is not exactly ``sources``."""
+    """The effective AGY MCP configuration differs from the scoped launch policy."""
 
 
 @dataclass(frozen=True)
@@ -612,7 +612,9 @@ def agy_review_app_data_dir(agy_home: Path | str) -> Path:
 
 
 def agy_review_settings(
-    review_access: str | None = "isolated", *, checkout_root: Path | str | None = None
+    review_access: str | None = "isolated", *,
+    checkout_root: Path | str | None = None,
+    sources_enabled: bool = True,
 ) -> dict[str, Any]:
     """Grant the review contract and explicitly deny the other Sources tools.
 
@@ -621,6 +623,7 @@ def agy_review_settings(
     Non-receipt Ukrainian reviews use REVIEW_TOOLS too. Full attempts retain
     their existing contract's search_resources grant. Read the launched server
     afresh so an unavailable inventory cannot yield a partial deny profile.
+    A consumer with no MCP servers gets only native file reads.
     """
     file_grants = []
     if checkout_root is not None:
@@ -636,20 +639,15 @@ def agy_review_settings(
         ):
             raise ValueError("agy_review_permissions_unsafe_checkout")
         file_grants.append(f"read_file({root})")
-    readers, writers = sources_tool_sets(sources_server_launch()[1])
-    tools = review_tools(review_access or "isolated")
-    if not set(readers) >= tools:
-        raise ValueError("review_contract_contains_non_read_only_sources_tool")
-    return {
-        "permissions": {
-            "allow": [*file_grants, *[f"mcp(sources/{name})" for name in sorted(tools)]],
-            "deny": [
-                "command(*)",
-                "write_file(*)",
-                *[f"mcp(sources/{name})" for name in sorted((set(readers) | set(writers)) - tools)],
-            ],
-        }
-    }
+    deny = ["command(*)", "write_file(*)"]
+    if sources_enabled:
+        readers, writers = sources_tool_sets(sources_server_launch()[1])
+        tools = review_tools(review_access or "isolated")
+        if not set(readers) >= tools:
+            raise ValueError("review_contract_contains_non_read_only_sources_tool")
+        file_grants.extend(f"mcp(sources/{name})" for name in sorted(tools))
+        deny.extend(f"mcp(sources/{name})" for name in sorted((set(readers) | set(writers)) - tools))
+    return {"permissions": {"allow": file_grants, "deny": deny}}
 
 
 def agy_full_review_settings() -> dict[str, Any]:
@@ -1387,7 +1385,7 @@ def verify_agy_review_effective_mcp(
     timeout: float = _AGY_MCP_LIST_TIMEOUT_S,
     boundary: Any = None,
 ) -> None:
-    """Refuse an AGY review attempt unless its effective MCP set is exactly ``sources``.
+    """Require exactly the scoped MCP set: Sources or a verified empty consumer config.
 
     ``agy mcp list`` (run under ``env``, the environment the launch will get) proves the
     server set, name, transport, enabled state and command line; it does not show ``env``,
@@ -1414,23 +1412,31 @@ def verify_agy_review_effective_mcp(
         verify_review_attempt_paths(config)
     except (OSError, ReviewDirectoryError):
         raise refuse(_ATTEMPT_PATHS_CHANGED) from None
+    sources_enabled = boundary is None or boundary.sources_enabled
+    names = ["sources"] if sources_enabled else []
+    launch_config = Path(boundary.tool_config["mcp_config_path"]) if boundary else config
     try:
-        expected = json_depth.loads(_read_attempt_file(config.parent, config.name), max_depth=512)["mcpServers"]["sources"]
-        command = expected["command"]
-        args = list(expected["args"])
+        expected_servers = _strict_json_object(_read_attempt_file(launch_config.parent, launch_config.name))["mcpServers"]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise refuse(
             f"cannot read the attempt MCP config {_echo_identifier(config.name)!r}: {_exc_reason(exc, diagnostics)}"
         ) from exc
+    if not isinstance(expected_servers, dict) or set(expected_servers) != set(names):
+        raise refuse(f"the attempt MCP config must hold exactly {names!r}")
+    expected = expected_servers.get("sources", {})
+    if sources_enabled and (
+        not isinstance(expected, dict) or "command" not in expected or not isinstance(expected.get("args"), list)
+    ):
+        raise refuse("the attempt Sources server must declare a command and args")
+    recording_env = expected.get("env")
     if boundary:
-        expected = json_depth.loads(Path(boundary.tool_config["mcp_config_path"]).read_bytes(), max_depth=512)["mcpServers"]["sources"]
-        command, args = expected["command"], list(expected["args"])
+        access = "full" if boundary.full else "isolated"
     else:
-        recording_env = expected.get("env")
         if not isinstance(recording_env, dict) or set(recording_env) != {*ENV_KEYS, "LU_REVIEW_ACCESS"}:
             raise refuse("the attempt MCP config does not carry exactly the review recording variables")
+        access = recording_env["LU_REVIEW_ACCESS"]
         try:
-            review_tools(recording_env["LU_REVIEW_ACCESS"])
+            review_tools(access)
         except ValueError:
             raise refuse("the attempt MCP config has invalid review access") from None
 
@@ -1439,7 +1445,6 @@ def verify_agy_review_effective_mcp(
     if env.get("HOME") != str(agy_home) or env.get("AGY_APP_DATA_DIR") != str(app_data):
         # Name the variables, never their values: the launch environment is not log-safe.
         raise refuse("the launch environment does not carry the scoped HOME/AGY_APP_DATA_DIR")
-    access = ("full" if boundary.full else "isolated") if boundary else expected["env"]["LU_REVIEW_ACCESS"]
     settings = app_data / "settings.json"
     try:
         permissions = _strict_json_object(
@@ -1447,19 +1452,19 @@ def verify_agy_review_effective_mcp(
         )
     except (OSError, ValueError):
         raise refuse("AGY review requires the scoped permission rules") from None
-    if permissions != agy_review_settings(access, checkout_root=boundary.workspace if boundary else cwd):
-        raise refuse("AGY review requires exactly the sources review tool and command permission rules")
+    if permissions != agy_review_settings(
+        access, checkout_root=boundary.workspace if boundary else cwd, sources_enabled=sources_enabled,
+    ):
+        raise refuse("AGY review requires exactly the scoped tool and command permission rules")
     if (app_data / "mcp_config.json").exists() or (app_data / "mcp_config.json").is_symlink():
         raise refuse("the scoped AGY_APP_DATA_DIR holds an unexpected mcp_config.json")
 
-    parts = [command, *args]
+    parts = [expected["command"], *expected["args"]] if sources_enabled else []
     if any(not isinstance(part, str) or not part or any(ch.isspace() for ch in part) for part in parts):
         raise refuse(
             "the attempt command or args contain whitespace or an empty part, so the flat "
             "`agy mcp list` COMMAND/URL text cannot identify them uniquely"
         )
-    expected_target = " ".join(parts)
-
     probe = [agy_bin, "mcp", "list"]
     if boundary:
         probe, env = boundary.wrap(probe, {})
@@ -1478,18 +1483,21 @@ def verify_agy_review_effective_mcp(
     if proc.returncode != 0:
         raise refuse(f"`agy mcp list` exited {proc.returncode}: {_untrusted('stderr', proc.stderr, diagnostics)}")
 
-    rows = _agy_mcp_list_rows(proc.stdout, refuse, diagnostics)
-    if [row["name"] for row in rows] != ["sources"]:
-        raise refuse(
-            f"effective MCP servers are {_describe_names([row['name'] for row in rows])}; exactly ['sources'] is allowed"
-        )
-    row = rows[0]
-    if row["type"] != "stdio":
-        raise refuse(f"the sources server type is {_echo_identifier(row['type'])!r}, not stdio")
-    if row["status"] != "enabled":
-        raise refuse(f"the sources server status is {_echo_identifier(row['status'])!r}, not enabled")
-    if row["target"] != expected_target:
-        raise refuse("the sources server command/args differ from the attempt's .mcp.json")
+    if sources_enabled:
+        rows = _agy_mcp_list_rows(proc.stdout, refuse, diagnostics)
+        if [row["name"] for row in rows] != names:
+            raise refuse(
+                f"effective MCP servers are {_describe_names([row['name'] for row in rows])}; exactly {names!r} is allowed"
+            )
+        row = rows[0]
+        if row["type"] != "stdio":
+            raise refuse(f"the sources server type is {_echo_identifier(row['type'])!r}, not stdio")
+        if row["status"] != "enabled":
+            raise refuse(f"the sources server status is {_echo_identifier(row['status'])!r}, not enabled")
+        if row["target"] != " ".join(parts):
+            raise refuse("the sources server command/args differ from the attempt's .mcp.json")
+    elif proc.stdout.strip() != "No MCP servers configured.":
+        raise refuse("the effective MCP configuration is not empty")
 
     scoped_config = agy_review_mcp_config_path(agy_home)
     try:
@@ -1504,9 +1512,10 @@ def verify_agy_review_effective_mcp(
     if not isinstance(loaded, dict) or set(loaded) != {"mcpServers"}:
         raise refuse("the scoped agy MCP config has keys other than mcpServers")
     servers = loaded["mcpServers"]
-    if not isinstance(servers, dict) or set(servers) != {"sources"}:
-        raise refuse("the scoped agy MCP config does not hold exactly the one sources server")
-    if servers["sources"] != expected:
+    if not isinstance(servers, dict) or set(servers) != set(names):
+        allowed = "the one sources server" if sources_enabled else "zero servers"
+        raise refuse(f"the scoped agy MCP config does not hold exactly {allowed}")
+    if servers != expected_servers:
         raise refuse(
             "the scoped agy MCP config's sources server (command/args/env) differs from the attempt's .mcp.json"
         )

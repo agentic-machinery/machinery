@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import sentinel
 
 import pytest
@@ -86,6 +87,49 @@ def test_consumer_read_only_agy_without_tool_config_gets_bounded_route(
     assert not scratch[0].exists()
     assert not (checkout / ".agents").exists()
     assert token.read_text() == "fixture"
+
+
+def test_consumer_read_only_agy_skips_sources_with_foreign_scripts_package(tmp_path, monkeypatch):
+    """A registered consumer's imports must not prevent a bounded AGY ask."""
+    from lu_machinery.agent_runtime import review_mcp, runner
+    from lu_machinery.agent_runtime.adapters.agy import AgyAdapter
+    from lu_machinery.orchestration import fleet_repos
+
+    checkout = tmp_path / "consumer"
+    scripts_dir = checkout / "scripts"
+    scripts_dir.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=10)
+    consumer = fleet_repos.load_fleet_repos()["kube-dojo"]
+    monkeypatch.setattr(fleet_repos, "fleet_repo_for_checkout", lambda root: consumer if root == checkout else None)
+    scripts = ModuleType("scripts")
+    scripts.__path__ = [str(scripts_dir)]
+    monkeypatch.setitem(sys.modules, "scripts", scripts)
+    token = tmp_path / "auth"
+    token.write_text("fixture")
+    monkeypatch.setattr(review_mcp, "_real_agy_token", lambda: token)
+
+    def inspect(agent, prompt, *, cwd, mode, tool_config, allow_runner_failover, **_):
+        plan = AgyAdapter().build_invocation(
+            prompt=prompt, mode=mode, cwd=cwd, model=None, task_id=None,
+            session_id=None, tool_config=tool_config,
+        )
+        boundary = tool_config["review_attempt_boundary"]
+        assert boundary.workspace == plan.cwd == checkout
+        assert "--sandbox" in plan.cmd and "--dangerously-skip-permissions" not in plan.cmd
+        assert not allow_runner_failover
+        assert boundary.connection is None
+        assert json.loads(Path(plan.metadata["agy_mcp_config_path"]).read_text()) == {"mcpServers": {}}
+        home = Path(plan.env_overrides["HOME"])
+        settings = json.loads((review_mcp.agy_review_app_data_dir(home) / "settings.json").read_text())
+        assert settings == {"permissions": {
+            "allow": [f"read_file({checkout})"],
+            "deny": ["command(*)", "write_file(*)"],
+        }}
+        assert sys.modules["scripts"] is scripts
+        return sentinel.result
+
+    monkeypatch.setattr(runner, "_invoke_impl", inspect)
+    assert runner.invoke("agy", "Read README.md.", cwd=checkout, mode="read-only") is sentinel.result
 
 
 def test_agy_resolves_requested_global_mcp_server(
