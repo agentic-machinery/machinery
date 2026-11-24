@@ -11,6 +11,7 @@ The adapter writes or verifies this file under the attempt's scoped
 | Full content review | `review_tools("full")`, individually named | `read_file(<attempt checkout>)` | None |
 | Isolated content review | `review_tools("isolated")`, individually named | `read_file(<projected inputs>)` | None |
 | Scoped ad hoc review | Same isolated contract | `read_file(<review cwd>)` | None |
+| Consumer read-only ask | Same isolated contract | `read_file(<consumer checkout>)` | None |
 
 The shared review contract checks the behavior-audited Sources reader set;
 writer tools remain outside both the exposed review catalog and the allow set.
@@ -30,6 +31,39 @@ the actual review cwd; a different checkout or wider allow set fails closed.
 No hand-edited global settings are required. Native permissions supplement the
 existing OS review boundary; they do not replace it. The separate unsupported
 AGY code-review isolation route still refuses.
+
+## Read-only asks from a consumer checkout
+
+Call the public runtime from a configured machinery installation. Pass the
+checkout root as `cwd` and omit `tool_config` and `session_id`.
+
+```python
+from pathlib import Path
+
+from lu_machinery.agent_runtime.runner import invoke
+
+result = invoke(
+    "agy",
+    "Read README.md and summarize the project in one sentence.",
+    cwd=Path.cwd(),
+    mode="read-only",
+    model="gemini-4-hydrogen-medium",
+    hard_timeout=180,
+)
+```
+
+Use a Linux host with bubblewrap, a working AGY login, and the configured
+Sources service checkout. Machinery verifies the native AGY version and
+effective Sources catalog inside the boundary. It mounts the checkout
+read-only, masks checkout-owned AGY configuration, and relays Sources calls
+through the isolated review tool allowlist. AGY uses a disposable private home.
+Network connections go through the same restricted egress as a review
+attempt. Read-only asks use the current checkout contents, so keep the inputs
+stable while the ask runs.
+
+An explicit tool configuration, including an empty dictionary or
+`{"reviewer_tools": True}`, still requires the caller to supply a valid
+review configuration and may be refused before AGY starts.
 
 ## Production plan prompt command decisions
 

@@ -22,6 +22,8 @@ from lu_machinery.common.safe_open import safe_open_below
 
 GUARD_NAME = "shell-secret-print-guard"
 GUARD_TIMEOUT_FLOOR = 10
+# AGY accepts three aliases for .agents and a .gemini workspace discovery override.
+AGY_WORKSPACE_CONFIG_DIRS = (".agents", ".agent", "_agents", "_agent", ".gemini")
 PRIMARY_GUARD_NAME = "primary-checkout-write-guard"
 PRIMARY_GUARD_ENTRY = "agents_extensions/shared/hooks/guard-primary-checkout-write.py"
 GUARD_MODE = "agy-secret-print"
@@ -166,7 +168,7 @@ def hook_locations(cwd: Path, home: Path, agy_home: Path | None = None) -> tuple
     if agy_home is not None and not agy_home.is_absolute():
         raise AgyHookConfigError("relative_scoped_home")
     effective_home = agy_home if agy_home is not None else home
-    return (cwd / ".agents/hooks.json", effective_home / ".gemini/config/hooks.json")
+    return (cwd / AGY_WORKSPACE_CONFIG_DIRS[0] / "hooks.json", effective_home / ".gemini/config/hooks.json")
 
 
 def _read_config(path: Path) -> dict:

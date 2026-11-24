@@ -1655,7 +1655,7 @@ def _build_gemini_attempt_tool_config(
     return attempt_tool_config
 
 
-def _attempt_boundary_refusal(exc: Exception, *, stage: str) -> str:
+def _attempt_boundary_refusal(exc: Exception, *, stage: str, consumer: bool = False) -> str:
     """Keep the refusal identifier, never isolation diagnostics or exception text."""
     from lu_machinery.review.isolation import ReviewIsolationError
 
@@ -1664,7 +1664,8 @@ def _attempt_boundary_refusal(exc: Exception, *, stage: str) -> str:
         code = str(exc).partition(":")[0]
         if re.fullmatch(r"[a-z][a-z0-9_]*", code):
             detail = code
-    return f"formal attempt filesystem boundary refused: {stage}: {detail}"
+    scope = "AGY consumer read-only" if consumer else "formal attempt filesystem"
+    return f"{scope} boundary refused: {stage}: {detail}"
 
 
 def _execute_invocation_plan(
@@ -1949,7 +1950,9 @@ def _execute_invocation_once(
             boundary.verify_seat(review_cmd, plan.env_overrides)
             review_cmd, env = boundary.wrap(review_cmd, plan.env_overrides)
         except (OSError, ValueError, RuntimeError) as exc:
-            raise AgentUnavailableError(_attempt_boundary_refusal(exc, stage="wrap")) from exc
+            raise AgentUnavailableError(
+                _attempt_boundary_refusal(exc, stage="wrap", consumer=getattr(boundary, "consumer", False))
+            ) from exc
         for key in plan.env_unsets:
             env.pop(key, None)
         env["AGENT_NO_TELEMETRY_FOOTER"] = "1"
@@ -3949,6 +3952,9 @@ def invoke(
     ``attempt_evidence`` receives the boundary's egress summary after cleanup,
     even when invocation raises or cancellation unwinds past this call.
 
+    A fresh AGY read-only ask with omitted ``tool_config`` uses a private home
+    and the read-only attempt boundary for the supplied checkout root.
+
     Retired Kimi seats and models are refused before attribution, ownership
     resolution or execution-tree reads. Other retired models are refused next,
     still before attribution.
@@ -3968,16 +3974,24 @@ def invoke(
     selector_token = _REQUESTED_SELECTOR.set(model)
     nonce_token = _INVOCATION_NONCE.set((tool_config or {}).get("run_nonce"))
     attempt = None
+    agy_consumer = agent_name == "agy" and mode == "read-only" and tool_config is None
     try:
-        from .attempt_boundary import prepare_attempt_boundary
+        from .attempt_boundary import AttemptBoundary, prepare_attempt_boundary
 
+        if agy_consumer and session_id is not None:
+            from .adapters.agy import AgyReviewPermissionError
+
+            raise AgyReviewPermissionError("agy_review_permissions_require_fresh_session")
         try:
-            boundary_config = tool_config
-            if tool_config and tool_config.get("review_access") == "full":
-                boundary_config = {**tool_config, "review_cwd": str(cwd)}
-            attempt = prepare_attempt_boundary(agent_name, mode, session_id, boundary_config)
+            if agy_consumer:
+                attempt = AttemptBoundary(agent="agy", tool_config={}, consumer_workspace=cwd or Path.cwd())
+            else:
+                boundary_config = tool_config
+                if tool_config and tool_config.get("review_access") == "full":
+                    boundary_config = {**tool_config, "review_cwd": str(cwd)}
+                attempt = prepare_attempt_boundary(agent_name, mode, session_id, boundary_config)
         except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
-            raise AgentUnavailableError(_attempt_boundary_refusal(exc, stage="prepare")) from exc
+            raise AgentUnavailableError(_attempt_boundary_refusal(exc, stage="prepare", consumer=agy_consumer)) from exc
         return _invoke_impl(
             agent_name,
             prompt,
