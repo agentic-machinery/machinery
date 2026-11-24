@@ -9,10 +9,12 @@ never starts another turn.
 
 ```bash
 .venv/bin/python -m lu_machinery.dispatch dispatch --agent claude --model <model> \
-  --mode orchestrator --stream epic:<n> --initiator claude-cto --hard-timeout 7200 \
-  --task-id turn-<slug> --prompt-file <brief.md> --worktree
+  --mode orchestrator --stream epic:<n> --repo <fleet-key> --initiator claude-cto \
+  --hard-timeout 7200 --task-id turn-<slug> --prompt-file <brief.md> --worktree
 ```
 
+- `--repo` is the brief's repository key (`lu_machinery/config/fleet_repos.yaml`); without it the
+  turn's tree is made in the default public repository, whatever the stream.
 - The stream is a canonical, uniquely registered `epic:<n>`, and the agent and model must map to a
   registered launcher slot of its lane (`orchestrator_stream_unregistered`,
   `orchestrator_slot_unregistered`).
@@ -25,8 +27,10 @@ never starts another turn.
   means an uncleared lease holds the stream, a turn's or a legacy driver's, expired or not: stop.
   `orchestrator_lease_unknown` means the claim answer was unknown: nothing started, and the stream
   may stay held until the recovery runbook proves otherwise. Neither is retried or forced.
-- Settle with `dispatch wait <task-id> --run-nonce <nonce> --timeout 300` in a loop, then
-  `dispatch status`.
+- Settle with `dispatch wait <task-id> --run-nonce <nonce> --timeout 300`, repeated only while it
+  returns 124 (the bounded wait expired and the turn still runs). Exit 0 is `done`; exit 1 is any
+  other terminal status (`blocked` and `handoff` settle `no_deliverable`). Read the record with
+  `dispatch status <task-id> --run-nonce <nonce>`. Any other exit is an error to report, not retry.
 
 ## Operating limits
 
@@ -52,7 +56,8 @@ first, and the receipt and its note must verify, else settlement gives a typed
 `orchestrator_handoff_*` reason. Past those checks `done` settles `done` once the turn's processes
 are proven gone, and `blocked` and `handoff` settle `no_deliverable` (`orchestrator_blocked`,
 `orchestrator_handoff`), never `done`. A recorded receipt is not the result: read the settled
-status and reason (`dispatch status`). The turn's own steps come from its brief.
+status and reason (`dispatch status <task-id> --run-nonce <nonce>`). The turn's own steps come
+from its brief.
 
 ## Claim release and recovery
 
