@@ -8,14 +8,15 @@ never starts another turn.
 ## Start a turn
 
 ```bash
-.venv/bin/python -m lu_machinery.dispatch dispatch --agent claude --model <model> \
+.venv/bin/python -m lu_machinery.dispatch dispatch --agent <driver-agent> --model <driver-model> \
   --mode orchestrator --stream epic:<n> --repo <fleet-key> --initiator claude-cto \
   --hard-timeout 7200 --task-id turn-<slug> --prompt-file <brief.md> --worktree
 ```
 
 - `--repo` is the brief's repository key (`lu_machinery/config/fleet_repos.yaml`); without it the
   turn's tree is made in the default public repository, whatever the stream.
-- The stream is a canonical, uniquely registered `epic:<n>`, and the agent and model must map to a
+- The stream is a canonical, uniquely registered `epic:<n>`. Take `<driver-agent>` and
+  `<driver-model>` from the stream's assigned driver route (the brief names it); they must map to a
   registered launcher slot of its lane (`orchestrator_stream_unregistered`,
   `orchestrator_slot_unregistered`).
 - The task id starts with `turn-` (one is generated when omitted). It is Monitor-safe and names the
