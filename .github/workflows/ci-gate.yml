@@ -58,8 +58,8 @@
 #   tarballs for actionlint, ShellCheck, zizmor, TruffleHog, Trivy and uv;
 #   uv-managed CPython (uv checks each download against the hash it ships);
 #   `uv sync --locked` from uv.lock, which checks the SHA-256 of every wheel,
-#   for Ruff, mypy, pip-audit and Semgrep. The build tools use hash-pinned PyPI
-#   wheels (pip --require-hashes --only-binary=:all:). npm audit uses the pinned
+#   for Ruff, mypy, pip-audit, Semgrep and the release build tools (`build`
+#   group). npm audit uses the pinned
 #   Node/npm release via actions/setup-node. Every venv lives in the job temp
 #   directory. Installers that run Python use isolated interpreters (python -I),
 #   so no Python module in the checkout is imported while installing.
@@ -93,9 +93,8 @@ concurrency:
 
 # Python: machinery jobs default to the uv-managed CPython in .python-version.
 # .github/actions/uv-python installs it with the uv release pinned below.
-# Python dependencies come from uv.lock (`uv sync --locked`,
-# which checks every SHA-256 in the lock). The build tools that release_cut
-# reads from this file use hash-pinned heredocs.
+# Python dependencies and the release build tools (`build` group) come from
+# uv.lock (`uv sync --locked`, which checks every SHA-256 in the lock).
 # Cache only verified release archives, never venvs or repository build outputs.
 # Fork PRs restore only. No prefix restore keys.
 env:
@@ -1064,19 +1063,8 @@ jobs:
           # Only tracked files, as in a release build.
           git archive --format=tar HEAD | tar -x -C "$work/src"
           cd "$work"
-          python -I -m venv build-venv
-          cat > build-requirements.txt <<'REQUIREMENTS'
-          build==1.6.1 \
-              --hash=sha256:ecd351a4be9d35a9eaaba244a7687143c9c7d4aea6ac964e7e7ddab20cbcf4e7
-          packaging==26.3 \
-              --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
-          pyproject-hooks==1.2.0 \
-              --hash=sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913
-          setuptools==84.1.0 \
-              --hash=sha256:5231689c6ac8156cd155cfb98c3fd6fb252c3e7e9bd3d78b64d3c55f132624c9
-          REQUIREMENTS
-          build-venv/bin/python -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement build-requirements.txt
+          UV_PROJECT_ENVIRONMENT="$work/build-venv" uv sync --directory "$work/src" \
+            --locked --no-build --no-python-downloads --only-group build
           build-venv/bin/python -I -m build --sdist --wheel --no-isolation --outdir dist src
           ls -l dist
           wheels="$(find dist -maxdepth 1 -name 'lu_machinery-*-py3-none-any.whl' | wc -l)"
@@ -1113,7 +1101,7 @@ jobs:
           cd "$work"
           wheel="$(find dist -maxdepth 1 -name 'lu_machinery-*-py3-none-any.whl')"
           mkdir wheelhouse
-          # The build venv has pip. The activated uv venv has no pip.
+          # The build venv gets pip from the locked build group. The activated uv venv has no pip.
           build-venv/bin/python -I -m pip download --no-cache-dir --disable-pip-version-check --no-input \
             --require-hashes --only-binary=:all: --no-deps --dest wheelhouse --requirement wheelhouse.txt
           cp "$wheel" wheelhouse/

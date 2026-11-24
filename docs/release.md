@@ -124,7 +124,9 @@ writes and reads it (`UV_VERSION` in `.github/workflows/pins.txt`), and
 CI's `uv sync --locked` fails when the lock no longer matches, and refuses
 any wheel whose hash differs from the lock. Semgrep runs in its own
 environment. The opt-in permission test gets MCP from the `test`
-dependency group. The release build tools use hash-pinned installs. The
+dependency group. The release build tools come from the locked `build`
+dependency group in `pyproject.toml` and `uv.lock` (including `pip` for
+downloading the offline wheelhouse). The
 product consumer check uses the job's checksum-verified `UV_VERSION`.
 
 uv gives third-party distributions a seven-day cooldown. A temporary third-party
@@ -186,10 +188,10 @@ the inventory.
 
 | Install path | Dependency and execution controls |
 | --- | --- |
-| [CI Gate](../.github/workflows/ci-gate.yml) and [pytest](../.github/workflows/tests.yml) Python jobs | Locked, wheel-only syncs into runner scratch for lint, mypy, Semgrep, dependency audit, attribution and test dependencies. Build tools use explicit wheel hashes. Built machinery wheels install offline with a hash of the artifact built in the job. |
+| [CI Gate](../.github/workflows/ci-gate.yml) and [pytest](../.github/workflows/tests.yml) Python jobs | Locked, wheel-only syncs into runner scratch for lint, mypy, Semgrep, dependency audit, attribution, release build tools (CI Gate `build` group) and test dependencies. `tests.yml` still builds with explicit wheel hashes. Built machinery wheels install offline with a hash of the artifact built in the job. |
 | [Native CI bootstrap](../lu_machinery/ci/setup_bubblewrap.sh), also used by the product | APT installs missing packages and dependencies from the official signed Ubuntu 24.04 snapshot at the timestamp in [`pins.txt`](../.github/workflows/pins.txt). The bootstrap checks the SHA-256 of the bubblewrap build fetched from the same snapshot. It skips APT when the runner already has the required packages and fails if a needed snapshot is unavailable. |
 | CI Gate product consumer | The pinned product checkout supplies `uv.lock`. A wheel-only sync installs the locked build tools first. The second sync builds the Git-pinned `ipa-uk` and the checkout's `learn-ukrainian-v4-runtime` using those tools in the product scratch venv. The candidate machinery wheel installs offline in a separate venv. |
-| [Release cut](../lu_machinery/release_cut.py) and [contract canary](../lu_machinery/review/contract_canary.py) | Build-tool hashes and the locked runtime wheel export cover the wheelhouse. The cut installs the candidate offline in a scratch venv. The canary installs the exact built wheel with dependencies disabled and a verified hash. |
+| [Release cut](../lu_machinery/release_cut.py) and [contract canary](../lu_machinery/review/contract_canary.py) | Locked, wheel-only sync of the `build` group from `uv.lock` builds the release artifacts, and the locked runtime wheel export covers the wheelhouse. The cut installs the candidate offline in a scratch venv. The canary installs the exact built wheel with dependencies disabled and a verified hash. |
 | ACPX release prefix and CI pytest provisioning | `npm ci --ignore-scripts` reads the packaged `package-lock.json` in a separate prefix. Sealing verifies cached archives against the lock. The documented offline restore uses the retained cache and the same lock. |
 | [Dispatched site dependencies](../lu_machinery/dispatcher/site_deps.py) | `npm ci` reads the target checkout's site lock into a staging directory with a fresh home. The lock determines reuse of the resulting tree. |
 | [Clean-machine drill](../drill/clean-machine/README.md), [filesystem parity probe](../lu_machinery/ci/linux_fs_parity.sh), [attribution](runbooks/agent-attribution.md) and [venv repair](../lu_machinery/hygiene/check_venv_integrity.py) | The drill checks the published wheel against `SHA256SUMS` and installs from the hashed consumer lock. The parity probe verifies its uv archive and installs from a hashed lock export in a container. Attribution and venv repair use hashed pip requirements. |
@@ -307,11 +309,12 @@ does these steps in order:
      candidate and in the product `main` checkout used for adoption and test
      collection. This check also applies to dry runs that proceed to a build.
 2. **Release notes**, generated as described under Changelog.
-3. **Build** once from `git archive "$SHA"`, outside any checkout, with the
-   build pins of the `Installed wheel` job (the `build-requirements.txt`
-   heredoc in `ci-gate.yml` at `$SHA`):
-   `python -I -m build --sdist --wheel --no-isolation`. It writes `SHA256SUMS`
-   for the wheel and sdist.
+3. **Build** once from `git archive "$SHA"`, outside any checkout, in a
+   scratch `build-venv` synced from the locked `build` dependency group in
+   `pyproject.toml`/`uv.lock` at `$SHA`
+   (`uv sync --locked --no-build --only-group build --no-python-downloads`),
+   then `python -I -m build --sdist --wheel --no-isolation`. It writes
+   `SHA256SUMS` for the wheel and sdist.
 4. **Wheelhouse and consumer lock.** The wheelhouse is the wheel plus
    `pip download --require-hashes --only-binary=:all: --no-deps -r <export>`,
    where `<export>` is the runtime closure above, exported from `uv.lock` at

@@ -1688,3 +1688,104 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         cut.publisher_invocation("pr-create")
     # Manual command formatting fails soft (None) when publisher_invocation fails so original push errors are not masked.
     assert cut._manual_post_release_command(["pr-create"]) is None
+
+
+def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
+    """Defect class: release build reads the workflow heredoc or syncs the build group without --locked/--no-build/--only-group, leaks ambient env, or fails open on missing uv or lock mismatch."""
+    seed = tmp_path / "machinery-seed"
+    _init_repo(seed)
+    (seed / "pyproject.toml").write_text(
+        '[project]\nname = "lu-machinery"\nversion = "0.1.68"\n\n[dependency-groups]\nbuild = ["build==1.6.1"]\n',
+        encoding="utf-8",
+    )
+    (seed / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    _git(seed, "add", "pyproject.toml", "uv.lock")
+    _git(seed, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "fixture build inputs")
+    head = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+
+    bare = tmp_path / "machinery.git"
+    subprocess.run(["git", "clone", "--quiet", "--bare", str(seed), str(bare)], check=True, capture_output=True, text=True)
+
+    host_python = tmp_path / "host-python"
+    host_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    host_python.chmod(0o755)
+
+    def make_cut(name: str) -> Cut:
+        work = tmp_path / name
+        work.mkdir()
+        (work / "home").mkdir()
+        (work / "tmp").mkdir()
+        subprocess.run(
+            ["git", "clone", "--quiet", "--no-checkout", str(bare), str(work / "machinery")],
+            check=True, capture_output=True, text=True,
+        )
+        return Cut(
+            work=work, dry_run=True, machinery_remote=str(bare), product_remote="",
+            machinery_repo=REPO, product_repo="learn-ukrainian/learn-ukrainian.github.io",
+            host_python=host_python, primary=tmp_path, alert=False, x_agent="claude/claude-opus-5-5",
+            head=head,
+        )
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    build_log = tmp_path / "build-calls.log"
+    fail_marker = tmp_path / "fail-uv-sync"
+    fake_uv = bin_dir / "uv"
+    fake_uv.write_text(
+        "#!/bin/sh\nset -eu\n"
+        f'if [ -e {shlex.quote(str(fail_marker))} ]; then\n'
+        '  printf "error: lockfile mismatch or missing build group\\n" >&2\n'
+        "  exit 2\n"
+        "fi\n"
+        '[ -f pyproject.toml ] && [ -f uv.lock ] && [ ! -e .github/workflows/ci-gate.yml ]\n'
+        '[ -z "${GH_TOKEN+x}${ANTHROPIC_API_KEY+x}${UV_INDEX_URL+x}${UV_EXCLUDE_NEWER+x}${UV_NO_SYNC+x}" ]\n'
+        '[ "$HOME" = "${PWD%/*}/home" ] && [ "$TMPDIR" = "${PWD%/*}/tmp" ]\n'
+        '[ "$UV_PROJECT_ENVIRONMENT" = "${PWD%/*}/build-venv" ]\n'
+        '[ "$#" -eq 8 ]\n'
+        '[ "$1 $2 $3 $4 $5 $6 $7" = "sync --locked --no-build --only-group build --no-python-downloads --python" ]\n'
+        f'[ "$8" = {shlex.quote(str(host_python))} ]\n'
+        'mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"\n'
+        'cat > "$UV_PROJECT_ENVIRONMENT/bin/python" <<\'PYEOF\'\n'
+        "#!/bin/sh\nset -eu\n"
+        '[ -z "${GH_TOKEN+x}${ANTHROPIC_API_KEY+x}${UV_PROJECT_ENVIRONMENT+x}" ]\n'
+        '[ "$1 $2 $3 $4 $5 $6 $7" = "-I -m build --sdist --wheel --no-isolation --outdir" ]\n'
+        f'printf "build %s %s\\n" "$8" "$9" >> {shlex.quote(str(build_log))}\n'
+        'printf "wheel-bytes" > "$8/lu_machinery-0.1.68-py3-none-any.whl"\n'
+        'printf "sdist-bytes" > "$8/lu_machinery-0.1.68.tar.gz"\n'
+        "PYEOF\n"
+        'chmod 755 "$UV_PROJECT_ENVIRONMENT/bin/python"\n',
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+
+    monkeypatch.setenv("GH_TOKEN", "fixture-gh")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-key")
+    monkeypatch.setenv("UV_INDEX_URL", "https://evil.example/simple")
+    monkeypatch.setenv("UV_EXCLUDE_NEWER", "2000-01-01")
+    monkeypatch.setenv("UV_NO_SYNC", "1")
+
+    # 1. Happy path: syncs the locked build group from uv.lock with no ci-gate.yml heredoc and builds dist + SHA256SUMS.
+    ok_cut = make_cut("work-ok")
+    ok_cut.uv = fake_uv
+    files = ok_cut.build("0.1.68")
+    assert files["wheel"].read_bytes() == b"wheel-bytes"
+    assert files["sdist"].read_bytes() == b"sdist-bytes"
+    assert files["sums"].is_file()
+    assert not (ok_cut.work / "build-requirements.txt").exists()
+    assert build_log.read_text(encoding="utf-8").strip() == f"build {ok_cut.work / 'dist'} {ok_cut.work / 'src'}"
+
+    # 2. Fail closed when uv sync rejects a missing/mismatched lock or build group: never invokes build.
+    build_log.unlink()
+    fail_marker.write_text("1", encoding="utf-8")
+    bad_lock_cut = make_cut("work-bad-lock")
+    bad_lock_cut.uv = fake_uv
+    with pytest.raises(CutError, match=r"lockfile mismatch or missing build group"):
+        bad_lock_cut.build("0.1.68")
+    assert not build_log.exists()
+    fail_marker.unlink()
+
+    # 3. Fail closed when uv is unavailable on PATH.
+    no_uv_cut = make_cut("work-no-uv")
+    monkeypatch.setattr(release_cut.shutil, "which", lambda _name: None)
+    with pytest.raises(CutError, match=r"uv is not on PATH; the release build tools are synced from uv\.lock"):
+        no_uv_cut.build("0.1.68")

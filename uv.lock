@@ -152,6 +152,20 @@ wheels = [
 ]
 
 [[package]]
+name = "build"
+version = "1.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "os_name == 'nt'" },
+    { name = "packaging" },
+    { name = "pyproject-hooks" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bd/67/4898a44ea4f3f8e213b0954ec0aa0a16971d62a6212d6ea3931e97115b99/build-1.6.1.tar.gz", hash = "sha256:51cc11666391ab6f092070437ac747002ff46f3e4113a3622177ee6b488bfc53", size = 113427, upload-time = "2026-09-10T07:56:00.417Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ad/9b/9fb3585dabcd73a1b2a6267f63f62649347c9e6d072c9fde365b105abb2c/build-1.6.1-py3-none-any.whl", hash = "sha256:ecd351a4be9d35a9eaaba244a7687143c9c7d4aea6ac964e7e7ddab20cbcf4e7", size = 31179, upload-time = "2026-09-10T07:55:59.148Z" },
+]
+
+[[package]]
 name = "cachecontrol"
 version = "0.14.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1201,6 +1215,13 @@ attribution = [
 audit = [
     { name = "pip-audit" },
 ]
+build = [
+    { name = "build" },
+    { name = "packaging" },
+    { name = "pip" },
+    { name = "pyproject-hooks" },
+    { name = "setuptools" },
+]
 lint = [
     { name = "ruff" },
     { name = "zizmor" },
@@ -1252,6 +1273,13 @@ provides-extras = ["api", "postgres", "pytest", "test"]
 [package.metadata.requires-dev]
 attribution = [{ name = "markdown-it-py", specifier = ">=4.2.0" }]
 audit = [{ name = "pip-audit", specifier = "==2.10.1" }]
+build = [
+    { name = "build", specifier = "==1.6.1" },
+    { name = "packaging", specifier = "==26.3" },
+    { name = "pip", specifier = "==26.3" },
+    { name = "pyproject-hooks", specifier = "==1.2.0" },
+    { name = "setuptools", specifier = "==84.1.0" },
+]
 lint = [
     { name = "ruff", specifier = "==0.15.21" },
     { name = "zizmor", specifier = "==1.31.1" },
@@ -2225,6 +2253,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pyproject-hooks"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e7/82/28175b2414effca1cdac8dc99f76d660e7a4fb0ceefa4b4ab8f5f6742925/pyproject_hooks-1.2.0.tar.gz", hash = "sha256:1e859bd5c40fae9448642dd871adf459e5e2084186e8d2c2a79a824c970da1f8", size = 19228, upload-time = "2024-09-29T09:24:13.293Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/24/12818598c362d7f300f18e74db45963dbcb85150324092410c8b49405e42/pyproject_hooks-1.2.0-py3-none-any.whl", hash = "sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913", size = 10216, upload-time = "2024-09-29T09:24:11.978Z" },
+]
+
+[[package]]
 name = "pytest"
 version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2657,6 +2694,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/81/9b/4e7b8265ed81064306673133829ab21cf8169ce39af5d6f19fa34edf84fb/semgrep-1.183.0-cp310.cp311.cp312.cp313.cp314.py310.py311.py312.py313.py314-none-musllinux_1_2_aarch64.whl", hash = "sha256:a06b09d20c5595a31be210283b8ce50251305d49fb6e9214b50329a119779751", size = 81370496, upload-time = "2026-10-29T21:29:41.559Z" },
     { url = "https://files.pythonhosted.org/packages/40/1f/258440e3c49b06ddaa5ed000014c275f2539e232029627471f89f2f8df4a/semgrep-1.183.0-cp310.cp311.cp312.cp313.cp314.py310.py311.py312.py313.py314-none-musllinux_1_2_x86_64.whl", hash = "sha256:204dce82a74be29cf6d84aa6a32b2244ff7429fafd3d77e0ea44996d0398ba4a", size = 78950063, upload-time = "2026-10-29T21:29:50.201Z" },
     { url = "https://files.pythonhosted.org/packages/ae/76/38c2f47f7173b6bd0fe1c52cc5fbc3d1b906dd925a1e65263a41f4102c6f/semgrep-1.183.0-cp310.cp311.cp312.cp313.cp314.py310.py311.py312.py313.py314-none-win_amd64.whl", hash = "sha256:8e9d96b976d6cb8e1240d454e50245decd52d1329d84540df26c7f06787439f7", size = 59495454, upload-time = "2026-10-29T21:29:57.391Z" },
+]
+
+[[package]]
+name = "setuptools"
+version = "84.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/eb/7e5f628ee2eb168fecbf8026de7856b2543d6d609cc85f086b9a91ac93d6/setuptools-84.1.0.tar.gz", hash = "sha256:23657205b63d4d31395ab917815247f694aafad28cd21316bf5fd45a51048ea0", size = 1171783, upload-time = "2026-10-19T20:11:43.489Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/18/02/b4bbb90f8f29e334898ff45c6d9b1fffaa6f378017052b3023a06262b5f7/setuptools-84.1.0-py3-none-any.whl", hash = "sha256:5231689c6ac8156cd155cfb98c3fd6fb252c3e7e9bd3d78b64d3c55f132624c9", size = 819380, upload-time = "2026-10-19T20:11:41.684Z" },
 ]
 
 [[package]]

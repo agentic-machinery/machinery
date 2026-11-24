@@ -39,6 +39,15 @@ test = ["hypothesis==6.170.15"]
 # never part of the wheel's metadata). CI selects them per job with
 # `uv sync --locked`; see .github/workflows/ci-gate.yml.
 [dependency-groups]
+# Release and CI build tools (`python -I -m build --sdist --wheel --no-isolation`),
+# plus pip for downloading the offline wheelhouse (a uv environment has no pip of its own).
+build = [
+    "build==1.6.1",
+    "packaging==26.3",
+    "pip==26.3",
+    "pyproject-hooks==1.2.0",
+    "setuptools==84.1.0",
+]
 # pip: tests drive `python -m pip` in the test environment, and a uv
 # environment has no pip of its own.
 test = [
