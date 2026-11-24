@@ -339,39 +339,78 @@ class NoAllowance(CanaryError):
 _WINDOW_DEPTH = 6
 
 
+# Window readings are named ``used_pct`` / ``remaining_pct`` (or end in ``_used_pct`` /
+# ``_remaining_pct``); a window's metadata is ``resets_at`` / ``window_minutes`` (or ``<name>_resets_at``
+# beside ``<name>_used_pct``). The provider sample block and every ``*windows`` container (``windows``,
+# ``provider_windows``, ``claude_gpt_windows``) must be a mapping, and so must each window in a container.
+_WINDOW_READINGS = ("used_pct", "remaining_pct")
+_WINDOW_METADATA = ("resets_at", "window_minutes")
+
+
+def _window_container(name: str) -> bool:
+    return name.endswith("windows")
+
+
 def _plan_window_readings(record: Mapping[str, Any]) -> list[tuple[str, Any, float | None]] | None:
     """Every plan-window reading in one account record, as (path, value, percent left or None).
 
-    A reading is any ``used_pct`` or ``remaining_pct`` field, or one ending ``_used_pct`` or
-    ``_remaining_pct``, anywhere in the record except its ``credit`` block (credit relief and the
-    near-cap threshold, not plan windows). Its percent left is the remaining value, or 100 minus
-    the used value, for a real number in 0-100, and None otherwise: the provider normalizer
-    clamps remaining from used, so a used value outside 0-100 can still publish a plausible
-    remaining one. None overall when the record nests deeper than ``_WINDOW_DEPTH``.
+    The record is walked everywhere except its ``credit`` block (credit relief and the near-cap
+    threshold, not plan windows). A reading's percent left is the remaining value, or 100 minus
+    the used value, for a real number in 0-100, and None for anything else, a container
+    included: the provider normalizer clamps remaining from used, so a used value outside 0-100
+    can still publish a plausible remaining one. A window block (an entry of a ``*windows``
+    container, or metadata beside its own reading fields) whose metadata is set but that has no
+    numeric reading (a measurement the normalizer dropped) is a reading with value None. A
+    provider sample block or window container that is not a mapping, or a window inside a
+    container that is not, is a reading with its own value. None overall when the record nests
+    deeper than ``_WINDOW_DEPTH``.
     """
     from lu_machinery.fleet import credit_lane
 
+    def reading(name: str) -> str | None:
+        return next((kind for kind in _WINDOW_READINGS if name == kind or name.endswith(f"_{kind}")), None)
+
     readings: list[tuple[str, Any, float | None]] = []
-    stack: list[tuple[str, Any, int]] = [("", record, 0)]
+    stack: list[tuple[str, Any, int, str]] = [("", record, 0, "")]
     while stack:
-        path, node, depth = stack.pop()
-        items = node.items() if isinstance(node, Mapping) else enumerate(node)
+        path, node, depth, parent = stack.pop()
+        if isinstance(node, Mapping):
+            items: Any = node.items()
+            for key, value in items:
+                name = str(key)
+                meta = next((kind for kind in _WINDOW_METADATA if name == kind or name.endswith(f"_{kind}")), None)
+                if value is None or meta is None:
+                    continue
+                prefix = name[: -len(meta)]
+                # A window block: an entry of a window container, or metadata beside its own reading
+                # fields (``resets_at`` elsewhere, as in the pool pace verdict, is not a window).
+                if not _window_container(parent) and not any(f"{prefix}{kind}" in node for kind in _WINDOW_READINGS):
+                    continue
+                if not any(credit_lane._number(node.get(f"{prefix}{kind}")) is not None for kind in _WINDOW_READINGS):
+                    readings.append((f"{path}.{prefix}{'|'.join(_WINDOW_READINGS)}".lstrip("."), None, None))
+        else:
+            items = enumerate(node)
         for key, value in items:
-            where = f"{path}.{key}" if path else str(key)
+            name = str(key)
+            where = f"{path}.{name}" if path else name
+            kind = reading(name)
+            if kind is not None:
+                if value is not None:
+                    number = credit_lane._number(value)
+                    left = None if number is None or not 0 <= number <= 100 else (
+                        100 - number if kind == "used_pct" else number)
+                    readings.append((where, value, left))
+                continue
+            if value is not None and (name == "codexbar" or _window_container(name) or _window_container(parent)) and (
+                    not isinstance(value, Mapping)):
+                readings.append((where, value, None))
+                continue
             if isinstance(value, (Mapping, list)):
-                if depth == 0 and key == "credit":
+                if depth == 0 and name == "credit":
                     continue
                 if depth + 1 >= _WINDOW_DEPTH:
                     return None
-                stack.append((where, value, depth + 1))
-                continue
-            name = str(key)
-            used = name == "used_pct" or name.endswith("_used_pct")
-            if value is None or not (used or name == "remaining_pct" or name.endswith("_remaining_pct")):
-                continue
-            number = credit_lane._number(value)
-            left = None if number is None or not 0 <= number <= 100 else (100 - number if used else number)
-            readings.append((where, value, left))
+                stack.append((where, value, depth + 1, name))
     return readings
 
 
@@ -387,9 +426,9 @@ def _allowance(
     provider-sourced record (``status_source`` ``weekly_pace``, not a ``ledger_burn`` estimate),
     its own fresh probe (``credit_lane.probe_freshness``) whose ``fetched_at`` is still within the
     probe age limit now (Monitor can serve a budget it built earlier, so the published age is the
-    age at build time), every plan-window reading a real 0-100 percentage and the tightest above
-    the near-cap reserve (``_plan_window_readings``; the capacity reading is the minimum of a few
-    named windows, which would hide another window or one above 100), no provider probe failure
+    age at build time), every plan window measured with real 0-100 percentages and the tightest
+    above the near-cap reserve (``_plan_window_readings``; the capacity reading is the minimum of a
+    few named windows, which would hide another window or one above 100), no provider probe failure
     since that sample, and ``own``: the
     record names this account, with no stale or contradictory account row behind it. These extend
     the credit lane's own checks for Codex account b. A route the resolver's
@@ -410,15 +449,12 @@ def _allowance(
     max_age = credit_lane.probe_max_age_s()
     probe, why = credit_lane.probe_freshness(record, max_age)
     source = record.get("status_source")
-    native = record.get("codexbar")
-    if native is not None and not isinstance(native, Mapping):
-        return False, f"{text}, its provider sample block is a {type(native).__name__}, not a mapping"
     readings = _plan_window_readings(record)
     if readings is None:
         return False, f"{text}, plan windows nested deeper than {_WINDOW_DEPTH} levels"
     invalid = [(path, value) for path, value, left in readings if left is None]
     if invalid:
-        return False, f"{text}, a plan window is not a 0-100 percentage ({invalid})"
+        return False, f"{text}, a plan window is unmeasured, malformed or not a 0-100 percentage ({invalid})"
     try:
         reserve = credit_lane.load_policy().near_cap_remaining_pct
     except ValueError:  # the same retained reserve review_capacity uses when the policy is unreadable
