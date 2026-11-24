@@ -328,6 +328,8 @@ def test_journal_db_unavailable_exit_3(tmp_path: Path, monkeypatch: pytest.Monke
             }
         ),
         '{"schema":"journal.v1","total":NaN,"latest_id":null,"entries":[]}',
+        '{"schema":"journal.v1","total":1,"latest_id":1,"entries":[{"id":1,"occurred_at":"2026-11-24T12:00:00Z","recorded_at":"2026-11-24T12:00:05Z","project":"machinery","type":"note","headline":"ok","body":"bad \\ud800 surrogate","links":[],"author_seat":"claude-cto","source_key":null,"source_item_id":null,"corrects_id":null}]}',
+        '{"schema":"journal.v1","total":1,"latest_id":1,"entries":[{"id":1,"occurred_at":"2026-11-24T12:00:00Z","recorded_at":"2026-11-24T12:00:05Z","project":"machinery","type":"note","headline":"bad \\udfff","body":"ok","links":[],"author_seat":"claude-cto","source_key":null,"source_item_id":null,"corrects_id":null}]}',
     ],
 )
 def test_journal_invalid_payload_variants(
@@ -369,6 +371,8 @@ def test_journal_invalid_payload_variants(
         "since=2026-11-24T12:00:00",
         "since=2026-02-30T12:00:00Z",
         "since=2026-11-24T12:00:00+25:00",
+        "since=0001-01-01T00:00:00+01:00",
+        "since=9999-12-31T23:59:59-01:00",
         "since=7d&since=24h",
         "after_id=",
         "after_id=-1",
@@ -408,11 +412,16 @@ def test_journal_invalid_params_return_422_no_store(
         (("testclient", 50000), "http://127.0.0.1:8765", {}),
         (("2001:db8::1", 50000), "http://127.0.0.1:8765", {}),
         (("127.0.0.1", 50000), "http://evil.example:8765", {}),
+        (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Host": "127.0.0.1:99999"}),
+        (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Host": "bad host"}),
+        (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Host": "127.0.0.1:0"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "https://evil.example"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "null"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": ""}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "http://localhost.evil.example"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "http://127.0.0.1:8765/path"}),
+        (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "http://127.0.0.1:8765?"}),
+        (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "http://127.0.0.1:8765#"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "http://user@localhost:8765"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "ftp://localhost:8765"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "http://127.0.0.1:"}),
@@ -434,6 +443,42 @@ def test_journal_non_loopback_peer_or_origin_returns_403_no_store(
 
     assert response.status_code == 403
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_journal_missing_or_duplicate_host_or_origin_headers_return_403() -> None:
+    """Defect class: missing/duplicate Host or Origin headers bypass loopback authority guard."""
+    from starlette.requests import Request
+
+    def make_request(headers: list[tuple[bytes, bytes]]) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "scheme": "http",
+                "path": "/api/journal",
+                "query_string": b"",
+                "headers": headers,
+                "server": ("127.0.0.1", 8765),
+                "client": ("127.0.0.1", 50000),
+            }
+        )
+
+    assert not journal_router._request_is_allowed(make_request([]))
+    assert not journal_router._request_is_allowed(
+        make_request([(b"host", b"127.0.0.1:8765"), (b"host", b"127.0.0.1:8765")])
+    )
+    assert not journal_router._request_is_allowed(
+        make_request(
+            [
+                (b"host", b"127.0.0.1:8765"),
+                (b"origin", b"http://127.0.0.1:8765"),
+                (b"origin", b"https://evil.example"),
+            ]
+        )
+    )
+    assert journal_router._request_is_allowed(
+        make_request([(b"host", b"127.0.0.1:8765"), (b"origin", b"http://localhost:8765")])
+    )
 
 
 def test_journal_loopback_ipv6_and_loopback_origins_allowed(
@@ -566,6 +611,46 @@ for (const state of ['cli_unavailable', 'db_unavailable', 'invalid_payload']) {
   assert.match(downHtml, /Journal unavailable:/);
   assert.doesNotMatch(downHtml, /No journal entries/i);
 }
+
+// F2 regression: filter change during an in-flight refresh aborts/supersedes the stale fetch
+// and resolves with the newly selected URL instead of overwriting with stale data.
+(async () => {
+  const calls = [];
+  let releaseFirst;
+  global.fetch = (url, opts) => {
+    calls.push(url);
+    if (calls.length === 1) {
+      return new Promise((resolve, reject) => {
+        if (opts && opts.signal) {
+          opts.signal.addEventListener('abort', () => reject(new Error('aborted')));
+        }
+        releaseFirst = () => resolve({
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({...payload, filters: {project: null, type: null, since: '7d', after_id: null}}),
+          headers: {get: () => null},
+        });
+      });
+    }
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({...payload, filters: {project: null, type: 'decision', since: '7d', after_id: null}}),
+      headers: {get: () => null},
+    });
+  };
+  global.location = {search: '', pathname: '/journal'};
+  const inFlight = fetchJournal();
+  assert.deepEqual(calls, ['/api/journal']);
+  // Simulate user changing filter while first fetch is still pending.
+  global.location.search = '?type=decision';
+  assert.ok(activeController);
+  activeController.abort();
+  const reading = await inFlight;
+  assert.deepEqual(calls, ['/api/journal', '/api/journal?type=decision']);
+  assert.equal(reading.url, '/api/journal?type=decision');
+  assert.equal(reading.data.filters.type, 'decision');
+})().catch(err => { console.error(err); process.exitCode = 1; });
 """
     )
     subprocess.run(["node", "-e", node_code], check=True, timeout=15)

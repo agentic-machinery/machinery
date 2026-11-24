@@ -391,6 +391,53 @@ function renderChips(latest, lastSeenId = readLastSeenId()) {
   return out.join("");
 }
 
+let activeController = null;
+
+async function fetchJournal() {
+  while (true) {
+    const targetUrl = journalUrl();
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    activeController = controller;
+    let timedOut = false;
+    const timer = controller
+      ? setTimeout(() => { timedOut = true; controller.abort(); }, Machinery.API_TIMEOUT_MS)
+      : null;
+    try {
+      const options = {headers: {Accept: "application/json"}};
+      if (controller) options.signal = controller.signal;
+      const response = await fetch(targetUrl, options);
+      if (targetUrl !== journalUrl()) continue;
+      if (!response.ok) throw new Error(`${targetUrl}: HTTP ${response.status}`);
+      const receivedAt = Date.now();
+      const receivedMono = Machinery.snapshotClockStamp();
+      const rawText = await response.text();
+      if (targetUrl !== journalUrl()) continue;
+      let data;
+      try { data = JSON.parse(rawText); } catch { throw new Error(`${targetUrl}: Invalid JSON`); }
+      if (data === null || typeof data !== "object" || Array.isArray(data)) {
+        throw new Error(`${targetUrl}: Invalid JSON shape`);
+      }
+      const headers = response.headers && typeof response.headers.get === "function" ? response.headers : null;
+      return {
+        data,
+        ageHeader: headers ? headers.get("X-Snapshot-Age-S") : null,
+        boundHeader: headers ? headers.get("X-Snapshot-Stale-After-S") : null,
+        state: headers ? headers.get("X-Snapshot-State") : null,
+        snapshot: true,
+        receivedAt,
+        ...(receivedMono === null ? {} : {receivedMono}),
+        url: targetUrl,
+      };
+    } catch (error) {
+      if (targetUrl !== journalUrl()) continue;
+      throw error;
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+      if (activeController === controller) activeController = null;
+    }
+  }
+}
+
 const PANELS = [
   {
     id: "journal",
@@ -404,7 +451,16 @@ const PANELS = [
 const runner = createPanelRunner({
   panels: PANELS,
   renderChips: latest => renderChips(latest),
+  fetchJson: fetchJournal,
 });
+
+function reloadForCurrentUrl() {
+  PANELS[0].urls = [journalUrl()];
+  if (activeController) {
+    activeController.abort();
+  }
+  runner.retryPanel("journal");
+}
 
 function repaintFromLatest() {
   const payload = runner.latest.journal;
@@ -424,8 +480,7 @@ function navigateSearch(search) {
   const target = `${currentPath()}${search}`;
   if (typeof history === "object" && history && typeof history.pushState === "function") {
     history.pushState(null, "", target);
-    PANELS[0].urls = [journalUrl()];
-    runner.retryPanel("journal");
+    reloadForCurrentUrl();
     return;
   }
   if (typeof location === "object" && location && typeof location.assign === "function") {
@@ -507,8 +562,7 @@ function bindJournalControls() {
 
   if (typeof window === "object" && window && typeof window.addEventListener === "function") {
     window.addEventListener("popstate", () => {
-      PANELS[0].urls = [journalUrl()];
-      runner.retryPanel("journal");
+      reloadForCurrentUrl();
     });
   }
 }

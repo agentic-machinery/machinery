@@ -44,13 +44,15 @@ JOURNAL_TYPES: tuple[str, ...] = (
     "correction",
     "note",
 )
-_JOURNAL_TYPE_SET = frozenset(JOURNAL_TYPES)
+_JOURNAL_TYPE_CANONICAL: dict[str, str] = {name: name for name in JOURNAL_TYPES}
 _SINCE_WINDOWS: dict[str, timedelta] = {
     "24h": timedelta(hours=24),
     "7d": timedelta(days=7),
     "30d": timedelta(days=30),
 }
 _ASCII_UINT_RE = re.compile(r"^[0-9]+$")
+_PORT_RE = re.compile(r"^[1-9][0-9]{0,4}$")
+_ORIGIN_SCHEME_RE = re.compile(r"^(?:http|https)://(.+)$", re.IGNORECASE)
 _RFC3339_RE = re.compile(
     r"^([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})"
     r"(?:\.([0-9]{1,9}))?(?:([Zz])|([+-])([0-9]{2}):([0-9]{2}))$"
@@ -62,47 +64,75 @@ def _isoformat_z(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _is_loopback_host(host: str | None) -> bool:
-    if not isinstance(host, str) or not host:
+def _is_loopback_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    mapped = getattr(address, "ipv4_mapped", None)
+    # ipaddress.{IPv4,IPv6}Address.is_loopback is a boolean property, not a method.
+    return address.is_loopback or bool(mapped and mapped.is_loopback)  # nosemgrep: python.lang.maintainability.is-function-without-parentheses
+
+
+def _valid_port(raw_port: str) -> bool:
+    return bool(_PORT_RE.fullmatch(raw_port)) and int(raw_port) <= 65535
+
+
+def _is_loopback_authority(raw: str) -> bool:
+    """Validate one raw HTTP authority (``host`` or ``host:port``) as strictly loopback."""
+    if not raw or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in "/?#@\\" for ch in raw):
         return False
-    if host.lower() == "localhost":
+    if raw.startswith("["):
+        end_bracket = raw.find("]")
+        if end_bracket <= 1:
+            return False
+        host_part = raw[1:end_bracket]
+        rest = raw[end_bracket + 1 :]
+        if rest and (not rest.startswith(":") or not _valid_port(rest[1:])):
+            return False
+        try:
+            address = ipaddress.IPv6Address(host_part)
+        except ValueError:
+            return False
+        return _is_loopback_ip(address)
+
+    if "]" in raw:
+        return False
+    if ":" in raw:
+        host_part, sep, port_part = raw.partition(":")
+        if not sep or ":" in port_part or not _valid_port(port_part):
+            return False
+    else:
+        host_part = raw
+
+    if host_part.lower() == "localhost":
         return True
     try:
-        address = ipaddress.ip_address(host)
+        ipv4 = ipaddress.IPv4Address(host_part)
     except ValueError:
         return False
-    mapped = getattr(address, "ipv4_mapped", None)
-    return address.is_loopback or bool(mapped and mapped.is_loopback)
+    return _is_loopback_ip(ipv4)
+
+
+def _host_is_allowed(request: Request) -> bool:
+    """Require exactly one valid loopback Host header (never rely on Starlette's server fallback)."""
+    hosts = request.headers.getlist("host")
+    if len(hosts) != 1:
+        return False
+    return _is_loopback_authority(hosts[0])
 
 
 def _origin_is_allowed(request: Request) -> bool:
-    """Allow requests with no Origin header or a single loopback http(s) Origin."""
+    """Allow requests with no Origin header or a single strict loopback http(s) Origin."""
     origins = request.headers.getlist("origin")
     if not origins:
         return True
     if len(origins) != 1:
         return False
-    raw = origins[0]
-    if not raw or raw != raw.strip() or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
+    match = _ORIGIN_SCHEME_RE.fullmatch(origins[0])
+    if match is None:
         return False
-    try:
-        parsed = urlsplit(raw)
-        _ = parsed.port
-    except ValueError:
-        return False
-    if parsed.scheme.lower() not in {"http", "https"}:
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return False
-    if parsed.path or parsed.query or parsed.fragment:
-        return False
-    if ":" in parsed.netloc and parsed.port is None and not parsed.netloc.endswith("]"):
-        return False
-    return _is_loopback_host(parsed.hostname)
+    return _is_loopback_authority(match.group(1))
 
 
 def _request_is_allowed(request: Request) -> bool:
-    return _direct_loopback_peer(request) and _origin_is_allowed(request)
+    return _direct_loopback_peer(request) and _host_is_allowed(request) and _origin_is_allowed(request)
 
 
 def _is_private_repo(repo: FleetRepo) -> bool:
@@ -146,22 +176,24 @@ def _parse_rfc3339(value: str) -> datetime | None:
     canonical = f"{year_s}-{month_s}-{day_s}T{hour_s}:{minute_s}:{second_s}{frac_part}{tz_part}"
     try:
         parsed = datetime.fromisoformat(canonical)
-    except ValueError:
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(UTC)
+    except (ValueError, OverflowError):
         return None
-    if parsed.tzinfo is None:
-        return None
-    return parsed.astimezone(UTC)
 
 
-def _parse_bounded_int(raw: str | None, *, default: int | None, minimum: int, maximum: int, name: str) -> int | None:
+def _parse_bounded_int(
+    raw: str | None, *, default: int | None, minimum: int, maximum: int
+) -> tuple[bool, int | None]:
     if raw is None:
-        return default
+        return True, default
     if not _ASCII_UINT_RE.fullmatch(raw):
-        raise ValueError(f"invalid_{name}")
+        return False, None
     value = int(raw)
     if value < minimum or value > maximum:
-        raise ValueError(f"invalid_{name}")
-    return value
+        return False, None
+    return True, value
 
 
 def _resolve_cli() -> str | None:
@@ -177,8 +209,18 @@ def _reject_json_constant(token: str) -> Any:
     raise ValueError(f"unexpected JSON constant: {token}")
 
 
+def _is_utf8_str(value: Any) -> TypeGuard[str]:
+    if not isinstance(value, str):
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _validate_safe_url(value: Any) -> str | None:
-    if not isinstance(value, str) or not value or value != value.strip():
+    if not _is_utf8_str(value) or not value or value != value.strip():
         return None
     if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
         return None
@@ -220,13 +262,13 @@ def _validate_entry(raw: Any) -> dict[str, Any] | None:
         return None
     if occurred_at is None or recorded_at is None:
         return None
-    if not isinstance(project, str) or not project or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in project):
+    if not _is_utf8_str(project) or not project or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in project):
         return None
-    if not isinstance(entry_type, str) or entry_type not in _JOURNAL_TYPE_SET:
+    if not isinstance(entry_type, str) or entry_type not in _JOURNAL_TYPE_CANONICAL:
         return None
-    if not isinstance(headline, str) or not headline:
+    if not _is_utf8_str(headline) or not headline:
         return None
-    if not isinstance(body, str):
+    if not _is_utf8_str(body):
         return None
     if not isinstance(links_raw, list):
         return None
@@ -236,14 +278,14 @@ def _validate_entry(raw: Any) -> dict[str, Any] | None:
             return None
         label = item.get("label")
         url = _validate_safe_url(item.get("url"))
-        if not isinstance(label, str) or not label or url is None:
+        if not _is_utf8_str(label) or not label or url is None:
             return None
         links.append({"label": label, "url": url})
-    if not isinstance(author_seat, str) or not author_seat:
+    if not _is_utf8_str(author_seat) or not author_seat:
         return None
-    if source_key is not None and not isinstance(source_key, str):
+    if source_key is not None and not _is_utf8_str(source_key):
         return None
-    if source_item_id is not None and not isinstance(source_item_id, str):
+    if source_item_id is not None and not _is_utf8_str(source_item_id):
         return None
     if corrects_id is not None and not _is_positive_int(corrects_id):
         return None
@@ -253,7 +295,7 @@ def _validate_entry(raw: Any) -> dict[str, Any] | None:
         "occurred_at": occurred_at,
         "recorded_at": recorded_at,
         "project": project,
-        "type": entry_type,
+        "type": _JOURNAL_TYPE_CANONICAL[entry_type],
         "headline": headline,
         "body": body,
         "links": links,
@@ -361,13 +403,19 @@ def get_journal(
             )
 
     projects = _project_catalog()
-    allowed_projects = {item["key"] for item in projects}
+    allowed_projects: dict[str, str] = {item["key"]: item["key"] for item in projects}
 
-    if project is not None and project not in allowed_projects:
-        return JSONResponse(status_code=422, content={"detail": "unknown_project"}, headers=_NO_STORE_HEADERS)
+    canonical_project: str | None = None
+    if project is not None:
+        canonical_project = allowed_projects.get(project)
+        if canonical_project is None:
+            return JSONResponse(status_code=422, content={"detail": "unknown_project"}, headers=_NO_STORE_HEADERS)
 
-    if type is not None and type not in _JOURNAL_TYPE_SET:
-        return JSONResponse(status_code=422, content={"detail": "unknown_type"}, headers=_NO_STORE_HEADERS)
+    canonical_type: str | None = None
+    if type is not None:
+        canonical_type = _JOURNAL_TYPE_CANONICAL.get(type)
+        if canonical_type is None:
+            return JSONResponse(status_code=422, content={"detail": "unknown_type"}, headers=_NO_STORE_HEADERS)
 
     now = datetime.now(UTC)
     observed_at = _isoformat_z(now)
@@ -390,18 +438,19 @@ def get_journal(
         since_filter = _isoformat_z(parsed_since)
         since_cli_arg = since_filter
 
-    try:
-        parsed_after_id = _parse_bounded_int(after_id, default=None, minimum=0, maximum=_INT64_MAX, name="after_id")
-        parsed_limit = _parse_bounded_int(limit, default=_DEFAULT_LIMIT, minimum=1, maximum=_MAX_LIMIT, name="limit")
-        parsed_offset = _parse_bounded_int(offset, default=0, minimum=0, maximum=_MAX_OFFSET, name="offset")
-    except ValueError as exc:
-        return JSONResponse(status_code=422, content={"detail": str(exc)}, headers=_NO_STORE_HEADERS)
-
-    assert parsed_limit is not None and parsed_offset is not None
+    ok_after, parsed_after_id = _parse_bounded_int(after_id, default=None, minimum=0, maximum=_INT64_MAX)
+    if not ok_after:
+        return JSONResponse(status_code=422, content={"detail": "invalid_after_id"}, headers=_NO_STORE_HEADERS)
+    ok_limit, parsed_limit = _parse_bounded_int(limit, default=_DEFAULT_LIMIT, minimum=1, maximum=_MAX_LIMIT)
+    if not ok_limit or parsed_limit is None:
+        return JSONResponse(status_code=422, content={"detail": "invalid_limit"}, headers=_NO_STORE_HEADERS)
+    ok_offset, parsed_offset = _parse_bounded_int(offset, default=0, minimum=0, maximum=_MAX_OFFSET)
+    if not ok_offset or parsed_offset is None:
+        return JSONResponse(status_code=422, content={"detail": "invalid_offset"}, headers=_NO_STORE_HEADERS)
 
     filters = {
-        "project": project,
-        "type": type,
+        "project": canonical_project,
+        "type": canonical_type,
         "since": since_filter,
         "after_id": parsed_after_id,
     }
@@ -421,10 +470,10 @@ def get_journal(
         )
 
     cmd = [cli, "journal", "list", "--json", "--limit", str(parsed_limit), "--offset", str(parsed_offset)]
-    if project is not None:
-        cmd.extend(["--project", project])
-    if type is not None:
-        cmd.extend(["--type", type])
+    if canonical_project is not None:
+        cmd.extend(["--project", canonical_project])
+    if canonical_type is not None:
+        cmd.extend(["--type", canonical_type])
     if since_cli_arg is not None:
         cmd.extend(["--since", since_cli_arg])
     if parsed_after_id is not None:
