@@ -14,8 +14,10 @@ identifies the table's printability.
 
 Inputs are the interpreters named with ``--python``, one per Python minor version. Each runs with
 ``-I -S``, imports only ``json``, ``sys`` and ``unicodedata``, and prints one ASCII positional JSON array
-(no object, so no member can repeat) of its minor version, its ``unidata_version`` and its
-printable ranges in canonical form (ascending, non-overlapping, non-adjacent). Any other dump, or
+(no object, so no member can repeat) of its minor version (``X.Y``), its ``unidata_version``
+(``X.Y.Z``) and its printable ranges in canonical form (ascending, non-overlapping, non-adjacent).
+Version components are canonical decimals (``0`` or no leading zero, at most 4 digits), so each
+version has one spelling and string identity is version identity. Any other dump, or
 a failed, timed-out or unreadable run, stops the generator with the interpreter and the reason.
 Exactly one Unicode 15.0.0 table is required, and several interpreters may share a Unicode version
 only if their bitmaps are identical. The output records
@@ -37,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterable
@@ -47,6 +50,11 @@ from lu_machinery.common import json_depth
 CODE_POINTS = 0x110000
 BASELINE_UNIDATA_VERSION = "15.0.0"
 OUTPUT = Path(__file__).with_name("unicode_printable.py")
+# Canonical version labels: one spelling per version, so string identity is version identity.
+# A component is 0 or a decimal without a leading zero, at most 4 digits.
+_COMPONENT = r"(?:0|[1-9][0-9]{0,3})"
+_PYTHON_MINOR_RE = re.compile(rf"{_COMPONENT}\.{_COMPONENT}")
+_UNIDATA_VERSION_RE = re.compile(rf"{_COMPONENT}\.{_COMPONENT}\.{_COMPONENT}")
 # The dump is [python, unidata_version, [[lo, hi], ...]].
 _DUMP_DEPTH = 3
 
@@ -110,7 +118,11 @@ def _version_key(version: str) -> tuple[int, ...]:
 
 
 def _dump(interpreter: str) -> tuple[str, str, bytes]:
-    """``(python_minor_version, unidata_version, bitmap)`` of *interpreter*'s table, else ``SystemExit``."""
+    """``(python_minor_version, unidata_version, bitmap)`` of *interpreter*'s table, else ``SystemExit``.
+
+    The two version labels are canonical (``_PYTHON_MINOR_RE``, ``_UNIDATA_VERSION_RE``), so callers
+    may deduplicate, look up and sort them as strings and integers.
+    """
     try:
         proc = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
             [interpreter, "-I", "-S", "-c", _DUMP], capture_output=True, check=False, timeout=600
@@ -127,14 +139,16 @@ def _dump(interpreter: str) -> tuple[str, str, bytes]:
     if not (
         isinstance(data, list)
         and len(data) == 3
-        and all(
-            isinstance(text, str) and all(part.isascii() and part.isdigit() for part in text.split("."))
-            for text in data[:2]
-        )
+        and isinstance(data[0], str)
+        and _PYTHON_MINOR_RE.fullmatch(data[0]) is not None
+        and isinstance(data[1], str)
+        and _UNIDATA_VERSION_RE.fullmatch(data[1]) is not None
         and isinstance(data[2], list)
         and all(isinstance(pair, list) and len(pair) == 2 and all(type(cp) is int for cp in pair) for pair in data[2])
     ):
-        raise SystemExit(f"{interpreter}: table dump is not [python, unidata_version, [[lo, hi], ...]]")
+        raise SystemExit(
+            f"{interpreter}: table dump is not [canonical X.Y python, canonical X.Y.Z unidata_version, [[lo, hi], ...]]"
+        )
     python, version, printable = data
     try:
         bits = ranges_bitmap(printable)
