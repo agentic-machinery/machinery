@@ -49,7 +49,7 @@ def test_consumer_read_only_agy_without_tool_config_gets_bounded_route(
 
     checkout = tmp_path / "consumer"
     checkout.mkdir()
-    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True, timeout=10)
     (checkout / "README.md").write_text("# Consumer\n")
     token = tmp_path / "auth"
     token.write_text("fixture")

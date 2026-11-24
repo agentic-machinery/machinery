@@ -1686,15 +1686,21 @@ def _agy_consumer_checkout(workspace: Path) -> Path:
 def _agy_consumer_hidden_roots(workspace: Path) -> list[Path]:
     from lu_machinery.review.isolation import ReviewIsolationError
 
+    from .agy_hook_config import AGY_WORKSPACE_CONFIG_DIRS
+
     # Do not load consumer-owned MCP, plugin or hook definitions. Do not
     # expose another worktree, the dispatch store or primary Git config.
     hidden = []
-    for name in (".agents", ".git", ".worktrees", "batch_state"):
+    for name in (*AGY_WORKSPACE_CONFIG_DIRS, ".git", ".worktrees", "batch_state"):
         path = workspace / name
-        if path.is_symlink():
-            raise ReviewIsolationError("agy_consumer_unsafe_checkout_entry")
-        if path.is_dir():
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(mode):
             hidden.append(path)
+        elif name in AGY_WORKSPACE_CONFIG_DIRS or stat.S_ISLNK(mode):
+            raise ReviewIsolationError("agy_consumer_unsafe_checkout_entry")
     _refuse_special_files((workspace,), hidden)
     return hidden
 
