@@ -338,7 +338,7 @@ def crash_budget(monkeypatch, tmp_path):
     monkeypatch.setattr(recorder, "_clean_merge_descent_prover", lambda *_, **_kwargs: lambda *_: None)
     monkeypatch.setattr(recorder, "_repair_round", lambda **_: None)
 
-    def attempt(minute, head, *, reply=None, **updates):
+    def attempt(minute, head, *, reply=None, omit_digest=False, **updates):
         task_id = f"attempt-{minute}"
         record = r3_record(
             reply or "", task_id=task_id, worktree_base_sha=head, pinned_head=head,
@@ -349,6 +349,8 @@ def crash_budget(monkeypatch, tmp_path):
         if reply is None:
             record["result_sha256"] = None
         record.update(updates)
+        if omit_digest:
+            del record["result_sha256"]
         (tasks / f"{task_id}.json").write_text(json.dumps(record))
         if reply is not None:
             (tasks / f"{task_id}.result").write_text(reply)
@@ -358,6 +360,10 @@ def crash_budget(monkeypatch, tmp_path):
         pr["headRefOid"] = head
         return recorder.dispatch_budget_check(REPOSITORY, number=42, branch=BRANCH, head=head, task_root=tasks)
 
+    def check(head):
+        pr["headRefOid"] = head
+        return recorder.budget_check(REPOSITORY, 42, task_root=tasks)
+
     def record(head, attempt):
         return recorder.budget_admission(
             repository=REPOSITORY, number=42, branch=BRANCH, sha=head, budget=3, comments=comments,
@@ -365,18 +371,71 @@ def crash_budget(monkeypatch, tmp_path):
             recording_run=(attempt["task_id"], attempt["run_nonce"]),
         )
 
-    return attempt, admit, record
+    return SimpleNamespace(attempt=attempt, admit=admit, check=check, record=record)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"status": "rate_limited", "provider_terminal_failure": False, "provider_terminal_status": None},
+        {"provider_pgid": None, "provider_terminal_failure": False, "provider_terminal_status": None,
+         "omit_digest": True, "never_started_reason": "setup_refusal"},
+        {"reply": "Provider returned an error."},
+        {},
+        {"status": "timeout", "reply": "Review started.", "provider_terminal_failure": False,
+         "provider_terminal_status": None},
+        {"status": "no_deliverable", "reply": "", "provider_terminal_failure": False,
+         "provider_terminal_status": None},
+        {"status": "cancelled", "provider_terminal_failure": False, "provider_terminal_status": None},
+        {"status": "crashed", "provider_terminal_failure": False, "provider_terminal_status": None},
+    ],
+    ids=["rate-limited", "never-started", "provider-error-with-reply", "provider-error-without-reply",
+         "timeout", "empty-reply", "cancelled", "crashed"],
+)
+def test_no_verdict_leaves_room_at_the_next_head(crash_budget, outcome):
+    """Defect class: a terminal attempt with no verdict spends one of the three reviewed heads."""
+    crash_budget.attempt(3, H3, **outcome)
+
+    admission = crash_budget.check(NEXT)
+    assert admission["reviewed_heads"] == 2
+    assert admission["unrecorded_rounds"] == []
+    crash_budget.admit(NEXT)
+
+    replacement = crash_budget.attempt(4, NEXT, reply="VERDICT: APPROVE", status="done", returncode=0,
+                                       provider_terminal_failure=False, provider_terminal_status=None)
+    crash_budget.record(NEXT, replacement)
+    with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
+        crash_budget.check("5" * 40)
+
+
+@pytest.mark.parametrize(
+    "reply", ["VERDICT: APPROVE", "VERDICT: REQUEST_CHANGES", "VERDICT: BLOCKED", blocked_reply(),
+              "The implementation admits a fourth review head."],
+    ids=["approve", "request-changes", "blocked", "structured-blocked", "completed-without-readable-verdict"],
+)
+def test_unpublished_verdict_exhausts_the_budget(crash_budget, reply):
+    """Defect class: dropping an unpublished verdict or unreadable completed review admits a fourth head."""
+    crash_budget.attempt(3, H3, reply=reply, status="done", returncode=0,
+                         provider_terminal_failure=False, provider_terminal_status=None)
+    for check in (crash_budget.check, crash_budget.admit):
+        with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
+            check(NEXT)
+
+    next_run = crash_budget.attempt(4, NEXT, reply="VERDICT: APPROVE", status="done", returncode=0,
+                                    provider_terminal_failure=False, provider_terminal_status=None)
+    with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
+        crash_budget.record(NEXT, next_run)
 
 
 @pytest.mark.parametrize("head", [H3, NEXT], ids=["unchanged-head", "moved-head"])
 def test_provider_crash_opens_one_recovery_at_the_current_head(crash_budget, head):
-    """Defect class: the last charged head blocks recovery or loses the identities of both attempts."""
-    attempt, admit, record = crash_budget
+    """Defect class: budget admission loses the identities of the crash and its replacement."""
+    attempt, admit, record = crash_budget.attempt, crash_budget.admit, crash_budget.record
     failed = attempt(3, H3)
     admission = admit(head)
     assert admission["provider_crash_recovery"]["replacement"] == {"head": head}
-    if head != H3:
-        assert {"head": H3, "tasks": ["attempt-3"]} in admission["unrecorded_rounds"]
+    assert admission["unrecorded_rounds"] == []
+    assert admission["reviewed_heads"] == 2
 
     replacement = attempt(4, head, reply="VERDICT: APPROVE", status="done", returncode=0,
                           provider_terminal_failure=False, provider_terminal_status=None)
@@ -392,8 +451,7 @@ def test_provider_crash_opens_one_recovery_at_the_current_head(crash_budget, hea
     if head != H3:
         with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
             admit(H3)
-        with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
-            record(head, {**replacement, "run_nonce": "0" * 32})
+        assert record(head, {**replacement, "run_nonce": "0" * 32}) == {}
     else:
         # A same-head sibling started before crash settlement is ordinary review, not recovery.
         attempt(3, H3, finished_at="2026-09-23T10:05:00+00:00")
@@ -404,19 +462,15 @@ def test_provider_crash_opens_one_recovery_at_the_current_head(crash_budget, hea
     "updates",
     [
         {"reply": "VERDICT: REQUEST_CHANGES"},
-        {"reply": ""},
-        {"run_nonce": None},
-        {"provider_terminal_failure": False},
-        {"returncode": 0},
         {"status": "running", "finished_at": None},
         {"result_sha256": "a" * 64},
+        {"status": "done"},
     ],
-    ids=["partial-verdict", "empty-file", "missing-nonce", "missing-attestation", "uncertain-exit",
-         "live-provider", "missing-bound-result"],
+    ids=["partial-verdict", "live-provider", "missing-bound-result", "success-without-result"],
 )
 def test_uncertain_provider_outcomes_keep_the_moved_head_budget_stop(crash_budget, updates):
     """Defect class: an ambiguous or partial result makes its charged head disappear."""
-    attempt, admit, _ = crash_budget
+    attempt, admit = crash_budget.attempt, crash_budget.admit
     attempt(3, H3, **updates)
     with pytest.raises(recorder.RecordError, match="REVIEW_BUDGET_EXHAUSTED"):
         admit(NEXT)
@@ -424,17 +478,21 @@ def test_uncertain_provider_outcomes_keep_the_moved_head_budget_stop(crash_budge
 
 @pytest.mark.parametrize("status", ["running", "failed"])
 def test_a_dispatched_replacement_blocks_a_second_recovery(crash_budget, status):
-    """Defect class: a live or crashed replacement replenishes the recovery after head churn."""
-    attempt, admit, _ = crash_budget
+    """Defect class: a live replacement accepts another dispatch or a crashed replacement renews recovery."""
+    attempt, admit = crash_budget.attempt, crash_budget.admit
     attempt(3, H3)
     assert admit(NEXT)["admitted"]
     attempt(4, NEXT, status=status)
-    code = "PROVIDER_CRASH_RECOVERY_UNRESOLVED" if status == "running" else "REVIEW_BUDGET_EXHAUSTED"
     for head in (H3, NEXT, "5" * 40):
-        with pytest.raises(recorder.RecordError, match=code):
-            admit(head)
+        if status == "running":
+            with pytest.raises(recorder.RecordError, match="PROVIDER_CRASH_RECOVERY_UNRESOLVED"):
+                admit(head)
+        else:
+            admission = admit(head)
+            assert admission["reviewed_heads"] == 2
+            assert "provider_crash_recovery" not in admission
     if status == "failed":
-        # Two failed attempts at a previously charged head add no allowance and use no new head.
+        # Attempts at a charged head add no allowance and use no new head.
         attempt(3, H2)
         attempt(4, H2)
         assert "provider_crash_recovery" not in admit(H3)

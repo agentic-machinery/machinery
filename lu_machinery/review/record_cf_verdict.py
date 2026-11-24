@@ -2511,11 +2511,9 @@ def require_review_round_within_budget(
     A round is one reviewed head: trusted verdicts on this PR are counted
     across heads, and more verdicts at an already reviewed head (a quorum seat,
     a later chunk of the same review, or a retried publication) open no new round.
-    A round is spent when its
-    reviewer is dispatched, so the head of every review run on record counts
-    too, its verdict recorded or not (``review_lineage.dispatched_rounds``,
-    #12098): ``dispatched_heads`` returns those heads other than ``sha``, read
-    only for a new head. Earlier PRs are not read: no GitHub listing finds them
+    A dispatch reserves a round until its record proves there was no verdict.
+    A verdict counts before publication. ``dispatched_heads`` returns the charged
+    and reserved heads other than ``sha``. Earlier PRs are not read: no GitHub listing finds them
     reliably (search index lag, the 250-commit PR listing cap). Budget end is
     never approval.
 
@@ -2652,7 +2650,7 @@ def _charging(
     login: str,
     sha: str,
 ) -> _Charging:
-    """Heads other than ``sha`` that a review run on record was dispatched at, with its task ids (#12098).
+    """Heads other than ``sha`` charged or reserved by review runs on record, with their task ids.
 
     ``exemption`` is the lineage's one uncharged capability failure (``review_lineage.capability_exemption``)
     with its head and seat, read from the PR's capability-failure events. An unreadable task ledger or
@@ -2772,12 +2770,7 @@ def budget_admission(
         nonlocal recovery
         history = rounds()
         recovery = _crash_recovery_receipt(history.crash_recovery, sha, recording_run)
-        heads = frozenset(history.rounds)
-        if recovery is not None:
-            failed = recovery["failed"]
-            if history.rounds.get(failed["head"]) == [failed["task"]]:
-                return heads - {failed["head"]}
-        return heads
+        return frozenset(history.rounds)
 
     if recording_run is None:
         # A live recovery blocks a duplicate dispatch even at an already reviewed head.
@@ -3657,9 +3650,8 @@ def budget_check(
 ) -> dict[str, Any]:
     """The recorder's round decision for a verdict at the PR's current head, before any review runs.
 
-    Every review run on record counts, its verdict recorded or not; ``unrecorded_rounds`` names
-    each head that has runs but no recorded verdict, so a skipped recording is visible. ``head``,
-    when given, must be the PR's current head.
+    ``unrecorded_rounds`` names charged or reserved heads without a published verdict.
+    ``head``, when given, must be the PR's current head.
     """
     root = _repo_root()
     from lu_machinery.common.task_store_paths import tasks_dir
@@ -3758,13 +3750,13 @@ def _open_pr_number(repository: str, branch: str) -> int | None:
 def dispatch_budget_check(
     repository: str, *, number: int | None, branch: str | None, head: str, task_root: Path
 ) -> dict[str, Any] | None:
-    """Refuse a review dispatch at ``head`` once its PR's review dispatches, recorded or not, reach the budget (#12098).
+    """Refuse a review dispatch at ``head`` once its PR's charged or reserved heads reach the budget.
 
     The dispatcher's own task records name each run's PR or review branch and its head
     (``review_lineage.dispatched_rounds``). A dispatch that names only one of PR and branch has
     the other read from GitHub first, so runs recorded under either count; with no review run of
     the repository on record, no round has been spent and nothing more is read. A head that
-    already has a run opens no round. When the dispatched heads reach the smallest applicable
+    already charged or reserved opens no round. When those heads reach the smallest applicable
     cap, defer to :func:`budget_check` for the PR's actual tier and round exemptions.
     A branch with no open PR uses the repository's standard budget.
     """
@@ -3794,13 +3786,13 @@ def dispatch_budget_check(
     heads = dispatched_rounds(runs=runs, comments=(), login="")
     if len(heads) < budget:
         return None
-    # A head already dispatched opens no round, unless its only runs are zero-finding BLOCKEDs: those may be
+    # A head already counted opens no round, unless only zero-finding BLOCKEDs count there: those may be
     # the lineage's uncharged capability failure, which only the PR's comments and rulings decide (#12717).
     if head in heads and (number is None or not capability_candidates_only(runs, head)):
         return None
     if number is None:
         raise RecordError(
-            f"REVIEW_BUDGET_EXHAUSTED: branch {branch} has review dispatches at {len(heads)} heads and no open PR; "
+            f"REVIEW_BUDGET_EXHAUSTED: branch {branch} has {len(heads)} charged or reserved heads and no open PR; "
             f"its budget is {budget} rounds; budget end is never approval, escalate instead"
         )
     return budget_check(repository, number, task_root=task_root, head=head)
@@ -3820,7 +3812,7 @@ def budget_check_main(argv: list[str]) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"{RECORDER_EXAMPLES}  {RECORDER_COMMAND} budget-check "
         "--repository learn-ukrainian/learn-ukrainian.github.io --pr 42\n"
-        "Outputs: JSON on stdout: admitted, the budget, unrecorded_rounds (heads reviewed with no recorded verdict)\n"
+        "Outputs: JSON on stdout: admitted, the budget, unrecorded_rounds (counted heads without a published verdict)\n"
         "  and any exemption or repair-round receipt.\n"
         "Exit codes: 0: admitted; 1: refused (the reason names what to escalate); 2: primary bootstrap refused.\n"
         "Related: agents_extensions/shared/skills/review-loop/references/policy.md",

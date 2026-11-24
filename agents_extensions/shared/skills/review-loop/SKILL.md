@@ -119,8 +119,8 @@ interpreter does not select the primary checkout's Python modules.
      --review-mode cross_family --require-review-verdict
    ```
 
-   The dispatcher refuses a review past the PR's round budget, counting every review dispatched
-   for the PR whether or not its verdict was recorded ([policy](references/policy.md#recording-the-verdict)).
+   The dispatcher applies the PR's budget to charged and reserved review heads
+   ([policy](references/policy.md#4-convergence)).
    For a code or infra review, `--require-review-verdict` binds
    `lu_machinery/schemas/code-review-findings.v1.schema.json` on a provider that accepts a schema. The
    brief asks for that object ([brief](references/brief.md#reply-format)). A provider that
@@ -164,7 +164,10 @@ interpreter does not select the primary checkout's Python modules.
    Fixes go to the authoring lane (the worker itself when it runs the loop); a driver does not
    patch them in.
 6. **Next round or stop.** The budget is three charged rounds per lineage, and nobody adds
-   one ([policy](references/policy.md#4-convergence)). Start a delta round only if an open blocker, a
+   one ([policy](references/policy.md#4-convergence)). A dispatch reserves its head. A recognized
+   verdict or a completed review with a nonempty reply charges that head before publication.
+   A settled attempt releases its reservation when the record shows it yielded neither.
+   Start a delta round only if an open blocker, a
    `not_applicable` claim the reviewer must confirm, a changed behaviour or a moved head needs
    it, and only after the recorder admits it. Ask the recorder itself before dispatching; it
    applies the clean-merge exemption and the lineage's one repair-verification round:
