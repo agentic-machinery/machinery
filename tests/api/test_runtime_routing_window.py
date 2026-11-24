@@ -135,13 +135,19 @@ def test_refused_start_shows_requested_id_and_plain_reason_not_the_raw_clause(tm
     assert "other-task" not in rows
     for name in ("d" * 32, "c" * 32, "b" * 32, "a" * 32, "9" * 32, "8" * 32, "7" * 32):
         assert (rows[name]["pool"], rows[name]["admission"]["state"]) == (None, "unknown")
-    # A refusal after launch is the task's own record: its own id, the refusal, and the pool its account paid.
+    # Any refused record but the CLI's (a fresh id naming the id asked for) is the task's own record, launched or
+    # not: its own id, the refusal, and the pool its own account fields name.
     _write_record(tasks, "launched", _write_task("launched", started=_NOW - timedelta(minutes=1), status="failed",
                                                  pid=4242, requested_task_id="other-task",
                                                  never_started_reason="boundary_refusal"))
+    _write_record(tasks, "unplaced", _write_task("unplaced", started=_NOW - timedelta(minutes=1), status="failed",
+                                                 never_started_reason="worker_placement", admission=None,
+                                                 codex_account="b-sub"))
     rows = {row["task_id"]: row for row in runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))["decisions"]}
     assert (rows["launched"]["pool"], rows["launched"]["admission"]) == (
         "codex:a", {"state": "refused", "reason": "refused by the write boundary"})
+    assert (rows["unplaced"]["pool"], rows["unplaced"]["admission"]) == (
+        "codex:b", {"state": "refused", "reason": "refused: no worker placement"})
 
 
 def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):

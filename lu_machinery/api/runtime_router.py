@@ -733,15 +733,17 @@ def _routing_substitution(record: Mapping[str, Any], model: str | None) -> str |
 
 
 def _routing_refusal(record: Mapping[str, Any]) -> tuple[str | None, bool]:
-    """The start refusal a record proves, and whether it is a pre-launch refusal record.
+    """The start refusal a record proves, and whether the record is the CLI's refusal record.
 
     The code is None when the record has no marker, and ``_ROUTING_REFUSAL_UNKNOWN``
     when the marker proves nothing: admission's own classification
     (``classify_never_started_refusal``) finds it inconsistent with the record's
-    lifecycle, dispatch never writes the code, launch evidence contradicts a code
-    only written before launch, or an admitting snapshot contradicts admission's
-    deferral. A pre-launch refusal record is the one dispatch writes under a fresh
-    id naming the id asked for; a refusal after launch is the task's own record.
+    lifecycle, dispatch never writes the code, a code only the CLI writes before
+    launch is on any other record, or an admitting snapshot contradicts admission's
+    deferral. The CLI's refusal record (``store.record_admission_refusal``) is a
+    pre-launch record under a fresh id that names the id asked for
+    (``requested_task_id``) and copies no account; any other refused record is the
+    task's own, with its own id and account fields, launched or not.
     """
     code = record.get("never_started_reason")
     if code is None:
@@ -749,11 +751,12 @@ def _routing_refusal(record: Mapping[str, Any]) -> tuple[str | None, bool]:
     pre_launch, contradiction = dispatch_admission.classify_never_started_refusal(record)
     if contradiction is not None or code not in _ROUTING_START_REFUSALS:
         return _ROUTING_REFUSAL_UNKNOWN, False
+    cli_record = pre_launch and "requested_task_id" in record
     snapshot = record.get("admission")
     admitted = isinstance(snapshot, Mapping) and snapshot.get("admitted") is True
-    if code in _ROUTING_PRE_LAUNCH_CODES and (not pre_launch or (code == StartRefusal.CAPACITY.value and admitted)):
+    if code in _ROUTING_PRE_LAUNCH_CODES and (not cli_record or (code == StartRefusal.CAPACITY.value and admitted)):
         return _ROUTING_REFUSAL_UNKNOWN, False
-    return cast(str, code), pre_launch
+    return cast(str, code), cli_record
 
 
 def _routing_admission(record: Mapping[str, Any], *, write: bool, refusal: str | None) -> dict[str, Any]:
@@ -779,16 +782,15 @@ def _routing_admission(record: Mapping[str, Any], *, write: bool, refusal: str |
     return {"state": "unknown", "reason": "started although its admission record did not admit it"}
 
 
-def _routing_pool(record: Mapping[str, Any], refusal: str | None, pre_launch: bool) -> str | None:
+def _routing_pool(record: Mapping[str, Any], refusal: str | None, cli_record: bool) -> str | None:
     if refusal == _ROUTING_REFUSAL_UNKNOWN:
         return None  # the record contradicts itself: which pool it meant is unknown
     snapshot = record.get("admission")
     recorded_meter = snapshot.get("meter") if isinstance(snapshot, Mapping) else None
     if isinstance(recorded_meter, str) and recorded_meter in _ROUTING_POOL_LABELS:
         return recorded_meter  # the meter admission judged
-    if pre_launch:
-        # A pre-launch refusal record written before any meter existed does not record the account asked
-        # for, so its own account fields hold defaults, not evidence: the pool is unknown.
+    if cli_record:
+        # The CLI's refusal record copies no account, so without a recorded meter the pool is unknown.
         return None
     agent = record.get("agent")
     model = panel_values.model(record.get("model"))  # the catalog id, so admission's meter reads its canonical name
@@ -842,8 +844,8 @@ def _routing_decision(record: Mapping[str, Any], *, now: datetime) -> dict[str, 
     Rows carry ids, labels, model names and fixed words only, never paths, prompts or free text.
     """
     # A refused start is recorded under its own id and names the asked-for id; any other record is its task id.
-    refusal, pre_launch = _routing_refusal(record)
-    raw_id = (record.get("requested_task_id") or record.get("task_id")) if pre_launch else record.get("task_id")
+    refusal, cli_record = _routing_refusal(record)
+    raw_id = (record.get("requested_task_id") or record.get("task_id")) if cli_record else record.get("task_id")
     started = _routing_started(record.get("started_at"))
     if not isinstance(raw_id, str) or not raw_id or started is None:
         raise _RoutingMalformed("task id or start time unreadable")
@@ -858,7 +860,7 @@ def _routing_decision(record: Mapping[str, Any], *, now: datetime) -> dict[str, 
     review = review_typed(dict(record))
     write = mode in dispatch_admission.WRITE_CAPABLE_MODES
     model = panel_values.model(record.get("model"))
-    pool = _routing_pool(record, refusal, pre_launch)
+    pool = _routing_pool(record, refusal, cli_record)
     status, live = _routing_status(record, now=now)
     risk = record.get("review_risk")
     return {
@@ -1560,39 +1562,41 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
 
     ``recent`` is one scan of the task records, served stale-while-revalidate.
     The store is listed on every request, and a listing fault makes ``recent``
-    unknown even when a scan is cached. Listing and the scan share one deadline
-    (routes answer within 1 s): past it, ``recent`` is ``pending`` and the shared
-    work runs on. A result that is not a reading (unknown or pending) carries no
+    unknown even when a scan is cached. Resolving the store, listing it and the
+    scan share one deadline (routes answer within 1 s): past it, ``recent`` is
+    ``pending`` and that work runs on to store its scan. A result that is not a reading (unknown or pending) carries no
     counts, and its ``as_of`` is the time of the last stored reading (None when
     there is none). A reading's ``age_s`` and ``X-Snapshot-Age-S`` count from the
     scan's own ``as_of``. Rows carry task references, catalog models, pool labels
     and fixed words only: no paths, prompts or credentials.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + ROUTING_WAIT_S
-    key = ctx_scoped_ttl_key(ctx, "runtime-routing-decisions")
+    keys: list[str] = []
 
-    async def bounded(work: Any) -> Any:
-        # The work runs on when the deadline passes: a scan stores its value for the next read.
-        task = asyncio.ensure_future(work)
-        task.add_done_callback(lambda done: done.cancelled() or done.exception())
-        return await asyncio.wait_for(asyncio.shield(task), max(deadline - loop.time(), 0.0))
-
-    stored = False
-    try:
-        _, store_fault = await bounded(asyncio.to_thread(_routing_listing, delegate_api._tasks_dir(resolve_context(ctx))))
+    async def read() -> tuple[dict[str, Any], bool]:
+        # Every filesystem step (paths, the listing, the scan) runs in this one task. Past the deadline it
+        # runs on: a listing that finishes late still starts the shared scan, which stores its value.
+        tasks_dir, key = await asyncio.to_thread(
+            lambda: (delegate_api._tasks_dir(resolve_context(ctx)), ctx_scoped_ttl_key(ctx, "runtime-routing-decisions")),
+        )
+        keys.append(key)
+        _, store_fault = await asyncio.to_thread(_routing_listing, tasks_dir)
         if store_fault is not None:
-            decisions: dict[str, Any] = {"status": "unknown", "reason": store_fault}
-        else:
-            decisions, _, stored = await bounded(cache_read_swr(
-                key, ROUTING_TTL_S, functools.partial(routing_decisions, ctx),
-                storable=lambda value: value.get("status") in {"ok", "partial"},
-            ))
+            return {"status": "unknown", "reason": store_fault}, False
+        value, _, stored = await cache_read_swr(
+            key, ROUTING_TTL_S, functools.partial(routing_decisions, ctx),
+            storable=lambda value: value.get("status") in {"ok", "partial"},
+        )
+        return value, stored
+
+    task = asyncio.ensure_future(read())
+    task.add_done_callback(lambda done: done.cancelled() or done.exception())
+    try:
+        decisions, stored = await asyncio.wait_for(asyncio.shield(task), ROUTING_WAIT_S)
     except TimeoutError:
-        decisions = {"status": "pending", "reason": "task_records_being_read"}
+        decisions, stored = {"status": "pending", "reason": "task_records_being_read"}, False
     if not stored:
         # Not a reading: "unknown since" the last stored reading, never since this attempt.
-        last = cache_get_stored(key)
+        last = cache_get_stored(keys[0]) if keys else None
         last_as_of = last[0].get("as_of") if last is not None and isinstance(last[0], dict) else None
         decisions = {"status": decisions.get("status"), "reason": decisions.get("reason"), "as_of": last_as_of}
     scanned = _routing_started(decisions.get("as_of")) if stored else None
