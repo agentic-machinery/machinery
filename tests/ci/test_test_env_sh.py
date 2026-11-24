@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -194,6 +195,8 @@ def test_snapshot_sources_restrict_components_to_main_and_preserve_integrity() -
     assert sources["Snapshot"] == "no"
     assert "-o Acquire::Retries=3" in setup
     assert "-o Acquire::Retries=1" not in setup
+    assert "-o Acquire::IndexTargets::deb::CNF::DefaultEnabled=false" in setup
+    assert "--no-download" in setup
     assert "--error-on=any" in setup
     assert 'echo "${digest}  $apt_dir/$deb" | sha256sum -c -' in setup
 
@@ -204,7 +207,7 @@ def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() ->
     assert "apt_deadline=$((SECONDS + 195))" in setup
     assert 'apt_install 55 40 "${missing[@]}"' in setup
     update_block = setup.split("apt_deadline=$((SECONDS + 195))\n", 1)[1].split(
-        '\n  install_log="$apt_dir/install.log"', 1
+        '\n    install_log="$apt_dir/install.log"', 1
     )[0]
     assert 'timeout --kill-after=5 "$update_cap"' in update_block
     assert "--error-on=any" in update_block
@@ -242,3 +245,159 @@ def test_snapshot_update_timeout_derives_from_apt_deadline_and_fails_closed() ->
         assert exhausted.returncode == 1, exhausted.stdout + exhausted.stderr
         assert "SUDO:" not in exhausted.stdout
         assert "::error::Could not update package indexes" in exhausted.stderr
+
+
+def test_poisoned_cached_bubblewrap_deb_is_rejected_and_refetched_or_fails_closed(tmp_path: Path) -> None:
+    """Defect class: cache poisoning or corrupted/symlinked bubblewrap .deb bypassing SHA-256 verification."""
+    setup = machinery_path("ci/setup_bubblewrap.sh").read_text()
+    # Only the fetch/verify helper is evaluated with fake curl and fake sleep on PATH.
+    # The host-changing setup body never runs.
+    fn_body = setup.split("fetch_verified_bubblewrap_deb() {", 1)[1].split("\n}\n", 1)[0]
+    deb = "bubblewrap_0.11.1-1ubuntu0.3_amd64.deb"
+    good_bytes = b"valid-pinned-bubblewrap-deb-payload\n"
+    good_digest = hashlib.sha256(good_bytes).hexdigest()
+
+    def _run_fetch(
+        case_dir: Path,
+        curl_script: str,
+        *,
+        cached_payload: bytes | None = None,
+        symlink_cache: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path, Path]:
+        case_dir.mkdir()
+        runner_temp = case_dir / "runner_temp"
+        apt_dir = case_dir / "apt_dir"
+        fake_bin = case_dir / "bin"
+        runner_temp.mkdir()
+        apt_dir.mkdir()
+        fake_bin.mkdir()
+        sleep_log = case_dir / "sleeps.log"
+        curl_log = case_dir / "curls.log"
+
+        fake_sleep = fake_bin / "sleep"
+        fake_sleep.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{sleep_log}"\n')
+        fake_sleep.chmod(fake_sleep.stat().st_mode | stat.S_IXUSR)
+
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text(curl_script.format(curl_log=curl_log))
+        fake_curl.chmod(fake_curl.stat().st_mode | stat.S_IXUSR)
+
+        cache_dir = runner_temp / "release-cache" / "bubblewrap"
+        cached_deb = cache_dir / deb
+        if cached_payload is not None or symlink_cache:
+            cache_dir.mkdir(parents=True)
+            if symlink_cache:
+                target = case_dir / "outside.deb"
+                target.write_bytes(good_bytes)
+                cached_deb.symlink_to(target)
+            elif cached_payload is not None:
+                cached_deb.write_bytes(cached_payload)
+
+        env = {
+            **os.environ,
+            "RUNNER_TEMP": str(runner_temp),
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        }
+        script = (
+            "set -euo pipefail\n"
+            "fetch_verified_bubblewrap_deb() {" + fn_body + "\n}\n"
+            'fetch_verified_bubblewrap_deb "$1" "$2" "$3" "$4" "$5"\n'
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                script,
+                "_",
+                deb,
+                good_digest,
+                "20261122T000000Z",
+                "https://snapshot.ubuntu.com/ubuntu/20261122T000000Z",
+                str(apt_dir),
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return result, apt_dir / deb, cached_deb, curl_log, sleep_log
+
+    # 1. Poisoned cache entry is rejected and evicted; transient 503 retries with backoff,
+    #    then refetches verified bytes and repopulates the cache cleanly.
+    payload_file = tmp_path / "good.deb"
+    payload_file.write_bytes(good_bytes)
+    retry_curl = f"""#!/usr/bin/env bash
+set -euo pipefail
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then out="$2"; shift 2; else shift; fi
+done
+count=0
+[ -f "{{curl_log}}" ] && count=$(wc -l < "{{curl_log}}")
+count=$((count + 1))
+printf 'attempt=%s\\n' "$count" >> "{{curl_log}}"
+if [ "$count" -eq 1 ]; then
+  printf 'partial-503-body' > "$out"
+  exit 22
+fi
+cp "{payload_file}" "$out"
+"""
+    res, dest, cached, curl_log, sleep_log = _run_fetch(
+        tmp_path / "poisoned-refetch", retry_curl, cached_payload=b"poisoned-wrong-bytes\n"
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "failed SHA-256 verification; rejecting and refetching" in res.stderr
+    assert dest.read_bytes() == good_bytes
+    assert cached.read_bytes() == good_bytes
+    assert curl_log.read_text().splitlines() == ["attempt=1", "attempt=2"]
+    assert sleep_log.read_text().splitlines() == ["2"]
+
+    # 2. Poisoned cache entry + hostile/mismatched snapshot fails closed, leaving no .deb behind.
+    bad_curl = """#!/usr/bin/env bash
+set -euo pipefail
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then out="$2"; shift 2; else shift; fi
+done
+printf 'attempt\\n' >> "{curl_log}"
+printf 'wrong-remote-bytes\\n' > "$out"
+"""
+    res_bad, dest_bad, cached_bad, curl_log_bad, sleep_log_bad = _run_fetch(
+        tmp_path / "poisoned-fail-closed", bad_curl, cached_payload=b"poisoned-cache\n"
+    )
+    assert res_bad.returncode == 1
+    assert not dest_bad.exists(), "unverified .deb must never remain in apt_dir"
+    assert not cached_bad.exists(), "poisoned cache entry must be evicted"
+    assert len(curl_log_bad.read_text().splitlines()) == 5
+    assert sleep_log_bad.read_text().splitlines() == ["2", "4", "8", "16"]
+    assert "::error::Could not fetch verified" in res_bad.stderr
+
+    # 3. Symlinked cached .deb is refused and refetched instead of being followed.
+    good_curl = f"""#!/usr/bin/env bash
+set -euo pipefail
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then out="$2"; shift 2; else shift; fi
+done
+printf 'attempt\\n' >> "{{curl_log}}"
+cp "{payload_file}" "$out"
+"""
+    res_sym, dest_sym, cached_sym, curl_log_sym, _ = _run_fetch(
+        tmp_path / "symlink-cache", good_curl, symlink_cache=True
+    )
+    assert res_sym.returncode == 0, res_sym.stdout + res_sym.stderr
+    assert "Ignoring non-regular cached" in res_sym.stderr
+    assert len(curl_log_sym.read_text().splitlines()) == 1
+    assert dest_sym.read_bytes() == good_bytes
+    assert cached_sym.is_file() and not cached_sym.is_symlink()
+    assert cached_sym.read_bytes() == good_bytes
+
+    # 4. Valid cached .deb is verified and reused with zero network calls.
+    res_hit, dest_hit, _, curl_log_hit, _ = _run_fetch(
+        tmp_path / "valid-cache-hit", bad_curl, cached_payload=good_bytes
+    )
+    assert res_hit.returncode == 0, res_hit.stdout + res_hit.stderr
+    assert "Using cached verified" in res_hit.stdout
+    assert dest_hit.read_bytes() == good_bytes
+    assert not curl_log_hit.exists()

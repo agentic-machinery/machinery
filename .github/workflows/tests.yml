@@ -83,6 +83,8 @@ env:
   UV_LINUX_X86_64_SHA256: a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5
   # uv-managed CPython only, the build the host runs; never the runner's own.
   UV_PYTHON_PREFERENCE: only-managed
+  BUBBLEWRAP_DEB: bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
+  BUBBLEWRAP_DEB_SHA256: d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
   MANIFEST: tests/machinery_tests.txt
 
 jobs:
@@ -119,6 +121,16 @@ jobs:
           # The affected-test plan diffs the pull_request merge commit against
           # its first parent. '0' is truthy, so a falsy numeric 0 cannot be used.
           fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+
+      # Restore the checksum-pinned bubblewrap .deb before starting the
+      # background postgres/bubblewrap setup. setup_bubblewrap.sh re-verifies
+      # SHA-256 against the pin before using any cached file.
+      - name: Restore cached bubblewrap package
+        id: cache-bubblewrap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-bubblewrap-${{ env.BUBBLEWRAP_DEB_SHA256 }}
 
       # PostgreSQL 16 and bubblewrap start in the background during the Python
       # installs below; `wait` blocks until the server answers on the DSN.
@@ -339,6 +351,26 @@ jobs:
           PY
 
       - run: bash lu_machinery/ci/test_env.sh wait
+
+      # Save only verified bytes after setup_bubblewrap.sh finishes. Fork PRs
+      # can restore base caches but cannot write through this step.
+      - name: Verify bubblewrap package before cache save
+        id: bubblewrap-cache-file
+        if: steps.cache-bubblewrap.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: |
+          set -euo pipefail
+          deb="$RUNNER_TEMP/release-cache/bubblewrap/$BUBBLEWRAP_DEB"
+          if [ -f "$deb" ] && [ ! -L "$deb" ]; then
+            printf '%s  %s\n' "$BUBBLEWRAP_DEB_SHA256" "$deb" | sha256sum --check --strict -
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save verified bubblewrap package
+        if: steps.bubblewrap-cache-file.outputs.ready == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
+          key: ${{ steps.cache-bubblewrap.outputs.cache-primary-key }}
 
       - name: Select pull request tests
         if: github.event_name == 'pull_request'

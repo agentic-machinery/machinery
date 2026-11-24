@@ -103,6 +103,8 @@ env:
   UV_LINUX_X86_64_SHA256: a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5
   # uv-managed CPython only, the build the host runs; never the runner's own.
   UV_PYTHON_PREFERENCE: only-managed
+  BUBBLEWRAP_DEB: bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
+  BUBBLEWRAP_DEB_SHA256: d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
   NODE_VERSION: "22.23.4"
   NPM_VERSION: "10.9.9"
   RUFF_VERSION: "0.15.21"
@@ -286,6 +288,46 @@ jobs:
           asset-id: ${{ env.ZIZMOR_RELEASE_ASSET_ID }}
           token: ${{ github.token }}
           member: zizmor
+
+      - name: Restore cached bubblewrap package
+        id: cache-bubblewrap
+        if: steps.match.outputs.run_id != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
+          key: ci-tools-v1-${{ runner.os }}-${{ runner.arch }}-bubblewrap-${{ env.BUBBLEWRAP_DEB_SHA256 }}
+
+      - name: Fetch and verify bubblewrap package on cache miss
+        if: steps.match.outputs.run_id != '' && steps.cache-bubblewrap.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          snapshot="$(awk -F= '$1 == "CI_UBUNTU_SNAPSHOT" { count++; value = substr($0, index($0, "=") + 1) } END { if (count != 1) exit 1; print value }' .github/workflows/pins.txt)"
+          if ! [[ "$snapshot" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+            echo "::error::Expected one CI_UBUNTU_SNAPSHOT in UTC (YYYYMMDDTHHMMSSZ) in .github/workflows/pins.txt" >&2
+            exit 1
+          fi
+          dest="$RUNNER_TEMP/release-cache/bubblewrap/$BUBBLEWRAP_DEB"
+          mkdir -p "$(dirname "$dest")"
+          url="https://snapshot.ubuntu.com/ubuntu/${snapshot}/pool/main/b/bubblewrap/${BUBBLEWRAP_DEB}"
+          if ! curl -q -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 30 \
+            --connect-timeout 4 --max-time 15 \
+            -o "$dest" "$url"; then
+            rm -f -- "$dest"
+            echo "::error::Could not fetch ${BUBBLEWRAP_DEB} from Ubuntu snapshot ${snapshot}" >&2
+            exit 1
+          fi
+          if ! printf '%s  %s\n' "$BUBBLEWRAP_DEB_SHA256" "$dest" | sha256sum --check --strict -; then
+            rm -f -- "$dest"
+            exit 1
+          fi
+
+      - name: Save verified bubblewrap package
+        if: steps.match.outputs.run_id != '' && steps.cache-bubblewrap.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/${{ env.BUBBLEWRAP_DEB }}
+          key: ${{ steps.cache-bubblewrap.outputs.cache-primary-key }}
 
       - name: Record reused CI Gate proof
         id: proof

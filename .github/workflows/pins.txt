@@ -109,6 +109,13 @@ CI_UBUNTU_SNAPSHOT=20261122T000000Z
 #   Noble, noble-updates and noble-security InRelease files and the existing
 #   checksum-pinned bubblewrap .deb were available on 2026-11-23. The CI
 #   bootstrap reads this pin directly in both the checkout and the wheel.
+BUBBLEWRAP_DEB=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
+BUBBLEWRAP_DEB_SHA256=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
+#   Checksum-pinned bubblewrap package from CI_UBUNTU_SNAPSHOT (provides
+#   --overlay-src). lu_machinery/ci/setup_bubblewrap.sh verifies every copy
+#   against this SHA-256 before use (both Actions cache restores and snapshot
+#   downloads). tests.yml and ci-gate.yml carry these values for the exact-hash
+#   Actions cache key.
 CI_GATE_PYTHON=.python-version
 #   Machinery jobs default to the uv-managed CPython named in the repository's
 #   .python-version (3.14.10 on 2026-11-20).
@@ -127,8 +134,9 @@ UV_LINUX_X86_64_SHA256=a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39
 #   (`uv sync --locked` refused an edited hash with "Hash mismatch", 2026-11-17).
 ACTIONS_CACHE=55cc8345863c7cc4c66a329aec7e433d2d1c52a9
 #   actions/cache v6.1.0, checked against its upstream tag on 2026-11-08.
-#   Restore/save sub-actions cache checksum-verified release archives only.
-#   Keys include OS, architecture, tool, version and expected archive SHA-256.
+#   Restore/save sub-actions cache checksum-verified release archives and the
+#   pinned bubblewrap .deb only.
+#   Keys include OS, architecture, tool, version (where applicable) and expected SHA-256.
 #   Fork PRs restore only; no restore-key prefixes or cached executable state.
 #   https://github.com/actions/cache/releases/tag/v6.1.0
 RUFF_VERSION=0.15.21
