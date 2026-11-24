@@ -27,6 +27,11 @@ from lu_machinery.agent_runtime.accounting import recorded_model_accounting_fiel
 from lu_machinery.agent_runtime.adapters.acpx import ACPX_SUPPORTED_PARTICIPANTS
 from lu_machinery.agent_runtime.adapters.gemini import has_gemini_oauth_credentials, resolve_gemini_auth_mode
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_ACCOUNT_REFUSAL_CODES
+from lu_machinery.agent_runtime.codex_accounts import (
+    DEFAULT_CODEX_ACCOUNT,
+    CodexAccountRefused,
+    resolve_codex_account_label,
+)
 from lu_machinery.agent_runtime.failure_codes import RUNTIME_FAILURE_CODES
 from lu_machinery.agent_runtime.usage import _iter_usage_records as _iter_usage_file_records
 from lu_machinery.common import json_depth
@@ -701,10 +706,13 @@ def _routing_account_by(record: Mapping[str, Any]) -> str | None:
         source = record.get("claude_account_source")
         return _ROUTING_CLAUDE_ACCOUNT_SOURCES.get(source) if isinstance(source, str) else None
     if agent == "codex":
-        options = record.get("options")
-        if not isinstance(options, Mapping):
+        # Dispatch resolves an omitted account to the default before it records its options, so
+        # the default label cannot tell an explicit choice from no choice: that is "not recorded".
+        try:
+            label = resolve_codex_account_label(record.get("codex_account"))
+        except CodexAccountRefused:
             return None
-        return "helper" if options.get("codex_account") else "saved_default"
+        return "not_recorded" if label == DEFAULT_CODEX_ACCOUNT else "helper"
     # AGY and Grok+Cursor each have one subscription: nothing chooses an account there.
     pool = _routing_meter(agent, record.get("model"), None, None)
     return "single_account" if pool is not None else None

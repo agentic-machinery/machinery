@@ -63,7 +63,8 @@ def test_window_boundary_keeps_the_last_day_and_never_leaks_older_starts(tmp_pat
     assert result["status"] == "partial"
     assert [row["task_id"] for row in result["decisions"]] == ["recent-write"]
     (row,) = result["decisions"]
-    assert (row["kind"], row["pool"], row["model_by"], row["account_by"]) == ("write", "codex:a", "brief", "helper")
+    # Dispatch records the default Codex account even when none was asked for, so the chooser is not recorded.
+    assert (row["kind"], row["pool"], row["model_by"], row["account_by"]) == ("write", "codex:a", "brief", "not_recorded")
     assert row["admission"] == {"state": "admitted", "reason": None}
     assert result["counts"]["brief"]["total"] == 1
     assert result["counts"]["resolver"]["total"] == 0
