@@ -366,8 +366,9 @@ does these steps in order:
    section. The command downloads the published assets and compares them with
    `SHA256SUMS` and with the built files.
 7. **Draft adopt PR** in the product. The cut changes the wheel pin in
-   `pyproject.toml` and verifies that `uv.lock` pins the published wheel's
-   SHA-256. Product CI runs on drafts. The merge-queue keeper refuses drafts.
+   `pyproject.toml`, runs `uv lock --upgrade-package lu-machinery` to refresh
+   `uv.lock`, and verifies that the lock pins the published wheel's SHA-256.
+   Product CI runs on drafts. The merge-queue keeper refuses drafts.
 
    To include a generated JSON snapshot in the adoption commit, add this
    table to the product's `pyproject.toml` and track both files in product main.
