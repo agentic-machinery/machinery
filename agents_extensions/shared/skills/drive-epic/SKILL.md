@@ -6,6 +6,13 @@ effort: high
 
 # Drive an epic lane
 
+**Two modes.** This file and its loop are the always-on **lane driver** (a launcher holds your
+lease). If your task ID (`$LEARN_UKRAINIAN_DISPATCH_TASK_ID`) starts with `turn-` and your task record
+has an `orchestrator` stream, you are a **milestone run** the CTO started as an orchestrator turn:
+follow
+[milestone-run](references/milestone-run.md). The dispatcher holds the stream lease; the run ends
+with one handoff note and one handoff receipt.
+
 You drive **one epic or track lane** (`SESSION_EPIC` is set), not the whole fleet. You own the
 lane's judgment: what is wrong, what is next, which model and harness should do it, whether the
 artifact really worked, and what residual remains. A worker you brief owns its own chain to
