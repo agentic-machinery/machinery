@@ -325,7 +325,9 @@ class NoAllowance(CanaryError):
         super().__init__(f"no-allowance: route {route}: no account with allowance ({accounts})")
 
 
-def _allowance(record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None, *, own: bool) -> tuple[bool, str]:
+def _allowance(
+    route: str, record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None, *, own: bool
+) -> tuple[bool, str]:
     """Whether one account's reading shows allowance, and that reading as the operator needs it.
 
     Allowance is the reviewer resolver's (#1328): ``_has_observed_allowance`` on ``review_capacity``.
@@ -334,10 +336,12 @@ def _allowance(record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None,
     only the account's own provider sample, as the credit lane requires of Codex account b: a
     provider-sourced record (``status_source`` ``weekly_pace``, not a ``ledger_burn`` estimate),
     its own fresh probe (``credit_lane.probe_freshness``), a real percentage, and ``own``: the
-    record names this account, with no stale or contradictory account row behind it.
+    record names this account, with no stale or contradictory account row behind it. A route the
+    resolver's ``review_capacity_action`` blocks (unhealthy, circuit open, NEED_LOGIN, ineligible,
+    headroom blocked) is never used, whatever its allowance.
     """
     from lu_machinery.fleet import credit_lane
-    from lu_machinery.review.capacity import review_capacity
+    from lu_machinery.review.capacity import review_capacity, review_capacity_action
     from lu_machinery.review.reviewer_resolver import _has_observed_allowance
 
     capacity = review_capacity(record, diagnostics)
@@ -355,6 +359,9 @@ def _allowance(record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None,
         return False, f"{text}, not this account's own fresh reading"
     if probe != credit_lane.FRESH:
         return False, f"{text}, provider probe {probe} ({why})"
+    blocked, cause = review_capacity_action(route, record, diagnostics, _RUN_MODELS[route])
+    if blocked:
+        return False, f"{text}, route blocked ({cause})"
     if capacity.near_cap:
         return False, f"{text}, at or below the near-cap reserve"
     if not _has_observed_allowance(capacity):
@@ -400,7 +407,7 @@ def _account_readings(route: str, snapshot: Mapping[str, Any]) -> list[tuple[str
         raise CanaryError(f"route {route}: the catalog has no formal reviewer seat for {model}")
     # Account b drains first among accounts with allowance, as the reviewer resolver orders them (#1328).
     return [
-        (label, *_allowance(record, diagnostics, own=own))
+        (label, *_allowance(route, record, diagnostics, own=own))
         for label, _letter, record, own in sorted(records, key=lambda item: item[1] != "b")
     ]
 
