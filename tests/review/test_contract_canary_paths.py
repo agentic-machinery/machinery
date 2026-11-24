@@ -287,14 +287,20 @@ def runner_roots(tmp_path, configured_roots, monkeypatch):
 
 
 def funded_snapshot(*, a: float, b: float) -> dict:
-    """A fresh routing budget with Codex and Claude accounts a and b at the given remaining %."""
-    probe = {"status": "healthy", "freshness": "fresh", "age_s": 60.0}
+    """A fresh routing budget, as Monitor publishes provider readings, with Codex and Claude
+    accounts a and b at the given remaining %."""
+    probe = {"status": "healthy", "status_source": "weekly_pace", "freshness": "fresh", "age_s": 60.0}
+
+    def account_row(left: float) -> dict:
+        return {"status": "ok", "stale": False, "age_s": 60.0,
+                "weekly": {"left_pct": left}, "session5h": {"left_pct": left}}
+
     return {
         "diagnostics": {"stale": False},
         "agents": {"codex": {**probe, "remaining_pct": a}, "claude": {**probe, "remaining_pct": a}},
-        "codex_accounts": {"codex:b": {**probe, "remaining_pct": b}},
-        "claude_accounts": {"claude:b": {"status": "ok", "stale": False, "age_s": 60.0,
-                                         "weekly": {"left_pct": b}, "session5h": {"left_pct": b}}},
+        "codex_accounts": {"codex:a": {**probe, "codex_account": "sub", "remaining_pct": a},
+                           "codex:b": {**probe, "codex_account": "b-sub", "remaining_pct": b}},
+        "claude_accounts": {"claude:a": account_row(a), "claude:b": account_row(b)},
     }
 
 

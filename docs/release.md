@@ -419,7 +419,9 @@ does these steps in order:
      reads the Monitor routing budget once and runs each of them on an account
      with observed allowance. This is the reviewer resolver's rule: a fresh
      reading above the near-cap reserve, account b first among funded accounts.
-     Claude considers only the subscription logins. When a route has no funded
+     The reading must be the account's own fresh provider sample. A ledger
+     estimate, a missing or stale probe, or a row for another account is not
+     allowance. Claude considers only the subscription logins. When a route has no funded
      account, or the budget is unreadable, the canary refuses with
      `no-allowance` and lists each account's reading. The run plan prints the
      chosen accounts. The installed gate

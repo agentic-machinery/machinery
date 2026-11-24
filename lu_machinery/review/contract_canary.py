@@ -325,14 +325,16 @@ class NoAllowance(CanaryError):
         super().__init__(f"no-allowance: route {route}: no account with allowance ({accounts})")
 
 
-def _allowance(record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None) -> tuple[bool, str]:
+def _allowance(record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None, *, own: bool) -> tuple[bool, str]:
     """Whether one account's reading shows allowance, and that reading as the operator needs it.
 
     Allowance is the reviewer resolver's (#1328): ``_has_observed_allowance`` on ``review_capacity``.
-    That reading counts a fresh snapshot as fresh even when the account's own provider probe is
-    missing (it serves ledger-only lanes), so the canary also needs the account's probe fresh
-    (``credit_lane.probe_freshness``) and a real percentage, as the credit lane requires of
-    Codex account b's own reading.
+    That reading also serves ledger-only lanes, so it counts a fresh snapshot as fresh without the
+    account's own probe and takes a ledger estimate as a percentage. The canary therefore counts
+    only the account's own provider sample, as the credit lane requires of Codex account b: a
+    provider-sourced record (``status_source`` ``weekly_pace``, not a ``ledger_burn`` estimate),
+    its own fresh probe (``credit_lane.probe_freshness``), a real percentage, and ``own``: the
+    record names this account, with no stale or contradictory account row behind it.
     """
     from lu_machinery.fleet import credit_lane
     from lu_machinery.review.capacity import review_capacity
@@ -344,8 +346,13 @@ def _allowance(record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None)
         return False, f"no allowance reading ({capacity.fallback_reason})"
     text = f"{remaining:g}% remaining, {capacity.freshness}"
     probe, why = credit_lane.probe_freshness(record, credit_lane.probe_max_age_s())
+    source = record.get("status_source")
     if not 0 <= remaining <= 100:
         return False, f"{text}, not a percentage"
+    if source != "weekly_pace":
+        return False, f"{text}, not a provider reading (status_source {source or 'missing'})"
+    if not own:
+        return False, f"{text}, not this account's own fresh reading"
     if probe != credit_lane.FRESH:
         return False, f"{text}, provider probe {probe} ({why})"
     if capacity.near_cap:
@@ -358,13 +365,16 @@ def _allowance(record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None)
 def _account_readings(route: str, snapshot: Mapping[str, Any]) -> list[tuple[str, bool, str]]:
     """Each account the route's canary model can run as, account b first, with its allowance.
 
-    Codex accounts are the catalog's formal seats for the model (one per ``--codex-account``);
-    Claude accounts are the subscription logins, each read through its own account-bound view.
-    API-key accounts have no plan meter, so they never show allowance and are not candidates.
+    Codex accounts are the catalog's formal seats for the model (one per ``--codex-account``); a
+    record is that account's own only when its ``codex_account`` names the same label. Claude
+    accounts are the subscription logins, each read through its own account-bound view; a record
+    is the account's own only when the account lane's fresh weekly reading exists
+    (``claude_account_lane.account_weekly_used_pct``: a fresh ``ok`` row that is not stale, or the
+    host account's fresh probe). API-key accounts have no plan meter and are not candidates.
     Each record is the reviewer resolver's own (``_route_record``); ``_allowance`` judges it.
     """
     from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
-    from lu_machinery.fleet.claude_account_lane import ClaudeAccount, bind_snapshot
+    from lu_machinery.fleet.claude_account_lane import ClaudeAccount, account_weekly_used_pct, bind_snapshot
     from lu_machinery.review.reviewer_scheduler import _route_record, codex_account_key
     from lu_machinery.review.role_resolution import invocation_codex_account
 
@@ -372,22 +382,26 @@ def _account_readings(route: str, snapshot: Mapping[str, Any]) -> list[tuple[str
     diagnostics = snapshot.get("diagnostics")
     diagnostics = diagnostics if isinstance(diagnostics, Mapping) else None
     seats = [candidate for candidate in _formal_candidates().get(route, []) if candidate.concrete_model == model]
-    records: list[tuple[str, str, Mapping[str, Any]]] = []  # (dispatch label, account letter, record)
+    # (dispatch label, account letter, record, whether the record is the account's own fresh reading)
+    records: list[tuple[str, str, Mapping[str, Any], bool]] = []
     if route == "codex":
         for candidate in seats:
+            label = invocation_codex_account(candidate.invocation)
+            record = _route_record(candidate, snapshot, prefer_route=True)
             letter = str(codex_account_key(candidate)).removeprefix("codex:")
-            records.append((invocation_codex_account(candidate.invocation), letter,
-                            _route_record(candidate, snapshot, prefer_route=True)))
+            records.append((label, letter, record, record.get("codex_account") == label))
     elif route == "claude" and len(seats) == 1:
         for label in CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS:
-            bound = bind_snapshot(snapshot, account=ClaudeAccount(label, "explicit"))
-            records.append((label, label, _route_record(seats[0], bound, prefer_route=True)))
+            account = ClaudeAccount(label, "explicit")
+            bound = bind_snapshot(snapshot, account=account)
+            own = account_weekly_used_pct(snapshot, account=account) is not None
+            records.append((label, label, _route_record(seats[0], bound, prefer_route=True), own))
     if not records:
         raise CanaryError(f"route {route}: the catalog has no formal reviewer seat for {model}")
     # Account b drains first among accounts with allowance, as the reviewer resolver orders them (#1328).
     return [
-        (label, *_allowance(record, diagnostics))
-        for label, _letter, record in sorted(records, key=lambda item: item[1] != "b")
+        (label, *_allowance(record, diagnostics, own=own))
+        for label, _letter, record, own in sorted(records, key=lambda item: item[1] != "b")
     ]
 
 
@@ -396,7 +410,7 @@ def _run_accounts(snapshot: Mapping[str, Any] | None) -> dict[str, tuple[str, st
 
     An account is used only with observed allowance (``_allowance``): a fresh reading above the
     near-cap reserve, the rule the reviewer resolver applies to same-model Codex accounts (#1328),
-    from the account's own fresh provider probe. Unknown, stale or exhausted allowance is not
+    from the account's own fresh provider sample. Unknown, stale or exhausted allowance is not
     allowance; with none on a route, or no readable budget, the run refuses before anything is
     created or dispatched, naming every account it could not use.
     """
