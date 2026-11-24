@@ -9,6 +9,33 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.68"></a>
+## [0.1.68] - 2026-11-24
+
+### Added
+
+- One shared navigation on every machinery page, kernel-first lookup (supersedes #1324) ([#1327](https://github.com/learn-ukrainian/machinery/pull/1327))
+
+### Changed
+
+- Fix pending count for legacy supervisory deliveries ([#1332](https://github.com/learn-ukrainian/machinery/pull/1332))
+- Add the threat model rule to the review policy ([#1336](https://github.com/learn-ukrainian/machinery/pull/1336))
+
+### Fixed
+
+- Support read-only consumer asks without Sources ([#1323](https://github.com/learn-ukrainian/machinery/pull/1323))
+- Select affordable direct importers in the extra PR test budget ([#1321](https://github.com/learn-ukrainian/machinery/pull/1321))
+- Route driver notices through ordinary inboxes ([#1326](https://github.com/learn-ukrainian/machinery/pull/1326))
+- Prefer Codex account b only while it has allowance ([#1328](https://github.com/learn-ukrainian/machinery/pull/1328))
+- Allow registered cross-repository issue parents ([#1330](https://github.com/learn-ukrainian/machinery/pull/1330))
+- Remove successful default work directory ([#1335](https://github.com/learn-ukrainian/machinery/pull/1335))
+- Read closing issue labels from their own repositories ([#1337](https://github.com/learn-ukrainian/machinery/pull/1337))
+- Return sealed reviews to replacement PR owners ([#1340](https://github.com/learn-ukrainian/machinery/pull/1340))
+- Unify Claude handoff prompt to DB handoff_note and remove dead job_host_exec ([#1339](https://github.com/learn-ukrainian/machinery/pull/1339))
+- Publish current Codex probe failures in routing budgets ([#1342](https://github.com/learn-ukrainian/machinery/pull/1342))
+- Retry the pinned bubblewrap download ([#1346](https://github.com/learn-ukrainian/machinery/pull/1346))
+- Pin the Codex contract canary to account a ([#1344](https://github.com/learn-ukrainian/machinery/pull/1344))
+
 <a id="v0.1.67"></a>
 ## [0.1.67] - 2026-11-24 [YANKED]
 
@@ -1571,7 +1598,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.67...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.68...HEAD
+[0.1.68]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...v0.1.68
 [0.1.67]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...v0.1.67
 [0.1.66]: https://github.com/learn-ukrainian/machinery/compare/v0.1.65...v0.1.66
 [0.1.65]: https://github.com/learn-ukrainian/machinery/compare/v0.1.64...v0.1.65
