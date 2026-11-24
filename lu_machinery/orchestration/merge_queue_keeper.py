@@ -531,7 +531,8 @@ class GitHub:
         """Test nodes and the first setup-error line from the one log fetch this call already makes.
 
         Node identifiers stay relative source paths. The error line is one bounded line for an
-        infrastructure report, or ``None`` when that log has no setup-error marker.
+        infrastructure report, or ``None`` when that log has no setup-error marker. The runner
+        exit line is not a marker.
         """
         log = self.call("run", "view", "-R", self.repository, "--job", str(job_id), "--log")
         if not isinstance(log, str):
@@ -2251,25 +2252,27 @@ def _log_message(line: str) -> str:
 
 
 def _first_setup_error_line(log: str) -> str | None:
-    """First setup-error line in a log already in memory. The runner's exit boilerplate is a fallback."""
+    """First setup-error line in a log already in memory.
+
+    ``Process completed with exit code`` is the runner's own exit line, not a
+    setup error, so a log that contains only that line returns ``None``. A
+    marker matches only an apt ``E:`` line, so a pytest assertion that quotes
+    a status code is not labeled a setup error.
+    """
     if not log:
         return None
-    fallback: str | None = None
     for raw in log.splitlines():
         message = _log_message(raw)
         if not message:
             continue
         if "##[error]" in message:
             message = message.split("##[error]", 1)[1].strip()
-            if not message:
-                continue
-            if message.startswith(_GENERIC_RUNNER_ERROR):
-                fallback = fallback or message[:DISPLAY_REASON_LIMIT]
+            if not message or message.startswith(_GENERIC_RUNNER_ERROR):
                 continue
             return message[:DISPLAY_REASON_LIMIT]
-        if any(marker in message for marker in _SETUP_LINE_MARKERS):
+        if message.startswith("E:") and any(marker in message for marker in _SETUP_LINE_MARKERS):
             return message[:DISPLAY_REASON_LIMIT]
-    return fallback
+    return None
 
 
 def _annotation_setup_error(job: Mapping[str, Any]) -> str | None:

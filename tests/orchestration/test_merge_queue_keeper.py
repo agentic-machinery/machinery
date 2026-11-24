@@ -2089,11 +2089,32 @@ def test_many_shard_jobs_of_one_run_with_no_failing_test_node_produce_one_report
         )
 
     monkeypatch.setattr(client, "call", _call)
-    nodes, error = client.job_failure(7)
-    assert nodes == [] and error is not None
-    assert "snapshot.ubuntu.com" in error and "503" in error and "@octocat" in error
-    assert "Process completed" not in error
+    nodes, setup_line = client.job_failure(7)
+    expected = "E: Failed to fetch http://snapshot.ubuntu.com/ubuntu 503 Service Unavailable @octocat"
+    assert nodes == [] and setup_line == expected
     assert len(calls) == 1 and calls[0][-3:] == ("--job", "7", "--log")
+
+    def _only_runner(*_args: object) -> str:
+        return (
+            "pytest (1)\tRun pytest\t2026-11-24T00:00:00.0000000Z "
+            "##[error]Process completed with exit code 137.\n"
+        )
+
+    monkeypatch.setattr(client, "call", _only_runner)
+    nodes, error = client.job_failure(8)
+    assert nodes == [] and error is None
+
+    def _pytest_assertion(*_args: object) -> str:
+        return (
+            "pytest (1)\tRun pytest\t2026-11-24T00:00:00.0000000Z "
+            "FAILED tests/my-dir/test_x.py::test_y - AssertionError\n"
+            "pytest (1)\tRun pytest\t2026-11-24T00:00:01.0000000Z "
+            "E   assert 'HTTP 503 from upstream' == ''\n"
+        )
+
+    monkeypatch.setattr(client, "call", _pytest_assertion)
+    nodes, error = client.job_failure(9)
+    assert nodes == [] and error is None
 
     class _AnnotatedJobs:
         def timeline(self, number: int) -> list[dict[str, Any]]:
@@ -2139,7 +2160,7 @@ def test_many_shard_jobs_of_one_run_with_no_failing_test_node_produce_one_report
     for number, shard_run in ((42, 45339348369), (43, 45339348370)):
         for job in shards:
             failures.append({"job": job, "pr": number, "at": stamp, "run_id": shard_run})
-    failures[0]["setup_error"] = error
+    failures[0]["setup_error"] = setup_line
     node = "tests/test_example.py::test_keeps_its_own_report"
     for number, shard_run in ((42, 45339348369), (43, 45339348370)):
         failures.append({"job": "pytest (1)", "pr": number, "at": stamp, "run_id": shard_run, "test": node})
@@ -2163,7 +2184,7 @@ def test_many_shard_jobs_of_one_run_with_no_failing_test_node_produce_one_report
         assert f"`{job}`" in body
     assert "#42" in body and "#43" in body
     assert "45339348369" in body and "45339348370" in body
-    assert keeper.code_span(error, keeper.DISPLAY_REASON_LIMIT) in body
+    assert keeper.code_span(setup_line, keeper.DISPLAY_REASON_LIMIT) in body
     assert "http://" not in body and "@" not in body
     assert "Setup error: setup error not read." not in body
     assert "a failure with no failing test node is infrastructure" in body
