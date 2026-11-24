@@ -31,7 +31,7 @@
   </div>
 </header>
 <main id="main" tabindex="-1">
-  <section class="wide" id="alerts">
+  <section class="wide stacked" id="alerts">
     <h2>Alerts firing <span class="age" id="alerts-age">Loading…</span></h2>
     <p id="alerts-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div id="alerts-content">Loading…</div>
@@ -51,55 +51,65 @@
 <script>
 "use strict";
 const {
-  escapeHtml, toDate, ageSpan, table, td, text, unknown, chip,
+  escapeHtml, toDate, utc, ageSpan, table, td, text, unknown, chip,
   readingState, windowLeft, paceCell, readingCell, signInCell,
   liveAccounts, summarizeSubscriptions, subscriptionChips,
   ciLabel, reviewLabel, prLink, repoCoverageIncomplete, repoOpenCount, prChips, prSnapshotState, createPanelRunner,
 } = Machinery;
 
-function alertIdentity(alert) {
-  const skip = new Set(["alertname", "severity", "starts_at"]);
-  const parts = [];
-  for (const [key, value] of Object.entries(alert)) {
-    if (skip.has(key) || value === null || value === undefined || value === "") continue;
-    if (typeof value !== "string" && typeof value !== "number") continue;
-    parts.push([key, value]);
-  }
-  parts.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
-  return JSON.stringify(parts);
+// What the API sends for one alert: a plain-English title, what it means, what happens next, and
+// at most one fixed-set subject (a pool or tool name). Nothing here reads free text from the rules.
+const ALERT_HEAD = ["Alert", "What it means", "What happens next", "Since"];
+const INFO_HEAD = ["Information", "What it means", "What happens next", "Since"];
+
+function alertLabel(group) {
+  // The API sentinel (a name outside the table) has no name to show; a listed name that arrives
+  // without text shows its raw name, and any subject still shows.
+  const raw = group.alertname && group.alertname !== "UnrecognizedAlert" ? `: ${group.alertname}` : "";
+  const head = group.title ? String(group.title) : `Unknown alert (name not listed)${raw}`;
+  return group.subject ? `${head}: ${group.subject}` : head;
 }
 
-function alertTitle(group) {
-  const plain = group.alertname && group.alertname !== "UnrecognizedAlert" ? String(group.alertname) : "Unrecognised alert";
-  const skip = new Set(["alertname", "severity", "starts_at", "count", "oldest"]);
-  const extra = [];
-  for (const [key, value] of Object.entries(group)) {
-    if (skip.has(key) || value === null || value === undefined || value === "") continue;
-    if (typeof value !== "string" && typeof value !== "number") continue;
-    extra.push(`${key.replaceAll("_", " ")} ${value}`);
+// One group per alert and subject. Severity varies per instance (it is a label), so it is not
+// part of the key: the group keeps the highest severity and the earliest start of its instances.
+const SEVERITY_RANK = {critical: 3, warning: 2};
+
+function alertGroups(items) {
+  const groups = new Map();
+  for (const alert of items) {
+    const key = `${alert.alertname}|${alert.subject || ""}`;
+    const group = groups.get(key) || {...alert, count: 0, oldest: alert.starts_at};
+    group.count += 1;
+    if ((SEVERITY_RANK[alert.severity] || 1) > (SEVERITY_RANK[group.severity] || 1)) group.severity = alert.severity;
+    if (toDate(alert.starts_at) && (!toDate(group.oldest) || toDate(alert.starts_at) < toDate(group.oldest))) group.oldest = alert.starts_at;
+    groups.set(key, group);
   }
-  return extra.length ? `${plain} (${extra.join("; ")})` : plain;
+  return [...groups.values()];
+}
+
+function alertRow(group) {
+  const label = alertLabel(group) + (group.count > 1 ? ` (${group.count} firing)` : "");
+  const severity = group.severity === "critical" ? "bad" : group.severity === "warning" ? "warn" : "";
+  const since = toDate(group.oldest) ? `${utc(group.oldest)} (${ageSpan(group.oldest)} ago)` : "—";
+  return [
+    text(group.severity === "critical" ? `Critical: ${label}` : label, severity),
+    text(group.meaning),
+    text(group.next_step),
+    text(since),
+  ];
 }
 
 function renderAlerts(alerts) {
   if (alerts.status !== "ok") return unknown(alerts.reason_code);
-  const groups = new Map();
-  for (const alert of Array.isArray(alerts.alerts) ? alerts.alerts : []) {
-    const key = `${alert.alertname}|${alert.severity}|${alertIdentity(alert)}`;
-    const group = groups.get(key) || {...alert, count: 0, oldest: alert.starts_at};
-    group.count += 1;
-    if (toDate(alert.starts_at) && (!toDate(group.oldest) || toDate(alert.starts_at) < toDate(group.oldest))) group.oldest = alert.starts_at;
-    groups.set(key, group);
-  }
-  const rows = [...groups.values()].map(group => [
-    text(alertTitle(group)),
-    text(group.severity, group.severity === "critical" ? "bad" : group.severity === "warning" ? "warn" : ""),
-    text(ageSpan(group.oldest), "num"),
-    text(group.count, "num"),
-  ]);
+  const items = Array.isArray(alerts.alerts) ? alerts.alerts : [];
+  const problems = alertGroups(items.filter(alert => alert.severity !== "info"));
+  const info = alertGroups(items.filter(alert => alert.severity === "info"));
   const beat = alerts.heartbeat ? '<p class="ok">Alertmanager heartbeat present.</p>'
     : '<p class="bad">Alertmanager heartbeat (Watchdog) missing: alerting may be down.</p>';
-  return (rows.length ? table(["Alert", "Severity", "Since", "Count"], rows) : '<p class="ok">Nothing firing.</p>') + beat;
+  const problemBlock = problems.length ? table(ALERT_HEAD, problems.map(alertRow), true)
+    : `<p class="ok">${info.length ? "No problems firing." : "Nothing firing."}</p>`;
+  const infoBlock = info.length ? `<h3>Recent information</h3>${table(INFO_HEAD, info.map(alertRow), true)}` : "";
+  return problemBlock + infoBlock + beat;
 }
 
 function signInNeedsAttention(account, logins) {
@@ -257,8 +267,10 @@ function renderQueueSummary(prs, prState = null) {
 function renderChips(latest) {
   const out = [];
   if (latest.alerts?.status === "ok") {
-    const firing = (latest.alerts.alerts || []).length;
-    const critical = (latest.alerts.alerts || []).some(alert => alert.severity === "critical");
+    // Information alerts (for example a pool restored) are good news, not problems.
+    const problems = (latest.alerts.alerts || []).filter(alert => alert.severity !== "info");
+    const firing = problems.length;
+    const critical = problems.some(alert => alert.severity === "critical");
     out.push(chip("#alerts", firing, "alerts firing", critical ? "bad" : firing ? "warn" : ""));
   } else if (latest.alerts) out.push(chip("#alerts", "?", "alerts unknown", "bad"));
   out.push(...subscriptionChips(latest.usage, latest.logins, "/subscriptions"));

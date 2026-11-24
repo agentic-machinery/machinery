@@ -82,6 +82,24 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
          "startsAt": "2030-01-03T00:00:00Z", "status": {"state": "active"}},
         {"labels": {"alertname": "SubscriptionPoolRunsOutBeforeReset", "severity": "warning", "pool": "claude:b"}, "annotations": {},
          "startsAt": "2030-01-04T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "SubscriptionPoolRunsOutBeforeReset", "severity": "warning", "pool": "leak-pool"}, "annotations": {},
+         "startsAt": "2030-01-04T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "CliHealthBehind", "severity": "warning", "cli": "agy", "name": "leak-name"}, "annotations": {},
+         "startsAt": "2030-01-04T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "UsagePoolRestored", "severity": "info", "pool": ["leak-pool"]}, "annotations": {},
+         "startsAt": "2030-01-04T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "UsagePoolReadingStale", "severity": "warning", "pool": "codex-a"}, "annotations": {},
+         "startsAt": "2030-01-06T00:00:00Z", "status": {"state": "active"}},
+        # Whole-second start times drop the fraction, so a string sort puts .5 before the whole second.
+        {"labels": {"alertname": "CertExpirySoon", "severity": "warning"}, "annotations": {},
+         "startsAt": "2030-01-06T00:00:00Z", "status": {"state": "active"}},
+        {"labels": {"alertname": "DiskAlmostFull", "severity": "warning"}, "annotations": {},
+         "startsAt": "2030-01-06T00:00:00.5Z", "status": {"state": "active"}},
+        # A date-only or absent start must sort beside real timestamps, never fail the route.
+        {"labels": {"alertname": "DiskCritical", "severity": "warning"}, "annotations": {},
+         "startsAt": "2030-01-06", "status": {"state": "active"}},
+        {"labels": {"alertname": "LuPaceStale", "severity": "warning"}, "annotations": {},
+         "status": {"state": "active"}},
         {"labels": {"alertname": "MonitorApiSlowRoute", "severity": "warning", "route": "/api/orient"}, "annotations": {},
          "startsAt": "2030-01-05T00:00:00Z", "status": {"state": "active"}},
         {"labels": {"alertname": "ForeignAlert", "severity": "warning"}, "annotations": {},
@@ -116,11 +134,26 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok" and body["heartbeat"] is True
+    # Problems oldest first, then information; the unlisted name is never echoed.
     assert [row["alertname"] for row in body["alerts"]] == [
         "UnrecognizedAlert", "ApprovedNotLanded30m", "PROpenOver60m",
-        "SubscriptionPoolRunsOutBeforeReset", "MonitorApiSlowRoute",
+        "SubscriptionPoolRunsOutBeforeReset", "SubscriptionPoolRunsOutBeforeReset", "CliHealthBehind",
+        "MonitorApiSlowRoute", "UsagePoolReadingStale", "CertExpirySoon", "DiskCritical", "DiskAlmostFull", "LuPaceStale",
+        "UsagePoolRestored",
     ]
-    assert all(set(row) == {"alertname", "severity", "starts_at"} for row in body["alerts"])
+    assert all(set(row) == {"alertname", "title", "meaning", "next_step", "subject", "severity", "starts_at"}
+               for row in body["alerts"])
+    by_name = {}
+    for row in body["alerts"]:
+        by_name.setdefault(row["alertname"], []).append(row)
+    unknown = by_name["UnrecognizedAlert"][0]
+    assert (unknown["title"], unknown["meaning"], unknown["next_step"], unknown["subject"]) == (None, None, None, None)
+    # A pool or tool subject is the fixed label; a value outside its set or of the wrong type is dropped.
+    assert [row["subject"] for row in by_name["SubscriptionPoolRunsOutBeforeReset"]] == ["Claude b", None]
+    assert by_name["CliHealthBehind"][0]["subject"] == "AGY"
+    assert by_name["UsagePoolRestored"][0]["subject"] is None
+    assert by_name["UsagePoolReadingStale"][0]["subject"] == "Codex a"
+    assert by_name["PROpenOver60m"][0]["title"] and by_name["PROpenOver60m"][0]["next_step"]
     assert body["stale_after_s"] == 60.0
     assert "leak" not in response.text and "ForeignAlert" not in response.text
     # One malformed item makes the whole reading unknown, never a healthy "nothing firing".
