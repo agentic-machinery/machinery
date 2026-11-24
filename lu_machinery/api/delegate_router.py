@@ -626,18 +626,6 @@ def _sort_public_task_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [_public_task_metadata(row) for row in rows]
 
 
-def _task_store_readable(tasks_dir: Path) -> bool:
-    """Whether the task directory can be read and searched; the record scan treats one it cannot as empty."""
-    if not os.access(tasks_dir, os.R_OK | os.X_OK):
-        return False
-    try:
-        with os.scandir(tasks_dir) as entries:
-            next(entries, None)
-    except OSError:
-        return False
-    return True
-
-
 def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     """Read hot records without waiting for the history scan or writing its cache."""
     tasks_dir = _tasks_dir(ctx)
@@ -645,10 +633,14 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     claims: list[tuple[str | None, list[str]]] = []
     # Live workers by claimed repository (read-only reviewers included). "" counts a confirmed live
     # record with no usable claim, so the Projects line can say how many are not attributed. A record
-    # that cannot be read is no confirmed worker, and a task store that cannot be read gives no counts.
+    # that cannot be read is no confirmed worker. A task store that cannot be read and searched (one
+    # without search permission lists names but not their records) or listed gives no counts.
     live_by_repository: dict[str, int] = {}
-    store_readable = _task_store_readable(tasks_dir)
-    for path in iter_task_records(tasks_dir, include_archive=False):
+    listing_failures: list[OSError] = []
+    store_readable = os.access(tasks_dir, os.R_OK | os.X_OK)
+    for path in iter_task_records(
+        tasks_dir, include_archive=False, on_error=lambda _path, exc: listing_failures.append(exc),
+    ):
         try:
             file_stat = path.stat()
             entry = _TASK_STATE_CACHE.get(str(path))
@@ -688,7 +680,7 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     # The HTTP /active projection omits these internal claims, including grants.
     return {
         "total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims,
-        "live_by_repository": live_by_repository if store_readable else None,
+        "live_by_repository": live_by_repository if store_readable and not listing_failures else None,
     }
 
 
