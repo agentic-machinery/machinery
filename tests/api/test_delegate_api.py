@@ -808,6 +808,11 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
             local.setattr(delegate_router, "_tasks_dir", lambda _ctx: plain)
             assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
             local.setattr(delegate_router, "_tasks_dir", lambda _ctx: tasks)
+            # A directory that cannot be read and searched lists names but not their types: no counts either.
+            local.setattr(delegate_router.os, "access", lambda *_args: False)
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
+            local.undo()
+            local.setattr(delegate_router, "_tasks_dir", lambda _ctx: tasks)
 
             def failing_listing(_path):
                 raise OSError(5, "input/output error")

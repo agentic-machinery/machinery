@@ -760,7 +760,8 @@ def _exact_pins(text: str) -> set[str] | None:
         versions: set[str] = set()
         for items, includes in lists:
             for item in items:
-                if includes and isinstance(item, dict):  # a PEP 735 include table
+                # A PEP 735 include table has the one key include-group, naming a group.
+                if includes and isinstance(item, dict) and set(item) == {"include-group"} and isinstance(item["include-group"], str):
                     continue
                 if not isinstance(item, str):
                     return None

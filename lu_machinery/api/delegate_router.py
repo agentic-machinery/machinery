@@ -627,7 +627,9 @@ def _sort_public_task_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _task_store_readable(tasks_dir: Path) -> bool:
-    """Whether the task directory lists; the record scan treats a store it cannot list as empty."""
+    """Whether the task directory can be read and searched; the record scan treats one it cannot as empty."""
+    if not os.access(tasks_dir, os.R_OK | os.X_OK):
+        return False
     try:
         with os.scandir(tasks_dir) as entries:
             next(entries, None)

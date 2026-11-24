@@ -436,7 +436,9 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     assert pin_of({"pin": None})["state"] == "none"
     for malformed in ('[project]\ndependencies = [0]\n', '[project]\noptional-dependencies = "x"\n',
                       '[project]\ndependencies = ["lu-machinery==1.2.*"]\n',
-                      '[dependency-groups]\ng = [0]\n'):
+                      '[dependency-groups]\ng = [0]\n', '[dependency-groups]\ng = [{include-group = 123}]\n',
+                      '[dependency-groups]\ng = [{other = "x"}]\n',
+                      '[dependency-groups]\nb = ["lu-machinery==1.0"]\ng = [{include-group = "b", extra = 1}]\n'):
         assert pin_of(manifest(malformed))["state"] == "unknown", malformed
     # A PEP 735 include table is allowed in a dependency group, and a pin beside it still reads.
     included = '[dependency-groups]\nbase = ["lu-machinery==3.4.5"]\nall = [{include-group = "base"}]\n'
