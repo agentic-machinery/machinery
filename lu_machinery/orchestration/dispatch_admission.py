@@ -1825,19 +1825,21 @@ def count_turn_children(
     for record in records:
         if record.get("parent_task_id") != parent_task_id:
             continue
+        rec_parent_nonce = record.get("parent_run_nonce")
+        if rec_parent_nonce is not None and not _is_valid_run_identity(rec_parent_nonce):
+            raise ValueError(f"malformed parent_run_nonce on {record['task_id']}: cannot verify turn child count")
+        if parent_run_nonce is not None and rec_parent_nonce not in (None, parent_run_nonce):
+            continue
+        rec_run_nonce = record.get("run_nonce")
+        if not isinstance(rec_run_nonce, str) or not _is_valid_run_identity(rec_run_nonce):
+            raise ValueError(f"malformed run_nonce on {record['task_id']}: cannot verify turn child count")
         never_started = record.get("never_started_reason")
         if never_started is not None:
             if not _is_valid_run_identity(never_started):
                 raise ValueError(f"malformed never_started_reason on {record['task_id']}: cannot verify turn child count")
-            continue
-        rec_parent_nonce = record.get("parent_run_nonce")
-        if rec_parent_nonce is not None and not _is_valid_run_identity(rec_parent_nonce):
-            raise ValueError(f"malformed parent_run_nonce on {record['task_id']}: cannot verify turn child count")
-        if parent_run_nonce is None or rec_parent_nonce in (None, parent_run_nonce):
-            rec_run_nonce = record.get("run_nonce")
-            if not isinstance(rec_run_nonce, str) or not _is_valid_run_identity(rec_run_nonce):
-                raise ValueError(f"malformed run_nonce on {record['task_id']}: cannot verify turn child count")
-            seen_runs.add((record["task_id"], rec_run_nonce))
+            if all(record.get(k) is None for k in ("pid", "process_start", "provider_pgid", "launch_unit", "launch_cgroup")):
+                continue
+        seen_runs.add((record["task_id"], rec_run_nonce))
     return len(seen_runs)
 
 

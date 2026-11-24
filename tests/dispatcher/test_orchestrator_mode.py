@@ -1486,6 +1486,26 @@ def test_live_unknown_or_unreadable_child_blocks_turn_done_keeps_lease_and_recor
         ("child-reused", "nonce-hot-2"),
     ]
     assert reuse_scan["live"] == [] and reuse_scan["unknown"] == [] and reuse_scan["unreadable"] == []
+    # PR1306-F2 R2: a settled hot record never masks a conflicting/malformed archived copy of the same run.
+    bad_dup_arch = arch_dir / "child-reused.20261123T000002Z.archived.json"
+    bad_dup_arch.write_text(json.dumps(dict(
+        schema_version=2, task_id="child-reused", agent="claude", mode="workspace-write",
+        status="done", run_nonce="nonce-hot-2", parent_task_id="turn-reuse-child",
+        parent_run_nonce="  ", parent_stream=STREAM,
+        launch_mode="scope", pid=_DEAD_PID, process_start="boot:1", worktree_disposition="removed",
+    )), encoding="utf-8")
+    bad_dup_scan = worker._scan_turn_children(reuse_turn)
+    assert "child-reused" in bad_dup_scan["unknown"]
+    bad_dup_arch.unlink()
+    bad_refusal_arch = arch_dir / "child-reused.20261123T000003Z.archived.json"
+    bad_refusal_arch.write_text(json.dumps(dict(
+        schema_version=2, task_id="child-reused", agent="claude", mode="workspace-write",
+        status="failed", run_nonce="nonce-hot-2", never_started_reason="  ",
+        parent_task_id="turn-reuse-child", parent_run_nonce="parent-nonce-reuse", parent_stream=STREAM,
+    )), encoding="utf-8")
+    bad_refusal_scan = worker._scan_turn_children(reuse_turn)
+    assert "child-reused" in bad_refusal_scan["unknown"]
+    bad_refusal_arch.unlink()
     # PR1306-F1: corrupt/unreadable archived record and unreadable archive dir fail closed in _scan_turn_children.
     corrupt_arch = arch_dir / "corrupt-archived.json"
     corrupt_arch.write_text("{", encoding="utf-8")
@@ -1879,11 +1899,14 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
         host_admission.check_turn_child_cap(linkage)
     fifo_link.unlink()
 
-    # PR1306-F2: whitespace in parent_run_nonce, run_nonce, or never_started_reason fails closed at child admission.
+    # PR1306-F2: whitespace in parent_run_nonce, run_nonce, or never_started_reason fails closed at child admission,
+    # even when never_started_reason is validly populated on the same record.
     for bad_id, bad_fields in (
         ("c-ws-parent", {"parent_run_nonce": "  ", "run_nonce": "cn-ok-1"}),
         ("c-ws-nonce", {"parent_run_nonce": parent_nonce, "run_nonce": "  "}),
         ("c-ws-refusal", {"parent_run_nonce": parent_nonce, "run_nonce": "cn-ok-2", "never_started_reason": "  "}),
+        ("c-ref-ws-parent", {"parent_run_nonce": "  ", "run_nonce": "cn-ok-3", "never_started_reason": "admission_capacity"}),
+        ("c-ref-ws-nonce", {"parent_run_nonce": parent_nonce, "run_nonce": "  ", "never_started_reason": "admission_capacity"}),
     ):
         bad_path = task_store / f"{bad_id}.json"
         _write(dict(schema_version=2, task_id=bad_id, agent="claude", mode="workspace-write",

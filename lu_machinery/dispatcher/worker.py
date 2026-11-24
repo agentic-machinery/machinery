@@ -861,11 +861,14 @@ def _scan_turn_children(record: dict) -> dict:
         child_status = other.get("status")
         valid_nonce = isinstance(child_nonce, str) and _is_valid_run_identity(child_nonce)
         run_key = (child_id, child_nonce, None) if valid_nonce else (child_id, None, fallback_key)
-        children[run_key] = {
-            "task_id": child_id,
-            "run_nonce": child_nonce if valid_nonce else None,
-            "status": child_status if isinstance(child_status, str) else None,
-        }
+        children.setdefault(
+            run_key,
+            {
+                "task_id": child_id,
+                "run_nonce": child_nonce if valid_nonce else None,
+                "status": child_status if isinstance(child_status, str) else None,
+            },
+        )
         if isinstance(child_status, str) and child_status in store.ACTIVE:
             live.append(child_id)
         elif nonce_malformed or not valid_nonce or not isinstance(child_status, str) or child_status not in store.TERMINAL:
@@ -919,10 +922,6 @@ def _scan_turn_children(record: dict) -> dict:
                         continue
                     if not isinstance(parsed, dict) or not _is_valid_run_identity(parsed.get("task_id")):
                         unreadable.append(f"{ARCHIVE_DIR_NAME}/{listed.name}")
-                        continue
-                    tid = parsed.get("task_id")
-                    c_nonce = parsed.get("run_nonce")
-                    if isinstance(tid, str) and isinstance(c_nonce, str) and _is_valid_run_identity(c_nonce) and (tid, c_nonce, None) in children:
                         continue
                     classify(parsed, listed.stem, f"archive:{listed.name}")
     except (OSError, ValueError):
