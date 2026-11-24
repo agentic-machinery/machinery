@@ -17,7 +17,7 @@ from lu_machinery.ai_agent_bridge.routing_guard import (
     assert_model_routing_allowed,
     savant_request_store,
 )
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import git, store
 from lu_machinery.dispatcher.types import TaskSpec
@@ -364,7 +364,8 @@ def _handle_private_input(spec: TaskSpec, message: str) -> None:
 def check_private_input(spec: TaskSpec, repo_key: str) -> None:
     if spec.agent not in {"muse", "opencode"}:
         return
-    repos = yaml.safe_load(machinery_path("config/fleet_repos.yaml").read_text())["repos"]
+    repos_path = profile.config_path("fleet_repos", default=machinery_path("config/fleet_repos.yaml"))
+    repos = yaml.safe_load(repos_path.read_text())["repos"]
     private_payload = False
     if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
         private_payload = not savant_request_store(spec.options.get("data_class"))

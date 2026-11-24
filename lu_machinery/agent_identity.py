@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path
 
 # Permanent CLI retirements: a dispatch agent whose native binary/subscription
@@ -168,8 +169,16 @@ VALID_AGENTS = STATIC_VALID_AGENTS
 VALID_POST_AGENTS = (*VALID_AGENTS, "user")
 VALID_RECIPIENT_AGENTS = VALID_AGENTS
 
-ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+_PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
 _SLOTS_CACHE: dict[str, Any] = {"key": None, "slots": ()}
+
+
+def default_assignments_path() -> Path:
+    """Resolve ``area_assignments.yaml`` at call time via the active profile, else the packaged copy."""
+    if ASSIGNMENTS_PATH != _PACKAGED_ASSIGNMENTS_PATH:
+        return ASSIGNMENTS_PATH
+    return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
 
 
 def _load_registry_slots(assignments_path: Path | None = None) -> tuple[str, ...]:
@@ -178,7 +187,7 @@ def _load_registry_slots(assignments_path: Path | None = None) -> tuple[str, ...
     Lazy load, fail-open: returns empty tuple on missing file, parse error,
     or missing PyYAML.
     """
-    path = (assignments_path or ASSIGNMENTS_PATH).resolve()
+    path = (assignments_path or default_assignments_path()).resolve()
     try:
         if not path.is_file():
             return ()
@@ -213,7 +222,7 @@ def get_valid_agents(*, assignments_path: Path | None = None) -> tuple[str, ...]
     Keyed by file mtime+size to prevent stale caching in long-lived processes
     while avoiding re-parsing unchanged files.
     """
-    path = (assignments_path or ASSIGNMENTS_PATH).resolve()
+    path = (assignments_path or default_assignments_path()).resolve()
     slots: tuple[str, ...] = ()
     try:
         st = path.stat()
@@ -254,7 +263,7 @@ def _load_empty_slot_areas(assignments_path: Path | None = None, *, provider: st
     Same lazy fail-open contract as ``_load_registry_slots``: empty tuple on
     missing file, parse error, or missing PyYAML.
     """
-    path = (assignments_path or ASSIGNMENTS_PATH).resolve()
+    path = (assignments_path or default_assignments_path()).resolve()
     try:
         if not path.is_file():
             return ()

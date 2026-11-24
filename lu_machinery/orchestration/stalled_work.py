@@ -30,7 +30,7 @@ from lu_machinery.orchestration import stale_task_records as stale
 from lu_machinery.orchestration.fleet_repos import FleetRepo, MissingFleetCheckout, load_fleet_repos, resolve_fleet_repo
 from lu_machinery.orchestration.integration_sweep import GitHubAdapter, SweepError, lookup_verdict
 from lu_machinery.orchestration.task_record_store import iter_task_records, read_task_record
-from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_PATH, TAXONOMY_PATH, _load_yaml
+from lu_machinery.orchestration.validate_fleet_taxonomy import TAXONOMY_PATH, _load_yaml, default_assignments_path
 from lu_machinery.orchestration.worktree_claims import RELEASED_TASK_STATUSES
 from lu_machinery.session_streams.store import TURN_HOLDER_HARNESS
 from lu_machinery.session_supervisor.remote import RemoteEpicClient, RemoteSupervisorError, RemoteUnreachableError
@@ -114,7 +114,7 @@ def closed_pull_pager(slug: str):
 
 def owner_lanes() -> dict[str, str]:
     """Resolve current slots and retired initiators through their registered stream."""
-    assignments = _load_yaml(ASSIGNMENTS_PATH)["assignments"]
+    assignments = _load_yaml(default_assignments_path())["assignments"]
     areas = _load_yaml(TAXONOMY_PATH)["areas"]
     lanes = {slot: slot for area in assignments.values() for slot in area["slots"]}
     stream_slots = {

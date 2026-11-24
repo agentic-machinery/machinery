@@ -26,6 +26,7 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lu_machinery.agent_runtime.agent_github_identity import resolve_agent_github_identity, revoke_installation_token
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import StateRootError, machinery_path, state_root
 from lu_machinery.orchestration import worktree_claims
 from lu_machinery.orchestration.execution_safe_git import LOCAL_COMMANDS, SafeGitRunner
@@ -40,7 +41,14 @@ from lu_machinery.orchestration.task_record_store import parse_task_record
 
 _GIT = "/usr/bin/git"
 _FETCH_REMOTE = "sibling-git-canonical"
-_REGISTRY_PATH = machinery_path("config/fleet_repos.yaml")
+_PACKAGED_REGISTRY_PATH = machinery_path("config/fleet_repos.yaml")
+_REGISTRY_PATH = _PACKAGED_REGISTRY_PATH
+
+
+def _registry_path() -> Path:
+    if _REGISTRY_PATH != _PACKAGED_REGISTRY_PATH:
+        return _REGISTRY_PATH
+    return profile.config_path("fleet_repos", default=_PACKAGED_REGISTRY_PATH)
 # The machinery package's import name, which is also the directory its files have in checkout
 # paths: from this module's package, or from its unresolved location when run as a file.
 _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
@@ -111,8 +119,9 @@ class Repository:
 
 
 def _registry_transport(key: str) -> str:
+    registry_path = _registry_path()
     try:
-        document = yaml.safe_load(_REGISTRY_PATH.read_text(encoding="utf-8"))
+        document = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
         transport = document["repos"].get(key, {}).get("transport", "ssh")
     except (OSError, yaml.YAMLError, KeyError, TypeError, AttributeError) as exc:
         raise Refusal("cannot inspect registered transport") from exc
@@ -476,7 +485,7 @@ def resolve_repository(key: str, primary: Path, git: Git) -> Repository:
         raise Refusal("select a registered non-default sibling repository")
     if spec.has_alternate_slug:
         try:
-            active = resolve_active_fleet_repo(key, repos=catalog, registry_path=_REGISTRY_PATH.resolve())
+            active = resolve_active_fleet_repo(key, repos=catalog, registry_path=_registry_path().resolve())
         except FleetRepoError:
             raise Refusal("fleet repository selector unavailable or invalid") from None
         active_github = active.active_github

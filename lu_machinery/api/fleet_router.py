@@ -1333,7 +1333,7 @@ def _fleet_seat_roster() -> tuple[list[_FleetSeat], str, str]:
         )
         seats.append(_FleetSeat(lane.name, "cto" if cto else "driver", lane.epic, recipients))
 
-    external, external_roster = load_external_recipients(agent_identity.ASSIGNMENTS_PATH)
+    external, external_roster = load_external_recipients(agent_identity.default_assignments_path())
     lane_names = {name for seat in seats for name in (seat.seat, *seat.recipients)}
     if lane_names.intersection(external):
         return seats, driver_roster, "unavailable"

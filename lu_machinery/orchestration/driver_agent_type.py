@@ -22,10 +22,18 @@ import yaml
 if __package__ in {None, ""}:  # run as a file (launchers do): the repository root holds the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path
 
-DEFAULT_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+_PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+DEFAULT_ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
 DEFAULT_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
+
+
+def _default_assignments_path() -> Path:
+    if DEFAULT_ASSIGNMENTS_PATH != _PACKAGED_ASSIGNMENTS_PATH:
+        return DEFAULT_ASSIGNMENTS_PATH
+    return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
 
 
 def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
@@ -49,15 +57,16 @@ def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
 def resolve_driver_agent_type(
     lane: str,
     *,
-    assignments_path: Path = DEFAULT_ASSIGNMENTS_PATH,
+    assignments_path: Path | None = None,
     taxonomy_path: Path = DEFAULT_TAXONOMY_PATH,
     provider: str = "claude",
 ) -> str | None:
     lane = (lane or "").strip()
     if not lane:
         return None
+    resolved_assignments = _default_assignments_path() if assignments_path is None else assignments_path
     try:
-        data = yaml.safe_load(assignments_path.read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(resolved_assignments.read_text(encoding="utf-8")) or {}
     except (OSError, yaml.YAMLError):
         return None
     assignments = data.get("assignments") if isinstance(data, dict) else None
@@ -88,17 +97,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--lane", required=True, help="launcher lane after selector normalisation, e.g. infra")
     parser.add_argument("--provider", default="claude", help="slot prefix used for the slots fallback (default claude)")
-    parser.add_argument("--assignments", type=Path, default=DEFAULT_ASSIGNMENTS_PATH, help="area_assignments.yaml path")
+    parser.add_argument("--assignments", type=Path, default=None, help="area_assignments.yaml path")
     parser.add_argument("--taxonomy", type=Path, default=DEFAULT_TAXONOMY_PATH, help="fleet_taxonomy.yaml path")
     args = parser.parse_args(argv)
+    assignments_path = _default_assignments_path() if args.assignments is None else args.assignments
     agent_type = resolve_driver_agent_type(
         args.lane,
-        assignments_path=args.assignments,
+        assignments_path=assignments_path,
         taxonomy_path=args.taxonomy,
         provider=args.provider,
     )
     if not agent_type:
-        print(f"no driver_agent_type for lane {args.lane!r} in {args.assignments}", file=sys.stderr)
+        print(f"no driver_agent_type for lane {args.lane!r} in {assignments_path}", file=sys.stderr)
         return 1
     print(agent_type)
     return 0

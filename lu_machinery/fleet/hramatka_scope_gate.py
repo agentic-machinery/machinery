@@ -17,7 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import issue_stream_audit
 from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
@@ -124,7 +124,9 @@ IssueReader = Callable[[IssueRef], IssueObservation]
 def load_stream_registry() -> dict[str, list[int]]:
     """Read the canonical stream-to-epic registry without making a network call."""
 
-    return issue_stream_audit.load_registry(machinery_path("config/issue_streams.yaml"))
+    return issue_stream_audit.load_registry(
+        profile.config_path("issue_streams", default=machinery_path("config/issue_streams.yaml"))
+    )
 
 
 def _gh_issue_observation(issue: IssueRef) -> IssueObservation:

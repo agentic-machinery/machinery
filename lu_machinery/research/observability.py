@@ -40,7 +40,7 @@ from typing import Any, NamedTuple, cast
 
 import yaml
 
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.orchestration import issue_stream_audit as isa
 from lu_machinery.research import consumption
@@ -220,8 +220,9 @@ def _lifecycle_and_adoption(root: Path, max_age_s: int, check: _Check) -> dict[s
             "known_ids": set(),
         }
 
+    streams_path = profile.config_path("issue_streams", default=machinery_path("config/issue_streams.yaml"))
     try:
-        streams = check.registry.load_streams(machinery_path("config/issue_streams.yaml"))
+        streams = check.registry.load_streams(streams_path)
     except (OSError, ValueError, yaml.YAMLError):
         streams = {}
     try:

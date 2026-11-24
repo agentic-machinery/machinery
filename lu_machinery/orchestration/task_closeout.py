@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path, state_root
 from lu_machinery.github_check_rollup import collapse_status_rollup
 from lu_machinery.opsec.prepublish import publication_boundary, publication_cli
@@ -227,7 +227,7 @@ class GhGitHubAdapter:
             # Closed epics stay in the file for launcher and Work API consumers.
             # Membership roots are the audit registry only (#12176).
             registry = issue_stream_audit.load_registry(
-                machinery_path("config/issue_streams.yaml"),
+                profile.config_path("issue_streams", default=machinery_path("config/issue_streams.yaml")),
                 audit_only=True,
                 **({"repo": repo_key} if repo_key is not None else {}),
             )

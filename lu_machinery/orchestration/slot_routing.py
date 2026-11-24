@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path, state_root
 from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.orchestration.fleet_taxonomy import (
@@ -45,7 +46,14 @@ from lu_machinery.orchestration.fleet_taxonomy import (
     resolve_area,
 )
 
-DEFAULT_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+_PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+DEFAULT_ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
+
+
+def _default_assignments_path() -> Path:
+    if DEFAULT_ASSIGNMENTS_PATH != _PACKAGED_ASSIGNMENTS_PATH:
+        return DEFAULT_ASSIGNMENTS_PATH
+    return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,7 +152,7 @@ def resolve_slot_holder(
     clean_slot = slot.strip()
     queue_loc = f"channels DB delivery queue for '{clean_slot}'"
 
-    assign_path = (assignments_path or DEFAULT_ASSIGNMENTS_PATH).resolve()
+    assign_path = (assignments_path or _default_assignments_path()).resolve()
     area_candidate = _find_area_for_slot(clean_slot, assign_path)
 
     if area_candidate is None:

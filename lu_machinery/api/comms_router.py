@@ -349,7 +349,7 @@ def comms_inbox(
     # Pass the configured spelling to the plane, including external recipients
     # which have no launcher slot.
     try:
-        external, _availability = load_external_recipients(agent_identity.ASSIGNMENTS_PATH)
+        external, _availability = load_external_recipients(agent_identity.default_assignments_path())
         seat = next((name for name in external if name == agent), None)
         if seat is None:
             roster, _complete = _load_roster()

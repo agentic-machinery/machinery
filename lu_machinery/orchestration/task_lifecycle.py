@@ -255,7 +255,7 @@ def stream_registry_target(repository: str, *, require_active_slug: bool = False
     try:
         has_own_roots = issue_stream_audit.repo_has_roots(
             active.repo.key,
-            issue_stream_audit.REGISTRY_PATH,
+            issue_stream_audit.default_registry_path(),
             default_key=default_key,
         )
     except (OSError, ValueError) as exc:

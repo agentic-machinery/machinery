@@ -1112,3 +1112,178 @@ def test_every_entry_point_converges_for_primary_and_non_git_state_root(
         monitor_context.production_context.cache_clear()
         for name in api_config_caches:
             vars(api_config).pop(name, None)
+
+
+def test_config_path_default_fallback_and_fail_closed(unconfigured, tmp_path):
+    """Defect class: fail-open fallback to packaged default on invalid profile, slug conflict, unknown name, missing or symlinked target."""
+    packaged = tmp_path / "packaged.yaml"
+    packaged.write_text("default: true\n", encoding="utf-8")
+
+    # No plane owner -> returns default; strict mode still refuses.
+    assert profile.config_path("fleet_repos", env={}, default=packaged) == packaged
+    with pytest.raises(profile.ProfileError, match="no plane owner is configured"):
+        profile.config_path("fleet_repos", env={})
+
+    # Plane owner with no profile -> returns default.
+    owner = _primary_checkout(tmp_path / "owner")
+    owner_env = {rr.LU_PRIMARY_ROOT_ENV: str(owner)}
+    assert profile.config_path("fleet_repos", env=owner_env, default=packaged) == packaged
+
+    # Valid profile: declared key resolves to profile file; omitted key returns default.
+    _write_profile(owner, _PROFILE)
+    assert profile.config_path("fleet_repos", env=owner_env, default=packaged) == owner / ".lu-machinery" / "fleet_repos.yaml"
+    assert profile.config_path("issue_streams", env=owner_env, default=packaged) == packaged
+
+    # Unknown config name never falls back to default.
+    with pytest.raises(profile.ProfileError, match="not a consumer config name"):
+        profile.config_path("model_catalog", env={}, default=packaged)
+    with pytest.raises(profile.ProfileError, match="not a consumer config name"):
+        profile.config_path("model_catalog", env=owner_env, default=packaged)
+
+    # Slug conflict never falls back to default.
+    with pytest.raises(profile.ProfileError, match="the profile is the one authority"):
+        profile.config_path(
+            "fleet_repos",
+            env={**owner_env, rr.LU_GITHUB_SLUG_ENV: "other-org/other-repo"},
+            default=packaged,
+        )
+
+    # Missing explicit LU_PROFILE_PATH never falls back to default.
+    with pytest.raises(profile.ProfileError):
+        profile.config_path(
+            "fleet_repos",
+            env={rr.PROFILE_PATH_ENV: str(tmp_path / "absent-profile.json")},
+            default=packaged,
+        )
+
+    # Missing declared target file never falls back to default.
+    (owner / ".lu-machinery" / "fleet_repos.yaml").unlink()
+    with pytest.raises(profile.ProfileError, match="does not exist"):
+        profile.config_path("fleet_repos", env=owner_env, default=packaged)
+
+    # Symlinked declared target file never falls back to default.
+    elsewhere = tmp_path / "elsewhere.yaml"
+    elsewhere.write_text("repos: {}\n", encoding="utf-8")
+    (owner / ".lu-machinery" / "fleet_repos.yaml").symlink_to(elsewhere)
+    with pytest.raises(profile.ProfileError, match="symlink"):
+        profile.config_path("fleet_repos", env=owner_env, default=packaged)
+
+    # Corrupt profile JSON never falls back to default.
+    (owner / profile.PROFILE_REL).write_text("{not-json", encoding="utf-8")
+    with pytest.raises(profile.ProfileError, match="not valid UTF-8 JSON"):
+        profile.config_path("issue_streams", env=owner_env, default=packaged)
+
+
+def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_path, monkeypatch):
+    """Defect class: import-time path freeze or bypass of profile.config_path causing loaders to ignore profile changes after import."""
+    from lu_machinery import agent_identity
+    from lu_machinery.common import git_credentials
+    from lu_machinery.dispatcher import git as dispatch_git
+    from lu_machinery.fleet import hramatka_scope_gate, sibling_git
+    from lu_machinery.orchestration import (
+        driver_agent_type,
+        issue_stream_audit,
+        slot_routing,
+        validate_fleet_taxonomy,
+    )
+    from lu_machinery.session_streams import inventory as stream_inventory
+
+    def _write_consumer_profile(name: str, slug: str, repo_key: str, epic: int, slot: str, agent_type: str, transport: str) -> Path:
+        root = tmp_path / name
+        root.mkdir()
+        (root / "fleet_repos.yaml").write_text(
+            f"repos:\n"
+            f"  {repo_key}:\n"
+            f"    github: {slug}\n"
+            f"    local_name: {repo_key}-dir\n"
+            f"    role: public-monorepo\n"
+            f"    default: true\n"
+            f"    transport: {transport}\n",
+            encoding="utf-8",
+        )
+        (root / "issue_streams.yaml").write_text(
+            f"streams:\n"
+            f"  {name}-stream:\n"
+            f"    title: {name}\n"
+            f"    epics: [{epic}]\n",
+            encoding="utf-8",
+        )
+        (root / "area_assignments.yaml").write_text(
+            f"version: 1\n"
+            f"assignments:\n"
+            f"  {name}-area:\n"
+            f"    slots: [{slot}]\n"
+            f"    driver_agent_type: {agent_type}\n",
+            encoding="utf-8",
+        )
+        profile_file = root / "profile.v1.json"
+        profile_file.write_text(
+            json.dumps(
+                {
+                    "schema": profile.PROFILE_SCHEMA,
+                    "version": profile.PROFILE_VERSION,
+                    "profile_id": name,
+                    "github_slug": slug,
+                    "config": {
+                        "fleet_repos": "fleet_repos.yaml",
+                        "issue_streams": "issue_streams.yaml",
+                        "area_assignments": "area_assignments.yaml",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return profile_file
+
+    # With no profile, every loader resolves to the packaged default (byte-identical to pre-profile behaviour).
+    assert git_credentials.default_config_path() == git_credentials.CONFIG
+    assert issue_stream_audit.default_registry_path() == issue_stream_audit.REGISTRY_PATH
+    assert agent_identity.default_assignments_path() == agent_identity.ASSIGNMENTS_PATH
+    assert validate_fleet_taxonomy.default_assignments_path() == validate_fleet_taxonomy.ASSIGNMENTS_PATH
+    assert slot_routing._default_assignments_path() == slot_routing.DEFAULT_ASSIGNMENTS_PATH
+    assert stream_inventory.resolve_streams_yaml(tmp_path) == stream_inventory.DEFAULT_STREAMS_YAML
+
+    profile_a = _write_consumer_profile("alpha", "alpha-org/alpha-repo", "alpha", 111, "claude-alpha", "alpha-driver", "https")
+    profile_b = _write_consumer_profile("beta", "beta-org/beta-repo", "beta", 222, "claude-beta", "beta-driver", "ssh")
+    product_dir = tmp_path / "product"
+    product_dir.mkdir()
+    monkeypatch.setenv(rr.PRODUCT_ROOT_ENV, str(product_dir))
+
+    try:
+        # Activate Profile A AFTER import -> call-time resolution picks Profile A's registries.
+        monkeypatch.setenv(rr.PROFILE_PATH_ENV, str(profile_a))
+        assert git_credentials.default_config_path() == profile_a.parent / "fleet_repos.yaml"
+        _, repo_a = dispatch_git.resolve_repo()
+        assert repo_a["key"] == "alpha"
+        assert repo_a["github"] == "alpha-org/alpha-repo"
+        assert sibling_git._registry_transport("alpha") == "https"
+        assert issue_stream_audit.load_registry() == {"alpha-stream": [111]}
+        assert hramatka_scope_gate.load_stream_registry() == {"alpha-stream": [111]}
+        assert stream_inventory.stream_map(tmp_path) == {"alpha-stream": [111]}
+        assert "claude-alpha" in agent_identity.get_valid_agents()
+        assert driver_agent_type.resolve_driver_agent_type("alpha-area") == "alpha-driver"
+        assert slot_routing._default_assignments_path() == profile_a.parent / "area_assignments.yaml"
+        assert validate_fleet_taxonomy.default_assignments_path() == profile_a.parent / "area_assignments.yaml"
+
+        # Switch to Profile B in the same process -> call-time resolution switches immediately.
+        monkeypatch.setenv(rr.PROFILE_PATH_ENV, str(profile_b))
+        assert git_credentials.default_config_path() == profile_b.parent / "fleet_repos.yaml"
+        _, repo_b = dispatch_git.resolve_repo()
+        assert repo_b["key"] == "beta"
+        assert repo_b["github"] == "beta-org/beta-repo"
+        assert sibling_git._registry_transport("beta") == "ssh"
+        assert issue_stream_audit.load_registry() == {"beta-stream": [222]}
+        assert hramatka_scope_gate.load_stream_registry() == {"beta-stream": [222]}
+        assert stream_inventory.stream_map(tmp_path) == {"beta-stream": [222]}
+        assert "claude-beta" in agent_identity.get_valid_agents()
+        assert "claude-alpha" not in agent_identity.get_valid_agents()
+        assert driver_agent_type.resolve_driver_agent_type("beta-area") == "beta-driver"
+
+        # Broken declared target in active profile fails closed rather than falling back to packaged defaults.
+        (profile_b.parent / "issue_streams.yaml").unlink()
+        with pytest.raises(profile.ProfileError, match="issue_streams"):
+            issue_stream_audit.load_registry()
+        with pytest.raises(profile.ProfileError, match="issue_streams"):
+            stream_inventory.resolve_streams_yaml(tmp_path)
+    finally:
+        git_credentials.repository_registry.cache_clear()

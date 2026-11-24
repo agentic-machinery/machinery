@@ -47,7 +47,7 @@ from pathlib import Path
 
 import yaml
 
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import github_slug, machinery_path, product_root, state_root
 from lu_machinery.opsec.prepublish import publication_cli
 from lu_machinery.orchestration import fleet_repos
@@ -59,7 +59,15 @@ from lu_machinery.publish.github import Request, request_run
 _PACKAGE = f"{Path(os.path.abspath(__file__)).parents[1].name}.{Path(os.path.abspath(__file__)).parent.name}"
 _PACKAGE_DIR = _PACKAGE.replace(".", "/")
 
-REGISTRY_PATH = machinery_path("config/issue_streams.yaml")
+_PACKAGED_REGISTRY_PATH = machinery_path("config/issue_streams.yaml")
+REGISTRY_PATH = _PACKAGED_REGISTRY_PATH
+
+
+def default_registry_path() -> Path:
+    """Resolve ``issue_streams.yaml`` at call time via the active profile, else the packaged copy."""
+    if REGISTRY_PATH != _PACKAGED_REGISTRY_PATH:
+        return REGISTRY_PATH
+    return profile.config_path("issue_streams", default=_PACKAGED_REGISTRY_PATH)
 ISSUE_REF_RE = re.compile(r"#(\d{2,6})\b")
 ISSUE_RANGE_RE = re.compile(r"#(\d{2,6})\s*[–-]\s*#(\d{2,6})\b")
 CONFIRMED_AT_RE = re.compile(r"\bconfirmed-at\s*:\s*(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE)
@@ -798,14 +806,14 @@ def _resolve_repo_section(
 
 def repo_has_registry(
     repo_key: str,
-    path: Path = REGISTRY_PATH,
+    path: Path | None = None,
     *,
     default_key: str | None = None,
 ) -> bool:
     """True when *repo_key* has a declared section in ``issue_streams.yaml`` (even before its first root)."""
     if not isinstance(repo_key, str) or not repo_key.strip() or repo_key != repo_key.strip() or "/" in repo_key:
         raise ValueError(f"invalid repository key {repo_key!r}")
-    doc = _load_registry_doc(path)
+    doc = _load_registry_doc(default_registry_path() if path is None else path)
     repos = _parse_repos(doc)
     resolved_default = _validate_registry_default_ownership(doc, repos, default_key=default_key, require_default=True)
     if repo_key in repos:
@@ -821,14 +829,14 @@ def repo_has_registry(
 
 def repo_has_roots(
     repo_key: str,
-    path: Path = REGISTRY_PATH,
+    path: Path | None = None,
     *,
     default_key: str | None = None,
 ) -> bool:
     """True when *repo_key* has a declared section in ``issue_streams.yaml`` with at least one registered epic."""
     if not isinstance(repo_key, str) or not repo_key.strip() or repo_key != repo_key.strip() or "/" in repo_key:
         raise ValueError(f"invalid repository key {repo_key!r}")
-    doc = _load_registry_doc(path)
+    doc = _load_registry_doc(default_registry_path() if path is None else path)
     repos = _parse_repos(doc)
     resolved_default = _validate_registry_default_ownership(doc, repos, default_key=default_key, require_default=True)
     if repo_key in repos:
@@ -843,7 +851,7 @@ def repo_has_roots(
 
 
 def load_registry(
-    path: Path = REGISTRY_PATH,
+    path: Path | None = None,
     *,
     audit_only: bool = False,
     repo: str | None = None,
@@ -855,7 +863,7 @@ def load_registry(
     selects that repository's section under ``repos:`` (accepting a declared
     section with empty epics before its bootstrap root exists).
     """
-    doc = _load_registry_doc(path)
+    doc = _load_registry_doc(default_registry_path() if path is None else path)
     streams_raw, allow_empty = _resolve_repo_section(doc, repo)
     registry = _parse_streams(streams_raw, allow_empty_epics=allow_empty, audit_only=audit_only)
     if not allow_empty and not registry:
@@ -863,14 +871,14 @@ def load_registry(
     return registry
 
 
-def load_closed_epics(path: Path = REGISTRY_PATH, *, repo: str | None = None) -> dict[str, list[int]]:
+def load_closed_epics(path: Path | None = None, *, repo: str | None = None) -> dict[str, list[int]]:
     """Return {stream_key: [closed_epic_numbers]} declared via ``closed_epics``.
 
     The list is hand-maintained, so the auditor re-checks each entry against
     live issue state and warns when a supposedly closed epic is actually open
     (see ``run_audit``).
     """
-    doc = _load_registry_doc(path)
+    doc = _load_registry_doc(default_registry_path() if path is None else path)
     streams_raw, allow_empty = _resolve_repo_section(doc, repo)
     _parse_streams(streams_raw, allow_empty_epics=allow_empty, audit_only=False)
     if not isinstance(streams_raw, dict):
@@ -1792,7 +1800,7 @@ def hygiene_warnings(
     membership cache writer both append them after the traversal warnings, so
     no publication of the shared cache serves a reduced hygiene report (#10793).
     """
-    registry_path = REGISTRY_PATH
+    registry_path = default_registry_path()
     closed_epics = load_closed_epics(registry_path, repo=repo_key)
     milestone_rows = (
         load_milestone_rows(root / "docs" / "WORKSTREAMS.md")
@@ -1920,7 +1928,7 @@ def run_audit(
         repository = "/".join(_repo_owner_name(root))
         if repository.casefold() != github_slug().casefold():
             raise ValueError("audit repository does not match the shared stream registry")
-        registry = load_registry(REGISTRY_PATH, audit_only=True)
+        registry = load_registry(default_registry_path(), audit_only=True)
         open_issues = fetch_open_issues(root)
         traversal_warnings: list[dict] = []
         membership = fetch_tree_membership(
@@ -1951,7 +1959,7 @@ def run_audit(
     if observed.casefold() != target_slug.casefold():
         raise ValueError(f"audit repository {observed!r} does not match expected active slug {target_slug!r}")
     repo_key = None if is_default else active.repo.key
-    registry = load_registry(REGISTRY_PATH, audit_only=True, repo=repo_key)
+    registry = load_registry(default_registry_path(), audit_only=True, repo=repo_key)
     if not registry:
         raise ValueError(f"issue_streams.yaml defines no active audit roots for repository {active.repo.key!r}")
     open_issues = fetch_open_issues(audit_cwd, repo_slug=target_slug)
@@ -2367,7 +2375,7 @@ def migrate(report: dict, *, repo: str | None = None) -> int:
         if not active.repo.default:
             repo_key = active.repo.key
             migrate_cwd = Path.cwd()
-    registry = load_registry(REGISTRY_PATH, audit_only=True, repo=repo_key)
+    registry = load_registry(default_registry_path(), audit_only=True, repo=repo_key)
     ambiguous = {m["number"] for m in report.get("multi_homed", [])}
     if ambiguous:
         print(

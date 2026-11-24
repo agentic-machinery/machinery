@@ -22,7 +22,7 @@ from urllib.parse import urlencode
 # A checkout that tracks DESCRIPTOR is enrolled in the installed agent deployment; STATE is its ownership manifest.
 from lu_machinery.agent_deploy.plan import DESCRIPTOR as AGENT_DEPLOY_DESCRIPTOR
 from lu_machinery.agent_deploy.plan import STATE as AGENT_DEPLOY_STATE
-from lu_machinery.common import git_credentials, json_depth
+from lu_machinery.common import git_credentials, json_depth, profile
 from lu_machinery.common.git_context import sanitized_git_env
 from lu_machinery.common.git_credentials import canonical_origins as canonical_origins
 from lu_machinery.common.git_credentials import verification_credentials
@@ -346,17 +346,21 @@ def _git(path: Path, *args: str, isolate: bool = False, strip: bool = True, env:
     return output.strip() if strip else output
 
 
+def _fleet_repos_path() -> Path:
+    return profile.config_path("fleet_repos", default=machinery_path("config/fleet_repos.yaml"))
+
+
 def pin_settlement_registry() -> None:
     """Load the registry for Git, guarded worktree removal, and closeout before provider execution."""
     from lu_machinery.orchestration.fleet_repos import load_fleet_repos
 
-    git_credentials.repository_registry(git_credentials.CONFIG)
-    git_credentials.repository_registry(machinery_path("config/fleet_repos.yaml"))
+    git_credentials.repository_registry(git_credentials.default_config_path())
+    git_credentials.repository_registry(_fleet_repos_path())
     load_fleet_repos()
 
 
 def resolve_repo(key: str | None = None) -> tuple[Path, dict]:
-    repos = git_credentials.repository_registry(machinery_path("config/fleet_repos.yaml"))
+    repos = git_credentials.repository_registry(_fleet_repos_path())
     key = key or next((name for name, item in repos.items() if item.get("default")), None)
     if key not in repos:
         raise ValueError("unknown repository key")

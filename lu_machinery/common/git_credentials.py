@@ -34,9 +34,18 @@ from typing import Any
 
 import yaml
 
+from lu_machinery.common import profile
 from lu_machinery.opsec.prepublish import PublishBlocked, real_gh
 
-CONFIG = Path(__file__).resolve().parents[1] / "config" / "fleet_repos.yaml"
+_PACKAGED_CONFIG = Path(__file__).resolve().parents[1] / "config" / "fleet_repos.yaml"
+CONFIG = _PACKAGED_CONFIG
+
+
+def default_config_path(*, env: Mapping[str, str] | None = None) -> Path:
+    """Resolve ``fleet_repos.yaml`` at call time via the active profile, else the packaged copy."""
+    if CONFIG != _PACKAGED_CONFIG:
+        return CONFIG
+    return profile.config_path("fleet_repos", env=env, default=_PACKAGED_CONFIG)
 SELECTOR_ENV = "LU_FLEET_REPO_SELECTOR_FILE"
 _MAX_SELECTOR_BYTES = 65536
 _SLUG_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*")
@@ -406,7 +415,7 @@ def load_selector(
     if not isinstance(active_raw, dict) or not all(isinstance(k, str) for k in active_raw):
         raise SelectorError("fleet repository selector active_slugs must be a string-keyed mapping")
 
-    cfg_path = (registry_path or CONFIG).resolve()
+    cfg_path = (registry_path or default_config_path(env=env)).resolve()
     repos = repository_registry(cfg_path)
     dual_rows = {key: entry for key, entry in repos.items() if entry.get("alternate_github") is not None}
 
@@ -445,7 +454,7 @@ def active_slug(
     if len(slugs) == 1:
         return slugs[0], None
 
-    cfg_path = (registry_path or CONFIG).resolve()
+    cfg_path = (registry_path or default_config_path(env=env)).resolve()
     selector = load_selector(registry_path=cfg_path, env=env)
     row_key = key or (repository.get("key") if isinstance(repository.get("key"), str) else None)
     if row_key is None:
@@ -576,7 +585,8 @@ def verification_credentials(remote: str) -> list[str]:
     """
     if not remote.startswith("https://github.com/"):
         return []
-    repositories = repository_registry(CONFIG)
+    cfg_path = default_config_path()
+    repositories = repository_registry(cfg_path)
     remote_folded = remote.casefold()
     for row_key, repository in repositories.items():
         if repository.get("alternate_github") is None:
@@ -589,7 +599,7 @@ def verification_credentials(remote: str) -> list[str]:
             for origin in _https_origins_for_slug(slug)
         }
         if remote_folded in candidate_origins:
-            chosen, _ = active_slug(repository, key=row_key, registry_path=CONFIG)
+            chosen, _ = active_slug(repository, key=row_key, registry_path=cfg_path)
             if remote in _https_origins_for_slug(chosen):
                 return _build_https_credential_settings(remote)
             return []
