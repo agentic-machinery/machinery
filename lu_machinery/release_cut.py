@@ -1588,8 +1588,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "  accept/bin/python -I -m lu_machinery.release_cut consumer-collection --python accept/bin/python \\\n"
         "      --product product --product-python product-venv/bin/python --version 0.1.24\n"
         "  .venv/bin/python -m lu_machinery.release_cut check-changelog\n"
-        "Outputs: step lines on stdout; successful cuts keep cut.log, dist, wheelhouse and release evidence;\n"
-        "failed or interrupted cuts keep the entire work directory.\n"
+        "Outputs: step lines on stdout; successful default runs archive cut.log in XDG state and remove work;\n"
+        "caller-supplied work, failed and interrupted runs keep their work directory.\n"
         "Exit codes: 0 released, skipped as unchanged, dry run passed, consumer collection passed or changelog\n"
         "check passed; 1 refused or failed (cut and post-release alert claude-cto); 2 invalid input.\n"
         "Related: docs/release.md#cut-a-release.",
@@ -1720,9 +1720,7 @@ def _run(args: argparse.Namespace) -> int:
         cut.git_identity = ("-c", f"user.name={name}", "-c", f"user.email={email}")
     cut.say(f"work directory {work}")
     try:
-        if args.command == "post-release":
-            return open_post_release(cut)
-        return execute(cut)
+        result = open_post_release(cut) if args.command == "post-release" else execute(cut)
     except (CutError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
         failed_step = cut.step
         cause = f"{failed_step}: {exc}"
@@ -1741,6 +1739,20 @@ def _run(args: argparse.Namespace) -> int:
         except (CutError, OSError, subprocess.SubprocessError) as exc:
             print(f"alert to {ALERT_RECIPIENT} failed: {exc}", file=sys.stderr)
         return 1
+    if result == 0 and args.work is None:
+        try:
+            state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "lu-release-cut"
+            state.mkdir(parents=True, exist_ok=True)
+            stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            log = state / f"{cut.version or cut.head or 'unknown'}-{stamp}.log"
+            with (work / "cut.log").open("rb") as source, log.open("xb") as destination:
+                shutil.copyfileobj(source, destination)
+            shutil.rmtree(work)
+            print(f"release log: {log}")
+        except OSError as exc:
+            print(f"release completed but work cleanup failed: {exc}; work directory: {work}", file=sys.stderr)
+            return 1
+    return result
 
 
 def open_post_release(cut: Cut) -> int:
