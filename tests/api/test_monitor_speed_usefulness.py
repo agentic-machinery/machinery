@@ -376,7 +376,7 @@ globalThis.fetch = async (url) => {
 def test_home_announces_panel_status_and_has_skip_purpose_and_sites_label():
     """Defect class: a panel status change is silent, or the skip link, sites label, or purpose line is missing."""
     dashboards = machinery_path("api/dashboards")
-    for name in ("index.html", "subscriptions.html", "fleet.html", "pull-requests.html", "milestones.html", "model-stats.html"):
+    for name in ("index.html", "subscriptions.html", "fleet.html", "pull-requests.html", "milestones.html", "model-stats.html", "journal.html"):
         page = (dashboards / name).read_text()
         assert 'class="skip" href="#main"' in page, name
         assert '<main id="main" tabindex="-1">' in page, name
@@ -388,6 +388,7 @@ def test_home_announces_panel_status_and_has_skip_purpose_and_sites_label():
     assert (dashboards / "fleet.html").read_text().count('aria-live="polite"') == 5
     assert (dashboards / "pull-requests.html").read_text().count('aria-live="polite"') == 1
     assert (dashboards / "milestones.html").read_text().count('aria-live="polite"') == 1
+    assert (dashboards / "journal.html").read_text().count('aria-live="polite"') == 1
 
     subs_script = _page_script("subscriptions.html")
     fleet_script = _page_script("fleet.html")

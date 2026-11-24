@@ -153,6 +153,7 @@ nav.sites { display: flex; gap: 12px; font-size: 13px; align-items: center; }
 .chip b { font-variant-numeric: tabular-nums; }
 .chip.bad { border-color: var(--bad); color: var(--bad); }
 .chip.warn { border-color: var(--warn); color: var(--warn); }
+.chip.info { border-color: var(--link); color: var(--link); background: var(--soft); }
 
 .refresh {
   display: flex;
@@ -323,6 +324,112 @@ table.subs th[colspan] { padding-top: 8px; color: var(--fg); }
   gap: 8px 12px;
   align-items: center;
   margin: 8px 0 0;
+}
+
+.journal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.journal-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.journal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.journal-entry {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+}
+
+.journal-entry.is-new {
+  border-left: 3px solid var(--link);
+  background: var(--soft);
+}
+
+.journal-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.journal-time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.journal-author {
+  color: var(--muted);
+}
+
+.journal-tag {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--fg);
+  background: var(--card);
+}
+
+.journal-tag.ok { border-color: var(--ok); color: var(--ok); }
+.journal-tag.warn { border-color: var(--warn); color: var(--warn); }
+.journal-tag.bad { border-color: var(--bad); color: var(--bad); }
+.journal-tag.info { border-color: var(--link); color: var(--link); }
+.journal-tag.muted { color: var(--muted); }
+
+.journal-headline {
+  margin: 6px 0 4px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+.journal-body {
+  margin: 4px 0 6px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.journal-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.journal-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.journal-divider::before,
+.journal-divider::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--line);
 }
 
 @media (max-width: 640px) {
