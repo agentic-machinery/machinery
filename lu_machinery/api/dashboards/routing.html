@@ -93,15 +93,15 @@
 <script src="/machinery.js"></script>
 <script>
 "use strict";
-const {escapeHtml, utc, relative, span, pct, bar, table, td, text, chip, panelAgeSeconds, createPanelRunner} = Machinery;
+const {escapeHtml, utc, relative, span, pct, bar, table, td, text, chip, createPanelRunner} = Machinery;
 
 const PAGE_ROWS = 25;
 const STALE_AFTER_S = 90;
 // Pools now is a snapshot at most 15 s old (CTO ruling 2026-11-24); the page reads it again from 11 s.
 const NOW_STALE_AFTER_S = 15;
 const NOW_RELOAD_AT_S = 11;
-// data/reading: the last successful response. failedAt: the last failed refresh, until one succeeds.
-const state = {data: null, reading: null, failedAt: null, shown: PAGE_ROWS, painted: ""};
+// data: the last successful response. failedAt: the last failed refresh, until one succeeds. chips: what the chip box shows.
+const state = {data: null, failedAt: null, shown: PAGE_ROWS, painted: "", chips: null};
 
 const ACCOUNT_BY = {helper: "account helper", saved_default: "saved default account", builtin_default: "built-in default", single_account: "only account", not_recorded: "not recorded"};
 const MODEL_BY = {brief: "brief", resolver: "resolver", not_recorded: "not recorded"};
@@ -116,16 +116,16 @@ function unknownSince(time, why) {
   return why ? `${when} · ${String(why).replaceAll("_", " ")}` : when;
 }
 
-// Seconds since a part of the response was computed: its age in the payload plus the time since it arrived.
-function ageNow(partAge) {
-  const received = state.reading?.receivedAt;
-  if (typeof partAge !== "number" || typeof received !== "number") return null;
-  return partAge + Math.max(0, (Date.now() - received) / 1000);
+// Seconds since a part of the response was computed, from the time it was computed (pools now: its
+// evaluated_at; recent: its scan's as_of). The server and the page share one loopback host, so its clock
+// is the page's: every age on the page, and every freshness bound, is measured this one way.
+function ageOf(time) {
+  const at = typeof time === "string" ? Date.parse(time) : NaN;
+  return Number.isFinite(at) ? Math.max(0, (Date.now() - at) / 1000) : null;
 }
 
-function timeOf(partAge) {
-  const age = ageNow(partAge);
-  return age === null ? null : new Date(Date.now() - age * 1000).toISOString();
+function timeOf(time) {
+  return ageOf(time) === null ? null : time;
 }
 
 // fresh, stale (older than the bound), partial (some records unreadable), failed (the last refresh failed) or missing.
@@ -133,7 +133,7 @@ function recentState(data) {
   const recent = data?.recent;
   if (!recent || !["ok", "partial"].includes(recent.status)) return "missing";
   if (state.failedAt) return "failed";
-  const age = ageNow(recent.age_s);
+  const age = ageOf(recent.as_of);
   if (age === null || age > STALE_AFTER_S) return "stale";
   return recent.status === "partial" ? "partial" : "fresh";
 }
@@ -144,7 +144,7 @@ function nowState(data) {
   if (!now || now.state === "unknown") return "unknown";
   if (state.failedAt) return "failed";
   if (now.state === "pending") return "pending";
-  const age = ageNow(now.age_s);
+  const age = ageOf(now.evaluated_at);
   return age === null || age > NOW_STALE_AFTER_S ? "stale" : "ok";
 }
 
@@ -153,7 +153,7 @@ function nowUnknownText(data) {
   const st = nowState(data);
   if (st === "pending") return "being evaluated, shown in a few seconds";
   if (st === "unknown") return unknownSince(now?.budget?.generated_at, now?.admission?.reason || now?.budget?.reason);
-  return unknownSince(timeOf(now?.age_s), st === "failed" ? "the last refresh failed" : "evaluation is out of date");
+  return unknownSince(timeOf(now?.evaluated_at), st === "failed" ? "the last refresh failed" : "evaluation is out of date");
 }
 
 function topCounts(counts, limit = 3) {
@@ -194,7 +194,7 @@ function resolverCallouts(data) {
   const now = data?.now || {};
   const resolver = now.resolver;
   if (nowState(data) !== "ok" || resolver?.state !== "ok") {
-    const why = nowState(data) === "ok" ? unknownSince(timeOf(now.age_s), resolver?.reason) : nowUnknownText(data);
+    const why = nowState(data) === "ok" ? unknownSince(timeOf(now.evaluated_at), resolver?.reason) : nowUnknownText(data);
     return `<h3>Who the resolver would seat right now</h3><p class="callout warn">Reviewer resolver: ${escapeHtml(why)}.</p>`;
   }
   // Author families that get the same seats share one line.
@@ -215,7 +215,7 @@ function resolverCallouts(data) {
     const warn = empty.length ? ` <span class="bad">${empty.map(seat => escapeHtml(seat.pool_label)).join(", ")} has 0% allowance left, so the review has to run on another account.</span>` : "";
     return `<li>${head}: the resolver seats ${named}${seats.length > 1 ? " (two-seat review)" : ""}.${warn}</li>`;
   });
-  return `<h3>Who the resolver would seat right now <span class="age">evaluated ${escapeHtml(span(ageNow(now.age_s)))} ago</span></h3><ul>${lines.join("")}</ul>`;
+  return `<h3>Who the resolver would seat right now <span class="age">evaluated ${escapeHtml(span(ageOf(now.evaluated_at)))} ago</span></h3><ul>${lines.join("")}</ul>`;
 }
 
 function admissionSplit(adm) {
@@ -248,7 +248,7 @@ function recentNote(data) {
   const st = recentState(data);
   if (st === "stale" || st === "failed") {
     const why = st === "failed" ? "the last refresh failed" : "the reading is out of date";
-    return `<p class="callout warn">Recent decisions are ${escapeHtml(unknownSince(timeOf(recent.age_s), why))}; what follows is that last reading.</p>`;
+    return `<p class="callout warn">Recent decisions are ${escapeHtml(unknownSince(timeOf(recent.as_of), why))}; what follows is that last reading.</p>`;
   }
   if (st === "partial") {
     return `<p class="callout warn">${recent.unreadable} task records in the window could not be read, so these counts and rows may be incomplete.</p>`;
@@ -279,7 +279,7 @@ function liveCell(meter, data) {
   const count = data.recent?.live_by_pool?.[meter];
   if (st === "missing" || st === "stale" || st === "failed" || typeof count !== "number") {
     const why = st === "failed" ? "the last refresh failed" : st === "missing" ? data.recent?.reason : "the reading is out of date";
-    return text(unknownSince(st === "missing" ? data.recent?.as_of : timeOf(data.recent?.age_s), why), "warn");
+    return text(unknownSince(st === "missing" ? data.recent?.as_of : timeOf(data.recent?.as_of), why), "warn");
   }
   return st === "partial" ? text(`${count}, may be low`, "warn") : text(String(count), count ? "" : "muted");
 }
@@ -296,7 +296,7 @@ function slotsCell(meter, data) {
   const admission = data.now?.admission;
   const verdict = admission?.pools?.[meter];
   if (nowState(data) !== "ok" || admission?.state !== "ok" || typeof verdict?.live_writes !== "number") {
-    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(data.now?.age_s), admission?.reason) : nowUnknownText(data), "warn");
+    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(data.now?.evaluated_at), admission?.reason) : nowUnknownText(data), "warn");
   }
   const cap = typeof verdict.cap === "number" ? ` of ${verdict.cap}` : "";
   return admission.incomplete
@@ -324,7 +324,7 @@ function admissionCell(meter, data) {
   const now = data.now || {};
   const verdict = now.admission?.pools?.[meter];
   if (nowState(data) !== "ok" || now.admission?.state !== "ok" || !verdict) {
-    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(now.age_s), now.admission?.reason) : nowUnknownText(data), "warn");
+    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(now.evaluated_at), now.admission?.reason) : nowUnknownText(data), "warn");
   }
   // Admitted without a fresh allowance reading is admission failing open with a lower cap: amber, not green.
   const blind = verdict.state === "admitted" && verdict.note;
@@ -337,7 +337,7 @@ function seatsCell(meter, data) {
   const now = data.now || {};
   const seats = now.resolver?.state === "ok" ? now.resolver.by_pool?.[meter] : null;
   if (nowState(data) !== "ok" || !Array.isArray(seats)) {
-    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(now.age_s), now.resolver?.reason) : nowUnknownText(data), "warn");
+    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(now.evaluated_at), now.resolver?.reason) : nowUnknownText(data), "warn");
   }
   if (!seats.length) return text("no automatic review seat", "muted");
   return cell(seats.map(seat => seat.state === "eligible"
@@ -351,7 +351,7 @@ function hostLine(data) {
   if (admissionUnknown(data)) return `<p class="callout warn">Host admission checks: ${escapeHtml(admissionUnknown(data))}.</p>`;
   const host = data.now?.admission?.host;
   if (nowState(data) !== "ok" || data.now?.admission?.state !== "ok" || !host) {
-    return `<p class="callout warn">Host admission checks: ${escapeHtml(nowState(data) === "ok" ? unknownSince(timeOf(data.now?.age_s), data.now?.admission?.reason) : nowUnknownText(data))}.</p>`;
+    return `<p class="callout warn">Host admission checks: ${escapeHtml(nowState(data) === "ok" ? unknownSince(timeOf(data.now?.evaluated_at), data.now?.admission?.reason) : nowUnknownText(data))}.</p>`;
   }
   const unmeasured = (host.unmeasured?.length ? ` Not measured: ${escapeHtml(host.unmeasured.join(", "))}.` : "")
     + (data.now.admission.incomplete ? ` ${escapeHtml(data.now.admission.incomplete)}.` : "");
@@ -463,11 +463,11 @@ function paintAges() {
   const data = state.data;
   if (!data) return;
   const ns = nowState(data);
-  setAge("pools-age", ns === "ok" ? `Evaluated ${span(ageNow(data.now.age_s))} ago` : `Admission and resolver ${nowUnknownText(data)}`,
+  setAge("pools-age", ns === "ok" ? `Evaluated ${span(ageOf(data.now.evaluated_at))} ago` : `Admission and resolver ${nowUnknownText(data)}`,
     ns === "ok" ? "" : ns === "pending" ? "warn" : "bad");
   const rs = recentState(data);
-  setAge("decisions-age", rs === "fresh" || rs === "partial" ? `Last 24 hours · read ${span(ageNow(data.recent.age_s))} ago`
-    : `Recent decisions ${unknownSince(rs === "missing" ? data.recent?.as_of : timeOf(data.recent?.age_s), rs === "failed" ? "the last refresh failed" : null)}`,
+  setAge("decisions-age", rs === "fresh" || rs === "partial" ? `Last 24 hours · read ${span(ageOf(data.recent.as_of))} ago`
+    : `Recent decisions ${unknownSince(rs === "missing" ? data.recent?.as_of : timeOf(data.recent?.as_of), rs === "failed" ? "the last refresh failed" : null)}`,
   rs === "fresh" ? "" : rs === "partial" ? "warn" : "bad");
 }
 
@@ -479,6 +479,7 @@ function paintAll() {
   document.getElementById("pools-content").innerHTML = renderPools(data);
   document.getElementById("decisions-content").innerHTML = renderDecisions(data);
   paintAges();
+  paintChips();
 }
 
 // The one-second clock: ages always, and every section again when a part crosses its bound.
@@ -486,21 +487,16 @@ function paintKey(data) {
   return `${nowState(data)}|${recentState(data)}|${expiredAllowances(data)}`;
 }
 
-function tick(updateChips) {
+function tick() {
   const data = state.data;
   if (!data) return;
   if (paintKey(data) !== state.painted) {
     paintAll();
     if (!state.failedAt) document.getElementById("flow-content").innerHTML = renderFlow(data);
   }
-  // Chips follow every change, including one a scheduled retry brought.
-  const shown = chips({flow: data});
-  if (shown !== state.chips && typeof updateChips === "function") {
-    state.chips = shown;
-    updateChips();
-  }
+  paintChips();
   // Read the snapshot again before it lapses, and once more if it has (one read per snapshot and phase).
-  const age = ageNow(data.now?.age_s);
+  const age = ageOf(data.now?.evaluated_at);
   const phase = age === null ? null : age > NOW_STALE_AFTER_S ? "stale" : age > NOW_RELOAD_AT_S ? "early" : null;
   const reloadKey = phase && `${data.now?.evaluated_at}|${phase}`;
   if (reloadKey && reloadKey !== state.reloaded && !state.failedAt) {
@@ -510,8 +506,18 @@ function tick(updateChips) {
   paintAges();
 }
 
-function chips(latest) {
-  const data = latest.flow ? state.data : null;
+// The page's one chip-render path (render, failure and the one-second clock all paint through it), so the
+// chips always follow the state the sections show, including an allowance that expires between fetches.
+function paintChips() {
+  const shown = chips();
+  if (shown === state.chips) return;
+  state.chips = shown;
+  const box = document.getElementById("chips");
+  if (box) box.innerHTML = shown;
+}
+
+function chips() {
+  const data = state.data;
   if (!data) return "";
   const out = [];
   const counts = data.recent?.counts;
@@ -537,10 +543,8 @@ const PANELS = [{
   id: "flow",
   label: "Routing",
   urls: ["/api/runtime/routing"],
-  withReadings: true,
-  render: (data, readings) => {
+  render: data => {
     state.data = data;
-    state.reading = readings?.[0] || null;
     state.failedAt = null;
     fillPoolFilter(data);
     paintAll();
@@ -557,9 +561,10 @@ const PANELS = [{
       for (const id of ["pools-content", "decisions-content"]) document.getElementById(id).innerHTML = message;
       setAge("pools-age", "unavailable", "bad");
       setAge("decisions-age", "unavailable", "bad");
+      paintChips();
     }
   },
-  onTick: (_panel, _latest, updateChips) => tick(updateChips),
+  onTick: () => tick(),
 }];
 
 document.getElementById("decision-filters").addEventListener("change", () => {
@@ -581,7 +586,7 @@ document.addEventListener("click", event => {
   }
 });
 
-const runner = createPanelRunner({panels: PANELS, renderChips: chips});
+const runner = createPanelRunner({panels: PANELS});
 runner.start();
 </script>
 </body>

@@ -608,9 +608,14 @@ _ROUTING_ROLES = frozenset({
     "driver",
 })
 _ROUTING_ACTIVE = dispatch_admission.ACTIVE_STATUSES
-# Admission's byte prefilter: a record last written before the window is read only to find live workers,
-# when its bytes name an active status or hold a JSON escape (which could spell one).
-_ROUTING_ACTIVE_MARKERS = (*(f'"{status}"'.encode() for status in sorted(_ROUTING_ACTIVE)), b"\\u")
+# The byte prefilter: a record last written before the window is read only to find live workers, when
+# its bytes could name an active status: the status key with an active word in any case and without its
+# closing quote (so a misspelt one such as "running " is read, and counted unreadable), or a JSON escape
+# (which could spell one).
+_ROUTING_ACTIVE_WORD = re.compile(b"|".join(re.escape(status.encode()) for status in sorted(_ROUTING_ACTIVE)), re.IGNORECASE)
+_ROUTING_STATUS_KEY = b'"status"'
+# A recorded worker identity, as dispatch writes it: the boot id and the process start time in clock ticks.
+_ROUTING_PROCESS_START = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9]+", re.ASCII)
 # Every mode dispatch records; any other value leaves the kind of work, and so its admission, unknown.
 _ROUTING_MODES = dispatch_admission.WRITE_CAPABLE_MODES | {"read-only"}
 # Fixed public text for each typed start refusal; nothing a record carries as free text is shown.
@@ -802,26 +807,32 @@ def _routing_pool(record: Mapping[str, Any]) -> str | None:
     return _routing_meter(agent, model, record.get("claude_account"), record.get("codex_account"))
 
 
-def _routing_status(record: Mapping[str, Any]) -> tuple[str, bool]:
+def _routing_status(record: Mapping[str, Any], *, now: datetime) -> tuple[str, bool]:
     """The record's status word, and whether its worker is live; raises ``_RoutingMalformed`` when unknowable.
 
-    A starting dispatch counts as live (admission's slot rule). A running one is
-    live only on the worker-identity check (PID and start time); a dead one is a
-    zombie, and one whose liveness cannot be proven is unreadable.
+    A starting dispatch is live by admission's own slot rule: without a worker PID,
+    ``pidless_spawning_holds_slot`` (owner, grace and clock-skew bounds); with one,
+    unless its worker is proven dead. A running one is live only on the
+    worker-identity check (PID and start time); a dead one is a zombie, and one
+    whose liveness cannot be proven, or whose recorded identity is not one
+    dispatch writes, is unreadable.
     """
     status = record.get("status")
     if not isinstance(status, str) or status not in _ROUTING_STATUSES:
         raise _RoutingMalformed("status unreadable or unsupported")
-    if status == "spawning":
-        # Admission's slot rule: a pid-less reservation is live until its own orphan proof; a started one
-        # is live unless its worker is proven dead.
-        if dispatch_admission._parse_pid(record.get("pid")) is None:
-            return status, not dispatch_admission.is_orphaned_pidless_record(dict(record))
-        return status, worker_liveness(dict(record), pid_alive=dispatch_admission.process_alive) is not False
-    if status != "running":
+    if status not in _ROUTING_ACTIVE:
         return status, False
+    identity = record.get("schema_version") == 2  # the records whose liveness compares a recorded start time
     start = record.get("process_start")
-    if record.get("schema_version") == 2 and not (isinstance(start, str) and start):
+    if identity and start is not None and not (isinstance(start, str) and _ROUTING_PROCESS_START.fullmatch(start)):
+        raise _RoutingMalformed("worker identity unreadable")  # compared as recorded, it would prove a death
+    if status == "spawning":
+        if dispatch_admission._parse_pid(record.get("pid")) is None:  # admission's own reading of the pid
+            return status, dispatch_admission.pidless_spawning_holds_slot(
+                dict(record), now=now, pid_alive=dispatch_admission.process_alive,
+            )
+        return status, worker_liveness(dict(record), pid_alive=dispatch_admission.process_alive) is not False
+    if identity and start is None:
         raise _RoutingMalformed("worker identity not recorded")  # liveness would rest on the PID alone
     alive = worker_liveness(dict(record), pid_alive=dispatch_admission.process_alive)
     if alive is None:
@@ -853,7 +864,7 @@ def _routing_decision(record: Mapping[str, Any], *, now: datetime) -> dict[str, 
     write = mode in dispatch_admission.WRITE_CAPABLE_MODES
     model = panel_values.model(record.get("model"))
     pool = _routing_pool(record)
-    status, live = _routing_status(record)
+    status, live = _routing_status(record, now=now)
     risk = record.get("review_risk")
     return {
         "task_id": panel_values.task_reference(raw_id),  # None: withheld by the public task-reference policy
@@ -928,15 +939,17 @@ def routing_decisions(ctx: MonitorContext | None = None) -> dict[str, Any]:
                 written = path.stat().st_mtime
             except FileNotFoundError:
                 continue  # archived or removed since the listing: no longer a hot record
-            if written < cutoff and not any(
-                marker in dispatch_admission.read_regular_task_record_bytes(path) for marker in _ROUTING_ACTIVE_MARKERS
-            ):
-                continue
+            if written < cutoff:
+                raw = dispatch_admission.read_regular_task_record_bytes(path)
+                if b"\\u" not in raw and not (
+                    _ROUTING_STATUS_KEY in raw and _ROUTING_ACTIVE_WORD.search(raw)
+                ):
+                    continue
             record = read_cached_task_record(path, tasks_dir=tasks_dir, display_unknown_schema=True)
             if record is None:
                 continue  # a foreign file in the store, not a task record
             row = _routing_decision(record, now=now)
-            if row is None and _routing_status(record)[1]:
+            if row is None and _routing_status(record, now=now)[1]:
                 live[_routing_pool(record)] += 1  # started before the window, still live
         except (OSError, ValueError, TypeError, OverflowError, RecursionError):
             unreadable += 1
@@ -1871,8 +1884,15 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
             asyncio.to_thread(routing_allowances),
         )
         now_value = cast(tuple[dict[str, Any], float], now_read)[0] if now_read is not None else {}
-        if now_value and now_value.get("epoch") != epoch:
-            cache_invalidate(now_key)  # started before a fault: retired; the next read evaluates afresh
+        if decisions.get("status") == "unknown" and str(decisions.get("reason")).startswith("task_records_"):
+            # A store fault the scan saw (after this request's own listing succeeded) retires earlier snapshots too.
+            _ROUTING_NOW_EPOCH[now_key] = _ROUTING_NOW_EPOCH.get(now_key, 0) + 1
+        # Read the epoch again after the wait: a fault any request observed meanwhile retires this one's evaluation.
+        current = _ROUTING_NOW_EPOCH.get(now_key, 0)
+        value_epoch = now_value.get("epoch")
+        if now_value and value_epoch != current:
+            if not isinstance(value_epoch, int) or value_epoch < current:
+                cache_invalidate(now_key)  # started before a fault: retired; the next read evaluates afresh
             now_value = {}
         # The snapshot's age counts from when its evaluation started, the time the page shows.
         started_eval = _routing_started(now_value.get("evaluated_at"))
