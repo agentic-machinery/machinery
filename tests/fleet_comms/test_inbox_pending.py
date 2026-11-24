@@ -18,9 +18,11 @@ from tests.helpers.agy_inbox_fixtures import (
     BODY_MARKER,
     CLI_BOOTSTRAP,
     MESSAGE_ID,
-    add_authority,
     run_cli,
     snapshot,
+)
+from tests.helpers.agy_inbox_fixtures import (
+    add_authority as add_legacy_authority,
 )
 from tests.helpers.product_tree import configured_roots as configured_roots
 
@@ -32,6 +34,21 @@ EXPECTED_UNKNOWN_NOTICE = (
     "PENDING ORDERS: unknown; "
     "authority: .venv/bin/python -m lu_machinery.fleet_comms deliveries --help"
 )
+
+
+def add_authority(path, **kwargs):
+    add_legacy_authority(path, **kwargs)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE comms_messages SET kind = 'request' WHERE message_id = ?", (kwargs.get("identifier", MESSAGE_ID),))
+
+
+def test_legacy_supervisory_only_in_ordinary_slot_is_not_pending(stores):
+    """Defect class: unclaimable legacy supervisory mail inflates ordinary inbox counts."""
+    add_legacy_authority(stores[0])
+    assert inbox_pending.probe("gemini-infra") == {
+        "count": 0, "ids": [], "truncated": False, "stores": {"authority": 0}, "probe": "ok",
+    }
+    assert inbox_pending.hook("{}", "gemini-infra") == {}
 
 
 @pytest.mark.parametrize(
