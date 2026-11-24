@@ -1334,7 +1334,7 @@ def _token_work(rows: Sequence[_Row]) -> dict[str, str]:
     """Classify recorded work without using task names, model names or reply text."""
     published_heads: dict[tuple[str, str], set[int]] = defaultdict(set)
     for row in rows:
-        if row.published_pr is not None and (head := row.raw.get("pinned_head")):
+        if row.published_pr is not None and isinstance(head := row.raw.get("pinned_head"), str):
             published_heads[row.raw["repo"], head].add(row.published_pr)
 
     work = {}
@@ -1346,8 +1346,9 @@ def _token_work(rows: Sequence[_Row]) -> dict[str, str]:
         elif row.role == "review":
             # The supplemental dispatch omits the PR and author flags, but pins the exact head.
             # Require a parsed verdict and one published PR on that head in the same repository.
-            matches = published_heads.get((row.raw["repo"], row.raw.get("pinned_head")), ())
-            kind = ("supplemental_review" if len(matches) == 1 and row.review is not None
+            head = row.raw.get("pinned_head")
+            matches = published_heads.get((row.raw["repo"], head)) if isinstance(head, str) else None
+            kind = ("supplemental_review" if matches and len(matches) == 1 and row.review is not None
                     and row.review[0] in VERDICTS[:3] and row.raw.get("pr") is None
                     and row.review_author is None else "unclassified_review")
         elif row.raw.get("implementation") is True or row.trailer:
