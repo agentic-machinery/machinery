@@ -192,7 +192,8 @@ def test_unusable_static_declaration_is_rejected_at_load_not_linked(tmp_path, mo
     context = fixture_context(tmp_path)
 
     # A usable declaration loads and is linked.
-    good = checked_product(ProductContribution(static_files={"reports.html": root / "reports.html"}, page_contracts=(page,)))
+    static = {"reports.html": root / "reports.html"}
+    good = checked_product(ProductContribution(static_files=static, page_contracts=(page,)))
     assert '<a href="/reports" class="product first">Reports</a>' in main._machinery_nav_html(None, tmp_path, good)
 
     popped = replace(page)

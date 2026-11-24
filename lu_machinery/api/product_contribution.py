@@ -195,7 +195,8 @@ def checked_product(product: ProductContribution) -> ProductContribution:
     to the product's map later is never served. A checked file that disappears later
     is runtime state: its route answers 404.
     """
-    from .route_contracts import PageContract  # noqa: PLC0415  # lazy-ok: import cycle, route_contracts imports this module
+    # route_contracts imports this module, so a top-level import is a cycle.
+    from .route_contracts import PageContract  # noqa: PLC0415  # lazy-ok: import cycle
 
     root = config.PRODUCT_ROOT.resolve()
     if not isinstance(product.static_files, Mapping):
@@ -204,7 +205,8 @@ def checked_product(product: ProductContribution) -> ProductContribution:
     for name, path in product.static_files.items():
         if type(name) is not str or not isinstance(path, Path):
             raise ProductEntryError(
-                f"static_files[{name!r}]: expected a str name and a Path, got {type(name).__name__} and {type(path).__name__}"
+                f"static_files[{name!r}]: expected a str name and a Path, "
+                f"got {type(name).__name__} and {type(path).__name__}"
             )
         try:
             resolved = path.resolve()
