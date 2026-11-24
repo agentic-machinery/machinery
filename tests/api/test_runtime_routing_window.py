@@ -143,7 +143,12 @@ def test_refused_start_shows_requested_id_and_plain_reason_not_the_raw_clause(tm
     _write_record(tasks, "unplaced", _write_task("unplaced", started=_NOW - timedelta(minutes=1), status="failed",
                                                  never_started_reason="worker_placement", admission=None,
                                                  codex_account="b-sub"))
-    rows = {row["task_id"]: row for row in runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))["decisions"]}
+    _write_record(tasks, "agentless", _write_task("agentless", started=_NOW - timedelta(minutes=1), status="failed",
+                                                  never_started_reason="setup_refusal", admission=None, agent=[]))
+    scan = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
+    rows = {row["task_id"]: row for row in scan["decisions"]}
+    # A wrongly typed agent names no pool; the refusal row stays readable.
+    assert (rows["agentless"]["pool"], rows["agentless"]["admission"]["state"], scan["unreadable"]) == (None, "refused", 0)
     assert (rows["launched"]["pool"], rows["launched"]["admission"]) == (
         "codex:a", {"state": "refused", "reason": "refused by the write boundary"})
     assert (rows["unplaced"]["pool"], rows["unplaced"]["admission"]) == (

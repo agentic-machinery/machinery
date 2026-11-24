@@ -793,6 +793,8 @@ def _routing_pool(record: Mapping[str, Any], refusal: str | None, cli_record: bo
         # The CLI's refusal record copies no account, so without a recorded meter the pool is unknown.
         return None
     agent = record.get("agent")
+    if not isinstance(agent, str):
+        return None  # no agent, no meter; the row and its outcome stay readable
     model = panel_values.model(record.get("model"))  # the catalog id, so admission's meter reads its canonical name
     # Admission splits these agents' meters by model or account (``gemini`` is AGY's older route name) and
     # defaults a missing one: here the pool is unknown instead.
