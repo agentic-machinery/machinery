@@ -430,6 +430,21 @@ Tests: `tests/test_agent_runtime.py` (`test_write_guard_*`,
 `test_invoke_codex_write_lane_*`) and `tests/test_gemini_bridge.py`
 (`test_run_gemini_sync_derives_runtime_mode_from_allow_write`).
 
+## Read-only Codex asks in a consumer checkout
+
+Pass the consumer's primary checkout as `cwd` to
+`lu_machinery.agent_runtime.runner.invoke` with `mode="read-only"`. A configured
+`LU_PRODUCT_ROOT` takes precedence. When no product root is configured or
+available from the in-tree package, the checkout must match a fleet repository
+by its Git identity.
+
+If that repository omits `sources_server`, start a fresh ask without MCP
+overrides. Machinery ignores the base user config, disables plugins and skill
+MCP installation, and checks the remaining Codex configuration layers for
+inherited MCP servers before launching. An explicit Sources request, caller MCP
+configuration, or unverified session resume is refused. When the product
+provides Sources, Codex uses its existing read-only tool allowlist.
+
 ## CLI probe
 
 Run the probe from the repository root:

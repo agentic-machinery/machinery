@@ -134,12 +134,40 @@ def test_review_rejects_unsafe_temp_roots(tmp_path, invalid):
 
 
 def test_sources_prompt_fails_fast_when_read_only_cannot_approve(tmp_path, monkeypatch):
+    from lu_machinery.orchestration import fleet_repos
+
     checkout = tmp_path / "checkout"
     checkout.mkdir()
     lease = tmp_path / "learn-ukrainian" / "review-test"
     lease.mkdir(parents=True)
-    monkeypatch.setattr(codex_adapter, "_argv_can_call_sources_mcp", lambda _argv: False)
-    with pytest.raises(ValueError, match="mcp__sources__"):
+    consumer = fleet_repos.load_fleet_repos()["kube-dojo"]
+    monkeypatch.delenv("LU_PRODUCT_ROOT")
+
+    def fleet_checkout(root):
+        assert root == checkout
+        return consumer
+
+    monkeypatch.setattr(fleet_repos, "fleet_repo_for_checkout", fleet_checkout)
+    monkeypatch.setattr(
+        codex_adapter,
+        "_codex_config_layers",
+        lambda _binary, _cwd, home: [
+            {
+                "name": {"type": "user", "file": f"{home}/config.toml"},
+                "config": {"mcp_servers": {"sources": {"command": "inherited"}}},
+            }
+        ],
+    )
+    plan = review_plan(checkout, lease)
+    try:
+        assert "--ignore-user-config" in plan.cmd
+        plugins = plan.cmd.index("plugins")
+        assert plan.cmd[plugins - 1] == "--disable"
+        assert not any(arg.startswith("mcp_servers.") for arg in plan.cmd)
+    finally:
+        plan.output_file.unlink()
+
+    with pytest.raises(codex_adapter.CodexReviewConfigError, match="codex_sources_undeclared"):
         CodexAdapter().build_invocation(
             prompt="Call mcp__sources__verify_words before judging the sentence.",
             mode="read-only",
