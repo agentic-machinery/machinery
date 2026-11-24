@@ -103,7 +103,8 @@ needs evidence, dropped needs an operator reference): [handoff](references/hando
 A new multi-PR outcome is briefed as a [decision report](references/decision-report.md). Report
 to the CTO hourly, and every 30 minutes while an operator-priority outcome is open, in the
 [lane-report](references/lane-report.md) format. Seat-specific adjustments:
-[model-deltas](references/model-deltas.md).
+[model-deltas](references/model-deltas.md). The CTO starts, limits and recovers dispatched stream
+turns (`dispatch --mode orchestrator`): [orchestrator-turn](references/orchestrator-turn.md).
 
 ## Escalate — do NOT decide these solo
 
