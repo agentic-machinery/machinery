@@ -664,6 +664,11 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
         repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [partial]}}
         _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
         assert git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][1]["status"] == "unknown", field
+    # Nor is one whose number or draft flag is malformed, or a count below the PRs listed.
+    for malformed, total in (({"number": "3"}, 1), ({"number": 0}, 1), ({"isDraft": None}, 1), ({}, 0)):
+        repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": total, "nodes": [{**_open_pr("codex/x", 3), **malformed}]}}
+        _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
+        assert git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][1]["status"] == "unknown", malformed
     # GitHub nulls a failed field and keeps its parent: an error anywhere in a repository's PRs leaves
     # that repository unknown (never "not queued" or "no CI yet"); one on its pin or CI leaves only that
     # field unknown; an error naming no repository of the query is no reading at all.

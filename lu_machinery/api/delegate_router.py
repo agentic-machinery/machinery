@@ -680,6 +680,8 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
                 with suppress(TypeError, ValueError):
                     paths = effective_scope(task)
             claims.append((_authoritative_task_repository(task) if task else None, paths))
+    # Checked again after the scan: a store that stopped being searchable during it read only part.
+    store_readable = store_readable and os.access(tasks_dir, os.R_OK | os.X_OK)
     # The HTTP /active projection omits these internal claims, including grants.
     return {
         "total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims,

@@ -901,11 +901,16 @@ _PR_NODE_KEYS = {"number", "isDraft", "createdAt", "headRefName", "mergeStateSta
 
 
 def _complete_pull_request(node: object) -> bool:
-    """Whether a PR node has every field the query asked for, each null or of its own type.
+    """Whether a PR node has every field the query asked for, each null or of its own type, and a
+    valid number and draft flag.
 
     A field GitHub left out or sent malformed must not read as "not queued", "no CI yet" or "none".
     """
     if not isinstance(node, dict) or not node.keys() >= _PR_NODE_KEYS:
+        return False
+    # A malformed number would read as a private PR, and a non-boolean draft flag as ready.
+    number = node["number"]
+    if type(number) is not int or not 0 < number < 1_000_000_000 or type(node["isDraft"]) is not bool:
         return False
     queue, commits = node["mergeQueueEntry"], node["commits"]
     if queue is not None and not (isinstance(queue, dict) and queue.keys() >= {"position", "state"}):
@@ -1003,10 +1008,10 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         private = repo.get("isPrivate") is not False or not catalog[index].role.startswith("public-")
         nodes = repo["pullRequests"].get("nodes")
         total = repo["pullRequests"].get("totalCount")
-        # A missing or null PR node would silently read as fewer open PRs, and a count that is not a
-        # non-negative integer is no reading of the open PRs at all.
+        # A missing or null PR node would silently read as fewer open PRs, and a count that is not an
+        # integer at least the number of PRs listed is no reading of the open PRs at all.
         if (not isinstance(nodes, list) or not all(_complete_pull_request(node) for node in nodes)
-                or type(total) is not int or total < 0):
+                or type(total) is not int or total < len(nodes)):
             rows.append(_unreadable_row(entry, "github_invalid_response", observed_at, private=private))
             continue
         _UNKNOWN_SINCE.pop(entry["repository"], None)
