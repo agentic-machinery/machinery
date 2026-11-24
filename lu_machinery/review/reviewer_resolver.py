@@ -1360,6 +1360,16 @@ def _evaluate_candidate(
     )
 
 
+def _has_observed_allowance(capacity: ReviewCapacity | None) -> bool:
+    """A fresh allowance reading above the near-cap reserve; unknown or stale is not allowance."""
+    return (
+        capacity is not None
+        and capacity.remaining_pct is not None
+        and capacity.freshness == credit_lane.FRESH
+        and not capacity.near_cap
+    )
+
+
 def _best_eligible(
     eligible_by_fit_and_tier: dict[
         tuple[bool, int, int, int, bool], list[tuple[ReviewerCandidate, CandidateResult, int]]
@@ -1371,7 +1381,8 @@ def _best_eligible(
     standard tier, then suitability and tier, plan-backed before credit-backed, deterministic
     selection_score inside it. ``exclude_families`` lets the dual-family quorum path pick
     a second seat outside the first seat's family without relaxing the fit-before-pressure
-    ordering. An eligible same-model primary transport precedes its declared fallback."""
+    ordering. An eligible same-model primary transport precedes its declared fallback, and a
+    same-model Codex account with observed allowance precedes one without (account b first)."""
     filtered = {
         fit_key: kept
         for fit_key, entries in eligible_by_fit_and_tier.items()
@@ -1385,15 +1396,26 @@ def _best_eligible(
         for fit_key, entries in filtered.items()
         if (kept := [item for item in entries if item[0].transport_fallback_for not in primary_names])
     }
-    b_models = {
-        candidate.concrete_model for entries in filtered.values() for candidate, _, _ in entries
-        if codex_account_key(candidate) == "codex:b"
+    # Same-model Codex accounts: an account with observed allowance outranks one
+    # without, and account b drains first among those with allowance.
+    funded = {
+        (candidate.concrete_model, codex_account_key(candidate))
+        for entries in filtered.values() for candidate, result, _ in entries
+        if codex_account_key(candidate) and _has_observed_allowance(result.capacity)
     }
+    funded_models = {model for model, _ in funded}
+
+    def yields(candidate: ReviewerCandidate, result: CandidateResult) -> bool:
+        account = codex_account_key(candidate)
+        if not account:
+            return False
+        if account == "codex:a" and (candidate.concrete_model, "codex:b") in funded:
+            return True
+        return candidate.concrete_model in funded_models and not _has_observed_allowance(result.capacity)
+
     filtered = {
         key: kept for key, entries in filtered.items()
-        if (kept := [item for item in entries if not (
-            codex_account_key(item[0]) == "codex:a" and item[0].concrete_model in b_models
-        )])
+        if (kept := [item for item in entries if not yields(item[0], item[1])])
     }
     if not filtered:
         return None

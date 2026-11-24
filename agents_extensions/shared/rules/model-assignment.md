@@ -1130,8 +1130,9 @@ API labels `api` and `b-api` are distinct from these subscription windows;
 `b-api` is planned and unset.
 
 The catalog exposes Sol review routes for both accounts with separate quota and
-credential buckets. The resolver prefers eligible b-sub, then sub for standard
-PR code/infra reviews. These reviews use `--branch`, `--pr` and
+credential buckets. For standard PR code/infra reviews the resolver prefers
+b-sub while its fresh allowance is above the near-cap reserve; otherwise the
+same model on an account that has that allowance goes first. These reviews use `--branch`, `--pr` and
 `--require-review-verdict` through the ordinary dispatcher, which already binds
 `--codex-account b-sub`. They do not use `--review-attempt`: dispatch rejects
 combining a bound attempt with `--branch` or `--pr`. The resolver's PR selection
