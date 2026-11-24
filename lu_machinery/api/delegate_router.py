@@ -645,9 +645,10 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     # Live workers by claimed repository (read-only reviewers included). "" counts a confirmed live
     # record with no usable claim, so the Projects line can say how many are not attributed. A task
     # store that cannot be read and searched (one without search permission lists names but not their
-    # records) or listed, or a record that cannot be statted, read or parsed (damaged), or that has no
-    # status from TASK_STATUSES (a newer schema's record is shown without its fields), gives no counts:
-    # it may be a live worker. A foreign file is no record.
+    # records) or listed, or a record that cannot be statted, read or parsed (damaged), or whose status
+    # is missing, empty or not a string (a newer schema's record is shown without its fields), gives no
+    # counts: it may be a live worker. Only running and spawning are live; any other string status is a
+    # writer-declared non-live state, not unknown. A foreign file is no record.
     live_by_repository: dict[str, int] = {}
     listing_failures: list[Exception] = []
     store_readable = os.access(tasks_dir, os.R_OK | os.X_OK)
@@ -668,8 +669,8 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
             if task is None:  # a foreign file
                 continue
             recorded = task.get("status")
-            if not isinstance(recorded, str) or recorded not in TASK_STATUSES:
-                raise ValueError(f"task record {path} has no known status")
+            if not isinstance(recorded, str) or not recorded:
+                raise ValueError(f"task record {path} has no status")
             if recorded not in ACTIVE_TASK_STATUSES:
                 continue
             status, alive = _derived_task_status(task)

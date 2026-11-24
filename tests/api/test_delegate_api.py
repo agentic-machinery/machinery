@@ -827,18 +827,19 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
             (tasks / "live.json").chmod(0o644)
         assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1
         # So may a damaged record (cut short, not UTF-8), one of a newer schema, or one whose status is
-        # missing or outside the known set, before and after the history scan has cached it; a foreign
-        # file is no record and leaves the counts known.
+        # missing, empty or not a string, before and after the history scan has cached it; a foreign
+        # file is no record, and any other string status is a writer-declared non-live state, so both
+        # leave the counts known.
         damaged = tasks / "other.json"
         v2 = {"schema_version": 2, "task_id": "other"}
         for body in (b'{"schema_version": 2, "task_id": "oth', b'{"task_id": "other\xff"}',
                      json.dumps({**v2, "schema_version": 3, "status": "running"}).encode(), json.dumps(v2).encode(),
-                     *(json.dumps({**v2, "status": status}).encode() for status in (None, {}, "paused", ""))):
+                     *(json.dumps({**v2, "status": status}).encode() for status in (None, {}, ""))):
             damaged.write_bytes(body)
             assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None, body
             delegate_router.list_delegate_tasks(ctx=ctx)  # the history scan caches the record
             assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None, body
-        for body in (b"[1, 2]", json.dumps({**v2, "status": "done"}).encode()):
+        for body in (b"[1, 2]", *(json.dumps({**v2, "status": status}).encode() for status in ("done", "paused", "dry-run"))):
             damaged.write_bytes(body)
             delegate_router.list_delegate_tasks(ctx=ctx)
             assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1, body
