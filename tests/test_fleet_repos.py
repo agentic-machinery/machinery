@@ -607,6 +607,8 @@ def test_review_checkout_origin_must_be_the_active_ascii_slug(tmp_path: Path, mo
     assert target_resolution.resolve_review_repository(good, "case", mode="pr") == good
     with pytest.raises(target_resolution.TargetResolutionError, match="not its repository's active slug"):
         target_resolution.resolve_review_repository(stale, None, mode="pr")
+    with pytest.raises(target_resolution.TargetResolutionError, match="not an exact owner/name"):
+        target_resolution.resolve_review_repository(look_alike, None, mode="pr")
     for root in (stale, look_alike):
         with pytest.raises(target_resolution.TargetResolutionError):
             target_resolution.resolve_review_repository(root, "case", mode="pr", commit="a" * 40)

@@ -455,15 +455,15 @@ def ensure_job_row_for_receipt(
     )
 
 
-def _refuse_conflicting_job(store: ArtifactStore, sealed: SealedVerdict, slugs: tuple[str, ...]) -> None:
-    """Refuse when a job for this PR head and gate exists, under either baked slug, with another review id."""
+def _refuse_conflicting_job(store: ArtifactStore, sealed: SealedVerdict) -> None:
+    """Refuse when a job for this PR head and gate exists, under any spelling of the same repository, with another
+    review id. Job rows keep the spelling they were created with (either baked slug, in any case)."""
     from lu_machinery.fleet_comms.formal_review_jobs import FormalReviewJobService
 
     # Do not close the service: it shares the caller's ArtifactStore connection.
     service = FormalReviewJobService(store=store)
-    for slug in slugs:
-        existing = service.find_job(slug, sealed.pr_number, sealed.head_sha, sealed.gate_kind, include_attempts=False)
-        if existing is not None and existing.review_id != sealed.review_id:
+    for existing in service.list_jobs(pr=sealed.pr_number, head_sha=sealed.head_sha, gate_kind=sealed.gate_kind):
+        if same_repository(existing.repository, sealed.repository) and existing.review_id != sealed.review_id:
             raise ReviewPublisherError(
                 f"formal_job_review_id_mismatch: job={existing.review_id!r} sealed={sealed.review_id!r}"
             )
@@ -504,7 +504,7 @@ def publish_sealed_verdict(
         raise ReviewPublisherError(f"repository_unresolved: {exc}") from exc
     sealed = replace(sealed, repository=target.repo.github)
     if store is not None:
-        _refuse_conflicting_job(store, sealed, target.repo.slugs)
+        _refuse_conflicting_job(store, sealed)
 
     head = current_head_sha
     if head is None:

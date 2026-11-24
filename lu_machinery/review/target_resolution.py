@@ -172,6 +172,8 @@ def resolve_review_repository(
                 registry = load_fleet_repos()
             except (OSError, FleetRepoError) as exc:
                 raise repository_target_error(None, exc) from None
+            if inferred is not None and not (inferred.isascii() and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", inferred)):
+                raise TargetResolutionError("checkout origin is not an exact owner/name")
             try:
                 registered = inferred is not None and bool(resolve_fleet_repo_by_slug(inferred, repos=registry))
             except FleetRepoError:
