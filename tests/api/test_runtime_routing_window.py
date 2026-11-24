@@ -118,17 +118,30 @@ def test_refused_start_shows_requested_id_and_plain_reason_not_the_raw_clause(tm
     assert rows["account-refused"]["pool"] is None
     assert rows["account-refused"]["admission"] == {"state": "refused", "reason": "refused: the account check failed"}
 
-    # A marker admission's own classification rejects (malformed, contradicting the lifecycle, or a code dispatch
-    # never writes) proves no refusal: the row keeps its own id, and its outcome and pool are unknown.
+    # A marker that proves no refusal keeps the row's own id, and its outcome and pool are unknown: one admission's
+    # own classification rejects (malformed, contradicting the lifecycle), a code dispatch never writes, a capacity
+    # deferral whose admission snapshot admitted it, or one with launch evidence (written only before launch).
     for name, marker in (("d" * 32, False), ("c" * 32, ""), ("b" * 32, {"code": "x"}), ("a" * 32, "not_a_refusal")):
         _write_record(tasks, name, _write_task(name, started=_NOW - timedelta(minutes=1), status="failed",
                                                requested_task_id="other-task", never_started_reason=marker))
     _write_record(tasks, "9" * 32, _write_task("9" * 32, started=_NOW - timedelta(minutes=1), status="done",
                                                requested_task_id="other-task", never_started_reason="admission_capacity"))
+    _write_record(tasks, "8" * 32, _write_task("8" * 32, started=_NOW - timedelta(minutes=1), status="failed",
+                                               requested_task_id="other-task", never_started_reason="admission_capacity"))
+    _write_record(tasks, "7" * 32, _write_task("7" * 32, started=_NOW - timedelta(minutes=1), status="failed", pid=4242,
+                                               requested_task_id="other-task", never_started_reason="admission_capacity",
+                                               admission={**snapshot, "failures": []}))
     rows = {row["task_id"]: row for row in runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))["decisions"]}
     assert "other-task" not in rows
-    for name in ("d" * 32, "c" * 32, "b" * 32, "a" * 32, "9" * 32):
+    for name in ("d" * 32, "c" * 32, "b" * 32, "a" * 32, "9" * 32, "8" * 32, "7" * 32):
         assert (rows[name]["pool"], rows[name]["admission"]["state"]) == (None, "unknown")
+    # A refusal after launch is the task's own record: its own id, the refusal, and the pool its account paid.
+    _write_record(tasks, "launched", _write_task("launched", started=_NOW - timedelta(minutes=1), status="failed",
+                                                 pid=4242, requested_task_id="other-task",
+                                                 never_started_reason="boundary_refusal"))
+    rows = {row["task_id"]: row for row in runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))["decisions"]}
+    assert (rows["launched"]["pool"], rows["launched"]["admission"]) == (
+        "codex:a", {"state": "refused", "reason": "refused by the write boundary"})
 
 
 def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
@@ -167,6 +180,7 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
     with TestClient(api) as client:
         payload = client.get("/api/runtime/routing").json()
         assert payload["recent"]["status"] == "partial"
+        last_reading = payload["recent"]["as_of"]
         scanned = datetime.fromisoformat(payload["recent"]["as_of"].replace("Z", "+00:00"))
         assert 0 <= payload["recent"]["age_s"] <= (datetime.now(UTC) - scanned).total_seconds()
 
@@ -182,3 +196,6 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
         warm = client.get("/api/runtime/routing").json()
         assert (warm["recent"]["status"], warm["recent"]["reason"]) == ("unknown", "task_records_unreadable")
         assert warm["recent"]["age_s"] is None
+        assert "counts" not in warm["recent"]
+        # Unknown since the last reading, never since this attempt.
+        assert warm["recent"]["as_of"] == last_reading
