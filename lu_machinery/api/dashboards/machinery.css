@@ -87,12 +87,24 @@ nav.pages a {
   font-weight: 500;
   color: var(--fg);
   text-decoration: none;
-  white-space: nowrap;
+  /* A link takes one line while the row has room; one wider than the row wraps inside it. */
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 nav.pages a:hover {
   background: var(--bg);
   border-color: var(--line);
+}
+
+/* Product pages follow the machinery pages as a second group, outlined so the two read apart. */
+nav.pages a.product {
+  border-style: dashed;
+  border-color: var(--line);
+}
+
+nav.pages a.product.first {
+  margin-left: 12px;
 }
 
 nav.pages a[aria-current="page"] {

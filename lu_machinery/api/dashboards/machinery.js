@@ -8,18 +8,9 @@
   const THEME_KEY = "machinery-theme";
   const THEMES = ["auto", "light", "dark"];
 
-  // Single source of truth for machinery navigation. Planning (#584) joins this list when it lands.
-  const NAV_PAGES = [
-    {href: "/machinery", label: "Overview", matches: ["/", "/index.html", "/machinery", "/machinery/"]},
-    {href: "/subscriptions", label: "Subscriptions", matches: ["/subscriptions", "/subscriptions.html"]},
-    {href: "/fleet", label: "Fleet", matches: ["/fleet", "/fleet.html"]},
-    {href: "/pull-requests", label: "Pull requests", matches: ["/pull-requests", "/pull-requests.html"]},
-    {href: "/milestones", label: "Milestones", matches: ["/milestones", "/milestones.html"]},
-    {href: "/model-stats", label: "Model statistics", matches: ["/model-stats", "/model-stats.html"]},
-  ];
-
+  // The page navigation is rendered by the server from the page contracts (main.py), so it is
+  // in the HTML before this script runs. Only external site links are built here.
   const SITE_LINKS = [
-    {href: "/", label: "Learn Ukrainian"},
     {href: "http://localhost:8768/", label: "KubeDojo"},
   ];
 
@@ -33,24 +24,6 @@
   }
 
   // ---- Navigation & theme ----
-
-  function currentPathname(explicitPath) {
-    if (typeof explicitPath === "string" && explicitPath) return explicitPath;
-    return typeof location === "object" && location && typeof location.pathname === "string"
-      ? location.pathname : "/machinery";
-  }
-
-  function isActivePage(page, pathname) {
-    return page.matches.includes(pathname);
-  }
-
-  function renderNavHtml(pathname) {
-    const path = currentPathname(pathname);
-    return NAV_PAGES.map(page => {
-      const current = isActivePage(page, path) ? ' aria-current="page"' : "";
-      return `<a href="${escapeHtml(page.href)}"${current}>${escapeHtml(page.label)}</a>`;
-    }).join("");
-  }
 
   function renderSitesHtml() {
     return SITE_LINKS.map(site => `<a href="${escapeHtml(site.href)}">${escapeHtml(site.label)}</a>`).join("");
@@ -113,10 +86,8 @@
     header.innerHTML = renderVersion(header.dataset?.version, header.dataset?.repository);
   }
 
-  function initChrome(options = {}) {
+  function initChrome() {
     if (typeof document !== "object" || !document || !document.getElementById) return;
-    const nav = document.getElementById("machinery-nav");
-    if (nav) nav.innerHTML = renderNavHtml(options.pathname);
     const sites = document.getElementById("machinery-sites");
     if (sites) sites.innerHTML = renderSitesHtml();
     let mode = applyTheme(readStoredTheme());
@@ -738,13 +709,11 @@
     REFRESH_MS,
     OPTIONAL_WAIT_MS,
     RETRY_LIMIT,
-    NAV_PAGES,
     SITE_LINKS,
     FRESHNESS_LABELS,
     DEFAULT_OPTIONAL,
     escapeHtml,
     safeHttpUrl,
-    renderNavHtml,
     renderSitesHtml,
     applyTheme,
     renderVersion,
