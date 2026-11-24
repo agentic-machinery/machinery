@@ -500,3 +500,78 @@ def test_selector_missing_unreadable_unknown_or_worker_writable_fails_closed(
         for f in cleanup_files:
             if f.exists():
                 f.chmod(0o600)
+
+
+def _selected(monkeypatch: pytest.MonkeyPatch, active: str, *, visibility: str) -> FleetRepo:
+    """One transferred row (org/repo, neworg/repo; repository_id 4242) whose host selector chooses *active*."""
+    row = FleetRepo(
+        key="case", github="org/repo", local_name="repo", role=f"{visibility}-labs",
+        repository_id=4242, visibility=visibility, alternate_github="neworg/repo",
+    )
+    default = FleetRepo(key="home", github="home/repo", local_name="home", role="public-monorepo", default=True)
+    monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: {"case": row, "home": default})
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: {"case": row, "home": default})
+    monkeypatch.setattr(
+        git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState({"case": active}, "d" * 64),
+    )
+    return row
+
+
+@pytest.mark.parametrize("active", BOTH)
+def test_opsec_private_exemption_follows_only_the_active_slug(monkeypatch: pytest.MonkeyPatch, active: str):
+    """Defect class: the OPSEC private-destination exemption matches only the registry's first slug, so after a
+    transfer the active slug of a private repository is scanned as public while its inactive slug stays exempt."""
+    from lu_machinery.opsec import prepublish
+
+    _selected(monkeypatch, active, visibility="private")
+    monkeypatch.setattr(prepublish, "catalog", lambda: {
+        "case": {"github": "org/repo", "alternate_github": "neworg/repo", "repository_id": 4242,
+                 "visibility": "private", "role": "private-labs", "local_name": "repo"},
+        "home": {"github": "home/repo", "role": "public-monorepo", "default": True, "local_name": "home"},
+    })
+    inactive = next(slug for slug in BOTH if slug != active)
+    assert prepublish.is_private(active) and prepublish.is_private(f"https://github.com/{active}.git")
+    assert not prepublish.is_private(inactive)
+    assert not prepublish.is_private("evil/repo")
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("visibility", ["public", "private"])
+@pytest.mark.parametrize("active", BOTH)
+def test_sandbox_repository_scope_follows_only_the_active_slug(
+    monkeypatch: pytest.MonkeyPatch, active: str, visibility: str, configured: bool,
+):
+    """Defect class: the AGY sandbox and write boundary scope a repository by the registry's first slug, so after a
+    transfer the active slug loses its public or private scope and the inactive slug keeps it, including through the
+    default repository's configured GitHub name when that name spells the inactive slug."""
+    from lu_machinery.common import repo_root
+    from lu_machinery.dispatcher import agy_sandbox
+
+    _selected(monkeypatch, active, visibility=visibility)
+    inactive = next(slug for slug in BOTH if slug != active)
+    monkeypatch.setattr(repo_root, "configured_github_slug", lambda *_a, **_k: inactive if configured else None)
+    assert agy_sandbox.public_repository(active) is (visibility == "public")
+    assert agy_sandbox.private_repository(active) is (visibility == "private")
+    for refused in (inactive, "evil/repo"):
+        assert not agy_sandbox.public_repository(refused)
+        assert not agy_sandbox.private_repository(refused)
+
+
+@pytest.mark.parametrize("active", BOTH)
+def test_dispatch_receipt_names_the_selector_a_dual_slug_row_was_resolved_with(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active: str):
+    """Defect class: a task record dispatched to a transferred repository keeps no trace of the host selector (value
+    and sha256) that chose its active slug, so a review or audit cannot tell which slug the dispatch relied on; the
+    stored repository identity stays the registry slug the lineage readers match."""
+    from lu_machinery.dispatcher import store
+    from lu_machinery.dispatcher.types import TaskSpec
+
+    _selected(monkeypatch, active, visibility="public")
+    (tmp_path / "p").write_text("prompt")
+    spec = TaskSpec("task", "codex", "gpt-6.2-sol", "high", "read-only", tmp_path, tmp_path / "p", tmp_path / "r")
+    entry = {"key": "case", "github": "org/repo", "alternate_github": "neworg/repo", "repository_id": 4242,
+             "visibility": "public"}
+    record = store.new_record(spec, entry, "codex/task", "a" * 40, {"research_owned_path": []})
+    assert record["fleet_repo_selector"] == {"selector_value": active, "selector_sha256": "d" * 64}
+    assert record["repository"] == "org/repo"
+    single = store.new_record(spec, {"key": "home", "github": "home/repo"}, "codex/task", "a" * 40, {"research_owned_path": []})
+    assert "fleet_repo_selector" not in single

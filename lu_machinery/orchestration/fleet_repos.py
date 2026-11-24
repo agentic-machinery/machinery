@@ -100,6 +100,14 @@ class FleetRepo:
     def has_alternate_slug(self) -> bool:
         return self.alternate_github is not None
 
+    @property
+    def authorized_visibility(self) -> str | None:
+        """The visibility authorization reads: the declared ``visibility`` (bound to ``repository_id`` on a
+        dual-slug row), else the role's ``public-`` or ``private-`` prefix, else None (neither)."""
+        if self.visibility is not None:
+            return self.visibility
+        return next((name for name in ("public", "private") if self.role.startswith(f"{name}-")), None)
+
 
 @dataclass(frozen=True)
 class ActiveFleetRepo:
@@ -244,7 +252,8 @@ def resolve_fleet_repo_by_slug(
     When *expected_repository_id* or *expected_visibility* is given, mismatches
     fail closed before any network call.
     """
-    if not isinstance(identifier, str) or not identifier.strip():
+    if not isinstance(identifier, str) or not identifier.strip() or not identifier.isascii():
+        # Keys and slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
         raise FleetRepoError("unknown fleet repository identifier")
     catalog = repos if repos is not None else load_fleet_repos()
     spelling = identifier.strip().casefold()
@@ -354,6 +363,72 @@ def resolve_active_fleet_repo(
         selector_value=chosen,
         selector_digest=state.digest,
     )
+
+
+def require_active_slug(
+    spelling: object,
+    *,
+    repos: Mapping[str, FleetRepo] | None = None,
+    registry_path: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> ActiveFleetRepo:
+    """The registered row whose active slug the exact owner/name *spelling* is (case-insensitive).
+
+    For live destinations: a push or ``gh`` target, a checkout's ``origin``, a ``--repo`` argument.
+    A registry key, an unregistered or malformed spelling, and a dual-slug row's inactive slug are
+    refused, as is a missing or untrusted selector for a dual-slug row.
+    """
+    if not isinstance(spelling, str) or not _EXACT_SLUG.fullmatch(spelling):
+        raise FleetRepoError("fleet repository must be an exact owner/name")
+    active = resolve_active_fleet_repo(spelling, repos=repos, registry_path=registry_path, env=env)
+    if active.active_github.casefold() != spelling.casefold():
+        raise FleetRepoError(f"{spelling!r} is not the active slug of fleet repository {active.repo.key!r}")
+    return active
+
+
+def resolve_payload_fleet_repo(
+    spelling: object,
+    *,
+    repos: Mapping[str, FleetRepo] | None = None,
+    registry_path: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> ActiveFleetRepo:
+    """The registered row a stored payload's exact owner/name names by either baked slug, bound to its active slug.
+
+    Task records, receipts and sealed verdicts written before or after a transfer name the same
+    row; act on its ``active_github``, never on the stored spelling. A registry key, an
+    unregistered or malformed spelling, or a missing or untrusted selector is refused.
+    """
+    if not isinstance(spelling, str) or not _EXACT_SLUG.fullmatch(spelling):
+        raise FleetRepoError("fleet repository must be an exact owner/name")
+    active = resolve_active_fleet_repo(spelling, repos=repos, registry_path=registry_path, env=env)
+    if active.active_github.casefold() != spelling.casefold() and active.repo.repository_id is None:
+        raise FleetRepoError(f"historical slug {spelling!r} is not bound to a repository_id")
+    return active
+
+
+def same_repository(left: object, right: object, *, repos: Mapping[str, FleetRepo] | None = None) -> bool:
+    """Whether two exact owner/name spellings name one repository.
+
+    Equal spellings always do. Otherwise both must be baked slugs (either one, case-insensitive)
+    of the same registered row, and two different slugs only of a row bound to a ``repository_id``,
+    so a payload written before a transfer matches one written after it. Anything else, an
+    unreadable catalog included, is not the same repository.
+    """
+    if not (
+        isinstance(left, str) and isinstance(right, str) and _EXACT_SLUG.fullmatch(left) and _EXACT_SLUG.fullmatch(right)
+    ):
+        return False
+    if left == right:
+        return True
+    try:
+        catalog = repos if repos is not None else _bundled_catalog()
+        row = resolve_fleet_repo_by_slug(left, repos=catalog)
+        if resolve_fleet_repo_by_slug(right, repos=catalog).key != row.key:
+            return False
+    except FleetRepoError:
+        return False
+    return left.casefold() == right.casefold() or row.repository_id is not None
 
 
 def verify_repository_identity(
@@ -886,9 +961,12 @@ __all__ = [
     "main",
     "pull_request_repository",
     "repository_slugs",
+    "require_active_slug",
     "resolve_active_fleet_repo",
     "resolve_fleet_repo",
     "resolve_fleet_repo_by_slug",
+    "resolve_payload_fleet_repo",
+    "same_repository",
     "selector_receipt",
     "verify_repository_identity",
 ]

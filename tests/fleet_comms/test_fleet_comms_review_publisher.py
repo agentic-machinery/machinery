@@ -335,3 +335,55 @@ def test_publish_from_review_id_via_accept_sealed(tmp_path: Path) -> None:
 def _synthetic_publishing_rules(synthetic_opsec, publisher_transport, monkeypatch):
     """Use synthetic private tooling and an explicit destination for send spies."""
     monkeypatch.setenv("GH_REPO", "unit/public")
+
+
+def _transferred(monkeypatch: pytest.MonkeyPatch, active: str) -> None:
+    """One transferred row (org/repo, neworg/repo; repository_id 4242) whose host selector chooses *active*."""
+    from lu_machinery.common import git_credentials
+    from lu_machinery.orchestration import fleet_repos
+
+    row = fleet_repos.FleetRepo(
+        "case", "org/repo", "repo", "public-labs", default=True,
+        repository_id=4242, visibility="public", alternate_github="neworg/repo",
+    )
+    monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: {"case": row})
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: {"case": row})
+    monkeypatch.setattr(
+        git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState({"case": active}, "d" * 64),
+    )
+
+
+@pytest.mark.parametrize("active", ["org/repo", "neworg/repo"])
+@pytest.mark.parametrize(("sealed_slug", "job_slug"), [
+    ("neworg/repo", "org/repo"), ("org/repo", "neworg/repo"), ("evil/repo", "org/repo"),
+])
+def test_sealed_verdict_across_a_transfer_publishes_at_the_active_slug(
+    monkeypatch: pytest.MonkeyPatch, active: str, sealed_slug: str, job_slug: str,
+) -> None:
+    """Defect class: a sealed verdict naming the other baked slug of its job's repository is refused as another
+    repository, and a publication goes to the slug the payload carries instead of the selector's active slug;
+    a slug of another repository must still refuse before any GitHub call."""
+    from lu_machinery.fleet_comms.review_publication import parse_sealed_verdict_payload
+
+    _transferred(monkeypatch, active)
+    sealed = parse_sealed_verdict_payload(json.dumps(_sealed(repository=sealed_slug, review_evidence=_approved_evidence())))
+    calls: list[list[str]] = []
+
+    def gh(argv, **_kwargs):
+        calls.append([str(part) for part in argv])
+        return subprocess.CompletedProcess(argv, 0, _SHA_A + "\n", "")
+
+    if sealed_slug == "evil/repo":
+        with pytest.raises(ReviewPublisherError, match="sealed_job_mismatch"):
+            sealed_matches_job(sealed, review_id=sealed.review_id, repository=job_slug, pr_number=sealed.pr_number,
+                               head_sha=sealed.head_sha, gate_kind=sealed.gate_kind)
+        with pytest.raises(ReviewPublisherError, match="repository_unresolved"):
+            publish_sealed_verdict(sealed, runner=gh)
+        assert calls == []
+        return
+    sealed_matches_job(sealed, review_id=sealed.review_id, repository=job_slug, pr_number=sealed.pr_number,
+                       head_sha=sealed.head_sha, gate_kind=sealed.gate_kind)
+    result = publish_sealed_verdict(sealed, runner=gh)
+    assert result.plan.action == "publish" and result.plan.repository == active
+    assert calls and all(active in " ".join(argv) for argv in calls)
+    assert result.to_dict()["fleet_repo_selector"] == {"selector_value": active, "selector_sha256": "d" * 64}

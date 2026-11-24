@@ -12,6 +12,7 @@ import uuid
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PureWindowsPath
+from typing import Any
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import validate_plain_branch_name
@@ -184,6 +185,13 @@ def new_record(
             record[target] = metadata[source]
     record.update(schema_version=2, run_nonce=uuid.uuid4().hex, status="spawning", started_at=now())
     record.update(repo=repository["key"], repository_id=repository["github"], repository=repository["github"])
+    if repository.get("alternate_github") is not None:
+        # The dispatch receipt names the host selector a dual-slug row was resolved with; the stored identity
+        # above stays the registry slug, which every lineage, budget and statistics reader matches on.
+        from lu_machinery.orchestration.fleet_repos import resolve_active_fleet_repo
+
+        receipt: dict[str, Any] = {"fleet_repo_selector": resolve_active_fleet_repo(repository["key"]).selector_receipt()}
+        record.update(receipt)
     record.update(worktree_attribution(spec, repository, branch, sha))
     if spec.mode == "read-only" and metadata.get("branch") is not None:
         record["review_branch"] = validate_plain_branch_name(metadata["branch"], repo_root=spec.worktree)
