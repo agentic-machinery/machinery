@@ -585,6 +585,44 @@ def _pr_view(task, *, labels=(), issues=()):
     }
 
 
+def test_pr_labels_follow_the_closing_issue_repository(monkeypatch):
+    """Defect class: closing issue labels come from the PR's repo or an unreadable issue gets a bare 404."""
+    from lu_machinery.orchestration.fleet_repos import FleetRepo
+
+    pr_repo = "unit/machinery"
+    issue_repo = "unit/product"
+    repos = {name: FleetRepo(name, f"unit/{name}", name, "test") for name in ("machinery", "product")}
+    monkeypatch.setattr(recorder, "load_fleet_repos", lambda: repos)
+    refs = [{"number": 403, "url": f"https://github.com/{issue_repo}/issues/403"}]
+    issue_reads = []
+    issue_result = (0, '{"labels":[{"name":"Security"}]}', "")
+
+    def run(args, **_kwargs):
+        if args[:3] == ["gh", "pr", "view"]:
+            assert args[3:6] == ["1", "--repo", pr_repo]
+            return subprocess.CompletedProcess(args, 0, json.dumps({
+                "state": "OPEN", "labels": [], "closingIssuesReferences": refs,
+            }), "")
+        issue_reads.append(args)
+        if args == ["gh", "issue", "view", "403", "--repo", issue_repo, "--json", "labels"]:
+            return subprocess.CompletedProcess(args, *issue_result)
+        return subprocess.CompletedProcess(args, 1, "", '{"error":"github_http_error","status":404}')
+
+    monkeypatch.setattr(recorder, "request_run", run)
+    pr = recorder._pr(pr_repo, "", 1)
+    assert recorder._security_labeled(pr)
+    assert pr["closingIssuesReferences"][0]["labels"] == [{"name": "Security"}]
+
+    issue_result = (1, "", '{"error":"github_http_error","status":404}')
+    with pytest.raises(recorder.RecordError, match=r"^LINKED_ISSUE_LABELS_UNAVAILABLE: unit/product#403 .*unreadable"):
+        recorder._pr(pr_repo, "", 1)
+
+    refs[0]["url"] = "https://github.com/other/public/issues/403"
+    with pytest.raises(recorder.RecordError, match=r"^LINKED_ISSUE_LABELS_UNAVAILABLE: other/public#403 .*fleet registry"):
+        recorder._pr(pr_repo, "", 1)
+    assert len(issue_reads) == 2
+
+
 def test_security_sensitive_verdicts_publish_the_finding_count_only(monkeypatch, low_review, tmp_path):
     """Defect class: a security-sensitive verdict is posted with its finding text.
 
@@ -604,7 +642,8 @@ def test_security_sensitive_verdicts_publish_the_finding_count_only(monkeypatch,
             f"VERDICT: APPROVE\n\n{_FINDING}\n",
             "APPROVED",
             (),
-            ({"number": 403, "labels": [{"name": "Security"}]},),
+            ({"number": 403, "url": "https://github.com/unit/public/issues/403",
+              "labels": [{"name": "Security"}]},),
         ),
     )
     for profile, reply, verdict, labels, issues in cases:
