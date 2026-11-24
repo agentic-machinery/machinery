@@ -234,35 +234,72 @@ def _denied(path: Path, exc: PermissionError, task_root: Path) -> str:
             "inside it, so the lineage cannot rule it out as a review run of this PR until it can be read")
 
 
+# Example names in the one identical-copy summary. One task's copies cannot fill every slot.
+_COPY_EXAMPLE_LIMIT = 3
+
+
+def _warn_identical_copies(copies: list[tuple[str, str]]) -> None:
+    """Log one summary for the identical copies one scan skipped.
+
+    The foreign-file summary in ``task_record_store`` counts files that are not
+    records. These copies are records, so they stay on their own line. Each
+    untrusted name is passed through ``repr`` before it is logged, and the
+    summary is one logging argument, so a name cannot start a new line or be
+    read as a format string.
+    """
+    if not copies:
+        return
+    count = len(copies)
+    noun = "copy" if count == 1 else "copies"
+    shown: list[str] = []
+    seen: set[str] = set()
+    for path, task_id in copies:
+        if task_id in seen:
+            continue
+        seen.add(task_id)
+        shown.append(repr(path) + " copies " + repr(task_id))
+        if len(shown) == _COPY_EXAMPLE_LIMIT:
+            break
+    summary = f"{count} identical {noun}; examples: {', '.join(shown)}"
+    _LOG.warning("NON_RECORD_FILE: %s", summary)
+
+
 def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dict[str, Any]]]:
     paths = [*sorted((task_root / ARCHIVE_DIR_NAME).glob("*.json")), *sorted(task_root.glob("*.json"))]
     records = []
-    for path in paths:
-        try:
-            path, raw = read_task_record_bytes(path, tasks_dir=task_root)
-            record = parse_task_record(path, raw)
-        except TaskIdentityMismatch as exc:
-            # A copy (a worker's saved `dispatch.py wait` output) never joins the lineage, and only an
-            # exact copy of the named record is skipped; any other misnamed file refuses.
-            if not is_identical_copy(exc):
-                raise LineageRefused(
-                    f"task record {path.name} has invalid task identity; {misnamed_record_refusal(path)}"
-                ) from None
-            _LOG.warning("NON_RECORD_FILE: %s copies task record %s", path, exc.record["task_id"])
-            continue
-        except PermissionError as exc:
-            raise LineageRefused(_denied(path, exc, task_root)) from None
-        except (OSError, ValueError) as exc:
-            raise LineageRefused(f"task record {path.name} unreadable: {exc}") from None
-        if not isinstance(record, dict):
-            continue
-        if record.get("status") in {"dry_run", "dry-run"} or not _is_review_task(record):
-            continue
-        if not isinstance(record.get("repository"), str) or normalize_repository(
-            record["repository"]
-        ) != normalize_repository(repository):
-            continue
-        records.append((path, record))
+    copies: list[tuple[str, str]] = []
+    try:
+        for path in paths:
+            try:
+                path, raw = read_task_record_bytes(path, tasks_dir=task_root)
+                record = parse_task_record(path, raw)
+            except TaskIdentityMismatch as exc:
+                # A copy (a worker's saved `dispatch.py wait` output) never joins the lineage, and only an
+                # exact copy of the named record is skipped; any other misnamed file refuses.
+                # The scan logs those copies once, after it finishes or refuses.
+                if not is_identical_copy(exc):
+                    raise LineageRefused(
+                        f"task record {path.name} has invalid task identity; {misnamed_record_refusal(path)}"
+                    ) from None
+                task_id = exc.record["task_id"]
+                if isinstance(task_id, str):
+                    copies.append((str(path), task_id))
+                continue
+            except PermissionError as exc:
+                raise LineageRefused(_denied(path, exc, task_root)) from None
+            except (OSError, ValueError) as exc:
+                raise LineageRefused(f"task record {path.name} unreadable: {exc}") from None
+            if not isinstance(record, dict):
+                continue
+            if record.get("status") in {"dry_run", "dry-run"} or not _is_review_task(record):
+                continue
+            if not isinstance(record.get("repository"), str) or normalize_repository(
+                record["repository"]
+            ) != normalize_repository(repository):
+                continue
+            records.append((path, record))
+    finally:
+        _warn_identical_copies(copies)
     return records
 
 
