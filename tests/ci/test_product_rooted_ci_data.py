@@ -440,6 +440,37 @@ def test_changed_test_budget_overflow_keeps_unrelated_test_unselected(overflow_i
     assert "tests/test_delta.py" not in overflow_import_plan["deferred_files"]
 
 
+def test_direct_importers_and_text_readers_share_extra_budget(tmp_path: Path, installed: tuple[Path, Path]) -> None:
+    """Defect class: the main budget defers a direct importer while a costly text reader uses the extra room."""
+    python, _wheel = installed
+    direct = "tests/test_direct.py"
+    cheap_reader = "tests/test_cheap_reader.py"
+    expensive_reader = "tests/test_expensive_reader.py"
+    shared = "tests/subdir/test_shared.py"
+    root, env = _product(tmp_path, "alpha", extra={
+        direct: "from scripts import runner\n",
+        cheap_reader: "TARGET = 'scripts/runner.py'\n",
+        expensive_reader: "TARGET = 'scripts/runner.py'\n",
+        "tests/subdir/conftest.py": "from scripts import runner\n",
+        shared: "def test_ok():\n    assert True\n",
+        "scripts/ci/pytest-file-durations.json": json.dumps({
+            FILES[0]: 345, direct: 58.5, cheap_reader: 2, expensive_reader: 59, shared: 6,
+        }),
+    })
+    base = _git(root, "rev-parse", "HEAD^1")
+    code = (
+        "import json, sys; from lu_machinery.ci.pr_affected_tests import plan; "
+        "print(json.dumps(plan(sys.argv[1], 'HEAD')))"
+    )
+    result = _run(python, tmp_path, env, "-c", code, base)
+    assert result.returncode == 0, result.stderr
+    record = json.loads(result.stdout)
+    assert record["run_files"] == [FILES[0], cheap_reader, direct]
+    assert record["deferred_files"] == [shared, expensive_reader]
+    assert record["estimate_seconds"] == 465.5
+    assert record["timeout_seconds"] == 550
+
+
 def test_selection_refuses_a_third_party_import_in_the_receipt_gate_closure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -81,11 +81,10 @@ GUARDS_REASON = "guards alone exceed the safe budget under the 480 second pytest
 # has no room for runner speed variance. Measured from the mandatory selection, not
 # from zero, so a heavy guard list never starves every importing test.
 FILL_SHARE = 0.5
-# Tests that name a changed file as text (`text_references`, #12789) fill a room of
-# their own after every other selection, so they never displace one; the rest defer to
-# merge-group pytest. The pytest timeout grows by the runner-variance margin of what
-# they use: at most ceil((406 + 60) * 1.18) = 550 seconds, under the 600 second cap.
-READER_ROOM_SECONDS = 60
+# Text readers (`text_references`, #12789) and remaining direct importers share
+# extra room after the main selection. The timeout includes the runner-variance
+# margin for what they use: at most ceil((406 + 60) * 1.18) = 550 seconds.
+EXTRA_DEPENDENCY_SECONDS = 60
 TEST = re.compile(r"tests/(?:[^/]+/)*test_[^/]+\.py")
 # A guard line is a test file, or `file::name[::name]` to pin one test (or Class::test) in a file
 # too slow to run whole under the PR cap. Names are plain identifiers, so a pinned id carries no
@@ -728,8 +727,10 @@ def _plan(base: str, candidate: str, *, importers: bool) -> dict:
                 run.add(p)
                 budget += durations.get(p, default)
     used = budget
-    for p in sorted(readers, key=lambda p: (durations.get(p, default), p)):
-        if budget + durations.get(p, default) <= fill_limit + READER_ROOM_SECONDS:
+    # The main pass gives direct importers first choice. In the extra room,
+    # choose the cheapest remaining direct evidence, whether an import or a literal.
+    for p in sorted((p for p in direct + readers if p not in run), key=lambda p: (durations.get(p, default), p)):
+        if budget + durations.get(p, default) <= fill_limit + EXTRA_DEPENDENCY_SECONDS:
             run.add(p)
             budget += durations.get(p, default)
     timeout = min(CAP_SECONDS, max(TIMEOUT_SECONDS, math.ceil(budget * VARIANCE_RATIO))) if budget > used else TIMEOUT_SECONDS
