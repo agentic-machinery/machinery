@@ -9,6 +9,29 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.69"></a>
+## [0.1.69] - 2026-11-24
+
+### Added
+
+- Plain-English alerts on the Monitor home ([#1349](https://github.com/learn-ukrainian/machinery/pull/1349))
+- Show token use and waste in Model Stats and Fleet ([#1356](https://github.com/learn-ukrainian/machinery/pull/1356))
+- Add loopback project journal API and Monitor UI ([#1365](https://github.com/learn-ukrainian/machinery/pull/1365))
+- Routing page with flow and recent decisions (lineage 4; supersedes #1363) ([#1366](https://github.com/learn-ukrainian/machinery/pull/1366))
+
+### Changed
+
+- Move release build tools into locked uv.lock build group ([#1347](https://github.com/learn-ukrainian/machinery/pull/1347))
+- Raise runtime floor to Python >=3.14 and drop 3.12 CI leg ([#1353](https://github.com/learn-ukrainian/machinery/pull/1353))
+- Run supplemental reviews only under a MEASURE brief line ([#1355](https://github.com/learn-ukrainian/machinery/pull/1355))
+
+### Fixed
+
+- Send one CTO report for a shared infrastructure failure ([#1348](https://github.com/learn-ukrainian/machinery/pull/1348))
+- Keep no-verdict attempts out of the round budget ([#1358](https://github.com/learn-ukrainian/machinery/pull/1358))
+- List every registered project on the Monitor, with a Projects section on the home ([#1364](https://github.com/learn-ukrainian/machinery/pull/1364))
+- Exclude Codex subscriptions with exhausted allowance ([#1362](https://github.com/learn-ukrainian/machinery/pull/1362))
+
 <a id="v0.1.68"></a>
 ## [0.1.68] - 2026-11-24
 
@@ -1598,7 +1621,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.68...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.69...HEAD
+[0.1.69]: https://github.com/learn-ukrainian/machinery/compare/v0.1.68...v0.1.69
 [0.1.68]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...v0.1.68
 [0.1.67]: https://github.com/learn-ukrainian/machinery/compare/v0.1.66...v0.1.67
 [0.1.66]: https://github.com/learn-ukrainian/machinery/compare/v0.1.65...v0.1.66
