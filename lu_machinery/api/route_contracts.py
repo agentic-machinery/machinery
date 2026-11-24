@@ -13,11 +13,12 @@ lookups read both: machinery first, then product
 from __future__ import annotations
 
 import os
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
-from .product_contribution import ProductContribution, installed_product
+from .product_contribution import ProductContribution, has_suffix, installed_product
 
 ContractKind = Literal["http", "websocket"]
 MatchType = Literal["exact", "prefix"]
@@ -72,6 +73,25 @@ class RouteContract:
         return data
 
 
+# Characters that show nothing: controls, format (bidi), unassigned, private-use and surrogate
+# code points, line and paragraph separators, and the letters and symbols drawn as blanks.
+_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Cs", "Zl", "Zp"})
+_BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
+
+
+def _visible_text(text: str) -> str:
+    """``text`` as one line of visible text, or ``""`` when a reader would see nothing.
+
+    Invisible characters are dropped and runs of whitespace collapse to one space. What is
+    left counts only when it holds a letter, number, punctuation mark or symbol.
+    """
+    kept = "".join(
+        ch for ch in text if unicodedata.category(ch) not in _INVISIBLE_CATEGORIES and ch not in _BLANK_GLYPHS
+    )
+    line = " ".join(kept.split())
+    return line if any(unicodedata.category(ch)[0] in "LNPS" for ch in line) else ""
+
+
 @dataclass(frozen=True)
 class PageContract:
     file: str
@@ -83,6 +103,27 @@ class PageContract:
     overlap: str
     stale_risk: str
     recommendation: str
+    label: str = ""
+
+    @property
+    def nav_label(self) -> str:
+        """The name the Monitor navigation shows, never empty.
+
+        The declared label, else one derived from the file name, else from the URL path
+        (``/`` is "Home"), else the URL itself. Each candidate is cleaned to one line of
+        visible text (``_visible_text``) and used only if something visible is left.
+        """
+        if label := _visible_text(self.label):
+            return label
+        if self.url == "/":
+            return "Home"
+        file_name = Path(self.file).name
+        # The file name without its suffix, by the rule has_suffix states (``PurePath.stem`` changed in 3.14).
+        stem = file_name.rpartition(".")[0] if has_suffix(file_name) else file_name
+        for source in (stem, self.url.strip("/")):
+            if name := _visible_text(source.replace("-", " ").replace("_", " ")):
+                return name.capitalize()
+        return _visible_text(self.url) or "Untitled page"
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -700,7 +741,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "http",
         "Static dashboard file serving catch-all.",
         "lu_machinery/api/dashboards/ (the machinery home at /machinery, and at / when the product declares no home), then the files the product entry declares (scripts/project_api/static/).",
-        "Static FileResponse; dashboard freshness comes from client-side API calls.",
+        "Static files; machinery pages are served with the shared navigation rendered in; dashboard freshness comes from client-side API calls.",
         ("humans",),
         "Can hide missing page contracts unless dashboard files are scanned separately.",
         "medium",
@@ -720,6 +761,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "The machinery overview; area pages carry the full per-area tables and product pages belong to the product.",
         "medium if a stale reading is read as current",
         "keep as the machinery overview home",
+        label="Overview",
     ),
     PageContract(
         "subscriptions.html",
@@ -731,6 +773,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Full detail backing the Overview capacity summary.",
         "medium if a stale reading is read as current",
         "keep",
+        label="Subscriptions",
     ),
     PageContract(
         "fleet.html",
@@ -742,6 +785,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Combines live agent dispatch activity and Fleet Comms metrics on one area page.",
         "medium if a stale reading is read as current",
         "keep",
+        label="Fleet & comms",
     ),
     PageContract(
         "pull-requests.html",
@@ -753,6 +797,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Full per-repository tables backing the Overview merge queue summary.",
         "medium if a two-minute-old queue position is read as live",
         "keep",
+        label="Pull requests",
     ),
     PageContract(
         "milestones.html",
@@ -764,6 +809,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "Dedicated area page for fleet milestones.",
         "medium if a stale or partial collection is mistaken for complete live progress",
         "keep",
+        label="Milestones",
     ),
     PageContract(
         "model-stats.html",
@@ -780,8 +826,10 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "shows live usage, not outcomes.",
         "medium if a low-sample rate is read as a verdict",
         "keep",
+        label="Model statistics",
     ),
 )
+
 
 def all_route_contracts(product: ProductContribution | None = None) -> tuple[RouteContract, ...]:
     """Machinery route contracts, then the product's (the installed product when none is given)."""

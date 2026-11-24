@@ -26,9 +26,12 @@ host-load cache that only the product routes keep.
 
 from __future__ import annotations
 
+import errno
 import functools
+import os
+import stat
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
@@ -179,7 +182,67 @@ def load_product(context: MonitorContext, *, product_root: Path | None = None) -
     product = build_api(context)
     if not isinstance(product, ProductContribution):
         raise ProductEntryError(f"{name}.build_api returned {type(product).__name__}, not ProductContribution")
-    return product
+    return checked_product(product, product_root=root)
+
+
+def checked_product(
+    product: ProductContribution, *, product_root: Path | None = None
+) -> ProductContribution:
+    """``product`` with its static files and page contracts checked, as the Monitor serves and lists them.
+
+    Every declared static file must be a ``Path`` naming a regular file inside the
+    product root once symlinks are resolved, and the Monitor must be able to open it for
+    reading. The root is ``product_root`` (``load_product`` passes the root it imported
+    the product from), else ``config.PRODUCT_ROOT``, the root ``product_file`` serves
+    from; it is looked up only when the product declares static files. ``page_contracts``
+    must be a tuple of ``PageContract`` instances whose ``url``, ``file`` and ``label``
+    are plain strings. The first entry that is not raises ``ProductEntryError`` naming it, and the product is refused as a
+    whole, as ``load_product`` refuses a contribution of the wrong shape. The returned
+    contribution keeps its own copy of the checked static file map, so an entry added
+    to the product's map later is never served. A checked file that disappears later
+    is runtime state: its route answers 404.
+    """
+    # route_contracts imports this module, so a top-level import is a cycle.
+    from .route_contracts import PageContract  # noqa: PLC0415  # lazy-ok: import cycle
+
+    if not isinstance(product.static_files, Mapping):
+        raise ProductEntryError(f"static_files is {type(product.static_files).__name__}, not a mapping")
+    static: dict[str, Path] = {}
+    root: Path | None = None
+    for name, path in product.static_files.items():
+        if type(name) is not str or not isinstance(path, Path):
+            raise ProductEntryError(
+                f"static_files[{name!r}]: expected a str name and a Path, "
+                f"got {type(name).__name__} and {type(path).__name__}"
+            )
+        try:
+            # The route looks the root and the file up the same way (product_file).
+            if root is None:
+                product_dir = kernel_lookup(config.PRODUCT_ROOT if product_root is None else product_root)
+                if product_dir is None:
+                    raise FileNotFoundError(errno.ENOENT, "the product root is missing")
+                root = product_dir[1]
+            found = kernel_lookup(path)
+            usable = found is not None and stat.S_ISREG(found[0]) and found[1].is_relative_to(root)
+            if found is not None and usable:
+                # The type check reads metadata only; the route must also be able to open the file.
+                with found[1].open("rb"):
+                    pass
+        except OSError as exc:
+            raise ProductEntryError(f"static_files[{name!r}]: unusable: {type(exc).__name__}") from exc
+        if not usable:
+            raise ProductEntryError(f"static_files[{name!r}]: not a regular file inside the product root")
+        static[name] = path
+    if type(product.page_contracts) is not tuple:
+        raise ProductEntryError(f"page_contracts is {type(product.page_contracts).__name__}, not a tuple")
+    for index, page in enumerate(product.page_contracts):
+        if type(page) is not PageContract:
+            raise ProductEntryError(f"page_contracts[{index}]: {type(page).__name__}, not a PageContract")
+        for attr in ("url", "file", "label"):
+            value = getattr(page, attr, None)
+            if type(value) is not str:
+                raise ProductEntryError(f"page_contracts[{index}].{attr}: {type(value).__name__}, not a str")
+    return replace(product, static_files=MappingProxyType(static))
 
 
 def product_file(product: ProductContribution | None, name: str) -> Path | None:
@@ -188,19 +251,58 @@ def product_file(product: ProductContribution | None, name: str) -> Path | None:
     An extension-less name also matches its ``.html`` page, as the static
     catch-all always allowed. Only declared names match, so a traversal string
     never reaches the filesystem; the declared file must still be a regular
-    file inside the product root once symlinks are resolved.
+    file inside the product root once symlinks are resolved, as the kernel
+    finds it (``kernel_lookup``). A lookup that fails serves nothing.
     """
     if product is None:
         return None
     path = product.static_files.get(name)
-    if path is None and name and not Path(name).suffix:
+    if path is None and name and not has_suffix(name):
         path = product.static_files.get(f"{name}.html")
     if path is None:
         return None
-    resolved = path.resolve()
-    if not resolved.is_file() or not resolved.is_relative_to(config.PRODUCT_ROOT.resolve()):
+    try:
+        found = kernel_lookup(path)
+        root = kernel_lookup(config.PRODUCT_ROOT)
+    except OSError:
         return None
-    return resolved
+    if found is None or root is None or not stat.S_ISREG(found[0]) or not found[1].is_relative_to(root[1]):
+        return None
+    return found[1]
+
+
+def has_suffix(path: str) -> bool:
+    """Whether the last component of the URL path ``path`` has a file suffix, by one rule on every interpreter.
+
+    The rule ``PurePath.suffix`` applies on Python 3.12 and 3.13: a dot after the first
+    character of the name and before its last. Python 3.14 changed it (a trailing dot, and
+    leading dots), so the static route never asks ``suffix`` whether to try an ``.html`` alias.
+    """
+    name = Path(path).name
+    dot = name.rfind(".")
+    return 0 < dot < len(name) - 1
+
+
+def kernel_lookup(path: Path) -> tuple[int, Path] | None:
+    """``path``'s file mode and resolved path, as the kernel finds them, or ``None`` when it is absent.
+
+    The kernel answers first (``os.stat``, following symlinks): ENOENT and ENOTDIR mean
+    absent; any other failure (a symlink loop, a denied directory, an overlong name, a NUL)
+    raises ``OSError``. Python resolves the path (``resolve(strict=True)``) only after the
+    kernel has, so Python's handling of broken trees, which differs between 3.12 and 3.13+
+    (loops, ``..`` after a missing or non-directory component, long link chains), never
+    decides an answer. A failure there (the tree changed in between) raises ``OSError`` too.
+    """
+    try:
+        mode = os.stat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except ValueError as exc:
+        raise OSError(errno.EINVAL, f"unusable path: {exc}") from exc
+    try:
+        return mode, path.resolve(strict=True)
+    except RuntimeError as exc:  # Python 3.12 reports a symlink loop met here as RuntimeError.
+        raise OSError(errno.ELOOP, str(exc)) from exc
 
 
 _atlas: AtlasProvider | None = None
