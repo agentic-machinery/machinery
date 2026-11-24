@@ -116,13 +116,16 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monke
             replace(base, file="relative.html", url="relative"),
             replace(base, file="backslash.html", url="/\\example.invalid"),
             replace(base, file="space.html", url="/a b"),
-            # F3: the route's own lookup decides; URLs it answers with a machinery page are not product
-            # links, and a product page at a machinery-looking path the route leaves to it is one.
+            # F3: the route's own lookup decides, on the path a browser requests; URLs it answers with a
+            # machinery page are not product links, and a product page the route leaves to it is one.
             replace(base, file="slash.html", url="/fleet.html/"),
             replace(base, file="home-slash.html", url="/index.html/"),
             replace(base, file="encoded.html", url="/fleet%2Ehtml?tab=x#y"),
             replace(base, file="dots.html", url="/x/../fleet"),
             replace(base, file="machinery.html", url="/machinery.html"),
+            replace(base, file="reports.html", url="/a/%2e/%2E%2e/reports"),
+            replace(base, file="notes.html", url="/notes?folder=a\\b#s one"),
+            replace(base, file="again-notes.html", url="/x/../notes"),
             # F4: a file name or URL with nothing visible falls back to the next visible name.
             replace(base, file="----.html", url="/dashes"),
             replace(base, file="\u2067\u3164.html", url="/--"),
@@ -138,14 +141,17 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monke
             links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', body)
             assert [(href, label) for href, _, label in links[: len(machinery)]] == machinery, path
             # The product group follows, starts once, is never current, escapes its labels, keeps a
-            # readable one-line label, and skips repeats, machinery paths and non-path URLs.
+            # readable one-line label, and skips repeated destinations, machinery paths and non-path URLs.
             assert links[len(machinery) :] == [
                 ("/", ' class="product first"', "Home"),
                 ("/curriculum-dashboard.html", ' class="product"', "Curriculum dashboard"),
                 ("/labelled", ' class="product"', "Q&amp;A &quot;x&quot;"),
                 ("/blank", ' class="product"', "Blank"),
                 ("/bidi", ' class="product"', "ab c"),
+                ("/a b", ' class="product"', "Space"),
                 ("/machinery.html", ' class="product"', "Machinery"),
+                ("/a/%2e/%2E%2e/reports", ' class="product"', "Reports"),
+                ("/notes?folder=a\\b#s one", ' class="product"', "Notes"),
                 ("/dashes", ' class="product"', "Dashes"),
                 ("/--", ' class="product"', "/--"),
             ], path

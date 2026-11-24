@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, unquote
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -1745,8 +1745,10 @@ MACHINERY_HOME_PATHS = frozenset({"machinery", "machinery/"})
 _VERSION_PLACEHOLDER = "__MACHINERY_VERSION__"
 _MACHINERY_REPOSITORY_PLACEHOLDER = "__MACHINERY_REPOSITORY__"
 _NAV_PLACEHOLDER = "__MACHINERY_NAV__"
-# A same-site absolute path: browsers read "//host" and "/\\host" as another site, so neither is one.
-_NAV_PATH = re.compile(r"/(?![/\\])[^\s\\\x00-\x1f\x7f]*")
+# URL Standard: characters trimmed from both ends of a URL, and the spellings of "." and ".." segments.
+_URL_TRIM = "".join(map(chr, range(0x21)))
+_SINGLE_DOT_SEGMENTS = frozenset({".", "%2e"})
+_DOUBLE_DOT_SEGMENTS = frozenset({"..", ".%2e", "%2e.", "%2e%2e"})
 
 
 def _dashboard_file(dashboards_dir: Path, path: str, product: Any) -> Path | None:
@@ -1783,23 +1785,58 @@ def _dashboard_file(dashboards_dir: Path, path: str, product: Any) -> Path | Non
     return None
 
 
-def _served_by_product(url: str, dashboards_dir: Path, product: Any) -> bool:
-    """Whether a link to the declared ``url`` reaches something other than a machinery dashboard file.
+def _request_path(url: str) -> str | None:
+    """The path the static route receives when a browser follows a link to ``url``, or ``None``.
 
-    The URL must be a same-site absolute path. The path the route receives is the one a
-    browser requests (query and fragment dropped, dot segments resolved) after the server
-    decodes it; a URL with a dot segment is skipped rather than guessed. The answer is the
-    static route's own lookup, so the navigation and the route never disagree.
+    The browser side follows the URL Standard for a link on a same-site page: C0 control and
+    space characters are trimmed from both ends and tab and newline removed; the fragment
+    and query are dropped; a backslash is a slash; ``.`` and ``..`` segments, plain or
+    percent-encoded, are resolved. The server then percent-decodes the path, as uvicorn
+    does. ``None`` means the link does not name a fixed path on this site: it names another
+    host (``//host``) or a scheme, is relative to the current page, or is not text a page
+    can carry.
     """
-    if not _NAV_PATH.fullmatch(url):
-        return False
-    path = unquote(urlsplit(url).path)[1:]
-    if any(segment in {".", ".."} for segment in path.split("/")):
-        return False
     try:
-        return _dashboard_file(dashboards_dir, path, product) is None
-    except HTTPException:
-        return False
+        url.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    url = url.strip(_URL_TRIM).translate({0x09: None, 0x0A: None, 0x0D: None})
+    url = url.split("#", 1)[0].split("?", 1)[0].replace("\\", "/")
+    if not url.startswith("/") or url.startswith("//"):
+        return None
+    segments: list[str] = []
+    parts = url[1:].split("/")
+    for index, segment in enumerate(parts):
+        last = index == len(parts) - 1
+        if segment.lower() in _DOUBLE_DOT_SEGMENTS:
+            if segments:
+                segments.pop()
+            if last:
+                segments.append("")
+        elif segment.lower() in _SINGLE_DOT_SEGMENTS:
+            if last:
+                segments.append("")
+        else:
+            segments.append(segment)
+    return unquote("/".join(segments))
+
+
+def _product_link_path(url: str, dashboards_dir: Path, product: Any) -> str | None:
+    """The request path of a declared product ``url`` when the static route leaves it to the product.
+
+    ``None`` when the link does not name a fixed path on this site (``_request_path``),
+    or the route's own lookup answers it with a machinery dashboard file or refuses it, or
+    the lookup fails on the filesystem (on Python 3.12 a symlink loop raises
+    ``RuntimeError``; an overlong name raises ``OSError``). The failure then drops this one
+    link, never the page.
+    """
+    path = _request_path(url)
+    if path is None:
+        return None
+    try:
+        return path if _dashboard_file(dashboards_dir, path, product) is None else None
+    except (HTTPException, OSError, RuntimeError, ValueError):
+        return None
 
 
 def _machinery_nav_html(current_file: str | None, dashboards_dir: Path, product: Any) -> str:
@@ -1807,24 +1844,25 @@ def _machinery_nav_html(current_file: str | None, dashboards_dir: Path, product:
 
     The current page is the machinery page whose file is being served. A product page is
     listed only because the product declares it, so no page is named here that the
-    installed product does not serve. A declared URL is skipped when it repeats one
-    already listed or the static route does not leave it to the product (see
-    ``_served_by_product``): a product contract that reuses a machinery URL replaces the
-    contract, never the page.
+    installed product does not serve. A declared URL is skipped when the static route does
+    not leave it to the product (``_product_link_path``), or when it opens the same request
+    path as a link already listed: a product contract that reuses a machinery URL replaces
+    the contract, never the page.
     """
 
     def link(page: PageContract, attrs: str) -> str:
         return f'<a href="{html.escape(page.url, quote=True)}"{attrs}>{html.escape(page.nav_label)}</a>'
 
     links = [link(page, ' aria-current="page"' if page.file == current_file else "") for page in PAGE_CONTRACTS]
-    listed = {page.url for page in PAGE_CONTRACTS}
+    listed: set[str] = set()
     first_product = True
     for page in all_page_contracts(product):
-        if page in PAGE_CONTRACTS or page.url in listed:
+        if page in PAGE_CONTRACTS:
             continue
-        if not _served_by_product(page.url, dashboards_dir, product):
+        path = _product_link_path(page.url, dashboards_dir, product)
+        if path is None or path in listed:
             continue
-        listed.add(page.url)
+        listed.add(path)
         links.append(link(page, ' class="product first"' if first_product else ' class="product"'))
         first_product = False
     return "".join(links)
