@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import posixpath
 import re
+import stat
+import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -28,6 +32,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from lu_machinery.agent_runtime.sources_read_only import SERVER_RELATIVE_PATH, printable_text
 from lu_machinery.common.git_credentials import (
     SELECTOR_ENV,
     SelectorError,
@@ -37,9 +42,21 @@ from lu_machinery.common.git_credentials import (
     repository_registry,
     verify_authenticated_repository,
 )
+from lu_machinery.common.repo_root import PRODUCT_MARKER
+from lu_machinery.orchestration.product_policy import POLICY_REL
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "fleet_repos.yaml"
 _VALID_VISIBILITIES = frozenset({"public", "private"})
+# A row carrying the Learn Ukrainian slug must declare both product files: it never gets consumer defaults.
+_LEARN_UKRAINIAN_SLUG = "learn-ukrainian/learn-ukrainian.github.io"
+_PRODUCT_FILE_CANONICAL: dict[str, str] = {
+    "sources_server": SERVER_RELATIVE_PATH.as_posix(),
+    "admission_policy": POLICY_REL,
+}
+# Local config keys read to identify a checkout. An include or a URL rewrite can make Git use an
+# origin other than the literal remote.origin.url, so their presence refuses identification.
+_CHECKOUT_IDENTITY_KEYS = r"^(remote\.origin\.url|include\..*|includeif\..*|url\..*)$"
+_CHECKOUT_GIT_TIMEOUT_S = 10
 
 
 @dataclass(frozen=True)
@@ -53,6 +70,8 @@ class FleetRepo:
     repository_id: int | None = None
     visibility: str | None = None
     alternate_github: str | None = None
+    sources_server: str | None = None
+    admission_policy: str | None = None
 
     @property
     def owner(self) -> str:
@@ -128,6 +147,13 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
         repository_id = body.get("repository_id")
         visibility = body.get("visibility")
         alternate_github = body.get("alternate_github")
+        product_files = {field: body[field] for field in _PRODUCT_FILE_CANONICAL if field in body}
+        for field, value in product_files.items():
+            if not isinstance(value, str) or not value.strip():
+                raise FleetRepoError(f"fleet_repos[{key!r}].{field} must be a repo-relative file path")
+            canonical = _PRODUCT_FILE_CANONICAL[field]
+            if value != canonical:
+                raise FleetRepoError(f"fleet_repos[{key!r}].{field} must be {canonical!r}")
         if not isinstance(github, str) or "/" not in github:
             raise FleetRepoError(f"fleet_repos[{key!r}].github must be owner/name")
         if not isinstance(local_name, str) or not local_name.strip():
@@ -145,6 +171,10 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
                 raise FleetRepoError(
                     f"fleet_repos[{key!r}] with alternate_github requires repository_id and visibility"
                 )
+        if _LEARN_UKRAINIAN_SLUG in {github.lower(), str(alternate_github).lower()}:
+            for field in _PRODUCT_FILE_CANONICAL:
+                if field not in product_files:
+                    raise FleetRepoError(f"fleet_repos[{key!r}].{field} is required for Learn Ukrainian")
         if default:
             defaults += 1
         out[key] = FleetRepo(
@@ -157,6 +187,7 @@ def load_fleet_repos(path: Path | None = None) -> dict[str, FleetRepo]:
             repository_id=repository_id,
             visibility=visibility,
             alternate_github=alternate_github,
+            **product_files,
         )
     if defaults != 1:
         raise FleetRepoError("fleet_repos must mark exactly one default repo")
@@ -484,6 +515,285 @@ def pull_request_repository(payload: Any, *, scoped_repository: str | None = Non
     return next(iter(canonical)) if canonical else scoped_repository
 
 
+_FDINFO_DIR = Path("/proc/self/fdinfo")
+_KERNEL_UINT_RE = re.compile(rb"^(?:0|[1-9][0-9]{0,9})$")
+_KERNEL_INT32_MAX = 0x7FFFFFFF
+_KERNEL_UINT32_MAX = 0xFFFFFFFF
+# The octal escapes each kernel mountinfo writer emits (fs/proc_namespace.c): seq_dentry() and
+# seq_path_root() for the root and mount point; mangle() for the fs type and the default source;
+# seq_show_option() and filesystem writers for super options. Any other escape, and any raw
+# backslash, is non-canonical.
+_MOUNTINFO_ESCAPE_RE = re.compile(rb"\\([0-7]{3})")
+_MOUNTINFO_PATH_ESCAPED = frozenset(b" \t\n\\")
+_MOUNTINFO_MANGLE_ESCAPED = _MOUNTINFO_PATH_ESCAPED | frozenset(b"#")
+_MOUNTINFO_SUPER_OPTS_ESCAPED = _MOUNTINFO_MANGLE_ESCAPED | frozenset(b",=")
+# One fdinfo line: a canonical lowercase key, exactly ":\t", then printable non-space ASCII.
+_FDINFO_LINE_RE = re.compile(rb"([a-z][a-z_]*):\t([\x21-\x7e]+)")
+
+
+def _parse_kernel_int(token: bytes, *, max_value: int) -> int | None:
+    """Parse a bounded non-negative decimal kernel integer without unbounded ``int()`` conversion."""
+    if not _KERNEL_UINT_RE.fullmatch(token):
+        return None
+    value = int(token)
+    return value if value <= max_value else None
+
+
+def _decode_mountinfo_field(field: bytes, *, escaped: frozenset[int] = frozenset()) -> str | None:
+    """Decode one kernel-escaped ``mountinfo`` text field, or ``None`` unless it is canonical and printable.
+
+    Only the octal escapes the kernel writes for that field (*escaped*) are accepted; a raw
+    backslash or any other escape is refused. The decoded text must be non-empty and
+    :func:`~lu_machinery.agent_runtime.sources_read_only.printable_text`, so control bytes such as
+    CR, escaped tab or newline, format and separator characters, code points unassigned in
+    Unicode 15.0.0, and undecodable bytes (which :func:`os.fsdecode` maps to lone surrogates,
+    category ``Cs``) all refuse the field, with the same result on every supported Python.
+    """
+    out = bytearray()
+    pos = 0
+    for match in _MOUNTINFO_ESCAPE_RE.finditer(field):
+        literal = field[pos : match.start()]
+        byte = int(match.group(1), 8)
+        if b"\\" in literal or byte not in escaped:
+            return None
+        out += literal
+        out.append(byte)
+        pos = match.end()
+    if b"\\" in field[pos:]:
+        return None
+    out += field[pos:]
+    text = os.fsdecode(bytes(out))
+    return text if text and printable_text(text) else None
+
+
+def _canonical_mount_point(text: str | None) -> str | None:
+    """*text* if it is an absolute, normalized path as ``d_path()`` prints it, else ``None``."""
+    if text is None or not text.startswith("/") or text.startswith("//") or posixpath.normpath(text) != text:
+        return None
+    return text
+
+
+def _read_mount_table() -> dict[int, str] | None:
+    """Strictly parse ``/proc/self/mountinfo`` into ``{mount_id: mount_point}``, or ``None`` on any error.
+
+    Fail closed by class: one malformed, non-canonical or non-printable field in any line, a
+    duplicate mount ID, an empty line or a missing final newline refuses the whole table.
+    """
+    from lu_machinery.common import task_scratch
+
+    try:
+        raw = task_scratch._MOUNTINFO_PATH.read_bytes()
+    except OSError:
+        return None
+    if not raw or not raw.endswith(b"\n"):
+        return None
+    table: dict[int, str] = {}
+    for line in raw[:-1].split(b"\n"):
+        fields = line.split(b" ")
+        try:
+            sep = fields.index(b"-")
+        except ValueError:
+            return None
+        if sep < 6 or len(fields) != sep + 4:
+            return None
+        mount_id_b, parent_id_b, dev_b, root_b, mount_point_b = fields[:5]
+        mount_id = _parse_kernel_int(mount_id_b, max_value=_KERNEL_INT32_MAX)
+        major_b, colon, minor_b = dev_b.partition(b":")
+        mount_point = _canonical_mount_point(_decode_mountinfo_field(mount_point_b, escaped=_MOUNTINFO_PATH_ESCAPED))
+        fstype_b, source_b, super_opts_b = fields[sep + 1 :]
+        if (
+            mount_id is None
+            or mount_id in table
+            or mount_point is None
+            or _parse_kernel_int(parent_id_b, max_value=_KERNEL_INT32_MAX) is None
+            or not colon
+            or _parse_kernel_int(major_b, max_value=_KERNEL_UINT32_MAX) is None
+            or _parse_kernel_int(minor_b, max_value=_KERNEL_UINT32_MAX) is None
+            # Mount options and optional fields are fixed kernel tokens: never escaped.
+            or any(_decode_mountinfo_field(opt) is None for opt in fields[5:sep])
+            or _decode_mountinfo_field(root_b, escaped=_MOUNTINFO_PATH_ESCAPED) is None
+            or _decode_mountinfo_field(fstype_b, escaped=_MOUNTINFO_MANGLE_ESCAPED) is None
+            or _decode_mountinfo_field(source_b, escaped=_MOUNTINFO_MANGLE_ESCAPED) is None
+            or _decode_mountinfo_field(super_opts_b, escaped=_MOUNTINFO_SUPER_OPTS_ESCAPED) is None
+        ):
+            return None
+        table[mount_id] = mount_point
+    return table if "/" in table.values() else None
+
+
+def _read_fd_mount_id(fd: int) -> int | None:
+    """Strictly read the single ``mnt_id`` from ``/proc/self/fdinfo/<fd>``, or ``None`` on any error.
+
+    Fail closed by class: every line must be ``<key>:\\t<value>`` with a canonical lowercase key
+    (no padding or case variants) and a printable non-space ASCII value; a duplicate key of any
+    name, an empty line, a missing final newline, or anything but exactly one bounded ``mnt_id``
+    refuses the file.
+    """
+    try:
+        raw = (_FDINFO_DIR / str(fd)).read_bytes()
+    except OSError:
+        return None
+    if not raw.endswith(b"\n"):
+        return None
+    values: dict[bytes, bytes] = {}
+    for line in raw[:-1].split(b"\n"):
+        match = _FDINFO_LINE_RE.fullmatch(line)
+        if match is None or match.group(1) in values:
+            return None
+        values[match.group(1)] = match.group(2)
+    mount_id = values.get(b"mnt_id")
+    return None if mount_id is None else _parse_kernel_int(mount_id, max_value=_KERNEL_INT32_MAX)
+
+
+def _crosses_mount_boundary(resolved: Path) -> bool:
+    """Whether *resolved* or any ancestor below ``/`` crosses a mount boundary, or mount data is unavailable."""
+    table = _read_mount_table()
+    if table is None:
+        return True
+    mounts = frozenset(table.values())
+    if any(str(ancestor) in mounts for ancestor in (resolved, *resolved.parents) if ancestor.parent != ancestor):
+        return True
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        root_fd = os.open("/", flags)
+    except (OSError, ValueError):
+        return True
+    try:
+        try:
+            checkout_fd = os.open(resolved, flags)
+        except (OSError, ValueError):
+            return True
+        try:
+            root_mount_id = _read_fd_mount_id(root_fd)
+            checkout_mount_id = _read_fd_mount_id(checkout_fd)
+            if (
+                root_mount_id is None
+                or checkout_mount_id is None
+                or checkout_mount_id != root_mount_id
+                or table.get(root_mount_id) != "/"
+            ):
+                return True
+            try:
+                if os.fstat(checkout_fd).st_dev != os.lstat(resolved.parent).st_dev:
+                    return True
+            except (OSError, ValueError):
+                return True
+        finally:
+            os.close(checkout_fd)
+    finally:
+        os.close(root_fd)
+    return False
+
+
+def fleet_repo_for_checkout(root: Path, *, repos: Mapping[str, FleetRepo] | None = None) -> FleetRepo | None:
+    """The registered row whose GitHub ``origin`` the Git checkout at ``root`` declares, else ``None``.
+
+    Git reads the checkout's metadata, never Python: ``git rev-parse`` and ``git config`` run
+    through :func:`~lu_machinery.orchestration.execution_safe_git.run_git`, which strips every
+    inherited ``GIT_*`` variable, disables global and system config, and turns off
+    repository-configured hooks and filesystem monitors. Callers treat ``None`` as an
+    unregistered root that keeps every Learn Ukrainian requirement. Only a standalone primary
+    checkout is identified: Git must report ``root`` as the top of its work tree, ``root/.git``
+    as its shared Git directory, no mount boundary (cross-device or same-filesystem bind mount)
+    may lie at ``root`` or any ancestor below ``/`` (strictly verified against
+    ``/proc/self/mountinfo`` and ``/proc/self/fdinfo/<fd>``, failing closed on unreadable or
+    malformed mount data), and an
+    execution-safe ``rev-parse --show-toplevel`` on ``root``'s parent must traverse all ancestors
+    and fail with Git's exact ``not a git repository (or any of the parent directories): .git``
+    diagnostic (reading no parent index or tree). A linked worktree, a
+    separate Git directory, a bare repository's worktree, or any checkout nested inside another
+    Git repository (including an embedded-Git submodule) is never identified, because Git cannot
+    name the checkout whose curriculum marker would decide it. ``None`` is also returned when Git
+    fails, times out or cannot run; ``root`` carries ``PRODUCT_MARKER``, has a non-directory or
+    symlink marker ancestor, or cannot be checked for it; the config has an include or a URL
+    rewrite; ``origin`` has no URL or several; the URL names Learn Ukrainian; or the URL is not
+    exactly the HTTPS or SSH form of one registered slug (ASCII, case-insensitive, optional
+    ``.git``). Trust boundary: Learn Ukrainian stays strict when either ``PRODUCT_MARKER`` or a
+    Learn Ukrainian ``origin`` is present; simultaneous marker removal and ``origin`` rewriting
+    is out of scope for checkout-local identification.
+    """
+    # Lazy: execution_safe_git imports PyYAML, and this module is reached from dependency-free hooks.
+    from lu_machinery.orchestration.execution_safe_git import run_git
+
+    catalog = repos if repos is not None else _bundled_catalog()
+    # Pin C locale so Git's non-repository diagnostic is stable; run_git strips GIT_* and disables hooks.
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C", "LANGUAGE": ""}
+    try:
+        resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if resolved.parent == resolved:
+        # The process root has no parent to discover from and is itself a mount point: never a consumer.
+        return None
+
+    def git(*args: str, cwd: Path = resolved) -> subprocess.CompletedProcess[Any] | None:
+        try:
+            return run_git(
+                list(args),
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=_CHECKOUT_GIT_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+
+    # Two lstat-only refusals come before any Git subprocess, so dispatch admission's cheap precheck
+    # spawns nothing for the curriculum product or a non-checkout product root. Neither changes a
+    # result: a curriculum marker always gives None, and Git can report ``root/.git`` as the common
+    # directory only when it is a real directory (it reports a symlinked ``.git`` by its realpath).
+    marker = Path(PRODUCT_MARKER)
+    for rel_marker in (*reversed(marker.parents[:-1]), marker):
+        try:
+            st = os.lstat(resolved / rel_marker)
+        except FileNotFoundError:
+            break
+        except (OSError, ValueError):
+            return None
+        if rel_marker == marker or not stat.S_ISDIR(st.st_mode):
+            return None
+    try:
+        if not stat.S_ISDIR(os.lstat(resolved / ".git").st_mode):
+            return None
+    except (OSError, ValueError):
+        return None
+    layout = git("rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir")
+    lines = [] if layout is None or layout.returncode != 0 else layout.stdout.split(b"\n")
+    if len(lines) != 3 or lines[2] or [Path(os.fsdecode(line)) for line in lines[:2]] != [resolved, resolved / ".git"]:
+        return None
+    if _crosses_mount_boundary(resolved):
+        return None
+    parent_top = git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=resolved.parent)
+    if (
+        parent_top is None
+        or parent_top.returncode != 128
+        or parent_top.stdout
+        or parent_top.stderr != b"fatal: not a git repository (or any of the parent directories): .git\n"
+    ):
+        return None
+    config = git("config", "--no-includes", "--null", "--get-regexp", _CHECKOUT_IDENTITY_KEYS)
+    entries = [] if config is None or config.returncode != 0 else config.stdout.split(b"\0")[:-1]
+    key = b"remote.origin.url\n"
+    if len(entries) != 1 or not entries[0].startswith(key):
+        return None
+    url = entries[0][len(key) :].decode("ascii", errors="replace").lower()
+    matches = [
+        row
+        for row in catalog.values()
+        if any(
+            url == f"{prefix}{slug.lower()}{suffix}"
+            for slug in row.slugs
+            for prefix in ("https://github.com/", "ssh://git@github.com/", "git@github.com:")
+            for suffix in ("", ".git")
+        )
+    ]
+    if len(matches) != 1 or _LEARN_UKRAINIAN_SLUG in {slug.lower() for slug in matches[0].slugs}:
+        return None
+    return matches[0]
+
+
 def main(argv: list[str] | None = None) -> int:
     """Non-network preflight CLI for fleet repository selector verification."""
     parser = argparse.ArgumentParser(
@@ -529,6 +839,7 @@ __all__ = [
     "canonical_repository",
     "clear_repository_cache",
     "default_repo_key",
+    "fleet_repo_for_checkout",
     "load_fleet_repo_selector",
     "load_fleet_repos",
     "main",

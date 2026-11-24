@@ -10,7 +10,9 @@ the default path is in the product checkout ``scripts.common.repo_root.product_r
 selects (C-4746): ``LU_PRODUCT_ROOT`` when the operator sets it, else the checkout
 this package is in, so a dispatcher that runs the primary checkout's code
 (``scripts/dispatcher/primary.py``) also reads the primary checkout's policy. No
-command-line flag redirects it; the ``path`` argument exists for tests.
+command-line flag redirects it; the ``path`` argument exists for tests. A registered
+repository whose ``lu_machinery/config/fleet_repos.yaml`` row omits ``admission_policy``
+(a non-curriculum consumer) gets :func:`machinery_default_policy` instead of a file.
 
 Fail closed. :func:`load_policy` raises :class:`ProductPolicyError` (a
 ``ValueError``, so admission callers that already refuse on an invalid threshold
@@ -84,6 +86,7 @@ from lu_machinery.common.repo_root import ProductRootError, product_root
 SCHEMA = "learn-ukrainian.product-admission-policy"
 SCHEMA_VERSION = 1
 POLICY_REL = "scripts/curriculum/admission_policy.v1.json"
+MACHINERY_DEFAULT_ORIGIN = "lu_machinery:default"
 MAX_POLICY_BYTES = 64 * 1024
 DIGEST_FIELD = "content_sha256"
 
@@ -474,17 +477,60 @@ def parse_policy(document: Any, *, file_name: str | None = None) -> ProductPolic
     )
 
 
-def default_policy_path() -> Path:
-    """:data:`POLICY_REL` in the selected product checkout; refuse (``policy_missing``) without one."""
+def machinery_default_policy() -> ProductPolicy:
+    """The policy of a registered repository whose fleet row declares no ``admission_policy``.
+
+    No content agent types, Ukrainian content families, Ukrainian review seats or learner
+    payload paths, and the v1 default receipt floor. It never applies to a checkout that
+    :func:`default_policy_path` cannot identify, so Learn Ukrainian keeps its file.
+    """
+    return ProductPolicy(
+        origin=MACHINERY_DEFAULT_ORIGIN,
+        content_agent_types=frozenset(),
+        ukrainian_content_families=frozenset(),
+        ukrainian_review_seats=frozenset(),
+        learner_payload_paths=(),
+        review_receipts_by_author_family=MappingProxyType({}),
+        review_receipts_default=_V1_RECEIPTS_DEFAULT_FLOOR,
+    )
+
+
+def default_policy_path() -> Path | None:
+    """The selected product checkout's policy file, or ``None`` when its fleet row declares none.
+
+    :func:`~lu_machinery.orchestration.fleet_repos.fleet_repo_for_checkout` identifies the
+    checkout: a registered row that omits ``admission_policy`` gives ``None``; any other checkout
+    keeps :data:`POLICY_REL`, so a missing file still refuses. A declared value must be
+    :data:`POLICY_REL`, the origin every v1 policy carries. Refuse (``policy_missing``) without a
+    product checkout.
+    """
     try:
-        return product_root() / POLICY_REL
+        root = product_root()
     except ProductRootError as exc:
         raise ProductPolicyError("policy_missing", str(exc)) from None
+    # Lazy: fleet_repos imports PyYAML, and dependency-free hooks import this module.
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, fleet_repo_for_checkout
+
+    try:
+        repo = fleet_repo_for_checkout(root)
+    except FleetRepoError as exc:
+        raise ProductPolicyError("policy_unreadable", str(exc)) from None
+    if repo is not None and repo.admission_policy is None:
+        return None
+    if repo is not None and repo.admission_policy != POLICY_REL:
+        raise ProductPolicyError("policy_origin_mismatch", f"fleet_repos[{repo.key!r}].admission_policy must be {POLICY_REL!r}")
+    return root / POLICY_REL
 
 
 def load_policy(path: Path | None = None) -> ProductPolicy:
-    """Read and validate the product policy, or raise :class:`ProductPolicyError`."""
+    """Read and validate the product policy, or raise :class:`ProductPolicyError`.
+
+    Without ``path``, a repository whose fleet row declares no policy file gets
+    :func:`machinery_default_policy`; ``path`` is always read.
+    """
     target = default_policy_path() if path is None else Path(path)
+    if target is None:
+        return machinery_default_policy()
     return parse_policy(_decode(_read_bytes(target), target), file_name=target.name)
 
 
@@ -499,6 +545,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.path is None:
             args.path = default_policy_path()
+        if args.path is None:
+            raise ProductPolicyError("policy_missing", "this repository declares no admission policy file")
         if args.digest:
             document = _decode(_read_bytes(args.path), args.path)
             if not isinstance(document, dict):
@@ -521,6 +569,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "MACHINERY_DEFAULT_ORIGIN",
     "POLICY_REL",
     "SCHEMA",
     "SCHEMA_VERSION",
@@ -530,5 +579,6 @@ __all__ = [
     "canonical_digest",
     "default_policy_path",
     "load_policy",
+    "machinery_default_policy",
     "parse_policy",
 ]

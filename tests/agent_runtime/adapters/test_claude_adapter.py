@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,8 @@ from lu_machinery.agent_runtime.adapters.claude import (
     _mcp_server_names,
 )
 from lu_machinery.agent_runtime.errors import AgentUnavailableError
+from lu_machinery.agent_runtime.sources_read_only import printable_text
+from lu_machinery.agent_runtime.unicode_printable_gen import verify_runtime
 
 
 def test_claude_stream_single_turn_byte_identical() -> None:
@@ -147,3 +150,233 @@ def test_missing_native_claude_on_fake_path_refuses_without_package_runner(
     assert "@latest" not in message
     assert "npm install" not in message
     assert not runner_marker.exists()
+
+
+def _install_fake_claude_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from lu_machinery.review.isolation import CLAUDE_MIN_SUPPORTED_CLI_VERSION
+
+    fake_bin = tmp_path / "fake-claude-bin"
+    fake_bin.mkdir(exist_ok=True)
+    binary = fake_bin / "claude"
+    version = ".".join(str(part) for part in CLAUDE_MIN_SUPPORTED_CLI_VERSION)
+    binary.write_text(f"#!/bin/sh\nprintf '%s\\n' '{version} (Claude Code)'\n", encoding="utf-8")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+
+def _product_checkout(root: Path, origin: str | None) -> Path:
+    """A Git checkout with the shared Claude settings and no Sources server or admission policy."""
+    import shutil
+    import subprocess
+
+    from lu_machinery.orchestration.execution_safe_git import GIT, safe_git_env
+
+    settings = Path(__file__).resolve().parents[2] / "fixtures" / "product_tree" / "agents_extensions" / "shared"
+    (root / "agents_extensions" / "shared").mkdir(parents=True)
+    shutil.copyfile(settings / "settings.json", root / "agents_extensions" / "shared" / "settings.json")
+    subprocess.run([GIT, "-C", str(root), "init", "-q"], env=safe_git_env(), check=True, timeout=60)
+    if origin is not None:
+        subprocess.run([GIT, "-C", str(root), "remote", "add", "origin", origin], env=safe_git_env(), check=True, timeout=60)
+    return root
+
+
+def _read_only(root: Path, tool_config: dict | None) -> list[str]:
+    plan = ClaudeAdapter().build_invocation(
+        prompt="inspect",
+        mode="read-only",
+        cwd=root,
+        model=None,
+        task_id="consumer",
+        session_id=None,
+        tool_config=tool_config,
+    )
+    return list(plan.cmd)
+
+
+def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Normalize scratch-mount boundaries above ``root`` when pytest ``tmp_path`` sits on a separate mount."""
+    import os
+    import subprocess
+
+    from lu_machinery.orchestration import execution_safe_git, fleet_repos
+
+    real_run_git = execution_safe_git.run_git
+    real_mount_table = fleet_repos._read_mount_table
+    real_fd_mount_id = fleet_repos._read_fd_mount_id
+    parent = root.resolve().parent
+    scratch_ancestors = frozenset(str(p) for p in (parent, *parent.parents) if p.parent != p)
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    root_fd = os.open("/", flags)
+    try:
+        root_mount_id = real_fd_mount_id(root_fd)
+    finally:
+        os.close(root_fd)
+    parent_fd = os.open(parent, flags)
+    try:
+        parent_dev = os.fstat(parent_fd).st_dev
+        parent_mount_id = real_fd_mount_id(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+    def wrapped_mount_table() -> dict[int, str] | None:
+        table = real_mount_table()
+        return None if table is None else {mid: mp for mid, mp in table.items() if mp not in scratch_ancestors}
+
+    def wrapped_fd_mount_id(fd: int) -> int | None:
+        mount_id = real_fd_mount_id(fd)
+        if (
+            mount_id is not None
+            and parent_mount_id is not None
+            and root_mount_id is not None
+            and mount_id == parent_mount_id
+            and os.fstat(fd).st_dev == parent_dev
+        ):
+            return root_mount_id
+        return mount_id
+
+    def wrapped_run_git(args: list[str], *, cwd: Path, **kwargs: object):
+        result = real_run_git(args, cwd=cwd, **kwargs)
+        if (
+            Path(cwd).resolve() == parent
+            and "--show-toplevel" in args
+            and result.returncode == 128
+            and not result.stdout
+            and result.stderr.startswith(b"fatal: not a git repository (or any parent up to mount point ")
+        ):
+            return subprocess.CompletedProcess(
+                result.args,
+                128,
+                b"",
+                b"fatal: not a git repository (or any of the parent directories): .git\n",
+            )
+        return result
+
+    monkeypatch.setattr(fleet_repos, "_read_mount_table", wrapped_mount_table)
+    monkeypatch.setattr(fleet_repos, "_read_fd_mount_id", wrapped_fd_mount_id)
+    monkeypatch.setattr(execution_safe_git, "run_git", wrapped_run_git)
+
+
+def test_read_only_claude_loads_no_mcp_server_in_a_consumer_without_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class (F1/F4): in a registered consumer whose fleet row declares no Sources server, a
+    read-only Claude run crashes looking for the server, or leaves user, project or caller MCP
+    servers loaded with no Sources writer denies."""
+    _install_fake_claude_cli(tmp_path, monkeypatch)
+    consumer = _product_checkout(tmp_path / "renamed-consumer", "https://github.com/kube-dojo/kube-dojo.github.io")
+    _allow_eligible_parent_discovery(monkeypatch, consumer)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+
+    for tool_config in (None, {"reviewer_tools": True}, {"allowed_tools": "Read,mcp__sources__verify_word"}):
+        cmd = _read_only(consumer, tool_config)
+        assert cmd.count("--strict-mcp-config") == 1
+        assert cmd.count("--mcp-config") == 1
+        assert json.loads(cmd[cmd.index("--mcp-config") + 1]) == {"mcpServers": {}}
+        if "--disallowedTools" in cmd:
+            assert "sources" not in cmd[cmd.index("--disallowedTools") + 1]
+        if tool_config is not None:
+            assert "--allowedTools" in cmd
+            assert not any("mcp__" in rule.lower() for rule in cmd[cmd.index("--allowedTools") + 1].split(","))
+    explicit = _read_only(
+        consumer,
+        {"allowed_tools": "Read, Bash(git log --format=%H,%s), mcp__sources__*, mcp__*, mcp__other__tool, mcp*"},
+    )
+    assert explicit[explicit.index("--allowedTools") + 1] == "Read,Bash(git log --format=%H,%s)"
+    # Printable, NFKC-normalized non-ASCII qualifiers (Cyrillic, U+2019, accented Latin, and code points
+    # assigned after Unicode 3.2.0 that are printable in 15.0: U+20B4, U+2184, PR1300-F2) stay supported.
+    unicode_rules = (
+        "Read(/\u0434\u0430\u043d\u0456/\u0444\u2019.md) Read(/donn\u00e9es/a.md) Read(\u20b4\u2184),mcp__sources__verify_word"
+    )
+    unicode_path = _read_only(consumer, {"allowed_tools": unicode_rules})
+    assert unicode_path[unicode_path.index("--allowedTools") + 1] == unicode_rules.rsplit(",", 1)[0].replace(" ", ",")
+    for bad_allowed in (
+        "",
+        "   ",
+        ["Read"],
+        123,
+        "['Read']",
+        "(orphan),mcp__sources__verify_word",
+        "Read(file)Grep",
+        "Read(a)(b)",
+        "Read()",
+        "Read(   )",
+        ",Read",
+        "Read,",
+        "Read,,Grep",
+        "Bash (git status)",
+        "Read\x1cGrep",
+        "Read\tGrep",
+        "Read\nGrep",
+        "Read\u00a0Grep",
+        "Read\u2028Grep",
+        # Fail closed by class (PR1297-F2, CTO class decision): every Unicode 15.0 category C* and Z*
+        # except the ASCII space, the same answer on every supported Python; non-NFKC input; backslash
+        # escapes the tokenizer does not model.
+        "Read(notes-\U0001fae9.md)",  # Cn in Unicode 15.0 (So since 16.0): refused on every version
+        "Read(a\u00adb)",  # SOFT HYPHEN: Cf
+        "Read(\ud800)",  # Cs unpaired surrogate
+        "Read(\ue000)",  # Co private use
+        "Read(\u0378)",  # Cn unassigned
+        "Read(\u200b)",  # Cf zero-width space
+        "Read(\u202e)",  # Cf bidi override
+        "Read(\x7f)",  # Cc DEL
+        "Read(\x85)",  # Cc NEL
+        "Read(a\u3000b)",  # Zs ideographic space
+        "Read(a\u2029b)",  # Zp
+        "Read(\uff21)",  # fullwidth A (NFKC-compatibility form)
+        "Read(e\u0301)",  # decomposed (non-NFKC) accent
+        "Read(\ufb01le)",  # ligature (non-NFKC)
+        "Read\uff08x\uff09",  # fullwidth parentheses around a would-be qualifier
+        "Bash(echo \\)),mcp__sources__verify_word",  # backslash escape
+        "Read(a\\,b)",
+        "Read,mcp__sources__verify_word(x)",
+        "Read,mcp__other__tool(x)",
+        "Read,mcp__*(x)",
+        "mcp__sources__verify_word",
+        "mcp__*",
+        "Read(foo,mcp__sources__verify_word",
+    ):
+        with pytest.raises(ValueError):
+            _read_only(consumer, {"allowed_tools": bad_allowed})
+
+    docs = consumer / "docs.mcp.json"
+    docs.write_text('{"mcpServers":{"docs":{"command":"/bin/true"}}}', encoding="utf-8")
+    for tool_config in (
+        {"mcp_config_path": str(docs)},
+        {"mcp_config_path": "docs.mcp.json", "strict_mcp_config": True},
+        {"mcp_config_path": '{"mcpServers":{}}'},
+        {"reviewer_tools": True, "mcp_config_path": str(docs), "review_access": "full"},
+    ):
+        with pytest.raises(ValueError, match="declares no Sources server"):
+            _read_only(consumer, tool_config)
+
+
+def test_printable_text_gives_the_unicode_15_answer_and_refuses_an_unverified_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defect class (PR1300-F2): the shared printable baseline of the allowlist guard and the
+    mountinfo reader follows the running interpreter's Unicode table, or applies generated
+    corrections that are stale or keyed to the wrong table, so the same text classifies differently
+    on supported Pythons; or a table with no verified correction is consulted instead of refused."""
+    assert verify_runtime() is None
+    monkeypatch.setattr(unicodedata, "unidata_version", "99.0.0")
+    assert printable_text(" Read(a~b.md)")
+    for unverified in ("\u20b4", "\u0434", "\u00e9", "\x7f", "\x00"):
+        assert not printable_text(unverified)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [None, "https://github.com/learn-ukrainian/learn-ukrainian.github.io.git", "https://github.com/other/repo.git"],
+    ids=["no-origin", "learn-ukrainian-origin", "unregistered-origin"],
+)
+def test_read_only_claude_still_requires_the_sources_server_outside_a_registered_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str | None
+) -> None:
+    """Defect class (F1 fail closed): a Learn Ukrainian or unidentified checkout without its Sources
+    server launches a read-only run with no Sources writer denies."""
+    _install_fake_claude_cli(tmp_path, monkeypatch)
+    root = _product_checkout(tmp_path / "kube-dojo", origin)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+    with pytest.raises(FileNotFoundError):
+        _read_only(root, None)

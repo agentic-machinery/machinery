@@ -32,6 +32,18 @@
 # post-release PR in machinery). Omitting the key leaves release PRs without a
 # milestone; an invalid, closed, or ambiguous value refuses before publication.
 #
+# `sources_server` and `admission_policy` (optional) declare the product's Sources MCP
+# server and dispatch admission policy at the only locations machinery reads:
+# `.mcp/servers/sources/server.py` and `scripts/curriculum/admission_policy.v1.json`
+# (any other value refuses where the file is read). A row carrying the
+# Learn Ukrainian slug must declare both. A primary product checkout (never a linked
+# worktree) is matched to its row by its Git `origin`
+# (`fleet_repos.fleet_repo_for_checkout`); a row that omits
+# `sources_server` runs read-only Claude with no MCP server at all, and one that
+# omits `admission_policy` gets the machinery default policy (no Ukrainian seats or
+# learner payloads). A checkout that cannot be matched, or that carries the
+# curriculum marker, keeps both Learn Ukrainian files and refuses without them.
+#
 # Dual-slug transfer bridge (PLAN NEW-ORG-1122 A01):
 # - `alternate_github` (optional, owner/name) names the one exact alternate slug
 #   for a repository being transferred. Both `github` and `alternate_github`
@@ -76,6 +88,8 @@ repos:
     role: public-monorepo
     verdict_recorder: true
     default: true
+    sources_server: .mcp/servers/sources/server.py
+    admission_policy: scripts/curriculum/admission_policy.v1.json
   infra-private:
     github: learn-ukrainian/learn-ukrainian-infra-private
     alternate_github: agentic-machinery/machinery-infra

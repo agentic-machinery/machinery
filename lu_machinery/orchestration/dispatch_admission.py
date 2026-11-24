@@ -63,13 +63,18 @@ every check passes. Read-only dispatches are exempt.
   whose review receipts a Ukrainian head needs) are product data in
   ``scripts/curriculum/admission_policy.v1.json``, read only through
   :mod:`scripts.orchestration.product_policy`. Every :func:`evaluate`, of any
-  mode, and every write-mode :func:`precheck` loads it first; a missing,
+  mode, loads it first, and a write-mode :func:`precheck` loads it before it
+  admits (a host refusal comes first and needs no policy); a missing,
   renamed, truncated or incompatible policy raises
   :class:`~scripts.orchestration.product_policy.ProductPolicyError`, a
   ``ValueError``, so callers refuse exactly as they do for an invalid
   threshold and ``--force-admission`` cannot override it. The policy is read
   from the checkout this module runs from, so a dispatch that runs the
-  primary checkout's code reads the primary checkout's policy.
+  primary checkout's code reads the primary checkout's policy. A registered
+  non-curriculum repository whose ``fleet_repos.yaml`` row declares no
+  ``admission_policy`` gets the machinery default policy (no Ukrainian seats,
+  no learner payloads) instead; any checkout the catalog cannot identify
+  still needs the file.
 * **Slice use is reported, not enforced.** When ``lu-dispatch.slice`` is
   active, the admission line adds its current memory against ``MemoryMax``.
   An inactive or missing slice omits that clause. The floor and the caps
@@ -1837,20 +1842,24 @@ def precheck(mode: str, *, thresholds: Thresholds | None = None) -> AdmissionDec
     stop (#10776). ``None`` (an exempt mode,
     memory and load pass or are unknown, or a full disk) admits nothing:
     :func:`evaluate` under :func:`admission_lock` stays the decision. Invalid
-    threshold environment variables raise ``ValueError``; so does a missing or
-    incompatible product policy (``ProductPolicyError``, #12680).
+    threshold environment variables raise ``ValueError``. A missing or
+    incompatible product policy (``ProductPolicyError``, #12680) raises only on
+    the paths that return ``None``: a refusal is decided first, because locating
+    the policy can identify the checkout with Git subprocesses and a refused
+    dispatch is already blocked (PR1305-F4).
     """
     if mode not in WRITE_CAPABLE_MODES:
         return None
-    load_product_policy()
     limits = thresholds or load_thresholds()
     probe = probe_host()
     failures = host_failures(probe, limits)
     if not failures:
+        load_product_policy()
         observe_pressure(probe, limits, phase="precheck")
         return None
     disk_used = probe_disk().used_percent
     if disk_used is not None and disk_used >= limits.disk_refuse_used_percent:
+        load_product_policy()
         observe_pressure(probe, limits, phase="precheck")
         return None
     decision = AdmissionDecision(

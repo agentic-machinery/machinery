@@ -1273,3 +1273,599 @@ def test_healthy_test_host_never_reads_the_real_test_slot_pool(tmp_path, probe, 
     assert decision.admitted
     assert decision.slots is not None and decision.slots.skipped == "test host"
     assert "test-slot queue check skipped (test host)" in decision.summary()
+
+
+_KUBE_DOJO_URL = "https://github.com/kube-dojo/kube-dojo.github.io.git"
+_LEARN_UKRAINIAN_URL = "git@github.com:learn-ukrainian/learn-ukrainian.github.io.git"
+
+
+def _git(cwd: Path, *args: str) -> None:
+    import subprocess
+
+    from lu_machinery.orchestration.execution_safe_git import GIT, safe_git_env
+
+    env = {**safe_git_env(), "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid"}
+    env |= {"GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    subprocess.run([GIT, "-C", str(cwd), *args], env=env, check=True, capture_output=True, timeout=60)
+
+
+def _checkout(path: Path, *origins: str) -> Path:
+    """A real Git checkout at ``path`` with one commit and the given ``origin`` URLs."""
+    path.mkdir(parents=True)
+    _git(path, "init", "-q")
+    _git(path, "commit", "-q", "--allow-empty", "-m", "init")
+    for index, url in enumerate(origins):
+        _git(path, "config", *(["--add"] if index else []), "remote.origin.url", url)
+    return path
+
+
+def _mark_curriculum(root: Path) -> None:
+    marker = root / "curriculum" / "l2-uk-en" / "curriculum.yaml"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("levels: {}\n", encoding="utf-8")
+
+
+def _allow_eligible_parent_discovery(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Normalize scratch-mount boundaries above ``root`` when pytest ``tmp_path`` sits on a separate mount."""
+    import os
+    import subprocess
+
+    from lu_machinery.orchestration import execution_safe_git, fleet_repos
+
+    real_run_git = execution_safe_git.run_git
+    real_mount_table = fleet_repos._read_mount_table
+    real_fd_mount_id = fleet_repos._read_fd_mount_id
+    parent = root.resolve().parent
+    scratch_ancestors = frozenset(str(p) for p in (parent, *parent.parents) if p.parent != p)
+    flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    root_fd = os.open("/", flags)
+    try:
+        root_mount_id = real_fd_mount_id(root_fd)
+    finally:
+        os.close(root_fd)
+    parent_fd = os.open(parent, flags)
+    try:
+        parent_dev = os.fstat(parent_fd).st_dev
+        parent_mount_id = real_fd_mount_id(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+    def wrapped_mount_table() -> dict[int, str] | None:
+        table = real_mount_table()
+        return None if table is None else {mid: mp for mid, mp in table.items() if mp not in scratch_ancestors}
+
+    def wrapped_fd_mount_id(fd: int) -> int | None:
+        mount_id = real_fd_mount_id(fd)
+        if (
+            mount_id is not None
+            and parent_mount_id is not None
+            and root_mount_id is not None
+            and mount_id == parent_mount_id
+            and os.fstat(fd).st_dev == parent_dev
+        ):
+            return root_mount_id
+        return mount_id
+
+    def wrapped_run_git(args: list[str], *, cwd: Path, **kwargs: object):
+        result = real_run_git(args, cwd=cwd, **kwargs)
+        if (
+            Path(cwd).resolve() == parent
+            and "--show-toplevel" in args
+            and result.returncode == 128
+            and not result.stdout
+            and result.stderr.startswith(b"fatal: not a git repository (or any parent up to mount point ")
+        ):
+            return subprocess.CompletedProcess(
+                result.args,
+                128,
+                b"",
+                b"fatal: not a git repository (or any of the parent directories): .git\n",
+            )
+        return result
+
+    monkeypatch.setattr(fleet_repos, "_read_mount_table", wrapped_mount_table)
+    monkeypatch.setattr(fleet_repos, "_read_fd_mount_id", wrapped_fd_mount_id)
+    monkeypatch.setattr(execution_safe_git, "run_git", wrapped_run_git)
+
+
+def test_consumer_without_admission_policy_uses_fail_closed_machinery_default(tmp_path, probe, monkeypatch):
+    """Defect class (F5): a registered non-curriculum consumer without an admission policy file is refused
+    (policy_missing), or its default policy admits Ukrainian content or seats."""
+    from lu_machinery.orchestration import product_policy
+
+    consumer = _checkout(tmp_path / "renamed-kd", _KUBE_DOJO_URL)
+    _allow_eligible_parent_discovery(monkeypatch, consumer)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+    policy = adm.load_product_policy()
+    assert policy.origin == product_policy.MACHINERY_DEFAULT_ORIGIN
+    assert not adm.is_content_seat("curriculum-orchestrator")
+    assert not any(adm.ukrainian_content_family_allowed(f) for f in ("anthropic", "google", "openai"))
+    assert not adm.is_ukrainian_review_seat("agy", "google")
+    assert not adm.requires_ukrainian_review(["curriculum/l2-uk-en/a1/lesson.md", "src/index.ts"])
+    assert adm.required_review_receipts(["google"]) == frozenset({"google", "openai"})
+    assert adm.precheck("workspace-write", thresholds=_LIMITS) is None
+    assert adm.evaluate("workspace-write", tmp_path / "tasks", thresholds=_LIMITS).admitted
+
+    # An explicit path is always read.
+    with pytest.raises(product_policy.ProductPolicyError) as explicit_missing:
+        adm.load_product_policy(tmp_path / "missing.json")
+    assert explicit_missing.value.code == "policy_missing"
+
+
+def test_precheck_refuses_overloaded_markerless_git_checkout_without_git(tmp_path, probe, monkeypatch, configured_roots):
+    """Defect class (PR1305-F4): precheck spawns Git subprocesses (checkout identification for the
+    policy path) before it refuses an overloaded host, so its refusal-only path is no longer cheap."""
+    import subprocess
+
+    from lu_machinery.orchestration import product_policy
+
+    root = _checkout(tmp_path / "lu-origin", _LEARN_UKRAINIAN_URL)
+    policy = root / product_policy.POLICY_REL
+    policy.parent.mkdir(parents=True)
+    policy.write_bytes((configured_roots.product / product_policy.POLICY_REL).read_bytes())
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+    probe["probe"] = adm.HostProbe(mem_available_bytes=1 * _GIB, load1=40.0, cpu_count=8, proc_available=True)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("precheck spawned a subprocess before refusing an overloaded host")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    refused = adm.precheck("workspace-write", thresholds=_LIMITS)
+    assert refused is not None and not refused.admitted
+    assert refused.failures == tuple(adm.host_failures(probe["probe"], _LIMITS))
+
+
+def _unidentifiable_roots(tmp_path: Path) -> dict[str, Path]:
+    """Checkouts that must keep the Learn Ukrainian requirements: Git cannot tie each to one consumer row."""
+    roots = {
+        "no-git": tmp_path / "kube-dojo",
+        "learn-ukrainian-origin": _checkout(tmp_path / "lu-origin", _LEARN_UKRAINIAN_URL),
+        "unregistered-origin": _checkout(tmp_path / "other", "https://github.com/other/repo.git"),
+        "lookalike-origin": _checkout(tmp_path / "lookalike", _KUBE_DOJO_URL.replace("k", "K", 1)),
+        "two-origins": _checkout(tmp_path / "two", _KUBE_DOJO_URL, _LEARN_UKRAINIAN_URL),
+        "no-origin": _checkout(tmp_path / "bare-name"),
+        "include": _checkout(tmp_path / "include", _KUBE_DOJO_URL),
+        "url-rewrite": _checkout(tmp_path / "rewrite", _KUBE_DOJO_URL),
+        "marker": _checkout(tmp_path / "marked", _KUBE_DOJO_URL),
+        "malformed-config": _checkout(tmp_path / "malformed", _KUBE_DOJO_URL),
+    }
+    roots["no-git"].mkdir()
+    _git(roots["include"], "config", "include.path", "extra")
+    _git(roots["url-rewrite"], "config", "url.https://github.com/learn-ukrainian/.insteadOf", "https://github.com/kube-dojo/")
+    _mark_curriculum(roots["marker"])
+    with (roots["malformed-config"] / ".git" / "config").open("a", encoding="utf-8") as config:
+        config.write("[broken-header\n")
+    # Per-worktree config adds a second origin URL that Git itself reports.
+    worktree_config = _checkout(tmp_path / "wtconfig", _KUBE_DOJO_URL)
+    _git(worktree_config, "config", "extensions.worktreeConfig", "2")
+    _git(worktree_config, "config", "--worktree", "--add", "remote.origin.url", _LEARN_UKRAINIAN_URL)
+    roots["worktree-config-origin"] = worktree_config
+    # A linked worktree whose primary checkout carries the curriculum marker.
+    marked_primary = _checkout(tmp_path / "marked-primary", _KUBE_DOJO_URL)
+    _mark_curriculum(marked_primary)
+    _git(marked_primary, "worktree", "add", "-q", "-b", "wt", str(tmp_path / "marked-linked"))
+    roots["marked-primary"] = tmp_path / "marked-linked"
+    # Only a primary checkout is identified: a linked worktree's shared Git directory is not its own
+    # .git, and with Git metadata kept apart (--separate-git-dir, even in a directory named .git) Git
+    # cannot name the checkout that carries the marker (#1285 R1 and R2 F6).
+    consumer_linked = _checkout(tmp_path / "consumer-primary", _KUBE_DOJO_URL)
+    _git(consumer_linked, "worktree", "add", "-q", "-b", "wt", str(tmp_path / "consumer-linked"))
+    roots["linked-worktree"] = tmp_path / "consumer-linked"
+    for name, metadata in (("separate-git-dir", "separate-meta"), ("separate-dot-git", "storage/.git")):
+        original = tmp_path / f"{name}-original"
+        (tmp_path / name / metadata).parent.mkdir(parents=True)
+        _git(tmp_path, "init", "-q", f"--separate-git-dir={tmp_path / name / metadata}", str(original))
+        _git(original, "commit", "-q", "--allow-empty", "-m", "init")
+        _git(original, "config", "remote.origin.url", _KUBE_DOJO_URL)
+        _mark_curriculum(original)
+        _git(original, "worktree", "add", "-q", "-b", "wt", str(tmp_path / f"{name}-linked"))
+        roots[name] = original
+        roots[f"{name}-linked"] = tmp_path / f"{name}-linked"
+    # A .git symlink to the Git directory of a checkout that carries the marker.
+    (tmp_path / "symlinked-git").mkdir()
+    (tmp_path / "symlinked-git" / ".git").symlink_to(roots["marker"] / ".git")
+    roots["symlinked-git-dir"] = tmp_path / "symlinked-git"
+    # A subdirectory of a consumer is not a checkout top; a symlink resolves to its target.
+    consumer = _checkout(tmp_path / "consumer", _KUBE_DOJO_URL)
+    (consumer / "sub").mkdir()
+    roots["subdirectory"] = consumer / "sub"
+    (tmp_path / "link-to-lu").symlink_to(roots["learn-ukrainian-origin"])
+    roots["symlink-to-learn-ukrainian"] = tmp_path / "link-to-lu"
+    # A gitfile Git refuses (no space after "gitdir:") naming the consumer's own Git directory.
+    gitfile = tmp_path / "gitfile"
+    gitfile.mkdir()
+    (gitfile / ".git").write_text(f"gitdir:{consumer / '.git'}\n", encoding="utf-8")
+    roots["gitfile-no-space"] = gitfile
+    # An embedded-Git submodule inside an enclosing superproject (#1287 R1–R3 F2, R2 F5).
+    # Configure a hostile core.fsmonitor hook on the superprojects after commit; checkout
+    # identification must never execute it and must still fail closed when the parent index
+    # is corrupt or missing or the parent config is corrupt.
+    hook_marker = tmp_path / "fsmonitor-hook-ran"
+    hook = tmp_path / "evil-fsmonitor.sh"
+    hook.write_text(f"#!/bin/sh\ntouch '{hook_marker}'\necho '1'\n", encoding="utf-8")
+    hook.chmod(0o755)
+    for name, corrupt in (
+        ("embedded-git-submodule", None),
+        ("embedded-git-submodule-corrupt-index", "index"),
+        ("embedded-git-submodule-missing-index", "missing-index"),
+        ("embedded-git-submodule-corrupt-config", "config"),
+    ):
+        superproject = _checkout(tmp_path / f"super-{name}", _LEARN_UKRAINIAN_URL)
+        embedded_sub = _checkout(superproject / "sub-consumer", _KUBE_DOJO_URL)
+        _git(superproject, "add", "sub-consumer")
+        _git(superproject, "commit", "-q", "-m", "track embedded submodule")
+        _git(superproject, "config", "core.fsmonitor", str(hook))
+        if corrupt == "index":
+            (superproject / ".git" / "index").write_bytes(b"corrupt")
+        elif corrupt == "missing-index":
+            (superproject / ".git" / "index").unlink()
+        elif corrupt == "config":
+            with (superproject / ".git" / "config").open("a", encoding="utf-8") as cfg:
+                cfg.write("[broken-header\n")
+        roots[name] = embedded_sub
+    # A non-directory or symlink ancestor along PRODUCT_MARKER fails closed (#1287 R1 F3).
+    non_dir_ancestor = _checkout(tmp_path / "non-dir-ancestor", _KUBE_DOJO_URL)
+    (non_dir_ancestor / "curriculum").write_text("not-a-dir\n", encoding="utf-8")
+    roots["non-directory-marker-ancestor"] = non_dir_ancestor
+    symlink_ancestor = _checkout(tmp_path / "symlink-ancestor", _KUBE_DOJO_URL)
+    (symlink_ancestor / "curriculum").symlink_to(tmp_path / "missing-target")
+    roots["symlink-marker-ancestor"] = symlink_ancestor
+    return roots
+
+
+_UNIDENTIFIABLE = [
+    "no-git",
+    "learn-ukrainian-origin",
+    "unregistered-origin",
+    "lookalike-origin",
+    "two-origins",
+    "no-origin",
+    "include",
+    "url-rewrite",
+    "marker",
+    "malformed-config",
+    "worktree-config-origin",
+    "marked-primary",
+    "subdirectory",
+    "symlink-to-learn-ukrainian",
+    "gitfile-no-space",
+    "linked-worktree",
+    "separate-git-dir",
+    "separate-git-dir-linked",
+    "separate-dot-git",
+    "separate-dot-git-linked",
+    "symlinked-git-dir",
+    "embedded-git-submodule",
+    "embedded-git-submodule-corrupt-index",
+    "embedded-git-submodule-missing-index",
+    "embedded-git-submodule-corrupt-config",
+    "non-directory-marker-ancestor",
+    "symlink-marker-ancestor",
+]
+
+
+@pytest.mark.parametrize("case", _UNIDENTIFIABLE)
+def test_unidentified_checkout_keeps_the_learn_ukrainian_policy_requirement(tmp_path, monkeypatch, case):
+    """Defect class (F1/F3/F5): a checkout Git cannot tie to exactly one consumer row (or a curriculum
+    checkout) silently drops the admission policy requirement instead of refusing policy_missing."""
+    from lu_machinery.orchestration import fleet_repos, product_policy
+
+    root = _unidentifiable_roots(tmp_path)[case]
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(root))
+    # Inherited Git redirection must not substitute another repository's metadata.
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "consumer" / ".git"))
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'remote.origin.url'='{_KUBE_DOJO_URL}'")
+    assert fleet_repos.fleet_repo_for_checkout(root) is None
+    with pytest.raises(product_policy.ProductPolicyError) as exc_info:
+        adm.evaluate("read-only", tmp_path / "tasks")
+    assert exc_info.value.code == "policy_missing"
+    assert not (tmp_path / "fsmonitor-hook-ran").exists()
+
+
+def test_linked_consumer_worktree_fails_closed_with_typed_reason(tmp_path, monkeypatch):
+    """Defect class (F8 primary-only contract): an ordinary linked worktree of a registered
+    consumer configured as LU_PRODUCT_ROOT silently receives consumer defaults instead of failing
+    closed with policy_missing and requiring the Sources server."""
+    from lu_machinery.agent_runtime.sources_read_only import (
+        SERVER_RELATIVE_PATH,
+        sources_server_path,
+        sources_tool_sets,
+    )
+    from lu_machinery.orchestration import fleet_repos, product_policy
+
+    primary = _checkout(tmp_path / "kd-primary", _KUBE_DOJO_URL)
+    linked = tmp_path / "kd-linked"
+    _git(primary, "worktree", "add", "-q", "-b", "wt", str(linked))
+
+    # Positive control: the consumer's primary checkout resolves to kube-dojo.
+    _allow_eligible_parent_discovery(monkeypatch, primary)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(primary))
+    identified = fleet_repos.fleet_repo_for_checkout(primary)
+    assert identified is not None and identified.key == "kube-dojo"
+    assert adm.load_product_policy().origin == product_policy.MACHINERY_DEFAULT_ORIGIN
+    assert sources_server_path() is None
+
+    # Mount boundaries fail closed at the checkout root, at any ancestor (including same-device
+    # bind mounts where st_dev matches and st_ino differs), on unreadable/malformed mountinfo
+    # or fdinfo metadata, on cross-device parent stat mismatch/error, and during parent discovery
+    # (PR1294-F2 / PR1297-F1).
+    import os
+    import subprocess
+    from types import SimpleNamespace
+
+    from lu_machinery.common import task_scratch
+    from lu_machinery.orchestration import execution_safe_git
+
+    resolved_primary = primary.resolve()
+    root_st = os.lstat("/")
+    real_lstat = os.lstat
+    real_run_git = execution_safe_git.run_git
+    for fake_table in (
+        {42: "/", 99: str(resolved_primary)},
+        {42: "/", 99: str(resolved_primary.parent)},
+        {},
+        None,
+    ):
+        with monkeypatch.context() as mp:
+            mp.setattr(fleet_repos, "_read_mount_table", lambda _t=fake_table: _t)
+            assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    for fake_fd_mount in (
+        lambda fd, _r=(root_st.st_dev, root_st.st_ino): 42 if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) == _r else 99,
+        lambda _fd: None,
+    ):
+        with monkeypatch.context() as mp:
+            mp.setattr(fleet_repos, "_read_mount_table", lambda: {42: "/"})
+            mp.setattr(fleet_repos, "_read_fd_mount_id", fake_fd_mount)
+            assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    # Parser-level and end-to-end refusal on raw malformed /proc/self/mountinfo and /proc/self/fdinfo files
+    # (including oversized 5,000-digit / out-of-range kernel IDs, PR1297-F1). Fail closed by class
+    # (PR1297-F4, CTO class decision): one non-canonical or non-printable field in ANY line, related or
+    # not (CR, control, bidi or non-ASCII separator characters, undecodable bytes, raw backslashes,
+    # non-kernel escapes, padding, non-normalized mount points), refuses the whole table.
+    valid_root_line = b"42 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+    oversized_id = b"9" * 5000
+
+    def _rec(mount_point=b"/other", *, opts=b"rw", optional=b"", fstype=b"ext4", source=b"/dev/sda1", sb=b"rw"):
+        return b" ".join([b"99 42 8:1 /", mount_point, opts, *([optional] if optional else []), b"-", fstype, source, sb]) + b"\n"
+
+    for idx, bad_mountinfo in enumerate(
+        (
+            valid_root_line + b"99 42 8:1\n",  # truncated record after valid root
+            valid_root_line + b"99 42 8:1 / /mnt\n",  # invalid 5-field record missing '-'
+            valid_root_line + b"42 1 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # duplicate mount id
+            valid_root_line + oversized_id + b" 42 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # >4300-digit id
+            valid_root_line + b"2147483648 42 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # >int32 max id
+            valid_root_line + b"099 42 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # non-canonical id (leading zero)
+            valid_root_line + _rec(b"/bad\\777"),  # invalid octal escape
+            valid_root_line + _rec(b"/bad\\101"),  # escape of a byte the kernel never escapes
+            valid_root_line + _rec(b"/bad\\x"),  # raw backslash
+            valid_root_line + _rec(b"/bad\\011tab"),  # escaped control byte
+            valid_root_line + _rec(b"/bad\\000"),  # escaped NUL
+            valid_root_line + _rec(b"/mnt/unrelated\xff"),  # undecodable path byte (PR1297-F3 reversed)
+            valid_root_line + _rec(b"/mnt/unrelated\rdir"),  # CR in path (PR1297-F3 reversed)
+            valid_root_line + _rec("/mnt/\u202ertl".encode()),  # bidi format character (Cf)
+            valid_root_line + _rec("/mnt/\u00a0nbsp".encode()),  # non-ASCII separator (Zs)
+            valid_root_line + _rec("/mnt/\U0001fae9".encode()),  # Cn in Unicode 15.0 (So since 16.0): refused everywhere
+            valid_root_line + _rec("/mnt/a\u00adb".encode()),  # SOFT HYPHEN: Cf, refused everywhere
+            valid_root_line + _rec(b"/mnt/hash\\043"),  # '#' escape the path writer never emits
+            valid_root_line + _rec(b"/mnt/"),  # non-normalized mount point
+            valid_root_line + _rec(b"/mnt//x"),
+            valid_root_line + _rec(b"/mnt/../x"),
+            valid_root_line + _rec(b"//mnt"),
+            valid_root_line + _rec(b"relative"),
+            valid_root_line + _rec(opts=b"rw\r"),  # CR in mount options (PR1297-F4)
+            valid_root_line + _rec(opts=b"rw\\054ro"),  # escape in an unescaped kernel field
+            valid_root_line + _rec(optional=b"shared:1\r"),  # CR in an optional field (PR1297-F4)
+            valid_root_line + _rec(optional=b"shared:1\x0b"),  # VT in an optional field
+            valid_root_line + _rec(fstype=b"ext4\r"),  # CR in fs type (PR1297-F4)
+            valid_root_line + _rec(source=b"/dev/sda1\r"),  # CR in source (PR1297-F4)
+            valid_root_line + _rec(sb=b"rw\r"),  # CR in super options (PR1297-F4)
+            valid_root_line + _rec(sb=b"rw,errors=\x1b"),  # ESC in super options
+            valid_root_line + b"99 42 8:1 / /other rw  - ext4 /dev/sda1 rw\n",  # double-space padding
+            valid_root_line + b" 99 42 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # leading padding
+            valid_root_line + b"99 42 8:1 / /other rw - ext4 /dev/sda1 rw \n",  # trailing padding
+            valid_root_line + b"99\t42 8:1 / /other rw - ext4 /dev/sda1 rw\n",  # tab separator
+            valid_root_line + b"\n",  # empty line
+            valid_root_line.rstrip(b"\n"),  # missing trailing newline
+            b"",
+        )
+    ):
+        fake_mi = tmp_path / f"mountinfo-{idx}"
+        fake_mi.write_bytes(bad_mountinfo)
+        with monkeypatch.context() as mp:
+            mp.setattr(task_scratch, "_MOUNTINFO_PATH", fake_mi)
+            assert fleet_repos._read_mount_table() is None, bad_mountinfo[-80:]
+            assert fleet_repos.fleet_repo_for_checkout(primary) is None
+            with pytest.raises(product_policy.ProductPolicyError) as bad_pol:
+                adm.load_product_policy()
+            assert bad_pol.value.code == "policy_missing"
+            assert sources_server_path() == primary / SERVER_RELATIVE_PATH
+    with monkeypatch.context() as mp:
+        mp.setattr(task_scratch, "_MOUNTINFO_PATH", tmp_path / "missing-mountinfo")
+        assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    # Canonical kernel encodings of unrelated mounts keep the consumer eligible: escaped space and
+    # backslash, literal '#' in paths, UTF-8 names (including code points assigned after Unicode 3.2.0
+    # and printable in 15.0, PR1300-F2), nsfs roots, deleted mount points, mangle()'s '#' escape in fs
+    # type and source (FUSE subtype and source), and escaped super-option commas.
+    real_mi_bytes = task_scratch._MOUNTINFO_PATH.read_bytes()
+    unrelated_valid_mi = tmp_path / "mountinfo-canonical-escapes"
+    unrelated_valid_mi.write_bytes(
+        real_mi_bytes
+        + b"999001 1 8:1 /src /mnt/with\\040space\\134slash rw - ext4 /dev/sda1 rw\n"
+        + "999002 1 0:4 net:[4026532617] /run/netns/дані rw shared:5 - nsfs nsfs rw\n".encode()
+        + b"999003 1 0:52 / /mnt/gone\\040(deleted) rw,relatime - overlay overlay rw,lowerdir=/a\\054b\n"
+        + b"999004 1 0:53 / /mnt/fuse#dir rw - fuse.sample\\043type sample\\043source rw,user_id=0\n"
+        + "999005 1 8:1 / /mnt/\u20b4\u2184 rw - ext4 /dev/sda1 rw\n".encode()
+    )
+    with monkeypatch.context() as mp:
+        mp.setattr(task_scratch, "_MOUNTINFO_PATH", unrelated_valid_mi)
+        parsed = fleet_repos._read_mount_table()
+        assert parsed is not None
+        assert parsed[999001] == "/mnt/with space\\slash"
+        assert parsed[999002] == "/run/netns/дані"
+        assert parsed[999003] == "/mnt/gone (deleted)"
+        assert parsed[999004] == "/mnt/fuse#dir"
+        assert parsed[999005] == "/mnt/\u20b4\u2184"
+        identified_with_unrelated = fleet_repos.fleet_repo_for_checkout(primary)
+        assert identified_with_unrelated is not None and identified_with_unrelated.key == "kube-dojo"
+    fake_fdinfo_dir = tmp_path / "fdinfo"
+    fake_fdinfo_dir.mkdir()
+    # Canonical kernel fdinfo parses, up to the int32 bound.
+    (fake_fdinfo_dir / "100").write_bytes(b"pos:\t0\nflags:\t012200000\nmnt_id:\t2147483647\nino:\t2\n")
+    with monkeypatch.context() as mp:
+        mp.setattr(fleet_repos, "_FDINFO_DIR", fake_fdinfo_dir)
+        assert fleet_repos._read_fd_mount_id(100) == 2147483647
+    for fd_num, bad_fdinfo in enumerate(
+        (
+            b"pos:\t0\nflags:\t012200000\nmnt_id:\t42\nmnt_id:\t99\nino:\t2\n",  # conflicting ids
+            b"pos:\t0\nmnt_id:\t42\nmnt_id:\t42\n",  # duplicate id
+            b"pos:\t0\npos:\t0\nmnt_id:\t42\n",  # duplicate unrelated key
+            b"pos:\t0\nmnt_id:\t42\n\x0bmnt_id:\t99\n",  # VT-padded key beside a canonical one (PR1297-F4)
+            b"pos:\t0\nmnt_id :\t42\n",  # padded key
+            b"pos:\t0\nMNT_ID:\t42\n",  # case variant key
+            b"pos:\t0\nmnt_id: 42\n",  # space instead of tab
+            b"pos:\t0\nmnt_id:\t 42\n",  # padded value
+            b"pos:\t0\nmnt_id:\t42\r\n",  # CR
+            b"pos:\t0\nmnt_id:\t042\n",  # non-canonical id
+            b"pos:\t0\n\nmnt_id:\t42\n",  # empty line
+            b"pos:\t\xff\nmnt_id:\t42\n",  # non-ASCII value
+            b"pos:\t0\nmnt_id:\tbad\n",  # non-integer id
+            b"pos:\t0\nino:\t2\n",  # missing mnt_id
+            b"pos:\t0\nmnt_id:\t42",  # missing trailing newline
+            b"pos:\t0\nmnt_id:\t" + oversized_id + b"\n",  # >4300-digit id
+            b"pos:\t0\nmnt_id:\t2147483648\n",  # >int32 max id
+            b"",
+        ),
+        start=101,
+    ):
+        (fake_fdinfo_dir / str(fd_num)).write_bytes(bad_fdinfo)
+        with monkeypatch.context() as mp:
+            mp.setattr(fleet_repos, "_FDINFO_DIR", fake_fdinfo_dir)
+            assert fleet_repos._read_fd_mount_id(fd_num) is None, bad_fdinfo
+    with monkeypatch.context() as mp:
+        mp.setattr(fleet_repos, "_FDINFO_DIR", fake_fdinfo_dir)
+        assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    for mode in ("cross-dev", "lstat-error"):
+        with monkeypatch.context() as mp:
+            def _fake_lstat(path, *, _mode=mode, _real=real_lstat, _parent=resolved_primary.parent):
+                if Path(path) == _parent:
+                    if _mode == "lstat-error":
+                        raise OSError("stat failed")
+                    st = _real(path)
+                    return SimpleNamespace(st_mode=st.st_mode, st_dev=st.st_dev + 1, st_ino=st.st_ino)
+                return _real(path)
+
+            mp.setattr(os, "lstat", _fake_lstat)
+            assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    with monkeypatch.context() as mp:
+        def _fake_mount_stop(args, *, cwd, **kw):
+            if Path(cwd) == resolved_primary.parent and "--show-toplevel" in args:
+                return subprocess.CompletedProcess(
+                    args,
+                    128,
+                    b"",
+                    b"fatal: not a git repository (or any parent up to mount point /mnt)\n"
+                    b"Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+                )
+            return real_run_git(args, cwd=cwd, **kw)
+
+        mp.setattr(execution_safe_git, "run_git", _fake_mount_stop)
+        assert fleet_repos.fleet_repo_for_checkout(primary) is None
+    # The process root is never a consumer, even when Git reports it as a registered standalone
+    # checkout: it has no parent to discover from and is itself a mount point (PR1294-F2 at "/").
+    with monkeypatch.context() as mp:
+        def _fake_root_checkout(args, *, cwd, **kw):
+            if "--show-toplevel" in args:
+                return subprocess.CompletedProcess(args, 0, b"/\n/.git\n", b"")
+            if "config" in args:
+                origin = b"remote.origin.url\n" + _KUBE_DOJO_URL.encode() + b"\0"
+                return subprocess.CompletedProcess(args, 0, origin, b"")
+            return real_run_git(args, cwd=cwd, **kw)
+
+        mp.setattr(execution_safe_git, "run_git", _fake_root_checkout)
+        mp.setattr(fleet_repos, "_read_mount_table", lambda: None)
+        assert fleet_repos.fleet_repo_for_checkout(Path("/")) is None
+
+    # Linked worktree of that same primary fails closed on both policy and Sources server.
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(linked))
+    assert fleet_repos.fleet_repo_for_checkout(linked) is None
+    with pytest.raises(product_policy.ProductPolicyError) as load_exc:
+        adm.load_product_policy()
+    assert load_exc.value.code == "policy_missing"
+    with pytest.raises(product_policy.ProductPolicyError) as eval_exc:
+        adm.evaluate("read-only", tmp_path / "tasks")
+    assert eval_exc.value.code == "policy_missing"
+    assert sources_server_path() == linked / SERVER_RELATIVE_PATH
+    with pytest.raises(FileNotFoundError):
+        sources_tool_sets()
+
+
+def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
+    """Defect class (F5 config validation): a malformed product file declaration, a declaration naming a
+    location machinery does not read, or a Learn Ukrainian row without both declarations is accepted."""
+    import yaml
+
+    from lu_machinery.agent_runtime.sources_read_only import sources_server_path
+    from lu_machinery.orchestration import fleet_repos, product_policy
+
+    lu_row = {
+        "github": "learn-ukrainian/learn-ukrainian.github.io",
+        "local_name": "learn-ukrainian",
+        "default": True,
+        "sources_server": ".mcp/servers/sources/server.py",
+        "admission_policy": "scripts/curriculum/admission_policy.v1.json",
+    }
+
+    def load(rows: dict) -> dict:
+        cfg = tmp_path / "fleet_repos.yaml"
+        cfg.write_text(yaml.safe_dump({"version": 1, "repos": rows}), encoding="utf-8")
+        fleet_repos.clear_repository_cache()  # the registry reader caches by path
+        return fleet_repos.load_fleet_repos(cfg)
+
+    load({"primary": lu_row})
+    for field in ("sources_server", "admission_policy"):
+        for bad in (None, "", " ", "\t\n", 123, ["x"]):
+            with pytest.raises(fleet_repos.FleetRepoError, match=field):
+                load({"primary": {**lu_row, field: bad}})
+        for bad_path in ("tools/server.py", "policy/admission_policy.v1.json", "typo"):
+            with pytest.raises(fleet_repos.FleetRepoError, match=f"{field} must be"):
+                load({"primary": {**lu_row, field: bad_path}})
+            with pytest.raises(fleet_repos.FleetRepoError, match=f"{field} must be"):
+                load(
+                    {
+                        "primary": {
+                            **lu_row,
+                            "github": "learn-ukrainian/renamed",
+                            "alternate_github": "learn-ukrainian/learn-ukrainian.github.io",
+                            "repository_id": 1,
+                            "visibility": "public",
+                            field: bad_path,
+                        }
+                    }
+                )
+        for github in ("learn-ukrainian/learn-ukrainian.github.io", "Learn-Ukrainian/LEARN-UKRAINIAN.github.io"):
+            with pytest.raises(fleet_repos.FleetRepoError, match=f"{field} is required"):
+                load({"primary": {**{k: v for k, v in lu_row.items() if k != field}, "github": github}})
+
+    # Read-time defense in depth: a row constructed with a non-canonical location refuses where read.
+    consumer = _checkout(tmp_path / "consumer", _KUBE_DOJO_URL)
+    _allow_eligible_parent_discovery(monkeypatch, consumer)
+    catalog = {
+        **load({"primary": lu_row}),
+        "kube-dojo": fleet_repos.FleetRepo(
+            key="kube-dojo",
+            github="kube-dojo/kube-dojo.github.io",
+            local_name="kube-dojo",
+            role="",
+            sources_server="tools/server.py",
+            admission_policy="policy/admission_policy.v1.json",
+        ),
+    }
+    monkeypatch.setattr(fleet_repos, "_bundled_catalog", lambda: catalog)
+    monkeypatch.setenv("LU_PRODUCT_ROOT", str(consumer))
+    with pytest.raises(ValueError, match="sources_server must be"):
+        sources_server_path()
+    with pytest.raises(product_policy.ProductPolicyError) as exc_info:
+        adm.load_product_policy()
+    assert exc_info.value.code == "policy_origin_mismatch"

@@ -239,6 +239,7 @@ Issue: #1184
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import os
@@ -247,6 +248,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Mapping, Sequence
 from functools import cache
 from pathlib import Path
@@ -266,7 +268,7 @@ from ..env_sanitize import (
 from ..errors import AgentUnavailableError
 from ..jsonl import jsonl_lines
 from ..result import ParseResult
-from ..sources_read_only import sources_tool_sets
+from ..sources_read_only import printable_text, sources_server_path, sources_tool_sets
 from ..tool_calls import normalize_tool_calls, parse_json_events
 from ._output_schema import json_value, load_output_schema, plan_output_schema, schema_metadata, structured_result
 from .base import InvocationPlan
@@ -604,6 +606,101 @@ def _sources_writer_denies(tools: tuple[str, ...]) -> list[str]:
     exact canonical rule stays first and does not depend on glob support.
     """
     return [*_sources_rules(tools), *(f"mcp__*__{name}" for name in tools)]
+
+
+_EMPTY_MCP_CONFIG = '{"mcpServers":{}}'
+_ALLOW_RULE_NAME_RE = re.compile(r"^[A-Za-z_*?][A-Za-z0-9_.*?-]*$")
+
+
+def _is_mcp_allow_rule(tool_lower: str) -> bool:
+    return (
+        tool_lower.startswith("mcp__")
+        or fnmatch.fnmatchcase(f"mcp__{SOURCES_MCP_SERVER}__x", tool_lower)
+        or fnmatch.fnmatchcase(f"mcp__{SOURCES_MCP_SERVER}", tool_lower)
+    )
+
+
+def _validate_allow_rule(rule: str) -> str:
+    """Validate one Claude allowlist rule (``Tool`` or ``Tool(qualifier)``) and return its lowercase tool name."""
+    if not rule:
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    if "(" not in rule and ")" not in rule:
+        if not _ALLOW_RULE_NAME_RE.fullmatch(rule):
+            raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+        return rule.lower()
+    open_idx = rule.find("(")
+    name = rule[:open_idx]
+    if open_idx <= 0 or not rule.endswith(")") or not _ALLOW_RULE_NAME_RE.fullmatch(name):
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    depth = 0
+    for idx, ch in enumerate(rule[open_idx:], start=open_idx):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0 or (depth == 0 and idx != len(rule) - 1):
+                raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    if depth != 0 or not rule[open_idx + 1 : -1].strip():
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    name_lower = name.lower()
+    if _is_mcp_allow_rule(name_lower):
+        raise ValueError("ClaudeAdapter: MCP allowed_tools rules do not accept specifiers")
+    return name_lower
+
+
+def _strip_mcp_allow_rules(raw: object) -> str:
+    """Drop MCP/Sources allow rules when a read-only run loads no MCP servers.
+
+    Fail closed by class before tokenizing: the list must satisfy
+    :func:`~lu_machinery.agent_runtime.sources_read_only.printable_text` (no Unicode ``C*`` or ``Z*``
+    character except the ASCII space, the same answer on every supported Python), be
+    NFKC-normalized, and hold no backslash (the tokenizer models no escape syntax, so an escape
+    could split differently in the CLI).
+    """
+    if not isinstance(raw, str):
+        raise ValueError("ClaudeAdapter: allowed_tools must be a string")
+    if not printable_text(raw) or "\\" in raw or not unicodedata.is_normalized("NFKC", raw):
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    if not raw.strip(" "):
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    rules: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    expect_rule = True
+    for ch in raw:
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            expect_rule = False
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+            buf.append(ch)
+        elif depth == 0 and ch == ",":
+            if expect_rule:
+                raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+            if buf:
+                rules.append("".join(buf))
+                buf.clear()
+            expect_rule = True
+        elif depth == 0 and ch == " ":
+            if buf:
+                rules.append("".join(buf))
+                buf.clear()
+        else:
+            buf.append(ch)
+            expect_rule = False
+    if depth != 0 or expect_rule:
+        raise ValueError("ClaudeAdapter: malformed allowed_tools rule list")
+    if buf:
+        rules.append("".join(buf))
+    kept = [rule for rule in rules if not _is_mcp_allow_rule(_validate_allow_rule(rule))]
+    if not kept:
+        raise ValueError(
+            "ClaudeAdapter: this repository declares no Sources server; allowed_tools contains no non-MCP tools"
+        )
+    return ",".join(kept)
 
 
 def _reviewer_mcp_config() -> str:
@@ -1071,7 +1168,19 @@ class ClaudeAdapter:
         # ``mcp__<server>__*``, and any allow rule in user or checkout
         # settings, whatever name the server is registered under. An unreadable server
         # declaration raises here rather than launching without the denies.
-        sources_readers, sources_writers = sources_tool_sets() if mode == "read-only" else ((), ())
+        sources_server = sources_server_path() if mode == "read-only" else None
+        sources_readers, sources_writers = sources_tool_sets() if sources_server is not None else ((), ())
+        no_sources_readonly = mode == "read-only" and sources_server is None and not review_isolation
+        if no_sources_readonly:
+            # The checkout's fleet row declares no Sources server, so no writer list exists to
+            # deny. Load no MCP server at all: user, project and plugin servers stay off, and a
+            # caller's config is refused rather than validated (any server could be Sources).
+            if tc.get("mcp_config_path"):
+                raise ValueError(
+                    "ClaudeAdapter: this repository declares no Sources server; a read-only run "
+                    "loads no MCP server and accepts no mcp_config_path"
+                )
+            cmd.extend(["--strict-mcp-config", "--mcp-config", _EMPTY_MCP_CONFIG])
         if mode == "danger":
             cmd.append("--dangerously-skip-permissions")
         elif ordinary_reviewer:
@@ -1088,7 +1197,7 @@ class ClaudeAdapter:
                     "ClaudeAdapter: an ordinary reviewer's MCP config is built by the harness; "
                     "mcp_config_path is accepted only for a formal full-access review attempt"
                 )
-            else:
+            elif sources_server is not None:
                 cmd.extend(["--strict-mcp-config", "--mcp-config", _reviewer_mcp_config()])
                 granted.extend(_sources_rules(sources_readers))
             cmd.extend(["--allowedTools", ",".join(dict.fromkeys(granted))])
@@ -1107,7 +1216,9 @@ class ClaudeAdapter:
         elif mcp_config_path and not review_isolation:
             cmd.extend(["--mcp-config", str(mcp_config_path)])
         if explicit_allowed_tools and not review_isolation:
-            cmd.extend(["--allowedTools", str(tc["allowed_tools"])])
+            raw_allowed = tc["allowed_tools"]
+            allowed = _strip_mcp_allow_rules(raw_allowed) if no_sources_readonly else str(raw_allowed)
+            cmd.extend(["--allowedTools", allowed])
 
         # Cache-warmth optimization (CC 2.1.98+)
         if cli_version and cli_version >= _EFFORT_MIN_VERSION:
