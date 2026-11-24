@@ -1173,24 +1173,73 @@ def test_sealed_acpx_receipt_exposes_participant_and_credential_bucket_sharing()
 
 
 @pytest.mark.usefixtures('configured_roots')
-@pytest.mark.parametrize("b_remaining", [0.0, 5.0], ids=["exhausted", "near-cap"])
-def test_codex_b_without_allowance_never_outranks_same_model_on_funded_account_a(b_remaining):
-    """Defect class: account-preference starvation. The drain-b-first rule routed every Sol
-    review of record to Codex account b while b's fresh reading was exhausted or near cap,
-    and the same model on account a, with allowance, was dropped, so reviews stalled."""
+@pytest.mark.parametrize(
+    ("b_reading", "snapshot_stale", "excluded"),
+    [
+        pytest.param(
+            {
+                "remaining_pct": 0.0,
+                "status_source": "weekly_pace",
+                "codexbar": {"weekly_remaining_pct": 0.0, "secondary_remaining_pct": 0.0},
+                "credit": {"state": credit_lane.CREDITS_EXHAUSTED},
+            },
+            False, True, id="monitor-exhausted",
+        ),
+        pytest.param({"remaining_pct": 0.0}, False, True, id="plan-exhausted"),
+        *(
+            pytest.param({"remaining_pct": 5.0, "codexbar": {window: 0.0}}, False, True, id=window)
+            for window in ("weekly_remaining_pct", "primary_remaining_pct", "secondary_remaining_pct")
+        ),
+        pytest.param({"credit": {"state": credit_lane.CREDITS_EXHAUSTED}}, False, True, id="credits-only"),
+        pytest.param(
+            {"scheduler": {"quota_remaining_pct": 0.0, "quota_stale": False}},
+            False, True, id="scheduler-exhausted",
+        ),
+        pytest.param(
+            {"scheduler": {"quota_remaining_pct": 0.0, "quota_stale": True}},
+            False, False, id="scheduler-stale",
+        ),
+        pytest.param({"remaining_pct": 5.0}, False, False, id="near-cap"),
+        pytest.param({"remaining_pct": 0.0}, True, False, id="snapshot-stale"),
+        pytest.param({"remaining_pct": 0.0}, None, False, id="snapshot-unknown"),
+        pytest.param({"remaining_pct": 0.0, "freshness": "stale_last_good"}, False, False, id="probe-stale"),
+        pytest.param({"remaining_pct": 0.0, "freshness": "unavailable"}, False, False, id="probe-unknown"),
+        pytest.param({"remaining_pct": 0.0, "status_source": "ledger_burn"}, False, False, id="dollar-ledger"),
+        pytest.param(
+            {"credit": {"state": credit_lane.CREDITS_EXHAUSTED,
+                        "evidence": {"credit_fetched_at": "2000-01-01T00:00:00Z"}}},
+            False, False, id="credit-stale",
+        ),
+        pytest.param({"remaining_pct": False}, False, False, id="invalid-allowance"),
+    ],
+)
+def test_codex_b_without_allowance_never_outranks_same_model_on_funded_account_a(
+    b_reading, snapshot_stale, excluded,
+):
+    """Fresh exhausted allowance must exclude the account before any ranking or pin."""
     inputs = ResolverInputs(
         author_model="claude-opus-5-5", risk="critical", claude_account=HOST_ACCOUNT,
         routing_snapshot={
-            "diagnostics": {"stale": False},
+            "diagnostics": {"stale": snapshot_stale},
             "agents": {"codex": {"status": "healthy", "remaining_pct": 84.0, **_FRESH_PROBE}},
-            "codex_accounts": {"codex:b": {"status": "near_cap", "remaining_pct": b_remaining, **_FRESH_PROBE}},
+            "codex_accounts": {"codex:b": {"status": "near_cap", **_FRESH_PROBE, **b_reading}},
         },
     )
     resolution = resolve_reviewer(inputs)
     b_row = next(item for item in resolution.trace if item.name == "openai_frontier_b")
-    assert b_row.capacity.near_cap and b_row.status == "eligible"
-    assert resolution.selected is not None and resolution.selected.name == "openai_frontier"
-    assert "--codex-account b-sub" not in resolution.selected.invocation
+    if excluded:
+        assert b_row.status == "excluded"
+        assert "exhausted" in b_row.reason
+        assert resolution.selected is not None and resolution.selected.name == "openai_frontier"
+        assert resolution.selected.concrete_model == b_row.concrete_model
+        pinned = resolve_reviewer(replace(
+            inputs, pinned_candidate="openai_frontier_b", pressure_override_reason="test pin",
+        ))
+        assert pinned.selected is None
+    else:
+        assert b_row.status in {"eligible", "selected"}
+        if b_reading.get("remaining_pct") == 5.0:
+            assert resolution.selected is not None and resolution.selected.name == "openai_frontier"
 
 
 @pytest.mark.usefixtures('configured_roots')
@@ -2177,10 +2226,19 @@ def test_near_cap_codex_does_not_require_credit_relief():
         "not-configured",
     ],
 )
-def test_near_cap_without_usable_credits_still_admits_sol(credit):
-    inputs = ResolverInputs(author_model="claude-opus-5-5", risk="high", routing_snapshot=_credit_codex(credit), claude_account=HOST_ACCOUNT)
+def test_near_cap_admits_sol_unless_credits_are_exhausted(credit):
+    snapshot = _credit_codex(credit)
+    snapshot["codex_accounts"] = {"codex:b": {"status": "healthy", "remaining_pct": 5.0, **_FRESH_PROBE}}
+    inputs = ResolverInputs(author_model="claude-opus-5-5", risk="high", routing_snapshot=snapshot, claude_account=HOST_ACCOUNT)
     result = evaluate_candidate(OPENAI_FRONTIER, inputs)
-    assert result.status == "eligible"
+    if credit and credit["state"] == credit_lane.CREDITS_EXHAUSTED:
+        assert result.status == "excluded"
+        assert "exhausted" in result.reason
+        selected = resolve_reviewer(inputs).selected
+        assert selected is not None and selected.name == "openai_frontier_b"
+        assert selected.concrete_model == result.concrete_model
+    else:
+        assert result.status == "eligible"
     assert result.credit is None
 
 

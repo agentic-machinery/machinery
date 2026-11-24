@@ -7,8 +7,8 @@ cross-family requirement by switching harness. Domain and data-egress
 exclusions are fail-closed: an unspecified or non-matching policy excludes
 a gated candidate, it does not admit it. Missing lane-health data is fail-open
 (no signal ≠ unhealthy, matching ``scripts/api/lane_health.py``'s convention),
-but an explicitly unhealthy route is unavailable. Usage does not exclude or
-rank reviewers. Claude retains its existing account cap protection.
+but an explicitly unhealthy route is unavailable. Fresh exhaustion excludes
+the observed Codex account. Claude retains its existing account cap protection.
 
 The model inventory, candidate routes, and risk ladders are loaded from the
 versioned ``scripts/config/model_catalog.yaml`` catalog at import time
@@ -1061,7 +1061,11 @@ def _evaluate_candidate(
     snapshot = inputs.routing_snapshot
     record = _route_record(candidate, snapshot, prefer_route=True)
     diagnostics = snapshot.get("diagnostics") if isinstance(snapshot, Mapping) else None
-    capacity = review_capacity(record or {}, diagnostics if isinstance(diagnostics, Mapping) else None)
+    capacity = review_capacity(
+        record,
+        diagnostics if isinstance(diagnostics, Mapping) else None,
+        codex_subscription=candidate.route == "codex",
+    )
     usage_status = str(record.get("status") or "").strip().lower()
     if health not in {"unhealthy", "degraded_telemetry"}:
         if candidate.route == "claude" and capacity.near_cap:
