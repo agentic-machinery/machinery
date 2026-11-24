@@ -227,9 +227,9 @@ ID and blocks. A real sibling outside the frozen obligation that the PR neither
 introduces, exposes nor worsens, or an unrelated discovery with those same
 properties, is a P3 `follow_up` with an owner. A hypothetical case without a
 plausible path needs no finding. A P0–P2 finding cites `sources` that show its
-trigger is reachable under the input contract
-([findings](../review-loop/references/policy.md#3-findings)); a trigger absent from
-the frozen input of a one-shot run is P3. Reviewers keep their own independent
+trigger is reachable under the input contract and the
+[threat model](../review-loop/references/policy.md#3-findings), which decides
+when a one-shot run's pinned bytes bound its input. Reviewers keep their own independent
 adversarial cases; the author's matrix narrows nothing.
 
 For `verify_review.py`, a structured reply may use bare schema-valid JSON or
@@ -264,10 +264,10 @@ Disposition guide, subject to this round's scope under the review budget:
   demonstrated P0–P2 regression against main. A reviewer who cannot establish
   reachability says so, and the author answers with a reproduction or a
   code-path proof.
-- **`follow_up`** — a real P3 that does not block: a pre-existing defect the
-  change does not expose or worsen, or a real sibling or unrelated discovery
-  outside the frozen obligation that the PR neither introduces, exposes nor
-  worsens ([findings](../review-loop/references/policy.md#3-findings)); track it
+- **`follow_up`** — a real P3 that does not block: a defect outside the frozen
+  obligation that the PR neither introduces, exposes nor worsens (a
+  pre-existing defect, a real sibling or an unrelated discovery)
+  ([findings](../review-loop/references/policy.md#3-findings)); track it
   with an owner. Style, naming, cleanup and "consider" items are not findings.
 - **`stop_and_escalate`** — fixing it would itself blow a breaker (Step 6):
   it changes the public/task contract, crosses an owner boundary, needs a

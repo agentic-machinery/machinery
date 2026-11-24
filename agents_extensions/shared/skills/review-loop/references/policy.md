@@ -65,8 +65,8 @@ Critical and high risk take Sol, Opus or Gemini 4 Neon High (NEON-SOLTIER-1120).
 - Only real defects block: wrong behaviour, data loss, security, broken contract. Style,
   naming, cleanup, diagnostics and "consider" items never block and are not posted as
   findings. A factual language error in learner-facing Ukrainian is a real defect.
-- Tag each finding New or Pre-existing. A pre-existing defect blocks only when the PR exposes
-  or worsens it; otherwise it becomes an issue. An unresolved security finding always blocks.
+- Tag each finding New or Pre-existing. A pre-existing defect outside the frozen obligation
+  blocks only when the PR exposes or worsens it; otherwise it becomes an issue. An unresolved security finding always blocks.
 - Report one finding per root cause and violated invariant; never repeat a posted finding. One
   representative case is sufficient unless another reachable case changes the impact or the
   required fix. A sibling that proves the same reachable P0–P2 failure survived the fix stays on

@@ -122,9 +122,9 @@ read-only dispatch (#8703; [accepted wording](../../review-loop/references/brief
    - `in_scope_blocker` — a P0–P2 finding whose trigger is reachable under the input
      contract ([findings](../../review-loop/references/policy.md#3-findings)), or a demonstrated
      P0–P2 regression against main;
-   - `follow_up` — a P3 with an owner: a pre-existing defect the change does not expose or
-     worsen, or a real sibling or unrelated discovery outside the frozen obligation that the PR
-     neither introduces, exposes nor worsens;
+   - `follow_up` — a P3 with an owner: a defect outside the frozen obligation that the PR
+     neither introduces, exposes nor worsens (a pre-existing defect, a real sibling or an
+     unrelated discovery);
    - `stop_and_escalate` — material contract ambiguity, or a fix that would trip a breaker.
 5. **Reviewer duties** — one finding per root cause and violated invariant, with one
    representative case unless another reachable case changes the impact or the required fix;
