@@ -19,8 +19,35 @@ class ReviewCapacity:
     hard_reason: str | None
 
 
-def review_capacity(record: Mapping[str, object], diagnostics: Mapping[str, object] | None = None) -> ReviewCapacity:
-    """Read allowance for diagnostics; only operational failures block every review lane."""
+def _codex_exhaustion_reason(
+    record: Mapping[str, object], remaining: float | None, max_age_s: float,
+) -> str | None:
+    """Read a Codex subscription's allowance from a fresh budget snapshot."""
+    scheduler = record.get("scheduler")
+    if isinstance(scheduler, Mapping) and scheduler.get("quota_stale", False) is False:
+        quota = scheduler.get("quota_remaining_pct")
+        if type(quota) in (int, float) and quota == 0:
+            return "Codex subscription allowance exhausted (0% scheduler quota remaining)"
+
+    native = record.get("codexbar")
+    has_probe = "freshness" in record or (isinstance(native, Mapping) and "freshness" in native)
+    if has_probe and credit_lane.probe_freshness(record, max_age_s)[0] != credit_lane.FRESH:
+        return None
+    if record.get("status_source") == "ledger_burn":
+        # The ledger's dollar cap is a different meter from the subscription.
+        remaining = credit_lane.plan_remaining_pct({**record, "remaining_pct": None})
+    if remaining is not None and remaining <= 0:
+        return "Codex subscription allowance exhausted (0% remaining)"
+    return None
+
+
+def review_capacity(
+    record: Mapping[str, object],
+    diagnostics: Mapping[str, object] | None = None,
+    *,
+    codex_subscription: bool = False,
+) -> ReviewCapacity:
+    """Read capacity, with a hard allowance check for an account-bound Codex seat."""
     remaining = credit_lane.plan_remaining_pct(record)
     try:
         policy = credit_lane.load_policy()
@@ -50,6 +77,8 @@ def review_capacity(record: Mapping[str, object], diagnostics: Mapping[str, obje
         hard_reason = "runtime headroom blocked"
     elif isinstance(scheduler, Mapping) and scheduler.get("capacity_exhausted"):
         hard_reason = "credential bucket has no unreserved concurrency slot"
+    elif codex_subscription and freshness == credit_lane.FRESH:
+        hard_reason = _codex_exhaustion_reason(record, remaining, max_age_s)
     return ReviewCapacity(
         remaining_pct=remaining,
         freshness=freshness if remaining is not None else credit_lane.UNKNOWN,
