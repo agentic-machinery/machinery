@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Clean-machine release drill for lu-machinery: install, run every consumer row, roll back, rerun.
 
-Run it with a plain CPython 3.12+ on Linux, with no machinery checkout anywhere on the machine.
+Run it on Linux with CPython 3.14+ for the release venv (the script itself runs on CPython 3.12+
+when ``--python`` selects CPython 3.14+), with no machinery checkout anywhere on the machine.
 ``--version`` and ``--rollback-to`` are required; there is no default release:
 
-    python3 -I drill.py all --version <release> --rollback-to <previous-release>
+    python3 -I drill.py all --version <release> --rollback-to <previous-release> \
+      --python "$(uv python find 3.14)"
 
 Replace the placeholders with version numbers, without angle brackets.
 
@@ -1755,14 +1757,23 @@ def bwrap_prefix(workdir: Path, roots: list[str]) -> list[str]:
     return [*argv, "--"]
 
 
+MIN_VENV_PYTHON = (3, 14)
+
+
 def resolve_interpreter(choice: str | None) -> str:
     """The real path of the base interpreter for the venv: this one, or ``--python`` found on PATH.
 
     A bare name is looked up on PATH, never against the current directory, and the interpreter
     itself reports its real base executable, so a venv or a symlink resolves to the installation
-    the sandbox must bind.
+    the sandbox must bind. The selected interpreter must be CPython 3.14+ to install the wheel.
     """
+    min_label = ".".join(str(part) for part in MIN_VENV_PYTHON)
     if choice is None:
+        if sys.version_info[:2] < MIN_VENV_PYTHON:
+            raise DrillError(
+                f"running interpreter Python {platform.python_version()} is older than Python {min_label}; "
+                f'pass --python "$(uv python find {min_label})" or run with Python {min_label}+'
+            )
         return base_interpreter()
     found = choice if os.sep in choice else shutil.which(choice)
     if not found or not os.path.isfile(found):
@@ -1771,7 +1782,7 @@ def resolve_interpreter(choice: str | None) -> str:
         )
     script = (
         "import json, os, sys; print(json.dumps([os.path.realpath(getattr(sys, '_base_executable', None) "
-        "or sys.executable), sys.version_info[:2] >= (3, 12)]))"
+        f"or sys.executable), sys.version_info[:2] >= {MIN_VENV_PYTHON!r}]))"
     )
     result = subprocess.run(  # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         [os.path.abspath(found), "-I", "-c", script],
@@ -1792,7 +1803,7 @@ def resolve_interpreter(choice: str | None) -> str:
     except (UnicodeDecodeError, ValueError, TypeError):
         raise DrillError(f"--python {choice!r} gave an unreadable report") from None
     if not new_enough:
-        raise DrillError(f"--python {choice!r} is older than Python 3.12")
+        raise DrillError(f"--python {choice!r} is older than Python {min_label}")
     return path
 
 
@@ -2054,7 +2065,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--python",
         default=None,
-        help="Base interpreter for the venv (default: this one, resolved)",
+        help="Base CPython 3.14+ interpreter for the venv (default: this one, resolved)",
     )
     parser.add_argument(
         "--no-strace",
@@ -2142,7 +2153,9 @@ def main(argv: list[str] | None = None) -> int:
         paths = build_world(workdir, base_py)
         home = paths["home"]
         py = venv / "bin" / "python"
-        if not py.exists():
+        if py.exists():
+            resolve_interpreter(str(py))
+        else:
             log(f"setup: venv from {base_py}")
             py = create_venv(base_py, venv, home)
         log(f"setup: install v{args.version}")
