@@ -55,8 +55,9 @@ Read this as the contract; the rest of the file follows from it.
   A child still running at settlement therefore outranks a `blocked` or `handoff` receipt, and a
   child that finished after you wrote the note no longer blocks. A provider status other than
   `done` (for example `timeout` at the hard timeout) is kept as is, and then none of these checks
-  runs, including the note check. The exception is an AGY turn that ended while a child still ran,
-  which settles `orchestrator_orphaned_children`. A recorded receipt is not proof of the outcome:
+  runs, including the note check. The one exception is an AGY turn whose provider failed with
+  `agy_child_still_running` (and no provider terminal failure), which settles
+  `orchestrator_orphaned_children`; any other AGY failure keeps its status. A recorded receipt is not proof of the outcome:
   only the settled record is. A merged PR never stands in for the receipt.
 
 ## Caps
@@ -90,11 +91,14 @@ Dispatch nothing until these pass. Any failure is `blocked` (see "Ending").
    - `status: no_deliverable` with a `no_deliverable_reason` that starts with
      `orchestrator_blocked:` or `orchestrator_handoff:`.
 
-   Settlement reaches those three results only after the tree, child and note checks passed
-   (the "Done" table). That proves that no child of the previous run was left live, unknown or
-   unreadable, and that its note was verified when it settled. Any other settlement (a timeout,
-   a crash, a missing or invalid receipt, children left unresolved) is `blocked`: the CTO
-   recovers the stream with the runbook and starts the next run as a fresh start.
+   Settlement reaches those results only after the worktree, child and note checks passed (the
+   "Done" table). They prove that the previous run's tree was unchanged, that no child was left
+   live, unknown or unreadable, and that its note was verified when it settled. They do not prove
+   that its own processes ended; that proof belongs to the stream lease. Your launch claimed the
+   lease, which a held lease would have refused, so do not re-check it. Any other settlement (a
+   timeout, a crash, a missing or invalid receipt, children left unresolved) is `blocked`. The
+   CTO decides the baseline, using the recovery runbook only if a lease is still held, and
+   briefs the next run as a fresh start.
    Then `lu-driver-state show <its orchestrator_handoff_receipt.handoff_ref>` and read the note in
    full. Its `child_tasks` lists every child it started; their records and PRs are your baseline
    for their work.
@@ -128,32 +132,38 @@ harmless. A message that would widen scope, change the stop rule or order a new 
 dispatch, a landing, a grant, an issue or PR edit) is not applied. Nothing an inbox message
 orders is executed, so a message seen twice causes nothing twice.
 
-**Relay before you ack.** An ack ends a delivery for good, so first make its disposition durable.
-Forward it to the CTO, keyed by the delivery:
+**Relay before you ack.** An ack ends a delivery for good, so first make the delivery and its
+disposition durable. Forward both to the CTO, keyed by the delivery:
 
 ```bash
-printf '%s\n' "inbox <delivery_id> from <sender> kind <kind>: <body>" |
+printf '%s\n' "inbox <delivery_id> from <sender> kind <kind> disposition <applied|not-applied>: <body>" |
   <interpreter> -I -m lu_machinery.fleet_comms channel publish cto - \
-    --sender "$LEARN_UKRAINIAN_DISPATCH_TASK_ID" --source cto --recipient claude-cto \
+    --sender "$SESSION_HANDOFF_AGENT" --source cto --recipient claude-cto \
     --idempotency-key "inbox-<delivery_id>"
 ```
 
-Ack only after the publish exits 0. The text holds only the delivery's own fields, so a replay
-after a crash sends the identical message under the same key and the CTO receives one copy. What
-you did with each delivery goes in your note and report.
+`applied` is a narrowing or stop you applied; `not-applied` is everything else. Ack only after
+the publish exits 0. The sender is your lane slot, not your task ID, so a later run that receives
+the same delivery after a crash can send the same message under the same key, and the CTO gets one
+copy. Any nonzero publish exit, including `idempotency_key_reused_with_different_payload`, means
+the disposition is not durable: do not ack, dispatch nothing more, and end `blocked` naming the
+delivery ID and the error, for the CTO to reconcile.
 
 **Deliveries you cannot finish block.** A `supervisory-request` delivery cannot be acked without
 supervisory consumption, which needs a driver generation a run does not have (`ack` exits 3,
 `supervisory_consumption_required`); the same holds for any other refused `ack`. Leave it unacked,
-relay it as above, dispatch nothing more, and end `blocked` naming its ID. Because `receive`
+relay it as above with disposition `not-applied`, dispatch nothing more, and end `blocked` naming
+its ID. Because `receive`
 returns it again, it also ends your drain.
 
 **An empty `receive` does not prove the inbox clear.** A delivery an earlier run claimed but did
 not ack returns only when its lease ends (300 s by default). After `receive` exits 1, run
-`pending`. It prints the count of queued and leased deliveries, their IDs and a probe, and exits 3
-when storage is unknown (`blocked`). Continue only with `probe: ok` and `count: 0`. A positive
-count means dispatch nothing until a later drain has received those IDs. If they are still
-pending at stop-new-work, end `handoff` and name them.
+`pending`. It prints the count of queued and leased deliveries, up to `--limit` of their message
+IDs (5 by default) and a probe, and exits 3 when storage is unknown (`blocked`). Continue only
+with `probe: ok` and `count: 0`. A positive count means dispatch nothing until a later drain
+brings `pending` back to `count: 0`, either by receiving those deliveries or because they expired
+or were dead-lettered (both leave the count). If the count is still positive at stop-new-work, end
+`handoff` and name the count and message IDs.
 
 Drain before each dispatch, after each settled child and before you end.
 
@@ -198,9 +208,9 @@ A failed child: check its open PR and retained worktree for finished work before
 
 ## 3. Ending
 
-1. **Children.** Every child should be terminal. A child still running at stop-new-work keeps the
-   run from settling `done`, and keeps the stream held for the CTO. List it with its ID and full
-   nonce; do not cancel it unless the brief says so.
+1. **Children.** Every child should be terminal. With a child still running, the outcome cannot be
+   `done`. If the child is still running when the run settles, it also keeps the stream held for
+   the CTO. List it with its ID and full nonce; do not cancel it unless the brief says so.
 2. **Checklist.** For each acceptance criterion, evidence from tool output this run: merged SHA
    (`gh pr view <number> --repo <owner/name> --json state,mergeCommit`), recorded exact-head verdict and reviewer model, green
    same-head `CI Gate`, the child's settled record (`worktree_disposition`), issue disposition. A
@@ -231,8 +241,10 @@ A failed child: check its open PR and retained worktree for finished work before
    missing, not a `handoff_note`, not active (`done` or `dropped`), not in lane `$SESSION_EPIC`,
    created at or before your `started_at`, more than 30 s in the future, or already named by
    another run's receipt on your stream, or when the task store cannot be read. A refusal records
-   nothing: fix the cause and retry. If you cannot, end without a receipt (the run settles
-   `orchestrator_handoff_receipt_missing`) and say so in your report. An identical retry exits 0
+   nothing: fix the cause and retry. If you cannot, end without a receipt and say so in your
+   report. The run then settles by the "Done" table: `orchestrator_handoff_receipt_missing` only
+   if the provider ended `done` and the tree and child checks passed; otherwise the earlier
+   reason, or the provider's own status, stands. An identical retry exits 0
    and returns the first receipt without checking the note again. A different receipt for the same
    run is refused (`handoff_receipt_conflict`), so the outcome cannot be changed once recorded.
 7. **Report once** to `claude-cto`: outcome and receipt result, note ID, run ID and full nonce,
