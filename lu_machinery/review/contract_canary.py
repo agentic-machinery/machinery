@@ -303,11 +303,97 @@ def record(task_id: str, root: Path | None = None) -> Path:
 
 
 _RUN_MODELS = {
-    "codex": ("gpt-6.2-sol", "--codex-account", "b-sub"),
-    "claude": ("claude-sonnet-5-5", "--claude-account", "b"),
-    "cursor": ("grok-4.7-high",),
-    "agy": ("gemini-4-neon-high",),
+    "codex": "gpt-6.2-sol",
+    "claude": "claude-sonnet-5-5",
+    "cursor": "grok-4.7-high",
+    "agy": "gemini-4-neon-high",
 }
+
+# Routes whose allowance is metered per account, and the dispatch flag that names the account.
+# The account is chosen per run from the live allowance reading (``_run_accounts``), never pinned:
+# a pinned account at 0% failed the v0.1.67 cut on the codex route while account a had allowance.
+_ACCOUNT_FLAGS = {"codex": "--codex-account", "claude": "--claude-account"}
+
+
+class NoAllowance(CanaryError):
+    """No account of a metered route shows allowance, so its canary could only hit a usage limit."""
+
+    def __init__(self, route: str, readings: Sequence[tuple[str, str]]) -> None:
+        self.route = route
+        self.readings = tuple(readings)
+        accounts = "; ".join(f"{label}: {reading}" for label, reading in self.readings)
+        super().__init__(f"no-allowance: route {route} has no account with allowance ({accounts})")
+
+
+def _allowance_text(capacity: Any) -> str:
+    """One account's reading, as the operator needs it to see why it was or was not used."""
+    if capacity.remaining_pct is None:
+        return f"no allowance reading ({capacity.fallback_reason})"
+    text = f"{capacity.remaining_pct:g}% remaining, {capacity.freshness}"
+    if capacity.near_cap:
+        text += ", at or below the near-cap reserve"
+    elif capacity.fallback_reason:
+        text += f" ({capacity.fallback_reason})"
+    return text
+
+
+def _account_readings(route: str, snapshot: Mapping[str, Any]) -> list[tuple[str, Any]]:
+    """Each account the route's canary model can run as, account b first, with its review allowance.
+
+    Codex accounts are the catalog's formal seats for the model (one per ``--codex-account``);
+    Claude accounts are the subscription logins, each read through its own account-bound view.
+    API-key accounts have no plan meter, so they never show allowance and are not candidates.
+    The reading is the reviewer resolver's own (``_route_record`` and ``review_capacity``).
+    """
+    from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
+    from lu_machinery.fleet.claude_account_lane import ClaudeAccount, bind_snapshot
+    from lu_machinery.review.capacity import review_capacity
+    from lu_machinery.review.reviewer_scheduler import _route_record, codex_account_key
+    from lu_machinery.review.role_resolution import invocation_codex_account
+
+    model = _RUN_MODELS[route]
+    diagnostics = snapshot.get("diagnostics")
+    diagnostics = diagnostics if isinstance(diagnostics, Mapping) else None
+    seats = [candidate for candidate in _formal_candidates().get(route, []) if candidate.concrete_model == model]
+    readings: list[tuple[str, str, Any]] = []  # (dispatch label, account letter, capacity)
+    if route == "codex":
+        for candidate in seats:
+            record = _route_record(candidate, snapshot, prefer_route=True)
+            letter = str(codex_account_key(candidate)).removeprefix("codex:")
+            readings.append((invocation_codex_account(candidate.invocation), letter, review_capacity(record, diagnostics)))
+    elif route == "claude" and len(seats) == 1:
+        for label in CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS:
+            bound = bind_snapshot(snapshot, account=ClaudeAccount(label, "explicit"))
+            readings.append((label, label, review_capacity(_route_record(seats[0], bound, prefer_route=True), diagnostics)))
+    if not readings:
+        raise CanaryError(f"route {route}: the catalog has no formal reviewer seat for {model}")
+    # Account b drains first among accounts with allowance, as the reviewer resolver orders them (#1328).
+    return [(label, capacity) for label, letter, capacity in sorted(readings, key=lambda item: item[1] != "b")]
+
+
+def _run_accounts(snapshot: Mapping[str, Any] | None) -> dict[str, tuple[str, str]]:
+    """The account flag and label each metered route's canary runs as, or a typed refusal.
+
+    An account is used only with observed allowance: a fresh reading above the near-cap
+    reserve, the rule the reviewer resolver applies to same-model Codex accounts (#1328).
+    Unknown, stale or exhausted allowance is not allowance; with none on a route, the run
+    refuses before anything is created or dispatched.
+    """
+    from lu_machinery.review.reviewer_resolver import _has_observed_allowance
+
+    if not isinstance(snapshot, Mapping):
+        raise CanaryError(
+            f"no-allowance: the Monitor routing budget is unreadable, so no {'/'.join(_ACCOUNT_FLAGS)} "
+            "account's allowance is known; refusing before any dispatch"
+        )
+    chosen: dict[str, tuple[str, str]] = {}
+    for route, flag in _ACCOUNT_FLAGS.items():
+        readings = _account_readings(route, snapshot)
+        funded = [label for label, capacity in readings if _has_observed_allowance(capacity)]
+        if not funded:
+            raise NoAllowance(route, [(label, _allowance_text(capacity)) for label, capacity in readings])
+        chosen[route] = (flag, funded[0])
+    return chosen
 
 # Run inside the candidate interpreter, with the existing dispatcher and recorder.
 # Keep dispatch and wait in one user unit; receipts are never reviews of record.
@@ -358,7 +444,7 @@ def _invoke(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str], check: bo
 
 def _run_steps(
     work: Path, source: Path, repo_key: str, repo: str, head: str, interpreter: Path, routes: Sequence[str],
-    hard_timeout: int, env: Mapping[str, str], wheelhouse: str,
+    hard_timeout: int, env: Mapping[str, str], wheelhouse: str, accounts: Mapping[str, tuple[str, str]],
 ) -> tuple[list[list[str]], list[tuple[str, list[str]]], list[str]]:
     """Build the exact argv plan without creating files, units, mounts or tasks.
 
@@ -403,7 +489,7 @@ def _run_steps(
     context = ["PATH", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT", "LU_PRODUCT_ROOT", "LEARN_UKRAINIAN_STATE_ROOT",
                "LEARN_UKRAINIAN_PYTHON"]
     for route in routes:
-        model, *account = _RUN_MODELS[route]
+        model, account = _RUN_MODELS[route], accounts.get(route, ())
         unit = f"{work.name.lstrip('.')}-{route}"
         argv = ["systemd-run", "--user", "--wait", "--pipe", "--collect", "--service-type=exec",
                 f"--unit={unit}", f"--working-directory={work}"]
@@ -464,6 +550,7 @@ def run(args: argparse.Namespace) -> int:
         project_interpreter,
     )
     from lu_machinery.dispatcher.git import resolve_repo
+    from lu_machinery.fleet import credit_lane
 
     if not args.dry_run and os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID"):
         raise CanaryError("run must execute on the host, outside a dispatched worker; use --dry-run here")
@@ -491,6 +578,10 @@ def run(args: argparse.Namespace) -> int:
     routes = required_routes()
     if set(routes) != set(_RUN_MODELS):
         raise CanaryError("required routes changed; update the supported canary model map before running")
+    # Before anything is created: a route with no funded account refuses here, naming its accounts.
+    accounts = _run_accounts(credit_lane.read_routing_budget())
+    for route, (flag, label) in accounts.items():
+        print(f"{route}: {flag} {label} (allowance-aware choice)", flush=True)
     interpreter = project_interpreter()
     wheelhouse = os.environ.get(WHEELHOUSE_ENV, "")
     if wheelhouse and not (os.path.isabs(wheelhouse) and os.path.isdir(wheelhouse)):
@@ -503,7 +594,7 @@ def run(args: argparse.Namespace) -> int:
         work = Path(tempfile.mkdtemp(prefix=".lu-contract-canary-", dir=Path.home()))
     setup, route_commands, unmount = _run_steps(
         work, source, repository["key"], repository["github"], head, interpreter, routes, args.hard_timeout, env,
-        wheelhouse,
+        wheelhouse, accounts,
     )
     # Force a full score even if this head's changed files do not touch the contract.
     # The sealed candidate supplies the gate and catalog that will be installed together.
@@ -611,7 +702,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Run on the host with a working user bus and existing provider credentials; workers use --dry-run.\n"
         f"Only machinery heads are supported. {WHEELHOUSE_ENV}, when set, is an absolute wheelhouse\n"
         "path pip also searches. A run refuses before creating\n"
-        "anything when its estimated disk need would reach the dispatch admission's disk refuse level.",
+        "anything when its estimated disk need would reach the dispatch admission's disk refuse level.\n"
+        "Codex and Claude run on an account whose fresh Monitor allowance reading is above the\n"
+        "near-cap reserve, account b first; a route with no such account refuses before anything starts.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
         f"  {WHEELHOUSE_ENV}=<wheelhouse> .venv/bin/python -m lu_machinery.review.contract_canary run --repo machinery --pr 585\n"

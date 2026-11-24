@@ -279,7 +279,23 @@ def runner_roots(tmp_path, configured_roots, monkeypatch):
     monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(used=GIB, free=1000 * GIB))
     (tmp_path / "wheelhouse").mkdir()
     monkeypatch.setenv(canary.WHEELHOUSE_ENV, str(tmp_path / "wheelhouse"))
+    # Every metered account has fresh allowance, never the host Monitor's reading.
+    from lu_machinery.fleet import credit_lane
+
+    monkeypatch.setattr(credit_lane, "read_routing_budget", lambda **kw: funded_snapshot(a=80.0, b=80.0))
     return home
+
+
+def funded_snapshot(*, a: float, b: float) -> dict:
+    """A fresh routing budget with Codex and Claude accounts a and b at the given remaining %."""
+    probe = {"status": "healthy", "freshness": "fresh", "age_s": 60.0}
+    return {
+        "diagnostics": {"stale": False},
+        "agents": {"codex": {**probe, "remaining_pct": a}, "claude": {**probe, "remaining_pct": a}},
+        "codex_accounts": {"codex:b": {**probe, "remaining_pct": b}},
+        "claude_accounts": {"claude:b": {"status": "ok", "stale": False, "age_s": 60.0,
+                                         "weekly": {"left_pct": b}, "session5h": {"left_pct": b}}},
+    }
 
 
 def fake_setup(argv, cwd) -> None:
@@ -310,8 +326,9 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert "--no-emit-project --no-default-groups --all-extras --no-extra test" in output
     # lu-machinery is on no package index: the host wheelhouse supplies it, the lock's hashes pick the bytes.
     assert f"--require-hashes --only-binary=:all: --find-links {runner_roots.parent / 'wheelhouse'} -r " in output
-    assert "--codex-account b-sub" in output and "--claude-account b" in output
-    assert "--codex-account a" not in output
+    # With allowance on both accounts, account b drains first (the reviewer resolver's order).
+    assert "--codex-account b-sub" in output and "--claude-account b " in output
+    assert "--codex-account sub " not in output and "--claude-account a " not in output
     assert "--require-hashes" in output and "contract-canary.pth" in output
     assert "--pinned-head " + "a" * 40 in output
     assert "check --head " + "a" * 40 in output
@@ -514,6 +531,30 @@ def test_runner_resolves_pr_head_once_before_planning(runner_roots, monkeypatch,
     assert len(reads) == 1
     assert "--repo" in reads[0] and "example/machinery" in reads[0]
     assert "--pinned-head " + "d" * 40 in capsys.readouterr().out
+
+
+def test_codex_canary_runs_on_the_funded_account_and_refuses_when_none_is(runner_roots, monkeypatch, capsys):
+    """Defect class: account-pin starvation. The canary pinned Codex account b, so with b at 0%
+    and account a funded the v0.1.67 cut's codex route hit a usage limit and every release was
+    blocked until b reset. With no funded account it must refuse, naming the route and accounts."""
+    from lu_machinery.fleet import credit_lane
+
+    monkeypatch.setattr(canary, "_invoke", lambda *a, **kw: pytest.fail("planning executed a command"))
+    monkeypatch.setattr(credit_lane, "read_routing_budget", lambda **kw: funded_snapshot(a=80.0, b=0.0))
+    assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 0
+    # The plan prints each route's argv; its dispatch arguments follow the embedded bootstrap script.
+    codex = next(line for line in capsys.readouterr().out.splitlines() if " --agent codex " in line)
+    assert " --codex-account sub " in codex and "b-sub" not in codex  # account a's dispatch label
+
+    monkeypatch.setattr(credit_lane, "read_routing_budget", lambda **kw: funded_snapshot(a=0.0, b=0.0))
+    assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 2
+    err = capsys.readouterr().err
+    assert "no-allowance: route codex has no account with allowance (b-sub: 0% remaining" in err
+    assert "; sub: 0% remaining" in err
+    assert list(runner_roots.iterdir()) == []
+    with pytest.raises(canary.NoAllowance) as refused:
+        canary._run_accounts(funded_snapshot(a=0.0, b=0.0))
+    assert (refused.value.route, [label for label, _ in refused.value.readings]) == ("codex", ["b-sub", "sub"])
 
 
 @pytest.mark.parametrize("outcome", [

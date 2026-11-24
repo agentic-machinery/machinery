@@ -414,7 +414,15 @@ does these steps in order:
      candidate source on `PYTHONPATH`):
      `"$HOST_PYTHON" -m lu_machinery.review.contract_canary run --repo machinery --head "$SHA"`.
      Every required route must pass, and the final receipt check, which uses
-     the sealed candidate's gate and catalog, must succeed. The installed gate
+     the sealed candidate's gate and catalog, must succeed. The Codex and
+     Claude routes have no pinned account. Before anything is built, the canary
+     reads the Monitor routing budget once and runs each of them on an account
+     with observed allowance. This is the reviewer resolver's rule: a fresh
+     reading above the near-cap reserve, account b first among funded accounts.
+     Claude considers only the subscription logins. When a route has no funded
+     account, or the budget is unreadable, the canary refuses with
+     `no-allowance` and lists each account's reading. The run plan prints the
+     chosen accounts. The installed gate
      originally matched the keeper's runtime when canaries gated PR admission.
      At cut time, the candidate gate validates the models and catalog that this
      release installs together. A failing route or an incomplete run
