@@ -506,7 +506,7 @@ def _record_failed_launch(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
         if (current is None or current.get("run_nonce") != record["run_nonce"]
                 or current.get("status") not in store.ACTIVE):
             return
-        fields = (exc.fields if isinstance(exc, admission.LaunchRefused) else
+        fields = (dict(exc.fields) if isinstance(exc, admission.LaunchRefused) else
                   dict(status="failed" if current.get("pid") is None else "crashed",
                        error="supervisor launch failed"))
         reason = (fields["error"].split(":", 1)[0] if isinstance(exc, admission.LaunchRefused) else
@@ -517,6 +517,11 @@ def _record_failed_launch(path: Path, spec: TaskSpec, record: dict, exc: BaseExc
             # start() sends the launch payload only after placement returns and the PID is recorded.
             fields.update(usage=None, never_started_reason=(
                 StartRefusal.SETUP if reason == "spawn_setup_failed" else StartRefusal.PLACEMENT))
+        if (isinstance(exc, admission.LaunchRefused) and not exc.never_started
+                and reason in {"dispatch_isolation_failed", "dispatch_fallback_refused"}):
+            # A scope launch ran or ended ambiguously: record launch evidence so per-turn child cap
+            # and settlement never exclude this record as a verified pre-launch refusal.
+            fields["launch_mode"] = "scope"
         if cleanup_error is not None:
             fields["launch_cleanup_error"] = _launch_cleanup_text(cleanup_error)
         current.update(fields, finished_at=store.now(), returncode_reason=reason)
@@ -727,7 +732,6 @@ _PRE_LAUNCH_TERMINAL_REASONS = frozenset({
     "spawn_process_missing",
     "dispatch_died_after_admission",
     "spawn_setup_failed",
-    "dispatch_isolation_failed",
 })
 
 

@@ -1997,8 +1997,9 @@ def test_turn_children_count_contradictory_never_started_reason(
             pid=_DEAD_PID, process_start="boot:1", launch_mode="scope",
             launch_unit="lu-worker-c-contra", worktree_disposition="removed", **linkage,
         )
-        monkeypatch.setattr(worker, "_provider_alive", lambda _rec: False)
-        assert worker._terminal_child_unsettled_state(settled_headroom) is None
+        with monkeypatch.context() as mp:
+            mp.setattr(worker, "_provider_alive", lambda _rec: False)
+            assert worker._terminal_child_unsettled_state(settled_headroom) is None
         for refusal_status in ("failed", "rate_limited"):
             valid_refusal = dict(
                 schema_version=2, task_id="c-contra", agent="claude", mode="workspace-write",
@@ -2009,6 +2010,52 @@ def test_turn_children_count_contradictory_never_started_reason(
             assert dispatch_admission.count_turn_children(task_store, "turn-f5", parent_nonce) == 3
             host_admission.check_turn_child_cap(linkage)
             assert worker._terminal_child_unsettled_state(valid_refusal) is None
+        # PR1310-F1: ambiguous LaunchRefused(never_started=False) records launch_mode="scope" so it counts
+        # toward the cap and stays unsettled ("unknown"), whereas LaunchRefused(never_started=True) is excluded.
+        from lu_machinery.dispatcher import admission
+        from lu_machinery.dispatcher.types import TaskSpec
+
+        spec = TaskSpec("c-contra", "claude", "claude-sonnet-5-5", "high", "workspace-write",
+                        task_store, task_store / "p", task_store / "r")
+        rec_path = store.record_path("c-contra")
+        for err_code in ("dispatch_isolation_failed", "dispatch_fallback_refused"):
+            spawning = dict(
+                schema_version=2, task_id="c-contra", agent="claude", mode="workspace-write",
+                status="spawning", pid=None, run_nonce="cn-contra", **linkage,
+            )
+            _write(spawning)
+            worker._record_failed_launch(
+                rec_path, spec, spawning,
+                admission.LaunchRefused("ambiguous", {"status": "failed", "error": f"{err_code}: ambiguous"}, never_started=False),
+            )
+            ambig = store.read("c-contra")
+            assert ambig["launch_mode"] == "scope"
+            assert dispatch_admission.classify_never_started_refusal(ambig) == (False, None)
+            assert dispatch_admission.count_turn_children(task_store, "turn-f5", parent_nonce) == 4
+            with pytest.raises(host_admission.Refused, match=r"orchestrator_child_cap_reached:.*4/4"):
+                host_admission.check_turn_child_cap(linkage)
+            assert worker._terminal_child_unsettled_state(ambig) == "unknown"
+        # dispatch_isolation_failed without never_started_reason is no longer cleared by _PRE_LAUNCH_TERMINAL_REASONS.
+        assert worker._terminal_child_unsettled_state(dict(
+            schema_version=2, task_id="c-contra", agent="claude", mode="workspace-write",
+            status="failed", pid=None, run_nonce="cn-contra",
+            returncode_reason="dispatch_isolation_failed", **linkage,
+        )) == "unknown"
+        spawning_unstarted = dict(
+            schema_version=2, task_id="c-contra", agent="claude", mode="workspace-write",
+            status="spawning", pid=None, run_nonce="cn-contra", **linkage,
+        )
+        _write(spawning_unstarted)
+        worker._record_failed_launch(
+            rec_path, spec, spawning_unstarted,
+            admission.LaunchRefused("not started", {"status": "failed", "error": "dispatch_isolation_failed: nothing started"}, never_started=True),
+        )
+        unstarted = store.read("c-contra")
+        assert unstarted.get("launch_mode") is None
+        assert dispatch_admission.classify_never_started_refusal(unstarted) == (True, None)
+        assert dispatch_admission.count_turn_children(task_store, "turn-f5", parent_nonce) == 3
+        host_admission.check_turn_child_cap(linkage)
+        assert worker._terminal_child_unsettled_state(unstarted) is None
 
 
 def test_scope_runtime_max_stop_labels_timeout_not_client_cancel(task_store, tmp_path, monkeypatch):
