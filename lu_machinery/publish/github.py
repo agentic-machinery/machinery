@@ -2254,17 +2254,45 @@ def _repo_matches(identity, slug, repository_id):
     )
 
 
+def _repo_admin_emit(text):
+    """Write *text* to stdout unbuffered; False when it cannot be written (it never raises).
+
+    Nothing is left in the stdout buffer on failure, so interpreter shutdown cannot fail on it.
+    """
+    try:
+        sys.stdout.flush()
+        try:
+            descriptor = sys.stdout.fileno()
+        except (OSError, ValueError):
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            return True
+        data = text.encode("utf-8")
+        while data:
+            data = data[os.write(descriptor, data):]
+        return True
+    except Exception:
+        return False
+
+
+def _repo_admin_note(message):
+    """One stderr line; a failed write is ignored (the receipt and exit code carry the outcome)."""
+    with contextlib.suppress(OSError, ValueError):
+        print(message, file=sys.stderr)
+
+
 def _repo_admin_result(verb, receipt, code, capture_output, text):
+    """The command result; it never raises, and a failed stdout write after a mutation exits unsettled."""
     encoded = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
-    if not capture_output:
-        print(encoded, end="")
+    if not capture_output and not _repo_admin_emit(encoded):
+        _repo_admin_note(f"{verb.upper().replace('-', '_')}_STDOUT_UNWRITTEN: the receipt is only in its file.")
+        if receipt["mutations_sent"]:
+            code = REPO_ADMIN_UNSETTLED
     if code == REPO_ADMIN_UNSETTLED:
-        with contextlib.suppress(OSError, ValueError):
-            print(
-                f"{verb.upper().replace('-', '_')}_UNSETTLED: {receipt['detail'] or 'the result is unknown'}; "
-                "do not retry. Reconcile the state on GitHub first (see --help).",
-                file=sys.stderr,
-            )
+        _repo_admin_note(
+            f"{verb.upper().replace('-', '_')}_UNSETTLED: {receipt['detail'] or 'the result is unknown'}; "
+            "do not retry. Reconcile the state on GitHub first (see --help)."
+        )
     return subprocess.CompletedProcess(
         ["github", verb], code,
         (encoded if text else encoded.encode("utf-8")) if capture_output else None,
@@ -2275,14 +2303,34 @@ def _repo_admin_result(verb, receipt, code, capture_output, text):
 def _repo_admin_settle(verb, receipt, sink, code, outcome, detail, capture_output, text):
     receipt["outcome"], receipt["detail"] = outcome, detail
     if not _write_transfer_receipt(sink, receipt):
-        print(f"{verb.upper().replace('-', '_')}_RECEIPT_UNWRITTEN: the receipt is on stdout only.", file=sys.stderr)
+        _repo_admin_note(f"{verb.upper().replace('-', '_')}_RECEIPT_UNWRITTEN: the receipt is on stdout only.")
         code = code or (REPO_ADMIN_UNSETTLED if receipt["mutations_sent"] else 2)
-    print(f"{verb}: receipt {sink['path']}", file=sys.stderr)
+    _repo_admin_note(f"{verb}: receipt {sink['path']}")
     return _repo_admin_result(verb, receipt, code, capture_output, text)
 
 
+def _repo_admin_lock(directory_fd, name):
+    """An exclusive flock on *name* in the private directory, held until its descriptor closes; None when held elsewhere."""
+    import fcntl
+
+    descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory_fd)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text):
-    """Run repo-create or repo-transfer: static refusals, a private receipt, then the checked verb."""
+    """Run repo-create or repo-transfer: static refusals, a private receipt and lock, then the checked verb.
+
+    One lock per fixture name or repository id is held from the first read to settlement, so a
+    second run never acts on reads taken before the first run's mutation.
+    """
     _repo_admin_authority(verb, environment)
     repos, row = _repo_admin_row(verb, fields["repo"])
     plan = (_repo_create_plan if verb == "repo-create" else _repo_transfer_plan)(verb, fields, repos, row, environment)
@@ -2297,11 +2345,24 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
         "detail": None,
     }
     sink = {"fd": None, "path": None}
+    held = {"directory": None, "lock": None}
     try:
         sink.update(_reserve_receipt(None, REPO_ADMIN_DIRECTORY, plan["stem"], environment, plan["refused"]))
+        held["directory"], directory = _private_directory(None, REPO_ADMIN_DIRECTORY, environment, plan["refused"])
+        try:
+            held["lock"] = _repo_admin_lock(held["directory"], f"{plan['stem']}.lock")
+        except OSError:
+            raise plan["refused"]("the run lock cannot be opened") from None
+        if held["lock"] is None:
+            return _repo_admin_settle(
+                verb, receipt, sink, REPO_ADMIN_UNSETTLED, "in-progress",
+                f"another {verb} run for {plan['stem']} holds its lock and may be sending; nothing was sent by this "
+                "run. Wait for it to finish, then rerun to reconcile",
+                capture_output, text,
+            )
         return plan["run"](
-            fields, plan, receipt, sink, runner=runner, cwd=cwd, environment=environment,
-            capture_output=capture_output, text=text,
+            fields, plan, receipt, sink, held["directory"], directory, runner=runner, cwd=cwd,
+            environment=environment, capture_output=capture_output, text=text,
         )
     except Exception as exc:
         if not receipt["mutations_sent"]:
@@ -2318,8 +2379,10 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
         _write_transfer_receipt(sink, receipt)
         return _repo_admin_result(verb, receipt, REPO_ADMIN_UNSETTLED, capture_output, text)
     finally:
-        if sink["fd"] is not None:
-            os.close(sink["fd"])
+        for descriptor in (sink["fd"], held["lock"], held["directory"]):
+            if descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
 
 
 def _repo_admin_checks(verb, receipt, sink, capture_output, text, checks):
@@ -2419,7 +2482,8 @@ def _repo_create_plan(verb, fields, repos, row, environment):
     }
 
 
-def _repo_create_checked(fields, plan, receipt, sink, *, runner, cwd, environment, capture_output, text):
+def _repo_create_checked(fields, plan, receipt, sink, _directory_fd, _directory, *, runner, cwd, environment,
+                         capture_output, text):
     verb, reader = "repo-create", merge_readiness_runner(runner)
     source, destination = plan["source"], plan["destination"]
 
@@ -2560,20 +2624,6 @@ def _repo_transfer_plan(verb, fields, repos, row, environment):
     }
 
 
-def _repo_transfer_checked(fields, plan, receipt, sink, *, runner, cwd, environment, capture_output, text):
-    reader = merge_readiness_runner(runner)
-    journal_name = f"repo-transfer-{plan['repository_id']}.pending"
-    directory_fd, directory = _private_directory(None, REPO_ADMIN_DIRECTORY, environment, plan["refused"])
-    receipt["journal"] = str(directory / journal_name)
-    try:
-        return _repo_transfer_journaled(
-            fields, plan, receipt, sink, directory_fd, journal_name, reader,
-            runner=runner, cwd=cwd, environment=environment, capture_output=capture_output, text=text,
-        )
-    finally:
-        os.close(directory_fd)
-
-
 def _journal_exists(directory_fd, name):
     try:
         os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -2582,23 +2632,43 @@ def _journal_exists(directory_fd, name):
     return True
 
 
-def _repo_transfer_journaled(fields, plan, receipt, sink, directory_fd, journal_name, reader, *, runner, cwd,
-                             environment, capture_output, text):
-    verb = "repo-transfer"
+def _repo_transfer_acknowledged(document, source, destination, repository_id):
+    """Whether the transfer's answer names the pinned private repository at its source or destination slug."""
+    return (
+        type(document.get("id")) is int and document["id"] == repository_id and document.get("private") is True
+        and (_same_slug(document.get("full_name"), source) or _same_slug(document.get("full_name"), destination))
+    )
+
+
+def _repo_transfer_checked(fields, plan, receipt, sink, directory_fd, directory, *, runner, cwd, environment,
+                           capture_output, text):
+    """Reconcile from the exact destination first, then the fresh source checks, then one journaled transfer."""
+    verb, reader = "repo-transfer", merge_readiness_runner(runner)
     source, destination, repository_id = plan["source"], plan["destination"], plan["repository_id"]
     destination_owner = destination.split("/", 1)[0]
+    journal_name = f"repo-transfer-{repository_id}.pending"
+    receipt["journal"] = str(directory / journal_name)
     state = {}
 
     def checks():
         receipt["principal"]["before"] = _repo_admin_principal(verb, fields["principal"], reader, cwd, environment)
+        # The exact destination decides first: a pending transfer settles from it whatever the old slug shows.
+        moved = _repo_admin_get(reader, f"repos/{destination}", cwd, environment)
+        observed = _repo_identity(moved) if moved is not None else None
+        receipt["preflight"]["destination_observed"] = observed and {
+            key: observed[key] for key in ("id", "full_name", "private")
+        }
+        if observed is not None and _repo_matches(observed, destination, repository_id):
+            state["moved"] = True
+            return
+        if _journal_exists(directory_fd, journal_name):
+            state["unreconciled"] = True
+            return
+        if observed is not None:
+            raise _repo_refused(verb, f"the destination name {destination} holds repository {observed['id']}")
         found = _repo_admin_get(reader, f"repos/{source}", cwd, environment)
         identity = _repo_identity(found) if found is not None else None
         if identity is None or not _same_slug(identity["full_name"], source):
-            # Moved already (GitHub may follow the old slug), or gone: only the exact destination settles it.
-            moved = _repo_admin_get(reader, f"repos/{destination}", cwd, environment)
-            if moved is not None and _repo_matches(_repo_identity(moved), destination, repository_id):
-                state["moved"] = True
-                return
             raise _repo_refused(verb, f"repository {repository_id} is neither at {source} nor at {destination}")
         if identity["id"] != repository_id:
             raise _repo_refused(verb, f"{source} is repository {identity['id']}, not the pinned {repository_id}")
@@ -2608,14 +2678,9 @@ def _repo_transfer_journaled(fields, plan, receipt, sink, directory_fd, journal_
             raise _repo_refused(verb, f"{source} is archived")
         if (found.get("permissions") or {}).get("admin") is not True:
             raise _repo_refused(verb, f"the principal is not an admin of {source}")
-        if _journal_exists(directory_fd, journal_name):
-            state["unreconciled"] = True
-            return
         receipt["preflight"]["destination_organization"] = _repo_admin_owner(
             verb, destination_owner, reader, cwd, environment,
         )
-        if _repo_admin_get(reader, f"repos/{destination}", cwd, environment) is not None:
-            raise _repo_refused(verb, f"the destination name {destination} is taken")
         receipt["preflight"]["destination_available"] = destination
 
     _repo_admin_checks(verb, receipt, sink, capture_output, text, checks)
@@ -2630,9 +2695,9 @@ def _repo_transfer_journaled(fields, plan, receipt, sink, directory_fd, journal_
     if state.get("unreconciled"):
         return _repo_admin_settle(
             verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unreconciled",
-            f"an earlier transfer of repository {repository_id} was sent and is unsettled, and GitHub still shows "
-            f"it at {source}. Check on GitHub that no transfer is pending, then remove {receipt['journal']} "
-            "before a new attempt; no mutation was sent",
+            f"an earlier transfer of repository {repository_id} was sent and is unsettled, and {destination} does not "
+            f"show it private. Check on GitHub that no transfer is pending, then remove {receipt['journal']} before "
+            "a new attempt; no mutation was sent",
             capture_output, text,
         )
     if receipt["dry_run"]:
@@ -2653,31 +2718,52 @@ def _repo_transfer_journaled(fields, plan, receipt, sink, directory_fd, journal_
 
 def _repo_transfer_send(fields, plan, receipt, sink, directory_fd, journal_name, frozen, reader, *, runner, cwd,
                         environment, capture_output, text):
-    """Create the journal, send the one transfer and verify it; every failure after the send is unsettled."""
+    """Create the journal, re-read the source, send the one transfer and verify it.
+
+    A refusal before the POST removes the journal; every failure after it is unsettled.
+    """
     verb = "repo-transfer"
     source, destination, repository_id = plan["source"], plan["destination"], plan["repository_id"]
+
+    def refuse(reason):
+        with contextlib.suppress(OSError):
+            os.unlink(journal_name, dir_fd=directory_fd)
+        _repo_admin_settle(verb, receipt, sink, 2, "refused", reason, True, True)
+        return _repo_refused(verb, reason)
+
     try:
         journal = os.open(
             journal_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd,
         )
     except OSError:
+        # Only the lock holder writes the journal, so an existing one is a crashed earlier run's.
         _repo_admin_settle(verb, receipt, sink, 2, "refused", "the transfer journal cannot be created", True, True)
         raise _repo_refused(verb, "the transfer journal exists or cannot be created") from None
     try:
         with os.fdopen(journal, "w", encoding="utf-8") as handle:
             handle.write(json.dumps({"receipt": str(sink["path"]), "source": source, "destination": destination}) + "\n")
     except OSError:
-        with contextlib.suppress(OSError):
-            os.unlink(journal_name, dir_fd=directory_fd)
-        _repo_admin_settle(verb, receipt, sink, 2, "refused", "the transfer journal cannot be written", True, True)
-        raise _repo_refused(verb, "the transfer journal cannot be written") from None
+        raise refuse("the transfer journal cannot be written") from None
+    # GitHub addresses the transfer by slug only: re-read it just before the POST to keep the window to one request.
+    try:
+        current = _repo_admin_get(reader, f"repos/{source}", cwd, environment)
+        bound = current is not None and _repo_matches(_repo_identity(current), source, repository_id)
+    except Exception:
+        raise refuse("the source re-read before the transfer was unreadable or rate limited") from None
+    if not bound:
+        raise refuse(f"{source} no longer holds the pinned private repository {repository_id}")
     receipt["mutations_sent"] = 1
     try:
-        _repo_admin_post(f"repos/{source}/transfer", frozen, runner, cwd, environment)
+        acknowledged = _repo_admin_post(f"repos/{source}/transfer", frozen, runner, cwd, environment)
     except Exception:
         return _repo_admin_settle(
             verb, receipt, sink, REPO_ADMIN_UNSETTLED, "ambiguous", "the transfer's result is unknown",
             capture_output, text,
+        )
+    if not _repo_transfer_acknowledged(acknowledged, source, destination, repository_id):
+        return _repo_admin_settle(
+            verb, receipt, sink, REPO_ADMIN_UNSETTLED, "unverified",
+            f"GitHub's answer does not name the pinned private repository {repository_id}", capture_output, text,
         )
     try:
         receipt["principal"]["after"] = _repo_admin_readback(
@@ -4444,12 +4530,14 @@ def main(argv=None, *, runner=None):
                 "Checks before the mutation: no worker marker; none of GH_TOKEN, GITHUB_TOKEN, GH_ENTERPRISE_TOKEN,\n"
                 "  GITHUB_ENTERPRISE_TOKEN, GH_CONFIG_DIR, XDG_CONFIG_HOME set; GH_HOST unset or github.com; GET /user\n"
                 "  is --principal; the principal is an active admin of the source organization; both names are free.\n"
+                "  One run per fixture name: a lock in the private directory is held from the first read to settlement.\n"
                 "Outputs: one POST orgs/<owner>/repos (private, auto_init), a readback of the same id, private, and\n"
                 "  GET /user again. Receipt JSON on stdout and in a new 0600 file under\n"
                 "  $XDG_STATE_HOME/learn-ukrainian/repo-admin/ (else ~/.local/state/...): repository id and slug,\n"
                 "  rehearsal_destination, principal before and after. repo-transfer --create-receipt takes that file.\n"
                 "Exit codes: 0 created and verified, or dry run passed (no mutation); 2 invalid input or refusal, no\n"
-                "  mutation; 3 UNSETTLED: the POST was sent and its result is unknown or unverified; never retry with\n"
+                "  mutation; 3 UNSETTLED: the POST was sent and its result is unknown or unverified (a stdout failure\n"
+                "  after the POST included), or another run holds the lock (in-progress); never retry with\n"
                 "  the same name: check the organization on GitHub and use a new name; a rate limit at the POST is 3;\n"
                 "  75 a rate limit refused a read before the POST.\n"
                 "Related: decision GH-ADMIN-VERBS-1124; repo-transfer; docs/runbooks/write-worker-boundary.md."
@@ -4470,18 +4558,22 @@ def main(argv=None, *, runner=None):
                 "  repository_id, and LU_FLEET_REPO_SELECTOR_FILE must still name the github slug (else refused).\n"
                 "Rehearsal (--create-receipt): the repo-create receipt from the private state directory binds the\n"
                 "  fixture's id and its exact <name>-moved destination; registered ids and names are refused.\n"
-                "Checks before the mutation: the repo-create caller checks; the source slug is that id, private,\n"
-                "  not archived, administered by the principal; the principal is an active admin of the destination\n"
-                "  organization (creation rights and effective access); the destination name is free; no unsettled\n"
-                "  transfer journal for that id. If the id is already at the exact destination, private, it exits 0\n"
-                "  as already-transferred with no mutation and clears the journal.\n"
-                "Outputs: one POST repos/<source>/transfer {new_owner, new_name}, then readbacks of the exact\n"
-                "  destination slug (same id, private) over about 180 s, and GET /user again. Receipt JSON on\n"
-                "  stdout and in a new 0600 file in the same private directory; journal repo-transfer-<id>.pending\n"
-                "  there from just before the POST until verified.\n"
+                "Checks before the mutation, under one lock per repository id held to settlement: the repo-create\n"
+                "  caller checks; first the exact destination: the id there, private, exits 0 as already-transferred\n"
+                "  with no mutation and clears the journal; else an unsettled journal for that id exits 3 with no\n"
+                "  mutation; else the destination name must be free, the source slug must be that id, private, not\n"
+                "  archived and administered by the principal, and the principal an active admin of the destination\n"
+                "  organization (creation rights and effective access). The source slug is re-read just before the POST.\n"
+                "Operator precondition: GitHub addresses a transfer by slug only, so nobody else may rename, transfer\n"
+                "  or create repositories in the source organization during the run.\n"
+                "Outputs: one POST repos/<source>/transfer {new_owner, new_name}; its answer must name the pinned id,\n"
+                "  private; then readbacks of the exact destination slug (same id, private) over about 180 s, and\n"
+                "  GET /user again. Receipt JSON on stdout and in a new 0600 file in the same private directory;\n"
+                "  journal repo-transfer-<id>.pending there from just before the POST until verified.\n"
                 "Exit codes: 0 transferred and verified, already transferred, or dry run passed; 2 invalid input or\n"
-                "  refusal, no mutation; 3 UNSETTLED: the POST was sent and the result is unknown or unverified, or an\n"
-                "  earlier one is unreconciled. Never retry: rerun only to reconcile (it exits 0 once the id is at the\n"
+                "  refusal, no mutation; 3 UNSETTLED: the POST was sent and the result is unknown or unverified (a stdout\n"
+                "  failure after the POST included), an earlier one is unreconciled, or another run holds the lock\n"
+                "  (in-progress). Never retry: rerun only to reconcile (it exits 0 once the id is at the\n"
                 "  destination); if GitHub still shows it at the source, confirm no transfer is pending and remove\n"
                 "  the journal by hand. Do not flip the selector until reconciled. A rate limit at the POST is 3;\n"
                 "  75 a rate limit refused a read before the POST.\n"

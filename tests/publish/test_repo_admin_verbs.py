@@ -265,24 +265,35 @@ def test_real_move_derives_endpoints_from_selector_row(selector):
         assert gh.posts == []
 
 
+def _swapped_before_post(gh):
+    """The source slug holds the pinned id at preflight and another repository at the pre-POST re-read."""
+    reads = []
+
+    def respond(args):
+        reads.append(args)
+        return answer(args, repository(REPO_ID if len(reads) == 1 else 4242, SOURCE))
+    gh.overrides[("GET", f"repos/{SOURCE}", False)] = respond
+
+
 @pytest.mark.parametrize("change,reason", [
-    (lambda row: row.update(id=999), "not the pinned"),
-    (lambda row: row.update(private=False, visibility="public"), "is not private"),
-    (lambda row: row.update(archived=True), "is archived"),
-    (lambda row: row.update(permissions={"admin": False}), "not an admin"),
-    (lambda row: row.update(full_name=f"{OLD}/elsewhere"), "neither at"),
+    (lambda gh: gh.repos[SOURCE].update(id=999), "not the pinned"),
+    (lambda gh: gh.repos[SOURCE].update(private=False, visibility="public"), "is not private"),
+    (lambda gh: gh.repos[SOURCE].update(archived=True), "is archived"),
+    (lambda gh: gh.repos[SOURCE].update(permissions={"admin": False}), "not an admin"),
+    (lambda gh: gh.repos[SOURCE].update(full_name=f"{OLD}/elsewhere"), "neither at"),
+    (_swapped_before_post, "no longer holds the pinned"),
 ])
-def test_transfer_source_identity_refusals(change, reason):
-    """Defect class: a stale or substituted source identity passing the fresh match."""
+def test_transfer_source_identity_refusals(tmp_path, change, reason):
+    """Defect class: a stale or substituted source identity passing the fresh match, before or at the POST."""
     gh = FakeGitHub()
-    change(gh.repos[SOURCE])
+    change(gh)
     with pytest.raises(gate.PublishBlocked, match=reason):
         run("repo-transfer", gh, repo="infra-private")
-    assert gh.posts == []
+    assert gh.posts == [] and not journal(tmp_path).exists()
 
 
 @pytest.mark.parametrize("change,reason", [
-    (_taken(DESTINATION), "is taken"),
+    (_taken(DESTINATION), "holds repository 5"),
     (lambda gh: gh.overrides.update({("GET", f"repos/{DESTINATION}", False): server_error}), "unreadable"),
     (lambda gh: gh.memberships[NEW].update(role="member"), "not an active admin"),
     (lambda gh: gh.memberships.pop(NEW), "not an active admin"),
@@ -308,23 +319,72 @@ def test_transfer_sends_once_and_verifies_exact_readback(tmp_path):
     assert not journal(tmp_path).exists()
 
 
+def _applied_then(gh, reply):
+    """A POST answer that applies the transfer and then answers *reply* (a document or an exception)."""
+    def respond(args):
+        gh.post(args, f"repos/{SOURCE}/transfer", {"new_owner": NEW, "new_name": "infra-next"})
+        if isinstance(reply, BaseException):
+            raise reply
+        return answer(args, reply)
+    return respond
+
+
+class _Unwritable:
+    """A stdout whose every write fails, like a closed pipe."""
+
+    def write(self, _text):
+        raise OSError("closed")
+
+    def flush(self):
+        raise OSError("closed")
+
+    def fileno(self):
+        raise OSError("closed")
+
+
 @pytest.mark.parametrize("outcome", [
     server_error,
     subprocess.TimeoutExpired(["gh"], 60),
     "public-readback",
     "rate-limited-readback",
+    "empty-acknowledgement",
+    "other-id-acknowledgement",
+    "old-slug-reused",
+    "stdout-unwritable",
 ])
-def test_unsettled_transfer_blocks_retry_until_reconciled(tmp_path, outcome):
-    """Defect class: a second send after an unknown outcome, or a post-send rate limit reported as nothing landed."""
+def test_unsettled_transfer_blocks_retry_until_reconciled(tmp_path, monkeypatch, outcome):
+    """Defect class: a second send after an unknown outcome, or a post-send failure reported as nothing landed."""
     gh = FakeGitHub()
-    if outcome == "public-readback":
+    transfer = ("POST", f"repos/{SOURCE}/transfer", False)
+    if outcome == "old-slug-reused":
+        # The response is lost, then a new repository takes the old name: the exact destination still settles it.
+        gh.overrides[transfer] = _applied_then(gh, subprocess.TimeoutExpired(["gh"], 60))
+        result, _ = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and journal(tmp_path).exists()
+        gh.overrides.clear()
+        gh.repos[SOURCE] = repository(4242, SOURCE)
+        result, receipt = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
+        assert len(gh.posts) == 1 and not journal(tmp_path).exists()
+        return
+    if outcome == "stdout-unwritable":
+        monkeypatch.setattr("sys.stdout", _Unwritable())
+        assert pub.main(["repo-transfer", "--repo", "infra-private", "--principal", PRINCIPAL], runner=gh) == 3
+        receipts = sorted(state_dir(tmp_path).glob(f"repo-transfer-{REPO_ID}-*.json"))
+        assert len(gh.posts) == 1 and json.loads(receipts[-1].read_text())["outcome"] == "transferred"
+        return
+    if outcome == "empty-acknowledgement":
+        gh.overrides[transfer] = _applied_then(gh, {})
+    elif outcome == "other-id-acknowledgement":
+        gh.overrides[transfer] = _applied_then(gh, repository(4242, SOURCE))
+    elif outcome == "public-readback":
         gh.overrides[("GET", f"repos/{DESTINATION}", True)] = lambda args: answer(
             args, repository(REPO_ID, DESTINATION, private=False),
         )
     elif outcome == "rate-limited-readback":
         gh.overrides[("GET", f"repos/{DESTINATION}", True)] = github_client.GitHubRateLimited(None, "pool_exhausted")
     else:
-        gh.overrides[("POST", f"repos/{SOURCE}/transfer", False)] = outcome
+        gh.overrides[transfer] = outcome
     result, receipt = run("repo-transfer", gh, repo="infra-private")
     assert result.returncode == pub.REPO_ADMIN_UNSETTLED and len(gh.posts) == 1 and journal(tmp_path).exists()
     gh.overrides.clear()
@@ -426,3 +486,21 @@ def test_help_documents_examples_outputs_and_exit_codes(capsys, verb):
     for section in ("Examples:", "Outputs:", "Exit codes:", "Related:", "--principal", "--dry-run", "UNSETTLED"):
         assert section in out
     assert "omitted by default" not in out
+
+
+@pytest.mark.parametrize("verb,fields,lock", [
+    ("repo-transfer", {}, f"repo-transfer-{REPO_ID}.lock"),
+    ("repo-create", {"name": "rehearsal-1"}, "repo-create-rehearsal-1.lock"),
+])
+def test_concurrent_run_lock_refuses_without_sending(tmp_path, verb, fields, lock):
+    """Defect class: a second run acting on reads taken before the first run's mutation."""
+    import fcntl
+
+    directory = state_dir(tmp_path)
+    directory.mkdir(mode=0o700, parents=True)
+    with open(directory / lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        gh = FakeGitHub()
+        result, receipt = run(verb, gh, repo="infra-private", **fields)
+    assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "in-progress"
+    assert gh.calls == []
