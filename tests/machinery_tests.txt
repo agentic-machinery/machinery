@@ -663,6 +663,7 @@ tests/review/test_verdict_parser_root.py
 tests/publish/test_guard_pr_merge.py
 tests/publish/test_merge_guard.py
 tests/publish/test_merge_queue_keeper_untrusted_text.py
+tests/publish/test_repo_admin_verbs.py
 tests/lint/test_boundary_ratchet.py
 tests/lint/test_lint_fleet_roster.py
 tests/lint/test_lint_prompts.py
