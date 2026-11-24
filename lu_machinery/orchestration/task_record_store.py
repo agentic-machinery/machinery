@@ -60,18 +60,18 @@ _FOREIGN_LOCK = threading.Lock()
 _SCAN_DEPTH = 0
 # Example names in the one summary line. Names outside the families below are chosen first.
 _FOREIGN_EXAMPLE_LIMIT = 3
-# After a family token, the next character must not continue the token. Otherwise
-# routingbackup, closeout-stateful and a non-ASCII continuation are treated as
-# the known family and can fall out of the three-name sample.
-_FOREIGN_TOKEN_TAIL = r"(?!\w).*\.json\Z"
+# A known routing or closeout-state name is that word, then .json, or one
+# hyphen and an ASCII word, then .json. A longer, dotted or continued suffix
+# is a different kind and stays in the sample.
+_FOREIGN_HYPHEN_TAIL = r"(?:-[A-Za-z0-9]+)?\.json\Z"
 # Families short-lived readers already find beside task records (review-loop and closeout state).
 # A name that matches none of these is unexpected: the summary names it ahead of the families.
 _ROUTINE_FOREIGN_KINDS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("review-state", re.compile(r".*\.review-state\.json\Z")),
     ("resolver", re.compile(r".*\.resolver\.json\Z")),
-    ("routing", re.compile(r".*\.routing" + _FOREIGN_TOKEN_TAIL)),
+    ("routing", re.compile(r".*\.routing" + _FOREIGN_HYPHEN_TAIL)),
     ("ac-policy", re.compile(r".*\.ac-policy\.json\Z")),
-    ("closeout-state", re.compile(r".*\.closeout-state" + _FOREIGN_TOKEN_TAIL)),
+    ("closeout-state", re.compile(r".*\.closeout-state" + _FOREIGN_HYPHEN_TAIL)),
 )
 # Literal suffixes of files and directories the dispatcher writes beside ``<task_id>.json``.
 # Each string is the suffix that writer passes to ``Path.with_suffix`` or appends to the task id,
@@ -129,11 +129,27 @@ def _foreign_kind(path: str) -> str:
         for kind in sorted((item[0] for item in _ROUTINE_FOREIGN_KINDS), key=len, reverse=True):
             if stem == kind or stem.endswith("-" + kind):
                 return kind
-        return stem.rsplit("-", 1)[-1]
+        return _foreign_stem_kind(stem, last_hyphen_word=True)
     tail = stem[dot + 1:]
     if "." in tail:
         tail = tail.rsplit(".", 1)[-1]
-    return tail
+    return _foreign_stem_kind(tail, last_hyphen_word=False)
+
+
+def _foreign_stem_kind(stem: str, *, last_hyphen_word: bool) -> str:
+    """Drop a trailing number so ``loose-0`` and ``loose-1`` share one sample slot.
+
+    A dotted suffix keeps the rest of its last word (``custom-tail``). A name
+    with no dot still groups by its last hyphen word, as before.
+    """
+    while "-" in stem:
+        head, _, word = stem.rpartition("-")
+        if not word.isdigit() or not head:
+            break
+        stem = head
+    if last_hyphen_word:
+        return stem.rsplit("-", 1)[-1]
+    return stem
 
 
 def _foreign_summary(items: list[tuple[str, _PendingForeign]]) -> str:
