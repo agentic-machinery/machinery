@@ -85,7 +85,7 @@ def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, m
 
 
 def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monkeypatch):
-    """Defect class: machinery pages name product pages the product does not declare, or mark one current."""
+    """Defect class: a product page label appears in the shared machinery Monitor navigation."""
     import html
     import re
 
@@ -147,25 +147,12 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monke
             body = main.serve_static(path, request, context).body.decode("utf-8")
             links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', body)
             assert [(href, label) for href, _, label in links[: len(machinery)]] == machinery, path
-            # The product group follows, starts once, is never current, escapes its labels, keeps a
-            # readable one-line label, and skips repeated destinations, machinery paths and non-path URLs.
-            assert links[len(machinery) :] == [
-                ("/", ' class="product first"', "Home"),
-                ("/curriculum-dashboard.html", ' class="product"', "Curriculum dashboard"),
-                ("/labelled", ' class="product"', "Q&amp;A &quot;x&quot;"),
-                ("/blank", ' class="product"', "Blank"),
-                ("/bidi", ' class="product"', "ab c"),
-                ("/a b", ' class="product"', "Space"),
-                ("/machinery.html", ' class="product"', "Machinery"),
-                ("/a/%2e/%2E%2e/reports", ' class="product"', "Reports"),
-                ("/notes?folder=a\\b#s one", ' class="product"', "Notes"),
-                ("/x/../notes", ' class="product"', "Again notes"),
-                ("/fleet\x00", ' class="product"', "Nul"),
-                ("/reports?tab=second", ' class="product"', "Tab"),
-                ("/y/../notes?folder=a\\b#s one", ' class="product"', "Dup notes"),
-                ("/dashes", ' class="product"', "Dashes"),
-                ("/--", ' class="product"', "/--"),
-            ], path
+            # Declared product pages are served, and none of their labels is a navigation entry.
+            assert links[len(machinery) :] == [], path
+            assert not any(label in {
+                "Home", "Curriculum dashboard", "Q&amp;A &quot;x&quot;", "Blank", "ab c", "Space",
+                "Machinery", "Reports", "Notes", "Again notes", "Nul", "Tab", "Dup notes", "Dashes", "/--",
+            } for _, _, label in links), path
             assert [href for href, attrs, _ in links if 'aria-current="page"' in attrs] == [contract.url], path
 
 
@@ -191,10 +178,11 @@ def test_unusable_static_declaration_is_rejected_at_load_not_linked(tmp_path, mo
     page = replace(route_contracts.PAGE_CONTRACTS[0], file="reports.html", url="/reports", label="Reports")
     context = fixture_context(tmp_path)
 
-    # A usable declaration loads and is linked.
+    # A usable declaration loads. Its page label is not a navigation entry.
     static = {"reports.html": root / "reports.html"}
     good = checked_product(ProductContribution(static_files=static, page_contracts=(page,)))
-    assert '<a href="/reports" class="product first">Reports</a>' in main._machinery_nav_html(None, tmp_path, good)
+    assert good.page_contracts[0].nav_label == "Reports"
+    assert '<a href="/reports" class="product first">Reports</a>' not in main._machinery_nav_html(None)
 
     popped = replace(page)
     del vars(popped)["url"]
@@ -230,8 +218,8 @@ def test_navigation_and_route_agree_on_a_broken_tree(tmp_path, monkeypatch):
     missing or non-directory component, a denied directory, an overlong name, a dangling link)
     differently on 3.12 and 3.13+, so a lookup through them gave the route, and the navigation that
     must match it, a different answer on each interpreter. The lookup now asks the kernel first, so
-    each answer below is the same on every supported interpreter, and a product link is listed
-    exactly when the route leaves its path to the product.
+    each answer below is the same on every supported interpreter. The navigation lists no
+    product page.
     """
     import os
     import re
@@ -302,11 +290,11 @@ def test_navigation_and_route_agree_on_a_broken_tree(tmp_path, monkeypatch):
                 answers[url] = refused.status_code
             else:
                 answers[url] = "product" if response.path.is_relative_to(product_root) else str(response.path)
-        listed = re.findall(r'<a href="([^"]*)" class="product', main._machinery_nav_html(None, dashboards, product))
+        listed = re.findall(r'<a href="([^"]*)" class="product', main._machinery_nav_html(None))
     finally:
         (dashboards / "denied").chmod(0o700)
     assert answers == expected
-    assert listed == [url for url, answer in expected.items() if answer == "product"]
+    assert listed == []
 
 
 def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
