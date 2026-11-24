@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
-from .product_contribution import ProductContribution, installed_product
+from .product_contribution import ProductContribution, has_suffix, installed_product
 
 ContractKind = Literal["http", "websocket"]
 MatchType = Literal["exact", "prefix"]
@@ -117,7 +117,10 @@ class PageContract:
             return label
         if self.url == "/":
             return "Home"
-        for source in (Path(self.file).stem, self.url.strip("/")):
+        file_name = Path(self.file).name
+        # The file name without its suffix, by the rule has_suffix states (``PurePath.stem`` changed in 3.14).
+        stem = file_name.rpartition(".")[0] if has_suffix(file_name) else file_name
+        for source in (stem, self.url.strip("/")):
             if name := _visible_text(source.replace("-", " ").replace("_", " ")):
                 return name.capitalize()
         return _visible_text(self.url) or "Untitled page"

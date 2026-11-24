@@ -11,6 +11,7 @@ import functools
 import html
 import importlib.metadata
 import logging
+import mimetypes
 import os
 import re
 import socket
@@ -94,6 +95,7 @@ from .product_contribution import (
     OrientSection,
     ProductContribution,
     checked_product,
+    has_suffix,
     install_providers,
     kernel_lookup,
     load_product,
@@ -1759,11 +1761,12 @@ _PAGE_FILES = frozenset(page.file for page in PAGE_CONTRACTS)
 
 def _dashboard_file(
     dashboards_dir: Path, path: str, product: ProductContribution | None
-) -> tuple[Path, str | None] | None:
+) -> tuple[Path, str] | None:
     """The machinery dashboard file the static route serves at ``path``, or ``None`` when it serves none.
 
-    Returns the resolved file and, when it is a page-contract file, that page's ``file``.
-    ``None`` leaves the path to the product's declared files. This is the one lookup: the
+    Returns the resolved file and the name it was found under inside the dashboards (the
+    requested path, its ``index.html`` or its ``.html`` alias). That name, not the link
+    target, decides the media type and whether it is a page-contract page. ``None`` leaves the path to the product's declared files. This is the one lookup: the
     route serves what it returns, and the navigation uses it to tell machinery pages from
     product pages. Each candidate is looked up kernel first, so the answer is the same on
     every supported interpreter:
@@ -1785,10 +1788,11 @@ def _dashboard_file(
         path = "index.html"
     root: Path | None = None
 
-    def lookup(name: str, *, outside_is_absent: bool = False) -> tuple[int, Path] | None:
+    def lookup(name: str, *, outside_is_absent: bool = False) -> tuple[int, Path, str] | None:
         nonlocal root
         try:
-            candidate = dashboards_dir.joinpath(*_clean_parts((name,)))
+            parts = _clean_parts((name,))
+            candidate = dashboards_dir.joinpath(*parts)
         except ValueError:
             raise HTTPException(status_code=403, detail="Path traversal not allowed") from None
         try:
@@ -1807,25 +1811,20 @@ def _dashboard_file(
             if outside_is_absent:
                 return None
             raise HTTPException(status_code=403, detail="Path traversal not allowed")
-        return found
-
-    def served(resolved: Path) -> tuple[Path, str | None]:
-        page = resolved.relative_to(root).as_posix() if root is not None else None
-        return resolved, page if page in _PAGE_FILES else None
+        return found[0], found[1], "/".join(parts)
 
     found = lookup(path)
     if found is not None:
-        mode, resolved = found
-        if stat.S_ISREG(mode):
-            return served(resolved)
-        if stat.S_ISDIR(mode):
+        if stat.S_ISREG(found[0]):
+            return found[1], found[2]
+        if stat.S_ISDIR(found[0]):
             index = lookup(f"{path}/index.html")
             if index is not None and stat.S_ISREG(index[0]):
-                return served(index[1])
-    if not Path(path).suffix:
+                return index[1], index[2]
+    if not has_suffix(path):
         alias = lookup(f"{path}.html", outside_is_absent=True)
         if alias is not None and stat.S_ISREG(alias[0]):
-            return served(alias[1])
+            return alias[1], alias[2]
     return None
 
 
@@ -1952,10 +1951,11 @@ def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_
     product = getattr(request.app.state, "product", None)
     dashboard = _dashboard_file(dashboards_dir, path, product)
     if dashboard is not None:
-        file, page = dashboard
-        if page is not None:
-            return _machinery_page_response(file, page, dashboards_dir, product)
-        return FileResponse(file)
+        file, name = dashboard
+        if name in _PAGE_FILES:
+            return _machinery_page_response(file, name, dashboards_dir, product)
+        # The name it was found under sets the type, as when the route served that path itself.
+        return FileResponse(file, media_type=mimetypes.guess_type(name)[0] or "text/plain")
     declared = product_file(product, "index.html" if path in {"", "/"} else path)
     if declared is not None:
         return FileResponse(declared)

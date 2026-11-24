@@ -257,7 +257,7 @@ def product_file(product: ProductContribution | None, name: str) -> Path | None:
     if product is None:
         return None
     path = product.static_files.get(name)
-    if path is None and name and not Path(name).suffix:
+    if path is None and name and not has_suffix(name):
         path = product.static_files.get(f"{name}.html")
     if path is None:
         return None
@@ -269,6 +269,18 @@ def product_file(product: ProductContribution | None, name: str) -> Path | None:
     if found is None or root is None or not stat.S_ISREG(found[0]) or not found[1].is_relative_to(root[1]):
         return None
     return found[1]
+
+
+def has_suffix(path: str) -> bool:
+    """Whether the last component of the URL path ``path`` has a file suffix, by one rule on every interpreter.
+
+    The rule ``PurePath.suffix`` applies on Python 3.12 and 3.13: a dot after the first
+    character of the name and before its last. Python 3.14 changed it (a trailing dot, and
+    leading dots), so the static route never asks ``suffix`` whether to try an ``.html`` alias.
+    """
+    name = Path(path).name
+    dot = name.rfind(".")
+    return 0 < dot < len(name) - 1
 
 
 def kernel_lookup(path: Path) -> tuple[int, Path] | None:
