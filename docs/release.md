@@ -433,22 +433,27 @@ does these steps in order:
      When no Codex account is funded, or the budget is unreadable, the canary
      refuses with `no-allowance` and lists each account's reading. A dry run
      reads the same budget, prints the chosen accounts and refuses the same
-     way. Known residual (FU-ROUTING-BUDGET-FAILSTATE, owned by the Monitor
-     routing-budget owner): the canary reads the budget once per run, before
-     anything is created, and Monitor answers from its stored budget when it
-     has one. Once that budget is 15 seconds old, a request schedules a
-     rebuild beside it and is still answered from the stored budget. A
-     provider probe failure recorded after that build, such as a lost login,
-     is not in the budget the canary reads until a rebuild completes, so the
-     canary can choose that account.
+     way. The canary reads the budget once per run, before anything is
+     created. In every budget Monitor serves, a stored one included, a Codex
+     account whose latest Monitor probe failed carries that failure's time
+     and kind and is marked ineligible, and the canary does not use such an
+     account. Known residual: the canary does not probe the
+     provider itself, so a failure after Monitor's latest probe of an
+     account, such as a login lost since then, is not in the budget until a
+     later Monitor probe records it, and the canary can choose that account.
      The canary's own age check still applies: it counts a sample only while
      its `fetched_at` is within the probe age limit (`credit_max_age_s`, 900
      seconds as shipped) of now. For account b-sub, dispatch admission runs
      `codex login status` in the bound home and refuses the route with
      `codex_account_not_logged_in` when it exits non-zero. Account a (`sub`)
      has no such admission check, and no admission check covers other kinds
-     of provider probe failure. If a run reports a retained mount and
-     environment, settle its tasks before unmounting, as that message says.
+     of provider probe failure. The Codex unit inherits `HOME`,
+     `XDG_CONFIG_HOME` and `LU_CODEX_ACCOUNTS_FILE` from the user manager,
+     which locate account a's login and account b's binding. The budget does
+     not say which home or binding Monitor probed (FU-CODEX-PROBE-IDENTITY,
+     owned by the Monitor routing-budget owner). If a run reports a retained
+     mount and environment, settle its tasks before unmounting, as that
+     message says.
      The Claude route runs on subscription account b. The installed gate
      originally matched the keeper's runtime when canaries gated PR admission.
      At cut time, the candidate gate validates the models and catalog that this
