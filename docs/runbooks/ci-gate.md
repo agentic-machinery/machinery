@@ -61,24 +61,23 @@ estimate of 464.9 seconds was killed at 480), so 406 seconds. If the estimate ex
 outside the guards defer to merge-group pytest. If it exceeds the safe budget, the guards
 run and changed tests fill the rest of the budget, cheapest recorded duration first; the
 others defer with an explicit reason. Otherwise the importing tests fill half of the room
-the guards and changed tests leave under the cap, never past the safe budget. The selector
-considers direct importers before tests that only share a conftest, cheapest recorded duration
-first within each group. It lists both groups in `importing_test_files`. If the guards alone exceed
-the safe budget, the job writes `pr-affected.json` with `execution_status` `not_run_guards_exceed_safe_budget`
+the guards and changed tests leave under the cap, never past the safe budget, cheapest
+recorded duration first, with direct importers ahead of tests that only share a conftest.
+Both groups are listed in `importing_test_files`. If the guards alone exceed the safe budget,
+the job writes `pr-affected.json` with `execution_status` `not_run_guards_exceed_safe_budget`
 and fails with that reason instead of running to the timeout. The recorded estimate includes the importing tests that run, and
 `unknown_duration_files` includes every importing test with no recorded time.
 Some tests read a changed file as text through a computed path (for example a parametrized
 list of paths that the test parses), which the import scan cannot follow. A test file whose
 parsed source holds a string literal equal to a changed file's repository-relative path, or
 to the dotted module name of a changed Python module that is not a package `__init__.py`, is
-a text reader of that file (#12789). The whole literal must match. Comments, docstrings,
+a text reader of that file (#12789). The whole literal must match; comments, docstrings,
 other bare string statements, f-string pieces and literals in `conftest.py` never count.
-After the main selection, remaining direct importers and text readers share up to 60 seconds
-of extra estimated runtime. The selector considers them by recorded duration, cheapest first,
-then by path for ties. The result lists the text readers under `text_reading_test_files` and
-files that still do not fit under `deferred_files` for merge-group pytest. The extra pass can
-extend the default timeout to the total estimate times 1.18, rounded up to at most 550 seconds.
-Infrastructure includes conftest, pytest configuration, dependency locks, the CI workflow, CI Python setup,
+After the main selection, remaining direct importers and text readers share 60 extra seconds,
+ordered by duration, then by path. `text_reading_test_files` lists the reader candidates.
+Tests still over budget appear in `deferred_files` for merge-group pytest. The extra pass
+can extend the timeout to the total estimate times 1.18, rounded up to at most 550 seconds. Infrastructure
+includes conftest, pytest configuration, dependency locks, the CI workflow, CI Python setup,
 CI helpers and quarantine inputs; such a PR also runs and requires the pytest
 shards (see CI Gate). The summary and `pr-affected-proof` artifact
 record the candidate, requested files, deferred files and reason, recorded
