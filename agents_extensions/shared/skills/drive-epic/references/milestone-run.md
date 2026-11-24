@@ -350,6 +350,12 @@ turn to settle:
      `isCrossRepository` rows: a fork PR with the same branch name is not the child's. `--state
      all` is required, because the default lists open PRs only and misses one that merged during
      the stop; a result of 100 rows is truncated, so it is unresolved.
+   - **Exact head.** When the row's `commits_ahead` is above 0, `gh api --paginate --slurp
+     repos/<owner/name>/commits/<its head_sha>/pulls` lists every PR that contains the child's
+     final commit, on any branch and in any state (the association the dispatcher uses for a merged
+     delivery).
+     Keep rows whose head and base repositories are both `<owner/name>`. A zero-commit head names
+     no PR: another task's PR can share it.
    - **Ownership ledger.** `<interpreter> -m lu_machinery.orchestration.pr_ownership status`
      prints it. Every `handoffs` and `history` entry that names the child in any field
      (`successor`, `predecessor`, `worker_task`, `previous_worker_task`) is the child's PR, keyed
