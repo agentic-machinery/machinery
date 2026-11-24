@@ -127,7 +127,7 @@ def test_installed_hooks_refuse_unverifiable_ownership(hook_world, stage, case):
         else:
             record["worktree_path"] = str(repo.parent)
     elif case == "git-failure" and stage == "push":
-        record["worktree_base_ref"] = "missing-base"
+        record["worktree_base_sha"] = "1" * 40
     record_path.write_text(json.dumps(record), encoding="utf-8")
     if case == "missing":
         record_path.unlink()
@@ -154,6 +154,8 @@ def test_installed_hooks_refuse_unverifiable_ownership(hook_world, stage, case):
             record_path.chmod(0o600)
     assert result.returncode != 0, result.stdout
     assert "owned-path check could not run (" in result.stderr
+    if case == "git-failure" and stage == "push":
+        assert "WORKTREE_BASE_SHA_NOT_COMMIT" in result.stderr
     assert "); refusing" in result.stderr
     assert "DO-NOT-ECHO" not in result.stderr
     assert "owned-path check skipped" not in result.stderr

@@ -2,23 +2,23 @@
 
 
 
+import concurrent.futures
+import copy
 import json
 import subprocess
+import sys
+import time
 from contextlib import suppress
 from pathlib import Path
 from unittest.mock import Mock
+
 import pytest
-from lu_machinery.dispatcher import git, worker
+
+from lu_machinery.dispatcher import cli, git, ownership, store, worker
+from tests.dispatcher.conftest import MERGED as MERGED
 from tests.dispatcher.conftest import run_git as run_git
 from tests.helpers.product_tree import configured_roots as configured_roots
-import concurrent.futures
-import copy
-import sys
-import time
-from lu_machinery.dispatcher import cli
-from lu_machinery.dispatcher import ownership
-from lu_machinery.dispatcher import store
-from tests.dispatcher.conftest import MERGED as MERGED
+
 
 @pytest.mark.parametrize("fault", ["deleted-branch", "deleted-after-initial", "transient", "persistent"])
 @pytest.mark.parametrize("scope", ["owned", "granted", "outside"])
@@ -126,7 +126,7 @@ def test_matching_branch_requires_ownership_even_for_merge_rescue(
         real_run = git._verification_git
 
         def rejected_fetch(path, command, *args, **kwargs):
-            if command == "fetch":
+            if command == "fetch" and f"+{record['head_sha']}:refs/heads/delivery" in args:
                 raise git.VerificationFetchError(128, "fatal: git upload-pack: not our ref")
             return real_run(path, command, *args, **kwargs)
 
@@ -145,7 +145,7 @@ def test_matching_branch_requires_ownership_even_for_merge_rescue(
 
 
 @pytest.mark.parametrize("status", ["done", "failed", "cancelled", "timeout", "crashed"])
-@pytest.mark.parametrize("command", ["fetch", "merge-base", "version", "rev-list", "log"])
+@pytest.mark.parametrize("command", ["fetch", "ls-remote", "version", "rev-list", "log"])
 def test_scope_verification_failure_only_rejects_success(delivery_settle, monkeypatch, status, command):
     record, settle = delivery_settle
     record = settle("pushed")
@@ -238,7 +238,7 @@ def test_merge_resolution_and_root_paths_cannot_escape_scope(sandbox, delivery_s
             (tree / "outside.txt").write_text("worker merge edit\n")
             run_git(tree, "add", "outside.txt")
         run_git(tree, "commit", "--no-edit")
-    run_git(sandbox.repo, "push", "origin", "main:release")
+    run_git(sandbox.repo, "push", "origin", "main")
     # A new owned commit makes the supervisor exercise delivery after the merge.
     result = settle("pushed")
     assert result["status"] == ("done" if history == "clean" else "no_deliverable")

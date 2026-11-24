@@ -4,16 +4,14 @@ import os
 import subprocess
 from pathlib import Path
 from unittest.mock import Mock
+
 import pytest
 import yaml
-from lu_machinery.dispatcher import git, worker
+
+from lu_machinery.dispatcher import git, ownership, worker
 from lu_machinery.dispatcher.types import TaskSpec
 from tests.dispatcher.conftest import run_git
 from tests.helpers.product_tree import configured_roots  # noqa: F401
-
-
-
-
 
 
 @pytest.mark.parametrize("attack", ["alias-shell", "alias-empty", "replace", "origin", "insteadOf", "pushInsteadOf"])
@@ -46,6 +44,31 @@ def test_worker_git_state_cannot_hide_outside_commit(sandbox, delivery_settle, a
     assert record["status"] == "no_deliverable"
     assert record["error"].startswith(
         "outside_owned_paths: outside.txt" if attack == "replace" else "owned_paths_verification_failed: ")
+
+
+def test_pushed_paths_uses_recorded_base_sha_when_base_ref_deleted(sandbox, delivery_settle):
+    """Deleting a stacked branch cannot invalidate the commit recorded at dispatch."""
+    record, settle = delivery_settle
+    tree = Path(record["cwd"])
+    (tree / "inherited.txt").write_text("parent branch delivery\n")
+    run_git(tree, "add", "inherited.txt")
+    run_git(tree, "commit", "-m", "parent branch delivery")
+    record["worktree_base_sha"] = run_git(tree, "rev-parse", "HEAD")
+    run_git(tree, "push", "origin", "HEAD:refs/heads/release")
+    run_git(sandbox.remote, "update-ref", "-d", "refs/heads/release")
+    run_git(tree, "fetch", "--prune", "origin")
+    assert not run_git(tree, "for-each-ref", "refs/remotes/origin/release")
+    (tree / "delivered.txt").write_text("owned delivery\n")
+    run_git(tree, "add", "delivered.txt")
+    run_git(tree, "commit", "-m", "owned delivery")
+    ref = f"refs/heads/{record['worktree_branch']}"
+    head = run_git(tree, "rev-parse", "HEAD")
+    updates = f"{ref} {head} {ref} {'0' * len(head)}\n"
+    paths = ownership._pushed_paths(ownership._local_git(tree), record, updates)
+    assert set(paths) - {""} == {"delivered.txt"}
+
+    result = settle("pushed")
+    assert (result["status"], result["error"]) == ("done", None)
 
 
 def test_ownership_walk_verifies_distinct_publish_branch(sandbox, delivery_settle):
@@ -84,9 +107,9 @@ def test_ownership_walk_excludes_all_merge_bases(sandbox, delivery_settle):
     run_git(sandbox.repo, "commit", "-m", "right")
     right = run_git(sandbox.repo, "rev-parse", "HEAD")
     run_git(sandbox.repo, "merge", "--no-ff", "--no-edit", left)
-    run_git(sandbox.repo, "push", "origin", "main:release")
+    run_git(sandbox.repo, "push", "origin", "main")
     run_git(tree, "merge", "--no-ff", "--no-edit", right)
-    assert set(run_git(tree, "merge-base", "--all", "HEAD", "origin/release").splitlines()) == {left, right}
+    assert set(run_git(tree, "merge-base", "--all", "HEAD", "origin/main").splitlines()) == {left, right}
 
     delivered = settle("pushed")
     assert (delivered["status"], delivered["error"]) == ("done", None)
@@ -101,7 +124,7 @@ def test_ownership_walk_requires_distinct_refs_and_nonempty_range(sandbox, deliv
     (tree / "outside.txt").write_text("scope fixture\n")
     run_git(tree, "add", "outside.txt")
     run_git(tree, "commit", "-m", "scope fixture")
-    refs = list(dict.fromkeys(("refs/heads/release", f"refs/heads/{publish_branch}")))
+    refs = list(dict.fromkeys(("refs/heads/main", f"refs/heads/{publish_branch}")))
     run_git(tree, "push", "origin", *(f"HEAD:{ref}" for ref in refs))
     rejected = settle()
     assert rejected["remote_ref"] == f"refs/heads/{publish_branch}"
@@ -260,9 +283,10 @@ def test_isolated_private_https_fetch_credentials_never_escape_exact_registered_
     local_imports = []
 
     def local_transport(argv, **kwargs):
-        if "fetch" not in argv:
+        command = next((name for name in ("fetch", "ls-remote") if name in argv), None)
+        if command is None:
             return real_run(argv, **kwargs)
-        index = argv.index("fetch")
+        index = argv.index(command)
         prefix = argv[:index]
         env = kwargs["env"]
         assert env["GIT_CONFIG_GLOBAL"] == env["GIT_CONFIG_SYSTEM"] == os.devnull
@@ -321,7 +345,7 @@ def test_ownership_walk_does_not_fetch_full_history(tmp_path, monkeypatch, shape
     walk must obtain non-shallow history and apply the ownership rules to it.
     """
     remote, tree = tmp_path / "remote.git", tmp_path / "tree"
-    run_git(tmp_path, "init", "--bare", str(remote))
+    run_git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
     run_git(remote, "config", "uploadpack.allowFilter", "true")
     run_git(tmp_path, "init", "-b", "main", str(tree))
     run_git(tree, "config", "user.email", "stub@example.invalid")
@@ -401,7 +425,7 @@ def test_ownership_walk_falls_back_to_full_history_when_tips_predate_skewed_task
     rules to it.
     """
     remote, tree = tmp_path / "remote.git", tmp_path / "tree"
-    run_git(tmp_path, "init", "--bare", str(remote))
+    run_git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
     run_git(remote, "config", "uploadpack.allowFilter", "true")
     run_git(tmp_path, "init", "-b", "main", str(tree))
     run_git(tree, "config", "user.email", "stub@example.invalid")
