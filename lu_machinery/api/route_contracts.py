@@ -541,7 +541,10 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "and waste breakdowns, cache hit ratios and five highest-volume runs. Unsupported attributions are null. "
         "/metrics exports "
         "selected gauges from the same cached snapshot for 7d, 30d, 90d, all and ISO weeks (omitting 24h, observed "
-        "wall hours and chart series). Comparisons list the observed effort levels. The unknown effort group is "
+        "wall hours and chart series). Token gauges cover 24h and 7d: lu_tokens_fresh_input, lu_tokens_cached_input, "
+        "lu_tokens_output and lu_tokens_per_merged_pr by model and work type, lu_tokens_waste by model and waste "
+        "class, and lu_token_data_age_seconds. Figures without readings emit no sample. Comparisons list the "
+        "observed effort levels. The unknown effort group is "
         "reported separately and excluded from model totals.",
         "The durable model-stats summary rows under batch_state/model-stats/, written at settlement and "
         "backfilled from hot and archived task records, plus whole-line X-Agent trailers on each registered "

@@ -450,6 +450,23 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
         {"model": "gpt-6.1-sol", "tasks": 3, "reported_tasks": 3, "ratio": 0.4},
     ]
     assert [r["status"] for r in token_use["top_tasks"]] == ["no_deliverable", "done", "done"]
+    ctx = fixture_context(tmp_path)
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx: (snapshot, 1.0))
+    registry = CollectorRegistry()
+    registry.register(stats.ModelStatsCollector(ctx))
+    for window in ("7d", "24h"):
+        labels = {"window": window, "model": "gpt-6.1-sol", "work_type": "implementation"}
+        assert registry.get_sample_value("lu_tokens_fresh_input", labels) == 600
+        assert registry.get_sample_value("lu_tokens_cached_input", labels) == 400
+        assert registry.get_sample_value("lu_tokens_output", labels) == 100
+        assert registry.get_sample_value("lu_tokens_per_merged_pr", labels) == (1100 if window == "7d" else None)
+    assert registry.get_sample_value("lu_token_data_age_seconds") == 1
+    assert registry.get_sample_value("lu_tokens_waste", {
+        "window": "7d", "model": "gpt-6.1-sol", "waste_class": "failed_or_empty",
+    }) == 1100
+    assert registry.get_sample_value("lu_tokens_waste", {
+        "window": "7d", "model": "gpt-6.1-sol", "waste_class": "capped_and_replaced",
+    }) is None
 
     review = _row(payload, "claude-opus-5-5", "review")
     assert review["tasks"] == 3 and "landed" not in review
@@ -1366,6 +1383,7 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
             assert response.status_code == 200
             assert not re.search(r"\b(?:glm|kimi)", response.text, re.I), view
     assert "24h" in snapshot["windows"] and "24h" not in snapshot["metrics"]["windows"]
+    assert set(snapshot["metrics"]["token_windows"]) == {"24h", "7d"}
     metrics = snapshot["metrics"]["windows"]["all"]
     exported = {(r["model"], e["effort"]) for r in metrics["models"] for e in r["by_effort"]}
     assert ("gpt-6.1-sol", "unknown") in exported and ("other", "high") in exported
