@@ -379,16 +379,19 @@ def test_journal_invalid_payload_variants(
         "after_id=abc",
         "after_id=1.5",
         "after_id=9999999999999999999999",
+        "after_id=" + "9" * 4301,
         "limit=",
         "limit=0",
         "limit=-5",
         "limit=101",
         "limit=abc",
+        "limit=" + "9" * 4301,
         "limit=10&limit=20",
         "offset=",
         "offset=-1",
         "offset=abc",
         "offset=3000000000",
+        "offset=" + "9" * 4301,
     ],
 )
 def test_journal_invalid_params_return_422_no_store(
@@ -415,6 +418,9 @@ def test_journal_invalid_params_return_422_no_store(
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Host": "127.0.0.1:99999"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Host": "bad host"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Host": "127.0.0.1:0"}),
+        (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Host": "[::1%lo]:8765"}),
+        (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "http://[::1%lo]:8765"}),
+        (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "http://[::1%25lo]:8765"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "https://evil.example"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": "null"}),
         (("127.0.0.1", 50000), "http://127.0.0.1:8765", {"Origin": ""}),
@@ -612,11 +618,11 @@ for (const state of ['cli_unavailable', 'db_unavailable', 'invalid_payload']) {
   assert.doesNotMatch(downHtml, /No journal entries/i);
 }
 
-// F2 regression: filter change during an in-flight refresh aborts/supersedes the stale fetch
-// and resolves with the newly selected URL instead of overwriting with stale data.
+// F2 regression: (a) filter change during an in-flight refresh aborts/supersedes the stale fetch;
+// (b) Clear filters / same-URL reload during an in-flight fetch keeps it alive without erroring.
 (async () => {
   const calls = [];
-  let releaseFirst;
+  let releaseSameUrl;
   global.fetch = (url, opts) => {
     calls.push(url);
     if (calls.length === 1) {
@@ -624,32 +630,52 @@ for (const state of ['cli_unavailable', 'db_unavailable', 'invalid_payload']) {
         if (opts && opts.signal) {
           opts.signal.addEventListener('abort', () => reject(new Error('aborted')));
         }
-        releaseFirst = () => resolve({
-          ok: true,
-          status: 200,
-          text: async () => JSON.stringify({...payload, filters: {project: null, type: null, since: '7d', after_id: null}}),
-          headers: {get: () => null},
-        });
       });
     }
-    return Promise.resolve({
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify({...payload, filters: {project: null, type: 'decision', since: '7d', after_id: null}}),
-      headers: {get: () => null},
+    if (calls.length === 2) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({...payload, filters: {project: null, type: 'decision', since: '7d', after_id: null}}),
+        headers: {get: () => null},
+      });
+    }
+    return new Promise((resolve, reject) => {
+      if (opts && opts.signal) {
+        opts.signal.addEventListener('abort', () => reject(new Error('aborted')));
+      }
+      releaseSameUrl = () => resolve({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(payload),
+        headers: {get: () => null},
+      });
     });
   };
   global.location = {search: '', pathname: '/journal'};
-  const inFlight = fetchJournal();
+  const firstLoad = runner.loadPanel(PANELS[0]);
   assert.deepEqual(calls, ['/api/journal']);
-  // Simulate user changing filter while first fetch is still pending.
+  assert.equal(activeRequestUrl, '/api/journal');
+  // (a) Changing URL during in-flight fetch aborts and supersedes.
   global.location.search = '?type=decision';
-  assert.ok(activeController);
-  activeController.abort();
-  const reading = await inFlight;
+  reloadForCurrentUrl();
+  await firstLoad;
   assert.deepEqual(calls, ['/api/journal', '/api/journal?type=decision']);
-  assert.equal(reading.url, '/api/journal?type=decision');
-  assert.equal(reading.data.filters.type, 'decision');
+  assert.equal(PANELS[0].ok, true);
+  assert.equal(PANELS[0].readings[0].url, '/api/journal?type=decision');
+  assert.equal(runner.latest.journal.filters.type, 'decision');
+
+  // (b) Same-URL reload (e.g. Clear filters while unfiltered load is pending) must NOT abort.
+  global.location.search = '';
+  const sameUrlLoad = runner.loadPanel(PANELS[0]);
+  assert.equal(calls.length, 3);
+  assert.equal(activeRequestUrl, '/api/journal');
+  reloadForCurrentUrl();
+  assert.equal(activeController.signal.aborted, false);
+  releaseSameUrl();
+  await sameUrlLoad;
+  assert.equal(PANELS[0].ok, true);
+  assert.equal(calls.length, 3);
 })().catch(err => { console.error(err); process.exitCode = 1; });
 """
     )

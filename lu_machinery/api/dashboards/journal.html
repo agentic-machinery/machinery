@@ -392,15 +392,16 @@ function renderChips(latest, lastSeenId = readLastSeenId()) {
 }
 
 let activeController = null;
+let activeRequestUrl = null;
 
 async function fetchJournal() {
   while (true) {
     const targetUrl = journalUrl();
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     activeController = controller;
-    let timedOut = false;
+    activeRequestUrl = targetUrl;
     const timer = controller
-      ? setTimeout(() => { timedOut = true; controller.abort(); }, Machinery.API_TIMEOUT_MS)
+      ? setTimeout(() => { controller.abort(); }, Machinery.API_TIMEOUT_MS)
       : null;
     try {
       const options = {headers: {Accept: "application/json"}};
@@ -433,7 +434,10 @@ async function fetchJournal() {
       throw error;
     } finally {
       if (timer !== null) clearTimeout(timer);
-      if (activeController === controller) activeController = null;
+      if (activeController === controller) {
+        activeController = null;
+        activeRequestUrl = null;
+      }
     }
   }
 }
@@ -455,8 +459,9 @@ const runner = createPanelRunner({
 });
 
 function reloadForCurrentUrl() {
-  PANELS[0].urls = [journalUrl()];
-  if (activeController) {
+  const nextUrl = journalUrl();
+  PANELS[0].urls = [nextUrl];
+  if (activeController && !activeController.signal.aborted && activeRequestUrl !== nextUrl) {
     activeController.abort();
   }
   runner.retryPanel("journal");

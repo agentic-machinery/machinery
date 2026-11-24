@@ -76,7 +76,7 @@ def _valid_port(raw_port: str) -> bool:
 
 def _is_loopback_authority(raw: str) -> bool:
     """Validate one raw HTTP authority (``host`` or ``host:port``) as strictly loopback."""
-    if not raw or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in "/?#@\\" for ch in raw):
+    if not raw or any(ord(ch) <= 0x20 or ord(ch) >= 0x7F or ch in "/?#@\\%" for ch in raw):
         return False
     if raw.startswith("["):
         end_bracket = raw.find("]")
@@ -89,6 +89,8 @@ def _is_loopback_authority(raw: str) -> bool:
         try:
             address = ipaddress.IPv6Address(host_part)
         except ValueError:
+            return False
+        if address.scope_id is not None:
             return False
         return _is_loopback_ip(address)
 
@@ -190,7 +192,10 @@ def _parse_bounded_int(
         return True, default
     if not _ASCII_UINT_RE.fullmatch(raw):
         return False, None
-    value = int(raw)
+    try:
+        value = int(raw)
+    except ValueError:
+        return False, None
     if value < minimum or value > maximum:
         return False, None
     return True, value
