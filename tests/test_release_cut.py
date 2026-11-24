@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ from lu_machinery.ci import check_agent_attribution as attribution
 from lu_machinery.common import repo_root
 from lu_machinery.dispatcher import git as git_module
 from lu_machinery.release_cut import Cut, CutError, main, preflight, record_changelog, release_notes
+from tests.wait_helpers import wait_for_line
 
 HEAD = "a" * 40
 TAG_COMMIT = "b" * 40
@@ -1742,6 +1744,8 @@ def test_successful_default_work_dir_cut_removes_the_directory_and_preserves_cut
         assert "0.1.66-" in log.name
         assert "a" * 12 in log.name
         assert re.fullmatch(r"0\.1\.66-a{12}-\d{8}T\d{6}Z(?:-\d+)?-cut\.log", log.name)
+        assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    assert stat.S_IMODE((state / "lu-release-cut").stat().st_mode) == 0o700
 
     monkeypatch.setattr(release_cut, "execute", fail)
     assert main(["cut", "--dry-run", "--no-alert", "--x-agent", "claude/claude-opus-5-5"]) == 1
@@ -1769,14 +1773,21 @@ def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(mo
     lock = tmp_path / "release-cut.lock"
     monkeypatch.setattr(release_cut, "_operator_home", lambda: home)
     monkeypatch.setattr(release_cut, "_release_lock_path", lambda: lock)
+    # A cut on the host is a real release-cut process. This fixture proves its own live
+    # directory and its own stand-in pid, so the host process is not part of the result.
+    monkeypatch.setattr(release_cut, "_live_release_cut_pids", lambda _proc: [])
     assert release_cut._operator_home() == home
 
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "keep").write_text("safe", encoding="utf-8")
-    link = home / ".lu-release-cut-link"
+    link = home / ".lu-release-cut-linkaaaa"
     link.symlink_to(outside, target_is_directory=True)
     _backdate(link, 48)
+    handmade = home / ".lu-release-cut-manual"
+    handmade.mkdir()
+    (handmade / "keep").write_text("handmade", encoding="utf-8")
+    _backdate(handmade, 48)
     other = home / "scratch-notes"
     other.mkdir()
     (other / "notes").write_text("keep", encoding="utf-8")
@@ -1789,15 +1800,15 @@ def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(mo
     nested.mkdir()
     (nested / "payload").write_text("keep", encoding="utf-8")
     _backdate(nested, 48)
-    fresh = home / ".lu-release-cut-fresh"
+    fresh = home / ".lu-release-cut-fresh001"
     fresh.mkdir()
     (fresh / "new").write_text("new", encoding="utf-8")
-    stale = home / ".lu-release-cut-stale"
+    stale = home / ".lu-release-cut-stale001"
     stale.mkdir()
     (stale / "blob").write_bytes(b"x" * 2048)
     (stale / "jump").symlink_to(outside, target_is_directory=True)
     _backdate(stale, 48)
-    live = home / ".lu-release-cut-live"
+    live = home / ".lu-release-cut-live0001"
     live.mkdir()
     (live / "blob").write_bytes(b"y" * 100)
     _backdate(live, 48)
@@ -1833,18 +1844,29 @@ def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(mo
         assert str(other) not in tokens
         assert str(bare) not in tokens
         assert str(nested) not in tokens
+        assert str(handmade) not in tokens
         assert stale.is_dir()
         assert (outside / "keep").read_text(encoding="utf-8") == "safe"
 
+        monkeypatch.setattr(release_cut, "_live_release_cut_pids", lambda _proc: [os.getpid()])
+        assert main(["prune", "--apply"]) == 0
+        running = capsys.readouterr().out
+        only_fixture(running)
+        assert "release-cut is running" in running
+        assert stale.is_dir()
+        monkeypatch.setattr(release_cut, "_live_release_cut_pids", lambda _proc: [])
+
+        ready = tmp_path / "lock-ready"
         holder = subprocess.Popen(
             [sys.executable, "-c",
-             "import fcntl, sys, time; "
-             "handle = open(sys.argv[1], 'a'); fcntl.flock(handle, fcntl.LOCK_EX); time.sleep(120)",
-             str(lock)],
+             "import fcntl, sys, time\n"
+             "handle = open(sys.argv[1], 'a')\n"
+             "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+             "open(sys.argv[2], 'w', encoding='utf-8').write('ready\\n')\n"
+             "time.sleep(120)\n",
+             str(lock), str(ready)],
         )
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and not _lock_is_held(lock):
-            time.sleep(0.02)
+        wait_for_line(ready, timeout=5, stop_if=lambda: holder.poll() is not None)
         assert _lock_is_held(lock)
         assert main(["prune", "--apply"]) == 0
         held_out = capsys.readouterr().out
@@ -1868,6 +1890,64 @@ def test_prune_refuses_symlinks_non_prefix_names_and_live_process_directories(mo
         assert bare.is_dir()
         assert nested.is_dir() and (nested / "payload").read_text(encoding="utf-8") == "keep"
         assert fresh.is_dir()
+        assert handmade.is_dir() and (handmade / "keep").read_text(encoding="utf-8") == "handmade"
+        assert (outside / "keep").read_text(encoding="utf-8") == "safe"
+
+        swap = home / ".lu-release-cut-swap0001"
+        swap.mkdir()
+        (swap / "old").write_text("old", encoding="utf-8")
+        _backdate(swap, 48)
+        aside = tmp_path / "aside-old"
+        real_size = release_cut._directory_size
+
+        def swapping(path: Path) -> int:
+            if path == swap and path.exists() and (path / "old").exists():
+                path.rename(aside)
+                path.mkdir()
+                (path / "fresh").write_text("fresh", encoding="utf-8")
+            return real_size(path)
+
+        monkeypatch.setattr(release_cut, "_directory_size", swapping)
+        assert main(["prune", "--apply"]) == 0
+        swapped = capsys.readouterr().out
+        only_fixture(swapped)
+        assert "directory changed" in swapped
+        assert (swap / "fresh").read_text(encoding="utf-8") == "fresh"
+        assert (aside / "old").read_text(encoding="utf-8") == "old"
+
+        here = home / ".lu-release-cut-cwd00001"
+        here.mkdir()
+        (here / "blob").write_text("stay", encoding="utf-8")
+        _backdate(here, 48)
+        previous = os.getcwd()
+        os.chdir(here)
+        try:
+            assert main(["prune", "--apply"]) == 0
+            stayed = capsys.readouterr().out
+        finally:
+            os.chdir(previous)
+        only_fixture(stayed)
+        assert f"prune: keep {here} (in use by a live process)" in stayed
+        assert (here / "blob").read_text(encoding="utf-8") == "stay"
+
+        mounted = home / ".lu-release-cut-mount001"
+        mounted.mkdir()
+        (mounted / "blob").write_text("mounted", encoding="utf-8")
+        _backdate(mounted, 48)
+        monkeypatch.setattr(release_cut.task_scratch, "mount_points", lambda: None)
+        assert main(["prune", "--apply"]) == 0
+        unknown = capsys.readouterr().out
+        only_fixture(unknown)
+        assert (mounted / "blob").read_text(encoding="utf-8") == "mounted"
+        assert "mount information unavailable" in unknown
+        monkeypatch.setattr(
+            release_cut.task_scratch, "mount_points", lambda: frozenset({str(mounted / "bind")}),
+        )
+        assert main(["prune", "--apply"]) == 0
+        bound = capsys.readouterr().out
+        only_fixture(bound)
+        assert (mounted / "blob").read_text(encoding="utf-8") == "mounted"
+        assert "mount point" in bound
         assert (outside / "keep").read_text(encoding="utf-8") == "safe"
     finally:
         if proc.poll() is None:

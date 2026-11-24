@@ -258,10 +258,12 @@ work directory itself (no `--work`), a successful `cut` or `post-release`,
 including a successful dry run, copies `cut.log` to
 `$XDG_STATE_HOME/lu-release-cut/<version>-<head>-<UTC time>-cut.log`
 (`~/.local/state/lu-release-cut/` when `XDG_STATE_HOME` is unset, empty or
-relative) and then removes the work directory. A relative `XDG_STATE_HOME` is
-ignored, as the XDG base-directory spec requires. The log name uses the
+relative) and then removes the work directory. The `lu-release-cut` directory
+is mode `0700` and the archived log is mode `0600`. A relative `XDG_STATE_HOME`
+is ignored, as the XDG base-directory spec requires. The log name uses the
 version, the first 12 characters of the machinery HEAD, and a UTC timestamp
-such as `0.1.66-6b51fa6d435f-20261124T031228Z-cut.log`. A directory passed with
+such as `0.1.66-6b51fa6d435f-20261124T031228Z-cut.log`. `post-release` uses the
+HEAD it resolved. A directory passed with
 `--work` is never removed. On a successful real cut that keeps a `--work`
 directory, the last step still removes only the rebuildable scratch (`accept`,
 `product`, `npm-cache`, `build-venv`, `agent-consumer`, `src`, `src.tar`,
@@ -290,10 +292,20 @@ remove and the space, and it deletes nothing unless `--apply` is set:
 ```
 
 `prune` only considers direct children of the home directory whose names are
-the tool's own `.lu-release-cut-` prefix plus the random suffix `mkdtemp`
-adds. It refuses symlinks, other names, files, and directories a live process
-is using, and it does not follow symlinks. While a cut holds `release-cut.lock`,
-or another `cut` or `post-release` process is running, `prune` removes nothing.
+the tool's own `.lu-release-cut-` prefix plus the eight characters `mkdtemp`
+appends (letters, digits and underscore). A different suffix, including a
+hand-made name, is left alone. It refuses symlinks, other names, files, a
+directory a live process is using (including `prune`'s own current directory),
+and a directory that was replaced or touched after it was chosen. It does not
+follow symlinks, and it refuses to delete a directory that contains a mount,
+including a bind mount of the same filesystem. While a cut holds
+`release-cut.lock`, or another `cut` or `post-release` process is running,
+`prune` removes nothing. A directory passed with `--work` is not removed by
+the cut; do not pass a home-directory child of this exact shape as `--work`
+if a later prune should keep it. `HOME` must be an absolute path. A relative
+or empty `HOME` is refused, and the path is resolved before a directory is
+created or listed, so a symlink in `HOME` cannot make prune and the cut use
+two different directories.
 
 ```bash
 "$PRIMARY/.venv/bin/python" -I -m lu_machinery.release_cut cut --dry-run --x-agent claude/claude-opus-5-5

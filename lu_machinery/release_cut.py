@@ -38,7 +38,7 @@ from functools import partial
 from pathlib import Path
 from typing import Literal
 
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, task_scratch
 from lu_machinery.common.git_context import sanitized_git_env
 
 # The post-release PR's title. A range holding only these PRs is unchanged.
@@ -66,9 +66,10 @@ VERSION_FILES = ("pyproject.toml", "package.json", "package-lock.json")
 ALERT_RECIPIENT = "claude-cto"
 _PROXY_VARIABLES = frozenset({"http_proxy", "https_proxy", "no_proxy", "all_proxy"})
 CI_WORKFLOW = "CI Gate"
-# tempfile.mkdtemp appends letters, digits and underscores. Prune deletes only that shape.
+# tempfile.mkdtemp appends exactly eight letters, digits or underscores. Prune deletes only that shape.
 _WORK_PREFIX = ".lu-release-cut-"
-_WORK_NAME = re.compile(re.escape(_WORK_PREFIX) + r"[A-Za-z0-9_]+\Z")
+_WORK_SUFFIX = r"[A-Za-z0-9_]{8}"
+_WORK_NAME = re.compile(re.escape(_WORK_PREFIX) + _WORK_SUFFIX + r"\Z")
 _STATE_DIR_NAME = "lu-release-cut"
 _PRUNE_DEFAULT_HOURS = 24.0
 _RELEASE_COMMANDS = frozenset({"cut", "post-release"})
@@ -1562,8 +1563,23 @@ def execute(cut: Cut) -> int:
 
 
 def _operator_home() -> Path:
-    """The home directory where a default work directory is created. Tests replace this."""
-    return Path.home()
+    """The real home directory where a default work directory is created. Tests replace this.
+
+    A relative or empty ``HOME`` is refused. ``Path.home()`` turns an empty ``HOME`` into ``/``,
+    and a ``HOME`` that walks through a symlink otherwise names a different directory than the one
+    ``mkdtemp`` creates. The resolved path is the directory both creation and prune use.
+    """
+    raw = os.environ.get("HOME")
+    if raw is not None and (not raw or not Path(raw).is_absolute()):
+        raise OSError("HOME must be an absolute path")
+    try:
+        home = Path.home().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise OSError(f"cannot resolve the home directory: {exc}") from exc
+    info = home.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or home == Path("/"):
+        raise OSError(f"refusing home directory {home}")
+    return home
 
 
 def _release_lock_path() -> Path:
@@ -1619,8 +1635,10 @@ def _preserve_cut_log(work: Path, *, version: str, head: str) -> Path | None:
         raise OSError(f"cut.log is not a regular file: {source}")
     state = _release_state_dir()
     state.mkdir(parents=True, exist_ok=True)
-    if state.is_symlink() or not state.is_dir():
+    state_info = state.lstat()
+    if stat.S_ISLNK(state_info.st_mode) or not stat.S_ISDIR(state_info.st_mode):
         raise OSError(f"release-cut state directory is not a real directory: {state}")
+    os.chmod(state, 0o700)
     stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     stem = f"{_filename_token(version or 'noversion')}-{_filename_token((head or 'nohead')[:12])}-{stamp}"
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -1631,10 +1649,11 @@ def _preserve_cut_log(work: Path, *, version: str, head: str) -> Path | None:
         for suffix in ("", "-2", "-3", "-4", "-5", "-6", "-7", "-8"):
             dest = state / f"{stem}{suffix}-cut.log"
             try:
-                out_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow, 0o644)
+                out_fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | nofollow, 0o600)
             except FileExistsError:
                 continue
             try:
+                os.fchmod(out_fd, 0o600)
                 while chunk := os.read(src_fd, 1024 * 1024):
                     view = memoryview(chunk)
                     while view:
@@ -1663,11 +1682,14 @@ def _preserve_cut_log(work: Path, *, version: str, head: str) -> Path | None:
     raise OSError(f"could not allocate a cut.log name in {state}")
 
 
-def _unlink_tool_work_directory(work: Path, home: Path) -> None:
+def _unlink_tool_work_directory(
+    work: Path, home: Path, *, expected: tuple[int, int] | None = None,
+) -> None:
     """Remove ``work`` only when it is a real direct child of ``home`` with this tool's prefix.
 
-    Opens ``home`` and deletes the child by directory file descriptor, so a symlink that replaced
-    the child is refused instead of followed.
+    Opens ``home`` and deletes the child through the task-scratch remover, which refuses a symlink,
+    a replaced directory, and a mount (including a same-device bind mount) before it unlinks anything.
+    ``expected`` is the device and inode chosen earlier; a different directory at the same path is refused.
     """
     name = work.name
     if _WORK_NAME.fullmatch(name) is None:
@@ -1683,7 +1705,14 @@ def _unlink_tool_work_directory(work: Path, home: Path) -> None:
         info = os.lstat(name, dir_fd=directory)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise OSError(f"refusing to remove {home_abs / name}: not a real directory")
-        shutil.rmtree(name, dir_fd=directory)
+        if expected is not None and (info.st_dev, info.st_ino) != expected:
+            raise OSError(f"refusing to remove {home_abs / name}: directory was replaced")
+        try:
+            task_scratch._remove_invocation_dir(
+                directory, name, namespace=home_abs, expected_dev=info.st_dev, expected_ino=info.st_ino,
+            )
+        except task_scratch.ContainmentError as exc:
+            raise OSError(f"refusing to remove {home_abs / name}: {exc}") from exc
     finally:
         os.close(directory)
 
@@ -1790,6 +1819,10 @@ def _referenced_paths(proc_root: Path) -> set[str]:
         if not entry.name.isdigit() or int(entry.name) == me:
             continue
         _collect_process_paths(entry, found)
+    # This process is omitted above so its own directory walk is not a holder. Its cwd still is:
+    # prune launched inside a candidate must not delete that directory.
+    with contextlib.suppress(OSError):
+        found.add(os.getcwd())
     return found
 
 
@@ -1889,7 +1922,7 @@ def prune_stale_work_directories(
     except OSError as exc:
         print(f"prune: cannot list {home_abs}: {exc}", file=sys.stderr)
         return 1
-    chosen: list[tuple[str, int]] = []
+    chosen: list[tuple[str, int, int, int]] = []
     for name in names:
         if _WORK_NAME.fullmatch(name) is None:
             continue
@@ -1920,14 +1953,13 @@ def prune_stale_work_directories(
         except OSError as exc:
             print(f"prune: refuse {candidate} (size unknown: {exc})")
             continue
-        chosen.append((name, size))
-        action = "remove" if apply else "would remove"
-        print(f"prune: {action} {candidate} ({_format_bytes(size)}, age {age / 3600:.1f} h)")
-    total = sum(size for _, size in chosen)
+        chosen.append((name, size, info.st_dev, info.st_ino))
+        print(f"prune: would remove {candidate} ({_format_bytes(size)}, age {age / 3600:.1f} h)")
+    total = sum(size for _, size, _, _ in chosen)
     if apply:
         removed = 0
         removed_bytes = 0
-        for name, size in chosen:
+        for name, size, dev, ino in chosen:
             candidate = home_abs / name
             held_now = _release_cut_lock_held(lock_path)
             if held_now is None:
@@ -1940,9 +1972,23 @@ def prune_stale_work_directories(
                 if _live_release_cut_pids(proc_root) or _path_is_held(candidate, _referenced_paths(proc_root)):
                     print(f"prune: keep {candidate} (in use by a live process)")
                     continue
-                _unlink_tool_work_directory(candidate, home_abs)
+                current = candidate.lstat()
             except OSError as exc:
-                print(f"prune: refuse {candidate} ({exc})", file=sys.stderr)
+                print(f"prune: refuse {candidate} ({exc})")
+                continue
+            if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+                print(f"prune: refuse {candidate} (not a real directory)")
+                continue
+            if (current.st_dev, current.st_ino) != (dev, ino):
+                print(f"prune: refuse {candidate} (directory changed)")
+                continue
+            if time.time() - current.st_mtime < threshold:
+                print(f"prune: keep {candidate} (newer than {older_than_hours:g} h)")
+                continue
+            try:
+                _unlink_tool_work_directory(candidate, home_abs, expected=(dev, ino))
+            except OSError as exc:
+                print(f"prune: refuse {candidate} ({exc})")
                 continue
             removed += 1
             removed_bytes += size
@@ -1957,12 +2003,17 @@ def prune_stale_work_directories(
 
 def _prune_cli(args: argparse.Namespace) -> int:
     try:
+        home = _operator_home()
+    except OSError as exc:
+        print(f"prune: {exc}", file=sys.stderr)
+        return 1
+    try:
         lock_path = _release_lock_path()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"prune: cannot locate release-cut.lock: {exc}", file=sys.stderr)
         return 1
     return prune_stale_work_directories(
-        _operator_home(), apply=args.apply, older_than_hours=args.older_than, lock_path=lock_path,
+        home, apply=args.apply, older_than_hours=args.older_than, lock_path=lock_path,
     )
 
 
@@ -2040,8 +2091,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     prune_text = (
         "Remove old tool-created release work directories from the home directory.\n"
         "Use it after a cut to reclaim directories a failed or interrupted run left behind. "
-        "Do not use it to delete a directory you passed as --work, or any path that is not a direct "
-        "child of the home directory named with this tool's .lu-release-cut- prefix."
+        "It removes only a direct child of the home directory whose name is .lu-release-cut- plus the "
+        "eight characters mkdtemp appends. A different suffix is left alone. A --work directory is not "
+        "removed by cut; do not give --work that exact home-directory name if prune should keep it."
     )
     prune = sub.add_parser(
         "prune", help="Remove old ~/.lu-release-cut-* directories left in the home directory",
@@ -2146,7 +2198,12 @@ def _run(args: argparse.Namespace) -> int:
     # Only a directory this command created is removed, and only after success. A failure keeps it.
     tool_created = args.work is None
     if tool_created:
-        work = Path(tempfile.mkdtemp(prefix=_WORK_PREFIX, dir=_operator_home())).absolute()
+        try:
+            home = _operator_home()
+        except OSError as exc:
+            print(f"release cut refused: {exc}", file=sys.stderr)
+            return 1
+        work = Path(tempfile.mkdtemp(prefix=_WORK_PREFIX, dir=home)).absolute()
     else:
         work = Path(args.work).absolute()
     work.mkdir(parents=True, exist_ok=True)
@@ -2199,6 +2256,7 @@ def open_post_release(cut: Cut) -> int:
     clone = cut.work / "machinery"
     cut.run(["git", "clone", "--quiet", "--no-checkout", cut.machinery_remote, clone], timeout=900)
     head = cut.git(clone, "rev-parse", "refs/remotes/origin/main^{commit}")
+    cut.head = head
     tag = cut.git(clone, "describe", "--tags", "--abbrev=0", "--match", _TAG_GLOB, head)
     cut.version = tag.removeprefix("v")
     previous = cut.git(clone, "describe", "--tags", "--abbrev=0", "--match", _TAG_GLOB, f"{tag}^")
