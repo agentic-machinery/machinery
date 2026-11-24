@@ -19,7 +19,12 @@
 # `required_workflow` (optional) is the workflow file, or a non-empty list of distinct workflow files,
 # whose failed PR or merge-queue run is the CI evidence for a repair-verification review round
 # (lu_machinery/review/repair_round.py); a failure of any one listed workflow is evidence. Default
-# `.github/workflows/ci.yml`.
+# `.github/workflows/ci.yml`. Name the workflows that gate a merge: the ones behind the branch's
+# GitHub-required checks, or, where GitHub requires none, every workflow that runs on pull requests
+# (the publisher refuses a head with any failing check). A repository with a merge queue names one
+# workflow: merge closeout binds the single merge-group run of it. tests/review/fixtures/
+# fleet_repo_workflows.yaml records each repository's pull-request workflows; the test beside it
+# refuses a row naming a workflow that does not run there, the ci.yml default included.
 #
 # `security_alerts` (optional, boolean, default true) controls whether
 # `lu_machinery.security scan` watches GitHub code-scanning, Dependabot and
@@ -99,12 +104,23 @@ repos:
     transport: https
     role: private-infra
     verdict_recorder: true
+    # No GitHub-required check and no ci.yml: every workflow that runs on its pull requests gates.
+    required_workflow:
+      - .github/workflows/private-boundary.yml
+      - .github/workflows/security-scan.yml
+      - .github/workflows/fleet-security-caller.yml
+      - .github/workflows/hramatka-cd.yml
   hramatka:
     github: learn-ukrainian/hramatka
     local_name: hramatka
     transport: ssh
     role: private-product
     verdict_recorder: false
+    # No GitHub-required check: every workflow that runs on its pull requests gates.
+    required_workflow:
+      - .github/workflows/ci.yml
+      - .github/workflows/security.yml
+      - .github/workflows/codeql.yml
   # kube-dojo (#12499, plan approved under #12239). Both are public repositories, so their roles
   # deliberately avoid "public-monorepo" (learn-ukrainian-only audits, Kimi and DeepSeek admission)
   # and any "private" spelling (private-input and OPSEC private-repo handling).
@@ -129,6 +145,10 @@ repos:
     transport: https
     role: public-labs
     verdict_recorder: true
+    # No GitHub-required check and no ci.yml: every workflow that runs on its pull requests gates.
+    required_workflow:
+      - .github/workflows/test-scenarios.yml
+      - .github/workflows/codeql.yml
   # machinery: the public machinery repository. Role avoids "public-monorepo" (learn-ukrainian-only
   # audits, Kimi and DeepSeek admission) and keeps the "public-" prefix for publisher privacy handling.
   machinery:

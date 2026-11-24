@@ -1,0 +1,68 @@
+# Each registered repository's pull-request workflows: the files under .github/workflows on its main
+# branch whose `on:` includes pull_request or merge_group (the only events repair_round accepts as CI
+# evidence), and whether its main branch has a GitHub merge queue (merge closeout binds one
+# merge-group workflow there). Read-only snapshot from the GitHub workflows, contents and rules APIs
+# on 2026-11-24.
+# Re-record a repository's list when its workflows change or a repository is registered.
+version: 1
+observed: "2026-11-24"
+repos:
+  public:
+    merge_queue: true
+    pull_request_workflows:
+      - .github/workflows/actionlint.yml
+      - .github/workflows/atlas-grow.yml
+      - .github/workflows/cache-hygiene.yml
+      - .github/workflows/ci.yml
+      - .github/workflows/model-catalog-freshness.yml
+      - .github/workflows/pr-body-guard.yml
+      - .github/workflows/pr-publication-scan.yml
+      - .github/workflows/pr-size-warning.yml
+      - .github/workflows/rules-deployment-check.yml
+      - .github/workflows/security-audit.yml
+      - .github/workflows/validate-yaml.yml
+  infra-private:
+    merge_queue: false
+    pull_request_workflows:
+      - .github/workflows/fleet-security-caller.yml
+      - .github/workflows/hramatka-cd.yml
+      - .github/workflows/private-boundary.yml
+      - .github/workflows/security-scan.yml
+  hramatka:
+    merge_queue: false
+    pull_request_workflows:
+      - .github/workflows/ci.yml
+      - .github/workflows/codeql.yml
+      - .github/workflows/security.yml
+  kube-dojo:
+    merge_queue: false
+    pull_request_workflows:
+      - .github/workflows/arxiv-citations.yml
+      - .github/workflows/build-check.yml
+      - .github/workflows/extensions-sync.yml
+      - .github/workflows/incident-dedup.yml
+      - .github/workflows/link-check.yml
+      - .github/workflows/security.yml
+      - .github/workflows/supply-chain.yml
+      - .github/workflows/uk-quality-checks.yml
+      - .github/workflows/vitest-check.yml
+      - .github/workflows/zizmor.yml
+  kubedojo-labs:
+    merge_queue: false
+    pull_request_workflows:
+      - .github/workflows/codeql.yml
+      - .github/workflows/test-scenarios.yml
+  machinery:
+    merge_queue: true
+    pull_request_workflows:
+      - .github/workflows/ci-gate.yml
+      - .github/workflows/codeql.yml
+      - .github/workflows/security.yml
+  ukrainian-llm-eval:
+    merge_queue: false
+    pull_request_workflows:
+      - .github/workflows/ci.yml
+  mnq-orb:
+    merge_queue: false
+    pull_request_workflows:
+      - .github/workflows/ci.yml

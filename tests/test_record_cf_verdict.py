@@ -398,14 +398,7 @@ def test_ci_fix_uses_the_repository_required_workflow(monkeypatch, tmp_path):
     monkeypatch.setattr(repair_round.prepublish, "catalog", lambda: {"a": row, "b": row})
     with pytest.raises(repair_round.RepairRefused, match=r"\[evidence\].*registered more than once"):
         repair_round.required_workflows(REPOSITORY)
-    # Every registered repository without the key keeps ci.yml; machinery names ci-gate.yml and kube-dojo its four.
-    monkeypatch.undo()
-    workflows = {key: repair_round.required_workflows(repo.github) for key, repo in recorder.load_fleet_repos().items()}
-    assert workflows.pop("machinery") == (gate,)
-    assert workflows.pop("kube-dojo") == tuple(
-        f".github/workflows/{name}.yml" for name in ("incident-dedup", "link-check", "build-check", "vitest-check")
-    )
-    assert set(workflows.values()) == {(repair_round.DEFAULT_REQUIRED_WORKFLOW,)}
+    # The registered rows themselves: tests/review/test_fleet_repo_required_workflows.py.
 
 
 def _misnamed_copy(tasks, name, **updates):
