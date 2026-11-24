@@ -1285,5 +1285,56 @@ def test_registry_loaders_resolve_profile_config_at_call_time(unconfigured, tmp_
             issue_stream_audit.load_registry()
         with pytest.raises(profile.ProfileError, match="issue_streams"):
             stream_inventory.resolve_streams_yaml(tmp_path)
+
+        # F6: explicit streams_yaml still works even when the unused profile default is missing,
+        # and reports the explicit file as authority.
+        explicit_streams = tmp_path / "explicit_streams.yaml"
+        explicit_streams.write_text("streams:\n  explicit:\n    title: Explicit\n    epics: [123]\n", encoding="utf-8")
+        snap = stream_inventory.inventory_snapshot(tmp_path, streams_yaml=explicit_streams)
+        assert snap["epics"] == [123]
+        assert snap["authority"] == str(explicit_streams)
+
+        # F2: sibling_git catalog loader binds to the resolved profile registry path.
+        assert "alpha" in sibling_git._load_catalog(profile_a.parent / "fleet_repos.yaml")
+
+        # F5: observability rejects a fresh membership report belonging to a different profile.
+        from lu_machinery.research import observability
+
+        stale_profile_report = {"repository": "alpha-org/alpha-repo", "streams": {"alpha-stream": [111]}}
+        assert not observability._membership_report_matches_active_profile(
+            stale_profile_report, profile_a.parent / "issue_streams.yaml"
+        )
+        matching_report = {"repository": "beta-org/beta-repo", "streams": {"alpha-stream": [111]}}
+        assert observability._membership_report_matches_active_profile(
+            matching_report, profile_a.parent / "issue_streams.yaml"
+        )
+
+        # F1: malformed external_recipients marks the Fleet Comms roster incomplete.
+        from lu_machinery.api import fleet_router
+        from lu_machinery.fleet_comms import authority
+
+        (profile_b.parent / "area_assignments.yaml").write_text(
+            "version: 1\nexternal_recipients: eggbot\nassignments:\n  beta-area:\n    slots: [claude-beta]\n    driver_agent_type: 7\n",
+            encoding="utf-8",
+        )
+        authority._ROSTER_CACHE.clear()
+        _, complete = authority._load_roster()
+        assert complete is False
+
+        # F4: non-string driver_agent_type fails closed instead of stringifying to "7".
+        assert driver_agent_type.resolve_driver_agent_type("beta-area") is None
+
+        # F4: malformed assignments mapping raises ValueError in stalled_work.owner_lanes().
+        from lu_machinery.orchestration import stalled_work
+
+        (profile_b.parent / "area_assignments.yaml").write_text("version: 1\nassignments: []\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="assignments"):
+            stalled_work.owner_lanes()
+
+        # F3: missing declared area_assignments yields distinct CLI exit 2 and degraded Monitor roster.
+        (profile_b.parent / "area_assignments.yaml").unlink()
+        assert driver_agent_type.main(["--lane", "beta-area"]) == 2
+        _, _, external_roster = fleet_router._fleet_seat_roster()
+        assert external_roster == "unavailable"
     finally:
         git_credentials.repository_registry.cache_clear()

@@ -36,6 +36,15 @@ def _default_assignments_path() -> Path:
     return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
 
 
+def _valid_driver_agent_type(entry: object) -> str | None:
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("driver_agent_type")
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
+
+
 def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
     """Map a stream alias to its canonical area id via ``fleet_taxonomy.yaml``."""
     try:
@@ -46,11 +55,13 @@ def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
     if not isinstance(areas, dict):
         return None
     for area_id, entry in areas.items():
-        if not isinstance(entry, dict):
+        if not isinstance(area_id, str) or not isinstance(entry, dict):
             continue
         aliases = entry.get("aliases") or []
-        if isinstance(aliases, list) and lane in aliases:
-            return str(entry.get("id") or area_id).strip() or None
+        if isinstance(aliases, list) and all(isinstance(item, str) for item in aliases) and lane in aliases:
+            raw_id = entry.get("id")
+            candidate = raw_id if isinstance(raw_id, str) else area_id
+            return candidate.strip() or None
     return None
 
 
@@ -73,23 +84,25 @@ def resolve_driver_agent_type(
     if not isinstance(assignments, dict):
         return None
 
-    direct = assignments.get(lane)
-    if isinstance(direct, dict) and direct.get("driver_agent_type"):
-        return str(direct["driver_agent_type"]).strip() or None
+    direct = _valid_driver_agent_type(assignments.get(lane))
+    if direct:
+        return direct
 
     canonical = _canonical_area_for_alias(lane, taxonomy_path)
     if canonical and canonical != lane:
-        entry = assignments.get(canonical)
-        if isinstance(entry, dict) and entry.get("driver_agent_type"):
-            return str(entry["driver_agent_type"]).strip() or None
+        aliased = _valid_driver_agent_type(assignments.get(canonical))
+        if aliased:
+            return aliased
 
     slot = f"{provider}-{lane}"
     for entry in assignments.values():
         if not isinstance(entry, dict):
             continue
         slots = entry.get("slots") or []
-        if isinstance(slots, list) and slot in slots and entry.get("driver_agent_type"):
-            return str(entry["driver_agent_type"]).strip() or None
+        if isinstance(slots, list) and all(isinstance(item, str) for item in slots) and slot in slots:
+            slotted = _valid_driver_agent_type(entry)
+            if slotted:
+                return slotted
     return None
 
 
@@ -100,7 +113,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--assignments", type=Path, default=None, help="area_assignments.yaml path")
     parser.add_argument("--taxonomy", type=Path, default=DEFAULT_TAXONOMY_PATH, help="fleet_taxonomy.yaml path")
     args = parser.parse_args(argv)
-    assignments_path = _default_assignments_path() if args.assignments is None else args.assignments
+    try:
+        assignments_path = _default_assignments_path() if args.assignments is None else args.assignments
+    except profile.ProfileError as exc:
+        print(f"profile error: {exc}", file=sys.stderr)
+        return 2
     agent_type = resolve_driver_agent_type(
         args.lane,
         assignments_path=assignments_path,

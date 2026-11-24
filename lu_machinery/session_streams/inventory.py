@@ -335,7 +335,13 @@ def inventory_snapshot(
     streams_yaml: Path | None = None,
 ) -> dict[str, Any]:
     """Machine-readable inventory: sorted epics, stream map, source hash."""
-    path = resolve_streams_yaml(repo_root, streams_yaml)
+    if streams_yaml is not None:
+        path = resolve_streams_yaml(repo_root, streams_yaml)
+        authority = str(streams_yaml)
+    else:
+        default_yaml = _default_streams_yaml()
+        path = resolve_streams_yaml(repo_root, default_yaml)
+        authority = str(default_yaml)
     scan = scan_stream_epic_inventory(repo_root, streams_yaml=path)
     records = scan.records
     mapping = stream_map(repo_root, streams_yaml=path)
@@ -362,7 +368,7 @@ def inventory_snapshot(
             }
             for r in records
         ],
-        "authority": str(_default_streams_yaml()),
+        "authority": authority,
         "hard_coded_subset_authoritative": False,
     }
 

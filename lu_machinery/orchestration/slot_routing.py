@@ -110,10 +110,14 @@ def _find_area_for_slot(slot: str, assignments_path: Path) -> str | None:
         if not isinstance(assignments, dict):
             return None
         for area_id, area_data in assignments.items():
-            if isinstance(area_data, dict):
+            if isinstance(area_id, str) and isinstance(area_data, dict):
                 slots = area_data.get("slots", [])
-                if isinstance(slots, (list, tuple)) and slot in slots:
-                    return str(area_id)
+                if (
+                    isinstance(slots, (list, tuple))
+                    and all(isinstance(item, str) for item in slots)
+                    and slot in slots
+                ):
+                    return area_id
     except Exception:
         pass
     return None

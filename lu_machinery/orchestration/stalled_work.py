@@ -114,12 +114,32 @@ def closed_pull_pager(slug: str):
 
 def owner_lanes() -> dict[str, str]:
     """Resolve current slots and retired initiators through their registered stream."""
-    assignments = _load_yaml(default_assignments_path())["assignments"]
-    areas = _load_yaml(TAXONOMY_PATH)["areas"]
-    lanes = {slot: slot for area in assignments.values() for slot in area["slots"]}
-    stream_slots = {
-        f"epic:{epic['number']}": assignments[area]["slots"] for area, spec in areas.items() for epic in spec["epics"]
-    }
+    raw_assignments = _load_yaml(default_assignments_path()).get("assignments")
+    if not isinstance(raw_assignments, dict):
+        raise ValueError("area_assignments.yaml 'assignments' must be a mapping")
+    raw_areas = _load_yaml(TAXONOMY_PATH).get("areas")
+    if not isinstance(raw_areas, dict):
+        raise ValueError("fleet_taxonomy.yaml 'areas' must be a mapping")
+    assignments: dict[str, list[str]] = {}
+    for area, entry in raw_assignments.items():
+        if not isinstance(area, str) or not isinstance(entry, dict):
+            raise ValueError(f"area_assignments.yaml entry {area!r} must be a mapping")
+        slots = entry.get("slots")
+        if not isinstance(slots, list) or not all(isinstance(slot, str) and slot.strip() for slot in slots):
+            raise ValueError(f"area_assignments.yaml[{area!r}].slots must be a list of non-empty strings")
+        assignments[area] = slots
+    lanes = {slot: slot for slots in assignments.values() for slot in slots}
+    stream_slots: dict[str, list[str]] = {}
+    for area, spec in raw_areas.items():
+        if not isinstance(area, str) or not isinstance(spec, dict) or area not in assignments:
+            raise ValueError(f"area {area!r} is malformed or missing from area_assignments.yaml")
+        epics = spec.get("epics")
+        if not isinstance(epics, list):
+            raise ValueError(f"fleet_taxonomy.yaml[{area!r}].epics must be a list")
+        for epic in epics:
+            if not isinstance(epic, dict) or type(epic.get("number")) is not int or epic["number"] <= 0:
+                raise ValueError(f"fleet_taxonomy.yaml[{area!r}].epics entry must declare a positive integer 'number'")
+            stream_slots[f"epic:{epic['number']}"] = assignments[area]
     succession, _ = succession_streams()
     for initiator, stream in succession.items():
         slots = stream_slots.get(stream, [])

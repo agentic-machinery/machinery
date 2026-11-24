@@ -254,16 +254,16 @@ def _load_roster() -> tuple[frozenset[str], bool]:
     if cached is not None:
         return cached
     slots = agent_identity._load_registry_slots(paths[0])
-    external, _availability = load_external_recipients(paths[0])
+    external, external_availability = load_external_recipients(paths[0])
     lanes: tuple[str, ...] = ()
     with contextlib.suppress(Exception):
         lanes = tuple(lane.sender for lane in driver_lanes.load_registry(paths[1]).lanes)
-    complete = bool(slots) and bool(lanes)
+    complete = bool(slots) and bool(lanes) and external_availability == "available"
     if not complete:
         _LOG.warning(
-            "fleet_comms recipient roster incomplete (slots=%d, lanes=%d): "
+            "fleet_comms recipient roster incomplete (slots=%d, lanes=%d, external=%s): "
             "unregistered names are admitted and no subscription or delivery is ended",
-            len(slots), len(lanes),
+            len(slots), len(lanes), external_availability,
         )
     roster = (frozenset({DURABLE_CTO_RECIPIENT, *slots, *external, *lanes}), complete)
     _ROSTER_CACHE.clear()
