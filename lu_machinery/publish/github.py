@@ -1101,14 +1101,15 @@ def _catalog_fleet_repos():
     return repos
 
 
-def _fleet_catalog_row(gh_repo, *, env=None):
+def _fleet_catalog_row(gh_repo, *, env=None, repos=None):
     """Resolve *gh_repo* through the A01 active-slug resolver, or None when unregistered."""
     from lu_machinery.orchestration import fleet_repos
 
     slug = _github_slug_or_none(gh_repo)
     if slug is None:
         return None
-    repos = _catalog_fleet_repos()
+    if repos is None:
+        repos = _catalog_fleet_repos()
     try:
         fleet_repos.resolve_fleet_repo_by_slug(slug, repos=repos)
     except fleet_repos.FleetRepoError:
@@ -1151,88 +1152,55 @@ def _owns_stream_registry(active, *, default_key=None):
     return has_registry
 
 
-def _issue_create_parent_policy(gh_repo, *, env=None):
-    """``stream`` (own open epic), ``none`` (no --parent), or ``unregistered``."""
-    active = _fleet_catalog_row(gh_repo, env=env)
-    if active is None:
-        return "unregistered"
-    repos = _catalog_fleet_repos()
-    default_keys = [key for key, item in repos.items() if item.default]
-    default_key = default_keys[0] if len(default_keys) == 1 else None
-    return "stream" if _owns_stream_registry(active, default_key=default_key) else "none"
+def _parent_epic_node(read_runner, active, repos, parent, cwd, environment):
+    """Return the repository and node ID of the registered open parent before issue creation."""
+    from lu_machinery.orchestration import fleet_repos, issue_stream_audit
 
-
-def _cli_keeps_stream_parent_refusal(explicit):
-    """Keep the historical missing-parent sentence unless this destination has no stream registry.
-
-    An unresolved destination keeps that sentence, so a checkout of the default repository
-    that omits ``--repo`` still prints it. A resolved repository with no stream registry, and
-    a resolved unregistered or inactive repository, fall through to ``publish``.
-    """
-    destination = None
-    if isinstance(explicit, str) and explicit.strip():
-        normalized = gate.normalize_repository(explicit)
-        if normalized != "unknown":
-            destination = normalized
-    environment = None
-    if destination is None:
-        try:
-            environment = _validated_environment(None)
-            dest = repository(Path.cwd(), environment, explicit)
-        except gate.PublishBlocked:
-            return True
-        if dest == "unknown":
-            return True
-        destination = dest
-    else:
-        try:
-            environment = _validated_environment(None)
-        except gate.PublishBlocked:
-            return False
+    default_key = fleet_repos.default_repo_key(repos)
+    target = active
     try:
-        return _issue_create_parent_policy(destination, env=environment) == "stream"
-    except gate.PublishBlocked:
-        return False
-
-
-def _parent_epic_node(read_runner, gh_repo, parent, cwd, environment):
-    """Resolve --parent to a local registered open stream epic's node id before anything is created."""
-    from lu_machinery.orchestration import issue_stream_audit
-
-    active = _fleet_catalog_row(gh_repo, env=environment)
-    if active is None:
-        raise gate.PublishBlocked(
-            f"REPO_REFUSED: issue-create only targets a repository registered in {_FLEET_REPOS}; nothing was created."
-        )
-    try:
+        if not issue_stream_audit.repo_has_roots(active.repo.key, default_key=default_key, path=issue_stream_audit.REGISTRY_PATH):
+            target = fleet_repos.resolve_active_fleet_repo(default_key, repos=repos, env=environment)
+            if active.active_github.split("/", 1)[0] != target.active_github.split("/", 1)[0] or not all(
+                item.repo.role.startswith("public-") and item.repo.visibility in (None, "public")
+                for item in (active, target)
+            ):
+                raise gate.PublishBlocked(
+                    "PARENT_REFUSED: cross-repository parents require two public repositories with the same "
+                    "GitHub owner. Use a registered open stream epic in the target repository once it has one. "
+                    "Nothing was created."
+                )
         registry = issue_stream_audit.load_registry(
             issue_stream_audit.REGISTRY_PATH,
             audit_only=True,
-            repo=None if active.repo.default else active.repo.key,
+            repo=None if target.repo.default else target.repo.key,
         )
+    except fleet_repos.FleetRepoError as exc:
+        raise gate.PublishBlocked(f"REPO_REFUSED: {exc}; nothing was created.") from None
     except (OSError, ValueError) as exc:
         raise gate.PublishBlocked(f"REGISTRY_REFUSED: issue_streams.yaml is unreadable ({exc}); nothing was created.") from None
+    requirement = f"--parent <number> of a registered, open stream epic in {target.active_github}"
+    if parent is None:
+        raise gate.PublishBlocked(f"PARENT_REQUIRED: issue-create requires {requirement}. Nothing was created.")
     epics = {number for numbers in registry.values() for number in numbers}
     node = (
         _issue_node(
             read_runner,
-            active.active_github,
+            target.active_github,
             parent,
             cwd,
             environment,
-            allowed_slugs=active.repo.slugs,
+            allowed_slugs=target.repo.slugs,
         )
         if parent in epics
         else None
     )
     if node is None:
-        raise gate.PublishBlocked(
-            "PARENT_REFUSED: --parent must be the number of a registered, open stream epic; nothing was created."
-        )
-    return node
+        raise gate.PublishBlocked(f"PARENT_REFUSED: use {requirement}. Nothing was created.")
+    return target.active_github, node
 
 
-def _link_created_issue(created, parent, parent_node, gh_repo, read_runner, runner, cwd, environment):
+def _link_created_issue(created, parent_ref, parent_node, gh_repo, read_runner, runner, cwd, environment):
     """Link the issue ``created`` printed to the stream epic through the ``issue-link`` verb."""
     match = re.search(r"/issues/(\d+)\s*$", created)
     number = int(match.group(1)) if match else None
@@ -1253,14 +1221,14 @@ def _link_created_issue(created, parent, parent_node, gh_repo, read_runner, runn
     if limited is not None:
         # Keep the typed rate-limit exit and reset time, and still say which issue is unlinked.
         print(
-            f"LINK_PENDING: {which} was created but not linked to parent #{parent}; "
+            f"LINK_PENDING: {which} was created but not linked to parent {parent_ref}; "
             "link it with the issue-link verb after the rate limit resets.",
             file=sys.stderr,
         )
         raise limited
     if link is None or link.returncode:
         raise gate.PublishBlocked(
-            f"LINK_FAILED: {which} was created but not linked to parent #{parent}; "
+            f"LINK_FAILED: {which} was created but not linked to parent {parent_ref}; "
             "link it with the issue-link verb before doing anything else."
         )
 
@@ -3024,18 +2992,22 @@ def publish(
         _refuse_verdict_markers(verb, fields)
 
         readiness_runner = merge_readiness_runner(runner)
-        parent_node = None
+        parent_epic = None
         if verb == "issue-create":
-            policy = _issue_create_parent_policy(dest, env=environment)
-            if policy == "unregistered":
+            from lu_machinery.orchestration import fleet_repos
+
+            repos = _catalog_fleet_repos()
+            active = _fleet_catalog_row(dest, env=environment, repos=repos)
+            if active is None:
                 raise gate.PublishBlocked(
                     "REPO_REFUSED: issue-create only targets a repository registered in "
                     f"{_FLEET_REPOS}; nothing was created."
                 )
+            owns_registry = _owns_stream_registry(active, default_key=fleet_repos.default_repo_key(repos))
             if fields.get("epic"):
                 if not cto_safe_mode.is_cto_caller(os.environ):
                     raise gate.PublishBlocked("EPIC_REFUSED: --epic requires the CTO seat; nothing was created.")
-                if policy != "stream" or environment["GH_HOST"] != "github.com" or "parent" in fields:
+                if not owns_registry or environment["GH_HOST"] != "github.com" or "parent" in fields:
                     raise gate.PublishBlocked(
                         "EPIC_REFUSED: use --epic without --parent in the stream registry repository on github.com; "
                         "nothing was created."
@@ -3045,17 +3017,9 @@ def publish(
                         "EPIC_REFUSED: --epic requires a title in the form '[EPIC][stream-key] Title'; "
                         "nothing was created."
                     )
-            elif policy == "stream":
-                if "parent" not in fields:
-                    raise gate.PublishBlocked(
-                        "PARENT_REQUIRED: issue-create requires parent, the number of a registered open stream epic; "
-                        "nothing was created."
-                    )
-                parent_node = _parent_epic_node(readiness_runner, dest, fields["parent"], cwd, environment)
-            elif "parent" in fields:
-                raise gate.PublishBlocked(
-                    "PARENT_REFUSED: this repository has no stream registry, so issue-create accepts no --parent; "
-                    "nothing was created."
+            elif owns_registry or "parent" in fields:
+                parent_epic = _parent_epic_node(
+                    readiness_runner, active, repos, fields.get("parent"), cwd, environment,
                 )
 
         def queue_probe():
@@ -3431,9 +3395,8 @@ def publish(
             if reservation:
                 path, number, head, action, evidence = reservation
                 recovery.consume(path, dest, number, head, action, evidence)
-        linking = parent_node is not None
         applying_milestone = pr_milestone is not None
-        capture_created = linking or applying_milestone
+        capture_created = parent_epic is not None or applying_milestone
         result = subprocess.CompletedProcess(argv, 0, "" if text else b"", "" if text else b"") if already_queued else _send(
             argv,
             environment=environment,
@@ -3446,9 +3409,11 @@ def publish(
             stdout=stdout,
             stderr=stderr,
         )
-        if linking and result.returncode == 0:
+        if parent_epic is not None and result.returncode == 0:
+            parent_repo, parent_node = parent_epic
             _link_created_issue(
-                str(result.stdout or "").strip(), fields["parent"], parent_node, gh_repo, readiness_runner, runner,
+                str(result.stdout or "").strip(), f"{parent_repo}#{fields['parent']}", parent_node, gh_repo,
+                readiness_runner, runner,
                 cwd, environment,
             )
             if not capture_output:
@@ -3514,7 +3479,7 @@ def main(argv=None, *, runner=None):
         if verb == "issue-create":
             sub.description = (
                 "Create an issue in a registered repository.\n"
-                "Use --parent for ordinary issues in the stream registry repository. "
+                "Link ordinary issues with --parent. "
                 "Use --epic to create an approved stream root."
             )
             sub.formatter_class = argparse.RawDescriptionHelpFormatter
@@ -3735,7 +3700,11 @@ def main(argv=None, *, runner=None):
                 kwargs["action"] = StoreOnce
                 kwargs["help"] = "Required GitHub owner/name, such as kube-dojo/kubedojo-labs. No default."
             if verb == "issue-create" and key == "parent":
-                kwargs["help"] = "Open registered epic number, such as 123. Required for ordinary issues in the registry repository."
+                kwargs["help"] = (
+                    "Open registered epic number, such as 123. Use a local epic when the repository has roots. "
+                    "Otherwise use a default-repository epic when both repositories are public and share a GitHub owner. "
+                    "Required for ordinary issues in repositories that declare a registry section."
+                )
             if verb == "pr-create" and key == "milestone":
                 kwargs["help"] = (
                     "Open repository milestone title or number (e.g. 'v0.11.0 - CI and GitHub budget reliability' or '13'); "
@@ -3895,18 +3864,6 @@ def main(argv=None, *, runner=None):
     )
     args = vars(parser.parse_args(argv))
     verb = args.pop("verb")
-    if (
-        verb == "issue-create"
-        and "parent" not in args
-        and not args.get("epic")
-        and _cli_keeps_stream_parent_refusal(args.get("repo"))
-    ):
-        print(
-            "issue-create requires --parent <stream epic issue number>; the new issue is linked to it. "
-            "Nothing was created.",
-            file=sys.stderr,
-        )
-        return 2
     try:
         if verb == "read":
             return read(args.pop("name"), runner=runner, **args).returncode
