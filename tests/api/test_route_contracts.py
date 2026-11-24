@@ -99,13 +99,17 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monke
     product_home.write_text("product home")
     base = replace(route_contracts.PAGE_CONTRACTS[0], label="")
     product = ProductContribution(
-        static_files={"index.html": product_home},
+        # F7: a static file entry the route cannot read (a string, not a path) drops its link.
+        static_files={"index.html": product_home, "bad.html": "bad.html"},
         page_contracts=(
             # F7: a declaration of the wrong shape drops its own link, never the page or the first-link mark.
             None,
             replace(base, file="none-label.html", url="/none-label", label=None),
+            replace(base, file="list-label.html", url="/list-label", label=[]),
             replace(base, file="none-url.html", url=None),
             replace(base, file="list-url.html", url=["/list"]),
+            replace(base, file="sub-url.html", url=type("Url", (str,), {})("/sub-url")),
+            replace(base, file="bad.html", url="/bad"),
             replace(base, file="index.html", url="/"),
             replace(base, file="curriculum-dashboard.html", url="/curriculum-dashboard.html"),
             replace(base, file="labelled.html", url="/labelled", label='Q&A "x"'),

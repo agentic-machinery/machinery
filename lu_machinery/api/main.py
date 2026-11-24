@@ -1830,13 +1830,18 @@ def _leaves_to_product(url: str, dashboards_dir: Path, product: Any) -> bool:
     route's own lookup answers the path with a machinery dashboard file or refuses it, or
     the lookup fails on the filesystem (on Python 3.12 a symlink loop raises
     ``RuntimeError``; an overlong name raises ``OSError``). The failure then drops this one
-    link, never the page.
+    link, never the page. The route's next lookup, the product's declared file, runs here
+    too, so a declaration the route cannot read raises to the caller instead of being
+    listed; no declared file is fine, since a product router may serve the path.
     """
     path = _request_path(url)
     if path is None:
         return False
     try:
-        return _dashboard_file(dashboards_dir, path, product) is None
+        if _dashboard_file(dashboards_dir, path, product) is not None:
+            return False
+        product_file(product, "index.html" if path in {"", "/"} else path)
+        return True
     except (HTTPException, OSError, RuntimeError, ValueError):
         return False
 
@@ -1851,8 +1856,9 @@ def _machinery_nav_html(current_file: str | None, dashboards_dir: Path, product:
     reuses a machinery URL replaces the contract, never the page. A URL declared twice is
     listed once; distinct declared URLs are never merged, since the product may tell them
     apart. The product's declarations are its own code, checked only as a whole when it is
-    loaded: a declaration that fails here (a value of the wrong type, a malformed static
-    file entry) drops its own link with a logged reason, never the page.
+    loaded. Each one is read here only as a ``PageContract`` whose URL, file and label are
+    plain strings; any other value, or a declaration whose lookup fails (a malformed static
+    file entry), drops its own link with a logged reason, never the page.
     """
 
     def link(page: PageContract, attrs: str) -> str:
@@ -1866,14 +1872,17 @@ def _machinery_nav_html(current_file: str | None, dashboards_dir: Path, product:
         declared = ()
     listed: set[str] = set()
     for index, page in enumerate(declared):
+        if type(page) is not PageContract or any(type(value) is not str for value in (page.url, page.file, page.label)):
+            logger.warning("Monitor navigation skips product page %d: not a page contract of plain strings", index)
+            continue
         try:
             if page.url in listed or not _leaves_to_product(page.url, dashboards_dir, product):
                 continue
             product_link = link(page, ' class="product"' if listed else ' class="product first"')
+            listed.add(page.url)
         except Exception as exc:
             logger.warning("Monitor navigation skips product page %d: %s", index, type(exc).__name__)
             continue
-        listed.add(page.url)
         links.append(product_link)
     return "".join(links)
 
