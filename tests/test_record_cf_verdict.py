@@ -2962,8 +2962,8 @@ def test_single_family_branch_resolution_unchanged(tmp_path, monkeypatch):
         assert "review_scopes" not in asdict(result)
 
 
-# Dual-slug transfer bridge (A01b): one row baked as org/repo and neworg/repo, bound to repository_id 4242.
-_BAKED = ("org/repo", "neworg/repo")
+# Dual-slug transfer bridge (A01b): one row baked as org/repos and neworg/repos, bound to repository_id 4242.
+_BAKED = ("org/repos", "neworg/repos")
 
 
 def _transferred(monkeypatch, active):
@@ -2972,8 +2972,8 @@ def _transferred(monkeypatch, active):
     from lu_machinery.orchestration import fleet_repos
 
     row = fleet_repos.FleetRepo(
-        "case", "org/repo", "repo", "public-labs", default=True,
-        repository_id=4242, visibility="public", alternate_github="neworg/repo",
+        "case", "org/repos", "repo", "public-labs", default=True,
+        repository_id=4242, visibility="public", alternate_github="neworg/repos",
     )
     monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: {"case": row})
     monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda path=None: {"case": row})
@@ -2986,7 +2986,7 @@ def _transferred(monkeypatch, active):
 
 @pytest.mark.parametrize("active", _BAKED)
 @pytest.mark.parametrize(("stored", "review", "same"), [
-    ("org/repo", "neworg/repo", True), ("neworg/repo", "org/repo", True), ("evil/repo", "neworg/repo", False),
+    ("org/repos", "neworg/repos", True), ("neworg/repos", "org/repos", True), ("evil/repo", "neworg/repos", False),
 ])
 def test_author_task_under_either_baked_slug_binds_to_the_review_repository(tmp_path, monkeypatch, active, stored, review, same):
     """Defect class: an author task recorded under one baked slug of a transferred repository is read as another
@@ -3008,7 +3008,7 @@ def test_author_task_under_either_baked_slug_binds_to_the_review_repository(tmp_
 
 @pytest.mark.parametrize("active", _BAKED)
 @pytest.mark.parametrize(("stored", "review", "same"), [
-    ("org/repo", "neworg/repo", True), ("neworg/repo", "org/repo", True), ("evil/repo", "org/repo", False),
+    ("org/repos", "neworg/repos", True), ("neworg/repos", "org/repos", True), ("evil/repo", "org/repos", False),
 ])
 def test_authoring_admission_under_either_baked_slug_admits_its_history(tmp_path, monkeypatch, active, stored, review, same):
     """Defect class: a red-team authoring admission receipt written under one baked slug is ignored once the
@@ -3030,17 +3030,21 @@ def test_authoring_admission_under_either_baked_slug_admits_its_history(tmp_path
 
 
 @pytest.mark.parametrize("active", _BAKED)
-@pytest.mark.parametrize("spelling", [*_BAKED, "evil/repo"])
+@pytest.mark.parametrize("spelling", [*_BAKED, "evil/repo", "org/repo\u017f"])
 def test_review_checkout_resolves_either_baked_slug_and_refuses_another(tmp_path, monkeypatch, active, spelling):
     """Defect class: the review checkout lookup matches only the registry's first slug, so a review named by the
     transferred repository's other slug is reported as unregistered."""
-    _transferred(monkeypatch, active)
+    row = _transferred(monkeypatch, active)
     monkeypatch.setattr(recorder, "resolve_review_repository", lambda root, key, **_kwargs: root / key)
-    if spelling == "evil/repo":
-        with pytest.raises(recorder.RecordError, match="not uniquely registered"):
-            recorder._review_repository_root(spelling, tmp_path)
-    else:
+    if spelling in _BAKED:
         assert recorder._review_repository_root(spelling, tmp_path) == tmp_path / "case"
+        # The review budget policy keys either baked slug to the row's one registry slug.
+        assert recorder._budget_key(spelling, {"case": row}) == "github.com/org/repos"
+        return
+    with pytest.raises(recorder.RecordError, match="not uniquely registered"):
+        recorder._review_repository_root(spelling, tmp_path)
+    # Another repository keeps its own key; a non-ASCII look-alike is no repository at all.
+    assert recorder._budget_key(spelling, {"case": row}) == ("unknown" if not spelling.isascii() else "github.com/evil/repo")
 
 
 @pytest.mark.usefixtures("configured_roots")
@@ -3074,7 +3078,7 @@ def test_publication_import_reads_the_active_slug_and_stores_the_registry_slug(t
         return
     assert run()["added"] == 1
     assert read == [active]
-    assert [entry["repository"] for entry in _ledger(tmp_path)] == ["org/repo"]
+    assert [entry["repository"] for entry in _ledger(tmp_path)] == ["org/repos"]
 
 
 @pytest.mark.usefixtures('configured_roots', 'recorder_matcher')
@@ -3085,7 +3089,7 @@ def test_recorded_verdict_posts_at_the_active_slug_and_names_the_selector(monkey
     dispatched with, not the selector's active slug, and its receipt never names the selector it relied on."""
     tasks, _comments, calls = setup_record(monkeypatch, tmp_path)
     _transferred(monkeypatch, active)
-    write_task(tasks, reply="VERDICT: APPROVE\nOrdinary reviewer text.\n", repository="org/repo")
+    write_task(tasks, reply="VERDICT: APPROVE\nOrdinary reviewer text.\n", repository="org/repos")
     written = []
     monkeypatch.setattr(recorder, "post_commit_status", lambda **fields: written.append(fields["repository"]))
     post = recorder._post_verdict
@@ -3096,6 +3100,6 @@ def test_recorded_verdict_posts_at_the_active_slug_and_names_the_selector(monkey
     result = recorder.record("review-one", pr_number=42, task_root=tasks, lock_root=tmp_path / "locks")
     assert result["comment"] == "posted" and calls["posts"] == 1
     assert written == [active, active]
-    assert reads == [("org/repo", active)]  # records matched at the registry slug, GitHub read at the active one
+    assert reads == [("org/repos", active)]  # records matched at the registry slug, GitHub read at the active one
     assert result["fleet_repo_selector"] == {"selector_value": active, "selector_sha256": "d" * 64}
-    assert [entry["repository"] for entry in _ledger(tmp_path)] == ["org/repo"]
+    assert [entry["repository"] for entry in _ledger(tmp_path)] == ["org/repos"]

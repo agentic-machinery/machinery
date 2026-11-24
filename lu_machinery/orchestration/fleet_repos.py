@@ -243,7 +243,8 @@ def resolve_fleet_repo_by_slug(
     When *expected_repository_id* or *expected_visibility* is given, mismatches
     fail closed before any network call.
     """
-    if not isinstance(identifier, str) or not identifier.strip():
+    if not isinstance(identifier, str) or not identifier.strip() or not identifier.isascii():
+        # Keys and slugs are ASCII; casefold would map look-alikes such as U+212A onto them.
         raise FleetRepoError("unknown fleet repository identifier")
     catalog = repos if repos is not None else load_fleet_repos()
     spelling = identifier.strip().casefold()

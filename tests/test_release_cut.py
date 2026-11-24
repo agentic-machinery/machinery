@@ -1933,8 +1933,8 @@ def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
         no_uv_cut.build("0.1.68")
 
 
-# Dual-slug transfer bridge (A01b): machinery baked as org/repo and neworg/repo, bound to repository_id 4242.
-_BAKED = ("org/repo", "neworg/repo")
+# Dual-slug transfer bridge (A01b): machinery baked as org/repos and neworg/repos, bound to repository_id 4242.
+_BAKED = ("org/repos", "neworg/repos")
 
 
 def _transferred(monkeypatch, active):
@@ -1943,19 +1943,19 @@ def _transferred(monkeypatch, active):
     from lu_machinery.orchestration import fleet_repos
 
     row = fleet_repos.FleetRepo(
-        "machinery", "org/repo", "machinery", "public-machinery", default=True,
-        repository_id=4242, visibility="public", alternate_github="neworg/repo",
+        "machinery", "org/repos", "machinery", "public-machinery", default=True,
+        repository_id=4242, visibility="public", alternate_github="neworg/repos",
     )
     monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: {"machinery": row})
     monkeypatch.setattr(
         git_credentials, "load_selector",
         lambda **_kwargs: git_credentials.SelectorState({"machinery": active}, "d" * 64),
     )
-    return {"key": "machinery", "github": "org/repo", "alternate_github": "neworg/repo",
+    return {"key": "machinery", "github": "org/repos", "alternate_github": "neworg/repos",
             "repository_id": 4242, "visibility": "public", "local_name": "machinery"}
 
 
-@pytest.mark.parametrize("remote", [None, "active", "inactive"])
+@pytest.mark.parametrize("remote", [None, "active", "case", "local", "inactive", "elsewhere"])
 @pytest.mark.parametrize("active", [*_BAKED, "evil/repo"])
 def test_release_cut_runs_at_the_active_slug_and_logs_the_selector(monkeypatch, tmp_path, capsys, active, remote):
     """Defect class: the release cut clones, tags and publishes at the registry's first slug after a transfer, and
@@ -1972,24 +1972,32 @@ def test_release_cut_runs_at_the_active_slug_and_logs_the_selector(monkeypatch, 
 
     monkeypatch.setattr(release_cut, "execute", execute)
     argv = ["cut", "--dry-run", "--no-alert", "--work", str(tmp_path / "w"), "--x-agent", "claude/claude-opus-5-5"]
-    named = {"active": active, "inactive": next(slug for slug in _BAKED if slug != active)}.get(remote)
-    if named is not None:
-        argv += ["--machinery-remote", f"https://github.com/{named}.git"]
+    inactive = next((slug for slug in _BAKED if slug != active), _BAKED[0])
+    override = {
+        "active": f"https://github.com/{active}.git", "case": f"https://github.com/{active.upper()}.git",
+        "local": str(tmp_path / "mirror.git"), "inactive": f"https://github.com/{inactive}.git",
+        "elsewhere": f"https://example.invalid/{active}.git",
+    }.get(remote)
+    if remote == "local":
+        (tmp_path / "mirror.git").mkdir()
+    if override is not None:
+        argv += ["--machinery-remote", override]
     if active == "evil/repo":
         assert main(argv) == 1
         assert "release cut refused: fleet repository selector" in capsys.readouterr().err and not seen
         return
-    if remote == "inactive":
+    if remote in {"inactive", "elsewhere"}:
         assert main(argv) == 1
-        assert "--machinery-remote is not the active GitHub slug" in capsys.readouterr().err and not seen
+        assert "--machinery-remote is neither a local path nor an origin" in capsys.readouterr().err and not seen
         return
     assert main(argv) == 0
-    assert (seen["repo"], seen["remote"]) == (active, f"https://github.com/{active}.git")
+    expected = str(tmp_path / "mirror.git") if remote == "local" else f"https://github.com/{active}.git"
+    assert (seen["repo"], seen["remote"]) == (active, expected)
     assert f'fleet_repo_selector: {{"selector_sha256": "{"d" * 64}", "selector_value": "{active}"}}' in seen["log"]
 
 
 @pytest.mark.parametrize("active", _BAKED)
-@pytest.mark.parametrize("pinned", [*_BAKED, "Org/Repo", "NewOrg/Repo", "evil/repo"])
+@pytest.mark.parametrize("pinned", [*_BAKED, "Org/Repos", "NewOrg/Repos", "evil/repo", "org/repo\u017f"])
 def test_adoption_replaces_a_pin_under_either_baked_slug_with_the_active_slug(monkeypatch, tmp_path, active, pinned):
     """Defect class: after a transfer the product's wheel pin still names the old release slug, so the adoption
     refuses it as another repository's; a pin under a slug the row does not bake must still refuse."""
@@ -2012,8 +2020,8 @@ def test_adoption_replaces_a_pin_under_either_baked_slug_with_the_active_slug(mo
         raise Locked
 
     cut.run = run
-    if pinned == "evil/repo":
-        with pytest.raises(CutError, match="from this release repository"):
+    if pinned in {"evil/repo", "org/repo\u017f"}:  # another repository, or a non-ASCII look-alike of a baked slug
+        with pytest.raises(CutError, match="lu-machinery wheel URL"):
             cut.update_adopt_inputs(product)
         return
     with pytest.raises(Locked):

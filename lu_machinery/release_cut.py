@@ -511,7 +511,7 @@ def adopt_manifest(
     manifest = tomllib.loads(text)
     uv = _manifest_table(_manifest_table(manifest, "tool"), "uv")
     source = _manifest_table(uv, "sources").get("lu-machinery")
-    if not isinstance(source, dict) or not isinstance(old_url := source.get("url"), str):
+    if not isinstance(source, dict) or not isinstance(old_url := source.get("url"), str) or not old_url.isascii():
         raise CutError("pyproject.toml must declare one lu-machinery wheel URL")
     bases = "|".join(_release_base_pattern(base) for base in (release_base, *previous_bases))
     old = re.fullmatch(rf"(?:{bases})/v(\d+\.\d+\.\d+)/lu_machinery-\1-py3-none-any\.whl", old_url)
@@ -1802,11 +1802,29 @@ def _consumer_collection(args: argparse.Namespace) -> int:
     return 0
 
 
-_GITHUB_REMOTE_PREFIXES = ("https://github.com/", "http://github.com/", "git@github.com:", "ssh://git@github.com/")
+def _release_remote(flag: str, remote: str | None, row: Mapping[str, object]) -> str | None:
+    """The Git remote a release override names, admitted only as a local path or the row's active GitHub origin.
+
+    A live destination is an allowlist: a ``file://`` URI or an existing local path (fixtures, mirrors), else one
+    of the row's active-slug origins (``canonical_origins``; ASCII, owner/name in any case), returned in its
+    canonical spelling. Any other remote, including an inactive slug or another host, refuses.
+    """
+    from lu_machinery.common.git_credentials import canonical_origins
+
+    if not remote:
+        return remote
+    if remote.startswith("file://") or Path(remote).exists():
+        return remote
+    key = row.get("key")
+    if remote.isascii():
+        for origin in canonical_origins(dict(row), key=key if isinstance(key, str) else None):
+            if remote.casefold() == origin.casefold():
+                return origin
+    raise CutError(f"{flag} is neither a local path nor an origin of its repository's active GitHub slug")
 
 
 def _run(args: argparse.Namespace) -> int:
-    from lu_machinery.common.git_credentials import SelectorError, active_slug, canonical_origins
+    from lu_machinery.common.git_credentials import SelectorError, active_slug
     from lu_machinery.common.repo_root import primary_root, project_interpreter
     from lu_machinery.dispatcher.git import resolve_repo
 
@@ -1816,14 +1834,11 @@ def _run(args: argparse.Namespace) -> int:
         # Each row is cut, cloned and published at its active slug; a dual-slug row needs the host selector.
         machinery_repo, selector = active_slug(machinery, key=machinery.get("key"))
         product_repo, _ = active_slug(product, key=product.get("key"))
-        # A GitHub remote override is a live destination: it must be the row's active slug, never another one.
-        for flag, remote, row in (("--machinery-remote", args.machinery_remote, machinery),
-                                  ("--product-remote", args.product_remote, product)):
-            if remote and remote.casefold().startswith(_GITHUB_REMOTE_PREFIXES) and remote not in canonical_origins(
-                row, key=row.get("key")
-            ):
-                print(f"release cut refused: {flag} is not the active GitHub slug of its repository", file=sys.stderr)
-                return 1
+        machinery_override = _release_remote("--machinery-remote", args.machinery_remote, machinery)
+        product_override = _release_remote("--product-remote", args.product_remote, product)
+    except CutError as exc:
+        print(f"release cut refused: {exc}", file=sys.stderr)
+        return 1
     except (SelectorError, ValueError, OSError) as exc:
         print(f"release cut refused: fleet repository selector: {exc}", file=sys.stderr)
         return 1
@@ -1846,8 +1861,8 @@ def _run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 2
     cut = Cut(work=work, dry_run=dry_run,
-              machinery_remote=args.machinery_remote or f"https://github.com/{machinery_repo}.git",
-              product_remote=args.product_remote or f"https://github.com/{product_repo}.git",
+              machinery_remote=machinery_override or f"https://github.com/{machinery_repo}.git",
+              product_remote=product_override or f"https://github.com/{product_repo}.git",
               machinery_repo=machinery_repo, product_repo=product_repo, host_python=project_interpreter(),
               primary=primary_root(), alert=not args.no_alert, x_agent=args.x_agent,
               machinery_milestone=machinery_milestone, product_milestone=product_milestone)
