@@ -196,6 +196,8 @@ def test_blank_v2_named_record_is_damaged_not_foreign(tmp_path):
 
 def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
     """Defect class: a foreign sidecar filename forges a second log entry."""
+    store._REPORTED_FOREIGN.clear()
+    store._PENDING_FOREIGN.clear()
     # CR/LF, NEL, line/paragraph separators, ESC, and a literal format token.
     fragments = ("\r\n", "\u0085", "\u2028", "\u2029", "\x1b", "%(levelname)s")
     formatter = logging.Formatter("%(levelname)s %(message)s")
@@ -205,7 +207,7 @@ def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
         assert store.parse_task_record(path, b"[]") is None
         assert len(caplog.records) == before + 1
         message = caplog.records[-1].getMessage()
-        assert message == f"NON_RECORD_FILE: {str(path)!r}"
+        assert message == f"NON_RECORD_FILE: 1 non-record file, 1 unexpected; examples: {str(path)!r}"
         assert not any(sep in message for sep in ("\n", "\r", "\u0085", "\u2028", "\u2029", "\x1b"))
         assert "\n" not in formatter.format(caplog.records[-1])
 
@@ -241,3 +243,131 @@ def test_foreign_filename_cannot_inject_log_lines(tmp_path, caplog):
     assert store.parse_task_record(tmp_path / "receipt.json", payload) is None
     assert len(caplog.records) == before + 1
     assert "receipt.json" in caplog.records[-1].getMessage()
+
+    # One directory scan is one line. Unexpected kinds are named; a routine family cannot fill the sample.
+    tasks = tmp_path / "scan"
+    tasks.mkdir()
+    routine = (
+        "a.review-state.json", "b.resolver.json", "c.routing-note.json",
+        "d.ac-policy.json", "e.closeout-state-2.json",
+    )
+    for name in routine:
+        (tasks / name).write_bytes(b"[]")
+    unexpected = (
+        tasks / "custom.json",
+        tasks / "zzz.custom-tail.json",
+        tasks / "other.review.state.json",
+        tasks / "second.review.state.json",
+        tasks / "bad\nname.json",
+    )
+    for path in unexpected:
+        path.write_bytes(b"[]")
+    (tasks / "ok.json").write_text(json.dumps({"task_id": "ok", "schema_version": 2}), encoding="utf-8")
+    (tasks / "a.write-boundary.json").write_bytes(payload)
+    before = len(caplog.records)
+    for path in store.iter_task_records(tasks, include_archive=False):
+        raw = path.read_bytes()
+        assert store.parse_task_record(path, raw) is None or path.name == "ok.json"
+        assert store.parse_task_record(path, raw) is None or path.name == "ok.json"
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    message = notes[0].getMessage()
+    assert message.startswith("NON_RECORD_FILE: 10 non-record files, 5 unexpected; examples: ")
+    assert repr(str(tasks / "bad\nname.json")) in message
+    assert "custom-tail" in message and "custom.json" in message
+    assert "review.state" not in message and "review-state" not in message
+    assert "write-boundary" not in message and "ok.json" not in message
+    assert not any(sep in message for sep in ("\n", "\r", "\u0085", "\u2028", "\u2029", "\x1b"))
+    assert "\n" not in formatter.format(notes[0])
+
+    routine_dir = tmp_path / "routine"
+    routine_dir.mkdir()
+    for name in ("a.review-state.json", "b.resolver.json"):
+        (routine_dir / name).write_bytes(b"[]")
+    before = len(caplog.records)
+    for path in store.iter_task_records(routine_dir, include_archive=False):
+        assert store.parse_task_record(path, path.read_bytes()) is None
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    message = notes[0].getMessage()
+    assert message.startswith("NON_RECORD_FILE: 2 non-record files; examples: ")
+    assert "unexpected" not in message
+    assert "review-state" in message and "resolver" in message
+
+    # Hot and archive are one scan, so they share one line.
+    both = tmp_path / "both"
+    (both / "archive").mkdir(parents=True)
+    (both / "hot.custom.json").write_bytes(b"[]")
+    (both / "archive" / "old.custom.json").write_bytes(b"[]")
+    (both / "archive" / "old.review-state.json").write_bytes(b"[]")
+    before = len(caplog.records)
+    for path in store.iter_task_records(both, include_archive=True):
+        assert store.parse_task_record(path, path.read_bytes()) is None
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    assert notes[0].getMessage().startswith("NON_RECORD_FILE: 3 non-record files, 2 unexpected; examples: ")
+
+    # A lookalike name is not the known family. A too-wide pattern would drop it from the unexpected count.
+    alike = tmp_path / "alike"
+    alike.mkdir()
+    for name in ("x.review-state.json", "x.not-review-state.json", "x.routing.json", "x.notrouting.json"):
+        (alike / name).write_bytes(b"[]")
+    before = len(caplog.records)
+    for path in store.iter_task_records(alike, include_archive=False):
+        assert store.parse_task_record(path, path.read_bytes()) is None
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    message = notes[0].getMessage()
+    assert message.startswith("NON_RECORD_FILE: 4 non-record files, 2 unexpected; examples: ")
+    assert "not-review-state" in message and "notrouting" in message
+
+    # A varying token in front of one suffix must not use up every example slot.
+    varied = tmp_path / "varied"
+    varied.mkdir()
+    for name in (
+        "t.AC-01.test-evidence.json", "t.AC-02.test-evidence.json",
+        "t.AC-03.test-evidence.json", "t.unique-marker.json",
+    ):
+        (varied / name).write_bytes(b"[]")
+    before = len(caplog.records)
+    for path in store.iter_task_records(varied, include_archive=False):
+        assert store.parse_task_record(path, path.read_bytes()) is None
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    message = notes[0].getMessage()
+    assert message.startswith("NON_RECORD_FILE: 4 non-record files, 4 unexpected; examples: ")
+    assert "unique-marker" in message and "test-evidence" in message
+
+    # Hyphen-only copies of one family share a slot, so they cannot crowd out another suffix.
+    hyphen = tmp_path / "hyphen"
+    hyphen.mkdir()
+    for name in (
+        "aaa-one-ac-policy.json", "bbb-two-ac-policy.json",
+        "ccc-three-ac-policy.json", "zzz.unique-marker.json",
+    ):
+        (hyphen / name).write_bytes(b"[]")
+    before = len(caplog.records)
+    for path in store.iter_task_records(hyphen, include_archive=False):
+        assert store.parse_task_record(path, path.read_bytes()) is None
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    message = notes[0].getMessage()
+    assert message.startswith("NON_RECORD_FILE: 4 non-record files, 4 unexpected; examples: ")
+    assert "unique-marker" in message and "ac-policy" in message
+
+    # Breaking out of a scan still emits what was read and does not hold later reads silent.
+    early = tmp_path / "early"
+    early.mkdir()
+    for name in ("a.review-state.json", "b.resolver.json"):
+        (early / name).write_bytes(b"[]")
+    before = len(caplog.records)
+    for path in store.iter_task_records(early, include_archive=False):
+        assert store.parse_task_record(path, path.read_bytes()) is None
+        break
+    assert store._SCAN_DEPTH == 0
+    notes = [record for record in caplog.records[before:] if "NON_RECORD_FILE" in record.getMessage()]
+    assert len(notes) == 1
+    assert "1 non-record file" in notes[0].getMessage()
+    before = len(caplog.records)
+    assert store.parse_task_record(tmp_path / "after-break.json", b"[]") is None
+    assert len(caplog.records) == before + 1

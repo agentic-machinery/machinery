@@ -146,6 +146,7 @@ def test_unchanged_foreign_files_are_not_reparsed_or_rewarned(tmp_path, monkeypa
     # Force warning dedup eviction between scans: the scan cache must avoid
     # reading foreign files independently of the logger's bounded set.
     monkeypatch.setattr(task_record_store, "_REPORTED_FOREIGN", set())
+    monkeypatch.setattr(task_record_store, "_PENDING_FOREIGN", {})
     ctx = fixture_context(tmp_path)
     tasks = ctx.roots.batch_state_dir / "tasks"
     tasks.mkdir(parents=True)
@@ -154,6 +155,7 @@ def test_unchanged_foreign_files_are_not_reparsed_or_rewarned(tmp_path, monkeypa
     assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 0
     assert len([r for r in caplog.records if "NON_RECORD_FILE" in r.message]) == 1
     task_record_store._REPORTED_FOREIGN.clear()
+    task_record_store._PENDING_FOREIGN.clear()
     caplog.clear()
     assert delegate_router.list_delegate_tasks(ctx=ctx)["total"] == 0
     assert not [r for r in caplog.records if "NON_RECORD_FILE" in r.message]
