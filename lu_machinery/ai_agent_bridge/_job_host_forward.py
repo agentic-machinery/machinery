@@ -8,8 +8,8 @@ configured, re-run the same ``ask-*`` on the job-host checkout where the
 canonical plane lives.
 
 This is not a second Monitor, not a local shadow plane, and not a new control
-surface. It reuses the existing BatchMode SSH path that ``services.sh`` and
-``job_host_exec`` already use for notebook clients.
+surface. It reuses the existing BatchMode SSH path that ``services.sh`` already
+uses for notebook clients.
 
 Never prints SSH host aliases, IPs, or remote absolute paths.
 """
@@ -84,7 +84,7 @@ def resolve_ask_forward_target() -> AskForwardTarget | None:
     """Return the job-host SSH target when notebook forward config is present.
 
     Configured means an SSH Host alias plus an absolute remote checkout —
-    the same contract ``services.sh`` / ``job_host_exec`` use. Returns None
+    the same contract ``services.sh`` uses. Returns None
     when the operator has not wired the notebook client yet, and None when
     a host is set but no absolute repo env var is: there is no baked-in
     default run-root (#7515 follow-up); fail closed instead.

@@ -24,7 +24,7 @@ REPO = Path(__file__).resolve().parents[2]
 START = dt.datetime(2026, 10, 16, 12, 0, tzinfo=dt.UTC)
 ECHO = (
     "> HANDOFF NOW (CTO automated, 2026-10-16T12:00:00Z): your context is 70% (hand off at 70%). "
-    "Finish the current step only, write the top of .claude/infra-epic/DRIVER-STATE.md "
+    "Finish the current step only, record a DB handoff_note for lane infra "
     "(in-flight workers with task ids, waits with nonces, PRs, holds, orders and their status, next actions), "
     "stop every background task you started (background Bash tasks and Monitor streams), "
     "post 'HANDOFF-DONE infra .claude/infra-epic/DRIVER-STATE.md' to Fleet Comms recipient claude-cto, then stop. "

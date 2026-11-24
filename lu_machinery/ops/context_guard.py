@@ -498,9 +498,7 @@ class Guard:
     # ---- helpers -------------------------------------------------------
     def _prompt(self, lane: Lane, reason: str, reminder: int) -> str:
         again = f"reminder {reminder}, " if reminder > 1 else ""
-        handoff = (
-            f"record a DB handoff_note for lane {lane.epic}" if lane.kind == "codex" else f"write the top of {lane.goal}"
-        )
+        handoff = f"record a DB handoff_note for lane {lane.epic}"
         stop_tasks = (
             "stop every background task you started (background Bash tasks and Monitor streams), "
             if lane.kind == "claude"

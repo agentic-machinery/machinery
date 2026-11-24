@@ -22,9 +22,6 @@ from lu_machinery.orchestration import (
     handoff_ready as hr,
 )
 from lu_machinery.orchestration import (
-    job_host_exec as jhe,
-)
-from lu_machinery.orchestration import (
     orchestrator_control as oc,
 )
 from lu_machinery.orchestration import (
@@ -160,42 +157,6 @@ def test_reaper_lifecycle_restore_worktree_timeouts(tmp_path: Path) -> None:
     assert len(calls) == 3
     assert all(c.get("timeout") == rl.DEFAULT_GIT_TIMEOUT_SECONDS for c in calls)
     assert calls[-1]["profile"] == "checkout"
-
-
-# ---------------------------------------------------------------------------
-# 2. job_host_exec.py
-# ---------------------------------------------------------------------------
-
-
-def test_job_host_exec_forward_dispatch_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(jhe.ENV_HOST, "job-alias")
-    monkeypatch.setenv(jhe.ENV_REPO, "/remote/repo")
-
-    calls: list[dict] = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append({"cmd": cmd, **kwargs})
-        return _completed(cmd, returncode=0)
-
-    with patch("subprocess.run", side_effect=fake_run):
-        rc = jhe.forward_dispatch(
-            host_id="host-job",
-            argv=["scripts/dispatch.py", "dispatch", "--agent", "codex", "--task-id", "test-task"],
-        )
-        assert rc == 0
-
-    assert len(calls) == 1
-    assert calls[0]["timeout"] == jhe.DEFAULT_SSH_TIMEOUT_SECONDS
-
-    with patch(
-        "subprocess.run",
-        side_effect=subprocess.TimeoutExpired(["ssh"], jhe.DEFAULT_SSH_TIMEOUT_SECONDS),
-    ):
-        with pytest.raises(jhe.SshTransportError, match=r"SSH transport timed out after 300\.0s"):
-            jhe.forward_dispatch(
-                host_id="host-job",
-                argv=["scripts/dispatch.py", "dispatch", "--agent", "codex", "--task-id", "test-task"],
-            )
 
 
 # ---------------------------------------------------------------------------

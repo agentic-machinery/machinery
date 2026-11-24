@@ -1630,16 +1630,6 @@
    "sha256": "0ea8fe2666a65f4e7f5f05a0ae8cf3e03d332a90ff88a9b357bb503585c63788"
   },
   {
-   "path": "lu_machinery/orchestration/job_host_exec.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "96ac73dfdaff3ceb7b4aca30e493d6de581aee4622938b002794de018dcc2263"
-  },
-  {
-   "path": "lu_machinery/orchestration/job_host_exec.py",
-   "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
-   "sha256": "d661413b17c9f07ab9aedb791bf7022fb113ba5eda77d37795ada687103364f1"
-  },
-  {
    "path": "lu_machinery/orchestration/opencode_session_retention.py",
    "rule": "python.lang.security.audit.dangerous-subprocess-use-audit",
    "sha256": "d086d2c4ec6832c62ebf5a845d4723f0d4c2a956ddba5bfb711f65049cec1f0c"
@@ -1968,11 +1958,6 @@
    "path": "lu_machinery/orchestration/handoff_ready.py",
    "rule": "python.lang.security.audit.dynamic-urllib-use-detected",
    "sha256": "d66d2d3a331505d8a1c5c59604b86a7b6459854c1d916b948b5ab1ee7b6d917e"
-  },
-  {
-   "path": "lu_machinery/orchestration/job_host_exec.py",
-   "rule": "python.lang.security.audit.dynamic-urllib-use-detected",
-   "sha256": "7f3fe4542d71d3fef24a592747c782ee47f29015d3637e66d27fa7299c8d177d"
   },
   {
    "path": "lu_machinery/orchestration/plane_tunnel_gate.py",

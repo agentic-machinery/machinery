@@ -112,7 +112,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Exit codes:\n"
             "  0 after a probe (ok, degraded, or skipped); 2 on CLI misuse.\n\n"
             "Related:\n"
-            f"  Dispatch: {_PACKAGE_DIR}/job_host_exec.py\n"
             f"  Fleet: {_MACHINERY}/lib/fleet_comms_cold_start.sh\n"
             "  Issue: #7177\n"
         ),
