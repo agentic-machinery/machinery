@@ -1641,17 +1641,20 @@ def is_orphaned_pidless_record(record: dict[str, Any]) -> bool:
 
 
 def pidless_spawning_holds_slot(
-    state: dict[str, Any], *, now: datetime, pid_alive: Callable[[int], bool] | None = None,
+    state: dict[str, Any], *, now: datetime, task_id: str, pid_alive: Callable[[int], bool] | None = None,
 ) -> bool:
     """Whether a record without a worker pid holds its slot now: admission's reservation rule.
 
-    Only a ``spawning`` record that is not orphaned (:func:`is_orphaned_pidless_record`)
-    holds one. When it names its dispatcher's pid it holds the slot while that
-    dispatcher lives (its recorded identity when there is one); otherwise from
-    :data:`PIDLESS_CLOCK_SKEW_S` before its ``started_at`` to
-    :data:`PIDLESS_SPAWNING_GRACE_S` after. An unreadable ``started_at`` holds none.
+    The caller has already found the record not orphaned
+    (:func:`is_orphaned_pidless_record`; a scan files an orphan as dead), and
+    passes that one decision on: the rule never probes the owner a second time.
+    Only a ``spawning`` record holds a slot. When it names its dispatcher's pid
+    it holds the slot while that dispatcher lives (its recorded identity when
+    there is one); otherwise from :data:`PIDLESS_CLOCK_SKEW_S` before its
+    ``started_at`` to :data:`PIDLESS_SPAWNING_GRACE_S` after. An unreadable
+    ``started_at`` holds none. ``task_id`` names the record in the skew warning.
     """
-    if state.get("status") != "spawning" or is_orphaned_pidless_record(state):
+    if state.get("status") != "spawning":
         return False
     owner = _dispatcher_owner(state)
     owner_pid = _parse_pid(owner.get("owner_pid")) if owner is not None else None
@@ -1667,7 +1670,7 @@ def pidless_spawning_holds_slot(
     if age is not None and age < -PIDLESS_CLOCK_SKEW_S:
         _logger.warning(
             "dispatch admission: pidless spawning record %s has started_at %.0f s in the future; not counted",
-            state.get("task_id"),
+            task_id,
             -age,
         )
         return False
@@ -2006,7 +2009,9 @@ def scan_task_records(
             if is_orphaned_pidless_record(state):
                 dead.append((path, state))
                 continue
-            if (write_capable or is_orchestrator) and pidless_spawning_holds_slot(state, now=clock, pid_alive=alive):
+            if (write_capable or is_orchestrator) and pidless_spawning_holds_slot(
+                state, now=clock, task_id=task_id, pid_alive=alive,
+            ):
                 if write_capable:
                     live.append(task_id)
                     live_on_meter += on_meter

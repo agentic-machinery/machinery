@@ -116,10 +116,11 @@ cold-prompts; silent plane flips; “for now” cutovers.
 ### Routing observability contract
 
 Use the body-free `GET /api/runtime/routing` view (the Monitor's Routing page)
-to diagnose who picked a dispatch's model (the brief or the reviewer resolver),
-which pool and account paid, whether admission admitted or deferred it, and
-whether a substitution was recorded. Its counts cover only the last 24 hours
-of task records; they are not all-time totals, routing weights, provider
+to diagnose which model and pool each recent dispatch ran on, who chose them
+where the task record proves it (a review row shows the seat that ran; the
+resolver's pick is not recorded), whether admission admitted, deferred or
+refused it, and whether a substitution was recorded. Its counts cover only the
+last 24 hours of task records; they are not all-time totals, routing weights, provider
 quotas, or caching evidence.
 
 Inspect the chronological event and selection trace before attributing

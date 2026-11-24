@@ -13,11 +13,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 import lu_machinery.api.runtime_router as runtime_router
-import lu_machinery.api.state_router as state_router
 from lu_machinery.api.main import app
 from lu_machinery.api.state_helpers import cache_invalidate
 
@@ -49,18 +47,15 @@ def _write_task(task_id: str, *, started: datetime, **fields) -> dict:
     }
 
 
-def test_window_boundary_keeps_the_last_day_and_never_leaks_older_starts(tmp_path, monkeypatch):
+def test_window_boundary_keeps_the_last_day_and_never_leaks_older_starts(tmp_path):
     """Defect class: window boundary leak or drop (started_at against the mtime prefilter).
 
     A record started an hour ago is a decision. One started 30 hours ago is
     outside the window both when its file was rewritten since (fresh mtime, old
-    start) and when it was not (old mtime): neither is counted. A start hours in
-    the future is no decision either: it is counted as unreadable. A worker
-    started before the window and still running is no decision but is a live
-    worker on its pool, even when its record was last written before the window.
+    start) and when it was not (old mtime): neither is counted, whatever its
+    status. A start hours in the future is no decision either: it is counted as
+    unreadable.
     """
-    # Worker identity is not the class under test here: the running record's worker is taken as alive.
-    monkeypatch.setattr(runtime_router, "worker_liveness", lambda record, pid_alive=None: True)
     tasks = tmp_path / "batch_state" / "tasks"
     _write_record(tasks, "recent-write", _write_task("recent-write", started=_NOW - timedelta(hours=1)))
     old = _NOW - timedelta(hours=30)
@@ -71,9 +66,6 @@ def test_window_boundary_keeps_the_last_day_and_never_leaks_older_starts(tmp_pat
     _write_record(tasks, "from-the-future", _write_task("from-the-future", started=_NOW + timedelta(hours=2)))
 
     result = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
-
-    assert result["live_by_pool"]["codex:a"] == 1
-    assert sum(result["live_by_pool"].values()) + result["live_unpooled"] == 1
 
     assert result["status"] == "partial"
     assert [row["task_id"] for row in result["decisions"]] == ["recent-write"]
@@ -126,19 +118,28 @@ def test_refused_start_shows_requested_id_and_plain_reason_not_the_raw_clause(tm
     assert rows["account-refused"]["pool"] is None
     assert rows["account-refused"]["admission"] == {"state": "refused", "reason": "refused: the account check failed"}
 
+    # A marker admission's own classification rejects (malformed, contradicting the lifecycle, or a code dispatch
+    # never writes) proves no refusal: the row keeps its own id, and its outcome and pool are unknown.
+    for name, marker in (("d" * 32, False), ("c" * 32, ""), ("b" * 32, {"code": "x"}), ("a" * 32, "not_a_refusal")):
+        _write_record(tasks, name, _write_task(name, started=_NOW - timedelta(minutes=1), status="failed",
+                                               requested_task_id="other-task", never_started_reason=marker))
+    _write_record(tasks, "9" * 32, _write_task("9" * 32, started=_NOW - timedelta(minutes=1), status="done",
+                                               requested_task_id="other-task", never_started_reason="admission_capacity"))
+    rows = {row["task_id"]: row for row in runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))["decisions"]}
+    assert "other-task" not in rows
+    for name in ("d" * 32, "c" * 32, "b" * 32, "a" * 32, "9" * 32):
+        assert (rows[name]["pool"], rows[name]["admission"]["state"]) == (None, "unknown")
+
 
 def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
-    """Defect class: unknown or unreadable input (task data, the routing budget) read as a known, complete or current value.
+    """Defect class: unknown or unreadable task data read as a known, complete or current value.
 
     A missing store is unknown with no counts. A record in the window whose
     fields cannot be used (an unhashable, empty or unsupported ``mode``, an
     unreadable start time) never fails the scan and never vanishes: it makes the
-    result partial, and the route then reports an admitted pool as unknown while
-    a deferral stands. Pools now is a snapshot with its evaluation time (CTO
-    ruling 2026-11-24): a budget whose freshness fields have the wrong type is
-    unusable and discards it, so the next usable read evaluates afresh. A store
-    that stops being listable is unknown at once, although an earlier scan and
-    snapshot are cached.
+    result partial. A store that stops being listable is unknown at once,
+    although an earlier scan is cached, and the scan's age counts from its own
+    ``as_of``.
     """
     result = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
 
@@ -150,59 +151,24 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
     tasks = tmp_path / "batch_state" / "tasks"
     recent = _NOW - timedelta(minutes=5)
     _write_record(tasks, "good", _write_task("good", started=recent))
+    _write_record(tasks, "bad-mode", _write_task("bad-mode", started=recent, mode=[]))
+    _write_record(tasks, "empty-mode", _write_task("empty-mode", started=recent, mode=""))
+    _write_record(tasks, "other-mode", _write_task("other-mode", started=recent, mode="turbo"))
+    _write_record(tasks, "bad-start", _write_task("bad-start", started=recent) | {"started_at": "9999-12-31T23:59:59-23:59"})
+    partial = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
+    assert partial["status"] == "partial"
+    assert partial["unreadable"] == 4
+    assert [row["task_id"] for row in partial["decisions"]] == ["good"]
 
-    evaluations = []
-
-    def evaluate(_ctx, budget, epoch=0):
-        evaluations.append(budget["generated_at"])
-        verdict = {"note": None, "live_writes": 0, "cap": 8}
-        return {"budget_generated_at": budget["generated_at"], "evaluated_at": _iso(datetime.now(UTC)), "epoch": epoch,
-                "admission": {"state": "ok", "host": {"admitting": True, "failing": [], "unmeasured": []},
-                              "pools": {"codex:a": {**verdict, "state": "admitted", "reason": None},
-                                        "codex:b": {**verdict, "state": "deferred", "reason": "Codex b: cap"}}},
-                "resolver": {"state": "unknown", "reason": "not evaluated here"}}
-
-    budget = {"generated_at": _iso(_NOW), "agents": {}, "diagnostics": {"stale": False, "data_age_s": 1.0,
-              "stale_threshold_s": 900}, "claude_accounts": {"claude:a": {"age_s": 3.0, "weekly": {"left_pct": 50}}}}
-
-    async def serve_budget(**_kwargs):
-        return JSONResponse(content=budget)
-
-    monkeypatch.setattr(state_router, "routing_budget", serve_budget)
-    monkeypatch.setattr(runtime_router, "routing_now", evaluate)
-    monkeypatch.setattr(runtime_router, "routing_allowances", dict)
+    cache_invalidate()  # the route scans the store afresh
     api = FastAPI()
     api.include_router(runtime_router.router, prefix="/api/runtime")
     api.dependency_overrides[runtime_router.get_ctx] = lambda: _ctx(tmp_path / "batch_state")
     with TestClient(api) as client:
-        first = client.get("/api/runtime/routing").json()["now"]
-        assert first["admission"]["pools"]["codex:a"]["state"] == "admitted"
-        assert first["evaluated_at"] and 0 <= first["age_s"] <= runtime_router.ROUTING_NOW_TTL_S
-
-        for field, wrong in (("stale", "false"), ("data_age_s", "1"), ("stale_threshold_s", None)):
-            budget["diagnostics"] = {"stale": False, "data_age_s": 1.0, "stale_threshold_s": 900, field: wrong}
-            mistyped = client.get("/api/runtime/routing").json()["now"]
-            assert (mistyped["budget"]["state"], mistyped["budget"]["reason"]) == ("unknown", "invalid_budget")
-            assert mistyped["admission"]["state"] == "unknown"
-        budget["diagnostics"] = {"stale": False, "data_age_s": 1.0, "stale_threshold_s": 900}
-        assert client.get("/api/runtime/routing").json()["now"]["state"] == "ok"
-        assert len(evaluations) == 2  # the unusable budget discarded the first snapshot
-
-        _write_record(tasks, "bad-mode", _write_task("bad-mode", started=recent, mode=[]))
-        _write_record(tasks, "empty-mode", _write_task("empty-mode", started=recent, mode=""))
-        _write_record(tasks, "other-mode", _write_task("other-mode", started=recent, mode="turbo"))
-        _write_record(tasks, "bad-start", _write_task("bad-start", started=recent) | {"started_at": "9999-12-31T23:59:59-23:59"})
-        partial = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
-        assert partial["status"] == "partial"
-        assert partial["unreadable"] == 4
-        assert [row["task_id"] for row in partial["decisions"]] == ["good"]
-
-        cache_invalidate()  # the next read scans the store again
         payload = client.get("/api/runtime/routing").json()
         assert payload["recent"]["status"] == "partial"
-        pools = payload["now"]["admission"]["pools"]
-        assert (pools["codex:a"]["state"], pools["codex:b"]["state"]) == ("unknown", "deferred")
-        assert payload["now"]["admission"]["host"]["admitting"] is None
+        scanned = datetime.fromisoformat(payload["recent"]["as_of"].replace("Z", "+00:00"))
+        assert 0 <= payload["recent"]["age_s"] <= (datetime.now(UTC) - scanned).total_seconds()
 
         def listing_fault(_directory):
             raise PermissionError("listing refused")
@@ -212,7 +178,7 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
         assert unlistable["status"] == "unknown"
         assert unlistable["reason"] == "task_records_unreadable"
         assert "decisions" not in unlistable
-        # The scan and the evaluation are both cached, but the store is listed on every read.
+        # The scan is cached, but the store is listed on every read.
         warm = client.get("/api/runtime/routing").json()
         assert (warm["recent"]["status"], warm["recent"]["reason"]) == ("unknown", "task_records_unreadable")
-        assert warm["now"]["admission"]["state"] == "unknown"
+        assert warm["recent"]["age_s"] is None

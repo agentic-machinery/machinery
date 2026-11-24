@@ -372,28 +372,22 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "/api/runtime/routing",
         "exact",
         "http",
-        "How work is routed, for the Routing page. now: each subscription pool's live workers, weekly allowance left and "
-        "reset, what admission says about a new write dispatch there and why (admission's own meter rule and host "
-        "checks), and the reviewer resolver's eligible or excluded seats and first choice per author family. recent: one "
-        "row per dispatch and review seat in the last 24 hours (what was asked, the model and pool chosen, who chose "
-        "each, the admission outcome, any recorded substitution) with per-lane counts.",
-        "Hot task records (batch_state/tasks), the routing budget dispatch admission reads (/api/state/routing-budget), "
-        f"{_rel('orchestration', 'dispatch_admission.py')} thresholds, meter rule and host probes, the subscription "
-        f"readings shared with /api/runtime/subscriptions, and {_rel('review', 'reviewer_resolver.py')} seat evaluation.",
-        "now's verdicts are a snapshot of admission's report-only evaluation with its evaluation time, at most "
-        "15 s old (a read waits up to 0.5 s for the next one, else answers pending and the page reads again after "
-        "3 s); every dispatch is evaluated again when it starts. recent is one scan of the task records (the last "
-        "day's decisions and every live worker), served stale-while-revalidate (state_helpers.cache_read_swr): the "
-        "last value at once with its true age in X-Snapshot-Age-S, refreshed after 30 s, stale after 90 s. The task "
-        "store is listed on every request. A source that cannot be read is typed unknown with its reason and the "
-        "time of its last reading, never zero; unreadable task data makes an admitted verdict unknown, and each "
-        "allowance carries the time it stops being fresh.",
+        "How work was routed, for the Routing page: one row per dispatch and review seat in the last 24 hours (what "
+        "was asked, the model and pool chosen, who chose each where the record proves it, the admission outcome, any "
+        "recorded substitution) with per-lane counts, and the subscription pools in page order.",
+        "Hot task records (batch_state/tasks) with the admission snapshot each dispatch records; the start-refusal "
+        f"and pid-less liveness rules of {_rel('orchestration', 'dispatch_admission.py')}.",
+        "recent is one scan of the task records, served stale-while-revalidate (state_helpers.cache_read_swr): the "
+        "last value at once, refreshed after 30 s, stale after 90 s; a read waits up to 0.5 s for a first scan, else "
+        "answers pending and the page reads again after 3 s. Its age_s and X-Snapshot-Age-S count from the scan's "
+        "as_of. The task store is listed on every request: a listing fault is typed unknown with its reason, never "
+        "zero, and unreadable records make the scan partial.",
         ("routing.html", "operators", "agents"),
         "Replaces /api/runtime/routing-assignments, whose routing-reservation ledger lost its only writer when the "
-        "sealed formal review path was retired; reuses the routing budget, subscription and resolver projections "
-        "instead of keeping a second record.",
-        "medium if the resolver's first choice is read as the seat a past review ran on (the task record keeps the "
-        "seat that ran, not the resolver's pick), or a per-pool verdict as a promise that a dispatch will start",
+        "sealed formal review path was retired; reads the task records dispatch already writes instead of keeping a "
+        "second record.",
+        "medium if a review row's model is read as the resolver's pick (the task record keeps the seat that ran, "
+        "not who chose it)",
         "keep as the routing observer; routing stays with the brief, the account choice, admission and the resolver",
         response_schema_version="routing.v1",
     ),
@@ -841,16 +835,15 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
     PageContract(
         "routing.html",
         "/routing",
-        "Routing: a flow picture of the four routing stages (brief picks the model, account choice, admission, reviewer "
-        "resolver) with the last 24 hours' counts; each pool now with live workers, allowance left, reset time, whether "
-        "new writes are admitted or deferred and why, and its review seats; and one row per recent dispatch and review "
-        "seat with what was asked, what was chosen, by whom and why.",
+        "Routing: a flow picture of the four routing stages (who picks the model, which account pays, admission, what "
+        "ran) with the last 24 hours' counts, and one row per recent dispatch and review seat with what was asked, "
+        "what was chosen, by whom where the record proves it, and why.",
         "GET /api/runtime/routing.",
         "HTTP reads every 30 seconds; recent decisions are at most 90 seconds old and their age is shown; a stale or "
         "missing source reads unknown since the time of its last reading.",
         ("humans", "operators"),
         "Shows routing decisions; the Subscriptions page keeps the full per-account usage and Fleet the live worker list.",
-        "medium if the resolver's current first choice is read as history",
+        "medium if a review row's model is read as the resolver's pick",
         "keep",
         label="Routing",
     ),

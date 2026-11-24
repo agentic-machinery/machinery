@@ -39,33 +39,18 @@ from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.common.task_store_paths import read_cached_task_record
 from lu_machinery.dispatcher.admission import review_typed
 from lu_machinery.dispatcher.types import StartRefusal
-from lu_machinery.fleet import claude_account_lane
 from lu_machinery.fleet_comms import message_plane
 from lu_machinery.lib.readonly_sqlite import SQLiteConnection, import_named_module, open_readonly
 from lu_machinery.orchestration import codex_transport_health, dispatch_admission
 from lu_machinery.orchestration.dead_worker_state import worker_liveness
-from lu_machinery.review import bench_health
 from lu_machinery.review.model_catalog import VALID_CODEX_EFFORTS, canonical_model_id, load_model_catalog
-from lu_machinery.review.reviewer_resolver import (
-    REVIEW_CANDIDATES,
-    REVIEW_LADDERS,
-    ResolverInputs,
-    codex_account_key,
-    resolve_reviewer,
-)
 
 from . import account_logins, panel_values, subscriptions
 from . import delegate_router as delegate_api
 from .model_stats_rows import current_catalog_model_ids
 from .monitor_context import MonitorContext, get_ctx, resolve_context
 from .monitor_context import production_context as production_context  # re-export: test monkeypatches
-from .state_helpers import (
-    cache_get_or_refresh,
-    cache_invalidate,
-    cache_read_swr,
-    ctx_scoped_ttl_key,
-    swr_route,
-)
+from .state_helpers import cache_read_swr, ctx_scoped_ttl_key, swr_route
 
 router = APIRouter(tags=["runtime"])
 
@@ -554,33 +539,18 @@ ACP_CONVERSATIONS_TTL_S = 15.0
 #
 # Work is routed in four places: the brief names the worker's model, the dispatch
 # picks the account, dispatch admission admits or defers a write, and the reviewer
-# resolver seats each review. This view reads each stage's own evidence where it
-# already lives and keeps no store: task records (with the admission snapshot each
-# dispatch records), the routing budget admission reads, admission's own report-only
-# evaluation per pool, and the resolver's own evaluation and pick.
+# resolver seats each review. This view reads the evidence each dispatch already
+# records on its task record (with the admission snapshot it took) and keeps no store.
 
-# Both snapshots (recent decisions; pools now) are served stale-while-revalidate; the
-# page's freshness bound allows two refreshes.
+# The scan is served stale-while-revalidate; the page's freshness bound allows two refreshes.
 ROUTING_TTL_S = 30.0
 ROUTING_STALE_AFTER_S = 90.0
 ROUTING_WINDOW_S = 24 * 3600.0
 # A start later than this past the snapshot time is a bad clock or a bad record, not a decision.
 ROUTING_FUTURE_SKEW_S = 300.0
-# Pools now is admission's report-only snapshot with its evaluation time, never older than the
-# routing budget's own TTL; every dispatch is evaluated again when it starts.
-ROUTING_NOW_TTL_S = 15.0
-# A read starts the next evaluation once the stored one is this old, so it is usually ready before the bound
-# (the page reads again from 11 s).
-ROUTING_NOW_REFRESH_S = 5.0
-# Raised for a context on every unusable budget or task-store fault: an evaluation started before it is
-# never served afterwards, even one still in flight when the source recovers.
-_ROUTING_NOW_EPOCH: dict[str, int] = {}
-# An evaluation takes about 3 s on a full store and a scan up to about 1 s: a read waits this long
-# (routes answer within 1 s) and otherwise answers "pending"; the page reads again after 3 s.
-ROUTING_NOW_WAIT_S = 0.5
-# The review the "excluded" column and the resolver's pick describe.
-ROUTING_REVIEW_PROFILE = "code"
-ROUTING_REVIEW_RISK = "medium"
+# A scan takes up to about 1 s on a full store: a read waits this long (routes answer within 1 s) and
+# otherwise answers "pending"; the page reads again after 3 s.
+ROUTING_WAIT_S = 0.5
 # Admission meters in page order, with the subscription account each one bills.
 ROUTING_POOLS: tuple[tuple[str, str], ...] = (
     ("claude:a", "Claude a"),
@@ -592,8 +562,6 @@ ROUTING_POOLS: tuple[tuple[str, str], ...] = (
     ("grok+cursor", "Grok+Cursor"),
 )
 _ROUTING_POOL_LABELS = dict(ROUTING_POOLS)
-# Author families the resolver's pick is shown for, with the page's name for each.
-_ROUTING_AUTHOR_FAMILIES = (("anthropic", "Claude"), ("openai", "GPT"), ("google", "Gemini"), ("xai", "Grok"))
 # Closed public vocabularies: a value outside them is published as None ("not recorded"), never verbatim.
 _ROUTING_RISKS = frozenset({"low", "medium", "high", "critical"})
 _ROUTING_PROFILES = frozenset({"code", "infra", "ukrainian"})
@@ -608,12 +576,6 @@ _ROUTING_ROLES = frozenset({
     "driver",
 })
 _ROUTING_ACTIVE = dispatch_admission.ACTIVE_STATUSES
-# The byte prefilter: a record last written before the window is read only to find live workers, when
-# its bytes could name an active status: the status key with an active word in any case and without its
-# closing quote (so a misspelt one such as "running " is read, and counted unreadable), or a JSON escape
-# (which could spell one).
-_ROUTING_ACTIVE_WORD = re.compile(b"|".join(re.escape(status.encode()) for status in sorted(_ROUTING_ACTIVE)), re.IGNORECASE)
-_ROUTING_STATUS_KEY = b'"status"'
 # A recorded worker identity, as dispatch writes it: the boot id and the process start time in clock ticks.
 _ROUTING_PROCESS_START = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9]+", re.ASCII)
 # Every mode dispatch records; any other value leaves the kind of work, and so its admission, unknown.
@@ -630,6 +592,8 @@ _ROUTING_START_REFUSALS = {
     StartRefusal.SETUP.value: ("refused", "refused during setup"),
     StartRefusal.REVIEW_SETUP.value: ("refused", "refused during review setup (round budget or target)"),
 }
+# A refusal marker that proves nothing: malformed, contradicting the record's lifecycle, or a code dispatch never writes.
+_ROUTING_REFUSAL_UNKNOWN = "unknown"
 _ROUTING_METER_DEFERS = {
     "exhausted": "the pool's allowance is used up",
     "near_cap": "the pool's allowance is nearly used up",
@@ -765,14 +729,31 @@ def _routing_substitution(record: Mapping[str, Any], model: str | None) -> str |
     return None
 
 
-def _routing_admission(record: Mapping[str, Any], *, write: bool) -> dict[str, Any]:
-    """The admission outcome a record proves, in fixed words; missing evidence is unknown."""
+def _routing_refusal(record: Mapping[str, Any]) -> str | None:
+    """The typed start refusal a record proves: its code, None when it records none, or ``_ROUTING_REFUSAL_UNKNOWN``.
+
+    A marker proves a refusal only when admission's own classification
+    (``classify_never_started_refusal``) finds it consistent with the record's
+    lifecycle and it is a code dispatch writes. Anything else proves nothing: the
+    row's outcome and pool are unknown and it keeps its own id.
+    """
+    code = record.get("never_started_reason")
+    if code is None:
+        return None
+    _, contradiction = dispatch_admission.classify_never_started_refusal(record)
+    if contradiction is not None or code not in _ROUTING_START_REFUSALS:
+        return _ROUTING_REFUSAL_UNKNOWN
+    return cast(str, code)
+
+
+def _routing_admission(record: Mapping[str, Any], *, write: bool, refusal: str | None) -> dict[str, Any]:
+    """The admission outcome a record proves, in fixed words; missing or contradictory evidence is unknown."""
     snapshot = record.get("admission")
     check = _routing_admission_check(snapshot) if isinstance(snapshot, Mapping) else None
-    never = record.get("never_started_reason")
-    if never is not None:
-        state, reason = _ROUTING_START_REFUSALS.get(never, ("refused", "refused before start")) if isinstance(
-            never, str) else ("refused", "refused before start")
+    if refusal == _ROUTING_REFUSAL_UNKNOWN:
+        return {"state": "unknown", "reason": "its refusal marker contradicts the record"}
+    if refusal is not None:
+        state, reason = _ROUTING_START_REFUSALS[refusal]
         if check and check["failing"] and state == "deferred":
             reason = f"{reason}: {'; '.join(check['failing'])}"
         return {"state": state, "reason": reason}
@@ -788,12 +769,14 @@ def _routing_admission(record: Mapping[str, Any], *, write: bool) -> dict[str, A
     return {"state": "unknown", "reason": "started although its admission record did not admit it"}
 
 
-def _routing_pool(record: Mapping[str, Any]) -> str | None:
+def _routing_pool(record: Mapping[str, Any], refusal: str | None) -> str | None:
+    if refusal == _ROUTING_REFUSAL_UNKNOWN:
+        return None  # the record contradicts itself: which pool it meant is unknown
     snapshot = record.get("admission")
     recorded_meter = snapshot.get("meter") if isinstance(snapshot, Mapping) else None
     if isinstance(recorded_meter, str) and recorded_meter in _ROUTING_POOL_LABELS:
         return recorded_meter  # the meter admission judged
-    if record.get("never_started_reason") is not None:
+    if refusal is not None:
         # A refusal written before any meter existed does not record the account asked for, so
         # its own account fields hold defaults, not evidence: the pool is unknown.
         return None
@@ -811,8 +794,8 @@ def _routing_status(record: Mapping[str, Any], *, now: datetime) -> tuple[str, b
     """The record's status word, and whether its worker is live; raises ``_RoutingMalformed`` when unknowable.
 
     A starting dispatch is live by admission's own slot rule: without a worker PID,
-    ``pidless_spawning_holds_slot`` (owner, grace and clock-skew bounds); with one,
-    unless its worker is proven dead. A running one is live only on the
+    when it is not orphaned and ``pidless_spawning_holds_slot`` holds (owner, grace
+    and clock-skew bounds); with one, unless its worker is proven dead. A running one is live only on the
     worker-identity check (PID and start time); a dead one is a zombie, and one
     whose liveness cannot be proven, or whose recorded identity is not one
     dispatch writes, is unreadable.
@@ -828,8 +811,11 @@ def _routing_status(record: Mapping[str, Any], *, now: datetime) -> tuple[str, b
         raise _RoutingMalformed("worker identity unreadable")  # compared as recorded, it would prove a death
     if status == "spawning":
         if dispatch_admission._parse_pid(record.get("pid")) is None:  # admission's own reading of the pid
-            return status, dispatch_admission.pidless_spawning_holds_slot(
-                dict(record), now=now, pid_alive=dispatch_admission.process_alive,
+            state = dict(record)
+            return status, not dispatch_admission.is_orphaned_pidless_record(state) and (
+                dispatch_admission.pidless_spawning_holds_slot(
+                    state, now=now, task_id=str(record.get("task_id")), pid_alive=dispatch_admission.process_alive,
+                )
             )
         return status, worker_liveness(dict(record), pid_alive=dispatch_admission.process_alive) is not False
     if identity and start is None:
@@ -845,10 +831,10 @@ def _routing_decision(record: Mapping[str, Any], *, now: datetime) -> dict[str, 
 
     Rows carry ids, labels, model names and fixed words only, never paths, prompts or free text.
     """
-    # A refused start is recorded under its own id; the id the dispatch asked for is the one people know.
     # A refused start is recorded under its own id and names the asked-for id; any other record is its task id.
-    raw_id = (record.get("requested_task_id") or record.get("task_id")) if record.get("never_started_reason") is not None \
-        else record.get("task_id")
+    refusal = _routing_refusal(record)
+    proven = refusal not in (None, _ROUTING_REFUSAL_UNKNOWN)
+    raw_id = (record.get("requested_task_id") or record.get("task_id")) if proven else record.get("task_id")
     started = _routing_started(record.get("started_at"))
     if not isinstance(raw_id, str) or not raw_id or started is None:
         raise _RoutingMalformed("task id or start time unreadable")
@@ -863,7 +849,7 @@ def _routing_decision(record: Mapping[str, Any], *, now: datetime) -> dict[str, 
     review = review_typed(dict(record))
     write = mode in dispatch_admission.WRITE_CAPABLE_MODES
     model = panel_values.model(record.get("model"))
-    pool = _routing_pool(record)
+    pool = _routing_pool(record, refusal)
     status, live = _routing_status(record, now=now)
     risk = record.get("review_risk")
     return {
@@ -881,7 +867,7 @@ def _routing_decision(record: Mapping[str, Any], *, now: datetime) -> dict[str, 
         # The dispatch caller names the model; a review record does not prove the resolver picked it.
         "model_by": "not_recorded" if review else "brief",
         "account_by": _routing_account_by(record, pool),
-        "admission": _routing_admission(record, write=write),
+        "admission": _routing_admission(record, write=write, refusal=refusal),
         "status": status,
         "live": live,
         "substitution": _routing_substitution(record, model),
@@ -916,13 +902,12 @@ def _routing_listing(tasks_dir: Path) -> tuple[list[Path], str | None]:
 
 
 def routing_decisions(ctx: MonitorContext | None = None) -> dict[str, Any]:
-    """Every dispatch and review decision started in the last day, and the live workers per pool.
+    """Every dispatch and review decision started in the last day.
 
-    A record last written before the window is read only when its bytes name an
-    active status (admission's prefilter): a record is written when its task
-    starts, so its mtime is never older than its start, but a worker started
-    earlier is still live. A store that cannot be listed is ``unknown``; records
-    that cannot be read or parsed are counted, and make the result ``partial``.
+    A record is written when its task starts, so a file last written before the
+    window holds no decision in it and is not read. A store that cannot be listed
+    is ``unknown``; records that cannot be read or parsed are counted, and make
+    the result ``partial``.
     """
     now = datetime.now(UTC)
     tasks_dir = delegate_api._tasks_dir(resolve_context(ctx))
@@ -931,7 +916,6 @@ def routing_decisions(ctx: MonitorContext | None = None) -> dict[str, Any]:
         return {"status": "unknown", "reason": fault, "as_of": _routing_iso_z(now)}
     cutoff = now.timestamp() - ROUTING_WINDOW_S
     rows: list[dict[str, Any]] = []
-    live: Counter[str | None] = Counter()
     unreadable = 0
     for path in candidates:
         try:
@@ -940,23 +924,16 @@ def routing_decisions(ctx: MonitorContext | None = None) -> dict[str, Any]:
             except FileNotFoundError:
                 continue  # archived or removed since the listing: no longer a hot record
             if written < cutoff:
-                raw = dispatch_admission.read_regular_task_record_bytes(path)
-                if b"\\u" not in raw and not (
-                    _ROUTING_STATUS_KEY in raw and _ROUTING_ACTIVE_WORD.search(raw)
-                ):
-                    continue
+                continue
             record = read_cached_task_record(path, tasks_dir=tasks_dir, display_unknown_schema=True)
             if record is None:
                 continue  # a foreign file in the store, not a task record
             row = _routing_decision(record, now=now)
-            if row is None and _routing_status(record, now=now)[1]:
-                live[_routing_pool(record)] += 1  # started before the window, still live
         except (OSError, ValueError, TypeError, OverflowError, RecursionError):
             unreadable += 1
             continue
         if row is not None:
             rows.append(row)
-            live[row["pool"]] += int(row["live"])
     rows.sort(key=lambda row: row["started_at"], reverse=True)
     reviews = [row for row in rows if row["kind"] == "review"]
     return {
@@ -966,267 +943,12 @@ def routing_decisions(ctx: MonitorContext | None = None) -> dict[str, Any]:
         "window_s": ROUTING_WINDOW_S,
         "total": len(rows),
         "unreadable": unreadable,
-        # Every live worker in the store by pool, whatever its mode; None: no pool recorded.
-        "live_by_pool": {meter: live[meter] for meter, _ in ROUTING_POOLS},
-        "live_unpooled": live[None],
         "counts": {
             "brief": _routing_lane_counts([row for row in rows if row["kind"] != "review"]),
             "resolver": _routing_lane_counts(reviews),
         },
         "decisions": rows,
     }
-
-
-def _routing_candidate_pool(candidate: Any, claude_label: str | None) -> str | None:
-    if candidate.route == "codex":
-        return codex_account_key(candidate)
-    if candidate.route == "claude":
-        return f"claude:{claude_label}" if claude_label else None
-    return _routing_meter(candidate.route, candidate.concrete_model, None, None)
-
-
-def _routing_resolver_pick(budget: Mapping[str, Any], family: str, account: Any) -> dict[str, Any]:
-    """The seat ``resolve_reviewer`` itself picks now for a review authored in ``family``."""
-    resolution = resolve_reviewer(ResolverInputs(
-        author_model=family, author_family=family, review_profile=ROUTING_REVIEW_PROFILE,
-        risk=ROUTING_REVIEW_RISK, data_egress_policy="local_interactive",
-        routing_snapshot=budget, claude_account=account,
-    ))
-    seats = [resolution.selected] if resolution.selected is not None else list(resolution.quorum)
-    picks = []
-    for seat in seats:
-        candidate = REVIEW_CANDIDATES.get(seat.name)
-        meter = _routing_candidate_pool(candidate, account.label) if candidate is not None else None
-        picks.append({"name": seat.name, "model": seat.concrete_model, "pool": meter,
-                      "pool_label": _ROUTING_POOL_LABELS.get(meter or "")})
-    return {"picks": picks, "reason": None if picks else resolution.fail_closed_reason or "no eligible reviewer"}
-
-
-def _routing_review_seats(budget: Mapping[str, Any]) -> dict[str, Any]:
-    """The resolver's own evaluation of each automatic seat on the medium code ladder, and its pick.
-
-    A seat is eligible when the resolver would admit it for at least one author
-    family; otherwise it is excluded with the resolver's reason for another family
-    (same-family exclusion is the cross-family rule, not a pool state). Among
-    eligible seats the resolver ranks by fit, tier and allowance, so the pick per
-    author family comes from ``resolve_reviewer`` itself, never from ladder order.
-    """
-    eligible, excluded = bench_health._bench_inventory(
-        budget, data_egress_policy="local_interactive",
-        review_profile=ROUTING_REVIEW_PROFILE, risk=ROUTING_REVIEW_RISK,
-    )
-    account = claude_account_lane.resolve_route_account(None, strict=False)
-    first_choice = []
-    picked_for: dict[str, list[str]] = {}
-    for family, name in _ROUTING_AUTHOR_FAMILIES:
-        pick = _routing_resolver_pick(budget, family, account)
-        first_choice.append({"author": name, "seats": [
-            {key: picked[key] for key in ("model", "pool", "pool_label")} for picked in pick["picks"]
-        ], "reason": pick["reason"]})
-        for picked in pick["picks"]:
-            picked_for.setdefault(picked["name"], []).append(name)
-    seats: dict[str, list[dict[str, Any]]] = {meter: [] for meter, _ in ROUTING_POOLS}
-    unpooled = []
-    for candidate in (candidate for rung in REVIEW_LADDERS[ROUTING_REVIEW_RISK] for candidate in rung):
-        families = [family for family in eligible if family != candidate.family]
-        seat: dict[str, Any] = {"model": candidate.concrete_model, "picked_for": picked_for.get(candidate.name, [])}
-        if any(candidate.name in eligible[family] for family in families):
-            seat.update(state="eligible", reason=None)
-        else:
-            reason = next((excluded[family].get(candidate.name) for family in families
-                           if excluded[family].get(candidate.name)), None)
-            seat.update(state="excluded", reason=reason or "not eligible")
-        meter = _routing_candidate_pool(candidate, account.label)
-        if meter in seats:
-            seats[meter].append(seat)
-        else:
-            unpooled.append(seat)
-    return {"by_pool": seats, "unpooled": unpooled, "first_choice": first_choice}
-
-
-def _routing_host_check(decision: Any, disk: Any, limits: Any) -> dict[str, list[str]]:
-    """Admission's host-wide checks from the unrounded decision, with the same predicates ``evaluate`` applies."""
-    failing: list[str] = []
-    unmeasured: list[str] = []
-    if decision.live_write_workers >= limits.max_live_write_workers:
-        failing.append("the host's write-worker cap was reached")
-    probe = decision.probe
-    if probe is None or probe.mem_available_gib is None:
-        unmeasured.append("memory")
-    if probe is None or probe.load_per_cpu is None:
-        unmeasured.append("CPU load")
-    for failure in dispatch_admission.host_failures(probe, limits) if probe is not None else []:
-        failing.append(
-            "host memory is below the floor" if failure.startswith("MemAvailable")
-            else "host CPU load is above the limit" if failure.startswith("load ")
-            else "another host check"
-        )
-    pool = decision.pool
-    if pool is None or pool.skipped is not None:
-        unmeasured.append("shared worker memory pool")
-    elif not pool.fits:
-        failing.append("the shared worker memory pool is full")
-    slots = decision.slots
-    if slots is None or slots.depth is None:
-        unmeasured.append("test-slot queue")
-    elif slots.depth > limits.max_test_slot_queue:
-        failing.append("too many runs are waiting for test slots")
-    if disk.refused:
-        failing.append("the disk is too full")
-    elif disk.probe.used_percent is None:
-        unmeasured.append("disk")
-    return {"failing": failing, "unmeasured": unmeasured}
-
-
-def _routing_admission_now(tasks_dir: Path, budget: Mapping[str, Any]) -> dict[str, Any]:
-    """Admission's own report-only evaluation of a new write on each pool, and the host checks.
-
-    ``dispatch_admission.evaluate`` runs exactly as dispatch runs it, except that it
-    sweeps no dead record, writes no pressure journal, and leaves the disk to one
-    ``check_disk`` here, which measures and never alerts. The write-slot counts are
-    admission's own: a slot held by a starting dispatch counts, as it does for dispatch.
-    Admission's iterator reads an unlistable store as empty, so the store is listed
-    strictly before and after: a listing fault raises (the evaluation is unknown).
-    """
-    dispatch_admission.scan_record_candidates(tasks_dir)
-    limits = dispatch_admission.load_thresholds()
-    disk, _ = dispatch_admission.check_disk(limits)
-    pools: dict[str, Any] = {}
-    host: dict[str, Any] | None = None
-    for meter, label in ROUTING_POOLS:
-        decision = dispatch_admission.evaluate(
-            "workspace-write", tasks_dir, pid_alive=dispatch_admission.process_alive,
-            record_liveness=lambda record: worker_liveness(record, pid_alive=dispatch_admission.process_alive),
-            on_dead=None, thresholds=limits, disk_guard=False, record_shadow=False,
-            meter=meter, meter_budget=budget,
-        )
-        check = _routing_host_check(decision, disk, limits)
-        if host is None:
-            host = {"admitting": not check["failing"], **check,
-                    "live_writes": decision.live_write_workers, "write_cap": limits.max_live_write_workers}
-        defer = decision.meter.defer if decision.meter is not None else None
-        reasons = ([f"{label}: {_ROUTING_METER_DEFERS.get(str(defer), 'a pool limit was reached')}"] if defer else [])
-        reasons += check["failing"]
-        admitted = decision.admitted and not disk.refused
-        telemetry = decision.meter_telemetry
-        note = None if telemetry == "fresh" else (
-            f"admission cannot see this pool's allowance ({telemetry.replace('_', ' ').replace(':', ': ')}); "
-            f"its cap is lowered to {decision.meter_effective_cap}"
-        )
-        pools[meter] = {
-            "state": "admitted" if admitted else "deferred",
-            "reason": None if admitted else "; ".join(reasons) or "another admission check",
-            "note": note,
-            "live_writes": decision.meter.live if decision.meter is not None else None,
-            "cap": decision.meter_effective_cap,
-        }
-    dispatch_admission.scan_record_candidates(tasks_dir)
-    return {"host": host, "pools": pools}
-
-
-def routing_now(ctx: MonitorContext, budget: Mapping[str, Any], epoch: int = 0) -> dict[str, Any]:
-    """Pools now, evaluated against one usable routing budget: admission (with its write slots) and the resolver.
-
-    A part that cannot be evaluated is ``unknown`` with its reason; it never falls back to a guess.
-    """
-    tasks_dir = delegate_api._tasks_dir(resolve_context(ctx))
-    now: dict[str, Any] = {"budget_generated_at": budget["generated_at"], "evaluated_at": _routing_iso_z(datetime.now(UTC)),
-                           "epoch": epoch}
-    try:
-        now["admission"] = {"state": "ok", **_routing_admission_now(tasks_dir, budget)}
-    except (OSError, ValueError, TypeError, OverflowError, RecursionError):
-        # Unreadable settings, policy or task records: admission itself could not decide, so neither can this view.
-        now["admission"] = {"state": "unknown", "reason": "admission could not evaluate its settings or task records"}
-    try:
-        now["resolver"] = {"state": "ok", **_routing_review_seats(budget)}
-    except (ValueError, TypeError, KeyError, OverflowError):
-        # The resolver refuses a malformed health reading; its seats are then unknown, never eligible.
-        now["resolver"] = {"state": "unknown", "reason": "the resolver could not read the routing budget"}
-    return now
-
-
-def _routing_allowance(account: Mapping[str, Any] | None, stale_after_s: float | None) -> dict[str, Any]:
-    """One pool's weekly allowance; only a fresh reading carries a figure, and the time it stops being fresh."""
-    if account is None:
-        return {"state": "unknown", "reason": "no subscription reading for this pool", "read_at": None}
-    raw_reading, raw_weekly = account.get("reading"), account.get("weekly")
-    reading: Mapping[str, Any] = raw_reading if isinstance(raw_reading, Mapping) else {}
-    weekly: Mapping[str, Any] = raw_weekly if isinstance(raw_weekly, Mapping) else {}
-    left = panel_values.number(weekly.get("left_pct"))
-    state = reading.get("status") if reading.get("status") in {"fresh", "stale", "unknown"} else "unknown"
-    if weekly.get("status") != "ok" or left is None:
-        state = "unknown"
-    read_at = _routing_started(reading.get("read_at"))
-    reset = _routing_started(weekly.get("resets_at"))
-    # The subscription reader's own rule (fresh until stale_after_s past the reading), and never past the
-    # weekly reset the reading belongs to: the page expires the figure at the earlier of the two.
-    deadline = (read_at + timedelta(seconds=stale_after_s)
-                if state == "fresh" and read_at is not None and stale_after_s is not None else None)
-    if deadline is not None and reset is not None and reset < deadline:
-        deadline = reset
-    reason = reading.get("reason_code")
-    if state == "fresh" and (deadline is None or deadline <= datetime.now(UTC)):
-        state = "unknown"  # no freshness bound, or the window it measured has already reset
-        if deadline is not None:
-            reason = "awaiting_new_window" if deadline == reset else "reading_expired"
-    fresh = state == "fresh" and deadline is not None
-    fresh_until = _routing_iso_z(deadline) if fresh and deadline is not None else None
-    window_reset = fresh and deadline is not None and deadline == reset
-    return {
-        "state": state,
-        "reason": reason if state != "fresh" else None,
-        "read_at": reading.get("read_at"),
-        "left_pct": left if fresh else None,
-        "resets_at": weekly.get("resets_at") if fresh else None,
-        "fresh_until": fresh_until,
-        # Whether fresh_until is the weekly reset (the page then awaits a reading for the new window).
-        "until_reset": window_reset,
-    }
-
-
-def routing_allowances() -> dict[str, Any]:
-    subs = _public_subscriptions(subscriptions.subscriptions_snapshot())
-    accounts = {row["account"]: row for provider in subs["providers"] for row in provider["accounts"]}
-    stale_after = _routing_number(subs.get("stale_after_s"))
-    return {meter: _routing_allowance(accounts.get(label), stale_after) for meter, label in ROUTING_POOLS}
-
-
-async def _routing_budget(ctx: MonitorContext) -> tuple[dict[str, Any] | None, str | None]:
-    """The routing budget exactly as dispatch admission reads it (``GET /api/state/routing-budget``).
-
-    Usable means a ``generated_at``, an ``agents`` mapping and typed freshness
-    (``diagnostics.stale`` a bool, its age and bound numbers) within its bound.
-    Anything else is ``None`` with its reason.
-    """
-    from . import state_router  # noqa: PLC0415  # lazy-ok: import cycle (state_router imports this module)
-
-    try:
-        response = await state_router.routing_budget(
-            fresh_codexbar=False, transport="dispatch", ctx=ctx, include_subscriptions=False,
-        )
-    except HTTPException as exc:
-        return None, "warming" if exc.status_code == 503 else f"http_{exc.status_code}"
-    except OSError:
-        return None, "budget_unreadable"
-    try:
-        body = json_depth.loads(bytes(response.body), max_depth=512)
-    except (ValueError, RecursionError):
-        return None, "invalid_budget"
-    usable = (
-        isinstance(body, dict) and isinstance(body.get("agents"), Mapping)
-        and _routing_started(body.get("generated_at")) is not None
-    )
-    diagnostics = body.get("diagnostics") if usable else None
-    if not isinstance(diagnostics, Mapping):
-        return None, "invalid_budget"
-    stale = diagnostics.get("stale")
-    age, bound = _routing_number(diagnostics.get("data_age_s")), _routing_number(diagnostics.get("stale_threshold_s"))
-    if not isinstance(stale, bool) or age is None or bound is None:
-        return None, "invalid_budget"
-    # Past its own bound the budget no longer authorizes a lane (the Monitor then withdraws eligibility).
-    if stale or age > bound:
-        return None, "stale_budget"
-    return body, None
 
 
 def runtime_recent_outcomes_today(ctx: MonitorContext | None = None, *, unreadable: dict[str, int] | None = None) -> dict[str, int]:
@@ -1825,30 +1547,21 @@ async def runtime_acp_conversation_transcript(
 
 @router.get("/routing")
 async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONResponse:
-    """How work is routed: each pool now, and the last day's dispatch and review decisions.
+    """How work was routed: the last day's dispatch and review decisions, with per-lane counts.
 
-    ``now`` is a snapshot: admission's report-only evaluation per pool and the
-    reviewer resolver's, against the routing budget dispatch admission reads, with
-    its evaluation time, at most 15 s old (``pending`` while the next is evaluated);
-    every dispatch is evaluated again when it starts. An unusable budget or an
-    unreadable store makes those parts ``unknown`` and discards the snapshot.
-    Allowance comes from the subscription readings on every request, with the time
-    each stops being fresh. ``recent`` is one scan of the task records (the last
-    day's decisions and every live worker per pool), served stale-while-revalidate
-    (``pending`` while a first scan runs); the store is listed on every request, and
-    a listing fault makes ``recent`` and admission unknown. Unreadable or unread
-    records turn an affirmative admission verdict unknown. Ages are in the payload
-    and the oldest is in ``X-Snapshot-Age-S``. Rows carry task references, catalog
-    models, pool labels and fixed words only: no paths, prompts or credentials.
+    ``recent`` is one scan of the task records, served stale-while-revalidate
+    (``pending`` while a first scan runs). The store is listed on every request,
+    and a listing fault makes ``recent`` unknown even when a scan is cached. Its
+    ``age_s`` and ``X-Snapshot-Age-S`` count from the scan's own ``as_of``. Rows
+    carry task references, catalog models, pool labels and fixed words only: no
+    paths, prompts or credentials.
     """
-    budget, budget_reason = await _routing_budget(ctx)
-    # The store is listed on every read: a cached scan or evaluation never hides that it cannot be read now.
     _, store_fault = await asyncio.to_thread(_routing_listing, delegate_api._tasks_dir(resolve_context(ctx)))
-
-    async def recent() -> tuple[dict[str, Any], float, bool]:
-        as_of = _routing_iso_z(datetime.now(UTC))
-        if store_fault is not None:
-            return {"status": "unknown", "reason": store_fault, "as_of": as_of}, 0.0, False
+    as_of = _routing_iso_z(datetime.now(UTC))
+    stored = False
+    if store_fault is not None:
+        decisions: dict[str, Any] = {"status": "unknown", "reason": store_fault, "as_of": as_of}
+    else:
         # A first or dormant read waits for a whole scan: answer "pending" within the route's budget instead,
         # while the shared scan runs on and stores its value for the next read.
         scan = asyncio.ensure_future(cache_read_swr(
@@ -1857,92 +1570,18 @@ async def runtime_routing(ctx: MonitorContext = Depends(get_ctx)) -> JSONRespons
         ))
         scan.add_done_callback(lambda done: done.cancelled() or done.exception())
         try:
-            return await asyncio.wait_for(asyncio.shield(scan), ROUTING_NOW_WAIT_S)
+            decisions, _, stored = await asyncio.wait_for(asyncio.shield(scan), ROUTING_WAIT_S)
         except TimeoutError:
-            return {"status": "pending", "reason": "task_records_being_read", "as_of": as_of}, 0.0, False
-
-    now_key = ctx_scoped_ttl_key(ctx, "runtime-routing-now")
-    if budget is None or store_fault is not None:
-        # An unusable budget or an unreadable store: never serve an earlier snapshot; the next one starts afresh.
-        _ROUTING_NOW_EPOCH[now_key] = _ROUTING_NOW_EPOCH.get(now_key, 0) + 1
-        cache_invalidate(now_key)
-    epoch = _ROUTING_NOW_EPOCH.get(now_key, 0)
-    if budget is None:
-        (decisions, age, stored), allowance = await asyncio.gather(recent(), asyncio.to_thread(routing_allowances))
-        evaluated: dict[str, Any] = {
-            "state": "unknown", "age_s": None, "budget_generated_at": None,
-            "admission": {"state": "unknown", "reason": f"routing budget unavailable ({budget_reason})"},
-            "resolver": {"state": "unknown", "reason": f"routing budget unavailable ({budget_reason})"},
-        }
-    else:
-        (decisions, age, stored), now_read, allowance = await asyncio.gather(
-            recent(),
-            asyncio.to_thread(
-                cache_get_or_refresh, now_key, ROUTING_NOW_REFRESH_S,
-                functools.partial(routing_now, ctx, budget, epoch), wait_s=ROUTING_NOW_WAIT_S,
-            ),
-            asyncio.to_thread(routing_allowances),
-        )
-        now_value = cast(tuple[dict[str, Any], float], now_read)[0] if now_read is not None else {}
-        if decisions.get("status") == "unknown" and str(decisions.get("reason")).startswith("task_records_"):
-            # A store fault the scan saw (after this request's own listing succeeded) retires earlier snapshots too.
-            _ROUTING_NOW_EPOCH[now_key] = _ROUTING_NOW_EPOCH.get(now_key, 0) + 1
-        # Read the epoch again after the wait: a fault any request observed meanwhile retires this one's evaluation.
-        current = _ROUTING_NOW_EPOCH.get(now_key, 0)
-        value_epoch = now_value.get("epoch")
-        if now_value and value_epoch != current:
-            if not isinstance(value_epoch, int) or value_epoch < current:
-                cache_invalidate(now_key)  # started before a fault: retired; the next read evaluates afresh
-            now_value = {}
-        # The snapshot's age counts from when its evaluation started, the time the page shows.
-        started_eval = _routing_started(now_value.get("evaluated_at"))
-        now_age = (datetime.now(UTC) - started_eval).total_seconds() if started_eval is not None else None
-        if now_age is None or now_age > ROUTING_NOW_TTL_S:
-            # No snapshot yet, or the last one is past its bound while the next is evaluated.
-            pending = {"state": "pending", "reason": "being evaluated"}
-            evaluated = {"state": "pending", "age_s": None, "budget_generated_at": None,
-                         "admission": pending, "resolver": pending}
-        else:
-            evaluated = {"state": "ok", "age_s": round(max(now_age, 0.0), 3),
-                         **{key: value for key, value in now_value.items() if key != "epoch"}}
-    admission, status = evaluated["admission"], decisions.get("status")
-    if admission.get("state") in {"ok", "pending"} and (store_fault is not None or status not in {"ok", "partial", "pending"}):
-        # Admission counts write slots from this store: when it cannot be read, its verdicts are unknown,
-        # also while the resolver part is still being evaluated.
-        evaluated["admission"] = {"state": "unknown", "reason": "the task store could not be read"}
-    elif admission.get("state") == "ok" and status in {"partial", "pending"}:
-        # A record not yet read, or unreadable, may hold a write slot: an affirmative verdict is unknown;
-        # a deferral stands.
-        incomplete = (f"{decisions.get('unreadable')} task records could not be read, so write-slot counts may be low"
-                      if status == "partial" else "the task records are still being read")
-        host = admission.get("host")
-        evaluated["admission"] = {
-            **admission, "incomplete": incomplete,
-            "host": {**host, "admitting": None} if isinstance(host, dict) and host.get("admitting") else host,
-            "pools": {meter: {**verdict, "state": "unknown", "reason": incomplete}
-                      if verdict.get("state") == "admitted" else verdict
-                      for meter, verdict in admission.get("pools", {}).items()},
-        }
-    diagnostics = budget.get("diagnostics") if budget is not None else None
+            decisions = {"status": "pending", "reason": "task_records_being_read", "as_of": as_of}
+    scanned = _routing_started(decisions.get("as_of")) if stored else None
+    # The scan's age counts from when it read the store, not from when its result was cached.
+    age = round(max((datetime.now(UTC) - scanned).total_seconds(), 0.0), 3) if scanned is not None else None
     payload = {
-        "now": {
-            "pools": [{"pool": meter, "label": label} for meter, label in ROUTING_POOLS],
-            "profile": ROUTING_REVIEW_PROFILE,
-            "risk": ROUTING_REVIEW_RISK,
-            "budget": {
-                "state": "ok" if budget is not None else "unknown",
-                "reason": budget_reason,
-                "generated_at": budget.get("generated_at") if budget is not None else None,
-                "age_s": panel_values.number(diagnostics.get("data_age_s")) if isinstance(diagnostics, Mapping) else None,
-            },
-            "allowance": allowance,
-            **evaluated,
-        },
-        "recent": {**decisions, "age_s": round(age, 3) if stored else None},
+        "pools": [{"pool": meter, "label": label} for meter, label in ROUTING_POOLS],
+        "recent": {**decisions, "age_s": age},
     }
-    ages = [value for value in (age if stored else None, evaluated["age_s"]) if value is not None]
     return JSONResponse(content=payload, headers=panel_values.snapshot_headers(
-        max(ages) if stored else None, ROUTING_STALE_AFTER_S, unavailable=not stored,
+        age, ROUTING_STALE_AFTER_S, unavailable=age is None,
     ))
 
 

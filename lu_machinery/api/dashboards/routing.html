@@ -19,9 +19,7 @@
   .stage .split { font-size: 12px; overflow-wrap: anywhere; }
   .flow-head { font-size: 12px; color: var(--muted); font-weight: 600; }
   .callout { border-left: 3px solid var(--line); padding: 2px 0 2px 10px; margin: 8px 0; }
-  .callout.bad { border-color: var(--bad); font-weight: normal; }
   .callout.warn { border-color: var(--warn); }
-  .seat { display: block; }
   td .why { display: block; font-size: 12px; color: var(--muted); white-space: normal; }
   @media (max-width: 900px) {
     .flow { grid-template-columns: 1fr; gap: 6px; }
@@ -38,7 +36,7 @@
   <div class="header-top">
     <div class="title">
       <h1>Routing</h1>
-      <p class="purpose">Who picks each worker's model and account, whether admission lets new work start, and where reviews are seated.</p>
+      <p class="purpose">Who picked each recent worker's model and account, what admission decided, and what ran.</p>
     </div>
     <div class="header-utils">
       <nav class="sites" id="machinery-sites" aria-label="Sites"></nav>
@@ -59,10 +57,6 @@
     <h2>How work is routed, last 24 hours <span class="age" id="flow-age">Loading…</span></h2>
     <p id="flow-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
     <div id="flow-content">Loading…</div>
-  </section>
-  <section class="wide stacked" id="pools">
-    <h2>Pools now <span class="age" id="pools-age">Loading…</span></h2>
-    <div id="pools-content">Loading…</div>
   </section>
   <section class="wide stacked" id="decisions">
     <h2>Recent decisions <span class="age" id="decisions-age">Loading…</span></h2>
@@ -93,20 +87,17 @@
 <script src="/machinery.js"></script>
 <script>
 "use strict";
-const {escapeHtml, utc, relative, span, pct, bar, table, td, text, chip, createPanelRunner} = Machinery;
+const {escapeHtml, utc, span, table, td, text, chip, createPanelRunner} = Machinery;
 
 const PAGE_ROWS = 25;
 const STALE_AFTER_S = 90;
-// Pools now is a snapshot at most 15 s old (CTO ruling 2026-11-24); the page reads it again from 11 s.
-const NOW_STALE_AFTER_S = 15;
-const NOW_RELOAD_AT_S = 11;
 // data: the last successful response. failedAt: the last failed refresh, until one succeeds. chips: what the chip box shows.
 const state = {data: null, failedAt: null, shown: PAGE_ROWS, painted: "", chips: null};
 
 const ACCOUNT_BY = {helper: "account helper", saved_default: "saved default account", builtin_default: "built-in default", single_account: "only account", not_recorded: "not recorded"};
-const MODEL_BY = {brief: "brief", resolver: "resolver", not_recorded: "not recorded"};
-const ADMISSION_CLASS = {admitted: "ok", forced: "warn", deferred: "bad", refused: "bad", not_checked: "muted", unknown: "warn", pending: "muted"};
-const ADMISSION_WORD = {admitted: "Admitted", forced: "Started by override", deferred: "Deferred", refused: "Refused", not_checked: "Not checked", unknown: "Unknown", pending: "Evaluating"};
+const MODEL_BY = {brief: "brief", not_recorded: "not recorded"};
+const ADMISSION_CLASS = {admitted: "ok", forced: "warn", deferred: "bad", refused: "bad", not_checked: "muted", unknown: "warn"};
+const ADMISSION_WORD = {admitted: "Admitted", forced: "Started by override", deferred: "Deferred", refused: "Refused", not_checked: "Not checked", unknown: "Unknown"};
 
 // A cell whose content is one block, so the stacked (card) layout keeps its label beside it.
 const cell = (html, cls = "") => td(`<div>${html}</div>`, cls);
@@ -116,9 +107,8 @@ function unknownSince(time, why) {
   return why ? `${when} · ${String(why).replaceAll("_", " ")}` : when;
 }
 
-// Seconds since a part of the response was computed, from the time it was computed (pools now: its
-// evaluated_at; recent: its scan's as_of). The server and the page share one loopback host, so its clock
-// is the page's: every age on the page, and every freshness bound, is measured this one way.
+// Seconds since the scan read the store (its as_of). The server and the page share one loopback host, so
+// its clock is the page's: every age on the page, and the freshness bound, is measured this one way.
 function ageOf(time) {
   const at = typeof time === "string" ? Date.parse(time) : NaN;
   return Number.isFinite(at) ? Math.max(0, (Date.now() - at) / 1000) : null;
@@ -138,23 +128,7 @@ function recentState(data) {
   return recent.status === "partial" ? "partial" : "fresh";
 }
 
-// ok, pending, stale, failed or unknown, for the admission, resolver and live-worker evaluation.
-function nowState(data) {
-  const now = data?.now;
-  if (!now || now.state === "unknown") return "unknown";
-  if (state.failedAt) return "failed";
-  if (now.state === "pending") return "pending";
-  const age = ageOf(now.evaluated_at);
-  return age === null || age > NOW_STALE_AFTER_S ? "stale" : "ok";
-}
 
-function nowUnknownText(data) {
-  const now = data?.now;
-  const st = nowState(data);
-  if (st === "pending") return "being evaluated, shown in a few seconds";
-  if (st === "unknown") return unknownSince(now?.budget?.generated_at, now?.admission?.reason || now?.budget?.reason);
-  return unknownSince(timeOf(now?.evaluated_at), st === "failed" ? "the last refresh failed" : "evaluation is out of date");
-}
 
 function topCounts(counts, limit = 3) {
   const entries = Object.entries(counts || {}).sort((a, b) => b[1] - a[1]);
@@ -168,55 +142,10 @@ function stage(who, count, split, cls = "") {
     + `<div class="count">${count}</div><div class="split">${split}</div></div>`;
 }
 
-function poolLabel(data, meter) {
-  return (data?.now?.pools || []).find(pool => pool.pool === meter)?.label || meter;
-}
 
-// A reading is current only until its own freshness deadline, also between fetches, and never after a failed refresh.
-function allowanceCurrent(allowance) {
-  return !state.failedAt && allowance?.state === "fresh" && typeof allowance.left_pct === "number"
-    && typeof allowance.fresh_until === "string" && Date.now() < Date.parse(allowance.fresh_until);
-}
 
-// Pools whose reading has expired since it arrived: part of the repaint key.
-function expiredAllowances(data) {
-  return Object.entries(data?.now?.allowance || {})
-    .filter(([, allowance]) => allowance?.state === "fresh" && !allowanceCurrent(allowance)).map(([meter]) => meter).join(",");
-}
 
-// Only a current reading may claim that a pool has no allowance left.
-function emptyPool(data, meter) {
-  const allowance = data?.now?.allowance?.[meter];
-  return allowanceCurrent(allowance) && allowance.left_pct <= 0;
-}
 
-function resolverCallouts(data) {
-  const now = data?.now || {};
-  const resolver = now.resolver;
-  if (nowState(data) !== "ok" || resolver?.state !== "ok") {
-    const why = nowState(data) === "ok" ? unknownSince(timeOf(now.evaluated_at), resolver?.reason) : nowUnknownText(data);
-    return `<h3>Who the resolver would seat right now</h3><p class="callout warn">Reviewer resolver: ${escapeHtml(why)}.</p>`;
-  }
-  // Author families that get the same seats share one line.
-  const groups = new Map();
-  for (const choice of resolver.first_choice || []) {
-    const seats = choice.seats || [];
-    const key = seats.map(seat => `${seat.model}|${seat.pool}`).join("+") || `none|${choice.reason}`;
-    if (!groups.has(key)) groups.set(key, {choice, authors: []});
-    groups.get(key).authors.push(choice.author);
-  }
-  const lines = [...groups.values()].map(({choice, authors}) => {
-    const who = authors.length > 1 ? `${authors.slice(0, -1).join(", ")} and ${authors.at(-1)}` : authors[0];
-    const head = `${escapeHtml(who)}-authored ${escapeHtml(now.profile)} reviews (${escapeHtml(now.risk)} risk)`;
-    const seats = choice.seats || [];
-    if (!seats.length) return `<li class="bad">${head}: no reviewer can be seated (${escapeHtml(choice.reason || "no eligible reviewer")}).</li>`;
-    const named = seats.map(seat => `<b>${escapeHtml(seat.model)}</b>${seat.pool_label ? ` on ${escapeHtml(seat.pool_label)}` : ""}`).join(" and ");
-    const empty = seats.filter(seat => emptyPool(data, seat.pool));
-    const warn = empty.length ? ` <span class="bad">${empty.map(seat => escapeHtml(seat.pool_label)).join(", ")} has 0% allowance left, so the review has to run on another account.</span>` : "";
-    return `<li>${head}: the resolver seats ${named}${seats.length > 1 ? " (two-seat review)" : ""}.${warn}</li>`;
-  });
-  return `<h3>Who the resolver would seat right now <span class="age">evaluated ${escapeHtml(span(ageOf(now.evaluated_at)))} ago</span></h3><ul>${lines.join("")}</ul>`;
-}
 
 function admissionSplit(adm) {
   const parts = [`<span class="${adm.deferred ? "bad" : "muted"}">${adm.deferred ?? 0} deferred</span>`,
@@ -259,8 +188,7 @@ function recentNote(data) {
 function renderFlow(data) {
   const recent = data.recent || {};
   if (recentState(data) === "missing") {
-    return `<p class="warn">Recent decisions are ${escapeHtml(unknownSince(recent.as_of, recent.reason))}; no counts are shown.</p>`
-      + resolverCallouts(data);
+    return `<p class="warn">Recent decisions are ${escapeHtml(unknownSince(recent.as_of, recent.reason))}; no counts are shown.</p>`;
   }
   const counts = recent.counts || {};
   const flow = '<div class="flow" role="group" aria-label="Routing flow for writes and for reviews: who picks the model, which account pays, admission, what ran">'
@@ -270,124 +198,17 @@ function renderFlow(data) {
     + laneRow("Reviews", "The dispatch names the reviewer (the resolver's pick is not recorded on the task)", counts.resolver || {})
     + "</div>";
   const windowNote = `<p class="muted">${recent.total ?? 0} decisions started since ${escapeHtml(utc(Date.parse(recent.as_of) - (recent.window_s || 86400) * 1000))}.</p>`;
-  return recentNote(data) + flow + windowNote + resolverCallouts(data);
+  return recentNote(data) + flow + windowNote;
 }
 
-// Every live worker on the pool, any mode, from the task-record scan.
-function liveCell(meter, data) {
-  const st = recentState(data);
-  const count = data.recent?.live_by_pool?.[meter];
-  if (st === "missing" || st === "stale" || st === "failed" || typeof count !== "number") {
-    const why = st === "failed" ? "the last refresh failed" : st === "missing" ? data.recent?.reason : "the reading is out of date";
-    return text(unknownSince(st === "missing" ? data.recent?.as_of : timeOf(data.recent?.as_of), why), "warn");
-  }
-  return st === "partial" ? text(`${count}, may be low`, "warn") : text(String(count), count ? "" : "muted");
-}
 
-// Admission known to be unknown (a task-store fault) wins over a resolver evaluation still pending.
-function admissionUnknown(data) {
-  const admission = data.now?.admission;
-  return admission?.state === "unknown" && nowState(data) === "pending" ? unknownSince(data.recent?.as_of, admission.reason) : null;
-}
 
-// Admission's own write-slot count for the pool (a slot held by a starting dispatch counts, as for dispatch).
-function slotsCell(meter, data) {
-  if (admissionUnknown(data)) return text(admissionUnknown(data), "warn");
-  const admission = data.now?.admission;
-  const verdict = admission?.pools?.[meter];
-  if (nowState(data) !== "ok" || admission?.state !== "ok" || typeof verdict?.live_writes !== "number") {
-    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(data.now?.evaluated_at), admission?.reason) : nowUnknownText(data), "warn");
-  }
-  const cap = typeof verdict.cap === "number" ? ` of ${verdict.cap}` : "";
-  return admission.incomplete
-    ? text(`${verdict.live_writes}${cap}, may be low`, "warn")
-    : text(`${verdict.live_writes}${cap}`, verdict.live_writes ? "" : "muted");
-}
 
-// A reading shown after a failed refresh is no longer current: unknown since that reading.
-function allowanceCell(allowance) {
-  if (state.failedAt) return text(unknownSince(allowance?.read_at, "the last refresh failed"), "warn");
-  if (!allowanceCurrent(allowance)) {
-    const expired = allowance?.state === "fresh" ? (allowance.until_reset ? "awaiting a reading for the new window" : "reading expired") : allowance?.reason;
-    return text(unknownSince(allowance?.read_at, expired), "warn");
-  }
-  return cell(`${bar(allowance.left_pct)}${escapeHtml(pct(allowance.left_pct))}`, allowance.left_pct <= 0 ? "bad" : "");
-}
 
-function resetCell(allowance) {
-  if (!allowanceCurrent(allowance) || !allowance.resets_at) return text("—", "muted");
-  return cell(`${escapeHtml(utc(allowance.resets_at))}<span class="why">${escapeHtml(relative(allowance.resets_at))}</span>`);
-}
 
-function admissionCell(meter, data) {
-  if (admissionUnknown(data)) return text(admissionUnknown(data), "warn");
-  const now = data.now || {};
-  const verdict = now.admission?.pools?.[meter];
-  if (nowState(data) !== "ok" || now.admission?.state !== "ok" || !verdict) {
-    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(now.evaluated_at), now.admission?.reason) : nowUnknownText(data), "warn");
-  }
-  // Admitted without a fresh allowance reading is admission failing open with a lower cap: amber, not green.
-  const blind = verdict.state === "admitted" && verdict.note;
-  const word = blind ? "Admitted, allowance not seen" : ADMISSION_WORD[verdict.state] || verdict.state;
-  const why = [verdict.reason, verdict.note].filter(Boolean).map(escapeHtml).join(" · ");
-  return cell(`<span class="${blind ? "warn" : ADMISSION_CLASS[verdict.state] || ""}">${escapeHtml(word)}</span>${why ? `<span class="why">${why}</span>` : ""}`);
-}
 
-function seatsCell(meter, data) {
-  const now = data.now || {};
-  const seats = now.resolver?.state === "ok" ? now.resolver.by_pool?.[meter] : null;
-  if (nowState(data) !== "ok" || !Array.isArray(seats)) {
-    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(now.evaluated_at), now.resolver?.reason) : nowUnknownText(data), "warn");
-  }
-  if (!seats.length) return text("no automatic review seat", "muted");
-  return cell(seats.map(seat => seat.state === "eligible"
-    ? `<span class="seat"><span class="ok">Eligible</span> · ${escapeHtml(seat.model)}${seat.picked_for?.length
-      ? `<span class="why">first choice for ${escapeHtml(seat.picked_for.join(", "))}-authored reviews</span>`
-      : '<span class="why">eligible, not the first choice now</span>'}</span>`
-    : `<span class="seat"><span class="warn">Excluded</span> · ${escapeHtml(seat.model)}<span class="why">${escapeHtml(seat.reason || "")}</span></span>`).join(""));
-}
 
-function hostLine(data) {
-  if (admissionUnknown(data)) return `<p class="callout warn">Host admission checks: ${escapeHtml(admissionUnknown(data))}.</p>`;
-  const host = data.now?.admission?.host;
-  if (nowState(data) !== "ok" || data.now?.admission?.state !== "ok" || !host) {
-    return `<p class="callout warn">Host admission checks: ${escapeHtml(nowState(data) === "ok" ? unknownSince(timeOf(data.now?.evaluated_at), data.now?.admission?.reason) : nowUnknownText(data))}.</p>`;
-  }
-  const unmeasured = (host.unmeasured?.length ? ` Not measured: ${escapeHtml(host.unmeasured.join(", "))}.` : "")
-    + (data.now.admission.incomplete ? ` ${escapeHtml(data.now.admission.incomplete)}.` : "");
-  if (host.admitting === null) {
-    return `<p class="callout warn">Host: unknown whether admission is letting new writes start: ${escapeHtml(data.now.admission.incomplete || "the reading is incomplete")}.</p>`;
-  }
-  if (!host.admitting) {
-    return `<p class="callout bad">Host: admission is deferring <b>every</b> new write: ${escapeHtml(host.failing.join("; "))}.${unmeasured}</p>`;
-  }
-  return `<p class="callout${unmeasured ? " warn" : ""}">Host: admission is letting new writes start (${host.live_writes} of ${host.write_cap} write slots in use; `
-    + `memory, CPU load, worker memory pool, test-slot queue and disk checks ${host.unmeasured?.length ? "pass where measured" : "pass"}).${unmeasured}</p>`;
-}
 
-function renderPools(data) {
-  const now = data.now || {};
-  const budget = now.budget || {};
-  const budgetLine = budget.state === "ok"
-    ? `<p class="muted">Admission and resolver verdicts describe a new <b>write</b> dispatch and a ${escapeHtml(now.profile)} review at ${escapeHtml(now.risk)} risk: a snapshot${now.evaluated_at ? ` evaluated at ${escapeHtml(utc(now.evaluated_at))}` : ""} against the routing budget admission reads (from ${escapeHtml(utc(now.budget_generated_at || budget.generated_at))}). Every dispatch is evaluated again when it starts.</p>`
-    : `<p class="warn">Routing budget ${escapeHtml(unknownSince(null, budget.reason))}: admission and resolver verdicts are unknown.</p>`;
-  const rows = (now.pools || []).map(({pool, label}) => [
-    td(`<b>${escapeHtml(label)}</b>`),
-    liveCell(pool, data),
-    slotsCell(pool, data),
-    allowanceCell(now.allowance?.[pool]),
-    resetCell(now.allowance?.[pool]),
-    admissionCell(pool, data),
-    seatsCell(pool, data),
-  ]);
-  const rs = recentState(data);
-  const liveUnpooled = ["fresh", "partial"].includes(rs) && data.recent?.live_unpooled
-    ? `<p class="${rs === "partial" ? "warn" : "muted"}">${Number(data.recent.live_unpooled)} more live workers have no recorded pool${rs === "partial" ? " (may be low)" : ""}.</p>` : "";
-  const unpooled = liveUnpooled + (nowState(data) === "ok" && now.resolver?.unpooled?.length
-    ? `<p class="muted">Seats without a pool (the account they would run on is not resolved): ${now.resolver.unpooled.map(seat => `${escapeHtml(seat.model)} — ${escapeHtml(seat.reason || seat.state)}`).join("; ")}.</p>` : "");
-  return hostLine(data) + budgetLine
-    + table(["Pool", "Live workers", "Write slots in use", "Allowance left", "Resets", "New write work", "Review seats"], rows, true) + unpooled;
-}
 
 function asked(row) {
   if (row.kind === "review") {
@@ -444,7 +265,7 @@ function renderDecisions(data) {
 function fillPoolFilter(data) {
   const select = document.getElementById("filter-pool");
   if (!select || select.options.length > 1) return;
-  for (const pool of data?.now?.pools || []) {
+  for (const pool of data?.pools || []) {
     const option = document.createElement("option");
     option.value = pool.pool;
     option.textContent = pool.label;
@@ -462,9 +283,6 @@ function setAge(id, line, cls) {
 function paintAges() {
   const data = state.data;
   if (!data) return;
-  const ns = nowState(data);
-  setAge("pools-age", ns === "ok" ? `Evaluated ${span(ageOf(data.now.evaluated_at))} ago` : `Admission and resolver ${nowUnknownText(data)}`,
-    ns === "ok" ? "" : ns === "pending" ? "warn" : "bad");
   const rs = recentState(data);
   setAge("decisions-age", rs === "fresh" || rs === "partial" ? `Last 24 hours · read ${span(ageOf(data.recent.as_of))} ago`
     : `Recent decisions ${unknownSince(rs === "missing" ? data.recent?.as_of : timeOf(data.recent?.as_of), rs === "failed" ? "the last refresh failed" : null)}`,
@@ -476,15 +294,14 @@ function paintAll() {
   const data = state.data;
   if (!data) return;
   state.painted = paintKey(data);
-  document.getElementById("pools-content").innerHTML = renderPools(data);
   document.getElementById("decisions-content").innerHTML = renderDecisions(data);
   paintAges();
   paintChips();
 }
 
-// The one-second clock: ages always, and every section again when a part crosses its bound.
+// The one-second clock: ages always, and every section again when the scan crosses its bound.
 function paintKey(data) {
-  return `${nowState(data)}|${recentState(data)}|${expiredAllowances(data)}`;
+  return recentState(data);
 }
 
 function tick() {
@@ -495,19 +312,11 @@ function tick() {
     if (!state.failedAt) document.getElementById("flow-content").innerHTML = renderFlow(data);
   }
   paintChips();
-  // Read the snapshot again before it lapses, and once more if it has (one read per snapshot and phase).
-  const age = ageOf(data.now?.evaluated_at);
-  const phase = age === null ? null : age > NOW_STALE_AFTER_S ? "stale" : age > NOW_RELOAD_AT_S ? "early" : null;
-  const reloadKey = phase && `${data.now?.evaluated_at}|${phase}`;
-  if (reloadKey && reloadKey !== state.reloaded && !state.failedAt) {
-    state.reloaded = reloadKey;
-    runner.loadPanel(PANELS[0]);
-  }
   paintAges();
 }
 
 // The page's one chip-render path (render, failure and the one-second clock all paint through it), so the
-// chips always follow the state the sections show, including an allowance that expires between fetches.
+// chips always follow the state the sections show, including a scan that goes stale between fetches.
 function paintChips() {
   const shown = chips();
   if (shown === state.chips) return;
@@ -529,13 +338,6 @@ function chips() {
     out.push(chip("#decisions", held, `deferred or refused in 24 h${low}`, held || low ? "warn" : ""));
     if (substituted) out.push(chip("#decisions", substituted, `substitutions${low}`, "warn"));
   }
-  if (nowState(data) === "ok" && data.now.resolver?.state === "ok") {
-    const empty = (data.now.resolver.first_choice || []).filter(choice => (choice.seats || []).some(seat => emptyPool(data, seat.pool)));
-    if (empty.length) out.push(chip("#flow", empty.length, "author families get a reviewer on a pool with 0% left", "bad"));
-  }
-  if (nowState(data) === "ok" && data.now.admission?.host?.admitting === false) {
-    out.push(chip("#pools", "!", "host is deferring writes", "bad"));
-  }
   return out.join("");
 }
 
@@ -550,16 +352,15 @@ const PANELS = [{
     paintAll();
     return renderFlow(data);
   },
-  // A cold evaluation answers "pending": read again shortly rather than wait 30 s.
-  retry: data => data?.now?.state === "pending" || data?.recent?.status === "pending",
+  // A cold scan answers "pending": read again shortly rather than wait 30 s.
+  retry: data => data?.recent?.status === "pending",
   onError: () => {
     state.failedAt = Date.now();
     if (state.data) {
       paintAll();
     } else {
       const message = '<p class="error">Routing data could not load; see the panel above.</p>';
-      for (const id of ["pools-content", "decisions-content"]) document.getElementById(id).innerHTML = message;
-      setAge("pools-age", "unavailable", "bad");
+      document.getElementById("decisions-content").innerHTML = message;
       setAge("decisions-age", "unavailable", "bad");
       paintChips();
     }
@@ -586,8 +387,7 @@ document.addEventListener("click", event => {
   }
 });
 
-const runner = createPanelRunner({panels: PANELS});
-runner.start();
+createPanelRunner({panels: PANELS}).start();
 </script>
 </body>
 </html>

@@ -160,16 +160,16 @@ Read each decision row from left to right:
 1. **Asked for** is the work: a write or read-only role, or a review with its
    profile, risk and author model.
 2. **Chosen** is the model and the pool that paid for it.
-3. **Chosen by** names who picked the model (the brief, or the reviewer
-   resolver for a review) and who picked the account (the account helper, a
-   saved default, or the pool's only account).
+3. **Chosen by** names who picked the model (the brief; a review reads "not
+   recorded", because its record keeps the seat that ran, not the resolver's
+   pick) and who picked the account (the account helper, a saved default, or
+   the pool's only account).
 4. **Admission and substitution** shows whether admission admitted, deferred or
    refused a write (read-only work is not checked), and any recorded case where
    another model ran.
 
-**Pools now** shows what admission would say about a new write on each pool
-and which review seats the resolver would seat there; it is current state, not
-the history of a past review. A source the page cannot read shows "unknown
+The page is history only: it does not say what admission or the resolver
+would decide for new work now. A source the page cannot read shows "unknown
 since" the time of its last reading, never zero. Before diagnosing unfair
 routing, filter by work kind and pool, then corroborate current headroom on the
 Subscriptions page. Never infer provider health from route counts alone.
