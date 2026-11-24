@@ -1190,7 +1190,12 @@ def test_sealed_acpx_receipt_exposes_participant_and_credential_bucket_sharing()
             pytest.param({"remaining_pct": 5.0, "codexbar": {window: 0.0}}, False, True, id=window)
             for window in ("weekly_remaining_pct", "primary_remaining_pct", "secondary_remaining_pct")
         ),
-        pytest.param({"credit": {"state": credit_lane.CREDITS_EXHAUSTED}}, False, True, id="credits-only"),
+        pytest.param({"credit": {"state": credit_lane.CREDITS_EXHAUSTED}}, False, False, id="credits-only"),
+        pytest.param(
+            {"remaining_pct": 50.0, "credit_balance": 62500.0,
+             "credit": {"state": credit_lane.CREDITS_EXHAUSTED}},
+            False, False, id="credit-state-contradicts-observation",
+        ),
         pytest.param(
             {"scheduler": {"quota_remaining_pct": 0.0, "quota_stale": False}},
             False, True, id="scheduler-exhausted",
@@ -1205,11 +1210,6 @@ def test_sealed_acpx_receipt_exposes_participant_and_credential_bucket_sharing()
         pytest.param({"remaining_pct": 0.0, "freshness": "stale_last_good"}, False, False, id="probe-stale"),
         pytest.param({"remaining_pct": 0.0, "freshness": "unavailable"}, False, False, id="probe-unknown"),
         pytest.param({"remaining_pct": 0.0, "status_source": "ledger_burn"}, False, False, id="dollar-ledger"),
-        pytest.param(
-            {"credit": {"state": credit_lane.CREDITS_EXHAUSTED,
-                        "evidence": {"credit_fetched_at": "2000-01-01T00:00:00Z"}}},
-            False, False, id="credit-stale",
-        ),
         pytest.param({"remaining_pct": False}, False, False, id="invalid-allowance"),
     ],
 )
@@ -2180,7 +2180,7 @@ def _credit_codex(credit: dict | None, *, diagnostics: dict | None = None, **ove
     return snapshot
 
 
-def _published_credit(*, fetched_at: datetime | None = None) -> dict:
+def _published_credit(*, fetched_at: datetime | None = None, balance: float = 62500.0) -> dict:
     """The credit field routing-budget publishes, computed by credit_lane itself (conftest: no rate limits)."""
     now = datetime.now(UTC)
     fetched = (fetched_at or now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
@@ -2188,15 +2188,23 @@ def _published_credit(*, fetched_at: datetime | None = None) -> dict:
         "remaining_pct": 1.0,
         "freshness": "fresh",
         "age_s": 60.0,
-        "credit_balance": 62500.0,
+        "credit_balance": balance,
         "codexbar": {"weekly_remaining_pct": 1.0, "freshness": "fresh", "age_s": 60.0, "fetched_at": fetched},
     }
     return credit_lane.lane_credit_state("codex", info, credit_lane.load_policy(), now=now)
 
 
 @pytest.mark.usefixtures('configured_roots')
-def test_near_cap_codex_does_not_require_credit_relief():
-    inputs = ResolverInputs(author_model="claude-opus-5-5", risk="high", routing_snapshot=_credit_codex(_published_credit()), claude_account=HOST_ACCOUNT)
+@pytest.mark.parametrize(
+    ("balance", "state"),
+    [(62500.0, credit_lane.CREDIT_BALANCE_PRESENT), (0.0, credit_lane.CREDITS_EXHAUSTED)],
+    ids=["credit-relief", "credits-exhausted-with-positive-plan"],
+)
+def test_near_cap_codex_does_not_require_credit_relief(balance, state):
+    credit = _published_credit(balance=balance)
+    assert credit["state"] == state
+    snapshot = _credit_codex(credit, credit_balance=balance)
+    inputs = ResolverInputs(author_model="claude-opus-5-5", risk="high", routing_snapshot=snapshot, claude_account=HOST_ACCOUNT)
     result = evaluate_candidate(OPENAI_FRONTIER, inputs)
     assert result.status == "eligible"
     assert result.health == "healthy"
@@ -2226,19 +2234,10 @@ def test_near_cap_codex_does_not_require_credit_relief():
         "not-configured",
     ],
 )
-def test_near_cap_admits_sol_unless_credits_are_exhausted(credit):
-    snapshot = _credit_codex(credit)
-    snapshot["codex_accounts"] = {"codex:b": {"status": "healthy", "remaining_pct": 5.0, **_FRESH_PROBE}}
-    inputs = ResolverInputs(author_model="claude-opus-5-5", risk="high", routing_snapshot=snapshot, claude_account=HOST_ACCOUNT)
+def test_near_cap_without_usable_credits_still_admits_sol(credit):
+    inputs = ResolverInputs(author_model="claude-opus-5-5", risk="high", routing_snapshot=_credit_codex(credit), claude_account=HOST_ACCOUNT)
     result = evaluate_candidate(OPENAI_FRONTIER, inputs)
-    if credit and credit["state"] == credit_lane.CREDITS_EXHAUSTED:
-        assert result.status == "excluded"
-        assert "exhausted" in result.reason
-        selected = resolve_reviewer(inputs).selected
-        assert selected is not None and selected.name == "openai_frontier_b"
-        assert selected.concrete_model == result.concrete_model
-    else:
-        assert result.status == "eligible"
+    assert result.status == "eligible"
     assert result.credit is None
 
 

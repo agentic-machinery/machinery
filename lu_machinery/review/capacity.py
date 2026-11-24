@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from math import isfinite
 
 from lu_machinery.fleet import credit_lane
@@ -39,13 +38,6 @@ def _codex_exhaustion_reason(
         remaining = credit_lane.plan_remaining_pct({**record, "remaining_pct": None})
     if remaining is not None and remaining <= 0:
         return "Codex subscription allowance exhausted (0% remaining)"
-
-    credit = record.get("credit")
-    if isinstance(credit, Mapping) and credit.get("state") == credit_lane.CREDITS_EXHAUSTED:
-        evidence = credit.get("evidence")
-        fetched_at = evidence.get("credit_fetched_at") if isinstance(evidence, Mapping) else None
-        if fetched_at is None or credit_lane._fresh_at(fetched_at, datetime.now(UTC), max_age_s) is not None:
-            return "Codex subscription credits exhausted"
     return None
 
 
