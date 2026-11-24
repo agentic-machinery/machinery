@@ -1324,7 +1324,8 @@ def test_run_prs_lists_unrecorded_branch_pr_via_x_agent_trailer(tmp_path, monkey
     assert rc_self == 0
     assert json.loads(captured_self.out) == []
 
-    # F1: keeper history bound to run B's nonce is NOT returned when querying run A by --run-nonce.
+    # F1: keeper history bound to run B's nonce (plus its release row, and even if the PR sits on
+    # run A's recorded branch) is NOT returned when querying run A by --run-nonce.
     run_a = {
         "schema_version": 2,
         "task_id": "reused-worker",
@@ -1349,15 +1350,33 @@ def test_run_prs_lists_unrecorded_branch_pr_via_x_agent_trailer(tmp_path, monkey
     }
     _write_task_file(archive_dir, "reused-worker.20261028T120400Z.archived.json", run_a)
     _write_task_file(tasks_root, "reused-worker.json", run_b)
-    ownership_data["history"].append({
-        "pr": own.pr_key(MACHINERY, 60),
-        "event": "keeper_transfer_acknowledged",
-        "at": at(6).isoformat(),
-        "worker_task": "reused-worker",
-        "worker_nonce": "nonce-b",
-        "head": sha_handoff,
-    })
+    ownership_data["history"].extend([
+        {
+            "pr": own.pr_key(MACHINERY, 60),
+            "event": "keeper_transfer_acknowledged",
+            "at": at(6).isoformat(),
+            "worker_task": "reused-worker",
+            "worker_nonce": "nonce-b",
+            "head": sha_handoff,
+        },
+        {
+            "pr": own.pr_key(MACHINERY, 60),
+            "event": "keeper_custody_released",
+            "at": at(7).isoformat(),
+            "how": "PR state changed",
+            "worker_task": "reused-worker",
+        },
+    ])
     state_file.write_text(json.dumps(ownership_data), encoding="utf-8")
+    pr_60_on_a_branch = _rest_pr(MACHINERY, 60, branch="agy/run-a-only", head_sha=sha_handoff, state="open")
+
+    def fake_gh_reused(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if endpoint.startswith(f"repos/{MACHINERY}/pulls?head=learn-ukrainian%3Aagy%2Frun-a-only"):
+            return SimpleNamespace(returncode=0, stdout=json.dumps([[pr_60_on_a_branch]]), stderr="", github_result=None)
+        return fake_gh(cmd, **kwargs)
+
+    monkeypatch.setattr(own.github_client, "run", fake_gh_reused)
     rc_a = own.main(["run-prs", "--task", "reused-worker", "--run-nonce", "nonce-a"])
     captured_a = capsys.readouterr()
     assert rc_a == 0 and json.loads(captured_a.out) == []
@@ -1610,3 +1629,108 @@ def test_run_prs_exits_2_on_unreadable_archived_child_record(tmp_path, monkeypat
     rc_capped = own.main(["run-prs", "--task", "turn-parent"])
     captured_capped = capsys.readouterr()
     assert rc_capped == 2 and captured_capped.out == "" and "250-commit listing cap" in captured_capped.err
+
+    # F2 (R2): omitted predecessor on accepted history row and misbound keeper key exit 2.
+    no_pred_state = own._empty()
+    no_pred_state["history"].append({
+        "pr": own.pr_key(MACHINERY, 10), "event": "accepted", "at": at(1).isoformat(),
+        "successor": "other-succ", "head": HEAD,
+    })
+    state_file.write_text(json.dumps(no_pred_state), encoding="utf-8")
+    rc_no_pred = own.main(["run-prs", "--task", "turn-parent"])
+    captured_no_pred = capsys.readouterr()
+    assert rc_no_pred == 2 and captured_no_pred.out == "" and "missing predecessor" in captured_no_pred.err
+
+    misbound_state = own._empty()
+    keeper_payload = own.transfer_to_keeper(
+        own._empty(),
+        repo=MACHINERY,
+        number=61,
+        pr={
+            "state": "OPEN", "isDraft": False, "headRefOid": HEAD,
+            "headRefName": "codex/turn-parent", "baseRefName": "main", "isCrossRepository": False,
+        },
+        worker_task="turn-parent",
+        worker_nonce="nonce-parent",
+        records=[{**parent_rec, "status": "running"}],
+        now=at(1),
+        rerun="unspent",
+        repos=FLEET,
+        trivial=True,
+        live=is_live,
+    )
+    misbound_state["handoffs"][own.pr_key(MACHINERY, 60)] = keeper_payload
+    state_file.write_text(json.dumps(misbound_state), encoding="utf-8")
+    rc_misbound = own.main(["run-prs", "--task", "turn-parent"])
+    captured_misbound = capsys.readouterr()
+    assert rc_misbound == 2 and captured_misbound.out == "" and "disagrees with payload" in captured_misbound.err
+    state_file.unlink()
+
+    # F4 (R2): overlapping commit pages (duplicate SHA) and mismatched numbered PR lookup exit 2.
+    def gh_dup_commit(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if "?head=" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([[]]), stderr="", github_result=None)
+        if MACHINERY in endpoint and "sort=updated" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([probe_pr]), stderr="", github_result=None)
+        if "/pulls/72/commits" in endpoint:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([
+                    [{"sha": "1" * 40, "commit": {"message": "first"}}],
+                    [
+                        {"sha": "1" * 40, "commit": {"message": "first"}},
+                        {"sha": "a" * 40, "commit": {"message": "head"}},
+                    ],
+                ]),
+                stderr="",
+                github_result=None,
+            )
+        return SimpleNamespace(returncode=0, stdout=json.dumps([]), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", gh_dup_commit)
+    rc_dup_commit = own.main(["run-prs", "--task", "turn-parent"])
+    captured_dup = capsys.readouterr()
+    assert rc_dup_commit == 2 and captured_dup.out == "" and "duplicate commit" in captured_dup.err
+
+    parent_delivery = {**parent_rec, "delivery_prs": [f"{MACHINERY}#60"]}
+    _write_task_file(tasks_root, "turn-parent.json", parent_delivery)
+    wrong_num_pr = _rest_pr(MACHINERY, 61, branch="other/b", head_sha="a" * 40, head_repo="external/fork")
+
+    def gh_wrong_num(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if "?head=" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([[]]), stderr="", github_result=None)
+        if endpoint == f"repos/{MACHINERY}/pulls/60":
+            return SimpleNamespace(returncode=0, stdout=json.dumps(wrong_num_pr), stderr="", github_result=None)
+        return SimpleNamespace(returncode=0, stdout=json.dumps([]), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", gh_wrong_num)
+    rc_wrong_num = own.main(["run-prs", "--task", "turn-parent"])
+    captured_wrong = capsys.readouterr()
+    assert rc_wrong_num == 2 and captured_wrong.out == "" and "mismatched PR #61" in captured_wrong.err
+    _write_task_file(tasks_root, "turn-parent.json", parent_rec)
+
+    # F5 (R2): attribution parser whole-message refusal (e.g. HTML comment marker) fails closed with exit 2.
+    def gh_refused_msg(cmd, **kwargs):
+        endpoint = cmd[-1]
+        if "?head=" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([[]]), stderr="", github_result=None)
+        if MACHINERY in endpoint and "sort=updated" in endpoint:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([probe_pr]), stderr="", github_result=None)
+        if "/pulls/72/commits" in endpoint:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps([[{
+                    "sha": "a" * 40,
+                    "commit": {"message": "note <!-- comment -->\n\nX-Agent: codex/turn-parent"},
+                }]]),
+                stderr="",
+                github_result=None,
+            )
+        return SimpleNamespace(returncode=0, stdout=json.dumps([]), stderr="", github_result=None)
+
+    monkeypatch.setattr(own.github_client, "run", gh_refused_msg)
+    rc_refused = own.main(["run-prs", "--task", "turn-parent"])
+    captured_refused = capsys.readouterr()
+    assert rc_refused == 2 and captured_refused.out == "" and "COMMENT_MARKER" in captured_refused.err
