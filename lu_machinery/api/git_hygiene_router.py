@@ -18,7 +18,7 @@ import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, TypeGuard
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
@@ -791,8 +791,8 @@ def _default_branch_ci(repo: dict[str, Any], *, errored: bool) -> dict[str, Any]
     rollup = tip["statusCheckRollup"]
     if rollup is None:
         return {"ci": None}
-    state = _lower(rollup.get("state")) if isinstance(rollup, dict) else None
-    return {"ci": state} if state in _CI_STATES else None
+    state = rollup.get("state") if isinstance(rollup, dict) else None
+    return {"ci": state.lower()} if _enum(state, _CI_ENUM) else None
 
 
 def _errored_fields(document: object, aliases: set[str]) -> dict[str, set[str]] | None:
@@ -817,8 +817,23 @@ def _errored_fields(document: object, aliases: set[str]) -> dict[str, set[str]] 
     return found
 
 
-def _state_in(value: object, states: set[str]) -> bool:
-    return isinstance(value, str) and value.lower() in states
+# GitHub's response types for the fields the query reads: enum values are the exact upper-case names
+# (compared as whole strings, so no case folding admits another spelling), Int is a 32-bit signed
+# integer and never a bool, and DateTime is ISO 8601 in UTC as GitHub writes it.
+_CI_ENUM = frozenset(state.upper() for state in _CI_STATES)
+_QUEUE_ENUM = frozenset(state.upper() for state in _QUEUE_STATES)
+_MERGE_STATE_ENUM = frozenset({"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"})
+_GRAPHQL_INT_MAX = 2**31 - 1
+_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+
+def _graphql_int(value: object, low: int) -> bool:
+    return type(value) is int and low <= value <= _GRAPHQL_INT_MAX
+
+
+def _enum(value: object, names: frozenset[str]) -> TypeGuard[str]:
+    # The type check comes first: an unhashable value would raise on set membership.
+    return isinstance(value, str) and value in names
 
 
 # Keys every PR node, its commit and its queue entry carry when GitHub answers the query as asked.
@@ -826,22 +841,24 @@ _PR_NODE_KEYS = {"number", "isDraft", "createdAt", "headRefName", "mergeStateSta
 
 
 def _complete_pull_request(node: object) -> bool:
-    """Whether a PR node has every field the query asked for, each null or of its own type, and a
-    valid number and draft flag.
+    """Whether a PR node has every field the query asked for, each null where GitHub allows it or
+    else a value of GitHub's own type (see the enums, Int and DateTime above).
 
     A field GitHub left out or sent malformed must not read as "not queued", "no CI yet" or "none".
     """
     if not isinstance(node, dict) or not node.keys() >= _PR_NODE_KEYS:
         return False
     # A malformed number would read as a private PR, and a non-boolean draft flag as ready.
-    number = node["number"]
-    if type(number) is not int or not 0 < number < 1_000_000_000 or type(node["isDraft"]) is not bool:
+    created = node["createdAt"]
+    if (not _graphql_int(node["number"], 1) or node["number"] >= 1_000_000_000 or type(node["isDraft"]) is not bool
+            or not isinstance(node["headRefName"], str) or not _enum(node["mergeStateStatus"], _MERGE_STATE_ENUM)
+            or not isinstance(created, str) or not _DATETIME.fullmatch(created) or panel_values.timestamp(created) is None):
         return False
     queue, commits = node["mergeQueueEntry"], node["commits"]
     # A queue entry, rollup or review context that is present carries a value of GitHub's own type
     # and set; a malformed one must not read as "not queued", "no CI yet" or "none".
-    if queue is not None and not (isinstance(queue, dict) and _state_in(queue.get("state"), _QUEUE_STATES)
-                                  and type(queue.get("position")) is int and queue["position"] >= 0):
+    if queue is not None and not (isinstance(queue, dict) and _enum(queue.get("state"), _QUEUE_ENUM)
+                                  and _graphql_int(queue.get("position"), 0)):
         return False
     nodes = commits.get("nodes") if isinstance(commits, dict) else None
     if not isinstance(nodes, list) or not all(item is None or isinstance(item, dict) for item in nodes):
@@ -852,14 +869,14 @@ def _complete_pull_request(node: object) -> bool:
     if not isinstance(commit, dict) or not commit.keys() >= {"statusCheckRollup", "status"}:
         return False
     rollup, status = commit["statusCheckRollup"], commit["status"]
-    if rollup is not None and not (isinstance(rollup, dict) and _state_in(rollup.get("state"), _CI_STATES)):
+    if rollup is not None and not (isinstance(rollup, dict) and _enum(rollup.get("state"), _CI_ENUM)):
         return False
     if status is None:
         return True
     if not isinstance(status, dict) or "context" not in status:
         return False
     context = status["context"]
-    return context is None or (isinstance(context, dict) and _state_in(context.get("state"), _CI_STATES))
+    return context is None or (isinstance(context, dict) and _enum(context.get("state"), _CI_ENUM))
 
 
 def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) -> dict[str, Any]:
@@ -942,7 +959,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         # A missing or null PR node would silently read as fewer open PRs, and a count that is not an
         # integer at least the number of PRs listed is no reading of the open PRs at all.
         if (not isinstance(nodes, list) or not all(_complete_pull_request(node) for node in nodes)
-                or type(total) is not int or total < len(nodes)):
+                or not _graphql_int(total, len(nodes))):
             rows.append(_unreadable_row(entry, "github_invalid_response", observed_at, private=private))
             continue
         _UNKNOWN_SINCE.pop(entry["repository"], None)

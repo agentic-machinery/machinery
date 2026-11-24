@@ -461,7 +461,8 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     assert ci_of({"target": {"statusCheckRollup": None}}) == {"ci": None}
     assert ci_of({"target": {"statusCheckRollup": {"state": "SUCCESS"}}}) == {"ci": "success"}
     for malformed in ({}, {"target": None}, {"target": {}}, {"target": {"statusCheckRollup": "x"}},
-                      {"target": {"statusCheckRollup": {}}}, {"target": {"statusCheckRollup": {"state": "GREEN"}}}, "x"):
+                      {"target": {"statusCheckRollup": {}}}, {"target": {"statusCheckRollup": {"state": "GREEN"}}}, "x",
+                      {"target": {"statusCheckRollup": {"state": "success"}}}, {"target": {"statusCheckRollup": {"state": []}}}):
         assert ci_of(malformed) is None, malformed
 
 
@@ -659,7 +660,17 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
                              ({"mergeQueueEntry": {"position": True, "state": "QUEUED"}}, 1),
                              ({"mergeQueueEntry": {"position": 1, "state": "PARKED"}}, 1),
                              (commit({"state": {}}, {"state": "SUCCESS"}), 1),
-                             (commit({"state": "SUCCESS"}, {"state": True}), 1)):
+                             (commit({"state": "SUCCESS"}, {"state": True}), 1),
+                             # GitHub's exact enum names and Int range: no other spelling, no case folding.
+                             (commit({"state": "success"}, {"state": "SUCCESS"}), 1),
+                             (commit({"state": "SUCCESS"}, {"state": "sUcCeSs"}), 1),
+                             ({"mergeQueueEntry": {"position": 1, "state": "queued"}}, 1),
+                             ({"mergeQueueEntry": {"position": 1, "state": "LOC\u212aED"}}, 1),
+                             ({"mergeQueueEntry": {"position": 2**31, "state": "QUEUED"}}, 1),
+                             ({"mergeQueueEntry": {"position": 1, "state": []}}, 1),
+                             ({"mergeStateStatus": "clean"}, 1), ({"mergeStateStatus": {}}, 1),
+                             ({"createdAt": "2030-01-01"}, 1), ({"createdAt": "2030-01-01T00:00:00+05:00"}, 1),
+                             ({"createdAt": None}, 1), ({"headRefName": 7}, 1), ({}, 2**31)):
         repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": total, "nodes": [{**_open_pr("codex/x", 3), **malformed}]}}
         _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
         assert git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][1]["status"] == "unknown", malformed

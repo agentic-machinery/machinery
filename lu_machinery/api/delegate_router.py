@@ -69,6 +69,13 @@ RESULT_BYTES_LIMIT = 64 * 1024
 TASK_READ_RETRIES = 2
 TASK_READ_RETRY_SECONDS = 0.01
 ACTIVE_TASK_STATUSES = {"running", "spawning"}
+# Every status a task record carries, as the delegate panel shows them ("zombie" is derived from a
+# running record whose process is gone). A record with any other status is not known to be settled.
+TASK_STATUSES = frozenset({
+    "running", "spawning", "done", "failed", "timeout", "rate_limited", "cancelled", "crashed",
+    "no_deliverable", "needs_finalize", "settling", "zombie", "dry_run", "blocked",
+})
+_SETTLED_TASK_STATUSES = TASK_STATUSES - ACTIVE_TASK_STATUSES
 # Short enough that a dead pid drops off the active list quickly, long enough
 # that a burst of dashboard polls shares one directory scan.
 DELEGATE_LIST_TTL_S = 2.0
@@ -638,8 +645,9 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     # Live workers by claimed repository (read-only reviewers included). "" counts a confirmed live
     # record with no usable claim, so the Projects line can say how many are not attributed. A task
     # store that cannot be read and searched (one without search permission lists names but not their
-    # records) or listed, or a record that cannot be statted, read or parsed (damaged, or of a newer
-    # schema), gives no counts: the missing record may be a live worker. A foreign file is no record.
+    # records) or listed, or a record that cannot be statted, read or parsed (damaged), or that has no
+    # status from TASK_STATUSES (a newer schema's record is shown without its fields), gives no counts:
+    # it may be a live worker. A foreign file is no record.
     live_by_repository: dict[str, int] = {}
     listing_failures: list[Exception] = []
     store_readable = os.access(tasks_dir, os.R_OK | os.X_OK)
@@ -649,36 +657,31 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
         try:
             file_stat = path.stat()
             entry = _TASK_STATE_CACHE.get(str(path))
-            # The history scan caches foreign files and damaged records alike as misses (no summary),
-            # so only a fresh parse, served from the record cache, tells them apart.
-            if entry is not None and entry[1] is not None and entry[0] == _task_file_fingerprint(path.name, file_stat):
-                # Cache entries are replaced as a unit. Recheck live PIDs even
-                # when the record is unchanged.
-                _, summary, status, alive, _, pid = entry
-                if summary is None or status not in ACTIVE_TASK_STATUSES:
-                    continue
-                if status == "running" and pid:
-                    alive = _pid_alive(pid)
-                    if not alive:
-                        continue
-                task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
-            else:
-                task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
-                if task is not None and set(task) == {"schema_version"}:
-                    # A newer schema's record is shown without its fields; it may be a live worker.
-                    raise ValueError(f"task record {path} has a newer schema")
-                if task is None or str(task.get("status") or "") not in ACTIVE_TASK_STATUSES:
-                    continue
-                status, alive = _derived_task_status(task)
-                if status not in ACTIVE_TASK_STATUSES:
-                    continue
-                summary = _task_summary(path, task)
+            # The history scan's cache skips only an unchanged record it parsed (it has a summary)
+            # with a settled status. Foreign files and damaged records are both cached without a
+            # summary, and every other record is read again (served per file version by the record
+            # cache), so each one counted or skipped below is checked on its current content.
+            if (entry is not None and entry[1] is not None and entry[2] in _SETTLED_TASK_STATUSES
+                    and entry[0] == _task_file_fingerprint(path.name, file_stat)):
+                continue
+            task = _read_task_state(str(path), tasks_dir=tasks_dir, raise_read_errors=True)
+            if task is None:  # a foreign file
+                continue
+            recorded = task.get("status")
+            if not isinstance(recorded, str) or recorded not in TASK_STATUSES:
+                raise ValueError(f"task record {path} has no known status")
+            if recorded not in ACTIVE_TASK_STATUSES:
+                continue
+            status, alive = _derived_task_status(task)
+            if status not in ACTIVE_TASK_STATUSES:
+                continue
+            summary = _task_summary(path, task)
         except OSError as exc:
             claims.append((None, []))
             if not isinstance(exc, FileNotFoundError):  # a record removed during the scan is no worker
                 listing_failures.append(exc)
             continue
-        except ValueError as exc:  # a damaged record claim: it may be a live worker
+        except (ValueError, TypeError) as exc:  # a damaged or uninterpretable record: it may be a live worker
             listing_failures.append(exc)
             continue
         rows.append(_task_summary_row(summary, status, alive, file_stat.st_mtime))
@@ -1065,10 +1068,7 @@ def _panel_task(raw: object) -> dict[str, Any]:
         "agent": panel_values.choice(row.get("agent"), panel_values.AGENTS, "unknown"),
         "model": panel_values.model(row.get("model")),
         "observed_model": panel_values.model(row.get("observed_model")),
-        "status": panel_values.choice(row.get("status"), {
-            "running", "spawning", "done", "failed", "timeout", "rate_limited", "cancelled", "crashed",
-            "no_deliverable", "needs_finalize", "settling", "zombie", "dry_run", "blocked",
-        }, "unknown"),
+        "status": panel_values.choice(row.get("status"), TASK_STATUSES, "unknown"),
         "push_state": panel_values.choice(row.get("push_state"), {"pushed", "unpushed", "unknown"}, "unknown"),
         "claude_account": panel_values.choice(row.get("claude_account"), {"a", "b"}),
         "codex_account": panel_values.choice(account, CODEX_ACCOUNT_LABELS),

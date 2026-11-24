@@ -826,17 +826,22 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
         finally:
             (tasks / "live.json").chmod(0o644)
         assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1
-        # So may a damaged record (cut short, not UTF-8) or one of a newer schema, even when the history
-        # scan has cached it as a miss; a foreign file is no record and leaves the counts known.
+        # So may a damaged record (cut short, not UTF-8), one of a newer schema, or one whose status is
+        # missing or outside the known set, before and after the history scan has cached it; a foreign
+        # file is no record and leaves the counts known.
         damaged = tasks / "other.json"
+        v2 = {"schema_version": 2, "task_id": "other"}
         for body in (b'{"schema_version": 2, "task_id": "oth', b'{"task_id": "other\xff"}',
-                     json.dumps({"schema_version": 3, "task_id": "other", "status": "running"}).encode()):
+                     json.dumps({**v2, "schema_version": 3, "status": "running"}).encode(), json.dumps(v2).encode(),
+                     *(json.dumps({**v2, "status": status}).encode() for status in (None, {}, "paused", ""))):
             damaged.write_bytes(body)
-            delegate_router._TASK_STATE_CACHE[str(damaged)] = (
-                delegate_router._task_file_fingerprint(damaged.name, damaged.stat()), None, "", False, None, None)
             assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None, body
-        damaged.write_text("[1, 2]")
-        assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1
+            delegate_router.list_delegate_tasks(ctx=ctx)  # the history scan caches the record
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None, body
+        for body in (b"[1, 2]", json.dumps({**v2, "status": "done"}).encode()):
+            damaged.write_bytes(body)
+            delegate_router.list_delegate_tasks(ctx=ctx)
+            assert sum(delegate_router._active_snapshot_tasks(ctx)["live_by_repository"].values()) == 1, body
         damaged.unlink()
         def forbidden(*args, **kwargs):
             raise AssertionError("request collected task history")
