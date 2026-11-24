@@ -67,12 +67,17 @@ Critical and high risk take Sol, Opus or Gemini 4 Neon High (NEON-SOLTIER-1120).
   findings. A factual language error in learner-facing Ukrainian is a real defect.
 - Tag each finding New or Pre-existing. A pre-existing defect blocks only when the PR exposes
   or worsens it; otherwise it becomes an issue. An unresolved security finding always blocks.
-- One finding per bug class, listing every instance; never repeat a posted finding.
+- Report one finding per root cause and violated invariant; never repeat a posted finding. One
+  representative case is sufficient unless another reachable case changes the impact or the
+  required fix. A sibling that proves the same reachable P0–P2 failure survived the fix stays on
+  the original ID and blocks. A real sibling outside the frozen obligation that the PR neither
+  introduces, exposes nor worsens, or an unrelated discovery with those same properties, is a P3
+  `follow_up` with an owner. Demonstrated material regressions and unresolved security findings
+  block in every round. A hypothetical case without a plausible path needs no finding. When the
+  acceptance criteria are met and only follow-ups remain, approve.
 - Every blocking finding is fixed, or dismissed with evidence the reviewer confirms.
 
-**Threat model.** Every code or infrastructure implementation brief and round-one review brief states the supported inputs and operating conditions, who can influence inputs or write relevant paths (including indirectly), and the controls that enforce any exclusions. The reviewer verifies material assumptions against the reviewed head and supported environments. Review covers supported operation, foreseeable operator errors, malformed or partial state, concurrency, and recovery. Use hostile-input assumptions for all High-tier or security-sensitive changes, including classifier changes and every path it identifies, and wherever the brief is missing or its assumptions lack evidence. Existing severity rules and the critical review floor apply. Unresolved security findings always block.
-
-Record a potentially blocking trigger as a non-blocking out-of-scope note with an owner only when the reviewer confirms evidence that it is unreachable under the supported contract and effective controls. An omission, mismatch, or uncertainty material to a potential P0–P2 blocks approval pending correction or evidence. Any material change to the model requires independent review on the applicable head before it can change a finding’s disposition.
+**Threat model.** Every code or infra brief identifies supported entry points and environments, input sources, who can influence each source or relevant write path directly or indirectly, and the controls that enforce any exclusion. The reviewer verifies those controls at the exact head. Low and Medium cover supported use, foreseeable operator error, and malformed or partial state, concurrency and recovery where applicable. High and security-sensitive reviews also assume hostile values, ordering and volume wherever an actor can influence them. Public product reviews include reachable user and contributor inputs. Machinery and private infra reviews include the actual PR, CI, artifact, operator and automation boundaries, including lower-trust inputs consumed by privileged steps. A one-shot run may use the bytes at its pinned SHA as the input ceiling when that is what it executes and no lower-trust actor can substitute those bytes before use. Reusable tools cover future reachable inputs. A size or shape exclusion requires evidence. Material uncertainty about a plausible P0–P2 path blocks pending evidence naming the actor, entry point, control in question and impact. The critical review floor and independent review of material threat-model changes still apply. Unresolved security findings always block.
 
 ## 4. Convergence
 
@@ -83,7 +88,14 @@ when its verdict cannot be parsed. A settled attempt releases its reservation wh
 shows it yielded no verdict or completed review. Active attempts and unverifiable results keep
 their reservation. The clean base merge, the repair round and the capability failure under
 [Recording the verdict](#recording-the-verdict) do not count against the 3.
-Round 1 is the full review. Rounds 2-3 review only the diff since the last reviewed head.
+Round 1 reviews the full candidate against the frozen contract. Delta rounds verify open
+finding IDs and `not_applicable` evidence, review the exact last-reviewed-head-to-candidate
+diff, and trace its effects on the frozen acceptance criteria and existing contracts. This
+includes changed fallbacks, fail-open paths, downstream callers and weakened tests. Unchanged
+code is context for those checks. A new blocker names the causal change or unresolved finding
+ID, the reachable trigger and the material impact. A demonstrated P0–P2 regression caused by
+the PR or a concrete unresolved security finding still blocks when discovered late. Once those
+checks are answered, the review is complete.
 When the cap prevents the next required round, stop and send the findings ledger and exact PR
 head to `claude-cto`. The CTO records one current disposition per work item on its parent
 issue or ordered brief. Record the capped PR and full head SHA, rounds used, every unresolved
@@ -96,10 +108,13 @@ replacement brief carries the ledger, predecessor rounds used and cap decision f
 authorized replacement starts at round 1 of its own configured PR budget. Record earlier
 rounds as history. The capped PR remains capped.
 
-Keep blockers assigned to other named work open with their owners in the parent record. They
-still block the replacement until the reviewer confirms on its exact head that the defect is
-fixed or that the replacement neither carries the defective change nor exposes or worsens the
-defect. The rule for unresolved security findings in [Findings](#3-findings) still applies.
+A replacement gets a full pass on its own candidate and authorized scope. It carries
+predecessor IDs and dispositions and verifies inherited blockers on its exact head. Settled
+classes reopen only on new material evidence. Keep blockers assigned to other named work open
+with their owners in the parent record. They still block the replacement until the reviewer
+confirms on its exact head that the defect is fixed or that the replacement neither carries
+the defective change nor exposes or worsens the defect. The rule for unresolved security
+findings in [Findings](#3-findings) still applies.
 The replacement needs its own CI under the [delivery gate](../../full-send/references/delivery.md#the-gate).
 
 ## 5. Recovery over gates

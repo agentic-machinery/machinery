@@ -58,7 +58,7 @@ interpreter does not select the primary checkout's Python modules.
 
 0. **Hand the reviewer an updated head, before round 1 and before every delta round.** Answer the
    PR's outstanding review comments with evidenced dispositions, fix every accepted
-   `in_scope_blocker`, and run the relevant checks. Keep tracked P2/P3 follow-ups as they are, and
+   `in_scope_blocker`, and run the relevant checks. Keep tracked P3 follow-ups as they are, and
    escalate a dispute or a scope breaker. A budgeted round is never spent on a defect the author
    already knows. If the change is being discarded for a new approach, skip repairs to the code
    being replaced; the code that stays and its replacement still get checks and exact-head review.
