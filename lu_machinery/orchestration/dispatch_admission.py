@@ -1725,10 +1725,14 @@ def strict_task_inventory_in(tasks_dir: Path, *, include_archive: bool = True) -
                 raise ValueError(f"unreadable task record {listed.name}") from None
             except (OSError, ValueError, RecursionError):
                 raise ValueError(f"unreadable task record {listed.name}") from None
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("task_id"), str) or not parsed["task_id"]:
+            if not isinstance(parsed, dict) or not _is_valid_run_identity(parsed.get("task_id")):
                 raise ValueError(f"unreadable task record {listed.name}")
             records.append(parsed)
     return records
+
+
+def _is_valid_run_identity(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and not any(ch.isspace() for ch in value)
 
 
 _KNOWN_TERMINAL_STATUSES = frozenset({
@@ -1822,16 +1826,16 @@ def count_turn_children(
         if record.get("parent_task_id") != parent_task_id:
             continue
         never_started = record.get("never_started_reason")
-        if never_started is not None and not isinstance(never_started, str):
-            raise ValueError(f"malformed never_started_reason on {record['task_id']}: cannot verify turn child count")
-        if never_started:
+        if never_started is not None:
+            if not _is_valid_run_identity(never_started):
+                raise ValueError(f"malformed never_started_reason on {record['task_id']}: cannot verify turn child count")
             continue
         rec_parent_nonce = record.get("parent_run_nonce")
-        if rec_parent_nonce is not None and (not isinstance(rec_parent_nonce, str) or not rec_parent_nonce):
+        if rec_parent_nonce is not None and not _is_valid_run_identity(rec_parent_nonce):
             raise ValueError(f"malformed parent_run_nonce on {record['task_id']}: cannot verify turn child count")
         if parent_run_nonce is None or rec_parent_nonce in (None, parent_run_nonce):
             rec_run_nonce = record.get("run_nonce")
-            if not isinstance(rec_run_nonce, str) or not rec_run_nonce:
+            if not isinstance(rec_run_nonce, str) or not _is_valid_run_identity(rec_run_nonce):
                 raise ValueError(f"malformed run_nonce on {record['task_id']}: cannot verify turn child count")
             seen_runs.add((record["task_id"], rec_run_nonce))
     return len(seen_runs)

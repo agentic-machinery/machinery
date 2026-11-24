@@ -731,12 +731,16 @@ _PRE_LAUNCH_TERMINAL_REASONS = frozenset({
 })
 
 
+def _is_valid_run_identity(value: object) -> bool:
+    return isinstance(value, str) and bool(value) and not any(ch.isspace() for ch in value)
+
+
 def _terminal_child_unsettled_state(other: dict) -> str | None:
     """Return ``'live'`` or ``'unknown'`` when a terminal child lacks proof that its processes and services stopped."""
     from lu_machinery.orchestration import dispatch_isolation
 
     never_started = other.get("never_started_reason")
-    if never_started is not None and not isinstance(never_started, str):
+    if never_started is not None and not _is_valid_run_identity(never_started):
         return "unknown"
     disp_reason = other.get("worktree_disposition_reason")
     if disp_reason is not None and not isinstance(disp_reason, str):
@@ -751,7 +755,7 @@ def _terminal_child_unsettled_state(other: dict) -> str | None:
     if rc_reason is not None and not isinstance(rc_reason, str):
         return "unknown"
 
-    if (isinstance(never_started, str) and never_started
+    if (_is_valid_run_identity(never_started)
             and other.get("pid") is None and other.get("process_start") is None
             and other.get("provider_pgid") is None and other.get("launch_unit") is None
             and other.get("launch_cgroup") is None):
@@ -815,9 +819,9 @@ def _terminal_child_unsettled_state(other: dict) -> str | None:
 def _scan_turn_children(record: dict) -> dict:
     """Inspect every child task dispatched by this turn; fail closed on unreadable or unknown records.
 
-    Hot records are scanned strictly under the archive lock so a damaged or unreadable file in the
-    active task store cannot hide a running child. Archived records are also checked best-effort so
-    settled children stay recorded with their full run nonces.
+    Both hot and archived stores are scanned strictly under ``task_archive_lock`` so a damaged,
+    misnamed, or unreadable file in either store cannot hide a live or unsettled child. An absent
+    archive directory is ignored, while an existing archive that cannot be enumerated fails closed.
     """
     from lu_machinery.orchestration.dispatch_admission import (
         is_safe_identical_copy,
@@ -849,13 +853,13 @@ def _scan_turn_children(record: dict) -> dict:
         if other.get("parent_task_id") != own_id:
             return
         parent_nonce = other.get("parent_run_nonce")
-        nonce_malformed = parent_nonce is not None and (not isinstance(parent_nonce, str) or not parent_nonce)
-        if not nonce_malformed and parent_nonce is not None and own_nonce is not None and parent_nonce != own_nonce:
+        nonce_malformed = parent_nonce is not None and not _is_valid_run_identity(parent_nonce)
+        if not nonce_malformed and parent_nonce is not None and _is_valid_run_identity(own_nonce) and parent_nonce != own_nonce:
             return
-        child_id = tid if isinstance(tid, str) and tid else fallback_name
+        child_id = tid if isinstance(tid, str) and _is_valid_run_identity(tid) else fallback_name
         child_nonce = other.get("run_nonce")
         child_status = other.get("status")
-        valid_nonce = isinstance(child_nonce, str) and bool(child_nonce)
+        valid_nonce = isinstance(child_nonce, str) and _is_valid_run_identity(child_nonce)
         run_key = (child_id, child_nonce, None) if valid_nonce else (child_id, None, fallback_key)
         children[run_key] = {
             "task_id": child_id,
@@ -882,28 +886,45 @@ def _scan_turn_children(record: dict) -> dict:
                 except (OSError, ValueError, RecursionError):
                     unreadable.append(listed.name)
                     continue
-                if not isinstance(parsed, dict) or not isinstance(parsed.get("task_id"), str) or not parsed["task_id"]:
+                if not isinstance(parsed, dict) or not _is_valid_run_identity(parsed.get("task_id")):
                     unreadable.append(listed.name)
                     continue
                 classify(parsed, listed.stem, f"hot:{listed.name}")
             archive_dir = root / ARCHIVE_DIR_NAME
             try:
-                archive_candidates = scan_record_candidates(archive_dir)
+                archive_dir.lstat()
+            except FileNotFoundError:
+                archive_present = False
             except OSError:
-                archive_candidates = []
-            for listed in archive_candidates:
+                archive_present = False
+                unreadable.append(ARCHIVE_DIR_NAME)
+            else:
+                archive_present = True
+            if archive_present:
                 try:
-                    raw = read_regular_task_record_bytes(listed)
-                    parsed = parse_task_record(listed, raw)
-                except (TaskIdentityMismatch, OSError, ValueError, RecursionError):
-                    continue
-                if not isinstance(parsed, dict):
-                    continue
-                tid = parsed.get("task_id")
-                c_nonce = parsed.get("run_nonce")
-                if isinstance(tid, str) and isinstance(c_nonce, str) and c_nonce and (tid, c_nonce, None) in children:
-                    continue
-                classify(parsed, listed.stem, f"archive:{listed.name}")
+                    archive_candidates = scan_record_candidates(archive_dir)
+                except OSError:
+                    unreadable.append(ARCHIVE_DIR_NAME)
+                    archive_candidates = []
+                for listed in archive_candidates:
+                    try:
+                        raw = read_regular_task_record_bytes(listed)
+                        parsed = parse_task_record(listed, raw)
+                    except TaskIdentityMismatch as exc:
+                        if not is_safe_identical_copy(exc):
+                            unreadable.append(f"{ARCHIVE_DIR_NAME}/{listed.name}")
+                        continue
+                    except (OSError, ValueError, RecursionError):
+                        unreadable.append(f"{ARCHIVE_DIR_NAME}/{listed.name}")
+                        continue
+                    if not isinstance(parsed, dict) or not _is_valid_run_identity(parsed.get("task_id")):
+                        unreadable.append(f"{ARCHIVE_DIR_NAME}/{listed.name}")
+                        continue
+                    tid = parsed.get("task_id")
+                    c_nonce = parsed.get("run_nonce")
+                    if isinstance(tid, str) and isinstance(c_nonce, str) and _is_valid_run_identity(c_nonce) and (tid, c_nonce, None) in children:
+                        continue
+                    classify(parsed, listed.stem, f"archive:{listed.name}")
     except (OSError, ValueError):
         unreadable.append("task_store_unreadable")
     return {

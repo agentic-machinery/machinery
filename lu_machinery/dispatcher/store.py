@@ -10,7 +10,7 @@ import subprocess
 import unicodedata
 import uuid
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PureWindowsPath
 
 from lu_machinery.common import json_depth
@@ -609,6 +609,7 @@ _HANDOFF_RECEIPT_FIELDS = frozenset({
 DRIVER_STATE_CLI_ENV = "LU_DRIVER_STATE_CLI"
 DRIVER_STATE_CLI_DEFAULT = "lu-driver-state"
 _DRIVER_STATE_TIMEOUT_S = 30
+HANDOFF_NOTE_FUTURE_SKEW_SECONDS = 30.0
 
 
 # An ISO-8601 UTC date-time as now() (+00:00) or Monitor (Z) writes it: ASCII digits, a T separator, at most
@@ -739,6 +740,9 @@ def verify_handoff_note(record: dict, stream: str, handoff_ref: str) -> str | No
         return "orchestrator_handoff_note_invalid: handoff_note created_utc is missing or invalid"
     if created <= started:
         return "orchestrator_handoff_note_reused: handoff_note was created before or at turn start"
+    observed_at = datetime.now(UTC)
+    if created > observed_at + timedelta(seconds=HANDOFF_NOTE_FUTURE_SKEW_SECONDS):
+        return "orchestrator_handoff_note_future: handoff_note created_utc is in the future"
     refs = {handoff_ref, note_id}
     if isinstance(note_alias, str) and note_alias:
         refs.add(note_alias)

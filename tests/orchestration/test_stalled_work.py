@@ -721,6 +721,28 @@ def test_held_turn_lease_surfaces_one_cto_alert_and_refuses_ttl_takeover_advice(
         (host.tasks / "truncated-unrelated.json").unlink()
         (host.tasks / "malformed-status-unrelated.json").unlink()
 
+        # PR1306-F3: an overflowing/malformed runtime budget on a running turn never crashes the scan or
+        # suppresses held-lease alerts supported by Monitor lease evidence.
+        bad_budget_path = host.tasks / "turn-overdue.json"
+        orig_overdue = bad_budget_path.read_text(encoding="utf-8")
+        try:
+            bad_rec = json.loads(orig_overdue)
+            bad_rec["scope_runtime_max_s"] = 10**400
+            bad_budget_path.write_text(json.dumps(bad_rec), encoding="utf-8")
+            report_overflow = mod.scan(
+                host.tasks,
+                {SLUG: host.tmp_path},
+                repos=REPOS,
+                now=NOW + timedelta(minutes=12),
+                adapter_factory=lambda path: mod.GitHubAdapter(path, runner=host.gh),
+                stream_fetcher=lambda: streams_cycle2,
+            )
+            assert any("turn-overdue: malformed turn runtime budget" in err for err in report_overflow["errors"]), report_overflow["errors"]
+            assert {row["task_id"] for row in report_overflow["rows"]} == {"turn-terminal", "turn-overdue"}
+            assert mod.route(report_overflow, cycle=4, service=service) == cycle1
+        finally:
+            bad_budget_path.write_text(orig_overdue, encoding="utf-8")
+
     # diagnose_handoff and SessionSupervisor.recover_expired_driver (local and remote) never advise TTL takeover.
     local_store = SessionStreamStore(SessionStreamDatabase(tmp_path / "local-streams.db"))
     holder = LeaseHolder("claude", TURN_HOLDER_HARNESS, terminal_nonce, process_id=999999, task_id="turn-terminal")

@@ -41,6 +41,7 @@ def _fake_driver_state_cli(tmp_path: Path, notes: dict[str, dict | None]) -> Pat
     script = tmp_path / "fake-lu-driver-state"
     script.write_text(
         f"#!{sys.executable}\n"
+        "from datetime import UTC, datetime\n"
         "import json, sys\n"
         f"notes = json.loads(open({str(db_file)!r}, encoding='utf-8').read())\n"
         "args = sys.argv[1:]\n"
@@ -50,6 +51,8 @@ def _fake_driver_state_cli(tmp_path: Path, notes: dict[str, dict | None]) -> Pat
         "    if item is None:\n"
         "        sys.stderr.write(f'not found: {ref}\\n')\n"
         "        raise SystemExit(2)\n"
+        "    if isinstance(item, dict) and item.get('created_utc') == '__NOW__':\n"
+        "        item = {**item, 'created_utc': datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f+00:00')}\n"
         "    print(json.dumps(item))\n"
         "    raise SystemExit(0)\n"
         "raise SystemExit(2)\n",
@@ -60,7 +63,7 @@ def _fake_driver_state_cli(tmp_path: Path, notes: dict[str, dict | None]) -> Pat
 
 
 def _fresh_note(note_id: str, *, lane: str = STREAM_LANE, created_utc: str | None = None, **extra) -> dict:
-    created = created_utc or (datetime.now(UTC) + timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
+    created = created_utc or "__NOW__"
     return {
         "id": note_id,
         "alias": None,
@@ -1483,14 +1486,55 @@ def test_live_unknown_or_unreadable_child_blocks_turn_done_keeps_lease_and_recor
         ("child-reused", "nonce-hot-2"),
     ]
     assert reuse_scan["live"] == [] and reuse_scan["unknown"] == [] and reuse_scan["unreadable"] == []
+    # PR1306-F1: corrupt/unreadable archived record and unreadable archive dir fail closed in _scan_turn_children.
+    corrupt_arch = arch_dir / "corrupt-archived.json"
+    corrupt_arch.write_text("{", encoding="utf-8")
+    corrupt_scan = worker._scan_turn_children(reuse_turn)
+    assert "archive/corrupt-archived.json" in corrupt_scan["unreadable"]
+    corrupt_arch.unlink()
+    misnamed_arch = arch_dir / "renamed-archived.json"
+    misnamed_arch.write_text(json.dumps(dict(
+        schema_version=2, task_id="other-id", agent="claude", mode="workspace-write",
+        status="done", run_nonce="nonce-other",
+    )), encoding="utf-8")
+    misnamed_scan = worker._scan_turn_children(reuse_turn)
+    assert "archive/renamed-archived.json" in misnamed_scan["unreadable"]
+    misnamed_arch.unlink()
     for p in arch_dir.glob("child-reused.*.json"):
         p.unlink()
+    arch_dir.rmdir()
+    arch_dir.symlink_to(tmp_path / "missing-archive-scan")
+    dangling_arch_scan = worker._scan_turn_children(reuse_turn)
+    assert "archive" in dangling_arch_scan["unreadable"]
+    arch_dir.unlink()
+
+    # PR1306-F2: whitespace in parent_run_nonce, run_nonce, or never_started_reason never hides a child.
+    ws_turn = _orchestrator_record("turn-ws-child", run_nonce="parent-nonce-ws")
+    _write(ws_turn)
+    _write(dict(schema_version=2, task_id="child-ws-parent", agent="claude", mode="workspace-write",
+                status="running", run_nonce="cn-ws-1", parent_task_id="turn-ws-child",
+                parent_run_nonce="  ", parent_stream=STREAM))
+    _write(dict(schema_version=2, task_id="child-ws-padded", agent="claude", mode="workspace-write",
+                status="done", run_nonce="cn-ws-2", parent_task_id="turn-ws-child",
+                parent_run_nonce=" parent-nonce-ws ", parent_stream=STREAM,
+                launch_mode="scope", pid=_DEAD_PID, process_start="boot:1", worktree_disposition="removed"))
+    _write(dict(schema_version=2, task_id="child-ws-nonce", agent="claude", mode="workspace-write",
+                status="done", run_nonce="   ", parent_task_id="turn-ws-child",
+                parent_run_nonce="parent-nonce-ws", parent_stream=STREAM,
+                launch_mode="scope", pid=_DEAD_PID, process_start="boot:1", worktree_disposition="removed"))
+    _write(dict(schema_version=2, task_id="child-ws-refusal", agent="claude", mode="workspace-write",
+                status="failed", run_nonce="cn-ws-4", never_started_reason="   ",
+                parent_task_id="turn-ws-child", parent_run_nonce="parent-nonce-ws", parent_stream=STREAM))
+    ws_scan = worker._scan_turn_children(ws_turn)
+    assert "child-ws-parent" in ws_scan["live"]
+    assert {"child-ws-padded", "child-ws-nonce", "child-ws-refusal"}.issubset(set(ws_scan["unknown"]))
 
 
 def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_store, tmp_path, monkeypatch):
     """Item 2 defect class: syntax-only handoff receipt certifies missing, wrong-kind, wrong-lane, dropped or reused
     notes, or settles blocked/handoff runs as done."""
     past = (datetime.now(UTC) - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
+    future = (datetime.now(UTC) + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S.%f+00:00")
     notes = {
         "note-wrong-kind": _fresh_note("note-wrong-kind", kind="task"),
         "note-wrong-lane": _fresh_note("note-wrong-lane", lane="atlas"),
@@ -1498,6 +1542,7 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
         "note-completed": _fresh_note("note-completed", status="done"),
         "note-bad-alias": _fresh_note("note-bad-alias", alias=["not-a-string"]),
         "note-old": _fresh_note("note-old", created_utc=past),
+        "note-future": _fresh_note("note-future", created_utc=future),
         "note-done": _fresh_note("note-done"),
         "note-blocked": _fresh_note("note-blocked"),
         "note-handoff": _fresh_note("note-handoff"),
@@ -1516,6 +1561,7 @@ def test_handoff_receipt_verifies_driver_state_note_and_non_done_outcomes(task_s
         ("note-completed", "orchestrator_handoff_note_invalid"),
         ("note-bad-alias", "orchestrator_handoff_note_invalid"),
         ("note-old", "orchestrator_handoff_note_reused"),
+        ("note-future", "orchestrator_handoff_note_future"),
     ):
         with pytest.raises(ValueError, match=expected_code):
             store.record_handoff_receipt("turn-verify", turn["run_nonce"], STREAM, bad_ref, outcome="done")
@@ -1832,6 +1878,19 @@ def test_orchestrator_fleet_cap_and_per_turn_child_cap_refuse_excess_dispatches(
     with pytest.raises(host_admission.Refused, match=r"orchestrator_child_cap_unknown:.*fifo-cap\.json"):
         host_admission.check_turn_child_cap(linkage)
     fifo_link.unlink()
+
+    # PR1306-F2: whitespace in parent_run_nonce, run_nonce, or never_started_reason fails closed at child admission.
+    for bad_id, bad_fields in (
+        ("c-ws-parent", {"parent_run_nonce": "  ", "run_nonce": "cn-ok-1"}),
+        ("c-ws-nonce", {"parent_run_nonce": parent_nonce, "run_nonce": "  "}),
+        ("c-ws-refusal", {"parent_run_nonce": parent_nonce, "run_nonce": "cn-ok-2", "never_started_reason": "  "}),
+    ):
+        bad_path = task_store / f"{bad_id}.json"
+        _write(dict(schema_version=2, task_id=bad_id, agent="claude", mode="workspace-write",
+                    status="running", parent_task_id="turn-cap-1", parent_stream=STREAM, **bad_fields))
+        with pytest.raises(host_admission.Refused, match=r"orchestrator_child_cap_unknown:"):
+            host_admission.check_turn_child_cap(linkage)
+        bad_path.unlink()
 
     _write(dict(schema_version=2, task_id="c-3", agent="claude", mode="workspace-write",
                 status="running", run_nonce="cn-3", **linkage))

@@ -9,6 +9,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import sys
 from collections import Counter, defaultdict
@@ -201,23 +202,38 @@ def _fetch_remote_streams() -> list[dict[str, Any]]:
     return [entry for entry in streams if isinstance(entry, dict)]
 
 
+_MAX_TURN_BUDGET_SECONDS = 365 * 24 * 3600.0
+
+
+def _parse_bounded_seconds(value: object, *, allow_zero: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("runtime budget must be a finite number")
+    try:
+        seconds = float(value)
+    except OverflowError as exc:
+        raise ValueError("runtime budget overflows float") from exc
+    if not math.isfinite(seconds) or (seconds < 0 if allow_zero else seconds <= 0) or seconds > _MAX_TURN_BUDGET_SECONDS:
+        raise ValueError("runtime budget out of supported range")
+    return seconds
+
+
 def _turn_overdue_budget_seconds(record: Mapping[str, Any]) -> float | None:
     runtime_max = record.get("scope_runtime_max_s")
-    stop_timeout = record.get("scope_stop_timeout_s")
-    if (
-        isinstance(runtime_max, (int, float))
-        and not isinstance(runtime_max, bool)
-        and runtime_max > 0
-    ):
-        stop = (
-            float(stop_timeout)
-            if isinstance(stop_timeout, (int, float)) and not isinstance(stop_timeout, bool) and stop_timeout >= 0
-            else 30.0
-        )
-        return float(runtime_max) + stop
+    if runtime_max is not None:
+        base = _parse_bounded_seconds(runtime_max, allow_zero=False)
+        stop_timeout = record.get("scope_stop_timeout_s")
+        stop = 30.0 if stop_timeout is None else _parse_bounded_seconds(stop_timeout, allow_zero=True)
+        total = base + stop
+        if not math.isfinite(total) or total > _MAX_TURN_BUDGET_SECONDS:
+            raise ValueError("runtime budget sum out of supported range")
+        return total
     hard_timeout = record.get("hard_timeout")
-    if isinstance(hard_timeout, (int, float)) and not isinstance(hard_timeout, bool) and hard_timeout > 0:
-        return float(hard_timeout) + TURN_LEASE_OVERDUE_GRACE_SECONDS
+    if hard_timeout is not None:
+        base = _parse_bounded_seconds(hard_timeout, allow_zero=False)
+        total = base + TURN_LEASE_OVERDUE_GRACE_SECONDS
+        if not math.isfinite(total) or total > _MAX_TURN_BUDGET_SECONDS:
+            raise ValueError("hard_timeout budget sum out of supported range")
+        return total
     return None
 
 
@@ -226,6 +242,7 @@ def _held_turn_lease_rows(
     streams: list[dict[str, Any]],
     *,
     now: datetime,
+    errors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Surface held dispatch-turn leases whose turn record is terminal, overdue, or missing (DRIVERS-1122)."""
     by_task = {c.task_id: c for c in candidates}
@@ -267,7 +284,12 @@ def _held_turn_lease_rows(
                         since = settled
                 else:
                     started = stale._parse_ts(rec.get("started_at"))
-                    budget = _turn_overdue_budget_seconds(rec)
+                    budget: float | None = None
+                    try:
+                        budget = _turn_overdue_budget_seconds(rec)
+                    except ValueError as exc:
+                        if errors is not None:
+                            errors.append(f"{candidate.task_id}: malformed turn runtime budget ({exc})")
                     record_overdue = (
                         started is not None
                         and budget is not None
@@ -278,7 +300,12 @@ def _held_turn_lease_rows(
                         if lease_expired and expires_at is not None:
                             since = expires_at
                         elif started is not None and budget is not None:
-                            since = started + timedelta(seconds=budget)
+                            try:
+                                since = started + timedelta(seconds=budget)
+                            except (OverflowError, ValueError):
+                                since = heartbeat_at
+                                if errors is not None:
+                                    errors.append(f"{candidate.task_id}: turn overdue timestamp overflow")
                         else:
                             since = heartbeat_at
         elif lease_expired:
@@ -500,7 +527,7 @@ def scan(
             errors.append(f"monitor: turn lease state unavailable ({type(exc).__name__})")
             streams = None
         if streams is not None:
-            rows.extend(_held_turn_lease_rows(candidates, streams, now=now))
+            rows.extend(_held_turn_lease_rows(candidates, streams, now=now, errors=errors))
     rows.sort(key=lambda row: (row["lane"], row["task_id"], row["kind"]))
     return {"rows": rows, "errors": errors, "terminal_records": terminal_count, "open_prs": open_count}
 

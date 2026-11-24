@@ -306,7 +306,7 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
    except (OSError, ValueError) as exc:
        refuse("task store or turn record unreadable", f"{type(exc).__name__}: {exc}")
    for_tid = [r for r in records if r.get("task_id") == tid]
-   if any(not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce").strip() for r in for_tid):
+   if any(not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce") or any(c.isspace() for c in r.get("run_nonce")) for r in for_tid):
        refuse("malformed run_nonce on turn record", tid)
    matches = [r for r in for_tid if r.get("run_nonce") == nonce]
    if for_tid and not matches:
@@ -389,7 +389,7 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
    except (OSError, ValueError) as exc:
        refuse("task store or turn record unreadable", f"{type(exc).__name__}: {exc}")
    for_tid = [r for r in records if r.get("task_id") == tid]
-   if any(not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce").strip() for r in for_tid):
+   if any(not isinstance(r.get("run_nonce"), str) or not r.get("run_nonce") or any(c.isspace() for c in r.get("run_nonce")) for r in for_tid):
        refuse("malformed run_nonce on turn record", tid)
    if for_tid and not any(r.get("run_nonce") == nonce for r in for_tid):
        refuse("run nonce mismatch", {"task_id": tid, "run_nonce": nonce})
@@ -397,7 +397,12 @@ Before closing a held `dispatch-turn` lease, verify quiescence in three steps:
        {k: r.get(k) for k in ("task_id", "run_nonce", "parent_run_nonce", "status", "worktree_disposition_reason")}
        for r in records
        if r.get("parent_task_id") == tid
-       and (not isinstance(r.get("parent_run_nonce"), str) or not r.get("parent_run_nonce").strip() or r.get("parent_run_nonce") == nonce)
+       and (
+           not isinstance(r.get("parent_run_nonce"), str)
+           or not r.get("parent_run_nonce")
+           or any(c.isspace() for c in r.get("parent_run_nonce"))
+           or r.get("parent_run_nonce") == nonce
+       )
    ]
    print(json.dumps(rows, indent=2))
    ' <task-id> <run-nonce>
