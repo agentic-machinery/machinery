@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager, nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qs, unquote
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
@@ -1759,14 +1759,18 @@ _DOUBLE_DOT_SEGMENTS = frozenset({"..", ".%2e", "%2e.", "%2e%2e"})
 _PAGE_FILES = frozenset(page.file for page in PAGE_CONTRACTS)
 
 
-def _dashboard_file(
-    dashboards_dir: Path, path: str, product: ProductContribution | None
-) -> tuple[Path, str] | None:
+class _DashboardFile(NamedTuple):
+    """A machinery dashboard file the static route serves."""
+
+    path: Path  # the resolved file, inside the dashboards
+    name: str  # the name it was found under (the path, its index.html or its .html alias): sets the media type
+    page: str | None  # the page-contract file it is, by its resolved place in the dashboards: rendered, marked current
+
+
+def _dashboard_file(dashboards_dir: Path, path: str, product: ProductContribution | None) -> _DashboardFile | None:
     """The machinery dashboard file the static route serves at ``path``, or ``None`` when it serves none.
 
-    Returns the resolved file and the name it was found under inside the dashboards (the
-    requested path, its ``index.html`` or its ``.html`` alias). That name, not the link
-    target, decides the media type and whether it is a page-contract page. ``None`` leaves the path to the product's declared files. This is the one lookup: the
+    ``None`` leaves the path to the product's declared files. This is the one lookup: the
     route serves what it returns, and the navigation uses it to tell machinery pages from
     product pages. Each candidate is looked up kernel first, so the answer is the same on
     every supported interpreter:
@@ -1788,7 +1792,7 @@ def _dashboard_file(
         path = "index.html"
     root: Path | None = None
 
-    def lookup(name: str, *, outside_is_absent: bool = False) -> tuple[int, Path, str] | None:
+    def lookup(name: str, *, outside_is_absent: bool = False) -> tuple[int, _DashboardFile] | None:
         nonlocal root
         try:
             parts = _clean_parts((name,))
@@ -1811,20 +1815,21 @@ def _dashboard_file(
             if outside_is_absent:
                 return None
             raise HTTPException(status_code=403, detail="Path traversal not allowed")
-        return found[0], found[1], "/".join(parts)
+        page = found[1].relative_to(root).as_posix()
+        return found[0], _DashboardFile(found[1], "/".join(parts), page if page in _PAGE_FILES else None)
 
     found = lookup(path)
     if found is not None:
         if stat.S_ISREG(found[0]):
-            return found[1], found[2]
+            return found[1]
         if stat.S_ISDIR(found[0]):
             index = lookup(f"{path}/index.html")
             if index is not None and stat.S_ISREG(index[0]):
-                return index[1], index[2]
+                return index[1]
     if not has_suffix(path):
         alias = lookup(f"{path}.html", outside_is_absent=True)
         if alias is not None and stat.S_ISREG(alias[0]):
-            return alias[1], alias[2]
+            return alias[1]
     return None
 
 
@@ -1951,11 +1956,11 @@ def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_
     product = getattr(request.app.state, "product", None)
     dashboard = _dashboard_file(dashboards_dir, path, product)
     if dashboard is not None:
-        file, name = dashboard
-        if name in _PAGE_FILES:
-            return _machinery_page_response(file, name, dashboards_dir, product)
-        # The name it was found under sets the type, as when the route served that path itself.
-        return FileResponse(file, media_type=mimetypes.guess_type(name)[0] or "text/plain")
+        if dashboard.page is not None:
+            return _machinery_page_response(dashboard.path, dashboard.page, dashboards_dir, product)
+        # Starlette's own rule, applied to the name the file was found under rather than to the link target.
+        media_type = mimetypes.guess_type(dashboard.name)[0] or "application/octet-stream"
+        return FileResponse(dashboard.path, media_type=media_type)
     declared = product_file(product, "index.html" if path in {"", "/"} else path)
     if declared is not None:
         return FileResponse(declared)
