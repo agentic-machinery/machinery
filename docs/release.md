@@ -1,8 +1,8 @@
 # Releasing lu-machinery
 
-Consumers install `lu-machinery` from a released wheel, pinned by version and
-SHA-256 in their own `requirements-machinery.lock`. There is no editable
-install and no machinery checkout on `PYTHONPATH`.
+Consumers install a released `lu-machinery` wheel pinned by version and
+SHA-256. The product pins the wheel in `uv.lock`. Kube-dojo pins it in
+`requirements-machinery.lock`.
 
 ## Release when ready
 
@@ -239,8 +239,7 @@ The first live cut or dry run after moving the release build tools into the
 locked `build` dependency group (removing the `build-requirements.txt` heredoc
 from `.github/workflows/ci-gate.yml`) needs the updated release tool. Earlier
 installed releases (through `v0.1.67`) still parse that heredoc from
-`ci-gate.yml` and fail at the build step with `CutError`, and older releases
-pre-dating `uv.lock` read `requirements-machinery.lock`. Until a release
+`ci-gate.yml` and fail at the build step with `CutError`. Until a release
 containing the updated `release_cut` is installed on the host, run live cuts
 and dry runs from the release-candidate checkout of machinery `main` as
 `$MACHINERY` with the uv version from `.github/workflows/pins.txt` on `PATH`:
@@ -316,7 +315,8 @@ does these steps in order:
      `ci-gate-evidence-<attempt>`) is present and valid.
    - The uv on `PATH` satisfies `[tool.uv] required-version` in the machinery
      candidate and in the product `main` checkout used for adoption and test
-     collection. This check also applies to dry runs that proceed to a build.
+     collection. The product checkout must include `uv.lock`. These checks
+     also apply to dry runs that proceed to a build.
 2. **Release notes**, generated as described under Changelog.
 3. **Build** once from `git archive "$SHA"`, outside any checkout: export the
    locked `build` dependency group from `pyproject.toml`/`uv.lock` at `$SHA`
@@ -366,9 +366,8 @@ does these steps in order:
    section. The command downloads the published assets and compares them with
    `SHA256SUMS` and with the built files.
 7. **Draft adopt PR** in the product. The cut changes the wheel pin in
-   `pyproject.toml` and `uv.lock`, or replaces `requirements-machinery.lock`
-   for a legacy consumer. Product CI runs on drafts. The merge-queue keeper
-   refuses drafts.
+   `pyproject.toml` and verifies that `uv.lock` pins the published wheel's
+   SHA-256. Product CI runs on drafts. The merge-queue keeper refuses drafts.
 
    To include a generated JSON snapshot in the adoption commit, add this
    table to the product's `pyproject.toml` and track both files in product main.
@@ -767,17 +766,17 @@ are intentional:
 - The release ownership manifest replaces the legacy shared-to-agent manifest.
   These control files are recorded separately from the provider-output census.
 
-A consumer adopts a release with one PR that replaces its
-`requirements-machinery.lock` with the consumer lock above. Shared locks name
-packages, versions and hashes only, never a host path. On the server,
-consumers install from the host wheelhouse with the accept command under
-Cut a release. In CI, a
-consumer downloads the exact release asset into a temporary wheelhouse,
-downloads the locked dependencies into the same directory, and installs with
-the same command. Rolling back restores the previous lock, wheel,
-configuration, the matching Node prefix and generated deployments, then
-verifies behaviour, including the ACP known-answer checks; reverting
-the lock alone is not a rollback.
+The release cut opens the product's adoption PR with the wheel URL in
+`pyproject.toml` and its verified SHA-256 in `uv.lock`.
+
+Kube-dojo adopts a release by replacing `requirements-machinery.lock` with
+the consumer lock from the release notes. Its extensions sync downloads the
+exact release wheel into a temporary wheelhouse and installs with
+`uv pip install --require-hashes -r requirements-machinery.lock`.
+
+Rolling back restores the previous pin, wheel, configuration, matching Node
+prefix and generated deployments, then verifies behaviour, including the ACP
+known-answer checks.
 
 A consumer Codex session sets `LU_PRODUCT_ROOT` to the absolute product checkout.
 The guards shipped in #137 already require that root; they do not infer the
