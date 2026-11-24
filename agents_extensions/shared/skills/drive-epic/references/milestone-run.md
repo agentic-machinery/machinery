@@ -330,21 +330,42 @@ turn to settle:
    dequeue recipe in `full-stop` ("Protect the PR before any work") with the verified repository
    on every command (`--repo <owner/name>`; `pr-dequeue` takes the node ID from
    `gh pr view <number> --repo <owner/name> --json id`), and verify its results.
-2. **Sweep the turn's children until none is left open.** Take one inventory, `dispatch list`, and
-   keep every record whose `parent_task_id` and `parent_run_nonce` are the turn's. For each covered
-   child that is not terminal, `dispatch cancel <child-id> --run-nonce <its nonce>`; for each
-   covered child's PR (`gh pr list --repo <owner/name> --head <its worktree_branch>`), protect it
-   as in step 1 as soon as you find it. A cancel refused while the child is still spawning
-   (`supervisor identity is unavailable; cancellation refused`) stays on your list: retry it on
-   the next sweep. Repeat the sweep, one inventory each time, while the turn or any covered child
-   is not terminal, and once more after the turn settles.
+2. **Sweep the turn's children until none is left open.** Take one inventory, `dispatch list
+   --all` (it includes archived records, which the default hot list omits), and keep every record
+   whose `parent_task_id` and `parent_run_nonce` are the turn's, then every record whose parent is
+   a kept one (a child's own follow-up tasks), until no record is added. For each covered child
+   that is not terminal, `dispatch cancel <child-id> --run-nonce <its nonce>`. A cancel refused
+   while the child is still spawning (`supervisor identity is unavailable; cancellation refused`)
+   stays on your list: retry it on the next sweep.
+
+   A covered child's PRs are those it can be linked to by its record or the ownership ledger, from
+   all of these, whether open or already merged. Protect each open one as in step 1 as soon as you
+   find it; a merged one is a landing the stop did not prevent, so report it:
+
+   - **Recorded branches.** `gh pr list --repo <owner/name> --state all --head <branch>` for the
+     child's `worktree_branch` and, when it has one, its `publish_branch` (a child that continues
+     an existing PR pushes there). `--state all` is required: the default lists open PRs only and
+     misses one that merged during the stop.
+   - **Accepted ownership.** `<interpreter> -m lu_machinery.orchestration.pr_ownership status`
+     prints the ledger. A PR is the child's when its `handoffs` entry, or a `history` entry with
+     `event: accepted`, names the child as `successor` (an accepted hand-off, from any branch) or
+     `worker_task` (keeper custody the child transferred). The key is `<owner/name>#<number>`.
+   - **Merged delivery.** Once the child has settled, `dispatch status <child-id> --run-nonce
+     <its nonce>` shows `delivery_pr` and `delivery_merge_sha`, the merged PR the dispatcher
+     attributed to it.
+
+   Repeat the sweep, one inventory each time, while the turn or any covered child is not terminal,
+   and once more after the turn settles.
 3. **Verify the turn's settlement** for that nonce in short passes between sweeps:
    `dispatch wait <turn-id> --run-nonce <full-nonce> --timeout 60`, until it exits 0 or 1.
    Settlement keeps a non-`done` provider status, so a cancelled run settles `cancelled` and is
    never a handoff baseline (cold start step 2).
 4. **Reconcile what settlement reveals.** Read `child_tasks`, `orphaned_child_tasks`,
    `unknown_child_tasks` and `unreadable_child_records`; any covered child or PR not handled
-   above goes back into the step 2 sweep, and each cancelled child must settle the same way.
+   above goes back into the step 2 sweep, and each cancelled child must settle the same way. Read
+   a child the inventory omits directly with `dispatch status <child-id> --run-nonce <its nonce>`.
+   A child, branch listing or ledger read that fails or cannot be verified is unresolved custody:
+   report it with its owner, never as "no PR".
 5. **Reconcile the lease separately.** A terminal turn alone neither clears the lease nor
    authorizes a successor: the dispatcher releases it only when the run's processes are proven
    gone and no child is live, unknown or unreadable. A lease still held after settlement goes
