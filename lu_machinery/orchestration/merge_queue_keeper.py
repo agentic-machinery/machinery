@@ -527,23 +527,21 @@ class GitHub:
                 raise KeeperError("merge_group job page incomplete")
         return list(data["jobs"])
 
-    def failed_tests(self, job_id: int) -> list[str]:
-        """Extract only a failing test node's relative source identifier (pytest ``FAILED`` or
-        ``ERROR``), never log values."""
+    def job_failure(self, job_id: int) -> tuple[list[str], str | None]:
+        """Test nodes and the first setup-error line from the one log fetch this call already makes.
+
+        Node identifiers stay relative source paths. The error line is one bounded line for an
+        infrastructure report, or ``None`` when that log has no setup-error marker. The runner
+        exit line is not a marker.
+        """
         log = self.call("run", "view", "-R", self.repository, "--job", str(job_id), "--log")
-        tests: list[str] = []
-        for match in re.finditer(r"\b(?:FAILED|ERROR)\s+(tests/[^\r\n]+?)(?:\s+-\s|\r?$)", log, re.M):
-            # Pytest parameter IDs can contain arbitrary private runtime data.
-            # Project only the source path and Python identifiers; decline any
-            # unrecognized text instead of forwarding it into a public comment.
-            identifier = match[1].partition("[")[0]
-            if re.fullmatch(
-                r"tests/(?:[A-Za-z_][A-Za-z0-9_]*/)*[A-Za-z_][A-Za-z0-9_]*\.py"
-                r"(?:::[A-Za-z_][A-Za-z0-9_]*)+",
-                identifier,
-            ) and identifier not in tests:
-                tests.append(identifier)
-        return tests
+        if not isinstance(log, str):
+            raise KeeperError("job log incomplete")
+        return _failed_test_nodes(log), _first_setup_error_line(log)
+
+    def failed_tests(self, job_id: int) -> list[str]:
+        """Failing test node identifiers from the job log. See ``job_failure``."""
+        return self.job_failure(job_id)[0]
 
 
 _SYSTEMD_UNIT_SUFFIXES = (".service", ".timer", ".target", ".service.j2", ".timer.j2", ".target.j2")
@@ -2223,12 +2221,123 @@ def _deliver_alerts(state_path: Path, service_factory: Callable[[], Any] = _aler
     return [f"CTO alert delivery FAILED: {error}" for error in errors]
 
 
+_SETUP_LINE_MARKERS = ("E: Failed to fetch", "HTTP 503", "503 Service Unavailable")
+_LOG_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\S+Z\s+")
+_GENERIC_RUNNER_ERROR = "Process completed with exit code"
+
+
+def _failed_test_nodes(log: str) -> list[str]:
+    """Relative source identifiers of pytest ``FAILED`` or ``ERROR`` nodes. Never log values."""
+    tests: list[str] = []
+    for match in re.finditer(r"\b(?:FAILED|ERROR)\s+(tests/[^\r\n]+?)(?:\s+-\s|\r?$)", log, re.M):
+        # Pytest parameter IDs can contain arbitrary private runtime data.
+        # Project only the source path and Python identifiers; decline any
+        # unrecognized text instead of forwarding it into a public comment.
+        identifier = match[1].partition("[")[0]
+        if re.fullmatch(
+            r"tests/(?:[A-Za-z_][A-Za-z0-9_]*/)*[A-Za-z_][A-Za-z0-9_]*\.py"
+            r"(?:::[A-Za-z_][A-Za-z0-9_]*)+",
+            identifier,
+        ) and identifier not in tests:
+            tests.append(identifier)
+    return tests
+
+
+def _log_message(line: str) -> str:
+    """Drop a ``gh run view --log`` job, step and timestamp prefix when it is present."""
+    text = line.strip()
+    if text.count("\t") >= 2:
+        text = text.split("\t", 2)[2].strip()
+    return _LOG_STAMP.sub("", text, count=1).strip()
+
+
+def _first_setup_error_line(log: str) -> str | None:
+    """First setup-error line in a log already in memory.
+
+    ``Process completed with exit code`` is the runner's own exit line, not a
+    setup error, so a log that contains only that line returns ``None``. A
+    marker matches only an apt ``E:`` line, so a pytest assertion that quotes
+    a status code is not labeled a setup error.
+    """
+    if not log:
+        return None
+    for raw in log.splitlines():
+        message = _log_message(raw)
+        if not message:
+            continue
+        if "##[error]" in message:
+            message = message.split("##[error]", 1)[1].strip()
+            if not message or message.startswith(_GENERIC_RUNNER_ERROR):
+                continue
+            return message[:DISPLAY_REASON_LIMIT]
+        if message.startswith("E:") and any(marker in message for marker in _SETUP_LINE_MARKERS):
+            return message[:DISPLAY_REASON_LIMIT]
+    return None
+
+
+def _annotation_setup_error(job: Mapping[str, Any]) -> str | None:
+    """First annotation message already on ``job``. This does not fetch annotations."""
+    raw = job.get("annotations")
+    if isinstance(raw, str):
+        items: list[object] = [raw]
+    elif isinstance(raw, list):
+        items = list(raw)
+    else:
+        return None
+    for item in items:
+        if isinstance(item, str):
+            text: object = item
+        elif isinstance(item, dict):
+            text = item.get("message")
+        else:
+            continue
+        if isinstance(text, str) and text.strip():
+            line = text.strip().splitlines()[0][:DISPLAY_REASON_LIMIT]
+            if line:
+                return line
+    return None
+
+
+def _method_func(method: object) -> object:
+    return getattr(method, "__func__", method)
+
+
+def _read_job_failure(gh: Any, job_id: int) -> tuple[list[str], str | None]:
+    """Nodes and a setup line from the log reader already in use.
+
+    A fake or test that replaces ``failed_tests`` keeps that reader and has no setup line.
+    The stock client reads the log once through ``job_failure``.
+    """
+    current = getattr(gh, "failed_tests", None)
+    stock = getattr(type(gh), "failed_tests", None)
+    if callable(current) and (not callable(stock) or _method_func(current) is not _method_func(stock)):
+        nodes = current(job_id)
+        if not isinstance(nodes, list):
+            raise KeeperError("failed test list incomplete")
+        return list(nodes), None
+    reader = getattr(gh, "job_failure", None)
+    if callable(reader):
+        found = reader(job_id)
+        if not (isinstance(found, tuple) and len(found) == 2 and isinstance(found[0], list)):
+            raise KeeperError("job log diagnosis incomplete")
+        error = found[1]
+        if error is not None and not isinstance(error, str):
+            raise KeeperError("job log diagnosis incomplete")
+        text = error.strip() if isinstance(error, str) else ""
+        return list(found[0]), text or None
+    nodes = gh.failed_tests(job_id)
+    if not isinstance(nodes, list):
+        raise KeeperError("failed test list incomplete")
+    return list(nodes), None
+
+
 def _drop_detail(
     gh: GitHub, number: int, head: str, since: str
-) -> tuple[str, list[str], dict[str, list[str]], int | None, list[int]]:
-    """Return the diagnosis text, the failed job names and all failed tests per job, the latest
-    run ID, and the IDs of every matching failed run, oldest first. The PR comment and the
-    repeated-failure records use it."""
+) -> tuple[str, list[str], dict[str, list[str]], int | None, list[int], dict[str, str]]:
+    """Return the diagnosis text, the failed job names, failed tests per job, the latest run ID,
+    every matching failed run (oldest first), and one setup-error line per job that had no test node.
+    The PR comment and the repeated-failure records use it. Setup lines come only from the log fetch
+    this diagnosis already makes, or from annotations already on the job payload."""
     timeline = gh.timeline(number)
     events = [
         item
@@ -2256,7 +2365,7 @@ def _drop_detail(
         and extract_pr_number(str(item.get("head_branch", ""))) == number
     ]
     if not runs:
-        return (" Queue removal confirmed; failing merge_group run unknown." if events else ""), [], {}, None, []
+        return (" Queue removal confirmed; failing merge_group run unknown." if events else ""), [], {}, None, [], {}
     run = max(runs, key=lambda item: item.get("created_at", ""))
     if not isinstance(run.get("id"), int):
         raise KeeperError("matching merge_group run has no valid id")
@@ -2265,24 +2374,35 @@ def _drop_detail(
     try:
         jobs = gh.jobs(run["id"])
     except KeeperError as exc:
-        return f"{run_detail}; failing job lookup failed: {display_text(str(exc), DISPLAY_REASON_LIMIT)}.", [], {}, run["id"], run_ids
+        return (
+            f"{run_detail}; failing job lookup failed: {display_text(str(exc), DISPLAY_REASON_LIMIT)}.",
+            [], {}, run["id"], run_ids, {},
+        )
     failed = sorted(
         {str(job["name"]) for job in jobs if job.get("conclusion") == "failure" and isinstance(job.get("name"), str)}
     )
     names = ", ".join(code_span(name) for name in failed) or "none reported"
     detail = f"{run_detail}; failing jobs: {names}."
     tests: dict[str, list[str]] = {}
+    setup_errors: dict[str, str] = {}
     for job in jobs:
-        if job.get("conclusion") != "failure" or TEST_JOB_MARKER not in str(job.get("name", "")) or type(job.get("id")) is not int:
+        if job.get("conclusion") != "failure" or not isinstance(job.get("name"), str) or job["name"] in AGGREGATE_JOBS:
             continue
-        try:
-            nodes = gh.failed_tests(job["id"])
-            if nodes:
-                detail += f" First FAILED test: {code_span(nodes[0], DISPLAY_TEST_LIMIT)}."
-                tests[str(job["name"])] = nodes
-        except KeeperError:
-            pass  # Optional log enrichment must not hide the run/job diagnosis.
-    return detail, failed, tests, run["id"], run_ids
+        name = str(job["name"])
+        nodes: list[str] = []
+        log_error: str | None = None
+        if TEST_JOB_MARKER in name and type(job.get("id")) is int:
+            # A log failure must not hide the run and job names already read.
+            with contextlib.suppress(KeeperError):
+                nodes, log_error = _read_job_failure(gh, job["id"])
+        if nodes:
+            detail += f" First FAILED test: {code_span(nodes[0], DISPLAY_TEST_LIMIT)}."
+            tests[name] = nodes
+            continue
+        error = log_error or _annotation_setup_error(job)
+        if error:
+            setup_errors[name] = error
+    return detail, failed, tests, run["id"], run_ids, setup_errors
 
 
 def _repeated_failures(failures: Any) -> dict[tuple[str, str], tuple[list[int], list[str]]]:
@@ -2303,6 +2423,42 @@ def _repeated_failures(failures: Any) -> dict[tuple[str, str], tuple[list[int], 
     return {
         job: (sorted(numbers), sorted(tests[job])) for job, numbers in prs.items() if len(numbers) >= REPEATED_FAILURE_PRS
     }
+
+
+def _failure_identity(item: Mapping[str, Any]) -> tuple[str, str]:
+    """``("test", node)`` when a failing node was read, else ``("job", job name)``."""
+    test = item.get("test")
+    if isinstance(test, str) and test:
+        return ("test", test)
+    job = item.get("job")
+    return ("job", job if isinstance(job, str) else "")
+
+
+def _failure_run_ids(items: Sequence[Mapping[str, Any]]) -> list[int]:
+    return sorted({item["run_id"] for item in items if type(item.get("run_id")) is int})
+
+
+def _stored_setup_error(items: Sequence[Mapping[str, Any]]) -> str | None:
+    """First setup line already stored on these records, in job, PR, time order."""
+    ordered = sorted(
+        items,
+        key=lambda row: (
+            row.get("job") if isinstance(row.get("job"), str) else "",
+            row.get("pr") if type(row.get("pr")) is int else 0,
+            row.get("at") if isinstance(row.get("at"), str) else "",
+        ),
+    )
+    for item in ordered:
+        text = item.get("setup_error")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return None
+
+
+def _repeated_line(kind: str, shown: str, numbers: Sequence[int], run_ids: Sequence[int]) -> str:
+    runs = ",".join(str(item) for item in run_ids) or "unknown"
+    prs = ",".join(str(item) for item in numbers)
+    return f"repeated {kind} failure: {shown}; PRs={prs}; runs={runs}"
 
 
 def _repeat_kind(line: str) -> str:
@@ -3013,6 +3169,7 @@ def run(
         detail = ""
         failed_jobs: list[str] = []
         failed_tests: dict[str, list[str]] = {}
+        setup_errors: dict[str, str] = {}
         failed_run: int | None = None
         if dropped:
             dropped_head = previous["queued"][key]
@@ -3025,14 +3182,16 @@ def run(
         if queued is False and prior_drop_key in previous.get("undiagnosed", {}):
             try:
                 since = previous["undiagnosed"][prior_drop_key]
-                detail, failed_jobs, failed_tests, failed_run, run_ids = _drop_detail(gh, number, head, since)
+                detail, failed_jobs, failed_tests, failed_run, run_ids, setup_errors = _drop_detail(
+                    gh, number, head, since
+                )
                 seen_runs = previous.setdefault("ejections", {}).setdefault(prior_drop_key, [])
                 new_runs = [run_id for run_id in run_ids if run_id not in seen_runs]
                 seen_runs.extend(new_runs)
                 if failed_run is not None and failed_run not in new_runs:
                     # An earlier removal's run, already diagnosed and recorded: it says
                     # nothing about this removal, whose own run may still be running.
-                    failed_jobs, failed_tests = [], {}
+                    failed_jobs, failed_tests, setup_errors = [], {}, {}
                 if detail:
                     previous["undiagnosed"].pop(prior_drop_key)
                 elif not detail:
@@ -3619,6 +3778,9 @@ def run(
                         record["run_id"] = failed_run
                     if test:
                         record["test"] = test
+                    elif job in setup_errors:
+                        # Untrusted log or annotation text. Published only through code_span.
+                        record["setup_error"] = setup_errors[job]
                     previous.setdefault("failures", []).append(record)
         except KeeperError as exc:
             failed = True
@@ -3666,35 +3828,77 @@ def run(
     ]
     previous["failures"] = failures
     # A test failing merge_group runs of distinct PRs is a defect, never infrastructure (rules
-    # core P4). It goes to the CTO inbox once per test and set of PRs; the CTO assigns the fix.
+    # core P4). It goes to the CTO inbox once per test and set of PRs. Job-kind failures (no
+    # test node) that share one PR set and one run-id set are one infrastructure report, so one
+    # setup failure across pytest shards does not send one message per shard.
     reports = previous.setdefault("defect_reports", {})
     for report_key, stamp in list(reports.items()):
         if not isinstance(stamp, str) or stamp < cutoff:
             reports.pop(report_key)
-    for (kind, key), (numbers, tests) in sorted(_repeated_failures(failures).items()):
-        matching = [item for item in failures if (
-            (("test", item["test"]) if isinstance(item.get("test"), str) and item["test"] else ("job", item.get("job")))
-            == (kind, key)
-        )]
-        run_ids = sorted({item["run_id"] for item in matching if type(item.get("run_id")) is int})
-        lines.append(f"repeated {kind} failure: {display_text(key, DISPLAY_TEST_LIMIT)}; PRs={','.join(map(str, numbers))}; "
-                     f"runs={','.join(map(str, run_ids)) or 'unknown'}")
-        digest = hashlib.sha256(f"{kind}\n{key}\n{numbers}".encode("utf-8", "surrogatepass")).hexdigest()[:MARKER_ID_LENGTH]
-        report_key = f"merge-queue-keeper:test-defect:{digest}"
-        if not apply or report_key in reports:
+    repeated = _repeated_failures(failures)
+
+    def _send_repeated(material: str, body: str) -> None:
+        digest = hashlib.sha256(material.encode("utf-8", "surrogatepass")).hexdigest()[:MARKER_ID_LENGTH]
+        sent_key = f"merge-queue-keeper:test-defect:{digest}"
+        if not apply or sent_key in reports:
+            return
+        _queue_cto_report(previous, "queue-test-defect", sent_key, body)
+        reports[sent_key] = observed
+
+    for (kind, key), (numbers, _tests) in sorted(repeated.items()):
+        if kind != "test":
             continue
-        _queue_cto_report(previous, "queue-test-defect", report_key, (
-            f"Merge queue keeper: {code_span(key, DISPLAY_TEST_LIMIT)} failed merge_group runs of distinct PRs "
-            f"{', '.join(f'#{n}' for n in numbers)} within 24 hours (run IDs: {', '.join(map(str, run_ids)) or 'unknown'}). "
-            + (
+        matching = [item for item in failures if _failure_identity(item) == (kind, key)]
+        run_ids = _failure_run_ids(matching)
+        lines.append(_repeated_line(kind, display_text(key, DISPLAY_TEST_LIMIT), numbers, run_ids))
+        run_text = ", ".join(map(str, run_ids)) or "unknown"
+        _send_repeated(
+            f"{kind}\n{key}\n{numbers}",
+            (
+                f"Merge queue keeper: {code_span(key, DISPLAY_TEST_LIMIT)} failed merge_group runs of distinct PRs "
+                f"{', '.join(f'#{n}' for n in numbers)} within 24 hours (run IDs: {run_text}). "
                 "A failing test is never infrastructure and is never rerun (rules core P4): assign a fix, or delete "
                 "the test with the reason in the commit and a note on its issue."
-                if tests else
+            ),
+        )
+    # Group job-kind keys by the PR set and run-id set they share. The dedup key is that pair,
+    # not the job name, so a later keeper pass does not send the group again.
+    clusters: dict[tuple[tuple[int, ...], tuple[int, ...]], tuple[list[str], str | None]] = {}
+    for (kind, key), (numbers, _tests) in sorted(repeated.items()):
+        if kind != "job":
+            continue
+        matching = [item for item in failures if _failure_identity(item) == (kind, key)]
+        signature = (tuple(numbers), tuple(_failure_run_ids(matching)))
+        found = clusters.get(signature)
+        if found is None:
+            jobs = [key]
+            error = _stored_setup_error(matching)
+        else:
+            jobs, error = found
+            jobs.append(key)
+            if error is None:
+                error = _stored_setup_error(matching)
+        clusters[signature] = (jobs, error)
+    for (pr_numbers, group_runs), (group_jobs, group_error) in sorted(clusters.items()):
+        ordered = sorted(group_jobs)
+        shown = ", ".join(display_text(job, DISPLAY_TEST_LIMIT) for job in ordered)
+        named = ", ".join(code_span(job, DISPLAY_TEST_LIMIT) for job in ordered)
+        lines.append(_repeated_line("job", shown, pr_numbers, group_runs))
+        run_text = ", ".join(map(str, group_runs)) or "unknown"
+        if group_error:
+            error_sentence = f"Setup error: {code_span(group_error, DISPLAY_REASON_LIMIT)}."
+        else:
+            error_sentence = "Setup error: setup error not read."
+        _send_repeated(
+            f"job-group\n{list(group_runs)}\n{list(pr_numbers)}",
+            (
+                f"Merge queue keeper: {named} failed merge_group runs of distinct PRs "
+                f"{', '.join(f'#{n}' for n in pr_numbers)} within 24 hours (run IDs: {run_text}). "
+                f"{error_sentence} "
                 "No failing test node was read for it: diagnose the job. A failing test node is fixed, never rerun "
                 "(rules core P4); a failure with no failing test node is infrastructure."
-            )
-        ))
-        reports[report_key] = observed
+            ),
+        )
     if apply:
         _save(state_path, previous)
     elif report_state_dirty:
@@ -3712,7 +3916,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Guard and replenish approved, green pull requests in configured merge queues.\nUse --report to inspect and --apply only for authorized local scheduling.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"Examples:\n  .venv/bin/python -m {_MODULE} --report\n  .venv/bin/python -m {_MODULE} --apply\nHold mechanisms: labels (needs-operator-go, hold, do-not-merge, blocked) and the [hold] or [needs operator go] title marker.\nOutputs: PR states. --apply reprints a steady line only when it changes, and an unchanged error at most hourly. A skip or stop that did not read the queue leaves those lines in place. It also mutates queue/comments and local batch_state, and runs the\nownerless-PR alert to the CTO inbox (pr_ownership.py, every 5 minutes).\nThe keeper enqueues only a PR that was never in the merge queue (P4); every later enqueue is the owner's pr-merge. It\nholds such a PR, comments once per head and reports it to the CTO inbox once per head; an unread timeline holds a PR\nuntil a later pass reads it. A test failing merge_group runs of two PRs within 24 hours is reported to the CTO inbox.\nEnvironment: MQ_KEEPER_MIN_INTERVAL_SECONDS or an existing MQ_KEEPER_SLOW_FLAG file (300 s) throttles --apply.\nExit codes: 0 success/lock overlap/slow-mode skip; 1 lookup or mutation failure.\nRelated: #8564, integration_sweep.py, record_cf_verdict.py.",
+        epilog=f"Examples:\n  .venv/bin/python -m {_MODULE} --report\n  .venv/bin/python -m {_MODULE} --apply\nHold mechanisms: labels (needs-operator-go, hold, do-not-merge, blocked) and the [hold] or [needs operator go] title marker.\nOutputs: PR states. --apply reprints a steady line only when it changes, and an unchanged error at most hourly. A skip or stop that did not read the queue leaves those lines in place. It also mutates queue/comments and local batch_state, and runs the\nownerless-PR alert to the CTO inbox (pr_ownership.py, every 5 minutes).\nThe keeper enqueues only a PR that was never in the merge queue (P4); every later enqueue is the owner's pr-merge. It\nholds such a PR, comments once per head and reports it to the CTO inbox once per head; an unread timeline holds a PR\nuntil a later pass reads it. A test failing merge_group runs of two PRs within 24 hours is reported to the CTO inbox once per test. Job failures with no failing test node that share one PR set and one run-id set are one report.\nEnvironment: MQ_KEEPER_MIN_INTERVAL_SECONDS or an existing MQ_KEEPER_SLOW_FLAG file (300 s) throttles --apply.\nExit codes: 0 success/lock overlap/slow-mode skip; 1 lookup or mutation failure.\nRelated: #8564, integration_sweep.py, record_cf_verdict.py.",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--report", action="store_true", help="Read-only report (default).")

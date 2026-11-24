@@ -2066,3 +2066,131 @@ def test_ejected_repaired_head_reenqueues_once_only_with_repair_evidence(tmp_pat
     assert [action for action in real_clean.actions if action[0] == "enqueue"] == [("enqueue", (45, merged_sha))]
     assert "#45 re-enqueued (repaired:clean-base-merge)" in rc_lines
     assert _git(keeper_clone, "for-each-ref") == refs_before
+
+
+def test_many_shard_jobs_of_one_run_with_no_failing_test_node_produce_one_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: per-shard alert flood.
+
+    Shard jobs that share one PR set and one run-id set, and name no failing test node, are one
+    CTO report. A failing test node on those same runs stays its own report.
+    """
+    client = keeper.GitHub(tmp_path, "unit/public")
+    calls: list[tuple[object, ...]] = []
+
+    def _call(*args: object) -> str:
+        calls.append(args)
+        return (
+            "pytest (1)\tSet up job\t2026-11-24T00:00:00.0000000Z "
+            "##[error]Process completed with exit code 100.\n"
+            "pytest (1)\tSet up job\t2026-11-24T00:00:01.0000000Z "
+            "E: Failed to fetch http://snapshot.ubuntu.com/ubuntu 503 Service Unavailable @octocat\n"
+        )
+
+    monkeypatch.setattr(client, "call", _call)
+    nodes, setup_line = client.job_failure(7)
+    expected = "E: Failed to fetch http://snapshot.ubuntu.com/ubuntu 503 Service Unavailable @octocat"
+    assert nodes == [] and setup_line == expected
+    assert len(calls) == 1 and calls[0][-3:] == ("--job", "7", "--log")
+
+    def _only_runner(*_args: object) -> str:
+        return (
+            "pytest (1)\tRun pytest\t2026-11-24T00:00:00.0000000Z "
+            "##[error]Process completed with exit code 137.\n"
+        )
+
+    monkeypatch.setattr(client, "call", _only_runner)
+    nodes, error = client.job_failure(8)
+    assert nodes == [] and error is None
+
+    def _pytest_assertion(*_args: object) -> str:
+        return (
+            "pytest (1)\tRun pytest\t2026-11-24T00:00:00.0000000Z "
+            "FAILED tests/my-dir/test_x.py::test_y - AssertionError\n"
+            "pytest (1)\tRun pytest\t2026-11-24T00:00:01.0000000Z "
+            "E   assert 'HTTP 503 from upstream' == ''\n"
+        )
+
+    monkeypatch.setattr(client, "call", _pytest_assertion)
+    nodes, error = client.job_failure(9)
+    assert nodes == [] and error is None
+
+    class _AnnotatedJobs:
+        def timeline(self, number: int) -> list[dict[str, Any]]:
+            return [
+                {"event": "added_to_merge_queue", "created_at": "2026-09-23T00:00:00Z"},
+                {"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"},
+            ]
+
+        def created_at(self, number: int) -> str:
+            return "2026-09-01T00:00:00Z"
+
+        def runs(self, since: str) -> list[dict[str, Any]]:
+            return [{
+                "id": 45339348369,
+                "event": "merge_group",
+                "conclusion": "failure",
+                "created_at": "2026-09-23T00:00:02Z",
+                "updated_at": "2026-09-23T00:00:03Z",
+                "head_branch": "gh-readonly-queue/main/pr-42-deadbeef",
+            }]
+
+        def jobs(self, run_id: int) -> list[dict[str, Any]]:
+            return [{
+                "id": 9,
+                "name": "pytest (1)",
+                "conclusion": "failure",
+                "annotations": [{"message": "HTTP 503 from snapshot.ubuntu.com"}],
+            }]
+
+        def failed_tests(self, job_id: int) -> list[str]:
+            return []
+
+    _detail, failed_jobs, failed_tests, run_id, run_ids, setup = keeper._drop_detail(
+        _AnnotatedJobs(), 42, HEAD_A, "2026-09-23T00:00:00Z"
+    )
+    assert failed_jobs == ["pytest (1)"] and failed_tests == {} and run_id == 45339348369
+    assert run_ids == [45339348369]
+    assert setup == {"pytest (1)": "HTTP 503 from snapshot.ubuntu.com"}
+
+    shards = [f"pytest ({index})" for index in range(1, 25)]
+    stamp = "2999-01-01T00:00:00+00:00"
+    failures: list[dict[str, Any]] = []
+    for number, shard_run in ((42, 45339348369), (43, 45339348370)):
+        for job in shards:
+            failures.append({"job": job, "pr": number, "at": stamp, "run_id": shard_run})
+    failures[0]["setup_error"] = setup_line
+    node = "tests/test_example.py::test_keeps_its_own_report"
+    for number, shard_run in ((42, 45339348369), (43, 45339348370)):
+        failures.append({"job": "pytest (1)", "pr": number, "at": stamp, "run_id": shard_run, "test": node})
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"queued": {}, "drops": {}, "failures": failures}))
+    fake = FakeGitHub()
+    lines, failed = run(fake, path, monkeypatch)
+    assert not failed, lines
+
+    def _bodies(kind_phrase: str) -> list[dict[str, Any]]:
+        return [
+            entry for entry in json.loads(path.read_text()).get("cto_outbox", [])
+            if entry["kind"] == "queue-test-defect" and kind_phrase in entry["body"]
+        ]
+
+    infra = _bodies("No failing test node was read")
+    node_reports = _bodies("never infrastructure and is never rerun")
+    assert len(infra) == 1 and len(node_reports) == 1
+    body = infra[0]["body"]
+    for job in shards:
+        assert f"`{job}`" in body
+    assert "#42" in body and "#43" in body
+    assert "45339348369" in body and "45339348370" in body
+    assert keeper.code_span(setup_line, keeper.DISPLAY_REASON_LIMIT) in body
+    assert "http://" not in body and "@" not in body
+    assert "Setup error: setup error not read." not in body
+    assert "a failure with no failing test node is infrastructure" in body
+    assert f"`{node}`" in node_reports[0]["body"]
+    job_lines = [line for line in lines if line.startswith("repeated job failure:")]
+    assert len(job_lines) == 1 and "pytest (1)" in job_lines[0] and "pytest (24)" in job_lines[0]
+    run(fake, path, monkeypatch)
+    again = _bodies("No failing test node was read")
+    assert len(again) == 1 and again[0]["key"] == infra[0]["key"] and again[0]["body"] == body
