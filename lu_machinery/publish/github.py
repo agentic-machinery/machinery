@@ -20,6 +20,7 @@ import time
 import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import quote
 
 import yaml
@@ -104,6 +105,7 @@ SCHEMAS = {
     "issue-reopen": ({"number"}, {**COMMON, "number": "number"}),
     "run-rerun": ({"number"}, {**COMMON, "number": "number"}),
     "run-cancel": ({"number"}, {**COMMON, "number": "number"}),
+    "run-force-cancel": ({"number"}, {**COMMON, "number": "number"}),
     "workflow-run": (
         {"workflow", "ref"},
         {**COMMON, "workflow": "workflow", "ref": "ref", "inputs": "workflow_inputs"},
@@ -2882,6 +2884,121 @@ def _publish_branch_delete(fields, *, gh_repo, runner, cwd, environment, capture
     )
 
 
+# Non-completed GitHub Actions workflow run statuses (GitHub REST API).
+_FORCE_CANCEL_ACTIVE_STATUSES = frozenset({"queued", "in_progress", "waiting", "requested", "pending", "cancelling"})
+_FORCE_CANCEL_JOB_STATUSES = _FORCE_CANCEL_ACTIVE_STATUSES | {"completed"}
+
+
+def _require_force_cancel_eligible(
+    dest: str,
+    gh_repo: str,
+    run_id: int,
+    runner,
+    cwd: Path,
+    environment: dict[str, str],
+) -> None:
+    """Require a non-completed workflow run with prior cancellation evidence before force-cancel."""
+    if any(part in {".", ".."} for part in gh_repo.split("/")):
+        raise gate.PublishBlocked("OPSEC: invalid publisher repository.")
+
+    def refuse(reason: str) -> NoReturn:
+        raise gate.PublishBlocked(f"FORCE_CANCEL_REFUSED: {reason}; nothing was sent.")
+
+    try:
+        run_result = read(
+            "run",
+            repo=dest,
+            number=run_id,
+            runner=runner,
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except github_client.GitHubRateLimited:
+        raise
+    except Exception:
+        refuse("Actions run lookup failed; --number requires an Actions run ID, not a PR number")
+    if run_result.returncode:
+        refuse("Actions run lookup failed; --number requires an Actions run ID, not a PR number")
+    try:
+        run = github_client.loads_strict_json(run_result.stdout)
+    except Exception:
+        refuse("Actions run response is malformed")
+    if not isinstance(run, dict) or type(run.get("id")) is not int or run["id"] != run_id:
+        refuse("Actions run identity is unreadable or mismatched")
+    status = run.get("status")
+    if status == "completed":
+        refuse("workflow run is already completed")
+    if not isinstance(status, str) or status not in _FORCE_CANCEL_ACTIVE_STATUSES:
+        refuse("workflow run status is unknown or unsupported")
+    conclusion = run.get("conclusion")
+    if conclusion is not None and conclusion != "cancelled":
+        refuse("workflow run already has a non-cancelled conclusion")
+    if status == "cancelling" or conclusion == "cancelled":
+        return
+
+    try:
+        jobs_result = read(
+            "jobs",
+            repo=dest,
+            number=run_id,
+            runner=runner,
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            paginate=True,
+            slurp=True,
+        )
+    except github_client.GitHubRateLimited:
+        raise
+    except Exception:
+        refuse("workflow run jobs are unreadable")
+    if jobs_result.returncode:
+        refuse("workflow run jobs are unreadable")
+    try:
+        pages = github_client.loads_strict_json(jobs_result.stdout)
+    except Exception:
+        refuse("workflow run jobs response is malformed")
+    if not isinstance(pages, list) or not pages:
+        refuse("workflow run jobs response is malformed")
+    jobs: list[dict] = []
+    expected_total: int | None = None
+    for page in pages:
+        if not isinstance(page, dict):
+            refuse("workflow run jobs response is malformed")
+        total = page.get("total_count")
+        page_jobs = page.get("jobs")
+        if type(total) is not int or total < 0 or not isinstance(page_jobs, list):
+            refuse("workflow run jobs response is malformed")
+        expected_total = total
+        for job in page_jobs:
+            if not isinstance(job, dict):
+                refuse("workflow run jobs response is malformed")
+            if "run_id" in job and (type(job["run_id"]) is not int or job["run_id"] != run_id):
+                refuse("workflow run job identity is mismatched")
+            job_status = job.get("status")
+            if not isinstance(job_status, str) or job_status not in _FORCE_CANCEL_JOB_STATUSES:
+                refuse("workflow run job status is unknown or unsupported")
+            job_conclusion = job.get("conclusion")
+            if job_conclusion is not None and (not isinstance(job_conclusion, str) or not job_conclusion):
+                refuse("workflow run job conclusion is malformed")
+            jobs.append(job)
+    if expected_total is None or len(jobs) != expected_total:
+        refuse("workflow run jobs pagination is incomplete")
+    if not any(
+        (job["status"] == "completed" and job.get("conclusion") == "cancelled")
+        or job["status"] == "cancelling"
+        for job in jobs
+    ):
+        refuse("run has no prior cancellation evidence; run run-cancel first")
+
+
 # Native read-only reviews have no GitHub credential or direct route; named GETs use the host relay.
 BROKER_ENV = "LU_WRITE_BOUNDARY_BROKER"
 
@@ -3303,6 +3420,15 @@ def publish(
             body_file("body")
         elif verb in {"pr-update-branch", "pr-ready", "pr-close", "issue-reopen", "run-cancel"}:
             pass
+        elif verb == "run-force-cancel":
+            argv = [
+                "gh",
+                "api",
+                "--method",
+                "POST",
+                f"repos/{gh_repo}/actions/runs/{fields['number']}/force-cancel",
+                *_hostname_flag(dest),
+            ]
         elif verb == "run-rerun":
             argv.append("--failed")
         elif verb == "workflow-run":
@@ -3390,6 +3516,8 @@ def publish(
             _refuse_incomplete_seats(
                 dest, fields["number"], fields["match_head"], readiness_runner, cwd, environment,
             )
+        if verb == "run-force-cancel":
+            _require_force_cancel_eligible(dest, gh_repo, fields["number"], readiness_runner, cwd, environment)
         if verb == "run-rerun" or (verb == "pr-merge" and "recovery_run_id" in fields and not already_queued):
             reservation = _prepare_recovery(verb, fields, dest, cwd, environment, readiness_runner)
             if reservation:
@@ -3608,10 +3736,29 @@ def main(argv=None, *, runner=None):
                 "Outputs: requests ordinary cancellation; can interrupt work and eject a merge-group run from the queue.\n"
                 "  Request acceptance does not prove terminal cancellation; read back the run state.\n"
                 "  Cancellation does not satisfy CI or merge gates and does not consume or reset recovery allowances.\n"
-                "  Force cancellation is unavailable.\n"
+                "  When a cancelled run stays non-completed (for example, an if: always() job stays queued), use run-force-cancel.\n"
                 "Exit codes: 0 request accepted, terminal state unverified; 1 GitHub API failure;\n"
                 "  2 invalid input, publishing refusal or transport error; 75 rate-limit refusal.\n"
-                "Related: docs/dev/agent-public-text.md; read run; run-rerun."
+                "Related: docs/dev/agent-public-text.md; read run; run-force-cancel; run-rerun."
+            )
+        if verb == "run-force-cancel":
+            sub.description = (
+                "Force-cancel one GitHub Actions workflow run that stayed non-completed after ordinary cancellation.\n"
+                "Use only after run-cancel; refuses completed runs and runs with no cancellation evidence."
+            )
+            sub.formatter_class = argparse.RawDescriptionHelpFormatter
+            sub.epilog = (
+                "Examples:\n"
+                f"  .venv/bin/python -m {_PUBLISHER} read run --repo unit/public --number 12345678901\n"
+                f"  .venv/bin/python -m {_PUBLISHER} run-force-cancel --repo unit/public --number 12345678901\n"
+                "Outputs: verifies the run is not completed and shows prior cancellation (status cancelling,\n"
+                "  conclusion cancelled, or at least one completed/cancelled or cancelling job), then POSTs\n"
+                "  repos/<owner>/<name>/actions/runs/<number>/force-cancel.\n"
+                "  Request acceptance does not prove terminal cancellation; read back the run state.\n"
+                "  Cancellation does not satisfy CI or merge gates and does not consume or reset recovery allowances.\n"
+                "Exit codes: 0 request accepted, terminal state unverified; 1 GitHub API failure;\n"
+                "  2 invalid input, preflight refusal, publishing refusal or transport error; 75 rate-limit refusal.\n"
+                "Related: docs/dev/agent-public-text.md; read run; read jobs; run-cancel."
             )
         if verb == "run-rerun":
             sub.description = (
@@ -3761,7 +3908,9 @@ def main(argv=None, *, runner=None):
                     "analysis_id": "Required positive code-scanning analysis ID, e.g. 41; no default",
                     "branch": "Required exact branch name without refs/heads/, e.g. salvage/old-attempt; no default",
                 }[key]
-            if verb in {"run-rerun", "run-cancel"}:
+            if verb in {"run-rerun", "run-cancel", "run-force-cancel"}:
+                if verb == "run-force-cancel":
+                    kwargs["action"] = StoreOnce
                 kwargs["help"] = {
                     "repo": "Repository owner/name (e.g. unit/public); defaults to GH_REPO or Git origin",
                     "number": (
