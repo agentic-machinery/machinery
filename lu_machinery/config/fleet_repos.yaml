@@ -23,8 +23,8 @@
 # GitHub-required checks, or, where GitHub requires none, every workflow that runs on pull requests
 # (the publisher refuses a head with any failing check). A repository with a merge queue names one
 # workflow: merge closeout binds the single merge-group run of it. tests/review/fixtures/
-# fleet_repo_workflows.yaml records each repository's pull-request workflows; the test beside it
-# refuses a row naming a workflow that does not run there, the ci.yml default included.
+# fleet_repo_workflows.yaml records each repository's gates as read from GitHub, and
+# tests/test_record_cf_verdict.py refuses a row (the ci.yml default included) that names others.
 #
 # `security_alerts` (optional, boolean, default true) controls whether
 # `lu_machinery.security scan` watches GitHub code-scanning, Dependabot and
