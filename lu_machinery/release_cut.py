@@ -994,7 +994,11 @@ class Cut:
         manifest = product / "pyproject.toml"
         if not manifest.exists():
             return None
-        tool = _manifest_table(tomllib.loads(manifest.read_text(encoding="utf-8")), "tool")
+        try:
+            manifest_data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (ValueError, RecursionError) as exc:
+            raise CutError("ADOPTION_SNAPSHOT_CONFIG: could not parse product pyproject.toml") from exc
+        tool = _manifest_table(manifest_data, "tool")
         settings = _manifest_table(tool, "lu-machinery")
         if "adoption-snapshot" not in settings:
             return None
@@ -1009,8 +1013,12 @@ class Cut:
         module_file = module.replace(".", "/") + ".py"
         for relative in (module_file, output):
             path = product / relative
-            if path.resolve() != product.resolve() / relative or not path.is_file():
-                raise CutError(f"ADOPTION_SNAPSHOT_PATH: expected a regular file in the product checkout: {relative}")
+            path_error = f"ADOPTION_SNAPSHOT_PATH: expected a regular file in the product checkout: {relative}"
+            try:
+                if path.resolve(strict=True) != product.resolve(strict=True) / relative or not path.is_file():
+                    raise CutError(path_error)
+            except (OSError, RuntimeError) as exc:
+                raise CutError(path_error) from exc
             try:
                 self.git(product, "ls-files", "--error-unmatch", "--", relative)
             except CutError as exc:
@@ -1027,7 +1035,7 @@ class Cut:
             raise CutError("ADOPTION_SNAPSHOT_DIRTY: the snapshot module must write only to stdout")
         try:
             snapshot = json_depth.loads(rendered, max_depth=32)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             raise CutError("ADOPTION_SNAPSHOT_JSON: the module must print one JSON object") from exc
         if not isinstance(snapshot, dict):
             raise CutError("ADOPTION_SNAPSHOT_JSON: the module must print one JSON object")
