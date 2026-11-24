@@ -49,7 +49,7 @@ def _write_task(task_id: str, *, started: datetime, **fields) -> dict:
     }
 
 
-def test_window_boundary_keeps_the_last_day_and_never_leaks_older_starts(tmp_path):
+def test_window_boundary_keeps_the_last_day_and_never_leaks_older_starts(tmp_path, monkeypatch):
     """Defect class: window boundary leak or drop (started_at against the mtime prefilter).
 
     A record started an hour ago is a decision. One started 30 hours ago is
@@ -59,6 +59,8 @@ def test_window_boundary_keeps_the_last_day_and_never_leaks_older_starts(tmp_pat
     started before the window and still running is no decision but is a live
     worker on its pool, even when its record was last written before the window.
     """
+    # Worker identity is not the class under test here: the running record's worker is taken as alive.
+    monkeypatch.setattr(runtime_router, "worker_liveness", lambda record, pid_alive=None: True)
     tasks = tmp_path / "batch_state" / "tasks"
     _write_record(tasks, "recent-write", _write_task("recent-write", started=_NOW - timedelta(hours=1)))
     old = _NOW - timedelta(hours=30)
@@ -132,10 +134,11 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
     fields cannot be used (an unhashable, empty or unsupported ``mode``, an
     unreadable start time) never fails the scan and never vanishes: it makes the
     result partial, and the route then reports an admitted pool as unknown while
-    a deferral stands. The route's evaluation is reused only for the same budget
-    body (ages aside): an overlay that changes the body is evaluated afresh. A
-    budget whose freshness fields have the wrong type is unusable. A store that
-    stops being listable is unknown at once, although an earlier scan is cached.
+    a deferral stands. Pools now is a snapshot with its evaluation time (CTO
+    ruling 2026-11-24): a budget whose freshness fields have the wrong type is
+    unusable and discards it, so the next usable read evaluates afresh. A store
+    that stops being listable is unknown at once, although an earlier scan and
+    snapshot are cached.
     """
     result = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
 
@@ -150,10 +153,10 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
 
     evaluations = []
 
-    def evaluate(_ctx, budget, budget_key):
-        evaluations.append(budget_key)
+    def evaluate(_ctx, budget):
+        evaluations.append(budget["generated_at"])
         verdict = {"note": None, "live_writes": 0, "cap": 8}
-        return {"budget_generated_at": budget["generated_at"], "budget_key": budget_key, "evaluated_at": _iso(_NOW),
+        return {"budget_generated_at": budget["generated_at"], "evaluated_at": _iso(datetime.now(UTC)),
                 "admission": {"state": "ok", "host": {"admitting": True, "failing": [], "unmeasured": []},
                               "pools": {"codex:a": {**verdict, "state": "admitted", "reason": None},
                                         "codex:b": {**verdict, "state": "deferred", "reason": "Codex b: cap"}}},
@@ -174,13 +177,7 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
     with TestClient(api) as client:
         first = client.get("/api/runtime/routing").json()["now"]
         assert first["admission"]["pools"]["codex:a"]["state"] == "admitted"
-        budget["diagnostics"]["data_age_s"], budget["claude_accounts"]["claude:a"]["age_s"] = 9.0, 11.0
-        assert client.get("/api/runtime/routing").json()["now"]["state"] == "ok"
-        assert len(evaluations) == 1  # only the ages the Monitor re-stamps on each read changed
-        budget["claude_accounts"]["claude:a"]["weekly"]["left_pct"] = 0  # a serve-time overlay, same generated_at
-        overlaid = client.get("/api/runtime/routing").json()["now"]
-        assert len(evaluations) == 2
-        assert overlaid["budget_key"] == evaluations[1] != evaluations[0]
+        assert first["evaluated_at"] and 0 <= first["age_s"] <= runtime_router.ROUTING_NOW_TTL_S
 
         for field, wrong in (("stale", "false"), ("data_age_s", "1"), ("stale_threshold_s", None)):
             budget["diagnostics"] = {"stale": False, "data_age_s": 1.0, "stale_threshold_s": 900, field: wrong}
@@ -188,6 +185,8 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
             assert (mistyped["budget"]["state"], mistyped["budget"]["reason"]) == ("unknown", "invalid_budget")
             assert mistyped["admission"]["state"] == "unknown"
         budget["diagnostics"] = {"stale": False, "data_age_s": 1.0, "stale_threshold_s": 900}
+        assert client.get("/api/runtime/routing").json()["now"]["state"] == "ok"
+        assert len(evaluations) == 2  # the unusable budget discarded the first snapshot
 
         _write_record(tasks, "bad-mode", _write_task("bad-mode", started=recent, mode=[]))
         _write_record(tasks, "empty-mode", _write_task("empty-mode", started=recent, mode=""))

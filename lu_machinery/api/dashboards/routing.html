@@ -101,7 +101,7 @@ const STALE_AFTER_S = 90;
 const state = {data: null, reading: null, failedAt: null, shown: PAGE_ROWS, painted: ""};
 
 const ACCOUNT_BY = {helper: "account helper", saved_default: "saved default account", builtin_default: "built-in default", single_account: "only account", not_recorded: "not recorded"};
-const MODEL_BY = {brief: "brief", resolver: "resolver"};
+const MODEL_BY = {brief: "brief", resolver: "resolver", not_recorded: "not recorded"};
 const ADMISSION_CLASS = {admitted: "ok", forced: "warn", deferred: "bad", refused: "bad", not_checked: "muted", unknown: "warn", pending: "muted"};
 const ADMISSION_WORD = {admitted: "Admitted", forced: "Started by override", deferred: "Deferred", refused: "Refused", not_checked: "Not checked", unknown: "Unknown", pending: "Evaluating"};
 
@@ -169,10 +169,22 @@ function poolLabel(data, meter) {
   return (data?.now?.pools || []).find(pool => pool.pool === meter)?.label || meter;
 }
 
-// Only a fresh reading may claim that a pool has no allowance left.
+// A reading is current only until its own freshness deadline, also between fetches, and never after a failed refresh.
+function allowanceCurrent(allowance) {
+  return !state.failedAt && allowance?.state === "fresh" && typeof allowance.left_pct === "number"
+    && typeof allowance.fresh_until === "string" && Date.now() < Date.parse(allowance.fresh_until);
+}
+
+// Pools whose reading has expired since it arrived: part of the repaint key.
+function expiredAllowances(data) {
+  return Object.entries(data?.now?.allowance || {})
+    .filter(([, allowance]) => allowance?.state === "fresh" && !allowanceCurrent(allowance)).map(([meter]) => meter).join(",");
+}
+
+// Only a current reading may claim that a pool has no allowance left.
 function emptyPool(data, meter) {
   const allowance = data?.now?.allowance?.[meter];
-  return allowance?.state === "fresh" && typeof allowance.left_pct === "number" && allowance.left_pct <= 0;
+  return allowanceCurrent(allowance) && allowance.left_pct <= 0;
 }
 
 function resolverCallouts(data) {
@@ -252,7 +264,7 @@ function renderFlow(data) {
     + '<div class="flow-head"></div><div class="flow-head">1 · Who picks the model</div><div class="flow-head">2 · Which account pays</div>'
     + '<div class="flow-head">3 · Admission (writes only)</div><div class="flow-head">4 · What ran</div>'
     + laneRow("Writes and other work", "The brief (CTO or lead) names the model", counts.brief || {})
-    + laneRow("Reviews", "The reviewer resolver seats a model from another family", counts.resolver || {})
+    + laneRow("Reviews", "The dispatch names a reviewer from another family (the resolver's pick is not recorded on the task)", counts.resolver || {})
     + "</div>";
   const windowNote = `<p class="muted">${recent.total ?? 0} decisions started since ${escapeHtml(utc(Date.parse(recent.as_of) - (recent.window_s || 86400) * 1000))}.</p>`;
   return recentNote(data) + flow + windowNote + resolverCallouts(data);
@@ -269,8 +281,15 @@ function liveCell(meter, data) {
   return st === "partial" ? text(`${count}, may be low`, "warn") : text(String(count), count ? "" : "muted");
 }
 
+// Admission known to be unknown (a task-store fault) wins over a resolver evaluation still pending.
+function admissionUnknown(data) {
+  const admission = data.now?.admission;
+  return admission?.state === "unknown" && nowState(data) === "pending" ? unknownSince(data.recent?.as_of, admission.reason) : null;
+}
+
 // Admission's own write-slot count for the pool (a slot held by a starting dispatch counts, as for dispatch).
 function slotsCell(meter, data) {
+  if (admissionUnknown(data)) return text(admissionUnknown(data), "warn");
   const admission = data.now?.admission;
   const verdict = admission?.pools?.[meter];
   if (nowState(data) !== "ok" || admission?.state !== "ok" || typeof verdict?.live_writes !== "number") {
@@ -285,18 +304,19 @@ function slotsCell(meter, data) {
 // A reading shown after a failed refresh is no longer current: unknown since that reading.
 function allowanceCell(allowance) {
   if (state.failedAt) return text(unknownSince(allowance?.read_at, "the last refresh failed"), "warn");
-  if (!allowance || allowance.state !== "fresh" || typeof allowance.left_pct !== "number") {
-    return text(unknownSince(allowance?.read_at, allowance?.reason), "warn");
+  if (!allowanceCurrent(allowance)) {
+    return text(unknownSince(allowance?.read_at, allowance?.state === "fresh" ? "reading expired" : allowance?.reason), "warn");
   }
   return cell(`${bar(allowance.left_pct)}${escapeHtml(pct(allowance.left_pct))}`, allowance.left_pct <= 0 ? "bad" : "");
 }
 
 function resetCell(allowance) {
-  if (state.failedAt || !allowance || allowance.state !== "fresh" || !allowance.resets_at) return text("—", "muted");
+  if (!allowanceCurrent(allowance) || !allowance.resets_at) return text("—", "muted");
   return cell(`${escapeHtml(utc(allowance.resets_at))}<span class="why">${escapeHtml(relative(allowance.resets_at))}</span>`);
 }
 
 function admissionCell(meter, data) {
+  if (admissionUnknown(data)) return text(admissionUnknown(data), "warn");
   const now = data.now || {};
   const verdict = now.admission?.pools?.[meter];
   if (nowState(data) !== "ok" || now.admission?.state !== "ok" || !verdict) {
@@ -324,6 +344,7 @@ function seatsCell(meter, data) {
 }
 
 function hostLine(data) {
+  if (admissionUnknown(data)) return `<p class="callout warn">Host admission checks: ${escapeHtml(admissionUnknown(data))}.</p>`;
   const host = data.now?.admission?.host;
   if (nowState(data) !== "ok" || data.now?.admission?.state !== "ok" || !host) {
     return `<p class="callout warn">Host admission checks: ${escapeHtml(nowState(data) === "ok" ? unknownSince(timeOf(data.now?.age_s), data.now?.admission?.reason) : nowUnknownText(data))}.</p>`;
@@ -344,7 +365,7 @@ function renderPools(data) {
   const now = data.now || {};
   const budget = now.budget || {};
   const budgetLine = budget.state === "ok"
-    ? `<p class="muted">Admission and resolver verdicts describe a new <b>write</b> dispatch and a ${escapeHtml(now.profile)} review at ${escapeHtml(now.risk)} risk, evaluated against the routing budget admission reads (from ${escapeHtml(utc(now.budget_generated_at || budget.generated_at))}).</p>`
+    ? `<p class="muted">Admission and resolver verdicts describe a new <b>write</b> dispatch and a ${escapeHtml(now.profile)} review at ${escapeHtml(now.risk)} risk: a snapshot${now.evaluated_at ? ` evaluated at ${escapeHtml(utc(now.evaluated_at))}` : ""} against the routing budget admission reads (from ${escapeHtml(utc(now.budget_generated_at || budget.generated_at))}). Every dispatch is evaluated again when it starts.</p>`
     : `<p class="warn">Routing budget ${escapeHtml(unknownSince(null, budget.reason))}: admission and resolver verdicts are unknown.</p>`;
   const rows = (now.pools || []).map(({pool, label}) => [
     td(`<b>${escapeHtml(label)}</b>`),
@@ -355,8 +376,9 @@ function renderPools(data) {
     admissionCell(pool, data),
     seatsCell(pool, data),
   ]);
-  const liveUnpooled = recentState(data) !== "missing" && data.recent?.live_unpooled
-    ? `<p class="muted">${Number(data.recent.live_unpooled)} more live workers have no recorded pool.</p>` : "";
+  const rs = recentState(data);
+  const liveUnpooled = ["fresh", "partial"].includes(rs) && data.recent?.live_unpooled
+    ? `<p class="${rs === "partial" ? "warn" : "muted"}">${Number(data.recent.live_unpooled)} more live workers have no recorded pool${rs === "partial" ? " (may be low)" : ""}.</p>` : "";
   const unpooled = liveUnpooled + (nowState(data) === "ok" && now.resolver?.unpooled?.length
     ? `<p class="muted">Seats without a pool (the account they would run on is not resolved): ${now.resolver.unpooled.map(seat => `${escapeHtml(seat.model)} — ${escapeHtml(seat.reason || seat.state)}`).join("; ")}.</p>` : "");
   return hostLine(data) + budgetLine
@@ -365,7 +387,7 @@ function renderPools(data) {
 
 function asked(row) {
   if (row.kind === "review") {
-    const parts = [`${row.profile || "code"} review`, row.risk ? `${row.risk} risk` : null, row.author_model ? `author ${row.author_model}` : null];
+    const parts = [row.profile ? `${row.profile} review` : "review, profile not recorded", row.risk ? `${row.risk} risk` : null, row.author_model ? `author ${row.author_model}` : null];
     return parts.filter(Boolean).join(" · ");
   }
   return `${row.kind === "write" ? "write" : "read-only"} · ${row.role ? row.role.replaceAll("_", " ") : "role not recorded"}`;
@@ -381,7 +403,7 @@ function decisionRow(row) {
     + `<span class="why">account: ${escapeHtml(ACCOUNT_BY[row.account_by] || (row.pool ? "not recorded" : "—"))}</span>`;
   const why = [admission.reason, row.substitution ? `substitution: ${row.substitution}` : null].filter(Boolean);
   return [
-    cell(`${escapeHtml(row.task_id)}<span class="why">${escapeHtml(utc(row.started_at))}</span>`),
+    cell(`${row.task_id ? escapeHtml(row.task_id) : '<span class="muted">id withheld</span>'}<span class="why">${escapeHtml(utc(row.started_at))}</span>`),
     text(asked(row)),
     cell(chosen),
     cell(by),
@@ -449,19 +471,24 @@ function paintAges() {
 function paintAll() {
   const data = state.data;
   if (!data) return;
-  state.painted = `${nowState(data)}|${recentState(data)}`;
+  state.painted = paintKey(data);
   document.getElementById("pools-content").innerHTML = renderPools(data);
   document.getElementById("decisions-content").innerHTML = renderDecisions(data);
   paintAges();
 }
 
 // The one-second clock: ages always, and every section again when a part crosses its bound.
-function tick() {
+function paintKey(data) {
+  return `${nowState(data)}|${recentState(data)}|${expiredAllowances(data)}`;
+}
+
+function tick(updateChips) {
   const data = state.data;
   if (!data) return;
-  if (`${nowState(data)}|${recentState(data)}` !== state.painted) {
+  if (paintKey(data) !== state.painted) {
     paintAll();
     if (!state.failedAt) document.getElementById("flow-content").innerHTML = renderFlow(data);
+    if (typeof updateChips === "function") updateChips();
   }
   paintAges();
 }
@@ -471,7 +498,7 @@ function chips(latest) {
   if (!data) return "";
   const out = [];
   const counts = data.recent?.counts;
-  if (recentState(data) !== "missing" && counts) {
+  if (["fresh", "partial"].includes(recentState(data)) && counts) {
     const lanes = [counts.brief || {}, counts.resolver || {}];
     const held = lanes.reduce((n, lane) => n + (lane.admission?.deferred || 0) + (lane.admission?.refused || 0), 0);
     const substituted = lanes.reduce((n, lane) => n + (lane.substitutions || 0), 0);
@@ -502,7 +529,7 @@ const PANELS = [{
     return renderFlow(data);
   },
   // A cold evaluation answers "pending": read again shortly rather than wait 30 s.
-  retry: data => data?.now?.state === "pending",
+  retry: data => data?.now?.state === "pending" || data?.recent?.status === "pending",
   onError: () => {
     state.failedAt = Date.now();
     if (state.data) {
@@ -514,7 +541,7 @@ const PANELS = [{
       setAge("decisions-age", "unavailable", "bad");
     }
   },
-  onTick: () => tick(),
+  onTick: (_panel, _latest, updateChips) => tick(updateChips),
 }];
 
 document.getElementById("decision-filters").addEventListener("change", () => {

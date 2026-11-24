@@ -380,14 +380,14 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "Hot task records (batch_state/tasks), the routing budget dispatch admission reads (/api/state/routing-budget), "
         f"{_rel('orchestration', 'dispatch_admission.py')} thresholds, meter rule and host probes, the subscription "
         f"readings shared with /api/runtime/subscriptions, and {_rel('review', 'reviewer_resolver.py')} seat evaluation.",
-        "now's verdicts are evaluated against the routing budget read by the request, keyed by its fingerprint: "
-        "another budget is evaluated afresh (the request waits up to 0.5 s, else answers pending and the page "
-        "reads again after 3 s). recent is one scan of the "
-        "task records (the last day's decisions and every live worker), served stale-while-revalidate "
-        "(state_helpers.cache_read_swr): the last value at once with its true age in X-Snapshot-Age-S, refreshed "
-        "after 30 s, stale after 90 s. The task store is listed on every request. A source that cannot be read is "
-        "typed unknown with its reason and the time of its last reading, never zero; partial task data makes an "
-        "admitted verdict unknown.",
+        "now's verdicts are a snapshot of admission's report-only evaluation with its evaluation time, at most "
+        "15 s old (a read waits up to 0.5 s for the next one, else answers pending and the page reads again after "
+        "3 s); every dispatch is evaluated again when it starts. recent is one scan of the task records (the last "
+        "day's decisions and every live worker), served stale-while-revalidate (state_helpers.cache_read_swr): the "
+        "last value at once with its true age in X-Snapshot-Age-S, refreshed after 30 s, stale after 90 s. The task "
+        "store is listed on every request. A source that cannot be read is typed unknown with its reason and the "
+        "time of its last reading, never zero; unreadable task data makes an admitted verdict unknown, and each "
+        "allowance carries the time it stops being fresh.",
         ("routing.html", "operators", "agents"),
         "Replaces /api/runtime/routing-assignments, whose routing-reservation ledger lost its only writer when the "
         "sealed formal review path was retired; reuses the routing budget, subscription and resolver projections "
