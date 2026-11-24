@@ -422,8 +422,10 @@ does these steps in order:
      allowance. This is the reviewer resolver's rule: a fresh reading above
      the near-cap reserve, account b first among funded accounts. The reading
      must be the account's own fresh provider sample. A ledger estimate, a
-     missing or stale probe, a row for another account, or a route the
-     resolver blocks (unhealthy, logged out, circuit open) is not allowance.
+     missing or stale probe, a sample fetched longer ago than the probe age
+     limit, a plan window outside 0–100%, a provider probe that failed after
+     the sample, a row for another account, or a route the resolver blocks
+     (unhealthy, logged out, circuit open) is not allowance.
      When no Codex account is funded, or the budget is unreadable, the canary
      refuses with `no-allowance` and lists each account's reading. A dry run
      reads the same budget, prints the chosen accounts and refuses the same

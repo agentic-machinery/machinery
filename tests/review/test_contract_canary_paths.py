@@ -289,7 +289,11 @@ def runner_roots(tmp_path, configured_roots, monkeypatch):
 def funded_snapshot(*, a: float, b: float) -> dict:
     """A fresh routing budget, as Monitor publishes provider readings, with Codex accounts a and b
     at the given remaining %."""
-    probe = {"status": "healthy", "status_source": "weekly_pace", "freshness": "fresh", "age_s": 60.0}
+    from datetime import UTC, datetime, timedelta
+
+    fetched = (datetime.now(UTC) - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+    probe = {"status": "healthy", "status_source": "weekly_pace", "freshness": "fresh", "age_s": 60.0,
+             "fetched_at": fetched}
     return {
         "diagnostics": {"stale": False},
         "agents": {"codex": {**probe, "remaining_pct": a}},

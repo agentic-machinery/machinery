@@ -340,11 +340,17 @@ def _allowance(
     account's own probe and takes a ledger estimate as a percentage. The canary therefore counts
     only the account's own provider sample, as the credit lane requires of Codex account b: a
     provider-sourced record (``status_source`` ``weekly_pace``, not a ``ledger_burn`` estimate),
-    its own fresh probe (``credit_lane.probe_freshness``), a real percentage, and ``own``: the
-    record names this account, with no stale or contradictory account row behind it. A route the
-    resolver's ``review_capacity_action`` blocks (unhealthy, circuit open, NEED_LOGIN, ineligible,
-    headroom blocked) is never used, whatever its allowance.
+    its own fresh probe (``credit_lane.probe_freshness``) whose ``fetched_at`` is still within the
+    probe age limit now (Monitor can serve a budget it built earlier, so the published age is the
+    age at build time), every plan window a real percentage (the reading is their minimum, which
+    would hide a window above 100), no provider probe failure since that sample, and ``own``: the
+    record names this account, with no stale or contradictory account row behind it. These extend
+    the credit lane's own checks for Codex account b. A route the resolver's
+    ``review_capacity_action`` blocks (unhealthy, circuit open, NEED_LOGIN, ineligible, headroom
+    blocked) is never used, whatever its allowance.
     """
+    from datetime import UTC, datetime
+
     from lu_machinery.fleet import credit_lane
     from lu_machinery.review.capacity import review_capacity, review_capacity_action
     from lu_machinery.review.reviewer_resolver import _has_observed_allowance
@@ -354,16 +360,32 @@ def _allowance(
     if remaining is None:
         return False, f"no allowance reading ({capacity.fallback_reason})"
     text = f"{remaining:g}% remaining, {capacity.freshness}"
-    probe, why = credit_lane.probe_freshness(record, credit_lane.probe_max_age_s())
+    max_age = credit_lane.probe_max_age_s()
+    probe, why = credit_lane.probe_freshness(record, max_age)
     source = record.get("status_source")
-    if not 0 <= remaining <= 100:
-        return False, f"{text}, not a percentage"
+    native = record.get("codexbar")
+    native = native if isinstance(native, Mapping) else {}
+    windows = [record.get("remaining_pct"), credit_lane._auto_window(record).get("remaining_pct"),
+               *(native.get(f"{name}_remaining_pct") for name in ("weekly", "primary", "secondary"))]
+    if any(value is not None and not (credit_lane._number(value) is not None and 0 <= value <= 100)
+           for value in windows):
+        return False, f"{text}, a plan window is not a percentage ({windows})"
     if source != "weekly_pace":
         return False, f"{text}, not a provider reading (status_source {source or 'missing'})"
     if not own:
         return False, f"{text}, not this account's own fresh reading"
     if probe != credit_lane.FRESH:
         return False, f"{text}, provider probe {probe} ({why})"
+    fetched = credit_lane._field(dict(record), "fetched_at")
+    if credit_lane._fresh_at(fetched, datetime.now(UTC), max_age) is None:
+        return False, f"{text}, provider sample fetched at {fetched or 'missing'}, not within {max_age:g}s of now"
+    # Monitor keeps the last usable sample when a later probe fails, and marks the failure with
+    # ``last_failure_at`` (cleared by the next usable probe). A failed latest probe (a login
+    # failure among them) means the sample is not the account's current state.
+    failed = credit_lane._field(dict(record), "last_failure_at")
+    if failed is not None:
+        kind = credit_lane._field(dict(record), "failure_kind") or "unknown"
+        return False, f"{text}, its latest provider probe failed at {failed} ({kind})"
     blocked, cause = review_capacity_action(route, record, diagnostics, _RUN_MODELS[route])
     if blocked:
         return False, f"{text}, route blocked ({cause})"
