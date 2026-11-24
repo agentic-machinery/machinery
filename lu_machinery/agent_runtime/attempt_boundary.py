@@ -29,7 +29,7 @@ import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -56,6 +56,9 @@ from .env_sanitize import (
     claude_machine_policy_state,
     claude_profile_store_dirs,
 )
+
+if TYPE_CHECKING:
+    from lu_machinery.dispatcher.agy_sandbox import SourcesRelay
 
 # Claude account labels. A run carries one label; the default account is the
 # one this host has always used. Which account a non-default label means lives
@@ -1276,7 +1279,9 @@ def runtime_files(binary: Path) -> list[Path]:
 
 
 class AttemptBoundary:
-    def __init__(self, *, agent: str, tool_config: dict[str, Any]):
+    def __init__(
+        self, *, agent: str, tool_config: dict[str, Any], consumer_workspace: Path | None = None,
+    ):
         from lu_machinery.review.isolation import ReviewIsolationError, stage_engine_auth
 
         from .attempt_network import AttemptEgress
@@ -1284,42 +1289,55 @@ class AttemptBoundary:
 
         # Claude's adapter must land with its own eligible cross-family review
         # before formal attempts can stage credentials or launch any process.
+        self.consumer = consumer_workspace is not None
         self.full = tool_config.get("review_access") == "full"
         if agent == "claude" and not self.full:
             raise ReviewIsolationError("attempt_boundary_claude_adapter_pending")
         if agent not in SUPPORTED_HARNESSES:
             raise ReviewIsolationError("attempt_harness_unsupported")
-        config = Path(tool_config["mcp_config_path"])
-        verify_review_attempt_paths(config)
-        self.config_path = config
-        server = json_depth.loads(config.read_bytes(), max_depth=512)["mcpServers"]["sources"]
         access = "full" if self.full else "isolated"
-        if server["env"].get("LU_REVIEW_ACCESS") != access:
-            raise ReviewIsolationError("attempt_review_access_mismatch")
-        manifest_path = Path(tool_config["review_manifest"])
-        data = manifest_path.read_bytes()
-        if hashlib.sha256(data).hexdigest() != server["env"]["LU_REVIEW_MANIFEST_SHA256"]:
-            raise ReviewIsolationError("attempt_manifest_hash_mismatch")
-        if server["env"]["LU_REVIEW_ATTEMPT_ID"] != tool_config["attempt_id"]:
-            raise ReviewIsolationError("attempt_identity_mismatch")
-        root = Path(tool_config["review_input_root"]).resolve(strict=True)
-        closure = {} if self.full else authorized_closure(yaml.safe_load(data), root)
+        if consumer_workspace is not None:
+            if agent != "agy" or tool_config:
+                raise ReviewIsolationError("agy_consumer_boundary_requires_default_config")
+            root = _agy_consumer_checkout(consumer_workspace)
+            closure: dict[str, bytes] = {}
+        else:
+            config = Path(tool_config["mcp_config_path"])
+            verify_review_attempt_paths(config)
+            self.config_path = config
+            server = json_depth.loads(config.read_bytes(), max_depth=512)["mcpServers"]["sources"]
+            if server["env"].get("LU_REVIEW_ACCESS") != access:
+                raise ReviewIsolationError("attempt_review_access_mismatch")
+            data = Path(tool_config["review_manifest"]).read_bytes()
+            if hashlib.sha256(data).hexdigest() != server["env"]["LU_REVIEW_MANIFEST_SHA256"]:
+                raise ReviewIsolationError("attempt_manifest_hash_mismatch")
+            if server["env"]["LU_REVIEW_ATTEMPT_ID"] != tool_config["attempt_id"]:
+                raise ReviewIsolationError("attempt_identity_mismatch")
+            root = Path(tool_config["review_input_root"]).resolve(strict=True)
+            closure = {} if self.full else authorized_closure(yaml.safe_load(data), root)
+        self.reject_root = root
         temporary_parent = tool_config.get("read_only_tmp_root")
+        if self.consumer and Path(tempfile.gettempdir()).resolve().is_relative_to(root):
+            raise ReviewIsolationError("agy_consumer_scratch_inside_checkout")
         self.temp = tempfile.TemporaryDirectory(prefix="attempt-", dir=temporary_parent)
-        self.connection = None
+        self.connection: SourcesConnection | SourcesRelay | None = None
         self.egress = None
         self.egress_evidence: dict = {}
         self.agent = agent
         try:
             if platform.system() != "Linux":
                 raise ReviewIsolationError(
-                    "full_review_bwrap_unavailable" if self.full else "attempt_network_namespace_unavailable"
+                    "full_review_bwrap_unavailable" if self.full or self.consumer else "attempt_network_namespace_unavailable"
                 )
             base = Path(self.temp.name).resolve()
-            self.workspace = Path(tool_config["review_cwd"]).resolve(strict=True) if self.full else base / "inputs"
-            self.write_root = base / "runtime"
-            if not self.full:
+            if self.consumer:
+                self.workspace = root
+            elif self.full:
+                self.workspace = Path(tool_config["review_cwd"]).resolve(strict=True)
+            else:
+                self.workspace = base / "inputs"
                 self.workspace.mkdir(mode=0o700)
+            self.write_root = base / "runtime"
             self.write_root.mkdir(mode=0o700)
             for name, content in closure.items():
                 destination = self.workspace / name
@@ -1327,7 +1345,7 @@ class AttemptBoundary:
                 destination.write_bytes(content)
             home = self.write_root / "home"
             (self.write_root / "tmp").mkdir()
-            self.env = build_agent_env(provider=agent)
+            self.env = {"LANG": "C.UTF-8"} if self.consumer else build_agent_env(provider=agent)
             home.mkdir()
             if agent == "codex":
                 self.env.update(stage_codex_account_auth(tool_config.get(CODEX_ACCOUNT_KEY), home))
@@ -1349,7 +1367,14 @@ class AttemptBoundary:
             proxy.write_bytes(Path(__file__).with_name("attempt_proxy.py").read_bytes())
             endpoint = self.write_root / "sources.sock"
             self.endpoint = endpoint
-            self.connection = SourcesConnection(endpoint, server)
+            if self.consumer:
+                from lu_machinery.dispatcher.agy_sandbox import SourcesRelay
+
+                from .review_mcp import REVIEWER_SOURCES_ENV, review_tools
+
+                self.connection = SourcesRelay(endpoint, review_tools(access), dict(REVIEWER_SOURCES_ENV))
+            else:
+                self.connection = SourcesConnection(endpoint, server)
             self.egress_endpoint = self.write_root / "egress.sock"
             self.egress = AttemptEgress(self.egress_endpoint)
             self.forwarder = self.write_root / "forwarder.py"
@@ -1359,8 +1384,10 @@ class AttemptBoundary:
                 "command": str(Path(sys.executable).resolve(strict=True)),
                 "args": ["-I", str(proxy), str(endpoint)],
             }
-            proxy_config = self.write_root / "mcp.json"
+            proxy_config = self.write_root / ("consumer.mcp.json" if self.consumer else "mcp.json")
             proxy_config.write_text(json.dumps({"mcpServers": {"sources": proxy_server}}))
+            if self.consumer:
+                self.config_path = proxy_config
             self.tool_config = {
                 **tool_config,
                 "mcp_config_path": str(proxy_config),
@@ -1413,7 +1440,7 @@ class AttemptBoundary:
                 settings = target.parent / "settings.json"
                 fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                 with os.fdopen(fd, "w") as handle:
-                    handle.write(json.dumps(agy_review_settings(access, checkout_root=self.workspace)))
+                    handle.write(json.dumps(agy_review_settings(access, checkout_root=consumer_workspace or self.workspace)))
                 self.tool_config["agy_home_override"] = str(home)
                 self.env["AGY_APP_DATA_DIR"] = str(target.parent)
             else:
@@ -1428,15 +1455,19 @@ class AttemptBoundary:
 
         binary = Path(shutil.which(cmd[0]) or cmd[0]).resolve(strict=True)
         runtime = runtime_files(binary)
-        reject = Path(self.tool_config["review_input_root"]).resolve()
+        reject = self.reject_root
         if not self.full and any(p.is_relative_to(reject) or reject.is_relative_to(p) for p in runtime):
             raise ReviewIsolationError("attempt_runtime_overlaps_repository")
-        full_reads, hidden = full_review_reads(self.workspace) if self.full else ([], [])
+        full_reads: list[Path]
+        if self.consumer:
+            full_reads, hidden = [], _agy_consumer_hidden_roots(self.workspace)
+        else:
+            full_reads, hidden = full_review_reads(self.workspace) if self.full else ([], [])
         self.sandbox = prepare_host_sandbox(
             engine=self.agent,
             snapshot_root=self.workspace,
             write_root=self.write_root,
-            reject_root=Path(self.tool_config["review_input_root"]),
+            reject_root=reject,
             runtime_reads=[*runtime, *full_reads, self.endpoint],
             network_allowed=False,
         )
@@ -1477,12 +1508,13 @@ class AttemptBoundary:
                 "/proc",
                 "--chdir",
                 str(self.workspace),
+                *(("--remount-ro", "/") if self.consumer else ()),
             ]
         return wrapped, env
 
     def verify_seat(self, cmd: list[str], env_overrides: dict[str, str]) -> None:
         """Probe CLI compatibility and effective MCP inside the full OS boundary."""
-        if not self.full:
+        if not (self.full or self.consumer):
             return
         from lu_machinery.review.isolation import CLAUDE_MIN_SUPPORTED_CLI_VERSION, ReviewIsolationError
 
@@ -1617,17 +1649,54 @@ def full_review_reads(workspace: Path) -> tuple[list[Path], list[Path]]:
         hidden = [
             p for p in (workspace / "batch_state", workspace / ".worktrees", workspace / ".git/worktrees") if p.is_dir()
         ]
-        for root in (workspace, *reads):
-            if root.is_dir():
-                for directory, subdirs, files in os.walk(root, followlinks=False):
-                    subdirs[:] = [name for name in subdirs if Path(directory) / name not in hidden]
-                    for name in (*subdirs, *files):
-                        mode = (Path(directory) / name).lstat().st_mode
-                        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
-                            raise ReviewIsolationError("full_review_special_file_refused")
+        _refuse_special_files((workspace, *reads), hidden)
         return reads, hidden
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ReviewIsolationError("full_review_git_context_unavailable") from exc
+
+
+def _refuse_special_files(roots: Iterable[Path], hidden: list[Path]) -> None:
+    from lu_machinery.review.isolation import ReviewIsolationError
+
+    for root in roots:
+        if root.is_dir():
+            for directory, subdirs, files in os.walk(root, followlinks=False):
+                parent = Path(directory)
+                subdirs[:] = [name for name in subdirs if parent / name not in hidden]
+                for name in (*subdirs, *files):
+                    mode = (parent / name).lstat().st_mode
+                    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                        raise ReviewIsolationError("full_review_special_file_refused")
+
+
+def _agy_consumer_checkout(workspace: Path) -> Path:
+    from lu_machinery.orchestration.execution_safe_git import run_git
+    from lu_machinery.review.isolation import ReviewIsolationError
+
+    try:
+        root = workspace.resolve(strict=True)
+        git = run_git(["rev-parse", "--show-toplevel"], cwd=root, env={}, capture_output=True, text=True)
+        if git.returncode or Path(git.stdout.removesuffix("\n")) != root or Path.home().resolve().is_relative_to(root):
+            raise ReviewIsolationError("agy_consumer_checkout_required")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ReviewIsolationError("agy_consumer_checkout_required") from exc
+    return root
+
+
+def _agy_consumer_hidden_roots(workspace: Path) -> list[Path]:
+    from lu_machinery.review.isolation import ReviewIsolationError
+
+    # Do not load consumer-owned MCP, plugin or hook definitions. Do not
+    # expose another worktree, the dispatch store or primary Git config.
+    hidden = []
+    for name in (".agents", ".git", ".worktrees", "batch_state"):
+        path = workspace / name
+        if path.is_symlink():
+            raise ReviewIsolationError("agy_consumer_unsafe_checkout_entry")
+        if path.is_dir():
+            hidden.append(path)
+    _refuse_special_files((workspace,), hidden)
+    return hidden
 
 
 def prepare_attempt_boundary(agent: str, mode: str, session_id: str | None, tool_config: dict | None):

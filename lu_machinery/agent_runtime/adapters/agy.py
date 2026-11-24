@@ -43,9 +43,8 @@ per-invocation MCP flag because agy has none; ``tool_config["mcp_server_names"]`
 is accepted for API parity and observability. Writer dispatch registers and
 verifies the catalog via ``tool_config.ensure_agy_mcp_catalog`` before spawning.
 
-A receipt-recording review attempt (#8617) is the one exception to "global config
-only": ``tool_config["agy_home_override"]`` points at a per-attempt scoped home
-(built by ``review_mcp.prepare_review_attempt``) and the invocation's env overrides
+A scoped read-only invocation uses ``tool_config["agy_home_override"]`` to point
+at a private home. The invocation's env overrides
 set ``HOME`` to it and ``AGY_APP_DATA_DIR`` to ``<home>/.gemini/antigravity-cli``.
 The CLI then loads the scoped ``config/mcp_config.json`` (one stdio ``sources``
 server) and the transcript reader follows ``AGY_APP_DATA_DIR`` to the scoped app
@@ -98,7 +97,12 @@ from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from lu_machinery.agent_runtime.agy_hook_config import require_hook_config
+from lu_machinery.agent_runtime.agy_hook_config import (
+    AgyHookConfigError,
+    check_hook_config,
+    hook_locations,
+    require_hook_config,
+)
 from lu_machinery.agent_runtime.attempt_safe_read import (
     AttemptReadError,
     safe_attempt_file_size,
@@ -1083,18 +1087,24 @@ class AgyAdapter:
             validate_agy_read_only_paths(prompt, mode=mode, cwd=cwd, tool_config=tc)
             _write_review_permissions(tc, mode=mode, session_id=session_id, cwd=cwd)
 
-        require_hook_config(
-            cwd,
-            Path.home(),
-            Path(str(tc["agy_home_override"])) if tc.get("agy_home_override") else None,
-            install=True,
-        )
+        from ..attempt_boundary import AttemptBoundary
+
+        boundary = tc.get("review_attempt_boundary")
+        consumer_route = isinstance(boundary, AttemptBoundary) and boundary.consumer
+        scoped_home = Path(str(tc["agy_home_override"])) if tc.get("agy_home_override") else None
+        if consumer_route:
+            # Only the scoped registration is loadable in the consumer sandbox.
+            result = check_hook_config(hook_locations(cwd, Path.home(), scoped_home)[1:])
+            if not result.passed:
+                raise AgyHookConfigError(result.reason)
+        else:
+            require_hook_config(cwd, Path.home(), scoped_home, install=True)
 
         agy_bin = shutil.which("agy") or str(Path.home() / ".local/bin/agy")
         # Prefer absolute binary for isolation policy / sandbox argv0 rules.
         with contextlib.suppress(OSError):
             agy_bin = str(Path(agy_bin).resolve())
-        if not (tc.get("review_attempt_boundary") and tc.get("review_access") == "full"):
+        if not (consumer_route or (boundary and tc.get("review_access") == "full")):
             _require_background_wait_support(agy_bin)
         if (review_isolation or tc.get("review_attempt_boundary")) and tc.get("review_write_root"):
             log_dir = Path(str(tc["review_write_root"])) / "tmp"

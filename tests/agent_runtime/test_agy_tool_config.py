@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import sentinel
 
 import pytest
 
@@ -35,6 +37,55 @@ def _write_agy_mcp_config(app_data_dir: Path, data: dict) -> Path:
     config_path = app_data_dir / "mcp_config.json"
     config_path.write_text(json.dumps(data), encoding="utf-8")
     return config_path
+
+
+def test_consumer_read_only_agy_without_tool_config_gets_bounded_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consumer read-only AGY with no tool_config was refused instead of bounded."""
+    from lu_machinery.agent_runtime import review_mcp, runner
+    from lu_machinery.agent_runtime.adapters.agy import AgyAdapter
+    from lu_machinery.agent_runtime.attempt_boundary import AttemptBoundary
+
+    checkout = tmp_path / "consumer"
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    (checkout / "README.md").write_text("# Consumer\n")
+    token = tmp_path / "auth"
+    token.write_text("fixture")
+    monkeypatch.setattr(review_mcp, "_real_agy_token", lambda: token)
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "not-the-checkout"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ambient-config"))
+    monkeypatch.setenv("LU_REVIEW_ATTEMPT_ID", "ambient-attempt")
+    scratch = []
+
+    def inspect(agent, prompt, *, cwd, mode, tool_config, allow_runner_failover, **_):
+        plan = AgyAdapter().build_invocation(
+            prompt=prompt, mode=mode, cwd=cwd, model=None, task_id=None,
+            session_id=None, tool_config=tool_config,
+        )
+        boundary = tool_config["review_attempt_boundary"]
+        assert isinstance(boundary, AttemptBoundary)
+        assert boundary.workspace == plan.cwd == checkout
+        assert not allow_runner_failover
+        assert "--sandbox" in plan.cmd
+        assert "--dangerously-skip-permissions" not in plan.cmd
+        home = Path(plan.env_overrides["HOME"])
+        assert home.is_relative_to(boundary.write_root)
+        assert not home.is_relative_to(checkout)
+        assert not ({"GIT_DIR", "XDG_CONFIG_HOME", "LU_REVIEW_ATTEMPT_ID"} & boundary.env.keys())
+        settings = json.loads((review_mcp.agy_review_app_data_dir(home) / "settings.json").read_text())
+        assert settings["permissions"]["allow"][0] == f"read_file({checkout})"
+        assert {"command(*)", "write_file(*)"} <= set(settings["permissions"]["deny"])
+        scratch.append(boundary.write_root)
+        return sentinel.result
+
+    monkeypatch.setattr(runner, "_invoke_impl", inspect)
+    assert runner.invoke("agy", "Read README.md.", cwd=checkout, mode="read-only") is sentinel.result
+    assert len(scratch) == 1
+    assert not scratch[0].exists()
+    assert not (checkout / ".agents").exists()
+    assert token.read_text() == "fixture"
 
 
 def test_agy_resolves_requested_global_mcp_server(
