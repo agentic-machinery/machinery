@@ -9,7 +9,8 @@ One read-only collector joins two durable sources:
 
 One refresh computes every window (24 hours, 7, 30, 90 days and all) and the ISO-week buckets; the route serves a
 window of that snapshot and ``ModelStatsCollector`` exposes the same snapshot on the Monitor's ``/metrics``.
-``/metrics`` keeps the four longer windows, so a 24-hour series does not add a label value. ``view=page`` serves
+``/metrics`` keeps the four longer windows for its existing model stats and exports token gauges at 24 hours
+and seven days. ``view=page`` serves
 the same figures without the per-class tree and without reply text. ``view=samples`` serves that reply text
 alone, and the page asks for it on its own. Every figure
 splits by the concrete model id and the effective effort. Unknown effort is shown separately from model totals.
@@ -42,6 +43,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
+from heapq import nlargest
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -102,6 +104,10 @@ PAGE_DROP = frozenset({
 # Snapshot sides the route never spreads into a response. ``sample_windows`` is served only by ``view=samples``.
 _UNSERVED = frozenset({"windows", "page_windows", "sample_windows", "metrics", "worker_allowance"})
 STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed", NEVER_STARTED)
+FAILED_RUNS = frozenset(STATUSES) - {"done"}
+TOKEN_FIELDS = ("fresh_input", "cached_input", "output")
+TOKEN_WASTE_CLASSES = ("failed_or_empty", "supplemental_review")
+TOKEN_METRIC_WINDOWS = frozenset({"24h", "7d"})
 START_REFUSAL_CODES = frozenset(StartRefusal)
 UNPARSED_REASON_KEYS = (*UNPARSED_REASONS, "not_done", "unknown")
 ALL_EFFORTS = "all"
@@ -1327,6 +1333,102 @@ def _reviewed_pr(row: _Row) -> _PrKey | None:
     return (row.raw["repo"], pr) if isinstance(pr, int) and pr > 0 else None
 
 
+def _token_work(rows: Sequence[_Row]) -> dict[str, str]:
+    """Classify recorded work without using task names, model names or reply text."""
+    published_heads: dict[tuple[str, str], set[int]] = defaultdict(set)
+    for row in rows:
+        if row.published_pr is not None and isinstance(head := row.raw.get("pinned_head"), str):
+            published_heads[row.raw["repo"], head].add(row.published_pr)
+
+    work = {}
+    for row in rows:
+        if row.status in FAILED_RUNS:
+            kind = "failed_or_empty"
+        elif row.published is not None:
+            kind = "review_of_record"
+        elif row.role == "review":
+            # The supplemental dispatch omits the PR and author flags, but pins the exact head.
+            # Require a parsed verdict and one published PR on that head in the same repository.
+            head = row.raw.get("pinned_head")
+            matches = published_heads.get((row.raw["repo"], head)) if isinstance(head, str) else None
+            kind = ("supplemental_review" if matches and len(matches) == 1 and row.review is not None
+                    and row.review[0] in VERDICTS[:3] and row.raw.get("pr") is None
+                    and row.review_author is None else "unclassified_review")
+        elif row.raw.get("implementation") is True or row.trailer:
+            kind = "implementation"
+        else:
+            kind = "unclassified_work"
+        work[row.task_id] = kind
+    return work
+
+
+def _has_token_reading(row: _Row) -> bool:
+    # Old rows encode missing usage as (0, 0, 0), indistinguishable from an actual zero-token reading.
+    known = row.raw.get("usage_known")
+    if known is None:
+        return any(row.tokens) or row.status == NEVER_STARTED
+    return known is True
+
+
+def _token_totals(rows: Sequence[_Row], merged: int | None) -> dict[str, Any]:
+    counts = [row.tokens for row in rows if _has_token_reading(row)]
+    totals = None
+    if counts:
+        totals = {field: sum(column) for field, column in zip(TOKEN_FIELDS, zip(*counts, strict=True), strict=True)}
+    volume = sum(totals.values()) if totals is not None else None
+    return {"tasks": len(rows), "reported_tasks": len(counts), "totals": totals,
+            "tokens": volume, "per_merged_pr": round(volume / merged) if volume is not None and merged else None}
+
+
+_TokenMetricRows = list[tuple[str, str, dict[str, int]]]
+
+
+def _token_use(rows: list[_Row], work: Mapping[str, str], merged: int | None, *,
+               include_metrics: bool) -> tuple[dict[str, Any], _TokenMetricRows]:
+    def model_name(row: _Row) -> str:
+        return OTHER if retired_subscription_model(row.model) else _page_model(row.model)
+
+    by_work: dict[str, list[_Row]] = defaultdict(list)
+    by_model: dict[str, list[_Row]] = defaultdict(list)
+    by_model_work: dict[tuple[str, str], list[_Row]] = defaultdict(list)
+    for row in rows:
+        kind, model = work[row.task_id], model_name(row)
+        by_work[kind].append(row)
+        by_model[model].append(row)
+        if include_metrics:
+            by_model_work[model, kind].append(row)
+    overall = _token_totals(rows, merged)
+    kinds = ("implementation", "review_of_record", "supplemental_review", "failed_or_empty",
+             "unclassified_review", "unclassified_work")
+    work_totals = {kind: _token_totals(by_work[kind], merged) for kind in kinds}
+    waste = {}
+    for kind in TOKEN_WASTE_CLASSES:
+        group = work_totals[kind]
+        amount = group["tokens"]
+        waste[kind] = {**group, "share": amount / overall["tokens"]
+                       if amount is not None and overall["tokens"] else None}
+
+    cache = []
+    for model, tasks in sorted(by_model.items()):
+        group = _token_totals(tasks, None)
+        totals = group["totals"]
+        input_tokens = totals["fresh_input"] + totals["cached_input"] if totals is not None else 0
+        cache.append({"model": model, "tasks": group["tasks"], "reported_tasks": group["reported_tasks"],
+                      "ratio": totals["cached_input"] / input_tokens if input_tokens else None})
+
+    largest = nlargest(5, (row for row in rows if _has_token_reading(row)),
+                       key=lambda row: (sum(row.tokens), row.task_id))
+    report = {
+        **overall, "merged_prs": merged, "by_work": {**work_totals, "landing_helpers": None},
+        "waste": {**waste, "capped_and_replaced": None}, "avoidable_share": None, "cache_by_model": cache,
+        "top_tasks": [{"model": model_name(row), "status": row.status, "tokens": sum(row.tokens)}
+                      for row in largest],
+    }
+    metrics = [(model, kind, totals) for (model, kind), tasks in sorted(by_model_work.items())
+               if (totals := _token_totals(tasks, None)["totals"]) is not None]
+    return report, metrics
+
+
 def _review_order(row: _Row) -> tuple[datetime, str]:
     return (row.started or row.moment, row.task_id)
 
@@ -1899,6 +2001,12 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     for pr in all_record_prs:
         if (merged := landing.prs.get(pr["key"])) and merged.at < until:
             pr["diff_size"] = merged.size
+    # Token spend covers every recorded model and effort, including historical routes absent from today's tables.
+    token_rows = rows
+    token_work = _token_work(token_rows)
+    merge_times = [pr.at for pr in landing.prs.values() if pr.at < until]
+    read_repositories = landing.repositories["read"]
+    complete_landing = read_repositories > 0 and read_repositories == landing.repositories.total()
     rows = [replace(row, author=None, review_author=None)
             if row.review_author and retired_subscription_model(row.review_author) else row
             for row in rows if not retired_subscription_model(row.model)]
@@ -1908,7 +2016,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     # Group on page labels so tables and charts have one row per bucket. The raw repository remains the PR join key.
     page_rows = [replace(row, model=_page_model(row.model),
                          task_class=_page_class(row.task_class)) for row in rows]
-    windows, metric_windows, page_windows, sample_windows = {}, {}, {}, {}
+    windows, metric_windows, page_windows, sample_windows, token_windows = {}, {}, {}, {}, {}
     for name, days in WINDOWS.items():
         since = first if days is None else until - timedelta(days=days)
         rework_since = datetime.min.replace(tzinfo=UTC) if days is None else since
@@ -1919,8 +2027,14 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         record_prs = [pr for pr in all_record_prs if since <= pr["first_at"]]
         window = {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
                   "cohort": "finished_at, else started_at, in [since, until)"}
+        merged_prs = sum(since <= at for at in merge_times) if complete_landing else None
+        token_use, token_metrics = _token_use([row for row in token_rows if since <= row.moment], token_work,
+                                             merged_prs, include_metrics=name in TOKEN_METRIC_WINDOWS)
+        if name in TOKEN_METRIC_WINDOWS:
+            token_windows[name] = {"rows": token_metrics, "merged_prs": merged_prs}
         windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows, touched=touched,
                                                        record_prs=record_prs),
+                         "token_use": token_use,
                          "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since)}
         # Bound each member of the author id after deriving PR outcomes: a joint author stays joint, never a known model.
         page_prs, page_record_prs = (
@@ -1932,6 +2046,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
                                  touched=touched, accuracy_rows=selected, reviewer_name=_page_model)
         sample_windows[name] = {"window": window, "models": _sample_models(page_summary["models"])}
         page_windows[name] = {"window": window, **page_window(page_summary),
+                              "token_use": token_use,
                               "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since, _page_author)}
         # /metrics labels come from a finite set: a model outside the catalog's known values is "other".
         # 24h stays off this label set.
@@ -1952,7 +2067,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         "page_windows": page_windows,
         "sample_windows": sample_windows,
         "weeks": _weeks(weeks),
-        "metrics": {"windows": metric_windows, "weeks": _weeks(bounded_weeks)},
+        "metrics": {"windows": metric_windows, "weeks": _weeks(bounded_weeks), "token_windows": token_windows},
         "worker_allowance": _worker_allowance([row for row in rows if row.moment >= until - timedelta(days=7)]),
         "coverage": {"rows": dict(sorted(row_counts.items())), "landing": landing.to_dict(),
                      "publications": dict(sorted(publication_counts.items())),
@@ -2034,10 +2149,10 @@ def page_window(payload: Mapping[str, Any]) -> dict[str, Any]:
 async def model_stats(
     window: Literal["24h", "7d", "30d", "90d", "all"] = Query(
         default="7d", description="Window: 24h, 7d, 30d, 90d or all"),
-    view: Literal["full", "page", "samples"] = Query(
+    view: Literal["full", "page", "samples", "tokens"] = Query(
         default="full",
         description="full keeps every class; page is the dashboard projection without reply text; "
-                    "samples is that reply text alone"),
+                    "samples is that reply text alone; tokens is the token-use summary alone"),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> JSONResponse:
     """Serve one window of the cached snapshot; a refresh runs off-loop with the shared single flight.
@@ -2067,6 +2182,10 @@ async def model_stats(
         stored = (computed, 0.0)
     snapshot, age = cast(dict[str, Any], stored[0]), stored[1]
     headers = snapshot_headers(age, FRESHNESS_BOUND_SECONDS)
+    if view == "tokens":
+        selected = snapshot["page_windows"][window]
+        return JSONResponse({"schema_version": snapshot["schema_version"], "status": "ok", "age_seconds": round(age, 1),
+                             **{key: selected[key] for key in ("window", "token_use")}}, headers=headers)
     if view == "samples":
         samples = snapshot.get("sample_windows")
         window_samples = samples.get(window) if isinstance(samples, Mapping) else None
@@ -2127,6 +2246,33 @@ class ModelStatsCollector:
         yield age_gauge
         yield from self._windows(snapshot["metrics"]["windows"])
         yield from self._weeks(snapshot["metrics"]["weeks"])
+        yield from self._token_gauges(snapshot["metrics"].get("token_windows", {}), age)
+
+    @staticmethod
+    def _token_gauges(windows: Mapping[str, Mapping[str, Any]], age: float) -> Iterator[GaugeMetricFamily]:
+        labels = ["window", "model", "work_type"]
+        usage = {field: GaugeMetricFamily(f"lu_tokens_{field}", f"Recorded {field.replace('_', ' ')} tokens.",
+                                          labels=labels) for field in TOKEN_FIELDS}
+        per_pr = GaugeMetricFamily("lu_tokens_per_merged_pr", "Recorded tokens per observed merged PR.", labels=labels)
+        waste = GaugeMetricFamily("lu_tokens_waste", "Recorded token volume by waste class.",
+                                  labels=["window", "model", "waste_class"])
+        token_age = GaugeMetricFamily("lu_token_data_age_seconds", "Age of the cached token snapshot.")
+        token_age.add_metric([], round(age, 3))
+        for name, window in windows.items():
+            merged = window["merged_prs"]
+            for model, kind, totals in window["rows"]:
+                values = [name, model, kind]
+                for count_name, gauge in usage.items():
+                    gauge.add_metric(values, totals[count_name])
+                volume = sum(totals.values())
+                if kind in TOKEN_WASTE_CLASSES:
+                    waste.add_metric(values, volume)
+                if merged:
+                    per_pr.add_metric(values, volume / merged)
+        yield from usage.values()
+        yield per_pr
+        yield waste
+        yield token_age
 
     @staticmethod
     def _windows(windows: Mapping[str, Mapping[str, Any]]) -> Iterator[GaugeMetricFamily]:

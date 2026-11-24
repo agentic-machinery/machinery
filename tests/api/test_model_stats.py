@@ -44,6 +44,7 @@ def test_model_value_sections_explain_how_to_read_the_figures():
     sections = re.findall(r"<section\b[^>]*>.*?</section>", html, re.DOTALL)
     explanations = {
         "Window summary": ("Landed share divides those merges by all write tasks", "Low sample means"),
+        "Token use and waste": ("Codex fresh input is input minus cache reads", "Cache hit is cached input divided by fresh plus cached input"),
         "Value frontier": ("first-round approval with recorded hours per landed task", "Look toward the upper left"),
         "Best model per job": ("Compare landed share within each job class", "A star marks the highest positive share"),
         "Where the work went": ("how many write tasks settled", "A larger Done share"),
@@ -380,7 +381,8 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     # Codex output_tokens already include the reasoning tokens.
     usage = {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 100, "reasoning_output_tokens": 50}
     # Settled through the dispatcher store: the row is appended after the record's write.
-    settled = _record(tasks, "w1", duration_s=600, usage=usage, research_task_family="code")
+    settled = _record(tasks, "w1", duration_s=600, usage=usage, research_task_family="code",
+                      research_role="implementation")
     store.replace(settled, tasks / "w1.json")
     # A later terminal rewrite whose row write fails leaves the record as written and an older row stored.
     rewritten = _record(tasks, "w3", duration_s=1800, usage=usage)
@@ -414,7 +416,11 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     first = rows.backfill(tasks, batch_state)
     again = rows.backfill(tasks, batch_state)
     shutil.rmtree(tasks)  # retention removes every task record; the rows remain
-    payload = _window(batch_state, stats.Landing(task_ids={"w1", "r2-review"}))
+    landing = stats.Landing(task_ids={"w1", "r2-review"})
+    landing.repositories["read"] = 1
+    landing.prs["public", "7"] = stats._MergedPR(head2, NOW - timedelta(days=2), {"w1"}, set(), set())
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=landing)
+    payload = snapshot["windows"]["7d"]
 
     assert (first["added"], first["refreshed"], first["already_present"]) == (4, 1, 2)
     assert first["invalid_task_id"] == 1 and "/srv/private/model" not in rows.rows_path(batch_state).read_text()
@@ -430,6 +436,46 @@ def test_per_model_figures_survive_settlement_backfill_and_retention(tmp_path, m
     assert write["tokens"] == {"fresh_input": 1800, "cached_input": 1200, "output": 300}
     assert write["output_tokens_per_landed"]["value"] == 300
     assert [(c["class"], c["tasks"], c["landed"]) for c in write["by_class"]] == [("code", 2, 1), ("unclassified", 1, 0)]
+    token_use = payload["token_use"]
+    assert (token_use["tasks"], token_use["reported_tasks"], token_use["merged_prs"]) == (6, 3, 1)
+    assert token_use["totals"] == {"fresh_input": 1800, "cached_input": 1200, "output": 300}
+    assert token_use["per_merged_pr"] == 3300
+    assert snapshot["windows"]["24h"]["token_use"]["per_merged_pr"] is None
+    assert token_use["by_work"]["implementation"]["tokens"] == 1100
+    assert token_use["by_work"]["landing_helpers"] is None
+    assert token_use["waste"]["failed_or_empty"]["share"] == 1 / 3
+    assert token_use["waste"]["capped_and_replaced"] is token_use["avoidable_share"] is None
+    assert token_use["cache_by_model"] == [
+        {"model": "claude-opus-5-5", "tasks": 3, "reported_tasks": 0, "ratio": None},
+        {"model": "gpt-6.1-sol", "tasks": 3, "reported_tasks": 3, "ratio": 0.4},
+    ]
+    assert [r["status"] for r in token_use["top_tasks"]] == ["no_deliverable", "done", "done"]
+    ctx = fixture_context(tmp_path)
+    monkeypatch.setattr(stats, "cached_snapshot", lambda _ctx: (snapshot, 1.0))
+    registry = CollectorRegistry()
+    registry.register(stats.ModelStatsCollector(ctx))
+    for window in ("7d", "24h"):
+        labels = {"window": window, "model": "gpt-6.1-sol", "work_type": "implementation"}
+        assert registry.get_sample_value("lu_tokens_fresh_input", labels) == 600
+        assert registry.get_sample_value("lu_tokens_cached_input", labels) == 400
+        assert registry.get_sample_value("lu_tokens_output", labels) == 100
+        assert registry.get_sample_value("lu_tokens_per_merged_pr", labels) == (1100 if window == "7d" else None)
+    assert registry.get_sample_value("lu_token_data_age_seconds") == 1
+    assert registry.get_sample_value("lu_tokens_waste", {
+        "window": "7d", "model": "gpt-6.1-sol", "waste_class": "failed_or_empty",
+    }) == 1100
+    assert registry.get_sample_value("lu_tokens_waste", {
+        "window": "7d", "model": "gpt-6.1-sol", "waste_class": "capped_and_replaced",
+    }) is None
+    landing.repositories["unavailable"] = 1
+    snapshot = stats.collect(batch_state, tmp_path, NOW, landing=landing)
+    partial = snapshot["page_windows"]["7d"]["token_use"]
+    assert partial["totals"] == token_use["totals"]
+    assert partial["merged_prs"] is partial["per_merged_pr"] is None
+    assert partial["by_work"]["implementation"]["per_merged_pr"] is None
+    labels = {"window": "7d", "model": "gpt-6.1-sol", "work_type": "implementation"}
+    assert registry.get_sample_value("lu_tokens_per_merged_pr", labels) is None
+    assert registry.get_sample_value("lu_tokens_fresh_input", labels) == 600
 
     review = _row(payload, "claude-opus-5-5", "review")
     assert review["tasks"] == 3 and "landed" not in review
@@ -940,7 +986,8 @@ def test_samples_view_returns_the_reply_text_view_page_omits(tmp_path, monkeypat
         page = client.get("/api/fleet/model-stats?window=7d&view=page")
         samples = client.get("/api/fleet/model-stats?window=7d&view=samples")
         full = client.get("/api/fleet/model-stats?window=7d&view=full")
-    assert page.status_code == samples.status_code == full.status_code == 200
+        token_view = client.get("/api/fleet/model-stats?window=7d&view=tokens")
+    assert page.status_code == samples.status_code == full.status_code == token_view.status_code == 200
     assert _LEAK not in page.text
     assert "unparsed_samples" not in page.text
     assert {"gemini-4-neon", "subq-savant-1.4"} <= set(page.json()["idle_catalog_models"])
@@ -951,6 +998,10 @@ def test_samples_view_returns_the_reply_text_view_page_omits(tmp_path, monkeypat
     assert found == [{"model": "claude-opus-5-5", "role": "review",
                       "unparsed_samples": {"bad_format": _LEAK}, "unparsed_sample_efforts": {"bad_format": "high"}}]
     assert _LEAK in full.text
+    assert _LEAK not in token_view.text and "leaky-review" not in token_view.text
+    assert set(token_view.json()) == {"schema_version", "status", "age_seconds", "window", "token_use"}
+    assert token_view.json()["token_use"] == page.json()["token_use"] == full.json()["token_use"]
+    assert token_view.json()["token_use"]["totals"] is None
     review = _row(page.json(), "claude-opus-5-5", "review")
     assert review["unparsed_reasons"]["bad_format"] == 1
 
@@ -1336,11 +1387,12 @@ def test_model_version_and_effort_are_never_collapsed_or_defaulted(tmp_path, mon
     # /metrics keeps finite label sets: values outside the catalog's known set export as "other".
     snapshot = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())
     with _serve(snapshot, tmp_path, monkeypatch) as client:
-        for view in ("full", "page", "samples"):
+        for view in ("full", "page", "samples", "tokens"):
             response = client.get(f"/api/fleet/model-stats?window=all&view={view}")
             assert response.status_code == 200
             assert not re.search(r"\b(?:glm|kimi)", response.text, re.I), view
     assert "24h" in snapshot["windows"] and "24h" not in snapshot["metrics"]["windows"]
+    assert set(snapshot["metrics"]["token_windows"]) == {"24h", "7d"}
     metrics = snapshot["metrics"]["windows"]["all"]
     exported = {(r["model"], e["effort"]) for r in metrics["models"] for e in r["by_effort"]}
     assert ("gpt-6.1-sol", "unknown") in exported and ("other", "high") in exported
@@ -2224,14 +2276,30 @@ def test_publication_ledger_writes_only_well_formed_lines_and_trusts_no_damaged_
     from lu_machinery.orchestration import fleet_repos
 
     _review(tasks, "c-review", "incorrect", ["P1"], pr=3, pinned_head="c" * 40, review_author_model="grok-4.7",
-            repo="machinery")
+            repo="machinery", usage={"input_tokens": 5, "cache_read_input_tokens": 8,
+                                     "cache_creation_input_tokens": 2, "output_tokens": 3})
+    _review(tasks, "supp-review", "correct", [], pinned_head="c" * 40, repo="machinery", agent="agy",
+            model="gemini-4-neon", usage={"input_tokens": 7, "cache_read_tokens": 9, "output_tokens": 4,
+                                         "thinking_tokens": 6})
+    _review(tasks, "same-head-other-repo", "correct", [], pinned_head="c" * 40, repo="public", agent="cursor",
+            model="grok-4.7", usage={"inputTokens": 10, "cacheReadTokens": 12, "cacheWriteTokens": 2,
+                                     "outputTokens": 2, "reasoningTokens": 1})
+    _record(tasks, "missing-output", usage={"input_tokens": 20, "cached_input_tokens": 10})
+    _record(tasks, "zero-usage", usage={"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0})
     _record(tasks, "u-review", mode="read-only", agent="claude", model="claude-opus-5-5", data_class="public-code",
             review_profile="code")
     (tasks / "u-review.result").write_text("prose reply", encoding="utf-8")
     rows.backfill(tasks, batch_state)
     stored = {row["task_id"]: row for row in rows.read_rows(batch_state)[0]}
     assert stored["u-review"]["review"]["unparsed_sample"] == "prose reply"
+    assert stored["missing-output"]["usage_known"] is False and stored["zero-usage"]["usage_known"] is True
     assert _publish(batch_state, ("c-review", 3, "c" * 40, "CHANGES_REQUESTED")) == 1
+    token_use = stats.collect(batch_state, tmp_path, NOW, landing=stats.Landing())["page_windows"]["7d"]["token_use"]
+    assert token_use["totals"] == {"fresh_input": 26, "cached_input": 29, "output": 16}
+    assert token_use["reported_tasks"] == 4 and token_use["merged_prs"] is None
+    assert token_use["by_work"]["review_of_record"]["tokens"] == 18
+    assert token_use["waste"]["supplemental_review"]["share"] == 26 / 71
+    assert token_use["by_work"]["unclassified_review"]["tokens"] == 27
     registry = fleet_repos._CONFIG_PATH.read_text(encoding="utf-8")
     assert "github: learn-ukrainian/machinery" in registry
     catalog = tmp_path / "fleet_repos.yaml"
