@@ -1,14 +1,14 @@
 name: uv and the pinned CPython
 description: >-
   Install the pinned uv release (checksum-verified) and activate a venv of a
-  uv-managed CPython: the exact version in .python-version, the requires-python
-  floor of pyproject.toml, or a named minor version. The calling workflow sets
-  UV_PYTHON_PREFERENCE=only-managed, so the runner's own Pythons are never used.
+  uv-managed CPython: the exact version in .python-version or a named minor
+  version. The calling workflow sets UV_PYTHON_PREFERENCE=only-managed, so the
+  runner's own Pythons are never used.
 inputs:
   python:
     description: >-
-      pinned (.python-version, exact), floor (the >=X.Y bound of requires-python)
-      or an X.Y minor version for a tool pinned to one ABI.
+      pinned (.python-version, exact) or an X.Y minor version for a tool pinned
+      to one ABI.
     default: pinned
   uv-version:
     description: >-
@@ -36,11 +36,6 @@ runs:
           pinned)
             want="$(tr -d '[:space:]' < .python-version)"
             pattern='^3\.[0-9]+\.[0-9]+$'
-            ;;
-          floor)
-            # Exactly one `requires-python = ">=3.N"` line; anything else fails.
-            want="$(sed -nE 's/^requires-python = ">=(3\.[0-9]+)"$/\1/p' pyproject.toml)"
-            pattern='^3\.[0-9]+$'
             ;;
           *)
             want="$WHICH"

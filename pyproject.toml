@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "lu-machinery"
 version = "0.1.68"
 description = "Shared agent orchestration and development tooling"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 # Core commands also read routing and verification helpers from the API package.
 dependencies = [
     "fastapi>=0.139.0",
@@ -100,14 +100,6 @@ line-length = 120
 target-version = "py314"
 src = [".", "lu_machinery"]
 exclude = [".venv/", "node_modules/", "starlight/", "lu_machinery/oneoff/"]
-
-[tool.ruff.per-file-target-version]
-# The fingerprint functions must retain the 3.12 ast.dump branch.
-"lu_machinery/ci/subprocess_timeout_guard.py" = "py312"
-"lu_machinery/hygiene/lint_source_db_writable_connects.py" = "py312"
-"lu_machinery/lint/lint_test_waits.py" = "py312"
-# Generator requires all three type arguments on the supported floor.
-"lu_machinery/common/pytest_scratch.py" = "py312"
 
 [tool.ruff.lint]
 select = ["F", "E", "W", "I", "UP", "B", "SIM", "RUF", "PLC0415"]

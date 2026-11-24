@@ -114,8 +114,8 @@ CI_GATE_PYTHON=.python-version
 #   .python-version (3.14.10 on 2026-11-20).
 #   .github/actions/uv-python checks the interpreter it puts on PATH.
 #   UV_PYTHON_PREFERENCE=only-managed keeps uv off the runner's own Pythons.
-LINUX_FS_PARITY_IMAGE=python@sha256:3c3ba8ad4c85eb63b7568f806434f14e33370056985da7fdf2673621cb1d7e93
-#   python:3.12-bookworm linux/amd64 manifest from Docker Hub, checked 2026-11-23.
+LINUX_FS_PARITY_IMAGE=python@sha256:cf063ce98ede9b3e88127463b3fa6d1c46d0f85a548345b148e50eaaad36ef86
+#   python:3.14-bookworm linux/amd64 manifest (PYTHON_VERSION=3.14.10) from Docker Hub, checked 2026-11-24.
 #   The parity probe requires x86_64 for its uv archive.
 UV_VERSION=0.13.9
 #   https://github.com/astral-sh/uv/releases/tag/0.13.9 (published 2026-11-17).
@@ -148,9 +148,9 @@ MYPY_VERSION=2.4.0
 #   is required: typed packages change the error census, and on 2026-11-08 a
 #   venv with only mypy and its own dependencies reported 16 ratchet
 #   violations on a tree the full closure passes. uv.lock was first written
-#   with the previous heredoc pins as constraints. On 2026-11-17 the ratchet
-#   matched the baseline in that environment on CPython 3.14.8, with mypy's
-#   python_version still 3.12. Bump these pins together with the baseline.
+#   with the previous heredoc pins as constraints. pyproject.toml sets mypy's
+#   python_version to 3.14 alongside requires-python >=3.14. Bump these pins
+#   together with the baseline.
 ZIZMOR_VERSION=1.31.1
 ZIZMOR_RELEASE_ASSET_ID=645467284
 #   Release v1.31.1, published 2026-10-15, tag commit effdb35fa7868863f11655db256d9008922fa427
