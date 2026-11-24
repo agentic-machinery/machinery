@@ -1157,8 +1157,9 @@ def test_sealed_acpx_receipt_exposes_participant_and_credential_bucket_sharing()
     assert selected.credential_bucket == "codex:a"
     assert selected.quota_limit == selected.credential_limit == 1
     inputs = ResolverInputs(author_model="claude", risk="high", claude_account=HOST_ACCOUNT,
-                            routing_snapshot={"agents": {"codex": {"status": "healthy"}},
-                                "codex_accounts": {"codex:b": {"status": "healthy", "remaining_pct": 83}}})
+                            routing_snapshot={"diagnostics": {"stale": False},
+                                "agents": {"codex": {"status": "healthy", "remaining_pct": 84, **_FRESH_PROBE}},
+                                "codex_accounts": {"codex:b": {"status": "healthy", "remaining_pct": 83, **_FRESH_PROBE}}})
     b = resolve_reviewer(inputs).selected
     assert b is not None and b.name == "openai_frontier_b"
     assert b.quota_bucket == b.credential_bucket == "codex:b"
@@ -1169,6 +1170,27 @@ def test_sealed_acpx_receipt_exposes_participant_and_credential_bucket_sharing()
 
     # Kimi seats admit web, UI and backend coding only: no review candidate binds a Kimi participant.
     assert not [c for c in REVIEW_CANDIDATES.values() if c.participant in {"kimi", "kimicc"}]
+
+
+@pytest.mark.usefixtures('configured_roots')
+@pytest.mark.parametrize("b_remaining", [0.0, 5.0], ids=["exhausted", "near-cap"])
+def test_codex_b_without_allowance_never_outranks_same_model_on_funded_account_a(b_remaining):
+    """Defect class: account-preference starvation. The drain-b-first rule routed every Sol
+    review of record to Codex account b while b's fresh reading was exhausted or near cap,
+    and the same model on account a, with allowance, was dropped, so reviews stalled."""
+    inputs = ResolverInputs(
+        author_model="claude-opus-5-5", risk="critical", claude_account=HOST_ACCOUNT,
+        routing_snapshot={
+            "diagnostics": {"stale": False},
+            "agents": {"codex": {"status": "healthy", "remaining_pct": 84.0, **_FRESH_PROBE}},
+            "codex_accounts": {"codex:b": {"status": "near_cap", "remaining_pct": b_remaining, **_FRESH_PROBE}},
+        },
+    )
+    resolution = resolve_reviewer(inputs)
+    b_row = next(item for item in resolution.trace if item.name == "openai_frontier_b")
+    assert b_row.capacity.near_cap and b_row.status == "eligible"
+    assert resolution.selected is not None and resolution.selected.name == "openai_frontier"
+    assert "--codex-account b-sub" not in resolution.selected.invocation
 
 
 @pytest.mark.usefixtures('configured_roots')
