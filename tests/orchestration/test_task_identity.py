@@ -495,4 +495,3 @@ def test_native_title_failure_can_retry_to_durable_success() -> None:
         error="transient adapter response",
         now="2026-07-16T10:03:00Z",
     ) == reconciled
-

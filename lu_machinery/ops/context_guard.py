@@ -498,7 +498,9 @@ class Guard:
     # ---- helpers -------------------------------------------------------
     def _prompt(self, lane: Lane, reason: str, reminder: int) -> str:
         again = f"reminder {reminder}, " if reminder > 1 else ""
-        handoff = f"record a DB handoff_note for lane {lane.epic}"
+        # The CTO launcher holds the epics lease, but its driver-state DB lane is cto (launcher_core.sh).
+        state_lane = "cto" if Path(lane.launcher).name == "start-claude-cto.sh" else lane.epic
+        handoff = f"record a DB handoff_note for lane {state_lane}"
         stop_tasks = (
             "stop every background task you started (background Bash tasks and Monitor streams), "
             if lane.kind == "claude"
