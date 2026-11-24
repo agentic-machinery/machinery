@@ -45,19 +45,24 @@ never starts another turn.
 ## Handoff receipt and outcomes
 
 A turn ends by recording its one handoff receipt (`dispatch handoff-receipt --help`) naming its
-handoff note and an outcome: `done`, `blocked` or `handoff`. `done` settles `done` only with a clean
-tree, every child proven terminal and a verified receipt and note; a live, unknown or unreadable
-child refuses it. `blocked` and `handoff` settle `no_deliverable` (`orchestrator_blocked`,
-`orchestrator_handoff`), never `done`. The turn's own steps come from its brief.
+handoff note and an outcome: `done`, `blocked` or `handoff`. The outcome applies only when the
+provider ended `done` and settlement then passes its earlier checks: a timeout or cancel
+keeps its own status, and a changed product tree or a live, unknown or unreadable child settles
+`no_deliverable` first. Past those checks `done` settles `done` once the receipt and note verify and
+the turn's processes are proven gone, and `blocked` and `handoff` settle `no_deliverable`
+(`orchestrator_blocked`, `orchestrator_handoff`), never `done`. A recorded receipt is not the
+result: read the settled status and reason (`dispatch status`). The turn's own steps come from its
+brief.
 
 ## Claim release and recovery
 
-Only the dispatcher closes its own exact claim, and only on proof. A dispatch that fails before its
-supervisor starts releases it. Otherwise the supervisor releases it after settlement, when the
-launch was a scope whose processes are gone, no task service remains and no child is live, unknown
-or unreadable; else the stream stays held. Expiry, a missing process or an unknown response never
-authorizes takeover: a dispatch-turn claim is never superseded by TTL/CAS or a local PID, and force
-release is operator-only and attributed. `stalled_work` raises a `held_turn_lease` row to
-`claude-cto`, who recovers a stranded claim only through the three-step quiescence proof and the
-fenced exact-envelope close in `docs/runbooks/session-supervisor.md` ("Dispatch-turn lease
-recovery"); never improvise.
+A turn claim closes only three ways. (1) The dispatcher closes its own exact claim automatically, only
+on proof: a dispatch releases it when it proves its launch never started, and any other doubt leaves
+it held; otherwise the supervisor releases it after settlement, when the launch was a scope whose
+processes are gone, no task service remains and no child is live, unknown or unreadable, else the
+stream stays held. (2) The CTO closes a stranded claim, once it has expired and quiescence is proven,
+through the three-step proof and fenced exact-envelope close in `docs/runbooks/session-supervisor.md`
+("Dispatch-turn lease recovery"); never improvise. (3) Force release is operator-only and attributed.
+Expiry, a missing process or an unknown response never authorizes takeover: a dispatch-turn claim is
+never superseded by TTL/CAS or a local PID. `stalled_work` raises a `held_turn_lease` row to
+`claude-cto` for a held claim whose turn record is terminal, overdue or missing.
