@@ -330,28 +330,35 @@ turn to settle:
    on every command (`--repo <owner/name>`; `pr-dequeue` takes the node ID from
    `gh pr view <number> --repo <owner/name> --json id`), and verify its results.
 2. **Sweep the turn's children until none is left open.** Take one inventory, `dispatch list
-   --all` (it includes archived records, which the default hot list omits), and keep every record
-   whose `parent_task_id` and `parent_run_nonce` are the turn's, then every record whose parent is
-   a kept one (a child's own follow-up tasks), until no record is added. For each covered child
-   that is not terminal, `dispatch cancel <child-id> --run-nonce <its nonce>`. A cancel refused
-   while the child is still spawning (`supervisor identity is unavailable; cancellation refused`)
-   stays on your list: retry it on the next sweep.
+   --all` (it includes archived records, which the default hot list omits), and keep every row
+   whose `parent_task_id` and `parent_run_nonce` are the turn's, then every row whose
+   `parent_task_id` is a kept row's (a child's own follow-up tasks record no `parent_run_nonce`
+   and settlement does not list them), until no row is added. Read each child's fields from
+   its row, matched on `task_id` and `run_nonce` together. The command skips a record it cannot
+   read and still exits 0, so an inventory never proves that no child is missing: step 4 holds
+   the unresolved cases. For each covered child that is not terminal, `dispatch cancel <child-id>
+   --run-nonce <its nonce>`. A cancel refused while the child is still spawning (`supervisor
+   identity is unavailable; cancellation refused`) stays on your list: retry it on the next sweep.
 
-   A covered child's PRs are those it can be linked to by its record or the ownership ledger, from
-   all of these, whether open or already merged. Protect each open one as in step 1 as soon as you
-   find it; a merged one is a landing the stop did not prevent, so report it:
+   A covered child's PRs, open or already merged, come from all of these. Protect each open one as
+   in step 1 as soon as you find it; a merged one is a landing the stop did not prevent, so report
+   it:
 
-   - **Recorded branches.** `gh pr list --repo <owner/name> --state all --head <branch>` for the
-     child's `worktree_branch` and, when it has one, its `publish_branch` (a child that continues
-     an existing PR pushes there). `--state all` is required: the default lists open PRs only and
-     misses one that merged during the stop.
-   - **Accepted ownership.** `<interpreter> -m lu_machinery.orchestration.pr_ownership status`
-     prints the ledger. A PR is the child's when its `handoffs` entry, or a `history` entry with
-     `event: accepted`, names the child as `successor` (an accepted hand-off, from any branch) or
-     `worker_task` (keeper custody the child transferred). The key is `<owner/name>#<number>`.
-   - **Merged delivery.** Once the child has settled, `dispatch status <child-id> --run-nonce
-     <its nonce>` shows `delivery_pr` and `delivery_merge_sha`, the merged PR the dispatcher
-     attributed to it.
+   - **Recorded branches.** `gh pr list --repo <owner/name> --state all --limit 100 --head
+     <branch> --json number,state,isCrossRepository` for the row's `worktree_branch` and, when it
+     has one, its `publish_branch` (a child that continues an existing PR pushes there). Drop
+     `isCrossRepository` rows: a fork PR with the same branch name is not the child's. `--state
+     all` is required, because the default lists open PRs only and misses one that merged during
+     the stop; a result of 100 rows is truncated, so it is unresolved.
+   - **Ownership ledger.** `<interpreter> -m lu_machinery.orchestration.pr_ownership status`
+     prints it. Every `handoffs` and `history` entry that names the child in any field
+     (`successor`, `predecessor`, `worker_task`, `previous_worker_task`) is the child's PR, keyed
+     `<owner/name>#<number>`. `history` keeps an accepted hand-off, a keeper transfer and their
+     releases after the active entry is gone, up to its cap.
+   - **Merged delivery.** Once the child has settled, its row lists every merged PR the dispatcher
+     attributed to it in `delivery_prs` (`<owner/name>#<number>`), with `delivery_merge_sha`.
+     Take it from the row: `dispatch status` cannot locate a collision-stamped archive record
+     (`run nonce mismatch`).
 
    Repeat the sweep, one inventory each time, while the turn or any covered child is not terminal,
    and once more after the turn settles.
@@ -361,10 +368,12 @@ turn to settle:
    never a handoff baseline (cold start step 2).
 4. **Reconcile what settlement reveals.** Read `child_tasks`, `orphaned_child_tasks`,
    `unknown_child_tasks` and `unreadable_child_records`; any covered child or PR not handled
-   above goes back into the step 2 sweep, and each cancelled child must settle the same way. Read
-   a child the inventory omits directly with `dispatch status <child-id> --run-nonce <its nonce>`.
-   A child, branch listing or ledger read that fails or cannot be verified is unresolved custody:
-   report it with its owner, never as "no PR".
+   above goes back into the step 2 sweep, and each cancelled child must settle the same way. A
+   child that settlement names and the inventory omits is read with `dispatch status <child-id>
+   --run-nonce <its nonce>`. A child, follow-up task, branch listing, ledger read or delivery
+   lookup that is missing, fails, is truncated or cannot be verified is unresolved custody
+   (`merged_delivery_lookup` set to anything but `no_match` is a failed delivery lookup): report it
+   with its owner, never as "no PR".
 5. **Reconcile the lease separately.** A terminal turn alone neither clears the lease nor
    authorizes a successor: the dispatcher releases it only when the run's processes are proven
    gone and no child is live, unknown or unreadable. A lease still held after settlement goes
