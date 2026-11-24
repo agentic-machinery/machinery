@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
@@ -179,7 +179,63 @@ def load_product(context: MonitorContext, *, product_root: Path | None = None) -
     product = build_api(context)
     if not isinstance(product, ProductContribution):
         raise ProductEntryError(f"{name}.build_api returned {type(product).__name__}, not ProductContribution")
-    return product
+    return checked_product(product, product_root=root)
+
+
+def checked_product(
+    product: ProductContribution, *, product_root: Path | None = None
+) -> ProductContribution:
+    """``product`` with its static files and page contracts checked, as the Monitor serves and lists them.
+
+    Every declared static file must be a ``Path`` naming a regular file inside the
+    product root once symlinks are resolved, and the Monitor must be able to open it for
+    reading. The root is ``product_root`` (``load_product`` passes the root it imported
+    the product from), else ``config.PRODUCT_ROOT``, the root ``product_file`` serves
+    from; it is looked up only when the product declares static files. ``page_contracts``
+    must be a tuple of ``PageContract`` instances whose ``url``, ``file`` and ``label``
+    are plain strings. The first entry that is not raises ``ProductEntryError`` naming it, and the product is refused as a
+    whole, as ``load_product`` refuses a contribution of the wrong shape. The returned
+    contribution keeps its own copy of the checked static file map, so an entry added
+    to the product's map later is never served. A checked file that disappears later
+    is runtime state: its route answers 404.
+    """
+    # route_contracts imports this module, so a top-level import is a cycle.
+    from .route_contracts import PageContract  # noqa: PLC0415  # lazy-ok: import cycle
+
+    if not isinstance(product.static_files, Mapping):
+        raise ProductEntryError(f"static_files is {type(product.static_files).__name__}, not a mapping")
+    static: dict[str, Path] = {}
+    root: Path | None = None
+    for name, path in product.static_files.items():
+        if type(name) is not str or not isinstance(path, Path):
+            raise ProductEntryError(
+                f"static_files[{name!r}]: expected a str name and a Path, "
+                f"got {type(name).__name__} and {type(path).__name__}"
+            )
+        if root is None:
+            root = (config.PRODUCT_ROOT if product_root is None else product_root).resolve()
+        try:
+            resolved = path.resolve()
+            usable = resolved.is_file() and resolved.is_relative_to(root)
+            if usable:
+                # The type check reads metadata only; the route must also be able to open the file.
+                with resolved.open("rb"):
+                    pass
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProductEntryError(f"static_files[{name!r}]: unusable: {type(exc).__name__}") from exc
+        if not usable:
+            raise ProductEntryError(f"static_files[{name!r}]: not a regular file inside the product root")
+        static[name] = path
+    if type(product.page_contracts) is not tuple:
+        raise ProductEntryError(f"page_contracts is {type(product.page_contracts).__name__}, not a tuple")
+    for index, page in enumerate(product.page_contracts):
+        if type(page) is not PageContract:
+            raise ProductEntryError(f"page_contracts[{index}]: {type(page).__name__}, not a PageContract")
+        for attr in ("url", "file", "label"):
+            value = getattr(page, attr, None)
+            if type(value) is not str:
+                raise ProductEntryError(f"page_contracts[{index}].{attr}: {type(value).__name__}, not a str")
+    return replace(product, static_files=MappingProxyType(static))
 
 
 def product_file(product: ProductContribution | None, name: str) -> Path | None:

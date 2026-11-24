@@ -75,10 +75,156 @@ def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, m
     for path in ("machinery", "machinery/"):
         assert main.serve_static(path, request, context).body == b"machinery home"
 
+    # A path the machinery dashboards do not hold still reaches the product's declared file.
+    empty_dashboards = tmp_path / "empty"
+    empty_dashboards.mkdir()
+    bare = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=empty_dashboards))
+    declared_product = ProductContribution(static_files={"index": product_index})
+    declared_request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=declared_product))})
+    assert main.serve_static("index", declared_request, bare).path == product_index
+
+
+def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monkeypatch):
+    """Defect class: machinery pages name product pages the product does not declare, or mark one current."""
+    import html
+    import re
+
+    from lu_machinery.api import main, route_contracts
+    from lu_machinery.api.product_contribution import ProductContribution, checked_product
+
+    monkeypatch.setattr(main.config, "PRODUCT_ROOT", tmp_path)
+    for contract in route_contracts.PAGE_CONTRACTS:
+        (tmp_path / contract.file).write_text('<nav id="machinery-nav">__MACHINERY_NAV__</nav>')
+    product_home = tmp_path / "product-home.html"
+    product_home.write_text("product home")
+    base = replace(route_contracts.PAGE_CONTRACTS[0], label="")
+    # The Monitor serves a product only as checked at load (create_app, load_product).
+    product = checked_product(ProductContribution(
+        static_files={"index.html": product_home},
+        page_contracts=(
+            replace(base, file="index.html", url="/"),
+            replace(base, file="curriculum-dashboard.html", url="/curriculum-dashboard.html"),
+            replace(base, file="labelled.html", url="/labelled", label='Q&A "x"'),
+            replace(base, file="again.html", url="/labelled", label="Repeated URL"),
+            replace(base, file="blank.html", url="/blank", label="  \t "),
+            replace(base, file="bidi.html", url="/bidi", label="a\u202eb\n  c\x00"),
+            # Contracts that reuse a machinery URL or alias replace the contract, never the machinery page.
+            replace(base, file="product-fleet.html", url="/fleet", label="Product fleet"),
+            replace(base, file="fleet.html", url="/fleet", label="Second fleet"),
+            replace(base, file="alias.html", url="/fleet.html"),
+            replace(base, file="overview.html", url="/index"),
+            replace(base, file="elsewhere.html", url="//example.invalid/x"),
+            replace(base, file="relative.html", url="relative"),
+            replace(base, file="backslash.html", url="/\\example.invalid"),
+            replace(base, file="space.html", url="/a b"),
+            # F3: the route's own lookup decides, on the path a browser requests; URLs it answers with a
+            # machinery page are not product links, and a product page the route leaves to it is one.
+            replace(base, file="slash.html", url="/fleet.html/"),
+            replace(base, file="home-slash.html", url="/index.html/"),
+            replace(base, file="encoded.html", url="/fleet%2Ehtml?tab=x#y"),
+            replace(base, file="dots.html", url="/x/../fleet"),
+            replace(base, file="machinery.html", url="/machinery.html"),
+            replace(base, file="reports.html", url="/a/%2e/%2E%2e/reports"),
+            replace(base, file="notes.html", url="/notes?folder=a\\b#s one"),
+            replace(base, file="again-notes.html", url="/x/../notes"),
+            # The page is parsed as HTML first: a NUL in the attribute becomes U+FFFD.
+            replace(base, file="nul.html", url="/fleet\x00"),
+            replace(base, file="lead-nul.html", url="\x00/reports"),
+            # Distinct declared URLs stay distinct links: the product may tell them apart.
+            replace(base, file="tab.html", url="/reports?tab=second"),
+            replace(base, file="dup-notes.html", url="/y/../notes?folder=a\\b#s one"),
+            # F4: a file name or URL with nothing visible falls back to the next visible name.
+            replace(base, file="----.html", url="/dashes"),
+            replace(base, file="\u2067\u3164.html", url="/--"),
+        ),
+    ))
+    request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=product))})
+    context = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=tmp_path))
+    machinery = [(c.url, html.escape(c.nav_label)) for c in route_contracts.PAGE_CONTRACTS]
+    for contract in route_contracts.PAGE_CONTRACTS:
+        # The product's home owns /index.html, so the Overview's file alias is /index.
+        for path in (contract.url.lstrip("/"), "index" if contract.file == "index.html" else contract.file):
+            body = main.serve_static(path, request, context).body.decode("utf-8")
+            links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', body)
+            assert [(href, label) for href, _, label in links[: len(machinery)]] == machinery, path
+            # The product group follows, starts once, is never current, escapes its labels, keeps a
+            # readable one-line label, and skips repeated destinations, machinery paths and non-path URLs.
+            assert links[len(machinery) :] == [
+                ("/", ' class="product first"', "Home"),
+                ("/curriculum-dashboard.html", ' class="product"', "Curriculum dashboard"),
+                ("/labelled", ' class="product"', "Q&amp;A &quot;x&quot;"),
+                ("/blank", ' class="product"', "Blank"),
+                ("/bidi", ' class="product"', "ab c"),
+                ("/a b", ' class="product"', "Space"),
+                ("/machinery.html", ' class="product"', "Machinery"),
+                ("/a/%2e/%2E%2e/reports", ' class="product"', "Reports"),
+                ("/notes?folder=a\\b#s one", ' class="product"', "Notes"),
+                ("/x/../notes", ' class="product"', "Again notes"),
+                ("/fleet\x00", ' class="product"', "Nul"),
+                ("/reports?tab=second", ' class="product"', "Tab"),
+                ("/y/../notes?folder=a\\b#s one", ' class="product"', "Dup notes"),
+                ("/dashes", ' class="product"', "Dashes"),
+                ("/--", ' class="product"', "/--"),
+            ], path
+            assert [href for href, attrs, _ in links if 'aria-current="page"' in attrs] == [contract.url], path
+
+
+def test_unusable_static_declaration_is_rejected_at_load_not_linked(tmp_path, monkeypatch):
+    """Defect class: a product declaration the Monitor cannot serve or read is linked instead of refused at load.
+
+    A declared static file that is missing, a directory, outside the product root or a symlink loop
+    got a navigation link its route answered with 404 (F8); a page contract whose fields are not plain
+    strings reached the navigation (F7). Both now refuse the product, naming the entry.
+    """
+    from lu_machinery.api import main, route_contracts
+    from lu_machinery.api.monitor_context import fixture_context
+    from lu_machinery.api.product_contribution import ProductContribution, ProductEntryError, checked_product
+
+    root = tmp_path / "product"
+    root.mkdir()
+    monkeypatch.setattr(main.config, "PRODUCT_ROOT", root)
+    (root / "reports.html").write_text("reports")
+    (root / "folder").mkdir()
+    (tmp_path / "outside.html").write_text("outside")
+    (root / "escape.html").symlink_to(tmp_path / "outside.html")
+    (root / "loop.html").symlink_to(root / "loop.html")
+    page = replace(route_contracts.PAGE_CONTRACTS[0], file="reports.html", url="/reports", label="Reports")
+    context = fixture_context(tmp_path)
+
+    # A usable declaration loads and is linked.
+    static = {"reports.html": root / "reports.html"}
+    good = checked_product(ProductContribution(static_files=static, page_contracts=(page,)))
+    assert '<a href="/reports" class="product first">Reports</a>' in main._machinery_nav_html(None, tmp_path, good)
+
+    popped = replace(page)
+    del vars(popped)["url"]
+    unusable = {
+        "static_files['reports.html']": {"reports.html": root / "missing.html"},
+        "static_files['folder.html']": {"folder.html": root / "folder"},
+        "static_files['escape.html']": {"escape.html": root / "escape.html"},
+        "static_files['loop.html']": {"loop.html": root / "loop.html"},
+        "static_files['text.html']": {"text.html": "reports.html"},
+    }
+    for entry, static_files in unusable.items():
+        product = ProductContribution(static_files=static_files, page_contracts=(page,))
+        with pytest.raises(ProductEntryError) as refused:
+            main.create_app(context, product=product)
+        assert str(refused.value).startswith(entry), refused.value
+    malformed = {
+        "page_contracts[0]": (None,),
+        "page_contracts[0].label": (replace(page, label=None),),
+        "page_contracts[0].url": (replace(page, url=type("Url", (str,), {})("/reports")),),
+        "page_contracts[1].url": (page, popped),
+        "page_contracts is list": [page],
+    }
+    for entry, pages in malformed.items():
+        with pytest.raises(ProductEntryError) as refused:
+            main.create_app(context, product=ProductContribution(page_contracts=pages))
+        assert str(refused.value).startswith(entry), refused.value
+
 
 def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
     """Defect class: a split dashboard page misses its contract, shared nav/assets, or fetches another area's API."""
-    import json
     import re
     import subprocess
 
@@ -103,16 +249,25 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
     for page in route_contracts.PAGE_CONTRACTS:
         slug = page.url.lstrip("/")
         response = main.serve_static(slug, request, context)
+        body = response.body.decode("utf-8")
+        assert "__MACHINERY_" not in body, page.file
         if page.file == "index.html":
-            assert b"__MACHINERY_VERSION__" not in response.body
-            assert b"/machinery.css" in response.body
-            assert b"/machinery.js" in response.body
+            assert "/machinery.css" in body
+            assert "/machinery.js" in body
             root_response = main.serve_static("", request, context)
             assert b"/machinery.css" in root_response.body
+            # /index is the same page with the same fill-ins.
+            assert main.serve_static("index", request, context).body == response.body
         else:
-            assert response.path == dashboards / page.file
-            html_response = main.serve_static(page.file, request, context)
-            assert html_response.path == dashboards / page.file
+            assert main.serve_static(page.file, request, context).body == response.body
+        # The shared navigation is in the served HTML (no script needed), lists every machinery page in
+        # contract order, and marks exactly the page being served.
+        nav = re.search(r'<nav class="pages" id="machinery-nav"[^>]*>(.*?)</nav>', body, re.S)
+        assert nav, page.file
+        links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', nav.group(1))
+        assert [href for href, _, _ in links] == [contract.url for contract in route_contracts.PAGE_CONTRACTS]
+        assert [href for href, attrs, _ in links if 'aria-current="page"' in attrs] == [page.url], page.file
+        assert not any("product" in attrs for _, attrs, _ in links)
 
     # Every page loads the shared stylesheet, script, landmarks, and only its own API endpoints.
     expected_apis = {
@@ -151,23 +306,10 @@ def test_machinery_split_pages_contracts_shared_assets_and_scoped_reads():
         found_apis = set(re.findall(r"/api/[a-z0-9/_-]+", text))
         assert found_apis == allowed, (filename, found_apis, allowed)
 
-    # Shared navigation covers every contracted page, marks active page, handles storage errors, and rejects unsafe URLs.
-    urls = [page.url for page in route_contracts.PAGE_CONTRACTS]
+    # The shared script rejects unsafe URLs, and its panel and rendering regressions stay fixed.
     node_script = r"""
 const assert = require('node:assert/strict');
 const M = require(process.argv[1]);
-const urls = JSON.parse(process.argv[2]);
-assert.deepEqual(M.NAV_PAGES.map(p => p.href), urls);
-for (const path of ['/', '/index.html', '/machinery', '/machinery/']) {
-  const html = M.renderNavHtml(path);
-  assert.match(html, /href="\/machinery" aria-current="page">Overview</, path);
-  assert.equal((html.match(/aria-current="page"/g) || []).length, 1, path);
-}
-for (const url of urls.filter(u => u !== '/machinery')) {
-  const html = M.renderNavHtml(url);
-  assert.ok(html.includes(`href="${url}" aria-current="page"`), url);
-  assert.equal((html.match(/aria-current="page"/g) || []).length, 1, url);
-}
 assert.equal(M.safeHttpUrl('https://github.com/learn-ukrainian/machinery/pull/1'), 'https://github.com/learn-ukrainian/machinery/pull/1');
 assert.equal(M.safeHttpUrl('javascript:alert(1)'), null);
 assert.equal(M.safeHttpUrl('data:text/html,x'), null);
@@ -681,7 +823,7 @@ assert.match(M.prChips(unknownTotalPrs).join(''), /<b>1<\/b> open PRs observed Â
 })().catch(err => { console.error(err); process.exitCode = 1; });
 """
     ran = subprocess.run(
-        ["node", "-e", node_script, str(dashboards / "machinery.js"), json.dumps(urls)],
+        ["node", "-e", node_script, str(dashboards / "machinery.js")],
         check=False,
         capture_output=True,
         text=True,
