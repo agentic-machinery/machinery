@@ -797,6 +797,10 @@ def test_active_snapshot_never_collects_on_requests(tmp_path, monkeypatch):
         # The internal per-repository worker counts reach the Projects line, never the public panel.
         assert sum(expected["live_by_repository"].values()) == 1
         assert "live_by_repository" not in expected_http
+        # A task store that cannot be read gives no counts (unknown), never a fleet of zeroes.
+        with monkeypatch.context() as local:
+            local.setattr(delegate_router, "_tasks_dir", lambda _ctx: tmp_path / "absent")
+            assert delegate_router._active_snapshot_tasks(ctx)["live_by_repository"] is None
         def forbidden(*args, **kwargs):
             raise AssertionError("request collected task history")
         monkeypatch.setattr(delegate_router, "_active_snapshot_tasks", forbidden)

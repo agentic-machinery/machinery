@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import time
+import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,8 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
 from pydantic import AfterValidator, BaseModel
 
 from lu_machinery.common import github_client, json_depth
@@ -612,7 +615,6 @@ PULL_REQUESTS_PER_REPOSITORY = 50
 REVIEW_STATUS_CONTEXT = "fleet/cross-family-review"
 # The one file a project pins the lu-machinery release in, read from its default branch.
 PIN_FILE = "pyproject.toml"
-_PIN = re.compile(r"""["']lu-machinery(?:\[[^\]\n]*\])?==\s*([0-9][0-9A-Za-z.+!_-]{0,63})["']""")
 _CI_STATES = {"success", "failure", "error", "pending", "expected"}
 # A reading older than the delegate panel's own bound is not a live count.
 LIVE_WORKERS_MAX_AGE_S = 60.0
@@ -627,12 +629,15 @@ _PR_FIELDS = (
 )
 
 
-def _pull_requests_query(repositories: list[tuple[str, str, str]]) -> str:
+def _pull_requests_query(repositories: list[tuple[str, str, str] | None]) -> str:
     pulls = (
         f"pullRequests(states: OPEN, first: {PULL_REQUESTS_PER_REPOSITORY}, orderBy: {{field: CREATED_AT, direction: DESC}})"
     )
     blocks = []
-    for index, (owner, name, _display) in enumerate(repositories):
+    for index, entry in enumerate(repositories):
+        if entry is None:  # an invalid slug stays out of the query; its row says so
+            continue
+        owner, name, _display = entry
         header = f'r{index}: repository(owner: "{owner}", name: "{name}")'
         tip = "defaultBranchRef { target { ... on Commit { statusCheckRollup { state } } } }"
         pin = f'pin: object(expression: "HEAD:{PIN_FILE}") {{ ... on Blob {{ isTruncated text }} }}'
@@ -725,32 +730,77 @@ def _unknown_pull_requests(
     return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
 
 
-def _pin(blob: object, *, private: bool) -> dict[str, Any]:
+def _exact_pins(text: str) -> set[str] | None:
+    """Versions of lu-machinery that a manifest pins exactly, in any dependency group.
+
+    ``None`` when the manifest cannot be read, or names lu-machinery without one exact version.
+    """
+    try:
+        manifest = tomllib.loads(text)
+        project = _mapping(manifest.get("project"))
+        groups = [project.get("dependencies", []), *_mapping(project.get("optional-dependencies")).values(),
+                  *_mapping(manifest.get("dependency-groups")).values()]
+        versions: set[str] = set()
+        for group in groups:
+            if not isinstance(group, list):
+                return None
+            for spec in (item for item in group if isinstance(item, str)):  # PEP 735 includes are tables
+                req = Requirement(spec)
+                if canonicalize_name(req.name) != "lu-machinery":
+                    continue
+                exact = list(req.specifier)
+                if len(exact) != 1 or exact[0].operator != "==":
+                    return None
+                versions.add(exact[0].version)
+    except (tomllib.TOMLDecodeError, InvalidRequirement, RecursionError, ValueError):
+        return None
+    return versions
+
+
+def _pin(repo: dict[str, Any], *, private: bool, errored: bool) -> dict[str, Any]:
     """The lu-machinery version a project pins, from its default branch's pyproject.toml.
 
-    ``withheld`` for a private project (counts and states only). ``none`` when the file is
-    absent or names no pin; ``unknown`` when the file was cut short or names several versions.
+    ``withheld`` for a private project (counts and states only). ``none`` only when GitHub says
+    the file is absent or it names no lu-machinery; ``unknown`` when the field is missing or
+    errored, the file was cut short or cannot be parsed, or it names several versions.
     """
     if private:
         return {"state": "withheld", "version": None}
+    if errored or "pin" not in repo:
+        return {"state": "unknown", "version": None}
+    blob = repo["pin"]
     if blob is None:
         return {"state": "none", "version": None}
     fields = _mapping(blob)
     body = fields.get("text")
     if not isinstance(body, str) or fields.get("isTruncated") is not False:
         return {"state": "unknown", "version": None}
-    versions = set(_PIN.findall(body))
-    if not versions:
-        return {"state": "none", "version": None}
-    if len(versions) > 1:
+    versions = _exact_pins(body)
+    if versions is None or len(versions) > 1:
         return {"state": "unknown", "version": None}
-    return {"state": "pinned", "version": versions.pop()}
+    return {"state": "pinned", "version": versions.pop()} if versions else {"state": "none", "version": None}
 
 
-def _default_branch_ci(repo: dict[str, Any]) -> dict[str, Any]:
-    """The check rollup of the default branch's latest commit; no rollup is ``None``, never success."""
-    tip = _mapping(_mapping(repo.get("defaultBranchRef")).get("target"))
+def _default_branch_ci(repo: dict[str, Any], *, errored: bool) -> dict[str, Any] | None:
+    """The check rollup of the default branch's latest commit; no rollup is ``None``, never success.
+
+    The whole entry is ``None`` (unknown) when the field is missing or GitHub errored on it.
+    """
+    if errored or "defaultBranchRef" not in repo:
+        return None
+    tip = _mapping(_mapping(repo["defaultBranchRef"]).get("target"))
     return {"ci": panel_values.choice(_lower(_mapping(tip.get("statusCheckRollup")).get("state")), _CI_STATES)}
+
+
+def _errored_fields(document: object) -> dict[str, set[str]]:
+    """Fields GitHub reported an error for, by repository alias: ``{"r0": {"pin"}}``."""
+    errors = document.get("errors") if isinstance(document, dict) else None
+    found: dict[str, set[str]] = {}
+    for item in errors if isinstance(errors, list) else []:
+        path = item.get("path") if isinstance(item, dict) else None
+        if isinstance(path, list) and len(path) >= 2 and isinstance(path[0], str) and isinstance(path[1], str):
+            found.setdefault(path[0], set()).add(path[1])
+    return found
 
 
 def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) -> dict[str, Any]:
@@ -766,10 +816,14 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         catalog = list(load_fleet_repos().values())
     except FleetRepoError:
         return _unknown_pull_requests("registry_unavailable", observed_at)
-    if any(not _REPOSITORY_SLUG.fullmatch(repo.github) or repo.name in {".", ".."} for repo in catalog):
-        return _unknown_pull_requests("invalid_repository", observed_at)
     targets = [(repo.key, repo.owner, repo.name, repo.local_name) for repo in catalog]
-    repositories = [(owner, name, display) for _key, owner, name, display in targets]
+    # One invalid slug is that project's unknown row, never a failed read for the others.
+    valid = [bool(_REPOSITORY_SLUG.fullmatch(repo.github)) and repo.name not in {".", ".."} for repo in catalog]
+    repositories: list[tuple[str, str, str] | None] = [
+        (owner, name, display) if ok else None for ok, (_key, owner, name, display) in zip(valid, targets, strict=True)
+    ]
+    if not any(valid):
+        return _unknown_pull_requests("invalid_repository", observed_at, targets)
 
     def unknown(reason: str) -> dict[str, Any]:
         return _unknown_pull_requests(reason, observed_at, targets)
@@ -790,15 +844,20 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
     # gh exits 1 when any one repository is unresolvable, and still prints the rest under "data".
     # Read it per repository; no data at all is a failed read.
     try:
-        data = json_depth.loads(proc.stdout or "", max_depth=512)["data"]
+        document = json_depth.loads(proc.stdout or "", max_depth=512)
+        data = document["data"]
     except (ValueError, KeyError, TypeError):
         return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
     if not isinstance(data, dict):
         return unknown("github_unavailable" if proc.returncode != 0 else "github_invalid_response")
+    errored = _errored_fields(document)
     rows = []
     for index, (key, owner, name, display) in enumerate(targets):
         repo = data.get(f"r{index}")
         entry: dict[str, Any] = {"repository": f"{owner}/{name}", "name": display, "key": key}
+        if not valid[index]:
+            rows.append(_unreadable_row(entry, "invalid_repository", observed_at))
+            continue
         if not isinstance(repo, dict) or not isinstance(repo.get("pullRequests"), dict):
             rows.append(_unreadable_row(entry, "not_readable", observed_at))
             continue
@@ -807,8 +866,10 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
         private = repo.get("isPrivate") is not False or not catalog[index].role.startswith("public-")
         nodes = repo["pullRequests"].get("nodes")
         total = repo["pullRequests"].get("totalCount")
-        # A missing or null PR node would silently read as fewer open PRs.
-        if not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes):
+        # A missing or null PR node would silently read as fewer open PRs, and a count that is not a
+        # non-negative integer is no reading of the open PRs at all.
+        if (not isinstance(nodes, list) or not all(isinstance(node, dict) for node in nodes)
+                or type(total) is not int or total < 0):
             rows.append(_unreadable_row(entry, "github_invalid_response", observed_at, private=private))
             continue
         _UNKNOWN_SINCE.pop(entry["repository"], None)
@@ -817,15 +878,18 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
             "status": "ok",
             "reason": None,
             "private": private,
-            "open_total": total if isinstance(total, int) else None,
-            "default_branch": _default_branch_ci(repo),
-            "pin": _pin(repo.get("pin"), private=private),
+            "open_total": total,
+            "default_branch": _default_branch_ci(repo, errored="defaultBranchRef" in errored.get(f"r{index}", ())),
+            "pin": _pin(repo, private=private, errored="pin" in errored.get(f"r{index}", ())),
             "unknown_since": None,
             "pull_requests": [
                 _pull_request_row(node, private=private, repository=f"{owner}/{name}", tasks_dir=records)
                 for node in nodes[:PULL_REQUESTS_PER_REPOSITORY]
             ],
         })
+    if proc.returncode != 0 and not any(row["status"] == "ok" for row in rows):
+        # gh failed (rate limit, auth) and no repository came back: a failed read, not "all unreadable".
+        return unknown("github_unavailable")
     return {"status": "ok", "reason": None, "observed_at": observed_at, "repositories": rows}
 
 
@@ -838,7 +902,11 @@ def _live_workers(ctx: MonitorContext) -> dict[str, int] | None:
     counts = payload.get("live_by_repository") if isinstance(payload, dict) else None
     if age > LIVE_WORKERS_MAX_AGE_S or not isinstance(counts, dict):
         return None
-    return {str(claimed).casefold(): n for claimed, n in counts.items() if type(n) is int}
+    merged: dict[str, int] = {}
+    for claimed, n in counts.items():
+        if type(n) is int:  # claims that differ only in case are one repository
+            merged[str(claimed).casefold()] = merged.get(str(claimed).casefold(), 0) + n
+    return merged
 
 
 def _with_live_workers(payload: dict[str, Any], counts: dict[str, int] | None) -> dict[str, Any]:
@@ -862,7 +930,7 @@ def _with_live_workers(payload: dict[str, Any], counts: dict[str, int] | None) -
         if counts is None or repo is None:
             out.append({**row, "live_workers": None} if isinstance(row, dict) else row)
             continue
-        live = sum(counts.get(slug.casefold(), 0) for slug in repo.slugs)
+        live = sum(counts.get(slug, 0) for slug in {slug.casefold() for slug in repo.slugs})
         seen += live
         out.append({**row, "live_workers": live})
     return {**payload, "repositories": out,

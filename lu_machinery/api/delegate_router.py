@@ -631,8 +631,9 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     tasks_dir = _tasks_dir(ctx)
     rows = []
     claims: list[tuple[str | None, list[str]]] = []
-    # Live workers by claimed repository (read-only reviewers included). "" counts a record
-    # with no usable claim, so the Projects line can say how many are not attributed.
+    # Live workers by claimed repository (read-only reviewers included). "" counts a confirmed live
+    # record with no usable claim, so the Projects line can say how many are not attributed. A record
+    # that cannot be read is no confirmed worker, and a task store that cannot be read gives no counts.
     live_by_repository: dict[str, int] = {}
     for path in iter_task_records(tasks_dir, include_archive=False):
         try:
@@ -659,7 +660,6 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
                 summary = _task_summary(path, task)
         except OSError:
             claims.append((None, []))
-            live_by_repository[""] = live_by_repository.get("", 0) + 1
             continue
         except ValueError:
             continue
@@ -675,7 +675,7 @@ def _active_snapshot_tasks(ctx: MonitorContext) -> dict[str, Any]:
     # The HTTP /active projection omits these internal claims, including grants.
     return {
         "total": len(rows), "tasks": _sort_public_task_rows(rows), "planning_claims": claims,
-        "live_by_repository": live_by_repository,
+        "live_by_repository": live_by_repository if os.access(tasks_dir, os.R_OK | os.X_OK) else None,
     }
 
 

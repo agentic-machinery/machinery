@@ -377,13 +377,15 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
             "mergeQueueEntry": {"position": 1, "state": "QUEUED"},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"},
                                               "status": {"context": {"state": "SUCCESS"}}}}]}}
-    pinned = {"isTruncated": False, "text": 'dependencies = ["lu-machinery[api,pytest]==0.1.68"]'}
+    pinned = {"isTruncated": False, "text": '[project]\ndependencies = ["lu-machinery[api,pytest]==0.1.68"]\n'}
     tip = {"target": {"statusCheckRollup": {"state": "FAILURE"}}}
     extra = {"defaultBranchRef": tip, "pin": pinned}
     repos = {"r0": {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [node]}, **extra},
              "r1": {"isPrivate": True, "pullRequests": {"totalCount": 1, "nodes": [node]}, **extra},
              "r2": {"pullRequests": {"totalCount": 1, "nodes": [node]}, **extra}}
-    _three_repo_registry(monkeypatch)
+    catalog = _three_repo_registry(monkeypatch)
+    # r2 states no visibility and carries a public role: only the fail-closed default can make it private.
+    catalog["infra-private"] = FleetRepo("infra-private", "other-owner/private-infra", "private-infra", "public-labs")
 
     def github_run(args, **_kwargs):
         assert 'r0: repository(owner: "new-owner", name: "machinery")' in args[-1]
@@ -411,6 +413,32 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
         assert "title" not in repo["pull_requests"][0]
         assert repo["pull_requests"][0]["task_reference"] is None
         assert "secret" not in json.dumps(repo)
+
+    # A private registry role alone makes a project private, whatever GitHub states.
+    catalog["machinery"] = FleetRepo("machinery", "new-owner/machinery", "machinery", "private-product")
+    by_role = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][0]
+    assert by_role["private"] is True and by_role["pin"]["state"] == "withheld"
+
+    # The pin is read from the parsed manifest, not from its text: a comment is no pin, another
+    # spelling of the name is one, and anything that is not one exact version is unknown, never "none".
+    def pin_of(repo: dict) -> dict:
+        return git_hygiene_router._pin(repo, private=False, errored=False)
+
+    def manifest(body: str) -> dict:
+        return {"pin": {"isTruncated": False, "text": body}}
+
+    dependency = '[project]\ndependencies = ["lu_machinery == 1.2.3"]\n'
+    assert pin_of(manifest(dependency)) == {"state": "pinned", "version": "1.2.3"}
+    assert pin_of(manifest('[project]\ndependencies = []\n# "lu-machinery==9.9.9"\n'))["state"] == "none"
+    assert pin_of({"pin": None})["state"] == "none"
+    for unknown in (
+        {}, manifest("not = [toml"), manifest('[project]\ndependencies = ["lu-machinery>=1"]\n'),
+        manifest('[project]\ndependencies = ["lu-machinery==1.0"]\n[project.optional-dependencies]\nx = ["lu-machinery==2.0"]\n'),
+        {"pin": {"isTruncated": True, "text": dependency}},
+    ):
+        assert pin_of(unknown) == {"state": "unknown", "version": None}
+    assert git_hygiene_router._pin(manifest(dependency), private=False, errored=True)["state"] == "unknown"
+    assert git_hygiene_router._default_branch_ci({}, errored=False) is None
 
 
 def _heading_repo(*, loaded: bool) -> dict:
@@ -466,15 +494,19 @@ def test_pull_request_heading_uses_loaded_repositories(monkeypatch, tmp_path: Pa
     assert [repo["live_workers"] for repo in body["repositories"]] == [None, None, None]
     # Live workers count over every slug of a registry row, ignore letter case, and the ones no row
     # names (or with no claim) are reported apart, never dropped. A snapshot past its bound is unknown.
+    # A row whose two slugs differ only in case is counted once.
+    catalog = git_hygiene_router.load_fleet_repos()
+    catalog["machinery"] = FleetRepo("machinery", "new-owner/machinery", "machinery", "public-machinery",
+                                     repository_id=2, visibility="public", alternate_github="New-Owner/MACHINERY")
     counts = {"new-owner/machinery": 2, "alt-owner/private-infra": 1, "other-owner/private-infra": 1,
-              "": 1, "gone/elsewhere": 1}
+              "ALT-OWNER/PRIVATE-INFRA": 1, "": 1, "gone/elsewhere": 1}
     snapshot = {"age": 1.0}
     real_snapshot = git_hygiene_router.active_snapshot
     monkeypatch.setattr(git_hygiene_router, "active_snapshot",
                         lambda _ctx: SimpleNamespace(read=lambda: ({"live_by_repository": counts}, snapshot["age"])))
     state_helpers.cache_invalidate()
     counted = client.get("/api/git/pull-requests").json()
-    assert [repo["live_workers"] for repo in counted["repositories"]] == [2, 0, 2]
+    assert [repo["live_workers"] for repo in counted["repositories"]] == [2, 0, 3]
     assert counted["live_workers_unattributed"] == 2
     snapshot["age"] = git_hygiene_router.LIVE_WORKERS_MAX_AGE_S + 1
     state_helpers.cache_invalidate()
@@ -491,6 +523,16 @@ def test_pull_request_heading_uses_loaded_repositories(monkeypatch, tmp_path: Pa
     assert [repo["status"] for repo in partial["repositories"]] == ["ok", "unknown", "ok"]
     # The first failure's time survives the next failed reading of the same project.
     assert partial["repositories"][1]["unknown_since"] == body["repositories"][1]["unknown_since"]
+    # A PR list beside an open count that is no non-negative integer is no reading: still unknown,
+    # still since the first failure.
+    for bad_total in (False, -1, "3", None):
+        payload.clear()
+        payload.update({**_heading_payload(True, True, True),
+                        "r1": {"isPrivate": False, "pullRequests": {"totalCount": bad_total, "nodes": []}}})
+        state_helpers.cache_invalidate()
+        invalid = client.get("/api/git/pull-requests").json()["repositories"][1]
+        assert (invalid["status"], invalid["reason"], invalid["open_total"]) == ("unknown", "github_invalid_response", None)
+        assert invalid["unknown_since"] == body["repositories"][1]["unknown_since"]
 
     headers, body = heading((False, False, False))
     assert (headers["X-Snapshot-State"], headers["X-Snapshot-Age-S"]) == ("unavailable", "unknown")
@@ -520,6 +562,10 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     assert payload["reason"] == "github_unavailable"
     assert [(repo["key"], repo["status"], repo["unknown_since"]) for repo in payload["repositories"]] == [
         (key, "unknown", payload["observed_at"]) for key in ("machinery", "public", "infra-private")]
+    # No repository came back and gh failed (rate limit): a failed read, not a reading of unreadable projects.
+    _graphql_result(monkeypatch, 1, json.dumps({"data": {}, "errors": [{"type": "RATE_LIMITED"}]}))
+    limited = git_hygiene_router.compute_pull_requests(tmp_path)
+    assert (limited["status"], limited["reason"]) == ("unknown", "github_unavailable")
     _graphql_result(monkeypatch, 0, "not json")
     assert git_hygiene_router.compute_pull_requests(tmp_path)["reason"] == "github_invalid_response"
     # GitHub's nullable commit nodes and contexts read as "no CI yet", never an exception.
@@ -529,6 +575,22 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
     rows = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][0]["pull_requests"]
     assert [(row["number"], row["ci"], row["review"]) for row in rows] == [(1, None, None), (2, None, None)]
+    # One invalid slug is that project's unknown row; the others are still read in the same call.
+    catalog = _three_repo_registry(monkeypatch)
+    catalog["public"] = FleetRepo("public", "fixture/invalid!", "product", "public-monorepo")
+    queries = []
+
+    def github_run(args, **_kwargs):
+        queries.append(args[-1])
+        return SimpleNamespace(returncode=0, stdout=json.dumps({"data": {"r0": repos["r0"], "r2": repos["r2"]}}))
+
+    monkeypatch.setattr(git_hygiene_router.github_client, "run", github_run)
+    isolated = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]
+    assert [(row["status"], row["reason"]) for row in isolated] == [
+        ("ok", None), ("unknown", "invalid_repository"), ("ok", None)]
+    assert "invalid!" not in queries[0] and 'r2: repository(owner: "other-owner"' in queries[0]
+    _three_repo_registry(monkeypatch)
+    _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
     # A null PR node or a non-list connection marks that repository unknown, never "fewer PRs".
     repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": 2, "nodes": [node, None]}}
     repos["r2"] = {"isPrivate": False, "pullRequests": {"totalCount": 2, "nodes": None}}
@@ -579,6 +641,7 @@ def _write_task_record(tasks: Path, task_id: str, *, recorded: str | None = None
 def _identifier_client(tmp_path: Path, monkeypatch, repos: str, tasks: dict):
     """Serve the three routes with task records outside the project batch_state default."""
     state_helpers.cache_invalidate()
+    _three_repo_registry(monkeypatch)
     store = tmp_path / "dispatcher-store"
     ctx = fixture_context(tmp_path).with_roots(batch_state_dir=store)
     panel = FastAPI()

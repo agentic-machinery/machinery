@@ -280,24 +280,31 @@ function pinCell(pin) {
   return text(label || "?", label ? "muted" : "warn");
 }
 
-function projectRow(repo) {
-  const readable = repo.status === "ok";
+// The status column also carries the snapshot's freshness: a GitHub value past its bound is a cached
+// observation, and one that is unavailable or has no measured age is not confirmed as current.
+const PROJECT_FRESHNESS = {expired: "cached (expired)", unknown: "age unknown", unbounded: "freshness unknown"};
+
+function projectRow(repo, prState) {
+  const unavailable = prState === "unavailable";
+  const readable = repo.status === "ok" && !unavailable;
   const open = readable && typeof repo.open_total === "number" && Number.isFinite(repo.open_total) && repo.open_total >= 0 ? repo.open_total : null;
-  const ciState = readable ? repo.default_branch?.ci : null;
+  const branch = readable ? repo.default_branch : null;
+  const ciState = branch ? branch.ci : null;
   const [ci, ciClass] = ciLabel(ciState);
   const workers = typeof repo.live_workers === "number" && Number.isFinite(repo.live_workers) && repo.live_workers >= 0 ? repo.live_workers : null;
   const since = toDate(repo.unknown_since) ? `unknown since ${utc(repo.unknown_since)}` : "unknown";
+  const caveat = PROJECT_FRESHNESS[prState];
   return [
     text(repo.name),
     text(open ?? "?", open === null ? "num warn" : "num"),
     readable ? pinCell(repo.pin) : text("?", "warn"),
-    readable ? text(ciState ? ci.replace(/^CI /, "") : "none reported", ciClass) : text("?", "warn"),
+    branch ? text(ciState ? ci.replace(/^CI /, "") : "none reported", ciClass) : text("?", "warn"),
     text(workers ?? "?", workers === null ? "num warn" : workers ? "num ok" : "num"),
-    readable ? text("ok", "ok") : text(since, "warn"),
+    readable ? (caveat ? text(caveat, "warn") : text("ok", "ok")) : text(unavailable ? "snapshot unavailable" : since, "warn"),
   ];
 }
 
-function renderProjects(prs) {
+function renderProjects(prs, prState = null) {
   const repos = Array.isArray(prs.repositories) ? prs.repositories.filter(repo => repo && typeof repo === "object") : [];
   if (!repos.length) return unknown(prs.reason);
   const notes = [];
@@ -308,7 +315,7 @@ function renderProjects(prs) {
   if (typeof unattributed === "number" && unattributed > 0) {
     notes.push(`${unattributed} live worker${unattributed === 1 ? "" : "s"} not counted above: no repository, or one outside the registry.`);
   }
-  return table(["Project", "Open PRs", "lu-machinery pin", "Default-branch CI", "Live workers", "Status"], repos.map(projectRow), true)
+  return table(["Project", "Open PRs", "lu-machinery pin", "Default-branch CI", "Live workers", "Status"], repos.map(repo => projectRow(repo, prState)), true)
     + notes.map(note => `<p class="muted">${escapeHtml(note)}</p>`).join("");
 }
 
@@ -357,7 +364,25 @@ const PANELS = [
       updateChips();
     },
   },
-  {id: "projects", label: "Projects", urls: ["/api/git/pull-requests"], render: renderProjects},
+  {
+    id: "projects",
+    label: "Projects",
+    urls: ["/api/git/pull-requests"],
+    withReadings: true,
+    render: (prs, readings, now) => renderProjects(prs, prSnapshotState(readings?.[0], now).status),
+    onData: (_data, latest, readings, now) => { latest.projectsStatus = prSnapshotState(readings?.[0], now).status; },
+    onError: latest => { latest.projectsStatus = null; },
+    // The reading can cross its bound between polls: draw it again as cached when it does.
+    onTick: (panel, latest, _updateChips, now) => {
+      if (!panel.ok) return;
+      const reading = panel.readings?.[0];
+      const next = prSnapshotState(reading, now);
+      if (next.status === latest.projectsStatus) return;
+      latest.projectsStatus = next.status;
+      const box = document.getElementById("projects-content");
+      if (box && reading && reading.data) box.innerHTML = renderProjects(reading.data, next.status);
+    },
+  },
 ];
 
 const runner = createPanelRunner({panels: PANELS, renderChips});
