@@ -326,9 +326,11 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert "--no-emit-project --no-default-groups --all-extras --no-extra test" in output
     # lu-machinery is on no package index: the host wheelhouse supplies it, the lock's hashes pick the bytes.
     assert f"--require-hashes --only-binary=:all: --find-links {runner_roots.parent / 'wheelhouse'} -r " in output
-    # With allowance on both accounts, account b drains first (the reviewer resolver's order).
-    assert "--codex-account b-sub" in output and "--claude-account b " in output
-    assert "--codex-account sub " not in output and "--claude-account a " not in output
+    # With allowance on both accounts, account b drains first (the reviewer resolver's order),
+    # in each route's dispatch argv itself (it follows the embedded bootstrap script).
+    dispatch = {route: next(line for line in output.splitlines() if f" --agent {route} " in line)
+                for route in ("codex", "claude")}
+    assert " --codex-account b-sub " in dispatch["codex"] and " --claude-account b " in dispatch["claude"]
     assert "--require-hashes" in output and "contract-canary.pth" in output
     assert "--pinned-head " + "a" * 40 in output
     assert "check --head " + "a" * 40 in output
@@ -549,7 +551,7 @@ def test_codex_canary_runs_on_the_funded_account_and_refuses_when_none_is(runner
     monkeypatch.setattr(credit_lane, "read_routing_budget", lambda **kw: funded_snapshot(a=0.0, b=0.0))
     assert canary.main(["run", "--head", "a" * 40, "--dry-run"]) == 2
     err = capsys.readouterr().err
-    assert "no-allowance: route codex has no account with allowance (b-sub: 0% remaining" in err
+    assert "no-allowance: route codex: no account with allowance (b-sub: 0% remaining" in err
     assert "; sub: 0% remaining" in err
     assert list(runner_roots.iterdir()) == []
     with pytest.raises(canary.NoAllowance) as refused:
