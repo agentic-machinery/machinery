@@ -15,6 +15,9 @@ Add to the template's **Target** section:
 - the checks already run, with their results or CI run ids (reviewers do not re-run suites),
   and the checks still pending on that head, named as pending. Review starts without waiting
   for the PR's `CI Gate`; pending CI is not successful CI.
+- the threat model statement (supported inputs and operating conditions, who can influence
+  inputs or write relevant paths, and the controls that enforce exclusions), as the
+  [policy's Threat model paragraph](policy.md#3-findings) requires.
 
 ## Judge inputs come from the merge-base
 
