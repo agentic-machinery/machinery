@@ -1701,10 +1701,14 @@ def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
     (seed / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     _git(seed, "add", "pyproject.toml", "uv.lock")
     _git(seed, "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "-m", "fixture build inputs")
-    head = subprocess.run(["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    head = subprocess.run(
+        ["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True, timeout=30,
+    ).stdout.strip()
 
     bare = tmp_path / "machinery.git"
-    subprocess.run(["git", "clone", "--quiet", "--bare", str(seed), str(bare)], check=True, capture_output=True, text=True)
+    subprocess.run(
+        ["git", "clone", "--quiet", "--bare", str(seed), str(bare)], check=True, capture_output=True, text=True, timeout=30,
+    )
 
     host_python = tmp_path / "host-python"
     host_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -1717,7 +1721,7 @@ def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
         (work / "tmp").mkdir()
         subprocess.run(
             ["git", "clone", "--quiet", "--no-checkout", str(bare), str(work / "machinery")],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, text=True, timeout=30,
         )
         return Cut(
             work=work, dry_run=True, machinery_remote=str(bare), product_remote="",
