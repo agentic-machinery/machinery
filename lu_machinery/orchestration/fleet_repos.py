@@ -415,12 +415,12 @@ def same_repository(left: object, right: object, *, repos: Mapping[str, FleetRep
     so a payload written before a transfer matches one written after it. Anything else, an
     unreadable catalog included, is not the same repository.
     """
+    if isinstance(left, str) and left == right:
+        return True
     if not (
         isinstance(left, str) and isinstance(right, str) and _EXACT_SLUG.fullmatch(left) and _EXACT_SLUG.fullmatch(right)
     ):
         return False
-    if left == right:
-        return True
     try:
         catalog = repos if repos is not None else _bundled_catalog()
         row = resolve_fleet_repo_by_slug(left, repos=catalog)
