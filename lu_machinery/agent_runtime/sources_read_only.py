@@ -8,6 +8,7 @@ The side-effect audit tests these annotations against actual persistent writes.
 from __future__ import annotations
 
 import ast
+import os
 import unicodedata
 from bisect import bisect_right
 from functools import lru_cache
@@ -15,7 +16,7 @@ from operator import itemgetter
 from pathlib import Path
 
 from lu_machinery.agent_runtime.unicode_printable import CORRECTIONS
-from lu_machinery.common.repo_root import product_root
+from lu_machinery.common.repo_root import PRODUCT_ROOT_ENV, ProductRootError, product_root
 
 # The Sources server is product-owned (C-4843): its path is the configured product checkout's.
 SERVER_RELATIVE_PATH = Path(".mcp/servers/sources/server.py")
@@ -48,7 +49,7 @@ def printable_text(text: str) -> bool:
     return True
 
 
-def sources_server_path() -> Path | None:
+def sources_server_path(*, fallback_checkout: Path | None = None) -> Path | None:
     """The configured product checkout's Sources server, or ``None`` when its fleet row declares none.
 
     The checkout is identified by :func:`~lu_machinery.orchestration.fleet_repos.fleet_repo_for_checkout`.
@@ -56,11 +57,23 @@ def sources_server_path() -> Path | None:
     :data:`SERVER_RELATIVE_PATH`, so a missing server still fails closed. A declared value must be
     :data:`SERVER_RELATIVE_PATH`, the only location read. Only a caller that has disabled every other
     MCP source may act on ``None``; :func:`sources_tool_sets` never does.
+
+    With no configured or in-tree product, a caller may name its checkout. Git must identify
+    that checkout as a registered fleet consumer before it can supply a Sources policy.
     """
     from lu_machinery.orchestration.fleet_repos import fleet_repo_for_checkout
 
-    root = product_root()
-    repo = fleet_repo_for_checkout(root)
+    try:
+        root = product_root()
+    except ProductRootError:
+        if fallback_checkout is None or os.environ.get(PRODUCT_ROOT_ENV):
+            raise
+        root = fallback_checkout.absolute()
+        repo = fleet_repo_for_checkout(root)
+        if repo is None:
+            raise
+    else:
+        repo = fleet_repo_for_checkout(root)
     if repo is not None and repo.sources_server is None:
         return None
     if repo is not None and repo.sources_server != SERVER_RELATIVE_PATH.as_posix():

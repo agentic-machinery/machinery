@@ -61,7 +61,7 @@ from lu_machinery.secret_redactor import redact_text
 
 from ..read_only_tmp import validate_read_only_tmp_root
 from ..result import ParseResult
-from ..sources_read_only import sources_tool_sets
+from ..sources_read_only import sources_server_path, sources_tool_sets
 from ._output_schema import (
     json_value,
     load_output_schema,
@@ -236,24 +236,6 @@ def _sources_read_only_flags(tool_names: tuple[str, ...] | None = None) -> list[
     ]
 
 
-def _prompt_names_sources_mcp(prompt: str) -> bool:
-    return "mcp__sources__" in prompt
-
-
-def _argv_can_call_sources_mcp(argv: list[str]) -> bool:
-    if "--dangerously-bypass-approvals-and-sandbox" in argv:
-        return True
-    if any(
-        all(flag in argv for flag in _sources_read_only_flags(tools))
-        for tools in (
-            tuple(sorted(attempt_hooks().ledger().review_tools())),
-            tuple(sorted(attempt_hooks().ledger().review_tools("full"))),
-        )
-    ):
-        return True
-    return all(flag in argv for flag in _sources_read_only_flags())
-
-
 def _read_only_tmp_flags(root: Path) -> list[str]:
     # Replace the entire permissions map so inherited entries cannot add
     # writable paths. The legacy mode is a fail-closed fallback for old CLIs.
@@ -425,7 +407,16 @@ class CodexAdapter:
             # --ignore-rules. Run from the parent-created instruction-free
             # directory; complete changed content remains in the sealed prompt.
             execution_cwd = review_write_root / "exec"
-        guard_sources_config = tc_early.get("ignore_user_config") or tc_early.get("review_isolation")
+        needs_sources = "mcp__sources__" in prompt
+        ordinary_read_only = mode == "read-only" and not tc_early.get("review_isolation")
+        sources_server = sources_server_path(fallback_checkout=cwd) if ordinary_read_only else None
+        no_sources = ordinary_read_only and sources_server is None
+        if no_sources:
+            if tc_early.get("mcp_config_path") or tc_early.get("mcp_servers") or needs_sources:
+                raise CodexReviewConfigError("codex_sources_undeclared: mcp__sources__ tools are unavailable")
+            if session_id is not None:
+                raise CodexReviewConfigError("codex_consumer_resume_config_unverified")
+        guard_sources_config = no_sources or tc_early.get("ignore_user_config") or tc_early.get("review_isolation")
         if guard_sources_config:
             servers = tc_early.get("mcp_servers", {})
             if not isinstance(servers, dict):
@@ -482,7 +473,7 @@ class CodexAdapter:
         # older binary are the caller's responsibility to feature-detect; the
         # bridge refuses engines that cannot prove these capabilities.
         tc = tool_config or {}
-        if tc.get("review_isolation") or tc.get("ignore_user_config"):
+        if guard_sources_config:
             cmd.append("--ignore-user-config")
         if tc.get("review_isolation") or tc.get("ignore_rules"):
             cmd.append("--ignore-rules")
@@ -524,24 +515,31 @@ class CodexAdapter:
         # enables toggles.
         cmd.extend(["--disable", "apps"])
         cmd.extend(self._tool_config_flags(tool_config))
+        if no_sources:
+            # An empty CLI MCP table merges with inherited config. The layer
+            # check above rejects remaining configured servers, and these flags
+            # keep plugin-provided servers and skill MCP installation off.
+            cmd.extend(["--disable", "plugins", "--disable", "skill_mcp_dependency_install"])
         mcp_servers = tc.get("mcp_servers")
         sources = mcp_servers.get("sources") if isinstance(mcp_servers, dict) else None
         sources_defined = isinstance(sources, dict) and bool(sources.get("command") or sources.get("url"))
-        if mode == "read-only" and ("--ignore-user-config" not in cmd or sources_defined):
+        sources_flags = []
+        if mode == "read-only" and not no_sources and (not guard_sources_config or sources_defined):
             # Last overrides win: caller/global config cannot re-expose writers.
             # Formal scoped homes use the receipt contract, including when the
             # parent AttemptBoundary replaces their server with a stdio proxy.
             if tc.get("codex_home_override") and tc.get("mcp_config_path"):
                 tools = tuple(sorted(attempt_hooks().ledger().review_tools(tc.get("review_access", "isolated"))))
             else:
-                tools = sources_tool_sets()[0]
-            cmd.extend(_sources_read_only_flags(tools))
+                tools = sources_tool_sets(sources_server)[0]
+            sources_flags = _sources_read_only_flags(tools)
+            cmd.extend(sources_flags)
         if has_session_to_resume:
             cmd.append(session_id)
         cmd.append("-")  # Read prompt from stdin.
 
         env_overrides: dict[str, str] = {}
-        if _prompt_names_sources_mcp(prompt) and not _argv_can_call_sources_mcp(cmd):
+        if needs_sources and not (sources_flags or "--dangerously-bypass-approvals-and-sandbox" in cmd):
             raise ValueError(
                 "CodexAdapter: this mode cannot call mcp__sources__* "
                 "(a read-only sandbox cancels unapproved stdio MCP). "
