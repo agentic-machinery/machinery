@@ -223,7 +223,7 @@ function laneRow(name, chooser, counts) {
     stage(`Account: ${chooserSplit}`, Object.values(counts.by_pool || {}).reduce((n, v) => n + v, 0), topCounts(counts.by_pool, 4)),
     stage("Admission: host and pool limits", `${adm.admitted ?? 0} <small class="ok">admitted</small>`, admissionSplit(adm),
       checked ? "" : "skip"),
-    stage("Ran", `${counts.live ?? 0} <small>running now</small>`,
+    stage("Ran", `${counts.live ?? 0} <small>running or starting</small>`,
       counts.substitutions ? `<a class="warn" href="#decisions" data-outcome="substituted">${counts.substitutions} ran another model</a>` : "no substitutions recorded"),
   ].join("");
 }
@@ -258,18 +258,22 @@ function renderFlow(data) {
   return recentNote(data) + flow + windowNote + resolverCallouts(data);
 }
 
-function liveCell(meter, data) {
-  const now = data.now || {};
-  const all = now.live?.state === "ok" ? now.live.by_pool?.[meter] : null;
-  const writes = nowState(data) === "ok" && now.admission?.state === "ok" ? now.admission.pools?.[meter]?.live_writes : null;
-  if (typeof all !== "number") return text(unknownSince(null, now.live?.reason), "warn");
-  // A count from an out-of-date evaluation, or after a failed refresh, is no longer a live count.
-  if (state.failedAt || (now.state === "ok" && nowState(data) !== "ok")) return text(nowUnknownText(data), "warn");
-  const writeText = typeof writes === "number" ? ` (${writes} write${writes === 1 ? "" : "s"})` : "";
-  return text(`${all}${all || writes ? writeText : ""}`, all ? "" : "muted");
+// Admission's own write-slot count for the pool (a slot held by a starting dispatch counts, as for dispatch).
+function slotsCell(meter, data) {
+  const admission = data.now?.admission;
+  const verdict = admission?.pools?.[meter];
+  if (nowState(data) !== "ok" || admission?.state !== "ok" || typeof verdict?.live_writes !== "number") {
+    return text(nowState(data) === "pending" ? "being evaluated" : nowState(data) === "ok" ? unknownSince(timeOf(data.now?.age_s), admission?.reason) : nowUnknownText(data), "warn");
+  }
+  const cap = typeof verdict.cap === "number" ? ` of ${verdict.cap}` : "";
+  return admission.incomplete
+    ? text(`${verdict.live_writes}${cap}, may be low`, "warn")
+    : text(`${verdict.live_writes}${cap}`, verdict.live_writes ? "" : "muted");
 }
 
+// A reading shown after a failed refresh is no longer current: unknown since that reading.
 function allowanceCell(allowance) {
+  if (state.failedAt) return text(unknownSince(allowance?.read_at, "the last refresh failed"), "warn");
   if (!allowance || allowance.state !== "fresh" || typeof allowance.left_pct !== "number") {
     return text(unknownSince(allowance?.read_at, allowance?.reason), "warn");
   }
@@ -277,7 +281,7 @@ function allowanceCell(allowance) {
 }
 
 function resetCell(allowance) {
-  if (!allowance || allowance.state !== "fresh" || !allowance.resets_at) return text("—", "muted");
+  if (state.failedAt || !allowance || allowance.state !== "fresh" || !allowance.resets_at) return text("—", "muted");
   return cell(`${escapeHtml(utc(allowance.resets_at))}<span class="why">${escapeHtml(relative(allowance.resets_at))}</span>`);
 }
 
@@ -313,12 +317,13 @@ function hostLine(data) {
   if (nowState(data) !== "ok" || data.now?.admission?.state !== "ok" || !host) {
     return `<p class="callout warn">Host admission checks: ${escapeHtml(nowState(data) === "ok" ? unknownSince(timeOf(data.now?.age_s), data.now?.admission?.reason) : nowUnknownText(data))}.</p>`;
   }
-  const unmeasured = host.unmeasured?.length ? ` Not measured: ${escapeHtml(host.unmeasured.join(", "))}.` : "";
+  const unmeasured = (host.unmeasured?.length ? ` Not measured: ${escapeHtml(host.unmeasured.join(", "))}.` : "")
+    + (data.now.admission.incomplete ? ` ${escapeHtml(data.now.admission.incomplete)}.` : "");
   if (!host.admitting) {
     return `<p class="callout bad">Host: admission is deferring <b>every</b> new write: ${escapeHtml(host.failing.join("; "))}.${unmeasured}</p>`;
   }
-  return `<p class="callout${unmeasured ? " warn" : ""}">Host: admission is letting new writes start (${host.live_writes} of ${host.write_cap} write workers running; `
-    + `memory, CPU load, worker memory pool, test-slot queue and disk checks ${unmeasured ? "pass where measured" : "pass"}).${unmeasured}</p>`;
+  return `<p class="callout${unmeasured ? " warn" : ""}">Host: admission is letting new writes start (${host.live_writes} of ${host.write_cap} write slots in use; `
+    + `memory, CPU load, worker memory pool, test-slot queue and disk checks ${host.unmeasured?.length ? "pass where measured" : "pass"}).${unmeasured}</p>`;
 }
 
 function renderPools(data) {
@@ -329,7 +334,7 @@ function renderPools(data) {
     : `<p class="warn">Routing budget ${escapeHtml(unknownSince(null, budget.reason))}: admission and resolver verdicts are unknown.</p>`;
   const rows = (now.pools || []).map(({pool, label}) => [
     td(`<b>${escapeHtml(label)}</b>`),
-    liveCell(pool, data),
+    slotsCell(pool, data),
     allowanceCell(now.allowance?.[pool]),
     resetCell(now.allowance?.[pool]),
     admissionCell(pool, data),
@@ -338,7 +343,7 @@ function renderPools(data) {
   const unpooled = nowState(data) === "ok" && now.resolver?.unpooled?.length
     ? `<p class="muted">Seats without a pool (the account they would run on is not resolved): ${now.resolver.unpooled.map(seat => `${escapeHtml(seat.model)} — ${escapeHtml(seat.reason || seat.state)}`).join("; ")}.</p>` : "";
   return hostLine(data) + budgetLine
-    + table(["Pool", "Live now", "Allowance left", "Resets", "New write work", "Review seats"], rows, true) + unpooled;
+    + table(["Pool", "Write slots in use", "Allowance left", "Resets", "New write work", "Review seats"], rows, true) + unpooled;
 }
 
 function asked(row) {
@@ -354,7 +359,7 @@ function decisionRow(row) {
   const admission = row.admission || {};
   const statusClass = row.live ? "ok" : ["failed", "crashed", "timeout", "no_deliverable", "rate_limited"].includes(row.status) ? "bad" : "";
   const chosen = `${escapeHtml(row.model || "unknown model")}${row.effort ? ` <span class="muted">(${escapeHtml(row.effort)})</span>` : ""}`
-    + `<span class="why">on ${escapeHtml(row.pool_label || "no subscription pool")}</span>`;
+    + `<span class="why">${row.pool_label ? `on ${escapeHtml(row.pool_label)}` : "pool not recorded"}</span>`;
   const by = `model: ${escapeHtml(MODEL_BY[row.model_by] || row.model_by)}`
     + `<span class="why">account: ${escapeHtml(ACCOUNT_BY[row.account_by] || (row.pool ? "not recorded" : "—"))}</span>`;
   const why = [admission.reason, row.substitution ? `substitution: ${row.substitution}` : null].filter(Boolean);

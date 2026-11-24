@@ -101,8 +101,18 @@ def test_refused_start_shows_requested_id_and_plain_reason_not_the_raw_clause(tm
     }
     assert "SECRET-MARKER" not in str(row)
 
+    # A refusal written before any meter existed records no account choice: its pool is unknown, not the default.
+    account_refusal = _write_task(
+        "e" * 32, started=_NOW - timedelta(minutes=2), status="failed", requested_task_id="account-refused",
+        never_started_reason="account_check", admission=None,
+    )
+    _write_record(tasks, "e" * 32, account_refusal)
+    rows = {row["task_id"]: row for row in runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))["decisions"]}
+    assert rows["account-refused"]["pool"] is None
+    assert rows["account-refused"]["admission"] == {"state": "refused", "reason": "refused: the account check failed"}
 
-def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path):
+
+def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path, monkeypatch):
     """Defect class: missing or unreadable task data read as a complete (possibly empty) day.
 
     A missing store is unknown with no counts. A record in the window whose
@@ -127,3 +137,12 @@ def test_missing_task_store_is_unknown_not_an_empty_day(tmp_path):
     assert partial["status"] == "partial"
     assert partial["unreadable"] == 2
     assert [row["task_id"] for row in partial["decisions"]] == ["good"]
+
+    def listing_fault(_directory):
+        raise PermissionError("listing refused")
+
+    monkeypatch.setattr(runtime_router.dispatch_admission, "scan_record_candidates", listing_fault)
+    unlistable = runtime_router.routing_decisions(_ctx(tmp_path / "batch_state"))
+    assert unlistable["status"] == "unknown"
+    assert unlistable["reason"] == "task_records_unreadable"
+    assert "decisions" not in unlistable
