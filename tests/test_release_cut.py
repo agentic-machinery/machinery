@@ -778,6 +778,32 @@ def _host(monkeypatch, tmp_path, interpreter):
     return primary
 
 
+def test_successful_default_work_is_removed_and_log_archived(monkeypatch, tmp_path):
+    """Defect class: successful default release work directories accumulate large artifacts."""
+    _host(monkeypatch, tmp_path, sys.executable)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    def execute(cut):
+        cut.version = "1.2.3"
+        with (cut.work / "cut.log").open("a") as log:
+            log.write("fixture release complete\n")
+        (cut.work / "large-artifact").write_text("fixture")
+        sealed = cut.work / "accept" / "node"
+        sealed.mkdir(parents=True)
+        (sealed / "file").write_text("fixture")
+        sealed.chmod(0o555)
+        sealed.parent.chmod(0o555)
+        return 0
+
+    monkeypatch.setattr(release_cut, "execute", execute)
+    assert main(["cut", "--dry-run", "--no-alert", "--x-agent", "claude/claude-opus-5-5"]) == 0
+    assert not list(tmp_path.glob(".lu-release-cut-*"))
+    logs = list((tmp_path / "state" / "lu-release-cut").glob("1.2.3-*.log"))
+    assert len(logs) == 1
+    assert "fixture release complete" in logs[0].read_text()
+
+
 # prepare_node_dependencies, in the accept interpreter: parents, the 0755 prefix, then the contract copies.
 _PREPARE_PREFIX = (
     "import pathlib, shutil, sys; work = pathlib.Path(sys.argv[1]); contract = work / 'contract'; contract.mkdir(); "
@@ -848,13 +874,15 @@ def test_failure_alert_is_published_from_the_primary_checkout(monkeypatch, tmp_p
     )
     publisher.chmod(0o755)
     primary = _host(monkeypatch, tmp_path, publisher)
+    monkeypatch.setenv("HOME", str(tmp_path))
 
     def execute(cut):
         cut.step = "Node provisioning"
         raise CutError("Unsafe Node dependency artifact")
 
     monkeypatch.setattr(release_cut, "execute", execute)
-    assert main(["cut", "--dry-run", "--work", str(tmp_path / "work"), "--x-agent", "claude/claude-opus-5-5"]) == 1
+    assert main(["cut", "--dry-run", "--x-agent", "claude/claude-opus-5-5"]) == 1
+    assert len(list(tmp_path.glob(".lu-release-cut-*/cut.log"))) == 1
     assert "alert to claude-cto failed" not in capsys.readouterr().err
     toplevel, argv, body = record.read_text(encoding="utf-8").split("\n", 2)
     assert Path(toplevel).resolve() == primary.resolve()
