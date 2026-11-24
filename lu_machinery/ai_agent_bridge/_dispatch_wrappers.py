@@ -33,7 +33,7 @@ REVIEW_DEEP_INSTRUCTIONS = (
     "agents_extensions/shared/skills/review-loop/references/policy.md section "
     "3: one finding per root cause. "
     "Dispositions (local-code-review checklist Step 5): in_scope_blocker (a "
-    "reachable P0-P2 defect or demonstrated regression against main, cited "
+    "reachable P0-P2 defect or demonstrated P0-P2 regression against main, cited "
     "by path:line, published history or a reproduction), follow_up (a P3 "
     "with an owner that the change neither introduces, exposes nor worsens) "
     "or stop_and_escalate (material contract ambiguity). An unresolved "
