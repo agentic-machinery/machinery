@@ -1355,6 +1355,293 @@ def test_no_text_driver_operations(verb, fields, expected, monkeypatch, tmp_path
 
 
 @pytest.mark.usefixtures('configured_roots', 'catalog')
+def test_run_force_cancel_allows_stuck_cancelled_run_and_posts_force_cancel(
+    tmp_path, synthetic_opsec, github_transport
+):
+    """Defect class: a non-completed run with cancelled scan jobs and a queued always() job fails to POST force-cancel."""
+    from lu_machinery.common.github_client import Response
+
+    run_doc = {"id": 123, "status": "queued", "conclusion": None}
+    jobs_page = {
+        "total_count": 2,
+        "jobs": [
+            {"id": 1, "run_id": 123, "name": "Secret scan", "status": "completed", "conclusion": "cancelled"},
+            {"id": 2, "run_id": 123, "name": "Fleet security gate", "status": "queued", "conclusion": None},
+        ],
+    }
+    calls = []
+
+    def spy(args, **kwargs):
+        calls.append((args, kwargs["env"]))
+        if args[1:4] == ["api", "--method", "GET"] and "/actions/runs/123/jobs" in args[4]:
+            return subprocess.CompletedProcess(args, 0, json.dumps([jobs_page]), "")
+        if args[1:4] == ["api", "--method", "GET"] and "/actions/runs/123" in args[4]:
+            return subprocess.CompletedProcess(args, 0, json.dumps(run_doc), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    assert pub.publish("run-force-cancel", repo="unit/public", number=123, cwd=tmp_path, runner=spy, env={}).returncode == 0
+    assert [argv for argv, _ in calls] == [
+        ["gh", "api", "--method", "GET", "repos/unit/public/actions/runs/123?per_page=100"],
+        ["gh", "api", "--method", "GET", "repos/unit/public/actions/runs/123/jobs?per_page=100", "--paginate", "--slurp"],
+        ["gh", "api", "--method", "POST", "repos/unit/public/actions/runs/123/force-cancel"],
+    ]
+    assert all(env["GH_HOST"] == "github.com" for _, env in calls)
+    assert pub.main(["run-force-cancel", "--repo", "unit/public", "--number", "123"], runner=spy) == 0
+
+    def transport(method, endpoint, headers, body, timeout):
+        if method == "GET" and endpoint.endswith("/actions/runs/123?per_page=100"):
+            return Response(200, {}, json.dumps(run_doc).encode())
+        if method == "GET" and endpoint.endswith("/actions/runs/123/jobs?per_page=100"):
+            return Response(200, {}, json.dumps(jobs_page).encode())
+        if method == "POST" and endpoint == "repos/unit/public/actions/runs/123/force-cancel":
+            return Response(202, {}, b"")
+        pytest.fail(f"unexpected request: {method} {endpoint}")
+
+    requests = github_transport(transport)
+    assert pub.publish("run-force-cancel", repo="unit/public", number=123, cwd=tmp_path, env={}).returncode == 0
+    assert [(method, endpoint, body) for method, endpoint, _headers, body, _timeout in requests] == [
+        ("GET", "repos/unit/public/actions/runs/123?per_page=100", None),
+        ("GET", "repos/unit/public/actions/runs/123/jobs?per_page=100", None),
+        ("POST", "repos/unit/public/actions/runs/123/force-cancel", None),
+    ]
+
+
+@pytest.mark.usefixtures('configured_roots', 'catalog')
+@pytest.mark.parametrize(
+    "repo,host,run_doc,jobs_pages,expect_jobs_read",
+    [
+        ("unit/public", "github.com", {"id": 123, "status": "cancelling", "conclusion": None}, None, False),
+        ("unit/public", "github.com", {"id": 123, "status": "in_progress", "conclusion": "cancelled"}, None, False),
+        (
+            "unit/public",
+            "github.com",
+            {"id": 123, "status": "queued", "conclusion": None},
+            [
+                {"total_count": 2, "jobs": [{"id": 1, "run_id": 123, "status": "queued", "conclusion": None}]},
+                {"total_count": 2, "jobs": [{"id": 2, "run_id": 123, "status": "completed", "conclusion": "cancelled"}]},
+            ],
+            True,
+        ),
+        (
+            "unit/public",
+            "github.com",
+            {"id": 123, "status": "waiting", "conclusion": None},
+            [{"total_count": 1, "jobs": [{"id": 1, "run_id": 123, "status": "cancelling", "conclusion": None}]}],
+            True,
+        ),
+        (
+            "git.enterprise-example.test/unit/public",
+            "git.enterprise-example.test",
+            {"id": 123, "status": "cancelling", "conclusion": None},
+            None,
+            False,
+        ),
+    ],
+)
+def test_run_force_cancel_allows_cancelling_multipage_and_enterprise_host(
+    repo, host, run_doc, jobs_pages, expect_jobs_read, tmp_path, synthetic_opsec
+):
+    """Defect class: cancelling/multipage/enterprise eligible runs are wrongly refused or lose --hostname."""
+    calls = []
+
+    def spy(args, **kwargs):
+        calls.append((args, kwargs["env"]))
+        if args[1:4] == ["api", "--method", "GET"] and "/actions/runs/123/jobs" in args[4]:
+            assert jobs_pages is not None
+            return subprocess.CompletedProcess(args, 0, json.dumps(jobs_pages), "")
+        if args[1:4] == ["api", "--method", "GET"] and "/actions/runs/123" in args[4]:
+            return subprocess.CompletedProcess(args, 0, json.dumps(run_doc), "")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    assert pub.publish("run-force-cancel", repo=repo, number=123, cwd=tmp_path, runner=spy, env={}).returncode == 0
+    assert len(calls) == (3 if expect_jobs_read else 2)
+    post_argv, post_env = calls[-1]
+    expected_host_flag = [] if host == "github.com" else ["--hostname", host]
+    assert post_argv == ["gh", "api", "--method", "POST", "repos/unit/public/actions/runs/123/force-cancel", *expected_host_flag]
+    assert post_env["GH_HOST"] == host
+
+
+@pytest.mark.usefixtures('configured_roots', 'catalog')
+@pytest.mark.parametrize(
+    "run_doc,jobs_pages,match",
+    [
+        ({"id": 123, "status": "completed", "conclusion": "success"}, None, "already completed"),
+        ({"id": 123, "status": "completed", "conclusion": "failure"}, None, "already completed"),
+        ({"id": 123, "status": "completed", "conclusion": "cancelled"}, None, "already completed"),
+        (
+            {"id": 123, "status": "queued", "conclusion": None},
+            [{"total_count": 2, "jobs": [
+                {"id": 1, "run_id": 123, "status": "queued", "conclusion": None},
+                {"id": 2, "run_id": 123, "status": "queued", "conclusion": None},
+            ]}],
+            "no prior cancellation evidence",
+        ),
+        (
+            {"id": 123, "status": "in_progress", "conclusion": None},
+            [{"total_count": 2, "jobs": [
+                {"id": 1, "run_id": 123, "status": "completed", "conclusion": "success"},
+                {"id": 2, "run_id": 123, "status": "in_progress", "conclusion": None},
+            ]}],
+            "no prior cancellation evidence",
+        ),
+        (
+            {"id": 123, "status": "queued", "conclusion": None},
+            [{"total_count": 2, "jobs": [
+                {"id": 1, "run_id": 123, "status": "completed", "conclusion": "failure"},
+                {"id": 2, "run_id": 123, "status": "queued", "conclusion": None},
+            ]}],
+            "no prior cancellation evidence",
+        ),
+        (
+            {"id": 123, "status": "queued", "conclusion": None},
+            [{"total_count": 0, "jobs": []}],
+            "no prior cancellation evidence",
+        ),
+    ],
+)
+def test_run_force_cancel_refuses_completed_and_uncancelled_runs_before_post(
+    run_doc, jobs_pages, match, tmp_path, synthetic_opsec
+):
+    """Defect class: a completed run or an active run with no prior cancel reaches force-cancel POST."""
+    calls = []
+
+    def spy(args, **kwargs):
+        calls.append(args)
+        if args[1:4] == ["api", "--method", "POST"]:
+            pytest.fail("must not POST force-cancel")
+        if "/actions/runs/123/jobs" in args[4]:
+            assert jobs_pages is not None, "completed run must not read jobs"
+            return subprocess.CompletedProcess(args, 0, json.dumps(jobs_pages), "")
+        return subprocess.CompletedProcess(args, 0, json.dumps(run_doc), "")
+
+    with pytest.raises(gate.PublishBlocked, match=f"FORCE_CANCEL_REFUSED:.*{match}"):
+        pub.publish("run-force-cancel", repo="unit/public", number=123, cwd=tmp_path, runner=spy, env={})
+    assert all(call[1:4] == ["api", "--method", "GET"] for call in calls)
+
+
+@pytest.mark.usefixtures('configured_roots', 'catalog')
+@pytest.mark.parametrize(
+    "run_reply,jobs_reply",
+    [
+        ((1, ""), None),
+        ((0, "not-json"), None),
+        ((0, json.dumps({"id": 999, "status": "cancelling", "conclusion": None})), None),
+        ((0, json.dumps({"id": True, "status": "cancelling", "conclusion": None})), None),
+        ((0, json.dumps({"id": 123, "status": "bogus", "conclusion": None})), None),
+        ((0, json.dumps({"id": 123, "status": None, "conclusion": None})), None),
+        ((0, json.dumps({"id": 123, "status": "queued", "conclusion": "success"})), None),
+        ((0, json.dumps({"id": 123, "status": "queued", "conclusion": None})), (1, "")),
+        ((0, json.dumps({"id": 123, "status": "queued", "conclusion": None})), (0, "not-json")),
+        ((0, json.dumps({"id": 123, "status": "queued", "conclusion": None})), (0, json.dumps([]))),
+        ((0, json.dumps({"id": 123, "status": "queued", "conclusion": None})), (0, json.dumps(["bad"]))),
+        (
+            (0, json.dumps({"id": 123, "status": "queued", "conclusion": None})),
+            (0, json.dumps([{"total_count": 2, "jobs": [{"id": 1, "run_id": 123, "status": "completed", "conclusion": "cancelled"}]}])),
+        ),
+        (
+            (0, json.dumps({"id": 123, "status": "queued", "conclusion": None})),
+            (0, json.dumps([{"total_count": True, "jobs": [{"id": 1, "run_id": 123, "status": "completed", "conclusion": "cancelled"}]}])),
+        ),
+        (
+            (0, json.dumps({"id": 123, "status": "queued", "conclusion": None})),
+            (0, json.dumps([{"total_count": 1, "jobs": [{"id": 1, "run_id": 999, "status": "completed", "conclusion": "cancelled"}]}])),
+        ),
+        (
+            (0, json.dumps({"id": 123, "status": "queued", "conclusion": None})),
+            (0, json.dumps([{"total_count": 1, "jobs": [{"id": 1, "run_id": 123, "status": "bogus", "conclusion": "cancelled"}]}])),
+        ),
+        (
+            (0, json.dumps({"id": 123, "status": "queued", "conclusion": None})),
+            (0, json.dumps([{"total_count": 1, "jobs": [{"id": 1, "run_id": 123, "status": "completed", "conclusion": ""}]}])),
+        ),
+    ],
+)
+def test_run_force_cancel_fails_closed_on_unreadable_or_malformed_evidence(
+    run_reply, jobs_reply, tmp_path, synthetic_opsec
+):
+    """Defect class: unreadable, mismatched, truncated or malformed run/jobs responses reach force-cancel POST."""
+    def spy(args, **kwargs):
+        if args[1:4] == ["api", "--method", "POST"]:
+            pytest.fail("must not POST force-cancel")
+        code, body = jobs_reply if "/actions/runs/123/jobs" in args[4] else run_reply
+        return subprocess.CompletedProcess(args, code, body, "")
+
+    with pytest.raises(gate.PublishBlocked, match="FORCE_CANCEL_REFUSED"):
+        pub.publish("run-force-cancel", repo="unit/public", number=123, cwd=tmp_path, runner=spy, env={})
+
+
+@pytest.mark.usefixtures('configured_roots', 'catalog')
+def test_run_force_cancel_refuses_invalid_inputs_dot_repo_and_repeated_cli_flags(tmp_path, monkeypatch):
+    """Defect class: invalid fields, path-traversal repo segments or repeated CLI flags reach transport."""
+    def fail_send(*args, **kwargs):
+        pytest.fail("must not reach transport")
+
+    for bad_fields in (
+        {"repo": "unit/public", "number": 123, "body": "arbitrary"},
+        {"repo": "unit/public", "number": 0},
+        {"repo": "unit/public", "number": -5},
+        {"repo": "unit/public", "number": True},
+        {"repo": "unit/..", "number": 123},
+        {"repo": "./public", "number": 123},
+    ):
+        with pytest.raises(gate.PublishBlocked):
+            pub.publish("run-force-cancel", cwd=tmp_path, runner=fail_send, env={}, **bad_fields)
+
+    monkeypatch.setattr(pub, "repository", lambda *args: "unknown")
+    with pytest.raises(gate.PublishBlocked, match="repository unresolved"):
+        pub.publish("run-force-cancel", number=123, cwd=tmp_path, runner=fail_send, env={})
+
+    for bad_cli in (
+        ["run-force-cancel", "--repo", "unit/public", "--number", "1", "--number", "2"],
+        ["run-force-cancel", "--repo", "unit/public", "--repo", "unit/private", "--number", "1"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            pub.main(bad_cli, runner=fail_send)
+        assert exc.value.code == 2
+
+
+@pytest.mark.usefixtures('configured_roots', 'catalog')
+@pytest.mark.parametrize("stage", ["run", "jobs"])
+def test_run_force_cancel_propagates_rate_limit_without_posting(stage, tmp_path, synthetic_opsec):
+    """Defect class: a rate-limited preflight lookup is masked as exit 2 or reaches force-cancel POST."""
+    from lu_machinery.common import github_client
+
+    def spy(args, **kwargs):
+        if args[1:4] == ["api", "--method", "POST"]:
+            pytest.fail("must not POST force-cancel")
+        if "/actions/runs/123/jobs" in args[4]:
+            result = subprocess.CompletedProcess(args, 75, json.dumps({"error": "github_rate_limited"}), "")
+            result.github_result = github_client.Result(error="github_rate_limited", reason="secondary_hold")
+            return result
+        if stage == "run":
+            result = subprocess.CompletedProcess(args, 75, json.dumps({"error": "github_rate_limited"}), "")
+            result.github_result = github_client.Result(error="github_rate_limited", reason="secondary_hold")
+            return result
+        return subprocess.CompletedProcess(args, 0, json.dumps({"id": 123, "status": "queued", "conclusion": None}), "")
+
+    answer = pub.publish("run-force-cancel", repo="unit/public", number=123, cwd=tmp_path, runner=spy, env={}, capture_output=True, text=True)
+    assert answer.returncode == 75
+    assert json.loads(answer.stdout)["error"] == "github_rate_limited"
+
+
+@pytest.mark.usefixtures('configured_roots', 'catalog')
+def test_run_force_cancel_and_run_cancel_help_document_contract(capsys):
+    """Defect class: run-force-cancel is missing from --help or run-cancel still claims force cancellation is unavailable."""
+    with pytest.raises(SystemExit) as exc:
+        pub.main(["run-force-cancel", "--help"])
+    assert exc.value.code == 0
+    force_help = capsys.readouterr().out
+    assert "force-cancel" in force_help and "run-cancel" in force_help and "75" in force_help
+
+    with pytest.raises(SystemExit) as exc:
+        pub.main(["run-cancel", "--help"])
+    assert exc.value.code == 0
+    cancel_help = capsys.readouterr().out
+    assert "run-force-cancel" in cancel_help
+    assert "Force cancellation is unavailable" not in cancel_help
+
+
+@pytest.mark.usefixtures('configured_roots', 'catalog')
 @pytest.mark.parametrize("fields", [
     {"workflow": "unknown.yml", "ref": "main"},
     {"workflow": "ci.yml", "ref": "main", "inputs": {"body": "anything"}},
