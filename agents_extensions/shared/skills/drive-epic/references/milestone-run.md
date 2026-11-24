@@ -272,13 +272,12 @@ and the stream's launcher lane, which can be an alias (for example `gemini-core`
 lane is `curriculum-upgrade`); a launch with an unregistered slot is refused.
 
 **Supervisory requests in the drain.** Drain with `deliveries receive` (§5 claim, read and ack,
-with your identity and each returned fence). A generic claim takes the oldest queued delivery of
-any kind and first requeues expired leases, so it can lease a `supervisory-request`, changing its
-owner, fence and attempt count. That exposure is a known Fleet Comms routing defect, shared with
-the lane driver's own drain; its fix is a follow-up owned by claude-cto. When `receive` returns a
-delivery whose `kind` is `supervisory-request`, never consume or acknowledge it: stop that drain,
-record its delivery ID, fence and attempt count as unresolved custody, and reconcile it through
-§5. Before draining you may read the lane's queued and running deliveries without bodies
+with your identity and each returned fence). Fleet Comms accepts a new `supervisory-request` only
+at `supervisor:epic:<N>`, and an ordinary claim on a lane or CTO inbox skips one sent there
+earlier (it waits for its deadline). If `receive` still returns a delivery whose `kind` is
+`supervisory-request` (an installed release older than that routing fix), never consume or
+acknowledge it: stop that drain, record its delivery ID, fence and attempt count as unresolved custody, and reconcile it
+through §5. Before draining you may read the lane's queued and running deliveries without bodies
 (`curl -sS --max-time 5 "http://127.0.0.1:8765/api/fleet/deliveries?seat=<lane>&state=queued&since=all&limit=100"`,
 and `state=running`; each row has a `kind`). That read is diagnostic, not a gate: it can miss a
 delivery that arrives after it, and a lane seat need not cover an alias slot. `deliveries
