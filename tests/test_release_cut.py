@@ -1955,7 +1955,7 @@ def _transferred(monkeypatch, active):
             "repository_id": 4242, "visibility": "public", "local_name": "machinery"}
 
 
-@pytest.mark.parametrize("remote", [None, "active", "case", "local", "inactive", "elsewhere"])
+@pytest.mark.parametrize("remote", [None, "active", "case", "local", "file", "inactive", "elsewhere", "file-host"])
 @pytest.mark.parametrize("active", [*_BAKED, "evil/repo"])
 def test_release_cut_runs_at_the_active_slug_and_logs_the_selector(monkeypatch, tmp_path, capsys, active, remote):
     """Defect class: the release cut clones, tags and publishes at the registry's first slug after a transfer, and
@@ -1975,23 +1975,26 @@ def test_release_cut_runs_at_the_active_slug_and_logs_the_selector(monkeypatch, 
     inactive = next((slug for slug in _BAKED if slug != active), _BAKED[0])
     override = {
         "active": f"https://github.com/{active}.git", "case": f"https://github.com/{active.upper()}.git",
-        "local": str(tmp_path / "mirror.git"), "inactive": f"https://github.com/{inactive}.git",
-        "elsewhere": f"https://example.invalid/{active}.git",
+        # Relative to the launch directory: Git must receive the checked absolute location, never this spelling.
+        "local": "mirror.git", "file": (tmp_path / "mirror.git").as_uri(),
+        "inactive": f"https://github.com/{inactive}.git", "elsewhere": f"https://example.invalid/{active}.git",
+        "file-host": f"file://example.invalid{tmp_path / 'mirror.git'}",
     }.get(remote)
-    if remote == "local":
-        (tmp_path / "mirror.git").mkdir()
+    (tmp_path / "mirror.git").mkdir()
+    monkeypatch.chdir(tmp_path)
     if override is not None:
         argv += ["--machinery-remote", override]
     if active == "evil/repo":
         assert main(argv) == 1
         assert "release cut refused: fleet repository selector" in capsys.readouterr().err and not seen
         return
-    if remote in {"inactive", "elsewhere"}:
+    if remote in {"inactive", "elsewhere", "file-host"}:
         assert main(argv) == 1
-        assert "--machinery-remote is neither a local path nor an origin" in capsys.readouterr().err and not seen
+        assert "release cut refused: --machinery-remote is " in capsys.readouterr().err and not seen
         return
     assert main(argv) == 0
-    expected = str(tmp_path / "mirror.git") if remote == "local" else f"https://github.com/{active}.git"
+    local = (tmp_path / "mirror.git").resolve().as_uri()
+    expected = local if remote in {"local", "file"} else f"https://github.com/{active}.git"
     assert (seen["repo"], seen["remote"]) == (active, expected)
     assert f'fleet_repo_selector: {{"selector_sha256": "{"d" * 64}", "selector_value": "{active}"}}' in seen["log"]
 
@@ -2020,8 +2023,12 @@ def test_adoption_replaces_a_pin_under_either_baked_slug_with_the_active_slug(mo
         raise Locked
 
     cut.run = run
-    if pinned in {"evil/repo", "org/repo\u017f"}:  # another repository, or a non-ASCII look-alike of a baked slug
-        with pytest.raises(CutError, match="lu-machinery wheel URL"):
+    if pinned == "evil/repo":
+        with pytest.raises(CutError, match="from this release repository"):
+            cut.update_adopt_inputs(product)
+        return
+    if not pinned.isascii():  # a non-ASCII look-alike of a baked slug is no wheel URL at all
+        with pytest.raises(CutError, match="must declare one lu-machinery wheel URL$"):
             cut.update_adopt_inputs(product)
         return
     with pytest.raises(Locked):

@@ -1805,16 +1805,27 @@ def _consumer_collection(args: argparse.Namespace) -> int:
 def _release_remote(flag: str, remote: str | None, row: Mapping[str, object]) -> str | None:
     """The Git remote a release override names, admitted only as a local path or the row's active GitHub origin.
 
-    A live destination is an allowlist: a ``file://`` URI or an existing local path (fixtures, mirrors), else one
-    of the row's active-slug origins (``canonical_origins``; ASCII, owner/name in any case), returned in its
-    canonical spelling. Any other remote, including an inactive slug or another host, refuses.
+    A live destination is an allowlist, and Git receives exactly what was checked: an existing local path
+    (fixtures, mirrors), or a ``file://`` URI naming one with no remote host, becomes the absolute ``file://`` URI
+    of that path, so neither the subprocess's working directory nor Git's URL and remote-name parsing can pick
+    another destination. Otherwise it must be one of the row's active-slug origins (``canonical_origins``; ASCII,
+    owner/name in any case), returned in its canonical spelling. Any other remote, including an inactive slug or
+    another host, refuses.
     """
+    from urllib.parse import unquote, urlsplit
+
     from lu_machinery.common.git_credentials import canonical_origins
 
     if not remote:
         return remote
-    if remote.startswith("file://") or Path(remote).exists():
-        return remote
+    if remote.casefold().startswith("file:"):
+        parts = urlsplit(remote)
+        local = Path(unquote(parts.path)) if parts.scheme == "file" and parts.netloc in {"", "localhost"} else None
+        if local is None or not local.is_absolute() or parts.query or parts.fragment or not local.exists():
+            raise CutError(f"{flag} is a file URI that names no existing local path")
+        return local.resolve().as_uri()
+    if Path(remote).exists():
+        return Path(remote).resolve().as_uri()
     key = row.get("key")
     if remote.isascii():
         for origin in canonical_origins(dict(row), key=key if isinstance(key, str) else None):
