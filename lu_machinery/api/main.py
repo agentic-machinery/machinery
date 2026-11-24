@@ -100,7 +100,7 @@ from .project_state_router import router as project_state_router
 from .repository_authority import build_repository_authority, cwd_role
 from .resilience import get_resilience_snapshot, resilience_middleware
 from .rollover_router import collect_rollover_orient_data
-from .route_contracts import PAGE_CONTRACTS, PageContract, all_page_contracts
+from .route_contracts import PAGE_CONTRACTS, PageContract
 from .rules_router import router as rules_router
 from .runtime_router import router as runtime_router
 from .session_router import router as session_router
@@ -1850,23 +1850,31 @@ def _machinery_nav_html(current_file: str | None, dashboards_dir: Path, product:
     not leave its path to the product (``_leaves_to_product``): a product contract that
     reuses a machinery URL replaces the contract, never the page. A URL declared twice is
     listed once; distinct declared URLs are never merged, since the product may tell them
-    apart.
+    apart. The product's declarations are its own code, checked only as a whole when it is
+    loaded: a declaration that fails here (a value of the wrong type, a malformed static
+    file entry) drops its own link with a logged reason, never the page.
     """
 
     def link(page: PageContract, attrs: str) -> str:
         return f'<a href="{html.escape(page.url, quote=True)}"{attrs}>{html.escape(page.nav_label)}</a>'
 
     links = [link(page, ' aria-current="page"' if page.file == current_file else "") for page in PAGE_CONTRACTS]
+    try:
+        declared = tuple(getattr(product, "page_contracts", ()))
+    except Exception as exc:
+        logger.warning("Monitor navigation skips the product page list: %s", type(exc).__name__)
+        declared = ()
     listed: set[str] = set()
-    first_product = True
-    for page in all_page_contracts(product):
-        if page in PAGE_CONTRACTS or page.url in listed:
-            continue
-        if not _leaves_to_product(page.url, dashboards_dir, product):
+    for index, page in enumerate(declared):
+        try:
+            if page.url in listed or not _leaves_to_product(page.url, dashboards_dir, product):
+                continue
+            product_link = link(page, ' class="product"' if listed else ' class="product first"')
+        except Exception as exc:
+            logger.warning("Monitor navigation skips product page %d: %s", index, type(exc).__name__)
             continue
         listed.add(page.url)
-        links.append(link(page, ' class="product first"' if first_product else ' class="product"'))
-        first_product = False
+        links.append(product_link)
     return "".join(links)
 
 

@@ -101,6 +101,11 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monke
     product = ProductContribution(
         static_files={"index.html": product_home},
         page_contracts=(
+            # F7: a declaration of the wrong shape drops its own link, never the page or the first-link mark.
+            None,
+            replace(base, file="none-label.html", url="/none-label", label=None),
+            replace(base, file="none-url.html", url=None),
+            replace(base, file="list-url.html", url=["/list"]),
             replace(base, file="index.html", url="/"),
             replace(base, file="curriculum-dashboard.html", url="/curriculum-dashboard.html"),
             replace(base, file="labelled.html", url="/labelled", label='Q&A "x"'),
