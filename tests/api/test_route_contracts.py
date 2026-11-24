@@ -84,7 +84,7 @@ def test_machinery_path_serves_machinery_home_when_product_owns_root(tmp_path, m
     assert main.serve_static("index", declared_request, bare).path == product_index
 
 
-def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path):
+def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path, monkeypatch):
     """Defect class: machinery pages name product pages the product does not declare, or mark one current."""
     import html
     import re
@@ -92,10 +92,14 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path):
     from lu_machinery.api import main, route_contracts
     from lu_machinery.api.product_contribution import ProductContribution
 
+    monkeypatch.setattr(main.config, "PRODUCT_ROOT", tmp_path)
     for contract in route_contracts.PAGE_CONTRACTS:
         (tmp_path / contract.file).write_text('<nav id="machinery-nav">__MACHINERY_NAV__</nav>')
+    product_home = tmp_path / "product-home.html"
+    product_home.write_text("product home")
     base = replace(route_contracts.PAGE_CONTRACTS[0], label="")
     product = ProductContribution(
+        static_files={"index.html": product_home},
         page_contracts=(
             replace(base, file="index.html", url="/"),
             replace(base, file="curriculum-dashboard.html", url="/curriculum-dashboard.html"),
@@ -112,13 +116,24 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path):
             replace(base, file="relative.html", url="relative"),
             replace(base, file="backslash.html", url="/\\example.invalid"),
             replace(base, file="space.html", url="/a b"),
-        )
+            # F3: the route's own lookup decides; URLs it answers with a machinery page are not product
+            # links, and a product page at a machinery-looking path the route leaves to it is one.
+            replace(base, file="slash.html", url="/fleet.html/"),
+            replace(base, file="home-slash.html", url="/index.html/"),
+            replace(base, file="encoded.html", url="/fleet%2Ehtml?tab=x#y"),
+            replace(base, file="dots.html", url="/x/../fleet"),
+            replace(base, file="machinery.html", url="/machinery.html"),
+            # F4: a file name or URL with nothing visible falls back to the next visible name.
+            replace(base, file="----.html", url="/dashes"),
+            replace(base, file="\u2067\u3164.html", url="/--"),
+        ),
     )
     request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(product=product))})
     context = SimpleNamespace(roots=SimpleNamespace(dashboards_dir=tmp_path))
     machinery = [(c.url, html.escape(c.nav_label)) for c in route_contracts.PAGE_CONTRACTS]
     for contract in route_contracts.PAGE_CONTRACTS:
-        for path in (contract.url.lstrip("/"), contract.file):
+        # The product's home owns /index.html, so the Overview's file alias is /index.
+        for path in (contract.url.lstrip("/"), "index" if contract.file == "index.html" else contract.file):
             body = main.serve_static(path, request, context).body.decode("utf-8")
             links = re.findall(r'<a href="([^"]*)"([^>]*)>([^<]*)</a>', body)
             assert [(href, label) for href, _, label in links[: len(machinery)]] == machinery, path
@@ -130,6 +145,9 @@ def test_monitor_navigation_lists_the_pages_the_product_declares(tmp_path):
                 ("/labelled", ' class="product"', "Q&amp;A &quot;x&quot;"),
                 ("/blank", ' class="product"', "Blank"),
                 ("/bidi", ' class="product"', "ab c"),
+                ("/machinery.html", ' class="product"', "Machinery"),
+                ("/dashes", ' class="product"', "Dashes"),
+                ("/--", ' class="product"', "/--"),
             ], path
             assert [href for href, attrs, _ in links if 'aria-current="page"' in attrs] == [contract.url], path
 

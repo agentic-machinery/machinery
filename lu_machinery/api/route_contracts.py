@@ -73,6 +73,25 @@ class RouteContract:
         return data
 
 
+# Characters that show nothing: controls, format (bidi), unassigned, private-use and surrogate
+# code points, line and paragraph separators, and the letters and symbols drawn as blanks.
+_INVISIBLE_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Cs", "Zl", "Zp"})
+_BLANK_GLYPHS = frozenset("\u115f\u1160\u2800\u3164\uffa0")
+
+
+def _visible_text(text: str) -> str:
+    """``text`` as one line of visible text, or ``""`` when a reader would see nothing.
+
+    Invisible characters are dropped and runs of whitespace collapse to one space. What is
+    left counts only when it holds a letter, number, punctuation mark or symbol.
+    """
+    kept = "".join(
+        ch for ch in text if unicodedata.category(ch) not in _INVISIBLE_CATEGORIES and ch not in _BLANK_GLYPHS
+    )
+    line = " ".join(kept.split())
+    return line if any(unicodedata.category(ch)[0] in "LNPS" for ch in line) else ""
+
+
 @dataclass(frozen=True)
 class PageContract:
     file: str
@@ -88,18 +107,20 @@ class PageContract:
 
     @property
     def nav_label(self) -> str:
-        """The name the Monitor navigation shows: the declared label, else one derived from the file name.
+        """The name the Monitor navigation shows, never empty.
 
-        A declared label is one line of visible text: control, format (bidi) and line or paragraph
-        separator characters are dropped and runs of whitespace collapse. A label with nothing left
-        falls back to the derived name, so no link is ever unnamed.
+        The declared label, else one derived from the file name, else from the URL path
+        (``/`` is "Home"), else the URL itself. Each candidate is cleaned to one line of
+        visible text (``_visible_text``) and used only if something visible is left.
         """
-        visible = "".join(ch for ch in self.label if unicodedata.category(ch) not in {"Cc", "Cf", "Zl", "Zp"})
-        if label := " ".join(visible.split()):
+        if label := _visible_text(self.label):
             return label
         if self.url == "/":
             return "Home"
-        return Path(self.file).stem.replace("-", " ").replace("_", " ").capitalize()
+        for source in (Path(self.file).stem, self.url.strip("/")):
+            if name := _visible_text(source.replace("-", " ").replace("_", " ")):
+                return name.capitalize()
+        return _visible_text(self.url) or "Untitled page"
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -805,6 +826,7 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         label="Model statistics",
     ),
 )
+
 
 def all_route_contracts(product: ProductContribution | None = None) -> tuple[RouteContract, ...]:
     """Machinery route contracts, then the product's (the installed product when none is given)."""

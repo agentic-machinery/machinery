@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -1749,30 +1749,69 @@ _NAV_PLACEHOLDER = "__MACHINERY_NAV__"
 _NAV_PATH = re.compile(r"/(?![/\\])[^\s\\\x00-\x1f\x7f]*")
 
 
-def _machinery_page_paths() -> frozenset[str]:
-    """Every path the machinery dashboards answer for a machinery page.
+def _dashboard_file(dashboards_dir: Path, path: str, product: Any) -> Path | None:
+    """The machinery dashboard file the static route serves at ``path``, or ``None`` when it serves none.
 
-    ``/x`` and ``/x.html`` both serve a machinery file ahead of any product file, as does
-    ``/index`` (the Overview). ``/index.html`` is not listed: a product that declares a
-    home owns it.
+    ``None`` leaves the path to the product's declared files. This is the one lookup: the
+    route serves what it returns, and the navigation uses it to tell machinery pages from
+    product pages. Raises ``HTTPException(403)`` for a path that escapes the dashboards.
     """
-    paths = {"/index", "/machinery/"}
-    for page in PAGE_CONTRACTS:
-        paths.update({page.url, f"{page.url}.html", f"/{page.file}"})
-    paths.discard("/index.html")
-    return frozenset(paths)
+    if path in MACHINERY_HOME_PATHS:
+        # The machinery home has its own address, so a product that owns ``/`` never hides it.
+        return dashboards_dir / "index.html"
+    if not path or path in {"/", "index.html"}:
+        return None if product_file(product, "index.html") is not None else dashboards_dir / "index.html"
+    file_path = _safe_join(dashboards_dir, path)
+    if file_path is None:
+        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+    dashboards_root = dashboards_dir.resolve()
+    # Keep explicit traversal guard if relative path join bypassed via symlink tricks.
+    if not file_path.resolve().is_relative_to(dashboards_root):
+        raise HTTPException(status_code=403, detail="Path traversal not allowed")
+    if file_path.is_file():
+        return file_path
+    if file_path.is_dir() and (file_path / "index.html").is_file():
+        return file_path / "index.html"
+    if not file_path.suffix:
+        html_candidate = _safe_join(dashboards_dir, f"{path}.html")
+        if (
+            html_candidate is not None
+            and html_candidate.resolve().is_relative_to(dashboards_root)
+            and html_candidate.is_file()
+        ):
+            return html_candidate
+    return None
 
 
-def _machinery_nav_html(current_file: str | None, product: Any) -> str:
+def _served_by_product(url: str, dashboards_dir: Path, product: Any) -> bool:
+    """Whether a link to the declared ``url`` reaches something other than a machinery dashboard file.
+
+    The URL must be a same-site absolute path. The path the route receives is the one a
+    browser requests (query and fragment dropped, dot segments resolved) after the server
+    decodes it; a URL with a dot segment is skipped rather than guessed. The answer is the
+    static route's own lookup, so the navigation and the route never disagree.
+    """
+    if not _NAV_PATH.fullmatch(url):
+        return False
+    path = unquote(urlsplit(url).path)[1:]
+    if any(segment in {".", ".."} for segment in path.split("/")):
+        return False
+    try:
+        return _dashboard_file(dashboards_dir, path, product) is None
+    except HTTPException:
+        return False
+
+
+def _machinery_nav_html(current_file: str | None, dashboards_dir: Path, product: Any) -> str:
     """The shared Monitor navigation: every machinery page once, then the pages the product declares.
 
     The current page is the machinery page whose file is being served. A product page is
     listed only because the product declares it, so no page is named here that the
-    installed product does not serve. A declared URL is skipped when it is not a same-site
-    absolute path, repeats one already listed, or is a path the machinery dashboards serve
-    (a product contract that reuses a machinery URL replaces the contract, never the page).
+    installed product does not serve. A declared URL is skipped when it repeats one
+    already listed or the static route does not leave it to the product (see
+    ``_served_by_product``): a product contract that reuses a machinery URL replaces the
+    contract, never the page.
     """
-    machinery_paths = _machinery_page_paths()
 
     def link(page: PageContract, attrs: str) -> str:
         return f'<a href="{html.escape(page.url, quote=True)}"{attrs}>{html.escape(page.nav_label)}</a>'
@@ -1781,9 +1820,9 @@ def _machinery_nav_html(current_file: str | None, product: Any) -> str:
     listed = {page.url for page in PAGE_CONTRACTS}
     first_product = True
     for page in all_page_contracts(product):
-        if page in PAGE_CONTRACTS or page.url in listed or page.url in machinery_paths:
+        if page in PAGE_CONTRACTS or page.url in listed:
             continue
-        if not _NAV_PATH.fullmatch(page.url):
+        if not _served_by_product(page.url, dashboards_dir, product):
             continue
         listed.add(page.url)
         links.append(link(page, ' class="product first"' if first_product else ' class="product"'))
@@ -1791,7 +1830,7 @@ def _machinery_nav_html(current_file: str | None, product: Any) -> str:
     return "".join(links)
 
 
-def _machinery_page_response(page: Path, product: Any) -> HTMLResponse:
+def _machinery_page_response(page: Path, dashboards_dir: Path, product: Any) -> HTMLResponse:
     """A machinery page with the installed release, its repository and the shared navigation filled in.
 
     The page reads the version from the document, not from ``/api/health``, so a
@@ -1808,15 +1847,8 @@ def _machinery_page_response(page: Path, product: Any) -> HTMLResponse:
         text = text.replace(_VERSION_PLACEHOLDER, version)
         text = text.replace(_MACHINERY_REPOSITORY_PLACEHOLDER, html.escape(repository, quote=True))
     if _NAV_PLACEHOLDER in text:
-        text = text.replace(_NAV_PLACEHOLDER, _machinery_nav_html(page.name, product))
+        text = text.replace(_NAV_PLACEHOLDER, _machinery_nav_html(page.name, dashboards_dir, product))
     return HTMLResponse(text)
-
-
-def _dashboard_file_response(path: Path, product: Any) -> Response:
-    """A dashboard file: an HTML page is rendered with the shared chrome, any other file is sent as it is."""
-    if path.suffix == ".html":
-        return _machinery_page_response(path, product)
-    return FileResponse(path)
 
 
 def _safe_join(base: Path, *parts: str | Path) -> Path | None:
@@ -1838,35 +1870,12 @@ def serve_static(path: str, request: Request, ctx: MonitorContext = Depends(get_
     """
     dashboards_dir = ctx.roots.dashboards_dir
     product = getattr(request.app.state, "product", None)
-    if path in MACHINERY_HOME_PATHS:
-        # The machinery home has its own address, so a product that owns ``/``
-        # never hides it.
-        return _machinery_page_response(dashboards_dir / "index.html", product)
-    if not path or path in {"/", "index.html"}:
-        product_index = product_file(product, "index.html")
-        if product_index is not None:
-            return FileResponse(product_index)
-        return _machinery_page_response(dashboards_dir / "index.html", product)
-    file_path = _safe_join(dashboards_dir, path)
-    if file_path is None:
-        raise HTTPException(status_code=403, detail="Path traversal not allowed")
-    dashboards_root = dashboards_dir.resolve()
-    # Keep explicit traversal guard if relative path join bypassed via symlink tricks.
-    if not file_path.resolve().is_relative_to(dashboards_root):
-        raise HTTPException(status_code=403, detail="Path traversal not allowed")
-    if file_path.is_file():
-        return _dashboard_file_response(file_path, product)
-    if file_path.is_dir() and (file_path / "index.html").is_file():
-        return _dashboard_file_response(file_path / "index.html", product)
-    if not file_path.suffix:
-        html_candidate = _safe_join(dashboards_dir, f"{path}.html")
-        if (
-            html_candidate is not None
-            and html_candidate.resolve().is_relative_to(dashboards_root)
-            and html_candidate.is_file()
-        ):
-            return _dashboard_file_response(html_candidate, product)
-    declared = product_file(product, path)
+    dashboard = _dashboard_file(dashboards_dir, path, product)
+    if dashboard is not None:
+        if dashboard.suffix == ".html":
+            return _machinery_page_response(dashboard, dashboards_dir, product)
+        return FileResponse(dashboard)
+    declared = product_file(product, "index.html" if path in {"", "/"} else path)
     if declared is not None:
         return FileResponse(declared)
     raise HTTPException(status_code=404)
