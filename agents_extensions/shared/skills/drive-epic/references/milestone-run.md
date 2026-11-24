@@ -350,12 +350,13 @@ turn to settle:
      `isCrossRepository` rows: a fork PR with the same branch name is not the child's. `--state
      all` is required, because the default lists open PRs only and misses one that merged during
      the stop; a result of 100 rows is truncated, so it is unresolved.
-   - **Exact head.** When the row's `commits_ahead` is above 0, `gh api --paginate --slurp
-     repos/<owner/name>/commits/<its head_sha>/pulls` lists every PR that contains the child's
-     final commit, on any branch and in any state (the association the dispatcher uses for a merged
-     delivery).
-     Keep rows whose head and base repositories are both `<owner/name>`. A zero-commit head names
-     no PR: another task's PR can share it.
+   - **Exact head (supplemental).** Once the child has exited, its row has a `head_sha` (a running
+     child's row has none) and, when `commits_ahead` is above 0, `gh api --paginate --slurp
+     repos/<owner/name>/commits/<its head_sha>/pulls` lists PRs that contain its final commit, on
+     any branch and in any state (the association the dispatcher uses for a merged delivery). Keep
+     rows whose head and base repositories are both `<owner/name>`. A PR that reached the default
+     branch is returned only as its introducing PR, and a zero-commit head names no PR: this read
+     adds candidates and never proves a PR is absent.
    - **Ownership ledger.** `<interpreter> -m lu_machinery.orchestration.pr_ownership status`
      prints it. Every `handoffs` and `history` entry that names the child in any field
      (`successor`, `predecessor`, `worker_task`, `previous_worker_task`) is the child's PR, keyed
@@ -364,7 +365,9 @@ turn to settle:
    - **Merged delivery.** Once the child has settled, its row lists every merged PR the dispatcher
      attributed to it in `delivery_prs` (`<owner/name>#<number>`), with `delivery_merge_sha`.
      Take it from the row: `dispatch status` cannot locate a collision-stamped archive record
-     (`run nonce mismatch`).
+     (`run nonce mismatch`). A row without `delivery_prs` is never proof that nothing merged: the
+     branch query decides, and a `merged_delivery_lookup` of `error:...` or
+     `ambiguous_task_attribution` is a failed lookup.
 
    Repeat the sweep, one inventory each time, while the turn or any covered child is not terminal,
    and once more after the turn settles.
@@ -376,10 +379,23 @@ turn to settle:
    `unknown_child_tasks` and `unreadable_child_records`; any covered child or PR not handled
    above goes back into the step 2 sweep, and each cancelled child must settle the same way. A
    child that settlement names and the inventory omits is read with `dispatch status <child-id>
-   --run-nonce <its nonce>`. A child, follow-up task, branch listing, ledger read or delivery
-   lookup that is missing, fails, is truncated or cannot be verified is unresolved custody
-   (`merged_delivery_lookup` set to anything but `no_match` is a failed delivery lookup): report it
-   with its owner, never as "no PR".
+   --run-nonce <its nonce>`.
+
+   Then, with every covered child terminal, run `<interpreter> -m
+   lu_machinery.orchestration.pr_ownership check`. It reads the hot task records strictly (exit 2
+   on an unreadable one) and prints one JSON row for each open PR in the fleet that has no live
+   owner, with its `repo`, `number` and `head`. A PR a child owned only through the `X-Agent`
+   trailer on its head commit, on a branch the child's record does not name, becomes such a row
+   once that child is terminal. Read the row's head commit (`gh api
+   repos/<owner/name>/commits/<head>`) and protect the PR as in step 1 only when its `X-Agent`
+   trailer names a covered child; report every other row to the CTO and leave it alone, since it
+   belongs to another task.
+
+   A child, follow-up task, branch listing, ledger read or delivery lookup that is missing, fails,
+   is truncated or cannot be verified is unresolved custody: report it with its owner, never as
+   "no PR". `check` exits 2 when it cannot establish an owner, and archived records are read on a
+   best-effort basis. An ownership ledger whose `last_tick` is null was not read from the keeper's
+   state, so it is unresolved as well.
 5. **Reconcile the lease separately.** A terminal turn alone neither clears the lease nor
    authorizes a successor: the dispatcher releases it only when the run's processes are proven
    gone and no child is live, unknown or unreadable. A lease still held after settlement goes
