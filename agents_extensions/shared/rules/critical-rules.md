@@ -147,7 +147,8 @@ everything" cannot survive this repo's merge rate and is corporate dual-control 
 - **Scope of the question (#10665).** It is asked of the change's stated contract, the paths the
   change introduces, modifies or newly exposes, and regressions against main. A defect outside the
   frozen obligation that the change neither introduces, exposes nor worsens is a P3 follow-up with an
-  owner; a P0–P2 finding whose trigger is reachable under the input contract blocks
+  owner; a P0–P2 finding whose trigger is reachable under the input contract blocks, and an
+  unresolved security finding always blocks
   ([review policy](../skills/review-loop/references/policy.md#3-findings)). Dispositions, root-cause
   findings and INCONCLUSIVE (a reviewer missing a required capability; it still blocks) follow the
   `local-code-review` checklist, Steps 2-6.
