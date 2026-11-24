@@ -419,7 +419,9 @@ does these steps in order:
      the sealed candidate's gate and catalog, must succeed. The Codex route
      runs on Codex account a (`--codex-account sub`) and the Claude route on
      subscription account b; an account without allowance fails its route,
-     which blocks the release. The installed gate
+     which blocks the release. The Codex unit unsets `CODEX_HOME` and the
+     Codex and OpenAI key variables, so a value set in the user manager cannot
+     move it off account a's login. The installed gate
      originally matched the keeper's runtime when canaries gated PR admission.
      At cut time, the candidate gate validates the models and catalog that this
      release installs together. A failing route or an incomplete run

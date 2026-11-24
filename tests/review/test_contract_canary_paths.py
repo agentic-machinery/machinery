@@ -312,6 +312,11 @@ def test_runner_dry_run_never_mounts_dispatches_or_writes(runner_roots, monkeypa
     assert f"--require-hashes --only-binary=:all: --find-links {runner_roots.parent / 'wheelhouse'} -r " in output
     assert "--codex-account sub" in output and "--claude-account b" in output
     assert "--codex-account b-sub" not in output
+    # Only the Codex unit drops an inherited Codex home or key, so it runs on account a's login.
+    unset = "'--property=UnsetEnvironment=CODEX_HOME OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN'"
+    assert output.count(unset) == 1
+    unit = output[output.index(unset) :].split("systemd-run --user")[0]
+    assert "--agent codex --model gpt-6.2-sol --codex-account sub" in unit
     assert "--require-hashes" in output and "contract-canary.pth" in output
     assert "--pinned-head " + "a" * 40 in output
     assert "check --head " + "a" * 40 in output

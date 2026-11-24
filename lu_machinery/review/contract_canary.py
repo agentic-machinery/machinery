@@ -308,6 +308,7 @@ _RUN_MODELS = {
     "cursor": ("grok-4.7-high",),
     "agy": ("gemini-4-neon-high",),
 }
+_CODEX_UNIT_UNSET = ("CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
 
 # Run inside the candidate interpreter, with the existing dispatcher and recorder.
 # Keep dispatch and wait in one user unit; receipts are never reviews of record.
@@ -407,6 +408,9 @@ def _run_steps(
         unit = f"{work.name.lstrip('.')}-{route}"
         argv = ["systemd-run", "--user", "--wait", "--pipe", "--collect", "--service-type=exec",
                 f"--unit={unit}", f"--working-directory={work}"]
+        if route == "codex":
+            # Account a is the login under HOME; a Codex home or key inherited from the user manager would replace it.
+            argv.append(f"--property=UnsetEnvironment={' '.join(_CODEX_UNIT_UNSET)}")
         argv += [f"--setenv={key}={env[key]}" for key in context if key in env]
         argv += [python, "-I", "-B", "-c", _RUN_ROUTE, "dispatch", "--repo", repo_key,
                  "--agent", route, "--model", model, *account, "--effort", "high", "--mode", "read-only",
