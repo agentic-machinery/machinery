@@ -104,8 +104,8 @@ Review tiers, findings, rounds and the ledger live only in the
 Every review brief, code or Ukrainian, uses these sections. Round 1 freezes sections 2 to 4;
 later rounds reuse them unchanged. From round 2 on, section 1 names both the last
 reviewed head and the new exact head, the fix diff, and each earlier blocker's
-resolution evidence. The reviewer brief states DELTA scope under the
-[review budget](../../review-loop/references/policy.md). A review-typed
+resolution evidence. The reviewer brief states the delta scope of the
+[review policy](../../review-loop/references/policy.md#4-convergence). A review-typed
 dispatch whose brief has no heading naming the dispositions is still dispatched, with the
 typed warning `review_brief_no_dispositions` on stderr and in the task record. Phrase
 reviewer asks as questions or statements: a line that starts with a write verb refuses a
@@ -122,17 +122,24 @@ read-only dispatch (#8703; [accepted wording](../../review-loop/references/brief
    - `in_scope_blocker` — a P0–P2 finding whose trigger is reachable under the input
      contract ([findings](../../review-loop/references/policy.md#3-findings)), or a demonstrated
      P0–P2 regression against main;
-   - `follow_up` — a pre-existing defect the change does not expose or worsen, filed as an
-     issue with an owner;
+   - `follow_up` — a P3 with an owner: a defect outside the frozen obligation that the PR
+     neither introduces, exposes nor worsens (a pre-existing defect, a real sibling or an
+     unrelated discovery);
    - `stop_and_escalate` — material contract ambiguity, or a fix that would trip a breaker.
-5. **Reviewer duties** — one class-level finding per input class, with a concrete example and every
-   sibling found within this round's scope. Every P0–P2 finding cites `sources` that show its
-   trigger is reachable under the input contract; a reviewer who cannot establish reachability
-   says so. Later rounds use the review budget to decide blockers and follow-ups. Each blocker states the demonstrated failure, its impact and the required
-   corrected behaviour; a code fix is a suggestion. APPROVE with tracked follow-ups is allowed.
-   A delta-review brief asks the reviewer to probe every fallback or fail-open path changed
-   by the fix diff and check listed fixes, interactions and weakened tests at the new exact
-   head. A missing required capability is INCONCLUSIVE: the verdict line uses `BLOCKED` and
+5. **Reviewer duties** — one finding per root cause and violated invariant, with one
+   representative case unless another reachable case changes the impact or the required fix;
+   a sibling that proves the same reachable P0–P2 failure survived the fix stays on the
+   original id and blocks; a hypothetical case without a plausible path needs no finding
+   ([findings](../../review-loop/references/policy.md#3-findings)). Every P0–P2 finding cites
+   `sources` that show its trigger is reachable under the input contract; a reviewer who cannot
+   establish reachability says so. Each blocker states the demonstrated failure, its impact and
+   the required corrected behaviour; a code fix is a suggestion. Demonstrated material
+   regressions and unresolved security findings block in every round. When the acceptance
+   criteria are met and only follow-ups remain, the reviewer approves. A delta-review brief
+   follows the [delta-round rule](../../review-loop/references/policy.md#4-convergence): open
+   ids, `not_applicable` evidence and the fix diff's effects on the frozen acceptance criteria
+   and existing contracts (changed fallbacks, fail-open paths, downstream callers, weakened
+   tests). A missing required capability is INCONCLUSIVE: the verdict line uses `BLOCKED` and
    names the capability; it still blocks.
 6. **Breakers** — the review budget and `local-code-review` checklist
    Step 6 apply, even when the outstanding-finding count shrinks.

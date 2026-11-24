@@ -68,19 +68,20 @@ you exactly what to reason about yourself. Do not re-run test suites that the
 PR's CI runs; review the diff, run at most the specific tests that reproduce
 a finding you are checking, and cite CI run ids for suite results.
 
-The review rules bind every round (#10665): the round-1 brief freezes the
-outcome, the input contract and the dispositions (checklist Step 2);
-findings are one per input class, each with a reproducer (Step 4); a P0–P2
-finding blocks only when its trigger is reachable under the input contract,
-a demonstrated P0–P2 regression against main blocks, the author may answer
-with `not_applicable` and proof for the reviewer to confirm, verdicts are
-proportional, and a missing required capability is INCONCLUSIVE, which still
-blocks (Step 5); exact-head CI that
+The [review policy](../review-loop/references/policy.md) decides findings,
+dispositions and rounds; the checklist applies it (#10665). The round-1 brief
+freezes the outcome, the input contract and the dispositions (checklist Step 2).
+Findings are one per root cause and violated invariant, with one representative
+case (Step 4). A P0–P2 finding blocks only when its trigger is reachable under
+the input contract; demonstrated P0–P2 regressions caused by the PR and
+unresolved security findings block in every round. The author may answer with
+`not_applicable` and proof for the reviewer to confirm; when the acceptance
+criteria are met and only follow-ups remain, the reviewer approves; a missing
+required capability is INCONCLUSIVE, which still blocks; exact-head CI that
 answers the execution questions is valid evidence, a capability note is not a
 verdict, and new tests name their defect class (Step 5). From round 2 on, the
-reviewer brief uses DELTA scope. Step 6 applies the canonical
-[review budget](../review-loop/references/policy.md)
-alongside the scope breakers.
+reviewer follows the policy's delta-round rule. Step 6 applies the policy's
+budget alongside the scope breakers.
 
 ## Output
 

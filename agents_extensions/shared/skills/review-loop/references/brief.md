@@ -5,19 +5,28 @@ dispositions, reviewer duties, breakers) is the
 [review brief template](../../drive-epic/references/review-merge-cleanup.md#review-brief-template-10665).
 Use it unchanged. This file lists only what review-loop adds to it.
 
-## Round 1 (full review)
+## Required brief contents (round 1)
 
-Add to the template's **Target** section:
+The template's **Outcome** section carries what the CTO froze: the acceptance-criterion IDs
+and expected behaviour, the non-goals, the owner boundary, the risk and, for a replacement,
+its authorized scope.
+
+The template's **Target** and **Input contract** sections carry what the author supplies:
 
 - the review round (`round 1 of 3`, or of the budget the repository declares);
 - the author model of every commit on the branch, the catalog risk and the review profile;
-- the base ref and merge-base SHA, so the reviewer reviews `merge-base..exact head`;
-- the checks already run, with their results or CI run ids (reviewers do not re-run suites),
-  and the checks still pending on that head, named as pending. Review starts without waiting
-  for the PR's `CI Gate`; pending CI is not successful CI.
-- the threat model statement (supported inputs and operating conditions, who can influence
-  inputs or write relevant paths, and the controls that enforce exclusions), as the
-  [policy's Threat model paragraph](policy.md#3-findings) requires.
+- the exact head, the base ref and the merge-base SHA, so the reviewer reviews
+  `merge-base..exact head`;
+- the real invocation, and one concrete case per input class;
+- the threat model: the actor-to-input paths (entry points and environments, input sources,
+  who can influence each source or relevant write path, and the controls that enforce any
+  exclusion) with evidence for every exclusion, as the
+  [policy's Threat model paragraph](policy.md#3-findings) requires;
+- targeted same-head output or the relevant CI excerpts with their run ids (reviewers do not
+  re-run suites), and the checks still pending on that head, named as pending. Review starts
+  without waiting for the PR's `CI Gate`; pending CI is not successful CI.
+
+The reviewer brings its own independent adversarial cases; the author's cases narrow nothing.
 
 ## Judge inputs come from the merge-base
 
@@ -41,7 +50,9 @@ change kind, added and removed lines), and prints the matching items, each with 
 owning area, the owner of every area the diff touches, and the `judge-change` item when the diff
 touches a judge file (the checklist, the ownership map, the reply schema, the review skills, the
 brief template or the rules). Its JSON output's `brief_section` is the text the brief carries.
-The reviewer answers each item with file:line or test evidence. It runs the installed release:
+The reviewer answers each item with file:line or test evidence. In a delta round, prior
+evidence may answer an unchanged checklist item when the reviewer confirms its premises still
+hold; items affected by the delta or an open blocker require current-head evidence. It runs the installed release:
 `-P` keeps the working directory off `sys.path`, so a machinery checkout's own `lu_machinery`
 is not imported. It refuses to run from, or read a judge file from, a file the checkout under
 review tracks (in the work tree's top level, whichever subdirectory `--repo-root` names) or a
@@ -110,13 +121,22 @@ Freeze sections 2 to 4 of the template from round 1; do not edit them. Section 1
 
 - the last reviewed head and the new exact head;
 - the fix diff between them (`git diff <last reviewed head>..<new head>`);
-- the ledger: every open id with its fix evidence, the author's decline with file:line or
-  test evidence, or the author's `not_applicable` claim with its proof;
+- the acceptance-criterion IDs the fix diff affects;
+- the ledger: every finding id with its disposition and proof, that is its fix evidence, the
+  author's decline with file:line or test evidence, or the author's `not_applicable` claim
+  with its proof;
+- targeted same-head output or the relevant CI excerpts, and the checks still pending;
 - the budget state (`round 2 of 3`, or of the budget the repository declares).
 
 The reviewer marks every earlier id `resolved` or `still open: <reason>`, confirms or contests
-each `not_applicable` claim on its evidence ([findings](policy.md#3-findings)), reviews only the
-diff since the last reviewed head ([policy](policy.md#4-convergence)), and replies in the round 1 reply format.
+each `not_applicable` claim on its evidence ([findings](policy.md#3-findings)), reviews the fix
+diff and traces its effects on the frozen acceptance criteria and existing contracts, including
+changed fallbacks, fail-open paths, downstream callers and weakened tests; unchanged code is
+context for those checks. A new blocker names the causal change or unresolved finding id, the
+reachable trigger and the material impact; a demonstrated P0–P2 regression caused by the PR or
+a concrete unresolved security finding still blocks when discovered late. Once those checks are
+answered, the review is complete ([policy](policy.md#4-convergence)). The reply uses the round 1
+reply format.
 
 ## Commands a read-only reviewer can run
 

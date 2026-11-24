@@ -97,10 +97,10 @@ template is `drive-epic` `references/review-merge-cleanup.md` §6; a review-type
 dispatch whose brief has no heading naming the dispositions gets the typed
 warning `review_brief_no_dispositions` (stderr and task record), not a refusal.
 
-For round 2 and later, the reviewer brief states DELTA scope and names the last
-reviewed head, the new exact head, the fix diff between them, and resolution
-evidence for each earlier blocker. Apply the canonical
-[review budget](../review-loop/references/policy.md).
+For round 2 and later, the reviewer brief names the last reviewed head, the new
+exact head, the fix diff between them, and resolution evidence for each earlier
+blocker, and applies the
+[delta-round rule](../review-loop/references/policy.md#4-convergence).
 
 Learner-content semantic review is unsupported here. A normal BIO request uses
 `$curriculum-lifecycle` / `$track-completion`, with `$post-build-review` as its
@@ -219,20 +219,18 @@ to any other model, including an advisory seat. Ask it to find
 bugs, logic errors, missed edge cases, and security/reuse issues in the
 frozen target's diff — nothing outside `frozen_files`.
 
-**Sibling instances**: if the reviewer or you spot the same bug pattern
-elsewhere in the codebase, only widen the *look* to sibling instances of
-that exact bug class within the frozen touched surfaces — not a general
-audit of the owning module, and not files outside `frozen_files` unless a
-sibling instance is actually found there. Its disposition follows this round's
-scope under the review budget and the Step 6 breakers.
-
-**Class-level findings (#10665)**: the reviewer reports one finding per input
-class, with one reproducer and every sibling spelling found in this round, not
-one spelling per round. A P0–P2 finding cites `sources` that show its trigger is
-reachable under the input contract
-([findings](../review-loop/references/policy.md#3-findings)); a trigger absent from
-the frozen input of a one-shot run is P3. Later rounds apply the review budget. Reviewers keep their own
-independent adversarial cases; the author's matrix narrows nothing.
+**Findings by root cause (#10665)**: the reviewer reports one finding per root
+cause and violated invariant. One representative case is sufficient unless
+another reachable case changes the impact or the required fix. A sibling that
+proves the same reachable P0–P2 failure survived the fix stays on the original
+ID and blocks. A real sibling outside the frozen obligation that the PR neither
+introduces, exposes nor worsens, or an unrelated discovery with those same
+properties, is a P3 `follow_up` with an owner. A hypothetical case without a
+plausible path needs no finding. A P0–P2 finding cites `sources` that show its
+trigger is reachable under the input contract and the
+[threat model](../review-loop/references/policy.md#3-findings), which decides
+when a one-shot run's pinned bytes bound its input. Reviewers keep their own independent
+adversarial cases; the author's matrix narrows nothing.
 
 For `verify_review.py`, a structured reply may use bare schema-valid JSON or
 the review-loop envelope: one leading `VERDICT:` line, one `SCORE:` line and
@@ -266,29 +264,36 @@ Disposition guide, subject to this round's scope under the review budget:
   demonstrated P0–P2 regression against main. A reviewer who cannot establish
   reachability says so, and the author answers with a reproduction or a
   code-path proof.
-- **`follow_up`** — real but not blocking: a pre-existing defect the change
-  does not expose or worsen, which becomes an issue
-  ([findings](../review-loop/references/policy.md#3-findings)); track it with an
-  owner. Style, naming, cleanup and "consider" items are not findings.
+- **`follow_up`** — a real P3 that does not block: a defect outside the frozen
+  obligation that the PR neither introduces, exposes nor worsens (a
+  pre-existing defect, a real sibling or an unrelated discovery)
+  ([findings](../review-loop/references/policy.md#3-findings)); track it
+  with an owner. Style, naming, cleanup and "consider" items are not findings.
 - **`stop_and_escalate`** — fixing it would itself blow a breaker (Step 6):
   it changes the public/task contract, crosses an owner boundary, needs a
   canonical design decision, or the fix/review loop already failed to
   converge; material ambiguity in the contract also escalates. Escalate
   instead of patching around it.
 
-**Proportional verdicts (#10665).** APPROVE with tracked follow-ups is allowed;
-only an `in_scope_blocker` (or an open `stop_and_escalate`) withholds approval.
+**Proportional verdicts (#10665).** When the acceptance criteria are met and
+only follow-ups remain, approve; only an `in_scope_blocker` (or an open
+`stop_and_escalate`) withholds approval.
 The author may answer a P0–P2 finding with `not_applicable` and its proof
 (command and output, or code path) in the ledger; the priority stays as the
 reviewer set it, and the reviewer confirms or contests the claim in the delta
 round ([findings](../review-loop/references/policy.md#3-findings)).
 Every blocker states a reproducible failure, its impact and the required
 corrected behaviour; a code-level fix is a suggestion, not the requirement. A
-delta review (round 2 onwards) attests the new exact head and checks only the fix
-diff since the last reviewed head and resolution of earlier blockers. Checking
-the fix's interactions includes weakened or deleted tests in that diff. A new
-blocker must satisfy the canonical review budget, including its security
-FAIL exception; other findings are tracked follow-ups with owners.
+delta review (round 2 onwards) attests the new exact head and follows the
+[delta-round rule](../review-loop/references/policy.md#4-convergence): it
+verifies open finding IDs and `not_applicable` evidence, reviews the exact
+last-reviewed-head-to-candidate diff, and traces its effects on the frozen
+acceptance criteria and existing contracts, including changed fallbacks,
+fail-open paths, downstream callers and weakened or deleted tests. A new blocker
+names the causal change or unresolved finding ID, the reachable trigger and the
+material impact. Demonstrated P0–P2 regressions caused by the PR and unresolved
+security findings block in every round; other findings are tracked follow-ups
+with owners. Once those checks are answered, the review is complete.
 A reviewer that lacks a capability the brief requires (shell, diff access,
 hashing, the `sources` tools) returns INCONCLUSIVE: the verdict line uses the
 `BLOCKED` token and names the missing capability. INCONCLUSIVE still blocks
