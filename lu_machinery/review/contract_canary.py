@@ -313,6 +313,10 @@ _RUN_MODELS = {
 # the dispatch flag that names the account: a pinned Codex account at 0% failed the v0.1.67 cut
 # while account a had allowance.
 _ACCOUNT_FLAGS = {"codex": "--codex-account"}
+# Environment that selects a route's account outside its flag, removed from that route's unit: the
+# Codex login home and the API keys the dispatcher passes to Codex (``dispatcher.environment._AUTH``
+# and ``codex_accounts._AUTH_ENV``).
+_ACCOUNT_ENV = {"codex": ("CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")}
 # Routes that keep a fixed account. Claude stays on subscription account b: it passed the v0.1.67
 # cut, and the Claude account sample has no per-account provider reading this rule can trust yet
 # (a cached host lane beside fresher per-account rows), so an allowance choice there is follow-up
@@ -330,6 +334,47 @@ class NoAllowance(CanaryError):
         super().__init__(f"no-allowance: route {route}: no account with allowance ({accounts})")
 
 
+# How deep the canary looks for plan windows in one account record (``codexbar.windows.<name>``
+# is three levels down). A deeper container refuses the account instead of hiding a window.
+_WINDOW_DEPTH = 6
+
+
+def _plan_window_readings(record: Mapping[str, Any]) -> list[tuple[str, Any, float | None]] | None:
+    """Every plan-window reading in one account record, as (path, value, percent left or None).
+
+    A reading is any ``used_pct`` or ``remaining_pct`` field, or one ending ``_used_pct`` or
+    ``_remaining_pct``, anywhere in the record except its ``credit`` block (credit relief and the
+    near-cap threshold, not plan windows). Its percent left is the remaining value, or 100 minus
+    the used value, for a real number in 0-100, and None otherwise: the provider normalizer
+    clamps remaining from used, so a used value outside 0-100 can still publish a plausible
+    remaining one. None overall when the record nests deeper than ``_WINDOW_DEPTH``.
+    """
+    from lu_machinery.fleet import credit_lane
+
+    readings: list[tuple[str, Any, float | None]] = []
+    stack: list[tuple[str, Any, int]] = [("", record, 0)]
+    while stack:
+        path, node, depth = stack.pop()
+        items = node.items() if isinstance(node, Mapping) else enumerate(node)
+        for key, value in items:
+            where = f"{path}.{key}" if path else str(key)
+            if isinstance(value, (Mapping, list)):
+                if depth == 0 and key == "credit":
+                    continue
+                if depth + 1 >= _WINDOW_DEPTH:
+                    return None
+                stack.append((where, value, depth + 1))
+                continue
+            name = str(key)
+            used = name == "used_pct" or name.endswith("_used_pct")
+            if value is None or not (used or name == "remaining_pct" or name.endswith("_remaining_pct")):
+                continue
+            number = credit_lane._number(value)
+            left = None if number is None or not 0 <= number <= 100 else (100 - number if used else number)
+            readings.append((where, value, left))
+    return readings
+
+
 def _allowance(
     route: str, record: Mapping[str, Any], diagnostics: Mapping[str, Any] | None, *, own: bool
 ) -> tuple[bool, str]:
@@ -342,8 +387,10 @@ def _allowance(
     provider-sourced record (``status_source`` ``weekly_pace``, not a ``ledger_burn`` estimate),
     its own fresh probe (``credit_lane.probe_freshness``) whose ``fetched_at`` is still within the
     probe age limit now (Monitor can serve a budget it built earlier, so the published age is the
-    age at build time), every plan window a real percentage (the reading is their minimum, which
-    would hide a window above 100), no provider probe failure since that sample, and ``own``: the
+    age at build time), every plan-window reading a real 0-100 percentage and the tightest above
+    the near-cap reserve (``_plan_window_readings``; the capacity reading is the minimum of a few
+    named windows, which would hide another window or one above 100), no provider probe failure
+    since that sample, and ``own``: the
     record names this account, with no stale or contradictory account row behind it. These extend
     the credit lane's own checks for Codex account b. A route the resolver's
     ``review_capacity_action`` blocks (unhealthy, circuit open, NEED_LOGIN, ineligible, headroom
@@ -364,12 +411,22 @@ def _allowance(
     probe, why = credit_lane.probe_freshness(record, max_age)
     source = record.get("status_source")
     native = record.get("codexbar")
-    native = native if isinstance(native, Mapping) else {}
-    windows = [record.get("remaining_pct"), credit_lane._auto_window(record).get("remaining_pct"),
-               *(native.get(f"{name}_remaining_pct") for name in ("weekly", "primary", "secondary"))]
-    if any(value is not None and not (credit_lane._number(value) is not None and 0 <= value <= 100)
-           for value in windows):
-        return False, f"{text}, a plan window is not a percentage ({windows})"
+    if native is not None and not isinstance(native, Mapping):
+        return False, f"{text}, its provider sample block is a {type(native).__name__}, not a mapping"
+    readings = _plan_window_readings(record)
+    if readings is None:
+        return False, f"{text}, plan windows nested deeper than {_WINDOW_DEPTH} levels"
+    invalid = [(path, value) for path, value, left in readings if left is None]
+    if invalid:
+        return False, f"{text}, a plan window is not a 0-100 percentage ({invalid})"
+    try:
+        reserve = credit_lane.load_policy().near_cap_remaining_pct
+    except ValueError:  # the same retained reserve review_capacity uses when the policy is unreadable
+        reserve = credit_lane._CREDIT_NEAR_CAP_REMAINING_PCT
+    lefts = [(path, left) for path, _value, left in readings if left is not None]
+    tight = min(lefts, key=lambda item: item[1], default=None)
+    if tight is not None and tight[1] <= reserve:
+        return False, f"{text}, plan window {tight[0]} has {tight[1]:g}% left, at or below the near-cap reserve"
     if source != "weekly_pace":
         return False, f"{text}, not a provider reading (status_source {source or 'missing'})"
     if not own:
@@ -401,7 +458,10 @@ def _account_readings(route: str, snapshot: Mapping[str, Any]) -> list[tuple[str
 
     Codex accounts are the catalog's formal seats for the model (one per ``--codex-account``); a
     record is that account's own only when its ``codex_account`` names the same label. Each record
-    is the reviewer resolver's own (``_route_record``); ``_allowance`` judges it.
+    is the reviewer resolver's own (``_route_record``); ``_allowance`` judges it. The budget is
+    untrusted input: a value that makes reading or judging one account's record raise (an
+    integer too large for a float, a wrong type) refuses that account with the error named, and
+    the other accounts are still judged.
     """
     from lu_machinery.review.reviewer_scheduler import _route_record, codex_account_key
     from lu_machinery.review.role_resolution import invocation_codex_account
@@ -410,20 +470,27 @@ def _account_readings(route: str, snapshot: Mapping[str, Any]) -> list[tuple[str
     diagnostics = snapshot.get("diagnostics")
     diagnostics = diagnostics if isinstance(diagnostics, Mapping) else None
     seats = [candidate for candidate in _formal_candidates().get(route, []) if candidate.concrete_model == model]
-    # (dispatch label, account letter, record, whether the record is the account's own fresh reading)
-    records: list[tuple[str, str, Mapping[str, Any], bool]] = []
+    # (dispatch label, account letter, seat)
+    accounts: list[tuple[str, str, Any]] = []
     if route == "codex":
         for candidate in seats:
             label = invocation_codex_account(candidate.invocation)
-            record = _route_record(candidate, snapshot, prefer_route=True)
             letter = str(codex_account_key(candidate)).removeprefix("codex:")
-            records.append((label, letter, record, record.get("codex_account") == label))
-    if not records:
+            accounts.append((label, letter, candidate))
+    if not accounts:
         raise CanaryError(f"route {route}: the catalog has no formal reviewer seat for {model}")
+
+    def judge(label: str, candidate: Any) -> tuple[bool, str]:
+        try:
+            record = _route_record(candidate, snapshot, prefer_route=True)
+            return _allowance(route, record, diagnostics, own=record.get("codex_account") == label)
+        except (ArithmeticError, AttributeError, LookupError, RecursionError, TypeError, ValueError) as exc:
+            return False, f"unreadable reading ({type(exc).__name__}: {str(exc)[:200]})"
+
     # Account b drains first among accounts with allowance, as the reviewer resolver orders them (#1328).
     return [
-        (label, *_allowance(route, record, diagnostics, own=own))
-        for label, _letter, record, own in sorted(records, key=lambda item: item[1] != "b")
+        (label, *judge(label, candidate))
+        for label, _letter, candidate in sorted(accounts, key=lambda item: item[1] != "b")
     ]
 
 
@@ -549,6 +616,10 @@ def _run_steps(
         argv = ["systemd-run", "--user", "--wait", "--pipe", "--collect", "--service-type=exec",
                 f"--unit={unit}", f"--working-directory={work}"]
         argv += [f"--setenv={key}={env[key]}" for key in context if key in env]
+        # The unit inherits the user manager's environment, and the dispatcher passes an inherited Codex
+        # home or API key through for account a (`sub`): either would run the canary on another account
+        # than the one chosen. Account b's dispatch binds its own home and refuses an inherited key.
+        argv += [f"--property=UnsetEnvironment={key}" for key in _ACCOUNT_ENV.get(route, ())]
         argv += [python, "-I", "-B", "-c", _RUN_ROUTE, "dispatch", "--repo", repo_key,
                  "--agent", route, "--model", model, *account, "--effort", "high", "--mode", "read-only",
                  "--worktree", "--task-id", f"{unit}", "--pinned-head", head, "--base", head,

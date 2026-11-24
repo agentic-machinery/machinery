@@ -423,9 +423,13 @@ does these steps in order:
      the near-cap reserve, account b first among funded accounts. The reading
      must be the account's own fresh provider sample. A ledger estimate, a
      missing or stale probe, a sample fetched longer ago than the probe age
-     limit, a plan window outside 0–100%, a provider probe that failed after
-     the sample, a row for another account, or a route the resolver blocks
-     (unhealthy, logged out, circuit open) is not allowance.
+     limit, any used or remaining plan-window value outside 0–100%, any plan
+     window at or below the near-cap reserve, a provider probe that failed
+     after the sample, a row for another account, a value the canary cannot
+     read, or a route the resolver blocks (unhealthy, logged out, circuit
+     open) is not allowance. The Codex unit drops any inherited `CODEX_HOME`
+     and Codex API-key variables, so the dispatch uses the chosen account's
+     login.
      When no Codex account is funded, or the budget is unreadable, the canary
      refuses with `no-allowance` and lists each account's reading. A dry run
      reads the same budget, prints the chosen accounts and refuses the same
