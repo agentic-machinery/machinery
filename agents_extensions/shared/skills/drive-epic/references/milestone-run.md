@@ -15,6 +15,8 @@ stream (`epic:<N>`). Otherwise follow the [SKILL.md](../SKILL.md) loop and ignor
 - **You never claim, read, relay or acknowledge lane-slot mail.** The CTO owns the lane's mail
   between runs ([For the CTO](#for-the-cto-around-a-run)). A stop or narrowing that must reach you
   while you run goes to the CTO, who cancels the run.
+- **Inbox counts or a `deliveries receive` command that a hook or board shows you are lane-driver
+  tooling.** Take no action on them and never run the printed command; the CTO owns that mail.
 
 A run still follows SKILL.md "Delivery and done", "Escalate" and "This skill is NOT", and the
 [routing](routing-and-dispatch.md), [queue](queue-and-capacity.md), [orient](orient.md),
@@ -112,7 +114,19 @@ Dispatch nothing until these pass. Any failure is `blocked` (see "Ending").
 3. Read live state from tool output this turn: the milestone issue and its checklist; every PR the
    note or the brief names (`gh pr view <number> --repo <owner/name>`: state, head, merge commit,
    recorded verdict and its head, same-head `CI Gate`, queue status per
-   [review-merge-cleanup](review-merge-cleanup.md)); the board and next list in [orient](orient.md).
+   [review-merge-cleanup](review-merge-cleanup.md)); and only these orient reads, which carry no
+   lane-mail data:
+
+   ```bash
+   curl -sS --max-time 2 "http://127.0.0.1:8765/api/orient?lean=true" || true
+   curl -sS --max-time 2 "http://127.0.0.1:8765/api/work/v1/projection?stream=<stream key>" || true
+   curl -sS --max-time 2 "http://127.0.0.1:8765/api/work/v1/next?stream=<stream key>" || true
+   <interpreter> -I -m lu_machinery.fleet_comms plane-status
+   ```
+
+   The three `curl` reads are best effort, as in orient (a cold or absent source is not a
+   failure; an unknown `<stream key>` answers with `valid_streams`). Do not run `cold-start-board`, `backlog` or `dead-letters` from [orient](orient.md):
+   they show lane-slot counts and delivery rows.
 4. If the note or the brief disagrees with live state on a fact a next step depends on (a PR
    merged or its head moved, an issue closed), live state wins. Record the difference in your
    note; never repair by guessing.
@@ -257,21 +271,36 @@ The lane slot is the registered slot the dispatcher resolves at launch from the 
 and the stream's launcher lane, which can be an alias (for example `gemini-core` for the stream whose note
 lane is `curriculum-upgrade`); a launch with an unregistered slot is refused.
 
+**Supervisory check before any claim.** A generic `deliveries claim` or `receive` takes the
+oldest queued delivery of any kind and first requeues expired leases, so it can take a
+supervisory request and change its owner, fence and attempt count. Immediately before each
+claim on the lane slot, read the lane's deliveries without bodies:
+
+```bash
+curl -sS --max-time 5 "http://127.0.0.1:8765/api/fleet/deliveries?seat=<lane>&state=queued&since=all&limit=100"
+curl -sS --max-time 5 "http://127.0.0.1:8765/api/fleet/deliveries?seat=<lane>&state=running&since=all&limit=100"
+```
+
+Claim only when both answer `availability: available`, every row is returned (`total` equals the
+rows, or page with `offset`), and no row has `kind: supervisory-request`. A `running` supervisory
+row includes one a legacy driver consumed and never acknowledged; `deliveries pending` does not
+count those, so its `count: 0` never clears them. Any supervisory row, or any other answer, means
+claim nothing on the slot: the request stays with its canonical supervisor, and you reconcile it
+through §5 first.
+
 **Before launch.**
 
 1. **Reconcile prior effects and unresolved deliveries** on the lane slot, including any a legacy
-   lane driver left claimed, unacknowledged or supervisory-consumed. `pending`
-   does not count a delivery whose supervisory consumption is recorded, so `count: 0` does not
-   clear one that a legacy driver consumed and never acknowledged; reconcile those from the
-   predecessor's handoff and the supervisor's records. For each delivery, check the durable
-   outcome of what it ordered before acting, never repeat a completed side effect, and record its
-   disposition in the CTO's driver-state before you acknowledge it.
+   lane driver left claimed, unacknowledged or supervisory-consumed, after the supervisory check.
+   For each delivery, check the durable outcome of what it ordered before acting, never repeat a
+   completed side effect, and record its disposition in the CTO's driver-state before you
+   acknowledge it.
 2. **Unknown slot custody stops the launch.** If you cannot establish who holds the slot, a
    delivery's current fence or an order's outcome, launch nothing and use the authorized-sender
    reconciliation in §5.
-3. **Supervisory requests stay with the canonical supervisor.** Never consume or acknowledge a
-   `supervisory-request` from the CTO seat; §5 reserves that sequence for the launcher or watcher.
-   Record it as unresolved with its owner.
+3. **Supervisory requests stay with the canonical supervisor.** Never claim, consume or acknowledge
+   a `supervisory-request` from the CTO seat; §5 reserves that sequence for the launcher or
+   watcher. Record it as unresolved with its owner.
 4. **Establish the stop path.** Mail that can wait until the run ends may go to the lane slot. A
    stop or narrowing order that must affect active work, or any order whose deadline falls before
    the run ends, goes to `claude-cto` (or the authorized dispatcher controller). Make that path
@@ -279,9 +308,14 @@ lane is `curriculum-upgrade`); a launch with an unregistered slot is refused.
 5. **Carry authorized work into the brief** under "Carried mail", by reference to the original
    delivery ID and its recorded disposition, never by pasting a new order.
 
-**Between runs.** Drain the lane slot at the first CTO cycle after the run settles, or after a
-`held_turn_lease` alert for it, and again immediately before launching a successor. Read the
-settled result first (`dispatch wait <turn-id> --run-nonce <full-nonce>`).
+**Between runs.** Drain the lane slot, after the supervisory check, at the first CTO cycle after
+either boundary, and again immediately before launching a successor:
+
+- **The run settled:** read the settled result (`dispatch wait <turn-id> --run-nonce <full-nonce>
+  --timeout 300`), then drain.
+- **A `held_turn_lease` alert names the run:** read its record without waiting
+  (`dispatch status <turn-id> --run-nonce <full-nonce>`); the record may still be running. Drain
+  now, because the run touches no mail; settlement and lease recovery stay open separately.
 
 **Stopping a run.** On a live stop, run at once:
 
@@ -292,19 +326,25 @@ settled result first (`dispatch wait <turn-id> --run-nonce <full-nonce>`).
 `cancel` refuses a wrong nonce (exit 2, `dispatcher: run nonce mismatch`), a legacy record, and
 a supervisor whose identity is missing or changed. Otherwise it sends the turn's supervisor
 SIGTERM, waits at most 10 s and prints the record, which may still be running. It gives no
-guaranteed time to quiescence. Then:
+guaranteed time to quiescence, signals no child and dequeues no PR. Do the next two steps
+without waiting for the turn to settle:
 
-1. **Verify settlement** for that nonce: `dispatch wait <turn-id> --run-nonce <full-nonce>
-   --timeout 300`, repeated until it exits 0 or 1. Settlement keeps a non-`done` provider status,
-   so a cancelled run settles `cancelled` and is never a handoff baseline (cold start step 2).
-2. **Reconcile children separately.** `cancel` signals only the turn's own supervisor; settlement
-   lists a still-live child as orphaned and keeps the lease. Read `child_tasks`,
-   `orphaned_child_tasks`, `unknown_child_tasks` and `unreadable_child_records`; for each child
-   the stop covers, `dispatch cancel <child-id> --run-nonce <its nonce>` and verify it the same way.
-3. **Reconcile in-flight landings separately.** A child's PR may already be queued or merging, and
-   no cancel dequeues it. For each PR the stop covers, run the hold, disarm and dequeue recipe in
-   `full-stop` ("Protect the PR before any work") and verify its results.
-4. **Reconcile the lease separately.** A terminal turn alone neither clears the lease nor
+1. **Protect covered PRs now.** For each PR the stop covers (the brief's PRs and those of known
+   children), run the hold, disarm and dequeue recipe in `full-stop` ("Protect the PR before any
+   work") with the verified repository on every command (`--repo <owner/name>`; `pr-dequeue`
+   takes the node ID from `gh pr view <number> --repo <owner/name> --json id`), and verify its
+   results.
+2. **Cancel covered children now.** Find the turn's active children with `dispatch list --status
+   running` and `dispatch list --status spawning`, by `parent_task_id` and `parent_run_nonce`; for each one the stop
+   covers, `dispatch cancel <child-id> --run-nonce <its nonce>`.
+3. **Verify the turn's settlement** for that nonce: `dispatch wait <turn-id> --run-nonce
+   <full-nonce> --timeout 300`, repeated until it exits 0 or 1. Settlement keeps a non-`done`
+   provider status, so a cancelled run settles `cancelled` and is never a handoff baseline (cold
+   start step 2).
+4. **Reconcile what settlement reveals.** Read `child_tasks`, `orphaned_child_tasks`,
+   `unknown_child_tasks` and `unreadable_child_records`; protect and cancel any covered child or
+   PR not handled above, and verify each cancelled child settles the same way.
+5. **Reconcile the lease separately.** A terminal turn alone neither clears the lease nor
    authorizes a successor: the dispatcher releases it only when the run's processes are proven
    gone and no child is live, unknown or unreadable. A lease still held after settlement goes
    through "Dispatch-turn lease recovery" in `docs/runbooks/session-supervisor.md`.
