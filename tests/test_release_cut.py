@@ -789,6 +789,11 @@ def test_successful_default_work_is_removed_and_log_archived(monkeypatch, tmp_pa
         with (cut.work / "cut.log").open("a") as log:
             log.write("fixture release complete\n")
         (cut.work / "large-artifact").write_text("fixture")
+        sealed = cut.work / "accept" / "node"
+        sealed.mkdir(parents=True)
+        (sealed / "file").write_text("fixture")
+        sealed.chmod(0o555)
+        sealed.parent.chmod(0o555)
         return 0
 
     monkeypatch.setattr(release_cut, "execute", execute)

@@ -1747,9 +1747,10 @@ def _run(args: argparse.Namespace) -> int:
             log = state / f"{cut.version or cut.head or 'unknown'}-{stamp}.log"
             with (work / "cut.log").open("rb") as source, log.open("xb") as destination:
                 shutil.copyfileobj(source, destination)
+            cut.remove_rebuildable_scratch()
             shutil.rmtree(work)
             print(f"release log: {log}")
-        except OSError as exc:
+        except (CutError, OSError) as exc:
             print(f"release completed but work cleanup failed: {exc}; work directory: {work}", file=sys.stderr)
             return 1
     return result
