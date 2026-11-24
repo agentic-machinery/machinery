@@ -377,7 +377,7 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
             "mergeQueueEntry": {"position": 1, "state": "QUEUED"},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"},
                                               "status": {"context": {"state": "SUCCESS"}}}}]}}
-    pinned = {"isTruncated": False, "text": '[project]\ndependencies = ["lu-machinery[api,pytest]==0.1.68"]\n'}
+    pinned = {"isTruncated": False, "text": '[[package]]\nname = "lu-machinery"\nversion = "0.1.68"\n'}
     tip = {"target": {"statusCheckRollup": {"state": "FAILURE"}}}
     extra = {"defaultBranchRef": tip, "pin": pinned}
     repos = {"r0": {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [node]}, **extra},
@@ -389,6 +389,9 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
 
     def github_run(args, **_kwargs):
         assert 'r0: repository(owner: "new-owner", name: "machinery")' in args[-1]
+        # The machinery repository's own lock is never fetched; every other project's uv.lock is.
+        assert args[-1].count('pin: object(expression: "HEAD:uv.lock")') == 2
+        assert "pyproject" not in args[-1]
         assert 'r1: repository(owner: "old-owner", name: "product.pages")' in args[-1]
         assert 'r2: repository(owner: "other-owner", name: "private-infra")' in args[-1]
         return SimpleNamespace(returncode=0, stdout=json.dumps({"data": repos}))
@@ -404,7 +407,8 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     assert "secret-branch" not in json.dumps(public["pull_requests"])
     assert public["pull_requests"][0]["queue"] == {"position": 1, "state": "queued"}
     assert public["default_branch"] == {"ci": "failure"}
-    assert public["pin"] == {"state": "pinned", "version": "0.1.68"}
+    # The machinery repository itself shows "self", never a version read from elsewhere.
+    assert public["pin"] == {"state": "self", "version": None}
     for repo in (private, unstated):
         assert repo["default_branch"] == {"ci": "failure"}
         # A private project shows counts and states only: its pin is withheld.
@@ -422,50 +426,29 @@ def test_pull_requests_route_hides_private_repo_titles_and_branches(monkeypatch,
     by_role = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][0]
     assert by_role["private"] is True and by_role["pin"]["state"] == "withheld"
 
-    # The pin is read from the parsed manifest, not from its text: a comment is no pin, another
-    # spelling of the name is one, and anything that is not one exact version is unknown, never "none".
-    def pin_of(repo: dict) -> dict:
-        return git_hygiene_router._pin(repo, private=False, errored=False)
+    # The pin is the version of the one [[package]] entry named exactly lu-machinery in the uv.lock,
+    # read as TOML (CTO ruling for this lineage); anything else is unknown. pyproject.toml is not read.
+    def pin_of(repo: dict, *, own: bool = False) -> dict:
+        return git_hygiene_router._pin(repo, private=False, errored=False, own=own)
 
-    def manifest(body: str) -> dict:
+    def lock(body: str) -> dict:
         return {"pin": {"isTruncated": False, "text": body}}
 
-    dependency = '[project]\ndependencies = ["lu_machinery == 1.2.3"]\n'
-    assert pin_of(manifest(dependency)) == {"state": "pinned", "version": "1.2.3"}
-    assert pin_of(manifest('[project]\ndependencies = []\n# "lu-machinery==9.9.9"\n'))["state"] == "none"
-    assert pin_of({"pin": None})["state"] == "none"
-    for malformed in ('[project]\ndependencies = [0]\n', '[project]\noptional-dependencies = "x"\n',
-                      '[project]\ndependencies = ["lu-machinery==1.2.*"]\n',
-                      '[dependency-groups]\ng = [0]\n', '[dependency-groups]\ng = [{include-group = 123}]\n',
-                      '[dependency-groups]\ng = [{other = "x"}]\n',
-                      '[dependency-groups]\nb = ["lu-machinery==1.0"]\ng = [{include-group = "b", extra = 1}]\n',
-                      # PEP 735: an include must name a group, includes must not cycle, names must not collide.
-                      '[dependency-groups]\na = [{include-group = "missing"}]\n',
-                      '[dependency-groups]\na = ["lu-machinery==1.2.3", {include-group = "b"}]\nb = [{include-group = "a"}]\n',
-                      '[dependency-groups]\na = ["lu-machinery==1.2.3", {include-group = "a"}]\n',
-                      '[dependency-groups]\na-b = ["lu-machinery==1.2.3"]\na_b = []\n',
-                      '[project]\noptional-dependencies = {X = ["lu-machinery==1.2.3"], x = []}\n',
-                      # Dependencies declared outside the file may pin it there.
-                      '[project]\ndynamic = ["dependencies"]\n', '[project]\ndynamic = "dependencies"\n',
-                      '[project]\ndependencies = ["lu-machinery==1.2.3"]\ndynamic = [123]\n',
-                      # Names must be valid PEP 508 names, ASCII only (packaging accepts the Kelvin sign as "k").
-                      '[dependency-groups]\n"bad group" = ["lu-machinery==1.2.3"]\nall = [{include-group = "bad group"}]\n',
-                      '[dependency-groups]\n"\u212a" = ["lu-machinery==1.2.3"]\n',
-                      '[project]\noptional-dependencies = {"bad extra" = ["lu-machinery==1.2.3"]}\n'):
-        assert pin_of(manifest(malformed))["state"] == "unknown", malformed
-    # A PEP 735 include table is allowed in a dependency group, and a pin beside it still reads.
-    included = '[dependency-groups]\nbase = ["lu-machinery==3.4.5"]\nall = [{include-group = "base"}]\n'
-    assert pin_of(manifest(included)) == {"state": "pinned", "version": "3.4.5"}
-    # Names compare normalized, so an include may spell its target another way.
-    respelled = '[dependency-groups]\nBase_Set = ["lu-machinery==3.4.5"]\nall = [{include-group = "base-set"}]\n'
-    assert pin_of(manifest(respelled)) == {"state": "pinned", "version": "3.4.5"}
-    for unknown in (
-        {}, manifest("not = [toml"), manifest('[project]\ndependencies = ["lu-machinery>=1"]\n'),
-        manifest('[project]\ndependencies = ["lu-machinery==1.0"]\n[project.optional-dependencies]\nx = ["lu-machinery==2.0"]\n'),
-        {"pin": {"isTruncated": True, "text": dependency}},
-    ):
-        assert pin_of(unknown) == {"state": "unknown", "version": None}
-    assert git_hygiene_router._pin(manifest(dependency), private=False, errored=True)["state"] == "unknown"
+    locked = '[[package]]\nname = "other"\nversion = "9.9.9"\n\n[[package]]\nname = "lu-machinery"\nversion = "1.2.3"\n'
+    assert pin_of(lock(locked)) == {"state": "pinned", "version": "1.2.3"}
+    assert pin_of(lock(locked), own=True) == {"state": "self", "version": None}
+    assert git_hygiene_router._pin(lock(locked), private=True, errored=False, own=True)["state"] == "withheld"
+    for malformed in ("not = [toml", 'package = "x"\n', "package = [1]\n", "version = 1\n",
+                      '[[package]]\nname = "other"\nversion = "1"\n# name = "lu-machinery"\n',
+                      '[[package]]\nname = "lu_machinery"\nversion = "1.2.3"\n',
+                      '[[package]]\nname = "lu-machinery"\n', '[[package]]\nname = "lu-machinery"\nversion = 1\n',
+                      '[[package]]\nname = "lu-machinery"\nversion = ""\n', locked + locked.split("\n\n")[1]):
+        assert pin_of(lock(malformed)) == {"state": "unknown", "version": None}, malformed
+    # A missing, unreadable (non-text) or cut-short lock is unknown, never "does not pin".
+    for unread in ({}, {"pin": None}, {"pin": {}}, {"pin": {"isTruncated": False, "text": None}},
+                   {"pin": {"isTruncated": True, "text": locked}}, {"pin": {"text": locked}}):
+        assert pin_of(unread) == {"state": "unknown", "version": None}, unread
+    assert git_hygiene_router._pin(lock(locked), private=False, errored=True, own=False)["state"] == "unknown"
     assert git_hygiene_router._default_branch_ci({}, errored=False) is None
     # Default-branch CI: "none reported" only when GitHub says there is no branch or no rollup;
     # a missing or malformed part, or a state outside GitHub's set, is unknown.
@@ -672,18 +655,32 @@ def test_pull_requests_route_reports_unknown_when_github_fails(monkeypatch, tmp_
     # GitHub nulls a failed field and keeps its parent: an error anywhere in a repository's PRs leaves
     # that repository unknown (never "not queued" or "no CI yet"); one on its pin or CI leaves only that
     # field unknown; an error naming no repository of the query is no reading at all.
-    repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [_open_pr("codex/x", 3)]}}
-    repos["r2"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [_open_pr("codex/y", 4)]}}
-    repos["r0"] = {**repos["r0"], "pin": None}  # the failed field, nulled
-    errors = [{"path": ["r1", "pullRequests", "nodes", 0, "mergeQueueEntry"], "message": "failed"},
-              {"path": ["r0", "pin"], "message": "failed"}]
+    uv_lock = {"isTruncated": False, "text": '[[package]]\nname = "lu-machinery"\nversion = "0.1.70"\n'}
+    repos["r0"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [_open_pr("codex/x", 3)]}}
+    repos["r1"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [_open_pr("codex/y", 4)]}, "pin": uv_lock}
+    repos["r2"] = {"isPrivate": False, "pullRequests": {"totalCount": 1, "nodes": [_open_pr("codex/z", 5)]}, "pin": uv_lock}
+    _graphql_result(monkeypatch, 0, json.dumps({"data": repos}))
+    assert [row["pin"] for row in git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]] == [
+        {"state": "self", "version": None}, {"state": "pinned", "version": "0.1.70"},
+        {"state": "withheld", "version": None}]
+    errors = [{"path": ["r0", "pullRequests", "nodes", 0, "mergeQueueEntry"], "message": "failed"},
+              {"path": ["r1", "pin"], "message": "failed"}]
     _graphql_result(monkeypatch, 1, json.dumps({"data": repos, "errors": errors}))
-    pin_failed, queue_failed, third = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]
+    queue_failed, pin_failed, third = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"]
     assert (queue_failed["status"], queue_failed["pull_requests"], queue_failed["unknown_since"] is not None) == (
         "unknown", [], True)
     assert (pin_failed["status"], pin_failed["pin"]["state"], third["status"]) == ("ok", "unknown", "ok")
+    # An error on isPrivate makes the project private, whatever value stands beside it.
+    _graphql_result(monkeypatch, 1, json.dumps({"data": repos, "errors": [{"path": ["r1", "isPrivate"], "message": "x"}]}))
+    forced = git_hygiene_router.compute_pull_requests(tmp_path)["repositories"][1]
+    assert (forced["private"], forced["pin"]["state"], forced["pull_requests"][0]["number"]) == (True, "withheld", None)
+    # Every path segment after the first must be a field name or a list index, else the error names
+    # no field and the whole read is unknown.
     for stray in ({"message": "no path"}, {"path": ["elsewhere"], "message": "x"}, {"path": [], "message": "x"},
-                  {"path": [[]], "message": "x"}, {"path": [{}], "message": "x"}, "not an object"):
+                  {"path": [[]], "message": "x"}, {"path": [{}], "message": "x"}, "not an object",
+                  {"path": ["r1", "isPrivate", {}], "message": "x"}, {"path": ["r1", True], "message": "x"},
+                  {"path": ["r1", "pullRequests", -1], "message": "x"}, {"path": ["r1", "pin", 1.5], "message": "x"},
+                  {"path": ["r1", None], "message": "x"}, {"path": ["r1", ["isPrivate"]], "message": "x"}):
         _graphql_result(monkeypatch, 1, json.dumps({"data": repos, "errors": [stray]}))
         assert git_hygiene_router.compute_pull_requests(tmp_path)["status"] == "unknown", stray
 

@@ -583,7 +583,7 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "/api/git/pull-requests",
         "exact",
         "http",
-        "Open pull requests and project status for every repository in the fleet registry: number, draft, age, CI rollup, cross-family review status and merge-queue position, plus per project the default-branch CI result, the lu-machinery version pinned in pyproject.toml, and the count of live workers.",
+        "Open pull requests and project status for every repository in the fleet registry: number, draft, age, CI rollup, cross-family review status and merge-queue position, plus per project the default-branch CI result, the lu-machinery version in the uv.lock at the default branch head (self for machinery; unknown when the lock is missing, cut short, malformed or has no single lu-machinery entry), and the count of live workers.",
         "One GitHub GraphQL read through the shared GitHub client over every registry repository, and the local live-worker snapshot for the worker counts.",
         "Startup warmup and a shared 120-second cache with one background refresh of expired snapshots. The 210-second display bound allows two 30-second page cycles plus collection/HTTP margin without extra GitHub reads. Age, bound and state are exposed in snapshot headers. A failed read is unknown, never an empty list: an unreadable project stays listed with status unknown, a reason and unknown_since (the first consecutive failed reading since this Monitor started), and one unreadable project never hides the others.",
         ("index.html", "pull-requests.html", "fleet.html", "operators"),

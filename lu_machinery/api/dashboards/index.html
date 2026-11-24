@@ -274,7 +274,8 @@ function renderQueueSummary(prs, prState = null) {
 // One line per project the registry lists. GitHub data that could not be read is never a zero:
 // the line says since when it has been unknown. Worker counts come from the local task store, so
 // they stay known when GitHub is not.
-const PIN_STATES = {none: "does not pin", withheld: "private"};
+// The pin is the lu-machinery version in the project's uv.lock; anything else it cannot name is "?".
+const PIN_STATES = {self: "self", withheld: "private"};
 
 function pinCell(pin) {
   if (pin && pin.state === "pinned" && pin.version) return text(`v${pin.version}`);

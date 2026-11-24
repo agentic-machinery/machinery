@@ -22,8 +22,6 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
-from packaging.requirements import InvalidRequirement, Requirement
-from packaging.utils import InvalidName, canonicalize_name
 from pydantic import AfterValidator, BaseModel
 
 from lu_machinery.common import github_client, json_depth
@@ -613,8 +611,11 @@ PULL_REQUESTS_TTL_S = 120.0
 PULL_REQUESTS_TIMEOUT_S = 20.0
 PULL_REQUESTS_PER_REPOSITORY = 50
 REVIEW_STATUS_CONTEXT = "fleet/cross-family-review"
-# The one file a project pins the lu-machinery release in, read from its default branch.
-PIN_FILE = "pyproject.toml"
+# The one file a project's lu-machinery version is read from, at its default branch head.
+PIN_FILE = "uv.lock"
+# The registry key of the machinery repository itself: its pin column says "self" and its lock
+# is not fetched.
+SELF_KEY = "machinery"
 _CI_STATES = {"success", "failure", "error", "pending", "expected"}
 # A reading older than the delegate panel's own bound is not a live count.
 LIVE_WORKERS_MAX_AGE_S = 60.0
@@ -629,7 +630,7 @@ _PR_FIELDS = (
 )
 
 
-def _pull_requests_query(repositories: list[tuple[str, str, str] | None]) -> str:
+def _pull_requests_query(repositories: list[tuple[str, str, bool] | None]) -> str:
     pulls = (
         f"pullRequests(states: OPEN, first: {PULL_REQUESTS_PER_REPOSITORY}, orderBy: {{field: CREATED_AT, direction: DESC}})"
     )
@@ -637,10 +638,11 @@ def _pull_requests_query(repositories: list[tuple[str, str, str] | None]) -> str
     for index, entry in enumerate(repositories):
         if entry is None:  # an invalid slug stays out of the query; its row says so
             continue
-        owner, name, _display = entry
+        owner, name, own = entry
         header = f'r{index}: repository(owner: "{owner}", name: "{name}")'
         tip = "defaultBranchRef { target { ... on Commit { statusCheckRollup { state } } } }"
-        pin = f'pin: object(expression: "HEAD:{PIN_FILE}") {{ ... on Blob {{ isTruncated text }} }}'
+        # The machinery repository's own lock is never fetched: its pin reads "self".
+        pin = "" if own else f'pin: object(expression: "HEAD:{PIN_FILE}") {{ ... on Blob {{ isTruncated text }} }}'
         blocks.append(f"{header} {{ isPrivate {tip} {pin} {pulls} {{ totalCount nodes {{ {_PR_FIELDS} }} }} }}")
     return "query { " + " ".join(blocks) + " }"
 
@@ -731,128 +733,39 @@ def _unknown_pull_requests(
     return {"status": "unknown", "reason": reason, "observed_at": observed_at, "repositories": rows}
 
 
-def _valid_name(name: object) -> str | None:
-    """The normalized form of a valid PEP 508 name (ASCII letters and digits, ``.``, ``_``, ``-``
-    inside), else ``None``. The ASCII gate matters: packaging accepts the Kelvin sign as ``k``.
-    """
-    if not isinstance(name, str) or not name.isascii():
-        return None
-    try:
-        return canonicalize_name(name, validate=True)
-    except InvalidName:
-        return None
+def _locked_version(text: str) -> str | None:
+    """The version of the one ``[[package]]`` entry named exactly ``lu-machinery`` in a uv.lock.
 
-
-def _group_requirements(groups: dict[str, Any]) -> list[Any] | None:
-    """The requirement strings of every PEP 735 dependency group, or ``None`` for an invalid table.
-
-    Invalid: a name that is not a valid PEP 508 name, a group that is not an array, two names equal
-    after normalization, an entry that is neither a string nor an ``{include-group = "<name>"}``
-    table, an include naming no group, or an include cycle. Every group is read, so an include adds no requirement that is not already listed.
-    """
-    entries: dict[str, list[Any]] = {}
-    for name, items in groups.items():
-        normalized = _valid_name(name)
-        if normalized is None or not isinstance(items, list) or normalized in entries:
-            return None
-        entries[normalized] = items
-    requirements: list[Any] = []
-    includes: dict[str, set[str]] = {name: set() for name in entries}
-    for name, items in entries.items():
-        for item in items:
-            if isinstance(item, dict):
-                target = _valid_name(item.get("include-group")) if set(item) == {"include-group"} else None
-                if target is None or target not in entries:
-                    return None
-                includes[name].add(target)
-            else:
-                requirements.append(item)
-    # An include cycle leaves groups that never reach in-degree zero (Kahn's algorithm).
-    indegree = dict.fromkeys(entries, 0)
-    for targets in includes.values():
-        for target in targets:
-            indegree[target] += 1
-    ready = [name for name, count in indegree.items() if count == 0]
-    resolved = 0
-    while ready:
-        resolved += 1
-        for target in includes[ready.pop()]:
-            indegree[target] -= 1
-            if indegree[target] == 0:
-                ready.append(target)
-    return requirements if resolved == len(entries) else None
-
-
-def _requirement_lists(manifest: dict[str, Any]) -> list[list[Any]] | None:
-    """Every dependency array of a manifest; ``None`` when any has a shape the format does not allow,
-    an extra's name is invalid or shared after normalization, ``dynamic`` holds anything but strings,
-    or the dependencies are dynamic (declared outside the file).
-    """
-    project, groups = manifest.get("project", {}), manifest.get("dependency-groups", {})
-    if not isinstance(project, dict) or not isinstance(groups, dict):
-        return None
-    optional, dynamic = project.get("optional-dependencies", {}), project.get("dynamic", [])
-    grouped = _group_requirements(groups)
-    if (not isinstance(optional, dict) or not isinstance(dynamic, list) or grouped is None
-            or not all(isinstance(item, str) for item in dynamic)
-            or {"dependencies", "optional-dependencies"} & set(dynamic)):
-        return None
-    extras = {_valid_name(extra) for extra in optional}
-    if None in extras or len(extras) != len(optional):
-        return None
-    lists = [project.get("dependencies", []), *optional.values(), grouped]
-    return lists if all(isinstance(items, list) for items in lists) else None
-
-
-def _exact_pins(text: str) -> set[str] | None:
-    """Versions of lu-machinery that a manifest pins exactly, in any dependency group.
-
-    ``None`` when the manifest cannot be read or has a malformed dependency table, or names
-    lu-machinery without one concrete version (a range or a wildcard).
+    ``None`` when the text is not valid TOML, ``package`` is not an array of tables, there are zero
+    or several such entries, or the entry has no non-empty string version.
     """
     try:
-        lists = _requirement_lists(tomllib.loads(text))
-        if lists is None:
-            return None
-        versions: set[str] = set()
-        for items in lists:
-            for item in items:
-                if not isinstance(item, str):
-                    return None
-                req = Requirement(item)
-                if canonicalize_name(req.name) != "lu-machinery":
-                    continue
-                exact = list(req.specifier)
-                if len(exact) != 1 or exact[0].operator != "==" or exact[0].version.endswith(".*"):
-                    return None
-                versions.add(exact[0].version)
-    except (tomllib.TOMLDecodeError, InvalidRequirement, RecursionError, ValueError):
+        lock = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, RecursionError):
         return None
-    return versions
+    packages = lock.get("package")
+    if not isinstance(packages, list) or not all(isinstance(entry, dict) for entry in packages):
+        return None
+    entries = [entry for entry in packages if entry.get("name") == "lu-machinery"]
+    version = entries[0].get("version") if len(entries) == 1 else None
+    return version if isinstance(version, str) and version else None
 
 
-def _pin(repo: dict[str, Any], *, private: bool, errored: bool) -> dict[str, Any]:
-    """The lu-machinery version a project pins, from its default branch's pyproject.toml.
+def _pin(repo: dict[str, Any], *, private: bool, errored: bool, own: bool) -> dict[str, Any]:
+    """The lu-machinery version a project locks, from the uv.lock at its default branch head.
 
-    ``withheld`` for a private project (counts and states only). ``none`` only when GitHub says
-    the file is absent or it names no lu-machinery; ``unknown`` when the field is missing or
-    errored, the file was cut short or cannot be parsed, or it names several versions.
+    ``withheld`` for a private project (counts and states only), ``self`` for the machinery
+    repository itself. ``unknown`` when the field is missing or errored, the file is absent, not a
+    file, cut short or not text, or it locks no single lu-machinery version. pyproject.toml is not read.
     """
     if private:
         return {"state": "withheld", "version": None}
-    if errored or "pin" not in repo:
-        return {"state": "unknown", "version": None}
-    blob = repo["pin"]
-    if blob is None:
-        return {"state": "none", "version": None}
-    fields = _mapping(blob)
-    body = fields.get("text")
-    if not isinstance(body, str) or fields.get("isTruncated") is not False:
-        return {"state": "unknown", "version": None}
-    versions = _exact_pins(body)
-    if versions is None or len(versions) > 1:
-        return {"state": "unknown", "version": None}
-    return {"state": "pinned", "version": versions.pop()} if versions else {"state": "none", "version": None}
+    if own:
+        return {"state": "self", "version": None}
+    blob = _mapping(repo.get("pin")) if not errored else {}
+    body = blob.get("text")
+    version = _locked_version(body) if isinstance(body, str) and blob.get("isTruncated") is False else None
+    return {"state": "pinned", "version": version} if version else {"state": "unknown", "version": None}
 
 
 def _default_branch_ci(repo: dict[str, Any], *, errored: bool) -> dict[str, Any] | None:
@@ -890,6 +803,9 @@ def _errored_fields(document: object, aliases: set[str]) -> dict[str, set[str]] 
     for item in errors or []:
         path = item.get("path") if isinstance(item, dict) else None
         if not isinstance(path, list) or not path or not isinstance(path[0], str) or path[0] not in aliases:
+            return None
+        # Every later segment is a field name or a list index; anything else names no field.
+        if not all(isinstance(part, str) or (type(part) is int and part >= 0) for part in path[1:]):
             return None
         field = path[1] if len(path) > 1 else ""
         found.setdefault(path[0], set()).add(field if isinstance(field, str) else "")
@@ -950,8 +866,8 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
     targets = [(repo.key, repo.owner, repo.name, repo.local_name) for repo in catalog]
     # One invalid slug is that project's unknown row, never a failed read for the others.
     valid = [bool(_REPOSITORY_SLUG.fullmatch(repo.github)) and repo.name not in {".", ".."} for repo in catalog]
-    repositories: list[tuple[str, str, str] | None] = [
-        (owner, name, display) if ok else None for ok, (_key, owner, name, display) in zip(valid, targets, strict=True)
+    repositories: list[tuple[str, str, bool] | None] = [
+        (owner, name, key == SELF_KEY) if ok else None for ok, (key, owner, name, _display) in zip(valid, targets, strict=True)
     ]
     if not any(valid):
         return _unknown_pull_requests("invalid_repository", observed_at, targets)
@@ -1005,7 +921,10 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
             continue
         # Fail closed: anything but an explicit public repository, or a registry role that is not
         # public, is private.
-        private = repo.get("isPrivate") is not False or not catalog[index].role.startswith("public-")
+        # An error on isPrivate makes it private too: GitHub nulls a failed field, so a value beside
+        # the error is no reading.
+        private = (repo.get("isPrivate") is not False or "isPrivate" in failed
+                   or not catalog[index].role.startswith("public-"))
         nodes = repo["pullRequests"].get("nodes")
         total = repo["pullRequests"].get("totalCount")
         # A missing or null PR node would silently read as fewer open PRs, and a count that is not an
@@ -1022,7 +941,7 @@ def compute_pull_requests(project_root: Path, *, tasks_dir: Path | None = None) 
             "private": private,
             "open_total": total,
             "default_branch": _default_branch_ci(repo, errored="defaultBranchRef" in failed),
-            "pin": _pin(repo, private=private, errored="pin" in failed),
+            "pin": _pin(repo, private=private, errored="pin" in failed, own=key == SELF_KEY),
             "unknown_since": None,
             "pull_requests": [
                 _pull_request_row(node, private=private, repository=f"{owner}/{name}", tasks_dir=records)
