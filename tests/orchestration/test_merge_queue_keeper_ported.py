@@ -988,6 +988,7 @@ def test_defect_report_requires_two_distinct_prs_and_is_sent_once(tmp_path: Path
     assert not failed and "repeated job failure: pytest; PRs=42,43; runs=unknown" in lines
     [body] = _defect_reports(path)
     assert "`pytest` failed merge_group runs of distinct PRs #42, #43 within 24 hours" in body
+    assert "Setup error: setup error not read." in body
     assert "No failing test node was read for it: diagnose the job." in body
     run(fake, path, monkeypatch)
     assert len(_defect_reports(path)) == 1
@@ -1292,7 +1293,7 @@ def test_drop_lookup_error_is_not_reported_as_unknown(tmp_path, monkeypatch) -> 
 def test_drop_without_matching_run_is_unknown() -> None:
     fake = FakeGitHub()
     fake.events = [{"event": "removed_from_merge_queue", "created_at": "2026-09-23T00:00:01Z"}]
-    detail, jobs, tests, run_id, _run_ids = keeper._drop_detail(fake, 42, HEAD_A, "2026-09-23T00:00:00Z")
+    detail, jobs, tests, run_id, _run_ids, _setup = keeper._drop_detail(fake, 42, HEAD_A, "2026-09-23T00:00:00Z")
     assert "failing merge_group run unknown" in detail and jobs == [] and tests == {}
     assert run_id is None
 
@@ -1324,7 +1325,7 @@ def test_drop_finds_run_created_before_last_queue_observation(monkeypatch, entry
 
     monkeypatch.setattr(fake, "runs", runs)
     fake.job_rows = [{"name": "pytest", "conclusion": "failure"}]
-    detail, jobs, tests, run_id, _run_ids = keeper._drop_detail(fake, 42, HEAD_A, observed)
+    detail, jobs, tests, run_id, _run_ids, _setup = keeper._drop_detail(fake, 42, HEAD_A, observed)
     assert windows == [entered if entry_available else fake.created_at(42)]
     assert "Failing merge_group: 123; failing jobs: `pytest`" in detail
     assert jobs == ["pytest"] and tests == {}
@@ -1414,11 +1415,12 @@ def test_drop_detail_keeps_run_and_jobs_with_optional_first_failed_test(tmp_path
         return "2026-10-10T01:00:00Z FAILED tests/test_lint_tmp_paths.py::test_paths - AssertionError\nFAILED tests/other.py::test_other - error"
 
     monkeypatch.setattr(client, "call", call)
-    detail, jobs, tests, run_id, _run_ids = keeper._drop_detail(client, 10256, HEAD_A, "2026-10-10T00:00:00Z")
+    detail, jobs, tests, run_id, _run_ids, setup_errors = keeper._drop_detail(client, 10256, HEAD_A, "2026-10-10T00:00:00Z")
     assert "https://github.com/example/runs/123" in detail and "pytest (N)" in detail
     assert jobs == ["CI Gate", "pytest (N)"]
     assert ("First FAILED test: `tests/test_lint_tmp_paths.py::test_paths`" in detail) is not log_error
     assert tests == ({} if log_error else {"pytest (N)": ["tests/test_lint_tmp_paths.py::test_paths", "tests/other.py::test_other"]})
+    assert setup_errors == {}
     assert "other.py" not in detail and "unknown" not in detail
     assert run_id == 123
 

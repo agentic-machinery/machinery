@@ -9,6 +9,10 @@ this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Report one infrastructure failure for a merge-group run to the CTO, listing every failing job, instead of one message per pytest shard.
+
 <a id="v0.1.67"></a>
 ## [0.1.67] - 2026-11-24 [YANKED]
 
