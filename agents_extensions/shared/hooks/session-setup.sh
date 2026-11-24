@@ -469,8 +469,15 @@ if [ "$IS_CODEX_SESSION" = "0" ] \
     # interpreter warnings. Only the problem count is shown, because the
     # problems name checkout paths. A held deployment lock is exit 1 too, but
     # it means "not checked", never drift.
+    # A project directory outside every checkout (the CTO workspace, GIT_COMMON_DIR
+    # empty above) holds a workspace deployment: check it in workspace mode, where the
+    # deployer refuses any .git at or above it.
+    DEPLOY_CHECK_MODE=()
+    if [ -z "${GIT_COMMON_DIR:-}" ] && [ -z "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
+      DEPLOY_CHECK_MODE=(--workspace)
+    fi
     DEPLOY_CHECK_ERR=$(run_bounded 3 "${PROJECT_PYTHON_COMMAND[@]}" \
-      -m lu_machinery.agent_deploy --project-root "$DEPLOY_CHECK_ROOT" --check 2>&1 >/dev/null) || DEPLOY_CHECK_RC=$?
+      -m lu_machinery.agent_deploy ${DEPLOY_CHECK_MODE[@]+"${DEPLOY_CHECK_MODE[@]}"} --project-root "$DEPLOY_CHECK_ROOT" --check 2>&1 >/dev/null) || DEPLOY_CHECK_RC=$?
     DEPLOY_CHECK_ERR="${DEPLOY_CHECK_ERR##*$'\n'}"
   else
     DEPLOY_CHECK_RC=2
@@ -483,11 +490,15 @@ if [ "$IS_CODEX_SESSION" = "0" ] \
       DEPLOY_CHECK_ERR="${DEPLOY_CHECK_ERR#*"; "}"
       DRIFT_COUNT=$((DRIFT_COUNT + 1))
     done
-    ISSUES+=("DEPLOY DRIFT: $DRIFT_COUNT file(s) differ between agents_extensions/shared/ and .claude/. Run: npm run agents:deploy")
+    if [ "${#DEPLOY_CHECK_MODE[@]}" -gt 0 ]; then
+      ISSUES+=("DEPLOY DRIFT: $DRIFT_COUNT file(s) differ in this workspace's deployment. Run: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace>")
+    else
+      ISSUES+=("DEPLOY DRIFT: $DRIFT_COUNT file(s) differ between agents_extensions/shared/ and .claude/. Run: npm run agents:deploy")
+    fi
   elif [ "$DEPLOY_CHECK_RC" -ne 0 ]; then
-    ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: .venv/bin/python -I -m lu_machinery.agent_deploy --project-root <checkout root> --check")
+    ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m lu_machinery.agent_deploy ${DEPLOY_CHECK_MODE[*]+${DEPLOY_CHECK_MODE[*]} }--project-root <checkout root> --check")
   fi
-  unset DEPLOY_CHECK_RC DEPLOY_CHECK_ERR DEPLOY_CHECK_ROOT DRIFT_COUNT
+  unset DEPLOY_CHECK_RC DEPLOY_CHECK_ERR DEPLOY_CHECK_ROOT DEPLOY_CHECK_MODE DRIFT_COUNT
 fi
 
 if [ "$CODEX_NORMAL_TASK" = "0" ]; then

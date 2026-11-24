@@ -125,10 +125,19 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
         repository = Path(policy["REPO"])
         config = Path(policy["CFG"])
         if workspace:
+            # The launcher admits only its exported physical workspace and a wrapper named
+            # start-claude-cto.sh whose physical directory is the package: compare those
+            # spellings, never resolved ones that the launcher would refuse.
             launcher = Path(policy["LAUNCHER"])
-            expected_entry = launcher.resolve() if launcher.is_absolute() else None
-            if expected_entry != _CTO_PACKAGE_WRAPPER or Path(workspace).resolve() != repository.resolve():
+            if (
+                policy["REPO"] != workspace
+                or not launcher.is_absolute()
+                or launcher.name != _CTO_PACKAGE_WRAPPER.name
+                or launcher.parent.resolve() != _CTO_PACKAGE_WRAPPER.parent
+                or entrypoint.name != _CTO_PACKAGE_WRAPPER.name
+            ):
                 raise ValueError("unsupported workspace intent")
+            expected_entry = _CTO_PACKAGE_WRAPPER
         else:
             expected_entry = (repository / "start-claude-cto.sh").resolve()
         if (

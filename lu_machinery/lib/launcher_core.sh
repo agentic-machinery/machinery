@@ -807,6 +807,9 @@ launcher_resolve_roots() {
       exit 3
     fi
     export LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="$LC_DURABLE_HELPER_ROOT"
+    if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then
+      launcher_validate_workspace_roots || exit 3
+    fi
     if [ "${LC_DRY_RUN:-0}" = 1 ]; then
       printf 'LAUNCHER_DRY_RUN=1: child environment LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=%q\n' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
     fi
@@ -847,6 +850,33 @@ launcher_workspace_primary_root() {
     return 1
   fi
   printf '%s\n' "$configured"
+}
+
+# A workspace launch's hooks will run the shared hook rule from the workspace as
+# their project directory, and every machinery tool will read state_root(). Run
+# both rules here, before any side effect, with the hooks' own inputs: the rule
+# refuses a state root that is a second checkout or has a stray .git, and
+# state_root() refuses a missing or relative one. The state root must also stay
+# out of the workspace, which the session itself writes.
+launcher_validate_workspace_roots() {
+  local reason
+  project_python_command "$LEARN_UKRAINIAN_PYTHON" || return 1
+  if ! reason="$(CLAUDE_PROJECT_DIR="$LC_ROOT" "${PROJECT_PYTHON_COMMAND[@]}" -c '
+import sys
+from pathlib import Path
+from lu_machinery.common.repo_root import MachineryConfigError, native_hook_roots, state_root
+workspace = Path(sys.argv[1])
+try:
+    native_hook_roots(workspace)
+    state = state_root().resolve()
+except (MachineryConfigError, OSError) as exc:
+    sys.exit(f"{type(exc).__name__}: {exc}")
+if state == workspace or workspace in state.parents:
+    sys.exit(f"the state root {state} is the workspace or inside it")
+' "$LC_ROOT" 2>&1 >/dev/null)"; then
+    launcher_error "LC_WORKSPACE_ROOT: the hook context or state root does not validate: ${reason##*$'\n'}"
+    return 1
+  fi
 }
 
 # Prints the physical path of an operator-named primary checkout, or explains
@@ -1548,10 +1578,12 @@ launcher_bind_drive_epic() {
   else
     fleet_clause='Fleet-comms: read the rules at /api/rules?scope=task:fleet-comms and run plane-status; cross-family review is direct ask-<lane> per the skill (§6). PRs may open so CI runs; enqueue only after independent exact-head cross-family APPROVE and same-head green CI Gate. The worker that owns the brief (or the driver, when no brief owns the PR) enqueues through the merge queue and runs closeout; authority mode is durable state and ACP is provider transport.'
   fi
-  local canary_status='not run'
+  local canary_status='not run' state_python='.venv/bin/python'
+  # A workspace has no .venv: name the exported project interpreter instead.
+  if [ -n "${LC_WORKSPACE_ROOT:-}" ]; then state_python='"$LEARN_UKRAINIAN_PYTHON" -I'; fi
   # A successful hook alone is no execution evidence; dry runs never run a probe.
   if [ "${LC_PROVIDER_CANARY_RAN:-0}" = 1 ] && [ "$LC_DRY_RUN" != 1 ]; then canary_status='ran'; fi
-  LC_DRIVER_PROMPT="First run lu-driver-state render --lane ${state_lane}, then lu-driver-state check --lane ${state_lane}. Read the newest full-content DB handoff_note as authority for goals, tasks, decisions and handoff state. Load ${skill_dir}/${entry_skill}/SKILL.md from the workspace root before continuing. The launcher already claimed the ${LC_EPIC} lease; provider canary: ${canary_status}; do not claim, renew, or reopen the lease. ${fleet_clause}${work_clause} Obtain independent cross-family review. The .claude/${LC_EPIC}-epic/DRIVER-STATE.md pointer holds only pinned provider/stream facts and DB render instructions; keep it under 4 KiB and do not update it when a goal lands. After any compaction or doubt, first repeat lu-driver-state render --lane ${state_lane} and lu-driver-state check --lane ${state_lane}; use .venv/bin/python -m ${LC_MACHINERY_PACKAGE}.driver_state whoami only as a pinned-identity diagnostic. For each handoff, write exactly one full-content DB handoff_note carrying rollover/lineage IDs, full live task IDs/run nonces, open order message IDs, PR heads and the next three actions. A temporary path or markdown content cannot substitute. Follow its standing decision policy: decide and execute reversible rule-following choices yourself, never ask for overrides, do listed actions in the same turn, escalate only deletes, money, security or rule changes (final message starts CTO-ESCALATION:), and end each turn with the privately configured worker target met and a wake-up armed."
+  LC_DRIVER_PROMPT="First run lu-driver-state render --lane ${state_lane}, then lu-driver-state check --lane ${state_lane}. Read the newest full-content DB handoff_note as authority for goals, tasks, decisions and handoff state. Load ${skill_dir}/${entry_skill}/SKILL.md from the workspace root before continuing. The launcher already claimed the ${LC_EPIC} lease; provider canary: ${canary_status}; do not claim, renew, or reopen the lease. ${fleet_clause}${work_clause} Obtain independent cross-family review. The .claude/${LC_EPIC}-epic/DRIVER-STATE.md pointer holds only pinned provider/stream facts and DB render instructions; keep it under 4 KiB and do not update it when a goal lands. After any compaction or doubt, first repeat lu-driver-state render --lane ${state_lane} and lu-driver-state check --lane ${state_lane}; use ${state_python} -m ${LC_MACHINERY_PACKAGE}.driver_state whoami only as a pinned-identity diagnostic. For each handoff, write exactly one full-content DB handoff_note carrying rollover/lineage IDs, full live task IDs/run nonces, open order message IDs, PR heads and the next three actions. A temporary path or markdown content cannot substitute. Follow its standing decision policy: decide and execute reversible rule-following choices yourself, never ask for overrides, do listed actions in the same turn, escalate only deletes, money, security or rule changes (final message starts CTO-ESCALATION:), and end each turn with the privately configured worker target met and a wake-up armed."
   if [ "${LC_PROVIDER:-}" = codex ]; then
     LC_DRIVER_PROMPT+=" Hand off after the fourth compaction and before the eighth; native automatic compaction remains enabled."
   fi

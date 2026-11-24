@@ -769,8 +769,13 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
     return problems
 
 
-def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None) -> int:
+def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None,
+           workspace: bool = False) -> int:
     plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None)
+    if workspace and TARGETS["claude"] not in plan.roots:
+        # The workspace runs Claude Code; enabling it makes the release's mandatory Claude
+        # hook settings a deployment requirement, so a guard-less workspace never verifies.
+        raise Invalid("a workspace target must enable the claude provider")
     old = old_state(tree)
     problems = preflight(tree, plan, old, check)
     if problems:

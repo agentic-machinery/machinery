@@ -29,8 +29,10 @@ for arg in "$@"; do
   esac
 done
 # The lane is a fixed wrapper option: scope re-entry and successors replay the
-# caller's argv, and this wrapper adds it exactly once.
-LC_WRAPPER_LAUNCHER_ARGS=(--epic epics)
+# caller's argv, and this wrapper adds it exactly once. LC_WRAPPER_FIXED_EPIC makes
+# the launcher refuse any other caller lane before side effects (#12553).
+LC_WRAPPER_FIXED_EPIC=epics
+LC_WRAPPER_LAUNCHER_ARGS=(--epic "$LC_WRAPPER_FIXED_EPIC")
 LAUNCHER_MODEL="${LAUNCHER_MODEL:-claude-sonnet-5-5}" \
 LAUNCHER_EFFORT="${LAUNCHER_EFFORT:-high}" \
 launcher_main claude driver "$@"

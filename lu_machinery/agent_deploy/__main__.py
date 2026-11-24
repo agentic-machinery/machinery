@@ -25,8 +25,9 @@ Outputs: enabled provider files and .deploy-state/agent-deploy.v1.json; check wr
 --inputs-commit OID composes the plan (checked or applied) from that commit's descriptor and sources, never the
 checkout's.
 --workspace targets a directory that is neither a Git checkout nor inside one: its descriptor and sources are
-read from that directory, as from a checkout. It needs an explicit --project-root (never LU_PRODUCT_ROOT, which
-names the product) and refuses --inputs-commit (a workspace has no commits).
+read from that directory, as from a checkout, and must enable the claude provider (so its mandatory hook settings
+are required). It needs an explicit --project-root (never LU_PRODUCT_ROOT, which names the product) and refuses
+--inputs-commit (a workspace has no commits).
 Exit codes: 0 verified/applied; 1 drift or application failure; 2 invalid/unsafe input.
 Recovery after an interrupted fresh apply followed by source edits:
   Keep a copy of the desired source edits. Restore the product sources and installed
@@ -57,7 +58,7 @@ Related: agents_extensions/deployment.v1.json; machinery #100.""",
         selected = args.project_root if args.project_root is not None else os.environ.get("LU_PRODUCT_ROOT")
         with selected_tree(selected, args.check, workspace=args.workspace) as tree:
             return deploy(tree, check=args.check, print_manifest=args.print_manifest,
-                          inputs_commit=args.inputs_commit)
+                          inputs_commit=args.inputs_commit, workspace=args.workspace)
     except Invalid as exc:
         print(f"invalid deployment: {exc}", file=sys.stderr)
         return 2

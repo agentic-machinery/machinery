@@ -164,6 +164,13 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
         assert run("--workspace", "--project-root", str(target)) == 2
         assert "outside every Git checkout" in capsys.readouterr().err
         assert snapshot(consumer) == before
+    guardless = tmp_path / "guardless-workspace"
+    shutil.copytree(consumer / "agents_extensions", guardless / "agents_extensions")
+    descriptor(guardless, providers=["codex"], sources={"codex": {"path": "agents_extensions/codex", "required": True}},
+               preserve=[])
+    assert run("--workspace", "--project-root", str(guardless)) == 2
+    assert "must enable the claude provider" in capsys.readouterr().err
+    assert not (guardless / ".codex").exists()
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(workspace))
     with pytest.raises(SystemExit) as refused:
         run("--workspace")

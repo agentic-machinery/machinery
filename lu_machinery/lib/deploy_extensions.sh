@@ -148,6 +148,6 @@ deploy_agent_workspace() {
     }
     project_python_run "$python" -m "$PROJECT_PACKAGE.agent_deploy" --workspace --project-root "$workspace" \
         >"$log_file" 2>&1 || exit_code=$?
-    deploy_agent_report "$workspace" "python -I -m $PROJECT_PACKAGE.agent_deploy --workspace --project-root $workspace" \
+    deploy_agent_report "$workspace" "$(printf '%q' "$python") -I -m $PROJECT_PACKAGE.agent_deploy --workspace --project-root $(printf '%q' "$workspace")" \
         "agent_deploy --workspace" "$exit_code" "$log_file" "$python"
 }

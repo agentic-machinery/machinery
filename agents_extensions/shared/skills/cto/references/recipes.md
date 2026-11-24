@@ -127,8 +127,8 @@ FULL run nonce with `note <id> <text>` so the tracker handoff can re-arm its wai
 Run every dispatch through the scratch table helper. It builds each
 `dispatch.py dispatch` argv from a table and logs stdout and stderr per task; grep the log
 for `run_nonce=`, `SUBSTITUTE` and `queued behind`. Record the actual substituted identity.
-Run Claude-account dispatches from the seat as `env -u CLAUDE_CONFIG_DIR .venv/bin/python
-scripts/dispatch.py dispatch ... --claude-account <label>`: the launcher exports
+Run Claude-account dispatches from the seat as `env -u CLAUDE_CONFIG_DIR "$LEARN_UKRAINIAN_PYTHON" -I
+-m lu_machinery.dispatch dispatch ... --claude-account <label>`: the launcher exports
 `CLAUDE_CONFIG_DIR` into the seat's shells, and the dispatcher refuses an explicit account
 while that ambient value is set (`claude_account_ambient_conflict`).
 CTO dispatches omit `--claude-account` unless a current order names an exception: the saved
@@ -164,7 +164,7 @@ A brief whose change adds or renames tracked files under `registry/` or `docs/` 
 `docs/knowledge/catalogue.yaml` and `docs/README.md`, because the docs catalogue check
 requires every tracked file under those roots to be covered by a family glob and, when that
 catalogue changes, the generated family table in `docs/README.md` regenerated
-(`python -m lu_machinery.docs.catalogue readme`).
+(`"$LEARN_UKRAINIAN_PYTHON" -I -m lu_machinery.docs.catalogue readme`).
 Retained evidence, evaluation material and anything a later session needs goes under
 `<durable-state-root>/<topic>/` (mode 0700 when private), never a session scratchpad, and the
 brief names that path.

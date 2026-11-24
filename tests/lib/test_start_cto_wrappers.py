@@ -1026,6 +1026,15 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
 
     nested = primary / "workspace"
     nested.mkdir()
+    stray, second = tmp_path / "stray-state", tmp_path / "second-checkout"
+    (stray / ".git").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(second)], check=True, timeout=30,
+                   env={"PATH": os.defpath, "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1"})
+    for state_root in (workspace, tmp_path / "absent-state", stray, second):
+        refused = launch(LU_STATE_ROOT=str(state_root))
+        assert refused.returncode == 3 and "state root does not validate" in refused.stderr, (state_root, refused.stderr)
+    refused = launch(args=("--epic", "infra"))
+    assert refused.returncode == 2 and "fixes the lane 'epics'" in refused.stderr, refused.stderr
     for changes, cwd, message in (
         ({"LU_PRIMARY_REPO_ROOT": None}, workspace, "needs LU_PRIMARY_REPO_ROOT"),
         ({}, state, "LC_WORKSPACE_ROOT_CWD"),
@@ -1100,10 +1109,16 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
     stray.write_text("#!/usr/bin/env bash\n")
     other = tmp_path / "other"
     other.mkdir()
+    alias = tmp_path / "workspace-alias"
+    alias.symlink_to(workspace)
+    renamed = tmp_path / "cto-launcher"
+    renamed.symlink_to(package_wrapper)
     for wrapper, root, entry in (
         (template(stray), workspace, stray),  # a wrapper copy outside the package
         (template(package_wrapper), workspace, stray),  # an entrypoint other than the named launcher
         (template(package_wrapper, other), other, package_wrapper),  # REPO is not LC_WORKSPACE_ROOT
+        (template(package_wrapper, alias), workspace, package_wrapper),  # REPO spelled through a symlink
+        (template(renamed), workspace, package_wrapper),  # LAUNCHER resolves there under another name
     ):
         with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
             cto_wrapper_signature(wrapper, root, entry, args)
