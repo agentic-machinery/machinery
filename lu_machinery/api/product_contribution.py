@@ -179,17 +179,21 @@ def load_product(context: MonitorContext, *, product_root: Path | None = None) -
     product = build_api(context)
     if not isinstance(product, ProductContribution):
         raise ProductEntryError(f"{name}.build_api returned {type(product).__name__}, not ProductContribution")
-    return checked_product(product)
+    return checked_product(product, product_root=root)
 
 
-def checked_product(product: ProductContribution) -> ProductContribution:
+def checked_product(
+    product: ProductContribution, *, product_root: Path | None = None
+) -> ProductContribution:
     """``product`` with its static files and page contracts checked, as the Monitor serves and lists them.
 
     Every declared static file must be a ``Path`` naming a regular file inside the
-    product root (``config.PRODUCT_ROOT``, the root ``product_file`` serves from) once
-    symlinks are resolved. ``page_contracts`` must be a tuple of ``PageContract``
-    instances whose ``url``, ``file`` and ``label`` are plain strings. The first entry
-    that is not raises ``ProductEntryError`` naming it, and the product is refused as a
+    product root once symlinks are resolved, and the Monitor must be able to open it for
+    reading. The root is ``product_root`` (``load_product`` passes the root it imported
+    the product from), else ``config.PRODUCT_ROOT``, the root ``product_file`` serves
+    from; it is looked up only when the product declares static files. ``page_contracts``
+    must be a tuple of ``PageContract`` instances whose ``url``, ``file`` and ``label``
+    are plain strings. The first entry that is not raises ``ProductEntryError`` naming it, and the product is refused as a
     whole, as ``load_product`` refuses a contribution of the wrong shape. The returned
     contribution keeps its own copy of the checked static file map, so an entry added
     to the product's map later is never served. A checked file that disappears later
@@ -198,21 +202,27 @@ def checked_product(product: ProductContribution) -> ProductContribution:
     # route_contracts imports this module, so a top-level import is a cycle.
     from .route_contracts import PageContract  # noqa: PLC0415  # lazy-ok: import cycle
 
-    root = config.PRODUCT_ROOT.resolve()
     if not isinstance(product.static_files, Mapping):
         raise ProductEntryError(f"static_files is {type(product.static_files).__name__}, not a mapping")
     static: dict[str, Path] = {}
+    root: Path | None = None
     for name, path in product.static_files.items():
         if type(name) is not str or not isinstance(path, Path):
             raise ProductEntryError(
                 f"static_files[{name!r}]: expected a str name and a Path, "
                 f"got {type(name).__name__} and {type(path).__name__}"
             )
+        if root is None:
+            root = (config.PRODUCT_ROOT if product_root is None else product_root).resolve()
         try:
             resolved = path.resolve()
             usable = resolved.is_file() and resolved.is_relative_to(root)
+            if usable:
+                # The type check reads metadata only; the route must also be able to open the file.
+                with resolved.open("rb"):
+                    pass
         except (OSError, RuntimeError, ValueError) as exc:
-            raise ProductEntryError(f"static_files[{name!r}]: unresolvable: {type(exc).__name__}") from exc
+            raise ProductEntryError(f"static_files[{name!r}]: unusable: {type(exc).__name__}") from exc
         if not usable:
             raise ProductEntryError(f"static_files[{name!r}]: not a regular file inside the product root")
         static[name] = path

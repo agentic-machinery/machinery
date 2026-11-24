@@ -1829,17 +1829,27 @@ def _leaves_to_product(url: str, dashboards_dir: Path, product: ProductContribut
 
     False when the link does not name a fixed path on this site (``_request_path``), or the
     route's own lookup answers the path with a machinery dashboard file or refuses it, or
-    the lookup fails on the filesystem (on Python 3.12 a symlink loop raises
-    ``RuntimeError``; an overlong name raises ``OSError``; a NUL raises ``ValueError``).
-    The failure then drops this one link, never the page. The product's own declared files
-    were checked when it was loaded (``checked_product``), and a path it declares no file
-    for is still its own, since a product router may serve it.
+    the lookup fails on the filesystem (a symlink loop, an overlong name, a denied
+    directory, a NUL). On Python 3.13+ the route's path predicates answer such a failure
+    as "no file" where 3.12 raises, so each name the route looks up is also stat'ed here
+    and only plain absence counts: the failure drops this one link on every interpreter,
+    never the page. The product's own declared files were checked when it was loaded
+    (``checked_product``), and a path it declares no file for is still its own, since a
+    product router may serve it.
     """
     path = _request_path(url)
     if path is None:
         return False
     try:
-        return _dashboard_file(dashboards_dir, path, product) is None
+        if _dashboard_file(dashboards_dir, path, product) is not None:
+            return False
+        base = dashboards_dir / path
+        for name in (base, base / "index.html", dashboards_dir / f"{path}.html"):
+            try:
+                name.stat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+        return True
     except (HTTPException, OSError, RuntimeError, ValueError):
         return False
 
