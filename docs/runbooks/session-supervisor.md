@@ -610,10 +610,9 @@ retain safe `close_failure_reason=` classification and prevent successor executi
 Recovery waits do not override lease fencing or the heartbeat TTL: losing the
 lease still stops the provider.
 
-Supervisory requests use the existing authority message/delivery store and the
-recipient `supervisor:epic:<number>`, keeping automatic events out of ordinary
-driver inbox traffic. Enqueue through `enqueue_supervisory_request` with an
-idempotency key and a bounded JSON body:
+Fleet Comms accepts a new `supervisory-request` delivery only at a single
+`supervisor:epic:<number>` recipient. Enqueue through
+`enqueue_supervisory_request` with an idempotency key and a bounded JSON body:
 
 ```json
 {"schema":"supervisory-wake.v1","action":"restart","stream_id":"epic:9999","generation":1}
@@ -622,6 +621,12 @@ idempotency key and a bounded JSON body:
 Only `wake` and `restart` are accepted. The generation names the predecessor;
 zero denotes a stream without a previous lease. The body cannot choose a
 launcher, model, command, approval setting, or filesystem path.
+
+Ordinary inbox drains claim and acknowledge `request` mail. That includes
+stalled-work packets, post-merge assignment alerts, and the context guard's
+durable copy of its pane nudge. Ordinary claims skip any supervisory
+deliveries previously sent to lane or CTO inboxes. Those deliveries expire at
+their existing deadlines.
 
 The intended host-resident invocation uses the existing watcher process:
 

@@ -214,6 +214,7 @@ RECIPIENT_SETTLED_REASON = "recipient_settled"
 _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 # The supervisory wake watcher's inbox (``ai_agent_bridge._inbox_watch.supervisory_recipient``).
 _SUPERVISORY_RECIPIENT_RE = re.compile(r"supervisor:epic:[1-9][0-9]*")
+_SUPERVISORY_REQUEST_KIND = "supervisory-request"
 RecipientStanding = Literal["registered", "live_task", "settled_task", "not_registered", "unknown"]
 _ROSTER_CACHE: dict[tuple[object, ...], tuple[frozenset[str], bool]] = {}
 # Dispatch v2 terminal statuses; only these prove a task has settled. Any other
@@ -940,12 +941,12 @@ class AuthorityService:
         deadline_at: str | None = None,
         created_at: str | None = None,
     ) -> AuthorityMessage:
-        """Durably enqueue one supervisory request, even while its driver is offline."""
+        """Enqueue a launcher event to its supervisory inbox, even while its driver is offline."""
         return self.publish_message(
             sender=sender,
             recipients=(_nonempty(recipient, field="recipient"),),
             body=body,
-            kind="supervisory-request",
+            kind=_SUPERVISORY_REQUEST_KIND,
             correlation_id=_nonempty(correlation_id, field="correlation_id"),
             idempotency_key=_nonempty(idempotency_key, field="idempotency_key"),
             deadline_at=deadline_at,
@@ -1571,9 +1572,11 @@ class AuthorityService:
         A Kimi recipient is refused before any write: Kimi is not a bridge
         recipient. A stored delivery of a request pinned to a Kimi model
         (legacy) is passed over unwritten (``_stored_kimi_delivery``).
+        Legacy supervisory requests on ordinary inboxes wait for their deadline.
         """
         (target,) = _admit_recipients((recipient,), mode=BRIDGE_MODE, claiming=True)
         recipient_name = _nonempty(target.recipient, field="recipient")
+        supervisory_inbox = bool(_SUPERVISORY_RECIPIENT_RE.fullmatch(recipient_name))
         worker = _nonempty(worker_id, field="worker_id")
         if lease_seconds <= 0 or max_attempts <= 0:
             raise AuthorityServiceError("lease_and_max_attempts_must_be_positive")
@@ -1583,10 +1586,11 @@ class AuthorityService:
             self._reclaim_expired_deliveries_tx(now_value, max_attempts=max_attempts)
             if resume_owned:
                 held = self._conn.execute(
-                    """SELECT * FROM authority_deliveries
-                       WHERE recipient = ? AND state = 'running' AND lease_owner = ?
-                       ORDER BY created_at ASC, delivery_id ASC""",
-                    (recipient_name, worker),
+                    """SELECT d.* FROM authority_deliveries d JOIN comms_messages m USING (message_id)
+                       WHERE d.recipient = ? AND d.state = 'running' AND d.lease_owner = ?
+                         AND (? OR m.kind <> ?)
+                       ORDER BY d.created_at ASC, d.delivery_id ASC""",
+                    (recipient_name, worker, supervisory_inbox, _SUPERVISORY_REQUEST_KIND),
                 ).fetchall()
                 for current in held:
                     if not self._stored_kimi_delivery(current):
@@ -1597,12 +1601,13 @@ class AuthorityService:
                             content_sha256=message.content_sha256,
                         )
             candidates = self._conn.execute(
-                """SELECT * FROM authority_deliveries
-                   WHERE recipient = ? AND state = 'queued'
-                     AND attempt_count < ?
-                     AND (deadline_at IS NULL OR deadline_at > ?)
-                   ORDER BY created_at ASC, delivery_id ASC""",
-                (recipient_name, max_attempts, now_value),
+                """SELECT d.* FROM authority_deliveries d JOIN comms_messages m USING (message_id)
+                   WHERE d.recipient = ? AND d.state = 'queued'
+                     AND d.attempt_count < ?
+                     AND (d.deadline_at IS NULL OR d.deadline_at > ?)
+                     AND (? OR m.kind <> ?)
+                   ORDER BY d.created_at ASC, d.delivery_id ASC""",
+                (recipient_name, max_attempts, now_value, supervisory_inbox, _SUPERVISORY_REQUEST_KIND),
             )
             row = next((item for item in candidates if not self._stored_kimi_delivery(item)), None)
             if row is None:
@@ -1746,7 +1751,7 @@ class AuthorityService:
         ).fetchone()
         if row is None:
             raise AuthorityServiceError("delivery_not_found")
-        if row["kind"] != "supervisory-request":
+        if row["kind"] != _SUPERVISORY_REQUEST_KIND:
             raise AuthorityServiceError("not_supervisory_delivery")
         state = str(row["state"])
         if state in _DELIVERY_TERMINAL:
@@ -1757,8 +1762,10 @@ class AuthorityService:
 
     def _require_supervisory_delivery_tx(self, delivery_id: str) -> sqlite3.Row:
         row = self._require_delivery_tx(_nonempty(delivery_id, field="delivery_id"))
-        if self.get_message(str(row["message_id"])).kind != "supervisory-request":
+        if self.get_message(str(row["message_id"])).kind != _SUPERVISORY_REQUEST_KIND:
             raise AuthorityServiceError("not_supervisory_delivery")
+        if not _SUPERVISORY_RECIPIENT_RE.fullmatch(row["recipient"]):
+            raise AuthorityServiceError("supervisory_recipient_required")
         return row
 
     def acknowledge_delivery(
@@ -1823,7 +1830,9 @@ class AuthorityService:
                 )
                 return self._delivery_from_row(row)
             self._assert_current_delivery_lease(row, worker, fence_token, now_value)
-            if self.get_message(str(row["message_id"])).kind == "supervisory-request":
+            if self.get_message(str(row["message_id"])).kind == _SUPERVISORY_REQUEST_KIND:
+                if not _SUPERVISORY_RECIPIENT_RE.fullmatch(row["recipient"]):
+                    raise AuthorityServiceError("supervisory_recipient_required")
                 consumed = self._conn.execute(
                     """SELECT 1 FROM authority_idempotency
                        WHERE namespace = ? AND idempotency_key = ?""",
@@ -2410,6 +2419,7 @@ class AuthorityService:
         sender_name = _nonempty(sender, field="sender")
         kind_name = _nonempty(kind, field="kind")
         key = _nonempty(idempotency_key, field="idempotency_key")
+        live_delivery = deliver and imported_source is None and imported_delivery_state is None
         channel_row = self._require_channel_tx(channel) if channel is not None else None
         if imported_recipients is not None:
             # Historical records keep the recipients they were written with.
@@ -2429,8 +2439,11 @@ class AuthorityService:
         else:
             recipients_norm = _normalize_recipients(require_admitted(target).recipient for target in targets or ())
             _refuse_session_cto_recipients(recipients_norm)
-            if deliver and imported_source is None and imported_delivery_state is None:
+            if live_delivery:
                 _require_readable_recipients(recipients_norm)
+        supervisory_inbox = len(recipients_norm) == 1 and bool(_SUPERVISORY_RECIPIENT_RE.fullmatch(recipients_norm[0]))
+        if live_delivery and kind_name == _SUPERVISORY_REQUEST_KIND and not supervisory_inbox:
+            raise AuthorityServiceError("supervisory_recipient_required")
         revisions = self._normalize_context_revisions(context_revisions, channel_row)
         provenance_data = _safe_json_mapping(provenance)
         deadline = self._normalize_deadline(deadline_at)
@@ -2458,7 +2471,19 @@ class AuthorityService:
             "deadline_at": deadline or "",
             "imported_source": imported_source or "",
         }
-        existing_id = self._check_idempotency_tx("message", key, _sha256_json(payload))
+        namespace = "message"
+        if live_delivery and kind_name == "request" and len(recipients_norm) == 1 and not supervisory_inbox:
+            # Reissue the same misrouted request as mail. Both records keep their key
+            # and payload binding, and the old delivery keeps its original deadline.
+            legacy_sha = _sha256_json({**payload, "kind": _SUPERVISORY_REQUEST_KIND})
+            if self._conn.execute(
+                """SELECT 1 FROM authority_idempotency
+                   WHERE namespace = 'message' AND idempotency_key = ? AND payload_sha256 = ?""",
+                (key, legacy_sha),
+            ).fetchone() is not None:
+                namespace = "message:reclassified-request"
+        payload_sha = _sha256_json(payload)
+        existing_id = self._check_idempotency_tx(namespace, key, payload_sha)
         if existing_id is not None:
             return self.get_message(existing_id)
 
@@ -2567,7 +2592,7 @@ class AuthorityService:
                 self._record_wake_receipt_tx(
                     delivery_id, recipient, 0, state="emitted", now=creation
                 )
-        self._insert_idempotency_tx("message", key, _sha256_json(payload), mid)
+        self._insert_idempotency_tx(namespace, key, payload_sha, mid)
         return AuthorityMessage(
             message_id=mid,
             conversation_id=conversation,
@@ -2819,13 +2844,16 @@ class AuthorityService:
                 reclaimed += 1
             self._end_unreadable_subscriptions_tx(settled_only=True)
         stale = self._conn.execute(
-            """SELECT delivery_id, fence_token, attempt_count, recipient, message_id FROM authority_deliveries
-               WHERE state = 'running' AND lease_expires_at IS NOT NULL
-                 AND lease_expires_at <= ?
-                 AND (deadline_at IS NULL OR deadline_at > ?)""",
+            """SELECT d.delivery_id, d.fence_token, d.attempt_count, d.recipient, d.message_id, m.kind
+               FROM authority_deliveries d JOIN comms_messages m USING (message_id)
+               WHERE d.state = 'running' AND d.lease_expires_at IS NOT NULL
+                 AND d.lease_expires_at <= ?
+                 AND (d.deadline_at IS NULL OR d.deadline_at > ?)""",
             (now, now),
         ).fetchall()
         for row in stale:
+            if row["kind"] == _SUPERVISORY_REQUEST_KIND and not _SUPERVISORY_RECIPIENT_RE.fullmatch(row["recipient"]):
+                continue
             if self._stored_kimi_delivery(row):
                 continue
             delivery_id = str(row["delivery_id"])

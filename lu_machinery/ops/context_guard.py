@@ -153,11 +153,9 @@ SINGLE_INSTANCE_RC = 3
 SINGLE_INSTANCE_REFUSAL_RE = re.compile(r"refused: .*process is still running")
 RELAUNCH_TAIL_LINES = 6
 ALERT_DETAIL_CHARS = 600
-# Fleet Comms message kinds, one per send. Only the launcher watcher consumes a supervisory
-# request, so it carries only the handoff request to a driver seat. An alert to claude-cto
-# is an ordinary request that the CTO seat claims and acknowledges (#12837).
-HANDOFF_REQUEST = "supervisory-request"
+# Lane handoff copies and CTO alerts are both handled by ordinary inbox drains.
 ALERT = "request"
+HANDOFF_REQUEST = ALERT
 # A lead lane (the CTO) whose session is missing alerts claude-cto after this long, then hourly.
 LEAD_MISSING_ALERT_SECONDS = 900
 LEAD_MISSING_REALERT_SECONDS = 3600
@@ -1345,21 +1343,16 @@ def fleet_sender(identity: str, log: Callable[[str], None]) -> Callable[[str, st
             from lu_machinery.fleet_comms.authority import AuthorityService
 
             service = AuthorityService(root=None)
-            if kind == HANDOFF_REQUEST:
-                message = service.enqueue_supervisory_request(
-                    sender=identity, recipient=recipient, body=body, correlation_id=key, idempotency_key=key
-                )
-            elif kind == ALERT:
-                message = service.publish_message(
-                    sender=identity,
-                    recipients=(recipient,),
-                    body=body,
-                    kind=ALERT,
-                    correlation_id=key,
-                    idempotency_key=key,
-                )
-            else:
+            if kind != ALERT:
                 raise ValueError(f"unknown guard message kind {kind!r}")
+            message = service.publish_message(
+                sender=identity,
+                recipients=(recipient,),
+                body=body,
+                kind=kind,
+                correlation_id=key,
+                idempotency_key=key,
+            )
             log(f"send {recipient} ok {message.message_id}")
         except Exception as exc:  # a Fleet outage must not stop the pane-side handoff
             log(f"send {recipient} failed {type(exc).__name__}: {exc}")

@@ -1418,9 +1418,13 @@ def test_concurrent_substitution_requests_converge_under_high_contention(
         assert service.get_job(job.job_id).state == "queued"
 
 
+SUPERVISORY_INBOX = "supervisor:epic:9999"
+
+
 def _supervisory_message(service: AuthorityService):
     return service.enqueue_supervisory_request(
-        sender="operator", recipient="driver", body="restart after handoff",
+        sender="operator", recipient=SUPERVISORY_INBOX,
+        body='{"schema":"supervisory-wake.v1","action":"restart","stream_id":"epic:9999","generation":1}',
         correlation_id="handoff-1", idempotency_key="supervisory-1",
         deadline_at="2037-01-01T00:00:00Z",
     )
@@ -1435,7 +1439,7 @@ def test_supervisory_duplicate_across_successor_start(tmp_path: Path) -> None:
         assert _supervisory_message(service) == message
         assert service.supervisory_delivery_status(did) == "queued"
         lease = service.claim_next_delivery(
-            "driver", "worker-a", lease_seconds=1, now="2036-01-01T00:00:00Z"
+            SUPERVISORY_INBOX, "worker-a", lease_seconds=1, now="2036-01-01T00:00:00Z"
         )
         assert lease is not None
         assert service.supervisory_delivery_status(did) == "delivered"
@@ -1454,7 +1458,7 @@ def test_supervisory_duplicate_across_successor_start(tmp_path: Path) -> None:
     # Crash after restart but before acknowledgement; the database is reopened.
     with AuthorityService(root=root) as service:
         lease = service.claim_next_delivery(
-            "driver", "worker-b", lease_seconds=1, now="2036-01-01T00:00:02Z"
+            SUPERVISORY_INBOX, "worker-b", lease_seconds=1, now="2036-01-01T00:00:02Z"
         )
         assert lease is not None and lease.fence_token == 2
         with pytest.raises(AuthorityStaleLeaseError):
@@ -1479,7 +1483,7 @@ def test_supervisory_duplicate_across_successor_start(tmp_path: Path) -> None:
     # A further crash must retain the original generation, not just the last one.
     with AuthorityService(root=root) as service:
         lease = service.claim_next_delivery(
-            "driver", "worker-c", now="2036-01-01T00:00:04Z"
+            SUPERVISORY_INBOX, "worker-c", now="2036-01-01T00:00:04Z"
         )
         assert lease is not None and lease.fence_token == 3
         receipt = service.record_supervisory_consumption(
@@ -1510,9 +1514,9 @@ def test_supervisory_subscriber_disconnect(tmp_path: Path) -> None:
     # No subscriber or active driver existed at publish time.
     with AuthorityService(root=root) as driver:
         assert driver.supervisory_delivery_status(did) == "queued"
-        lease = driver.claim_next_delivery("driver", "worker")
+        lease = driver.claim_next_delivery(SUPERVISORY_INBOX, "worker")
         assert lease is not None and lease.delivery.delivery_id == did
-        assert driver.claim_next_delivery("driver", "other") is None
+        assert driver.claim_next_delivery(SUPERVISORY_INBOX, "other") is None
         driver.record_supervisory_consumption(
             did, worker_id="worker", fence_token=lease.fence_token,
             driver_generation="generation",
@@ -1529,7 +1533,7 @@ def test_supervisory_subscriber_disconnect(tmp_path: Path) -> None:
 def test_supervisory_terminal_requires_fenced_consumption(tmp_path: Path, finish: str) -> None:
     with AuthorityService(root=_root(tmp_path)) as service:
         did = _supervisory_message(service).delivery_ids[0]
-        lease = service.claim_next_delivery("driver", "worker")
+        lease = service.claim_next_delivery(SUPERVISORY_INBOX, "worker")
         assert lease is not None
         args = dict(worker_id="worker", fence_token=lease.fence_token)
         with pytest.raises(AuthorityServiceError, match="consumption_required"):
@@ -1554,7 +1558,7 @@ def test_supervisory_worker_completion_during_handoff(tmp_path: Path) -> None:
         job = service.enqueue_request(recipient="worker", body="work", idempotency_key="work")
         job_lease = service.claim_next_job("job-worker", now="2036-01-01T00:00:00Z")
         lease = service.claim_next_delivery(
-            "driver", "old-driver", lease_seconds=1, now="2036-01-01T00:00:00Z"
+            SUPERVISORY_INBOX, "old-driver", lease_seconds=1, now="2036-01-01T00:00:00Z"
         )
         assert lease is not None and job_lease is not None
         service.record_supervisory_consumption(
@@ -1566,7 +1570,7 @@ def test_supervisory_worker_completion_during_handoff(tmp_path: Path) -> None:
             state="complete", result=b"completed during handoff", now="2036-01-01T00:00:02Z",
         )
     with AuthorityService(root=root) as successor:
-        lease = successor.claim_next_delivery("driver", "new-driver", now="2036-01-01T00:00:03Z")
+        lease = successor.claim_next_delivery(SUPERVISORY_INBOX, "new-driver", now="2036-01-01T00:00:03Z")
         assert lease is not None
         receipt = successor.record_supervisory_consumption(
             did, worker_id="new-driver", fence_token=lease.fence_token,
@@ -1585,14 +1589,14 @@ def test_supervisory_unconsumed_reclaim_does_not_invent_restart(tmp_path: Path) 
     with AuthorityService(root=_root(tmp_path)) as service:
         did = _supervisory_message(service).delivery_ids[0]
         service.claim_next_delivery(
-            "driver", "old", lease_seconds=1, now="2036-01-01T00:00:00Z"
+            SUPERVISORY_INBOX, "old", lease_seconds=1, now="2036-01-01T00:00:00Z"
         )
         with pytest.raises(AuthorityStaleLeaseError):
             service.record_supervisory_consumption(
                 did, worker_id="old", fence_token=1, driver_generation="old",
                 now="2036-01-01T00:00:01Z",
             )
-        lease = service.claim_next_delivery("driver", "new", now="2036-01-01T00:00:02Z")
+        lease = service.claim_next_delivery(SUPERVISORY_INBOX, "new", now="2036-01-01T00:00:02Z")
         assert lease is not None
         receipt = service.record_supervisory_consumption(
             did, worker_id="new", fence_token=lease.fence_token, driver_generation="new",
