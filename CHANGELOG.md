@@ -9,6 +9,18 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.64"></a>
+## [0.1.64] - 2026-11-24
+
+### Added
+
+- Sandbox read-only AGY consumer asks ([#1309](https://github.com/learn-ukrainian/machinery/pull/1309))
+
+### Fixed
+
+- One non-record warning line per scan ([#1308](https://github.com/learn-ukrainian/machinery/pull/1308))
+- Non-curriculum consumer support with a Git-free admission precheck refusal (supersedes #1305) ([#1311](https://github.com/learn-ukrainian/machinery/pull/1311))
+
 <a id="v0.1.63"></a>
 ## [0.1.63] - 2026-11-23
 
@@ -1527,7 +1539,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.63...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.64...HEAD
+[0.1.64]: https://github.com/learn-ukrainian/machinery/compare/v0.1.63...v0.1.64
 [0.1.63]: https://github.com/learn-ukrainian/machinery/compare/v0.1.62...v0.1.63
 [0.1.62]: https://github.com/learn-ukrainian/machinery/compare/v0.1.61...v0.1.62
 [0.1.61]: https://github.com/learn-ukrainian/machinery/compare/v0.1.60...v0.1.61
