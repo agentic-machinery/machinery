@@ -27,19 +27,20 @@ if TYPE_CHECKING:
 
 REVIEW_DEEP_INSTRUCTIONS = (
     "Adversarial review. Find logical bugs, security issues, contradictions, "
-    "missing tests, dead code, performance footguns. Cite file:line. Be terse "
+    "missing tests, dead code, performance footguns. Be terse "
     "but complete. Do NOT propose stylistic preferences. Output: structured "
-    "`## Findings` markdown. Report one finding per input class with a "
-    "reproducer, not one spelling at a time. Give each finding a disposition "
-    "from the local-code-review checklist Step 5: in_scope_blocker (a P0-P2 "
-    "finding whose trigger is reachable under the change's input contract, "
-    "cited by path:line, published history or a reproduction, or a "
-    "demonstrated P0-P2 regression against main), follow_up (pre-existing "
-    "off-path defect, wording, P3, or a confirmed non-regression P2) or "
-    "stop_and_escalate (material contract ambiguity). Each blocker states the "
-    "reproducible failure, its impact and the required corrected behaviour. "
-    "APPROVED may carry tracked follow-ups; a missing required capability is "
-    "BLOCKED, naming that capability (#10665)."
+    "`## Findings` markdown. Findings and verdict follow "
+    "agents_extensions/shared/skills/review-loop/references/policy.md section "
+    "3: one finding per root cause. "
+    "Dispositions (local-code-review checklist Step 5): in_scope_blocker (a "
+    "reachable P0-P2 defect or demonstrated P0-P2 regression against main, cited "
+    "by path:line, published history or a reproduction), follow_up (a P3 "
+    "with an owner that the change neither introduces, exposes nor worsens) "
+    "or stop_and_escalate (material contract ambiguity). An unresolved "
+    "security finding always blocks. Each blocker states the failure, its "
+    "impact and the corrected behaviour. APPROVED when acceptance criteria "
+    "are met and only follow-ups remain; a missing required capability is "
+    "BLOCKED, naming it (#10665)."
 )
 
 

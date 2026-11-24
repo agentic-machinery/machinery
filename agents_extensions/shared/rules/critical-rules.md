@@ -145,10 +145,13 @@ everything" cannot survive this repo's merge rate and is corporate dual-control 
   who disagrees escalates (rules core P6) rather than re-tiering their own finding; there is no
   second review.
 - **Scope of the question (#10665).** It is asked of the change's stated contract, the paths the
-  change introduces, modifies or newly exposes, and regressions against main. Pre-existing defects
-  off those paths and P2/P3 findings are tracked follow-ups unless their impact, or the change's
-  dependency on them, is material. Dispositions, class-level findings and INCONCLUSIVE (a reviewer
-  missing a required capability; it still blocks) follow the `local-code-review` checklist, Steps 2-6.
+  change introduces, modifies or newly exposes, and regressions against main. A defect outside the
+  frozen obligation that the change neither introduces, exposes nor worsens is a P3 follow-up with an
+  owner; a P0–P2 finding whose trigger is reachable under the input contract blocks, and an
+  unresolved security finding always blocks
+  ([review policy](../skills/review-loop/references/policy.md#3-findings)). Dispositions, root-cause
+  findings and INCONCLUSIVE (a reviewer missing a required capability; it still blocks) follow the
+  `local-code-review` checklist, Steps 2-6.
 
 **8.5 — Merge queue protocol.** The sole ordered landing and cleanup recipe is
 [`workflow.md`](workflow.md) § Merge policy. Nobody arms auto-merge. The worker that
