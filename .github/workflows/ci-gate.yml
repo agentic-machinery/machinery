@@ -58,8 +58,9 @@
 #   tarballs for actionlint, ShellCheck, zizmor, TruffleHog, Trivy and uv;
 #   uv-managed CPython (uv checks each download against the hash it ships);
 #   `uv sync --locked` from uv.lock, which checks the SHA-256 of every wheel,
-#   for Ruff, mypy, pip-audit and Semgrep. The build tools use hash-pinned PyPI
-#   wheels (pip --require-hashes --only-binary=:all:). npm audit uses the pinned
+#   for Ruff, mypy, pip-audit and Semgrep. The release build tools are exported
+#   from the locked `build` group in uv.lock and installed with
+#   `pip --require-hashes --only-binary=:all: --no-deps`. npm audit uses the pinned
 #   Node/npm release via actions/setup-node. Every venv lives in the job temp
 #   directory. Installers that run Python use isolated interpreters (python -I),
 #   so no Python module in the checkout is imported while installing.
@@ -93,9 +94,9 @@ concurrency:
 
 # Python: machinery jobs default to the uv-managed CPython in .python-version.
 # .github/actions/uv-python installs it with the uv release pinned below.
-# Python dependencies come from uv.lock (`uv sync --locked`,
-# which checks every SHA-256 in the lock). The build tools that release_cut
-# reads from this file use hash-pinned heredocs.
+# Python dependencies and the release build tools (`build` group) come from
+# uv.lock (`uv sync --locked` for CI tools; `uv export --locked` +
+# `pip --require-hashes --only-binary=:all: --no-deps` for the release build).
 # Cache only verified release archives, never venvs or repository build outputs.
 # Fork PRs restore only. No prefix restore keys.
 env:
@@ -1065,18 +1066,10 @@ jobs:
           git archive --format=tar HEAD | tar -x -C "$work/src"
           cd "$work"
           python -I -m venv build-venv
-          cat > build-requirements.txt <<'REQUIREMENTS'
-          build==1.6.1 \
-              --hash=sha256:ecd351a4be9d35a9eaaba244a7687143c9c7d4aea6ac964e7e7ddab20cbcf4e7
-          packaging==26.3 \
-              --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
-          pyproject-hooks==1.2.0 \
-              --hash=sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913
-          setuptools==84.1.0 \
-              --hash=sha256:5231689c6ac8156cd155cfb98c3fd6fb252c3e7e9bd3d78b64d3c55f132624c9
-          REQUIREMENTS
+          uv export --directory "$work/src" --locked --quiet --format requirements.txt \
+            --no-emit-project --only-group build --no-python-downloads > build-requirements.txt
           build-venv/bin/python -I -m pip install --no-cache-dir --disable-pip-version-check \
-            --no-input --require-hashes --only-binary=:all: --requirement build-requirements.txt
+            --no-input --require-hashes --only-binary=:all: --no-deps --requirement build-requirements.txt
           build-venv/bin/python -I -m build --sdist --wheel --no-isolation --outdir dist src
           ls -l dist
           wheels="$(find dist -maxdepth 1 -name 'lu_machinery-*-py3-none-any.whl' | wc -l)"

@@ -867,13 +867,22 @@ class Cut:
                             self.work / "src.tar", self.head])
         del archive
         self.run(["tar", "-x", "-f", self.work / "src.tar", "-C", src])
-        workflow = (src / ".github/workflows/ci-gate.yml").read_text(encoding="utf-8")
+        uv = self.uv or shutil.which("uv")
+        if uv is None:
+            raise CutError("uv is not on PATH; the release build tools are exported from uv.lock")
         pins = self.work / "build-requirements.txt"
-        pins.write_text(heredoc(workflow, "cat > build-requirements.txt <<'REQUIREMENTS'"), encoding="utf-8")
+        exported = self.run(
+            [uv, "export", "--locked", "--quiet", "--format", "requirements.txt",
+             "--no-emit-project", "--only-group", "build",
+             "--no-python-downloads", "--python", self.host_python],
+            cwd=src,
+            env=self.scratch_env(),
+        ).stdout
+        pins.write_text(exported, encoding="utf-8")
         build_python = self.venv(self.work / "build-venv")
         self.run([build_python, "-I", "-m", "pip", "install", "--no-cache-dir",
                   "--disable-pip-version-check", "--no-input", "--require-hashes", "--only-binary=:all:",
-                  "--requirement", pins], env=self.scratch_env())
+                  "--no-deps", "--requirement", pins], env=self.scratch_env())
         self.run([build_python, "-I", "-m", "build", "--sdist", "--wheel", "--no-isolation",
                   "--outdir", dist, src], env=self.scratch_env())
         files = {"wheel": dist / f"lu_machinery-{built_version}-py3-none-any.whl",
