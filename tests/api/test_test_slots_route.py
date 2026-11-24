@@ -95,6 +95,11 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
          "startsAt": "2030-01-06T00:00:00Z", "status": {"state": "active"}},
         {"labels": {"alertname": "DiskAlmostFull", "severity": "warning"}, "annotations": {},
          "startsAt": "2030-01-06T00:00:00.5Z", "status": {"state": "active"}},
+        # A date-only or absent start must sort beside real timestamps, never fail the route.
+        {"labels": {"alertname": "DiskCritical", "severity": "warning"}, "annotations": {},
+         "startsAt": "2030-01-06", "status": {"state": "active"}},
+        {"labels": {"alertname": "LuPaceStale", "severity": "warning"}, "annotations": {},
+         "status": {"state": "active"}},
         {"labels": {"alertname": "MonitorApiSlowRoute", "severity": "warning", "route": "/api/orient"}, "annotations": {},
          "startsAt": "2030-01-05T00:00:00Z", "status": {"state": "active"}},
         {"labels": {"alertname": "ForeignAlert", "severity": "warning"}, "annotations": {},
@@ -133,7 +138,8 @@ def test_alerts_route_emits_only_allowlisted_fields(client: TestClient, monkeypa
     assert [row["alertname"] for row in body["alerts"]] == [
         "UnrecognizedAlert", "ApprovedNotLanded30m", "PROpenOver60m",
         "SubscriptionPoolRunsOutBeforeReset", "SubscriptionPoolRunsOutBeforeReset", "CliHealthBehind",
-        "MonitorApiSlowRoute", "UsagePoolReadingStale", "CertExpirySoon", "DiskAlmostFull", "UsagePoolRestored",
+        "MonitorApiSlowRoute", "UsagePoolReadingStale", "CertExpirySoon", "DiskCritical", "DiskAlmostFull", "LuPaceStale",
+        "UsagePoolRestored",
     ]
     assert all(set(row) == {"alertname", "title", "meaning", "next_step", "subject", "severity", "starts_at"}
                for row in body["alerts"])

@@ -349,11 +349,13 @@ def _start_key(starts_at: str | None) -> datetime:
     """Chronological sort key for a normalised start time; a missing one sorts last.
 
     The serialised form drops the fraction for whole seconds, so comparing the strings
-    would put ``…:00.5Z`` before ``…:00Z``.
+    would put ``…:00.5Z`` before ``…:00Z``. A date-only value parses as a naive midnight,
+    so it is read as UTC: aware and naive keys never meet in one comparison.
     """
     if starts_at is None:
         return datetime.max.replace(tzinfo=UTC)
-    return datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
+    moment = datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def _alerts_reading() -> dict:
