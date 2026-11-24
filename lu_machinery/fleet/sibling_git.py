@@ -26,6 +26,7 @@ if __package__ in (None, ""):  # run as a file: put the repository root on sys.p
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from lu_machinery.agent_runtime.agent_github_identity import resolve_agent_github_identity, revoke_installation_token
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import StateRootError, machinery_path, state_root
 from lu_machinery.orchestration import worktree_claims
 from lu_machinery.orchestration.execution_safe_git import LOCAL_COMMANDS, SafeGitRunner
@@ -40,7 +41,21 @@ from lu_machinery.orchestration.task_record_store import parse_task_record
 
 _GIT = "/usr/bin/git"
 _FETCH_REMOTE = "sibling-git-canonical"
-_REGISTRY_PATH = machinery_path("config/fleet_repos.yaml")
+_PACKAGED_REGISTRY_PATH = machinery_path("config/fleet_repos.yaml")
+_REGISTRY_PATH = _PACKAGED_REGISTRY_PATH
+_DEFAULT_LOAD_FLEET_REPOS = load_fleet_repos
+
+
+def _registry_path() -> Path:
+    if _REGISTRY_PATH != _PACKAGED_REGISTRY_PATH:
+        return _REGISTRY_PATH
+    return profile.config_path("fleet_repos", default=_PACKAGED_REGISTRY_PATH)
+
+
+def _load_catalog(registry_path: Path):
+    if load_fleet_repos is _DEFAULT_LOAD_FLEET_REPOS:
+        return load_fleet_repos(registry_path)
+    return load_fleet_repos()
 # The machinery package's import name, which is also the directory its files have in checkout
 # paths: from this module's package, or from its unresolved location when run as a file.
 _MACHINERY = Path(os.path.abspath(__file__)).parents[1].name
@@ -110,15 +125,25 @@ class Repository:
     selector_digest: str | None = None
 
 
-def _registry_transport(key: str) -> str:
+def _registry_transport(key: str, *, registry_path: Path | None = None) -> str:
+    resolved_path = _registry_path() if registry_path is None else registry_path
     try:
-        document = yaml.safe_load(_REGISTRY_PATH.read_text(encoding="utf-8"))
+        document = yaml.safe_load(resolved_path.read_text(encoding="utf-8"))
         transport = document["repos"].get(key, {}).get("transport", "ssh")
     except (OSError, yaml.YAMLError, KeyError, TypeError, AttributeError) as exc:
         raise Refusal("cannot inspect registered transport") from exc
     if transport not in ("ssh", "https"):
         raise Refusal("unsupported registered transport")
     return transport
+
+
+_DEFAULT_REGISTRY_TRANSPORT = _registry_transport
+
+
+def _resolve_transport(key: str, registry_path: Path) -> str:
+    if _registry_transport is _DEFAULT_REGISTRY_TRANSPORT:
+        return _registry_transport(key, registry_path=registry_path)
+    return _registry_transport(key)
 
 
 def _https_url(remote: str, github: str) -> None:
@@ -470,13 +495,14 @@ def _metadata_safe(git_dir: Path, primary: Path) -> None:
 
 
 def resolve_repository(key: str, primary: Path, git: Git) -> Repository:
-    catalog = load_fleet_repos()
+    registry_path = _registry_path()
+    catalog = _load_catalog(registry_path)
     spec = catalog.get(key)
     if spec is None or spec.default or key == "public":
         raise Refusal("select a registered non-default sibling repository")
     if spec.has_alternate_slug:
         try:
-            active = resolve_active_fleet_repo(key, repos=catalog, registry_path=_REGISTRY_PATH.resolve())
+            active = resolve_active_fleet_repo(key, repos=catalog, registry_path=registry_path.resolve())
         except FleetRepoError:
             raise Refusal("fleet repository selector unavailable or invalid") from None
         active_github = active.active_github
@@ -498,7 +524,7 @@ def resolve_repository(key: str, primary: Path, git: Git) -> Repository:
     if git_dir != common or not common.is_relative_to(checkout):
         raise Refusal("sibling must own independent metadata beneath its checkout")
     _metadata_safe(common, primary)
-    transport = _registry_transport(key)
+    transport = _resolve_transport(key, registry_path)
     _safe_config(git, checkout, https=transport == "https")
     actual = git.text(
         checkout,

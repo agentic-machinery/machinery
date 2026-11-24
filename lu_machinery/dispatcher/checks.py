@@ -5,6 +5,7 @@ import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote
 
 import yaml
@@ -17,7 +18,7 @@ from lu_machinery.ai_agent_bridge.routing_guard import (
     assert_model_routing_allowed,
     savant_request_store,
 )
-from lu_machinery.common import json_depth
+from lu_machinery.common import git_credentials, json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
 from lu_machinery.dispatcher import git, store
 from lu_machinery.dispatcher.types import TaskSpec
@@ -361,22 +362,35 @@ def _handle_private_input(spec: TaskSpec, message: str) -> None:
         raise ValueError(message)
 
 
+def _is_private_repo(entry: dict[str, Any]) -> bool:
+    return (
+        bool(entry.get("private"))
+        or entry.get("visibility") == "private"
+        or "private" in (entry.get("role") or "")
+    )
+
+
 def check_private_input(spec: TaskSpec, repo_key: str) -> None:
     if spec.agent not in {"muse", "opencode"}:
         return
-    repos = yaml.safe_load(machinery_path("config/fleet_repos.yaml").read_text())["repos"]
+    repos_path = profile.config_path("fleet_repos", default=machinery_path("config/fleet_repos.yaml"))
+    repos = git_credentials.repository_registry(repos_path)
+    for item in repos.values():
+        private_flag = item.get("private")
+        if private_flag is not None and type(private_flag) is not bool:
+            raise ValueError("invalid fleet repository registry")
     private_payload = False
     if spec.agent == "opencode" and spec.provider == SAVANT_PROVIDER:
         private_payload = not savant_request_store(spec.options.get("data_class"))
         entry = repos.get(repo_key, {})
-        role = entry.get("role", "")
-        if not role.startswith(("public-", "private-")):
+        role = entry.get("role") or ""
+        visibility = entry.get("visibility")
+        known_visibility = role.startswith(("public-", "private-")) or visibility in {"public", "private"}
+        if not known_visibility:
             raise ValueError("savant_repository_refused: the target must be a registered repository with a known visibility")
-        if not private_payload and (entry.get("private") or role.startswith("private-")):
+        if not private_payload and _is_private_repo(entry):
             raise ValueError("savant_repository_refused: private repositories require a private data class")
-    private = {
-        key: item for key, item in repos.items() if item.get("private", False) or "private" in item.get("role", "")
-    }
+    private = {key: item for key, item in repos.items() if _is_private_repo(item)}
     roots = [git.resolve_repo(key)[0] for key in private]
     if not private_payload:
         if git.resolve_repo(repo_key)[0] in roots:
@@ -388,7 +402,7 @@ def check_private_input(spec: TaskSpec, repo_key: str) -> None:
     text = unquote(spec.prompt_file.read_text()).casefold()
     identifiers = [str(root) for root in roots]
     if not private_payload:
-        identifiers.extend(item.get(field, "") for item in private.values() for field in ("local_name", "github"))
+        identifiers.extend(item.get(field) or "" for item in private.values() for field in ("local_name", "github"))
     if any(identifier.casefold() in text for identifier in identifiers if identifier):
         _handle_private_input(spec, "private path input is not permitted for this agent")
 

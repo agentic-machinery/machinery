@@ -89,7 +89,7 @@ def orchestrator_identity(stream: str, *, agent: str, model: str | None = None) 
     from lu_machinery.orchestration.fleet_taxonomy import FleetTaxonomyError, load_fleet_taxonomy, resolve_area
     from lu_machinery.orchestration.issue_stream_audit import load_registry
     from lu_machinery.orchestration.launcher_aliases import load_launcher_bindings
-    from lu_machinery.orchestration.validate_fleet_taxonomy import ASSIGNMENTS_PATH, _load_yaml
+    from lu_machinery.orchestration.validate_fleet_taxonomy import _load_yaml, default_assignments_path
 
     session_epic = stream_lane(stream)
     epic_number = int(stream[5:])
@@ -100,7 +100,7 @@ def orchestrator_identity(stream: str, *, agent: str, model: str | None = None) 
     slot_lane = next(iter(matched_lanes)) if len(matched_lanes) == 1 else session_epic
     try:
         taxonomy = load_fleet_taxonomy()
-        assignments = _load_yaml(ASSIGNMENTS_PATH).get("assignments", {})
+        assignments = _load_yaml(default_assignments_path()).get("assignments", {})
     except (FleetTaxonomyError, OSError, ValueError, KeyError, TypeError) as exc:
         raise ValueError(f"orchestrator_stream_unregistered: {stream} registry unavailable ({type(exc).__name__})") from None
     resolved_areas: list[str] = []

@@ -22,10 +22,42 @@ import yaml
 if __package__ in {None, ""}:  # run as a file (launchers do): the repository root holds the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path
 
-DEFAULT_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+_PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+DEFAULT_ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
 DEFAULT_TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
+
+
+def _default_assignments_path() -> Path:
+    if DEFAULT_ASSIGNMENTS_PATH != _PACKAGED_ASSIGNMENTS_PATH:
+        return DEFAULT_ASSIGNMENTS_PATH
+    return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
+
+
+class DriverAgentConfigError(ValueError):
+    """Raised when ``area_assignments.yaml`` contains malformed driver agent configuration."""
+
+
+def _valid_driver_agent_type(entry: object, *, area_label: str) -> str | None:
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise DriverAgentConfigError(f"area_assignments.yaml entry {area_label!r} must be a mapping")
+    if "driver_agent_type" not in entry or entry["driver_agent_type"] is None:
+        return None
+    value = entry["driver_agent_type"]
+    if not isinstance(value, str):
+        raise DriverAgentConfigError(
+            f"area_assignments.yaml[{area_label!r}].driver_agent_type must be a string"
+        )
+    stripped = value.strip()
+    if not stripped:
+        raise DriverAgentConfigError(
+            f"area_assignments.yaml[{area_label!r}].driver_agent_type must be a non-empty string"
+        )
+    return stripped
 
 
 def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
@@ -38,49 +70,68 @@ def _canonical_area_for_alias(lane: str, taxonomy_path: Path) -> str | None:
     if not isinstance(areas, dict):
         return None
     for area_id, entry in areas.items():
-        if not isinstance(entry, dict):
+        if not isinstance(area_id, str) or not isinstance(entry, dict):
             continue
         aliases = entry.get("aliases") or []
-        if isinstance(aliases, list) and lane in aliases:
-            return str(entry.get("id") or area_id).strip() or None
+        if isinstance(aliases, list) and all(isinstance(item, str) for item in aliases) and lane in aliases:
+            raw_id = entry.get("id")
+            candidate = raw_id if isinstance(raw_id, str) else area_id
+            return candidate.strip() or None
     return None
 
 
 def resolve_driver_agent_type(
     lane: str,
     *,
-    assignments_path: Path = DEFAULT_ASSIGNMENTS_PATH,
+    assignments_path: Path | None = None,
     taxonomy_path: Path = DEFAULT_TAXONOMY_PATH,
     provider: str = "claude",
 ) -> str | None:
     lane = (lane or "").strip()
     if not lane:
         return None
+    resolved_assignments = _default_assignments_path() if assignments_path is None else assignments_path
     try:
-        data = yaml.safe_load(assignments_path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
+        raw_text = resolved_assignments.read_text(encoding="utf-8")
+    except OSError:
         return None
-    assignments = data.get("assignments") if isinstance(data, dict) else None
+    try:
+        data = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        raise DriverAgentConfigError(f"malformed YAML in {resolved_assignments}: {exc}") from exc
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise DriverAgentConfigError(f"{resolved_assignments} root must be a mapping")
+    assignments = data.get("assignments")
+    if assignments is None:
+        return None
     if not isinstance(assignments, dict):
-        return None
+        raise DriverAgentConfigError(f"{resolved_assignments} 'assignments' must be a mapping")
 
-    direct = assignments.get(lane)
-    if isinstance(direct, dict) and direct.get("driver_agent_type"):
-        return str(direct["driver_agent_type"]).strip() or None
+    direct = _valid_driver_agent_type(assignments.get(lane), area_label=lane)
+    if direct:
+        return direct
 
     canonical = _canonical_area_for_alias(lane, taxonomy_path)
     if canonical and canonical != lane:
-        entry = assignments.get(canonical)
-        if isinstance(entry, dict) and entry.get("driver_agent_type"):
-            return str(entry["driver_agent_type"]).strip() or None
+        aliased = _valid_driver_agent_type(assignments.get(canonical), area_label=canonical)
+        if aliased:
+            return aliased
 
     slot = f"{provider}-{lane}"
-    for entry in assignments.values():
-        if not isinstance(entry, dict):
+    for area_key, entry in assignments.items():
+        if not isinstance(area_key, str) or not isinstance(entry, dict):
+            raise DriverAgentConfigError(f"{resolved_assignments} entry {area_key!r} must be a mapping")
+        slots = entry.get("slots")
+        if slots is None:
             continue
-        slots = entry.get("slots") or []
-        if isinstance(slots, list) and slot in slots and entry.get("driver_agent_type"):
-            return str(entry["driver_agent_type"]).strip() or None
+        if not isinstance(slots, list) or not all(isinstance(item, str) for item in slots):
+            raise DriverAgentConfigError(f"{resolved_assignments}[{area_key!r}].slots must be a list of strings")
+        if slot in slots:
+            slotted = _valid_driver_agent_type(entry, area_label=area_key)
+            if slotted:
+                return slotted
     return None
 
 
@@ -88,17 +139,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--lane", required=True, help="launcher lane after selector normalisation, e.g. infra")
     parser.add_argument("--provider", default="claude", help="slot prefix used for the slots fallback (default claude)")
-    parser.add_argument("--assignments", type=Path, default=DEFAULT_ASSIGNMENTS_PATH, help="area_assignments.yaml path")
+    parser.add_argument("--assignments", type=Path, default=None, help="area_assignments.yaml path")
     parser.add_argument("--taxonomy", type=Path, default=DEFAULT_TAXONOMY_PATH, help="fleet_taxonomy.yaml path")
     args = parser.parse_args(argv)
-    agent_type = resolve_driver_agent_type(
-        args.lane,
-        assignments_path=args.assignments,
-        taxonomy_path=args.taxonomy,
-        provider=args.provider,
-    )
+    try:
+        assignments_path = _default_assignments_path() if args.assignments is None else args.assignments
+        agent_type = resolve_driver_agent_type(
+            args.lane,
+            assignments_path=assignments_path,
+            taxonomy_path=args.taxonomy,
+            provider=args.provider,
+        )
+    except (profile.ProfileError, DriverAgentConfigError) as exc:
+        print(f"profile/config error: {exc}", file=sys.stderr)
+        return 2
     if not agent_type:
-        print(f"no driver_agent_type for lane {args.lane!r} in {args.assignments}", file=sys.stderr)
+        print(f"no driver_agent_type for lane {args.lane!r} in {assignments_path}", file=sys.stderr)
         return 1
     print(agent_type)
     return 0

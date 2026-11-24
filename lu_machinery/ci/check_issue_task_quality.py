@@ -168,7 +168,7 @@ def registry_for(repository: str) -> dict[str, list[int]] | None:
         return None
     if active.active_github.casefold() != repository.casefold():
         return None
-    path = audit.REGISTRY_PATH
+    path = audit.default_registry_path()
     if active.repo.role == "public-monorepo" or active.repo.default:
         try:
             return audit.load_registry(path, audit_only=True)

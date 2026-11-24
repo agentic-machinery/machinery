@@ -1142,7 +1142,7 @@ def _owns_stream_registry(active, *, default_key=None):
     try:
         has_registry = issue_stream_audit.repo_has_registry(
             active.repo.key,
-            issue_stream_audit.REGISTRY_PATH,
+            issue_stream_audit.default_registry_path(),
             default_key=effective_default,
         )
     except (OSError, ValueError) as exc:
@@ -1161,7 +1161,11 @@ def _parent_epic_node(read_runner, active, repos, parent, cwd, environment):
     default_key = fleet_repos.default_repo_key(repos)
     target = active
     try:
-        if not issue_stream_audit.repo_has_roots(active.repo.key, default_key=default_key, path=issue_stream_audit.REGISTRY_PATH):
+        if not issue_stream_audit.repo_has_roots(
+            active.repo.key,
+            default_key=default_key,
+            path=issue_stream_audit.default_registry_path(),
+        ):
             target = fleet_repos.resolve_active_fleet_repo(default_key, repos=repos, env=environment)
             if active.active_github.split("/", 1)[0] != target.active_github.split("/", 1)[0] or not all(
                 item.repo.role.startswith("public-") and item.repo.visibility in (None, "public")
@@ -1173,7 +1177,7 @@ def _parent_epic_node(read_runner, active, repos, parent, cwd, environment):
                     "Nothing was created."
                 )
         registry = issue_stream_audit.load_registry(
-            issue_stream_audit.REGISTRY_PATH,
+            issue_stream_audit.default_registry_path(),
             audit_only=True,
             repo=None if target.repo.default else target.repo.key,
         )

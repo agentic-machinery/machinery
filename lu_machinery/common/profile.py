@@ -34,9 +34,13 @@ Identity. The profile's ``github_slug`` is the one authoritative slug
 to the same value; a conflict raises :class:`ProfileError` when the profile is loaded, before any
 caller acts on either value.
 
-Configuration. :func:`config_path` resolves a consumer config name only through the profile. With
-no plane owner, no profile, or no entry for the name it raises :class:`ProfileError` naming the
-name and the profile path: nothing falls back to configuration packaged with machinery.
+Configuration. :func:`config_path` resolves a consumer config name through the active profile.
+Without ``default``, no plane owner, no profile, or no entry for the name raises
+:class:`ProfileError` naming the name and the profile path. With ``default`` supplied by a
+registry loader, those three absent-profile / omitted-entry cases return ``default`` so an
+install without a profile reads packaged defaults unchanged; an unknown name, an invalid
+profile, a slug conflict, or a missing/unsafe declared target still raises :class:`ProfileError`
+and never falls back.
 Machinery's own configuration keeps being read through :func:`repo_root.machinery_path`.
 
 Like :mod:`.repo_root`, nothing here runs at import, and resolution only reads.
@@ -137,14 +141,21 @@ def load_profile(*, env: Mapping[str, str] | None = None) -> Profile | None:
     return _load(owner, env)
 
 
-def config_path(name: str, *, env: Mapping[str, str] | None = None) -> Path:
+def config_path(
+    name: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    default: Path | None = None,
+) -> Path:
     """The consumer config file ``name`` as the active profile names it.
 
     The returned path is below the profile's ``owner_root`` (``LU_PROFILE_PATH.parent`` for a
     host profile, else ``state_root()``) and was, when checked, a regular file owned by
     the current user reached without a symlink. Raises :class:`ProfileError` naming ``name`` when it
-    is not a consumer config name, no plane owner or profile exists, the profile has no entry for
-    it, or the entry is missing, a symlink or not a regular file.
+    is not a consumer config name, when the active profile is invalid or conflicts on slug, or when
+    a declared target entry is missing, a symlink or not a regular file. When ``default`` is given,
+    an absent plane owner, absent profile, or valid profile omitting ``name`` returns ``default``;
+    otherwise those cases raise :class:`ProfileError` too.
     """
     if name not in CONSUMER_CONFIG_NAMES:
         raise ProfileError(
@@ -159,13 +170,19 @@ def config_path(name: str, *, env: Mapping[str, str] | None = None) -> Path:
         try:
             owner = repo_root.state_root(env=env)
         except repo_root.StateRootError as exc:
+            if default is not None:
+                return default
             raise ProfileError(f"consumer config {name!r} needs a consumer profile, and no plane owner is configured: {exc}") from None
         profile = _load(owner, env)
         where = owner / PROFILE_REL
     if profile is None:
+        if default is not None:
+            return default
         raise ProfileError(f"consumer config {name!r} needs a consumer profile, and the plane owner has none at {where}")
     relative = profile.config.get(name)
     if relative is None:
+        if default is not None:
+            return default
         raise ProfileError(f"the consumer profile {where} names no {name!r} config")
     _check_regular_below(owner, relative, f"consumer config {name!r} ({relative}, named by {where})")
     return owner.joinpath(*relative.split("/"))

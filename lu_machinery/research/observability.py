@@ -40,8 +40,8 @@ from typing import Any, NamedTuple, cast
 
 import yaml
 
-from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import machinery_path
+from lu_machinery.common import json_depth, profile
+from lu_machinery.common.repo_root import github_slug, machinery_path
 from lu_machinery.orchestration import issue_stream_audit as isa
 from lu_machinery.research import consumption
 from lu_machinery.research import registry as reg
@@ -198,6 +198,19 @@ def _consumer_status(
     return "dead"  # unknown kind — cannot resolve
 
 
+def _membership_report_matches_active_profile(report: dict[str, Any], streams_path: Path) -> bool:
+    """Bind a cached membership report to the active repository slug and audit stream map."""
+    observed_repo = report.get("repository")
+    expected_repo = github_slug()
+    if not isinstance(observed_repo, str) or observed_repo.casefold() != expected_repo.casefold():
+        return False
+    try:
+        expected_registry = isa.load_registry(streams_path, audit_only=True)
+    except (OSError, ValueError):
+        return False
+    return bool(report.get("streams") == {key: sorted(epics) for key, epics in expected_registry.items()})
+
+
 def _lifecycle_and_adoption(root: Path, max_age_s: int, check: _Check) -> dict[str, Any]:
     records, status, invalid_ids = _load_raw_records(root, check)
     if records is None:
@@ -220,8 +233,9 @@ def _lifecycle_and_adoption(root: Path, max_age_s: int, check: _Check) -> dict[s
             "known_ids": set(),
         }
 
+    streams_path = profile.config_path("issue_streams", default=machinery_path("config/issue_streams.yaml"))
     try:
-        streams = check.registry.load_streams(machinery_path("config/issue_streams.yaml"))
+        streams = check.registry.load_streams(streams_path)
     except (OSError, ValueError, yaml.YAMLError):
         streams = {}
     try:
@@ -233,6 +247,8 @@ def _lifecycle_and_adoption(root: Path, max_age_s: int, check: _Check) -> dict[s
     # validated with DISTINCT resolvers built from the same fresh cache — they
     # prove different things and must not be conflated (ADR-011 P4 review).
     membership_report = isa.read_membership_index(max_age_s)
+    if membership_report is not None and not _membership_report_matches_active_profile(membership_report, streams_path):
+        membership_report = None
     ownership_cache = "fresh" if membership_report is not None else "missing"
     resolver = isa.make_membership_resolver(membership_report) if membership_report else None
     issue_consumer_resolver = (

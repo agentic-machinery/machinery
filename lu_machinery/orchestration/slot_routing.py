@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path, state_root
 from lu_machinery.lib.readonly_sqlite import open_readonly
 from lu_machinery.orchestration.fleet_taxonomy import (
@@ -45,7 +46,14 @@ from lu_machinery.orchestration.fleet_taxonomy import (
     resolve_area,
 )
 
-DEFAULT_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+_PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+DEFAULT_ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
+
+
+def _default_assignments_path() -> Path:
+    if DEFAULT_ASSIGNMENTS_PATH != _PACKAGED_ASSIGNMENTS_PATH:
+        return DEFAULT_ASSIGNMENTS_PATH
+    return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,27 +96,45 @@ def _parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(val).astimezone(UTC)
 
 
+class SlotAssignmentsConfigError(ValueError):
+    """Raised when ``area_assignments.yaml`` is unreadable or structurally malformed."""
+
+
 def _find_area_for_slot(slot: str, assignments_path: Path) -> str | None:
-    """Look up slot in area_assignments.yaml to find its area ID."""
+    """Look up slot in area_assignments.yaml to find its area ID.
+
+    Returns ``None`` only when ``assignments_path`` does not exist or is valid
+    and contains no mapping for ``slot``. Raises :class:`SlotAssignmentsConfigError`
+    on malformed YAML or invalid assignment/slot shapes so callers never fall
+    through to suffix-based area inference on a corrupt registry.
+    """
+    if not assignments_path.exists():
+        return None
+    if not assignments_path.is_file():
+        raise SlotAssignmentsConfigError(f"{assignments_path} is not a regular file")
+    import yaml
+
     try:
-        if not assignments_path.is_file():
-            return None
-        text = assignments_path.read_text(encoding="utf-8")
-        import yaml
-        raw_data = yaml.safe_load(text)
-        if not isinstance(raw_data, dict):
-            return None
-        assignments = raw_data.get("assignments")
-        if not isinstance(assignments, dict):
-            return None
-        for area_id, area_data in assignments.items():
-            if isinstance(area_data, dict):
-                slots = area_data.get("slots", [])
-                if isinstance(slots, (list, tuple)) and slot in slots:
-                    return str(area_id)
-    except Exception:
-        pass
-    return None
+        raw_data = yaml.safe_load(assignments_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise SlotAssignmentsConfigError(f"failed to parse {assignments_path}: {exc}") from exc
+    if not isinstance(raw_data, dict):
+        raise SlotAssignmentsConfigError(f"{assignments_path} root must be a mapping")
+    assignments = raw_data.get("assignments")
+    if not isinstance(assignments, dict):
+        raise SlotAssignmentsConfigError(f"{assignments_path} 'assignments' must be a mapping")
+    matched_area: str | None = None
+    for area_id, area_data in assignments.items():
+        if not isinstance(area_id, str) or not area_id.strip() or not isinstance(area_data, dict):
+            raise SlotAssignmentsConfigError(f"{assignments_path} entry {area_id!r} must be a mapping")
+        slots = area_data.get("slots", [])
+        if slots is None:
+            slots = []
+        if not isinstance(slots, (list, tuple)) or not all(isinstance(item, str) for item in slots):
+            raise SlotAssignmentsConfigError(f"{assignments_path}[{area_id!r}].slots must be a list of strings")
+        if matched_area is None and slot in slots:
+            matched_area = area_id
+    return matched_area
 
 
 def resolve_slot_holder(
@@ -144,7 +170,7 @@ def resolve_slot_holder(
     clean_slot = slot.strip()
     queue_loc = f"channels DB delivery queue for '{clean_slot}'"
 
-    assign_path = (assignments_path or DEFAULT_ASSIGNMENTS_PATH).resolve()
+    assign_path = (assignments_path or _default_assignments_path()).resolve()
     area_candidate = _find_area_for_slot(clean_slot, assign_path)
 
     if area_candidate is None:

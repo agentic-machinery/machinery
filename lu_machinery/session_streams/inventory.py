@@ -15,11 +15,19 @@ from typing import Any
 
 import yaml
 
+from lu_machinery.common import profile
 from lu_machinery.common.repo_root import machinery_path
 
 from .model import validate_stream_id
 
-DEFAULT_STREAMS_YAML = machinery_path("config/issue_streams.yaml")
+_PACKAGED_STREAMS_YAML = machinery_path("config/issue_streams.yaml")
+DEFAULT_STREAMS_YAML = _PACKAGED_STREAMS_YAML
+
+
+def _default_streams_yaml() -> Path:
+    if DEFAULT_STREAMS_YAML != _PACKAGED_STREAMS_YAML:
+        return DEFAULT_STREAMS_YAML
+    return profile.config_path("issue_streams", default=_PACKAGED_STREAMS_YAML)
 REGISTRY_STREAM_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 MAX_EPIC_NUMBER = 9_999_999_999
 
@@ -177,7 +185,7 @@ def _handoff_candidates_for(stream_name: str, epic_number: int) -> tuple[str, ..
 def resolve_streams_yaml(repo_root: Path, streams_yaml: Path | None = None) -> Path:
     """Resolve the issue_streams.yaml path under ``repo_root``."""
     root = repo_root.resolve()
-    path = streams_yaml if streams_yaml is not None else root / DEFAULT_STREAMS_YAML
+    path = streams_yaml if streams_yaml is not None else root / _default_streams_yaml()
     if not path.is_absolute():
         path = root / path
     return path
@@ -327,7 +335,13 @@ def inventory_snapshot(
     streams_yaml: Path | None = None,
 ) -> dict[str, Any]:
     """Machine-readable inventory: sorted epics, stream map, source hash."""
-    path = resolve_streams_yaml(repo_root, streams_yaml)
+    if streams_yaml is not None:
+        path = resolve_streams_yaml(repo_root, streams_yaml)
+        authority = str(streams_yaml)
+    else:
+        default_yaml = _default_streams_yaml()
+        path = resolve_streams_yaml(repo_root, default_yaml)
+        authority = str(default_yaml)
     scan = scan_stream_epic_inventory(repo_root, streams_yaml=path)
     records = scan.records
     mapping = stream_map(repo_root, streams_yaml=path)
@@ -354,7 +368,7 @@ def inventory_snapshot(
             }
             for r in records
         ],
-        "authority": str(DEFAULT_STREAMS_YAML),
+        "authority": authority,
         "hard_coded_subset_authoritative": False,
     }
 

@@ -14,11 +14,19 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 if __package__ in {None, ""}:  # run as a file (launchers do): the repository root holds the package
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from lu_machinery.common import json_depth
+from lu_machinery.common import json_depth, profile
 from lu_machinery.common.repo_root import machinery_path
 
 TAXONOMY_PATH = machinery_path("config/fleet_taxonomy.yaml")
-ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+_PACKAGED_ASSIGNMENTS_PATH = machinery_path("config/area_assignments.yaml")
+ASSIGNMENTS_PATH = _PACKAGED_ASSIGNMENTS_PATH
+
+
+def default_assignments_path() -> Path:
+    """Resolve ``area_assignments.yaml`` at call time via the active profile, else the packaged copy."""
+    if ASSIGNMENTS_PATH != _PACKAGED_ASSIGNMENTS_PATH:
+        return ASSIGNMENTS_PATH
+    return profile.config_path("area_assignments", default=_PACKAGED_ASSIGNMENTS_PATH)
 TAXONOMY_SCHEMA_PATH = (
     machinery_path("schemas/fleet-taxonomy.v1.schema.json")
 )
@@ -147,13 +155,14 @@ def validate_area_assignments_parity(
 def validate_fleet_taxonomy(
     *,
     taxonomy_path: Path = TAXONOMY_PATH,
-    assignments_path: Path = ASSIGNMENTS_PATH,
+    assignments_path: Path | None = None,
     taxonomy_schema_path: Path = TAXONOMY_SCHEMA_PATH,
     assignments_schema_path: Path = ASSIGNMENTS_SCHEMA_PATH,
 ) -> dict[str, Any]:
     """Validate both fleet_taxonomy.yaml and area_assignments.yaml."""
     taxonomy_data = _load_yaml(taxonomy_path)
-    assignments_data = _load_yaml(assignments_path)
+    resolved_assignments = default_assignments_path() if assignments_path is None else assignments_path
+    assignments_data = _load_yaml(resolved_assignments)
 
     validate_schemas(
         taxonomy_data,
@@ -191,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--assignments",
         type=Path,
-        default=ASSIGNMENTS_PATH,
+        default=None,
         help="path to area_assignments.yaml",
     )
     parser.add_argument(
@@ -202,11 +211,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        resolved_assignments = (
+            default_assignments_path() if args.assignments is None else args.assignments
+        ).resolve()
         summary = validate_fleet_taxonomy(
             taxonomy_path=args.taxonomy.resolve(),
-            assignments_path=args.assignments.resolve(),
+            assignments_path=resolved_assignments,
         )
-    except FleetTaxonomyValidationError as exc:
+    except (FleetTaxonomyValidationError, profile.ProfileError) as exc:
         if args.json:
             print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
         else:

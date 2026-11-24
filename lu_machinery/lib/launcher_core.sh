@@ -1340,9 +1340,16 @@ launcher_inject_driver_agent() {
   fi
   # The one project interpreter (R66); a worktree-local .venv is never tried
   # (#9118, #9121).
-  local py agent_type=""
+  local py agent_type="" rc=0
   py="$(launcher_project_python 2>/dev/null)" || return 0
-  agent_type="$(cd "$LC_SESSION_ROOT" && project_python_run "$py" -m "$LC_MACHINERY_PACKAGE.orchestration.driver_agent_type" --lane "$LC_EPIC" 2>/dev/null || true)"
+  agent_type="$(cd "$LC_SESSION_ROOT" && project_python_run "$py" -m "$LC_MACHINERY_PACKAGE.orchestration.driver_agent_type" --lane "$LC_EPIC" 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    launcher_error "refusing to launch ${LC_PROVIDER}: consumer profile or area_assignments config is invalid."
+    return 2
+  fi
+  if [ "${1:-}" = "--check-only" ]; then
+    return 0
+  fi
   if [ -z "$agent_type" ]; then
     printf 'launcher: no driver_agent_type for lane %s in area_assignments.yaml; no named agent selected; using the launcher model or project settings (Sonnet 5.5)\n' "$LC_EPIC" >&2
     return 0
@@ -1493,7 +1500,7 @@ launcher_bind_drive_epic() {
     # The shared binding owns caller text now; adapters must not prepend it.
     LC_CALLER_PROMPT_ARGS=()
   fi
-  launcher_inject_driver_agent
+  launcher_inject_driver_agent || return $?
   LC_FORWARD_ARGS+=("$LC_DRIVER_PROMPT")
   if [ "$LC_DRY_RUN" = "1" ]; then
     printf 'launcher: would bind %s after lease; provider canary: %s\n' "$entry_skill" "$canary_status"
@@ -1712,6 +1719,7 @@ launcher_main() {
       launcher_adapter_exec
       return
     fi
+    launcher_inject_driver_agent --check-only || exit 2
     launcher_claim_driver_lease || exit 1
     launcher_adapter_canary || canary_rc=$?
     if [ "$canary_rc" -ne 0 ]; then
@@ -1719,7 +1727,10 @@ launcher_main() {
       exit "$canary_rc"
     fi
     launcher_seed_driver_state
-    launcher_bind_drive_epic
+    if ! launcher_bind_drive_epic; then
+      launcher_close_failed_driver_lease
+      exit 2
+    fi
   fi
   if [ "$LC_MODE" = "driver" ] && [ "$LC_GOVERNOR" = "1" ] && [ "$LC_DRY_RUN" = "1" ]; then
     printf 'launcher: governor SESSION_EPIC=%s\n' "${SESSION_EPIC:-<unset>}"
