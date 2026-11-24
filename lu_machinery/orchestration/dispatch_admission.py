@@ -1640,6 +1640,43 @@ def is_orphaned_pidless_record(record: dict[str, Any]) -> bool:
     return worktree_prep.is_orphaned_prep_record(record) or is_orphaned_admission_hold(record)
 
 
+def pidless_spawning_holds_slot(
+    state: dict[str, Any], *, now: datetime, task_id: str, pid_alive: Callable[[int], bool] | None = None,
+) -> bool:
+    """Whether a record without a worker pid holds its slot now: admission's reservation rule.
+
+    The caller has already found the record not orphaned
+    (:func:`is_orphaned_pidless_record`; a scan files an orphan as dead), and
+    passes that one decision on: the rule never probes the owner a second time.
+    Only a ``spawning`` record holds a slot. When it names its dispatcher's pid
+    it holds the slot while that dispatcher lives (its recorded identity when
+    there is one); otherwise from :data:`PIDLESS_CLOCK_SKEW_S` before its
+    ``started_at`` to :data:`PIDLESS_SPAWNING_GRACE_S` after. An unreadable
+    ``started_at`` holds none. ``task_id`` names the record in the skew warning.
+    """
+    if state.get("status") != "spawning":
+        return False
+    owner = _dispatcher_owner(state)
+    owner_pid = _parse_pid(owner.get("owner_pid")) if owner is not None else None
+    if owner is not None and owner_pid is not None:
+        # Held while the dispatcher lives, however long its worktree add runs. A missing
+        # pid is proof it is gone even on a host without /proc, where only the pid can be checked.
+        if "owner_identity" in owner:
+            from lu_machinery.orchestration.dead_worker_state import worker_liveness
+
+            return worker_liveness({"pid": owner_pid, "worker_identity": owner["owner_identity"]}) is not False
+        return (pid_alive or process_alive)(owner_pid)
+    age = _age_s(state.get("started_at"), now)
+    if age is not None and age < -PIDLESS_CLOCK_SKEW_S:
+        _logger.warning(
+            "dispatch admission: pidless spawning record %s has started_at %.0f s in the future; not counted",
+            task_id,
+            -age,
+        )
+        return False
+    return age is not None and age <= PIDLESS_SPAWNING_GRACE_S
+
+
 @dataclass(frozen=True)
 class WorkerScan:
     live_task_ids: tuple[str, ...]
@@ -1972,35 +2009,9 @@ def scan_task_records(
             if is_orphaned_pidless_record(state):
                 dead.append((path, state))
                 continue
-            if (not write_capable and not is_orchestrator) or state.get("status") != "spawning":
-                continue
-            owner = _dispatcher_owner(state)
-            owner_pid = _parse_pid(owner.get("owner_pid")) if owner is not None else None
-            if owner is not None and owner_pid is not None:
-                # Held while the dispatcher lives, however long its worktree
-                # add runs. A missing pid is proof it is gone even on a host
-                # without /proc, where only the pid can be checked.
-                if "owner_identity" in owner:
-                    from lu_machinery.orchestration.dead_worker_state import worker_liveness
-
-                    owner_live = worker_liveness({"pid": owner_pid, "worker_identity": owner["owner_identity"]}) is not False
-                else:
-                    owner_live = alive(owner_pid)
-                if owner_live:
-                    if write_capable:
-                        live.append(task_id)
-                        live_on_meter += on_meter
-                    if is_orchestrator:
-                        live_orchestrators.append(task_id)
-                continue
-            age = _age_s(state.get("started_at"), clock)
-            if age is not None and age < -PIDLESS_CLOCK_SKEW_S:
-                _logger.warning(
-                    "dispatch admission: pidless spawning record %s has started_at %.0f s in the future; not counted",
-                    task_id,
-                    -age,
-                )
-            elif age is not None and age <= PIDLESS_SPAWNING_GRACE_S:
+            if (write_capable or is_orchestrator) and pidless_spawning_holds_slot(
+                state, now=clock, task_id=task_id, pid_alive=alive,
+            ):
                 if write_capable:
                     live.append(task_id)
                     live_on_meter += on_meter

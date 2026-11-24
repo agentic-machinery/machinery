@@ -369,17 +369,27 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "keep",
     ),
     RouteContract(
-        "/api/runtime/routing-assignments",
+        "/api/runtime/routing",
         "exact",
         "http",
-        "Body-free recent routing decisions with initiator, requested target, selected route, outcome, and lifecycle evidence.",
-        "Fleet Comms routing-reservation decision ledger read through its read-only authority projection.",
-        "The list is served stale-while-revalidate (state_helpers.swr_route): the last value at once with its true age in X-Snapshot-Age-S, per limit, refreshed after 15 s (as_of names the projection time); each projection reads at most ten times the requested event limit, then aggregated and capped to 1-100 recent assignments; quota fields are decision-time snapshots, not live provider health.",
-        ("agents", "orchestrators", "operators"),
-        "Complements /api/state/routing-budget and CodexBar health/quota signals; it does not expose all-time routing weights or choose a route.",
-        "medium if the bounded loaded window is treated as all-time distribution or stale activity as provider-liveness proof",
-        "keep as the canonical read-only routing-decision observer",
-        locality="cluster_authoritative",
+        "How work was routed, for the Routing page: one row per dispatch and review seat in the last 24 hours (what "
+        "was asked, the model and pool chosen, who chose each where the record proves it, the admission outcome, any "
+        "recorded substitution) with per-lane counts, and the subscription pools in page order.",
+        "Hot task records (batch_state/tasks) with the admission snapshot each dispatch records; the start-refusal "
+        f"and pid-less liveness rules of {_rel('orchestration', 'dispatch_admission.py')}.",
+        "recent is one scan of the task records, served stale-while-revalidate (state_helpers.cache_read_swr): the "
+        "last value at once, refreshed after 30 s, stale after 90 s; a read waits up to 0.5 s for a first scan, else "
+        "answers pending and the page reads again after 3 s. Its age_s and X-Snapshot-Age-S count from the scan's "
+        "as_of. The task store is listed on every request: a listing fault is typed unknown with its reason, never "
+        "zero, and unreadable records make the scan partial.",
+        ("routing.html", "operators", "agents"),
+        "Replaces /api/runtime/routing-assignments, whose routing-reservation ledger lost its only writer when the "
+        "sealed formal review path was retired; reads the task records dispatch already writes instead of keeping a "
+        "second record.",
+        "medium if a review row's model is read as the resolver's pick (the task record keeps the seat that ran, "
+        "not who chose it)",
+        "keep as the routing observer; routing stays with the brief, the account choice, admission and the resolver",
+        response_schema_version="routing.v1",
     ),
     RouteContract(
         "/api/runtime/subscriptions",
@@ -836,6 +846,21 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "medium if a stale or partial collection is mistaken for complete live progress",
         "keep",
         label="Milestones",
+    ),
+    PageContract(
+        "routing.html",
+        "/routing",
+        "Routing: a flow picture of the four routing stages (who picks the model, which account pays, admission, what "
+        "ran) with the last 24 hours' counts, and one row per recent dispatch and review seat with what was asked, "
+        "what was chosen, by whom where the record proves it, and why.",
+        "GET /api/runtime/routing.",
+        "HTTP reads every 30 seconds; recent decisions are at most 90 seconds old and their age is shown; a stale or "
+        "missing source reads unknown since the time of its last reading.",
+        ("humans", "operators"),
+        "Shows routing decisions; the Subscriptions page keeps the full per-account usage and Fleet the live worker list.",
+        "medium if a review row's model is read as the resolver's pick",
+        "keep",
+        label="Routing",
     ),
     PageContract(
         "model-stats.html",

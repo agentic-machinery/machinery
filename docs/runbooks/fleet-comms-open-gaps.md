@@ -160,19 +160,16 @@ request replays the durable verdict without a provider call or reservation.
 
 ### Diagnose quota concentration
 
-- Query `GET /api/runtime/routing-assignments?limit=100`. Start with the
-  lifecycle, automatic-versus-explicit, route-distribution, and failure-cause
-  fields, then filter by lifecycle, mode, route, initiator, model, reviewer, or
-  failure.
-- Read the decision path as initiator → request → selected route/model →
-  outcome. Expand one assignment for the body-free selection trace, quota and
-  credential evidence, retry/failover/replay state, authority IDs, and ordered
-  lifecycle events.
-- Query `/api/runtime/routing-assignments?limit=100` for the same read-only
-  projection. Counts describe the loaded recent window, not all-time fleet
-  totals, configured routing weights, provider quotas, or caching.
-- Treat “No ledger update” as stale activity evidence only. It is not proof of
-  provider liveness and does not authorize early lease reclamation.
+- Open the Monitor's Routing page (`/routing`) or query `GET /api/runtime/routing`.
+  Start with the per-lane counts (pool, account chooser, admission outcome),
+  then filter the recent decisions by work kind, pool, or deferred and
+  substituted rows.
+- Read each decision as asked for → chosen model and pool → who chose each →
+  admission and substitution. Counts describe the last 24 hours of task
+  records, not all-time fleet totals, configured routing weights, provider
+  quotas, or caching.
+- Treat a source shown as "unknown since" a time as missing evidence. It is not
+  proof of provider liveness and does not authorize early lease reclamation.
 - Compare the decision trace's hard-gate and suitability reasons before blaming
   load: a deliberately stronger suitable model may receive more work.
 - Confirm provider headroom with CodexBar and inspect the durable authority

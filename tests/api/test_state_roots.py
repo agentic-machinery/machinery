@@ -257,7 +257,7 @@ def test_fleet_plane_reads_state_root_not_the_product_checkout(roots, monkeypatc
     comms_router = _load_api("lu_machinery.api.comms_router", monkeypatch)
     fleet_router = _load_api("lu_machinery.api.fleet_router", monkeypatch)
     runtime_router = _load_api("lu_machinery.api.runtime_router", monkeypatch)
-    from lu_machinery.fleet_comms import message_plane, routing_reservations
+    from lu_machinery.fleet_comms import message_plane
 
     product, state = roots
     monkeypatch.delenv("FLEET_COMMS_ROOT", raising=False)
@@ -294,23 +294,9 @@ def test_fleet_plane_reads_state_root_not_the_product_checkout(roots, monkeypatc
 
     monkeypatch.setattr(message_plane, "read_plane_status", spy)
     monkeypatch.setattr(fleet_router, "read_plane_status", spy)
-    monkeypatch.setattr(runtime_router, "read_plane_status", spy)
     monkeypatch.setattr(comms_router, "read_plane_status", spy)
     fleet_router._safe_plane_status(ctx)
-    routing = runtime_router._routing_plane_status(ctx)
     comms_router.message_plane_status(ctx)
-    assert routing["mode"] == "off"
-    assert seen == [state.resolve()] * 3
-
-    roots_seen = []
-
-    def reader(*, root=None, limit=100):
-        roots_seen.append(root.resolve())
-        return []
-
-    monkeypatch.setattr(routing_reservations, "list_routing_decisions", reader)
-    listed = runtime_router.list_routing_assignments(limit=1, ctx=ctx)
-    assert roots_seen == [plane]
-    assert listed["availability"] == "empty"
+    assert seen == [state.resolve()] * 2
 
     assert not (product / "batch_state").exists()

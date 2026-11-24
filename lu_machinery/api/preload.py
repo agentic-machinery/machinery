@@ -64,7 +64,6 @@ DYNAMIC_LOADERS = {
         "description": "Loads agent runtime adapters and registry snapshots dynamically.",
         "strategy": "walk_adapters",
         "calls": [
-            {"func": "import_module", "caller": "list_routing_assignments"},
             {"func": "spec_from_file_location", "caller": "_load_registry_default_models"},
         ],
     },
