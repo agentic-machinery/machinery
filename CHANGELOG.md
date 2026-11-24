@@ -9,6 +9,18 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.65"></a>
+## [0.1.65] - 2026-11-24
+
+### Added
+
+- Orchestrator turn lifecycle, caps, handoff proof, and recovery (DRIVERS-1122 PR 3, supersedes #1306) ([#1310](https://github.com/learn-ukrainian/machinery/pull/1310))
+
+### Fixed
+
+- Support read-only asks in consumers without Sources ([#1313](https://github.com/learn-ukrainian/machinery/pull/1313))
+- Treat pre-launch fallback refusals as never-started (PR1310-F2) ([#1317](https://github.com/learn-ukrainian/machinery/pull/1317))
+
 <a id="v0.1.64"></a>
 ## [0.1.64] - 2026-11-24
 
@@ -1539,7 +1551,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.64...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.65...HEAD
+[0.1.65]: https://github.com/learn-ukrainian/machinery/compare/v0.1.64...v0.1.65
 [0.1.64]: https://github.com/learn-ukrainian/machinery/compare/v0.1.63...v0.1.64
 [0.1.63]: https://github.com/learn-ukrainian/machinery/compare/v0.1.62...v0.1.63
 [0.1.62]: https://github.com/learn-ukrainian/machinery/compare/v0.1.61...v0.1.62
