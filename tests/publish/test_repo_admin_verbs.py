@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,8 @@ CATALOG = {
     "guard": {"github": f"{OLD}/held-moved", "local_name": "held-moved", "role": "private-labs"},
 }
 WORKER_MARKERS = ("LEARN_UKRAINIAN_DISPATCH_TASK_ID", "LU_WRITE_BOUNDARY_BROKER")
+# The real state-directory resolver, before the autouse fixture replaces it with a tmp_path seam.
+REAL_STATE_DIRECTORY = pub._repo_admin_directory
 PRINCIPAL = "octo-admin"
 
 
@@ -115,7 +118,7 @@ def selector(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     (tmp_path / "product").mkdir()
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path / "product"))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(pub, "_repo_admin_directory", lambda: str(state_dir(tmp_path)))
     monkeypatch.setenv("LU_SCRATCH_ROOT", str(tmp_path / "scratch"))
     chosen = {"slug": SOURCE}
 
@@ -148,7 +151,7 @@ def create_fixture(gh, name="rehearsal-1"):
 
 
 def state_dir_of(_receipt):
-    return Path(os.environ["XDG_STATE_HOME"]) / "learn-ukrainian" / pub.REPO_ADMIN_DIRECTORY
+    return Path(pub._repo_admin_directory())
 
 
 CALLER = [
@@ -265,30 +268,73 @@ def test_real_move_derives_endpoints_from_selector_row(selector):
         assert gh.posts == []
 
 
-def _swapped_before_post(gh):
-    """The source slug holds the pinned id at preflight and another repository at the pre-POST re-read."""
+def _second_source_read(gh, second):
+    """The source slug holds the pinned id at preflight; the pre-POST re-read answers *second*."""
     reads = []
 
     def respond(args):
         reads.append(args)
-        return answer(args, repository(REPO_ID if len(reads) == 1 else 4242, SOURCE))
+        if len(reads) == 1:
+            return answer(args, repository(REPO_ID, SOURCE))
+        if isinstance(second, BaseException):
+            raise second
+        return answer(args, second)
     gh.overrides[("GET", f"repos/{SOURCE}", False)] = respond
 
 
+def _journal_unremovable(monkeypatch):
+    """os.unlink refuses the transfer journal, as on a directory made read-only mid-run."""
+    unlink = os.unlink
+
+    def refuse(path, *args, **kwargs):
+        if str(path).endswith(".pending"):
+            raise PermissionError("read-only directory")
+        return unlink(path, *args, **kwargs)
+    monkeypatch.setattr(os, "unlink", refuse)
+
+
+def _swapped_before_post(gh, _monkeypatch):
+    _second_source_read(gh, repository(4242, SOURCE))
+
+
+def _rate_limited_before_post(gh, _monkeypatch):
+    _second_source_read(gh, github_client.GitHubRateLimited(None, "pool_exhausted"))
+
+
+def _swapped_and_journal_unremovable(gh, monkeypatch):
+    _second_source_read(gh, repository(4242, SOURCE))
+    _journal_unremovable(monkeypatch)
+
+
 @pytest.mark.parametrize("change,reason", [
-    (lambda gh: gh.repos[SOURCE].update(id=999), "not the pinned"),
-    (lambda gh: gh.repos[SOURCE].update(private=False, visibility="public"), "is not private"),
-    (lambda gh: gh.repos[SOURCE].update(archived=True), "is archived"),
-    (lambda gh: gh.repos[SOURCE].update(permissions={"admin": False}), "not an admin"),
-    (lambda gh: gh.repos[SOURCE].update(full_name=f"{OLD}/elsewhere"), "neither at"),
+    (lambda gh, _: gh.repos[SOURCE].update(id=999), "not the pinned"),
+    (lambda gh, _: gh.repos[SOURCE].update(private=False, visibility="public"), "is not private"),
+    (lambda gh, _: gh.repos[SOURCE].update(archived=True), "is archived"),
+    (lambda gh, _: gh.repos[SOURCE].update(permissions={"admin": False}), "not an admin"),
+    (lambda gh, _: gh.repos[SOURCE].update(full_name=f"{OLD}/elsewhere"), "neither at"),
     (_swapped_before_post, "no longer holds the pinned"),
+    (_rate_limited_before_post, 75),
+    (_swapped_and_journal_unremovable, "journal-retained"),
 ])
-def test_transfer_source_identity_refusals(tmp_path, change, reason):
-    """Defect class: a stale or substituted source identity passing the fresh match, before or at the POST."""
+def test_transfer_source_identity_refusals(tmp_path, monkeypatch, change, reason):
+    """Defect class: a stale or substituted source identity passing the fresh match, before or at the POST.
+
+    A refusal before the POST leaves no journal and keeps its typed exit (2, or 75 for a rate limit);
+    a journal it cannot remove is reported and exits 3.
+    """
     gh = FakeGitHub()
-    change(gh)
-    with pytest.raises(gate.PublishBlocked, match=reason):
-        run("repo-transfer", gh, repo="infra-private")
+    change(gh, monkeypatch)
+    if reason == 75:
+        result, _ = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == 75
+    elif reason == "journal-retained":
+        result, receipt = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "journal-retained"
+        assert "no POST was sent" in receipt["detail"] and gh.posts == [] and journal(tmp_path).exists()
+        return
+    else:
+        with pytest.raises(gate.PublishBlocked, match=reason):
+            run("repo-transfer", gh, repo="infra-private")
     assert gh.posts == [] and not journal(tmp_path).exists()
 
 
@@ -307,16 +353,28 @@ def test_transfer_destination_preflight_refusals(change, reason):
     assert gh.posts == []
 
 
-def test_transfer_sends_once_and_verifies_exact_readback(tmp_path):
-    """Defect class: a duplicate transfer, or success reported without the exact destination readback."""
+def test_transfer_sends_once_and_verifies_exact_readback(tmp_path, monkeypatch):
+    """Defect class: a duplicate transfer, or success reported without the exact destination readback.
+
+    A receipt file that cannot be written does not turn a no-mutation success (dry run, already
+    transferred) into a refusal.
+    """
     gh = FakeGitHub()
     result, receipt = run("repo-transfer", gh, repo="infra-private", dry_run=True)
     assert result.returncode == 0 and gh.posts == [] and not journal(tmp_path).exists()
+    with monkeypatch.context() as patch:
+        patch.setattr(pub, "_write_transfer_receipt", lambda sink, receipt: False)
+        result, receipt = run("repo-transfer", gh, repo="infra-private", dry_run=True)
+        assert result.returncode == 0 and receipt["outcome"] == "dry-run"
     result, receipt = run("repo-transfer", gh, repo="infra-private")
     assert result.returncode == 0 and receipt["outcome"] == "transferred"
     assert gh.posts == [(f"repos/{SOURCE}/transfer", {"new_owner": NEW, "new_name": "infra-next"})]
     assert gh.find(DESTINATION)["id"] == REPO_ID and receipt["principal"]["after"]["login"] == PRINCIPAL
     assert not journal(tmp_path).exists()
+    with monkeypatch.context() as patch:
+        patch.setattr(pub, "_write_transfer_receipt", lambda sink, receipt: False)
+        result, receipt = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == 0 and receipt["outcome"] == "already-transferred" and len(gh.posts) == 1
 
 
 def _applied_then(gh, reply):
@@ -351,11 +409,85 @@ class _Unwritable:
     "other-id-acknowledgement",
     "old-slug-reused",
     "stdout-unwritable",
+    "pending-destination-server-error",
+    "pending-destination-malformed",
+    "pending-destination-rate-limited",
+    "reconciled-journal-unremovable",
+    "pending-selector-flipped",
+    "pending-selector-unbound",
+    "pending-directory-unusable",
+    "pending-state-home-changed",
 ])
-def test_unsettled_transfer_blocks_retry_until_reconciled(tmp_path, monkeypatch, outcome):
-    """Defect class: a second send after an unknown outcome, or a post-send failure reported as nothing landed."""
+def test_unsettled_transfer_blocks_retry_until_reconciled(tmp_path, monkeypatch, selector, outcome):
+    """Defect class: a second send after an unknown outcome, or a post-send failure reported as nothing landed.
+
+    While a journal is pending, only a verified destination match settles it (exit 0); every other outcome,
+    including an unreadable destination, exits 3 and sends nothing.
+    """
     gh = FakeGitHub()
     transfer = ("POST", f"repos/{SOURCE}/transfer", False)
+    if outcome == "pending-state-home-changed":
+        # The real resolver: the account's password-database home, whatever HOME and XDG_STATE_HOME say.
+        import pwd
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(tmp_path / "home")))
+        monkeypatch.setattr(pub, "_repo_admin_directory", REAL_STATE_DIRECTORY)
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-a"))
+        gh.overrides[transfer] = subprocess.TimeoutExpired(["gh"], 60)
+        result, _ = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED
+        gh.overrides.clear()
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-b"))
+        monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
+        result, receipt = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
+        assert len(gh.posts) == 1
+        assert (tmp_path / "home/.local/state/learn-ukrainian/repo-admin" / f"repo-transfer-{REPO_ID}.pending").exists()
+        return
+    if isinstance(outcome, str) and outcome.startswith(("pending-", "reconciled-")):
+        gh.overrides[transfer] = subprocess.TimeoutExpired(["gh"], 60)
+        result, _ = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and journal(tmp_path).exists()
+        gh.overrides.clear()
+        if outcome == "pending-selector-unbound":
+            selector["slug"] = None
+        if outcome == "pending-directory-unusable":
+            state_dir(tmp_path).chmod(0o750)
+        if outcome in {"pending-selector-unbound", "pending-directory-unusable"}:
+            try:
+                result, receipt = run("repo-transfer", gh, repo="infra-private")
+            finally:
+                state_dir(tmp_path).chmod(0o700)
+            assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
+            assert len(gh.posts) == 1 and journal(tmp_path).exists()
+            return
+        if outcome == "pending-selector-flipped":
+            # A premature selector flip does not hide the pending transfer; the destination still settles it.
+            selector["slug"] = DESTINATION
+            result, receipt = run("repo-transfer", gh, repo="infra-private")
+            assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
+            gh.repos = {DESTINATION: repository(REPO_ID, DESTINATION)}
+            result, receipt = run("repo-transfer", gh, repo="infra-private")
+            assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
+            assert len(gh.posts) == 1 and not journal(tmp_path).exists()
+            return
+        if outcome == "reconciled-journal-unremovable":
+            gh.repos = {DESTINATION: repository(REPO_ID, DESTINATION)}
+            _journal_unremovable(monkeypatch)
+            result, receipt = run("repo-transfer", gh, repo="infra-private")
+            assert result.returncode == 0 and receipt["outcome"] == "already-transferred"
+            assert receipt["journal_retained"] is True and journal(tmp_path).exists() and len(gh.posts) == 1
+            return
+        gh.overrides[("GET", f"repos/{DESTINATION}", True)] = {
+            "pending-destination-server-error": server_error,
+            "pending-destination-malformed": lambda args: answer(args, {"id": "not-a-number"}),
+            "pending-destination-rate-limited": github_client.GitHubRateLimited(None, "pool_exhausted"),
+        }[outcome]
+        result, receipt = run("repo-transfer", gh, repo="infra-private")
+        assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "unreconciled"
+        assert len(gh.posts) == 1 and journal(tmp_path).exists()
+        return
     if outcome == "old-slug-reused":
         # The response is lost, then a new repository takes the old name: the exact destination still settles it.
         gh.overrides[transfer] = _applied_then(gh, subprocess.TimeoutExpired(["gh"], 60))
@@ -449,6 +581,8 @@ def _replaced(path, tmp_path):
     (_edit(rehearsal_destination=DESTINATION), "not a created fixture"),
     (_edit(rehearsal_destination=f"{NEW}/rehearsal-1-moved-2"), "not a created fixture"),
     (_edit(slug="elsewhere/rehearsal-1"), "not a created fixture"),
+    (_edit(mutations_sent=True), "not a created fixture"),
+    (lambda path, tmp_path: path.parent / "..", "mode 0600 file"),
     (_replaced, "not the pinned"),
     (None, None),
 ])
@@ -504,3 +638,59 @@ def test_concurrent_run_lock_refuses_without_sending(tmp_path, verb, fields, loc
         result, receipt = run(verb, gh, repo="infra-private", **fields)
     assert result.returncode == pub.REPO_ADMIN_UNSETTLED and receipt["outcome"] == "in-progress"
     assert gh.calls == []
+
+
+# A child interpreter whose stdout and stderr are pipes with no reader, so every write fails.
+_BROKEN_STREAMS_CHILD = """
+import importlib.util, os, sys
+read_end, write_end = os.pipe()
+os.close(read_end)
+os.dup2(write_end, 1)
+os.dup2(write_end, 2)
+spec = importlib.util.spec_from_file_location("repo_admin_fixture", sys.argv[1])
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+from lu_machinery.opsec import prepublish as gate
+from lu_machinery.orchestration import fleet_repos
+from lu_machinery.publish import github as pub
+gate.catalog = lambda: fixture.CATALOG
+pub._transfer_sleep = lambda _delay: None
+pub._repo_admin_directory = lambda: os.environ["REPO_ADMIN_TEST_DIRECTORY"]
+fleet_repos.resolve_active_fleet_repo = lambda identifier, *, repos, env=None, **_: fleet_repos.ActiveFleetRepo(
+    repo=repos[identifier], active_github=fixture.SOURCE,
+)
+gh = fixture.FakeGitHub()
+if os.environ.get("REPO_ADMIN_TEST_RATE_LIMIT"):
+    from lu_machinery.common import github_client
+    gh.overrides[("GET", "user", False)] = github_client.GitHubRateLimited(None, "pool_exhausted")
+sys.exit(pub.main(sys.argv[2:], runner=gh))
+"""
+
+
+@pytest.mark.parametrize("argv,pattern,limited", [
+    (["repo-create", "--repo", "infra-private", "--name", "rehearsal-1"], "repo-create-rehearsal-1-*.json", False),
+    (["repo-transfer", "--repo", "infra-private"], f"repo-transfer-{REPO_ID}-*.json", False),
+    (["repo-transfer", "--repo", "infra-private"], f"repo-transfer-{REPO_ID}-*.json", True),
+])
+def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limited):
+    """Defect class: interpreter shutdown overriding the documented exit code after a failed stream write.
+
+    After a POST it stays 3; a rate limit before any POST stays 75.
+    """
+    environment = {
+        key: value for key, value in os.environ.items()
+        if key not in {*WORKER_MARKERS, *pub.REPO_ADMIN_CREDENTIAL_OVERRIDES, "GH_HOST", "PYTEST_CURRENT_TEST"}
+    }
+    # The child imports the same lu_machinery as this test.
+    root = str(Path(pub.__file__).resolve().parents[2])
+    environment["PYTHONPATH"] = os.pathsep.join(filter(None, [root, environment.get("PYTHONPATH")]))
+    environment["REPO_ADMIN_TEST_DIRECTORY"] = str(state_dir(tmp_path))
+    if limited:
+        environment["REPO_ADMIN_TEST_RATE_LIMIT"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", _BROKEN_STREAMS_CHILD, __file__, *argv, "--principal", PRINCIPAL],
+        env=environment, cwd=tmp_path, capture_output=True, timeout=120, check=False,
+    )
+    assert completed.returncode == (75 if limited else pub.REPO_ADMIN_UNSETTLED), completed.stderr
+    receipts = sorted(state_dir(tmp_path).glob(pattern))
+    assert receipts and json.loads(receipts[-1].read_text())["mutations_sent"] == (0 if limited else 1)
