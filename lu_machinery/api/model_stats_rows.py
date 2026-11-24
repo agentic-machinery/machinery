@@ -136,10 +136,10 @@ _PRE_START_ERRORS = {
 }
 
 
-def start_refusal(record: Mapping[str, Any]) -> str | None:
+def start_refusal(record: Mapping[str, Any], counts: tuple[int, int, int]) -> str | None:
     """Use the typed dispatcher reason, or require pre-start evidence from a legacy record."""
     status = record.get("status")
-    if status not in ("failed", "rate_limited", "crashed") or any(tokens(record.get("usage"))):
+    if status not in ("failed", "rate_limited", "crashed") or any(counts):
         return None
     if "never_started_reason" in record:
         # A modern settlement can rule out a refusal even when its last launch exited 125.
@@ -200,31 +200,43 @@ def timestamp(value: object) -> datetime | None:
         return None
 
 
-def tokens(usage: object) -> tuple[int, int, int]:
-    """(fresh input incl. cache writes, cached reads, output incl. reasoning), per provider shape."""
+def tokens(usage: object) -> tuple[tuple[int, int, int], bool]:
+    """Normalize fresh input, cache reads and output, and say whether all three are known."""
     if not isinstance(usage, Mapping):
-        return (0, 0, 0)
+        return (0, 0, 0), False
 
-    def n(mapping: Mapping[str, Any], key: str) -> int:
-        value = mapping.get(key)
-        return value if type(value) is int and value >= 0 else 0
+    valid = True
+
+    def n(mapping: Mapping[str, Any], key: str, *, optional: bool = False) -> int:
+        nonlocal valid
+        value = mapping.get(key, 0 if optional else None)
+        if _count_value(value):
+            return cast(int, value)
+        valid = False
+        return 0
 
     u = usage
     if "cache_read_input_tokens" in u:  # Claude
-        return (n(u, "input_tokens") + n(u, "cache_creation_input_tokens"), n(u, "cache_read_input_tokens"),
-                n(u, "output_tokens"))
-    if "cached_input_tokens" in u:  # Codex: input_tokens includes cached, output_tokens includes reasoning
-        return (max(0, n(u, "input_tokens") - n(u, "cached_input_tokens")), n(u, "cached_input_tokens"),
-                n(u, "output_tokens"))
-    if "inputTokens" in u:  # Cursor
-        return (n(u, "inputTokens") + n(u, "cacheWriteTokens"), n(u, "cacheReadTokens"),
-                n(u, "outputTokens") + n(u, "reasoningTokens"))
-    if "cache_read_tokens" in u:  # AGY
-        return (n(u, "input_tokens"), n(u, "cache_read_tokens"), n(u, "output_tokens") + n(u, "thinking_tokens"))
-    cache = u.get("cache")
-    if isinstance(cache, Mapping):  # opencode
-        return (n(u, "input"), n(cache, "read"), n(u, "output") + n(u, "reasoning"))
-    return (0, 0, 0)
+        counts = (n(u, "input_tokens") + n(u, "cache_creation_input_tokens", optional=True),
+                  n(u, "cache_read_input_tokens"), n(u, "output_tokens"))
+    elif "cached_input_tokens" in u:  # Codex: input includes cache reads, output includes reasoning
+        fresh, cached = n(u, "input_tokens"), n(u, "cached_input_tokens")
+        counts = (max(0, fresh - cached), cached, n(u, "output_tokens"))
+        valid = valid and fresh >= cached
+    elif "inputTokens" in u:  # Cursor
+        counts = (n(u, "inputTokens") + n(u, "cacheWriteTokens"), n(u, "cacheReadTokens"),
+                  n(u, "outputTokens") + n(u, "reasoningTokens", optional=True))
+    elif "cache_read_tokens" in u:  # AGY
+        counts = (n(u, "input_tokens"), n(u, "cache_read_tokens"),
+                  n(u, "output_tokens") + n(u, "thinking_tokens", optional=True))
+    elif isinstance(cache := u.get("cache"), Mapping):  # OpenCode
+        counts = (n(u, "input") + n(cache, "write", optional=True), n(cache, "read"),
+                  n(u, "output") + n(u, "reasoning", optional=True))
+    else:
+        return (0, 0, 0), False
+    if not all(_count_value(value) for value in counts):
+        return (0, 0, 0), False
+    return counts, valid
 
 
 @lru_cache(maxsize=1)
@@ -777,7 +789,8 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     status = record.get("status")
     if not valid_task_id(task_id) or not isinstance(status, str) or status in ACTIVE:
         return None
-    refusal = start_refusal(record)
+    counts, usage_known = tokens(record.get("usage"))
+    refusal = start_refusal(record, counts)
     options = _options(record)
     # One resolved copy drives typing, class, PR association and reply parsing. A typed review
     # that did not finish has no reply to read. Any other settled task is read once, so a legacy
@@ -797,7 +810,7 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
     raw_repo = record.get("repo") if record.get("repo") is not None else options.get("repo")
     repo = "public" if raw_repo is None else label(raw_repo, "unknown")
     raw_class = record.get("data_class") if record.get("data_class") is not None else options.get("data_class")
-    fresh, cached, output = tokens(record.get("usage"))
+    fresh, cached, output = counts
     # Terminal status still decides whether a verdict is stored. A review that is typed, or
     # whose reply validated, is not reported as missing review evidence.
     review = reading if role == "review" and not refusal and status == "done" else None
@@ -816,6 +829,9 @@ def summary_row(path: Path, record: Mapping[str, Any], source_mtime_ns: int | No
         "finished_at": _iso(record.get("finished_at")),
         "duration_s": _number(record.get("duration_s")),
         "tokens": {"fresh_input": fresh, "cached_input": cached, "output": output},
+        "usage_known": usage_known or refusal is not None,
+        "implementation": role == "write" and record.get("mode") == "workspace-write"
+        and record.get("research_role") == "implementation",
         "allowance": None if refusal else _allowance(record),
         "review": review,
         "repo": repo,
@@ -1155,6 +1171,8 @@ def _well_formed(row: Mapping[str, Any]) -> bool:
                   and row.get("status") == "no_deliverable"),
         isinstance(tokens_, dict) and tokens_.keys() == {"fresh_input", "cached_input", "output"}
         and all(_count_value(v) for v in tokens_.values()),
+        _optional(row.get("usage_known"), lambda v: type(v) is bool),
+        _optional(row.get("implementation"), lambda v: type(v) is bool and (not v or row.get("role") == "write")),
         _optional(allowance, lambda a: isinstance(a, dict) and a.keys() == {"pool", "start", "finish"}
                   and (a["pool"] is None or (isinstance(a["pool"], str) and a["pool"] in POOLS))
                   and _reading_ok(a["start"]) and _reading_ok(a["finish"])),
@@ -1235,7 +1253,7 @@ def _stale(present: Mapping[str, Any] | None, candidate: Mapping[str, Any]) -> b
         return True
     return stored == source and any(present.get(key) != candidate.get(key) for key in (
         "role", "class", "review", "effort", "pinned_head", "never_started_reason", "no_deliverable_cause",
-        "review_evidence_absent",
+        "review_evidence_absent", "usage_known", "implementation", "tokens",
     ))
 
 

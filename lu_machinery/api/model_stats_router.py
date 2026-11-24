@@ -42,6 +42,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
+from heapq import nlargest
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -102,6 +103,8 @@ PAGE_DROP = frozenset({
 # Snapshot sides the route never spreads into a response. ``sample_windows`` is served only by ``view=samples``.
 _UNSERVED = frozenset({"windows", "page_windows", "sample_windows", "metrics", "worker_allowance"})
 STATUSES = ("done", "no_deliverable", "failed", "timeout", "rate_limited", "cancelled", "crashed", NEVER_STARTED)
+FAILED_RUNS = frozenset(STATUSES) - {"done"}
+TOKEN_FIELDS = ("fresh_input", "cached_input", "output")
 START_REFUSAL_CODES = frozenset(StartRefusal)
 UNPARSED_REASON_KEYS = (*UNPARSED_REASONS, "not_done", "unknown")
 ALL_EFFORTS = "all"
@@ -1327,6 +1330,90 @@ def _reviewed_pr(row: _Row) -> _PrKey | None:
     return (row.raw["repo"], pr) if isinstance(pr, int) and pr > 0 else None
 
 
+def _token_work(rows: Sequence[_Row]) -> dict[str, str]:
+    """Classify recorded work without using task names, model names or reply text."""
+    published_heads: dict[tuple[str, str], set[int]] = defaultdict(set)
+    for row in rows:
+        if row.published_pr is not None and (head := row.raw.get("pinned_head")):
+            published_heads[row.raw["repo"], head].add(row.published_pr)
+
+    work = {}
+    for row in rows:
+        if row.status in FAILED_RUNS:
+            kind = "failed_or_empty"
+        elif row.published is not None:
+            kind = "review_of_record"
+        elif row.role == "review":
+            # The supplemental dispatch omits the PR and author flags, but pins the exact head.
+            # Require a parsed verdict and one published PR on that head in the same repository.
+            matches = published_heads.get((row.raw["repo"], row.raw.get("pinned_head")), ())
+            kind = ("supplemental_review" if len(matches) == 1 and row.review is not None
+                    and row.review[0] in VERDICTS[:3] and row.raw.get("pr") is None
+                    and row.review_author is None else "unclassified_review")
+        elif row.raw.get("implementation") is True or row.trailer:
+            kind = "implementation"
+        else:
+            kind = "unclassified_work"
+        work[row.task_id] = kind
+    return work
+
+
+def _has_token_reading(row: _Row) -> bool:
+    # Old rows encode missing usage as (0, 0, 0), indistinguishable from an actual zero-token reading.
+    known = row.raw.get("usage_known")
+    if known is None:
+        return any(row.tokens) or row.status == NEVER_STARTED
+    return known is True
+
+
+def _token_totals(rows: Sequence[_Row], merged: int | None) -> dict[str, Any]:
+    counts = [row.tokens for row in rows if _has_token_reading(row)]
+    totals = None
+    if counts:
+        totals = {field: sum(column) for field, column in zip(TOKEN_FIELDS, zip(*counts, strict=True), strict=True)}
+    volume = sum(totals.values()) if totals is not None else None
+    return {"tasks": len(rows), "reported_tasks": len(counts), "totals": totals,
+            "tokens": volume, "per_merged_pr": round(volume / merged) if volume is not None and merged else None}
+
+
+def _token_use(rows: list[_Row], work: Mapping[str, str], merged: int | None) -> dict[str, Any]:
+    def model_name(row: _Row) -> str:
+        return OTHER if retired_subscription_model(row.model) else _page_model(row.model)
+
+    by_work: dict[str, list[_Row]] = defaultdict(list)
+    by_model: dict[str, list[_Row]] = defaultdict(list)
+    for row in rows:
+        by_work[work[row.task_id]].append(row)
+        by_model[model_name(row)].append(row)
+    overall = _token_totals(rows, merged)
+    kinds = ("implementation", "review_of_record", "supplemental_review", "failed_or_empty",
+             "unclassified_review", "unclassified_work")
+    work_totals = {kind: _token_totals(by_work[kind], merged) for kind in kinds}
+    waste = {}
+    for kind in ("failed_or_empty", "supplemental_review"):
+        group = work_totals[kind]
+        amount = group["tokens"]
+        waste[kind] = {**group, "share": amount / overall["tokens"]
+                       if amount is not None and overall["tokens"] else None}
+
+    cache = []
+    for model, tasks in sorted(by_model.items()):
+        group = _token_totals(tasks, None)
+        totals = group["totals"]
+        input_tokens = totals["fresh_input"] + totals["cached_input"] if totals is not None else 0
+        cache.append({"model": model, "tasks": group["tasks"], "reported_tasks": group["reported_tasks"],
+                      "ratio": totals["cached_input"] / input_tokens if input_tokens else None})
+
+    largest = nlargest(5, (row for row in rows if _has_token_reading(row)),
+                       key=lambda row: (sum(row.tokens), row.task_id))
+    return {
+        **overall, "merged_prs": merged, "by_work": {**work_totals, "landing_helpers": None},
+        "waste": {**waste, "capped_and_replaced": None}, "avoidable_share": None, "cache_by_model": cache,
+        "top_tasks": [{"model": model_name(row), "status": row.status, "tokens": sum(row.tokens)}
+                      for row in largest],
+    }
+
+
 def _review_order(row: _Row) -> tuple[datetime, str]:
     return (row.started or row.moment, row.task_id)
 
@@ -1899,6 +1986,10 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
     for pr in all_record_prs:
         if (merged := landing.prs.get(pr["key"])) and merged.at < until:
             pr["diff_size"] = merged.size
+    # Token spend covers every recorded model and effort, including historical routes absent from today's tables.
+    token_rows = rows
+    token_work = _token_work(token_rows)
+    merge_times = [pr.at for pr in landing.prs.values() if pr.at < until]
     rows = [replace(row, author=None, review_author=None)
             if row.review_author and retired_subscription_model(row.review_author) else row
             for row in rows if not retired_subscription_model(row.model)]
@@ -1919,8 +2010,11 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
         record_prs = [pr for pr in all_record_prs if since <= pr["first_at"]]
         window = {"name": name, "since": since.isoformat(), "until": until.isoformat(), "days": days,
                   "cohort": "finished_at, else started_at, in [since, until)"}
+        token_use = _token_use([row for row in token_rows if since <= row.moment], token_work,
+                               sum(since <= at for at in merge_times) if landing.repositories["read"] else None)
         windows[name] = {"window": window, **summarize(selected, fine, prs, history=rows, touched=touched,
                                                        record_prs=record_prs),
+                         "token_use": token_use,
                          "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since)}
         # Bound each member of the author id after deriving PR outcomes: a joint author stays joint, never a known model.
         page_prs, page_record_prs = (
@@ -1932,6 +2026,7 @@ def collect(batch_state_dir: Path, primary_root: Path, now: datetime | None = No
                                  touched=touched, accuracy_rows=selected, reviewer_name=_page_model)
         sample_windows[name] = {"window": window, "models": _sample_models(page_summary["models"])}
         page_windows[name] = {"window": window, **page_window(page_summary),
+                              "token_use": token_use,
                               "post_merge_rework_proxy": _post_merge_rework(merge_outcomes, rework_since, _page_author)}
         # /metrics labels come from a finite set: a model outside the catalog's known values is "other".
         # 24h stays off this label set.
@@ -2034,10 +2129,10 @@ def page_window(payload: Mapping[str, Any]) -> dict[str, Any]:
 async def model_stats(
     window: Literal["24h", "7d", "30d", "90d", "all"] = Query(
         default="7d", description="Window: 24h, 7d, 30d, 90d or all"),
-    view: Literal["full", "page", "samples"] = Query(
+    view: Literal["full", "page", "samples", "tokens"] = Query(
         default="full",
         description="full keeps every class; page is the dashboard projection without reply text; "
-                    "samples is that reply text alone"),
+                    "samples is that reply text alone; tokens is the token-use summary alone"),
     ctx: MonitorContext = Depends(get_ctx),
 ) -> JSONResponse:
     """Serve one window of the cached snapshot; a refresh runs off-loop with the shared single flight.
@@ -2067,6 +2162,10 @@ async def model_stats(
         stored = (computed, 0.0)
     snapshot, age = cast(dict[str, Any], stored[0]), stored[1]
     headers = snapshot_headers(age, FRESHNESS_BOUND_SECONDS)
+    if view == "tokens":
+        selected = snapshot["page_windows"][window]
+        return JSONResponse({"schema_version": snapshot["schema_version"], "status": "ok", "age_seconds": round(age, 1),
+                             **{key: selected[key] for key in ("window", "token_use")}}, headers=headers)
     if view == "samples":
         samples = snapshot.get("sample_windows")
         window_samples = samples.get(window) if isinstance(samples, Mapping) else None

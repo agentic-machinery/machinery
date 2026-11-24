@@ -535,17 +535,22 @@ ROUTE_CONTRACTS: tuple[RouteContract, ...] = (
         "task when at most 1% or 1 of 10+ tasks is untimed), review verdicts and blocking findings of parsed reviews "
         "of record, reviewer levels, author-side review rounds, first-round approval per author, first reviewer and "
         "review class, what followed a blocked first round, routed catalog models idle in the window, cluster-grouped "
-        "weekly allowance spent per landed task and ISO-week counts, each with its sample size (#581). /metrics exports "
+        "weekly allowance spent per landed task and ISO-week counts, each with its sample size (#581). Both views "
+        "include token use and waste. view=tokens returns just that report and its window, without reply text or "
+        "task ids. The report has normalized token totals, usage coverage, tokens per observed merged PR, work "
+        "and waste breakdowns, cache hit ratios and five highest-volume runs. Unsupported attributions are null. "
+        "/metrics exports "
         "selected gauges from the same cached snapshot for 7d, 30d, 90d, all and ISO weeks (omitting 24h, observed "
         "wall hours and chart series). Comparisons list the observed effort levels. The unknown effort group is "
         "reported separately and excluded from model totals.",
         "The durable model-stats summary rows under batch_state/model-stats/, written at settlement and "
         "backfilled from hot and archived task records, plus whole-line X-Agent trailers on each registered "
-        "repository's local origin/main (never fetched) and the merged delivery each task recorded.",
+        "repository's local origin/main (never fetched), the merged delivery each task recorded, and exact-head "
+        "review verdict publications.",
         "One single-flight snapshot of all five windows, refreshed every 300s while the route or /metrics is read; "
         "healthy data at most 420s old; a request with no snapshot waits up to 15s for that collect, then answers "
         "pending with Retry-After 1, or 503 unavailable if the collect fails.",
-        ("model-stats.html", "operators"),
+        ("model-stats.html", "fleet.html", "operators"),
         "Joins the agent-runtime usage log (ACP runs only) and /api/fleet/workers/v1 (live workers); "
         "agent success counts runs without landing or rounds.",
         "medium if a low-sample rate or a confounded comparison is read as a routing verdict",
@@ -778,9 +783,11 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
     PageContract(
         "fleet.html",
         "/fleet",
-        "Fleet: live agent workers with optional open-PR status, recently finished dispatches and unfinished-record attention list, and Fleet Comms store/queue/failure metrics.",
-        "GET /api/delegate/active, /api/delegate/recent, /api/comms/v1/metrics and optional /api/git/pull-requests.",
-        "HTTP reads every 30 seconds; each panel paints independently and shows its own source age and freshness bound.",
+        "Fleet: live agent workers with optional open-PR status, recently finished dispatches and unfinished-record attention list, Fleet Comms store/queue/failure metrics, and a seven-day token summary.",
+        "GET /api/delegate/active, /api/delegate/recent, /api/comms/v1/metrics, "
+        "/api/fleet/model-stats?window=7d&view=tokens and optional /api/git/pull-requests.",
+        "HTTP reads every 30 seconds. Each panel paints independently and shows its source age and freshness bound. "
+        "The token line shares the Model Stats cache.",
         ("humans", "operators"),
         "Combines live agent dispatch activity and Fleet Comms metrics on one area page.",
         "medium if a stale reading is read as current",
@@ -816,7 +823,8 @@ PAGE_CONTRACTS: tuple[PageContract, ...] = (
         "/model-stats",
         "Model value, waste and speed: best-value frontier, per-class job ranking, status mix, weekly trends, "
         "reviewer strictness, wall-time distributions, pool allowance, observed wall hours per landed task "
-        "(wall_hours_observed), and write/review/author tables labelled with window and sample size.",
+        "(wall_hours_observed), write/review/author tables labelled with window and sample size, and token use and "
+        "waste with coverage and provider mapping.",
         "GET /api/fleet/model-stats?window=24h|7d|30d|90d|all&view=page, GET /api/state/routing-budget, "
         "and GET /api/fleet/model-stats/planning.",
         "HTTP read on load and on window change; the model-stats snapshot is at most 420 seconds old and its age is "

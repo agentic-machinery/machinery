@@ -67,6 +67,15 @@
   .coverage { display: flex; flex-wrap: wrap; gap: 4px 20px; margin: 8px 0 0; }
   .coverage div { display: flex; gap: 4px; }
   .coverage dd { margin: 0; font-weight: 600; }
+  .token-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 135px), 1fr)); gap: 8px; }
+  .token-summary div { background: var(--soft); border-radius: 6px; padding: 8px 10px; }
+  .token-summary dt { font-size: 13px; color: var(--muted); }
+  .token-summary dd { margin: 2px 0 0; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .token-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 18px; }
+  .token-grid tbody th { white-space: normal; }
+  @media (min-width: 760px) {
+    .token-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
   .alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
   .alert { border: 1px solid var(--bad); color: var(--bad); border-radius: 6px; padding: 4px 8px; font-size: 13px; }
   .jump-links { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0 0; font-size: 13px; }
@@ -128,6 +137,7 @@
       <a href="#trends-section">Week by week</a>
       <a href="#neon-section">Neon effort</a>
       <a href="#accuracy-section">Reviewer accuracy</a>
+      <a href="#token-use">Token use and waste</a>
       <a href="#pools-section">Pool pace</a>
       <span class="muted">· Related live pages:</span>
       <a href="/fleet">Dispatches</a>
@@ -140,6 +150,14 @@
       <p class="note">A first-round approval means the first reviewer approved the PR. P0–P2 are findings from the highest priority through P2. A dash means the records lack a value for that metric.</p>
       <p class="note">Per-task and per-PR links are omitted because the page feed carries no task ids or private repository identifiers.</p>
     </details></section>
+  <section class="wide" id="token-use" aria-label="Token use and waste">
+    <h2>Token use and waste <span class="meta" id="tokens-window"></span></h2>
+    <div id="tokens-body">Loading…</div>
+    <details><summary>How providers report tokens</summary>
+      <p class="note">Codex fresh input is input minus cache reads. Claude, Cursor and OpenCode add cache writes to fresh input. AGY reports fresh input directly. Cached input counts cache reads. Add the separate thinking or reasoning counter to output for AGY, Cursor and OpenCode. Codex and Claude output already include it.</p>
+      <p class="note">Rates divide recorded tokens for all work that settled in the window by PRs seen merging in the same window in local origin/main history. Cache hit is cached input divided by fresh plus cached input. Token volume does not measure price.</p>
+    </details>
+  </section>
   <section class="wide" id="jobs"><h2>Best model per job <span class="meta" id="jobs-meta"></span></h2>
     <p class="note">Compare landed share within each job class and check the interval and hours per merge. A star marks the highest positive share among models with at least 10 tasks in that class, including ties.</p>
     <div id="jobs-body">Loading…</div></section>
@@ -284,6 +302,47 @@ function updateTableScroll() {
 }
 function values(summary, head, rows, textColumns) {
   return `<details><summary>${summary}</summary>${table(head, rows, textColumns)}</details>`;
+}
+const TOKEN_WORK = {
+  implementation: "Implementation", review_of_record: "Review of record", supplemental_review: "Supplemental reviews",
+  landing_helpers: "Landing helpers", failed_or_empty: "Failed or empty runs", unclassified_review: "Unclassified reviews",
+  unclassified_work: "Other or unclassified work",
+};
+const tokenNumber = (value) => Number.isFinite(value) ? num(value) : "unknown";
+const tokenPercent = (value) => !Number.isFinite(value) ? "unknown"
+  : value > 0 && value < 0.0001 ? "&lt;0.01%" : `${num(value * 100, 2)}%`;
+
+function renderTokenUse(data, label) {
+  $("tokens-window").textContent = `All models · ${label}`;
+  const body = $("tokens-body");
+  if (!data) { body.textContent = "Token use is unknown."; return; }
+  const totals = data.totals;
+  const summary = [
+    ["Fresh input", totals?.fresh_input], ["Cached input", totals?.cached_input], ["Output", totals?.output],
+    ["Tokens per merged PR", data.per_merged_pr],
+  ].map(([name, value]) => `<div><dt>${name}</dt><dd>${tokenNumber(value)}</dd></div>`).join("");
+  const work = Object.entries(TOKEN_WORK).map(([kind, title]) => {
+    const group = data.by_work[kind];
+    return `<tr><th scope="row">${title}</th>${cell(tokenNumber(group?.tokens))}${cell(tokenNumber(group?.per_merged_pr))}</tr>`;
+  });
+  const waste = [
+    ["Failed or empty runs", data.waste.failed_or_empty],
+    ["Capped review lineages replaced", data.waste.capped_and_replaced],
+    ["Supplemental reviews", data.waste.supplemental_review],
+  ].map(([name, group]) => `<tr><th scope="row">${name}</th>${cell(tokenNumber(group?.tokens))}${cell(tokenPercent(group?.share))}</tr>`);
+  const tasks = data.top_tasks.map((task) => `<tr><th scope="row">${esc(task.model)}</th>`
+    + `<td>${esc(STATUS[task.status]?.[0] || "Unknown")}</td>${cell(tokenNumber(task.tokens))}</tr>`);
+  const cache = data.cache_by_model.map((model) => `<tr><th scope="row">${esc(model.model)}</th>`
+    + `${cell(tokenPercent(model.ratio))}${cell(`${tokenNumber(model.reported_tasks)} / ${tokenNumber(model.tasks)}`)}</tr>`);
+  body.innerHTML = `<dl class="token-summary">${summary}</dl>`
+    + `<p class="note">Recorded usage for ${tokenNumber(data.reported_tasks)} of ${tokenNumber(data.tasks)} settled runs. Observed merged PRs: ${tokenNumber(data.merged_prs)}.</p>`
+    + '<div class="token-grid"><div><h3>By work type</h3>' + table(["Work type", "Tokens", "Per merged PR"], work)
+    + '</div><div><h3>Waste</h3>' + table(["Runs", "Tokens", "Share"], waste)
+    + '<p class="note">Share is of recorded tokens. Failed runs include pre-start refusals. Supplemental reviews match an exact PR head with a published verdict. Avoidable spend and cap replacements are unknown.</p></div></div>'
+    + '<div class="token-grid"><div><h3>Top five runs by token volume</h3>'
+    + (tasks.length ? table(["Model", "Outcome", "Tokens"], tasks, [0, 1]) : '<p class="muted">Unknown</p>')
+    + '</div><div>' + (cache.length ? values("Cache hit ratio by model", ["Model", "Cache hit", "Runs with usage"], cache)
+      : '<p class="muted">Cache hit ratio by model is unknown.</p>') + '</div></div>';
 }
 const IDENTITY = {alias: "harness alias, version not observed", harness_choice: "Cursor Auto: the harness chose the model",
   unreported: "the harness reported no model", not_in_catalog: "spelling outside the model catalog",
@@ -1020,6 +1079,7 @@ function paintModelAge(records, label, reading) {
 function render() {
   if (!current) return;
   const data = current.data, charts = data.charts || {}, label = current.label;
+  renderTokenUse(data.token_use, label);
   $("recommend").innerHTML = recommend(charts.recommendation);
   $("waste").innerHTML = wasteList(charts.waste);
   $("waste-note").hidden = !$("waste").childElementCount;
