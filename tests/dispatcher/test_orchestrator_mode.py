@@ -216,7 +216,7 @@ def test_admission_scan_leaves_a_dead_record_the_writer_refuses_and_reports_only
     receipt reports a dead record as marked crashed when its heal was refused or declined and nothing was written."""
     monkeypatch.setattr(dispatch_admission, "host_failures", lambda *_a: [])
     child = subprocess.Popen(["true"])
-    child.wait()
+    child.wait(timeout=30)
 
     def dead_worker(task_id, **fields):
         record = _orchestrator_record(task_id, pid=child.pid, **fields)
