@@ -13,6 +13,7 @@ import pytest
 from lu_machinery.common import github_client
 from lu_machinery.dispatcher import git, ownership, worker
 from lu_machinery.orchestration import pr_ownership
+from tests.test_fleet_repos import transferred_catalog
 
 
 def _git(cwd, *args):
@@ -38,6 +39,50 @@ def test_merged_delivery_never_waives_dispatcher_integrity_refusals(monkeypatch,
     assert (record["status"], record["error"]) == ("failed", error)
     assert "delivery_pr" not in record
     assert "provider_terminal_error" not in record
+
+
+def test_landing_only_task_gets_credit_for_pr_accepted_before_transfer(tmp_path, monkeypatch):
+    """A historical acceptance must discover a merged PR when the worker pushed no commits."""
+    moved = transferred_catalog(monkeypatch, github="old-org/old-repo", alternate="new-org/new-repo")
+    active_repo, number = "new-org/new-repo", 42
+    start, pr_head, merge = "a" * 40, "b" * 40, "c" * 40
+    state = tmp_path / "ownership.json"
+    state.write_text(json.dumps({
+        "schema": 1, "episodes": {}, "handoffs": {},
+        "history": [{"event": "accepted", "pr": f"{moved.github}#{number}", "successor": "landing-task"}],
+    }))
+    monkeypatch.setattr(pr_ownership, "state_path", lambda: state)
+    record = dict(
+        task_id="landing-task", agent="codex", mode="workspace-write", status="done", owned_paths=[],
+        worktree_remote_url=f"https://github.com/{active_repo}.git", worktree_base_ref="origin/main",
+        worktree_branch="codex/landing-task", worktree_base_sha=start, head_sha=start,
+        started_at="2026-11-25T14:00:00+00:00", commits_ahead=0, worktree_dirty_on_exit=False,
+        push_state="unpushed",
+    )
+
+    def gh(*args):
+        if args[0] == "api" and args[-1].startswith(f"repos/{active_repo}/pulls?"):
+            return "[[]]"
+        assert args[:5] == ("pr", "view", str(number), "--repo", active_repo)
+        return json.dumps({
+            "state": "MERGED", "baseRefName": "main", "mergedAt": "2026-11-25T15:00:00Z",
+            "headRefOid": pr_head, "headRefName": "pre-existing-branch", "mergeCommit": {"oid": merge},
+            "isCrossRepository": False,
+        })
+
+    @contextmanager
+    def ownership_git(_record, *, head):
+        assert head == pr_head
+        yield Mock(return_value=start)
+
+    monkeypatch.setattr(git, "_gh", gh)
+    monkeypatch.setattr(git, "ownership_git", ownership_git)
+    monkeypatch.setattr(ownership, "delivered_paths", Mock(return_value=[]))
+    worker._enforce_delivery(record)
+
+    assert record["status"] == "done"
+    assert (record["delivery_pr"], record["delivery_merge_sha"]) == (f"{active_repo}#{number}", merge)
+    assert "merged_delivery_lookup" not in record
 
 
 @pytest.mark.parametrize(("task", "number", "head", "merge", "status", "verification_error"), [

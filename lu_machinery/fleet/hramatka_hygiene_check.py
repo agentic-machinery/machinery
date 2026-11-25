@@ -45,7 +45,7 @@ from lu_machinery.common import github_client, json_depth
 from lu_machinery.common.repo_root import main_checkout_root, product_root
 from lu_machinery.common.task_store_paths import tasks_dir as default_tasks_dir
 from lu_machinery.fleet import pr_identity
-from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos, resolve_active_fleet_repo
 from lu_machinery.orchestration.task_record_store import read_task_record
 
 POLICY_VERSION = "hramatka-hygiene-v1"
@@ -404,10 +404,18 @@ def hygiene_check(
     if reader is _gh_issue:
         reader = functools.partial(_gh_issue, cwd=repo_root)
 
+    # An explicit --private-repo is the one spelling the pointer may use.
+    pointer_repos: tuple[str, ...] = () if private_repo is None else (private_repo,)
     if private_repo is None:
         try:
-            private_repo = load_fleet_repos()["infra-private"].github
-        except (FleetRepoError, KeyError):
+            # The board is read at the row's active slug; an unknown row or a transferred row without a
+            # trusted selector is unknown, never the slug it may have left. The epic's pointer is a stored
+            # document: it may name the active slug or the row's github slug, the transfer source GitHub
+            # redirects once moved, but never an alternate the selector has not made live.
+            active = resolve_active_fleet_repo("infra-private", repos=load_fleet_repos())
+            private_repo = active.active_github
+            pointer_repos = tuple(dict.fromkeys((active.active_github, active.repo.github)))
+        except FleetRepoError:
             return _receipt(
                 status=Status.UNKNOWN,
                 epic_charter_ok=None,
@@ -415,7 +423,7 @@ def hygiene_check(
                 zombie_worktrees=[],
                 zombie_worktrees_detectable=False,
                 df=None,
-                reasons=["private board repository is unavailable in the fleet registry"],
+                reasons=["private board repository is unavailable in the fleet registry or its host selector"],
                 high_water_percent=high_water_percent,
             )
 
@@ -439,7 +447,7 @@ def hygiene_check(
     if not epic_charter_ok:
         reasons.append(f"public epic #{public_epic} still has {unchecked} live (unchecked) checkbox item(s)")
 
-    queue_pointer_ok = bool(_pointer_pattern(private_repo, private_board).search(body))
+    queue_pointer_ok = any(_pointer_pattern(repo, private_board).search(body) for repo in pointer_repos)
     if not queue_pointer_ok:
         reasons.append(f"public epic #{public_epic} is missing the {private_repo}#{private_board} pointer")
 

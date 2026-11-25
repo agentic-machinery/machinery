@@ -6,8 +6,9 @@ import json
 
 import pytest
 
+from lu_machinery.common import git_credentials
 from lu_machinery.fleet import hramatka_scope_gate as gate
-from lu_machinery.orchestration.fleet_repos import FleetRepo
+from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError
 
 PUBLIC = gate.PUBLIC_REPOSITORY
 PRIVATE = "new-owner/private-infra"
@@ -58,6 +59,47 @@ def test_constants_pin_the_approved_hramatka_scope() -> None:
     assert config.public_epic == 4542
     assert config.private_board == _issue(PRIVATE, 349)
     assert config.operator_only_issues == {_issue(PRIVATE, 360), _issue(PRIVATE, 212)}
+
+
+def test_default_scope_gate_uses_the_active_private_slug(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect class: reader acts on the baked slug after the selector flips to the alternate."""
+    moved = "moved-owner/private-infra"
+    repos = {"infra-private": FleetRepo("infra-private", PRIVATE, "private-infra", "private-infra",
+                                        repository_id=1, visibility="private", alternate_github=moved)}
+    monkeypatch.setattr(gate, "load_fleet_repos", lambda: repos)
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
+        {"infra-private": moved}, "d" * 64))
+
+    config = gate._default_scope_gate()
+
+    assert config.private_repository == moved
+    assert config.private_board == _issue(moved, 349)
+    assert config.operator_only_issues == {_issue(moved, 360), _issue(moved, 212)}
+    # Without a trusted selector the transferred row fails closed, never falling back to the baked slug.
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: (_ for _ in ()).throw(
+        git_credentials.SelectorError("fleet repository selector unavailable")))
+    with pytest.raises(FleetRepoError):
+        gate._default_scope_gate()
+
+
+def test_deeply_nested_selector_is_a_typed_refusal(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defect class: a parser-depth error on the host selector escapes the resolver untyped (RecursionError)."""
+    repos = {"infra-private": FleetRepo("infra-private", PRIVATE, "private-infra", "private-infra",
+                                        repository_id=1, visibility="private", alternate_github="moved-owner/x")}
+    monkeypatch.setattr(gate, "load_fleet_repos", lambda: repos)
+    monkeypatch.setattr(git_credentials, "_is_readonly_mount", lambda _fd: True)
+    selector_dir = tmp_path / "host-selector"
+    selector_dir.mkdir()
+    selector = selector_dir / "selector.yaml"
+    selector.write_text("version: 1\nactive_slugs: " + "[" * 1500 + "]" * 1500 + "\n", encoding="utf-8")
+    selector.chmod(0o400)
+    selector_dir.chmod(0o500)
+    monkeypatch.setenv(git_credentials.SELECTOR_ENV, str(selector))
+    try:
+        with pytest.raises(FleetRepoError, match="selector is malformed"):
+            gate._default_scope_gate()
+    finally:
+        selector_dir.chmod(0o700)
 
 
 def test_configured_public_epic_allows_without_api_lookup() -> None:

@@ -63,6 +63,7 @@ from lu_machinery.orchestration.fleet_repos import (
     ascii_repo_slug,
     canonical_repository,
     parse_ascii_positive_int,
+    same_repository,
 )
 
 # This package's import name, from the unresolved file location: never from __package__, which a
@@ -228,7 +229,7 @@ def _validate_verdict_receipt(receipt: object, *, pr: int, head: str, repo: str 
     if repo is not None and "repository" in receipt:
         rec_repo = ascii_repo_slug(receipt.get("repository"), strip=False)
         target_repo = ascii_repo_slug(repo, strip=False)
-        if rec_repo is None or target_repo is None or rec_repo != target_repo:
+        if target_repo is None or not same_repository(rec_repo, target_repo):
             raise OwnershipError("verdict_receipt repository does not match target repository")
     if type(receipt.get("pr")) is not int or receipt["pr"] != pr:
         raise OwnershipError("verdict_receipt pr does not match target PR")
@@ -1153,8 +1154,8 @@ def _branch_pr_numbers(repo: str, branch: str) -> Iterator[int]:
         base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
         if (
             type(number) is not int or number <= 0 or not isinstance(head, dict) or head.get("ref") != branch
-            or not _valid_repo_slug(head_name) or not _valid_repo_slug(base_name)
-            or base_name.casefold() != repo_slug or number in seen
+            or not _valid_repo_slug(head_name)
+            or not same_repository(ascii_repo_slug(base_name, strip=False), repo_slug) or number in seen
         ):
             raise OwnershipError(f"branch PR listing for {repo} has malformed, mismatched or repeated rows")
         seen.add(number)
