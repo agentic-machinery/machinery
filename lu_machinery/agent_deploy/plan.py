@@ -63,6 +63,34 @@ DISCOVERY = {
 # Gemini CLI target (.gemini) is no longer deployed; Gemini runs through AGY.
 SHARED_DISCOVERY = frozenset({"codex", "agy", "cursor"})
 
+# Workspace .claude/settings.json policy allowlists (FU-WS-SETTINGS-GUARD).
+# A non-Git CTO workspace runs with session-writable files (safe_open requires geteuid),
+# so workspace settings admit only the release's required hooks, benign runtime keys, and
+# numeric/boolean Claude runtime env knobs — never command-executing helpers (apiKeyHelper,
+# statusLine, awsAuthRefresh, awsCredentialExport, otelHeadersHelper, fileSuggestion),
+# permission/MCP overrides, extra hooks, or guard/route/interpreter env overrides.
+WORKSPACE_CLAUDE_SETTINGS_KEYS = frozenset({
+    "hooks",
+    "env",
+    "disableAllHooks",
+    "allowManagedHooksOnly",
+    "language",
+    "model",
+    "advisorModel",
+    "effortLevel",
+    "respectGitignore",
+    "acceptEdits",
+    "yolo",
+    "plansDirectory",
+    "worktree",
+})
+WORKSPACE_CLAUDE_SETTINGS_ENV_KEYS = frozenset({
+    "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "PYTHONDONTWRITEBYTECODE",
+})
+
 
 class Invalid(ValueError):
     """Invalid or unsafe input, exit 2."""
@@ -505,6 +533,61 @@ def release_inputs() -> tuple[dict[str, Output], dict[str, Any], str]:
     return result, inventory, identity
 
 
+def _validate_workspace_claude_settings(settings: dict[str, Any], requirements: list[dict[str, Any]]) -> None:
+    """Enforce the strict release-bound policy on a non-Git workspace's ``.claude/settings.json``."""
+    unknown = sorted(set(settings) - WORKSPACE_CLAUDE_SETTINGS_KEYS)
+    if unknown:
+        raise Invalid("unapproved workspace settings key: " + ", ".join(unknown))
+    if "env" in settings:
+        env_block = settings["env"]
+        if not isinstance(env_block, dict):
+            raise Invalid("invalid workspace settings env: .claude/settings.json")
+        for key, value in env_block.items():
+            if key not in WORKSPACE_CLAUDE_SETTINGS_ENV_KEYS:
+                raise Invalid("unapproved workspace settings env: " + str(key))
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+                raise Invalid("invalid workspace settings env value: " + key)
+    hooks_section = settings.get("hooks")
+    if not isinstance(hooks_section, dict):
+        raise Invalid("invalid workspace hook settings: .claude/settings.json")
+    allowed_by_event: dict[str, list[dict[str, Any]]] = {}
+    for requirement in requirements:
+        path = requirement.get("path")
+        if not isinstance(path, list) or len(path) != 2 or path[0] != "hooks" or not isinstance(path[1], str):
+            raise Invalid("invalid release required_hooks path")
+        allowed_by_event.setdefault(path[1], []).append(requirement)
+    for event, groups in hooks_section.items():
+        if event not in allowed_by_event:
+            raise Invalid("unapproved workspace hook event: " + str(event))
+        if not isinstance(groups, list):
+            raise Invalid("invalid workspace hook settings: " + event)
+        for group in groups:
+            if not isinstance(group, dict):
+                raise Invalid("invalid workspace hook group: " + event)
+            if group.get("enabled", True) is not True or group.get("disabled", False) is not False:
+                raise Invalid("disabled workspace hook group: " + event)
+            group_hooks = group.get("hooks")
+            if not isinstance(group_hooks, list):
+                raise Invalid("invalid workspace hook list: " + event)
+            group_meta = {k: v for k, v in group.items() if k != "hooks"}
+            matching = [req for req in allowed_by_event[event] if req["group"] == group_meta]
+            if not matching:
+                raise Invalid("unapproved workspace hook group: " + event)
+            allowed_hooks = [
+                {k: v for k, v in hook.items() if k != "statusMessage"}
+                for req in matching
+                for hook in req["hooks"]
+            ]
+            for candidate in group_hooks:
+                if not isinstance(candidate, dict):
+                    raise Invalid("invalid workspace hook entry: " + event)
+                if "statusMessage" in candidate and not isinstance(candidate["statusMessage"], str):
+                    raise Invalid("invalid workspace hook statusMessage: " + event)
+                normalized = {k: v for k, v in candidate.items() if k != "statusMessage"}
+                if normalized not in allowed_hooks:
+                    raise Invalid("unapproved workspace hook command: " + event)
+
+
 def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: bool = False) -> Plan:
     """The plan for ``tree``, composed from ``inputs`` (the descriptor and product sources); default: ``tree``."""
     inputs = tree if inputs is None else inputs
@@ -588,6 +671,8 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             if path in destination or (path in shared and
                     (shared[path].owner == "fleet" or not replaces(group, path))):
                 raise Invalid("duplicate fleet/product logical path: " + path)
+            if workspace and path.startswith("hooks/"):
+                raise Invalid("workspace source cannot supply hooks: " + path)
             if path.startswith("hooks/") and not mode & 0o111:
                 raise Invalid("product hook is not executable: " + path)
             destination[path] = Output(blob, 0o755 if mode & 0o111 else 0o644, "product", source + "/" + path)
@@ -674,8 +759,17 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             control_blob = planned.blob if planned is not None else existing[0] if existing is not None else None
             if control_blob is not None:
                 settings = decode(control_blob)
-                if not isinstance(settings, dict) or settings.get("disableAllHooks", False) is not False:
+                if (
+                    not isinstance(settings, dict)
+                    or settings.get("disableAllHooks", False) is not False
+                    or settings.get("allowManagedHooksOnly", False) is not False
+                ):
                     raise Invalid("mandatory Claude hooks disabled: " + config)
+                if workspace and config == ".claude/settings.json":
+                    _validate_workspace_claude_settings(
+                        settings,
+                        inventory["required_hooks"].get("claude", {}).get(config, []),
+                    )
     if "codex" in providers:
         planned = outputs.get(".codex/config.toml")
         existing = tree.read(".codex/config.toml") if planned is None else None
@@ -723,7 +817,7 @@ def matches(actual: tuple[bytes, int] | None, record: dict[str, Any]) -> bool:
     return actual is not None and digest(actual[0]) == record["sha256"] and actual[1] == record["mode"]
 
 
-def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[str]:
+def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool, *, workspace: bool = False) -> list[str]:
     problems: list[str] = []
     actual: tuple[bytes, int] | None
     staged = tree.read(STAGING)
@@ -758,6 +852,11 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
         actual = tree.read(path)
         if check and actual != (out.blob, out.mode):
             problems.append("output drift: " + path)
+        elif workspace and not check and path in old["files"]:
+            if actual is None:
+                problems.append("missing workspace output: " + path)
+            elif actual != (out.blob, out.mode) and not matches(actual, old["files"][path]):
+                problems.append("modified workspace output: " + path)
     for path, record in old["files"].items():
         if path in plan.files:
             continue
@@ -786,7 +885,7 @@ def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_comm
            workspace: bool = False) -> int:
     plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None, workspace=workspace)
     old = old_state(tree)
-    problems = preflight(tree, plan, old, check)
+    problems = preflight(tree, plan, old, check, workspace=workspace)
     if problems:
         raise Drift("; ".join(problems))
     if check:
@@ -798,12 +897,12 @@ def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_comm
             print(f"verified {len(plan.files)} outputs")
         return 0
     try:
-        return apply(tree, plan, old)
+        return apply(tree, plan, old, workspace=workspace)
     except OSError as exc:
         raise Drift(f"application failed before success publication: {exc}") from exc
 
 
-def apply(tree: Tree, plan: Plan, old: dict[str, Any]) -> int:
+def apply(tree: Tree, plan: Plan, old: dict[str, Any], *, workspace: bool = False) -> int:
     """Apply a fully admitted plan, then publish its verified ownership record."""
     changed = 0
     if tree.read(STAGING) is not None:
@@ -832,7 +931,7 @@ def apply(tree: Tree, plan: Plan, old: dict[str, Any]) -> int:
     for path, out in plan.files.items():
         if tree.read(path) != (out.blob, out.mode):
             raise Drift("post-write verification failed: " + path)
-    remaining = preflight(tree, plan, old, False)
+    remaining = preflight(tree, plan, old, False, workspace=workspace)
     if remaining:
         raise Drift("; ".join(remaining))
     if tree.read(STATE) != (plan.manifest(), 0o644):

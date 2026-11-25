@@ -210,6 +210,161 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
     assert refused.value.code == 2
 
 
+def test_workspace_settings_tamper_refused(consumer, release, tmp_path, monkeypatch, capsys):
+    """Defect class (FU-WS-SETTINGS-GUARD): a session in a non-Git CTO workspace editing its own
+    deployed settings/hooks or workspace agents_extensions policy inputs. Both the runtime write
+    guard and workspace deploy/launch verification must refuse tampering while preserving clean
+    release upgrades, approved settings updates and out-of-workspace writes."""
+    workspace = tmp_path / "cto-workspace"
+    shutil.copytree(consumer / "agents_extensions", workspace / "agents_extensions")
+
+    def run(*options):
+        monkeypatch.setattr(sys, "argv", ["agent_deploy", *options])
+        return main()
+
+    assert run("--workspace", "--project-root", str(workspace)) == 0
+    assert run("--workspace", "--project-root", str(workspace), "--check") == 0
+    capsys.readouterr()
+
+    # 1. Direct tamper of deployed settings or hooks is refused at deploy/launch (never silently overwritten).
+    deployed_settings = workspace / ".claude/settings.json"
+    original_settings_bytes = deployed_settings.read_bytes()
+    deployed_settings.write_text('{"disableAllHooks": true}\n')
+    before = snapshot(workspace)
+    assert run("--workspace", "--project-root", str(workspace)) == 1
+    assert "modified workspace output: .claude/settings.json" in capsys.readouterr().err
+    assert snapshot(workspace) == before
+    deployed_settings.unlink()
+    assert run("--workspace", "--project-root", str(workspace)) == 1
+    assert "missing workspace output: .claude/settings.json" in capsys.readouterr().err
+    deployed_settings.write_bytes(original_settings_bytes)
+    deployed_settings.chmod(0o644)
+
+    deployed_hook = workspace / ".claude/hooks/fleet.sh"
+    deployed_hook.chmod(0o644)
+    assert run("--workspace", "--project-root", str(workspace)) == 1
+    assert "modified workspace output: .claude/hooks/fleet.sh" in capsys.readouterr().err
+    deployed_hook.chmod(0o755)
+    assert run("--workspace", "--project-root", str(workspace)) == 0
+    capsys.readouterr()
+
+    # 2. Tampering workspace policy inputs (settings.json or workspace-supplied hooks) is refused.
+    source_settings = workspace / "agents_extensions/shared/settings.json"
+    clean_settings = json.loads(source_settings.read_text())
+    tampered_cases = [
+        ({**clean_settings, "allowManagedHooksOnly": True}, "mandatory Claude hooks disabled"),
+        ({**clean_settings, "apiKeyHelper": "/tmp/helper.sh"}, "unapproved workspace settings key: apiKeyHelper"),
+        ({**clean_settings, "statusLine": {"type": "command", "command": "id"}}, "unapproved workspace settings key: statusLine"),
+        ({**clean_settings, "permissions": {"allow": ["Bash"]}}, "unapproved workspace settings key: permissions"),
+        ({**clean_settings, "env": {"LEARN_UK_ALLOW_PRIMARY_GIT_WRITE": "1"}}, "unapproved workspace settings env: LEARN_UK_ALLOW_PRIMARY_GIT_WRITE"),
+        ({**clean_settings, "env": {"CLAUDE_NON_INTERACTIVE": "1"}}, "unapproved workspace settings env: CLAUDE_NON_INTERACTIVE"),
+        ({**clean_settings, "env": {"CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "not-a-number"}}, "invalid workspace settings env value"),
+        ({
+            "hooks": {
+                **clean_settings["hooks"],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "true", "timeout": 5}]}],
+            }
+        }, "unapproved workspace hook event: PreToolUse"),
+        ({
+            "hooks": {
+                "SessionStart": [
+                    *clean_settings["hooks"]["SessionStart"],
+                    {"matcher": "startup", "hooks": [{"type": "command", "command": "echo evil", "timeout": 5}]},
+                ]
+            }
+        }, "unapproved workspace hook command: SessionStart"),
+    ]
+    for mutated, expected_err in tampered_cases:
+        source_settings.write_text(json.dumps(mutated))
+        before = snapshot(workspace)
+        assert run("--workspace", "--project-root", str(workspace)) == 2
+        assert expected_err in capsys.readouterr().err, mutated
+        assert snapshot(workspace) == before
+    source_settings.write_text(json.dumps(clean_settings))
+
+    extra_hook = write(workspace, "agents_extensions/shared/hooks/extra.sh", "#!/bin/sh\nexit 0\n", 0o755)
+    before = snapshot(workspace)
+    assert run("--workspace", "--project-root", str(workspace)) == 2
+    assert "workspace source cannot supply hooks: hooks/extra.sh" in capsys.readouterr().err
+    assert snapshot(workspace) == before
+    extra_hook.unlink()
+    extra_hook.parent.rmdir()
+
+    # Legitimate approved env update and release upgrade still apply cleanly when deployed outputs are untampered.
+    upgraded_settings = {**clean_settings, "env": {"CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "32000", "PYTHONDONTWRITEBYTECODE": "1"}}
+    source_settings.write_text(json.dumps(upgraded_settings))
+    (release / "hooks/fleet.sh").write_bytes(HOOK + b"# upgraded\n")
+    assert run("--workspace", "--project-root", str(workspace)) == 0
+    assert run("--workspace", "--project-root", str(workspace), "--check") == 0
+    capsys.readouterr()
+
+    # 3. Runtime write guard refuses mid-session writes to the non-Git workspace while allowing out-of-workspace writes.
+    repo_root = Path(__file__).resolve().parents[2]
+    guard_script = repo_root / "agents_extensions/shared/hooks/guard-primary-checkout-write.py"
+    primary = tmp_path / "primary-anchor"
+    primary.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True, env=git_environment())
+    dispatch = primary / ".worktrees/dispatch/claude/task-1"
+    dispatch.mkdir(parents=True)
+    outside_link = tmp_path / "link-into-ws"
+    outside_link.symlink_to(workspace / ".claude/settings.json")
+    inside_link = workspace / "link-out"
+    inside_link.symlink_to(tmp_path / "scratch-outside.txt")
+    guard_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(tmp_path),
+        "CLAUDE_PROJECT_DIR": str(workspace),
+        "LU_PRODUCT_ROOT": str(workspace),
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary),
+        "PYTHONPATH": str(repo_root),
+    }
+
+    def run_guard(payload: dict) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(guard_script)],
+            input=json.dumps(payload),
+            env=guard_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    for target in (
+        workspace / ".claude/settings.json",
+        workspace / ".claude/settings.local.json",
+        workspace / ".claude/hooks/fleet.sh",
+        workspace / "agents_extensions/shared/settings.json",
+        workspace / "agents_extensions/deployment.v1.json",
+        workspace / ".deploy-state/agent-deploy.v1.json",
+        outside_link,
+        inside_link,
+    ):
+        res = run_guard({"tool_name": "Write", "cwd": str(workspace), "tool_input": {"file_path": str(target)}})
+        assert res.returncode == 2 and "protected_cto_workspace" in res.stderr, (target, res.returncode, res.stderr)
+
+    for command in (
+        "echo '{}' > .claude/settings.json",
+        "sed -i 's/fleet/evil/' .claude/hooks/fleet.sh",
+        "rm -f agents_extensions/deployment.v1.json",
+        "rm -f .claude/sett*.json",
+        "git init",
+        f"rm -f {inside_link}",
+    ):
+        res = run_guard({"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": command}})
+        assert res.returncode == 2, (command, res.returncode, res.stderr)
+
+    # Legitimate writes to external scratch or a dispatch worktree remain allowed.
+    for payload in (
+        {"tool_name": "Write", "cwd": str(workspace), "tool_input": {"file_path": str(tmp_path / "scratch-outside.txt")}},
+        {"tool_name": "Write", "cwd": str(dispatch), "tool_input": {"file_path": str(dispatch / "ok.py")}},
+        {"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": f"echo ok > {tmp_path}/scratch-outside.txt"}},
+        {"tool_name": "Bash", "cwd": str(workspace), "tool_input": {"command": "cat .claude/settings.json"}},
+    ):
+        res = run_guard(payload)
+        assert res.returncode == 0, (payload, res.returncode, res.stderr)
+
+
 def test_non_curriculum_consumer_lints_its_own_sources(consumer, monkeypatch):
     """A consumer with no curriculum marker must lint and deploy its own skills."""
     path = consumer / "agents_extensions/shared/skills/product/SKILL.md"

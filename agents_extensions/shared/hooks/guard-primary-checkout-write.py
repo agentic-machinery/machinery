@@ -262,6 +262,93 @@ def _protected_repo_roots(wc) -> tuple[Path, ...]:
     return tuple(dict.fromkeys((primary, product_primary)))
 
 
+def _has_git_marker(directory: Path) -> bool:
+    """Return True if ``directory/.git`` exists; only ``FileNotFoundError`` proves absence."""
+    try:
+        os.lstat(directory / ".git")
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _protected_workspace_roots() -> tuple[Path, ...]:
+    """Non-Git project/product directories (the CTO workspace) outside every Git checkout.
+
+    A non-Git CTO workspace holds deployed settings, hooks, rules, ``.deploy-state/`` and
+    ``agents_extensions/`` policy inputs, while ``worktree_containment`` classifies paths
+    there as ``outside_repo``. All legitimate CTO writes go outside the workspace (dispatch
+    worktrees, ``LU_STATE_ROOT``, ``CLAUDE_CONFIG_DIR``, temp scratch). Fails closed if
+    ``CLAUDE_PROJECT_DIR`` is set to a relative, missing, non-directory, root or unreadable path.
+    """
+    from lu_machinery.common.repo_root import resolve_path
+
+    roots: list[Path] = []
+    candidates: list[tuple[str, bool]] = []
+    project_dir = os.environ.get("CLAUDE_PROJECT_DIR", "")
+    if project_dir:
+        candidates.append((project_dir, True))
+    try:
+        product = _protected_repo_anchor()
+    except Exception:
+        product = None
+    if product is not None:
+        candidates.append((os.fspath(product), False))
+    for raw, strict_input in candidates:
+        path = Path(raw)
+        if not path.is_absolute():
+            if strict_input:
+                raise ValueError("CLAUDE_PROJECT_DIR must be an absolute path")
+            continue
+        resolved = resolve_path(path, strict=True)
+        if not resolved.is_dir():
+            if strict_input:
+                raise ValueError("CLAUDE_PROJECT_DIR must name an existing directory")
+            continue
+        if any(_has_git_marker(ancestor) for ancestor in (resolved, *resolved.parents)):
+            continue
+        if resolved == Path("/"):
+            raise ValueError("a non-Git workspace cannot be the filesystem root")
+        roots.append(resolved)
+    return tuple(dict.fromkeys(roots))
+
+
+def _is_within_root(path: Path, root: Path) -> bool:
+    return path == root or path.is_relative_to(root)
+
+
+def _evaluate_workspace_write(target: Path, wc, workspace_root: Path) -> object | None:
+    """Refuse writes whose resolved target or parent entry sits inside a non-Git workspace."""
+    message = (
+        f"The non-Git CTO workspace ({workspace_root}) holds deployed settings, hooks and "
+        "policy inputs and is read-only to the session. Do write work in a dispatch worktree "
+        "or scratch outside the workspace."
+    )
+    canonical = wc.canonicalize(target)
+    if _is_within_root(canonical, workspace_root):
+        return _UndecidableWrite("protected_cto_workspace", message)
+    lexical = Path(os.path.normpath(os.fspath(target)))
+    if lexical != Path("/") and lexical.name not in {"", ".", ".."}:
+        parent_canonical = wc.canonicalize(lexical.parent)
+        if _is_within_root(parent_canonical, workspace_root):
+            return _UndecidableWrite("protected_cto_workspace", message)
+    return None
+
+
+def _glob_may_reach_workspace(word: str, base: str, wc, workspace_root: Path) -> bool:
+    parts = Path(word).parts
+    first = next(i for i, part in enumerate(parts) if re.search(r"[*?\[\]{}]", part))
+    prefix_raw = Path(*parts[:first]) if first else Path(".")
+    prefix = wc.canonicalize(_resolve(str(prefix_raw), getattr(word, "base", None) or base, expand_user=False))
+    directory_glob = first < len(parts) - 1 or "**" in word
+    if _is_within_root(prefix, workspace_root):
+        return True
+    if prefix in workspace_root.parents:
+        return directory_glob or _final_component_matches(
+            parts[-1], workspace_root.relative_to(prefix).parts[0]
+        )
+    return False
+
+
 def _evaluate_write(target: Path, wc, main_root: Path) -> object:
     """A target-selected checkout may add a denial, never replace the pinned one."""
     decision = wc.evaluate_write(target, cwd=main_root)
@@ -2466,6 +2553,39 @@ def _writer_targets(
                     word.decision_reason = "unresolved_shell_variable"
                 word.base = str(git_base) if git_base is not None else None
                 targets.append(word)
+        elif rest and rest[0] == "init":
+            git_base = _resolve(c_path, cwd, expand_user=False) if c_path and cwd else cwd
+            init_targets: list[str] = []
+            i = 1
+            while i < len(rest):
+                tok = rest[i]
+                if tok == "--":
+                    init_targets.extend(rest[i + 1 :])
+                    break
+                if _long_option(tok, "--separate-git-dir") and "=" in tok:
+                    init_targets.append(tok.split("=", 1)[1])
+                    i += 1
+                    continue
+                if _long_option(tok, "--separate-git-dir") and i + 1 < len(rest):
+                    init_targets.append(rest[i + 1])
+                    i += 2
+                    continue
+                if tok in {"-b", "--initial-branch", "--template", "--object-format", "--ref-format"} and i + 1 < len(rest):
+                    i += 2
+                    continue
+                if tok.startswith("-"):
+                    i += 1
+                    continue
+                init_targets.append(tok)
+                i += 1
+            if not init_targets:
+                init_targets = ["."]
+            for target in init_targets:
+                word = target if isinstance(target, ShellWord) else ShellWord(str(target))
+                if c_path and getattr(c_path, "unresolved_at", None) is not None and not Path(word).is_absolute():
+                    word.decision_reason = "unresolved_shell_variable"
+                word.base = str(git_base) if git_base is not None else None
+                targets.append(word)
     elif cmd in {"trap", "coproc"}:
         script = _trap_coproc_script(segment)
         if script is not None:
@@ -3676,6 +3796,11 @@ def _main(payload: dict | None) -> int:
     except Exception:
         return _block_uncertain("product_root_unavailable")
 
+    try:
+        protected_workspaces = _protected_workspace_roots()
+    except Exception:
+        return _block_uncertain("workspace_root_unavailable")
+
     if is_shell_tool(tool_name) and any(
         words[i : i + 2] == ["-m", _SIBLING_GIT_MODULE] for i in range(len(words) - 1)
     ):
@@ -3683,7 +3808,7 @@ def _main(payload: dict | None) -> int:
 
     if is_shell_tool(tool_name):
         try:
-            parse_roots = list(protected_roots)
+            parse_roots = list(dict.fromkeys((*protected_roots, *protected_workspaces)))
             try:
                 cwd_root = wc.resolve_main_root(cwd)
             except wc.NotAGitRepositoryError:
@@ -3786,11 +3911,41 @@ def _main(payload: dict | None) -> int:
                 target = _resolve(raw, cwd)
                 decision = _evaluate_write(target, wc, decision_root)
             decisions.append((raw, decision))
+        for raw, workspace_root in ((raw, root) for raw in raw_targets for root in protected_workspaces):
+            if is_shell_tool(tool_name):
+                if getattr(raw, "unresolved_at", None) is not None or getattr(raw, "decision_reason", None) is not None:
+                    continue
+                if re.search(r"[*?\[\]{}]", raw):
+                    if _glob_may_reach_workspace(raw, cwd, wc, workspace_root):
+                        decisions.append((
+                            raw,
+                            _UndecidableWrite(
+                                "undecidable_glob_write_target",
+                                f"A glob or brace target may resolve inside the protected non-Git workspace ({workspace_root}). Use a literal path outside the workspace.",
+                            ),
+                        ))
+                    continue
+                ws_target = _resolve(raw, getattr(raw, "base", None) or cwd, expand_user=False)
+            else:
+                ws_target = _resolve(raw, cwd)
+            ws_decision = _evaluate_workspace_write(ws_target, wc, workspace_root)
+            if ws_decision is not None:
+                decisions.append((raw, ws_decision))
     except Exception:
         return _block_uncertain("undecidable_write_target")
 
     for raw, decision in decisions:
         if not decision.allowed:
+            if decision.reason == "protected_cto_workspace":
+                sys.stderr.write(
+                    f"BLOCKED by guard-primary-checkout-write: {tool_name} would write "
+                    f"'{_label(raw)}' inside a protected non-Git workspace "
+                    f"[{decision.reason}].\n\n"
+                    f"{decision.message}\n"
+                    "Hook source: agents_extensions/shared/hooks/"
+                    "guard-primary-checkout-write.py\n"
+                )
+                return 2
             sys.stderr.write(
                 f"BLOCKED by guard-primary-checkout-write: {tool_name} would write "
                 f"'{_label(raw)}' inside a protected primary checkout "
