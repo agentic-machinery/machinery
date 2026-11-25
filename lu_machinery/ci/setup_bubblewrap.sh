@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install bubblewrap and grant user namespaces on disposable CI VMs only.
 # Optional package names share the APT transaction with the pinned bubblewrap build.
-# Installed packages are reused. Missing packages come from one signed Ubuntu snapshot.
+# Installed packages are reused. Other missing packages come from one signed Ubuntu snapshot.
 set -euo pipefail
 
 : "${RUNNER_TEMP:?RUNNER_TEMP must be set}"
@@ -71,13 +71,40 @@ apt_install() {
     >"$install_log" 2>&1 || rc=$?
   cat "$install_log" || return "$?"
   if [ "$rc" -ne 0 ]; then
-    echo "apt-get install from Ubuntu snapshot ${snapshot} failed (exit ${rc})" >&2
+    echo "apt-get install for native CI packages failed (exit ${rc})" >&2
   fi
   return "$rc"
 }
 
 apt_reports_interrupted_dpkg() {
   grep -Fq 'E: dpkg was interrupted' "$install_log"
+}
+
+read_pin() {
+  awk -F= -v key="$1" '
+    $1 == key { count++; value = substr($0, index($0, "=") + 1) }
+    END { if (count != 1) exit 1; print value }
+  ' "$pins"
+}
+
+download_bubblewrap() {
+  local snapshot_url="$1" destination="$2" digest="$3" base
+  local deb="${destination##*/}"
+  for base in "$snapshot_url" https://security.ubuntu.com/ubuntu; do
+    # curl backs off on transient errors. Cap each source, including Retry-After.
+    if timeout --kill-after=1 14 \
+      curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 5 --retry 2 \
+      -o "$destination" "${base}/pool/main/b/bubblewrap/${deb}"; then
+      if ! printf '%s  %s\n' "$digest" "$destination" | sha256sum --check --status; then
+        echo "::error::SHA-256 verification failed for ${deb} from ${base}" >&2
+        return 1
+      fi
+      return 0
+    fi
+    echo "::warning::Could not fetch ${deb} from ${base} within the download limit" >&2
+  done
+  echo "::error::Could not fetch ${deb} from either official Ubuntu source" >&2
+  return 1
 }
 
 missing=()
@@ -93,8 +120,7 @@ for pkg in "$@" apparmor; do
 done
 
 # The write boundary uses --overlay-src (bubblewrap 0.10 and later), which the
-# Ubuntu 24.04 package lacks. Use the checksum-pinned build from the same
-# snapshot and let APT resolve its dependencies.
+# Ubuntu 24.04 package lacks. Fetch the checksum-pinned build directly.
 has_overlay_src() {
   local help
   help="$(bwrap --help 2>&1 || true)"
@@ -113,10 +139,7 @@ if [ "${#missing[@]}" -gt 0 ] || ! "$bwrap_ready"; then
       pins="${code_root%/*/*/*}/share/lu-machinery/ci/pins.txt"
       ;;
   esac
-  if ! snapshot="$(awk -F= '
-    $1 == "CI_UBUNTU_SNAPSHOT" { count++; value = substr($0, index($0, "=") + 1) }
-    END { if (count != 1) exit 1; print value }
-  ' "$pins")" || ! [[ "$snapshot" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+  if ! snapshot="$(read_pin CI_UBUNTU_SNAPSHOT)" || ! [[ "$snapshot" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
     echo "::error::Expected one CI_UBUNTU_SNAPSHOT in UTC (YYYYMMDDTHHMMSSZ) in ${pins}" >&2
     exit 1
   fi
@@ -151,28 +174,33 @@ EOF
     -o Acquire::https::Timeout=10
   )
 
+  missing_native=${#missing[@]}
   if ! "$bwrap_ready"; then
-    deb=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
-    digest=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
-    # Bound the whole download, including waits requested by Retry-After.
-    if ! timeout --kill-after=1 29 \
-      curl -q -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 4 --max-time 15 --retry 3 \
-      -o "$apt_dir/$deb" "${snapshot_url}/pool/main/b/bubblewrap/${deb}"; then
-      echo "::error::Could not fetch ${deb} from Ubuntu snapshot ${snapshot}" >&2
+    if ! deb="$(read_pin CI_BUBBLEWRAP_DEB)" || ! [[ "$deb" =~ ^bubblewrap_[0-9][a-z0-9.+~-]*_amd64\.deb$ ]]; then
+      echo "::error::Expected one CI_BUBBLEWRAP_DEB naming a versioned amd64 bubblewrap package in ${pins}" >&2
       exit 1
     fi
-    echo "${digest}  $apt_dir/$deb" | sha256sum -c -
+    if ! digest="$(read_pin CI_BUBBLEWRAP_SHA256)" || ! [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "::error::Expected one CI_BUBBLEWRAP_SHA256 with 64 lowercase hex digits in ${pins}" >&2
+      exit 1
+    fi
+    download_bubblewrap "$snapshot_url" "$apt_dir/$deb" "$digest"
     missing+=("$apt_dir/$deb")
   fi
 
-  echo "Installing missing native packages from Ubuntu snapshot ${snapshot}: ${missing[*]}"
+  echo "Installing missing native packages: ${missing[*]}"
   apt_deadline=$((SECONDS + 195))
-  # Reserve 55 s for the first apt install and 5 s kill grace per command.
-  update_cap=$((apt_deadline - SECONDS - 65))
-  if [ "$update_cap" -lt 1 ] ||
-    ! sudo timeout --kill-after=5 "$update_cap" env -u APT_CONFIG apt-get "${apt_opts[@]}" update --error-on=any; then
-    echo "::error::Could not update package indexes from Ubuntu snapshot ${snapshot}" >&2
-    exit 1
+  if [ "$missing_native" -gt 0 ]; then
+    # Reserve 55 s for the first apt install and 5 s kill grace per command.
+    update_cap=$((apt_deadline - SECONDS - 65))
+    if [ "$update_cap" -lt 1 ] ||
+      ! sudo timeout --kill-after=5 "$update_cap" env -u APT_CONFIG apt-get "${apt_opts[@]}" update --error-on=any; then
+      echo "::error::Could not update package indexes from Ubuntu snapshot ${snapshot}" >&2
+      exit 1
+    fi
+  else
+    # The runner already has the .deb's base libraries. Use only local packages.
+    apt_opts+=(--no-download)
   fi
   install_log="$apt_dir/install.log"
   install_rc=0
