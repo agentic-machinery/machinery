@@ -325,19 +325,25 @@ Do not change the gh login while this command runs.
 Run `.venv/bin/python -m lu_machinery.publish <verb> --help` for the checks, receipts and exit codes.
 The exit codes apply to that module entry point. After an interruption, check GitHub for the fixture
 name before trying another create, or rerun the transfer command to reconcile its journal. The
-journal binds the login and account id that started the transfer; only that principal settles it.
+journal binds the login, account id, and expected visibility at the start of the transfer.
+Reconciliation requires that principal and the same visibility in the journal, registry, and
+destination readback. Missing or mismatched bindings exit 3 and keep the journal.
 Every exit 0 that sends no POST (an already-transferred repository, with or without a journal, and
 each verb's dry run) and every journal removal (a refusal before the POST included) re-reads
 `GET /user` after its last GitHub read and requires that login and id; a failed or mismatched re-read
-exits 3 and keeps the journal. Because GitHub executes `POST /repos/<source>/transfer` asynchronously
-(`202 Accepted` with a `minimal-repository` payload whose `visibility` may be omitted and whose
-`full_name` may still name the source or an intermediate owner/name pair), `repo-transfer` accepts
-that POST answer once it proves the pinned private repository id, then polls `GET /repos/<destination>`
-across 8 fresh reads over a bounded 180 s wait (`0, 2, 4, 8, 16, 30, 60, 60` s backoff) until the
-exact pinned private repository (`id`, `full_name`, `private`, `visibility: "private"`) appears at the
-destination, and re-reads `GET /user` after the last GitHub read before removing the journal and
-exiting 0; only after that bound (or on a mismatched POST answer or final `GET /user`) does it exit 3
-(`unverified`) and keep the journal.
+exits 3 and keeps the journal.
+
+`repo-transfer` accepts registered dual-slug rows with public or private visibility that matches the
+role prefix. Rehearsals with `--create-receipt` require a private row.
+GitHub answers `POST /repos/<source>/transfer` with `202 Accepted` and a `minimal-repository` payload.
+The publisher verifies the pinned repository ID and `private` flag, and checks `visibility` if present.
+The payload's `full_name` can still name the source or an intermediate owner/name pair.
+The publisher polls `GET /repos/<destination>` for the exact repository ID, slug, and expected
+visibility. It makes up to eight reads over 180 seconds (`0, 2, 4, 8, 16, 30, 60, 60` s backoff).
+If a read shows the pinned repository at the destination with different visibility, the publisher
+stops polling, exits 3 (`unverified`), and keeps the journal. A mismatched POST answer, exhausted
+polling, or a failed final principal check also leaves the transfer unverified. After a matching
+readback and principal check, the publisher removes the journal and exits 0.
 
 ## Review contract canary
 
