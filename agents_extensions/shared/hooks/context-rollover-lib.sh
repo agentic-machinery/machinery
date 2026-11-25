@@ -283,11 +283,11 @@ context_outside_checkouts() {
   done
 }
 
-# An explicit state setting owns the session record. The legacy explicit
-# record override keeps its precedence when there is no state setting.
+# LU_STATE_ROOT owns session records. Checkout-mode consumers of the legacy
+# alias can still supply an explicit session record file.
 context_session_record_file() {
   local project_dir="$1" session_id="$2"
-  if [ -z "${PROJECT_HOOK_STATE_ROOT:-}" ] && [ -n "${LEARN_UKRAINIAN_SESSION_RECORD:-}" ] \
+  if [ -z "${LU_STATE_ROOT:-}" ] && [ -n "${LEARN_UKRAINIAN_SESSION_RECORD:-}" ] \
     && [ -f "$LEARN_UKRAINIAN_SESSION_RECORD" ]; then
     printf '%s\n' "$LEARN_UKRAINIAN_SESSION_RECORD"
     return 0

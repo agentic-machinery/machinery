@@ -905,14 +905,14 @@ def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path
     primary = product
     if setting == "LEARN_UKRAINIAN_STATE_ROOT":
         # The native hook's compatibility alias can name the configured primary.
-        subprocess.run(["git", "-C", str(state), "init", "-q"], check=True, env=_git_env())
+        subprocess.run(["git", "-C", str(state), "init", "-q"], check=True, env=_git_env(), timeout=10)
         primary = state
     project = product
     if layout == "worktree":
         project = product / ".worktrees/dispatch/worker/task"
         subprocess.run(
             ["git", "-C", str(product), "worktree", "add", "-q", str(project), "topic"],
-            capture_output=True, check=True, env=_git_env(),
+            capture_output=True, check=True, env=_git_env(), timeout=10,
         )
     elif layout == "workspace":
         project = tmp_path / "workspace"
@@ -945,7 +945,7 @@ def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path
             entry, str(hook),
         ]
     elif entry in {"session-setup.sh", "enforce-venv.sh"}:
-        version = subprocess.check_output([interpreter, "--version"], text=True, env=env).strip()
+        version = subprocess.check_output([interpreter, "--version"], text=True, env=env, timeout=10).strip()
         checkout = primary if layout == "workspace" else product
         (checkout / ".python-version").write_text(version.removeprefix("Python ") + "\n")
         if state != checkout:

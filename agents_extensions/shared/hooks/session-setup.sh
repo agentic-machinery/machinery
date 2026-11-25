@@ -355,7 +355,10 @@ unset LANE_PROBE_SCRIPT
 # a shadow comms DB and swallowed a message. Advisory only: the guard alerts
 # here and NEVER deletes (garbage root entries are forensic evidence).
 ROOT_GUARD_RC=0
-ROOT_GUARD_ROOT="${PRIMARY_CHECKOUT:-$CANONICAL_ROOT}"
+ROOT_GUARD_ROOT="$CANONICAL_ROOT"
+if [ -n "$PRIMARY_CHECKOUT" ]; then
+  ROOT_GUARD_ROOT="$PRIMARY_CHECKOUT"
+fi
 ROOT_GUARD_JSON=$(run_bounded 3 "${PROJECT_PYTHON_COMMAND[@]}" \
   -m lu_machinery.hygiene.root_entry_guard --repo-root "$ROOT_GUARD_ROOT" --json 2>/dev/null) || ROOT_GUARD_RC=$?
 if [ "$ROOT_GUARD_RC" -eq 0 ] && [ -n "$ROOT_GUARD_JSON" ]; then
