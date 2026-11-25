@@ -61,12 +61,12 @@
 #   run under `env -i` with a temporary HOME and TMPDIR, so no runner
 #   credential or user configuration reaches them, and with isolated
 #   interpreters (python -I -B). PATH puts the pinned node and npm symlinks
-#   ahead of /usr/bin:/bin for the launcher fixture's toolchain.
-# - Every shard starts its own runner PostgreSQL 16 cluster for the Postgres-marked tests
+#   and the verified bubblewrap executable ahead of /usr/bin:/bin.
+# - Every shard starts its own runner PostgreSQL 18 cluster for the Postgres-marked tests
 #   (lu_machinery/ci/test_env.sh start postgres, then wait). Its DSN is passed
 #   through `env -i`; lu_machinery.ci.pg_skip_guard then fails the job when a
 #   test skipped on the DSN or a Postgres test file has no passing test.
-# - Hosted runner only (ubuntu-24.04). ci-gate.yml calls this workflow as
+# - Hosted runner only (ubuntu-26.04). ci-gate.yml calls this workflow as
 #   `pytest` on merge_group, push and workflow_dispatch, and as `pr-affected`
 #   on pull_request. CI Gate fails unless the job for that event succeeds.
 name: Tests
@@ -88,14 +88,14 @@ env:
 jobs:
   pytest:
     name: ${{ github.event_name == 'pull_request' && 'PR changed tests and guards' || format('pytest ({0})', matrix.shard) }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     # About 6 minutes per shard at the measured suite (see the header).
     # The pull_request shard also collects repository invariants.
     timeout-minutes: ${{ github.event_name == 'pull_request' && 40 || 20 }}
     permissions:
       contents: read
     env:
-      # The runner's PostgreSQL 16 cluster, started below. Fleet Comms tests
+      # The runner's PostgreSQL 18 cluster, started below. Fleet Comms tests
       # marked `postgres` self-skip without a usable DSN; the guard step fails
       # the job if any did.
       LEARN_UKRAINIAN_CP_PG_DSN: postgresql://postgres:postgres@localhost:5432/lu
@@ -120,9 +120,18 @@ jobs:
           # its first parent. '0' is truthy, so a falsy numeric 0 cannot be used.
           fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
 
-      # PostgreSQL 16 and bubblewrap start in the background during the Python
-      # installs below; `wait` blocks until the server answers on the DSN.
+      - name: Restore pinned bubblewrap package
+        id: cache-bubblewrap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/archive.deb
+          key: ci-bubblewrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/pins.txt') }}
+
+      # Native setup overlaps the Python installs below. It verifies the
+      # package even on a cache hit and checks the PostgreSQL test DSN.
       - run: bash lu_machinery/ci/test_env.sh start postgres
+        env:
+          BUBBLEWRAP_CACHE_HIT: ${{ steps.cache-bubblewrap.outputs.cache-hit }}
 
       - uses: ./.github/actions/uv-python # zizmor: ignore[self-repository] -- actionlint 1.7.12 does not support $/ syntax.
         id: python
@@ -339,6 +348,13 @@ jobs:
           PY
 
       - run: bash lu_machinery/ci/test_env.sh wait
+
+      - name: Save verified bubblewrap package
+        if: steps.cache-bubblewrap.outputs.cache-hit != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/archive.deb
+          key: ${{ steps.cache-bubblewrap.outputs.cache-primary-key }}
 
       - name: Select pull request tests
         if: github.event_name == 'pull_request'
@@ -743,6 +759,7 @@ jobs:
             fi
             ln -s "$found" "$toolchain/$tool"
           done
+          ln -s /usr/local/bin/bwrap "$toolchain/bwrap"
           set +e
           env -i PATH="$toolchain:/usr/bin:/bin:$RUNNER_TEMP/trufflehog" HOME="$work/home" TMPDIR="$work/tmp" LU_TEST_WHEEL="$LU_TEST_WHEEL" \
             MACHINERY_GATE_SEMGREP_VENV="$RUNNER_TEMP/semgrep-venv" MACHINERY_GATE_RULES_SOURCE="$RUNNER_TEMP/semgrep-rules" \
@@ -842,6 +859,9 @@ jobs:
               ln -sfn "$found" "$toolchain/$tool"
             done
           fi
+          if [ -x /usr/local/bin/bwrap ]; then
+            ln -sfn /usr/local/bin/bwrap "$toolchain/bwrap"
+          fi
           set +e
           env -i PATH="$toolchain:/usr/bin:/bin:$RUNNER_TEMP/trufflehog" HOME="$work/home" TMPDIR="$work/tmp" LU_TEST_WHEEL="$LU_TEST_WHEEL" \
             MACHINERY_GATE_SEMGREP_VENV="$RUNNER_TEMP/semgrep-venv" MACHINERY_GATE_RULES_SOURCE="$RUNNER_TEMP/semgrep-rules" \
@@ -922,7 +942,7 @@ jobs:
     needs: [pytest]
     # always(): a skipped or cancelled matrix must fail here, not pass unseen.
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions: {}
     steps:

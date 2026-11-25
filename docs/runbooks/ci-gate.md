@@ -418,16 +418,18 @@ scan in place; see
 [secret-scanning.md](secret-scanning.md#blobless-ci-checkout-fr-58). The
 `full-history-audit` dispatch keeps a full clone.
 
-## Shard setup
+## Machinery shard setup
 
-Per shard: checkout (shallow; full history on the history shard), Python
-3.12.15, then `lu_machinery/ci/test_env.sh start` runs `npm ci` and
-`lu_machinery/ci/start_postgres.sh` (bubblewrap, PostgreSQL 16 cluster, DSN
-verification) in the background while `python-ci-env` installs the locked
-environment from main's exact-key uv cache; `test_env.sh wait` fails the job if
-either background task failed. A container image was not adopted: the checkout
-cannot be inside an image, and pulling a prebuilt environment of this size
-costs about what the cache restore does (see the measurements in the ci-v3 PR).
+Each shard runs on GitHub's Ubuntu 26.04 image and restores the pinned bubblewrap
+package from Actions cache. `lu_machinery/ci/test_env.sh start postgres` verifies
+the archive, installs its executable, starts the image's PostgreSQL service, and checks that
+the test DSN reaches the `18/main` cluster. This runs in the background while
+the shard installs locked Python dependencies. `test_env.sh wait` fails the job
+if setup fails. A matched push to `main` can skip pytest after the merge group
+passes. That push verifies and seeds the default branch's bubblewrap cache for
+later jobs.
+
+## Product shard setup
 
 All Python workflow jobs read the repository's `.python-version` with
 `setup-python`'s `python-version-file`. The shared composite reads the same

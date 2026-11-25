@@ -100,14 +100,12 @@ ACTIONS_SETUP_UV=c18668ad3cf93ea998bef934396af7bb5c839dc7
 # TruffleHog and Semgrep pins above, plus the checkout, setup, cache and
 # receipt-upload actions recorded here.
 # Upstream checks below were made on 2026-11-05.
-CI_GATE_RUNNER=ubuntu-24.04
-#   GitHub-hosted Ubuntu 24.04 x64 image, https://github.com/actions/runner-images
-#   (ubuntu-latest pointed to it on 2026-11-05). The versioned label keeps the
-#   image fixed when ubuntu-latest moves.
+CI_GATE_RUNNER=ubuntu-26.04
+#   GitHub-hosted Ubuntu 26.04 x64 image, which provides PostgreSQL 18.
+#   https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md
 CI_UBUNTU_SNAPSHOT=20261122T000000Z
 #   https://snapshot.ubuntu.com/ubuntu/20261122T000000Z/
-#   Signed noble, noble-updates and noble-security APT indexes for other
-#   native CI packages. Also the primary source of the pinned bubblewrap .deb.
+#   Primary download origin for the pinned bubblewrap .deb on a cache miss.
 CI_BUBBLEWRAP_DEB=bubblewrap_0.11.1-1ubuntu0.3_amd64.deb
 CI_BUBBLEWRAP_SHA256=d3a6c1b6b0e0474eaed6dbd055c0d601fd875af153976a0dc4aae75f4ea10868
 #   The snapshot and https://security.ubuntu.com/ubuntu both serve this file
@@ -226,6 +224,6 @@ PIP_AUDIT_VERSION=2.10.1
 
 # Main CI evidence receipt artifact (checked 2026-11-17 via git ls-remote).
 ACTIONS_UPLOAD_ARTIFACT=cf430e030ddbb5b0abf93d22962f4752f3646cd9
-#   actions/upload-artifact tag v7.0.2, Node 24 on hosted ubuntu-24.04.
+#   actions/upload-artifact tag v7.0.2, Node 24 on hosted ubuntu-26.04.
 #   https://github.com/actions/upload-artifact/releases/tag/v7.0.2
 #   Default ZIP archive; attempt-specific name prevents stale re-run evidence.

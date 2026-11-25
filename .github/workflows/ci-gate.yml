@@ -53,7 +53,7 @@
 #   `pr-affected` is required instead. A failed, cancelled, skipped or missing
 #   required job fails the gate on every event. A new job must be added to both
 #   `needs` and the gate's expected list; nothing else catches a job left out of both.
-# - Hosted runners only (ubuntu-24.04). Every tool is downloaded at a pinned
+# - Hosted runners only (ubuntu-26.04). Every tool is downloaded at a pinned
 #   version and checked against a pinned SHA-256 before it runs: release
 #   tarballs for actionlint, ShellCheck, zizmor, TruffleHog, Trivy and uv;
 #   uv-managed CPython (uv checks each download against the hash it ships);
@@ -128,7 +128,7 @@ jobs:
   main-proof:
     name: Reuse verified merge-group tree
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     # An unavailable reuse optimization falls back to the full required checks.
     # History checks independently refuse a missing history-base output.
@@ -288,6 +288,29 @@ jobs:
           token: ${{ github.token }}
           member: zizmor
 
+      # The matched main push skips pytest. Seed its default-branch cache
+      # here, since Actions cannot restore a queue-ref cache on later PRs.
+      - name: Restore pinned bubblewrap package
+        if: steps.match.outputs.run_id != ''
+        id: cache-bubblewrap
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/archive.deb
+          key: ci-bubblewrap-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/pins.txt') }}
+
+      - name: Verify bubblewrap package for the default-branch cache
+        if: steps.match.outputs.run_id != ''
+        run: bash lu_machinery/ci/setup_bubblewrap.sh --package-only
+        env:
+          BUBBLEWRAP_CACHE_HIT: ${{ steps.cache-bubblewrap.outputs.cache-hit }}
+
+      - name: Save verified bubblewrap package
+        if: steps.match.outputs.run_id != '' && steps.cache-bubblewrap.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/release-cache/bubblewrap/archive.deb
+          key: ${{ steps.cache-bubblewrap.outputs.cache-primary-key }}
+
       - name: Record reused CI Gate proof
         id: proof
         if: steps.match.outputs.run_id != ''
@@ -305,7 +328,7 @@ jobs:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Ruff
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -360,7 +383,7 @@ jobs:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Compile (pinned Python)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -423,7 +446,7 @@ jobs:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: mypy ratchet
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -532,7 +555,7 @@ jobs:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Test wait lint
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -686,7 +709,7 @@ jobs:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: SAST (Semgrep CE)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -878,7 +901,7 @@ jobs:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Dependency audit
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1037,7 +1060,7 @@ jobs:
     needs: [main-proof]
     if: always() && !cancelled() && needs.main-proof.outputs.reuse != 'true'
     name: Installed wheel (pinned Python)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1434,7 +1457,7 @@ jobs:
     needs: [main-proof]
     if: always() && !cancelled()
     name: Verified trailer
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -1519,7 +1542,7 @@ jobs:
     # as a passing required check.
     if: always()
     needs: [main-proof, ruff, compileall, mypy, test-waits, fleet-security, secret-scan, sast, dependency-audit, installed-wheel, verified-trailer, pytest, pr-affected]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read

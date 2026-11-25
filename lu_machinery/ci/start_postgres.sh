@@ -1,59 +1,37 @@
 #!/usr/bin/env bash
-# Native test dependencies and the PostgreSQL 16 server for a CI pytest shard.
-#
-# Install missing native packages from the pinned Ubuntu snapshot and grant
-# bwrap user namespaces. Start cluster 16/main and check that it serves
-# LEARN_UKRAINIAN_CP_PG_DSN. Any failure exits non-zero. Tests that need their
-# own clusters (initdb as the runner user) use the same binaries.
+# Set up bubblewrap and start the hosted image's PostgreSQL 18 for a CI shard.
 set -euo pipefail
 
 : "${LEARN_UKRAINIAN_CP_PG_DSN:?LEARN_UKRAINIAN_CP_PG_DSN must be set}"
 : "${RUNNER_TEMP:?RUNNER_TEMP must be set}"
 
-bash -- "$(dirname -- "${BASH_SOURCE[0]}")/setup_bubblewrap.sh" postgresql-16 libpq-dev
+bash -- "$(dirname -- "${BASH_SOURCE[0]}")/setup_bubblewrap.sh"
+sudo systemctl start postgresql.service
 
-if ! pg_lsclusters --no-header | grep -q '^16 main '; then
-  sudo pg_createcluster 16 main
-fi
-# Start errors are not suppressed; only an already-online cluster is skipped.
-if ! pg_lsclusters --no-header | awk '$1 == "16" && $2 == "main" && $4 == "online" {found = 1} END {exit !found}'; then
-  sudo pg_ctlcluster 16 main start
-fi
-ready=""
-for _ in $(seq 1 30); do
-  if pg_isready -h localhost -p 5432 -q; then ready=1; break; fi
-  sleep 2
-done
-if [ -z "$ready" ]; then
-  echo "::error::PostgreSQL 16 was not ready on localhost:5432 within 60 s" >&2
-  pg_lsclusters >&2 || true
-  sudo tail -n 40 /var/log/postgresql/postgresql-16-main.log >&2 || true
-  exit 1
-fi
-# 16/main must own the DSN port (5432), not some other server listening there.
-cluster="$(pg_lsclusters --no-header | awk '$1 == "16" && $2 == "main" {print $3 " " $4}')"
-if [ "$cluster" != "5432 online" ]; then
-  echo "::error::PostgreSQL cluster 16/main is '${cluster:-missing}', expected '5432 online'" >&2
+# 18/main must own the test port. Check it before changing the role or database.
+cluster="$(pg_lsclusters --no-header | awk '$1 == "18" && $2 == "main" {print $3, $4, $6}')"
+read -r port status expected_dir <<< "$cluster"
+if [ "$port" != 5432 ] || [ "$status" != online ] || [ -z "$expected_dir" ]; then
+  echo "::error::Expected the image's PostgreSQL 18/main cluster online on port 5432" >&2
   pg_lsclusters >&2
   exit 1
 fi
-sudo -u postgres psql -p 5432 -v ON_ERROR_STOP=1 -q <<'SQL'
+
+sudo -u postgres psql -X -p 5432 -v ON_ERROR_STOP=1 -q <<'SQL'
 ALTER ROLE postgres WITH PASSWORD 'postgres';
 SELECT 'CREATE DATABASE lu' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'lu')\gexec
 SQL
-# The exact DSN the tests use must connect, report major version 16, and
-# serve the 16/main data directory.
-version_num="$(PGPASSWORD=postgres psql "$LEARN_UKRAINIAN_CP_PG_DSN" -v ON_ERROR_STOP=1 -qtAc 'SHOW server_version_num')"
+
+# Check the exact DSN and its server, not just whether the port accepts TCP.
+version_num="$(psql "$LEARN_UKRAINIAN_CP_PG_DSN" -X -v ON_ERROR_STOP=1 -qtAc 'SHOW server_version_num')"
 echo "PostgreSQL server_version_num=${version_num}"
-if [ "${version_num:0:2}" != "16" ]; then
-  echo "::error::DSN server reports version ${version_num}, expected major 16" >&2
+if ! [[ "$version_num" =~ ^18[0-9]{4}$ ]]; then
+  echo "::error::DSN server reports version ${version_num}, expected major 18" >&2
   exit 1
 fi
-expected_dir="$(pg_lsclusters --no-header | awk '$1 == "16" && $2 == "main" {print $6}')"
-dsn_dir="$(PGPASSWORD=postgres psql "$LEARN_UKRAINIAN_CP_PG_DSN" -v ON_ERROR_STOP=1 -qtAc 'SHOW data_directory')"
-echo "DSN data_directory=${dsn_dir} (16/main: ${expected_dir})"
-if [ -z "$expected_dir" ] || [ "$dsn_dir" != "$expected_dir" ]; then
-  echo "::error::DSN server data_directory '${dsn_dir}' is not the 16/main data directory '${expected_dir:-missing}'" >&2
-  pg_lsclusters >&2
+dsn_dir="$(psql "$LEARN_UKRAINIAN_CP_PG_DSN" -X -v ON_ERROR_STOP=1 -qtAc 'SHOW data_directory')"
+if [ "$dsn_dir" != "$expected_dir" ]; then
+  echo "::error::DSN server data_directory '${dsn_dir}' differs from 18/main '${expected_dir}'" >&2
   exit 1
 fi
+echo "DSN connects to the image's PostgreSQL 18/main cluster"
