@@ -135,14 +135,14 @@ def _is_flat_task_store_dir(directory: Path, forbidden_dirs: set[Path]) -> bool:
     return parts[-2:] == ("batch_state", "tasks") or parts[-3:] == ("batch_state", "tasks", "archive")
 
 
-def _path_resolution_candidates(path: Path) -> list[Path] | None:
-    """Return lexical and intermediate POSIX symlink-resolution states for ``path``.
+def _path_resolution_candidates(path: Path) -> tuple[list[Path], set[Path]] | None:
+    """Return lexical/intermediate POSIX resolution states and walked conventional store roots.
 
     Walking components left to right preserves conventional ``batch_state/tasks``
-    and ``batch_state/tasks/archive`` spellings even when reached through
-    parent-directory symlinks and backed by differently named directories without
-    a configured state root. Returns ``None`` on malformed paths or symlink loops
-    so callers fail closed.
+    roots before following symlinks or collapsing pending ``..`` traversals, even
+    when reached through parent-directory symlinks and backed by differently named
+    directories without a configured state root. Returns ``None`` on malformed
+    paths, non-directory prefix traversal, or symlink loops so callers fail closed.
     """
     raw = os.fspath(path)
     if not raw or "\x00" in raw:
@@ -153,6 +153,7 @@ def _path_resolution_candidates(path: Path) -> list[Path] | None:
         except OSError:
             return None
     candidates: list[Path] = [Path(os.path.normpath(raw))]
+    conventional_roots: set[Path] = set()
     anchor = Path(raw).anchor or os.sep
     resolved = Path(anchor)
     remainder = raw[len(anchor) :]
@@ -162,12 +163,16 @@ def _path_resolution_candidates(path: Path) -> list[Path] | None:
         part = queue.popleft()
         if part == "..":
             resolved = resolved.parent
+            if resolved.parts[-2:] == ("batch_state", "tasks"):
+                conventional_roots.add(resolved)
             candidates.append(Path(os.path.normpath(os.path.join(resolved, *queue))))
             continue
         next_path = resolved / part
+        if next_path.parts[-2:] == ("batch_state", "tasks"):
+            conventional_roots.add(next_path)
         try:
             info = os.lstat(next_path)
-        except (FileNotFoundError, NotADirectoryError):
+        except FileNotFoundError:
             resolved = next_path
             continue
         except (OSError, ValueError):
@@ -192,10 +197,12 @@ def _path_resolution_candidates(path: Path) -> list[Path] | None:
             target_parts = [p for p in target_remainder.split(os.sep) if p and p != "."]
             queue.extendleft(reversed(target_parts))
             candidates.append(Path(os.path.normpath(os.path.join(resolved, *queue))))
+        elif queue and not stat.S_ISDIR(info.st_mode):
+            return None
         else:
             resolved = next_path
     candidates.append(resolved)
-    return candidates
+    return candidates, conventional_roots
 
 
 def _add_store_root(forbidden_dirs: set[Path], root: Path) -> None:
@@ -213,7 +220,10 @@ def _add_store_root(forbidden_dirs: set[Path], root: Path) -> None:
 
 
 def _forbidden_task_store_dirs(
-    candidates: list[Path], *, store_dir: Path | None = None,
+    candidates: list[Path],
+    conventional_roots: set[Path],
+    *,
+    store_dir: Path | None = None,
 ) -> set[Path]:
     configured: Path | None
     if store_dir is not None:
@@ -226,6 +236,8 @@ def _forbidden_task_store_dirs(
     forbidden_dirs: set[Path] = set()
     if configured is not None:
         _add_store_root(forbidden_dirs, configured)
+    for root in conventional_roots:
+        _add_store_root(forbidden_dirs, root)
     for candidate in candidates:
         for ancestor in (candidate, *candidate.parents):
             if ancestor.parts[-2:] == ("batch_state", "tasks"):
@@ -243,13 +255,16 @@ def is_direct_task_store_path(path: Path, *, store_dir: Path | None = None) -> b
     Checks lexical spellings, intermediate POSIX symlink-resolution states across
     all components, and realpath forms against the configured ``tasks_dir`` (and
     ``archive/``) as well as conventional ``batch_state/tasks`` layouts. Fails
-    closed on malformed paths or symlink loops.
+    closed on malformed paths, non-directory prefix traversal, or symlink loops.
     """
-    candidates = _path_resolution_candidates(path)
-    if candidates is None:
+    walked = _path_resolution_candidates(path)
+    if walked is None:
         return True
+    candidates, conventional_roots = walked
     try:
-        forbidden_dirs = _forbidden_task_store_dirs(candidates, store_dir=store_dir)
+        forbidden_dirs = _forbidden_task_store_dirs(
+            candidates, conventional_roots, store_dir=store_dir,
+        )
         resolved_parent = Path(os.path.realpath(path.parent))
         resolved_target = Path(os.path.realpath(path))
     except (OSError, ValueError):
