@@ -263,7 +263,8 @@ again immediately before launching a successor:
 
 ## Stopping a run
 
-The CTO stops a run from its own seat. One command discovers the PRs:
+The CTO stops a run from its own seat. One command discovers the PRs; the task inventory in 2a only chooses the runs to
+give it:
 
 ```bash
 <interpreter> -m lu_machinery.orchestration.pr_ownership run-prs --task-id <task-id> --run-nonce <nonce>
@@ -276,10 +277,10 @@ repository. It prints `pull_requests` (`repo`, `number`, `state`, `head`, `found
 Add no other PR search (a branch listing, a ledger scan, `pr_ownership check`): what this command
 cannot establish stays unknown.
 
-**Release check.** `run-prs --help` must exit 0 on `<interpreter>`. If it does not, still cancel
-the turn (1), build its tree (the read and rules in 2a) and cancel its tasks (2d), protect
-(2b and 2c) the open PRs the brief and the run's notes name, reconcile the lease (5), and report
-every other child PR as unknown custody.
+**Release check.** `run-prs --help` must exit 0 on `<interpreter>`. If it does not, there is no PR
+list and the stop writes to no PR: cancel the turn (1), build its tree (2a) and cancel its tasks
+(2d), reconcile the lease (5), and put all child PR custody, with each open PR the brief and the
+run's notes name, on the unresolved list for the CTO. This stop cannot reach final settlement.
 
 ### 1. Cancel the turn
 
@@ -302,7 +303,7 @@ turn-lease recovery uses (`dispatch list --all` skips a record it cannot read, s
 that a tree is complete).
 
 ```bash
-<interpreter> -I -c 'import json; from lu_machinery.dispatcher import store; keys = ("task_id", "run_nonce", "parent_task_id", "parent_run_nonce", "status", "never_started_reason", "pid", "process_start", "provider_pgid", "launch_unit", "launch_cgroup", "launch_mode", "worktree_disposition_reason"); print(json.dumps([{key: row.get(key) for key in keys} for row in store.strict_task_inventory(include_archive=True)]))'
+<interpreter> -I -c 'import json; from lu_machinery.dispatcher import store; keys = ("task_id", "run_nonce", "parent_task_id", "parent_run_nonce", "status"); print(json.dumps([{key: row.get(key) for key in keys} for row in store.strict_task_inventory(include_archive=True)]))'
 ```
 
 The turn's tree starts as the turn's run (task ID and nonce). From the rows of that one read, add
@@ -319,9 +320,13 @@ An unproven task, and every task descending from it, stays out of the tree: no `
 no write to its PRs and no cancel. Then run `run-prs` for the turn, and again, with that run's
 task ID and nonce, for each tree run that a tree row names as its parent: it lists only the
 direct children of the run it is given. This pass's PRs are all rows of all these runs, by
-`repo` and `number`, plus every PR an earlier pass listed and, when the strict read or any
-`run-prs` call fails, the open PRs the brief and the run's notes name. `run-prs` is the only PR
-search; the inventory only chooses the runs.
+`repo` and `number`, plus every PR an earlier pass's `run-prs` listed.
+
+**The stop writes only to PRs that a `run-prs` call of this stop listed.** A name in the brief or
+the run's notes does not prove that the run holds a PR (the notes also list PRs no brief owns).
+While the strict read or a `run-prs` call fails, put each open PR they name on the unresolved
+list, with no write, for the CTO's decision; those entries resolve when a later pass's strict
+read and every `run-prs` call succeed.
 
 If the strict read fails, the tree is unknown: that error is unresolved. For d, still take from
 `dispatch list --all` the rows whose `parent_task_id` and `parent_run_nonce` are both the
@@ -345,9 +350,8 @@ Apply the first row that matches:
 | `headRefOid` differs from the `head` that `run-prs` printed | Run that `run-prs` again, then this recheck, and apply the table to the new reads. If only the heads still differ, something is pushing: protect it (c) anyway and record both heads. Unresolved until a later pass reads one head from both; 2d cancels the tree's writers. |
 | `OPEN`, same repository, same head | Protect it (c). |
 
-For a PR this pass's `run-prs` did not print (it exited 2, or only an earlier pass listed the
-PR, or only the brief or a note names it), there is no printed head: skip the head row, and record
-the head you read.
+For a PR that only an earlier pass listed, this pass printed no head: skip the head row, and
+record the head you read.
 
 **c. Protect** ([full-stop](../../full-stop/SKILL.md#protect-the-pr-before-any-work)), with the
 rechecked repository on every command:
@@ -362,7 +366,8 @@ rechecked repository on every command:
 Then verify with tool output: the PR has the `hold` label, `autoMergeRequest` is null
 (`gh pr view <number> --repo <repo> --json state,headRefOid,labels,autoMergeRequest,mergedAt,mergeCommit`)
 and a fresh queue status shows it is not queued. If that read shows `MERGED`, classify it by the
-table. A refused command or a failed verification is unresolved; retry in the next pass. Verify
+table. The verification decides, not a command's exit code: unless these reads show all three (a
+failed queue status lookup shows nothing), the PR is unresolved; retry in the next pass. Verify
 earlier protection again in each pass.
 
 **d. Cancel** every tree task that is not terminal, after this pass has tried to protect its PRs:
@@ -371,53 +376,48 @@ earlier protection again in each pass.
 
 ### 3. Repeat until final settlement
 
-**Quiescent.** A terminal status does not prove that a task stopped: a task can settle with live
-processes. The turn or a tree task is quiescent only when its record is terminal and one of these
-holds:
+A terminal status does not prove that a task stopped: a task can settle with processes still
+running. The proof is the one turn-lease recovery uses
+(`docs/runbooks/session-supervisor.md`, "Dispatch-turn lease recovery"), run on the task's host:
+its step 2 (scope and task services gone) for the turn and each tree task, with that task's ID
+and nonce, and its step 3 (full child quiescence over a strict inventory) for the turn and for
+each tree run that a tree row names as its parent. Until that proof passes for a task, the task is
+on the unresolved list as quiescence unproven.
 
-- It never started: `status` is `failed` or `rate_limited`, `never_started_reason` is set, and
-  `pid`, `process_start`, `provider_pgid`, `launch_unit`, `launch_cgroup` and `launch_mode` are
-  all empty.
-- Its `launch_mode` is `scope`; its `worktree_disposition_reason` is none of
-  `provider_processes_alive`, `provider_liveness_unknown` and `task_record_damaged`; and the unit
-  check in step 2 of "Dispatch-turn lease recovery" (`docs/runbooks/session-supervisor.md`),
-  run on the task's host with its ID and nonce, prints `quiescent scope+services`.
+Repeat the pass until final settlement, below, holds. Between passes, wait for the turn in a
+short call, `dispatch wait <turn-id> --run-nonce <full-nonce> --timeout 60`, until it exits 0 or
+1. Settlement keeps a non-`done` provider status, so a cancelled run settles `cancelled` and is
+never a handoff baseline (cold start step 2). Once it settles, read `child_tasks`,
+`orphaned_child_tasks`, `unknown_child_tasks` and `unreadable_child_records`. A task named in the
+last three stays unresolved until the proof passes for it too; one the tree lacks gets no write.
 
-Any other task, including one launched without a scope, is not proven: it stays unresolved.
+**Final settlement** holds only when all of these are true:
 
-Repeat the pass while the turn or any tree task is not quiescent. Between passes, wait for the
-turn in a short call, `dispatch wait <turn-id> --run-nonce <full-nonce> --timeout 60`, until it
-exits 0 or 1. Settlement keeps a non-`done` provider status, so a cancelled run settles
-`cancelled` and is never a handoff baseline (cold start step 2). Once it settles, read
-`child_tasks`, `orphaned_child_tasks`, `unknown_child_tasks` and `unreadable_child_records`. A
-task named in the last three stays unresolved until it is in the tree and quiescent; one the tree
-lacks gets no write.
+1. The proof passes for the turn, every tree task and every task named in
+   `orphaned_child_tasks`, `unknown_child_tasks` or `unreadable_child_records`.
+2. In a pass that started after that, the strict read succeeds, every `run-prs` call exits 0 and
+   the tree holds no task the proof does not cover.
+3. In that pass, every listed PR is verified protected (2c) or the recheck (2b) reads it `MERGED`
+   or `CLOSED`.
+4. The unresolved list holds nothing but its two standing entries (4).
 
-**Final settlement** is one more pass that starts after the turn and every tree task are
-quiescent, in which the strict read succeeds, its tree holds no task without that proof, and
-every `run-prs` call exits 0. Until then the stop is not finished. If a read or call keeps failing
-for a cause you cannot clear (for example a reused task ID that `run-prs` refuses to attribute),
-or a task cannot be proven quiescent, end the stop as **unsettled** and keep that custody on the
-unresolved list with its owner.
+Until then the stop is unsettled. When a read, call, proof or protection keeps failing for a cause
+you cannot clear (for example a reused task ID that `run-prs` refuses to attribute), end the stop
+as **unsettled** and keep every remaining entry on the unresolved list with its owner.
 
 ### 4. Unknown custody
 
 From the first pass, keep an **unresolved custody** list in the CTO's driver-state, and put it in
-every report about the stop. It holds:
+every report about the stop. It holds everything the steps above call unresolved, each with its
+error or evidence, and two standing entries: every line of each `residuals` array, verbatim, and
+custody events the ownership ledger dropped before every release writing it had `run-prs`.
 
-- each failed strict read, with its error, and each `run-prs` exit 2, with its `UNKNOWN:` line;
-- each PR marked unresolved by the recheck or the protection;
-- each unproven task, each tree task that will not cancel or is not quiescent, and each task that
-  settlement names and step 3 has not resolved;
-- every line of each `residuals` array, verbatim;
-- custody events the ownership ledger dropped before every release writing it had `run-prs`.
-
-An entry leaves the list only when later tool output resolves it. A stop never resolves the
-command's residual (PRs on unrecorded branches without custody or delivery evidence) or the
-dropped events: an empty `pull_requests` list never means "no PR". The final report gives the PRs
-protected (with heads), those merged during the stop (with merge commits), those closed or merged
-earlier, and the unresolved list with an owner for each entry (`claude-cto` unless another is
-named).
+Any other entry leaves the list only when later tool output resolves it. A stop never resolves the
+standing entries (the command's residual covers PRs on unrecorded branches without custody or
+delivery evidence): an empty `pull_requests` list never means "no PR". The final report gives the
+PRs protected (with heads), those merged during the stop (with merge commits), those closed or
+merged earlier, and the unresolved list with an owner for each entry (`claude-cto` unless another
+is named).
 
 ### 5. Reconcile the lease separately
 
@@ -446,11 +446,8 @@ What the pass shows, in order:
 3. Recheck #102 and #104: same repository, same head. Protect both.
 4. Recheck #103: `MERGED` with `mergedAt` after the stop start. Report **merged during the
    stop** with its merge commit; write nothing.
-5. Cancel `live`, `lander` and `follow`; `adopter` is already terminal. Once the unit check
-   prints `quiescent scope+services` for the turn and all four tasks, the final pass starts:
-   its strict read and `run-prs` for both runs succeed. The unresolved list still holds the two
-   entries no stop resolves: the command's residual and the dropped events.
-
-If one task record is unreadable during a pass, the strict read fails and `run-prs` exits 2 with
-`UNKNOWN: ValueError: unreadable task record <file>` and prints no list. Both stay on the
-unresolved list until the record is readable again and a later read and call succeed.
+5. Cancel `live`, `lander` and `follow`; `adopter` is already terminal. Run the runbook's step 2
+   for the turn and all four tasks, and its step 3 for `turn-demo` and `live`. Then the final
+   pass starts: its strict read and `run-prs` for both runs succeed. With #101, #102 and #104
+   verified protected there, only the two standing entries remain and final settlement holds.
+   The fixture exercise stops short of that: it does not run the protection commands.
