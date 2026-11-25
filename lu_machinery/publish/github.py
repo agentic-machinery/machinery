@@ -930,6 +930,8 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             and associations[0]["number"] == pr_number
         )
 
+    failed_run_conclusions = {"failure", "cancelled", "timed_out", "action_required"}
+    incoherent_candidate = False
     if verb == "run-rerun":
         run_id = fields["number"]
         run = fetch("run", number=run_id)
@@ -939,8 +941,13 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         event = run.get("event")
         if associations == [] and isinstance(event, str) and event and event not in {"pull_request", "pull_request_target", "merge_group"}:
             return None
-        if run.get("status") != "completed" or run.get("conclusion") not in {"failure", "cancelled", "timed_out", "action_required"}:
-            raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
+        if run.get("status") != "completed" or run.get("conclusion") not in (
+            failed_run_conclusions | recovery.PASSING_RUN_CONCLUSIONS
+        ):
+            raise gate.PublishBlocked(
+                "RECOVERY_RUN_INVALID: completed failed or incoherent all-green run required"
+            )
+        incoherent_candidate = run.get("conclusion") in recovery.PASSING_RUN_CONCLUSIONS
         if run.get("event") == "merge_group":
             branch_pr = extract_pr_number(run.get("head_branch", ""))
             number = (
@@ -971,7 +978,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: run identity required")
         if run.get("event") != "merge_group":
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: merge_group failed run required for re-enqueue")
-        if run.get("status") != "completed" or run.get("conclusion") not in {"failure", "cancelled", "timed_out", "action_required"}:
+        if run.get("status") != "completed" or run.get("conclusion") not in failed_run_conclusions:
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
         if extract_pr_number(run.get("head_branch", "")) != number:
             raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run does not identify this PR")
@@ -1002,6 +1009,7 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     failed_run = run
     live_jobs: list[dict] | None = None
     cancelled_no_artifact = False
+    incoherent_ids: set[int] | None = None
     required_workflow = _single_required_workflow()
     failure_conclusions = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
 
@@ -1018,6 +1026,22 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
                 raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
             artifacts_cache[run_id] = listing
         return artifacts_cache[run_id]
+
+    if incoherent_candidate:
+        if type(failed_run.get("run_attempt")) is not int or failed_run["run_attempt"] < 1:
+            raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed run and attempt metadata required")
+        if failed_run["run_attempt"] > 1:
+            raise gate.PublishBlocked("RECOVERY_ALLOWANCE_SPENT: first=prior workflow run attempt")
+        jobs_check = load_jobs()
+        if not jobs_complete:
+            raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
+        incoherent_ids = recovery.incoherent_completed_run_job_ids(failed_run, jobs_check)
+        if incoherent_ids is None:
+            raise gate.PublishBlocked(
+                "RECOVERY_RUN_INVALID: completed all-green run with incoherent check row required"
+            )
+        if not incoherent_ids:
+            raise gate.PublishBlocked("RECOVERY_RUN_INVALID: coherent all-green run has nothing to recover")
 
     try:
         evidence = recovery.evidence_from_comments(
@@ -1060,32 +1084,41 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             allow_empty_jobs=True,
         )
         cancelled_no_artifact = True
+    allowed_conclusions = (
+        recovery.PASSING_RUN_CONCLUSIONS if incoherent_candidate else failed_run_conclusions
+    )
     if (type(failed_run.get("run_attempt")) is not int or failed_run["run_attempt"] < 1
             or failed_run.get("status") != "completed"
-            or failed_run.get("conclusion") not in {"failure", "cancelled", "timed_out", "action_required"}):
+            or failed_run.get("conclusion") not in allowed_conclusions):
         raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run and attempt metadata required")
     if failed_run["run_attempt"] > 1:
         raise gate.PublishBlocked("RECOVERY_ALLOWANCE_SPENT: first=prior workflow run attempt")
     if failed_run.get("head_sha") != evidence["tested_sha"]:
         raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: tested SHA does not match run")
     jobs = load_jobs()
-    failed_ids = {
-        job.get("id")
-        for job in jobs
-        if isinstance(job, dict) and job.get("conclusion") in failure_conclusions
-    }
-    if failed_ids != set(evidence["job_ids"]) or (not failed_ids and not cancelled_no_artifact):
-        raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: every failing job must be diagnosed")
-    if failed_run.get("event") == "merge_group" and not cancelled_no_artifact:
-        listing = load_artifacts_listing()
-        candidate_matches = [row for row in listing["artifacts"] if row.get("name") == "ci-queue-candidate"]
-        if not candidate_matches:
-            if jobs_complete and recovery.cancelled_merge_group_without_failure(
-                failed_run, jobs, required_workflow=required_workflow, pr_number=number
-            ):
-                cancelled_no_artifact = True
-            else:
-                raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
+    if incoherent_candidate:
+        assert incoherent_ids is not None
+        if incoherent_ids != set(evidence["job_ids"]):
+            raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: every incoherent job must be diagnosed")
+        evidence = {**evidence, "recovery_mode": recovery.INCOHERENT_CHECK_RECOVERY_MODE}
+    else:
+        failed_ids = {
+            job.get("id")
+            for job in jobs
+            if isinstance(job, dict) and job.get("conclusion") in failure_conclusions
+        }
+        if failed_ids != set(evidence["job_ids"]) or (not failed_ids and not cancelled_no_artifact):
+            raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: every failing job must be diagnosed")
+        if failed_run.get("event") == "merge_group" and not cancelled_no_artifact:
+            listing = load_artifacts_listing()
+            candidate_matches = [row for row in listing["artifacts"] if row.get("name") == "ci-queue-candidate"]
+            if not candidate_matches:
+                if jobs_complete and recovery.cancelled_merge_group_without_failure(
+                    failed_run, jobs, required_workflow=required_workflow, pr_number=number
+                ):
+                    cancelled_no_artifact = True
+                else:
+                    raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
     if cancelled_no_artifact:
         recovery.require_infra_diagnosis_evidence(evidence)
         action = "re-enqueue"
@@ -4862,7 +4895,7 @@ def publish(
                 *_hostname_flag(dest),
             ]
         elif verb == "run-rerun":
-            argv.append("--failed")
+            pass
         elif verb == "workflow-run":
             argv.insert(3, fields["workflow"])
             option("ref")
@@ -5050,7 +5083,11 @@ def publish(
                             result.queue_jump = True
                             print(f"queue-jump: enqueued at the front of the merge queue at {head}", file=sys.stderr)
                     return result
+                if verb == "run-rerun" and evidence.get("recovery_mode") != recovery.INCOHERENT_CHECK_RECOVERY_MODE:
+                    argv.append("--failed")
                 recovery.consume(path, dest, number, head, action, evidence)
+            elif verb == "run-rerun":
+                argv.append("--failed")
         applying_milestone = pr_milestone is not None
         capture_created = parent_epic is not None or applying_milestone
         result = subprocess.CompletedProcess(argv, 0, "" if text else b"", "" if text else b"") if already_queued else _send(
@@ -5294,7 +5331,8 @@ def _parse_args(argv):
             )
         if verb == "run-rerun":
             sub.description = (
-                "Rerun only failed jobs in an existing GitHub Actions run.\n"
+                "Rerun only failed jobs in an existing GitHub Actions run (or the whole run when a\n"
+                "completed all-green PR run has an incoherent check row).\n"
                 "Use an Actions run ID, not a PR number. After a base-branch fix, use pr-update-branch instead."
             )
             sub.formatter_class = argparse.RawDescriptionHelpFormatter
@@ -5305,6 +5343,12 @@ def _parse_args(argv):
                 "Outputs: requests a GitHub rerun with --failed on the original pinned run, not the latest PR head.\n"
                 "  PR recovery requires an eligible failed run, current-head approval and posted failure evidence.\n"
                 "  It consumes the one PR-head recovery allowance for reruns before sending the write.\n"
+                "  When a completed all-green PR run has every job and step completed with passing conclusions and\n"
+                "  valid completed_at, and at least one check row is incoherent (non-completed status such as\n"
+                "  in_progress while conclusion and completed_at are set), and posted evidence names those exact\n"
+                "  incoherent job IDs, run-rerun omits --failed to rerun all jobs on the same head using the same\n"
+                "  one-per-head allowance. Any failing job keeps --failed; a coherent all-green run is refused with\n"
+                "  RECOVERY_RUN_INVALID (nothing to recover).\n"
                 "  A completed cancelled merge_group run of the configured CI workflow with no failing job or step and\n"
                 "  no ci-queue-candidate artifact recovers instead through the same one-per-head allowance by enqueueing\n"
                 "  once at the approved PR head after the merge-readiness gates pass and the posted evidence carries\n"
