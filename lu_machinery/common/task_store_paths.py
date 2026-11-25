@@ -309,7 +309,8 @@ def kernel_follows_write_path(path: Path | str) -> bool:
     still resolve to an existing file. A writer that resolves before writing refuses ``False``, so
     it never writes where a lookup through the caller's spelling fails. The components below that
     ancestor do not exist yet, so they hold no symlink; the ancestor must then be a directory, and a
-    ``..`` among them is refused.
+    ``..`` among them is refused. Only a missing entry is climbed past: any other lookup error on the
+    spelling (for example a name too long for the kernel) refuses it.
     """
     raw = os.fspath(path)
     try:
@@ -317,12 +318,19 @@ def kernel_follows_write_path(path: Path | str) -> bool:
     except (OSError, ValueError):
         return False
     leaf = True
-    while not os.path.lexists(probe):
-        parent, name = os.path.split(probe)
-        if name == ".." or parent == probe:
+    while True:
+        try:
+            os.lstat(probe)
+        except FileNotFoundError:
+            parent, name = os.path.split(probe)
+            if name == ".." or parent == probe:
+                return False
+            probe, leaf = parent, False
+            continue
+        except (OSError, ValueError):
+            # ENAMETOOLONG, ENOTDIR, EACCES or ELOOP on the spelling itself: a later lookup through it fails too.
             return False
-        probe, leaf = parent, False
-    return os.path.exists(probe) if leaf else os.path.isdir(probe)
+        return os.path.exists(probe) if leaf else os.path.isdir(probe)
 
 
 def require_not_direct_task_store_path(
