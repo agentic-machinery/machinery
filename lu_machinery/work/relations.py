@@ -90,7 +90,7 @@ def extract_body_relations(
     seen: set[tuple[str, str]] = set()
 
     def add(rel_type: str, raw_number: str, evidence: str) -> None:
-        parsed = parse_ascii_positive_int(raw_number)
+        parsed = parse_ascii_positive_int(raw_number) if len(raw_number) <= 19 else None
         if parsed is None or parsed == self_number:
             return
         number = str(parsed)

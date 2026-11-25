@@ -100,7 +100,7 @@ def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
             if isinstance(url, str)
             else None
         )
-        number = parse_ascii_positive_int(match[2]) if match else None
+        number = parse_ascii_positive_int(match[2]) if match and len(match[2]) <= 19 else None
         if not match or number is None:
             raise ValueError("invalid closing issue URL")
         issues.add((match[1], number))
@@ -111,7 +111,7 @@ def closing_issues(pr: dict, repository: str) -> list[tuple[str, int]]:
         visible_markdown(pr.get("body") or ""),
     ):
         for match in re.finditer(r"(?:([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?#([1-9][0-9]*)(?!\w)", closing[1]):
-            number = parse_ascii_positive_int(match[2])
+            number = parse_ascii_positive_int(match[2]) if len(match[2]) <= 19 else None
             if number is not None:
                 issues.add((match[1] or repository, number))
     return sorted(issues)
