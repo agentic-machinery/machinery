@@ -8,12 +8,20 @@ from __future__ import annotations
 
 import pytest
 
+from lu_machinery.common import git_credentials
 from lu_machinery.dispatcher.checks import check_model_admission
 from lu_machinery.orchestration.integration_sweep import reviews_of_record
 from lu_machinery.publish import github as publisher
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.tiers import classify_pr_files
 from tests.helpers import current_sol, product_tree
+
+
+@pytest.fixture(autouse=True)
+def _pre_transfer_selector(monkeypatch):
+    """The registry's machinery row is dual-slug: the recorder binds its active slug, chosen by the host selector."""
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_k: git_credentials.SelectorState(
+        {"machinery": "learn-ukrainian/machinery", "infra-private": "learn-ukrainian/learn-ukrainian-infra-private"}, "0" * 64))
 
 CURRENT_SOL = current_sol()
 

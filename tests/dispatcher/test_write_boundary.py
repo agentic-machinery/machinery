@@ -758,7 +758,7 @@ def _refused(call) -> str:
     return str(refusal.value)
 
 
-_PRIVATE_URL = "https://github.com/learn-ukrainian/learn-ukrainian-infra-private.git"
+_PRIVATE_URL = "https://github.com/learn-ukrainian/hramatka.git"  # single-slug: a dual-slug row needs the host selector
 
 
 @pytest.mark.parametrize(("url", "host", "scanned"), [
@@ -919,7 +919,7 @@ def test_skill_publish_commands_reach_the_broker_for_the_own_target_only(primary
     monkeypatch.setattr(write_boundary, "machinery_path", lambda relative: push_sandbox.root / "lu_machinery" / relative)
     slug = "owner/repo"
     if target.startswith("private"):  # the registry's own private entry, checked by the real eligibility rules
-        slug = next(item.github for item in load_fleet_repos().values() if item.role.startswith("private-"))
+        slug = next(item.github for item in load_fleet_repos().values() if item.role.startswith("private-") and not item.has_alternate_slug)
         assert not agy_sandbox.public_repository(slug) and agy_sandbox.private_repository(slug)
     else:
         monkeypatch.setattr(agy_sandbox, "public_repository", lambda name: name == "owner/repo")

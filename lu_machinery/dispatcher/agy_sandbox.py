@@ -59,10 +59,16 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.repo_root import machinery_path, main_checkout_root, product_root
 from lu_machinery.common.scratch import ensure_scratch_root
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from lu_machinery.orchestration.fleet_repos import FleetRepo
 
 # The machinery package's canonical import name: the unresolved name of its directory.
 _PACKAGE = Path(__file__).absolute().parents[1].name
@@ -997,13 +1003,32 @@ def _link_interpreter(worktree: Path) -> bool:
     return True
 
 
+def _registered_row(slug: str, repos: Mapping[str, FleetRepo]) -> tuple[bool, FleetRepo | None]:
+    """Whether ``slug`` is a baked slug of a registered row, and that row only when ``slug`` is its active slug.
+
+    A registered row's inactive slug, or one whose selector is missing or untrusted, is registered with no row:
+    callers treat that as final and never fall back to another rule for it.
+    """
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, require_active_slug, resolve_fleet_repo_by_slug
+
+    try:
+        resolve_fleet_repo_by_slug(slug, repos=repos)
+    except FleetRepoError:
+        return False, None
+    try:
+        return True, require_active_slug(slug, repos=repos).repo
+    except (FleetRepoError, OSError, ValueError):
+        return True, None
+
+
 def public_repository(slug: str) -> bool:
-    """Whether ``slug`` is a registered fleet repository whose role is public (decision A6).
+    """Whether ``slug`` is the active slug of a registered fleet repository authorized as public (decision A6).
 
     Registration alone is not eligibility: the registry also lists private repositories. A worker's network
     reaches the public internet, so the host login reads or publishes for it only in a registered repository
-    with a ``public-`` role; a private, unknown or unreadable selection is refused. The default repository
-    keeps its configured GitHub name (#12681).
+    whose authorized visibility (``FleetRepo.authorized_visibility``) is public; a private, unknown, inactive or
+    unreadable selection is refused. A slug no registered row bakes may still be the default repository's
+    configured GitHub name (#12681); a registered row's inactive slug never is.
     """
     from lu_machinery.common.repo_root import configured_github_slug
     from lu_machinery.orchestration.fleet_repos import FleetRepoError, load_fleet_repos
@@ -1012,20 +1037,21 @@ def public_repository(slug: str) -> bool:
         return False
     try:
         repos = load_fleet_repos()
+        registered, repo = _registered_row(slug, repos)
+        if registered:
+            return repo is not None and repo.authorized_visibility == "public"
         configured = configured_github_slug()
     except (FleetRepoError, OSError, ValueError):
         return False
-    names = set()
-    for repo in repos.values():
-        if repo.role.startswith("public-"):
-            names.add(repo.github.casefold())
-            if repo.default and configured:
-                names.add(configured.casefold())
-    return slug.casefold() in names
+    if not configured:
+        return False
+    return slug.casefold() == configured.casefold() and any(
+        repo.default and repo.authorized_visibility == "public" for repo in repos.values()
+    )
 
 
 def private_repository(slug: str) -> bool:
-    """Whether ``slug`` is a registered fleet repository whose role is private (#565, designated approval C-5541).
+    """Whether ``slug`` is the active slug of a registered fleet repository authorized as private (#565, C-5541).
 
     Only the write boundary's broker uses this, and only to act on the task's own repository, branch and PR
     frozen at launch. It never widens ``public_repository``: the read-only relays here stay public-only.
@@ -1035,11 +1061,10 @@ def private_repository(slug: str) -> bool:
     if not (isinstance(slug, str) and _GH_REPO.fullmatch(slug)) or public_repository(slug):
         return False
     try:
-        repos = load_fleet_repos()
+        _, repo = _registered_row(slug, load_fleet_repos())
     except (FleetRepoError, OSError, ValueError):
         return False
-    return any(repo.role.startswith("private-") and repo.github.casefold() == slug.casefold()
-               for repo in repos.values())
+    return repo is not None and repo.authorized_visibility == "private"
 
 
 def origin_repository(checkout: Path) -> str | None:

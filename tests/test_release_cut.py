@@ -1469,6 +1469,11 @@ def test_publisher_uses_release_interpreter_not_stale_host_python(tmp_path, monk
         "    print('RUN_OK', probe_cut.host_python, probe_cut.x_agent, probe_cut.alert)\n"
         "    return 0\n"
         "release_cut.open_post_release = stub_open_post_release\n"
+        # The registry's machinery row is dual-slug: the host selector is the operator's, never the test's.
+        "from lu_machinery.common import git_credentials\n"
+        "git_credentials.load_selector = lambda **_k: git_credentials.SelectorState(\n"
+        "    {'machinery': 'learn-ukrainian/machinery', 'infra-private': 'learn-ukrainian/learn-ukrainian-infra-private'},\n"
+        "    'd' * 64)\n"
         "raise SystemExit(release_cut.main(sys.argv[4:]))\n",
         encoding="utf-8",
     )
@@ -1926,3 +1931,132 @@ def test_build_syncs_locked_build_group_from_uv_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(release_cut.shutil, "which", lambda _name: None)
     with pytest.raises(CutError, match=r"uv is not on PATH; the release build tools are exported from uv\.lock"):
         no_uv_cut.build("0.1.68")
+
+
+# Dual-slug transfer bridge (A01b): machinery baked as org/repos and neworg/repos, bound to repository_id 4242.
+_BAKED = ("org/repos", "neworg/repos")
+
+
+def _transferred(monkeypatch, active):
+    """The fleet registry's machinery row transferred between the two baked slugs; the host selector picks *active*."""
+    from lu_machinery.common import git_credentials
+    from lu_machinery.orchestration import fleet_repos
+
+    row = fleet_repos.FleetRepo(
+        "machinery", "org/repos", "machinery", "public-machinery", default=True,
+        repository_id=4242, visibility="public", alternate_github="neworg/repos",
+    )
+    monkeypatch.setattr(fleet_repos, "_repository_catalog", lambda _path: {"machinery": row})
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"machinery": active}, "d" * 64),
+    )
+    return {"key": "machinery", "github": "org/repos", "alternate_github": "neworg/repos",
+            "repository_id": 4242, "visibility": "public", "local_name": "machinery"}
+
+
+@pytest.mark.parametrize("remote", [None, "active", "case", "local", "file", "inactive", "elsewhere", "file-host"])
+@pytest.mark.parametrize("active", [*_BAKED, "evil/repo"])
+def test_release_cut_runs_at_the_active_slug_and_logs_the_selector(monkeypatch, tmp_path, capsys, active, remote):
+    """Defect class: the release cut clones, tags and publishes at the registry's first slug after a transfer, and
+    its log never names the selector; a selector choosing a slug the row does not bake must refuse the cut."""
+    _host(monkeypatch, tmp_path, sys.executable)
+    machinery = _transferred(monkeypatch, active)
+    monkeypatch.setattr(git_module, "resolve_repo", lambda name=None: (
+        tmp_path / "primary", machinery if name == "machinery" else {"github": "home/repo"}))
+    seen = {}
+
+    def execute(cut):
+        seen.update(repo=cut.machinery_repo, remote=cut.machinery_remote, log=(cut.work / "cut.log").read_text())
+        return 0
+
+    monkeypatch.setattr(release_cut, "execute", execute)
+    argv = ["cut", "--dry-run", "--no-alert", "--work", str(tmp_path / "w"), "--x-agent", "claude/claude-opus-5-5"]
+    inactive = next((slug for slug in _BAKED if slug != active), _BAKED[0])
+    override = {
+        "active": f"https://github.com/{active}.git", "case": f"https://github.com/{active.upper()}.git",
+        # Relative to the launch directory: Git must receive the checked absolute location, never this spelling.
+        "local": "mirror.git", "file": (tmp_path / "mirror.git").as_uri(),
+        "inactive": f"https://github.com/{inactive}.git", "elsewhere": f"https://example.invalid/{active}.git",
+        "file-host": f"file://example.invalid{tmp_path / 'mirror.git'}",
+    }.get(remote)
+    (tmp_path / "mirror.git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    if override is not None:
+        argv += ["--machinery-remote", override]
+    if active == "evil/repo":
+        assert main(argv) == 1
+        assert "release cut refused: fleet repository selector" in capsys.readouterr().err and not seen
+        return
+    if remote in {"inactive", "elsewhere", "file-host"}:
+        assert main(argv) == 1
+        assert "release cut refused: --machinery-remote is " in capsys.readouterr().err and not seen
+        return
+    assert main(argv) == 0
+    local = (tmp_path / "mirror.git").resolve().as_uri()
+    expected = local if remote in {"local", "file"} else f"https://github.com/{active}.git"
+    assert (seen["repo"], seen["remote"]) == (active, expected)
+    assert f'fleet_repo_selector: {{"selector_sha256": "{"d" * 64}", "selector_value": "{active}"}}' in seen["log"]
+
+
+@pytest.mark.parametrize("active", _BAKED)
+@pytest.mark.parametrize("pinned", [*_BAKED, "Org/Repos", "NewOrg/Repos", "evil/repo", "org/repo\u017f"])
+def test_adoption_replaces_a_pin_under_either_baked_slug_with_the_active_slug(monkeypatch, tmp_path, active, pinned):
+    """Defect class: after a transfer the product's wheel pin still names the old release slug, so the adoption
+    refuses it as another repository's; a pin under a slug the row does not bake must still refuse."""
+    _transferred(monkeypatch, active)
+    product = tmp_path / "product"
+    product.mkdir()
+    old_url = f"https://github.com/{pinned}/releases/download/v0.1.22/lu_machinery-0.1.22-py3-none-any.whl"
+    (product / "pyproject.toml").write_text(
+        '[project]\nname = "example-product"\nversion = "0.1.0"\ndependencies = ["lu-machinery==0.1.22"]\n'
+        f'[tool.uv.sources]\nlu-machinery = {{ url = "{old_url}" }}\n', encoding="utf-8")
+    cut = Cut(work=tmp_path, dry_run=True, machinery_remote="unused", product_remote="unused", machinery_repo=active,
+              product_repo="unused", host_python=Path(sys.executable), primary=tmp_path, alert=False,
+              x_agent="codex/test", head=HEAD)
+    cut.version, cut.uv = "0.1.23", "uv"
+
+    class Locked(Exception):
+        pass
+
+    def run(*_args, **_kwargs):
+        raise Locked
+
+    cut.run = run
+    if pinned == "evil/repo":
+        with pytest.raises(CutError, match="from this release repository"):
+            cut.update_adopt_inputs(product)
+        return
+    if not pinned.isascii():  # a non-ASCII look-alike of a baked slug is no wheel URL at all
+        with pytest.raises(CutError, match="must declare one lu-machinery wheel URL$"):
+            cut.update_adopt_inputs(product)
+        return
+    with pytest.raises(Locked):
+        cut.update_adopt_inputs(product)
+    text = (product / "pyproject.toml").read_text(encoding="utf-8")
+    assert f"https://github.com/{active}/releases/download/v0.1.23/lu_machinery-0.1.23-py3-none-any.whl" in text
+    assert "0.1.22" not in text
+
+
+@pytest.mark.parametrize("active", _BAKED)
+@pytest.mark.parametrize("recorded", [*_BAKED, "evil/repo"])
+def test_ci_receipt_recorded_under_either_baked_slug_proves_the_active_repository(monkeypatch, active, recorded):
+    """Defect class: a CI evidence receipt written before a transfer names the old slug and is refused as foreign
+    once the cut runs at the active slug; a receipt of another repository must still refuse."""
+    _transferred(monkeypatch, active)
+    tree = "c" * 40
+    target = {"id": 7, "run_attempt": 1, "head_sha": HEAD, "head_branch": "main", "event": "push",
+              "status": "completed", "conclusion": "success", "path": ".github/workflows/ci-gate.yml",
+              "repository": {"full_name": active}, "head_repository": {"full_name": active},
+              "head_commit": {"tree_id": tree}}
+    receipt = {"schema": "ci-gate-evidence.v1", "repository": recorded, "workflow": ".github/workflows/ci-gate.yml",
+               "mode": "full", "target": {"run_id": 7, "run_attempt": 1, "commit": HEAD, "tree": tree}, "source": None}
+
+    def validate():
+        return release_cut.validate_ci_receipt(receipt, repository=active, target=target, commit=HEAD, tree=tree)
+
+    if recorded == "evil/repo":
+        with pytest.raises(CutError, match="repository or workflow mismatch"):
+            validate()
+    else:
+        assert validate() is None

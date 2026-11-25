@@ -161,16 +161,31 @@ def normalize_repository(value: str, host: str = "github.com") -> str:
 
 
 def is_private(destination: str) -> bool:
-    """Grant the exemption only to a normalized, configured private repository."""
+    """Grant the exemption only to a normalized, configured private repository at its active slug.
+
+    A row is private by its declared ``visibility``, else by its ``private-`` role. A dual-slug row
+    (``alternate_github``) is matched only at the slug the host selector makes active; its inactive
+    slug, and a dual-slug row whose selector is missing or untrusted, are not private.
+    """
     destination = normalize_repository(destination)
     if destination == "unknown":
         return False
-    return any(
-        str(row.get("role", "")).startswith("private-")
-        and not row.get("default")
-        and normalize_repository(row["github"]) == destination
-        for row in catalog().values()
-    )
+    for key, row in catalog().items():
+        visibility = row.get("visibility") or ("private" if str(row.get("role", "")).startswith("private-") else None)
+        if visibility != "private" or row.get("default"):
+            continue
+        slug = row["github"]
+        if row.get("alternate_github") is not None:
+            try:
+                # Imported here: git_credentials imports this module. SelectorError is a ValueError.
+                from lu_machinery.common.git_credentials import active_slug
+
+                slug, _ = active_slug(row, key=key)
+            except (ImportError, ValueError, OSError):
+                continue
+        if normalize_repository(slug) == destination:
+            return True
+    return False
 
 
 def private_tooling() -> Path:

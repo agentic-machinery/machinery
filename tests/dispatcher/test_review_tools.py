@@ -169,17 +169,17 @@ def test_sandbox_reaches_public_hosts_and_github_while_filesystem_boundary_holds
     # test runner's different shim/config can fail even while this credential-free-env read works.
     host_env = {name: os.environ[name] for name in ("PATH", "HOME", "LANG", "XDG_CONFIG_HOME", "GH_CONFIG_DIR")
                 if name in os.environ}
-    host_read = subprocess.run(["gh", "issue", "view", "100", "-R", "learn-ukrainian/machinery", "--json", "number",
+    host_read = subprocess.run(["gh", "issue", "view", "100", "-R", "learn-ukrainian/ukrainian-llm-eval", "--json", "number",
                                 "--jq", ".number"], env=host_env, capture_output=True, text=True, timeout=60, check=False)
     logged_in = host_read.returncode == 0 and host_read.stdout == "100\n"
     # Each probe runs on its own line, so one outcome never hides the next.
     command = "\n".join([
         "curl -sSfI --max-time 30 https://www.example.org >/dev/null && echo public-host-reached",
         "curl -sSfI --max-time 10 https://api.github.com >/dev/null 2>&1 || echo direct-github-refused",
-        "gh issue view 100 -R learn-ukrainian/machinery --json number --jq .number 2>/dev/null; echo gh-exit=$?",
+        "gh issue view 100 -R learn-ukrainian/ukrainian-llm-eval --json number --jq .number 2>/dev/null; echo gh-exit=$?",
         f"touch {primary}/sandbox-egress-probe 2>/dev/null || echo primary-unwritable",
         f"ls -d {home}/.config/gh >/dev/null 2>&1 || echo host-gh-config-hidden",
-        "gh issue view 100 -R localhost/learn-ukrainian/machinery 2>/dev/null || echo other-host-refused",
+        "gh issue view 100 -R localhost/learn-ukrainian/ukrainian-llm-eval 2>/dev/null || echo other-host-refused",
     ])
     expected = ["public-host-reached", "direct-github-refused", *(["100", "gh-exit=0"] if logged_in else []), "primary-unwritable",
                 "host-gh-config-hidden", "other-host-refused"]
