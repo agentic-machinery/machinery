@@ -103,11 +103,15 @@ operator, as before.
 
 ## State
 
-Records, snapshots, the `audit.jsonl` log and `cleanup.jsonl` receipts live in
-`$XDG_STATE_HOME/learn-ukrainian/primary-dirt-audit/` (default
-`~/.local/state/...`), outside the repository. Directories are mode `0700` and
-files `0600`. Snapshots whose post phase never ran (denied or cancelled calls)
-are deleted after 6 hours. Records are kept as the audit trail.
+Records, snapshots, the `audit.jsonl` log and `cleanup.jsonl` receipts live under
+`.agent/primary-dirt-audit/` in the configured runtime state root. Use
+`LU_STATE_ROOT` for detached state. The `LEARN_UKRAINIAN_STATE_ROOT` alias can
+name the primary checkout. When both settings are unset, the audit uses
+`$XDG_STATE_HOME/learn-ukrainian/primary-dirt-audit/`, with
+`~/.local/state` as the default base directory.
+
+Directories are mode `0700` and files `0600`. The audit deletes snapshots
+without a post phase after 6 hours and keeps records as the audit trail.
 
 ## Threat model
 

@@ -41,6 +41,10 @@ _hook_deadline() {
   fi
 }
 
+git_common_dir() {
+  _hook_deadline 2 git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+}
+
 # 0. Pyenv-rehash stale-lock cleanup. Runs BEFORE the headless-skip
 #    because every shell startup (including pipeline jobs) hits pyenv
 #    init, and a stale lock costs 60s per Bash invocation.
@@ -149,17 +153,12 @@ fi
 ISSUES=()
 INFO=()
 
+CANONICAL_ROOT=$(context_canonical_root "$PROJECT_DIR" git_common_dir) || exit 1
+PRIMARY_CHECKOUT=""
 if [ -n "$WORKSPACE_PROJECT" ]; then
-  CANONICAL_ROOT=$(context_state_root "$WORKSPACE_PROJECT") || exit 1
-elif [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
-  CANONICAL_ROOT="$CODEX_CANONICAL_REPO_ROOT"
-else
-  GIT_COMMON_DIR=$(_hook_deadline 2 git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-  if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
-    CANONICAL_ROOT=$(dirname "$GIT_COMMON_DIR")
-  else
-    CANONICAL_ROOT="$PROJECT_DIR"
-  fi
+  PRIMARY_CHECKOUT="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
+elif [ -n "${PROJECT_HOOK_STATE_ROOT:-}" ]; then
+  PRIMARY_CHECKOUT=$(context_checkout_root "$PROJECT_DIR" git_common_dir) || exit 1
 fi
 
 # One interpreter (R66) and code root (machinery #100 R51, R62, R69): the release
@@ -356,10 +355,7 @@ unset LANE_PROBE_SCRIPT
 # a shadow comms DB and swallowed a message. Advisory only: the guard alerts
 # here and NEVER deletes (garbage root entries are forensic evidence).
 ROOT_GUARD_RC=0
-ROOT_GUARD_ROOT="$CANONICAL_ROOT"
-if [ -n "$WORKSPACE_PROJECT" ]; then
-  ROOT_GUARD_ROOT="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
-fi
+ROOT_GUARD_ROOT="${PRIMARY_CHECKOUT:-$CANONICAL_ROOT}"
 ROOT_GUARD_JSON=$(run_bounded 3 "${PROJECT_PYTHON_COMMAND[@]}" \
   -m lu_machinery.hygiene.root_entry_guard --repo-root "$ROOT_GUARD_ROOT" --json 2>/dev/null) || ROOT_GUARD_RC=$?
 if [ "$ROOT_GUARD_RC" -eq 0 ] && [ -n "$ROOT_GUARD_JSON" ]; then
@@ -426,7 +422,7 @@ unset ROOT_GUARD_RC ROOT_GUARD_ROOT ROOT_GUARD_JSON
 MEMORY_PROJECT="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}"
 MEMORY_GIT_COMMON=""
 if ! context_outside_checkouts "$MEMORY_PROJECT"; then
-  MEMORY_GIT_COMMON=$(_hook_deadline 2 git -C "$MEMORY_PROJECT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+  MEMORY_GIT_COMMON=$(git_common_dir "$MEMORY_PROJECT" || true)
 fi
 if [ -n "$MEMORY_GIT_COMMON" ] && [ "$(basename "$MEMORY_GIT_COMMON")" = ".git" ]; then
   MEMORY_PROJECT=$(dirname "$MEMORY_GIT_COMMON")
@@ -639,13 +635,13 @@ EOF
 }
 
 build_local_handoff_pointer() {
-  local handoff_path="$1"
+  local handoff_path="$1" bootstrap_path="$2"
   cat <<EOF
 PREVIOUS-SESSION HANDOFF — read the local thread rollover packet first.
 
 Agent: $HANDOFF_AGENT
 Thread handoff: $handoff_path
-Bootstrap prompt: .agent/${HANDOFF_AGENT}-thread-bootstrap.md
+Bootstrap prompt: $bootstrap_path
 Read with: Read tool. These files are gitignored local state and must not be committed.
 Cold-start protocol: docs/best-practices/codex-thread-handoff.md
 
@@ -804,8 +800,8 @@ GATE_ARGS=(
   --agent "$HANDOFF_AGENT" --session-id "$CURRENT_THREAD_ID"
   --record-session-id "$SESSION_ID"
 )
-if [ -n "$WORKSPACE_PROJECT" ]; then
-  GATE_ARGS+=(--primary-checkout "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
+if [ -n "$PRIMARY_CHECKOUT" ]; then
+  GATE_ARGS+=(--primary-checkout "$PRIMARY_CHECKOUT")
 fi
 [ -n "$TRANSCRIPT_PATH" ] && GATE_ARGS+=(--transcript-path "$TRANSCRIPT_PATH")
 [ -n "$SOURCE" ] && GATE_ARGS+=(--source "$SOURCE")
@@ -946,11 +942,12 @@ unset GATE_RC
 
 if [ -z "$HANDOFF_CONTEXT" ] && [ "$GATE_DETECT_STATUS" = "none" ]; then
   HANDOFF_FILE="$PROJECT_DIR/docs/session-state/current.md"
+  LOCAL_HANDOFF_PREFIX="${PROJECT_HOOK_STATE_ROOT:+$PROJECT_HOOK_STATE_ROOT/}.agent/${HANDOFF_AGENT}"
 
   if [ -n "$HANDOFF_NOTE_LANE" ]; then
     : # The lane banner names the DB note; no markdown handoff pointer competes with it.
-  elif [ -f "$PROJECT_DIR/.agent/${HANDOFF_AGENT}-thread-handoff.md" ]; then
-    HANDOFF_CONTEXT=$(build_local_handoff_pointer ".agent/${HANDOFF_AGENT}-thread-handoff.md")
+  elif [ -f "${PROJECT_HOOK_STATE_ROOT:-$PROJECT_DIR}/.agent/${HANDOFF_AGENT}-thread-handoff.md" ]; then
+    HANDOFF_CONTEXT=$(build_local_handoff_pointer "$LOCAL_HANDOFF_PREFIX-thread-handoff.md" "$LOCAL_HANDOFF_PREFIX-thread-bootstrap.md")
   elif [ "${SESSION_HANDOFF_ALLOW_GIT_ROUTER:-0}" = "1" ] && [ -f "$HANDOFF_FILE" ]; then
     AGENT_HANDOFF=$(sed -n "s/^[[:space:]]*-[[:space:]]*${HANDOFF_AGENT}:[[:space:]]*//p" "$HANDOFF_FILE" 2>/dev/null | head -1 | sed 's/[[:space:]]*$//')
 

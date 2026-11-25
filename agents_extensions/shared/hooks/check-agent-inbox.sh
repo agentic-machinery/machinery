@@ -54,7 +54,7 @@ if [ -z "$SESSION_ID" ]; then
   SESSION_ID=$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 fi
 if [ -n "$SESSION_ID" ]; then
-  STATE_DIR="$PROJECT_DIR/.agent/runtime"
+  STATE_DIR="${PROJECT_HOOK_STATE_ROOT:-$PROJECT_DIR}/.agent/runtime"
   STATE_KEY=""
   if command -v shasum >/dev/null 2>&1; then
     STATE_KEY=$(printf '%s\n%s' "$RECIPIENT" "$SESSION_ID" | shasum -a 256 | awk '{print $1}')

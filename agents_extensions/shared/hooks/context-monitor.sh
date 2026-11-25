@@ -171,8 +171,9 @@ else
 fi
 PREPARE_CMD="$PREPARE_CMD --semantic-title \"<specific semantic task title>\" --task-family <task-family> --role \"<role>\" --terminal-goal <merge|deploy|certify> --context-percent ${PCT} (fill each <placeholder>; add --issue-number <issue-number> when an issue scopes the work)"
 unset HANDOFF_IDENTITY_DEFAULT HANDOFF_IDENTITY_SH PREPARE_SCRIPT ROLLOVER_STREAM ROLLOVER_STREAM_EPIC PREPARE_PY PREPARE_HARNESS
-BOOTSTRAP_FILE=".agent/${HANDOFF_AGENT}-thread-bootstrap.md"
-HANDOFF_FILE=".agent/${HANDOFF_AGENT}-thread-handoff.md"
+RUNTIME_AGENT_DIR="${PROJECT_HOOK_STATE_ROOT:+$PROJECT_HOOK_STATE_ROOT/}.agent"
+BOOTSTRAP_FILE="$RUNTIME_AGENT_DIR/${HANDOFF_AGENT}-thread-bootstrap.md"
+HANDOFF_FILE="$RUNTIME_AGENT_DIR/${HANDOFF_AGENT}-thread-handoff.md"
 CONTEXT_FACT="${PCT}% of the ${WINDOW}-token context window [~${TOKENS}/${WINDOW}; ${USAGE_SOURCE}; capacity: ${WINDOW_PROVENANCE}]"
 
 # Announce each tier once per session, the first time it is crossed. Re-injecting
@@ -209,7 +210,7 @@ if [ -n "$LANE_NAME" ] && [ "$PCT" -ge "$TIER3_PCT" ]; then
     "" \
     "STOP all current work THIS TURN. Do not dispatch, start new work, or start a continuation thread. Only:" \
     "1. Refresh your lane handoff file with current state, in-flight work, and next steps, and stop every background task and Monitor stream you started." \
-    "2. Follow the thread-rollover skill's prepare phase (references/prepare.md): run ${PREPARE_CMD}. This writes the gitignored rollover lease plus its handoff and bootstrap packet under .agent/thread-rollovers/." \
+    "2. Follow the thread-rollover skill's prepare phase (references/prepare.md): run ${PREPARE_CMD}. This writes the gitignored rollover lease plus its handoff and bootstrap packet under $RUNTIME_AGENT_DIR/thread-rollovers/." \
     "3. Post a standalone line (a line of its own in your reply, not inside other text) reading: HANDOFF-DONE ${LANE_NAME}" \
     "4. END THE TURN. Do not tell the operator to restart and do not wait for one: the context guard sees HANDOFF-DONE, exits this session and restarts the lane.")
 elif [ -n "$LANE_NAME" ]; then
@@ -224,7 +225,7 @@ elif [ "$ROLLOVER_MODE" = "operator_restart" ] && [ "$PCT" -ge "$TIER3_PCT" ]; t
     "" \
     "STOP all current work THIS TURN. Do not dispatch, start new work, or start a continuation thread. Only:" \
     "1. Refresh your lane handoff file with current state, in-flight work, and next steps." \
-    "2. Follow the thread-rollover skill's prepare phase (references/prepare.md): run ${PREPARE_CMD}. This writes the gitignored rollover lease plus its handoff and bootstrap packet under .agent/thread-rollovers/." \
+    "2. Follow the thread-rollover skill's prepare phase (references/prepare.md): run ${PREPARE_CMD}. This writes the gitignored rollover lease plus its handoff and bootstrap packet under $RUNTIME_AGENT_DIR/thread-rollovers/." \
     "3. Tell the operator in one plain message that the handoff is ready and they should restart this session${RESTART_HINT}." \
     "4. END THE TURN and wait for the operator to restart the session. If the session keeps going instead, Claude Code may still compact it automatically near its own limit.")
 elif [ "$ROLLOVER_MODE" = "operator_restart" ] && [ "$PCT" -ge "$TIER2_PCT" ]; then
@@ -253,7 +254,7 @@ elif [ "$PCT" -ge "$TIER1_PCT" ]; then
   MSG=$(printf '%s\n%s\n%s\n' \
     "HEADS UP: Context is at ${CONTEXT_FACT}. The profile's first rollover tier is ${TIER1_PCT}%." \
     "" \
-    "Wrap up the current logical unit soon. For rollover, run ${PREPARE_CMD}; it writes gitignored .agent/ handoff state.")
+    "Wrap up the current logical unit soon. For rollover, run ${PREPARE_CMD}; it writes gitignored $RUNTIME_AGENT_DIR/ handoff state.")
 else
   exit 0
 fi

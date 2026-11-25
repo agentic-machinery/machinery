@@ -870,3 +870,183 @@ def test_workspace_session_audits_the_configured_primary_and_names_its_interpret
                           capture_output=True, cwd=workspace, env=env, timeout=60)
     assert venv.returncode == 2, venv.stderr
     assert f"Run this command instead:\n  {python} -V" in venv.stderr, venv.stderr
+
+
+@pytest.mark.parametrize(
+    ("layout", "setting"),
+    [
+        ("git", "LU_STATE_ROOT"),
+        ("subdirectory", "LU_STATE_ROOT"),
+        ("worktree", "LU_STATE_ROOT"),
+        ("workspace", "LU_STATE_ROOT"),
+        ("git", "LEARN_UKRAINIAN_STATE_ROOT"),
+    ],
+)
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "context-rollover-lib.sh",
+        "session-setup.sh",
+        "post-compact.sh",
+        "goal-driver-stop.sh",
+        "release-thread-lease.sh",
+        "context-monitor.sh",
+        "context-rollover-guard.sh",
+        "precompact-handoff-guard.sh",
+        "enforce-venv.sh",
+        "check-agent-inbox.sh",
+        "audit-primary-checkout-dirt.py",
+    ],
+)
+def test_git_checkout_hooks_use_configured_state_root(release, product, tmp_path, layout, setting, entry):
+    """Defect class: native hook readers and writers taking runtime state from checkout identity."""
+    state = tmp_path / "runtime state"
+    state.mkdir()
+    primary = product
+    if setting == "LEARN_UKRAINIAN_STATE_ROOT":
+        # The native hook's compatibility alias can name the configured primary.
+        subprocess.run(["git", "-C", str(state), "init", "-q"], check=True, env=_git_env())
+        primary = state
+    project = product
+    if layout == "worktree":
+        project = product / ".worktrees/dispatch/worker/task"
+        subprocess.run(
+            ["git", "-C", str(product), "worktree", "add", "-q", str(project), "topic"],
+            capture_output=True, check=True, env=_git_env(),
+        )
+    elif layout == "workspace":
+        project = tmp_path / "workspace"
+        project.mkdir()
+    elif layout == "subdirectory":
+        project = product / "nested"
+        project.mkdir()
+
+    interpreter = str(release.parent / "venv/bin/python")
+    sid = "root-probe"
+    env = {
+        "PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TMPDIR": str(tmp_path),
+        "CLAUDE_PROJECT_DIR": str(project), "CODEX_CANONICAL_REPO_ROOT": str(product),
+        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT": str(primary), "LEARN_UKRAINIAN_PYTHON": interpreter,
+        setting: str(state), "SESSION_START_BUDGET_SECONDS": "30",
+    }
+    if layout == "subdirectory":
+        env.pop("CODEX_CANONICAL_REPO_ROOT")
+    payload = {"session_id": sid, "source": "startup"}
+    hook = release / HOOKS / entry
+    argv = ["bash", str(hook)]
+    session_record = state / ".agent" / "sessions" / f"{sid}.json"
+    tier = state / "batch_state" / "context_monitor" / f"{sid}.tier"
+    observed_root = tmp_path / "observed-root"
+
+    if entry == "context-rollover-lib.sh":
+        argv = [
+            "bash", "-c",
+            'source "$1" && context_machinery_bootstrap "$CLAUDE_PROJECT_DIR" && context_canonical_root "$PROJECT_DIR"',
+            entry, str(hook),
+        ]
+    elif entry in {"session-setup.sh", "enforce-venv.sh"}:
+        version = subprocess.check_output([interpreter, "--version"], text=True, env=env).strip()
+        checkout = primary if layout == "workspace" else product
+        (checkout / ".python-version").write_text(version.removeprefix("Python ") + "\n")
+        if state != checkout:
+            (state / ".python-version").write_text("0.0.0\n")
+        if entry == "enforce-venv.sh":
+            payload.update(tool_input={"command": "python -V"}, cwd=str(project))
+    elif entry == "post-compact.sh":
+        detector = tmp_path / "detect.py"
+        detector.write_text(
+            "import sys\nfrom pathlib import Path\n"
+            f"Path({str(observed_root)!r}).write_text(sys.argv[2])\n"
+        )
+        env["THREAD_ROLLOVER_SCRIPT"] = str(detector)
+    elif entry in {"context-monitor.sh", "context-rollover-guard.sh"}:
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text(json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 90}}}) + "\n")
+        payload.update(hook_event_name="UserPromptSubmit", transcript_path=str(transcript))
+        session_record.parent.mkdir(parents=True)
+        session_record.write_text(json.dumps({
+            "session_id": sid, "actual_context_window_tokens": 100,
+            "rollover_warning_percentages": [50, 65, 80],
+            "rollover_mode": "operator_restart" if entry == "context-rollover-guard.sh" else "continuation",
+        }))
+        if entry == "context-rollover-guard.sh":
+            tier.parent.mkdir(parents=True)
+            tier.write_text("3 90\n")
+    elif entry == "precompact-handoff-guard.sh":
+        # Stub the detector, which needs a live harness lease. Exercise the hook's
+        # use of the detector's answer when its state-root argument is the fixture's root.
+        runner = tmp_path / "runner.py"
+        runner.write_text(
+            "import sys\n"
+            f"if sys.argv[sys.argv.index('--state-root') + 1] == {str(state)!r}:\n"
+            "    print('prepared')\n"
+        )
+        env["SESSION_BOUNDED_RUNNER"] = str(runner)
+    elif entry == "check-agent-inbox.sh":
+        # The inbox hook sees one pending delivery without touching a live store.
+        inbox_python = tmp_path / "inbox-python"
+        inbox_python.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = -I ] && [ "$2" = -m ] && [ "$3" = lu_machinery.fleet_comms ]; then\n'
+            """  printf '%s\\n' '{"probe":"ok","count":1,"ids":["fixture-delivery"]}'\n"""
+            "  exit 0\n"
+            "fi\n"
+            f'exec {shlex.quote(interpreter)} "$@"\n'
+        )
+        inbox_python.chmod(0o755)
+        env["LEARN_UKRAINIAN_PYTHON"] = str(inbox_python)
+        payload["hook_event_name"] = "UserPromptSubmit"
+    elif entry == "audit-primary-checkout-dirt.py":
+        argv = shlex.split(native_hook_command("claude-audit-hook"))
+        env["XDG_STATE_HOME"] = str(tmp_path / "xdg")
+        payload.update(
+            hook_event_name="PreToolUse", tool_name="Bash", tool_use_id="audit-call",
+            tool_input={"command": "touch fixture-dirt"}, cwd=str(project),
+        )
+
+    result = subprocess.run(
+        argv, cwd=project, env=env, input=json.dumps(payload),
+        text=True, capture_output=True, check=False, timeout=60,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == (2 if entry in {"precompact-handoff-guard.sh", "enforce-venv.sh"} else 0), output
+    if entry == "context-rollover-lib.sh":
+        assert result.stdout.strip() == str(state), output
+    elif entry == "session-setup.sh":
+        assert session_record.is_file(), output
+        assert "PYTHON VERSION PIN MISSING" not in output
+        assert "VENV WRONG PYTHON" not in output
+        if layout == "worktree":
+            assert "dispatch worker (worker/task): thread lease not evaluated" in output
+    elif entry == "post-compact.sh":
+        assert observed_root.read_text() == str(state), output
+    elif entry == "context-monitor.sh":
+        assert tier.is_file() and tier.read_text() == "3 90\n", output
+        assert str(state / ".agent/claude-thread-bootstrap.md") in result.stdout, output
+    elif entry == "context-rollover-guard.sh":
+        assert "above this session's final rollover tier" in result.stdout, output
+    elif entry == "precompact-handoff-guard.sh":
+        assert "Automatic compaction paused" in result.stderr
+    elif entry == "enforce-venv.sh":
+        assert f"Run this command instead:\n  {interpreter} -V" in result.stderr, output
+    elif entry == "check-agent-inbox.sh":
+        deduplication_file, = (state / ".agent/runtime").glob("inbox-*.ids")
+        assert deduplication_file.read_text() == "fixture-delivery\n", output
+    elif entry == "audit-primary-checkout-dirt.py":
+        snapshots = state / ".agent/primary-dirt-audit/snapshots"
+        assert len(list(snapshots.glob("*.json"))) == 1, output
+        assert not (tmp_path / "xdg").exists()
+        (product / "fixture-dirt").write_text("fixture\n")
+        payload["hook_event_name"] = "PostToolUse"
+        after = subprocess.run(
+            argv, cwd=project, env=env, input=json.dumps(payload),
+            text=True, capture_output=True, check=False, timeout=60,
+        )
+        assert after.returncode == 2 and "fixture-dirt" in after.stderr, after.stderr
+    else:
+        assert (state / ".agent/claude-thread-lease.json.lock").is_file(), output
+    for checkout in {product, project}:
+        assert not (checkout / ".agent/sessions" / f"{sid}.json").exists()
+        assert not (checkout / "batch_state/context_monitor" / f"{sid}.tier").exists()
+        assert not (checkout / ".agent/claude-thread-lease.json.lock").exists()
+        assert not list((checkout / ".agent/runtime").glob("inbox-*.ids"))

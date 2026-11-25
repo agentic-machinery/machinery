@@ -917,7 +917,7 @@ _HOOK_ROOTS_SCRIPT = (
     'printf "%s\\0%s\\0" "$LU_PRODUCT_ROOT" "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"'
 )
 # The only environment the shell rule reads (PATH for dirname/basename).
-_HOOK_ROOTS_ENV = ("PATH", PRODUCT_ROOT_ENV, "CLAUDE_PROJECT_DIR", PRIMARY_ROOT_ENV, STATE_ROOT_ENV)
+_HOOK_ROOTS_ENV = ("PATH", PRODUCT_ROOT_ENV, "CLAUDE_PROJECT_DIR", PRIMARY_ROOT_ENV)
 
 
 def _has_git_marker(directory: Path) -> bool:
@@ -929,42 +929,54 @@ def _has_git_marker(directory: Path) -> bool:
     return True
 
 
-def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
-    """The product and shared-state roots for ``invocation_dir`` by the one hook rule; read-only.
+def configured_hook_state_root(primary: Path) -> Path | None:
+    """Resolve the explicit state directory for a hook with a validated primary checkout.
 
-    Glue only: it runs ``project_hook_roots_resolve`` from the packaged
-    ``lib/project_interpreter.sh`` with an argv (no shell text from data), stdin
-    disconnected, ``invocation_dir`` as the working directory and only the variables
-    that rule reads. Configured roots take part as the rule says; nothing is set
-    here. The rule checks ``invocation_dir``'s own nearest ``.git`` entry even when a
-    product is configured, so a symlinked or malformed ``.git`` there refuses.
+    The native hook command's compatibility alias can name the primary. A
+    detached root is configured with ``LU_STATE_ROOT`` and lives outside Git,
+    including when reached through a directory alias.
+    """
+    try:
+        configured = configured_state_root()
+        if configured is None:
+            return None
+        configured_primary_root()
+        resolved = resolve_path(configured)
+        if "\n" in os.fspath(resolved):
+            raise MachineryConfigError("the physical hook state root contains a newline")
+        if resolved == resolve_path(primary):
+            return resolved
+        if os.environ.get(STATE_ROOT_ENV):
+            raise MachineryConfigError(f"{STATE_ROOT_ENV} must name the primary checkout; use {LU_STATE_ROOT_ENV} for detached state")
+        ancestors = (configured, *configured.parents, resolved, *resolved.parents)
+        if any(_has_git_marker(ancestor) for ancestor in ancestors):
+            raise MachineryConfigError(f"{LU_STATE_ROOT_ENV} must name the primary checkout or a directory outside Git")
+        return resolved
+    except (OSError, RuntimeError) as exc:
+        raise MachineryConfigError(f"the hook state root could not be verified: {exc}") from None
+
+
+def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
+    """The product and primary checkout for ``invocation_dir`` by the one hook rule; read-only.
+
+    Run ``project_hook_roots_resolve`` from the packaged ``lib/project_interpreter.sh``
+    with stdin disconnected and ``invocation_dir`` as the working directory. The
+    rule checks the nearest ``.git`` entry even when a product is configured, so
+    a symlinked or malformed ``.git`` there refuses. Check the explicit state
+    setting against the validated primary checkout. Leave the environment intact.
     A refusal, a timeout or a malformed answer raises :class:`ProductRootError`.
     """
     import subprocess
 
     library = machinery_path("lib/project_interpreter.sh")
     env = {name: os.environ[name] for name in _HOOK_ROOTS_ENV if name in os.environ}
-    # The shell rule reads the compatibility names only: hand it the value of whichever name is set
-    # (a conflict between the two refuses here, before the rule runs). The rule's state-root check
-    # is the checkout layout's: a state root that is a checkout must be the hook anchor. A dedicated
-    # non-Git LU_STATE_ROOT (the detached layout) is not a checkout and not an anchor, so it is not
-    # handed over; ``configure_native_hook_roots`` still validates it through :func:`state_root`.
-    # An alias set in the environment is copied above unchanged: the generated hook command sees it
-    # too, and the rule refuses it there and here alike.
+    # The shell rule supplies the primary checkout. Validate explicit state
+    # once the primary is known, as the shell lifecycle hooks do.
     try:
-        for name in (LU_PRIMARY_ROOT_ENV, LU_STATE_ROOT_ENV):
-            setting = _setting(name, None)
-            if setting is None:
-                continue
-            if name == LU_STATE_ROOT_ENV:
-                configured = configured_state_root()
-                if configured is not None:
-                    resolved = resolve_path(configured)
-                    ancestors = (configured, *configured.parents, resolved, *resolved.parents)
-                    if not any(_has_git_marker(ancestor) for ancestor in ancestors):
-                        continue
-            env[ENV_ALIASES[name]] = setting[1]
-    except (MachineryConfigError, OSError, RuntimeError) as exc:
+        primary_setting = _setting(LU_PRIMARY_ROOT_ENV, None)
+        if primary_setting is not None:
+            env[PRIMARY_ROOT_ENV] = primary_setting[1]
+    except MachineryConfigError as exc:
         raise ProductRootError(f"no hook context resolves from {invocation_dir}: {exc}") from None
     try:
         # Fixed /bin/bash argv; the library path and directory are arguments, never shell text.
@@ -989,6 +1001,10 @@ def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
     product, primary = (Path(os.fsdecode(field)) for field in fields[:2])
     if not product.is_absolute() or not primary.is_absolute():
         raise ProductRootError(f"no hook context resolves from {invocation_dir}: the resolver answered a relative root")
+    try:
+        configured_hook_state_root(primary)
+    except MachineryConfigError as exc:
+        raise ProductRootError(f"no hook context resolves from {invocation_dir}: {exc}") from None
     return product, primary
 
 
