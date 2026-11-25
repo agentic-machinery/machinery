@@ -6,6 +6,16 @@ effort: high
 
 # Drive an epic lane
 
+**Two modes.** This file and its loop are the always-on **lane driver** (a launcher holds your
+lease). If your task ID (`$LEARN_UKRAINIAN_DISPATCH_TASK_ID`) starts with `turn-` and your task record
+has an `orchestrator` stream, you are a **milestone run** the CTO started as an orchestrator turn:
+follow
+[milestone-run](references/milestone-run.md). The dispatcher holds the stream lease; the run ends
+with one handoff note and one handoff receipt. A milestone run takes its work and stop conditions
+only from the CTO's brief and never claims, reads, relays or acknowledges lane-slot mail: the
+Inbox drain steps below (§0a, §4a, §5a, §8a) belong to the lane driver, and for a run's lane the
+CTO is the one accountable mail consumer.
+
 You drive **one epic or track lane** (`SESSION_EPIC` is set), not the whole fleet. You own the
 lane's judgment: what is wrong, what is next, which model and harness should do it, whether the
 artifact really worked, and what residual remains. A worker you brief owns its own chain to
@@ -104,7 +114,8 @@ A new multi-PR outcome is briefed as a [decision report](references/decision-rep
 to the CTO hourly, and every 30 minutes while an operator-priority outcome is open, in the
 [lane-report](references/lane-report.md) format. Seat-specific adjustments:
 [model-deltas](references/model-deltas.md). The CTO starts, limits and recovers dispatched stream
-turns (`dispatch --mode orchestrator`): [orchestrator-turn](references/orchestrator-turn.md).
+turns (`dispatch --mode orchestrator`): [orchestrator-turn](references/orchestrator-turn.md);
+to stop one, follow [milestone-run, Stopping a run](references/milestone-run.md#stopping-a-run).
 
 ## Escalate — do NOT decide these solo
 

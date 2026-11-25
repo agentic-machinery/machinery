@@ -79,6 +79,7 @@ include agents_extensions/shared/skills/drive-epic/references/decision-report.md
 include agents_extensions/shared/skills/drive-epic/references/epic-specific.md
 include agents_extensions/shared/skills/drive-epic/references/handoff.md
 include agents_extensions/shared/skills/drive-epic/references/lane-report.md
+include agents_extensions/shared/skills/drive-epic/references/milestone-run.md
 include agents_extensions/shared/skills/drive-epic/references/model-deltas.md
 include agents_extensions/shared/skills/drive-epic/references/orchestrator-turn.md
 include agents_extensions/shared/skills/drive-epic/references/orient.md
