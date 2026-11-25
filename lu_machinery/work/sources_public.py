@@ -131,9 +131,14 @@ def admit_delegate_task_row(
     if not isinstance(row, dict):
         return None
     allowed = admit_public_repository_id(repository_id)
+    has_present_claim = any(
+        raw not in (None, "") and (not str(raw).isascii() or bool(str(raw).strip()))
+        for attr_name in DELEGATE_REPOSITORY_ATTR_FIELDS
+        if (raw := row.get(attr_name)) is not None
+    )
     claimed = _authoritative_delegate_repository(row)
     if claimed is None:
-        if not trusted_scoped:
+        if not trusted_scoped or has_present_claim:
             return None
         admitted = allowed
     else:

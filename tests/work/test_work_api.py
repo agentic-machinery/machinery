@@ -1826,6 +1826,20 @@ def test_work_sources_and_relations_refuse_non_ascii_slugs_and_digits():
 
     assert sources_public._authoritative_delegate_repository({"repository_id": "\u00a0learn-ukrainian/machinery"}) is None
     assert sources_public._authoritative_delegate_repository({"repository": "learn-u\u212arainian/machinery"}) is None
+    # F1: present non-ASCII claims must be refused even under trusted_scoped=True (never stamped as public).
+    assert sources_public.admit_delegate_task_row(
+        {"task_id": "t1", "repository_id": "\u00a0other-org/private-repo"},
+        trusted_scoped=True,
+    ) is None
+    assert sources_public.admit_delegate_task_row(
+        {"task_id": "t2", "repository": "learn-u\u212arainian/machinery"},
+        trusted_scoped=True,
+    ) is None
+    assert sources_public.admit_delegate_task_row(
+        {"task_id": "t3", "repository_id": "\u00a0"},
+        trusted_scoped=True,
+    ) is None
+    assert sources_public.admit_delegate_task_row({"task_id": "t4"}, trusted_scoped=True) is not None
 
     assert relations._BLOCKED_BY_RE.findall("blocked by #42 blocked by #\u0664\u0662 blocked by #4\u0662") == ["42"]
     valid_wid = relations.issue_work_id("learn-ukrainian/machinery", 42)

@@ -606,7 +606,7 @@ def _parse_github_time(value: object) -> datetime | None:
 def _closes_issue(text: str, issue: int) -> bool:
     return (
         re.search(
-            rf"(?ai:\b(?:close[ds]?|fix(?:e[ds])?|resolve[ds]?))[ \t\r\n]*:?[ \t\r\n]+"
+            rf"\b(?ai:close[ds]?|fix(?:e[ds])?|resolve[ds]?)[ \t\r\n]*:?[ \t\r\n]+"
             rf"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#{issue}(?!\d)",
             text,
         )

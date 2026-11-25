@@ -540,6 +540,7 @@ def test_branch_sweep_and_remote_cleanup_refuse_non_ascii_slugs_and_digits():
     assert sweep._closes_issue("Fixes learn-ukrainian/machinery#42", 42) is True
     assert sweep._closes_issue("Fixes learn-u\u212arainian/machinery#42", 42) is False
     assert sweep._closes_issue("Fixes #42\u0660", 42) is False
+    assert sweep._closes_issue("\u00e9close #42", 42) is False
     assert sweep._same_origin_repository(
         {"repository": {"full_name": "learn-u\u212arainian/machinery"}}, ("learn-ukrainian", "machinery")
     ) is False
