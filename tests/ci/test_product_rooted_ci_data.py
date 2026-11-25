@@ -394,7 +394,7 @@ def test_lock_only_diff_needs_no_distribution_metadata(monkeypatch: pytest.Monke
     assert affected.infrastructure_changed(["requirements-machinery.lock"])
     assert affected.infrastructure_changed(["requirements-dev.txt"])
     assert affected.infrastructure_changed(["uv.lock"])
-    assert affected.importing_tests({"requirements-machinery.lock"}, set(), "HEAD", {}) == ([], [])
+    assert affected.importing_tests({"requirements-machinery.lock"}, set(), "HEAD", {}) == ([], [], [])
 
 
 @pytest.fixture
@@ -469,6 +469,38 @@ def test_direct_importers_and_text_readers_share_extra_budget(tmp_path: Path, in
     assert record["deferred_files"] == [shared, expensive_reader]
     assert record["estimate_seconds"] == 465.5
     assert record["timeout_seconds"] == 550
+
+
+def test_two_edge_importer_uses_only_remaining_pr_budget(tmp_path: Path, installed: tuple[Path, Path]) -> None:
+    """Defect class: a test of an indirect importer is absent from the PR plan."""
+    python, _wheel = installed
+    reader = "tests/test_reader.py"
+    indirect = "tests/test_indirect.py"
+    expensive = "tests/test_expensive.py"
+    shared = "tests/direct/test_shared.py"
+    _, env = _product(tmp_path, "alpha", extra={
+        "scripts/reader.py": "from scripts import runner\n",
+        "scripts/wrapper.py": "from scripts import reader\n",
+        reader: "TARGET = 'scripts/runner.py'\n",
+        indirect: "from scripts import reader\n",
+        expensive: "from scripts import reader\n",
+        "tests/test_three_edges.py": "from scripts import wrapper\n",
+        "tests/direct/conftest.py": "from scripts import runner\n",
+        "tests/indirect/conftest.py": "from scripts import reader\n",
+        shared: "def test_ok():\n    assert True\n",
+        "tests/indirect/test_shared.py": "def test_ok():\n    assert True\n",
+        "scripts/ci/pytest-file-durations.json": json.dumps({
+            FILES[0]: 345, shared: 1, reader: 59, indirect: 0.5, expensive: 1.75,
+            "tests/test_three_edges.py": 0.1, "tests/indirect/test_shared.py": 0.1,
+        }),
+    })
+    code = "import json; from lu_machinery.ci.pr_affected_tests import plan; print(json.dumps(plan('HEAD^1', 'HEAD')))"
+    result = _run(python, tmp_path, env, "-c", code)
+    assert result.returncode == 0, result.stderr
+    record = json.loads(result.stdout)
+    assert record["run_files"] == [shared, FILES[0], indirect, reader]
+    assert record["deferred_files"] == [expensive]
+    assert record["estimate_seconds"] == 465.5
 
 
 def test_selection_refuses_a_third_party_import_in_the_receipt_gate_closure(
