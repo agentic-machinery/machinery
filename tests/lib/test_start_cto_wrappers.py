@@ -1026,8 +1026,12 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
 
     nested = primary / "workspace"
     nested.mkdir()
+    unsafe_name = tmp_path / "workspace\u200b"
+    unsafe_name.mkdir()
     primary_alias = tmp_path / "primary-alias"
     primary_alias.symlink_to(primary, target_is_directory=True)
+    package_alias = tmp_path / "package-alias"
+    package_alias.symlink_to(wrapper.parent, target_is_directory=True)
     stray, second = tmp_path / "stray-state", tmp_path / "second-checkout"
     (stray / ".git").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(second)], check=True, timeout=30,
@@ -1041,6 +1045,7 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
         ({"LU_PRIMARY_REPO_ROOT": None}, workspace, "needs LU_PRIMARY_REPO_ROOT"),
         ({}, state, "LC_WORKSPACE_ROOT_CWD"),
         ({"LC_WORKSPACE_ROOT": str(nested)}, nested, "outside every Git checkout"),
+        ({"LC_WORKSPACE_ROOT": str(unsafe_name)}, unsafe_name, "control/format characters in path"),
         ({"LEARN_UKRAINIAN_STATE_ROOT": str(state)}, workspace, "not LEARN_UKRAINIAN_STATE_ROOT"),
         ({"LU_PRODUCT_ROOT": str(workspace)}, workspace, "cannot be the CTO workspace"),
         ({"LU_PRIMARY_REPO_ROOT": str(primary_alias)}, workspace, "by its physical path"),
@@ -1051,6 +1056,8 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
         assert "would exec" not in refused.stdout
     refused = launch(entry=machinery_path("start-kube-dojo-driver.sh"), args=())
     assert refused.returncode == 3 and "LC_WORKSPACE_ROOT_UNSUPPORTED" in refused.stderr, refused.stderr
+    refused = launch(entry=package_alias / wrapper.name)
+    assert refused.returncode == 3 and "absolute physical path" in refused.stderr, refused.stderr
 
     # Supervisor start: the capsule lands under the state root, the lease receipt in the workspace.
     project, _capture = _build_fake_project(tmp_path)
@@ -1134,9 +1141,14 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
         (template(f"{package_wrapper.parent}/./{package_wrapper.name}"), workspace, package_wrapper),
         (template(f"{stale}/{package_wrapper.name}"), workspace, package_wrapper),  # a path exec cannot reach
         (template(f"{live}/{package_wrapper.name}"), workspace, package_wrapper),  # not the canonical path
+        (template(package_wrapper), workspace, live / package_wrapper.name),
     ):
         with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
             cto_wrapper_signature(wrapper, root, entry, args)
+    monkeypatch.setenv("LC_WORKSPACE_ROOT", str(alias))
+    with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
+        cto_wrapper_signature(template(package_wrapper, alias), workspace, package_wrapper, args)
+    monkeypatch.setenv("LC_WORKSPACE_ROOT", str(workspace))
     monkeypatch.chdir(tmp_path)
     with pytest.raises(SupervisorError, match="cto-wrapper-unsupported"):
         cto_wrapper_signature(template(package_wrapper), workspace, package_wrapper, args)

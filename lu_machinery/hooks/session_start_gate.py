@@ -154,7 +154,7 @@ def phase_session_record(args: argparse.Namespace) -> dict[str, Any]:
 
 def phase_python_version(args: argparse.Namespace) -> dict[str, Any]:
     """The gate runs ON the canonical venv python — compare in-process."""
-    pin_file = Path(args.repo_root) / ".python-version"
+    pin_file = Path(args.primary_checkout or args.repo_root) / ".python-version"
     try:
         if not pin_file.is_file():
             return {
@@ -179,7 +179,9 @@ def phase_primary_main(args: argparse.Namespace) -> dict[str, Any]:
     except Exception as exc:
         return _crash(exc)
     try:
-        rc, _out, _err = _run_cli_inprocess(assert_primary_on_main.main, ["--cwd", args.project_dir, "--quiet"])
+        rc, _out, _err = _run_cli_inprocess(
+            assert_primary_on_main.main, ["--cwd", args.primary_checkout or args.project_dir, "--quiet"]
+        )
     except Exception as exc:
         return _crash(exc)
     if rc != 0:
@@ -474,8 +476,12 @@ def phase_stack_drift(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo-root", required=True, help="canonical checkout (state root)")
-    parser.add_argument("--project-dir", required=True, help="session checkout (may be a worktree)")
+    parser.add_argument("--repo-root", required=True, help="runtime state root (the primary checkout in checkout mode)")
+    parser.add_argument("--project-dir", required=True, help="session project directory (may be a worktree)")
+    parser.add_argument(
+        "--primary-checkout",
+        help="validated absolute checkout for the version pin and branch checks when the project is a non-Git workspace",
+    )
     parser.add_argument("--agent", required=True)
     parser.add_argument("--session-id", default="")
     parser.add_argument(

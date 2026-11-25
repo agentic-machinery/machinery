@@ -159,6 +159,16 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
     assert run("--workspace", "--project-root", str(workspace), "--check") == 2
     assert "settings.local.json" in capsys.readouterr().err
     (workspace / ".claude/settings.local.json").unlink()
+    local = workspace / ".claude/settings.local.json"
+    local.mkdir()
+    assert run("--workspace", "--project-root", str(workspace)) == 2
+    assert "must not hold .claude/settings.local.json" in capsys.readouterr().err
+    local.rmdir()
+    local.symlink_to(workspace / "absent")
+    assert run("--workspace", "--project-root", str(workspace), "--check") == 2
+    assert "must not hold .claude/settings.local.json" in capsys.readouterr().err
+    assert local.is_symlink()
+    local.unlink()
     # A local settings layer planned from the workspace's own sources is refused before any write.
     planned = write(workspace, "agents_extensions/shared/settings.local.json", "{}")
     descriptor(workspace, preserve=[".agent/tmp"])

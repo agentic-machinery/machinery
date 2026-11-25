@@ -81,8 +81,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/context-rollover-lib.sh" \
   || { echo "session-setup.sh: context-rollover-lib.sh is missing beside this hook" >&2; exit 1; }
 context_machinery_bootstrap "${LU_PRODUCT_ROOT:-${CLAUDE_PROJECT_DIR:-}}" || exit 1
 
-_LU_REPO="$PROJECT_DIR"
-if [ "$(_hook_deadline 2 git -C "$_LU_REPO" config --get core.bare 2>/dev/null)" = "true" ]; then
+WORKSPACE_PROJECT=""
+if context_outside_checkouts "${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}"; then
+  WORKSPACE_PROJECT="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}"
+fi
+
+_LU_REPO="${WORKSPACE_PROJECT:-$PROJECT_DIR}"
+if [ -z "$WORKSPACE_PROJECT" ] && [ "$(_hook_deadline 2 git -C "$_LU_REPO" config --get core.bare 2>/dev/null)" = "true" ]; then
   _hook_deadline 2 git -C "$_LU_REPO" config --local core.bare false 2>/dev/null \
     && echo "⚠️  repo-health: reset core.bare true→false (git work tree was broken; see #2842)" >&2
 fi
@@ -144,18 +149,16 @@ fi
 ISSUES=()
 INFO=()
 
-if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
+if [ -n "$WORKSPACE_PROJECT" ]; then
+  CANONICAL_ROOT=$(context_state_root "$WORKSPACE_PROJECT") || exit 1
+elif [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
   CANONICAL_ROOT="$CODEX_CANONICAL_REPO_ROOT"
 else
-  GIT_COMMON_DIR=""
-  if ! context_outside_checkouts "$PROJECT_DIR"; then
-    GIT_COMMON_DIR=$(_hook_deadline 2 git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-  fi
+  GIT_COMMON_DIR=$(_hook_deadline 2 git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
   if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
     CANONICAL_ROOT=$(dirname "$GIT_COMMON_DIR")
   else
-    # Outside every checkout (the CTO workspace): the configured state root.
-    CANONICAL_ROOT=$(context_state_root "$PROJECT_DIR") || exit 1
+    CANONICAL_ROOT="$PROJECT_DIR"
   fi
 fi
 
@@ -353,8 +356,12 @@ unset LANE_PROBE_SCRIPT
 # a shadow comms DB and swallowed a message. Advisory only: the guard alerts
 # here and NEVER deletes (garbage root entries are forensic evidence).
 ROOT_GUARD_RC=0
+ROOT_GUARD_ROOT="$CANONICAL_ROOT"
+if [ -n "$WORKSPACE_PROJECT" ]; then
+  ROOT_GUARD_ROOT="$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT"
+fi
 ROOT_GUARD_JSON=$(run_bounded 3 "${PROJECT_PYTHON_COMMAND[@]}" \
-  -m lu_machinery.hygiene.root_entry_guard --repo-root "$CANONICAL_ROOT" --json 2>/dev/null) || ROOT_GUARD_RC=$?
+  -m lu_machinery.hygiene.root_entry_guard --repo-root "$ROOT_GUARD_ROOT" --json 2>/dev/null) || ROOT_GUARD_RC=$?
 if [ "$ROOT_GUARD_RC" -eq 0 ] && [ -n "$ROOT_GUARD_JSON" ]; then
   ROOT_GUARD_COUNT=$(printf '%s' "$ROOT_GUARD_JSON" | _hook_deadline 2 jq -r '.unexpected_count // 0' 2>/dev/null || echo 0)
   if [[ "$ROOT_GUARD_COUNT" =~ ^[0-9]+$ ]] && [ "$ROOT_GUARD_COUNT" -gt 0 ]; then
@@ -389,6 +396,9 @@ else:
     fi
     ROOT_GUARD_MODULE=lu_machinery.hygiene.root_entry_guard
     ROOT_GUARD_DETAIL="Detail: .venv/bin/python -m $ROOT_GUARD_MODULE"
+    if [ -n "$WORKSPACE_PROJECT" ]; then
+      ROOT_GUARD_DETAIL="Detail: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m $ROOT_GUARD_MODULE --repo-root \"\$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT\""
+    fi
     if [ "${CODEX_NORMAL_TASK:-0}" = "1" ]; then
       # Ordinary Codex context is contracted under 500 bytes (#10952): the
       # lane self-test and this notice must fit together, so withheld names
@@ -405,7 +415,7 @@ else
   # context budget (ordinary Codex starts are contracted under 500 bytes).
   echo "WARNING: root-hygiene canary could not run (rc=$ROOT_GUARD_RC): unexpected repo-root entries would go undetected this session (#6863)." >&2
 fi
-unset ROOT_GUARD_RC ROOT_GUARD_JSON
+unset ROOT_GUARD_RC ROOT_GUARD_ROOT ROOT_GUARD_JSON
 
 # 6. Check MEMORY.md line count (truncated at 200 lines by system)
 # Claude keys its per-project directory by its project directory's Git root (one
@@ -439,8 +449,8 @@ fi
 # root may be configured separately), else the product checkout, as before.
 DEPLOY_TARGET="$PROJECT_DIR"
 DEPLOY_CHECK_MODE=()
-if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && context_outside_checkouts "$CLAUDE_PROJECT_DIR"; then
-  DEPLOY_TARGET="$CLAUDE_PROJECT_DIR"
+if [ -n "$WORKSPACE_PROJECT" ]; then
+  DEPLOY_TARGET="$WORKSPACE_PROJECT"
   DEPLOY_CHECK_MODE=(--workspace)
 fi
 
@@ -509,7 +519,11 @@ if [ "$IS_CODEX_SESSION" = "0" ] \
       ISSUES+=("DEPLOY DRIFT: $DRIFT_COUNT file(s) differ between agents_extensions/shared/ and .claude/. Run: npm run agents:deploy")
     fi
   elif [ "$DEPLOY_CHECK_RC" -ne 0 ]; then
-    ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m lu_machinery.agent_deploy ${DEPLOY_CHECK_MODE[*]+${DEPLOY_CHECK_MODE[*]} }--project-root <checkout root> --check")
+    if [ -n "$WORKSPACE_PROJECT" ]; then
+      ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: \"\$LEARN_UKRAINIAN_PYTHON\" -I -m lu_machinery.agent_deploy --workspace --project-root <workspace> --check")
+    else
+      ISSUES+=("DEPLOY DRIFT CHECK COULD NOT RUN (rc=$DEPLOY_CHECK_RC): deployed agent extensions are unverified. Detail: .venv/bin/python -I -m lu_machinery.agent_deploy --project-root <checkout root> --check")
+    fi
   fi
   unset DEPLOY_CHECK_RC DEPLOY_CHECK_ERR DEPLOY_CHECK_ROOT DRIFT_COUNT
 fi
@@ -641,7 +655,10 @@ EOF
 
 build_handoff_fallback() {
   local warning_text="$1"
-  local prefix=""
+  local prefix="" interpreter=.venv/bin/python
+  if [ -n "$WORKSPACE_PROJECT" ]; then
+    interpreter='"$LEARN_UKRAINIAN_PYTHON" -I'
+  fi
 
   if [ -n "$warning_text" ]; then
     prefix="$warning_text
@@ -653,7 +670,7 @@ build_handoff_fallback() {
 ${prefix}PREVIOUS-SESSION HANDOFF — legacy git router opt-in could not locate a compact handoff.
 
 Do not dump or rewrite docs/session-state/current.md. For thread rollover, run:
-.venv/bin/python -m lu_machinery.orchestration.thread_handoff prepare --agent $HANDOFF_AGENT
+$interpreter -m lu_machinery.orchestration.thread_handoff prepare --agent $HANDOFF_AGENT
 
 ---
 EOF
@@ -787,6 +804,9 @@ GATE_ARGS=(
   --agent "$HANDOFF_AGENT" --session-id "$CURRENT_THREAD_ID"
   --record-session-id "$SESSION_ID"
 )
+if [ -n "$WORKSPACE_PROJECT" ]; then
+  GATE_ARGS+=(--primary-checkout "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")
+fi
 [ -n "$TRANSCRIPT_PATH" ] && GATE_ARGS+=(--transcript-path "$TRANSCRIPT_PATH")
 [ -n "$SOURCE" ] && GATE_ARGS+=(--source "$SOURCE")
 [ -n "$OBSERVED_MODEL" ] && GATE_ARGS+=(--observed-model "$OBSERVED_MODEL")

@@ -226,20 +226,21 @@ context_live_usage() {
 # outside every checkout (the CTO workspace) owns no runtime state: the
 # configured state root does (context_state_root).
 context_canonical_root() {
-  local project_dir="$1" git_common_dir
+  local project_dir="$1" session_project git_common_dir
+  session_project="${CLAUDE_PROJECT_DIR:-$project_dir}"
+  if context_outside_checkouts "$session_project"; then
+    context_state_root "$session_project"
+    return
+  fi
   if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
     printf '%s\n' "$CODEX_CANONICAL_REPO_ROOT"
     return 0
-  fi
-  if context_outside_checkouts "$project_dir"; then
-    context_state_root "$project_dir"
-    return
   fi
   git_common_dir=$(git -C "$project_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
   if [ -n "$git_common_dir" ] && [ "$(basename "$git_common_dir")" = ".git" ]; then
     dirname "$git_common_dir"
   else
-    context_state_root "$project_dir"
+    printf '%s\n' "$project_dir"
   fi
 }
 

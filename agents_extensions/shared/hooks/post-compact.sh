@@ -45,21 +45,17 @@ BOUNDED_RUNNER=""
 post_compact_bootstrap() {
   [ -n "$BOUNDED_PYTHON" ] && return 0
   context_machinery_bootstrap "${LU_PRODUCT_ROOT:-${CLAUDE_PROJECT_DIR:-}}" || exit 1
-  GIT_COMMON_DIR=""
-  if ! context_outside_checkouts "$PROJECT_DIR"; then
-    GIT_COMMON_DIR=$(git_common_dir) || GIT_COMMON_DIR=""
-  fi
-  PRIMARY_ROOT=""
-  if [ -n "$GIT_COMMON_DIR" ] && [ "$(basename "$GIT_COMMON_DIR")" = ".git" ]; then
-    PRIMARY_ROOT=$(dirname "$GIT_COMMON_DIR")
-  fi
-  if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
+  local session_project="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}" git_common
+  if context_outside_checkouts "$session_project"; then
+    CANONICAL_ROOT=$(context_state_root "$session_project") || exit 1
+  elif [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
     CANONICAL_ROOT="$CODEX_CANONICAL_REPO_ROOT"
-  elif [ -n "$PRIMARY_ROOT" ]; then
-    CANONICAL_ROOT="$PRIMARY_ROOT"
   else
-    # Outside every checkout (the CTO workspace): the configured state root.
-    CANONICAL_ROOT=$(context_state_root "$PROJECT_DIR") || exit 1
+    git_common=$(git_common_dir) || git_common=""
+    CANONICAL_ROOT="$PROJECT_DIR"
+    if [ -n "$git_common" ] && [ "$(basename "$git_common")" = ".git" ]; then
+      CANONICAL_ROOT=$(dirname "$git_common")
+    fi
   fi
   BOUNDED_PYTHON="$CONTEXT_PROJECT_PYTHON"
   BOUNDED_RUNNER="${SESSION_BOUNDED_RUNNER:-$MACHINERY_DIR/lu_machinery/agent_runtime/bounded_command.py}"

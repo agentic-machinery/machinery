@@ -135,8 +135,9 @@ def cto_wrapper_signature(wrapper: Path, root: Path, entrypoint: Path, args: lis
                 or not os.path.isfile(_CTO_PACKAGE_WRAPPER)
                 or not os.access(_CTO_PACKAGE_WRAPPER, os.X_OK)
                 or repo != workspace
+                or repo != os.getcwd()
                 or any(os.path.lexists(os.path.join(ancestor, ".git")) for ancestor in (repo, *map(str, Path(repo).parents)))
-                or entrypoint.name != _CTO_PACKAGE_WRAPPER.name
+                or entrypoint != _CTO_PACKAGE_WRAPPER
             ):
                 raise ValueError("unsupported workspace intent")
             expected_entry = _CTO_PACKAGE_WRAPPER

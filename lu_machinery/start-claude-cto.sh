@@ -11,8 +11,12 @@
 # their own optional inputs. Without LC_WORKSPACE_ROOT this wrapper refuses: the
 # product checkout keeps its own start-claude-cto.sh.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "$ROOT/lu_machinery/lib/launcher_core.sh"
+PACKAGE_DIR="$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [ "${BASH_SOURCE[0]}" != "$PACKAGE_DIR/start-claude-cto.sh" ] || [ -L "${BASH_SOURCE[0]}" ]; then
+  printf '%s\n' "LC_WORKSPACE_ROOT_INVALID: invoke the package CTO launcher by its absolute physical path." >&2
+  exit 3
+fi
+source "$PACKAGE_DIR/lib/launcher_core.sh"
 
 # Explicit CLI Opus escalation is limited to this wrapper's epics driver lane.
 for arg in "$@"; do

@@ -870,17 +870,19 @@ launcher_validate_workspace_roots() {
   if ! reason="$(CLAUDE_PROJECT_DIR="$LC_ROOT" "${PROJECT_PYTHON_COMMAND[@]}" -c '
 import sys
 from pathlib import Path
+from lu_machinery.agent_deploy.plan import Invalid, relative
 from lu_machinery.common.repo_root import MachineryConfigError, native_hook_roots, state_root
 workspace = Path(sys.argv[1])
 try:
+    relative(sys.argv[1].removeprefix("/"))
     native_hook_roots(workspace)
     state = state_root().resolve()
-except (MachineryConfigError, OSError) as exc:
+except (Invalid, MachineryConfigError, OSError) as exc:
     sys.exit(f"{type(exc).__name__}: {exc}")
 if state == workspace or workspace in state.parents:
     sys.exit(f"the state root {state} is the workspace or inside it")
 ' "$LC_ROOT" 2>&1 >/dev/null)"; then
-    launcher_error "LC_WORKSPACE_ROOT: the hook context or state root does not validate: ${reason##*$'\n'}"
+    launcher_error "LC_WORKSPACE_ROOT: the workspace path, hook context or state root does not validate: ${reason##*$'\n'}"
     return 1
   fi
 }

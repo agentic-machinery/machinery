@@ -87,6 +87,14 @@ def digest(blob: bytes) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _entry_exists(directory: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def encoded(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode()
 
@@ -160,6 +168,13 @@ class Tree:
         try:
             with self.directory(path):
                 return True
+        except FileNotFoundError:
+            return False
+
+    def has_entry(self, path: str) -> bool:
+        try:
+            with self.parent(path) as (directory, name):
+                return _entry_exists(directory, name)
         except FileNotFoundError:
             return False
 
@@ -364,15 +379,6 @@ class CommitInputs:
         return {key: (blob, mode) for (key, _, mode), blob in zip(items, contents, strict=True)}
 
 
-def _has_git_entry(directory: int) -> bool:
-    """``.git`` exists (any type, a dangling symlink included) in the open ``directory``."""
-    try:
-        os.stat(".git", dir_fd=directory, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
-
-
 @contextlib.contextmanager
 def selected_tree(selected: str | None, check: bool, *, workspace: bool = False) -> Iterator[Tree]:
     """Hold the selected target's directory and its per-target lock.
@@ -389,13 +395,13 @@ def selected_tree(selected: str | None, check: bool, *, workspace: bool = False)
     path = Path(selected)
     if not path.is_absolute():
         raise Invalid("project root must be absolute")
-    relative(str(path)[1:])
     if workspace and path == Path("/"):
         raise Invalid("a workspace target cannot be the filesystem root")
+    relative(str(path)[1:])
     # Open each component: resolve() would silently accept symlink targets.
     base = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
-        if workspace and _has_git_entry(base):
+        if workspace and _entry_exists(base, ".git"):
             raise Invalid("a workspace target must be outside every Git checkout: / has a .git entry")
         walked = ""
         for component in path.parts[1:]:
@@ -404,7 +410,7 @@ def selected_tree(selected: str | None, check: bool, *, workspace: bool = False)
             base = child
             walked += "/" + component
             # Checked on the held descriptors, so no path swap can hide a checkout.
-            if workspace and _has_git_entry(base):
+            if workspace and _entry_exists(base, ".git"):
                 raise Invalid(f"a workspace target must be outside every Git checkout: {walked} has a .git entry")
         tree = Tree(base)
         if not workspace:
@@ -499,7 +505,7 @@ def release_inputs() -> tuple[dict[str, Output], dict[str, Any], str]:
     return result, inventory, identity
 
 
-def build(tree: Tree, inputs: Tree | CommitInputs | None = None) -> Plan:
+def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: bool = False) -> Plan:
     """The plan for ``tree``, composed from ``inputs`` (the descriptor and product sources); default: ``tree``."""
     inputs = tree if inputs is None else inputs
     entry = inputs.read(DESCRIPTOR)
@@ -511,6 +517,8 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None) -> Plan:
     providers, sources, preserve = (descriptor[key] for key in ("providers", "sources", "preserve"))
     if not isinstance(providers, list) or not providers or any(p not in TARGETS for p in providers) or len(set(providers)) != len(providers):
         raise Invalid("invalid enabled providers")
+    if workspace and "claude" not in providers:
+        raise Invalid("a workspace target must enable the claude provider")
     if not isinstance(sources, dict) or set(sources) - {"shared", *providers}:
         raise Invalid("invalid source groups")
     roots = {TARGETS[p] for p in providers}
@@ -655,7 +663,12 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None) -> Plan:
     # is preserved. Only recognized control files are read; runtime scratch
     # remains excluded from the target inventory below.
     if "claude" in providers:
-        for config in (".claude/settings.json", ".claude/settings.local.json"):
+        local = ".claude/settings.local.json"
+        if workspace and (any(path == local or path.startswith(local + "/") for path in outputs)
+                          or tree.has_entry(local)):
+            raise Invalid("a workspace target must not hold .claude/settings.local.json")
+        configs = (".claude/settings.json",) if workspace else (".claude/settings.json", local)
+        for config in configs:
             planned = outputs.get(config)
             existing = tree.read(config) if planned is None else None
             control_blob = planned.blob if planned is not None else existing[0] if existing is not None else None
@@ -771,17 +784,7 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
 
 def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None,
            workspace: bool = False) -> int:
-    plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None)
-    if workspace:
-        if TARGETS["claude"] not in plan.roots:
-            # The workspace runs Claude Code; enabling it makes the release's mandatory Claude
-            # hook settings a deployment requirement, so a guard-less workspace never verifies.
-            raise Invalid("a workspace target must enable the claude provider")
-        local = ".claude/settings.local.json"
-        if any(path == local or path.startswith(local + "/") for path in plan.files) or tree.read(local) is not None:
-            # Claude loads local settings beside the deployed ones; in a workspace nothing else
-            # validates them, so none may be planned or present.
-            raise Invalid("a workspace target must not hold .claude/settings.local.json")
+    plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None, workspace=workspace)
     old = old_state(tree)
     problems = preflight(tree, plan, old, check)
     if problems:
