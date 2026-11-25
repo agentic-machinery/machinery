@@ -3108,11 +3108,14 @@ def _post_verdict(repository: str, number: int, comment: str, login: str) -> dic
     return readback
 
 
-def publication_of(repository: str, number: int, comment: Mapping[str, Any]) -> tuple[dict[str, Any] | None, str]:
+def publication_of(
+    repository: str, number: int, comment: Mapping[str, Any], *, fleet_repo_selector: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str]:
     """The publication-ledger entry a posted verdict comment proves, read as the verdict reader reads it (#902).
 
     Returns (entry, "") or (None, reason). A voided chunk, a second review and a marker of a model that cannot
     supply a review of record are no review of record. The caller decides whether the comment's author is trusted.
+    ``fleet_repo_selector`` is the selector receipt the caller resolved the repository with (provenance only).
     """
     from lu_machinery.api import model_stats_rows
 
@@ -3128,7 +3131,7 @@ def publication_of(repository: str, number: int, comment: Mapping[str, Any]) -> 
     try:
         entry = model_stats_rows.publication(
             task_id=marker["task"], repository=repository, pr=number, head=marker["sha"], verdict=verdict,
-            published_at=comment.get("created_at"),
+            published_at=comment.get("created_at"), fleet_repo_selector=fleet_repo_selector,
         )
     except ValueError:
         return None, "malformed field"
@@ -3139,7 +3142,10 @@ def _recovery_command(repository: str, number: int) -> str:
     return f"{RECORDER_COMMAND} import-publications --repository {repository} --pr {number}"
 
 
-def _store_publication(task_root: Path, *, repository: str, number: int, comment: Mapping[str, Any]) -> str:
+def _store_publication(
+    task_root: Path, *, repository: str, number: int, comment: Mapping[str, Any],
+    fleet_repo_selector: Mapping[str, Any] | None = None,
+) -> str:
     """Store the local marker of a verdict that is now on the PR (#902); the model statistics count only these.
 
     The marker goes to the publication ledger beside the task store (``model_stats_rows.record_publications``). A
@@ -3148,7 +3154,7 @@ def _store_publication(task_root: Path, *, repository: str, number: int, comment
     from lu_machinery.api import model_stats_rows
 
     try:
-        entry, reason = publication_of(repository, number, comment)
+        entry, reason = publication_of(repository, number, comment, fleet_repo_selector=fleet_repo_selector)
         if entry is None:
             return f"not stored: {reason}"
         model_stats_rows.record_publications(task_root.parent, [entry], wait_s=model_stats_rows.SETTLEMENT_LOCK_WAIT_S)
@@ -3231,7 +3237,7 @@ def import_publications(
             ):
                 counts["markers_untrusted"] += 1
                 continue
-            entry, _ = publication_of(target.repo.github, number, item)
+            entry, _ = publication_of(target.repo.github, number, item, fleet_repo_selector=target.selector_receipt())
             if entry is None:
                 counts["markers_skipped"] += 1
             else:
@@ -3689,6 +3695,7 @@ def record(
         # After the status, so a marker problem never stands between the verdict and its status.
         publication_marker = _store_publication(
             task_root, repository=github.stored, number=number, comment=posted_comment if posted else existing or {},
+            fleet_repo_selector=github.selector,
         )
     result = {
         "pr": number,

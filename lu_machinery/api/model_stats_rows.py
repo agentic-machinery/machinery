@@ -44,6 +44,7 @@ from typing import Any, cast
 from lu_machinery.agent_runtime.attempt_boundary import CLAUDE_SUBSCRIPTION_ACCOUNT_LABELS
 from lu_machinery.api.opsec_scan import scan_text
 from lu_machinery.common import json_depth
+from lu_machinery.common.git_credentials import _is_valid_slug as _is_selector_slug
 from lu_machinery.common.task_store_paths import read_cached_task_record, tasks_dir
 from lu_machinery.dispatcher.admission import review_typed
 from lu_machinery.dispatcher.types import NEVER_STARTED, StartRefusal
@@ -895,13 +896,13 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
-def _append_line(path: Path, line: Mapping[str, Any]) -> None:
+def _append_line(path: Path, line: bytes) -> None:
     """Append one whole line; a fragment an earlier failed append left is closed first, so it stays one bad line."""
     fd = _open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT)
     try:
         size = os.fstat(fd).st_size
         open_fragment = size > 0 and os.pread(fd, 1, size - 1) != b"\n"
-        _write_all(fd, (b"\n" if open_fragment else b"") + _line(line))
+        _write_all(fd, (b"\n" if open_fragment else b"") + line)
     finally:
         os.close(fd)
 
@@ -916,7 +917,7 @@ def append_row(batch_state_dir: Path, row: Mapping[str, Any] | Callable[[], Mapp
     with _locked(batch_state_dir, wait_s) as path:
         line = row() if callable(row) else row
         if line is not None:
-            _append_line(path, line)
+            _append_line(path, _line(line))
 
 
 def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path, source_mtime_ns: int) -> None:
@@ -933,16 +934,32 @@ def record_settled(path: Path, record: Mapping[str, Any], batch_state_dir: Path,
 # The published-verdict ledger (#902): one line per verdict the recorder published on a PR as the review of record,
 # in ``<batch_state>/model-stats/publications.jsonl``. Its one writer is ``record_cf_verdict`` (each ``record`` and
 # the one-shot ``import-publications``); the statistics read it and never reach GitHub. A review without a line is
-# of unknown publication.
+# of unknown publication. A line of a dual-slug repository also carries ``fleet_repo_selector``, the selector receipt
+# (value and sha256) the writer resolved the repository with (SELECTOR-DURABLE-RECEIPTS); lines without it (single-slug
+# rows, lines written before it) read as having none. The receipt is provenance, never authority: no reader may use
+# it to authorize a write, and it is no part of what makes two lines the same publication.
 PUBLICATION_SCHEMA = "review-publication.v1"
 PUBLICATIONS_FILE = "publications.jsonl"
 PUBLISHED_VERDICTS = frozenset({"APPROVED", "CHANGES_REQUESTED", "BLOCKED"})
 _PUBLICATION_KEYS = frozenset({"schema", "task_id", "repository", "pr", "head", "verdict", "published_at"})
+_PUBLICATION_SELECTOR = "fleet_repo_selector"
 REPOSITORY_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}\Z")
 
 
+def _selector_ok(receipt: object) -> bool:
+    """The optional receipt uses the selector loader's slug grammar and a lowercase SHA-256."""
+    if receipt is None:
+        return True
+    if not isinstance(receipt, dict) or receipt.keys() != {"selector_value", "selector_sha256"}:
+        return False
+    digest = receipt["selector_sha256"]
+    return _is_selector_slug(receipt["selector_value"]) and isinstance(digest, str) and _SHA256.fullmatch(digest) is not None
+
+
 def _publication_ok(entry: object) -> bool:
-    if not isinstance(entry, dict) or entry.keys() != _PUBLICATION_KEYS:
+    if not isinstance(entry, dict) or entry.keys() - {_PUBLICATION_SELECTOR} != _PUBLICATION_KEYS:
+        return False
+    if not _selector_ok(entry.get(_PUBLICATION_SELECTOR)):
         return False
     pr, repository = entry["pr"], entry["repository"]
     return (entry["schema"] == PUBLICATION_SCHEMA and valid_task_id(entry["task_id"])
@@ -953,14 +970,29 @@ def _publication_ok(entry: object) -> bool:
 
 
 def publication(*, task_id: str, repository: str, pr: int, head: str, verdict: str,
-                published_at: object) -> dict[str, Any]:
+                published_at: object, fleet_repo_selector: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """One ledger line: which review task's verdict was published on which PR head, and when GitHub stored it.
 
-    ``published_at`` is GitHub's comment time as read back (any value; only an ISO timestamp is accepted). Raises
-    ValueError when a field has the wrong shape, so a malformed line is never written.
+    ``published_at`` is GitHub's comment time as read back (any value; only an ISO timestamp is accepted).
+    ``fleet_repo_selector`` is the selector receipt the writer resolved a dual-slug repository with; the line carries
+    it only when it is not None. Raises ValueError when a field has the wrong shape, so a malformed line is never
+    written.
     """
-    entry = {"schema": PUBLICATION_SCHEMA, "task_id": task_id, "repository": repository, "pr": pr, "head": head,
-             "verdict": verdict, "published_at": published_at}
+    entry: dict[str, Any] = {"schema": PUBLICATION_SCHEMA, "task_id": task_id, "repository": repository, "pr": pr,
+                             "head": head, "verdict": verdict, "published_at": published_at}
+    if fleet_repo_selector is not None:
+        if not isinstance(fleet_repo_selector, Mapping):
+            raise ValueError("publication field has the wrong shape")
+        receipt: dict[str, str] = {}
+        for key, value in dict(fleet_repo_selector).items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise ValueError("publication field has the wrong shape")
+            # Match the JSON representation without invoking overridden methods on a string subclass.
+            name = str.__str__(key)
+            if name in receipt:
+                raise ValueError("publication field has the wrong shape")
+            receipt[name] = str.__str__(value)
+        entry[_PUBLICATION_SELECTOR] = receipt
     if not _publication_ok(entry):
         raise ValueError("publication field has the wrong shape")
     return entry
@@ -1003,18 +1035,36 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
     """Append, under ``rows.lock``, each entry the ledger does not hold yet (by ``publication_key``); the count added.
 
     Every entry is checked before anything is written: one malformed entry raises ValueError and writes nothing.
+    Each entry is validated from the exact JSON bytes that will be written.
     TimeoutError when ``wait_s`` passes before the lock is free; OSError when the ledger cannot be written.
     """
-    checked = [dict(entry) for entry in entries]
-    if not all(_publication_ok(entry) for entry in checked):
-        raise ValueError("publication field has the wrong shape")
+    def unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        members = dict(pairs)
+        if len(members) != len(pairs):
+            raise ValueError("duplicate publication object key")
+        return members
+
+    checked = []
+    for entry in entries:
+        try:
+            row = dict(entry)
+            # JSON encodes integer subclasses as plain integers. The ledger requires a built-in int for PRs.
+            if not _count_value(row.get("pr")):
+                raise ValueError("publication PR must be an integer in range")
+            line = _line(row)
+            snapshot = json_depth.loads(line, max_depth=_JSON_MAX_DEPTH, object_pairs_hook=unique_members)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("publication field has the wrong shape") from exc
+        if not _publication_ok(snapshot):
+            raise ValueError("publication field has the wrong shape")
+        checked.append((publication_key(snapshot), line))
     with _locked(batch_state_dir, wait_s) as rows_file:
         path = rows_file.with_name(PUBLICATIONS_FILE)
         present = {publication_key(e) for e in _publication_lines(path, Counter())}
         added = 0
-        for entry in checked:
-            if (key := publication_key(entry)) not in present:
-                _append_line(path, entry)
+        for key, line in checked:
+            if key not in present:
+                _append_line(path, line)
                 present.add(key)
                 added += 1
         return added
