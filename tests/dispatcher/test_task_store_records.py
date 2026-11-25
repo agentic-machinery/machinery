@@ -68,14 +68,20 @@ def test_strict_attempt_scan_keeps_a_moved_record_and_its_reply_once(tmp_path, m
 
 
 @pytest.mark.parametrize("archived", [False, True])
-@pytest.mark.parametrize("foreign", [
-    b"[curriculum_manifest_canary] Manifest written successfully: 3901 files\n",
-    b'{"schema":"agy-read-only.v1","task_id":"worker"}',
-    b'{"schema_version":"code-review-findings.v1","findings":[]}',
-    b'["a proof list"]',
+@pytest.mark.parametrize(("foreign", "refused"), [
+    (b"[curriculum_manifest_canary] Manifest written successfully: 3901 files\n", True),
+    (b'{"schema":"agy-read-only.v1","task_id":"worker"}', False),
+    (b'{"schema_version":"code-review-findings.v1","findings":[]}', False),
+    (b'["a proof list"]', True),
 ])
-def test_foreign_sidecar_does_not_block_review_admission(tmp_path, monkeypatch, caplog, foreign, archived):
-    """A foreign sidecar must not deny an unrelated review or spend its attempt."""
+def test_foreign_sidecar_blocks_review_admission_only_when_it_may_hold_a_record(
+    tmp_path, monkeypatch, caplog, foreign, refused, archived
+):
+    """A foreign JSON object must not deny an unrelated review or spend its attempt.
+
+    Text that is not JSON and a non-empty array are not foreign: either may hold a record, so
+    every admission reader refuses them rather than skipping a possible live run (#1440).
+    """
     monkeypatch.setenv("LU_TASKS_DIR", str(tmp_path))
     archive = tmp_path / "archive"
     archive.mkdir()
@@ -83,6 +89,20 @@ def test_foreign_sidecar_does_not_block_review_admission(tmp_path, monkeypatch, 
     (tmp_path / "unrelated.json").write_text(json.dumps(valid))
     sidecar = (archive if archived else tmp_path) / "worker.manifest-canary.json"
     sidecar.write_bytes(foreign)
+    if refused:
+        readers = admission_readers(tmp_path)
+        for reader in readers[:3]:
+            with pytest.raises((ValueError, recorder.RecordError), match="worker.manifest-canary.json"):
+                reader()
+        # The in-flight guard reads the active (hot) ledger only; an archived record is terminal.
+        if archived:
+            assert readers[3]() is None
+        else:
+            with pytest.raises(recorder.RecordError, match="RED_TEAM_REFUSED: task ledger unavailable"):
+                readers[3]()
+        with pytest.raises(ValueError, match="worker.manifest-canary.json"):
+            store.check_review_attempt(dict(review_id="unused", attempt_id="unused", manifest_sha256="b" * 64))
+        return
     assert [record["task_id"] for _, record in admission_readers(tmp_path)[0]()] == ["unrelated"]
     assert [record["task_id"] for record in admission_readers(tmp_path)[1]()] == ["unrelated"]
     assert admission_readers(tmp_path)[2]() == ()
