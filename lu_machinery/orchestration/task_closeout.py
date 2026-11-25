@@ -1006,9 +1006,9 @@ def perform_mutation(
 def _state_file(
     args: argparse.Namespace, identity: Mapping[str, Any] | None = None, *, writable: bool = True,
 ) -> Path:
-    if args.state_file:
-        # os.path.expanduser leaves an unknown ~user as given (Path.expanduser raises RuntimeError),
-        # and the string keeps a trailing "/", "/." or "/.." for the write-path check.
+    if args.state_file is not None:
+        # os.path.expanduser leaves an unknown ~user as given (Path.expanduser raises RuntimeError) and the
+        # write-path check refuses it; the string keeps a trailing "/", "/." or "/.." for that check too.
         raw = os.path.expanduser(args.state_file)
         if writable:
             task_lifecycle._validate_lifecycle_write_path(raw, label="lifecycle ledger")
