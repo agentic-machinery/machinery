@@ -1323,12 +1323,25 @@ def _require_not_direct_task_store(path: Path, *, label: str = "lifecycle ledger
         raise LifecycleError(str(exc)) from None
 
 
+def _validated_lifecycle_target(path: Path, *, label: str) -> tuple[Path, Path]:
+    _require_not_direct_task_store(path, label=label)
+    if not path.name or path.name in {".", ".."}:
+        raise LifecycleError(f"invalid {label} path: {path}")
+    try:
+        resolved_parent = Path(os.path.realpath(path.parent))
+    except (OSError, ValueError) as exc:
+        raise LifecycleError(f"invalid {label} path {path}: {exc}") from None
+    target = resolved_parent / path.name
+    _require_not_direct_task_store(target, label=label)
+    return resolved_parent, target
+
+
 def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
-    _require_not_direct_task_store(path, label="lifecycle ledger")
+    resolved_parent, target = _validated_lifecycle_target(path, label="lifecycle ledger")
     ledger = validate_lifecycle(payload)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=resolved_parent)
     tmp_path = Path(tmp_name)
     closed_fd = False
     try:
@@ -1336,7 +1349,7 @@ def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:
             closed_fd = True
             handle.write(encoded)
             handle.flush()
-        os.replace(tmp_path, path)
+        os.replace(tmp_path, target)
     finally:
         if not closed_fd:
             with suppress(OSError):
@@ -1351,9 +1364,9 @@ def lifecycle_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     if not path.name or path.name in {".", ".."}:
         raise LifecycleError(f"invalid lifecycle ledger path: {path}")
     lock_path = path.with_suffix(path.suffix + ".lock")
-    _require_not_direct_task_store(lock_path, label="lifecycle lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+", encoding="utf-8") as handle:
+    resolved_parent, lock_target = _validated_lifecycle_target(lock_path, label="lifecycle lock")
+    resolved_parent.mkdir(parents=True, exist_ok=True)
+    with lock_target.open("a+", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -1378,9 +1391,9 @@ def predecessor_archive_path(path: Path, raw: bytes) -> tuple[Path, str]:
 
 def archive_predecessor(raw: bytes, archive_path: Path, archive_sha256: str) -> None:
     """Store predecessor bytes once, never overwriting a different archive."""
-    _require_not_direct_task_store(archive_path, label="predecessor archive")
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{archive_path.name}.", suffix=".tmp", dir=archive_path.parent)
+    resolved_parent, target = _validated_lifecycle_target(archive_path, label="predecessor archive")
+    resolved_parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=resolved_parent)
     tmp_path = Path(tmp_name)
     closed_fd = False
     try:
@@ -1390,13 +1403,13 @@ def archive_predecessor(raw: bytes, archive_path: Path, archive_sha256: str) -> 
             handle.flush()
             os.fsync(handle.fileno())
         with suppress(FileExistsError):
-            os.link(tmp_path, archive_path)
+            os.link(tmp_path, target)
     finally:
         if not closed_fd:
             with suppress(OSError):
                 os.close(fd)
         tmp_path.unlink(missing_ok=True)
-    stored = archive_path.read_bytes()
+    stored = target.read_bytes()
     if stored != raw or "sha256:" + hashlib.sha256(stored).hexdigest() != archive_sha256:
         raise EvidencePolicyError(
             "PREDECESSOR_ARCHIVE_CONFLICT", f"archive {archive_path} does not hold the predecessor bytes"
