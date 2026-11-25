@@ -585,7 +585,7 @@ def test_repository_target_error_hides_unavailable_root_oserror():
     assert "absent-root" not in error
 
 
-def test_non_ascii_origin_refuses_with_module_typed_errors(tmp_path):
+def test_non_ascii_origin_refuses_with_module_typed_errors(tmp_path, monkeypatch):
     """Defect class: non-ASCII remote.origin.url raises uncaught TargetResolutionError instead of module typed errors."""
     from lu_machinery.ai_agent_bridge import _gemini_review
     from lu_machinery.review import closeout_cli
@@ -616,6 +616,18 @@ def test_non_ascii_origin_refuses_with_module_typed_errors(tmp_path):
     assert proc.returncode == 1
     assert json.loads(proc.stderr) == {"error": "checkout origin is not valid ASCII"}
     assert not state.exists()
+
+    # Decode failure during Gemini's second origin read (live_canonical_branch_head) must also translate cleanly.
+    _git(repo, "remote", "set-url", "origin", f"https://github.com/{catalog}.git")
+    valid_cfg = cfg.read_bytes()
+
+    def _corrupt_origin_during_pr_view(*_args, **_kwargs):
+        cfg.write_bytes(valid_cfg.replace(catalog.encode("ascii"), b"learn-\xffukrainian/machinery"))
+        return json.dumps({"headRefName": "main", "headRefOid": "a" * 40, "isCrossRepository": False})
+
+    monkeypatch.setattr(_gemini_review, "_run_changed_path_command", _corrupt_origin_during_pr_view)
+    with pytest.raises(_gemini_review.GeminiChangedPathListError, match="not valid ASCII"):
+        _gemini_review.resolve_same_repo_pr_head(9, repo_root=str(repo))
 
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

@@ -148,6 +148,15 @@ def _ledger_from_state(state: dict) -> FindingsLedger:
     return FindingsLedger.from_events(FindingEvent(**raw) for raw in state.get("findings", []))
 
 
+def _parse_positive_pr_arg(raw: str) -> int:
+    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+    parsed = parse_ascii_positive_int(raw) if len(raw) <= 19 else None
+    if parsed is None:
+        raise argparse.ArgumentTypeError(f"invalid positive ASCII PR number: {raw!r}")
+    return parsed
+
+
 def _cmd_target(args: argparse.Namespace) -> int:
     state = _load_state(args.state_file)
     if state.get("baseline"):
@@ -1753,7 +1762,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_target.add_argument("--commit", help="Commit SHA for --mode commit. Example: HEAD")
     p_target.add_argument("--branch", help="Branch name for --mode branch. Example: grok/impl-8946")
     p_target.add_argument("--base", help="Base ref for --mode branch. Example: origin/main")
-    p_target.add_argument("--pr", type=int, help="Pull request number for --mode pr. Example: 8946")
+    p_target.add_argument("--pr", type=_parse_positive_pr_arg, help="Pull request number for --mode pr. Example: 8946")
     p_target.set_defaults(func=_cmd_target)
 
     p_freeze = sub.add_parser("freeze", help="Freeze the scope baseline from the resolved target")

@@ -139,6 +139,8 @@ def _run_changed_path_command(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GeminiChangedPathListError(str(exc)) from exc
+    except UnicodeDecodeError as exc:
+        raise GeminiChangedPathListError("git or gh command output is not valid UTF-8") from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")
         raise GeminiChangedPathListError(detail or f"exit {proc.returncode}")
@@ -204,8 +206,10 @@ def resolve_same_repo_pr_head(pr_number: int, *, repo_root: str) -> tuple[str, s
         raise GeminiChangedPathListError(f"PR head branch {branch!r} is not a local branch name: {exc}") from exc
     try:
         sha = live_canonical_branch_head(Path(repo_root), branch, repository=slug)
-    except TargetResolutionError as exc:
+    except (TargetResolutionError, OSError, subprocess.TimeoutExpired) as exc:
         raise GeminiChangedPathListError(str(exc)) from exc
+    except UnicodeDecodeError as exc:
+        raise GeminiChangedPathListError("checkout origin is not valid ASCII") from exc
     return branch, sha
 
 
