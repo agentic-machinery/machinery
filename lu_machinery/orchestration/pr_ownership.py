@@ -358,7 +358,13 @@ def load(path: Path) -> dict[str, Any]:
         for table in ("episodes", "handoffs"):
             canonical = {}
             for spelling, record in data[table].items():
-                key = pr_key(*_parse_pr_ref(spelling, "ownership state"))
+                try:
+                    ref = _parse_pr_ref(spelling, "ownership state")
+                except OwnershipError:
+                    # An unusable legacy key must never alias a valid PR or hide its siblings.
+                    key = spelling
+                else:
+                    key = pr_key(*ref)
                 if key in canonical:
                     raise OwnershipError("ownership state has conflicting repository aliases")
                 canonical[key] = record
@@ -444,8 +450,11 @@ def _handoff_map(data: Mapping[str, Any]) -> dict[tuple[str, int], str]:
     for key, handoff in data["handoffs"].items():
         if decision_custody(handoff) or keeper_custody(handoff):
             continue
-        repo, _, number = key.rpartition("#")
-        result[(repo, int(number))] = handoff["successor"]
+        try:
+            ref = _parse_pr_ref(key, "accepted handoff")
+        except OwnershipError:
+            continue
+        result[ref] = handoff["successor"]
     return result
 
 
@@ -468,7 +477,7 @@ def keeper_custodies_for_repo(path: Path | None, repo: str) -> dict[int, dict[st
     prefix = f"{canonical_repository(repo)}#"
     found: dict[int, dict[str, Any]] = {}
     for key, handoff in data["handoffs"].items():
-        if key.startswith(prefix) and keeper_custody(handoff):
+        if keeper_custody(handoff) and key == f"{prefix}{handoff['pr']}":
             found[int(handoff["pr"])] = copy.deepcopy(handoff)
     return found
 
