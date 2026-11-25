@@ -48,8 +48,8 @@ import yaml
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
-from lu_machinery.common import json_depth
-from lu_machinery.common.repo_root import _PRODUCT_TREE
+from lu_machinery.common import json_depth, profile
+from lu_machinery.common.repo_root import _PRODUCT_TREE, machinery_path
 from lu_machinery.docs import store_census  # imports this module back; each side uses the other only at call time
 from lu_machinery.docs.docs_inventory import EXCLUDED_PARTS
 from lu_machinery.docs.docs_inventory import metadata as inventory_metadata
@@ -78,10 +78,7 @@ def _sibling_path(name: str) -> str:
 CATALOGUE_PATH = 'docs/knowledge/catalogue.yaml'
 SCHEMA_PATH = 'docs/knowledge/catalogue.schema.json'
 TRACKED_ROOTS = ('docs', 'registry', 'curriculum/l2-uk-en/evidence')
-# Owner registries, relative to the checkout's Python tree (``owner_tree``): ``scripts/config/``
-# in a product, never the installed package's own directory name.
-OWNER_SOURCES = (('config/issue_streams.yaml', 'streams'),
-                 ('config/area_assignments.yaml', 'assignments'))
+OWNER_SOURCES = (('issue_streams', 'streams'), ('area_assignments', 'assignments'))
 TERMINAL_LIFECYCLES = frozenset({'active', 'archive'})
 SQLITE_SIDECARS = ('-shm', '-wal', '-journal')
 PLACEHOLDER_NAMES = frozenset({'.gitkeep', '.gitignore'})
@@ -414,7 +411,7 @@ def owner_tree(repo: Path) -> str:
     else this package's own tree (machinery's checkout), else ``scripts``.
 
     ``product_tree_path``'s rule, decided from the index like every catalogue read, so a sparse,
-    untracked or unstaged directory cannot change it; a missing registry fails at the reader.
+    untracked or unstaged directory cannot change it.
     """
     for tree in dict.fromkeys((_PRODUCT_TREE, _top())):
         if git(repo, 'ls-files', '-z', '--', f':(top,literal){tree}/config/'):
@@ -423,12 +420,31 @@ def owner_tree(repo: Path) -> str:
 
 
 def owner_keys(repo: Path) -> set[str]:
-    """Stream and area keys from the owner registries in ``repo``'s index."""
+    """Stream and area keys from tracked copies or the profile's packaged defaults.
+
+    A tracked registry is read from the index. Each absent registry is resolved
+    through the active profile, defaulting to the file shipped with machinery.
+    """
     tree = owner_tree(repo)
     keys: set[str] = set()
-    for rel, section in OWNER_SOURCES:
-        data = yaml.safe_load(git(repo, 'show', f':{tree}/{rel}').decode('utf-8')) or {}
-        keys.update((data.get(section) or {}).keys())
+    for name, section in OWNER_SOURCES:
+        relative = f'config/{name}.yaml'
+        indexed = f'{tree}/{relative}'
+        paths = git(repo, 'ls-files', '--full-name', '-z', '--', f':(top,literal){indexed}').split(b'\0')
+        if indexed.encode() in paths:
+            data = yaml.safe_load(git(repo, 'show', f':{indexed}').decode('utf-8')) or {}
+            keys.update((data.get(section) or {}).keys())
+            continue
+
+        try:
+            path = profile.config_path(name, default=machinery_path(relative))
+            data = yaml.safe_load(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            raise CatalogueLoadError('owner_registry_unreadable', f'cannot load {name} ({type(exc).__name__})') from None
+        rows = data.get(section) if isinstance(data, dict) else None
+        if not isinstance(rows, dict) or any(not isinstance(key, str) for key in rows):
+            raise CatalogueLoadError('owner_registry_shape', f'{name} needs a {section} mapping with string keys')
+        keys.update(rows)
     return keys
 
 
