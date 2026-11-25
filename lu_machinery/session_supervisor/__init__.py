@@ -64,7 +64,7 @@ class SupervisorError(ValueError):
 # by its LAUNCHER policy line, from REPO, the CTO workspace. Each binds its own mode:
 # neither template's successor is admitted from a launch of the other mode.
 _CTO_CHECKOUT_TEMPLATE = "44dedafd91b354e31b9fcd8a4948518b57dc9f41cce9f34fd02e5cae36157280"
-_CTO_WORKSPACE_TEMPLATE = "1f73d54811a0b787328894a17e462389aded3771124c48aa215ffce62fd39eb2"
+_CTO_WORKSPACE_TEMPLATE = "5ef70ab35079e18c6ff33597e58b1e0aa992c7e2be615c4b3b4f806352bcf836"
 _CTO_PACKAGE_WRAPPER = Path(__file__).resolve().parents[1] / "start-claude-cto.sh"
 
 

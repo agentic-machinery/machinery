@@ -970,12 +970,23 @@ export CLAUDE_CONFIG_DIR=$DIR
 echo "CTO seat: Claude account $ACCT ($DIR)"
 
 LAUNCH=("$LAUNCHER" --epic epics --model "$MODEL" --effort "$EFFORT" "$KICK" -- --dangerously-skip-permissions --append-system-prompt "$(cat "$ROLE")")
+cd -- "$REPO"
 if [ "$HERE" = 1 ]; then
-  cd "$REPO" && LC_WORKSPACE_ROOT="$REPO" exec "${LAUNCH[@]}"
+  LC_WORKSPACE_ROOT="$REPO" exec "${LAUNCH[@]}"
 fi
 tmux has-session -t =cto 2>/dev/null && { echo "refused: tmux session cto exists (use --here inside it)" >&2; exit 3; }
-env -u LC_WORKSPACE_ROOT tmux new-session -d -s cto -c "$REPO" -e "CLAUDE_CONFIG_DIR=$DIR" \
-  bash -c 'LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash' bash "$REPO" "${LAUNCH[@]}"
+# tmux takes the client's working directory. An empty session value overrides
+# a reused server's selector. Escape trailing semicolons in tmux arguments.
+TMUX_ARGS=(
+  new-session -d -s cto -e "CLAUDE_CONFIG_DIR=$DIR" -e "LC_WORKSPACE_ROOT="
+  bash -c 'unset LC_WORKSPACE_ROOT; LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash' bash "$REPO" "${LAUNCH[@]}"
+)
+for index in "${!TMUX_ARGS[@]}"; do
+  if [[ "${TMUX_ARGS[index]}" == *';' ]]; then
+    TMUX_ARGS[index]="${TMUX_ARGS[index]%;}\\;"
+  fi
+done
+env -u LC_WORKSPACE_ROOT tmux "${TMUX_ARGS[@]}"
 echo "started; attach with: tmux attach -t cto"
 """
 
@@ -1097,10 +1108,10 @@ def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypat
     workspace, _state, _primary = _workspace_roots(tmp_path)
     config = tmp_path / "policy"
     config.mkdir()
-    (config / "CTO-ROLE-PROMPT.txt").write_text("role\n")
+    (config / "CTO-ROLE-PROMPT.txt").write_text("role;\n")
     package_wrapper = machinery_path("start-claude-cto.sh")
     args = ["--epic", "epics", "--model", "claude-opus-5-5", "--effort", "high", "kick", "--",
-            "--dangerously-skip-permissions", "--append-system-prompt", "role"]
+            "--dangerously-skip-permissions", "--append-system-prompt", "role;"]
 
     written = iter(range(1, 100))
 
