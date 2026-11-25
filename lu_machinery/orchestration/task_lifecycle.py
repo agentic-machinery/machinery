@@ -1323,7 +1323,7 @@ def _require_not_direct_task_store(path: Path, *, label: str = "lifecycle ledger
         raise LifecycleError(str(exc)) from None
 
 
-def _validate_lifecycle_write_path(path: Path, *, label: str) -> None:
+def _validate_lifecycle_write_path(path: Path | str, *, label: str) -> None:
     """Refuse a lifecycle write path that is malformed, has a ``..`` component or targets the task store.
 
     Writers create, stage and publish through ``path`` itself, so a later lookup through the
@@ -1331,11 +1331,15 @@ def _validate_lifecycle_write_path(path: Path, *, label: str) -> None:
     normalisation (``realpath``, or ``tempfile.mkstemp``'s ``abspath`` of ``dir``) collapses
     ``missing/..`` or ``symlink/..`` where the kernel does not, which can move the write away
     from where ``path`` resolves. No caller needs one: ``lifecycle_path`` builds from a resolved
-    state root, and every ``--state-file`` is resolved before it reaches a writer.
+    state root, and ``task_closeout`` checks a mutating ``--state-file`` here before resolving it.
+    A string keeps a trailing ``/``, ``/.`` or ``/..`` that ``Path`` would drop, so it is checked
+    as given.
     """
-    if not path.name or path.name in {".", ".."} or ".." in path.parts:
-        raise LifecycleError(f"invalid {label} path (empty name or '..' component refused): {path}")
-    _require_not_direct_task_store(path, label=label)
+    raw = os.fspath(path)
+    parts = raw.split(os.sep)
+    if parts[-1] in {"", ".", ".."} or ".." in parts:
+        raise LifecycleError(f"invalid {label} path (empty name or '..' component refused): {raw!r}")
+    _require_not_direct_task_store(Path(raw), label=label)
 
 
 def write_lifecycle(path: Path, payload: Mapping[str, Any]) -> None:

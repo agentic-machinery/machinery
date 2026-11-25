@@ -546,8 +546,15 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return EXIT_INVALID
-        args.receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        args.receipt_path.write_text(receipt_json + "\n", encoding="utf-8")
+        try:
+            args.receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            args.receipt_path.write_text(receipt_json + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(
+                json.dumps({"error": f"receipt_path_unwritable: {args.receipt_path}: {exc}"}, ensure_ascii=False),
+                file=sys.stderr,
+            )
+            return EXIT_INVALID
 
     if args.post_comment:
         _post_summary(args.issue, result.receipt)

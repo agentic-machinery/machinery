@@ -1007,10 +1007,12 @@ def _state_file(
     args: argparse.Namespace, identity: Mapping[str, Any] | None = None, *, writable: bool = True,
 ) -> Path:
     if args.state_file:
-        raw = Path(args.state_file).expanduser()
+        # os.path.expanduser leaves an unknown ~user as given (Path.expanduser raises RuntimeError),
+        # and the string keeps a trailing "/", "/." or "/.." for the write-path check.
+        raw = os.path.expanduser(args.state_file)
         if writable:
-            task_lifecycle._require_not_direct_task_store(raw, label="lifecycle ledger")
-        return raw.resolve()
+            task_lifecycle._validate_lifecycle_write_path(raw, label="lifecycle ledger")
+        return Path(os.path.realpath(raw))
     if identity is None:
         raise task_lifecycle.LifecycleError("--state-file is required for this command")
     return task_lifecycle.lifecycle_path(Path(args.repo_root), identity)

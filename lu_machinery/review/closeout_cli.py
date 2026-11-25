@@ -99,8 +99,11 @@ def _require_writable_path(path: Path, *, label: str) -> None:
 
 def _save_state(state_file: Path, state: dict) -> None:
     _require_writable_path(state_file, label="closeout state")
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    except OSError as exc:
+        raise CloseoutStateError(f"state_unwritable:{exc}") from exc
 
 
 def _target_from_dict(data: object) -> ReviewTarget:
@@ -988,8 +991,11 @@ def _cmd_behavior_proof_receipt(args: argparse.Namespace) -> int:
     receipt_path = raw_receipt_path.resolve()
     _require_writable_path(receipt_path, label="behavior-proof receipt")
     receipt_bytes = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_bytes(receipt_bytes)
+    try:
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_bytes(receipt_bytes)
+    except OSError as exc:
+        raise CloseoutStateError(f"receipt_unwritable:{exc}") from exc
     print(
         json.dumps(
             {
