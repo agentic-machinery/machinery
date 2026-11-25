@@ -1391,7 +1391,21 @@ def scan_fleet_alerts(
     for key, repo in catalog.items():
         if not repo.security_alerts:
             continue
-        active = resolve_active_fleet_repo(key, repos=catalog, registry_path=registry_path)
+        try:
+            active = resolve_active_fleet_repo(key, repos=catalog, registry_path=registry_path)
+        except FleetRepoError:
+            reason = "active_repository_unavailable"
+            all_ok = False
+            repositories[key] = {
+                "github": None,
+                "source_ok": False,
+                "tools": {
+                    tool: {"status": "error", "total": None, "by_severity": None, "error": reason}
+                    for tool in TOOLS
+                },
+                "fleet_security": _fleet_record("inaccessible_evidence", reason=reason),
+            }
+            continue
         tools_payload: dict[str, dict[str, Any]] = {}
         repo_ok = True
         for tool in TOOLS:
