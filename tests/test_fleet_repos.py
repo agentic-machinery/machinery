@@ -693,3 +693,22 @@ def test_research_observability_refuses_non_ascii_report_repository(tmp_path: Pa
         )
         is False
     )
+
+
+def test_parse_ascii_positive_int_refuses_values_longer_than_19_digits():
+    """Defect class: parse_ascii_positive_int reaches unbounded int() on >19-digit strings or accepts >19-digit ints."""
+    import sys
+
+    prev_limit = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(0)
+    try:
+        assert fleet_repos.parse_ascii_positive_int("9" * 19) == 9_999_999_999_999_999_999
+        assert fleet_repos.parse_ascii_positive_int("  " + "9" * 19 + "  ", strip=True) == 9_999_999_999_999_999_999
+        assert fleet_repos.parse_ascii_positive_int(9_999_999_999_999_999_999) == 9_999_999_999_999_999_999
+        assert fleet_repos.parse_ascii_positive_int("1" + "0" * 19) is None
+        assert fleet_repos.parse_ascii_positive_int("  " + "1" + "0" * 19 + "  ", strip=True) is None
+        assert fleet_repos.parse_ascii_positive_int("9" * 5000) is None
+        assert fleet_repos.parse_ascii_positive_int(10**19) is None
+        assert fleet_repos.parse_ascii_positive_int("42\n") is None
+    finally:
+        sys.set_int_max_str_digits(prev_limit)

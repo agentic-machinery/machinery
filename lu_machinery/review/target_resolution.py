@@ -113,6 +113,8 @@ def _origin_github_repo(checkout: Path) -> str | None:
         proc = _run_git(["config", "--get", "remote.origin.url"], checkout)
     except OSError:
         raise OSError(REVIEW_ROOT_UNAVAILABLE) from None
+    except UnicodeDecodeError as exc:
+        raise TargetResolutionError("checkout origin is not valid ASCII") from exc
     if proc.returncode != 0:
         return None
     if not proc.stdout.isascii():
