@@ -224,7 +224,8 @@ and are listed in the review-of-record brief as author context only.
 
 ## Stop and report
 
-Stop when the current head has a recorded APPROVE and only nits or follow-ups remain, when
+Stop when the current head has a recorded APPROVE and the only open findings are P3 and every
+acceptance criterion is met ([policy](references/policy.md#recording-the-verdict)), when
 `budget-check` refuses the next round, when a dispute is unresolved after two replies, or when a
 breaker trips. A head you only need to merge with the base, a CI fix after approval and a
 conflict resolution after approval are not stops: `budget-check` admits them while the
