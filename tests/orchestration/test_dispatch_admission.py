@@ -1869,3 +1869,123 @@ def test_fleet_repos_validates_declared_product_files(tmp_path, monkeypatch):
     with pytest.raises(product_policy.ProductPolicyError) as exc_info:
         adm.load_product_policy()
     assert exc_info.value.code == "policy_origin_mismatch"
+
+
+def test_strict_inventory_skips_foreign_json_beside_records(tmp_path):
+    """Defect class: a strict reader refuses the whole store over a file the record parser calls foreign.
+
+    Policy, build and receipt JSON objects written beside task records make no record claim, even
+    with a ``status`` or a string ``schema_version`` as the live store's build and receipt files
+    carry; the strict inventory skips them exactly as ``list_tasks(strict=True)`` does, so the turn
+    child count works.
+    """
+    tasks = tmp_path / "tasks"
+    child = _record(tasks, "turn-child", parent_task_id="turn-parent", parent_run_nonce="nonce-turn-parent")
+    archive = tasks / "archive"
+    archive.mkdir()
+    (tasks / "atlas-01a193ab-parent11943-ac-policy.json").write_text(
+        json.dumps({"criteria": [{"id": "AC-1", "applies": True}]}), encoding="utf-8"
+    )
+    (tasks / "turn-child.base-build.json").write_text(json.dumps({"status": "ok", "level": "a1"}), encoding="utf-8")
+    (tasks / "turn-child.behavior-receipt.json").write_text(
+        json.dumps({"schema_version": "code-review-receipt.v1", "exit_code": 0}), encoding="utf-8"
+    )
+    (archive / "turn-child.review-receipt.json").write_text(
+        json.dumps({"schema": "behavior-receipt.v1", "task_id": "turn-child"}), encoding="utf-8"
+    )
+    (archive / "empty-list.json").write_text("[]", encoding="utf-8")
+
+    records = adm.strict_task_inventory_in(tasks)
+
+    assert [record["task_id"] for record in records] == ["turn-child"]
+    assert records[0] == json.loads(child.read_text(encoding="utf-8"))
+    assert adm.count_turn_children(tasks, "turn-parent", "nonce-turn-parent") == 1
+
+
+_CLOSEOUT_REPORT = {
+    "apply": True, "branch_status": {}, "criterion_receipts": [], "errors": [], "lifecycle_observations": [],
+    "matched_worktrees": [], "ok": True, "pr": 7,
+}
+
+
+@pytest.mark.parametrize(
+    ("suffix", "receipt"),
+    [
+        pytest.param(".closeout.json", _CLOSEOUT_REPORT, id="closeout"),
+        pytest.param(".closeout-final.json", _CLOSEOUT_REPORT, id="closeout-final"),
+        pytest.param(".merge-closeout.json", _CLOSEOUT_REPORT, id="merge-closeout"),
+        pytest.param(
+            ".landing-report.json",
+            {
+                "ci": "green", "enqueued": True, "failed_jobs": [], "implementation_changes": [], "merged": True,
+                "new_review_rounds": 0, "new_tasks_or_prs": [], "pr": 7, "residual_owner": "none", "residuals": [],
+                "review": "APPROVE",
+            },
+            id="landing-report",
+        ),
+        pytest.param(
+            ".resolver-red_team.json",
+            {
+                "advisory": True, "branch_facts": {}, "catalog_reviewed_on": "2026-01-01", "claude_account": "a",
+                "fail_closed_reason": None, "limitation": None, "policy_version": "v1", "quorum": [],
+                "quorum_rule": "single", "resolved_risk": "high", "review_mode": "red_team", "routing_snapshot": {},
+                "selected": {}, "substitution_note": None, "trace": [],
+            },
+            id="resolver-red_team",
+        ),
+        pytest.param(
+            ".scope.json",
+            {
+                "frozen_files": [], "frozen_non_test_loc": 1, "intended_behavior": "x", "issue_ref": "#1",
+                "non_goals": [], "owner_boundary": "x", "review_profile": "infra", "risk": "critical", "target": "x",
+            },
+            id="scope",
+        ),
+    ],
+)
+def test_strict_inventory_skips_review_tool_receipts_without_identity(tmp_path, suffix, receipt):
+    """Defect class: a review tool's receipt (a PR number or review flag, no task_id) reads as a legacy record claim.
+
+    The key sets are the live store's closeout, landing-report, resolver and scope receipts, with
+    synthetic values; none names a task_id, repository, status or agent, so none claims a run.
+    """
+    tasks = tmp_path / "tasks"
+    _record(tasks, "turn-child", parent_task_id="turn-parent", parent_run_nonce="nonce-turn-parent")
+    (tasks / f"turn-child{suffix}").write_text(json.dumps(receipt), encoding="utf-8")
+
+    assert [record["task_id"] for record in adm.strict_task_inventory_in(tasks)] == ["turn-child"]
+    assert adm.count_turn_children(tasks, "turn-parent", "nonce-turn-parent") == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "raw"),
+    [
+        pytest.param("truncated.json", b'{"task_id": "truncated", "status": "runn', id="damaged-record-claim"),
+        pytest.param("bad-schema.json", b'{"task_id": "bad-schema", "schema_version": "2"}', id="invalid-schema"),
+        pytest.param("zeroed-child.json", b"\x00" * 64, id="v2-name-zero-filled"),
+        pytest.param("emptied-child.json", b"", id="v2-name-empty"),
+        pytest.param(
+            "bare-members.json", b'"task_id": "bare-members", "schema_version": 2, "status": "running"', id="bare-members"
+        ),
+        pytest.param(
+            "array-record.json",
+            b'[{"task_id": "array-record", "schema_version": 2, "status": "running"}]',
+            id="array-of-record",
+        ),
+        pytest.param("lost-identity.json", b'{"schema_version": 2, "status": "running"}', id="int-schema-object"),
+        pytest.param("note-list.json", b'["note"]', id="non-empty-foreign-array"),
+        pytest.param("nan-report.json", b'{"status": "ok", "elapsed_s": NaN}', id="non-json-nan"),
+        pytest.param("inf-report.json", b'{"status": "ok", "elapsed_s": Infinity}', id="non-json-infinity"),
+        pytest.param("neg-inf-report.json", b'{"status": "ok", "elapsed_s": -Infinity}', id="non-json-negative-infinity"),
+    ],
+)
+def test_strict_inventory_still_refuses_record_claims_that_fail_to_parse(tmp_path, name, raw):
+    """Defect class: skipping foreign files also hides a damaged record, so a live child escapes the cap."""
+    tasks = tmp_path / "tasks"
+    _record(tasks, "turn-child", parent_task_id="turn-parent", parent_run_nonce="nonce-turn-parent")
+    (tasks / name).write_bytes(raw)
+
+    with pytest.raises(ValueError, match=rf"unreadable task record {name}"):
+        adm.strict_task_inventory_in(tasks)
+    with pytest.raises(ValueError, match="cannot verify turn child count"):
+        adm.count_turn_children(tasks, "turn-parent", "nonce-turn-parent")
