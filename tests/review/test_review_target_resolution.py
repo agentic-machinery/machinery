@@ -6,7 +6,9 @@ import json
 import os
 import subprocess
 from pathlib import Path
+
 import pytest
+
 from lu_machinery.common.git_context import GIT_REDIRECT_ENV_KEYS, sanitized_git_env
 from lu_machinery.review.target_resolution import (
     TargetResolutionError,
@@ -16,11 +18,6 @@ from lu_machinery.review.target_resolution import (
     resolve_pr_target,
     resolve_review_target,
 )
-
-
-
-
-
 
 
 @pytest.mark.parametrize("key", [
@@ -538,3 +535,18 @@ def test_review_readers_refuse_non_ascii_slugs_and_keys(tmp_path, monkeypatch):
         adapter=StubAdapter(),
     )
     assert summary["rows_unregistered_repo"] == 1 and summary["prs"] == 0
+
+
+def test_origin_github_repo_turns_non_utf8_origin_into_target_resolution_error(tmp_path):
+    """Defect class: non-UTF-8 remote.origin.url bytes raise uncaught UnicodeDecodeError instead of TargetResolutionError."""
+    from lu_machinery.review import target_resolution as tr
+
+    repo = _init_repo(tmp_path)
+    _git(repo, "remote", "add", "origin", "https://github.com/example/catalog.git")
+    cfg = repo / ".git" / "config"
+    cfg.write_bytes(cfg.read_bytes().replace(b"example/catalog", b"example/\xffcatalog"))
+
+    with pytest.raises(TargetResolutionError, match="checkout origin is not valid ASCII"):
+        tr._origin_github_repo(repo)
+    with pytest.raises(TargetResolutionError, match="checkout origin is not valid ASCII"):
+        tr.resolve_pr_target(repo, 9)

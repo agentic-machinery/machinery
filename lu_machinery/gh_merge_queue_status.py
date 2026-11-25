@@ -49,8 +49,7 @@ def parse_pr_identifier(value: str | int) -> int:
     # Match URL like https://github.com/.../pull/1234
     url_m = re.search(r"/pull/([0-9]+)(?!\d)", text)
     if url_m:
-        raw_num = url_m.group(1)
-        parsed = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
+        parsed = parse_ascii_positive_int(url_m.group(1))
         if parsed is None:
             raise ValueError(f"Could not parse pull request number from: {value!r}")
         return parsed
@@ -63,16 +62,14 @@ def parse_pr_identifier(value: str | int) -> int:
     # Match branch or text with prefix '#123' or 'pr123'
     m = re.search(r"(?:^|[#/_-]|(?ai:pr))([0-9]+)(?:[#/_.-]|$)", text)
     if m:
-        raw_num = m.group(1)
-        parsed = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
+        parsed = parse_ascii_positive_int(m.group(1))
         if parsed is None:
             raise ValueError(f"Could not parse pull request number from: {value!r}")
         return parsed
     # Fallback to pure digits if present
     digits = re.findall(r"(?<!\d)[0-9]+(?!\d)", text)
     if digits:
-        raw_num = digits[0]
-        parsed = parse_ascii_positive_int(raw_num) if len(raw_num) <= 19 else None
+        parsed = parse_ascii_positive_int(digits[0])
         if parsed is None:
             raise ValueError(f"Could not parse pull request number from: {value!r}")
         return parsed

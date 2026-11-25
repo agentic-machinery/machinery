@@ -1130,9 +1130,9 @@ def cmd_init(args: argparse.Namespace) -> int:
             raise task_lifecycle.LifecycleError(f"lifecycle ledger already exists: {path}; use --reuse")
         if path.exists():
             existing = task_lifecycle.load_lifecycle(path)
-            if existing["lifecycle_id"] != ledger["lifecycle_id"]:
+            if not task_lifecycle.same_lifecycle_scope(existing["identity"], identity):
                 raise task_lifecycle.LifecycleError("existing lifecycle ledger belongs to another identity")
-            if identity.get("origin") == "fresh" and existing["identity"] != identity:
+            if identity.get("origin") == "fresh" and not task_lifecycle.same_task_identity(existing["identity"], identity):
                 raise task_lifecycle.LifecycleError("existing lifecycle ledger does not match the exact fresh task identity")
             if existing["ac_snapshot"]["content_hash"] != snapshot["content_hash"]:
                 raise task_lifecycle.EvidencePolicyError(
