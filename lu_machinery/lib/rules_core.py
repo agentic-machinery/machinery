@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -314,6 +315,63 @@ def _render(fmt: str, seat: str, root: Path | None) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
 
 
+def _resolve_cli_seat(seat: str | None, *, lane: str | None, provider: str) -> str:
+    """Resolve the CLI seat, refusing unreadable or malformed assignments fail-closed."""
+    explicit = normalize_seat(seat)
+    if explicit:
+        return explicit
+    from_env = normalize_seat(os.environ.get(SEAT_ENV))
+    if from_env:
+        return from_env
+    if lane and lane.strip():
+        from lu_machinery.common.repo_root import MachineryConfigError
+        from lu_machinery.orchestration import driver_agent_type
+
+        assignments_path: Path | None = None
+        try:
+            assignments_path = driver_agent_type._default_assignments_path()
+            assignments_path.read_text(encoding="utf-8")
+            if (
+                driver_agent_type.resolve_driver_agent_type(lane, assignments_path=assignments_path, provider=provider)
+                in CONTENT_AGENT_TYPES
+            ):
+                return "content"
+        except (driver_agent_type.DriverAgentConfigError, MachineryConfigError) as exc:
+            raise RulesCoreError(str(exc)) from exc
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            IndexError,
+            AttributeError,
+            OverflowError,
+            RecursionError,
+        ) as exc:
+            where = str(assignments_path) if assignments_path is not None else "area_assignments.yaml"
+            raise RulesCoreError(f"invalid or unreadable {where}: {exc.__class__.__name__}: {exc}") from exc
+    return "core"
+
+
+def _discard_stdout() -> None:
+    """Redirect a failed stdout fd to devnull so interpreter shutdown does not exit 120."""
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, io.UnsupportedOperation, ValueError, OSError):
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        if devnull != fd:
+            os.dup2(devnull, fd)
+    except OSError:
+        pass
+    finally:
+        if devnull != fd:
+            os.close(devnull)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -365,13 +423,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        seat = resolve_seat(args.seat, lane=args.lane, provider=args.provider)
+        seat = _resolve_cli_seat(args.seat, lane=args.lane, provider=args.provider)
         rendered = _render(args.format, seat, args.root)
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(rendered, encoding="utf-8")
         else:
-            sys.stdout.write(rendered)
+            if sys.stdout is None:
+                raise RulesCoreError("stdout is unavailable")
+            try:
+                sys.stdout.write(rendered)
+                sys.stdout.flush()
+            except OSError as exc:
+                _discard_stdout()
+                print(f"rules_core: {exc}", file=sys.stderr)
+                return 2
     except RulesCoreMissing as exc:
         print(f"rules_core: {exc}", file=sys.stderr)
         return 3
