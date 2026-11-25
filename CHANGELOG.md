@@ -9,6 +9,18 @@ this file.
 
 ## [Unreleased]
 
+<a id="v0.1.74"></a>
+## [0.1.74] - 2026-11-25
+
+### Changed
+
+- Use Ubuntu 26.04 and the runner PostgreSQL 18 ([#1424](https://github.com/learn-ukrainian/machinery/pull/1424))
+
+### Fixed
+
+- Fall back to the Ubuntu security pool for bubblewrap ([#1421](https://github.com/learn-ukrainian/machinery/pull/1421))
+- Resolve repository rows through the active-slug resolver ([#1423](https://github.com/learn-ukrainian/machinery/pull/1423))
+
 <a id="v0.1.73"></a>
 ## [0.1.73] - 2026-11-25
 
@@ -1706,7 +1718,8 @@ First release: the machinery extracted from learn-ukrainian as the installable `
 - Rollover confirms replacement bindings without a self-answered quiz. ([#65](https://github.com/learn-ukrainian/machinery/pull/65))
 - Deploy derives release identity from packaged bytes. ([#145](https://github.com/learn-ukrainian/machinery/pull/145))
 
-[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.73...HEAD
+[Unreleased]: https://github.com/learn-ukrainian/machinery/compare/v0.1.74...HEAD
+[0.1.74]: https://github.com/learn-ukrainian/machinery/compare/v0.1.73...v0.1.74
 [0.1.73]: https://github.com/learn-ukrainian/machinery/compare/v0.1.71...v0.1.73
 [0.1.72]: https://github.com/learn-ukrainian/machinery/compare/v0.1.71...v0.1.72
 [0.1.71]: https://github.com/learn-ukrainian/machinery/compare/v0.1.70...v0.1.71
