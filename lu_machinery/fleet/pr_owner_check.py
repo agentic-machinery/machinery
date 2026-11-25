@@ -30,7 +30,12 @@ from lu_machinery.fleet.pr_identity import (
     record_repository,
     supervisor_liveness,
 )
-from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepo,
+    FleetRepoError,
+    load_fleet_repos,
+    resolve_active_fleet_repo,
+)
 
 # The machinery package's import name, which is also the directory its files have in checkout
 # paths: from this module's package, or from its unresolved location when run as a file.
@@ -77,10 +82,14 @@ def evaluate(
         by_branch.setdefault((slug.casefold(), branch), []).append(record)
     unowned = []
     for slug, prs in open_prs.items():
+        try:
+            identity = record_repository({"repository": slug}, repos).casefold()
+        except RecordRepositoryRefusal:
+            identity = None
         for pr in prs:
             branch = pr.get("headRefName") or ""
             fork = bool(pr.get("isCrossRepository"))
-            tasks = [] if fork else by_branch.get((slug.casefold(), branch), [])
+            tasks = [] if fork or identity is None else by_branch.get((identity, branch), [])
             states = {alive(t) for t in tasks if t.get("status") in ACTIVE_TASK_STATUSES}
             if True in states:
                 continue
@@ -153,7 +162,8 @@ def fetch_open_prs(slug: str) -> list[dict]:
 
 
 def fetch_fleet_open_prs(repositories: Mapping[str, FleetRepo]) -> dict[str, list[dict]]:
-    return {repo.github: fetch_open_prs(repo.github) for repo in repositories.values()}
+    slugs = [resolve_active_fleet_repo(key, repos=repositories).active_github for key in repositories]
+    return {slug: fetch_open_prs(slug) for slug in slugs}
 
 
 def build_parser() -> argparse.ArgumentParser:

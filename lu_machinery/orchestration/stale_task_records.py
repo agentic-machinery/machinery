@@ -299,10 +299,13 @@ def fleet_fetch_target(slug: str) -> FetchTarget | None:
     place that says which repository a slug is. Credentials come from the
     normal git credential helper for ``https://github.com``.
     """
-    for key, repo in fleet_repos.load_fleet_repos().items():
-        if repo.github == slug and _SAFE_REPO_KEY_RE.match(key):
-            return FetchTarget(key=key, url=f"https://github.com/{slug}.git")
-    return None
+    try:
+        active = fleet_repos.resolve_payload_fleet_repo(slug)
+    except fleet_repos.FleetRepoError:
+        return None
+    if not _SAFE_REPO_KEY_RE.fullmatch(active.repo.key):
+        return None
+    return FetchTarget(key=active.repo.key, url=f"https://github.com/{active.active_github}.git")
 
 
 @dataclasses.dataclass
@@ -328,12 +331,13 @@ class RepoFacts:
 def default_repo_checkouts() -> dict[str, Path]:
     """Map each fleet repository slug to its local checkout beside the primary."""
     checkouts: dict[str, Path] = {}
-    for key, repo in fleet_repos.load_fleet_repos().items():
+    catalog = fleet_repos.load_fleet_repos()
+    for key, repo in catalog.items():
         try:
-            _repo, checkout = fleet_repos.resolve_fleet_repo(key, primary_root=state_root())
+            _repo, checkout = fleet_repos.resolve_fleet_repo(key, primary_root=state_root(), repos=catalog)
         except fleet_repos.FleetRepoError:
             continue
-        checkouts[repo.github] = checkout
+        checkouts.update(dict.fromkeys(repo.slugs, checkout))
     return checkouts
 
 
@@ -572,6 +576,7 @@ def gh_open_pull_page(slug: str, page: int) -> list[dict[str, Any]]:
 
 
 def _gh_pull_page(slug: str, page: int, *, state: str) -> list[dict[str, Any]]:
+    slug = fleet_repos.resolve_payload_fleet_repo(slug).active_github
     endpoint = f"repos/{slug}/pulls?state={state}&sort=updated&direction=desc&per_page={PR_PAGE_SIZE}&page={page}"
     proc = github_client.run(
         ["gh", "api", endpoint],
@@ -621,7 +626,7 @@ def build_pull_index(
             head_repo = head.get("repo") if isinstance(head, dict) else None
             if not isinstance(head, dict) or not isinstance(head_repo, dict):
                 continue
-            if head_repo.get("full_name") != slug or not isinstance(head.get("ref"), str):
+            if not fleet_repos.same_repository(head_repo.get("full_name"), slug) or not isinstance(head.get("ref"), str):
                 continue
             entry = {
                 "number": pull.get("number"),
@@ -1696,15 +1701,14 @@ def _anchored_record_paths(record: Mapping[str, Any]) -> list[str]:
 
 def _repository_checkout(slug: Any) -> Path | None:
     """The local checkout of the fleet repository ``slug``, or ``None`` when it has no usable one."""
-    if not isinstance(slug, str):
+    if not isinstance(slug, str) or "/" not in slug or slug != slug.strip():
         return None
     try:
-        for key, repo in fleet_repos.load_fleet_repos().items():
-            if repo.github == slug:
-                return fleet_repos.resolve_fleet_repo(key, primary_root=state_root())[1]
+        catalog = fleet_repos.load_fleet_repos()
+        repo = fleet_repos.resolve_fleet_repo_by_slug(slug, repos=catalog)
+        return fleet_repos.resolve_fleet_repo(repo.key, primary_root=state_root(), repos=catalog)[1]
     except (ValueError, OSError, RuntimeError):  # FleetRepoError, MachineryConfigError; a 3.12 symlink loop
         return None
-    return None
 
 
 def _anchored(raw: str, record: Mapping[str, Any]) -> str:

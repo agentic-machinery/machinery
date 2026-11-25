@@ -3,11 +3,13 @@
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from lu_machinery.common import git_credentials
 from lu_machinery.common.github_client import GitHubRateLimited, Result
 from lu_machinery.fleet import pr_owner_check as check
 from lu_machinery.orchestration.fleet_repos import FleetRepo
@@ -167,6 +169,30 @@ def test_main_exit_codes_and_output(monkeypatch, capsys):
     assert check.main(["--json"]) == 2
     (row,) = json.loads(capsys.readouterr().out)
     assert row["repo"] == MACHINERY and row["unknown"] and row["reason"] == "task_repository_missing"
+
+
+@pytest.mark.parametrize("active", [MACHINERY, "agentic-machinery/machinery"])
+def test_pr_owner_scan_uses_selected_slug_for_a_historical_record(monkeypatch, capsys, active):
+    """Defect class: a repository transfer hides an open PR or detaches its live owner."""
+    repos = {**REPOS, "machinery": replace(
+        REPOS["machinery"], alternate_github="agentic-machinery/machinery", repository_id=4242, visibility="public",
+    )}
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({"machinery": active}, "d" * 64),
+    )
+    open_pull = pr(42, "a")
+    patch_world(monkeypatch, {}, [live("a", "a", MACHINERY)], repos)
+    looked_up = []
+
+    def list_pulls(slug):
+        looked_up.append(slug)
+        return [open_pull]
+
+    monkeypatch.setattr(check, "fetch_open_prs", list_pulls)
+    assert check.main(["--repo", "machinery", "--json"]) == 0
+    assert looked_up == [active]
+    assert json.loads(capsys.readouterr().out) == []
 
 
 def test_unreadable_github_is_unknown_not_clean(monkeypatch, capsys):

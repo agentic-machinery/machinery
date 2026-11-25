@@ -533,7 +533,8 @@ def _publication(raw: Mapping[str, Any], publications: Mapping[str, Sequence[Map
         return None
     return next((entry for entry in publications.get(raw["task_id"], ())
                  if entry["head"] == raw.get("pinned_head")
-                 and keys.get(str(entry["repository"]).lower()) == (raw.get("repo") or "public")
+                 and isinstance(repository := entry["repository"], str) and repository.isascii()
+                 and keys.get(repository.lower()) == (raw.get("repo") or "public")
                  and raw.get("pr") in (None, entry["pr"])), None)
 
 

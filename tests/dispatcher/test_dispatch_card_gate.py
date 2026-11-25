@@ -2,18 +2,20 @@
 
 import json
 
+from lu_machinery.common import git_credentials
 from lu_machinery.dispatcher import git, store
 from tests.dispatcher.test_core_admission import admission_dispatch  # noqa: F401
 from tests.helpers.product_tree import configured_roots  # noqa: F401
+from tests.test_fleet_repos import transferred_catalog
 
 # The sandbox repository's GitHub field is a local remote path, so the card names fully qualified references.
-OPEN, CLOSED = "learn-ukrainian/machinery#575", "learn-ukrainian/machinery#12"
+OPEN, CLOSED = "example/phase#575", "example/phase#12"
 
 
-def _github(states, monkeypatch):
+def _github(states, monkeypatch, *, slug="example/phase"):
     """Answer the dispatcher's GitHub issue reads from ``states``; a missing issue raises like a refused read."""
     def gh(*args, **_kwargs):
-        assert args[0] == "api" and args[1].startswith("repos/learn-ukrainian/machinery/issues/"), args
+        assert args[0] == "api" and args[1].startswith(f"repos/{slug}/issues/"), args
         number = int(args[1].rpartition("/")[2])
         if number not in states:
             raise git.GitHubRefused("GitHub admission refused the read")
@@ -40,13 +42,25 @@ def test_open_or_unparseable_dependency_is_refused_before_launch(admission_dispa
     assert admission_dispatch.spawned == []
 
 
-def test_override_admits_the_named_dependency_and_is_recorded(admission_dispatch, tmp_path, monkeypatch):  # noqa: F811
+def test_override_admits_the_named_dependency_and_is_recorded(admission_dispatch, tmp_path, monkeypatch, capsys):  # noqa: F811
     """Defect class: the per-reference override admits the dispatch but the task record does not name it."""
-    _github({575: "open", 12: "closed"}, monkeypatch)
-    assert admission_dispatch.dispatch("--task-card", _card(tmp_path, OPEN, CLOSED), "--allow-open-dependency", OPEN) == 0
+    repo = transferred_catalog(monkeypatch)
+    opened, closed = f"{repo.github}#575", f"{repo.github}#12"
+    card = _card(tmp_path, opened, closed)
+    monkeypatch.delenv(git_credentials.SELECTOR_ENV, raising=False)
+    _github({575: "open", 12: "closed"}, monkeypatch, slug="neworg/repo")
+    args = ("--task-card", card, "--allow-open-dependency", opened)
+    assert admission_dispatch.dispatch(*args, "--dry-run") == 2
+    assert f"{closed} (unreadable (FleetRepoError))" in capsys.readouterr().err
+
+    monkeypatch.setattr(
+        git_credentials, "load_selector",
+        lambda **_kwargs: git_credentials.SelectorState({repo.key: "neworg/repo"}, "d" * 64),
+    )
+    assert admission_dispatch.dispatch(*args) == 0
     gate = store.read("adm-worker")["task_card"]
-    assert gate["dependencies"] == [{"ref": OPEN, "state": "open"}, {"ref": CLOSED, "state": "closed"}]
-    assert gate["allowed_open_dependencies"] == [OPEN]
+    assert gate["dependencies"] == [{"ref": opened, "state": "open"}, {"ref": closed, "state": "closed"}]
+    assert gate["allowed_open_dependencies"] == [opened]
 
 
 def test_github_read_failure_refuses_unless_that_reference_is_allowed(admission_dispatch, tmp_path, monkeypatch, capsys):  # noqa: F811

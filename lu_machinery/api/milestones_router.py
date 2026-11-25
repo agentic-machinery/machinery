@@ -11,7 +11,12 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
 from lu_machinery.github_rest_cache import GitHubRestError, GitHubRestTimeout, shared_cache
-from lu_machinery.orchestration.fleet_repos import FleetRepo, FleetRepoError, load_fleet_repos
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepo,
+    FleetRepoError,
+    load_fleet_repos,
+    resolve_active_fleet_repo,
+)
 
 from .monitor_context import MonitorContext, get_ctx
 from .opsec_sanitize import sanitize_text
@@ -81,13 +86,18 @@ def _repository(repo: FleetRepo) -> dict[str, Any]:
     started = time.time()
     private = not repo.role.startswith("public-")
     entry: dict[str, Any] = {
-        "repository": repo.github, "private": private, "status": "unknown", "reason": None,
+        "repository": None, "private": private, "status": "unknown", "reason": None,
         "observed_at": datetime.fromtimestamp(started, UTC).isoformat(), "rest_reads": 0, "milestones": [],
     }
     deadline = time.monotonic() + REPOSITORY_TIMEOUT_SECONDS
     try:
+        slug = resolve_active_fleet_repo(repo.key, repos={repo.key: repo}).active_github
+    except FleetRepoError:
+        return {**entry, "reason": "repository_resolution_failed"}
+    entry["repository"] = slug
+    try:
         rows, complete = _read_pages(
-            f"repos/{repo.github}/milestones?state=open&per_page=100", deadline=deadline, stats=entry,
+            f"repos/{slug}/milestones?state=open&per_page=100", deadline=deadline, stats=entry,
         )
         entry["milestones"] = [_milestone(row, private=private) for row in rows if row.get("state") == "open"]
         entry["status"] = "ok" if complete else "partial"
@@ -96,7 +106,7 @@ def _repository(repo: FleetRepo) -> dict[str, Any]:
             return entry
         # One repository-wide collection, never one call per milestone.
         issues, issues_complete = _read_pages(
-            f"repos/{repo.github}/issues?milestone=*&state=open&per_page=100", deadline=deadline, stats=entry,
+            f"repos/{slug}/issues?milestone=*&state=open&per_page=100", deadline=deadline, stats=entry,
         )
         by_number = {item["number"]: item for item in entry["milestones"]}
         for issue in issues:
@@ -109,7 +119,7 @@ def _repository(repo: FleetRepo) -> dict[str, Any]:
                 continue
             target["issues"].append({
                 "number": number, "title": _text(issue.get("title")),
-                "url": f"https://github.com/{repo.github}/issues/{number}",
+                "url": f"https://github.com/{slug}/issues/{number}",
                 "labels": [_text(label.get("name")) for label in (issue.get("labels") or []) if isinstance(label, dict)],
             })
         for milestone in entry["milestones"]:
