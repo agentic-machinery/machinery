@@ -226,29 +226,33 @@ def _report_foreign(path: Path, raw: bytes) -> None:
 atexit.register(_flush_foreign_reports, force=True)
 
 
-def _reject_json_constant(token: str) -> Any:
-    """Refuse ``NaN`` and ``Infinity``: Python's decoder admits them, JSON does not."""
-    raise ValueError(f"non-JSON constant {token}")
-
-
 def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = False) -> dict[str, Any] | None:
     """Distinguish records from sidecars without hiding damaged record claims.
 
     Only a strict JSON object or exactly ``[]`` can be foreign (``None``): the
     object classification below decides whether an object claims a run. Every
     other input raises ``ValueError``, so no reader can skip a file that may
-    hold a record: text that is not strict JSON (bare record members, a
-    truncated object, ``NaN`` or ``Infinity``), an empty, whitespace, BOM or
-    NUL-only file (a crash can leave a record zero-filled), and any other array
-    or scalar (an array can hold a record).
+    hold a record: text that is not JSON (bare record members, a truncated
+    object), an empty, whitespace, BOM or NUL-only file (a crash can leave a
+    record zero-filled), any other array or scalar (an array can hold a
+    record), and an object that would be foreign but holds ``NaN`` or
+    ``Infinity`` (not strict JSON). A record object holding one still parses:
+    the dispatcher's writer can emit them, so refusing them here first would
+    turn a writer quirk into a store-wide refusal (#1440).
 
     Dispatch writes an integer schema version and a task-id basename; legacy
     records may identify a run by filename and lifecycle fields alone. The v2
     basename and archive collision stamps follow the by-id naming contract.
     """
+    constants: list[str] = []
+
+    def constant(token: str) -> float:
+        constants.append(token)
+        return float(token)
+
     try:
         decoded = raw.decode("utf-8")
-        record = json_depth.loads(decoded, max_depth=_JSON_MAX_DEPTH, parse_constant=_reject_json_constant)
+        record = json_depth.loads(decoded, max_depth=_JSON_MAX_DEPTH, parse_constant=constant)
     except RecursionError as exc:
         raise ValueError(f"task record {path} exceeds JSON parser nesting") from exc
     except ValueError as exc:
@@ -276,6 +280,8 @@ def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = 
     receipt = ("schema" in record and "schema_version" not in record
                and isinstance(task_id, str) and not candidate_task_record_names(task_id, (path.name,)))
     if (receipt and not legacy) or not ("task_id" in record or isinstance(record.get("schema_version"), int) or legacy):
+        if constants:
+            raise ValueError(f"task record {path} holds non-JSON constant {constants[0]}")
         _report_foreign(path, raw)
         return None
     if "schema_version" in record and (type(record["schema_version"]) is not int
