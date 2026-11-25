@@ -5949,11 +5949,6 @@
     },
     {
       "path": "lu_machinery/opsec/prepublish.py",
-      "code": "no-any-return",
-      "message": "Returning Any from function declared to return \"dict[Any, Any]\""
-    },
-    {
-      "path": "lu_machinery/opsec/prepublish.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"None | dict[str, str]\" has no attribute \"pop\""
     },
