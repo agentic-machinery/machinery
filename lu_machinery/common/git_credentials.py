@@ -310,7 +310,7 @@ def repository_registry(path: Path) -> dict[str, dict[str, Any]]:
     """
     try:
         registry = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueSafeLoader)
-    except yaml.YAMLError:
+    except (yaml.YAMLError, RecursionError):  # PyYAML recurses per nesting level
         raise ValueError("invalid fleet repository registry") from None
     repos = registry.get("repos") if isinstance(registry, dict) else None
     if not isinstance(repos, dict) or not repos:
@@ -407,7 +407,7 @@ def load_selector(
     try:
         text = raw_bytes.decode("utf-8")
         document = yaml.load(text, Loader=_UniqueSafeLoader)
-    except (UnicodeDecodeError, yaml.YAMLError):
+    except (UnicodeDecodeError, yaml.YAMLError, RecursionError):  # PyYAML recurses per nesting level
         raise SelectorError("fleet repository selector is malformed") from None
 
     if not isinstance(document, dict) or set(document.keys()) != {"version", "active_slugs"}:
