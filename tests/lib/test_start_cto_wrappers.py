@@ -976,11 +976,26 @@ if [ "$HERE" = 1 ]; then
 fi
 tmux has-session -t =cto 2>/dev/null && { echo "refused: tmux session cto exists (use --here inside it)" >&2; exit 3; }
 # Enter REPO in the pane so a tmux config-client cwd cannot override it.
-# An empty session value overrides a reused server's selector.
+# Propagate caller root/interpreter settings (clearing stale server values when
+# unset) and override a reused server's workspace selector with an empty value.
 # Escape trailing semicolons in tmux arguments.
+ROOT_ENV_VARS=(
+  LU_PRIMARY_REPO_ROOT LEARN_UKRAINIAN_PRIMARY_REPO_ROOT
+  LU_STATE_ROOT LEARN_UKRAINIAN_STATE_ROOT
+  LU_PRODUCT_ROOT
+  LU_PYTHON LEARN_UKRAINIAN_PYTHON
+  LU_REPOS_ROOT LU_PROFILE_PATH
+  LU_GITHUB_SLUG LEARN_UKRAINIAN_GITHUB_SLUG
+)
 TMUX_ARGS=(
   new-session -d -s cto -e "CLAUDE_CONFIG_DIR=$DIR" -e "LC_WORKSPACE_ROOT="
-  bash -c 'unset LC_WORKSPACE_ROOT; cd -- "$1" || exit; LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash' bash "$REPO" "${LAUNCH[@]}"
+)
+for var in "${ROOT_ENV_VARS[@]}"; do
+  TMUX_ARGS+=(-e "$var=${!var:-}")
+done
+TMUX_ARGS+=(
+  bash -c 'unset LC_WORKSPACE_ROOT; for v in LU_PRIMARY_REPO_ROOT LEARN_UKRAINIAN_PRIMARY_REPO_ROOT LU_STATE_ROOT LEARN_UKRAINIAN_STATE_ROOT LU_PRODUCT_ROOT LU_PYTHON LEARN_UKRAINIAN_PYTHON LU_REPOS_ROOT LU_PROFILE_PATH LU_GITHUB_SLUG LEARN_UKRAINIAN_GITHUB_SLUG; do [ -n "${!v:-}" ] || unset "$v"; done; cd -- "$1" || exit; LC_WORKSPACE_ROOT="$1" "${@:2}"; exec bash'
+  bash "$REPO" "${LAUNCH[@]}"
 )
 for index in "${!TMUX_ARGS[@]}"; do
   if [[ "${TMUX_ARGS[index]}" == *';' ]]; then
@@ -1048,7 +1063,13 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
     (stray / ".git").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(second)], check=True, timeout=30,
                    env={"PATH": os.defpath, "HOME": str(tmp_path), "GIT_CONFIG_NOSYSTEM": "1"})
-    for state_root in (workspace, tmp_path / "absent-state", stray, second):
+    second_nested = second / "nested-state"
+    second_nested.mkdir()
+    primary_nested = primary / "nested-state"
+    primary_nested.mkdir()
+    second_nested_link = tmp_path / "second-nested-link"
+    second_nested_link.symlink_to(second_nested, target_is_directory=True)
+    for state_root in (workspace, tmp_path / "absent-state", stray, second, second_nested, primary_nested, second_nested_link):
         refused = launch(LU_STATE_ROOT=str(state_root))
         assert refused.returncode == 3 and "state root does not validate" in refused.stderr, (state_root, refused.stderr)
     refused = launch(args=("--epic", "infra"))

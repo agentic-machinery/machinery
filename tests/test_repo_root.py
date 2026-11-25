@@ -534,11 +534,23 @@ def test_native_hook_roots_admit_a_dedicated_non_git_state_root_beside_the_git_a
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(workspace))
     monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(state))
     assert rr.native_hook_roots(workspace) == (workspace, primary.resolve())
-    # A state root that is a checkout must still be the anchor; a stray .git still refuses.
+    # A state root that is a checkout or inside any checkout must still be refused; a stray .git still refuses.
     other = _primary_checkout(tmp_path / "other")
+    other_sub = other / "nested-state"
+    other_sub.mkdir()
+    primary_sub = primary / "nested-state"
+    primary_sub.mkdir()
+    link_to_other_sub = tmp_path / "link-to-other-sub"
+    link_to_other_sub.symlink_to(other_sub, target_is_directory=True)
+    outside = tmp_path / "outside-target"
+    outside.mkdir()
+    link_inside_other = other / "link-to-outside"
+    link_inside_other.symlink_to(outside, target_is_directory=True)
     stray = tmp_path / "stray"
     (stray / ".git").mkdir(parents=True)
-    for refused in (other, stray):
+    stray_sub = stray / "nested-state"
+    stray_sub.mkdir()
+    for refused in (other, other_sub, primary_sub, link_to_other_sub, link_inside_other, stray, stray_sub):
         monkeypatch.setenv(rr.LU_STATE_ROOT_ENV, str(refused))
         with pytest.raises(rr.ProductRootError, match="no hook context resolves"):
             rr.native_hook_roots(workspace)

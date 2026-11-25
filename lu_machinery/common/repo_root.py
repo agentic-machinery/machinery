@@ -949,10 +949,13 @@ def native_hook_roots(invocation_dir: Path) -> tuple[Path, Path]:
                 continue
             if name == LU_STATE_ROOT_ENV:
                 configured = configured_state_root()
-                if configured is not None and not os.path.lexists(configured / ".git"):
-                    continue
+                if configured is not None:
+                    resolved = resolve_path(configured)
+                    ancestors = (configured, *configured.parents, resolved, *resolved.parents)
+                    if not any(os.path.lexists(ancestor / ".git") for ancestor in ancestors):
+                        continue
             env[ENV_ALIASES[name]] = setting[1]
-    except MachineryConfigError as exc:
+    except (MachineryConfigError, OSError) as exc:
         raise ProductRootError(f"no hook context resolves from {invocation_dir}: {exc}") from None
     try:
         # Fixed /bin/bash argv; the library path and directory are arguments, never shell text.
