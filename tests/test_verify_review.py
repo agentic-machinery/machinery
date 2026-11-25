@@ -1388,6 +1388,59 @@ def test_cli_receipt_path_refuses_direct_task_store_and_allows_task_artifacts(tm
     assert code_ok == EXIT_CLEAN
     assert allowed.is_file()
 
+    # F2 regression: without a configured state root, a symlinked conventional batch_state/tasks
+    # (or archive) pointing to a differently named backing directory still refuses direct writes,
+    # while allowing writes under <task>.artifacts/.
+    from lu_machinery.common import repo_root as repo_root_mod
+
+    monkeypatch.delenv("LU_TASKS_DIR", raising=False)
+    monkeypatch.setattr(
+        "lu_machinery.common.task_store_paths.state_root",
+        lambda: (_ for _ in ()).throw(repo_root_mod.MachineryConfigError("no state root")),
+    )
+    backing = tmp_path / "external-backing"
+    backing_archive = tmp_path / "external-archive-backing"
+    backing.mkdir()
+    backing_archive.mkdir()
+    conv_parent = tmp_path / "conv" / "batch_state"
+    conv_parent.mkdir(parents=True)
+    conv_tasks = conv_parent / "tasks"
+    conv_tasks.symlink_to(backing)
+    (backing / "archive").symlink_to(backing_archive)
+
+    for conv_blocked in (
+        conv_tasks / "t2.behavior-receipt.json",
+        conv_tasks / "archive" / "t2.behavior-receipt.json",
+        conv_tasks / "t2.artifacts" / ".." / "t2.behavior-receipt.json",
+    ):
+        capsys.readouterr()
+        code_conv = verify_review_cli.main(
+            [
+                "--review-file",
+                str(review),
+                *_cli_envelope_args(repo),
+                "--receipt-path",
+                str(conv_blocked),
+            ]
+        )
+        assert code_conv == EXIT_INVALID, f"expected EXIT_INVALID for {conv_blocked}"
+        assert "receipt_path_forbidden" in capsys.readouterr().err
+    assert not (backing / "t2.behavior-receipt.json").exists()
+    assert not (backing_archive / "t2.behavior-receipt.json").exists()
+
+    conv_allowed = conv_tasks / "t2.artifacts" / "behavior-receipt.json"
+    code_conv_ok = verify_review_cli.main(
+        [
+            "--review-file",
+            str(review),
+            *_cli_envelope_args(repo),
+            "--receipt-path",
+            str(conv_allowed),
+        ]
+    )
+    assert code_conv_ok == EXIT_CLEAN
+    assert conv_allowed.is_file()
+
 
 def test_cli_issue_mode_posts_opt_in_comment(tmp_path, monkeypatch, capsys):
     repo = _init_repo(tmp_path)

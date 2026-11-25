@@ -1003,9 +1003,14 @@ def perform_mutation(
             ) from exc
 
 
-def _state_file(args: argparse.Namespace, identity: Mapping[str, Any] | None = None) -> Path:
+def _state_file(
+    args: argparse.Namespace, identity: Mapping[str, Any] | None = None, *, writable: bool = True,
+) -> Path:
     if args.state_file:
-        return Path(args.state_file).expanduser().resolve()
+        raw = Path(args.state_file).expanduser()
+        if writable:
+            task_lifecycle._require_not_direct_task_store(raw, label="lifecycle ledger")
+        return raw.resolve()
     if identity is None:
         raise task_lifecycle.LifecycleError("--state-file is required for this command")
     return task_lifecycle.lifecycle_path(Path(args.repo_root), identity)
@@ -1301,7 +1306,7 @@ def cmd_mutate(args: argparse.Namespace) -> int:
 
 
 def cmd_carrier(args: argparse.Namespace) -> int:
-    path = _state_file(args)
+    path = _state_file(args, writable=False)
     carrier = task_lifecycle.carrier_projection(
         task_lifecycle.load_lifecycle(path), state_file=str(path)
     )
@@ -1311,6 +1316,8 @@ def cmd_carrier(args: argparse.Namespace) -> int:
 
 def cmd_recover_local(args: argparse.Namespace) -> int:
     from lu_machinery.orchestration.lifecycle_observation import recover
+
+    task_lifecycle._require_not_direct_task_store(Path(args.state_file).expanduser(), label="lifecycle ledger")
 
     child_pr = None
     merged_pr = None
