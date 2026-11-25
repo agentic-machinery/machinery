@@ -3133,8 +3133,11 @@ def test_publication_ledger_keeps_the_selector_receipt_and_still_reads_legacy_li
     # A batch whose later line carries a receipt mapping JSON cannot hold is refused before any line is written.
     from types import MappingProxyType
 
-    with pytest.raises(ValueError):
-        model_stats_rows.record_publications(tmp_path, [legacy, {**entry, "fleet_repo_selector": MappingProxyType(receipt)}])
+    from collections import UserString
+
+    for unserializable in (MappingProxyType(receipt), {UserString(key): value for key, value in receipt.items()}):
+        with pytest.raises(ValueError):
+            model_stats_rows.record_publications(tmp_path, [legacy, {**entry, "fleet_repo_selector": unserializable}])
     assert model_stats_rows.read_publications(tmp_path)[0] == {}
     assert model_stats_rows.record_publications(tmp_path, [legacy, entry]) == 2
     # The receipt is no part of the publication key: the same publication without it is a duplicate.

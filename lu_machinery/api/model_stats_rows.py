@@ -1032,11 +1032,19 @@ def record_publications(batch_state_dir: Path, entries: Iterable[Mapping[str, An
     """Append, under ``rows.lock``, each entry the ledger does not hold yet (by ``publication_key``); the count added.
 
     Every entry is checked before anything is written: one malformed entry raises ValueError and writes nothing.
+    What is checked is the entry's own JSON line read back, and that same snapshot is what is written, so a value
+    JSON cannot hold, or a mapping that serializes differently from what it shows, is refused before the first line.
     TimeoutError when ``wait_s`` passes before the lock is free; OSError when the ledger cannot be written.
     """
-    checked = [dict(entry) for entry in entries]
-    if not all(_publication_ok(entry) for entry in checked):
-        raise ValueError("publication field has the wrong shape")
+    checked = []
+    for entry in entries:
+        try:
+            snapshot = json_depth.loads(_line(dict(entry)), max_depth=_JSON_MAX_DEPTH)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("publication field has the wrong shape") from exc
+        if not _publication_ok(snapshot):
+            raise ValueError("publication field has the wrong shape")
+        checked.append(snapshot)
     with _locked(batch_state_dir, wait_s) as rows_file:
         path = rows_file.with_name(PUBLICATIONS_FILE)
         present = {publication_key(e) for e in _publication_lines(path, Counter())}
