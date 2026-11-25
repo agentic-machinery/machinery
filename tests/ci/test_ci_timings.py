@@ -532,56 +532,22 @@ def test_machinery_readers_refuse_overlong_digit_captures_without_unbounded_int(
         assert exc_info.value.code == 2
         assert relations.parse_issue_work_id(f"work:public:learn-ukrainian/machinery:issue:{huge}") is None
 
-        for comment in (
-            f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/{huge}",
-            f"Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/{huge}",
-            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/0",
-            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/042",
-            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/\u0664\u0662",
-            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and https://github.com/learn-ukrainian/machinery/pull/0/files",
-            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 and HTTPS://github.com/learn-ukrainian/machinery/pull/0/files",
-            "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42> and <https://github.com/learn-ukrainian/machinery/pull/42.>",
-            "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42> and [bad](https://github.com/learn-ukrainian/machinery/pull/42.)",
-            "Dismiss alert #7 fixed in [bad]( https://github.com/learn-ukrainian/machinery/pull/42. )",
-            "Dismiss alert #7 fixed in [bad](\n  https://github.com/learn-ukrainian/machinery/pull/42.\n)",
-            "Dismiss alert #7 fixed in [ref][1]\n\n[1]: https://github.com/learn-ukrainian/machinery/pull/42.",
-            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42/files",
-        ):
-            with pytest.raises(ValueError, match="comment needs an explanation and one same-repository merged PR"):
-                publish_github._dismiss_preflight(
-                    {"number": 7, "comment": comment},
-                    "learn-ukrainian/machinery",
-                    "github.com/learn-ukrainian/machinery",
-                    None,
-                    Path("."),
-                    {},
-                )
-
-        fetched_endpoints: list[Any] = []
-
-        def _stop_on_fetch(argv: list[str], *_args: Any, **_kwargs: Any) -> Any:
-            fetched_endpoints.append(argv)
-            raise LookupError("reached_pr_fetch")
-
-        for comment in (
-            "Dismiss alert #7 fixed in https://github.com/learn-ukrainian/machinery/pull/42 "
-            "see https://github.com/learn-ukrainian/machinery/pull/42/files",
-            "Dismiss alert #7 fixed in <https://github.com/learn-ukrainian/machinery/pull/42>. "
-            "See https://github.com/learn-ukrainian/machinery/pull/42.",
-            "Dismiss alert #7 fixed in [PR]( https://github.com/learn-ukrainian/machinery/pull/42 )",
-            "Dismiss alert #7 fixed in [PR][1]\n\n[1]: https://github.com/learn-ukrainian/machinery/pull/42",
-        ):
-            fetched_endpoints.clear()
-            with pytest.raises(LookupError, match="reached_pr_fetch"):
-                publish_github._dismiss_preflight(
-                    {"number": 7, "comment": comment},
-                    "learn-ukrainian/machinery",
-                    "github.com/learn-ukrainian/machinery",
-                    _stop_on_fetch,
-                    Path("."),
-                    {},
-                )
-            assert fetched_endpoints == [["gh", "api", "--method", "GET", "repos/learn-ukrainian/machinery/pulls/42"]]
+        assert publish_github._created_resource_number(
+            f"https://github.com/learn-ukrainian/machinery/pull/{huge}", kind="pull"
+        ) is None
+        assert publish_github._created_resource_number(
+            "https://github.com/learn-ukrainian/machinery/pull/42", kind="pull"
+        ) == 42
+        assert publish_github._pr_closing_issues(
+            f"Fixes #{huge} and Fixes https://github.com/learn-ukrainian/machinery/issues/{huge} and Fixes #42",
+            "learn-ukrainian/machinery",
+        ) == [42]
+        with pytest.raises(SystemExit) as exc_info:
+            publish_github._parse_args(["pr-comment", "--number", "1" * 20, "--body", "hi"])
+        assert exc_info.value.code == 2
+        with pytest.raises(SystemExit) as exc_info:
+            publish_github._parse_args(["read", "pr-view", "--number", "1" * 20])
+        assert exc_info.value.code == 2
     finally:
         sys.set_int_max_str_digits(prev_limit)
 

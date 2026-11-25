@@ -3612,39 +3612,14 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     identifier = rf"(?i)\balert\s+#{number}\b"
     if not re.search(identifier, comment):
         raise ValueError("comment must identify its alert")
-    url_re = r"(?ai:https)://[^\s<>()]+"
+    links = re.findall(r"https://[^\s<>()]+", comment)
     known = _repository_slugs(gh_repo)
     if not known:
         raise ValueError("the repository is not an exact owner/name or the fleet registry is unreadable")
     slugs = "|".join(re.escape(slug) for slug in known)
-    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
-
-    pr_segment_re = rf"https://github\.com/(?:{slugs})/pull(?:/([^/#?]*)(?:[/#?].*)?|[#?].*)?"
-    pr_canonical_re = rf"https://github\.com/(?:{slugs})/pull/([1-9][0-9]*)(?:#[A-Za-z0-9_-]+)?"
-    prs: set[int] = set()
-    for url_match in re.finditer(url_re, comment):
-        raw_link = url_match.group(0)
-        start, end = url_match.span()
-        prefix = comment[:start]
-        explicit = (
-            (start > 0 and end < len(comment) and comment[start - 1] == "<" and comment[end] == ">")
-            or re.search(r"\]\([ \t]*(?:(?:\r\n|[\r\n])[ \t]*)?\Z", prefix) is not None
-            or re.search(
-                r"(?m)^(?:[ ]{0,3}>)*[ ]{0,3}\[[^\[\]]+\]:[ \t]*(?:(?:\r\n|[\r\n])[ \t]*)?\Z",
-                prefix,
-            )
-            is not None
-            or re.search(r"(?ai:\bhref)[ \t]*=[ \t]*['\"]\Z", prefix) is not None
-        )
-        link = raw_link if explicit else raw_link.rstrip(".,;:!?\"'`]")
-        if seg_match := re.fullmatch(pr_segment_re, link, re.ASCII | re.IGNORECASE):
-            seg = seg_match[1]
-            num = parse_ascii_positive_int(seg) if seg is not None and len(seg) <= 19 else None
-            if num is None:
-                raise ValueError("comment needs an explanation and one same-repository merged PR")
-            if re.fullmatch(pr_canonical_re, link):
-                prs.add(num)
-    explanation = re.sub(identifier, "", re.sub(url_re, "", comment)).strip(" .,:;\n")
+    pattern = rf"https://github\.com/(?:{slugs})/pull/([1-9][0-9]*)(?:#[A-Za-z0-9_-]+)?"
+    prs = {int(match[1]) for link in links if (match := re.fullmatch(pattern, link))}
+    explanation = re.sub(identifier, "", re.sub(r"https://[^\s<>()]+", "", comment)).strip(" .,:;\n")
     if dest.partition("/")[0] != "github.com" or len(prs) != 1 or not any(char.isalpha() for char in explanation):
         raise ValueError("comment needs an explanation and one same-repository merged PR")
     root = f"repos/{gh_repo}"
@@ -3855,23 +3830,16 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     baseline_ref = f"refs/heads/{base_ref}"
     if not any(instance["ref"] == baseline_ref for instance in instances):
         raise ValueError("no open triage-branch instance")
-    from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
-
-    pull_instance_set: set[int] = set()
-    for instance in instances:
-        if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            pr_num = parse_ascii_positive_int(match[1]) if len(match[1]) <= 19 else None
-            if pr_num is None:
-                raise ValueError("unknown instance PR identity or state")
-            pull_instance_set.add(pr_num)
-    pull_instance_nums = sorted(pull_instance_set)
+    pull_instance_nums = sorted({
+        int(match[1])
+        for instance in instances
+        if (match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]))
+    })
     pr_states = pull_states(pull_instance_nums) if pull_instance_nums else {}
     skipped_prs = {}
     for instance in instances:
         if match := re.fullmatch(r"refs/pull/([1-9][0-9]*)/merge", instance["ref"]):
-            pr_num = parse_ascii_positive_int(match[1]) if len(match[1]) <= 19 else None
-            if pr_num is None:
-                raise ValueError("unknown instance PR identity or state")
+            pr_num = int(match[1])
             state, merged = pr_states[pr_num]
             if state in {"CLOSED", "MERGED"} or merged:
                 skipped_prs[pr_num] = (state, merged)
