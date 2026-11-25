@@ -43,9 +43,9 @@ from lu_machinery.common.git_credentials import (
     repository_registry,
     verify_authenticated_repository,
 )
-from lu_machinery.common.profile import ProfileError
 from lu_machinery.common.repo_root import (
     PRODUCT_MARKER,
+    MachineryConfigError,
     StateRootError,
     configured_primary_root,
     configured_product_root,
@@ -307,7 +307,7 @@ def _resolved_registry_path(
     else:
         try:
             path = default_config_path(env=env)
-        except ProfileError as exc:
+        except MachineryConfigError as exc:
             raise FleetRepoError(f"fleet_repos catalog unreadable: {exc}") from exc
     try:
         return path.resolve()
