@@ -21,17 +21,22 @@ import sys
 import tomllib
 import unicodedata
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import yaml
+
 from lu_machinery.common import json_depth
+from lu_machinery.common.repo_root import state_root
 from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
 from lu_machinery.lint.lint_agent_skills import _parse_frontmatter, metadata_errors
 
 DESCRIPTOR = "agents_extensions/deployment.v1.json"
 STATE = ".deploy-state/agent-deploy.v1.json"
 STAGING = ".deploy-state/agent-deploy.tmp"
+WORKSPACE_RUNTIME = ".claude/epics-epic"
+POLICY_DIR_MODE = 0o555
 TARGETS = {"claude": ".claude", "codex": ".codex", "agy": ".agent", "cursor": ".cursor"}
 # Output roots of retired targets. A descriptor can no longer enable them, but
 # deployment state from an earlier release may still own files there; those
@@ -62,6 +67,40 @@ DISCOVERY = {
 # and Cursor (.agents/skills, https://cursor.com/docs/context/skills). The retired
 # Gemini CLI target (.gemini) is no longer deployed; Gemini runs through AGY.
 SHARED_DISCOVERY = frozenset({"codex", "agy", "cursor"})
+
+# Workspace .claude/settings.json policy allowlists (FU-WS-SETTINGS-GUARD).
+# A non-Git CTO workspace runs with session-writable files (safe_open requires geteuid),
+# so workspace settings admit only the release's required hooks, benign runtime keys, and
+# numeric/boolean Claude runtime env knobs — never command-executing helpers (apiKeyHelper,
+# statusLine, awsAuthRefresh, awsCredentialExport, otelHeadersHelper, fileSuggestion),
+# permission/MCP overrides, extra hooks, or guard/route/interpreter env overrides.
+WORKSPACE_CLAUDE_SETTINGS_KEYS = frozenset({
+    "hooks",
+    "env",
+    "disableAllHooks",
+    "allowManagedHooksOnly",
+    "language",
+    "model",
+    "advisorModel",
+    "effortLevel",
+    "respectGitignore",
+    "acceptEdits",
+    "yolo",
+    "plansDirectory",
+    "worktree",
+})
+WORKSPACE_CLAUDE_SETTINGS_ENV_KEYS = frozenset({
+    "CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING",
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "PYTHONDONTWRITEBYTECODE",
+})
+# Workspace source subtrees and filenames that can execute hooks/commands or register MCP outside release.v1.json.
+WORKSPACE_FORBIDDEN_SOURCE_PREFIXES = ("hooks/", "plugins/", "workflows/")
+WORKSPACE_FORBIDDEN_SOURCE_NAMES = frozenset({".mcp.json", "mcp_config.json", "mcp.json"})
+# Markdown frontmatter subtrees where Claude Code loads inline hooks or MCP servers.
+WORKSPACE_FRONTMATTER_PREFIXES = ("skills/", "agents/", "commands/", "output-styles/")
+WORKSPACE_FORBIDDEN_FRONTMATTER_KEYS = frozenset({"hooks", "mcpservers"})
 
 
 class Invalid(ValueError):
@@ -123,18 +162,38 @@ BYTECODE_CACHE = "__pycache__"
 class Tree:
     """All filesystem operations remain below a held, no-follow root fd."""
 
-    def __init__(self, fd: int):
+    def __init__(self, fd: int, *, workspace: bool = False, staging: str = STAGING):
         self.fd = fd
+        self.workspace = workspace
+        self.staging = staging
+
+    @contextlib.contextmanager
+    def writable(self, fd: int) -> Iterator[None]:
+        # Hold the same directory across chmod, the mutation and the relock.
+        locked = self.workspace and stat.S_IMODE(os.fstat(fd).st_mode) == POLICY_DIR_MODE
+        if locked:
+            os.fchmod(fd, POLICY_DIR_MODE | stat.S_IWUSR)
+        try:
+            yield
+        finally:
+            if locked:
+                os.fchmod(fd, POLICY_DIR_MODE)
+                os.fsync(fd)
 
     @contextlib.contextmanager
     def directory(self, path: str, *, create: bool = False) -> Iterator[int]:
         fd = os.dup(self.fd)
         try:
             for part in relative(path).split("/"):
-                if create:
-                    with contextlib.suppress(FileExistsError):
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                try:
+                    child = os.open(part, flags, dir_fd=fd)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    with self.writable(fd), contextlib.suppress(FileExistsError):
                         os.mkdir(part, 0o755, dir_fd=fd)
-                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+                    child = os.open(part, flags, dir_fd=fd)
                 os.close(fd)
                 fd = child
             yield fd
@@ -178,7 +237,8 @@ class Tree:
         except FileNotFoundError:
             return False
 
-    def inventory(self, path: str, *, exclude: Callable[[str], bool] | None = None) -> dict[str, tuple[bytes, int]]:
+    def inventory(self, path: str, *, exclude: Callable[[str], bool] | None = None,
+                  visit_directory: Callable[[str], None] | None = None) -> dict[str, tuple[bytes, int]]:
         found: dict[str, tuple[bytes, int]] = {}
         def visit(fd: int, prefix: str) -> None:
             for name in sorted(os.listdir(fd)):
@@ -187,9 +247,11 @@ class Tree:
                     continue
                 relative(name)
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode) and name == BYTECODE_CACHE:
-                    continue
                 if stat.S_ISDIR(info.st_mode):
+                    if visit_directory is not None:
+                        visit_directory(path + "/" + key)
+                    elif name == BYTECODE_CACHE:
+                        continue
                     child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                     try:
                         visit(child, key + "/")
@@ -200,7 +262,7 @@ class Tree:
                     with os.fdopen(child, "rb") as file:
                         found[key] = (file.read(), stat.S_IMODE(os.fstat(file.fileno()).st_mode))
                 else:
-                    raise Invalid("symlink or special file in deployment tree")
+                    raise Invalid("symlink or special file in deployment tree: " + path + "/" + key)
         try:
             with self.directory(path) as fd:
                 visit(fd, "")
@@ -212,7 +274,7 @@ class Tree:
         # The per-target lock serializes all writes, so one reserved staging
         # slot suffices. SIGKILL can leave it behind without polluting a provider
         # tree. Recovery validates its bytes against the reconstructed plan.
-        with self.parent(path, create=True) as (fd, name), self.parent(STAGING, create=True) as (stage_fd, temp):
+        with self.parent(path, create=True) as (fd, name), self.parent(self.staging, create=True) as (stage_fd, temp):
             handle = safe_open_below(stage_fd, temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 with os.fdopen(handle, "wb") as file:
@@ -220,21 +282,22 @@ class Tree:
                     os.fchmod(file.fileno(), mode)
                     file.flush()
                     os.fsync(file.fileno())
-                os.replace(temp, name, src_dir_fd=stage_fd, dst_dir_fd=fd)
-                os.fsync(fd)
+                with self.writable(fd):
+                    os.replace(temp, name, src_dir_fd=stage_fd, dst_dir_fd=fd)
+                    os.fsync(fd)
                 os.fsync(stage_fd)
             finally:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(temp, dir_fd=stage_fd)
 
     def unlink(self, path: str) -> None:
-        with self.parent(path) as (fd, name):
+        with self.parent(path) as (fd, name), self.writable(fd):
             os.unlink(name, dir_fd=fd)
             os.fsync(fd)
 
     def rmdir(self, path: str) -> None:
         try:
-            with self.parent(path) as (fd, name):
+            with self.parent(path) as (fd, name), self.writable(fd):
                 os.rmdir(name, dir_fd=fd)
         except FileNotFoundError:
             pass
@@ -412,7 +475,7 @@ def selected_tree(selected: str | None, check: bool, *, workspace: bool = False)
             # Checked on the held descriptors, so no path swap can hide a checkout.
             if workspace and _entry_exists(base, ".git"):
                 raise Invalid(f"a workspace target must be outside every Git checkout: {walked} has a .git entry")
-        tree = Tree(base)
+        tree = Tree(base, workspace=workspace)
         if not workspace:
             try:
                 result = subprocess.run(
@@ -452,12 +515,15 @@ class Plan:
     roots: set[str]
     release: str
     configuration: str
+    input_digests: dict[str, str] = field(default_factory=dict)
+
+    def directories(self) -> set[str]:
+        return {str(parent) for path in self.files for parent in PurePosixPath(path).parents if str(parent) != "."}
 
     def manifest(self) -> bytes:
-        directories = sorted({str(parent) for path in self.files for parent in PurePosixPath(path).parents if str(parent) != "."})
         return encoded({"version": 1, "release": self.release, "configuration": self.configuration,
                         "files": {p: out.record() for p, out in sorted(self.files.items())},
-                        "directories": directories})
+                        "directories": sorted(self.directories())})
 
 
 def agy_parts(core: bytes) -> dict[str, bytes]:
@@ -505,12 +571,91 @@ def release_inputs() -> tuple[dict[str, Output], dict[str, Any], str]:
     return result, inventory, identity
 
 
+def _validate_workspace_frontmatter(path: str, blob: bytes) -> None:
+    """Refuse inline ``hooks`` or ``mcpServers`` frontmatter in workspace skills/agents/commands."""
+    try:
+        text = blob.decode("utf-8").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeDecodeError as exc:
+        raise Invalid("non-UTF-8 workspace markdown: " + path) from exc
+    opener = re.match(r"^---[ \t]*\n", text)
+    if opener is None:
+        return
+    closer = re.search(r"\n---[ \t]*(?:\n|$)", text[opener.end():])
+    if closer is None:
+        raise Invalid("unterminated workspace frontmatter: " + path)
+    try:
+        data = yaml.safe_load(text[opener.end():opener.end() + closer.start()])
+    except yaml.YAMLError as exc:
+        raise Invalid("invalid workspace frontmatter: " + path) from exc
+    if not isinstance(data, dict):
+        raise Invalid("workspace frontmatter must be a mapping: " + path)
+    for key in data:
+        if str(key).casefold() in WORKSPACE_FORBIDDEN_FRONTMATTER_KEYS:
+            raise Invalid(f"workspace frontmatter cannot declare {key}: {path}")
+
+
+def _validate_workspace_claude_settings(settings: dict[str, Any], requirements: list[dict[str, Any]]) -> None:
+    """Enforce the strict release-bound policy on a non-Git workspace's ``.claude/settings.json``."""
+    unknown = sorted(set(settings) - WORKSPACE_CLAUDE_SETTINGS_KEYS)
+    if unknown:
+        raise Invalid("unapproved workspace settings key: " + ", ".join(unknown))
+    if "env" in settings:
+        env_block = settings["env"]
+        if not isinstance(env_block, dict):
+            raise Invalid("invalid workspace settings env: .claude/settings.json")
+        for key, value in env_block.items():
+            if key not in WORKSPACE_CLAUDE_SETTINGS_ENV_KEYS:
+                raise Invalid("unapproved workspace settings env: " + str(key))
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value):
+                raise Invalid("invalid workspace settings env value: " + key)
+    hooks_section = settings.get("hooks")
+    if not isinstance(hooks_section, dict):
+        raise Invalid("invalid workspace hook settings: .claude/settings.json")
+    allowed_by_event: dict[str, list[dict[str, Any]]] = {}
+    for requirement in requirements:
+        path = requirement.get("path")
+        if not isinstance(path, list) or len(path) != 2 or path[0] != "hooks" or not isinstance(path[1], str):
+            raise Invalid("invalid release required_hooks path")
+        allowed_by_event.setdefault(path[1], []).append(requirement)
+    for event, groups in hooks_section.items():
+        if event not in allowed_by_event:
+            raise Invalid("unapproved workspace hook event: " + str(event))
+        if not isinstance(groups, list):
+            raise Invalid("invalid workspace hook settings: " + event)
+        for group in groups:
+            if not isinstance(group, dict):
+                raise Invalid("invalid workspace hook group: " + event)
+            if group.get("enabled", True) is not True or group.get("disabled", False) is not False:
+                raise Invalid("disabled workspace hook group: " + event)
+            group_hooks = group.get("hooks")
+            if not isinstance(group_hooks, list):
+                raise Invalid("invalid workspace hook list: " + event)
+            group_meta = {k: v for k, v in group.items() if k != "hooks"}
+            matching = [req for req in allowed_by_event[event] if req["group"] == group_meta]
+            if not matching:
+                raise Invalid("unapproved workspace hook group: " + event)
+            allowed_hooks = [
+                {k: v for k, v in hook.items() if k != "statusMessage"}
+                for req in matching
+                for hook in req["hooks"]
+            ]
+            for candidate in group_hooks:
+                if not isinstance(candidate, dict):
+                    raise Invalid("invalid workspace hook entry: " + event)
+                if "statusMessage" in candidate and not isinstance(candidate["statusMessage"], str):
+                    raise Invalid("invalid workspace hook statusMessage: " + event)
+                normalized = {k: v for k, v in candidate.items() if k != "statusMessage"}
+                if normalized not in allowed_hooks:
+                    raise Invalid("unapproved workspace hook command: " + event)
+
+
 def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: bool = False) -> Plan:
     """The plan for ``tree``, composed from ``inputs`` (the descriptor and product sources); default: ``tree``."""
     inputs = tree if inputs is None else inputs
     entry = inputs.read(DESCRIPTOR)
     if entry is None:
         raise Invalid("missing " + DESCRIPTOR)
+    input_digests = {DESCRIPTOR: digest(entry[0])} if workspace else {}
     descriptor = decode(entry[0])
     if not isinstance(descriptor, dict) or set(descriptor) != {"providers", "sources", "preserve"}:
         raise Invalid("descriptor requires only providers, sources and preserve")
@@ -526,12 +671,18 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
         roots.add(".agents")
     if not isinstance(preserve, list):
         raise Invalid("preserve must be a list")
+    if workspace and WORKSPACE_RUNTIME not in preserve:
+        preserve = [*preserve, WORKSPACE_RUNTIME]
     for path in preserve:
         relative(path)
         if path.split("/")[0] not in roots or "/" not in path:
             raise Invalid("preserve must name a subtree within an enabled target")
         if path == ".codex/skills" or path.startswith(".codex/skills/"):
             raise Invalid("legacy Codex discovery cannot be preserved")
+        if workspace and path != ".claude/settings.local.json" and path.split("/")[1].casefold() in {
+            name.casefold() for name in DISCOVERY.get(path.split("/")[0], ())
+        }:
+            raise Invalid("workspace cannot preserve provider discovery path: " + path)
     shared, inventory, release = release_inputs()
     def replaces(provider: str, path: str) -> bool:
         return any(path == p or path.startswith(p + "/") for p in inventory["provider_replacements"].get(provider, []))
@@ -588,6 +739,17 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             if path in destination or (path in shared and
                     (shared[path].owner == "fleet" or not replaces(group, path))):
                 raise Invalid("duplicate fleet/product logical path: " + path)
+            if workspace:
+                full_source = source + "/" + path
+                input_digests[full_source] = digest(blob)
+                logical_path = path.casefold()
+                if any(logical_path == prefix.rstrip("/") or logical_path.startswith(prefix)
+                       for prefix in WORKSPACE_FORBIDDEN_SOURCE_PREFIXES):
+                    raise Invalid("workspace source cannot supply a hook, plugin or workflow: " + full_source)
+                if PurePosixPath(path).name.casefold() in WORKSPACE_FORBIDDEN_SOURCE_NAMES:
+                    raise Invalid("workspace source cannot supply control file: " + full_source)
+                if logical_path.endswith(".md") and logical_path.startswith(WORKSPACE_FRONTMATTER_PREFIXES):
+                    _validate_workspace_frontmatter(full_source, blob)
             if path.startswith("hooks/") and not mode & 0o111:
                 raise Invalid("product hook is not executable: " + path)
             destination[path] = Output(blob, 0o755 if mode & 0o111 else 0o644, "product", source + "/" + path)
@@ -640,7 +802,14 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             output = outputs.get(config)
             if output is None:
                 raise Invalid("missing provider settings: " + config)
-            settings = decode(output.blob)
+            try:
+                settings = decode(output.blob)
+                if workspace and config == ".claude/settings.json":
+                    if not isinstance(settings, dict):
+                        raise Invalid("expected a settings object")
+                    _validate_workspace_claude_settings(settings, requirements)
+            except Invalid as exc:
+                raise Invalid(f"{config}: {exc}") from exc
             for requirement in requirements:
                 groups_for_event = settings
                 for component in requirement["path"]:
@@ -667,6 +836,10 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
         if workspace and (any(path == local or path.startswith(local + "/") for path in outputs)
                           or tree.has_entry(local)):
             raise Invalid("a workspace target must not hold .claude/settings.local.json")
+        if workspace:
+            for path in (".mcp.json", "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md"):
+                if tree.has_entry(path):
+                    raise Invalid("a workspace target must not hold " + path)
         configs = (".claude/settings.json",) if workspace else (".claude/settings.json", local)
         for config in configs:
             planned = outputs.get(config)
@@ -674,7 +847,11 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
             control_blob = planned.blob if planned is not None else existing[0] if existing is not None else None
             if control_blob is not None:
                 settings = decode(control_blob)
-                if not isinstance(settings, dict) or settings.get("disableAllHooks", False) is not False:
+                if (
+                    not isinstance(settings, dict)
+                    or settings.get("disableAllHooks", False) is not False
+                    or settings.get("allowManagedHooksOnly", False) is not False
+                ):
                     raise Invalid("mandatory Claude hooks disabled: " + config)
     if "codex" in providers:
         planned = outputs.get(".codex/config.toml")
@@ -687,7 +864,13 @@ def build(tree: Tree, inputs: Tree | CommitInputs | None = None, *, workspace: b
     for path in outputs:
         if any(str(parent) in outputs for parent in PurePosixPath(path).parents):
             raise Invalid("file/directory collision in planned outputs")
-    return Plan(outputs, preserve, roots, release, digest(encoded({"descriptor": descriptor, "sources": {g: {p: o.record() for p, o in items.items() if o.owner == "product"} for g, items in groups.items()}})))
+    configuration = digest(encoded({
+        "descriptor": descriptor,
+        "sources": {g: {p: o.record() for p, o in items.items() if o.owner == "product"} for g, items in groups.items()},
+    }))
+    if workspace:
+        outputs = {p: Output(o.blob, o.mode & ~0o222, o.owner, o.source) for p, o in outputs.items()}
+    return Plan(outputs, preserve, roots, release, configuration, input_digests)
 
 
 def preserved(path: str, plan: Plan) -> bool:
@@ -698,7 +881,10 @@ def old_state(tree: Tree) -> dict[str, Any]:
     read = tree.read(STATE)
     if read is None:
         return {"files": {}, "directories": []}
-    data = decode(read[0])
+    return validate_ownership(decode(read[0]), modes={0o644, 0o755})
+
+
+def validate_ownership(data: Any, *, modes: set[int]) -> dict[str, Any]:
     if not isinstance(data, dict) or set(data) != {"version", "release", "configuration", "files", "directories"} or data["version"] != 1:
         raise Invalid("invalid ownership manifest")
     if not isinstance(data["files"], dict) or not isinstance(data["directories"], list):
@@ -709,7 +895,7 @@ def old_state(tree: Tree) -> dict[str, Any]:
             raise Invalid("manifest output outside provider directories")
         if not isinstance(record, dict) or set(record) != {"type", "sha256", "mode", "owner", "source"}:
             raise Invalid("invalid file record")
-        if record["type"] != "file" or record["owner"] not in {"fleet", "product"} or type(record["mode"]) is not int or record["mode"] not in {0o644, 0o755}:
+        if record["type"] != "file" or record["owner"] not in {"fleet", "product"} or type(record["mode"]) is not int or record["mode"] not in modes:
             raise Invalid("invalid file ownership/mode")
         if not isinstance(record["sha256"], str) or len(record["sha256"]) != 64:
             raise Invalid("invalid file hash")
@@ -723,10 +909,10 @@ def matches(actual: tuple[bytes, int] | None, record: dict[str, Any]) -> bool:
     return actual is not None and digest(actual[0]) == record["sha256"] and actual[1] == record["mode"]
 
 
-def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[str]:
+def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool, *, workspace: bool = False) -> list[str]:
     problems: list[str] = []
     actual: tuple[bytes, int] | None
-    staged = tree.read(STAGING)
+    staged = None if workspace and check else tree.read(STAGING)
     if staged is not None:
         # A killed buffered write may leave an empty or partial prefix, with
         # either its initial private mode or its final mode. Unrelated bytes,
@@ -743,14 +929,26 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
     def excluded(path: str) -> bool:
         root, name = path.split("/")[:2]
         return preserved(path, plan) or (root, name.casefold()) not in owned
+    directories = plan.directories()
+    known_directories = directories | set(old.get("directories", ()))
+
+    def inspect_directory(path: str) -> None:
+        if path not in known_directories:
+            problems.append("unknown discovery directory: " + path)
+
     for root in sorted(roots):
         # Exclude runtime entries before stat/open/recursion. Non-preserved
         # links and special files still fail closed inside inventory().
-        for path, actual in tree.inventory(root, exclude=excluded).items():
+        for path, actual in tree.inventory(root, exclude=excluded,
+                                           visit_directory=inspect_directory if workspace else None).items():
             full = root + "/" + path
             expected = plan.files.get(full)
             if expected is not None:
-                if full not in old["files"] and actual != (expected.blob, expected.mode):
+                adopted = actual == (expected.blob, expected.mode)
+                if workspace:
+                    # Adopt a pre-integrity deployment only when installed bytes match.
+                    adopted |= actual == (expected.blob, expected.mode | stat.S_IWUSR)
+                if full not in old["files"] and not adopted and not (workspace and check):
                     raise Invalid("differing unowned output: " + full + "; see --help section: Recovery after an interrupted fresh apply followed by source edits")
             elif full not in old["files"]:
                 problems.append("unknown unowned output: " + full)
@@ -758,6 +956,9 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
         actual = tree.read(path)
         if check and actual != (out.blob, out.mode):
             problems.append("output drift: " + path)
+        elif (workspace and not check and actual is not None and actual != (out.blob, out.mode)
+              and path in old["files"] and not matches(actual, old["files"][path])):
+            problems.append("modified workspace output: " + path)
     for path, record in old["files"].items():
         if path in plan.files:
             continue
@@ -775,45 +976,127 @@ def preflight(tree: Tree, plan: Plan, old: dict[str, Any], check: bool) -> list[
                 problems.append("legacy Codex discovery path remains")
         except FileNotFoundError:
             pass
-    if check:
+    if check and not workspace:
         state = tree.read(STATE)
         if state is None or state != (plan.manifest(), 0o644):
             problems.append("ownership manifest drift")
+    if workspace:
+        if check:
+            for path in sorted(directories):
+                try:
+                    with tree.directory(path) as fd:
+                        if stat.S_IMODE(os.fstat(fd).st_mode) != POLICY_DIR_MODE:
+                            problems.append("policy directory mode drift: " + path)
+                except FileNotFoundError:
+                    problems.append("missing policy directory: " + path)
+        if not tree.has_directory(WORKSPACE_RUNTIME) and check:
+            problems.append("missing runtime directory: " + WORKSPACE_RUNTIME)
     return problems
 
 
+@contextlib.contextmanager
+def workspace_anchor(workspace: str) -> Iterator[tuple[Tree, str]]:
+    root = state_root().resolve(strict=True)
+    records = "batch_state/agent-deploy"
+    if (root / records).is_relative_to(workspace):
+        raise Invalid("workspace digest record requires a state root outside --project-root")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        key = records + "/workspace-" + digest(os.fsencode(workspace))
+        yield Tree(fd, staging=key + ".tmp"), key + ".json"
+    finally:
+        os.close(fd)
+
+
+def deploy_workspace(tree: Tree, plan: Plan, workspace: str, *, check: bool, print_manifest: bool) -> int:
+    with workspace_anchor(workspace) as (anchor, path):
+        entry = anchor.read(path)
+        ownership = decode(plan.manifest())
+        expected = encoded({"ownership": ownership, "inputs": plan.input_digests})
+        old: dict[str, Any] = {"files": {}, "directories": []}
+        problems: list[str] = []
+        if entry is None:
+            if check:
+                problems.append("missing workspace digest record: " + path)
+        else:
+            record = decode(entry[0])
+            if (not isinstance(record, dict) or set(record) != {"ownership", "inputs"}
+                    or not isinstance(record["inputs"], dict) or entry[1] != 0o600):
+                raise Invalid("invalid workspace digest record: " + path)
+            old = validate_ownership(record["ownership"], modes={0o444, 0o555})
+            if check:
+                before = record["inputs"]
+                for name in sorted(before.keys() | plan.input_digests.keys()):
+                    if before.get(name) != plan.input_digests.get(name):
+                        problems.append("workspace input drift: " + relative(name))
+                if not problems and old != ownership:
+                    problems.append("workspace deployment differs from " + path)
+        problems.extend(preflight(tree, plan, old, check, workspace=True))
+        if problems:
+            raise Drift("; ".join(problems))
+        if check:
+            return report_check(plan, print_manifest)
+        changed = apply(tree, plan, old, workspace=True)
+        # Publish only after verifying the rendered files and locked directories.
+        # This staging name is reserved per workspace under the same deployment lock.
+        if anchor.read(anchor.staging) is not None:
+            anchor.unlink(anchor.staging)
+        if entry != (expected, 0o600):
+            anchor.replace(path, expected, 0o600)
+        print(f"deployed {len(plan.files)} outputs; {changed} changes")
+        return 0
+
+
+def report_check(plan: Plan, print_manifest: bool) -> int:
+    if print_manifest:
+        sys.stdout.buffer.write(plan.manifest())
+        sys.stdout.flush()
+    else:
+        print(f"verified {len(plan.files)} outputs")
+    return 0
+
+
 def deploy(tree: Tree, *, check: bool, print_manifest: bool = False, inputs_commit: str | None = None,
-           workspace: bool = False) -> int:
-    plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None, workspace=workspace)
+           workspace: str | None = None) -> int:
+    plan = build(tree, CommitInputs(tree, inputs_commit) if inputs_commit is not None else None,
+                 workspace=workspace is not None)
+    if workspace is not None:
+        return deploy_workspace(tree, plan, workspace, check=check, print_manifest=print_manifest)
     old = old_state(tree)
     problems = preflight(tree, plan, old, check)
     if problems:
         raise Drift("; ".join(problems))
     if check:
-        # The recomposed manifest, never the checkout's copy: a caller binds its trust to what was verified.
-        if print_manifest:
-            sys.stdout.buffer.write(plan.manifest())
-            sys.stdout.flush()
-        else:
-            print(f"verified {len(plan.files)} outputs")
-        return 0
+        return report_check(plan, print_manifest)
     try:
-        return apply(tree, plan, old)
+        changed = apply(tree, plan, old)
     except OSError as exc:
         raise Drift(f"application failed before success publication: {exc}") from exc
+    print(f"deployed {len(plan.files)} outputs; {changed} changes")
+    return 0
 
 
-def apply(tree: Tree, plan: Plan, old: dict[str, Any]) -> int:
+def apply(tree: Tree, plan: Plan, old: dict[str, Any], *, workspace: bool = False) -> int:
     """Apply a fully admitted plan, then publish its verified ownership record."""
     changed = 0
     if tree.read(STAGING) is not None:
         tree.unlink(STAGING)
         changed += 1
+    if workspace:
+        # Create the mutable lease/pointer directory before securing provider directories.
+        with tree.directory(WORKSPACE_RUNTIME, create=True):
+            pass
+        for path in sorted(plan.directories()):
+            with tree.directory(path, create=True) as fd:
+                if stat.S_IMODE(os.fstat(fd).st_mode) != POLICY_DIR_MODE:
+                    os.fchmod(fd, POLICY_DIR_MODE)
+                    os.fsync(fd)
     for path, out in sorted(plan.files.items()):
         actual = tree.read(path)
         if actual != (out.blob, out.mode):
             # Recheck ownership immediately before replacement, using held descriptors.
-            if actual is not None and path not in old["files"]:
+            legacy = workspace and actual == (out.blob, out.mode | stat.S_IWUSR)
+            if actual is not None and path not in old["files"] and not legacy:
                 raise Invalid("output appeared after preflight: " + path)
             tree.replace(path, out.blob, out.mode)
             changed += 1
@@ -825,18 +1108,16 @@ def apply(tree: Tree, plan: Plan, old: dict[str, Any]) -> int:
                     raise Drift("retirement candidate changed: " + path)
                 tree.unlink(path)
                 changed += 1
-    next_directories = decode(plan.manifest())["directories"]
-    for path in sorted(set(old["directories"]) - set(next_directories), key=lambda p: (-p.count("/"), p)):
+    for path in sorted(set(old["directories"]) - plan.directories(), key=lambda p: (-p.count("/"), p)):
         tree.rmdir(path)
     # Verify actual bytes/modes before publishing success. No manifest is a source of expected bytes.
     for path, out in plan.files.items():
         if tree.read(path) != (out.blob, out.mode):
             raise Drift("post-write verification failed: " + path)
-    remaining = preflight(tree, plan, old, False)
+    remaining = preflight(tree, plan, old, workspace, workspace=workspace)
     if remaining:
         raise Drift("; ".join(remaining))
     if tree.read(STATE) != (plan.manifest(), 0o644):
         tree.replace(STATE, plan.manifest(), 0o644)
         changed += 1
-    print(f"deployed {len(plan.files)} outputs; {changed} changes")
-    return 0
+    return changed

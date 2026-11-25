@@ -142,6 +142,10 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
     workspace = tmp_path / "cto-workspace"
     shutil.copytree(consumer / "agents_extensions", workspace / "agents_extensions")
     write(workspace, "agents_extensions/shared/agents/cto.md", "---\nname: cto\ndescription: CTO\n---\nDrive.\n")
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
 
     def run(*options):
         monkeypatch.setattr(sys, "argv", ["agent_deploy", *options])
@@ -155,6 +159,7 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
     assert (workspace / ".claude/agents/cto.md").read_text() == "---\nname: cto\ndescription: CTO\n---\nDrive.\n"
     assert (workspace / ".claude/skills/fleet/SKILL.md").read_bytes() == SKILL
     assert not (workspace / ".git").exists()
+    (workspace / ".claude").chmod(0o755)
     write(workspace, ".claude/settings.local.json", "{}")
     assert run("--workspace", "--project-root", str(workspace), "--check") == 2
     assert "settings.local.json" in capsys.readouterr().err
@@ -208,6 +213,72 @@ def test_workspace_target_deploys_outside_every_checkout_and_only_there(consumer
     with pytest.raises(SystemExit) as refused:
         run("--workspace", "--project-root", str(workspace), "--inputs-commit", "0" * 40)
     assert refused.value.code == 2
+
+
+def test_workspace_settings_tamper_refused(consumer, tmp_path, monkeypatch, capsys):
+    """Defect class: persistent drift accepted or repaired by the launcher's read-only deploy check."""
+    workspace = tmp_path / "cto-workspace"
+    shutil.copytree(consumer / "agents_extensions", workspace / "agents_extensions")
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("LU_STATE_ROOT", str(state))
+    monkeypatch.delenv("LEARN_UKRAINIAN_STATE_ROOT", raising=False)
+
+    def run(*options):
+        monkeypatch.setattr(sys, "argv", ["agent_deploy", "--workspace", "--project-root", str(workspace), *options])
+        return main()
+
+    def refuses(path):
+        before = snapshot(workspace), snapshot(state)
+        capsys.readouterr()
+        assert run("--check") != 0
+        assert path in capsys.readouterr().err
+        assert (snapshot(workspace), snapshot(state)) == before
+
+    assert run() == 0
+    assert run("--check") == 0
+    settings = workspace / ".claude/settings.json"
+    original = settings.read_bytes()
+    assert settings.stat().st_mode & 0o777 == 0o444
+    assert settings.parent.stat().st_mode & 0o777 == 0o555
+    hook = workspace / ".claude/hooks/fleet.sh"
+    assert hook.stat().st_mode & 0o777 == 0o555
+    assert hook.parent.stat().st_mode & 0o777 == 0o555
+
+    settings.chmod(0o644)
+    settings.write_bytes(original + b"\n")
+    settings.chmod(0o444)
+    refuses(".claude/settings.json")
+    settings.chmod(0o644)
+    settings.write_bytes(original)
+    refuses(".claude/settings.json")
+    settings.chmod(0o444)
+
+    # An atomic replacement with the right mode still differs from the approved bytes.
+    settings.parent.chmod(0o755)
+    replacement = write(workspace, "replacement.json", original + b" ", mode=0o444)
+    replacement.replace(settings)
+    settings.parent.chmod(0o555)
+    refuses(".claude/settings.json")
+
+    # Even a matching change to the source and workspace bookkeeping cannot update the external record.
+    source = workspace / "agents_extensions/shared/settings.json"
+    source.write_bytes(settings.read_bytes())
+    local_manifest = workspace / ".deploy-state/agent-deploy.v1.json"
+    local_manifest.write_text("{}")
+    refuses("agents_extensions/shared/settings.json")
+    source.write_bytes(original)
+    settings.parent.chmod(0o755)
+    settings.unlink()
+    settings.parent.chmod(0o555)
+    refuses(".claude/settings.json")
+    assert run() == 0
+    assert run("--check") == 0
+
+    settings.parent.chmod(0o755)
+    (settings.parent / "plugins").mkdir()
+    settings.parent.chmod(0o555)
+    refuses(".claude/plugins")
 
 
 def test_non_curriculum_consumer_lints_its_own_sources(consumer, monkeypatch):

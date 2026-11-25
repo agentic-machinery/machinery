@@ -18,7 +18,7 @@ from lu_machinery.session_streams.store import NotFoundError, SessionStreamStore
 from tests.epics_monitor_stub import isolated_monitor_state as isolated_monitor_state
 from tests.epics_monitor_stub import epics_monitor_stub as epics_monitor_stub
 from tests.helpers.product_tree import configured_roots as configured_roots
-from tests.launcher_sandbox import launcher_environment as launcher_environment
+from tests.launcher_sandbox import copy_launcher_sources, launcher_environment
 from tests.lib.test_claude_cap_guard import launch_with_usage as _usage_fixture
 from tests.lib.test_launcher_contract import REPO as REPO, _core_canary_failure_fixture as _core_canary_failure_fixture, run_launcher as run_launcher
 from tests.lib.test_launcher_driver_scope import scope_sandbox as scope_sandbox
@@ -1046,7 +1046,7 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
     assert result.returncode == 0, result.stdout + result.stderr
     argv = argv_file.read_bytes().split(b"\0")[:-1]
     assert argv[0] == b"claude" and argv[argv.index(b"--agent") + 1] == b"cto"
-    assert f"would deploy agent extensions (workspace {workspace})" in result.stdout
+    assert f"would verify agent extensions (workspace {workspace})" in result.stdout
     assert f"LEARN_UKRAINIAN_PRIMARY_REPO_ROOT={primary}" in result.stdout
     assert "would bind cto after lease" in result.stdout
     assert not list(workspace.iterdir()) and not list(state.iterdir())
@@ -1118,6 +1118,57 @@ def test_cto_workspace_launch_supervisor_and_driver_state_from_a_non_git_directo
                              input=stdin, env=hook_env, capture_output=True, text=True, check=False, timeout=60)
         assert ran.returncode == 0, ran.stdout + ran.stderr
     assert "PINNED DRIVER STATE" in json.loads(ran.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_cto_launch_refuses_drift(tmp_path: Path) -> None:
+    """The installed-layout CLI must reach Claude on a clean explicit deploy and refuse persistent drift."""
+    workspace, state, primary = _workspace_roots(tmp_path)
+    installed = tmp_path / "installed"
+    copy_launcher_sources(installed)
+    scope = scope_sandbox(installed, tmp_path)
+    wrapper = installed / "lu_machinery/start-claude-cto.sh"
+    fake_claude = tmp_path / "scope-bin/claude"
+    fake_claude.write_text("#!/bin/sh\nprintf 'CLAUDE_STARTED\\n'\n")
+    fake_claude.chmod(0o755)
+    env = launcher_environment(scope, tmp_path=tmp_path, LC_WORKSPACE_ROOT=str(workspace),
+                               LU_PRIMARY_REPO_ROOT=str(primary), LU_STATE_ROOT=str(state),
+                               LEARN_UKRAINIAN_PYTHON=sys.executable, LC_DRIVER_LEASE_ENABLED="0",
+                               LU_CLAUDE_CAP_OVERRIDE="1")
+    inventory = json.loads(machinery_path("agent_deploy/release.v1.json").read_text())
+    hooks: dict = {}
+    for requirement in inventory["required_hooks"]["claude"][".claude/settings.json"]:
+        hooks.setdefault(requirement["path"][-1], []).append({**requirement["group"], "hooks": requirement["hooks"]})
+    source = workspace / "agents_extensions"
+    (source / "claude").mkdir(parents=True)
+    (source / "claude/settings.json").write_text(json.dumps({"hooks": hooks}))
+    (source / "deployment.v1.json").write_text(json.dumps({
+        "providers": ["claude"], "sources": {"claude": {"path": "agents_extensions/claude", "required": True}},
+        "preserve": [],
+    }))
+
+    def launch(*args):
+        return subprocess.run([str(wrapper), "kick", *args], cwd=workspace, env=env,
+                              capture_output=True, text=True, check=False, timeout=60)
+
+    result = launch()
+    assert result.returncode == 1 and "missing workspace digest record" in result.stderr, result.stderr
+    assert not (workspace / ".claude").exists()
+    subprocess.run([sys.executable, "-I", "-m", "lu_machinery.agent_deploy", "--workspace",
+                    "--project-root", str(workspace)], cwd=workspace, env=env, check=True, capture_output=True, timeout=60)
+    result = launch()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CLAUDE_STARTED" in result.stdout
+    for flag in ("--settings", "--setting-sources", "--plugin-dir", "--plugin-url", "--mcp-config", "--add-dir"):
+        result = launch("--", flag + "=alternate")
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert "CLAUDE_STARTED" not in result.stdout
+
+    deployed = workspace / ".claude/settings.json"
+    deployed.chmod(0o644)
+    result = launch()
+    assert result.returncode == 1 and "output drift: .claude/settings.json" in result.stderr, result.stderr
+    assert "CLAUDE_STARTED" not in result.stdout
+    assert deployed.stat().st_mode & 0o777 == 0o644
 
 
 def test_cto_successor_signature_binds_the_launch_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

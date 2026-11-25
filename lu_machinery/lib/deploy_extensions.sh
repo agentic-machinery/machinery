@@ -130,24 +130,12 @@ deploy_agent_report() {
     return "$exit_code"
 }
 
-# deploy_agent_workspace <workspace> <python>
-# The CTO workspace deploy: the installed release's agent_deploy in workspace
-# target mode (a non-Git directory outside every checkout; no npm, no product
-# descriptor script). <python> is the launch's resolved project interpreter and
-# also writes the breadcrumb: nothing here resolves one from the workspace, which
-# has no Git metadata and would resolve to itself.
-deploy_agent_workspace() {
-    local workspace="$1" python="$2" log_file exit_code=0
-    if [ -z "$python" ]; then
-        echo "Error: no project interpreter; cannot deploy the workspace agent extensions." >&2
+# verify_agent_workspace <workspace> <python>
+verify_agent_workspace() {
+    local workspace="$1" python="$2"
+    if ! project_python_run "$python" -m "$PROJECT_PACKAGE.agent_deploy" --workspace --project-root "$workspace" --check; then
+        printf 'After reconciling the files named above, deploy explicitly with:\n  %q -I -m %s.agent_deploy --workspace --project-root %q\n' \
+            "$python" "$PROJECT_PACKAGE" "$workspace" >&2
         return 1
     fi
-    log_file="$(mktemp "${TMPDIR:-/tmp}/agents-deploy.XXXXXX")" || {
-        echo "Error: mktemp failed; cannot capture the workspace agent-extensions deploy output." >&2
-        return 1
-    }
-    project_python_run "$python" -m "$PROJECT_PACKAGE.agent_deploy" --workspace --project-root "$workspace" \
-        >"$log_file" 2>&1 || exit_code=$?
-    deploy_agent_report "$workspace" "$(printf '%q' "$python") -I -m $PROJECT_PACKAGE.agent_deploy --workspace --project-root $(printf '%q' "$workspace")" \
-        "agent_deploy --workspace" "$exit_code" "$log_file" "$python"
 }
