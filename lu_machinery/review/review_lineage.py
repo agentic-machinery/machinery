@@ -33,6 +33,7 @@ import hashlib
 import logging
 import os
 import stat
+import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -47,6 +48,7 @@ from lu_machinery.opsec.prepublish import normalize_repository
 from lu_machinery.orchestration.integration_sweep import (
     MARKER_PREFIX,
     REJECTED,
+    REVIEW_TASK_ID,
     SHA,
     TRUSTED_ASSOCIATIONS,
     _author_login,
@@ -76,6 +78,8 @@ from lu_machinery.review.ukrainian_seats import (
 from lu_machinery.review.verdict_parser import recognized_verdicts
 
 _LOG = logging.getLogger(__name__)
+_LOWER_HEX = frozenset("0123456789abcdef")
+_INT32_MAX = 2**31 - 1
 UNATTESTED_FAMILIES = frozenset({"unknown", "unattested", "ambiguous", "conflicting"})
 
 
@@ -92,8 +96,9 @@ def _is_review_task(task: Mapping[str, Any]) -> bool:
 
     An advisory decision (``advisory_role``) is not a review; its consumer checks it.
     """
-    if task.get("advisory_role") is not None or any(
-        task.get(key) for key in ("trial_label", "trial_role", "trial_qualified_task")
+    if any(
+        type(value := task.get(key)) is str and value.strip()
+        for key in ("advisory_role", "trial_label", "trial_role", "trial_qualified_task")
     ):
         return False
     raw_role = task.get("research_role")
@@ -104,10 +109,10 @@ def _is_review_task(task: Mapping[str, Any]) -> bool:
     return role == "review" or review_typed(dict(task)) or bool(task.get("review_mode") or task.get("type") == "review")
 
 
-def _review_branches(task: Mapping[str, Any]) -> set[Any]:
+def _review_branches(task: Mapping[str, Any]) -> tuple[str, ...]:
     """The branch identities the recorder reads for this run (``record_cf_verdict._review_branch``)."""
     fields = ("review_branch",) if task.get("schema_version") == 2 else ("review_branch", "worktree_branch")
-    return {task.get(field) for field in fields if task.get(field) is not None}
+    return tuple(value for field in fields if type(value := task.get(field)) is str)
 
 
 @dataclass(frozen=True)
@@ -119,6 +124,79 @@ class ReviewRun:
     reply: str | None
 
 
+def _require_record_shape(task_id: str, record: Mapping[str, Any]) -> None:
+    """Check the ledger's wire types before interpreting any review evidence."""
+    def invalid(field: str, expected: str) -> LineageRefused:
+        return LineageRefused(f"review task {task_id} has invalid {field} (expected {expected})")
+
+    if not isinstance(record, Mapping):
+        raise invalid("record", "a mapping")
+    if "task_id" in record:
+        recorded = record["task_id"]
+        if type(recorded) is not str or recorded != task_id or not REVIEW_TASK_ID.fullmatch(recorded) or ".." in recorded:
+            raise invalid("task_id", "the run's canonical task id")
+    status = record.get("status")
+    if type(status) is not str or not status.strip():
+        raise invalid("status", "a non-empty string")
+
+    for field in (
+        "agent", "model", "resolved_model", "resolved_model_source", "run_nonce", "mode", "repository",
+        "review_branch", "worktree_branch", "review_mode", "review_profile", "review_author_model", "review_risk",
+        "research_role", "research_task_family", "task_family", "advisory_role", "type", "trial_label", "trial_role",
+        "trial_qualified_task", "provider_terminal_status", "never_started_reason", "output_schema_path",
+    ):
+        value = record.get(field)
+        if value is not None and (type(value) is not str or not value.strip()):
+            raise invalid(field, "a non-empty string or null")
+    error = record.get("provider_terminal_error")
+    if error is not None and type(error) is not str:
+        raise invalid("provider_terminal_error", "a string or null")
+
+    for field, width in (
+        ("worktree_base_sha", 40), ("pinned_head", 40), ("result_sha256", 64), ("output_schema_sha256", 64),
+    ):
+        value = record.get(field)
+        if value is not None and (type(value) is not str or len(value) != width or not set(value) <= _LOWER_HEX):
+            raise invalid(field, f"{width} lowercase hexadecimal characters or null")
+
+    for field in ("started_at", "finished_at"):
+        value = record.get(field)
+        if value is None:
+            continue
+        try:
+            valid = type(value) is str and _timestamp(value) is not None
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise invalid(field, "an ISO timestamp representable in UTC")
+
+    # PR numbers use GraphQL Int, process fields use a signed C int, and the Sources count comes from len().
+    if "schema_version" in record and record["schema_version"] is None:
+        raise invalid("schema_version", "an integer version when present")
+    for field, minimum, maximum in (
+        ("schema_version", 1, 2), ("pr", 1, _INT32_MAX), ("provider_pgid", 1, _INT32_MAX),
+        ("returncode", -_INT32_MAX - 1, _INT32_MAX), ("sources_mcp_call_count", 0, sys.maxsize),
+    ):
+        value = record.get(field)
+        if value is not None and (type(value) is not int or not minimum <= value <= maximum):
+            raise invalid(field, f"an integer from {minimum} to {maximum} or null")
+    for field in ("require_review_verdict", "provider_terminal_failure", "resolved_model_known"):
+        value = record.get(field)
+        if value is not None and type(value) is not bool:
+            raise invalid(field, "a boolean or null")
+    for field in ("review_language_lane", "language_lane"):
+        value = record.get(field)
+        if value is not None and type(value) is not bool and type(value) is not str:
+            raise invalid(field, "a language label, boolean or null")
+    attempt = record.get("review_attempt")
+    if attempt is not None and type(attempt) is not bool and (type(attempt) is not dict or not attempt):
+        raise invalid("review_attempt", "a non-empty binding object, legacy boolean or null")
+    for field in ("orphaned_child_tasks", "unknown_child_tasks"):
+        value = record.get(field)
+        if value is not None and (type(value) is not list or not all(type(item) is str and item.strip() for item in value)):
+            raise invalid(field, "a list of non-empty strings or null")
+
+
 def _read_run(path: Path, record: Mapping[str, Any]) -> ReviewRun:
     """Read one run's reply, refusing a reply its record's digest disowns.
 
@@ -128,7 +206,8 @@ def _read_run(path: Path, record: Mapping[str, Any]) -> ReviewRun:
     never another run's reply under the bare task id.
     """
     recorded = record.get("task_id")
-    task_id = recorded if isinstance(recorded, str) and recorded else path.stem
+    task_id = recorded if type(recorded) is str and recorded else path.stem
+    _require_record_shape(task_id, record)
     result = path.with_suffix(".result")
     try:
         descriptor = os.open(result, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -146,7 +225,7 @@ def _read_run(path: Path, record: Mapping[str, Any]) -> ReviewRun:
             raise LineageRefused(f"review task {task_id} reply unreadable: {exc}") from None
     expected = record.get("result_sha256")
     if raw is not None and expected is not None and hashlib.sha256(raw).hexdigest() != expected:
-        raise LineageRefused(f"review task {task_id} reply does not match its recorded digest")
+        raise LineageRefused(f"review task {task_id} reply does not match its recorded digest (result_sha256)")
     try:
         reply = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n") if raw is not None else None
     except UnicodeDecodeError:
@@ -295,7 +374,7 @@ def _review_records(task_root: Path, *, repository: str) -> list[tuple[Path, dic
                 raise LineageRefused(f"task record {path.name} unreadable: {exc}") from None
             if not isinstance(record, dict):
                 continue
-            if record.get("status") in {"dry_run", "dry-run"} or not _is_review_task(record):
+            if record.get("status") in ("dry_run", "dry-run") or not _is_review_task(record):
                 continue
             if not isinstance(record.get("repository"), str) or normalize_repository(
                 record["repository"]
@@ -327,12 +406,17 @@ def lineage_runs(
         with task_archive_lock(task_root):
             if records is None:
                 records = _review_records(task_root, repository=repository)
-            return [
-                _read_run(path, record)
-                for path, record in records
-                if (number is not None and record.get("pr") == number)
-                or (record.get("pr") is None and branch in _review_branches(record))
-            ]
+            runs = []
+            for path, record in records:
+                pr = record.get("pr")
+                if type(pr) is int and 1 <= pr <= _INT32_MAX:
+                    belongs = pr == number
+                else:
+                    # A corrupt PR number cannot hide a run that the recorded branch identifies.
+                    belongs = branch in _review_branches(record)
+                if belongs:
+                    runs.append(_read_run(path, record))
+            return runs
     except OSError as exc:
         raise LineageRefused(f"task ledger unavailable: {exc}") from None
 
@@ -663,9 +747,6 @@ def provider_crash_recovery(
     return ProviderCrashRecovery(failed, replacement)
 
 
-_LOWER_SHA256 = frozenset("0123456789abcdef")
-
-
 def _attested_rate_limit(run: ReviewRun) -> bool:
     """Recognize a schema-bound native Codex review the supervisor settled as ``rate_limited``, with no result.
 
@@ -696,7 +777,7 @@ def _attested_rate_limit(run: ReviewRun) -> bool:
 
 
 def _lower_sha256(value: object) -> bool:
-    return isinstance(value, str) and len(value) == 64 and set(value) <= _LOWER_SHA256
+    return isinstance(value, str) and len(value) == 64 and set(value) <= _LOWER_HEX
 
 
 def _rate_limit_retried(
@@ -718,7 +799,7 @@ def _rate_limit_retried(
         return False
     try:
         return _bound_retry(run, runs, comments, login)
-    except (LineageRefused, recorder.RecordError, OverflowError):
+    except recorder.RecordError:
         return False
 
 
@@ -742,7 +823,7 @@ def _bound_retry(run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[M
     nonces = [(item, item.record.get("run_nonce")) for item in runs]
     seen = Counter((item.task_id, nonce) for item, nonce in nonces if isinstance(nonce, str))
     # A marker names its run by task id and start, so that pair must also name exactly one record.
-    publications = Counter((item.task_id, _start_or_none(item.record)) for item in runs)
+    publications = Counter((item.task_id, _started(item.record)) for item in runs)
     return any(
         _binds_retry(retry, settled, identity, markers, publications)
         for retry, nonce in nonces
@@ -751,13 +832,6 @@ def _bound_retry(run: ReviewRun, runs: Sequence[ReviewRun], comments: Sequence[M
         and nonce != record.get("run_nonce")
         and seen[(retry.task_id, nonce)] == 1
     )
-
-
-def _start_or_none(record: Mapping[str, Any]) -> str | None:
-    try:
-        return _started(record)
-    except OverflowError:
-        return None
 
 
 def _binds_retry(
@@ -788,7 +862,7 @@ def _binds_retry(
             or _profile(retry.record) != profile
         ):
             return False
-    except (recorder.RecordError, OverflowError):
+    except recorder.RecordError:
         return False
     retry_sha, verdict, _, model, retry_family, started = evidence
     if publications[(retry.task_id, started)] != 1:
@@ -832,6 +906,8 @@ def check_lineage(
     ``exclude_head`` drops the runs, verdicts and events of one later head, the
     round being recorded, which is not part of the lineage before it.
     """
+    for run in runs:
+        _require_record_shape(run.task_id, run.record)
     markers = [item for item in _trusted_markers(comments, login) if item[1]["sha"] != exclude_head]
     try:
         failures = [event for event in capability_failure.events(comments, login) if event.sha != exclude_head]
