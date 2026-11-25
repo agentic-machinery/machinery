@@ -655,6 +655,12 @@ def test_parse_rest_pr_item_maps_merged_at_to_merged() -> None:
     assert err is None
     assert (parsed.number, parsed.state, parsed.head_sha) == (7, "MERGED", "x")
 
+    checkout = wg.WorktreeInfo(Path("/nonexistent"), "codex/topic", "x", repository="agentic-machinery/machinery")
+    legacy = wg.PullRequestState(7, "MERGED", "x", repository="learn-ukrainian/machinery")
+    foreign = wg.PullRequestState(7, "MERGED", "x", repository="agentic-machinery/machinery-infra")
+    assert wg._pr_matches_worktree_head(checkout, legacy)
+    assert not wg._pr_matches_worktree_head(checkout, foreign)
+
     parsed, err = wg._parse_rest_pr_item({"number": 7, "state": "closed", "merged_at": None, "head": {}})
     assert err is None
     assert (parsed.number, parsed.state, parsed.head_sha) == (7, "CLOSED", None)

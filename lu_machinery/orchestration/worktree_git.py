@@ -27,7 +27,7 @@ from lu_machinery.orchestration import reaper_lifecycle, worktree_artifacts, wor
 from lu_machinery.orchestration.dead_worker_state import worker_liveness
 from lu_machinery.orchestration.execution_safe_git import COMMIT_COMMANDS, REMOTE_COMMANDS
 from lu_machinery.orchestration.execution_safe_git import run_git as safe_git
-from lu_machinery.orchestration.fleet_repos import canonical_repository, pull_request_repository
+from lu_machinery.orchestration.fleet_repos import canonical_repository, pull_request_repository, same_repository
 
 _GIT_ENV_DENYLIST = {
     "GIT_DIR",
@@ -630,7 +630,7 @@ def _sha_is_ancestor(cwd: Path, sha: str, descendant: str) -> bool:
 
 
 def _pr_belongs_to_checkout(info: WorktreeInfo, pr: PullRequestState) -> bool:
-    return pr.repository is None or pr.repository == info.repository
+    return pr.repository is None or same_repository(pr.repository, info.repository)
 
 
 def _pr_matches_worktree_head(
@@ -1665,7 +1665,7 @@ def _preservation_merged_creator(
             raise ValueError("merged continuation preservation head changed")
         expected_head = preservation["head_sha"]
     if (
-        (pr.repository is not None and pr.repository != _pr_repository(worktree))
+        not _pr_belongs_to_checkout(info, pr)
         or proof.get("owner") != creator.get("task_id")
         or proof.get("run_nonce") != creator.get("run_nonce")
         or head.returncode != 0

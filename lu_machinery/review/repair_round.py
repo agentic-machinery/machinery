@@ -58,6 +58,13 @@ from typing import Any
 
 from lu_machinery.common import json_depth
 from lu_machinery.opsec import prepublish
+from lu_machinery.orchestration.fleet_repos import (
+    FleetRepoError,
+    ascii_repo_slug,
+    repository_identity,
+    repository_slugs,
+    same_repository,
+)
 from lu_machinery.orchestration.integration_sweep import SHA
 from lu_machinery.review import record_cf_verdict as recorder
 from lu_machinery.review.review_lineage import LineageRefused, check_lineage, lineage_runs, superseded_runs
@@ -316,12 +323,20 @@ def _diff_sha256(repo_root: Path, approved: str, candidate: str) -> str:
 
 
 def lineage_keys(repository: str, number: int, branch: str, issues: Sequence[int]) -> list[str]:
-    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
-
     repo = ascii_repo_slug(repository, strip=False)
     if repo is None:
         raise RepairRefused(SPENT, f"repair repository must be an ASCII owner/name: {repository!r}")
-    return sorted({f"pr:{repo}#{number}", f"branch:{repo}:{branch}", *(f"issue:{repo}#{issue}" for issue in issues)})
+    try:
+        identity = str(repository_identity(repo))
+        legacy = {slug.casefold() for slug in repository_slugs(repo)}
+    except FleetRepoError:
+        raise RepairRefused(SPENT, "fleet repository identity is unavailable") from None
+    # Reserve the legacy keys too so overlapping releases share the same one-round limit.
+    return sorted({
+        key
+        for name in {identity, *legacy}
+        for key in (f"pr:{name}#{number}", f"branch:{name}:{branch}", *(f"issue:{name}#{issue}" for issue in issues))
+    })
 
 
 def _receipt_path(root: Path, key: str) -> Path:
@@ -341,14 +356,12 @@ def _read_receipt(path: Path) -> dict[str, Any] | None:
 
 
 def _same_round(receipt: Mapping[str, Any], *, repository: str, number: int, approved: str, candidate: str) -> bool:
-    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
-
     receipt_repo = ascii_repo_slug(receipt.get("repository"), strip=False)
     target_repo = ascii_repo_slug(repository, strip=False)
     return (
         receipt_repo is not None
         and target_repo is not None
-        and receipt_repo == target_repo
+        and same_repository(receipt_repo, target_repo)
         and receipt.get("pr") == number
         and receipt.get("approved_head") == approved
         and receipt.get("candidate_head") == candidate
@@ -357,19 +370,18 @@ def _same_round(receipt: Mapping[str, Any], *, repository: str, number: int, app
 
 def repair_heads(receipt_root: Path, *, repository: str, number: int, branch: str) -> frozenset[str]:
     """Candidate heads this PR's repair round admitted: they consume no budgeted round."""
-    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
-
     repo = ascii_repo_slug(repository, strip=False)
     if repo is None:
         return frozenset()
-    receipts = [
-        _read_receipt(_receipt_path(receipt_root, key)) for key in (f"pr:{repo}#{number}", f"branch:{repo}:{branch}")
-    ]
-    return frozenset(
+    receipts = [_read_receipt(_receipt_path(receipt_root, key)) for key in lineage_keys(repo, number, branch, ())]
+    heads = frozenset(
         str(item["candidate_head"])
         for item in receipts
-        if item and ascii_repo_slug(item.get("repository"), strip=False) == repo and item.get("pr") == number
+        if item and same_repository(item.get("repository"), repo) and item.get("pr") == number
     )
+    if len(heads) > 1:
+        raise RepairRefused(SPENT, f"repair receipts name conflicting rounds for PR #{number}")
+    return heads
 
 
 def admit_repair_round(
@@ -530,21 +542,23 @@ def record_admission(receipt_root: Path, receipt: Mapping[str, Any]) -> None:
 
 def receipt_at(receipt_root: Path, *, repository: str, number: int, branch: str, head: str) -> dict[str, Any] | None:
     """This PR's repair-round receipt when ``head`` is its candidate, else None."""
-    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
-
     repo = ascii_repo_slug(repository, strip=False)
     if repo is None:
         return None
-    for key in (f"pr:{repo}#{number}", f"branch:{repo}:{branch}"):
+    admitted = None
+    for key in lineage_keys(repo, number, branch, ()):
         receipt = _read_receipt(_receipt_path(receipt_root, key))
         if (
             receipt
-            and ascii_repo_slug(receipt.get("repository"), strip=False) == repo
+            and same_repository(receipt.get("repository"), repo)
             and receipt.get("pr") == number
             and receipt.get("candidate_head") == head
         ):
-            return receipt
-    return None
+            # An interrupted alias backfill can leave an admitted copy of an already consumed round.
+            if receipt.get("state") == "consumed":
+                return receipt
+            admitted = admitted or receipt
+    return admitted
 
 
 def require_repair_verified(reply: str, receipt: Mapping[str, Any]) -> None:

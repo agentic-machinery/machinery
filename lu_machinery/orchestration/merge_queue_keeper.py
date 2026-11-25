@@ -38,7 +38,7 @@ from lu_machinery.opsec.prepublish import (
     catalog as prepublish_catalog,
 )
 from lu_machinery.orchestration import pr_ownership
-from lu_machinery.orchestration.fleet_repos import ascii_repo_slug, parse_ascii_positive_int
+from lu_machinery.orchestration.fleet_repos import ascii_repo_slug, parse_ascii_positive_int, same_repository
 from lu_machinery.orchestration.integration_sweep import (
     COMMENTS_UNAVAILABLE,
     NEEDS_COVERAGE,
@@ -1819,7 +1819,7 @@ def _default_repair_proof(
             and receipt.get("candidate_head") == head
             and receipt.get("pr") == number
             and (receipt_repo := ascii_repo_slug(receipt.get("repository"), strip=False)) is not None
-            and receipt_repo == ascii_repo_slug(canonical_repo, strip=False)
+            and same_repository(receipt_repo, canonical_repo)
             and _str_in(receipt.get("approved_head"), ejected_set)
         ):
             return "repair-verified"
@@ -2914,7 +2914,7 @@ def run(
                     custody_error = "repair-custody"
                 elif (
                     (custody_repo := ascii_repo_slug(custody.get("repository"), strip=False)) is None
-                    or custody_repo != ascii_repo_slug(canonical_repo, strip=False)
+                    or not same_repository(custody_repo, canonical_repo)
                     or custody["base"] != base_name
                 ):
                     custody_error = "custody-mismatch"
@@ -3277,7 +3277,7 @@ def run(
                     mq_custody_error = "repair-custody"
                 elif (
                     (mq_custody_repo := ascii_repo_slug(mq_custody.get("repository"), strip=False)) is None
-                    or mq_custody_repo != ascii_repo_slug(canonical_repo, strip=False)
+                    or not same_repository(mq_custody_repo, canonical_repo)
                     or mq_custody["base"] != base_name
                 ):
                     mq_custody_error = "custody-mismatch"

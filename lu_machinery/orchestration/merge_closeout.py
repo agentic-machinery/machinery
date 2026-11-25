@@ -48,6 +48,7 @@ from lu_machinery.orchestration.fleet_repos import (
     resolve_fleet_repo,
     resolve_fleet_repo_by_slug,
     resolve_payload_fleet_repo,
+    same_repository,
 )
 from lu_machinery.publish.github import Request, request_run
 from lu_machinery.review.target_resolution import repository_target_error
@@ -582,9 +583,15 @@ def collect_criterion_receipts(repo_root: Path, pr: PullRequestInfo, *, repo: st
     slug = canonical_repository(repo) if repo else rw._pr_repository(repo_root)
     if not slug:
         return [{"closure_ready": False, "error": "CLOSEOUT_REPOSITORY_UNKNOWN"}]
-    namespace = hashlib.sha256(slug.encode()).hexdigest()[:16]
+    # The namespace hashes the immutable identity's spelling. Prior ledgers stay where they were written.
+    namespaces = {
+        hashlib.sha256(name.encode()).hexdigest()[:16]
+        for name in {slug, *repository_slugs(slug)}
+        if same_repository(name, slug)
+    }
+    state = primary / ".agent/task-lifecycle"
     reports = []
-    for path in sorted((primary / ".agent/task-lifecycle" / namespace).glob("issue-*.json")):
+    for path in sorted(path for namespace in namespaces for path in (state / namespace).glob("issue-*.json")):
         if not re.fullmatch(r"issue-[0-9]+\.json", path.name):
             continue
         try:
