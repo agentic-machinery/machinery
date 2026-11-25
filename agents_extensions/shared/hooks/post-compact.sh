@@ -23,10 +23,7 @@ fi
 source "$(dirname "${BASH_SOURCE[0]}")/context-rollover-lib.sh" \
   || { echo "post-compact.sh: context-rollover-lib.sh is missing beside this hook" >&2; exit 1; }
 
-# Resolve the primary checkout before choosing an interpreter, exactly as
-# session-setup.sh does: it owns the shared venv and the Claude memory
-# directory, and a linked worktree has neither. This must not depend on
-# run_bounded, whose interpreter is chosen from the result.
+# Bound Git reads for the legacy checkout fallback and Claude's memory key.
 _HOOK_TIMEOUT_BIN="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
 git_common_dir() {
   local dir="${1:-$PROJECT_DIR}"
@@ -45,18 +42,7 @@ BOUNDED_RUNNER=""
 post_compact_bootstrap() {
   [ -n "$BOUNDED_PYTHON" ] && return 0
   context_machinery_bootstrap "${LU_PRODUCT_ROOT:-${CLAUDE_PROJECT_DIR:-}}" || exit 1
-  local session_project="${CLAUDE_PROJECT_DIR:-$PROJECT_DIR}" git_common
-  if context_outside_checkouts "$session_project"; then
-    CANONICAL_ROOT=$(context_state_root "$session_project") || exit 1
-  elif [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
-    CANONICAL_ROOT="$CODEX_CANONICAL_REPO_ROOT"
-  else
-    git_common=$(git_common_dir) || git_common=""
-    CANONICAL_ROOT="$PROJECT_DIR"
-    if [ -n "$git_common" ] && [ "$(basename "$git_common")" = ".git" ]; then
-      CANONICAL_ROOT=$(dirname "$git_common")
-    fi
-  fi
+  CANONICAL_ROOT=$(context_canonical_root "$PROJECT_DIR" git_common_dir) || exit 1
   BOUNDED_PYTHON="$CONTEXT_PROJECT_PYTHON"
   BOUNDED_RUNNER="${SESSION_BOUNDED_RUNNER:-$MACHINERY_DIR/lu_machinery/agent_runtime/bounded_command.py}"
 }

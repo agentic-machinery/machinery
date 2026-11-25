@@ -216,7 +216,7 @@ def _dispatch_worker_identity(args: argparse.Namespace) -> tuple[str, str] | Non
         agent = os.environ.get("LEARN_UKRAINIAN_DISPATCH_AGENT", "").strip()
         return agent or args.agent, task_id
     try:
-        dispatch_root = Path(args.repo_root).resolve() / ".worktrees" / "dispatch"
+        dispatch_root = Path(args.primary_checkout or args.repo_root).resolve() / ".worktrees" / "dispatch"
         relative = Path(args.project_dir).resolve().relative_to(dispatch_root)
     except (OSError, ValueError):
         return None
@@ -476,11 +476,11 @@ def phase_stack_drift(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo-root", required=True, help="runtime state root (the primary checkout in checkout mode)")
+    parser.add_argument("--repo-root", required=True, help="runtime state root")
     parser.add_argument("--project-dir", required=True, help="session project directory (may be a worktree)")
     parser.add_argument(
         "--primary-checkout",
-        help="validated absolute checkout for the version pin and branch checks when the project is a non-Git workspace",
+        help="validated primary checkout for the version pin, branch checks and dispatch worktree detection",
     )
     parser.add_argument("--agent", required=True)
     parser.add_argument("--session-id", default="")

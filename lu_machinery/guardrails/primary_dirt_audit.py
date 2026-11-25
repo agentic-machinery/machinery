@@ -5,9 +5,9 @@ so a launched script that ``cd``s into the primary checkout and redirects to a
 relative path writes there unseen. This module backs a second, observational
 layer: ``audit-primary-checkout-dirt.py`` takes a snapshot of the protected
 primary checkout's ``git status`` before each shell call and compares it after
-the call. Paths that were not dirty before and are dirty after are attributed
-to that call in a record kept outside the repository; paths already dirty
-before the call are never attributed to it. Git-ignored paths never appear,
+the call. The audit state directory holds records of paths that become dirty
+during the call. Paths already dirty before the call are never attributed to
+it. Git-ignored paths never appear,
 because ``git status`` omits them.
 
 Attribution is temporal: a path is attributed to every call whose window saw
@@ -46,6 +46,7 @@ from pathlib import Path
 
 from lu_machinery.common import json_depth
 from lu_machinery.common.git_context import sanitized_git_env
+from lu_machinery.common.repo_root import configured_state_root
 from lu_machinery.guardrails import worktree_containment as wc
 
 SCHEMA = "primary-dirt-audit.v1"
@@ -72,8 +73,11 @@ class AuditError(RuntimeError):
 
 
 def state_dir(environ: Mapping[str, str] | None = None) -> Path:
-    """``$XDG_STATE_HOME/learn-ukrainian/primary-dirt-audit``; relative values are ignored per XDG."""
+    """The configured runtime state, or the per-user XDG audit directory."""
     env = os.environ if environ is None else environ
+    runtime_root = configured_state_root(env)
+    if runtime_root is not None:
+        return runtime_root / ".agent" / STATE_NAMESPACE[-1]
     configured = env.get("XDG_STATE_HOME", "")
     if configured and Path(configured).is_absolute():
         base = Path(configured)

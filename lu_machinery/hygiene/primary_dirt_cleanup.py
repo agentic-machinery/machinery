@@ -205,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"  .venv/bin/python -m {_mod('hygiene', 'primary_dirt_cleanup')} --session SESSION   # all records, dry run\n"
             "\n"
             "Outputs: a JSON report on stdout. With --apply, removes the eligible files and appends one receipt\n"
-            "per entry to $XDG_STATE_HOME/learn-ukrainian/primary-dirt-audit/cleanup.jsonl.\n"
+            "per entry to cleanup.jsonl in the audit state directory.\n"
             "\n"
             "Exit codes: 0 every entry is removable/removed/already absent; 1 no matching attribution record\n"
             "(nothing done); 2 at least one entry was refused (the rest were processed).\n"
@@ -234,7 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--state-dir",
         type=Path,
         default=None,
-        help="Audit state directory. Default: $XDG_STATE_HOME/learn-ukrainian/primary-dirt-audit.",
+        help=(
+            "Audit state directory. With LU_STATE_ROOT or its compatibility alias set, the default is "
+            ".agent/primary-dirt-audit under that root. Otherwise, the default is "
+            "$XDG_STATE_HOME/learn-ukrainian/primary-dirt-audit (XDG_STATE_HOME defaults to ~/.local/state)."
+        ),
     )
     return parser
 

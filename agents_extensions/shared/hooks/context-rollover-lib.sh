@@ -5,8 +5,8 @@
 
 # The machinery code root (#100 R51, R62, R69, R66): the release the one project
 # interpreter imports, never this file's location and never <project>/lu_machinery.
-# Before importing that release, the probe needs the configured shared-state
-# anchor LEARN_UKRAINIAN_PRIMARY_REPO_ROOT, exactly as the installed rule does,
+# Before importing that release, the probe needs the configured primary
+# checkout LEARN_UKRAINIAN_PRIMARY_REPO_ROOT, exactly as the installed rule does,
 # and then accepts an absolute executable LEARN_UKRAINIAN_PYTHON or the anchor's
 # .venv. A checkout's own Git metadata never names the probe's primary: whoever
 # works in a checkout can rewrite it. Invalid configuration does not fall back.
@@ -41,7 +41,7 @@ _context_physical_dir() {
   printf '%s\n' "$dir"
 }
 _context_rule_probe() {
-  local configured="${LEARN_UKRAINIAN_PYTHON:-}" anchor="${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}" root state
+  local configured="${LEARN_UKRAINIAN_PYTHON:-}" anchor="${LEARN_UKRAINIAN_PRIMARY_REPO_ROOT:-}" root
   # The anchor passes the installed rule's checks before any interpreter, even
   # a configured one, is chosen: an invalid anchor refuses before a process starts.
   case "$anchor" in
@@ -51,16 +51,6 @@ _context_rule_probe() {
   if ! root="$(_context_physical_dir "$anchor")" || ! root="$(_context_rule_root "$root")"; then
     echo "${0##*/}: project interpreter not found: LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=$anchor is not a primary checkout" >&2
     return 1
-  fi
-  if [ -n "${LEARN_UKRAINIAN_STATE_ROOT:-}" ]; then
-    case "$LEARN_UKRAINIAN_STATE_ROOT" in
-      /*) state="$(_context_physical_dir "$LEARN_UKRAINIAN_STATE_ROOT")" || state="" ;;
-      *) state="" ;;
-    esac
-    [ "$state" = "$root" ] || {
-      echo "${0##*/}: project interpreter not found: LEARN_UKRAINIAN_STATE_ROOT must name LEARN_UKRAINIAN_PRIMARY_REPO_ROOT" >&2
-      return 1
-    }
   fi
   if [ -n "$configured" ]; then
     case "$configured" in
@@ -85,16 +75,16 @@ _context_import_release() {
   MACHINERY_DIR="$found"
 }
 
-# Set PROJECT_DIR from the installed hook-root rule, MACHINERY_DIR (the release)
-# and CONTEXT_PROJECT_PYTHON (the one project interpreter). An empty argument
+# Set PROJECT_DIR, MACHINERY_DIR, CONTEXT_PROJECT_PYTHON and the explicit
+# PROJECT_HOOK_STATE_ROOT if configured. An empty argument
 # lets the rule select the nearest physical cwd ancestor with a .git entry.
 # Source the release's project_interpreter.sh. The probe
 # only finds the release; the release's resolver then decides, and its release is
 # sourced when it differs. Fails closed: on any doubt it says why on stderr and
 # returns 1, and the hook refuses instead of running code from anywhere else.
 context_machinery_bootstrap() {
-  local project_dir="$1" probe resolved
-  MACHINERY_DIR="" CONTEXT_PROJECT_PYTHON=""
+  local project_dir="$1" probe resolved state
+  MACHINERY_DIR="" CONTEXT_PROJECT_PYTHON="" PROJECT_HOOK_STATE_ROOT=""
   # Preserve the rule's refusal of nonempty relative roots before any import.
   case "$project_dir" in
     ''|/*) ;;
@@ -120,6 +110,24 @@ context_machinery_bootstrap() {
   if [ "$resolved" != "$probe" ]; then
     _context_import_release "$resolved" || { MACHINERY_DIR=""; return 1; }
   fi
+  if [ -n "${LU_STATE_ROOT:-}${LEARN_UKRAINIAN_STATE_ROOT:-}" ]; then
+    if ! state="$(project_python_run "$resolved" -c '
+import sys
+from pathlib import Path
+from lu_machinery.common.repo_root import MachineryConfigError, configured_hook_state_root
+try:
+    root = configured_hook_state_root(Path(sys.argv[1]))
+except MachineryConfigError as exc:
+    sys.exit(str(exc))
+if root is None:
+    sys.exit("configured hook state root is unavailable")
+print(root)
+' "$LEARN_UKRAINIAN_PRIMARY_REPO_ROOT")" || [[ "$state" != /* ]]; then
+      echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: explicit runtime state root did not resolve" >&2
+      return 1
+    fi
+    PROJECT_HOOK_STATE_ROOT="$state"
+  fi
   CONTEXT_PROJECT_PYTHON="$resolved"
 }
 
@@ -132,7 +140,7 @@ context_hook_state() {
   # stdlib-only: -I keeps the cwd and PYTHONPATH off its import path.
   helper="$MACHINERY_DIR/agents_extensions/shared/hooks/context-hook-state.py"
   [ -f "$helper" ] || return 0
-  "$CONTEXT_PROJECT_PYTHON" -I "$helper" "$operation" "$project_dir" "$session_id" "$@" 2>/dev/null || true
+  "$CONTEXT_PROJECT_PYTHON" -I "$helper" "$operation" "${PROJECT_HOOK_STATE_ROOT:-$project_dir}" "$session_id" "$@" 2>/dev/null || true
 }
 
 # Latest assistant input/cache usage from a Claude Code transcript, or 0.
@@ -220,28 +228,45 @@ context_live_usage() {
   printf '0\tunknown\n'
 }
 
-# Canonical checkout that owns runtime state (.agent/): CODEX_CANONICAL_REPO_ROOT
-# when set, else the git common dir's checkout, so linked worktrees share the
-# primary checkout's session records and rollover leases. A project directory
-# outside every checkout (the CTO workspace) owns no runtime state: the
-# configured state root does (context_state_root).
-context_canonical_root() {
-  local project_dir="$1" session_project git_common_dir
-  session_project="${CLAUDE_PROJECT_DIR:-$project_dir}"
-  if context_outside_checkouts "$session_project"; then
-    context_state_root "$session_project"
-    return
-  fi
+context_git_common_dir() {
+  git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+}
+
+context_checkout_root() {
+  local project_dir="$1" common_dir_reader="${2:-context_git_common_dir}" common_dir
   if [ -n "${CODEX_CANONICAL_REPO_ROOT:-}" ]; then
     printf '%s\n' "$CODEX_CANONICAL_REPO_ROOT"
     return 0
   fi
-  git_common_dir=$(git -C "$project_dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
-  if [ -n "$git_common_dir" ] && [ "$(basename "$git_common_dir")" = ".git" ]; then
-    dirname "$git_common_dir"
+  common_dir=$("$common_dir_reader" "$project_dir" || true)
+  if [ -n "$common_dir" ] && [ "$(basename "$common_dir")" = ".git" ]; then
+    dirname "$common_dir"
   else
     printf '%s\n' "$project_dir"
   fi
+}
+
+# The configured state directory already validated by the hook bootstrap.
+# With no state setting, a non-Git project uses the configured primary;
+# linked worktrees keep sharing session records and leases via Git's common
+# directory or the launcher's canonical checkout override.
+context_canonical_root() {
+  local project_dir="$1" state
+  if [ -n "${PROJECT_HOOK_STATE_ROOT:-}" ]; then
+    printf '%s\n' "$PROJECT_HOOK_STATE_ROOT"
+    return 0
+  fi
+  if context_outside_checkouts "${CLAUDE_PROJECT_DIR:-$project_dir}"; then
+    if ! state="$(project_python_run "$CONTEXT_PROJECT_PYTHON" -c \
+        'from lu_machinery.common.repo_root import state_root; print(state_root())' 2>/dev/null)" \
+        || [[ "$state" != /* ]]; then
+      echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: no runtime-state root (set LU_PRIMARY_REPO_ROOT)" >&2
+      return 1
+    fi
+    printf '%s\n' "$state"
+    return 0
+  fi
+  context_checkout_root "$@"
 }
 
 # True when <dir> is an existing directory outside every checkout: no .git entry
@@ -258,30 +283,12 @@ context_outside_checkouts() {
   done
 }
 
-# The runtime-state root for a project directory outside every checkout: the
-# configured state root by the one Python rule (common/repo_root.py state_root:
-# LU_STATE_ROOT, else the configured primary), run by the hook's resolved
-# interpreter. It never answers the directory itself, whose .agent no other
-# reader would find; when the rule does not resolve it says why and returns 1.
-context_state_root() {
-  local project_dir="$1" state
-  if [ -z "${CONTEXT_PROJECT_PYTHON:-}" ]; then
-    context_machinery_bootstrap "$project_dir" >/dev/null || return 1
-  fi
-  if ! state="$(project_python_run "$CONTEXT_PROJECT_PYTHON" -c \
-      'from lu_machinery.common.repo_root import state_root; print(state_root())' 2>/dev/null)" \
-      || [[ "$state" != /* ]]; then
-    echo "${0##*/}: HOOK-BOOTSTRAP-FAILED: no runtime-state root for $project_dir (set LU_STATE_ROOT or LU_PRIMARY_REPO_ROOT)" >&2
-    return 1
-  fi
-  printf '%s\n' "$state"
-}
-
-# Canonical session record path: an explicit existing override, else
-# <canonical checkout>/.agent/sessions/<session id>.json.
+# LU_STATE_ROOT owns session records. Checkout-mode consumers of the legacy
+# alias can still supply an explicit session record file.
 context_session_record_file() {
   local project_dir="$1" session_id="$2"
-  if [ -n "${LEARN_UKRAINIAN_SESSION_RECORD:-}" ] && [ -f "$LEARN_UKRAINIAN_SESSION_RECORD" ]; then
+  if [ -z "${LU_STATE_ROOT:-}" ] && [ -n "${LEARN_UKRAINIAN_SESSION_RECORD:-}" ] \
+    && [ -f "$LEARN_UKRAINIAN_SESSION_RECORD" ]; then
     printf '%s\n' "$LEARN_UKRAINIAN_SESSION_RECORD"
     return 0
   fi
