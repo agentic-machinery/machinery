@@ -799,18 +799,49 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
     from lu_machinery.orchestration.integration_sweep import changes_learner_content, lookup_verdict, pr_file_paths
 
     # An inactive, ambiguous or selector-less spelling is refused before any evidence read.
-    _fleet_catalog_entry(dest, environment)
+    catalog_entry = _fleet_catalog_entry(dest, environment)
+
+    def _single_required_workflow() -> str | None:
+        if catalog_entry is None:
+            return None
+        raw = catalog_entry[1].get("required_workflow", recovery.DEFAULT_REQUIRED_WORKFLOW)
+        if isinstance(raw, str):
+            workflow = raw
+        elif isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], str):
+            workflow = raw[0]
+        else:
+            return None
+        return workflow if recovery.is_valid_workflow_path(workflow) else None
+
+    def _valid_artifact_listing(listing: object) -> bool:
+        return (
+            isinstance(listing, dict)
+            and type(listing.get("total_count")) is int
+            and listing["total_count"] >= 0
+            and isinstance(listing.get("artifacts"), list)
+            and listing["total_count"] == len(listing["artifacts"])
+            and all(
+                isinstance(row, dict) and isinstance(row.get("name"), str) and bool(row["name"].strip())
+                for row in listing["artifacts"]
+            )
+        )
+
+    artifacts_cache: dict[int, dict] = {}
+    jobs_complete = False
 
     def fetch(name, **selectors):
+        nonlocal jobs_complete
         unknown = "RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable"
         if verb == "run-rerun" and name == "run":
             unknown += "; Actions run lookup failed; --number requires an Actions run ID, not a PR number"
         try:
             if name == "queue-candidate":
-                listing = fetch("run-artifacts", **selectors)
+                sel_num = selectors.get("number")
+                cached = artifacts_cache.get(sel_num) if set(selectors) == {"number"} and type(sel_num) is int else None
+                listing = cached if cached is not None else fetch("run-artifacts", **selectors)
+                if not _valid_artifact_listing(listing):
+                    raise ValueError("partial or malformed artifact listing")
                 artifacts = listing["artifacts"]
-                if type(listing["total_count"]) is not int or listing["total_count"] != len(artifacts):
-                    raise ValueError("partial artifact listing")
                 matches = [row for row in artifacts if row.get("name") == "ci-queue-candidate"]
                 if len(matches) != 1:
                     raise ValueError("missing or ambiguous queue candidate artifact")
@@ -854,7 +885,31 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
                     raise ValueError("PR files pagination incomplete")
                 return pr_file_paths([item for page in value for item in page])
             if name == "jobs":
-                return [job for page in value for job in page["jobs"]]
+                if (
+                    not isinstance(value, list)
+                    or not value
+                    or not all(isinstance(page, dict) and isinstance(page.get("jobs"), list) for page in value)
+                ):
+                    raise ValueError("jobs pagination incomplete")
+                collected = [job for page in value for job in page["jobs"]]
+                if not all(isinstance(job, dict) for job in collected):
+                    raise ValueError("jobs row malformed")
+                totals = [page["total_count"] for page in value if "total_count" in page]
+                if totals:
+                    if (
+                        len(totals) != len(value)
+                        or any(type(total) is not int or total < 0 for total in totals)
+                        or len(set(totals)) != 1
+                        or len(collected) != totals[0]
+                    ):
+                        raise ValueError("jobs pagination incomplete")
+                    ids = [job.get("id") for job in collected]
+                    if any(type(job_id) is not int or job_id <= 0 for job_id in ids) or len(set(ids)) != totals[0]:
+                        raise ValueError("jobs pagination incomplete or duplicate job IDs")
+                    jobs_complete = True
+                else:
+                    jobs_complete = False
+                return collected
             return value
         except github_client.GitHubRateLimited:
             raise
@@ -865,6 +920,15 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             raise gate.PublishBlocked(unknown) from None
         except Exception:
             raise gate.PublishBlocked(unknown) from None
+
+    def _merge_group_associations_consistent(associations: object, pr_number: int) -> bool:
+        return associations in (None, []) or (
+            isinstance(associations, list)
+            and len(associations) == 1
+            and isinstance(associations[0], dict)
+            and type(associations[0].get("number")) is int
+            and associations[0]["number"] == pr_number
+        )
 
     if verb == "run-rerun":
         run_id = fields["number"]
@@ -877,10 +941,15 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             return None
         if run.get("status") != "completed" or run.get("conclusion") not in {"failure", "cancelled", "timed_out", "action_required"}:
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
-        if isinstance(associations, list) and len(associations) == 1:
+        if run.get("event") == "merge_group":
+            branch_pr = extract_pr_number(run.get("head_branch", ""))
+            number = (
+                branch_pr
+                if type(branch_pr) is int and branch_pr > 0 and _merge_group_associations_consistent(associations, branch_pr)
+                else None
+            )
+        elif isinstance(associations, list) and len(associations) == 1 and isinstance(associations[0], dict):
             number = associations[0].get("number")
-        elif run.get("event") == "merge_group":
-            number = extract_pr_number(run.get("head_branch", ""))
         else:
             number = None
         if type(number) is not int or number <= 0:
@@ -906,6 +975,8 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
             raise gate.PublishBlocked("RECOVERY_RUN_INVALID: completed failed run required")
         if extract_pr_number(run.get("head_branch", "")) != number:
             raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run does not identify this PR")
+        if not _merge_group_associations_consistent(run.get("pull_requests"), number):
+            raise gate.PublishBlocked("RECOVERY_PR_UNKNOWN: merge_group run has conflicting PR associations")
         if not isinstance(head, str) or not recovery.SHA.fullmatch(head):
             raise gate.PublishBlocked("RECOVERY_HEAD_UNKNOWN: open PR head required")
         action = "re-enqueue"
@@ -928,15 +999,67 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         comments, head, verdict_login, learner_content=content,
     ).state != "APPROVED":
         raise gate.PublishBlocked("RECOVERY_APPROVAL_MISSING: exact-head recorded approval required")
-    evidence = recovery.evidence_from_comments(
-        comments,
-        number,
-        head,
-        authenticated_login=login,
-        run_id=run_id,
-        require_infra_diagnosis=require_infra_diagnosis,
-    )
     failed_run = run
+    live_jobs: list[dict] | None = None
+    cancelled_no_artifact = False
+    required_workflow = _single_required_workflow()
+    failure_conclusions = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+
+    def load_jobs() -> list[dict]:
+        nonlocal live_jobs
+        if live_jobs is None:
+            live_jobs = fetch("jobs", number=run_id)
+        return live_jobs
+
+    def load_artifacts_listing() -> dict:
+        if run_id not in artifacts_cache:
+            listing = fetch("run-artifacts", number=run_id)
+            if not _valid_artifact_listing(listing):
+                raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
+            artifacts_cache[run_id] = listing
+        return artifacts_cache[run_id]
+
+    try:
+        evidence = recovery.evidence_from_comments(
+            comments,
+            number,
+            head,
+            authenticated_login=login,
+            run_id=run_id,
+            require_infra_diagnosis=require_infra_diagnosis,
+        )
+    except gate.PublishBlocked as exc:
+        if (
+            not str(exc).startswith("RECOVERY_EVIDENCE_MISSING:")
+            or failed_run.get("event") != "merge_group"
+            or failed_run.get("conclusion") != "cancelled"
+        ):
+            raise
+        jobs_check = load_jobs()
+        if (
+            not jobs_complete
+            or not recovery.cancelled_merge_group_without_failure(
+                failed_run, jobs_check, required_workflow=required_workflow, pr_number=number
+            )
+            or any(
+                isinstance(job, dict) and job.get("conclusion") in failure_conclusions
+                for job in jobs_check
+            )
+        ):
+            raise
+        listing = load_artifacts_listing()
+        if any(row.get("name") == "ci-queue-candidate" for row in listing["artifacts"]):
+            raise
+        evidence = recovery.evidence_from_comments(
+            comments,
+            number,
+            head,
+            authenticated_login=login,
+            run_id=run_id,
+            require_infra_diagnosis=True,
+            allow_empty_jobs=True,
+        )
+        cancelled_no_artifact = True
     if (type(failed_run.get("run_attempt")) is not int or failed_run["run_attempt"] < 1
             or failed_run.get("status") != "completed"
             or failed_run.get("conclusion") not in {"failure", "cancelled", "timed_out", "action_required"}):
@@ -945,15 +1068,29 @@ def _prepare_recovery(verb, fields, dest, cwd, environment, runner):
         raise gate.PublishBlocked("RECOVERY_ALLOWANCE_SPENT: first=prior workflow run attempt")
     if failed_run.get("head_sha") != evidence["tested_sha"]:
         raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: tested SHA does not match run")
-    jobs = fetch("jobs", number=evidence["run_id"])
+    jobs = load_jobs()
     failed_ids = {
         job.get("id")
         for job in jobs
-        if job.get("conclusion") in {"failure", "cancelled", "timed_out", "action_required"}
+        if isinstance(job, dict) and job.get("conclusion") in failure_conclusions
     }
-    if not failed_ids or failed_ids != set(evidence["job_ids"]):
+    if failed_ids != set(evidence["job_ids"]) or (not failed_ids and not cancelled_no_artifact):
         raise gate.PublishBlocked("RECOVERY_EVIDENCE_MISMATCH: every failing job must be diagnosed")
-    if failed_run.get("event") == "merge_group":
+    if failed_run.get("event") == "merge_group" and not cancelled_no_artifact:
+        listing = load_artifacts_listing()
+        candidate_matches = [row for row in listing["artifacts"] if row.get("name") == "ci-queue-candidate"]
+        if not candidate_matches:
+            if jobs_complete and recovery.cancelled_merge_group_without_failure(
+                failed_run, jobs, required_workflow=required_workflow, pr_number=number
+            ):
+                cancelled_no_artifact = True
+            else:
+                raise gate.PublishBlocked("RECOVERY_LOOKUP_UNKNOWN: live evidence unavailable")
+    if cancelled_no_artifact:
+        recovery.require_infra_diagnosis_evidence(evidence)
+        action = "re-enqueue"
+        evidence = {**evidence, "recovery_mode": recovery.CANCELLED_MERGE_GROUP_RECOVERY_MODE}
+    elif failed_run.get("event") == "merge_group":
         recovery.require_queue_diff(evidence, failed_run, fetch)
     current = fetch("pull", number=number)
     if current.get("state") != "open" or current.get("head", {}).get("sha") != head:
@@ -4428,9 +4565,10 @@ def publish(
                     readiness_runner, active, repos, fields.get("parent"), cwd, environment,
                 )
 
-        def queue_probe():
+        def queue_probe(pr_number=None):
+            target_number = fields["number"] if pr_number is None else pr_number
             identity = readiness_runner(
-                ["gh", "pr", "view", str(fields["number"]), "--repo", gh_repo,
+                ["gh", "pr", "view", str(target_number), "--repo", gh_repo,
                  "--json", "id,headRefOid,isCrossRepository,baseRefName,labels"],
                 cwd=cwd, env=environment, capture_output=True, text=True, check=False, timeout=15,
             )
@@ -4438,7 +4576,7 @@ def publish(
                 raise ValueError("queue identity unavailable")
             identity = json_depth.loads(identity.stdout, max_depth=512)
             result = read(
-                "queue-status", repo=gh_repo, number=fields["number"], branch=identity["baseRefName"],
+                "queue-status", repo=gh_repo, number=target_number, branch=identity["baseRefName"],
                 runner=readiness_runner if runner is not None else None,
                 cwd=cwd, env=environment, capture_output=True, text=True, check=False, timeout=15,
             )
@@ -4457,10 +4595,12 @@ def publish(
                 "labels": identity.get("labels"),
             }
 
-        def queue_jump(pull):
+        def queue_jump(pull, pr_number=None, match_head=None):
             """Whether this enqueue jumps the queue; unreadable evidence never jumps."""
             from lu_machinery.orchestration.integration_sweep import PRIORITY_LABEL, priority_jump
 
+            target_number = fields["number"] if pr_number is None else pr_number
+            target_head = fields["match_head"] if match_head is None else match_head
             labels = pull.get("labels")
             if not isinstance(labels, list) or PRIORITY_LABEL not in {
                 row.get("name") for row in labels if isinstance(row, dict)
@@ -4473,14 +4613,14 @@ def publish(
                 result = read(
                     name, repo=gh_repo, runner=readiness_runner, cwd=cwd, env=environment,
                     capture_output=True, text=True, check=False, timeout=15,
-                    **({} if name == "identity" else {"number": fields["number"], "paginate": True, "slurp": True}),
+                    **({} if name == "identity" else {"number": target_number, "paginate": True, "slurp": True}),
                 )
                 if result.returncode:
                     raise ValueError(f"{name} unavailable")
                 value = json_depth.loads(result.stdout, max_depth=512)
                 documents[name] = value if name == "identity" else [row for page in value for row in page]
             jumped = priority_jump(
-                labels, documents["timeline"], documents["comments"], fields["match_head"],
+                labels, documents["timeline"], documents["comments"], target_head,
                 documents["identity"].get("login"),
             )
             if not jumped:
@@ -4814,6 +4954,102 @@ def publish(
             reservation = _prepare_recovery(verb, fields, dest, cwd, environment, readiness_runner)
             if reservation:
                 path, number, head, action, evidence = reservation
+                if verb == "run-rerun" and action == "re-enqueue":
+                    from lu_machinery.publish.merge_guard import ensure_merge_ready
+
+                    if refusal := cto_safe_mode.refusal("pr-merge", {**os.environ, **(env or {})}):
+                        raise gate.PublishBlocked(refusal)
+                    ensure_merge_ready(
+                        gh_repo,
+                        number,
+                        runner=readiness_runner,
+                        cwd=cwd,
+                        environment=environment,
+                        match_head=head,
+                    )
+                    _refuse_incomplete_seats(dest, number, head, readiness_runner, cwd, environment)
+                    default = _squash_text(
+                        gh_repo,
+                        {"number": number, "match_head": head},
+                        dest,
+                        temp,
+                        readiness_runner,
+                        cwd,
+                        environment,
+                    )
+                    if not default["queue"]:
+                        raise gate.PublishBlocked(
+                            "RECOVERY_QUEUE_REQUIRED: cancelled merge-group recovery requires an active merge queue."
+                        )
+                    if not "".join(gate.normalize_for_scan(default["subject"]).splitlines()[:1]).strip():
+                        raise gate.PublishBlocked("OPSEC: merge subject must not be blank.")
+                    try:
+                        gate.check_texts(
+                            dest,
+                            [default["subject"], default["body"]],
+                            environment=environment,
+                            field_names=["default_subject", "default_body"],
+                        )
+                    except gate.PublishBlocked:
+                        raise
+                    except Exception:
+                        raise gate.PublishBlocked("OPSEC: checker unavailable; write refused.") from None
+                    try:
+                        before = queue_probe(number)
+                        probe_head = before.get("headRefOid")
+                        if not isinstance(probe_head, str) or probe_head.lower() != head.lower():
+                            raise ValueError("head changed")
+                        if type(before.get("isInMergeQueue")) is not bool:
+                            raise ValueError("membership unknown")
+                        in_queue = before["isInMergeQueue"]
+                    except github_client.GitHubRateLimited:
+                        raise
+                    except Exception:
+                        raise gate.PublishBlocked("QUEUE_STATE_UNKNOWN: enqueue refused before publication") from None
+                    if in_queue:
+                        raise gate.PublishBlocked(
+                            "RECOVERY_STILL_QUEUED: PR is still in the merge queue and GitHub offers no "
+                            "candidate-conditional dequeue; verify the queue entry and run pr-dequeue manually "
+                            "before retrying recovery"
+                        )
+                    try:
+                        jump = queue_jump(before, number, head)
+                    except github_client.GitHubRateLimited:
+                        raise
+                    except Exception:
+                        print("queue-jump: priority evidence unreadable; enqueuing without jump", file=sys.stderr)
+                    recovery.consume(path, dest, number, head, action, evidence)
+                    enqueue_payload = temp / "enqueue.json"
+                    enqueue_payload.write_bytes(json.dumps({
+                        "query": "mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:"
+                        "{pullRequestId:$id,expectedHeadOid:$head,jump:" + str(jump).lower()
+                        + "}){mergeQueueEntry{position jump}}}",
+                        "variables": {"id": default["id"], "head": head},
+                    }).encode("utf-8"))
+                    enqueue_argv = [
+                        "gh", "api", "--method", "POST", "graphql", "--input", str(enqueue_payload),
+                        *_hostname_flag(dest),
+                    ]
+                    result = _send(
+                        enqueue_argv,
+                        environment=environment,
+                        runner=runner,
+                        cwd=cwd,
+                        capture_output=capture_output,
+                        text=text,
+                        check=check,
+                        timeout=timeout,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                    if result.returncode == 0:
+                        _confirm_enqueued(
+                            gh_repo, number, head, dest, temp, (readiness_runner, runner), cwd, environment,
+                        )
+                        if jump:
+                            result.queue_jump = True
+                            print(f"queue-jump: enqueued at the front of the merge queue at {head}", file=sys.stderr)
+                    return result
                 recovery.consume(path, dest, number, head, action, evidence)
         applying_milestone = pr_milestone is not None
         capture_created = parent_epic is not None or applying_milestone
@@ -5069,6 +5305,11 @@ def _parse_args(argv):
                 "Outputs: requests a GitHub rerun with --failed on the original pinned run, not the latest PR head.\n"
                 "  PR recovery requires an eligible failed run, current-head approval and posted failure evidence.\n"
                 "  It consumes the one PR-head recovery allowance for reruns before sending the write.\n"
+                "  A completed cancelled merge_group run of the configured CI workflow with no failing job or step and\n"
+                "  no ci-queue-candidate artifact recovers instead through the same one-per-head allowance by enqueueing\n"
+                "  once at the approved PR head after the merge-readiness gates pass and the posted evidence carries\n"
+                "  diagnosis=\"infrastructure\" and undermines_approval=false (when still queued, it refuses with\n"
+                "  RECOVERY_STILL_QUEUED without consuming the allowance so the owner can run pr-dequeue manually).\n"
                 "  An unclassified run lookup failure stays RECOVERY_LOOKUP_UNKNOWN, sends no write and consumes no allowance.\n"
                 "Exit codes: 0 request accepted, job results unverified; 1 gh failure;\n"
                 "  2 invalid input, unknown lookup, policy refusal or transport error.\n"

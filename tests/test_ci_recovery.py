@@ -71,12 +71,20 @@ class Transport:
         self.compare_rows = {"base_commit": {"sha": "d" * 40}, "merge_base_commit": {"sha": "d" * 40}, "status": "ahead", "files": [{"filename": "lu_machinery/earlier-pr.py"}, {"filename": "lu_machinery/this-pr.py"}]}
         self.candidate_record = {"base_sha": "d" * 40, "head_sha": TESTED, "head_ref": "refs/heads/gh-readonly-queue/main/pr-42-" + "e" * 40, "run_id": 123, "run_attempt": 1}
         self.candidate_file = None
+        self.jobs = None
+        self.jobs_pages = None
+        self.workflow_path = ".github/workflows/ci.yml"
+        self.artifacts_response = None
+        self.merge_queue_enabled = True
+        self.queue_entry_oid = TESTED
+        self.merge_state = "CLEAN"
+        self.mutation_queries = []
 
 
     def __call__(self, argv, **kwargs):
         if argv[1:3] == ["pr", "view"]:
             assert "isInMergeQueue" not in argv[argv.index("--json") + 1].split(",")
-            data = {"number": 42, "isDraft": False, "mergeStateStatus": "CLEAN", "headRefOid": self.head,
+            data = {"number": 42, "isDraft": False, "mergeStateStatus": self.merge_state, "headRefOid": self.head,
                     "headRefName": "codex/fixture", "state": "OPEN", "isCrossRepository": False,
                     "baseRefName": "main", "statusCheckRollup": [{
                         "__typename": "CheckRun", "name": "CI Gate", "workflowName": "CI",
@@ -90,6 +98,7 @@ class Transport:
             if query.startswith("mutation"):
                 assert "enqueuePullRequest" in query
                 self.writes.append(argv)
+                self.mutation_queries.append((query, payload.get("variables")))
                 if self.failure:
                     raise subprocess.TimeoutExpired(argv, 60)
                 self.queued = True
@@ -97,9 +106,14 @@ class Transport:
                     argv, 0, json.dumps({"data": {"enqueuePullRequest": {"mergeQueueEntry": {"position": 1}}}}), ""
                 )
             if "mergeQueueEntry" in query:
+                entry = (
+                    {"headCommit": {"oid": self.queue_entry_oid}}
+                    if self.queue_entry_oid is not None
+                    else None
+                )
                 data = {"number": 42, "state": "OPEN", "headRefOid": self.head,
                         "headRefName": "codex/fixture", "isInMergeQueue": self.queued,
-                        "mergeQueueEntry": {"headCommit": {"oid": TESTED}}}
+                        "mergeQueueEntry": entry}
                 return subprocess.CompletedProcess(argv, 0, json.dumps({"data": {"repository": {"pullRequest": data}}}), "")
             if "timelineItems" in query:
                 self.removal_reads.append(payload)
@@ -149,7 +163,7 @@ class Transport:
                     "repository": {
                         "pullRequest": {
                             "headRefOid": self.head,
-                            "isMergeQueueEnabled": True, "id": "PR_fixture_42",
+                            "isMergeQueueEnabled": self.merge_queue_enabled, "id": "PR_fixture_42",
                             "viewerMergeHeadlineText": "change (#42)",
                             "viewerMergeBodyText": "change",
                         }
@@ -200,7 +214,11 @@ class Transport:
                         {"event": "committed", "sha": self.head, "committer": {"date": "2099-01-01T00:00:00Z"}}
                     )
             elif endpoint.endswith("/jobs"):
-                data = [{"jobs": [{"id": job, "conclusion": "failure"} for job in self.failed_ids]}]
+                if self.jobs_pages is not None:
+                    data = self.jobs_pages
+                else:
+                    jobs = self.jobs if self.jobs is not None else [{"id": job, "conclusion": "failure"} for job in self.failed_ids]
+                    data = [{"total_count": len(jobs), "jobs": jobs}]
             elif endpoint.endswith("/runs/123"):
                 data = {
                     "id": 123,
@@ -208,6 +226,7 @@ class Transport:
                     "conclusion": self.conclusion,
                     "head_sha": TESTED,
                     "event": self.event,
+                    "path": self.workflow_path,
                     "head_branch": "gh-readonly-queue/main/pr-42-" + "e" * 40,
                     "run_attempt": self.attempt,
                     "pull_requests": self.associations
@@ -215,7 +234,11 @@ class Transport:
                     else ([] if self.event == "merge_group" else [{"number": 42, "head": {"sha": self.head}}]),
                 }
             elif endpoint.endswith("/actions/runs/123/artifacts"):
-                data = {"total_count": 1, "artifacts": [{"name": "ci-queue-candidate", "id": 77, "expired": False, "size_in_bytes": 1024}]}
+                data = (
+                    self.artifacts_response
+                    if self.artifacts_response is not None
+                    else {"total_count": 1, "artifacts": [{"name": "ci-queue-candidate", "id": 77, "expired": False, "size_in_bytes": 1024}]}
+                )
             elif endpoint.endswith("/actions/artifacts/77/zip"):
                 with io.BytesIO() as buffer:
                     with zipfile.ZipFile(buffer, "w") as archive:
@@ -819,6 +842,222 @@ def test_branch_rerun_does_not_block_normal_initial_enqueue(setup, action, remov
     assert prior["action"] == "run-rerun"
 
 
-from tests.helpers.product_tree import configured_roots  # noqa: E402, F401
+@pytest.mark.parametrize("mode", ["already-ejected", "zero-cancelled-jobs", "pr-merge-ejected"])
+def test_cancelled_merge_group_no_artifact_recovers_via_dequeue_and_enqueue(setup, mode):
+    """Defect class: ejected cancelled merge-group run of the configured CI workflow with 0 candidate artifacts and no failing job/step recovers via one-per-head re-enqueue."""
+    root, transport = setup
+    transport.event = "merge_group"
+    transport.conclusion = "cancelled"
+    transport.artifacts_response = {"total_count": 0, "artifacts": []}
+    transport.queued = False
+    transport.proof = {
+        "pr": 42,
+        "head": HEAD,
+        "run_id": 123,
+        "job_ids": [] if mode == "zero-cancelled-jobs" else [456],
+        "tested_sha": TESTED,
+        "diagnosis": "infrastructure",
+        "undermines_approval": False,
+        "failure_evidence": "merge-group run cancelled by GitHub during repository transfer; no test node failed",
+        "unrelated_to_diff": "GitHub cancelled the in-flight merge-group run before CI Gate uploaded ci-queue-candidate",
+    }
+    if mode == "zero-cancelled-jobs":
+        transport.jobs = [
+            {"id": 100, "status": "completed", "conclusion": "success", "steps": [{"name": "pytest", "conclusion": "success"}]},
+            {"id": 101, "status": "completed", "conclusion": "skipped", "steps": []},
+        ]
+    else:
+        transport.jobs = [
+            {"id": 100, "status": "completed", "conclusion": "success", "steps": [{"name": "pytest", "conclusion": "success"}]},
+            {"id": 456, "status": "completed", "conclusion": "cancelled", "steps": [{"name": "pytest", "conclusion": "cancelled"}, {"name": "cleanup", "conclusion": None}]},
+        ]
+
+    if mode == "pr-merge-ejected":
+        transport.proof.update(diagnosis="infrastructure", undermines_approval=False, failed_tests=[])
+        result = pub.publish(
+            "pr-merge",
+            number=42,
+            repo="unit/public",
+            match_head=HEAD,
+            expect_queue="true",
+            recovery_run_id=123,
+            cwd=root,
+            env={},
+            runner=transport,
+        )
+    else:
+        result = pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
+
+    assert result.returncode == 0
+    assert transport.queued is True
+    assert [
+        "dequeuePullRequest" if "dequeuePullRequest" in query else "enqueuePullRequest"
+        for query, _ in transport.mutation_queries
+    ] == ["enqueuePullRequest"]
+    prior = pub.recovery.first_attempt(pub.recovery.ledger_path(root), "github.com/unit/public", 42, HEAD)
+    assert prior is not None
+    assert prior["action"] == "re-enqueue"
+    assert prior["recovery_mode"] == pub.recovery.CANCELLED_MERGE_GROUP_RECOVERY_MODE
+    assert prior["run_id"] == 123
+    with pytest.raises(gate.PublishBlocked, match=r"RECOVERY_ALLOWANCE_SPENT.*re-enqueue"):
+        pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
+    assert len(transport.writes) == 1
+
+
+@pytest.mark.parametrize(
+    "case,expected_error",
+    [
+        ("still-queued", r"RECOVERY_STILL_QUEUED:.*pr-dequeue"),
+        ("failing-job", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("failing-step-in-cancelled-job", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("missing-steps-field", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("missing-step-conclusion-key", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("missing-job-status", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("incomplete-job-status", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("wrong-workflow", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("missing-workflow-path", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("jobs-missing-total-count", "RECOVERY_EVIDENCE_MISSING"),
+        ("jobs-missing-total-count-nonempty", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("jobs-duplicate-id-across-pages", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("jobs-changing-total-count", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("non-cancelled-run", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("partial-artifacts", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("artifact-missing-name", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("artifact-blank-name", "RECOVERY_LOOKUP_UNKNOWN"),
+        ("failed-tests-in-evidence", "RECOVERY_TEST_FAILURE_FORBIDDEN"),
+        ("missing-infra-diagnosis", "RECOVERY_INFRA_DIAGNOSIS_REQUIRED"),
+        ("missing-undermines-approval", "RECOVERY_REVIEW_DISPOSITION_REQUIRED"),
+        ("empty-jobs-missing-infra-diagnosis", "RECOVERY_INFRA_DIAGNOSIS_REQUIRED"),
+        ("conflicting-pr-association", "RECOVERY_PR_UNKNOWN"),
+        ("pr-merge-conflicting-pr-association", "RECOVERY_PR_UNKNOWN"),
+        ("queue-disabled", "RECOVERY_QUEUE_REQUIRED"),
+        ("unready-pr", "OPSEC: merge refused"),
+        ("unapproved-pr", "RECOVERY_APPROVAL_MISSING"),
+        ("missing-evidence", "RECOVERY_EVIDENCE_MISSING"),
+        ("job-id-mismatch", "RECOVERY_EVIDENCE_MISMATCH"),
+        ("pr-merge-failing-job", "RECOVERY_LOOKUP_UNKNOWN"),
+    ],
+)
+def test_cancelled_merge_group_no_artifact_refuses_on_failure_or_invalid_state(setup, case, expected_error):
+    """Defect class: still-queued PR, failing job/step, wrong workflow, incomplete pagination/rows, non-cancelled run, missing infra diagnosis, conflicting PR identity, failed_tests, or unmet merge gates refuse without spending allowance."""
+    root, transport = setup
+    transport.event = "merge_group"
+    transport.conclusion = "cancelled"
+    transport.artifacts_response = {"total_count": 0, "artifacts": []}
+    transport.queued = False
+    transport.jobs = [
+        {"id": 100, "status": "completed", "conclusion": "success", "steps": [{"name": "pytest", "conclusion": "success"}]},
+        {"id": 456, "status": "completed", "conclusion": "cancelled", "steps": [{"name": "pytest", "conclusion": "cancelled"}]},
+    ]
+    transport.proof = {
+        "pr": 42,
+        "head": HEAD,
+        "run_id": 123,
+        "job_ids": [456],
+        "tested_sha": TESTED,
+        "diagnosis": "infrastructure",
+        "undermines_approval": False,
+        "failure_evidence": "cancelled by GitHub",
+        "unrelated_to_diff": "repository transfer cancelled run",
+    }
+
+    if case == "still-queued":
+        transport.queued = True
+    elif case == "failing-job":
+        transport.jobs = [
+            {"id": 456, "status": "completed", "conclusion": "cancelled", "steps": [{"name": "pytest", "conclusion": "cancelled"}]},
+            {"id": 457, "status": "completed", "conclusion": "failure", "steps": [{"name": "pytest", "conclusion": "failure"}]},
+        ]
+        transport.proof["job_ids"] = [456, 457]
+    elif case == "failing-step-in-cancelled-job":
+        transport.jobs[1]["steps"] = [{"name": "pytest", "conclusion": "failure"}, {"name": "post", "conclusion": "cancelled"}]
+    elif case == "missing-steps-field":
+        del transport.jobs[1]["steps"]
+    elif case == "missing-step-conclusion-key":
+        transport.jobs[1]["steps"] = [{"name": "pytest"}]
+    elif case == "missing-job-status":
+        del transport.jobs[1]["status"]
+    elif case == "incomplete-job-status":
+        transport.jobs[1]["status"] = "in_progress"
+    elif case == "wrong-workflow":
+        transport.workflow_path = ".github/workflows/security.yml"
+    elif case == "missing-workflow-path":
+        transport.workflow_path = None
+    elif case == "jobs-missing-total-count":
+        transport.jobs_pages = [{"jobs": []}]
+        transport.proof["job_ids"] = []
+    elif case == "jobs-missing-total-count-nonempty":
+        transport.jobs_pages = [{"jobs": transport.jobs}]
+    elif case == "jobs-duplicate-id-across-pages":
+        dup = {"id": 456, "status": "completed", "conclusion": "cancelled", "steps": [{"name": "pytest", "conclusion": "cancelled"}]}
+        transport.jobs_pages = [{"total_count": 2, "jobs": [dup]}, {"total_count": 2, "jobs": [dup]}]
+    elif case == "jobs-changing-total-count":
+        transport.jobs_pages = [
+            {"total_count": 1, "jobs": [transport.jobs[0]]},
+            {"total_count": 2, "jobs": [transport.jobs[1]]},
+        ]
+    elif case == "non-cancelled-run":
+        transport.conclusion = "failure"
+        transport.jobs[1]["conclusion"] = "failure"
+    elif case == "partial-artifacts":
+        transport.artifacts_response = {"total_count": 2, "artifacts": []}
+    elif case == "artifact-missing-name":
+        transport.artifacts_response = {"total_count": 1, "artifacts": [{"id": 77, "expired": False}]}
+    elif case == "artifact-blank-name":
+        transport.artifacts_response = {"total_count": 1, "artifacts": [{"id": 77, "name": "   ", "expired": False}]}
+    elif case == "failed-tests-in-evidence":
+        transport.proof["failed_tests"] = ["tests/test_x.py::test_fail"]
+    elif case == "missing-infra-diagnosis":
+        del transport.proof["diagnosis"]
+    elif case == "missing-undermines-approval":
+        del transport.proof["undermines_approval"]
+    elif case == "empty-jobs-missing-infra-diagnosis":
+        transport.jobs = [
+            {"id": 100, "status": "completed", "conclusion": "success", "steps": [{"name": "pytest", "conclusion": "success"}]},
+        ]
+        transport.proof["job_ids"] = []
+        del transport.proof["diagnosis"]
+    elif case in {"conflicting-pr-association", "pr-merge-conflicting-pr-association"}:
+        transport.associations = [{"number": 99}]
+    elif case == "queue-disabled":
+        transport.merge_queue_enabled = False
+    elif case == "unready-pr":
+        transport.merge_state = "DIRTY"
+    elif case == "unapproved-pr":
+        transport.approved = False
+    elif case == "missing-evidence":
+        transport.proof = None
+    elif case == "job-id-mismatch":
+        transport.proof["job_ids"] = [999]
+    elif case == "pr-merge-failing-job":
+        transport.jobs = [
+            {"id": 456, "status": "completed", "conclusion": "cancelled", "steps": [{"name": "pytest", "conclusion": "cancelled"}]},
+            {"id": 457, "status": "completed", "conclusion": "failure", "steps": [{"name": "pytest", "conclusion": "failure"}]},
+        ]
+        transport.proof.update(
+            job_ids=[456, 457], diagnosis="infrastructure", undermines_approval=False, failed_tests=[]
+        )
+
+    if case in {"pr-merge-failing-job", "pr-merge-conflicting-pr-association"}:
+        with pytest.raises(gate.PublishBlocked, match=expected_error):
+            pub.publish(
+                "pr-merge",
+                number=42,
+                repo="unit/public",
+                match_head=HEAD,
+                expect_queue="true",
+                recovery_run_id=123,
+                cwd=root,
+                env={},
+                runner=transport,
+            )
+    else:
+        with pytest.raises(gate.PublishBlocked, match=expected_error):
+            pub.publish("run-rerun", number=123, repo="unit/public", cwd=root, env={}, runner=transport)
+    assert transport.writes == []
+    assert pub.recovery.first_attempt(pub.recovery.ledger_path(root), "github.com/unit/public", 42, HEAD) is None
+
+
+from tests.helpers.product_tree import configured_roots  # noqa: F401
 
 pytestmark = pytest.mark.usefixtures("configured_roots")

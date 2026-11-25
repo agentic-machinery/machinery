@@ -17,6 +17,71 @@ from lu_machinery.opsec.prepublish import PublishBlocked, normalize_repository
 MARKER = re.compile(r"<!-- ci-recovery-evidence\s+(\{.*?\})\s*-->", re.S)
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 RECOVERY_ACTIONS = frozenset({"run-rerun", "re-enqueue"})
+CANCELLED_MERGE_GROUP_RECOVERY_MODE = "cancelled_merge_group_no_artifact"
+DEFAULT_REQUIRED_WORKFLOW = ".github/workflows/ci.yml"
+_WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml\Z")
+_MERGE_GROUP_BRANCH = re.compile(r"gh-readonly-queue/(main)/pr-([1-9][0-9]*)-[0-9a-f]{40}")
+_CLEAN_CANCELLED_JOB_CONCLUSIONS = frozenset({"success", "skipped", "neutral", "cancelled"})
+_CLEAN_CANCELLED_STEP_CONCLUSIONS = frozenset({None, "success", "skipped", "neutral", "cancelled"})
+
+
+def is_valid_workflow_path(value: object) -> bool:
+    """True when *value* is a single `.github/workflows/<file>.yml|.yaml` path."""
+    return isinstance(value, str) and bool(_WORKFLOW_PATH.fullmatch(value))
+
+
+def cancelled_merge_group_without_failure(
+    run: object,
+    jobs: object,
+    *,
+    required_workflow: str | None = None,
+    pr_number: int | None = None,
+) -> bool:
+    """True only for a completed cancelled merge-group run of the configured CI workflow with zero failing jobs or steps."""
+    if not isinstance(run, dict) or not isinstance(jobs, list):
+        return False
+    if not is_valid_workflow_path(required_workflow):
+        return False
+    if (
+        run.get("event") != "merge_group"
+        or run.get("status") != "completed"
+        or run.get("conclusion") != "cancelled"
+    ):
+        return False
+    raw_path = run.get("path")
+    if not isinstance(raw_path, str) or raw_path.split("@", 1)[0] != required_workflow:
+        return False
+    run_id = run.get("id")
+    branch = run.get("head_branch")
+    head = run.get("head_sha")
+    match = _MERGE_GROUP_BRANCH.fullmatch(branch) if isinstance(branch, str) else None
+    if not match:
+        return False
+    if pr_number is not None and (type(pr_number) is not int or int(match[2]) != pr_number):
+        return False
+    if not isinstance(head, str) or not SHA.fullmatch(head):
+        return False
+    for job in jobs:
+        if not isinstance(job, dict):
+            return False
+        if type(job.get("id")) is not int or job["id"] <= 0:
+            return False
+        if "run_id" in job and (type(job["run_id"]) is not int or job["run_id"] != run_id):
+            return False
+        if job.get("status") != "completed":
+            return False
+        if job.get("conclusion") not in _CLEAN_CANCELLED_JOB_CONCLUSIONS:
+            return False
+        if "steps" not in job or not isinstance(job["steps"], list):
+            return False
+        for step in job["steps"]:
+            if (
+                not isinstance(step, dict)
+                or "conclusion" not in step
+                or step["conclusion"] not in _CLEAN_CANCELLED_STEP_CONCLUSIONS
+            ):
+                return False
+    return True
 
 
 def _repo_key(repo: object) -> str:
@@ -54,7 +119,7 @@ def require_queue_diff(evidence: dict, run: dict, fetch: Callable[..., dict]) ->
     Matching failed-job names never establish that changes are unrelated.
     """
     try:
-        match = re.fullmatch(r"gh-readonly-queue/(main)/pr-[1-9][0-9]*-[0-9a-f]{40}", run["head_branch"])
+        match = _MERGE_GROUP_BRANCH.fullmatch(run["head_branch"])
         head = run["head_sha"]
         if not match or not SHA.fullmatch(head) or evidence["tested_sha"] != head:
             raise ValueError
@@ -139,6 +204,18 @@ def spent_reason(attempt: dict) -> str:
     )
 
 
+def require_infra_diagnosis_evidence(evidence: dict) -> None:
+    """Require positive infrastructure diagnosis and explicit undermines_approval=False for same-head re-enqueue."""
+    if evidence.get("diagnosis") != "infrastructure":
+        raise PublishBlocked(
+            "RECOVERY_INFRA_DIAGNOSIS_REQUIRED: positive infrastructure diagnosis required"
+        )
+    if evidence.get("undermines_approval") is not False:
+        raise PublishBlocked(
+            "RECOVERY_REVIEW_DISPOSITION_REQUIRED: explicit undermines_approval=false required"
+        )
+
+
 def evidence_from_comments(
     comments: list,
     number: int,
@@ -147,6 +224,7 @@ def evidence_from_comments(
     authenticated_login: str,
     run_id: int | None = None,
     require_infra_diagnosis: bool = False,
+    allow_empty_jobs: bool = False,
 ) -> dict:
     """Require the written evidence to already exist on this PR and exact head.
 
@@ -183,7 +261,7 @@ def evidence_from_comments(
                 and evidence["run_id"] > 0
                 and (run_id is None or evidence["run_id"] == run_id)
                 and isinstance(jobs, list)
-                and jobs
+                and (bool(jobs) or allow_empty_jobs)
                 and all(type(job) is int and job > 0 for job in jobs)
                 and len(set(jobs)) == len(jobs)
                 and isinstance(evidence.get("tested_sha"), str)
@@ -209,14 +287,7 @@ def evidence_from_comments(
                         "RECOVERY_INFRA_DIAGNOSIS_REQUIRED: positive infrastructure diagnosis required"
                     )
                 if require_infra_diagnosis:
-                    if evidence.get("diagnosis") != "infrastructure":
-                        raise PublishBlocked(
-                            "RECOVERY_INFRA_DIAGNOSIS_REQUIRED: positive infrastructure diagnosis required"
-                        )
-                    if evidence.get("undermines_approval") is not False:
-                        raise PublishBlocked(
-                            "RECOVERY_REVIEW_DISPOSITION_REQUIRED: explicit undermines_approval=false required"
-                        )
+                    require_infra_diagnosis_evidence(evidence)
                 return {**evidence, "comment_id": comment["id"]}
     raise PublishBlocked(
         "RECOVERY_EVIDENCE_MISSING: run/job IDs, tested SHA, failure evidence and diff diagnosis required on PR"
