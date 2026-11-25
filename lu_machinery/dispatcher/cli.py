@@ -65,6 +65,20 @@ def _finite_seconds(text: str) -> float:
     return value
 
 
+def _no_non_finite(text: str) -> str:
+    """A numeric option's text, unchanged; a spelling of NaN or an infinity is refused at parse time (#1440).
+
+    Any other text goes on to the option's own check (``savant_token_cap``, ``resolve_claude_budget_usd``).
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        return text
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {text!r}")
+    return text
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run provider CLIs in detached dispatch worktrees.\nUse for new tasks; legacy tasks retain their supervisor.",
@@ -142,7 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("trial-role", None, "Shadow trial role, e.g. review; read-only, with --trial-qualified-task and --pinned-head (default: none)"),
         ("trial-qualified-task", None, "Successful qualified non-trial task on the same input, head and role, e.g. qualified-42 (default: none)"),
     ):
-        dispatch.add_argument(f"--{flag}", default=default, required=flag in {"agent", "model"}, help=help_text)
+        dispatch.add_argument(f"--{flag}", default=default, required=flag in {"agent", "model"}, help=help_text,
+                              **({"type": _no_non_finite} if flag in {"max-budget-usd", "max-tokens"} else {}))
     dispatch.add_argument(
         "--contributor-mode",
         choices=("on", "off"),
