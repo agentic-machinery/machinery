@@ -1,9 +1,11 @@
 """Ownerless-PR alert, accepted handoffs and queue custody (scripts/orchestration/pr_ownership.py)."""
 
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -1127,3 +1129,174 @@ def test_keeper_repair_custody_released_only_when_cto_successor_accepts():
     assert receipt["successor"] == "repair-1"
     assert not own.keeper_custody(data["handoffs"][KEY])
     assert any(item["event"] == "repair_custody_released" and item["successor"] == "repair-1" for item in data["history"])
+
+
+# --- run PR inventory ------------------------------------------------------------
+
+
+@pytest.fixture
+def run_pr_store(tmp_path, monkeypatch, capsys):
+    from lu_machinery.orchestration import fleet_repos
+
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    archive = tasks / "archive"
+    archive.mkdir()
+    ownership = tmp_path / "pr_ownership" / "state.json"
+    monkeypatch.setenv("LU_TASKS_DIR", str(tasks))
+    monkeypatch.delenv(own.TASK_ENV, raising=False)
+    monkeypatch.setattr(fleet_repos, "load_fleet_repos", lambda: FLEET)
+    branches = {}
+    prs = {}
+
+    def write(record, *, archived=False):
+        directory = archive if archived else tasks
+        (directory / f"{record['task_id']}.json").write_text(json.dumps({"schema_version": 2, **record}))
+
+    write({"task_id": "run", "run_nonce": "run-1"}, archived=True)
+
+    def child(task_id, branch=None, *, archived=False, **fields):
+        record = {
+            "task_id": task_id, "run_nonce": f"{task_id}-1", "parent_task_id": "run", "parent_run_nonce": "run-1",
+            "repository": REPO, "worktree_branch": branch, "status": "done" if archived else "running",
+            **fields,
+        }
+        write(record, archived=archived)
+        return record
+
+    def github(args, **kwargs):
+        if args[1] == "api":
+            assert args[2:4] == ["--paginate", "--slurp"]
+            endpoint = urlsplit(args[4])
+            repo = endpoint.path.removeprefix("repos/").removesuffix("/pulls")
+            body = [branches.get((repo, parse_qs(endpoint.query)["head"][0]), [])]
+            assert parse_qs(endpoint.query)["state"] == ["all"]
+        else:
+            assert args[1:3] == ["pr", "view"]
+            assert args[4] == "--repo" and args[6] == "--json"
+            assert "commits" not in args[7].split(",")
+            number, repo = int(args[3]), args[5]
+            state, head = prs[repo, number]
+            body = {"number": number, "state": state, "headRefOid": head}
+        return subprocess.CompletedProcess(args, 0, json.dumps(body), "")
+
+    monkeypatch.setattr(own.github_client, "run", github)
+
+    def read():
+        status = own.main(["run-prs", "--task-id", "run", "--run-nonce", "run-1"])
+        result = capsys.readouterr()
+        assert status == 0, result.err
+        payload = json.loads(result.out)
+        assert payload["task_id"] == "run" and payload["run_nonce"] == "run-1"
+        assert "unrecorded branches" in payload["residuals"][0]
+        return payload["pull_requests"]
+
+    return SimpleNamespace(
+        tasks=tasks, archive=archive, ownership=ownership, write=write, child=child, read=read,
+        branches=branches, prs=prs,
+    )
+
+
+def _branch_pull(repo, branch, number):
+    return {
+        "number": number, "state": "open", "head": {"ref": branch, "repo": {"full_name": repo}},
+        "base": {"repo": {"full_name": repo}},
+    }
+
+
+def test_run_prs_does_not_omit_live_children_open_prs_on_recorded_branches(run_pr_store):
+    store = run_pr_store
+    store.child("live", "codex/live", publish_branch="claude/published")
+    store.child("other-repo", "codex/live", repository=MACHINERY)
+    store.child("another-run", "codex/ignored", parent_run_nonce="run-2")
+    store.branches[REPO, "learn-ukrainian:codex/live"] = [_branch_pull(REPO, "codex/live", 42)]
+    store.branches[REPO, "learn-ukrainian:claude/published"] = [_branch_pull(REPO, "claude/published", 43)]
+    store.branches[MACHINERY, "learn-ukrainian:codex/live"] = [_branch_pull(MACHINERY, "codex/live", 42)]
+    store.branches[REPO, "learn-ukrainian:codex/ignored"] = [_branch_pull(REPO, "codex/ignored", 99)]
+    store.prs[REPO, 42] = store.prs[REPO, 43] = store.prs[MACHINERY, 42] = ("OPEN", HEAD)
+
+    assert store.read() == [
+        {"repo": REPO, "number": 42, "state": "OPEN", "head": HEAD, "found_via": ["worktree_branch"]},
+        {"repo": REPO, "number": 43, "state": "OPEN", "head": HEAD, "found_via": ["publish_branch"]},
+        {"repo": MACHINERY, "number": 42, "state": "OPEN", "head": HEAD, "found_via": ["worktree_branch"]},
+    ]
+
+
+def test_run_prs_does_not_omit_an_accepted_pr_on_another_branch(run_pr_store):
+    store = run_pr_store
+    successor = store.child("succ", "claude/repair", repository=MACHINERY)
+    with own.locked(store.ownership) as data:
+        do_accept(data, [successor])
+    live_head = "b" * 40
+    store.prs[REPO, 42] = ("OPEN", live_head)
+
+    assert store.read() == [
+        {"repo": REPO, "number": 42, "state": "OPEN", "head": live_head, "found_via": ["accepted"]},
+    ]
+
+
+def test_run_prs_does_not_omit_keeper_custody_before_or_after_release(run_pr_store):
+    store = run_pr_store
+    worker = store.child("worker", "codex/x")
+    own.acknowledge_keeper_transfer(
+        store.ownership, repo=REPO, number=42, worker_task="worker", worker_nonce="worker-1",
+        pr={"state": "OPEN", "isDraft": False, "headRefOid": HEAD, "headRefName": "codex/x",
+            "baseRefName": "main", "isCrossRepository": False},
+        records=[worker], now=at(0), rerun="unspent", repos=FLEET, trivial=True, live=is_live,
+    )
+    store.prs[REPO, 42] = ("OPEN", HEAD)
+    assert store.read() == [
+        {"repo": REPO, "number": 42, "state": "OPEN", "head": HEAD, "found_via": ["keeper_transfer"]},
+    ]
+
+    assert own.release_closed_keeper_custody(store.ownership, repo=REPO, number=42, how="merged", now=at(1))
+    store.prs[REPO, 42] = ("MERGED", HEAD)
+    assert store.read() == [
+        {"repo": REPO, "number": 42, "state": "MERGED", "head": HEAD,
+         "found_via": ["keeper_custody_released", "keeper_transfer"]},
+    ]
+
+
+def test_run_prs_reports_live_merge_state_after_branch_discovery(run_pr_store):
+    store = run_pr_store
+    store.child("merged", "codex/merged", archived=True, delivery_pr=f"{REPO}#42",
+                delivery_prs=[f"{REPO}#42", f"{MACHINERY}#43"])
+    store.branches[REPO, "learn-ukrainian:codex/merged"] = [_branch_pull(REPO, "codex/merged", 42)]
+    store.prs[REPO, 42] = store.prs[MACHINERY, 43] = ("MERGED", HEAD)
+
+    assert store.read() == [
+        {"repo": REPO, "number": 42, "state": "MERGED", "head": HEAD,
+         "found_via": ["delivery_pr", "delivery_prs", "worktree_branch"]},
+        {"repo": MACHINERY, "number": 43, "state": "MERGED", "head": HEAD, "found_via": ["delivery_prs"]},
+    ]
+
+
+def test_run_prs_custody_history_does_not_lose_accept_after_250_events(run_pr_store):
+    store = run_pr_store
+    store.child("succ", "claude/old", archived=True)
+    with own.locked(store.ownership) as data:
+        do_accept(data, [task("succ", "claude/old")])
+    with own.locked(store.ownership) as data:
+        own.step(data, set(), {}, at(31))
+        data["history"].extend(
+            {"pr": own.pr_key(REPO, n), "at": at(32).isoformat(), "event": "alerted"}
+            for n in range(100, 350)
+        )
+    data = own.load(store.ownership)
+    assert data["handoffs"] == {}
+    assert len(data["history"]) == 201
+    assert data["history"][0]["event"] == "accepted"
+    store.prs[REPO, 42] = ("CLOSED", HEAD)
+    assert store.read() == [
+        {"repo": REPO, "number": 42, "state": "CLOSED", "head": HEAD, "found_via": ["accepted"]},
+    ]
+
+
+def test_run_prs_refuses_complete_output_when_an_archive_record_is_unreadable(run_pr_store, capsys):
+    store = run_pr_store
+    store.child("succ", "codex/x")
+    (store.archive / "broken.json").write_text("{")
+    assert own.main(["run-prs", "--task-id", "run", "--run-nonce", "run-1"]) == 2
+    result = capsys.readouterr()
+    assert result.out == ""
+    assert "unreadable task record broken.json" in result.err

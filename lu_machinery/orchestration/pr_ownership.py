@@ -42,7 +42,10 @@ import hashlib
 import json
 import os
 import re
+import stat
+import subprocess
 import sys
+from collections import defaultdict
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -79,6 +82,11 @@ SENDER = "merge-queue-keeper"
 TASK_ENV = "LEARN_UKRAINIAN_DISPATCH_TASK_ID"
 NONCE_ENV = "LEARN_UKRAINIAN_RUN_NONCE"
 HISTORY_LIMIT = 200
+_CUSTODY_EVENTS = frozenset({
+    "accepted", "keeper_transfer_acknowledged", "custody_released",
+    "keeper_custody_released", "keeper_repair_held", "repair_custody_released",
+})
+_RUN_PRS_RESIDUAL = "PRs on unrecorded branches without custody or delivery evidence await steward slice 3."
 # Help and a mixed accept print these lines. Queue custody and recorded custody do not combine.
 QUEUE_CUSTODY_USAGE = (
     "queue custody (a live predecessor waiting in the merge queue hands the remaining "
@@ -328,9 +336,13 @@ def keeper_custody(handoff: Mapping[str, Any] | None) -> bool:
 
 
 def load(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return _empty()
     try:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return _empty()
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise OwnershipError("ownership state is not a regular file")
         data = json_depth.loads(path.read_text(), max_depth=512)
     except (OSError, ValueError) as exc:
         raise OwnershipError(f"ownership state unreadable: {type(exc).__name__}") from exc
@@ -364,7 +376,10 @@ def load(path: Path) -> dict[str, Any]:
             _at(last["at"])
             if not isinstance(last.get("ok"), bool) or type(last.get("reset_at", 0)) is not int:
                 raise TypeError("last_tick")
-        if not isinstance(data.setdefault("history", []), list):
+        history = data.setdefault("history", [])
+        if not isinstance(history, list) or any(
+            not isinstance(entry, dict) or not isinstance(entry.get("event"), str) for entry in history
+        ):
             raise TypeError("history")
         outbox = data.setdefault("outbox", [])
         if not isinstance(outbox, list) or not all(
@@ -388,7 +403,10 @@ def load(path: Path) -> dict[str, Any]:
 
 
 def _save(path: Path, data: dict[str, Any]) -> None:
-    data["history"] = data["history"][-HISTORY_LIMIT:]
+    history = data["history"]
+    data["history"] = [
+        entry for entry in history[:-HISTORY_LIMIT] if entry["event"] in _CUSTODY_EVENTS
+    ] + history[-HISTORY_LIMIT:]
     temporary = path.with_suffix(".tmp")
     with temporary.open("w") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
@@ -971,10 +989,14 @@ def _tick(now, path, observe, service_factory) -> tuple[list[str], bool]:
         return lines, bool(errors)
 
 
-def _gh_pr(repo: str, number: int) -> dict[str, Any]:
+def _gh_pr(
+    repo: str,
+    number: int,
+    *,
+    fields: str = "state,isDraft,headRefOid,headRefName,baseRefName,isCrossRepository,commits",
+) -> dict[str, Any]:
     proc = github_client.run(
-        ["gh", "pr", "view", str(number), "--repo", repo, "--json",
-         "state,isDraft,headRefOid,headRefName,baseRefName,isCrossRepository,commits"],
+        ["gh", "pr", "view", str(number), "--repo", repo, "--json", fields],
         capture_output=True, text=True, check=False, timeout=60,
     )
     try:
@@ -984,6 +1006,188 @@ def _gh_pr(repo: str, number: int) -> dict[str, Any]:
     if not isinstance(pr, dict) or not isinstance(pr.get("headRefOid"), str):
         raise OwnershipError(f"cannot read {repo}#{number}")
     return pr
+
+
+def _parse_pr_ref(value: object, source: str) -> tuple[str, int]:
+    repo, _, number = value.partition("#") if isinstance(value, str) else ("", "", "")
+    if not _valid_repo_slug(repo) or not re.fullmatch(r"[1-9][0-9]*", number):
+        raise OwnershipError(f"{source} has an invalid PR reference")
+    return repo, int(number)
+
+
+def _custody_bindings(data: Mapping[str, Any]) -> Iterator[tuple[str, int, str, str | None, str]]:
+    """Read task bindings from one validated ownership snapshot, including ended custody."""
+    for key, handoff in data["handoffs"].items():
+        repo, number = _parse_pr_ref(key, "ownership handoff")
+        if handoff.get("custody_mode") == "keeper":
+            # load() validates the receipt. Its identity must also agree with the ledger key.
+            if pr_key(handoff["repository"], handoff["pr"]) != pr_key(repo, number):
+                raise OwnershipError("keeper handoff PR reference differs from its ledger key")
+            yield repo, number, handoff["worker_task"], handoff["worker_nonce"], "keeper_transfer"
+        elif not decision_custody(handoff):
+            yield repo, number, handoff["successor"], None, "accepted"
+
+    task_fields = {
+        "accepted": ("successor",),
+        "keeper_transfer_acknowledged": ("worker_task",),
+        "keeper_custody_released": ("worker_task",),
+        "repair_custody_released": ("successor", "previous_worker_task"),
+    }
+    for entry in data["history"]:
+        event = entry["event"]
+        if event not in _CUSTODY_EVENTS:
+            continue
+        repo, number = _parse_pr_ref(entry.get("pr"), f"ownership history {event}")
+        if event == "accepted" and any(name in entry for name in ("reason", "decision_owner", "pr_state")):
+            if not decision_custody(entry):
+                raise OwnershipError("malformed decision custody history")
+            continue
+        nonce = None
+        if event == "keeper_transfer_acknowledged":
+            nonce = entry.get("worker_nonce")
+            if not _single_line(nonce):
+                raise OwnershipError("keeper transfer history has no worker nonce")
+        source = "keeper_transfer" if event == "keeper_transfer_acknowledged" else event
+        for field in task_fields.get(event, ()):
+            task = entry.get(field)
+            if not _single_line(task):
+                raise OwnershipError(f"ownership history {event} has an invalid {field}")
+            yield repo, number, task, nonce, source
+
+
+def _run_children(
+    records: list[dict[str, Any]], task_id: str, run_nonce: str,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], list[dict[str, Any]]]:
+    from lu_machinery.orchestration.dispatch_admission import _is_valid_run_identity
+
+    if not _is_valid_run_identity(task_id) or not _is_valid_run_identity(run_nonce):
+        raise OwnershipError("run-prs requires a valid task ID and run nonce")
+    parents = [record for record in records if record["task_id"] == task_id]
+    if sum(record.get("run_nonce") == run_nonce for record in parents) != 1:
+        raise OwnershipError("task inventory does not identify exactly one requested run")
+
+    children = {}
+    for record in records:
+        if record.get("parent_task_id") != task_id:
+            continue
+        child_id, nonce = record["task_id"], record.get("run_nonce")
+        parent_nonce = record.get("parent_run_nonce")
+        if parent_nonce is None:
+            if len(parents) != 1:
+                raise OwnershipError(f"child {child_id} has no parent nonce and the parent task ID was reused")
+        elif not _is_valid_run_identity(parent_nonce):
+            raise OwnershipError(f"child {child_id} has an invalid parent nonce")
+        elif parent_nonce != run_nonce:
+            continue
+        if not isinstance(nonce, str) or not _is_valid_run_identity(nonce):
+            raise OwnershipError(f"child {child_id} has an invalid run nonce")
+        children[child_id, nonce] = record
+
+    child_ids = {child_id for child_id, _ in children}
+    other_runs = []
+    for record in records:
+        child_id, nonce = record["task_id"], record.get("run_nonce")
+        if child_id not in child_ids:
+            continue
+        selected = children.get((child_id, nonce)) if isinstance(nonce, str) else None
+        if selected is None:
+            other_runs.append(record)
+        elif selected != record:
+            raise OwnershipError(f"conflicting records for child {child_id} and run nonce")
+    return children, other_runs
+
+
+def _branch_pr_numbers(repo: str, branch: str) -> Iterator[int]:
+    from lu_machinery.dispatcher.git import _branch_pulls, _same_repo_pr
+
+    seen = set()
+    for pr in _branch_pulls(repo, branch):
+        number, head, base = pr.get("number"), pr.get("head"), pr.get("base")
+        head_repo = head.get("repo") if isinstance(head, dict) else None
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        head_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+        base_name = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+        if (
+            type(number) is not int or number <= 0 or not isinstance(head, dict) or head.get("ref") != branch
+            or not _valid_repo_slug(head_name) or not _valid_repo_slug(base_name)
+            or base_name.casefold() != repo.casefold() or number in seen
+        ):
+            raise OwnershipError(f"branch PR listing for {repo} has malformed, mismatched or repeated rows")
+        seen.add(number)
+        if _same_repo_pr(pr, repo):
+            yield number
+
+
+def _run_prs(task_id: str, run_nonce: str, path: Path) -> dict[str, Any]:
+    from lu_machinery.common.git_context import validate_plain_branch_name
+    from lu_machinery.fleet.pr_identity import record_repository
+    from lu_machinery.orchestration.dispatch_admission import strict_task_inventory_in
+    from lu_machinery.orchestration.fleet_repos import load_fleet_repos, resolve_payload_fleet_repo
+
+    children, other_runs = _run_children(strict_task_inventory_in(tasks_dir()), task_id, run_nonce)
+    child_ids = {child_id for child_id, _ in children}
+    ambiguous_tasks = {record["task_id"] for record in other_runs}
+    ownership = load(path)
+    repos = load_fleet_repos()
+
+    def active_slug(repo: str) -> str:
+        return resolve_payload_fleet_repo(repo, repos=repos).active_github
+
+    def recorded_branches(record: dict[str, Any]) -> Iterator[tuple[str, str, str]]:
+        for field in ("worktree_branch", "publish_branch"):
+            branch = record.get(field)
+            if branch is None:
+                continue
+            if not _single_line(branch):
+                raise OwnershipError(f"child {record['task_id']} has an invalid {field}")
+            repo = active_slug(record_repository(record, repos))
+            yield repo, validate_plain_branch_name(branch, repo_root=path.parent), field
+
+    sources: dict[tuple[str, int], set[str]] = defaultdict(set)
+    for repo, number, child, nonce, source in _custody_bindings(ownership):
+        if nonce is not None:
+            if (child, nonce) not in children:
+                continue
+        elif child not in child_ids:
+            continue
+        elif child in ambiguous_tasks:
+            raise OwnershipError(f"custody for child {child} lacks a run nonce and its task ID was reused")
+        sources[active_slug(repo), number].add(source)
+
+    branch_sources: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for record in children.values():
+        for repo, branch, source in recorded_branches(record):
+            branch_sources[repo, branch].add(source)
+        delivery = record.get("delivery_pr")
+        if delivery is not None:
+            repo, number = _parse_pr_ref(delivery, "task delivery_pr")
+            sources[active_slug(repo), number].add("delivery_pr")
+        deliveries = record.get("delivery_prs")
+        if deliveries is not None:
+            if not isinstance(deliveries, list):
+                raise OwnershipError(f"child {record['task_id']} has malformed delivery_prs")
+            for delivery in deliveries:
+                repo, number = _parse_pr_ref(delivery, "task delivery_prs")
+                sources[active_slug(repo), number].add("delivery_prs")
+
+    shared_branches = {(repo, branch) for record in other_runs for repo, branch, _ in recorded_branches(record)}
+    for (repo, branch), found_via in sorted(branch_sources.items()):
+        for number in _branch_pr_numbers(repo, branch):
+            if (repo, branch) in shared_branches:
+                raise OwnershipError(f"branch {repo}:{branch} has PRs and is recorded by another run of a child task")
+            sources[repo, number].update(found_via)
+
+    pull_requests = []
+    for (repo, number), found_via in sorted(sources.items()):
+        pr = _gh_pr(repo, number, fields="number,state,headRefOid")
+        state, head = pr.get("state"), pr["headRefOid"]
+        if (
+            type(pr.get("number")) is not int or pr["number"] != number
+            or state not in ("OPEN", "CLOSED", "MERGED") or not _git_head(head)
+        ):
+            raise OwnershipError(f"{repo}#{number} returned an invalid number, state or head")
+        pull_requests.append(dict(repo=repo, number=number, state=state, head=head, found_via=sorted(found_via)))
+    return dict(task_id=task_id, run_nonce=run_nonce, pull_requests=pull_requests, residuals=[_RUN_PRS_RESIDUAL])
 
 
 def _queued_at(repo: str, number: int, head: str, base: str) -> bool | None:
@@ -1812,13 +2016,14 @@ def _usage_refusal(reason: str, usage: list[str]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Record who owns an open PR, or show whether the keeper already recorded custody.\n"
+            "Record PR ownership, check custody or list the PRs a run's child tasks touched.\n"
             "Use one accept form at a time. Not for enqueue, merge, review or CI."
         ),
         epilog=(
             "Examples:\n"
             f"  python -m {_MODULE} check\n"
             f"  python -m {_MODULE} status\n"
+            f"  .venv/bin/python -m {_MODULE} run-prs --task-id run-123 --run-nonce NONCE\n"
             f"  python -m {_MODULE} accept --pr 42 --repo OWNER/NAME\n"
             f"  {QUEUE_CUSTODY_USAGE}\n"
             f"  {RECORDED_CUSTODY_USAGE}\n"
@@ -1834,8 +2039,8 @@ def build_parser() -> argparse.ArgumentParser:
             "LEARN_UKRAINIAN_DISPATCH_TASK_ID.\n"
             "accept and queue-exit need --repo OWNER/NAME: they never act on a repository they were not told.\n"
             "Outputs: JSON on stdout (check: one line per PR without a live owner);\n"
-            "  only accept writes the shared ownership state. status adds custody and does not write it.\n"
-            "Exit codes: 0 accepted / may exit / every PR owned / status printed;\n"
+            "  accept and keeper-transfer write shared ownership state. status and run-prs are read-only.\n"
+            "Exit codes: 0 accepted / may exit / every PR owned / status or inventory printed;\n"
             "  1 refused / keep waiting / a PR is ownerless;\n"
             "  2 GitHub, task records or ownership state unreadable, an owner unobservable (unknown), or a usage\n"
             "  error such as a missing --repo.\n"
@@ -1850,6 +2055,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show waiting_for_grace, recorded_custody, unknown_evidence and outstanding alerts",
     )
     subs.add_parser("check", help="List open PRs with no live owner, counting accepted handoffs (read-only)")
+    run_prs = subs.add_parser(
+        "run-prs",
+        help="Read the live PR inventory for the child tasks of one run",
+        description=(
+            "List PRs found through direct child tasks' recorded branches, custody and deliveries.\n"
+            "Use at milestone stop to inventory PRs across the fleet. " + _RUN_PRS_RESIDUAL
+        ),
+        epilog=(
+            f"Example: .venv/bin/python -m {_MODULE} run-prs --task-id run-123 --run-nonce NONCE\n"
+            "Outputs: JSON containing pull_requests with repo, number, state, head and found_via, "
+            "plus residuals. No task or ownership state changes.\n"
+            "Exit codes: 0 inventory printed; 2 unreadable or ambiguous evidence, or invalid arguments.\n"
+            "Related: machinery issue #1413."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    run_prs.add_argument("--task-id", required=True, help="Parent task ID, e.g. run-123")
+    run_prs.add_argument("--run-nonce", required=True, help="Exact run_nonce from the parent task record")
     accept = subs.add_parser(
         "accept",
         help="Accept one owner: a successor task, queue custody, or recorded custody",
@@ -1963,8 +2186,11 @@ def _coordinator_accept(args: argparse.Namespace, path: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    path = state_path()
     try:
+        path = state_path()
+        if args.command == "run-prs":
+            print(json.dumps(_run_prs(args.task_id, args.run_nonce, path), indent=2, sort_keys=True))
+            return 0
         if args.command == "status":
             print(json.dumps(status_report(load(path)), indent=2, sort_keys=True))
             return 0
@@ -2058,7 +2284,8 @@ def main(argv: list[str] | None = None) -> int:
                              me=me, records=records, now=now)
         print(json.dumps({"may_exit": not reasons, "reasons": reasons}))
         return 1 if reasons else 0
-    except (OwnershipError, GitHubRateLimited, RuntimeError, ValueError, OSError, KeyError, TypeError) as exc:
+    except (OwnershipError, GitHubRateLimited, RuntimeError, ValueError, OSError, KeyError, TypeError,
+            subprocess.SubprocessError) as exc:
         print(f"UNKNOWN: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
