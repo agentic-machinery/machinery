@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import io
 import os
 import sys
 
@@ -48,7 +49,7 @@ def _repo_admin_cli(argv):
             code = 2
 
     # The streams have already been flushed. Prevent interpreter shutdown from replacing the result with 120.
-    sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115 - lives until exit
+    sys.stdout = sys.stderr = io.StringIO()
     return code
 
 

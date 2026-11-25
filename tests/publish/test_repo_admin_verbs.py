@@ -238,12 +238,13 @@ def test_repo_create_sends_once_and_receipt_binds_id(tmp_path):
     gh = FakeGitHub()
     result, receipt = run("repo-create", gh, repo="infra-private", name="rehearsal-1", dry_run=True)
     assert result.returncode == 0 and receipt["outcome"] == "dry-run" and gh.posts == []
+    assert receipt["preflight"]["no_visible_collisions"] == [f"{OLD}/rehearsal-1", f"{NEW}/rehearsal-1-moved"]
     result, receipt = run("repo-create", gh, repo="infra-private", name="rehearsal-1")
     assert result.returncode == 0 and receipt["outcome"] == "created"
     assert gh.posts == [(f"orgs/{OLD}/repos", {"name": "rehearsal-1", "private": True, "auto_init": True})]
     assert receipt["repository"] == {"slug": f"{OLD}/rehearsal-1", "id": 901, "private": True, "visibility": "private"}
     assert receipt["rehearsal_destination"] == f"{NEW}/rehearsal-1-moved"
-    assert receipt["principal"]["before"]["login"] == receipt["principal"]["after"]["login"] == PRINCIPAL
+    assert receipt["principal"]["before"] == receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
     files = sorted(state_dir(tmp_path).glob("repo-create-rehearsal-1-*.json"))
     assert len(files) == 2 and all(path.stat().st_mode & 0o777 == 0o600 for path in files)
     assert json.loads(files[-1].read_text()) == receipt
@@ -383,6 +384,7 @@ def test_transfer_sends_once_and_verifies_exact_readback(tmp_path, monkeypatch):
     gh = FakeGitHub()
     result, receipt = run("repo-transfer", gh, repo="infra-private", dry_run=True)
     assert result.returncode == 0 and gh.posts == [] and not journal(tmp_path).exists()
+    assert receipt["preflight"]["no_visible_collisions"] == [DESTINATION]
     with monkeypatch.context() as patch:
         patch.setattr(pub, "_write_transfer_receipt", lambda sink, receipt: False)
         result, receipt = run("repo-transfer", gh, repo="infra-private", dry_run=True)
@@ -390,7 +392,8 @@ def test_transfer_sends_once_and_verifies_exact_readback(tmp_path, monkeypatch):
     result, receipt = run("repo-transfer", gh, repo="infra-private")
     assert result.returncode == 0 and receipt["outcome"] == "transferred"
     assert gh.posts == [(f"repos/{SOURCE}/transfer", {"new_owner": NEW, "new_name": "infra-next"})]
-    assert gh.find(DESTINATION)["id"] == REPO_ID and receipt["principal"]["after"]["login"] == PRINCIPAL
+    assert gh.find(DESTINATION)["id"] == REPO_ID
+    assert receipt["principal"]["before"] == receipt["principal"]["after"] == {"login": PRINCIPAL, "id": 7}
     assert not journal(tmp_path).exists()
     with monkeypatch.context() as patch:
         patch.setattr(pub, "_write_transfer_receipt", lambda sink, receipt: False)
@@ -638,7 +641,7 @@ def test_rehearsal_transfer_bound_to_create_receipt(tmp_path, tamper, reason):
 
 @pytest.mark.parametrize("verb", ["repo-create", "repo-transfer"])
 def test_help_documents_examples_outputs_and_exit_codes(capsys, verb):
-    """Defect class: --help drifting from the CLI help standard (no examples, outputs, exit codes or option help)."""
+    """Check the CLI help standard and that successful in-process calls write to the caller's streams."""
     with pytest.raises(SystemExit) as exit_:
         pub.main([verb, "--help"])
     out = capsys.readouterr().out
@@ -648,6 +651,18 @@ def test_help_documents_examples_outputs_and_exit_codes(capsys, verb):
     ):
         assert section in out
     assert "omitted by default" not in out
+    assert "run as the destination organization owner" in out
+    assert "every repository in that organization" in out
+    assert "visible collisions only" in out
+    with pytest.raises(SystemExit) as exit_:
+        pub.main(["ruleset-merge-queue", "--invalid"])
+    assert exit_.value.code == 2 and "invalid publisher arguments" in capsys.readouterr().err
+    gh = FakeGitHub()
+    argv = [verb, "--repo", "infra-private", "--principal", PRINCIPAL, *(["--name", "rehearsal-1"] if verb == "repo-create" else [])]
+    for extra, outcome in ((["--dry-run"], "dry-run"), ([], "created" if verb == "repo-create" else "transferred")):
+        assert pub.main([*argv, *extra], runner=gh) == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out)["outcome"] == outcome and f"{verb}: receipt " in captured.err
 
 
 @pytest.mark.parametrize("verb,fields,lock", [

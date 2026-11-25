@@ -316,9 +316,11 @@ credential override (`GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_
 the account's password-database home
 (`gh` reads its stored login through it, and the client its rate-limit budget), and verify the
 `--principal` the operator names with `GET /user` through the same `gh` credential before and after the
-mutation. The marker refusal
+mutation. Both reads must report the same login and account id. The marker refusal
 stops accidents; it is not authentication, because a worker can drop its own markers. Both verbs need
 `LU_PRODUCT_ROOT` set to the product checkout, which their private state directory must stay outside.
+Run both verbs as the destination organization owner with a stored `gh` token that can read every
+repository in that organization. The destination lookup checks for visible collisions only.
 Run `.venv/bin/python -m lu_machinery.publish <verb> --help` for the checks, receipts and exit codes.
 The exit codes apply to that module entry point. After an interruption, check GitHub for the fixture
 name before trying another create, or rerun the transfer command to reconcile its journal.
