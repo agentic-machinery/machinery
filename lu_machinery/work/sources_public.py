@@ -91,7 +91,10 @@ def _authoritative_delegate_repository(row: dict[str, Any]) -> str | None:
         raw = row.get(attr_name)
         if raw is None or raw == "":
             continue
-        text = str(raw).strip()
+        raw_text = str(raw)
+        if not raw_text.isascii():
+            return None
+        text = raw_text.strip()
         if not text:
             continue
         claimed.append(text)

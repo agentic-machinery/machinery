@@ -12,29 +12,24 @@ from lu_machinery.work import SOURCE_PUBLIC, WORK_ID_PREFIX
 # partition. ``\s*(?::\s*)?`` is the same language — whitespace, then an optional
 # colon and the whitespace after it — and that failure is linear.
 _SUPERSEDED_BY_RE = re.compile(
-    r"(?:superseded[- ]?by|replaced[- ]?by|obsoleted[- ]?by)"
-    r"\s*(?::\s*)?#(\d+)",
-    re.IGNORECASE,
+    r"(?ai:superseded[- ]?by|replaced[- ]?by|obsoleted[- ]?by)"
+    r"[ \t\r\n]*(?::[ \t\r\n]*)?#([0-9]+)(?!\w)",
 )
 _SUPERSEDES_RE = re.compile(
-    r"(?:supersedes|replaces|obsoletes)"
-    r"\s*(?::\s*)?#(\d+)",
-    re.IGNORECASE,
+    r"(?ai:supersedes|replaces|obsoletes)"
+    r"[ \t\r\n]*(?::[ \t\r\n]*)?#([0-9]+)(?!\w)",
 )
 _DUPLICATE_RE = re.compile(
-    r"(?:duplicate of|duplicates)"
-    r"\s*(?::\s*)?#(\d+)",
-    re.IGNORECASE,
+    r"(?ai:duplicate of|duplicates)"
+    r"[ \t\r\n]*(?::[ \t\r\n]*)?#([0-9]+)(?!\w)",
 )
 _BLOCKS_RE = re.compile(
-    r"(?:blocks)"
-    r"\s*(?::\s*)?#(\d+)",
-    re.IGNORECASE,
+    r"(?ai:blocks)"
+    r"[ \t\r\n]*(?::[ \t\r\n]*)?#([0-9]+)(?!\w)",
 )
 _BLOCKED_BY_RE = re.compile(
-    r"(?:blocked by|depends on|waiting on)"
-    r"\s*(?::\s*)?#(\d+)",
-    re.IGNORECASE,
+    r"(?ai:blocked by|depends on|waiting on)"
+    r"[ \t\r\n]*(?::[ \t\r\n]*)?#([0-9]+)(?!\w)",
 )
 
 
@@ -55,14 +50,16 @@ def issue_work_id(repository_id: str, number: int | str) -> str:
 
 def parse_issue_work_id(work_id: str | None) -> tuple[str, int] | None:
     """Parse an issue work_id into (repository_id, issue_number)."""
-    if not work_id or not isinstance(work_id, str):
+    if not work_id or not isinstance(work_id, str) or not work_id.isascii():
         return None
     parts = work_id.split(":")
     if len(parts) == 5 and parts[0] == WORK_ID_PREFIX and parts[1] == SOURCE_PUBLIC and parts[3] == "issue":
-        try:
-            return parts[2], int(parts[4])
-        except ValueError:
+        from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
+        number = parse_ascii_positive_int(parts[4])
+        if number is None:
             return None
+        return parts[2], number
     return None
 
 
@@ -262,12 +259,19 @@ def resolve_live_blockers(
         if item.get("resource_kind") == "issue"
     }
     if target_lifecycle_by_id:
+        from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
+
         for k, v in target_lifecycle_by_id.items():
             state = str(v or "").lower()
             lifecycle_by_id[k] = state
-            if isinstance(k, int) or (isinstance(k, str) and k.isdigit()):
+            if isinstance(k, int) and not isinstance(k, bool):
                 lifecycle_by_id[str(k)] = state
-                lifecycle_by_id[int(k)] = state
+                lifecycle_by_id[k] = state
+            elif isinstance(k, str):
+                parsed_k = parse_ascii_positive_int(k)
+                if parsed_k is not None:
+                    lifecycle_by_id[str(parsed_k)] = state
+                    lifecycle_by_id[parsed_k] = state
 
     for item in items:
         if item.get("resource_kind") != "issue":

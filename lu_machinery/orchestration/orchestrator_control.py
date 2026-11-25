@@ -54,7 +54,7 @@ TASK_STATUS_ATTENTION = {
 }
 TASK_STATUS_ACTIVE = {"running", "spawning"}
 TASK_STATUS_TERMINAL = TASK_STATUS_ATTENTION | {"done"}
-PR_URL_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+")
+PR_URL_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*(?!\w)")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 

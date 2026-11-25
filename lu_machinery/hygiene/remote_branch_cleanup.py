@@ -280,8 +280,9 @@ def read_candidate(api: GitHub, name: str) -> Candidate:
 def eligible(candidate: Candidate, evidence: Evidence, repo: str, now: datetime) -> bool:
     if now.tzinfo != UTC:
         raise Unknown("clock must be UTC")
+    normalized_repo = repository(repo).lower()
     excluded = {"main", evidence.default} | evidence.keep | evidence.protected
-    excluded |= {ref for _, owner, ref, _, _ in evidence.prs if owner == repo.lower()}
+    excluded |= {ref for _, owner, ref, _, _ in evidence.prs if owner == normalized_repo}
     excluded |= {base for _, _, _, _, base in evidence.prs}
     return (
         candidate.name not in excluded

@@ -38,6 +38,7 @@ from lu_machinery.opsec.prepublish import (
     catalog as prepublish_catalog,
 )
 from lu_machinery.orchestration import pr_ownership
+from lu_machinery.orchestration.fleet_repos import ascii_repo_slug, parse_ascii_positive_int
 from lu_machinery.orchestration.integration_sweep import (
     COMMENTS_UNAVAILABLE,
     NEEDS_COVERAGE,
@@ -1394,12 +1395,12 @@ def _load(path: Path) -> dict[str, Any]:
         or not isinstance(data.get("defect_reports", {}), dict)
         or not isinstance(data.get("tracked", {}), dict)
         or not all(
-            isinstance(k, str) and k.isdigit() and isinstance(v, dict)
+            isinstance(k, str) and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
             for k, v in data.get("tracked", {}).items()
         )
         or not isinstance(data.get("pending_closeout", {}), dict)
         or not all(
-            isinstance(k, str) and k.isdigit() and isinstance(v, dict)
+            isinstance(k, str) and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
             for k, v in data.get("pending_closeout", {}).items()
         )
         or not isinstance(data.get("hold_alerts", {}), dict)
@@ -1410,12 +1411,12 @@ def _load(path: Path) -> dict[str, Any]:
         or not isinstance(data.get("base_ci_alerts", {}), dict)
         or not isinstance(data.get("report_heads", {}), dict)
         or not all(
-            isinstance(k, str) and k.isdigit() and isinstance(v, str) and SHA.fullmatch(v)
+            isinstance(k, str) and parse_ascii_positive_int(k) is not None and isinstance(v, str) and SHA.fullmatch(v)
             for k, v in data.get("report_heads", {}).items()
         )
         or not isinstance(data.get("repaired_reenqueues", {}), dict)
         or not all(
-            isinstance(k, str) and k.isdigit() and isinstance(v, dict)
+            isinstance(k, str) and parse_ascii_positive_int(k) is not None and isinstance(v, dict)
             for k, v in data.get("repaired_reenqueues", {}).items()
         )
         or not all(isinstance(data.get(name, {}), dict) for name in REQUEUE_STATE)
@@ -1814,7 +1815,8 @@ def _default_repair_proof(
             and receipt.get("state") == "consumed"
             and receipt.get("candidate_head") == head
             and receipt.get("pr") == number
-            and str(receipt.get("repository", "")).casefold() == canonical_repo.casefold()
+            and (receipt_repo := ascii_repo_slug(receipt.get("repository"), strip=False)) is not None
+            and receipt_repo == ascii_repo_slug(canonical_repo, strip=False)
             and _str_in(receipt.get("approved_head"), ejected_set)
         ):
             return "repair-verified"
@@ -1961,7 +1963,9 @@ def _queue_cto_report(previous: dict[str, Any], kind: str, key: str, body: str) 
 
 def _canonical_slug(repository: str) -> str:
     normalized = normalize_repository(repository)
-    return normalized.split("/", 1)[1] if normalized != "unknown" else repository.strip().casefold()
+    if normalized != "unknown":
+        return normalized.split("/", 1)[1]
+    return repository.strip().casefold() if isinstance(repository, str) and repository.isascii() else "unknown"
 
 
 def _queue_hold_alert(
@@ -2081,12 +2085,12 @@ def _reconcile_closed_tracked(
             )
     candidates: dict[str, dict[str, Any]] = {}
     for key, entry in tracked.items():
-        if not isinstance(key, str) or not key.isdigit():
+        if not isinstance(key, str) or parse_ascii_positive_int(key) is None:
             continue
         if key not in open_numbers or (isinstance(entry, dict) and entry.get("status") == "merge-sent"):
             candidates[key] = dict(entry) if isinstance(entry, dict) else {"number": int(key)}
     for key, entry in pending.items():
-        if not isinstance(key, str) or not key.isdigit():
+        if not isinstance(key, str) or parse_ascii_positive_int(key) is None:
             continue
         if key not in open_numbers:
             candidates.setdefault(key, dict(entry) if isinstance(entry, dict) else {"number": int(key)})
@@ -2478,7 +2482,7 @@ def _repeat_kind(line: str) -> str:
     if line.startswith("merge queue keeper: slow mode,"):
         return "steady"
     number, _, rest = line.partition(" ")
-    if not (number.startswith("#") and number[1:].isdigit() and rest):
+    if not (number.startswith("#") and parse_ascii_positive_int(number[1:]) is not None and rest):
         return "once"
     if rest.startswith("FAILED:") or rest == "squash text unverified":
         return "error"
@@ -2905,7 +2909,11 @@ def run(
                 old_head = str(custody["head"])
                 if custody["keeper_state"] == "repair":
                     custody_error = "repair-custody"
-                elif custody["repository"].casefold() != canonical_repo.casefold() or custody["base"] != base_name:
+                elif (
+                    (custody_repo := ascii_repo_slug(custody.get("repository"), strip=False)) is None
+                    or custody_repo != ascii_repo_slug(canonical_repo, strip=False)
+                    or custody["base"] != base_name
+                ):
                     custody_error = "custody-mismatch"
                 elif custody["head"] != head:
                     custody_error = "head-moved"
@@ -3264,7 +3272,11 @@ def run(
                 mq_old_head = str(mq_custody["head"])
                 if mq_custody["keeper_state"] == "repair":
                     mq_custody_error = "repair-custody"
-                elif mq_custody["repository"].casefold() != canonical_repo.casefold() or mq_custody["base"] != base_name:
+                elif (
+                    (mq_custody_repo := ascii_repo_slug(mq_custody.get("repository"), strip=False)) is None
+                    or mq_custody_repo != ascii_repo_slug(canonical_repo, strip=False)
+                    or mq_custody["base"] != base_name
+                ):
                     mq_custody_error = "custody-mismatch"
                 elif mq_custody["head"] != head or (
                     mq_custody["review_classification"] == "verdict"

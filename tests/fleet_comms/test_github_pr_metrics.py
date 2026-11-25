@@ -180,3 +180,39 @@ def test_first_review_wait_requires_an_intact_exact_head_publication(forge, monk
     assert output["first_exact_head_review_wait_seconds"] == {
         "source_ok": True, "n": 1, "gauge": {"median": 20, "p90": 20},
     }
+
+
+def test_github_pr_metrics_rejects_non_ascii_repo_and_publisher_login():
+    """Defect class: Kelvin-sign look-alike nameWithOwner or login passes casefold check in PR metrics."""
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from lu_machinery.fleet_comms import github_pr_metrics as gpm
+
+    class LookalikeClient:
+        def request(self, *_a, **_kw):
+            return SimpleNamespace(
+                error=None,
+                stale=False,
+                value={
+                    "data": {
+                        "repository": {
+                            "nameWithOwner": "learn-u\u212arainian/machinery",
+                            "pullRequests": {"totalCount": 0, "nodes": [], "pageInfo": {"hasNextPage": False}},
+                        }
+                    }
+                },
+            )
+
+    with pytest.raises(gpm.SourceUnavailable, match="merged_pr_repository_mismatch"):
+        gpm._merged_cohort("learn-ukrainian/machinery", datetime(2026, 11, 25, tzinfo=UTC), LookalikeClient())
+
+    created = "2026-11-25T10:00:00Z"
+    merged = datetime(2026, 11, 25, 11, 0, tzinfo=UTC)
+    wait = gpm._first_review_wait(
+        [{"user": {"login": "\u212arisz"}, "author_association": "MEMBER", "body": "", "created_at": created, "updated_at": created}],
+        "learn-ukrainian/machinery",
+        {"number": 1, "createdAt": created, "mergedAt": merged},
+        "krisz",
+    )
+    assert wait is None

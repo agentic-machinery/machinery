@@ -80,6 +80,8 @@ def _git(cwd: Path, *args: str) -> str:
 
 def _repository_slug(remote: str) -> str:
     """Return only owner/name, never a credential-bearing remote URL."""
+    if not isinstance(remote, str) or not remote.isascii():
+        raise RepositoryAuthorityError("origin remote contains non-ASCII characters")
     value = remote.strip()
     parsed = urlparse(value)
     if parsed.scheme:

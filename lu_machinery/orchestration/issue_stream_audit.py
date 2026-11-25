@@ -68,8 +68,8 @@ def default_registry_path() -> Path:
     if REGISTRY_PATH != _PACKAGED_REGISTRY_PATH:
         return REGISTRY_PATH
     return profile.config_path("issue_streams", default=_PACKAGED_REGISTRY_PATH)
-ISSUE_REF_RE = re.compile(r"#(\d{2,6})\b")
-ISSUE_RANGE_RE = re.compile(r"#(\d{2,6})\s*[–-]\s*#(\d{2,6})\b")
+ISSUE_REF_RE = re.compile(r"#([0-9]{2,6})(?!\w)")
+ISSUE_RANGE_RE = re.compile(r"#([0-9]{2,6})[ \t\r\n]*[–-][ \t\r\n]*#([0-9]{2,6})(?!\w)")
 CONFIRMED_AT_RE = re.compile(r"\bconfirmed-at\s*:\s*(\d{4}-\d{2}-\d{2})\b", re.IGNORECASE)
 MILESTONE_MARKER_RE = re.compile(r"\b(STALE|VACANT)\b", re.IGNORECASE)
 DEFAULT_MAX_CONFIRMED_AGE_DAYS = 14
@@ -1030,15 +1030,18 @@ def milestone_warnings(
 
 def resolve_audit_repo(repo: str) -> fleet_repos.ActiveFleetRepo:
     """Resolve ``--repo`` (fleet key or active owner/name) through the A01 resolver."""
-    if not isinstance(repo, str) or not repo.strip():
-        raise ValueError("audit repository must be non-empty")
+    if not isinstance(repo, str) or not repo.isascii() or not repo.strip():
+        raise ValueError("audit repository must be non-empty ASCII")
     raw = repo.strip()
     catalog = fleet_repos.load_fleet_repos()
     active = fleet_repos.resolve_active_fleet_repo(raw, repos=catalog)
-    if "/" in raw and active.active_github.casefold() != raw.casefold():
-        raise ValueError(
-            f"audit repository {raw!r} is not the active fleet slug ({active.active_github!r})"
-        )
+    if "/" in raw:
+        raw_slug = fleet_repos.ascii_repo_slug(raw, strip=False)
+        active_slug = fleet_repos.ascii_repo_slug(active.active_github, strip=False)
+        if raw_slug is None or active_slug is None or active_slug != raw_slug:
+            raise ValueError(
+                f"audit repository {raw!r} is not the active fleet slug ({active.active_github!r})"
+            )
     return active
 
 
@@ -1576,7 +1579,11 @@ def _tree_membership(
                         if not (isinstance(node, dict) and _is_positive_int(node.get("number"))):
                             continue
                         node_repo = (node.get("repository") or {}).get("nameWithOwner")
-                        if repo_slug and isinstance(node_repo, str) and node_repo.casefold() != repo_slug.casefold():
+                        expected_slug = fleet_repos.ascii_repo_slug(repo_slug, strip=False) if repo_slug else None
+                        node_slug = fleet_repos.ascii_repo_slug(node_repo, strip=False) if isinstance(node_repo, str) else None
+                        if repo_slug and isinstance(node_repo, str) and (
+                            expected_slug is None or node_slug is None or node_slug != expected_slug
+                        ):
                             if warnings is not None:
                                 warnings.append(
                                     {
@@ -1926,7 +1933,9 @@ def run_audit(
         root = product_root(repo_root)
         cache_path = state_root() / "batch_state/issue_stream_audit.json"
         repository = "/".join(_repo_owner_name(root))
-        if repository.casefold() != github_slug().casefold():
+        repo_norm = fleet_repos.ascii_repo_slug(repository, strip=False)
+        expected_norm = fleet_repos.ascii_repo_slug(github_slug(), strip=False)
+        if repo_norm is None or expected_norm is None or repo_norm != expected_norm:
             raise ValueError("audit repository does not match the shared stream registry")
         registry = load_registry(default_registry_path(), audit_only=True)
         open_issues = fetch_open_issues(root)
@@ -1956,7 +1965,9 @@ def run_audit(
     is_default = active.repo.default
     audit_cwd = product_root(repo_root) if is_default else (repo_root if repo_root is not None else Path.cwd())
     observed = "/".join(_repo_owner_name(audit_cwd, repo_slug=target_slug))
-    if observed.casefold() != target_slug.casefold():
+    observed_norm = fleet_repos.ascii_repo_slug(observed, strip=False)
+    target_norm = fleet_repos.ascii_repo_slug(target_slug, strip=False)
+    if observed_norm is None or target_norm is None or observed_norm != target_norm:
         raise ValueError(f"audit repository {observed!r} does not match expected active slug {target_slug!r}")
     repo_key = None if is_default else active.repo.key
     registry = load_registry(default_registry_path(), audit_only=True, repo=repo_key)
@@ -2142,7 +2153,7 @@ def _valid_membership_index(index: object) -> bool:
     if not isinstance(index, dict):
         return False
     for key, entry in index.items():
-        if not (isinstance(key, str) and key.isdigit() and int(key) > 0):
+        if not isinstance(key, str) or fleet_repos.parse_ascii_positive_int(key) is None:
             return False
         if not _valid_membership_entry(entry):
             return False
@@ -2342,7 +2353,8 @@ def make_issue_resolver(report: dict) -> Callable[[str], bool]:
     index = report.get("effective_membership") or {}
 
     def _resolve(ref: str) -> bool:
-        if not (ref.isdigit() and int(ref) in open_set):
+        parsed = fleet_repos.parse_ascii_positive_int(ref) if isinstance(ref, str) else None
+        if parsed is None or parsed not in open_set:
             return False
         entry = index.get(ref)
         return isinstance(entry, dict) and bool(entry.get("unique_stream"))

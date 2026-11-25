@@ -525,3 +525,27 @@ def test_no_bulk_root_means_no_local_deletion(
     assert bundle.read_bytes() == b"not read: the bulk root is checked first"
     assert receipts.read_text() == '{"event":"earlier"}\n'
     assert not empty_root.joinpath(sweep.BULK_ARCHIVE_DIR).exists()
+
+
+def test_branch_sweep_and_remote_cleanup_refuse_non_ascii_slugs_and_digits():
+    """Defect class: non-ASCII digits, Kelvin-sign look-alikes, or NBSP pass branch-sweep or remote-cleanup checks."""
+    from datetime import UTC, datetime, timedelta
+
+    from lu_machinery.hygiene import remote_branch_cleanup as rbc
+
+    assert sweep._ISSUE_NUMBER_RE.findall("420 \u0664\u0662\u0660 42\u0660") == ["420"]
+    assert sweep._COMMIT_ISSUE_RE.findall("#420 #\u0664\u0662\u0660 #42\u0660") == ["420"]
+    assert sweep._MERGE_SUBJECT_RE.match("Merge pull request #\u0664\u0662 from o/b") is None
+    assert sweep._SQUASH_SUBJECT_RE.search("feat: x (#\u0664\u0662)") is None
+    assert sweep._closes_issue("Fixes learn-ukrainian/machinery#42", 42) is True
+    assert sweep._closes_issue("Fixes learn-u\u212arainian/machinery#42", 42) is False
+    assert sweep._closes_issue("Fixes #42\u0660", 42) is False
+    assert sweep._same_origin_repository(
+        {"repository": {"full_name": "learn-u\u212arainian/machinery"}}, ("learn-ukrainian", "machinery")
+    ) is False
+
+    now = datetime(2026, 11, 25, tzinfo=UTC)
+    candidate = rbc.Candidate("topic", "a" * 40, now - timedelta(days=5), False)
+    evidence = rbc.Evidence("main", "a" * 40, "b" * 40, frozenset(), frozenset(), frozenset())
+    with pytest.raises(rbc.Unknown, match="invalid repository identity"):
+        rbc.eligible(candidate, evidence, "learn-u\u212arainian/machinery", now)

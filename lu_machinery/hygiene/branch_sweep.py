@@ -58,10 +58,10 @@ def _mod(*parts: str) -> str:
 AGENTS = frozenset({"codex", "claude", "grok", "agy", "kimi", "cursor", "deepseek", "gemini", "glm"})
 PROTECTED = frozenset({"main", "master", "gh-pages", "production"})
 SHA_RE = re.compile(r"[0-9a-f]{40,64}\Z")
-_ISSUE_NUMBER_RE = re.compile(r"(?<!\d)(\d{3,})(?!\d)")
-_COMMIT_ISSUE_RE = re.compile(r"(?<![A-Za-z0-9])#(\d{3,})(?!\d)")
-_MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #(\d+)\b")
-_SQUASH_SUBJECT_RE = re.compile(r"\(#(\d+)\)\s*$")
+_ISSUE_NUMBER_RE = re.compile(r"(?<!\d)([0-9]{3,})(?!\d)")
+_COMMIT_ISSUE_RE = re.compile(r"(?<![A-Za-z0-9])#([0-9]{3,})(?!\d)")
+_MERGE_SUBJECT_RE = re.compile(r"^Merge pull request #([0-9]+)(?!\w)")
+_SQUASH_SUBJECT_RE = re.compile(r"\(#([0-9]+)\)[ \t\r\n]*$")
 _HTTP_STATUS_RE = re.compile(r"HTTP/\d+(?:\.\d+)?\s+(\d+)")
 _CLOCK_SKEW = timedelta(seconds=10)
 LEDGER_PATH = Path("batch_state") / "branch-archive" / "evidence.jsonl"
@@ -606,7 +606,7 @@ def _parse_github_time(value: object) -> datetime | None:
 def _closes_issue(text: str, issue: int) -> bool:
     return (
         re.search(
-            rf"(?i)\b(?:close[ds]?|fix(?:e[ds])?|resolve[ds]?)\s*:?\s+"
+            rf"(?ai:\b(?:close[ds]?|fix(?:e[ds])?|resolve[ds]?))[ \t\r\n]*:?[ \t\r\n]+"
             rf"(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#{issue}(?!\d)",
             text,
         )
@@ -637,10 +637,11 @@ def _timeline_repository(item: dict[str, object]) -> str | None:
 
 
 def _same_origin_repository(item: dict[str, object], origin: tuple[str, str]) -> bool:
-    slug = _timeline_repository(item)
-    if slug is None:
-        return False
-    return slug.casefold() == f"{origin[0]}/{origin[1]}".casefold()
+    from lu_machinery.orchestration.fleet_repos import ascii_repo_slug
+
+    slug = ascii_repo_slug(_timeline_repository(item), strip=False)
+    expected = ascii_repo_slug(f"{origin[0]}/{origin[1]}", strip=False)
+    return slug is not None and expected is not None and slug == expected
 
 
 def _split_http(raw: str) -> tuple[str, str] | None:

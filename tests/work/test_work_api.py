@@ -1818,3 +1818,27 @@ def test_merge_qualification_adds_no_network_and_keeps_timeouts(monkeypatch):
     assert work_router.TIMEOUT_S == 5.0
     assert work_router.NEXT_BUILD_TIMEOUT_S == 20.0
     assert projection["budget"]["timeout_s"] == 5
+
+
+def test_work_sources_and_relations_refuse_non_ascii_slugs_and_digits():
+    """Defect class: NBSP-padded delegate repos or Unicode issue digits bypass work projection and relation parsers."""
+    from lu_machinery.work import relations, sources_public
+
+    assert sources_public._authoritative_delegate_repository({"repository_id": "\u00a0learn-ukrainian/machinery"}) is None
+    assert sources_public._authoritative_delegate_repository({"repository": "learn-u\u212arainian/machinery"}) is None
+
+    assert relations._BLOCKED_BY_RE.findall("blocked by #42 blocked by #\u0664\u0662 blocked by #4\u0662") == ["42"]
+    valid_wid = relations.issue_work_id("learn-ukrainian/machinery", 42)
+    assert relations.parse_issue_work_id(valid_wid) == ("learn-ukrainian/machinery", 42)
+    assert relations.parse_issue_work_id(relations.issue_work_id("learn-ukrainian/machinery", "\u0664\u0662")) is None
+    assert relations.parse_issue_work_id(relations.issue_work_id("learn-u\u212arainian/machinery", 42)) is None
+
+    items = [{
+        "work_id": relations.issue_work_id("learn-ukrainian/machinery", 10),
+        "resource_kind": "issue",
+        "lifecycle": "open",
+        "relationships": [{"type": "blocked_by", "target_id": valid_wid}],
+        "has_blocker": True,
+    }]
+    relations.resolve_live_blockers(items, target_lifecycle_by_id={"\u0664\u0662": "closed"})
+    assert items[0]["has_blocker"] is True

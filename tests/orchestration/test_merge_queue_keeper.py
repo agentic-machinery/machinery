@@ -2194,3 +2194,15 @@ def test_many_shard_jobs_of_one_run_with_no_failing_test_node_produce_one_report
     run(fake, path, monkeypatch)
     again = _bodies("No failing test node was read")
     assert len(again) == 1 and again[0]["key"] == infra[0]["key"] and again[0]["body"] == body
+
+
+def test_merge_queue_keeper_refuses_non_ascii_pr_keys_and_slugs(tmp_path):
+    """Defect class: Unicode-digit state keys or non-ASCII slugs bypass keeper state and canonical slug guards."""
+    bad_state = tmp_path / "state.json"
+    bad_state.write_text(json.dumps({"queued": {}, "tracked": {"\u0664\u0662": {"head": "a" * 40}}}))
+    with pytest.raises(keeper.KeeperError, match="malformed"):
+        keeper._load(bad_state)
+    assert keeper._canonical_slug("learn-u\u212arainian/machinery") == "unknown"
+    assert keeper._canonical_slug("\u00a0learn-ukrainian/machinery") == "unknown"
+    assert keeper._repeat_kind("#42 remains queued") == "steady"
+    assert keeper._repeat_kind("#\u0664\u0662 remains queued") == "once"
