@@ -5,11 +5,14 @@ from __future__ import annotations
 import os
 import stat
 import threading
+import uuid
 from collections import OrderedDict
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
 from lu_machinery.common.repo_root import MachineryConfigError, state_root
+from lu_machinery.common.safe_open import UnsafeEntryError, safe_open_below
 
 # Keep one version per path, including foreign-file classifications. Entry and
 # content caps bound retention; an evicted version is an ordinary cache miss.
@@ -132,17 +135,49 @@ def _is_flat_task_store_dir(directory: Path, forbidden_dirs: set[Path]) -> bool:
     return parts[-2:] == ("batch_state", "tasks") or parts[-3:] == ("batch_state", "tasks", "archive")
 
 
-def is_direct_task_store_path(path: Path, *, store_dir: Path | None = None) -> bool:
-    """Whether ``path`` targets the flat task-record store or its archive directly.
+def _lexical_candidates(path: Path) -> list[Path]:
+    """Return normalized lexical forms of ``path`` plus any unresolved symlink hops.
 
-    Every task-store reader scans ``tasks_dir/*.json`` and ``tasks_dir/archive/*.json``
-    as dispatch task records. Non-record tool files belong in a subdirectory such as
-    ``<task-id>.artifacts/`` rather than directly inside those two directories.
-
-    Resolves both the path's parent directory and the target path itself via
-    ``os.path.realpath`` so symlinked directories into the task store, symlink
-    files pointing into or out of the task store, and ``..`` traversals are all caught.
+    Preserving lexical directory spellings keeps the ``batch_state/tasks`` fallback
+    effective even when a conventional store directory is itself a symlink to a
+    differently named backing directory and no state root is configured.
     """
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    current = Path(os.path.normpath(os.path.abspath(path)))
+    for _ in range(40):
+        if current in seen:
+            break
+        seen.add(current)
+        candidates.append(current)
+        if not os.path.islink(current):
+            break
+        try:
+            raw_target = os.readlink(current)
+        except OSError:
+            break
+        target = Path(raw_target)
+        if not target.is_absolute():
+            target = current.parent / target
+        current = Path(os.path.normpath(os.path.abspath(target)))
+    return candidates
+
+
+def _add_store_root(forbidden_dirs: set[Path], root: Path) -> None:
+    lexical = Path(os.path.normpath(os.path.abspath(root)))
+    real = Path(os.path.realpath(root))
+    forbidden_dirs.update(
+        (
+            lexical,
+            lexical / "archive",
+            real,
+            real / "archive",
+            Path(os.path.realpath(root / "archive")),
+        )
+    )
+
+
+def _forbidden_task_store_dirs(path: Path, *, store_dir: Path | None = None) -> tuple[set[Path], list[Path]]:
     configured: Path | None
     if store_dir is not None:
         configured = store_dir
@@ -153,17 +188,35 @@ def is_direct_task_store_path(path: Path, *, store_dir: Path | None = None) -> b
             configured = None
     forbidden_dirs: set[Path] = set()
     if configured is not None:
-        root = Path(os.path.realpath(configured))
-        forbidden_dirs.add(root)
-        forbidden_dirs.add(root / "archive")
-        forbidden_dirs.add(Path(os.path.realpath(configured / "archive")))
+        _add_store_root(forbidden_dirs, configured)
+    lexical_paths = _lexical_candidates(path)
+    for candidate in lexical_paths:
+        for ancestor in (candidate, *candidate.parents):
+            if ancestor.parts[-2:] == ("batch_state", "tasks"):
+                _add_store_root(forbidden_dirs, ancestor)
+    return forbidden_dirs, lexical_paths
+
+
+def is_direct_task_store_path(path: Path, *, store_dir: Path | None = None) -> bool:
+    """Whether ``path`` targets the flat task-record store or its archive directly.
+
+    Every task-store reader scans ``tasks_dir/*.json`` and ``tasks_dir/archive/*.json``
+    as dispatch task records. Non-record tool files belong in a subdirectory such as
+    ``<task-id>.artifacts/`` rather than directly inside those two directories.
+
+    Checks lexical normalized spellings (including unresolved symlink hops), the
+    resolved parent directory, and the resolved target path so symlinked store
+    directories, symlink files pointing into or out of the store, and ``..``
+    traversals are all caught both with and without a configured state root.
+    """
+    forbidden_dirs, lexical_paths = _forbidden_task_store_dirs(path, store_dir=store_dir)
     resolved_parent = Path(os.path.realpath(path.parent))
     resolved_target = Path(os.path.realpath(path))
-    return (
-        _is_flat_task_store_dir(resolved_parent, forbidden_dirs)
-        or _is_flat_task_store_dir(resolved_target.parent, forbidden_dirs)
-        or _is_flat_task_store_dir(resolved_target, forbidden_dirs)
-    )
+    directories = [resolved_parent, resolved_target.parent, resolved_target]
+    for candidate in lexical_paths:
+        directories.append(candidate.parent)
+        directories.append(candidate)
+    return any(_is_flat_task_store_dir(directory, forbidden_dirs) for directory in directories)
 
 
 def require_not_direct_task_store_path(
@@ -175,3 +228,92 @@ def require_not_direct_task_store_path(
             f"task_store_direct_write_refused: refusing to write {label} directly in the task store "
             f"({path}); write it under <task>.artifacts/ instead"
         )
+
+
+def _dir_fd_path(dir_fd: int, fallback: Path) -> Path:
+    """Canonical path of an open directory descriptor."""
+    try:
+        return Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+    except OSError:
+        return Path(os.path.realpath(fallback))
+
+
+def open_verified_non_task_store_dir(
+    path: Path, *, label: str = "non-record file", store_dir: Path | None = None, create: bool = True,
+) -> tuple[int, Path, str]:
+    """Validate ``path``, open its parent directory fd, re-verify the opened fd, and return ``(dir_fd, dir_path, name)``."""
+    require_not_direct_task_store_path(path, label=label, store_dir=store_dir)
+    name = path.name
+    if not name or name in {".", ".."}:
+        raise ValueError(
+            f"task_store_direct_write_refused: invalid {label} filename ({path}); "
+            "write it under <task>.artifacts/ instead"
+        )
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        verified_dir = _dir_fd_path(dir_fd, path.parent)
+        forbidden_dirs, _ = _forbidden_task_store_dirs(path, store_dir=store_dir)
+        dir_stat = os.fstat(dir_fd)
+        is_forbidden = _is_flat_task_store_dir(verified_dir, forbidden_dirs)
+        if not is_forbidden:
+            for forbidden in forbidden_dirs:
+                try:
+                    if os.path.samestat(dir_stat, os.stat(forbidden)):
+                        is_forbidden = True
+                        break
+                except OSError:
+                    continue
+        if is_forbidden:
+            raise ValueError(
+                f"task_store_direct_write_refused: refusing to write {label} directly in the task store "
+                f"({verified_dir / name}); write it under <task>.artifacts/ instead"
+            )
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd, verified_dir, name
+
+
+def write_non_task_store_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    label: str = "non-record file",
+    mode: int = 0o600,
+    fsync: bool = False,
+    store_dir: Path | None = None,
+) -> Path:
+    """Atomically write ``payload`` into a verified non-task-store directory without following destination symlinks.
+
+    Returns the canonical path bound to the opened parent directory descriptor.
+    """
+    dir_fd, verified_dir, name = open_verified_non_task_store_dir(
+        path, label=label, store_dir=store_dir, create=True,
+    )
+    tmp_name = f".{name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    created_tmp = False
+    try:
+        try:
+            existing = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.geteuid():
+                raise UnsafeEntryError
+        fd = safe_open_below(dir_fd, tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        created_tmp = True
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            if fsync:
+                os.fsync(handle.fileno())
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        created_tmp = False
+        return verified_dir / name
+    finally:
+        if created_tmp:
+            with suppress(FileNotFoundError):
+                os.unlink(tmp_name, dir_fd=dir_fd)
+        os.close(dir_fd)
