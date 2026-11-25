@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 import json
+import re
 import subprocess
 import sys
 import types
@@ -123,9 +124,11 @@ def test_response_telemetry_keeps_product_transcript_identity_and_state_records(
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("LEARN_UKRAINIAN_TELEMETRY_FOOTER", "1")
-    for name in ("AGENT_NO_TELEMETRY_FOOTER", "LEARN_UKRAINIAN_TRANSCRIPT_PATH", "CLAUDE_TRANSCRIPT_PATH"):
+    # The default Claude account directory under HOME.
+    for name in ("AGENT_NO_TELEMETRY_FOOTER", "LEARN_UKRAINIAN_TRANSCRIPT_PATH", "CLAUDE_TRANSCRIPT_PATH", "CLAUDE_CONFIG_DIR"):
         monkeypatch.delenv(name, raising=False)
-    project_dir = home / ".claude/projects" / str(product.resolve()).replace("/", "-")
+    # Claude Code's project directory name: every non-alphanumeric character becomes "-".
+    project_dir = home / ".claude/projects" / re.sub(r"[^A-Za-z0-9]", "-", str(product.resolve()))
     project_dir.mkdir(parents=True)
     transcript = project_dir / "session-1.jsonl"
     transcript.write_text(json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 1234}}}) + "\n")

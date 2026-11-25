@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -231,7 +232,12 @@ def _reporter_code_root() -> str:
 
 
 def _systemd_exec_start(home: Path) -> subprocess.CompletedProcess[str]:
-    """Run the unit's ExecStart the way systemd does: Environment=, optional EnvironmentFile=, cwd."""
+    """Run the unit's ExecStart the way systemd does.
+
+    Environment= and EnvironmentFile= (``-`` marks it optional), ``%h``, a ``${NAME}`` word
+    expanded to exactly one argument (empty when unset), and a user unit's default working
+    directory, the home directory.
+    """
     unit = _unit_lines()
     env: dict[str, str] = {}
     for assignment in unit["Environment"]:
@@ -248,11 +254,13 @@ def _systemd_exec_start(home: Path) -> subprocess.CompletedProcess[str]:
                 key, value = line.split("=", 1)
                 env[key] = value
     (command,) = unit["ExecStart"]
-    (cwd,) = unit["WorkingDirectory"]
-    product_python = f"{home}/projects/learn-ukrainian/.venv/bin/python"
-    rendered = command.replace("%h", str(home)).replace(product_python, sys.executable, 1)
+    (cwd,) = unit.get("WorkingDirectory", ["%h"])
+    argv = [
+        env.get(match.group(1), "") if (match := re.fullmatch(r"\$\{(\w+)\}", word)) else word
+        for word in shlex.split(command.replace("%h", str(home)))
+    ]
     return subprocess.run(
-        shlex.split(rendered),
+        argv,
         cwd=cwd.replace("%h", str(home)),
         env={"HOME": str(home), **env},
         capture_output=True,
@@ -263,12 +271,9 @@ def _systemd_exec_start(home: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _systemd_home(tmp_path: Path) -> Path:
-    """A product checkout with no machinery tree. The unit must load its script from the package."""
+    """A home with no product checkout in it. The unit must load its script from the package."""
     home = tmp_path / "home"
-    (home / "projects").mkdir(parents=True)
-    runtime = tmp_path / "runtime-real"
-    runtime.mkdir()
-    (home / "projects/learn-ukrainian").symlink_to(runtime, target_is_directory=True)
+    home.mkdir()
     return home
 
 
@@ -358,9 +363,13 @@ def test_hook_interpreter_is_the_configured_interpreter(monkeypatch, layout, rep
 def test_systemd_exec_start_runs_with_the_configured_roots(tmp_path: Path, layout, repo: str) -> None:
     home = _systemd_home(tmp_path)
     record = tmp_path / "stand-in.json"
+    # The configured interpreter starts both the unit's resource lookup and the reporter. The
+    # stand-in hands the lookup to a real interpreter and records the reporter's start.
     stand_in = _executable(
         tmp_path / "stand-in" / "python",
         f"#!{sys.executable}\nimport json, os, sys\n"
+        "if 'run_project_state_reporter.sh' in ''.join(sys.argv[3:4]):\n"
+        "    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])\n"
         f"json.dump({{'argv': sys.argv[1:], 'primary': os.environ.get({rr.PRIMARY_ROOT_ENV!r}),"
         f" 'slug': os.environ.get({rr.GITHUB_SLUG_ENV!r})}},"
         f" open({str(record)!r}, 'w'))\n",
@@ -554,23 +563,20 @@ def test_linked_worktree_entry_refuses_an_unresolvable_primary(
     assert calls == []
 
 
-def test_unset_configuration_keeps_todays_systemd_exec_start() -> None:
+def test_reporter_unit_takes_every_root_from_the_required_settings_file(tmp_path: Path) -> None:
+    """Defect class: a packaged unit that hardcodes where the product checkout or its interpreter lives."""
     unit = _unit_lines()
     assert unit["ExecStart"] == [
-        "%h/projects/learn-ukrainian/.venv/bin/python -c 'import os,sys; from importlib.resources import files; "
+        "/usr/bin/env ${LEARN_UKRAINIAN_PYTHON} -I -c 'import os,sys; from importlib.resources import files; "
         'os.execvp("bash", ["bash", "--noprofile", "--norc", str(files("lu_machinery.orchestration")'
         '.joinpath("run_project_state_reporter.sh")), *sys.argv[1:]])\''
     ]
-    assert unit["WorkingDirectory"] == ["%h/projects/learn-ukrainian"]
-    assert unit["EnvironmentFile"] == ["-%h/.config/learn-ukrainian/machinery.env"]
-    assert [
-        line
-        for line in unit["Environment"]
-        if line.startswith(("LU_PRODUCT_ROOT=", "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT="))
-    ] == [
-        "LU_PRODUCT_ROOT=%h/projects/learn-ukrainian",
-        "LEARN_UKRAINIAN_PRIMARY_REPO_ROOT=%h/projects/learn-ukrainian",
-    ]
+    assert "WorkingDirectory" not in unit
+    assert unit["EnvironmentFile"] == ["%h/.config/learn-ukrainian/machinery.env"]
+    assert unit["Environment"] == ["PATH=/usr/local/bin:/usr/bin:/bin"]
+    # A missing settings file stops the unit before it starts anything.
+    with pytest.raises(AssertionError, match="required EnvironmentFile missing"):
+        _systemd_exec_start(_systemd_home(tmp_path))
 
 
 def test_machinery_path_refuses_absolute_traversal_and_escaping_symlink_inputs(monkeypatch, tmp_path: Path) -> None:

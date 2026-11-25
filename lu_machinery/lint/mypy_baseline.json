@@ -1819,16 +1819,6 @@
     },
     {
       "path": "lu_machinery/api/work_router.py",
-      "code": "assignment",
-      "message": "Incompatible types in assignment (expression has type \"None | str\", variable has type \"str\")"
-    },
-    {
-      "path": "lu_machinery/api/work_router.py",
-      "code": "no-redef",
-      "message": "Name \"body\" already defined"
-    },
-    {
-      "path": "lu_machinery/api/work_router.py",
       "code": "union-attr",
       "message": "Item \"None\" of \"Any | None | dict[Any, Any]\" has no attribute \"get\""
     },
