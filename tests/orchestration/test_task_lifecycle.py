@@ -3506,3 +3506,48 @@ def test_stream_epic_binding_accepts_either_baked_slug_of_the_registry_row(tmp_p
     finally:
         sel_dir.chmod(0o700)
         sel_file.chmod(0o600)
+
+
+def test_write_lifecycle_and_lock_refuse_direct_task_store_and_load_reads_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Defect class: lifecycle ledger or lock file written directly into the flat task store."""
+    store = tmp_path / "task-store"
+    (store / "archive").mkdir(parents=True)
+    monkeypatch.setenv("LU_TASKS_DIR", str(store))
+
+    ledger = _ledger()
+    link_dir = tmp_path / "tasks-link"
+    link_dir.symlink_to(store)
+    outside_link = tmp_path / "alias.closeout.json"
+    outside_link.symlink_to(store / "via-symlink.closeout.json")
+
+    for blocked in (
+        store / "t1.closeout.json",
+        store / "archive" / "t1.closeout.json",
+        link_dir / "t1.closeout.json",
+        outside_link,
+    ):
+        with pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"):
+            task_lifecycle.write_lifecycle(blocked, ledger)
+        with (
+            pytest.raises(task_lifecycle.LifecycleError, match="task_store_direct_write_refused"),
+            task_lifecycle.lifecycle_lock(blocked),
+        ):
+            pass
+    assert not any(store.glob("*.json"))
+    assert not any(store.glob("*.lock"))
+    assert not any((store / "archive").glob("*.json"))
+    assert not any((store / "archive").glob("*.lock"))
+
+    # Writing and locking under <task>.artifacts/ succeeds.
+    allowed = store / "t1.artifacts" / "closeout.json"
+    with task_lifecycle.lifecycle_lock(allowed):
+        task_lifecycle.write_lifecycle(allowed, ledger)
+    assert allowed.is_file()
+    assert task_lifecycle.load_lifecycle(allowed)["lifecycle_id"] == ledger["lifecycle_id"]
+
+    # Pre-existing legacy files directly in the task store remain readable.
+    legacy = store / "legacy.closeout.json"
+    legacy.write_text(allowed.read_text(encoding="utf-8"), encoding="utf-8")
+    assert task_lifecycle.load_lifecycle(legacy)["lifecycle_id"] == ledger["lifecycle_id"]
