@@ -3616,16 +3616,17 @@ def _dismiss_preflight(fields, gh_repo, dest, runner, cwd, environment, *, temp=
     slugs = "|".join(re.escape(slug) for slug in known)
     from lu_machinery.orchestration.fleet_repos import parse_ascii_positive_int
 
-    pr_prefix_re = rf"https://github\.com/(?:{slugs})/pull(?:/|\Z|\?|#)"
-    pr_link_re = rf"https://github\.com/(?:{slugs})/pull/([^/#?]*)(?:#[A-Za-z0-9_-]+)?"
+    pr_segment_re = rf"https://github\.com/(?:{slugs})/pull(?:/([^/#?]*)(?:[/#?].*)?|[#?].*)?"
+    pr_canonical_re = rf"https://github\.com/(?:{slugs})/pull/([1-9][0-9]*)(?:#[A-Za-z0-9_-]+)?"
     prs: set[int] = set()
     for link in links:
-        if re.match(pr_prefix_re, link, re.IGNORECASE):
-            match = re.fullmatch(pr_link_re, link)
-            num = parse_ascii_positive_int(match[1]) if match is not None and len(match[1]) <= 19 else None
+        if seg_match := re.fullmatch(pr_segment_re, link, re.IGNORECASE):
+            seg = seg_match[1]
+            num = parse_ascii_positive_int(seg) if seg is not None and len(seg) <= 19 else None
             if num is None:
                 raise ValueError("comment needs an explanation and one same-repository merged PR")
-            prs.add(num)
+            if re.fullmatch(pr_canonical_re, link):
+                prs.add(num)
     explanation = re.sub(identifier, "", re.sub(r"https://[^\s<>()]+", "", comment)).strip(" .,:;\n")
     if dest.partition("/")[0] != "github.com" or len(prs) != 1 or not any(char.isalpha() for char in explanation):
         raise ValueError("comment needs an explanation and one same-repository merged PR")
