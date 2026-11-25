@@ -468,6 +468,7 @@ def run(args: argparse.Namespace) -> int:
         project_interpreter,
     )
     from lu_machinery.dispatcher.git import resolve_repo
+    from lu_machinery.orchestration.fleet_repos import FleetRepoError, resolve_active_fleet_repo
 
     if not args.dry_run and os.environ.get("LEARN_UKRAINIAN_DISPATCH_TASK_ID"):
         raise CanaryError("run must execute on the host, outside a dispatched worker; use --dry-run here")
@@ -477,6 +478,11 @@ def run(args: argparse.Namespace) -> int:
         # supervise its routes, and the attestation step refuses that before any provider call.
         raise CanaryError(f"--repo {args.repo}: only machinery heads can be canaried; this runner cannot attest "
                           f"the dispatcher of a {repository['key']} head")
+    try:
+        # Read and clone at the row's active slug; a transferred row without a trusted selector fails closed.
+        github = resolve_active_fleet_repo(repository["key"]).active_github
+    except FleetRepoError as exc:
+        raise CanaryError(f"--repo {args.repo}: {exc}") from None
     env = sanitized_git_env(strip_config_injection=True)
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
@@ -484,7 +490,7 @@ def run(args: argparse.Namespace) -> int:
     head = args.head
     if args.pr is not None:
         result = github_client.run(
-            ["gh", "pr", "view", str(args.pr), "--repo", repository["github"], "--json", "headRefOid"],
+            ["gh", "pr", "view", str(args.pr), "--repo", github, "--json", "headRefOid"],
             cwd=source, env=env, text=True, capture_output=True, check=True,
         )
         head = json_depth.loads(result.stdout, max_depth=512)["headRefOid"]
@@ -506,7 +512,7 @@ def run(args: argparse.Namespace) -> int:
     else:
         work = Path(tempfile.mkdtemp(prefix=".lu-contract-canary-", dir=Path.home()))
     setup, route_commands, unmount = _run_steps(
-        work, source, repository["key"], repository["github"], head, interpreter, routes, args.hard_timeout, env,
+        work, source, repository["key"], github, head, interpreter, routes, args.hard_timeout, env,
         wheelhouse,
     )
     # Force a full score even if this head's changed files do not touch the contract.

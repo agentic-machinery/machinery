@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from lu_machinery.common import git_credentials
 from lu_machinery.fleet import hramatka_hygiene_check as hygiene
 from lu_machinery.orchestration.fleet_repos import FleetRepo
 from tests.helpers.product_tree import configured_roots  # noqa: F401
@@ -138,6 +139,52 @@ def test_verified_when_epic_clean_pointer_present_no_zombies(hermetic_repo) -> N
     assert receipt["reasons"] == []
 
 
+def test_private_board_is_read_at_the_active_slug(hermetic_repo, monkeypatch) -> None:
+    """Defect class: reader acts on the baked slug after the selector flips to the alternate."""
+    repo_root, tasks_dir = hermetic_repo
+    moved = "moved-owner/private-infra"
+    repos = {"infra-private": FleetRepo("infra-private", PRIVATE, "private-infra", "private-infra",
+                                        repository_id=1, visibility="private", alternate_github=moved)}
+    monkeypatch.setattr(hygiene, "load_fleet_repos", lambda: repos)
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
+        {"infra-private": moved}, "d" * 64))
+    body = f"Planning queue: private BOARD [{moved}#{BOARD}].\n"
+    reads: list[tuple[str, int]] = []
+    fixture = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": body}, (moved, BOARD): {"number": BOARD, "body": ""}})
+
+    def reader(repo: str, number: int) -> dict[str, Any]:
+        reads.append((repo, number))
+        return fixture(repo, number)
+
+    receipt = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+
+    assert receipt["status"] == "verified"
+    assert reads == [(PUBLIC, EPIC), (moved, BOARD)]
+    # The epic's existing pointer names the board by the slug it left (GitHub redirects it): still the board.
+    reads.clear()
+    fixture = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": CLEAN_BODY}, (moved, BOARD): {"number": BOARD, "body": ""}})
+    kept = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+    assert (kept["status"], kept["queue_pointer_ok"]) == ("verified", True)
+    assert reads == [(PUBLIC, EPIC), (moved, BOARD)]
+    # An explicit --private-repo is the one spelling its pointer may use.
+    explicit = hygiene.hygiene_check(reader=reader, private_repo=moved, **_base_kwargs(repo_root, tasks_dir))
+    assert explicit["queue_pointer_ok"] is False
+    # Before the selector makes the alternate live, a pointer to it reaches nothing yet: only the baked one counts.
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: git_credentials.SelectorState(
+        {"infra-private": PRIVATE}, "d" * 64))
+    fixture = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": body}, (PRIVATE, BOARD): {"number": BOARD, "body": ""}})
+    early = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+    assert (early["status"], early["queue_pointer_ok"]) == ("stale", False)
+    fixture = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": CLEAN_BODY}, (PRIVATE, BOARD): {"number": BOARD, "body": ""}})
+    assert hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))["status"] == "verified"
+    # Without a trusted selector the transferred row is unknown: no read of the slug it may have left.
+    monkeypatch.setattr(git_credentials, "load_selector", lambda **_kwargs: (_ for _ in ()).throw(
+        git_credentials.SelectorError("fleet repository selector unavailable")))
+    reads.clear()
+    unknown = hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))
+    assert unknown["status"] == "unknown" and reads == []
+
+
 def test_cli_exit_zero_on_verified(hermetic_repo, capsys) -> None:
     repo_root, tasks_dir = hermetic_repo
     reader = _reader(
@@ -201,6 +248,12 @@ def test_stale_when_349_pointer_missing(hermetic_repo) -> None:
     assert receipt["status"] == "stale"
     assert receipt["queue_pointer_ok"] is False
     assert any("pointer" in reason for reason in receipt["reasons"])
+    # Defect class: the pointer matched as a substring of another repository or another issue number.
+    for near_miss in (f"other-{PRIVATE}#{BOARD}", f"https://github.com/x{PRIVATE}/issues/{BOARD}",
+                      f"{PRIVATE}#{BOARD}0", f"{PRIVATE}/issues/{BOARD}1", f"{PRIVATE}#{BOARD}a"):
+        reader = _reader({(PUBLIC, EPIC): {"number": EPIC, "body": f"Queue: {near_miss} here."},
+                          (PRIVATE, BOARD): {"number": BOARD, "body": ""}})
+        assert hygiene.hygiene_check(reader=reader, **_base_kwargs(repo_root, tasks_dir))["queue_pointer_ok"] is False
 
 
 def test_pointer_short_form_is_also_accepted(hermetic_repo) -> None:
