@@ -38,7 +38,9 @@ from lu_machinery.common import json_depth
 _JSON_MAX_DEPTH = 128
 # The stdlib decoder's own constant values: it reuses one NaN object, so an unchanged record that
 # holds NaN still compares equal across reads (a fresh float("nan") never equals itself).
-_DEFAULT_PARSE_CONSTANT: Callable[[str], Any] = json.JSONDecoder().parse_constant
+_JSON_CONSTANTS: dict[str, Any] = {
+    token: json_depth.loads(token, max_depth=1) for token in ("NaN", "Infinity", "-Infinity")
+}
 
 ARCHIVE_DIR_NAME = "archive"
 REVIEW_TASK_FLAG_FIELDS = (
@@ -251,7 +253,7 @@ def parse_task_record(path: Path, raw: bytes, *, display_unknown_schema: bool = 
 
     def constant(token: str) -> Any:
         constants.append(token)
-        return _DEFAULT_PARSE_CONSTANT(token)
+        return _JSON_CONSTANTS[token]
 
     try:
         decoded = raw.decode("utf-8")
