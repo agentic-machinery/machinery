@@ -94,7 +94,7 @@ def resolve_driver_agent_type(
         return None
     try:
         data = yaml.safe_load(raw_text)
-    except (yaml.YAMLError, RecursionError) as exc:
+    except Exception as exc:  # YAMLError, a constructor ValueError (an invalid date), RecursionError
         raise DriverAgentConfigError(f"malformed YAML in {resolved_assignments}: {exc}") from exc
     if data is None:
         return None

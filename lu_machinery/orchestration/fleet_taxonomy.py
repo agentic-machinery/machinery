@@ -98,8 +98,9 @@ def _parse_fleet_taxonomy(path: Path, content: bytes) -> TaxonomyRegistry:
     for area_id, area_data in raw_data["areas"].items():
         if not isinstance(area_id, str) or not isinstance(area_data, dict):
             raise FleetTaxonomyError(f"Invalid taxonomy structure in {path}: area {area_id!r} must be a mapping")
-        raw_aliases = area_data.get("aliases", [])
-        raw_epics = area_data.get("epics", [])
+        # Both keys are required (fleet-taxonomy.v1): an omitted one is an error, never an empty list.
+        raw_aliases = area_data.get("aliases")
+        raw_epics = area_data.get("epics")
         if not isinstance(raw_aliases, list) or not all(isinstance(a, str) for a in raw_aliases):
             raise FleetTaxonomyError(f"Invalid taxonomy structure in {path}: {area_id}.aliases must be a list of strings")
         if not isinstance(raw_epics, list) or not all(

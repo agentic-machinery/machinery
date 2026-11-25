@@ -50,21 +50,28 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         raise FleetTaxonomyValidationError(f"YAML parse error in {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise FleetTaxonomyValidationError(f"Root of {path} must be a mapping/dict")
-    # JSON Schema (and every reader) expects JSON data: a YAML key such as `123` or `true` is not a
-    # string. Each node is visited once, so anchors that share or nest a node cannot loop the walk.
-    pending: list[Any] = [data]
-    seen: set[int] = set()
+    # JSON Schema (and every reader) expects a JSON tree: a YAML key such as `123` or `true` is not a
+    # string, and an anchor that contains itself is a cycle. Shared acyclic anchors are walked once.
+    done: set[int] = set()
+    on_path: set[int] = set()
+    pending: list[tuple[Any, bool]] = [(data, False)]
     while pending:
-        node = pending.pop()
-        if id(node) in seen:
+        node, leaving = pending.pop()
+        if not isinstance(node, (dict, list)):
             continue
-        seen.add(id(node))
-        if isinstance(node, dict):
-            if not all(isinstance(key, str) for key in node):
-                raise FleetTaxonomyValidationError(f"{path} has a mapping key that is not a string")
-            pending.extend(node.values())
-        elif isinstance(node, list):
-            pending.extend(node)
+        if leaving:
+            on_path.discard(id(node))
+            done.add(id(node))
+            continue
+        if id(node) in on_path:
+            raise FleetTaxonomyValidationError(f"{path} has a YAML anchor that contains itself")
+        if id(node) in done:
+            continue
+        if isinstance(node, dict) and not all(isinstance(key, str) for key in node):
+            raise FleetTaxonomyValidationError(f"{path} has a mapping key that is not a string")
+        on_path.add(id(node))
+        pending.append((node, True))
+        pending.extend((child, False) for child in (node.values() if isinstance(node, dict) else node))
     return data
 
 

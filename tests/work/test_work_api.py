@@ -723,13 +723,13 @@ def test_next_unreadable_fleet_taxonomy_is_registry_unavailable_503(monkeypatch,
     taxonomy = tmp_path / "fleet_taxonomy.yaml"
     monkeypatch.setattr(fleet_taxonomy, "DEFAULT_TAXONOMY_PATH", taxonomy)
     # A readable registry that lacks the name: the stream is unknown (and the parse is cached).
-    taxonomy.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n", encoding="utf-8")
+    taxonomy.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: []\n    epics: []\n", encoding="utf-8")
     response = client.get("/api/work/v1/next?stream=atlas-intake")
     assert response.status_code == 400
     assert response.json()["error"] == "unknown_stream"
 
     # The same file made malformed is read again and refused on both routes.
-    taxonomy.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: null\n", encoding="utf-8")
+    taxonomy.write_text("schema_version: 1\nareas:\n  atlas:\n    id: atlas\n    aliases: null\n    epics: []\n", encoding="utf-8")
     response = client.get("/api/work/v1/next?stream=atlas-intake")
     assert response.status_code == 503, response.text
     body = response.json()
