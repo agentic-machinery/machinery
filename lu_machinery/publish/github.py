@@ -2129,6 +2129,7 @@ def _transfer_checked(fields, source, destination, receipt, sink, temp, *, runne
 # failure exits REPO_ADMIN_UNSETTLED and a transfer journal refuses a second send.
 
 REPO_ADMIN_UNSETTLED = 3
+REPO_ADMIN_VERBS = frozenset({"repo-create", "repo-transfer"})
 # gh reads its credential from these; a caller value would replace the operator's own login.
 REPO_ADMIN_CREDENTIAL_OVERRIDES = (
     "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR", "XDG_CONFIG_HOME",
@@ -2271,54 +2272,91 @@ def _repo_matches(identity, slug, repository_id):
     )
 
 
-def _silence_stream(stream):
-    """Point a failed stream's descriptor at /dev/null, so interpreter shutdown cannot fail on its buffer.
+def _silence_stream(name):
+    """Make the failed ``sys.<name>`` stream harmless, so interpreter shutdown cannot fail on its buffer.
 
-    A failed write leaves data that CPython flushes again at exit, turning the exit code into 120;
-    this is the remedy the Python ``signal`` documentation gives for a broken pipe (Note on SIGPIPE).
+    A failed write leaves data that CPython flushes again at exit, turning the exit code into 120.
+    The descriptor is pointed at /dev/null, the remedy the Python ``signal`` documentation gives
+    for a broken pipe (Note on SIGPIPE); a stream without a usable descriptor is replaced by one.
     """
-    with contextlib.suppress(Exception):
+    stream = getattr(sys, name)
+    try:
         descriptor = stream.fileno()
         devnull = os.open(os.devnull, os.O_WRONLY)
         try:
             os.dup2(devnull, descriptor)
         finally:
             os.close(devnull)
+    except Exception:
+        with contextlib.suppress(Exception):
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115 - lives until exit
 
 
-def _stream_write(stream, text):
-    """Write and flush *text*; False when it cannot be written. It never raises."""
+# Output failures of the current repo-admin run; a failure after a mutation makes it unsettled.
+_REPO_ADMIN_OUTPUT_FAILED: list[str] = []
+
+
+def _stream_write(name, text):
+    """Write and flush *text* to ``sys.<name>``; False when it cannot be written. It never raises."""
     try:
+        stream = getattr(sys, name)
         stream.write(text)
         stream.flush()
         return True
     except Exception:
-        _silence_stream(stream)
+        _REPO_ADMIN_OUTPUT_FAILED.append(name)
+        _silence_stream(name)
         return False
 
 
-def _repo_admin_emit(text):
-    """The receipt on stdout; False when it cannot be written (it never raises)."""
-    return _stream_write(sys.stdout, text)
-
-
 def _stderr_note(message):
-    """One stderr line; a failed write is dropped (the receipt and exit code carry the outcome)."""
-    _stream_write(sys.stderr, message + "\n")
+    """One stderr line; a failed write is recorded for the exit code, never raised."""
+    return _stream_write("stderr", message + "\n")
+
+
+def _repo_admin_flush():
+    """Flush both streams through the guarded writer, so interpreter shutdown has nothing left to fail on."""
+    for name in ("stdout", "stderr"):
+        _stream_write(name, "")
+
+
+def _repo_admin_limited(verb, exc, capture_output, text):
+    """A rate limit before any mutation: exit 75 with the shared client's typed refusal on stdout and stderr.
+
+    It is written here through the guarded writer, not by the shared ``rate_limited_command`` wrapper,
+    whose ``stream.buffer`` write fails on a stream without one and would turn 75 into 2.
+    """
+    limited = github_client._result_process(
+        ["github", verb],
+        github_client.Result(
+            error=exc.code, reset_at=exc.reset_at, status=429, reason=exc.reason, created_pr=exc.created_pr,
+        ),
+        {}, {"capture_output": True, "text": text or not capture_output},
+    )
+    if not capture_output:
+        _stream_write("stdout", limited.stdout)
+        _stream_write("stderr", limited.stderr)
+        limited.stdout = limited.stderr = None
+    _repo_admin_flush()
+    return limited
 
 
 def _repo_admin_result(verb, receipt, code, capture_output, text):
-    """The command result; it never raises, and a failed stdout write after a mutation exits unsettled."""
+    """The command result; it never raises. Any output failure after a mutation exits unsettled.
+
+    Both streams are flushed here, so nothing is left for interpreter shutdown to fail on.
+    """
     encoded = json.dumps(receipt, indent=2, sort_keys=True) + "\n"
-    if not capture_output and not _repo_admin_emit(encoded):
+    if not capture_output and not _stream_write("stdout", encoded):
         _stderr_note(f"{verb.upper().replace('-', '_')}_STDOUT_UNWRITTEN: the receipt is only in its file.")
-        if receipt["mutations_sent"]:
-            code = REPO_ADMIN_UNSETTLED
-    if code == REPO_ADMIN_UNSETTLED:
+    if code == REPO_ADMIN_UNSETTLED or (receipt["mutations_sent"] and _REPO_ADMIN_OUTPUT_FAILED):
         _stderr_note(
             f"{verb.upper().replace('-', '_')}_UNSETTLED: {receipt['detail'] or 'the result is unknown'}; "
             "do not retry. Reconcile the state on GitHub first (see --help)."
         )
+    _repo_admin_flush()
+    if receipt["mutations_sent"] and _REPO_ADMIN_OUTPUT_FAILED:
+        code = REPO_ADMIN_UNSETTLED
     return subprocess.CompletedProcess(
         ["github", verb], code,
         (encoded if text else encoded.encode("utf-8")) if capture_output else None,
@@ -2369,6 +2407,7 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
     One lock per fixture name or repository id is held from the first read to settlement, so a
     second run never acts on reads taken before the first run's mutation.
     """
+    _REPO_ADMIN_OUTPUT_FAILED.clear()
     _repo_admin_authority(verb, environment)
     repos, row = _repo_admin_row(verb, fields["repo"])
     plan = (_repo_create_plan if verb == "repo-create" else _repo_transfer_plan)(verb, fields, repos, row, environment)
@@ -2425,6 +2464,8 @@ def _repo_admin(verb, fields, *, runner, cwd, environment, capture_output, text)
                     "an unexpected error stopped the checks before any mutation"
                 )
                 _write_transfer_receipt(sink, receipt)
+            if isinstance(exc, github_client.GitHubRateLimited):
+                return _repo_admin_limited(verb, exc, capture_output, text)
             raise
         if receipt["outcome"] in {None, "created", "transferred"}:
             receipt["outcome"], receipt["detail"] = "unverified", "a local step failed after the mutation was sent"
@@ -2678,8 +2719,10 @@ def _repo_transfer_plan(verb, fields, repos, row, environment):
         # Selector problems are judged after the destination and journal reads, so a pending transfer still settles.
         try:
             active = fleet_repos.resolve_active_fleet_repo(row.key, repos=repos, env=environment)
-        except fleet_repos.FleetRepoError as exc:
-            selector = f"the fleet repository selector cannot bind {row.key}: {exc}"
+        except Exception as exc:
+            # Any selector failure, the parser's RecursionError included, is judged after the pending journal.
+            detail = str(exc) if isinstance(exc, fleet_repos.FleetRepoError) else type(exc).__name__
+            selector = f"the fleet repository selector cannot bind {row.key}: {detail}"
         else:
             if not _same_slug(active.active_github, row.github):
                 selector = (
@@ -4664,8 +4707,8 @@ def main(argv=None, *, runner=None):
                 "  $HOME and $XDG_STATE_HOME are ignored, so every run finds the same journal): repository id and slug,\n"
                 "  rehearsal_destination, principal before and after. repo-transfer --create-receipt takes that file.\n"
                 "Exit codes: 0 created and verified, or dry run passed (no mutation); 2 invalid input or refusal, no\n"
-                "  mutation; 3 UNSETTLED: the POST was sent and its result is unknown or unverified (a stdout failure\n"
-                "  after the POST included), or another run holds the lock (in-progress); never retry with\n"
+                "  mutation; 3 UNSETTLED: the POST was sent and its result is unknown or unverified (an output\n"
+                "  failure after the POST included), or another run holds the lock (in-progress); never retry with\n"
                 "  the same name: check the organization on GitHub and use a new name; a rate limit at the POST is 3;\n"
                 "  75 a rate limit refused a read before the POST.\n"
                 "Related: decision GH-ADMIN-VERBS-1124; repo-transfer; docs/runbooks/write-worker-boundary.md."
@@ -4917,7 +4960,14 @@ def main(argv=None, *, runner=None):
         action="store_true",
         help="Wrap paginated pages in an array (default off; unsupported for shaped diagnostic reads)",
     )
-    args = vars(parser.parse_args(argv))
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = vars(parser.parse_args(argv))
+    except SystemExit:
+        if argv[:1] and argv[0] in REPO_ADMIN_VERBS:
+            # --help (0) or invalid input (2) of a repo-admin verb: a broken stream must not make it 120 at exit.
+            _repo_admin_flush()
+        raise
     verb = args.pop("verb")
     try:
         if verb == "read":
@@ -4925,14 +4975,20 @@ def main(argv=None, *, runner=None):
         else:
             code = publish(verb, runner=runner, **args).returncode
     except gate.PublishBlocked as exc:
+        if verb not in REPO_ADMIN_VERBS:
+            print(str(exc), file=sys.stderr)
+            return 2
         _stderr_note(str(exc))
         code = 2
     except Exception:
+        if verb not in REPO_ADMIN_VERBS:
+            print("OPSEC: publisher transport unavailable.", file=sys.stderr)
+            return 2
         _stderr_note("OPSEC: publisher transport unavailable.")
         code = 2
-    # A broken stream must not turn this code into 120 when the interpreter flushes it at exit.
-    for stream in (sys.stdout, sys.stderr):
-        _stream_write(stream, "")
+    if verb in REPO_ADMIN_VERBS:
+        # A refusal note that failed must not become 120 at interpreter exit.
+        _repo_admin_flush()
     return code
 
 

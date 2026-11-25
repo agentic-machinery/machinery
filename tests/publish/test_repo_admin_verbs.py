@@ -120,9 +120,11 @@ def selector(tmp_path, monkeypatch):
     monkeypatch.setenv("LU_PRODUCT_ROOT", str(tmp_path / "product"))
     monkeypatch.setattr(pub, "_repo_admin_directory", lambda: str(state_dir(tmp_path)))
     monkeypatch.setenv("LU_SCRATCH_ROOT", str(tmp_path / "scratch"))
-    chosen = {"slug": SOURCE}
+    chosen = {"slug": SOURCE, "error": None}
 
     def active(identifier, *, repos, env=None, **_):
+        if chosen["error"] is not None:
+            raise chosen["error"]
         if chosen["slug"] is None:
             raise fleet_repos.FleetRepoError("fleet repository selector required")
         return fleet_repos.ActiveFleetRepo(repo=repos[identifier], active_github=chosen["slug"])
@@ -415,6 +417,7 @@ class _Unwritable:
     "reconciled-journal-unremovable",
     "pending-selector-flipped",
     "pending-selector-unbound",
+    "pending-selector-crashed",
     "pending-directory-unusable",
     "pending-state-home-changed",
 ])
@@ -452,9 +455,12 @@ def test_unsettled_transfer_blocks_retry_until_reconciled(tmp_path, monkeypatch,
         gh.overrides.clear()
         if outcome == "pending-selector-unbound":
             selector["slug"] = None
+        if outcome == "pending-selector-crashed":
+            # A selector failure outside FleetRepoError (the parser's RecursionError) is judged after the journal.
+            selector["error"] = RecursionError("maximum recursion depth exceeded")
         if outcome == "pending-directory-unusable":
             state_dir(tmp_path).chmod(0o750)
-        if outcome in {"pending-selector-unbound", "pending-directory-unusable"}:
+        if outcome in {"pending-selector-unbound", "pending-selector-crashed", "pending-directory-unusable"}:
             try:
                 result, receipt = run("repo-transfer", gh, repo="infra-private")
             finally:
@@ -640,13 +646,34 @@ def test_concurrent_run_lock_refuses_without_sending(tmp_path, verb, fields, loc
     assert gh.calls == []
 
 
-# A child interpreter whose stdout and stderr are pipes with no reader, so every write fails.
+# A child interpreter whose stdout and stderr (or only one of them) are pipes with no reader, so every
+# write fails; "descriptorless" replaces stdout with a failing wrapper that has no descriptor to redirect,
+# and "bufferless" with a working stream that has no binary buffer.
 _BROKEN_STREAMS_CHILD = """
-import importlib.util, os, sys
+import importlib.util, io, os, sys
+streams = os.environ["REPO_ADMIN_TEST_STREAMS"]
 read_end, write_end = os.pipe()
 os.close(read_end)
-os.dup2(write_end, 1)
-os.dup2(write_end, 2)
+for descriptor, broken in ((1, "stdout"), (2, "stderr")):
+    if streams in {"both", broken}:
+        os.dup2(write_end, descriptor)
+
+
+class Descriptorless(io.TextIOBase):
+    def write(self, _text):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def fileno(self):
+        raise io.UnsupportedOperation("fileno")
+
+
+if streams == "descriptorless":
+    sys.stdout = Descriptorless()
+if streams == "bufferless":
+    sys.stdout = io.StringIO()
 spec = importlib.util.spec_from_file_location("repo_admin_fixture", sys.argv[1])
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
@@ -663,19 +690,57 @@ gh = fixture.FakeGitHub()
 if os.environ.get("REPO_ADMIN_TEST_RATE_LIMIT"):
     from lu_machinery.common import github_client
     gh.overrides[("GET", "user", False)] = github_client.GitHubRateLimited(None, "pool_exhausted")
+if sys.argv[2] == "ruleset-merge-queue":
+    import json, subprocess
+    guarded = pub._stream_write
+
+    def recorded(name, text):
+        with open(os.path.join(os.environ["REPO_ADMIN_TEST_MARKERS"], "guard-calls"), "a") as handle:
+            handle.write(name + "\\n")
+        return guarded(name, text)
+
+    pub._stream_write = recorded
+    gate.check_texts = lambda *_args, **_kwargs: None
+    ruleset = {
+        "id": 7, "name": "queue", "target": "branch", "enforcement": "active", "bypass_actors": [],
+        "conditions": {"ref_name": {"exclude": [], "include": ["refs/heads/main"]}},
+        "rules": [{"type": "merge_queue", "parameters": {"min_entries_to_merge_wait_minutes": 0}}],
+    }
+
+    def gh(args, **_kwargs):
+        if args[args.index("--method") + 1] == "PUT":
+            open(os.path.join(os.environ["REPO_ADMIN_TEST_MARKERS"], "ruleset-put"), "w").close()
+            raise subprocess.TimeoutExpired(args, 30)
+        return subprocess.CompletedProcess(args, 0, json.dumps(ruleset), "")
 sys.exit(pub.main(sys.argv[2:], runner=gh))
 """
 
 
-@pytest.mark.parametrize("argv,pattern,limited", [
-    (["repo-create", "--repo", "infra-private", "--name", "rehearsal-1"], "repo-create-rehearsal-1-*.json", False),
-    (["repo-transfer", "--repo", "infra-private"], f"repo-transfer-{REPO_ID}-*.json", False),
-    (["repo-transfer", "--repo", "infra-private"], f"repo-transfer-{REPO_ID}-*.json", True),
+_RULESET = ["ruleset-merge-queue", "--repo", f"{OLD}/public", "--ruleset", "7", "--min-entries-to-merge-wait-minutes", "1"]
+
+
+_CREATE = ["repo-create", "--repo", "infra-private", "--name", "rehearsal-1", "--principal", PRINCIPAL]
+_TRANSFER = ["repo-transfer", "--repo", "infra-private", "--principal", PRINCIPAL]
+_CREATED, _TRANSFERRED = "repo-create-rehearsal-1-*.json", f"repo-transfer-{REPO_ID}-*.json"
+
+
+@pytest.mark.parametrize("argv,pattern,limited,streams,code", [
+    (_CREATE, _CREATED, False, "both", 3),
+    (_TRANSFER, _TRANSFERRED, False, "both", 3),
+    (_TRANSFER, _TRANSFERRED, True, "both", 75),
+    (_TRANSFER, _TRANSFERRED, False, "stderr", 3),
+    (_CREATE, _CREATED, False, "descriptorless", 3),
+    (_TRANSFER, _TRANSFERRED, True, "bufferless", 75),
+    (["repo-transfer", "--help"], None, False, "stdout", 0),
+    (_RULESET, None, False, "stderr", 120),
 ])
-def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limited):
+def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limited, streams, code):
     """Defect class: interpreter shutdown overriding the documented exit code after a failed stream write.
 
-    After a POST it stays 3; a rate limit before any POST stays 75.
+    After a POST it stays 3, whichever stream failed and whether or not it has a descriptor (never 120);
+    a rate limit before any POST stays 75, also on a stream without a binary buffer (never 2); --help
+    stays 0. The repo-admin output guard never reaches another verb: a ruleset-merge-queue PUT that
+    timed out with a broken stderr keeps the code the shared main() gives it.
     """
     environment = {
         key: value for key, value in os.environ.items()
@@ -685,12 +750,20 @@ def test_broken_output_streams_keep_the_exit_code(tmp_path, argv, pattern, limit
     root = str(Path(pub.__file__).resolve().parents[2])
     environment["PYTHONPATH"] = os.pathsep.join(filter(None, [root, environment.get("PYTHONPATH")]))
     environment["REPO_ADMIN_TEST_DIRECTORY"] = str(state_dir(tmp_path))
+    environment["REPO_ADMIN_TEST_STREAMS"] = streams
+    environment["REPO_ADMIN_TEST_MARKERS"] = str(tmp_path)
     if limited:
         environment["REPO_ADMIN_TEST_RATE_LIMIT"] = "1"
     completed = subprocess.run(
-        [sys.executable, "-c", _BROKEN_STREAMS_CHILD, __file__, *argv, "--principal", PRINCIPAL],
+        [sys.executable, "-c", _BROKEN_STREAMS_CHILD, __file__, *argv],
         env=environment, cwd=tmp_path, capture_output=True, timeout=120, check=False,
     )
-    assert completed.returncode == (75 if limited else pub.REPO_ADMIN_UNSETTLED), completed.stderr
+    assert completed.returncode == code, completed.stderr
+    if argv is _RULESET:
+        # Unchanged from main() before the repo-admin verbs: the shared path leaves the failed stderr
+        # to interpreter shutdown (120); the repo-admin guard, had it run, would have made it 2.
+        assert (tmp_path / "ruleset-put").exists() and not (tmp_path / "guard-calls").exists()
+    if pattern is None:
+        return
     receipts = sorted(state_dir(tmp_path).glob(pattern))
     assert receipts and json.loads(receipts[-1].read_text())["mutations_sent"] == (0 if limited else 1)
